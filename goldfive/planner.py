@@ -293,6 +293,66 @@ class PassthroughPlanner:
         return None
 
 
+class StaticPlanner:
+    """Planner that returns a pre-built :class:`Plan` verbatim.
+
+    Useful for tests, CLIs, and the ``hello_callable`` example where the
+    caller already knows the DAG it wants executed. On every call to
+    :meth:`generate` a fresh copy of the template is returned, with
+    ``run_id`` rewritten to match the current session and ``goal_ids``
+    aligned to the provided goals. :meth:`refine` always returns
+    ``None`` — refinement is out of scope when the plan is hard-coded.
+    """
+
+    def __init__(self, plan: Plan) -> None:
+        if plan is None:  # pragma: no cover - defensive
+            raise TypeError("StaticPlanner requires a non-None Plan")
+        self._template = plan
+
+    async def generate(
+        self,
+        *,
+        goals: list[Goal],
+        available_agents: list[str],
+        context: Mapping[str, Any] | None = None,
+    ) -> Plan | None:
+        run_id = ""
+        if context is not None:
+            run_id = str(context.get("run_id") or "")
+        return Plan(
+            id=self._template.id or uuid.uuid4().hex,
+            run_id=run_id or self._template.run_id,
+            goal_ids=[g.id for g in goals if g.id] or list(self._template.goal_ids),
+            tasks=[
+                Task(
+                    id=t.id,
+                    title=t.title,
+                    description=t.description,
+                    assignee_agent_id=t.assignee_agent_id,
+                    status=t.status,
+                    predicted_start_ms=t.predicted_start_ms,
+                    predicted_duration_ms=t.predicted_duration_ms,
+                    bound_span_id=t.bound_span_id,
+                )
+                for t in self._template.tasks
+            ],
+            edges=[
+                TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
+                for e in self._template.edges
+            ],
+            summary=self._template.summary,
+        )
+
+    async def refine(
+        self,
+        *,
+        plan: Plan,
+        drift: DriftEvent,
+        goals: list[Goal],
+    ) -> Plan | None:
+        return None
+
+
 class LLMPlanner:
     """Delegates to a caller-supplied async LLM callable.
 
