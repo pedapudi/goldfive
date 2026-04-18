@@ -32,29 +32,73 @@ Optional extras: `goldfive[adk]`, `goldfive[claude]`, `goldfive[dev]`.
 
 ## Hello goldfive
 
-> **Intended API — coming in #15.** The types below do not exist yet; this
-> snippet is a sketch of how the package will feel once the core lands.
-
 ```python
 import asyncio
-from goldfive import Runner, Goal, CallableAdapter, InMemorySink
 
-async def agent(prompt: str) -> str:
-    return f"echo: {prompt}"
+from goldfive import (
+    CallableAdapter,
+    InMemorySink,
+    InvocationResult,
+    Plan,
+    ReportingToolSpec,
+    Runner,
+    SequentialExecutor,
+    Session,
+    StaticPlanner,
+    Task,
+    TaskEdge,
+)
+
+
+async def greeter(
+    task: Task,
+    session: Session,
+    tools: list[ReportingToolSpec],
+) -> InvocationResult:
+    text = {
+        "greet": "Hello!",
+        "ask": "What's your name?",
+        "thank": "Thanks for chatting!",
+    }.get(task.id, "")
+    return InvocationResult(task_id=task.id, text=text)
+
 
 async def main() -> None:
+    plan = Plan(
+        id="hello",
+        run_id="",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="greet", title="Greet", assignee_agent_id="greeter"),
+            Task(id="ask", title="Ask for a name", assignee_agent_id="greeter"),
+            Task(id="thank", title="Thank the user", assignee_agent_id="greeter"),
+        ],
+        edges=[
+            TaskEdge(from_task_id="greet", to_task_id="ask"),
+            TaskEdge(from_task_id="ask", to_task_id="thank"),
+        ],
+        summary="Greet, ask, thank.",
+    )
+
     sink = InMemorySink()
     runner = Runner(
-        adapter=CallableAdapter(agent),
-        goal=Goal("Summarize today's standup in three bullets."),
-        sink=sink,
+        agent=CallableAdapter(greeter, available_agents=["greeter"]),
+        planner=StaticPlanner(plan),
+        executor=SequentialExecutor(),
+        sinks=[sink],
     )
-    await runner.run()
-    for event in sink.events:
-        print(event)
+
+    outcome = await runner.run("run the greeter workflow")
+    await runner.close()
+
+    print(f"success={outcome.success} events={len(sink.events)}")
+
 
 asyncio.run(main())
 ```
+
+A runnable copy of this example lives in
+[`examples/hello_callable.py`](examples/hello_callable.py).
 
 ## Docs
 

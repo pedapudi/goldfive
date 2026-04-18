@@ -9,7 +9,8 @@ Related: [PROTOCOLS.md](../design/PROTOCOLS.md),
 
 ## Top-level imports
 
-Everything documented here is re-exported from `goldfive.__init__`:
+Everything documented here is re-exported from `goldfive.__init__`
+(see `goldfive.__all__` for the canonical list):
 
 ```python
 from goldfive import (
@@ -22,11 +23,22 @@ from goldfive import (
     # results
     InvocationResult, ExecutionOutcome,
     # reporting
-    ReportingToolSpec,
+    ReportingToolSpec, BUILTIN_REPORTING_TOOLS,
+    # default implementations re-exported at the package root
+    CallableAdapter,
+    SequentialExecutor, ParallelDAGExecutor,
+    PassthroughPlanner, StaticPlanner, LLMPlanner,
+    PassthroughGoalDeriver, LiteralGoalDeriver, LLMGoalDeriver,
+    DefaultSteerer,
+    InMemorySink,
+    # drift helpers
+    classify_tool_error, classify_refusal, classify_stop_reason,
 )
 ```
 
-Subpackages for implementations:
+Subpackages for implementations not included in the package-root
+re-exports (adapters gated behind optional extras, the heavier sinks
+that require the `proto` extra, etc.):
 
 ```python
 from goldfive.adapters.callable import CallableAdapter
@@ -36,11 +48,18 @@ from goldfive.adapters.claude import ClaudeAgentSDKAdapter  # extra: claude
 from goldfive.executors.sequential import SequentialExecutor
 from goldfive.executors.parallel import ParallelDAGExecutor
 
-from goldfive.planner import PassthroughPlanner, LLMPlanner
-from goldfive.goal_deriver import PassthroughGoalDeriver, LLMGoalDeriver
+from goldfive.planner import PassthroughPlanner, StaticPlanner, LLMPlanner
+from goldfive.goal_deriver import (
+    PassthroughGoalDeriver, LiteralGoalDeriver, LLMGoalDeriver,
+)
 from goldfive.steerer import DefaultSteerer
 
-from goldfive.sinks import InMemorySink, LoggingSink, JSONLPersistenceSink
+from goldfive.sinks import (
+    InMemorySink,
+    LoggingSink,
+    JSONLPersistenceSink,
+    SQLitePersistenceSink,
+)
 ```
 
 ## `Runner`
@@ -70,19 +89,29 @@ class Runner:
 
     async def resume(
         self,
-        session: Session,
-    ) -> ExecutionOutcome: ...  # pairs with JSONLPersistenceSink
+        persistence_path: str,
+    ) -> ExecutionOutcome: ...  # best-effort JSONL replay
+
+    async def close(self) -> None: ...  # close every sink
 ```
+
+`Runner.resume(persistence_path)` loads a JSONL log written by
+`JSONLPersistenceSink`, replays it through
+`goldfive.sinks.reconstruct_session`, and returns an
+`ExecutionOutcome` whose `session` reflects the latest state seen in
+the log. v0.1 does not continue execution from the cursor — callers
+who want live continuation should build a fresh `Runner` from the
+recovered goals. Tracked in issue #15.
 
 | Parameter | Default | Notes |
 |---|---|---|
 | `agent` | required | Any `AgentAdapter`. |
 | `planner` | required | Any `Planner`. |
 | `executor` | required | Any `Executor`. Typically `SequentialExecutor()` or `ParallelDAGExecutor()`. |
-| `goal_deriver` | `PassthroughGoalDeriver()` | Optional; defaults substitute when `None`. |
+| `goal_deriver` | `PassthroughGoalDeriver("run")` | Optional. When `None`, the Runner substitutes a passthrough deriver that emits a single `Goal(id="g1", summary="run")`. |
 | `steerer` | `DefaultSteerer()` | Optional. |
 | `sinks` | `[]` | Optional. Recommended: at least `InMemorySink` in tests and `JSONLPersistenceSink` in prod. |
-| `max_plan_reinvocations` | `3` | Executor aborts after this many consecutive refine loops without net progress. |
+| `max_plan_reinvocations` | `3` | Stamped onto the planner context so executors that honour it can cap refine loops. |
 
 ## Data types (`goldfive.types`)
 
@@ -109,7 +138,7 @@ class DriftSeverity(StrEnum):
 
 ### `DriftKind`
 
-25+ values. See [DRIFT.md](../design/DRIFT.md) for the full
+25 values. See [DRIFT.md](../design/DRIFT.md) for the full
 taxonomy. Examples:
 
 ```python
@@ -238,15 +267,16 @@ class ExecutionOutcome:
 
 ## Protocols (`goldfive.protocols`)
 
-All are `@runtime_checkable`. Full contracts in
+All are `@runtime_checkable`. Every method is `async` unless explicitly
+marked otherwise below. Full contracts in
 [PROTOCOLS.md](../design/PROTOCOLS.md).
 
 | Protocol | Methods |
 |---|---|
 | `GoalDeriver` | `derive(user_input, *, context=None) -> list[Goal]` |
 | `Planner` | `generate(*, goals, available_agents, context=None) -> Optional[Plan]` · `refine(*, plan, drift, goals) -> Optional[Plan]` |
-| `Steerer` | `observe(event, session)` · `transition(task_id, to, *, detail="", session)` · `detect_drift(event, session) -> Optional[DriftEvent]` · `bind(*, sinks, planner)` |
-| `AgentAdapter` | `register_reporting_tools(tools)` · `invoke(task, session) -> InvocationResult` · property `available_agents: list[str]` |
+| `Steerer` | `observe(event, session)` · `transition(task_id, to, *, detail="", session)` · `detect_drift(event, session) -> Optional[DriftEvent]` (sync) · `bind(*, sinks, planner)` (sync) |
+| `AgentAdapter` | `register_reporting_tools(tools)` · `invoke(task, session) -> InvocationResult` · property `available_agents: list[str]` (sync) |
 | `Executor` | `run(*, plan, session, adapter, steerer, planner, sinks) -> ExecutionOutcome` |
 | `EventSink` | `emit(event_pb)` · `close()` |
 
@@ -256,32 +286,47 @@ All are `@runtime_checkable`. Full contracts in
 
 ```python
 class PassthroughGoalDeriver(GoalDeriver):
-    async def derive(self, user_input, *, context=None): ...
+    def __init__(self, goals: str | list[str] | list[Goal]) -> None: ...
+    # ``derive(user_input, ...)`` ignores ``user_input`` and returns
+    # the pre-configured goals verbatim.
+
+class LiteralGoalDeriver(GoalDeriver):
+    def __init__(self) -> None: ...
+    # ``derive(user_input, ...)`` wraps a non-empty string as a single
+    # ``Goal(id="g1", summary=user_input)``.
 
 class LLMGoalDeriver(GoalDeriver):
     def __init__(
         self,
-        *,
         call_llm: Callable[[str, str, str], Awaitable[str]],
-        model: str,
-    ): ...
+        model: str = "",
+        *,
+        system_prompt: Optional[str] = None,
+    ) -> None: ...
 ```
 
 ### Planners (`goldfive.planner`)
 
 ```python
 class PassthroughPlanner(Planner):
-    def __init__(self, *, plan: Plan): ...
+    def __init__(self) -> None: ...
+    # generate() and refine() always return None.
+
+class StaticPlanner(Planner):
+    def __init__(self, plan: Plan) -> None: ...
+    # generate() returns a fresh copy of ``plan`` with run_id and
+    # goal_ids rewritten to match the current session. refine()
+    # always returns None.
 
 class LLMPlanner(Planner):
     def __init__(
         self,
         *,
         call_llm: Callable[[str, str, str], Awaitable[str]],
-        model: str,
-        system_prompt_override: Optional[str] = None,
-        refine_system_prompt_override: Optional[str] = None,
-    ): ...
+        model: str = "",
+        system_prompt: Optional[str] = None,
+        refine_system_prompt: Optional[str] = None,
+    ) -> None: ...
 ```
 
 ### Steerer (`goldfive.steerer`)
@@ -292,6 +337,13 @@ class DefaultSteerer(Steerer):
     # DRIFT.md and STATE-MACHINE.md. No required constructor args.
 ```
 
+In addition to the `Steerer` protocol methods, `DefaultSteerer`
+exposes `mark_task_running`, `mark_task_progress`,
+`mark_task_completed`, `mark_task_failed`, `mark_task_blocked`,
+`mark_task_cancelled`, `report_new_work_discovered`, and
+`report_plan_divergence` for the canonical reporting-tool handlers to
+call into.
+
 ### Executors (`goldfive.executors`)
 
 ```python
@@ -299,16 +351,17 @@ class SequentialExecutor(Executor):
     def __init__(
         self,
         *,
-        nudge_timeout_s: float = 60.0,
-    ): ...
+        max_plan_reinvocations: int = 3,
+        fail_fast: bool = True,
+    ) -> None: ...
 
 class ParallelDAGExecutor(Executor):
     def __init__(
         self,
-        *,
-        max_concurrency: Optional[int] = None,
+        max_concurrency: int = 0,  # 0 = unbounded fan-out
         drift_policy: Literal["cancel_stage", "finish_stage"] = "finish_stage",
-    ): ...
+        max_plan_reinvocations: int = 3,
+    ) -> None: ...
 ```
 
 ### Adapters (`goldfive.adapters`)
@@ -324,33 +377,40 @@ class CallableAdapter(AgentAdapter):
         ],
         *,
         available_agents: Optional[list[str]] = None,
-    ): ...
+    ) -> None: ...
 
 # Requires `goldfive[adk]`
 class ADKAdapter(AgentAdapter):
     def __init__(
         self,
-        root_agent: Any,  # google.adk.BaseAgent
+        agent_or_runner: Any,  # google.adk.BaseAgent OR an existing Runner
         *,
-        runner: Optional[Any] = None,
-    ): ...
+        user_id: str = "goldfive_user",
+        session_id: Optional[str] = None,
+        app_name: Optional[str] = None,
+    ) -> None: ...
 
 # Requires `goldfive[claude]`
 class ClaudeAgentSDKAdapter(AgentAdapter):
     def __init__(
         self,
         *,
-        system_prompt: str,
-        model: str,
-        client: Optional[Any] = None,  # claude_agent_sdk.ClaudeSDKClient
-    ): ...
+        client_factory: Callable[[], Any],  # () -> claude_agent_sdk.ClaudeSDKClient
+        steerer: Optional[Steerer] = None,
+        system_prompt_template: Optional[str] = None,
+        model: Optional[str] = None,
+        available_agents: Optional[list[str]] = None,
+    ) -> None: ...
+
+    def bind_steerer(self, steerer: Steerer) -> None:
+        """Wire a :class:`Steerer` in after construction."""
 ```
 
 ### Sinks (`goldfive.sinks`)
 
 ```python
 class InMemorySink(EventSink):
-    events: list[Event]  # attribute, inspect after the run
+    events: list[Any]  # property — the live event list
 
 class LoggingSink(EventSink):
     def __init__(
@@ -358,18 +418,53 @@ class LoggingSink(EventSink):
         *,
         logger: Optional[logging.Logger] = None,
         level: int = logging.INFO,
-    ): ...
+    ) -> None: ...
 
 class JSONLPersistenceSink(EventSink):
     def __init__(
         self,
-        path: str,  # may contain {run_id} placeholder
-    ): ...
+        path: str | Path,
+        mode: Literal["append", "write"] = "append",
+    ) -> None: ...
 
-    @classmethod
-    def from_jsonl(cls, path: str) -> list[Event]:
-        """Load a run's events for replay / recovery."""
+class SQLitePersistenceSink(EventSink):
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        table: str = "goldfive_events",
+    ) -> None: ...
+
+
+# Module-level replay / reconstruction helpers.
+def replay_from_jsonl(path: str | Path) -> list[Any]:
+    """Parse a JSONL log written by ``JSONLPersistenceSink`` into Event
+    proto messages, in emit order."""
+
+def replay_from_sqlite(
+    path: str | Path,
+    run_id: str,
+    *,
+    table: str = "goldfive_events",
+) -> list[Any]:
+    """Read a single run's events from a SQLite database, ordered by
+    sequence."""
+
+def list_runs(
+    path: str | Path,
+    *,
+    table: str = "goldfive_events",
+) -> list[str]:
+    """Return the distinct run_ids present in a SQLite database."""
+
+def reconstruct_session(events: list[Any]) -> Session:
+    """Replay events to rebuild a best-effort :class:`Session`."""
 ```
+
+`LoggingSink`, `JSONLPersistenceSink`, `SQLitePersistenceSink`, and
+the replay helpers require the `proto` extra (they lean on
+`google.protobuf`). When the extra is missing the symbols resolve to
+``None`` at import time so the rest of the package stays usable.
 
 ## Reporting (`goldfive.reporting`)
 
@@ -378,7 +473,7 @@ class JSONLPersistenceSink(EventSink):
 class ReportingToolSpec:
     name: str
     description: str
-    parameters: dict[str, Any]
+    parameters: dict[str, Any]   # JSON schema
     handler: Callable[
         [dict[str, Any], Session, Steerer],
         Awaitable[dict[str, Any]],
@@ -386,7 +481,7 @@ class ReportingToolSpec:
 
 
 # The seven canonical tool names (stable contract).
-REPORTING_TOOL_NAMES: frozenset[str] = frozenset({
+REPORTING_TOOL_NAMES: tuple[str, ...] = (
     "report_task_started",
     "report_task_progress",
     "report_task_completed",
@@ -394,11 +489,13 @@ REPORTING_TOOL_NAMES: frozenset[str] = frozenset({
     "report_task_blocked",
     "report_new_work_discovered",
     "report_plan_divergence",
-})
+)
 
 
-def build_default_reporting_tools(steerer: Steerer) -> list[ReportingToolSpec]:
-    """The seven canonical tool specs, wired to `steerer`."""
+# Pre-built list of the seven canonical specs. ``Runner`` registers
+# these with the adapter automatically; custom adapters can consume
+# the list directly.
+BUILTIN_REPORTING_TOOLS: list[ReportingToolSpec]
 ```
 
 See [tool-protocol.md](tool-protocol.md) for full semantics.
@@ -406,15 +503,32 @@ See [tool-protocol.md](tool-protocol.md) for full semantics.
 ## Events (`goldfive.events`)
 
 ```python
-def new_event(run_id: str, sequence: int) -> Event:
+def new_event(run_id: str, sequence: int) -> Any:
     """Fresh envelope with run_id, sequence, emitted_at populated."""
 
-def now_ts() -> google.protobuf.Timestamp:
-    """Current wall-clock time as a proto Timestamp."""
+def make_event(
+    *,
+    run_id: str,
+    sequence: int,
+    kind: str,
+    payload: dict[str, Any],
+) -> Any:
+    """Build an envelope from a ``kind`` + ``payload`` dict. Falls back
+    to a plain dict when the ``proto`` extra is not installed."""
 
-async def emit(sinks: list[EventSink], event_pb: Event) -> None:
+def now_ts() -> Any:
+    """Current wall-clock time as a proto ``Timestamp``."""
+
+async def emit(sinks: list[EventSink], event_pb: Any) -> None:
     """Fan out to every sink; swallow per-sink exceptions."""
 ```
+
+Per-event builders (`run_started_event`, `run_completed_event`,
+`run_aborted_event`, `goal_derived_event`, `plan_submitted_event`,
+`plan_revised_event`, `task_started_event`, `task_progress_event`,
+`task_completed_event`, `task_failed_event`, `task_blocked_event`,
+`task_cancelled_event`, `drift_detected_event`) are also available in
+`goldfive.events` as convenience constructors for sink implementations.
 
 ## Proto (`goldfive.pb.goldfive.v1`)
 
@@ -445,14 +559,27 @@ def from_pb_plan(msg: pb.Plan) -> Plan: ...
 def to_pb_goal(goal: Goal) -> pb.Goal: ...
 def from_pb_goal(msg: pb.Goal) -> Goal: ...
 
-# ... similar for Task, TaskEdge, DriftEvent
+def to_pb_task(task: Task) -> pb.Task: ...
+def from_pb_task(msg: pb.Task) -> Task: ...
+
+def to_pb_task_edge(edge: TaskEdge) -> pb.TaskEdge: ...
+def from_pb_task_edge(msg: pb.TaskEdge) -> TaskEdge: ...
+
+def to_pb_drift_event(evt: DriftEvent) -> pb.DriftEvent: ...
+def from_pb_drift_event(msg: pb.DriftEvent) -> DriftEvent: ...
 ```
 
-## Recovery (`goldfive.recovery`)
+## Recovery (`goldfive.sinks`)
 
 ```python
-def reconstruct_session(events: list[Event]) -> Session:
-    """Replay events to rebuild a Session from scratch."""
+def replay_from_jsonl(path: str | Path) -> list[Any]:
+    """Parse a JSONL log into ``Event`` proto messages, in emit order."""
+
+def replay_from_sqlite(path: str | Path, run_id: str) -> list[Any]:
+    """Read a single run's events from a SQLite database."""
+
+def reconstruct_session(events: list[Any]) -> Session:
+    """Replay events to rebuild a best-effort :class:`Session`."""
 ```
 
 Used by `Runner.resume()`. See
@@ -464,11 +591,16 @@ For custom steerer subclasses that want to compose the standard
 classifiers:
 
 ```python
-def classify_tool_error(err: Exception, tool_name: str) -> DriftEvent: ...
-def classify_refusal(text: str) -> Optional[DriftEvent]: ...
-def classify_stop_reason(reason: str) -> Optional[DriftEvent]: ...
-def classify_schema_violation(payload: Any, schema: Any) -> DriftEvent: ...
+def classify_tool_error(event: Any) -> Optional[DriftEvent]: ...
+def classify_refusal(text: Any) -> Optional[DriftEvent]: ...
+def classify_stop_reason(reason: Any) -> Optional[DriftEvent]: ...
 ```
+
+Each returns `None` when the input does not match the classifier's
+signal; callers compose them into a steerer's `detect_drift`
+pipeline. The module also exposes the marker tables
+`LLM_REFUSAL_MARKERS: tuple[str, ...]` and
+`CONTEXT_PRESSURE_STOP_REASONS: tuple[str, ...]` for downstream reuse.
 
 ## Version compatibility
 
