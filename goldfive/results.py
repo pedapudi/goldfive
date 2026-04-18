@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from goldfive.types import Session
@@ -19,7 +19,7 @@ class InvocationResult:
     task_id: str
     text: str = ""
     stop_reason: str = ""
-    error: Optional[Exception] = None
+    error: Exception | None = None
     raw: Any = None
 
 
@@ -32,5 +32,5 @@ class ExecutionOutcome:
     """
 
     success: bool
-    session: "Session"
+    session: Session
     reason: str = ""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any
 
 import pytest
 
@@ -32,7 +33,7 @@ class _GoalDeriverStub:
         self,
         user_input: str,
         *,
-        context: Optional[Mapping[str, Any]] = None,
+        context: Mapping[str, Any] | None = None,
     ) -> list[Any]:
         return []
 
@@ -43,8 +44,8 @@ class _PlannerStub:
         *,
         goals: list[Any],
         available_agents: list[str],
-        context: Optional[Mapping[str, Any]] = None,
-    ) -> Optional[Any]:
+        context: Mapping[str, Any] | None = None,
+    ) -> Any | None:
         return None
 
     async def refine(
@@ -53,7 +54,7 @@ class _PlannerStub:
         plan: Any,
         drift: Any,
         goals: list[Any],
-    ) -> Optional[Any]:
+    ) -> Any | None:
         return None
 
 
@@ -71,7 +72,7 @@ class _SteererStub:
     ) -> None:
         return None
 
-    def detect_drift(self, event: Any, session: Any) -> Optional[Any]:
+    def detect_drift(self, event: Any, session: Any) -> Any | None:
         return None
 
     def bind(self, *, sinks: list[Any], planner: Any) -> None:

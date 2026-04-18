@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Protocol, runtime_checkable
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from goldfive.reporting import ReportingToolSpec
@@ -23,8 +24,8 @@ class GoalDeriver(Protocol):
         self,
         user_input: str,
         *,
-        context: Optional[Mapping[str, Any]] = None,
-    ) -> list["Goal"]: ...
+        context: Mapping[str, Any] | None = None,
+    ) -> list[Goal]: ...
 
 
 @runtime_checkable
@@ -34,46 +35,46 @@ class Planner(Protocol):
     async def generate(
         self,
         *,
-        goals: list["Goal"],
+        goals: list[Goal],
         available_agents: list[str],
-        context: Optional[Mapping[str, Any]] = None,
-    ) -> Optional["Plan"]: ...
+        context: Mapping[str, Any] | None = None,
+    ) -> Plan | None: ...
 
     async def refine(
         self,
         *,
-        plan: "Plan",
-        drift: "DriftEvent",
-        goals: list["Goal"],
-    ) -> Optional["Plan"]: ...
+        plan: Plan,
+        drift: DriftEvent,
+        goals: list[Goal],
+    ) -> Plan | None: ...
 
 
 @runtime_checkable
 class Steerer(Protocol):
     """Observes execution events, drives task transitions, and detects drift."""
 
-    async def observe(self, event: Any, session: "Session") -> None: ...
+    async def observe(self, event: Any, session: Session) -> None: ...
 
     async def transition(
         self,
         task_id: str,
-        to: "TaskStatus",
+        to: TaskStatus,
         *,
         detail: str = "",
-        session: "Session",
+        session: Session,
     ) -> None: ...
 
     def detect_drift(
         self,
         event: Any,
-        session: "Session",
-    ) -> Optional["DriftEvent"]: ...
+        session: Session,
+    ) -> DriftEvent | None: ...
 
     # Called by executors to wire sinks/planner into the steerer.
     def bind(
         self,
         *,
-        sinks: list["EventSink"],
+        sinks: list[EventSink],
         planner: Planner,
     ) -> None: ...
 
@@ -84,14 +85,14 @@ class AgentAdapter(Protocol):
 
     async def register_reporting_tools(
         self,
-        tools: list["ReportingToolSpec"],
+        tools: list[ReportingToolSpec],
     ) -> None: ...
 
     async def invoke(
         self,
-        task: "Task",
-        session: "Session",
-    ) -> "InvocationResult": ...
+        task: Task,
+        session: Session,
+    ) -> InvocationResult: ...
 
     @property
     def available_agents(self) -> list[str]: ...
@@ -104,13 +105,13 @@ class Executor(Protocol):
     async def run(
         self,
         *,
-        plan: "Plan",
-        session: "Session",
+        plan: Plan,
+        session: Session,
         adapter: AgentAdapter,
         steerer: Steerer,
         planner: Planner,
-        sinks: list["EventSink"],
-    ) -> "ExecutionOutcome": ...
+        sinks: list[EventSink],
+    ) -> ExecutionOutcome: ...
 
 
 @runtime_checkable
