@@ -250,6 +250,56 @@ outcome = await runner.run("do the thing")
 That's it. ~50 lines, one new framework wrapped, full goldfive
 semantics on top.
 
+## Just wrap the root agent (multi-agent trees)
+
+When a framework supports nested agents — ADK's `sub_agents`, agent-as-tool
+wrappers, or custom "inner agent" composites — the adapter must coordinate
+**the entire tree**, not just the root. A sub-agent that is missing the
+reporting tools cannot report task outcomes, and the steerer will never see
+its state transitions.
+
+The rule for goldfive adapters: **the caller wraps the root agent; the
+adapter handles subtree propagation itself.** Users should never have to
+attach reporting tools by hand on every node.
+
+`ADKAdapter` implements this by walking the agent graph in
+`register_reporting_tools`. The walk follows three edges:
+
+- `agent.sub_agents` — native ADK child agents.
+- `agent.inner_agent` — wrapper agents that compose a single child.
+- `tool.agent` for each tool in `agent.tools` — agents exposed to a parent
+  via `AgentTool` (agent-as-tool).
+
+Every node that carries a mutable `tools` list gets the reporting tools
+appended. The walk is idempotent: agents that already carry the canonical
+reporting tool names are skipped, so double-registration is a no-op.
+
+Because ADK's plugin callbacks are **runner-scoped**, not agent-scoped,
+the `before_tool_callback` / `before_model_callback` installed once on the
+`Runner` fires for tool calls from every sub-agent. That means the shared
+`SessionContext` (session, task, steerer, handler map) routes every
+sub-agent's `report_task_*` call through the same Steerer — no per-agent
+wiring needed.
+
+```python
+from goldfive.adapters.adk import ADKAdapter
+
+# Tree: root -> child -> grandchild, plus a sibling agent-as-tool.
+adapter = ADKAdapter(root_agent)  # that's it — every descendant is wired.
+```
+
+If you are writing an adapter for a different framework with its own
+nested-agent shape, mirror this pattern:
+
+1. Walk the agent graph from the root you were handed.
+2. For each node, attach the reporting tools (dedupe by name).
+3. Install a single shared intercept (plugin / middleware / callback) on
+   the framework's outermost runtime so every sub-agent's tool calls route
+   through one handler map.
+
+See `goldfive/adapters/adk.py::_augment_subtree_with_reporting` for the
+reference implementation.
+
 ## The steerer reference
 
 In the example above, `self._steerer` is accessed but never set. In
