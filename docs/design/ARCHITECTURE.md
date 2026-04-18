@@ -139,14 +139,16 @@ primitives, owns a `Session`, and runs one invocation end-to-end. See
 Minimal construction:
 
 ```python
+# pseudo-code: `my_async_callable` and `precomputed_plan` are stand-ins
+# for the caller's real agent and plan. Everything else is real.
 from goldfive import Runner
 from goldfive.adapters.callable import CallableAdapter
-from goldfive.planner import PassthroughPlanner
+from goldfive.planner import StaticPlanner
 from goldfive.executors.sequential import SequentialExecutor
 
 runner = Runner(
     agent=CallableAdapter(my_async_callable),
-    planner=PassthroughPlanner(plan=precomputed_plan),
+    planner=StaticPlanner(precomputed_plan),
     executor=SequentialExecutor(),
 )
 outcome = await runner.run("build me a slide deck about Python")

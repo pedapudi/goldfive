@@ -14,6 +14,8 @@ Related: [ARCHITECTURE.md](ARCHITECTURE.md#control-direction),
 ## The `DriftEvent` shape
 
 ```python
+# pseudo-code: reproduces the live ``DriftEvent`` dataclass in
+# ``goldfive/types.py`` for reference.
 @dataclasses.dataclass
 class DriftEvent:
     kind: DriftKind          # one of 25+ enum values
@@ -154,14 +156,19 @@ flowchart TD
 The helper classifiers live in `goldfive/drift.py`:
 
 ```python
-def classify_tool_error(err: Exception, tool_name: str) -> DriftEvent: ...
-def classify_refusal(text: str) -> DriftEvent | None: ...
-def classify_stop_reason(reason: str) -> DriftEvent | None: ...
-def classify_schema_violation(payload: Any, schema: Any) -> DriftEvent: ...
+# pseudo-code: signature-only view. Live definitions are in
+# ``goldfive/drift.py``.
+def classify_tool_error(event: Any) -> DriftEvent | None: ...
+def classify_refusal(text: Any) -> DriftEvent | None: ...
+def classify_stop_reason(reason: Any) -> DriftEvent | None: ...
 ```
 
+Each helper takes an opaque event/text/reason (harmonograf-ish dicts,
+plain strings, or framework-native objects) and returns a
+``DriftEvent`` when a signal is recognised or ``None`` otherwise.
 Subclasses of `DefaultSteerer` can override any of them to tune
-thresholds or add domain-specific signals.
+thresholds or add domain-specific signals (for example a
+schema-violation classifier of your own).
 
 ## Refine policy
 
@@ -169,6 +176,11 @@ When `Steerer.detect_drift()` returns a `DriftEvent`, the executor
 decides whether to act on it:
 
 ```python
+# pseudo-code: `emit_drift_detected` / `emit_run_aborted` /
+# `emit_plan_revised` / `drift_is_recoverable` are illustrative
+# executor-local helpers. The real call sites live inline in
+# ``goldfive/executors/sequential.py`` and
+# ``goldfive/executors/parallel.py``.
 drift = steerer.detect_drift(result, session)
 if drift is None:
     continue

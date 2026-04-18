@@ -34,6 +34,8 @@ Python lives under `goldfive/pb/goldfive/v1/events_pb2.py`.
 Helpers in `goldfive/events.py` produce envelopes:
 
 ```python
+# pseudo-code: `session`, `task`, and `sinks` are supplied by the caller;
+# the `await` runs inside an async function.
 from goldfive.events import new_event, emit
 
 event = new_event(run_id=session.run_id, sequence=session.next_sequence())
@@ -93,6 +95,8 @@ See [DRIFT.md](DRIFT.md) for the full drift-kind taxonomy.
 `Session.next_sequence()`:
 
 ```python
+# pseudo-code: reproduces the body of ``Session.next_sequence`` in
+# ``goldfive/types.py`` for reference.
 def next_sequence(self) -> int:
     s = self._next_sequence
     self._next_sequence = s + 1
@@ -133,6 +137,8 @@ Beyond the per-run total order, goldfive guarantees:
 ## The EventSink contract
 
 ```python
+# pseudo-code: signature only. The live definition is in
+# ``goldfive/protocols.py``.
 @runtime_checkable
 class EventSink(Protocol):
     async def emit(self, event_pb: Any) -> None: ...
@@ -175,6 +181,8 @@ before returning.
 ### `InMemorySink`
 
 ```python
+# pseudo-code: the ``# ... run ...`` placeholder is where the caller's
+# Runner invocation populates the sink.
 from goldfive.sinks import InMemorySink
 
 sink = InMemorySink()
@@ -203,11 +211,14 @@ Useful for local dev.
 ```python
 from goldfive.sinks import JSONLPersistenceSink
 
-sink = JSONLPersistenceSink(path="./runs/{run_id}.jsonl")
+# ``path`` is a literal file path; there is no ``{run_id}`` templating
+# built in — callers that want one file per run format the path
+# themselves and construct a new sink each run.
+sink = JSONLPersistenceSink(path="./runs/example-run.jsonl")
 ```
 
 Writes one JSON-encoded proto message per line. Paired with
-`from_jsonl(path)` for crash recovery. See the full
+`replay_from_jsonl(path)` for crash recovery. See the full
 [persistence guide](../guides/persistence-and-recovery.md).
 
 ## Building a custom sink
@@ -239,9 +250,10 @@ assert isinstance(PrintingSink(), EventSink)  # runtime-checkable
 Plug into a `Runner`:
 
 ```python
+# pseudo-code: `my_callable` and `plan` are caller-supplied.
 runner = Runner(
     agent=CallableAdapter(my_callable),
-    planner=PassthroughPlanner(plan),
+    planner=StaticPlanner(plan),
     executor=SequentialExecutor(),
     sinks=[PrintingSink(), JSONLPersistenceSink("./runs/example.jsonl")],
 )
