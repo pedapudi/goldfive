@@ -25,6 +25,7 @@ the dependency surface to stdlib only.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -99,16 +100,26 @@ class JSONLPersistenceSink:
     async def emit(self, event: Any) -> None:
         """Serialise ``event`` to one JSON line and append it to the file.
 
-        Uses ``MessageToJson(event, sort_keys=True, indent=None)`` so the
-        line is valid JSONL (no embedded newlines) and byte-stable across
-        runs. Concurrent callers are serialised by an :class:`asyncio.Lock`
-        so lines never interleave.
+        Proto messages are serialised with ``MessageToJson(event,
+        sort_keys=True, indent=None)`` for byte-stable output. Non-proto
+        events (dicts or objects exposing ``to_dict``) fall through to
+        ``json.dumps`` so the sink accepts both shapes. Concurrent callers
+        are serialised by an :class:`asyncio.Lock` so lines never interleave.
         """
-        line = MessageToJson(event, sort_keys=True, indent=None) + "\n"
+        if hasattr(event, "DESCRIPTOR"):
+            line = MessageToJson(event, sort_keys=True, indent=None)
+        elif hasattr(event, "to_dict"):
+            line = json.dumps(event.to_dict(), sort_keys=True)
+        elif isinstance(event, dict):
+            line = json.dumps(event, sort_keys=True, default=str)
+        else:
+            # Last-resort: reflect public attributes.
+            payload = {k: v for k, v in vars(event).items() if not k.startswith("_")}
+            line = json.dumps(payload, sort_keys=True, default=str)
         async with self._lock:
             self._open()
             assert self._handle is not None
-            self._handle.write(line)
+            self._handle.write(line + "\n")
             self._handle.flush()
 
     async def close(self) -> None:
