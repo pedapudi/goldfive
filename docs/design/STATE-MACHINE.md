@@ -12,6 +12,8 @@ Related: [DRIFT.md](DRIFT.md), [PROTOCOLS.md](PROTOCOLS.md#steerer),
 ## States
 
 ```python
+# pseudo-code: reproduces the live ``TaskStatus`` ``StrEnum`` in
+# ``goldfive/types.py`` for reference.
 class TaskStatus(StrEnum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -65,6 +67,9 @@ transition is legal. `Steerer.transition()` rejects attempts to leave a
 terminal state:
 
 ```python
+# pseudo-code: illustrative of the absorbing-terminal-state guard.
+# The real transition method lives in
+# ``goldfive/steerer.py::DefaultSteerer.transition``.
 async def transition(self, task_id, to, *, detail="", session):
     task = _find_task(session.plan, task_id)
     if task.status in _TERMINAL_STATES:
