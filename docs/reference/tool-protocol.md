@@ -68,9 +68,10 @@ report_task_started(task_id: str, detail: str = "") -> dict
 
 **Side effects:**
 
-- Steerer transitions `task_id` from PENDING to RUNNING.
-- `session.current_task_id` is set.
-- `session.agent_notes[task_id] = detail`.
+- Steerer transitions `task_id` to RUNNING (unless the task is
+  already in a terminal status, in which case the call is a no-op).
+- `session.current_task_id = task_id`.
+- `session.agent_notes[task_id] = detail` when `detail` is non-empty.
 - Emits `TaskStarted(task_id, detail)`.
 
 **Example:**
@@ -95,8 +96,8 @@ announce. Optional; not required for correct operation.
 
 **Side effects:**
 
-- `session.task_progress[task_id] = fraction`.
-- `session.agent_notes[task_id] = detail`.
+- `session.task_progress[task_id] = fraction` (clamped to `[0.0, 1.0]`).
+- `session.agent_notes[task_id] = detail` when `detail` is non-empty.
 - Emits `TaskProgress(task_id, fraction, detail)`.
 - **No state transition.**
 
@@ -128,7 +129,8 @@ report_task_completed(
 
 **Side effects:**
 
-- Steerer transitions `task_id` from RUNNING to COMPLETED.
+- Steerer transitions `task_id` to COMPLETED (no-op if already
+  terminal).
 - `session.completed_results[task_id] = summary`. Downstream tasks
   see this in their context.
 - Emits `TaskCompleted(task_id, summary, artifacts)`.
@@ -161,9 +163,7 @@ report_task_failed(
 
 **Side effects:**
 
-- Steerer transitions `task_id` from RUNNING to FAILED.
-- `session.completed_results[task_id] = reason` (so failed tasks'
-  messages are still visible to downstream work).
+- Steerer transitions `task_id` to FAILED (no-op if already terminal).
 - Emits `TaskFailed(task_id, reason, recoverable)`.
 - Fires `DriftEvent(kind=TASK_FAILED_RECOVERABLE, severity=warning)`
   if `recoverable=True`.
@@ -200,12 +200,12 @@ asynchronous external process, rate-limited.
 
 **Side effects:**
 
-- Depending on blocker type:
-  - If structural (can be resolved by replanning): task transitions
-    to BLOCKED and fires `DriftEvent(kind=BLOCKED)`.
-  - If transient (will resolve on its own): task stays RUNNING,
-    `agent_notes` captures the blocker.
+- Steerer transitions `task_id` to BLOCKED (no-op if already terminal).
+- `session.agent_notes[task_id]` captures a `"blocked: <blocker>"`
+  message (and `(needed: <needed>)` when `needed` is non-empty).
 - Emits `TaskBlocked(task_id, blocker, needed)`.
+- Fires `DriftEvent(kind=BLOCKED, severity=warning)` which flows
+  through the standard drift pipeline (≥ WARNING → `planner.refine`).
 
 **Example:**
 
@@ -216,11 +216,6 @@ await report_task_blocked(
     needed="human confirmation via the approval queue",
 )
 ```
-
-The distinction between structural and transient is made by the
-steerer based on the `blocker` string — a classifier inspects for
-keywords like "awaiting", "waiting on", "needs human", etc. Custom
-steerers can override.
 
 ### 6. `report_new_work_discovered`
 
@@ -299,7 +294,7 @@ tools above; `report_plan_divergence` is the catch-all.
 | `report_task_progress` | `(task_id, fraction=0.0, detail="")` | RUNNING → RUNNING | — |
 | `report_task_completed` | `(task_id, summary, artifacts=None)` | RUNNING → COMPLETED | — |
 | `report_task_failed` | `(task_id, reason, recoverable=True)` | RUNNING → FAILED | `TASK_FAILED_RECOVERABLE` or `TASK_FAILED_FATAL` |
-| `report_task_blocked` | `(task_id, blocker, needed="")` | RUNNING → BLOCKED (structural) or stays RUNNING | `BLOCKED` |
+| `report_task_blocked` | `(task_id, blocker, needed="")` | RUNNING → BLOCKED | `BLOCKED` |
 | `report_new_work_discovered` | `(parent_task_id, title, description, assignee="")` | none | `NEW_WORK_DISCOVERED` |
 | `report_plan_divergence` | `(note, suggested_action="")` | none | `PLAN_DIVERGENCE` |
 
