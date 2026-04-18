@@ -348,3 +348,106 @@ def test_adapter_conforms_to_protocol() -> None:
     assert isinstance(adapter, AgentAdapter)
     # available_agents includes the root agent name at minimum.
     assert "test_agent" in adapter.available_agents
+
+
+# ---------------------------------------------------------------------------
+# Subtree propagation — wrapping the root coordinates every sub-agent
+# ---------------------------------------------------------------------------
+
+
+def _tool_names(agent: Any) -> set[str]:
+    names: set[str] = set()
+    for t in getattr(agent, "tools", None) or ():
+        n = getattr(t, "name", None) or getattr(
+            getattr(t, "func", None), "__name__", None
+        )
+        if n:
+            names.add(str(n))
+    return names
+
+
+async def test_register_reporting_tools_propagates_across_three_level_tree() -> None:
+    """Wrapping the root agent must attach reporting tools to every descendant.
+
+    Tree shape:
+
+        root
+        ├── child_a           (via sub_agents)
+        │   └── grandchild_a  (via sub_agents)
+        └── child_b_as_tool   (via AgentTool in root.tools)
+            └── grandchild_b  (via sub_agents)
+    """
+    from google.adk.agents.llm_agent import LlmAgent  # type: ignore
+    from google.adk.tools.agent_tool import AgentTool  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.reporting import BUILTIN_REPORTING_TOOLS, REPORTING_TOOL_NAMES
+
+    def _mk(name: str) -> Any:
+        return LlmAgent(
+            name=name, model="fake-model", description=name, instruction="x"
+        )
+
+    grandchild_a = _mk("grandchild_a")
+    grandchild_b = _mk("grandchild_b")
+    child_a = _mk("child_a")
+    child_a.sub_agents = [grandchild_a]
+    child_b_as_tool = _mk("child_b_as_tool")
+    child_b_as_tool.sub_agents = [grandchild_b]
+
+    root = _mk("root")
+    root.sub_agents = [child_a]
+    root.tools = [AgentTool(agent=child_b_as_tool)]
+
+    adapter = ADKAdapter(root)
+    await adapter.register_reporting_tools(list(BUILTIN_REPORTING_TOOLS))
+
+    expected = set(REPORTING_TOOL_NAMES)
+    for agent in (root, child_a, grandchild_a, child_b_as_tool, grandchild_b):
+        have = _tool_names(agent)
+        missing = expected - have
+        assert not missing, (
+            f"agent {agent.name!r} missing reporting tools: {sorted(missing)}"
+        )
+
+    # available_agents discovers every node in the tree.
+    discovered = set(adapter.available_agents)
+    assert {
+        "root",
+        "child_a",
+        "grandchild_a",
+        "child_b_as_tool",
+        "grandchild_b",
+    } <= discovered
+
+
+async def test_register_reporting_tools_is_idempotent() -> None:
+    """Registering twice must not duplicate the reporting tools on any agent."""
+    from google.adk.agents.llm_agent import LlmAgent  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.reporting import BUILTIN_REPORTING_TOOLS, REPORTING_TOOL_NAMES
+
+    child = LlmAgent(
+        name="child", model="fake-model", description="c", instruction="x"
+    )
+    root = LlmAgent(
+        name="root", model="fake-model", description="r", instruction="x"
+    )
+    root.sub_agents = [child]
+
+    adapter = ADKAdapter(root)
+    await adapter.register_reporting_tools(list(BUILTIN_REPORTING_TOOLS))
+    await adapter.register_reporting_tools(list(BUILTIN_REPORTING_TOOLS))
+
+    for agent in (root, child):
+        names = [
+            getattr(t, "name", None)
+            or getattr(getattr(t, "func", None), "__name__", None)
+            for t in getattr(agent, "tools", None) or ()
+        ]
+        for reporting_name in REPORTING_TOOL_NAMES:
+            assert names.count(reporting_name) == 1, (
+                f"{agent.name}: {reporting_name} registered "
+                f"{names.count(reporting_name)} times"
+            )
