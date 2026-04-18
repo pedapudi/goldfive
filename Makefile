@@ -22,6 +22,7 @@ proto:
 		--proto_path=$(PROTO_SRC) \
 		--python_out=$(PROTO_OUT) \
 		--pyi_out=$(PROTO_OUT) \
+		--grpc_python_out=$(PROTO_OUT) \
 		$(PROTO_FILES)
 	@echo "Proto stubs regenerated into $(PROTO_OUT)"
 

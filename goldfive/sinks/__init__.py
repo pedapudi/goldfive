@@ -1,6 +1,6 @@
 """Built-in EventSinks for goldfive.
 
-Four implementations ship in-box:
+Five implementations ship in-box:
 
 * :class:`InMemorySink` — collects events in a list; used by tests and
   ephemeral callers that want to inspect the stream after the run.
@@ -12,15 +12,18 @@ Four implementations ship in-box:
 * :class:`SQLitePersistenceSink` — writes events into a SQLite table so
   dashboards and shared-DB integrations can query across runs. Paired
   with :func:`replay_from_sqlite` and :func:`list_runs`.
+* :class:`GRPCSink` — forwards proto events over a client-streaming
+  gRPC RPC to a ``GoldfiveIngress`` server (see ``goldfive.server``).
 
-``InMemorySink`` is always importable. The other three depend on the
-optional ``proto`` extra (``google.protobuf``) — importing them when
-the extra is missing raises :class:`ImportError` with a friendly
-message. The top-level ``goldfive`` module handles that import
-gracefully so the bulk of the public API stays usable without ``proto``.
+``InMemorySink`` is always importable. The others depend on the optional
+``proto`` extra (``google.protobuf``, plus ``grpcio`` for :class:`GRPCSink`)
+— importing them when the extra is missing raises :class:`ImportError`
+with a friendly message. The top-level ``goldfive`` module handles that
+import gracefully so the bulk of the public API stays usable without
+``proto``.
 
 All sinks conform to the ``EventSink`` protocol pinned in
-``INTERFACE_SPEC.md`` (async ``emit`` / async ``close``).
+``goldfive.protocols`` (async ``emit`` / async ``close``).
 """
 
 from __future__ import annotations
@@ -54,7 +57,13 @@ except ImportError:  # pragma: no cover — proto extra not installed
     list_runs = None  # type: ignore[assignment]
     replay_from_sqlite = None  # type: ignore[assignment]
 
+try:
+    from goldfive.sinks.grpc_sink import GRPCSink
+except ImportError:  # pragma: no cover — grpcio not installed
+    GRPCSink = None  # type: ignore[assignment]
+
 __all__ = [
+    "GRPCSink",
     "InMemorySink",
     "JSONLPersistenceSink",
     "LoggingSink",
