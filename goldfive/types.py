@@ -55,6 +55,19 @@ class DriftSeverity(StrEnum):
     CRITICAL = "critical"
 
 
+_SEVERITY_RANK: dict[str, int] = {
+    DriftSeverity.INFO.value: 0,
+    DriftSeverity.WARNING.value: 1,
+    DriftSeverity.CRITICAL.value: 2,
+}
+
+
+def severity_rank(sev: DriftSeverity | str) -> int:
+    """Ordinal rank for comparing ``DriftSeverity`` values."""
+    v = sev.value if isinstance(sev, DriftSeverity) else str(sev)
+    return _SEVERITY_RANK.get(v, -1)
+
+
 @dataclasses.dataclass
 class Task:
     id: str
