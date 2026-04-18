@@ -39,9 +39,11 @@ that happened. Replaying the log reconstructs the session, and a new
 ## The sink
 
 ```python
+import uuid
 from goldfive.sinks import JSONLPersistenceSink
 
-sink = JSONLPersistenceSink(path="./runs/{run_id}.jsonl")
+run_id = uuid.uuid4().hex
+sink = JSONLPersistenceSink(f"./runs/{run_id}.jsonl")
 
 runner = Runner(
     agent=...,
@@ -52,8 +54,13 @@ runner = Runner(
 outcome = await runner.run("do the thing")
 ```
 
-The sink writes one JSON-encoded proto `Event` per line. `{run_id}`
-in the path is substituted at run start.
+The sink writes one JSON-encoded event per line: proto ``Event``
+messages from the executor and steerer go through
+``google.protobuf.json_format.MessageToJson`` and Runner-level dict
+envelopes go through plain ``json.dumps``. The ``path`` is a literal
+string — pick a filename yourself (for example, by generating a
+``run_id`` up-front and formatting it in) since the sink does not
+substitute placeholders.
 
 On-disk shape:
 
@@ -90,14 +97,17 @@ via the normal `Runner.run()` exit path; it happens automatically.
 
 ```python
 from goldfive import Runner
-from goldfive.sinks import JSONLPersistenceSink
+from goldfive.sinks import (
+    JSONLPersistenceSink,
+    reconstruct_session,
+    replay_from_jsonl,
+)
 
 
 # Step 1: load the events from the crashed run.
-events = JSONLPersistenceSink.from_jsonl("./runs/abc.jsonl")
+events = replay_from_jsonl("./runs/abc.jsonl")
 
 # Step 2: rebuild a Session from the events.
-from goldfive.recovery import reconstruct_session  # helper from issue #15
 session = reconstruct_session(events)
 
 # Step 3: construct a new Runner with the same components.
@@ -105,18 +115,25 @@ runner = Runner(
     agent=my_agent_adapter,   # same adapter configuration
     planner=my_planner,
     executor=my_executor,
-    sinks=[JSONLPersistenceSink(path="./runs/abc.jsonl")],  # same file, append
+    sinks=[JSONLPersistenceSink("./runs/abc.jsonl")],  # same file, append
 )
 
-# Step 4: resume.
-outcome = await runner.resume(session=session)
+# Step 4: resume from the persisted log. ``resume`` replays the
+# events internally, reports the last terminal marker as the
+# outcome, and returns the reconstructed session on
+# ``outcome.session``. v0.1 does not yet continue execution from the
+# last un-finished task — see "What's explicitly not in v0.1" below.
+outcome = await runner.resume("./runs/abc.jsonl")
 ```
 
-`Runner.resume()` picks up from the reconstructed session. The
+`Runner.resume()` replays the JSONL log and returns an
+`ExecutionOutcome` carrying the reconstructed session. The
 reconstructed plan has tasks in whatever terminal states the log
-records (COMPLETED, FAILED, CANCELLED), RUNNING tasks are rolled
-back to PENDING (with a warning log — see below), and PENDING tasks
-are executed as normal.
+records (COMPLETED, FAILED, CANCELLED); tasks that were mid-flight
+when the log ended stay RUNNING in ``reconstruct_session``'s output
+but the resume path will be converted to PENDING once live
+continuation lands (TODO in ``Runner.resume``). PENDING tasks are
+executed as normal when continuation is implemented.
 
 ### What `reconstruct_session` does
 
@@ -229,12 +246,14 @@ exhaustion, which is a stop-the-world condition anyway.
 Your tail line is `{"eventId":"01H...","runId":"abc","sequenc...`
 (cut off).
 
-`JSONLPersistenceSink.from_jsonl()` skips unparseable lines with a
-warning log. The reconstructed session will be slightly behind the
-true crash point, but every event up to the last complete line is
-replayed. On resume, the executor reconstructs from that state and
-carries on. You may re-run a task that was actually completed, which
-loops back to the idempotency argument from case (1).
+`replay_from_jsonl()` currently raises on unparseable lines. Callers
+that want best-effort tail-tolerant replay should catch
+``google.protobuf.json_format.ParseError`` and stop at the last
+parsed event. The reconstructed session then reflects every event up
+to the last complete line. On resume, the executor reconstructs from
+that state and carries on. You may re-run a task that was actually
+completed, which loops back to the idempotency argument from
+case (1).
 
 ## Operational guidance
 
@@ -381,30 +400,43 @@ SQLitePersistenceSink("./shared.db", table="harmonograf_events")
 A quick smoke test:
 
 ```python
-import asyncio, os
-from goldfive import Runner
-from goldfive.sinks import JSONLPersistenceSink
+import asyncio
+import os
 
-# run 1 — interrupted after task 1
+from goldfive import Runner
+from goldfive.sinks import (
+    JSONLPersistenceSink,
+    reconstruct_session,
+    replay_from_jsonl,
+)
+
 path = "./runs/smoke.jsonl"
 if os.path.exists(path):
     os.remove(path)
 
-runner_a = Runner(..., sinks=[JSONLPersistenceSink(path)])
+# run 1 — write events to disk.
+runner_a = Runner(..., sinks=[JSONLPersistenceSink(path, mode="write")])
 try:
-    # custom executor that raises after the first task, for the test
     await asyncio.wait_for(runner_a.run("demo"), timeout=1.0)
 except Exception:
     pass
+await runner_a.close()
 
-# run 2 — resume
-events = JSONLPersistenceSink.from_jsonl(path)
-from goldfive.recovery import reconstruct_session
+# Inspect what made it to the log (optional).
+events = replay_from_jsonl(path)
 session = reconstruct_session(events)
+print(
+    f"recovered run_id={session.run_id}, "
+    f"statuses={[t.status.value for t in (session.plan.tasks if session.plan else [])]}"
+)
 
-runner_b = Runner(..., sinks=[JSONLPersistenceSink(path)])
-outcome = await runner_b.resume(session=session)
-assert outcome.success
+# run 2 — resume from the log. v0.1 replays the events and
+# surfaces the last terminal marker via outcome.success; live
+# continuation of pending work is tracked as future work on
+# Runner.resume.
+runner_b = Runner(...)
+outcome = await runner_b.resume(path)
+print(f"resume outcome: success={outcome.success}")
 ```
 
 `tests/test_persistence_recovery.py` (in [issue #16](https://github.com/pedapudi/goldfive/issues/16))

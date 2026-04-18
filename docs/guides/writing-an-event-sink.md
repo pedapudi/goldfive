@@ -37,9 +37,16 @@ class EventSink(Protocol):
     async def close(self) -> None: ...
 ```
 
-Two methods. `emit(event_pb)` is called once per event, in per-run
+Two methods. `emit(event)` is called once per event, in per-run
 sequence order. `close()` is called once when the run ends. That's
 the entire contract.
+
+One wrinkle: v0.1 emits two event shapes on the same stream. The
+Runner emits dict envelopes (``{"run_id", "sequence", "emitted_at",
+"kind", "payload"}``) for run-lifecycle markers, and executors/
+steerers emit proto ``Event`` messages for per-task state changes.
+Sinks must accept both. ``JSONLPersistenceSink`` is the reference for
+how to fan out: proto via ``MessageToJson``, dict via ``json.dumps``.
 
 ## A minimal stdout sink
 
@@ -50,9 +57,16 @@ from typing import Any
 
 
 class StdoutSink:
-    async def emit(self, event_pb: Any) -> None:
-        kind = event_pb.WhichOneof("payload")
-        print(f"[{event_pb.sequence:04d}] {kind} (run={event_pb.run_id})")
+    async def emit(self, event: Any) -> None:
+        if isinstance(event, dict):
+            seq = int(event.get("sequence", 0))
+            kind = event.get("kind", "?")
+            run_id = event.get("run_id", "")
+        else:
+            seq = int(getattr(event, "sequence", 0))
+            kind = event.WhichOneof("payload") or "?"
+            run_id = getattr(event, "run_id", "")
+        print(f"[{seq:04d}] {kind} (run={run_id})")
 
     async def close(self) -> None:
         pass
@@ -119,7 +133,12 @@ class HttpBackendSink:
             item = await self._queue.get()
             if item is None:
                 return
-            payload = json.loads(MessageToJson(item, preserving_proto_field_name=True))
+            if isinstance(item, dict):
+                payload = item
+            else:
+                payload = json.loads(
+                    MessageToJson(item, preserving_proto_field_name=True)
+                )
             try:
                 await self._client.post(self._endpoint, json=payload)
             except httpx.HTTPError:
@@ -229,9 +248,13 @@ class FilteringSink:
         self._inner = inner
         self._kinds = set(kinds)
 
-    async def emit(self, event_pb) -> None:
-        if event_pb.WhichOneof("payload") in self._kinds:
-            await self._inner.emit(event_pb)
+    async def emit(self, event) -> None:
+        if isinstance(event, dict):
+            kind = event.get("kind", "")
+        else:
+            kind = event.WhichOneof("payload") or ""
+        if kind in self._kinds:
+            await self._inner.emit(event)
 
     async def close(self) -> None:
         await self._inner.close()
@@ -249,12 +272,12 @@ sink = FilteringSink(
 ## Pattern: replay from `JSONLPersistenceSink`
 
 The persistence sink stores every event, so you can reconstruct any
-run:
+run with the module-level ``replay_from_jsonl`` helper:
 
 ```python
-from goldfive.sinks import JSONLPersistenceSink
+from goldfive.sinks import replay_from_jsonl
 
-events = JSONLPersistenceSink.from_jsonl("./runs/abc123.jsonl")
+events = replay_from_jsonl("./runs/abc123.jsonl")
 for ev in events:
     kind = ev.WhichOneof("payload")
     print(ev.sequence, kind)
@@ -282,7 +305,8 @@ async def test_http_sink_posts_events(httpx_mock):
     sink = HttpBackendSink("http://mock.local/events")
 
     ev = Event(run_id="r1", sequence=0)
-    ev.run_started.user_input = "hello"
+    ev.run_started.run_id = "r1"
+    ev.run_started.goal_summary = "hello"
 
     await sink.emit(ev)
     await sink.close()
