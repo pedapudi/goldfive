@@ -9,13 +9,14 @@ working implementations.
 
 Related: [ARCHITECTURE.md](ARCHITECTURE.md), [api.md](../reference/api.md).
 
-All method signatures in this doc track `INTERFACE_SPEC.md` at the
-repository root. When they disagree, the spec wins until it is deleted
-(post-v0.1).
+All method signatures in this doc track `goldfive/protocols.py`. When
+they disagree, the source wins.
 
 ## GoalDeriver
 
 ```python
+# pseudo-code: protocol signature — live definition lives in
+# ``goldfive/protocols.py``.
 @runtime_checkable
 class GoalDeriver(Protocol):
     async def derive(
@@ -71,6 +72,8 @@ to write an `LLMGoalDeriver` instead.
 ## Planner
 
 ```python
+# pseudo-code: protocol signature — live definition lives in
+# ``goldfive/protocols.py``.
 @runtime_checkable
 class Planner(Protocol):
     async def generate(
@@ -130,10 +133,12 @@ from goldfive.types import DriftEvent, Goal, Plan
 
 
 class PassthroughPlanner:
-    """Returns a pre-baked plan; never refines."""
+    """No-op planner — ``generate`` and ``refine`` both return ``None``.
 
-    def __init__(self, plan: Plan) -> None:
-        self._plan = plan
+    Makes it safe to wire a ``planner=`` kwarg everywhere without
+    forcing callers to opt in to planning on day one. Mirrors the
+    live implementation in ``goldfive/planner.py``.
+    """
 
     async def generate(
         self,
@@ -142,7 +147,7 @@ class PassthroughPlanner:
         available_agents: list[str],
         context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Plan]:
-        return self._plan
+        return None
 
     async def refine(
         self,
@@ -151,16 +156,20 @@ class PassthroughPlanner:
         drift: DriftEvent,
         goals: list[Goal],
     ) -> Optional[Plan]:
-        return None  # no refine capability
+        return None
 ```
 
-For the full `LLMPlanner` that parses JSON plans out of an LLM
+Callers who already have a pre-built plan use ``StaticPlanner(plan)``
+instead — it returns the supplied plan verbatim and also declines to
+refine. For the full `LLMPlanner` that parses JSON plans out of an LLM
 response, see `goldfive/planner.py` or
 [goals-and-plans.md](../guides/goals-and-plans.md#writing-a-custom-planner).
 
 ## Steerer
 
 ```python
+# pseudo-code: protocol signature — live definition lives in
+# ``goldfive/protocols.py``.
 @runtime_checkable
 class Steerer(Protocol):
     async def observe(self, event: Any, session: Session) -> None: ...
@@ -261,6 +270,8 @@ drift classifier and event emission.
 ## AgentAdapter
 
 ```python
+# pseudo-code: protocol signature — live definition lives in
+# ``goldfive/protocols.py``.
 @runtime_checkable
 class AgentAdapter(Protocol):
     async def register_reporting_tools(
@@ -355,6 +366,8 @@ for a full worked example that wraps a hypothetical new framework.
 ## Executor
 
 ```python
+# pseudo-code: protocol signature — live definition lives in
+# ``goldfive/protocols.py``.
 @runtime_checkable
 class Executor(Protocol):
     async def run(
@@ -440,6 +453,8 @@ reinvocation loop.
 ## EventSink
 
 ```python
+# pseudo-code: protocol signature — live definition lives in
+# ``goldfive/protocols.py``.
 @runtime_checkable
 class EventSink(Protocol):
     async def emit(self, event_pb: Any) -> None: ...
