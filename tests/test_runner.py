@@ -70,14 +70,32 @@ async def _happy_agent(
 
 
 def _kinds(events: list[Any]) -> list[str]:
-    return [e.get("kind") if isinstance(e, dict) else getattr(e, "kind", "") for e in events]
+    def _one(e: Any) -> str:
+        if isinstance(e, dict):
+            return e.get("kind") or ""
+        if hasattr(e, "WhichOneof"):
+            name = e.WhichOneof("payload") or ""
+            return "".join(part.capitalize() for part in name.split("_")) if name else ""
+        return getattr(e, "kind", "")
+    return [_one(e) for e in events]
 
 
 def _payloads(events: list[Any]) -> list[dict[str, Any]]:
-    return [
-        (e.get("payload") if isinstance(e, dict) else getattr(e, "payload", {})) or {}
-        for e in events
-    ]
+    def _one(e: Any) -> dict[str, Any]:
+        if isinstance(e, dict):
+            return e.get("payload") or {}
+        if hasattr(e, "WhichOneof"):
+            name = e.WhichOneof("payload")
+            if not name:
+                return {}
+            msg = getattr(e, name)
+            # For each field, surface its value; gracefully handle missing attrs.
+            out: dict[str, Any] = {}
+            for fd, v in msg.ListFields():
+                out[fd.name] = v
+            return out
+        return getattr(e, "payload", {}) or {}
+    return [_one(e) for e in events]
 
 
 def _sequences(events: list[Any]) -> list[int]:
