@@ -237,11 +237,11 @@ Use it:
 ```python
 from goldfive import Runner
 from goldfive.executors.sequential import SequentialExecutor
-from goldfive.planner import PassthroughPlanner
+from goldfive.planner import StaticPlanner
 
 runner = Runner(
     agent=AwesomeAdapter(system_prompt="You are a helpful assistant."),
-    planner=PassthroughPlanner(plan=my_plan),
+    planner=StaticPlanner(my_plan),
     executor=SequentialExecutor(),
 )
 outcome = await runner.run("do the thing")

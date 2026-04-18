@@ -95,6 +95,7 @@ already has an explicit goal representation.
 
 ```python
 from goldfive.goal_deriver import PassthroughGoalDeriver
+from goldfive.types import Goal
 
 goals = [
     Goal(id="g1", summary="ship the feature"),
@@ -104,10 +105,16 @@ runner = Runner(
     agent=...,
     planner=...,
     executor=...,
-    goal_deriver=PassthroughGoalDeriver(),
+    goal_deriver=PassthroughGoalDeriver(goals),  # deriver is bypassed anyway
 )
-await runner.run(goals)  # list[Goal] directly
+await runner.run(goals)  # list[Goal] directly — deriver is not consulted
 ```
+
+`PassthroughGoalDeriver` requires a seed (``str``, ``list[str]``, or
+``list[Goal]``) so it can still serve ``derive()`` if anything calls
+it. When ``Runner.run`` receives a ``list[Goal]`` directly, the
+deriver is bypassed entirely, so what you pass as the seed is largely
+cosmetic.
 
 ### `LLMGoalDeriver`
 
@@ -128,7 +135,7 @@ runner = Runner(
     agent=...,
     planner=...,
     executor=...,
-    goal_deriver=LLMGoalDeriver(call_llm=call_llm, model="claude-opus-4-5-20251101"),
+    goal_deriver=LLMGoalDeriver(call_llm, model="claude-opus-4-5"),
 )
 ```
 
@@ -172,17 +179,24 @@ Keep the deriver small. Complex logic belongs further down the stack.
 
 ## Planners
 
-### `PassthroughPlanner`
+### `PassthroughPlanner` and `StaticPlanner`
 
 ```python
-from goldfive.planner import PassthroughPlanner
+from goldfive.planner import PassthroughPlanner, StaticPlanner
 
-planner = PassthroughPlanner(plan=precomputed_plan)
+# PassthroughPlanner is a no-op: generate() and refine() both return
+# None. Useful as a default when planning is opt-in.
+planner = PassthroughPlanner()
+
+# StaticPlanner hands a pre-built plan back from generate() verbatim
+# (with run_id / goal_ids stamped onto the returned copy).
+planner = StaticPlanner(precomputed_plan)
 ```
 
-Hands the caller-supplied plan back from `generate()`, returns `None`
-from `refine()`. For tests, demos, and cases where you're authoring
-plans ahead of time.
+Use ``PassthroughPlanner`` when planning is opt-in and a no-op is
+acceptable. Use ``StaticPlanner`` for tests, demos, and cases where
+you're authoring plans ahead of time. Both return ``None`` from
+``refine()`` — they don't mutate the plan in response to drift.
 
 ### `LLMPlanner`
 
@@ -196,9 +210,9 @@ async def call_llm(system_prompt: str, user_prompt: str, model: str) -> str:
 
 planner = LLMPlanner(
     call_llm=call_llm,
-    model="claude-opus-4-5-20251101",
-    system_prompt_override=None,  # optional
-    refine_system_prompt_override=None,  # optional
+    model="claude-opus-4-5",
+    system_prompt=None,          # optional override for goal→plan prompt
+    refine_system_prompt=None,   # optional override for refine prompt
 )
 ```
 
@@ -346,8 +360,8 @@ it after N tasks. For now, the mechanism is opt-in.
 
 ## Tuning the LLM planner prompts
 
-`LLMPlanner` exposes two overrides: `system_prompt_override` and
-`refine_system_prompt_override`. The shipped prompts are in
+`LLMPlanner` exposes two overrides: `system_prompt` and
+`refine_system_prompt`. The shipped prompts are in
 `goldfive/planner.py` under `_DEFAULT_SYSTEM_PROMPT` and
 `_REFINE_SYSTEM_PROMPT`. Port what you need from those; they're tuned
 for the JSON output format the parser expects.
@@ -358,11 +372,11 @@ The default output shape (in the prompt):
 {
   "summary": "short description of the plan",
   "tasks": [
-    {"id": "t1", "title": "...", "description": "...", "assignee": "..."},
-    {"id": "t2", "title": "...", "description": "...", "assignee": "..."}
+    {"id": "t1", "title": "...", "description": "...", "assignee_agent_id": "..."},
+    {"id": "t2", "title": "...", "description": "...", "assignee_agent_id": "..."}
   ],
   "edges": [
-    {"from": "t1", "to": "t2"}
+    {"from_task_id": "t1", "to_task_id": "t2"}
   ]
 }
 ```
@@ -380,7 +394,7 @@ they're matched.
 **Free-text input → LLM-derived goals, LLM-planned execution.** Use
 `LLMGoalDeriver` + `LLMPlanner`. Default combo for general assistants.
 
-**Fixed workflow, variable details.** Use `PassthroughPlanner` with a
+**Fixed workflow, variable details.** Use `StaticPlanner` with a
 plan template cloned per run, populated with the run-specific goal
 summaries.
 
