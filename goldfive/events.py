@@ -102,3 +102,185 @@ def make_event(
         "kind": kind,
         "payload": dict(payload or {}),
     }
+
+
+# ---------------------------------------------------------------------------
+# Typed event factories (proto path). Each returns a populated Event envelope
+# with the appropriate oneof payload set. Callers produce one Event per call
+# and pass it to :func:`emit` or a sink's ``emit`` directly.
+#
+# These helpers require the proto stubs; they raise ModuleNotFoundError if
+# issue #3 hasn't generated them. Executors that need to run without proto
+# should fall back to :func:`make_event`.
+# ---------------------------------------------------------------------------
+
+
+def run_started_event(
+    run_id: str,
+    sequence: int,
+    goal_summary: str = "",
+    started_at: Any | None = None,
+) -> Any:
+    evt = new_event(run_id, sequence)
+    evt.run_started.run_id = run_id
+    evt.run_started.goal_summary = goal_summary
+    evt.run_started.started_at.CopyFrom(started_at or now_ts())
+    return evt
+
+
+def run_completed_event(run_id: str, sequence: int, outcome_summary: str = "") -> Any:
+    evt = new_event(run_id, sequence)
+    evt.run_completed.outcome_summary = outcome_summary
+    return evt
+
+
+def run_aborted_event(run_id: str, sequence: int, reason: str = "") -> Any:
+    evt = new_event(run_id, sequence)
+    evt.run_aborted.reason = reason
+    return evt
+
+
+def goal_derived_event(run_id: str, sequence: int, goals: list[Any]) -> Any:
+    from goldfive.conv import to_pb_goal
+
+    evt = new_event(run_id, sequence)
+    for g in goals:
+        evt.goal_derived.goals.add().CopyFrom(to_pb_goal(g))
+    return evt
+
+
+def plan_submitted_event(run_id: str, sequence: int, plan: Any) -> Any:
+    from goldfive.conv import to_pb_plan
+
+    evt = new_event(run_id, sequence)
+    evt.plan_submitted.plan.CopyFrom(to_pb_plan(plan))
+    return evt
+
+
+def plan_revised_event(
+    run_id: str,
+    sequence: int,
+    plan: Any,
+    drift: Any | None = None,
+) -> Any:
+    from goldfive.conv import to_pb_plan
+
+    evt = new_event(run_id, sequence)
+    evt.plan_revised.plan.CopyFrom(to_pb_plan(plan))
+    if drift is not None:
+        pb = _events_pb_module()
+        kind_name = str(getattr(drift, "kind", ""))
+        sev_name = str(getattr(drift, "severity", ""))
+        if kind_name:
+            try:
+                evt.plan_revised.drift_kind = pb.DriftKind.Value(
+                    kind_name.upper() if not kind_name.startswith("DRIFT_") else kind_name
+                )
+            except (ValueError, AttributeError):
+                pass
+        if sev_name:
+            try:
+                evt.plan_revised.severity = pb.DriftSeverity.Value(
+                    sev_name.upper() if not sev_name.startswith("DRIFT_SEVERITY_") else sev_name
+                )
+            except (ValueError, AttributeError):
+                pass
+        evt.plan_revised.reason = getattr(drift, "detail", "")
+    evt.plan_revised.revision_index = int(getattr(plan, "revision_index", 0))
+    return evt
+
+
+def task_started_event(run_id: str, sequence: int, task_id: str, detail: str = "") -> Any:
+    evt = new_event(run_id, sequence)
+    evt.task_started.task_id = task_id
+    evt.task_started.detail = detail
+    return evt
+
+
+def task_progress_event(
+    run_id: str,
+    sequence: int,
+    task_id: str,
+    fraction: float = 0.0,
+    detail: str = "",
+) -> Any:
+    evt = new_event(run_id, sequence)
+    evt.task_progress.task_id = task_id
+    evt.task_progress.fraction = float(fraction)
+    evt.task_progress.detail = detail
+    return evt
+
+
+def task_completed_event(
+    run_id: str,
+    sequence: int,
+    task_id: str,
+    summary: str = "",
+    artifacts: dict[str, str] | None = None,
+) -> Any:
+    evt = new_event(run_id, sequence)
+    evt.task_completed.task_id = task_id
+    evt.task_completed.summary = summary
+    for k, v in (artifacts or {}).items():
+        evt.task_completed.artifacts[str(k)] = str(v)
+    return evt
+
+
+def task_failed_event(
+    run_id: str,
+    sequence: int,
+    task_id: str,
+    reason: str = "",
+    recoverable: bool = True,
+) -> Any:
+    evt = new_event(run_id, sequence)
+    evt.task_failed.task_id = task_id
+    evt.task_failed.reason = reason
+    evt.task_failed.recoverable = bool(recoverable)
+    return evt
+
+
+def task_blocked_event(
+    run_id: str,
+    sequence: int,
+    task_id: str,
+    blocker: str = "",
+    needed: str = "",
+) -> Any:
+    evt = new_event(run_id, sequence)
+    evt.task_blocked.task_id = task_id
+    evt.task_blocked.blocker = blocker
+    evt.task_blocked.needed = needed
+    return evt
+
+
+def task_cancelled_event(run_id: str, sequence: int, task_id: str, reason: str = "") -> Any:
+    evt = new_event(run_id, sequence)
+    evt.task_cancelled.task_id = task_id
+    evt.task_cancelled.reason = reason
+    return evt
+
+
+def drift_detected_event(run_id: str, sequence: int, drift: Any) -> Any:
+    pb = _events_pb_module()
+    evt = new_event(run_id, sequence)
+    kind_name = str(getattr(drift, "kind", ""))
+    sev_name = str(getattr(drift, "severity", ""))
+    if kind_name:
+        try:
+            evt.drift_detected.kind = pb.DriftKind.Value(
+                kind_name.upper() if not kind_name.startswith("DRIFT_") else kind_name
+            )
+        except (ValueError, AttributeError):
+            pass
+    if sev_name:
+        try:
+            evt.drift_detected.severity = pb.DriftSeverity.Value(
+                sev_name.upper() if not sev_name.startswith("DRIFT_SEVERITY_") else sev_name
+            )
+        except (ValueError, AttributeError):
+            pass
+    evt.drift_detected.detail = getattr(drift, "detail", "")
+    evt.drift_detected.current_task_id = getattr(drift, "current_task_id", "")
+    evt.drift_detected.current_agent_id = getattr(drift, "current_agent_id", "")
+    return evt
