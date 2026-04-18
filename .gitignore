@@ -22,9 +22,6 @@ env/
 .coverage
 htmlcov/
 
-# Generated proto stubs (see issue #3)
-goldfive/pb/
-
 # Editors / OS
 .idea/
 .vscode/
