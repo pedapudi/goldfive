@@ -78,7 +78,7 @@ import asyncio
 from goldfive import Runner
 from goldfive.adapters.callable import CallableAdapter
 from goldfive.executors.sequential import SequentialExecutor
-from goldfive.planner import PassthroughPlanner
+from goldfive.planner import StaticPlanner
 from goldfive.results import InvocationResult
 from goldfive.sinks import InMemorySink
 from goldfive.steerer import DefaultSteerer
@@ -92,21 +92,13 @@ from goldfive.types import Plan, Session, Task, TaskEdge
 #
 # `tools` is the list of reporting-tool specs the adapter registered.
 # In a real agent, this is where the LLM would be invoked and its
-# tool calls intercepted. Here, we just call the tools ourselves.
+# `report_task_*` tool calls intercepted.  The SequentialExecutor
+# auto-announces RUNNING before `invoke` and auto-completes the task
+# after a clean return, so a toy agent can just return a result.
 
 async def my_agent(task: Task, session: Session, tools) -> InvocationResult:
-    started = next(t for t in tools if t.name == "report_task_started")
-    completed = next(t for t in tools if t.name == "report_task_completed")
-
-    await started.handler({"task_id": task.id, "detail": ""}, session, None)
-    # ... do the "work" ...
-    result_text = f"did {task.title}"
-    await completed.handler(
-        {"task_id": task.id, "summary": result_text, "artifacts": {}},
-        session,
-        None,
-    )
-    return InvocationResult(task_id=task.id, text=result_text)
+    _ = tools  # unused in this toy agent
+    return InvocationResult(task_id=task.id, text=f"did {task.title}")
 
 
 # -- the plan -----------------------------------------------------------
@@ -132,11 +124,25 @@ plan = Plan(
 
 # -- the Runner ---------------------------------------------------------
 
+def event_kind(event) -> str:
+    # Runner emits dict events; executors/steerers emit proto Event
+    # messages whose payload is a oneof. Handle both shapes.
+    if isinstance(event, dict):
+        return event.get("kind", "?")
+    return event.WhichOneof("payload") or "?"
+
+
+def event_sequence(event) -> int:
+    if isinstance(event, dict):
+        return int(event.get("sequence", 0))
+    return int(getattr(event, "sequence", 0))
+
+
 async def main() -> None:
     sink = InMemorySink()
     runner = Runner(
         agent=CallableAdapter(my_agent),
-        planner=PassthroughPlanner(plan),
+        planner=StaticPlanner(plan),
         executor=SequentialExecutor(),
         steerer=DefaultSteerer(),
         sinks=[sink],
@@ -145,8 +151,7 @@ async def main() -> None:
 
     print(f"success={outcome.success}, tasks={len(outcome.session.plan.tasks)}")
     for event in sink.events:
-        kind = event.WhichOneof("payload")
-        print(f"  [{event.sequence:2d}] {kind}")
+        print(f"  [{event_sequence(event):2d}] {event_kind(event)}")
 
 
 if __name__ == "__main__":
@@ -163,27 +168,39 @@ Expected output:
 
 ```
 success=True, tasks=3
-  [ 0] run_started
-  [ 1] goal_derived
-  [ 2] plan_submitted
-  [ 3] task_started
-  [ 4] task_completed
-  [ 5] task_started
-  [ 6] task_completed
-  [ 7] task_started
-  [ 8] task_completed
-  [ 9] run_completed
+  [ 0] RunStarted
+  [ 1] GoalDerived
+  [ 2] PlanSubmitted
+  [ 3] run_started
+  [ 4] task_started
+  [ 5] task_completed
+  [ 6] task_started
+  [ 7] task_completed
+  [ 8] task_started
+  [ 9] task_completed
+  [10] run_completed
 ```
+
+Sequences 0–2 come from the Runner (it emits dict envelopes with a
+``kind`` field) and the rest come from the executor and steerer (proto
+``Event`` messages whose oneof payload is matched by ``WhichOneof``).
+You'll see a second ``run_started`` at sequence 3 because the
+executor also announces its start — treat the two together as the
+run's start marker.
 
 That's it. You have a full goldfive run, observable via the in-memory
 sink, walking a 3-task plan end-to-end.
 
 ### Step 3 — Inspect what happened
 
-Everything you'd want to know is in `sink.events`:
+Everything you'd want to know is in `sink.events`. The executor and
+steerer emit proto ``Event`` messages — use ``WhichOneof`` to pick out
+the payload, skipping the dict envelopes the Runner emits:
 
 ```python
 for event in sink.events:
+    if isinstance(event, dict):
+        continue  # Runner envelope: RunStarted / GoalDerived / PlanSubmitted
     kind = event.WhichOneof("payload")
     if kind == "task_completed":
         tc = event.task_completed
