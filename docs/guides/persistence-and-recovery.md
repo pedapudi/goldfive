@@ -273,6 +273,98 @@ independent.
 These three, dashboarded, give you an operational feel for goldfive
 without instrumenting anything beyond the sink.
 
+## SQLite: cross-run queryable persistence
+
+JSONL is perfect when you want the full event stream for a single run
+in one file you can `jq` and tail. It is less useful when you want to
+ask questions like "how many drift events across all runs this week?"
+or "what's the latest plan the harmonograf dashboard should render?"
+For that, goldfive ships `SQLitePersistenceSink`:
+
+```python
+from goldfive.sinks import (
+    SQLitePersistenceSink,
+    list_runs,
+    replay_from_sqlite,
+)
+
+sink = SQLitePersistenceSink("./runs/goldfive.db")
+runner = Runner(..., sinks=[sink])
+await runner.run("do the thing")
+```
+
+Each event is written to a single table (`goldfive_events` by default)
+with schema:
+
+```sql
+CREATE TABLE goldfive_events (
+    run_id       TEXT    NOT NULL,
+    sequence     INTEGER NOT NULL,
+    emitted_at   INTEGER NOT NULL,   -- milliseconds since epoch
+    kind         TEXT    NOT NULL,   -- e.g. "task_started", "drift_detected"
+    payload_json TEXT    NOT NULL,   -- full proto Event as JSON
+    PRIMARY KEY (run_id, sequence)
+);
+```
+
+The `(run_id, sequence)` primary key enforces at-most-one row per
+emitted event and makes per-run replay an indexed lookup. Concurrent
+`emit` coroutines are serialised with `asyncio.Lock`, same as the JSONL
+sink, so writes never interleave.
+
+### Queries
+
+```python
+# What runs are in the database?
+list_runs("./runs/goldfive.db")          # ['run-A', 'run-B', ...]
+
+# Replay one run as parsed proto Events.
+events = replay_from_sqlite("./runs/goldfive.db", run_id="run-A")
+
+# Pass to the same reconstructor used by JSONL recovery.
+from goldfive.sinks import reconstruct_session
+session = reconstruct_session(events)
+```
+
+Because `payload_json` is the full proto-encoded Event, raw SQL works
+too:
+
+```sql
+-- drift events across the database
+SELECT run_id, sequence, json_extract(payload_json, '$.driftDetected.kind')
+FROM goldfive_events
+WHERE kind = 'drift_detected';
+
+-- which runs actually completed
+SELECT DISTINCT run_id
+FROM goldfive_events
+WHERE kind = 'run_completed';
+```
+
+### When to pick which
+
+- Single run, durable audit, happy with files: **JSONL**.
+- Cross-run dashboards, shared integrations (e.g. a harmonograf server
+  reading goldfive events from the same file as observability data),
+  ad-hoc SQL: **SQLite**.
+- Both at once is fine — the two sinks are independent:
+  ```python
+  sinks = [
+      JSONLPersistenceSink(path=f"./runs/{run_id}.jsonl"),
+      SQLitePersistenceSink("./runs/goldfive.db"),
+  ]
+  ```
+
+### Custom tables
+
+Pass `table=` to co-locate goldfive events alongside existing schemas:
+
+```python
+SQLitePersistenceSink("./shared.db", table="harmonograf_events")
+```
+
+`replay_from_sqlite` and `list_runs` take the same `table=` argument.
+
 ## What's explicitly not in v0.1
 
 - **Live replay** — feeding JSONL back through sinks in real time.
