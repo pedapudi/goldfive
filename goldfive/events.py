@@ -77,3 +77,28 @@ async def emit(sinks: list[Any], event_pb: Any) -> None:
     for r in results:
         if isinstance(r, BaseException):
             raise r
+
+
+def make_event(
+    run_id: str,
+    sequence: int,
+    kind: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a dict event envelope for callers that don't need the proto.
+
+    Returns ``{run_id, sequence, kind, payload}``. Sinks type their
+    ``emit`` argument as ``Any`` so both the proto envelope (from
+    :func:`new_event`) and this dict envelope round-trip through the
+    same fan-out machinery.
+    """
+    import time
+
+    t = time.time_ns()
+    return {
+        "run_id": run_id,
+        "sequence": sequence,
+        "emitted_at": {"seconds": t // 1_000_000_000, "nanos": t % 1_000_000_000},
+        "kind": kind,
+        "payload": dict(payload or {}),
+    }

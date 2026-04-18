@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from goldfive.executors import ParallelDAGExecutor
+
 __version__ = "0.0.1"
 
-# Public API re-exports are added by subsequent PRs.
+__all__ = ["ParallelDAGExecutor", "__version__"]
