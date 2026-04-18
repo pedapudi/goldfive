@@ -170,6 +170,50 @@ def from_pb_task_edge(msg: Any) -> TaskEdge:
 # ---------------------------------------------------------------------------
 
 
+def _plan_revision_kind_to_pb(value: str, pb: Any) -> int:
+    """Convert a dataclass ``Plan.revision_kind`` (a ``DriftKind`` string
+    value or ``""``) into the matching proto enum int. Empty string →
+    ``DRIFT_KIND_UNSPECIFIED``; unknown value → ``DRIFT_KIND_CUSTOM``.
+    """
+    if not value:
+        return getattr(pb, "DRIFT_KIND_UNSPECIFIED", 0)
+    try:
+        kind = DriftKind(value)
+    except ValueError:
+        return getattr(pb, "DRIFT_KIND_CUSTOM", 0)
+    return _drift_kind_to_pb(kind, pb)
+
+
+def _plan_revision_severity_to_pb(value: str, pb: Any) -> int:
+    if not value:
+        return getattr(pb, "DRIFT_SEVERITY_UNSPECIFIED", 0)
+    try:
+        severity = DriftSeverity(value)
+    except ValueError:
+        return getattr(pb, "DRIFT_SEVERITY_UNSPECIFIED", 0)
+    return _drift_severity_to_pb(severity, pb)
+
+
+def _plan_revision_kind_from_pb(value: int, pb: Any) -> str:
+    try:
+        name = pb.DriftKind.Name(value)
+    except (ValueError, AttributeError):
+        return ""
+    if name == "DRIFT_KIND_UNSPECIFIED":
+        return ""
+    return _drift_kind_from_pb(value, pb).value
+
+
+def _plan_revision_severity_from_pb(value: int, pb: Any) -> str:
+    try:
+        name = pb.DriftSeverity.Name(value)
+    except (ValueError, AttributeError):
+        return ""
+    if name == "DRIFT_SEVERITY_UNSPECIFIED":
+        return ""
+    return _drift_severity_from_pb(value, pb).value
+
+
 def to_pb_plan(plan: Plan) -> Any:
     pb = _pb_module()
     msg = pb.Plan(
@@ -177,8 +221,8 @@ def to_pb_plan(plan: Plan) -> Any:
         run_id=plan.run_id,
         summary=plan.summary,
         revision_reason=plan.revision_reason,
-        revision_kind=plan.revision_kind,
-        revision_severity=plan.revision_severity,
+        revision_kind=_plan_revision_kind_to_pb(plan.revision_kind, pb),
+        revision_severity=_plan_revision_severity_to_pb(plan.revision_severity, pb),
         revision_index=plan.revision_index,
     )
     msg.goal_ids.extend(plan.goal_ids)
@@ -190,6 +234,7 @@ def to_pb_plan(plan: Plan) -> Any:
 
 
 def from_pb_plan(msg: Any) -> Plan:
+    pb = _pb_module()
     return Plan(
         id=msg.id,
         run_id=msg.run_id,
@@ -198,8 +243,8 @@ def from_pb_plan(msg: Any) -> Plan:
         edges=[from_pb_task_edge(e) for e in msg.edges],
         summary=msg.summary,
         revision_reason=msg.revision_reason,
-        revision_kind=msg.revision_kind,
-        revision_severity=msg.revision_severity,
+        revision_kind=_plan_revision_kind_from_pb(msg.revision_kind, pb),
+        revision_severity=_plan_revision_severity_from_pb(msg.revision_severity, pb),
         revision_index=msg.revision_index,
     )
 
@@ -233,11 +278,32 @@ def from_pb_goal(msg: Any) -> Goal:
 # ---------------------------------------------------------------------------
 
 
+def _events_pb_module() -> Any:
+    """Import ``goldfive.pb.goldfive.v1.events_pb2`` lazily.
+
+    ``DriftEvent`` is expressed on the wire as the ``DriftDetected``
+    payload of an ``Event`` envelope (see ``proto/goldfive/v1/events.proto``),
+    so the drift-event round-trip lives in the events module, not the
+    types module.
+    """
+    try:
+        from goldfive.pb.goldfive.v1 import events_pb2
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "goldfive protobuf stubs not available; generate them via "
+            "`make proto` (requires the `proto` optional-dependency group) "
+            "or install the package with the `proto` extra. See issue #3."
+        ) from exc
+    return events_pb2
+
+
 def to_pb_drift_event(evt: DriftEvent) -> Any:
-    pb = _pb_module()
-    return pb.DriftEvent(
-        kind=_drift_kind_to_pb(evt.kind, pb),
-        severity=_drift_severity_to_pb(evt.severity, pb),
+    """Convert a :class:`DriftEvent` to the wire ``DriftDetected`` proto."""
+    types_pb = _pb_module()
+    events_pb = _events_pb_module()
+    return events_pb.DriftDetected(
+        kind=_drift_kind_to_pb(evt.kind, types_pb),
+        severity=_drift_severity_to_pb(evt.severity, types_pb),
         detail=evt.detail,
         current_task_id=evt.current_task_id,
         current_agent_id=evt.current_agent_id,

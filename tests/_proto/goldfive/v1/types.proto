@@ -1,0 +1,159 @@
+// Goldfive v1 — core data types.
+//
+// These are the wire primitives that goldfive's EventSink surface
+// (events.proto) references. They are deliberately parallel to
+// harmonograf/v1/types.proto for the overlapping concepts (TaskStatus,
+// Task, TaskEdge, Plan revision metadata) so a goldfive -> harmonograf
+// sink can port values mechanically.
+//
+// Python-side dataclasses and converters live alongside the generated
+// stubs (see goldfive/conv.py, tracked separately in issue #4).
+
+syntax = "proto3";
+
+package goldfive.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/pedapudi/goldfive/gen/goldfive/v1;goldfivev1";
+
+// ---------------------------------------------------------------------------
+// Goals
+// ---------------------------------------------------------------------------
+
+// A Goal is the user's intent in a form the agent can plan against.
+// Goals are produced by the goal-derivation step that runs before the
+// planner sees the user's raw input.
+//
+// The framework lets callers attach a Python-side success predicate to a
+// goal (a callable evaluated against the run state). Predicates cannot
+// cross the proto boundary, so `has_success_predicate` just signals its
+// presence for observability; sinks render a badge or similar.
+message Goal {
+  string id = 1;
+  string summary = 2;
+  map<string, string> metadata = 3;
+  // True when the framework has a Python-side predicate attached to this
+  // goal. Predicate bodies are never serialized.
+  optional bool has_success_predicate = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Plans and tasks
+// ---------------------------------------------------------------------------
+
+// Lifecycle of a task within a plan.
+//
+// Mirrors harmonograf.v1.TaskStatus with the addition of BLOCKED, which
+// goldfive emits when a task is waiting on an external input (a tool,
+// another agent, a human). Harmonograf does not need a BLOCKED status
+// because its data model expresses that state via AWAITING_HUMAN on the
+// bound span.
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING = 1;
+  TASK_STATUS_RUNNING = 2;
+  TASK_STATUS_COMPLETED = 3;
+  TASK_STATUS_FAILED = 4;
+  TASK_STATUS_CANCELLED = 5;
+  TASK_STATUS_BLOCKED = 6;
+}
+
+// Severity of a drift event or of the drift that triggered a plan
+// revision. INFO is informational only (sinks may surface as a hint);
+// WARNING is actionable; CRITICAL requires human attention or stops the
+// run.
+enum DriftSeverity {
+  DRIFT_SEVERITY_UNSPECIFIED = 0;
+  DRIFT_SEVERITY_INFO = 1;
+  DRIFT_SEVERITY_WARNING = 2;
+  DRIFT_SEVERITY_CRITICAL = 3;
+}
+
+// Structured taxonomy of drift the observer can detect. Enum values
+// mirror harmonograf's drift kinds (see harmonograf client adk.py) so
+// sinks that forward to harmonograf can map 1:1 where the kinds overlap.
+// CUSTOM is an escape hatch paired with DriftDetected.detail.
+enum DriftKind {
+  DRIFT_KIND_UNSPECIFIED = 0;
+  DRIFT_KIND_TOOL_ERROR = 1;
+  DRIFT_KIND_AGENT_REFUSAL = 2;
+  DRIFT_KIND_NEW_WORK_DISCOVERED = 3;
+  DRIFT_KIND_PLAN_DIVERGENCE = 4;
+  DRIFT_KIND_USER_STEER = 5;
+  DRIFT_KIND_USER_CANCEL = 6;
+  DRIFT_KIND_TASK_FAILED_RECOVERABLE = 7;
+  DRIFT_KIND_TASK_FAILED_FATAL = 8;
+  DRIFT_KIND_CONTEXT_PRESSURE = 9;
+  DRIFT_KIND_BLOCKED = 10;
+  DRIFT_KIND_WRONG_AGENT = 11;
+  DRIFT_KIND_AGENT_TRANSFER = 12;
+  DRIFT_KIND_MODEL_REFUSAL = 13;
+  DRIFT_KIND_STOPPED_EARLY = 14;
+  DRIFT_KIND_TOO_MANY_STEPS = 15;
+  DRIFT_KIND_GOAL_UNREACHABLE = 16;
+  DRIFT_KIND_TASK_TIMEOUT = 17;
+  DRIFT_KIND_REPEATED_FAILURE = 18;
+  DRIFT_KIND_UNEXPECTED_OUTPUT = 19;
+  DRIFT_KIND_SCHEMA_VIOLATION = 20;
+  DRIFT_KIND_HALLUCINATION_SUSPECTED = 21;
+  DRIFT_KIND_SAFETY_CONCERN = 22;
+  DRIFT_KIND_RESOURCE_EXHAUSTED = 23;
+  DRIFT_KIND_AMBIGUOUS_INTENT = 24;
+  DRIFT_KIND_CUSTOM = 25;
+}
+
+// Directed edge in a plan's task dependency DAG. `from_task_id` must
+// reach a terminal status (COMPLETED, or — depending on the planner's
+// policy — FAILED/CANCELLED) before `to_task_id` can transition to
+// RUNNING.
+message TaskEdge {
+  string from_task_id = 1;
+  string to_task_id = 2;
+}
+
+// A single unit of work within a Plan.
+message Task {
+  string id = 1;
+  string title = 2;
+  string description = 3;
+  // Agent id expected to execute this task. May be empty if the planner
+  // has not assigned the task to an agent yet.
+  string assignee_agent_id = 4;
+  TaskStatus status = 5;
+  // Planner's predicted schedule, run-relative milliseconds. Sinks may
+  // fall back to stacking at t=0 when these are zero.
+  int64 predicted_start_ms = 6;
+  int64 predicted_duration_ms = 7;
+  // Optional. Span id that is executing (or has executed) this task.
+  // Populated by sinks that correlate goldfive tasks with harmonograf
+  // spans. Empty for sinks that do not track spans.
+  optional string bound_span_id = 8;
+}
+
+// A Plan is a DAG of Tasks with a revision history. The initial plan
+// submitted by the planner has `revision_index = 0`, `revision_reason`
+// empty, and `revision_kind` / `revision_severity` DRIFT_..._UNSPECIFIED.
+// Each subsequent revision (emitted by the observer in response to drift)
+// increments `revision_index` and fills in the drift metadata.
+message Plan {
+  string id = 1;
+  string run_id = 2;
+  // Goals this plan is working toward. References Goal.id values emitted
+  // by an earlier GoalDerived event on the same run.
+  repeated string goal_ids = 3;
+  string summary = 4;
+  repeated Task tasks = 5;
+  repeated TaskEdge edges = 6;
+
+  // Revision metadata. Empty / UNSPECIFIED on initial plans.
+  string revision_reason = 7;
+  DriftKind revision_kind = 8;
+  DriftSeverity revision_severity = 9;
+  // Monotonic revision index within a plan lineage. 0 for the initial
+  // plan, incrementing by one on each revision. Drives deterministic
+  // ordering in sink UIs.
+  uint32 revision_index = 10;
+
+  google.protobuf.Timestamp created_at = 11;
+}
