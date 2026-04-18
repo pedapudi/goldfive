@@ -162,31 +162,42 @@ def plan_revised_event(
     sequence: int,
     plan: Any,
     drift: Any | None = None,
+    *,
+    drift_kind: str = "",
+    severity: str = "",
+    reason: str = "",
+    revision_index: int | None = None,
 ) -> Any:
     from goldfive.conv import to_pb_plan
 
     evt = new_event(run_id, sequence)
     evt.plan_revised.plan.CopyFrom(to_pb_plan(plan))
+
     if drift is not None:
+        drift_kind = drift_kind or str(getattr(drift, "kind", ""))
+        severity = severity or str(getattr(drift, "severity", ""))
+        reason = reason or getattr(drift, "detail", "")
+
+    if drift_kind:
         pb = _events_pb_module()
-        kind_name = str(getattr(drift, "kind", ""))
-        sev_name = str(getattr(drift, "severity", ""))
-        if kind_name:
-            try:
-                evt.plan_revised.drift_kind = pb.DriftKind.Value(
-                    kind_name.upper() if not kind_name.startswith("DRIFT_") else kind_name
-                )
-            except (ValueError, AttributeError):
-                pass
-        if sev_name:
-            try:
-                evt.plan_revised.severity = pb.DriftSeverity.Value(
-                    sev_name.upper() if not sev_name.startswith("DRIFT_SEVERITY_") else sev_name
-                )
-            except (ValueError, AttributeError):
-                pass
-        evt.plan_revised.reason = getattr(drift, "detail", "")
-    evt.plan_revised.revision_index = int(getattr(plan, "revision_index", 0))
+        try:
+            normalized = drift_kind.upper() if not drift_kind.startswith("DRIFT_") else drift_kind
+            evt.plan_revised.drift_kind = pb.DriftKind.Value(normalized)
+        except (ValueError, AttributeError):
+            pass
+    if severity:
+        pb = _events_pb_module()
+        try:
+            normalized = (
+                severity.upper() if not severity.startswith("DRIFT_SEVERITY_") else severity
+            )
+            evt.plan_revised.severity = pb.DriftSeverity.Value(normalized)
+        except (ValueError, AttributeError):
+            pass
+    evt.plan_revised.reason = reason
+    evt.plan_revised.revision_index = int(
+        revision_index if revision_index is not None else getattr(plan, "revision_index", 0)
+    )
     return evt
 
 

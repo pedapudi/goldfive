@@ -49,7 +49,15 @@ class RecordingSink:
         self.closed = True
 
     def payload_kinds(self) -> list[str]:
-        return [getattr(e, "payload_kind", "") for e in self.events]
+        kinds: list[str] = []
+        for e in self.events:
+            if hasattr(e, "WhichOneof"):
+                kinds.append(e.WhichOneof("payload") or "")
+            elif isinstance(e, dict):
+                kinds.append(e.get("kind", ""))
+            else:
+                kinds.append(getattr(e, "payload_kind", ""))
+        return kinds
 
 
 class StubSteerer:
