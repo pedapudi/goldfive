@@ -415,16 +415,18 @@ async def test_budget_terminates_stuck_run() -> None:
     planner = StubPlanner()
     sink = RecordingSink()
 
-    async def _noop(
+    async def _stuck(
         task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
     ) -> InvocationResult:
-        # Deliberately do NOT transition the task. The executor should treat
-        # post-invoke PENDING as a local failure so the walker can move on,
-        # but it also will not progress past the failed task because the
-        # next edge depends on it.
-        return InvocationResult(task_id=task.id, text="")
+        # Return an invocation-level error without transitioning: the
+        # executor auto-fails the task on its behalf (matching the
+        # "InvocationResult.error is set" branch of the auto-transition
+        # logic) so fail_fast aborts after the first invocation.
+        return InvocationResult(
+            task_id=task.id, text="", error=RuntimeError("stuck")
+        )
 
-    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_noop)
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_stuck)
 
     executor = SequentialExecutor(max_plan_reinvocations=2, fail_fast=True)
     outcome = await executor.run(
@@ -436,9 +438,9 @@ async def test_budget_terminates_stuck_run() -> None:
         sinks=[sink],
     )
 
-    # fail_fast=True + first task ends FAILED (because it was left PENDING
-    # post-invoke and the executor marked it FAILED locally) -> aborts
-    # after the first invocation.
+    # fail_fast=True + first task ends FAILED (via the executor's auto
+    # transition on the non-None InvocationResult.error) -> aborts after
+    # the first invocation.
     assert outcome.success is False
     assert sink.payload_kinds()[-1] == "run_aborted"
     assert adapter.invocations == ["t0"]

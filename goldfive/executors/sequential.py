@@ -160,6 +160,15 @@ class SequentialExecutor(Executor):
                 task.id, invocations, self.max_plan_reinvocations,
             )
 
+            # Auto-announce the task as RUNNING before invoke so agents
+            # that never call report_task_started (the common callable
+            # case) still produce a TaskStarted event. The steerer's
+            # transition is idempotent once the task leaves PENDING.
+            if task.status == TaskStatus.PENDING:
+                await steerer.transition(
+                    task.id, TaskStatus.RUNNING, session=session
+                )
+
             # Adapter.invoke drives the agent, which calls reporting tools,
             # whose handlers route through the steerer to mutate task state
             # (PENDING -> RUNNING -> COMPLETED/FAILED/BLOCKED) and emit the
@@ -177,10 +186,13 @@ class SequentialExecutor(Executor):
                 break
 
             # If the adapter reported an error on the invocation envelope
-            # (but didn't raise), surface it as a failure when fail_fast is
-            # set. A well-behaved adapter will usually have already called
-            # report_task_failed through the agent.
-            if result is not None and getattr(result, "error", None) is not None:
+            # (but didn't raise), record it; the auto-transition block
+            # below routes that through steerer.mark_task_failed unless
+            # the agent already transitioned the task itself.
+            invocation_error = (
+                result is not None and getattr(result, "error", None) is not None
+            )
+            if invocation_error:
                 log.warning(
                     "SequentialExecutor: InvocationResult.error=%s task=%s",
                     result.error, task.id,
@@ -191,20 +203,34 @@ class SequentialExecutor(Executor):
             tracked_status = (
                 tracked.status if tracked is not None else TaskStatus.PENDING
             )
-            if tracked_status == TaskStatus.PENDING:
-                # The agent did not report a terminal state for this task.
-                # Treat as a soft failure: mark it failed locally so
-                # _pick_next_task does not pick it again next iteration.
-                # The steerer is the authority on status; if it cares, it
-                # can transition this itself on a follow-up observe().
-                log.info(
-                    "SequentialExecutor: task=%s returned PENDING post-invoke; "
-                    "marking FAILED locally to avoid repick",
-                    task.id,
+
+            # If the agent returned without emitting a terminal reporting
+            # call, auto-transition on its behalf: complete on a clean
+            # return, fail if the invocation carried an error. The steerer
+            # routes the transition (which dispatches to mark_task_*),
+            # and mark_task_* is idempotent on terminal states, so agents
+            # that DID emit reporting calls are unaffected.
+            if tracked_status in (TaskStatus.PENDING, TaskStatus.RUNNING):
+                if invocation_error:
+                    detail = str(result.error) if result is not None else ""
+                    await steerer.transition(
+                        task.id,
+                        TaskStatus.FAILED,
+                        detail=detail,
+                        session=session,
+                    )
+                else:
+                    summary = (result.text if result is not None else "") or ""
+                    await steerer.transition(
+                        task.id,
+                        TaskStatus.COMPLETED,
+                        detail=summary,
+                        session=session,
+                    )
+                tracked = _find_task(session.plan or current_plan, task.id)
+                tracked_status = (
+                    tracked.status if tracked is not None else TaskStatus.PENDING
                 )
-                if tracked is not None:
-                    tracked.status = TaskStatus.FAILED
-                tracked_status = TaskStatus.FAILED
 
             if tracked_status == TaskStatus.FAILED:
                 failure_reason = f"task {task.id} failed"
