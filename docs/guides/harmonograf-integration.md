@@ -1,0 +1,236 @@
+# Harmonograf integration
+
+[harmonograf](https://github.com/pedapudi/harmonograf) is a console for
+observing and coordinating multi-agent systems — Gantt timeline,
+drawer inspector, live plan-diff banners. goldfive is designed to feed
+harmonograf as a first-class `EventSink`.
+
+This guide covers how the integration is intended to work. The
+concrete harmonograf sink implementation lands in a harmonograf repo
+PR (not in goldfive itself); this document is forward-looking and
+describes the contract goldfive provides.
+
+Related: [ARCHITECTURE.md](../design/ARCHITECTURE.md),
+[EVENT-MODEL.md](../design/EVENT-MODEL.md),
+[writing-an-event-sink.md](writing-an-event-sink.md).
+
+## Why this pairing
+
+goldfive and harmonograf were born together and split on purpose:
+
+- **harmonograf** owns the observability and human-coordination
+  surface: the Gantt, the drawer, the control tabs, the timeline
+  store. It is a product-shaped UI plus a server and a client
+  library.
+- **goldfive** owns the orchestration semantics: goal derivation,
+  planning, task tracking, drift classification, refine. It is a
+  framework-agnostic library.
+
+The interface between them is the goldfive proto event stream. Every
+orchestration decision goldfive makes produces an event; harmonograf
+consumes events to render the timeline, the plan-diff banner, the
+drift markers.
+
+## Architectural placement
+
+```
+┌───────────────────────┐        ┌──────────────────────┐
+│   your agent stack    │        │    harmonograf       │
+│ (ADK / Claude SDK /   │        │                      │
+│  callable / …)        │        │  server + frontend   │
+│                       │        │  (timeline, drawer)  │
+└──────────┬────────────┘        └──────────▲───────────┘
+           │                                │
+           │                                │
+┌──────────▼────────────┐    proto events   │
+│       goldfive        ├──────────────────▶│
+│       Runner          │    via EventSink  │
+└───────────────────────┘                   │
+                                            │
+           (separate repo)                  │
+           HarmonografSink ─────────────────┘
+           (goldfive EventSink that forwards
+            to harmonograf's gRPC stream)
+```
+
+Your code imports goldfive for orchestration and harmonograf's
+goldfive-adapter package for observability. The two are composed at
+the sink layer.
+
+## Proto alignment
+
+goldfive's proto is the wire surface (per [issue #3](https://github.com/pedapudi/goldfive/issues/3)).
+harmonograf adopts goldfive's proto directly — the same
+`TaskStatus`, `DriftKind`, `Plan`, `Task`, and `TaskEdge` messages
+flow from goldfive into harmonograf without translation.
+
+This is D1 and D7 in the [vision doc](https://github.com/pedapudi/goldfive/issues/1):
+
+> - **D1**: goldfive owns the proto layer; sinks (including
+>   harmonograf) consume goldfive's proto.
+> - **D7**: Harmonograf adopts goldfive's proto directly (replaces its
+>   own TaskPlan / UpdatedTaskStatus).
+
+The practical consequence: there is no field-by-field mapping layer.
+A `goldfive.v1.Plan` message is the same bytes harmonograf stores on
+disk and renders on-screen.
+
+## The forthcoming `HarmonografSink`
+
+Pseudocode for the sink that will ship in the harmonograf repo:
+
+```python
+from __future__ import annotations
+
+from typing import Any
+
+from harmonograf_client import Client  # harmonograf's python client
+from goldfive.protocols import EventSink
+
+
+class HarmonografSink:
+    """goldfive EventSink that forwards events to a harmonograf server."""
+
+    def __init__(
+        self,
+        *,
+        server_addr: str = "127.0.0.1:7531",
+        auth_token: str | None = None,
+    ) -> None:
+        self._client = Client.connect(server_addr, auth_token=auth_token)
+
+    async def emit(self, event_pb: Any) -> None:
+        # harmonograf's telemetry stream expects goldfive events directly
+        await self._client.emit_goldfive_event(event_pb)
+
+    async def close(self) -> None:
+        await self._client.close()
+```
+
+Usage pattern from a goldfive caller:
+
+```python
+from goldfive import Runner
+from goldfive.sinks import JSONLPersistenceSink
+from harmonograf_goldfive import HarmonografSink  # forthcoming
+
+
+runner = Runner(
+    agent=my_agent_adapter,
+    planner=my_planner,
+    executor=my_executor,
+    sinks=[
+        HarmonografSink(server_addr="127.0.0.1:7531"),
+        JSONLPersistenceSink(path=f"./runs/{run_id}.jsonl"),
+    ],
+)
+outcome = await runner.run("build me a slide deck about Python")
+```
+
+The run emits events to both sinks. harmonograf's UI lights up in
+real time with the plan, the task states, drift markers, and plan
+revisions. JSONL captures the same stream for crash recovery and
+offline replay.
+
+## What harmonograf renders, per event
+
+An informal mapping of goldfive events to harmonograf UI elements.
+The authoritative mapping lives in harmonograf's frontend
+(`frontend/src/gantt/`).
+
+| goldfive event | harmonograf UI effect |
+|---|---|
+| `RunStarted` | New session appears in the session picker; root agent row created. |
+| `GoalDerived` | Goal chips appear in the session header. |
+| `PlanSubmitted` | Initial Gantt bars materialize, one per task, in PENDING state. |
+| `PlanRevised` | Plan-diff banner shows added / removed / modified tasks; a revision marker is placed on the timeline. |
+| `TaskStarted` | Bar transitions to RUNNING color; liveness indicator starts pulsing. |
+| `TaskProgress` | Bar fills to the reported fraction; drawer shows latest `detail`. |
+| `TaskCompleted` | Bar transitions to COMPLETED color; `summary` surfaces in the drawer. |
+| `TaskFailed` | Bar transitions to FAILED color; `reason` surfaces with an error badge. |
+| `TaskBlocked` | Bar shows a blocked indicator; `blocker` surfaces in the drawer. |
+| `TaskCancelled` | Bar greys out; drawer shows the cancellation reason. |
+| `DriftDetected` | A drift marker drops onto the timeline with the `DriftKind` icon and color. |
+| `RunCompleted` / `RunAborted` | Session shows terminal badge; timeline scroll locks. |
+
+Drift markers are positioned at the drift's `emitted_at` timestamp.
+`PlanRevised` markers chain off of the drift that caused them so the
+UI can render a "drift → refine" trail.
+
+## Replacing harmonograf's existing `TaskPlan`
+
+harmonograf today has its own `TaskPlan` / `UpdatedTaskStatus`
+messages in its proto (see `proto/harmonograf/v1/types.proto` in
+harmonograf). Per D7 in the vision doc, those are superseded by
+goldfive's messages once the integration lands.
+
+The migration is mechanical:
+
+1. Add `goldfive.v1.Plan` and friends to harmonograf's proto imports
+   (or, ideally, drop harmonograf's task proto entirely and re-export
+   from goldfive).
+2. Switch `TaskRegistry.upsertPlan(...)` to consume a `goldfive.v1.Plan`.
+3. Switch the drift-detection path to consume
+   `goldfive.v1.DriftDetected` events from the stream.
+4. Retire harmonograf's internal `_AdkState` state machine; state now
+   comes from goldfive's `TaskStarted` / `TaskCompleted` / etc. events.
+
+Because the proto values mirror harmonograf's existing ones
+(`TaskStatus.COMPLETED` = `"COMPLETED"`, `DriftKind.NEW_WORK_DISCOVERED`
+= `"new_work_discovered"`, etc.), the frontend needs no changes other
+than pointing at the new messages.
+
+## Bidirectional control (future)
+
+In v0.1, goldfive is emit-only: the sink receives events but does not
+take control inputs. harmonograf's "steer", "pause", "cancel" control
+actions flow through a separate control channel from frontend → server
+→ client library.
+
+A future goldfive version will expose a control-input surface (a way
+for an external system to synthesize a `DriftEvent(kind=USER_STEER)`
+and hand it to the running steerer). When that lands, harmonograf's
+control actions will flow through it. For now, use the per-agent
+control hooks harmonograf already provides.
+
+## Running the two together (today, pre-sink-implementation)
+
+Even without a shipped `HarmonografSink`, you can combine them
+manually:
+
+1. Use goldfive with `JSONLPersistenceSink`.
+2. Write a small bridge that tails the JSONL and forwards to
+   harmonograf via its existing client library.
+
+This is a stepping-stone pattern; the real integration lands once
+harmonograf's sink implementation is published.
+
+## FAQ
+
+**Will goldfive depend on harmonograf?** No. The dependency is
+one-way: harmonograf has an optional dep on goldfive (for the proto).
+goldfive has no concept of harmonograf at the code level — it sees
+only an `EventSink`.
+
+**What about harmonograf's reporting tools?** They are the same seven
+tools goldfive defines (see [tool-protocol.md](../reference/tool-protocol.md)).
+The intent is that harmonograf's client library stops defining them
+and re-exports from goldfive.
+
+**What happens if goldfive emits an event harmonograf doesn't
+recognize?** harmonograf ignores unknown fields (standard proto3
+behavior). Adding new events or fields to goldfive is
+backwards-compatible for harmonograf.
+
+**What happens if the harmonograf server is down when a goldfive run
+fires?** The `HarmonografSink` buffers with bounded capacity; on
+overflow, events drop (with a log warning). The other sinks
+(especially `JSONLPersistenceSink`) are unaffected — the durable log
+is intact regardless of harmonograf's health.
+
+## Tracking issue
+
+- Main vision issue: [goldfive#1](https://github.com/pedapudi/goldfive/issues/1).
+- Proto definition: [goldfive#3](https://github.com/pedapudi/goldfive/issues/3).
+- The `HarmonografSink` itself lands in harmonograf's repo once the
+  goldfive proto is published.
