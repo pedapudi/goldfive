@@ -36,9 +36,6 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
     "mypy>=1.10",
-    # Proto stubs are generated on demand by ``tests/_pbsetup.py`` so the
-    # steerer / reporting tests can exercise the real proto round-trip
-    # before issue #3 lands.
     "protobuf>=4.25",
     "grpcio-tools>=1.60",
 ]
