@@ -25,7 +25,7 @@ from goldfive.protocols import (
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS, ReportingToolSpec
 from goldfive.results import ExecutionOutcome, InvocationResult
 from goldfive.runner import Runner
-from goldfive.sinks import InMemorySink
+from goldfive.sinks import GRPCSink, InMemorySink
 from goldfive.steerer import DefaultSteerer
 from goldfive.types import (
     DriftEvent,
@@ -51,6 +51,7 @@ __all__ = [
     "EventSink",
     "ExecutionOutcome",
     "Executor",
+    "GRPCSink",
     "Goal",
     "GoalDeriver",
     "InMemorySink",
