@@ -1,0 +1,335 @@
+"""ADK session.state protocol for the goldfive adapter.
+
+This is a ported subset of harmonograf's ``state_protocol`` module,
+re-namespaced under the ``goldfive.*`` prefix. It owns the key names
+goldfive writes into an ADK ``session.state`` dict so agents can read
+the active task and plan context during their turn, and reads back
+agent-side writes (progress, outcome, notes, divergence flag) after
+the turn.
+
+Two directions share the state channel:
+
+* **Goldfive -> Agents** — written by the adapter in
+  ``before_model_callback`` before the LLM call. Keys under this
+  direction advertise the active task, plan summary, and the set of
+  reporting tools that are wired up.
+* **Agents -> Goldfive** — written by the agent as ``state_delta``
+  events (or by the plugin's ``before_tool_callback`` interception of
+  the canonical reporting tools). Keys under this direction carry
+  progress, outcome, free-form notes, and the divergence flag.
+
+All keys live under :data:`GOLDFIVE_PREFIX`. Non-goldfive keys in the
+state dict are ignored — readers never raise on missing or malformed
+state, and writers refuse to stamp non-goldfive keys so this module
+can't accidentally clobber application state.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, MutableMapping
+from typing import Any
+
+GOLDFIVE_PREFIX = "goldfive."
+
+# Goldfive -> Agents
+KEY_CURRENT_TASK_ID = "goldfive.current_task_id"
+KEY_CURRENT_TASK_TITLE = "goldfive.current_task_title"
+KEY_CURRENT_TASK_DESCRIPTION = "goldfive.current_task_description"
+KEY_CURRENT_TASK_ASSIGNEE = "goldfive.current_task_assignee"
+KEY_PLAN_ID = "goldfive.plan_id"
+KEY_PLAN_SUMMARY = "goldfive.plan_summary"
+KEY_RUN_ID = "goldfive.run_id"
+KEY_COMPLETED_TASK_RESULTS = "goldfive.completed_task_results"
+KEY_AVAILABLE_TASKS = "goldfive.available_tasks"
+KEY_TOOLS_AVAILABLE = "goldfive.tools_available"
+
+# Agents -> Goldfive
+KEY_TASK_PROGRESS = "goldfive.task_progress"
+KEY_TASK_OUTCOME = "goldfive.task_outcome"
+KEY_AGENT_NOTE = "goldfive.agent_note"
+KEY_DIVERGENCE_FLAG = "goldfive.divergence_flag"
+
+_CURRENT_TASK_KEYS: tuple[str, ...] = (
+    KEY_CURRENT_TASK_ID,
+    KEY_CURRENT_TASK_TITLE,
+    KEY_CURRENT_TASK_DESCRIPTION,
+    KEY_CURRENT_TASK_ASSIGNEE,
+)
+
+ALL_KEYS: tuple[str, ...] = (
+    KEY_CURRENT_TASK_ID,
+    KEY_CURRENT_TASK_TITLE,
+    KEY_CURRENT_TASK_DESCRIPTION,
+    KEY_CURRENT_TASK_ASSIGNEE,
+    KEY_PLAN_ID,
+    KEY_PLAN_SUMMARY,
+    KEY_RUN_ID,
+    KEY_COMPLETED_TASK_RESULTS,
+    KEY_AVAILABLE_TASKS,
+    KEY_TOOLS_AVAILABLE,
+    KEY_TASK_PROGRESS,
+    KEY_TASK_OUTCOME,
+    KEY_AGENT_NOTE,
+    KEY_DIVERGENCE_FLAG,
+)
+
+
+def _safe_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _safe_get(state: Any, key: str, default: Any = None) -> Any:
+    if not isinstance(state, Mapping):
+        return default
+    try:
+        value = state.get(key, default)
+    except Exception:
+        return default
+    return value if value is not None else default
+
+
+def _assert_goldfive_key(key: str) -> None:
+    if not key.startswith(GOLDFIVE_PREFIX):
+        raise ValueError(f"state_protocol refuses to write non-goldfive key: {key!r}")
+
+
+def _set(state: MutableMapping[str, Any], key: str, value: Any) -> None:
+    _assert_goldfive_key(key)
+    state[key] = value
+
+
+# ---------------------------------------------------------------------------
+# Readers
+# ---------------------------------------------------------------------------
+
+
+def read_current_task(state: Any) -> dict:
+    """Return ``{id, title, description, assignee}`` for the active task."""
+    return {
+        "id": _safe_str(_safe_get(state, KEY_CURRENT_TASK_ID, "")),
+        "title": _safe_str(_safe_get(state, KEY_CURRENT_TASK_TITLE, "")),
+        "description": _safe_str(_safe_get(state, KEY_CURRENT_TASK_DESCRIPTION, "")),
+        "assignee": _safe_str(_safe_get(state, KEY_CURRENT_TASK_ASSIGNEE, "")),
+    }
+
+
+def read_run_id(state: Any) -> str:
+    return _safe_str(_safe_get(state, KEY_RUN_ID, ""))
+
+
+def read_plan_id(state: Any) -> str:
+    return _safe_str(_safe_get(state, KEY_PLAN_ID, ""))
+
+
+def read_plan_summary(state: Any) -> str:
+    return _safe_str(_safe_get(state, KEY_PLAN_SUMMARY, ""))
+
+
+def read_completed_results(state: Any) -> dict:
+    value = _safe_get(state, KEY_COMPLETED_TASK_RESULTS, None)
+    if not isinstance(value, Mapping):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in value.items():
+        if isinstance(k, str):
+            out[k] = _safe_str(v)
+    return out
+
+
+def read_available_tasks(state: Any) -> list[dict]:
+    value = _safe_get(state, KEY_AVAILABLE_TASKS, None)
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def read_tools_available(state: Any) -> list[str]:
+    value = _safe_get(state, KEY_TOOLS_AVAILABLE, None)
+    if not isinstance(value, list):
+        return []
+    return [v for v in value if isinstance(v, str)]
+
+
+def read_agent_outcome(state: Any, task_id: str) -> str:
+    value = _safe_get(state, KEY_TASK_OUTCOME, None)
+    if not isinstance(value, Mapping):
+        return ""
+    return _safe_str(value.get(task_id, ""))
+
+
+def read_agent_progress(state: Any, task_id: str) -> float:
+    value = _safe_get(state, KEY_TASK_PROGRESS, None)
+    if not isinstance(value, Mapping):
+        return 0.0
+    raw = value.get(task_id, 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def read_agent_note(state: Any) -> str:
+    return _safe_str(_safe_get(state, KEY_AGENT_NOTE, ""))
+
+
+def read_divergence_flag(state: Any) -> bool:
+    return bool(_safe_get(state, KEY_DIVERGENCE_FLAG, False))
+
+
+# ---------------------------------------------------------------------------
+# Writers
+# ---------------------------------------------------------------------------
+
+
+def write_current_task(state: MutableMapping[str, Any], task: Any) -> None:
+    """Mutate state with current_task_* fields from a :class:`goldfive.types.Task`.
+
+    Accepts anything that duck-types to goldfive's ``Task`` (``.id``,
+    ``.title``, ``.description``, ``.assignee_agent_id``) or a mapping
+    with equivalent keys. ``None`` clears the current task.
+    """
+    if task is None:
+        clear_current_task(state)
+        return
+
+    if isinstance(task, Mapping):
+        tid = task.get("id", "")
+        title = task.get("title", "")
+        description = task.get("description", "")
+        assignee = task.get("assignee") or task.get("assignee_agent_id", "")
+    else:
+        tid = getattr(task, "id", "")
+        title = getattr(task, "title", "")
+        description = getattr(task, "description", "")
+        assignee = getattr(task, "assignee_agent_id", "") or getattr(
+            task, "assignee", ""
+        )
+
+    _set(state, KEY_CURRENT_TASK_ID, _safe_str(tid))
+    _set(state, KEY_CURRENT_TASK_TITLE, _safe_str(title))
+    _set(state, KEY_CURRENT_TASK_DESCRIPTION, _safe_str(description))
+    _set(state, KEY_CURRENT_TASK_ASSIGNEE, _safe_str(assignee))
+
+
+def clear_current_task(state: MutableMapping[str, Any]) -> None:
+    for key in _CURRENT_TASK_KEYS:
+        if key in state:
+            state.pop(key, None)
+
+
+def write_plan_context(
+    state: MutableMapping[str, Any],
+    plan: Any,
+    completed_results: Mapping[str, Any] | None,
+    host_agent: str,
+) -> None:
+    """Write plan_id, summary, available_tasks, and completed_results.
+
+    ``plan`` duck-types to :class:`goldfive.types.Plan` — anything with
+    ``.id``, ``.summary``, ``.tasks``, and optional ``.edges`` works.
+    ``host_agent`` is the fallback assignee rendered into
+    ``available_tasks`` when a task has none.
+    """
+    plan_id = ""
+    summary = ""
+    tasks_iter: Iterable[Any] = ()
+    edges_iter: Iterable[Any] = ()
+
+    if plan is not None:
+        plan_id = _safe_str(getattr(plan, "id", None) or getattr(plan, "plan_id", ""))
+        summary = _safe_str(getattr(plan, "summary", ""))
+        tasks_iter = getattr(plan, "tasks", ()) or ()
+        edges_iter = getattr(plan, "edges", ()) or ()
+
+    deps_by_task: dict[str, list[str]] = {}
+    for edge in edges_iter:
+        src = _safe_str(getattr(edge, "from_task_id", ""))
+        dst = _safe_str(getattr(edge, "to_task_id", ""))
+        if not src or not dst:
+            continue
+        deps_by_task.setdefault(dst, []).append(src)
+
+    available: list[dict] = []
+    for task in tasks_iter:
+        tid = _safe_str(getattr(task, "id", ""))
+        status = getattr(task, "status", "PENDING")
+        # Tolerate StrEnum or plain strings.
+        status_str = _safe_str(getattr(status, "value", status) or "PENDING")
+        available.append(
+            {
+                "id": tid,
+                "title": _safe_str(getattr(task, "title", "")),
+                "assignee": _safe_str(
+                    getattr(task, "assignee_agent_id", "") or host_agent
+                ),
+                "status": status_str,
+                "deps": list(deps_by_task.get(tid, [])),
+            }
+        )
+
+    _set(state, KEY_PLAN_ID, plan_id)
+    _set(state, KEY_PLAN_SUMMARY, summary)
+    _set(state, KEY_AVAILABLE_TASKS, available)
+
+    results_out: dict[str, str] = {}
+    if isinstance(completed_results, Mapping):
+        for k, v in completed_results.items():
+            if isinstance(k, str):
+                results_out[k] = _safe_str(v)
+    _set(state, KEY_COMPLETED_TASK_RESULTS, results_out)
+
+
+def write_run_id(state: MutableMapping[str, Any], run_id: str) -> None:
+    _set(state, KEY_RUN_ID, _safe_str(run_id))
+
+
+def write_tools_available(
+    state: MutableMapping[str, Any], tool_names: Iterable[str]
+) -> None:
+    _set(
+        state,
+        KEY_TOOLS_AVAILABLE,
+        [name for name in tool_names if isinstance(name, str)],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Diffing
+# ---------------------------------------------------------------------------
+
+
+def extract_agent_writes(before: Any, after: Any) -> dict:
+    """Return goldfive.* keys the agent added, changed, or removed.
+
+    A removed key is represented as ``{key: None}`` so callers can
+    distinguish it from an unset key. ``before``/``after`` may be any
+    mapping; non-mapping inputs are treated as empty.
+    """
+    before_map: Mapping[str, Any] = before if isinstance(before, Mapping) else {}
+    after_map: Mapping[str, Any] = after if isinstance(after, Mapping) else {}
+
+    before_g = {
+        k: v
+        for k, v in before_map.items()
+        if isinstance(k, str) and k.startswith(GOLDFIVE_PREFIX)
+    }
+    after_g = {
+        k: v
+        for k, v in after_map.items()
+        if isinstance(k, str) and k.startswith(GOLDFIVE_PREFIX)
+    }
+
+    changes: dict[str, Any] = {}
+    for key, value in after_g.items():
+        if key not in before_g:
+            changes[key] = value
+        elif before_g[key] != value:
+            changes[key] = value
+    for key in before_g:
+        if key not in after_g:
+            changes[key] = None
+    return changes
