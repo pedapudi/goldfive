@@ -47,6 +47,10 @@ log = logging.getLogger(__name__)
 
 _WARNING_RANK = severity_rank(DriftSeverity.WARNING)
 
+_TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+
 
 # A (task, result_or_drift) carrier for stage gather. Using a dataclass
 # would add import weight; a tuple is fine and stays local to this file.
@@ -167,15 +171,40 @@ class ParallelDAGExecutor:
                 )
 
                 # Fold terminal statuses + results back into the session.
+                # If the agent already transitioned the task via reporting
+                # tools (status is terminal), leave it alone. Otherwise
+                # auto-transition on its behalf so clean returns count as
+                # COMPLETED, not silently PENDING/RUNNING.
                 for task, inv, _task_drift, error in stage_results:
+                    already_terminal = task.status in _TERMINAL_TASK_STATUSES
                     if error is not None and not isinstance(error, asyncio.CancelledError):
-                        task.status = TaskStatus.FAILED
+                        if not already_terminal:
+                            await steerer.transition(
+                                task.id,
+                                TaskStatus.FAILED,
+                                detail=str(error),
+                                session=session,
+                            )
                     elif isinstance(error, asyncio.CancelledError):
-                        task.status = TaskStatus.CANCELLED
+                        if not already_terminal:
+                            task.status = TaskStatus.CANCELLED
                     elif inv is not None and inv.error is not None:
-                        task.status = TaskStatus.FAILED
+                        if not already_terminal:
+                            await steerer.transition(
+                                task.id,
+                                TaskStatus.FAILED,
+                                detail=str(inv.error),
+                                session=session,
+                            )
                     else:
-                        task.status = TaskStatus.COMPLETED
+                        summary = inv.text if inv is not None else ""
+                        if not already_terminal:
+                            await steerer.transition(
+                                task.id,
+                                TaskStatus.COMPLETED,
+                                detail=summary,
+                                session=session,
+                            )
                         if inv is not None:
                             session.completed_results[task.id] = inv.text
                     completed_stage_ids.add(task.id)
