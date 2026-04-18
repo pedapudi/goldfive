@@ -1,0 +1,37 @@
+// Goldfive v1 — gRPC transport surface.
+//
+// `GoldfiveIngress` is the network-facing twin of the in-process
+// `EventSink` contract. Clients (typically a `GRPCSink` inside a
+// Runner) stream `Event` messages over a client-streaming RPC; the
+// server fans them out to one or more local `EventSink`s (SQLite,
+// JSONL, in-memory, ...).
+//
+// The single RPC is `StreamEvents`: client-streaming, one response.
+// The server consumes the entire client stream and returns a summary
+// once the client half-closes. A non-empty `error` in the response
+// signals a server-side failure; `received` always reflects the
+// number of events the server successfully processed.
+
+syntax = "proto3";
+
+package goldfive.v1;
+
+import "goldfive/v1/events.proto";
+
+option go_package = "github.com/pedapudi/goldfive/gen/goldfive/v1;goldfivev1";
+
+service GoldfiveIngress {
+  // Client streams Events; server returns a single summary after the
+  // client half-closes. Implementations fan events out to local
+  // EventSinks in order.
+  rpc StreamEvents(stream Event) returns (StreamEventsResponse);
+}
+
+message StreamEventsResponse {
+  // Number of events the server successfully processed.
+  uint64 received = 1;
+  // Non-empty iff the server failed while processing the stream.
+  // The error string is informational; the RPC status code carries
+  // the authoritative failure signal.
+  string error = 2;
+}
