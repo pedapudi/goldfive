@@ -31,7 +31,9 @@ per-task ``Task*`` events (the latter via the steerer).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 from goldfive.events import (
     emit,
@@ -39,9 +41,17 @@ from goldfive.events import (
     run_aborted_event,
     run_completed_event,
 )
+from goldfive.executors._control import (
+    _ControlCancelled,
+    dispatch_control,
+    drain_controls,
+)
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome
 from goldfive.types import Plan, Session, Task, TaskStatus
+
+if TYPE_CHECKING:
+    from goldfive.control import ControlChannel
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +99,7 @@ class SequentialExecutor(Executor):
         steerer: Steerer,
         planner: Planner,
         sinks: list[EventSink],
+        control: ControlChannel | None = None,
     ) -> ExecutionOutcome:
         """Walk ``plan`` end-to-end, driving ``adapter`` once per eligible task.
 
@@ -119,6 +130,32 @@ class SequentialExecutor(Executor):
         # invocations we'll allow for the whole run. Each eligible task
         # burns one; mid-run plan revisions do not refund any.
         while invocations < self.max_plan_reinvocations:
+            # ------------------------------------------------------------------
+            # Control channel: drain any pending messages before picking
+            # the next task. PAUSE here blocks until RESUME arrives.
+            # ------------------------------------------------------------------
+            try:
+                stop, steer_msg = await self._apply_pre_task_controls(
+                    control=control,
+                    session=session,
+                    steerer=steerer,
+                    sinks=sinks,
+                )
+            except _ControlCancelled as cancelled:
+                failure_reason = cancelled.detail
+                run_failed = True
+                break
+            if stop:
+                failure_reason = "cancelled by control"
+                run_failed = True
+                break
+            if steer_msg is not None:
+                await self._apply_steer(
+                    steer_msg, steerer=steerer, session=session
+                )
+                # The steerer swapped session.plan; pick up the revision
+                # on the next outer iteration.
+
             current_plan = session.plan or plan
 
             # Detect an out-of-band plan revision (steerer swapped the plan
@@ -168,14 +205,33 @@ class SequentialExecutor(Executor):
                     task.id, TaskStatus.RUNNING, session=session
                 )
 
-            # Adapter.invoke drives the agent, which calls reporting tools,
-            # whose handlers route through the steerer to mutate task state
-            # (PENDING -> RUNNING -> COMPLETED/FAILED/BLOCKED) and emit the
-            # corresponding proto events via sinks.
-            try:
-                result = await adapter.invoke(task, session)
-            except Exception as exc:  # noqa: BLE001
-                # Hard adapter failure: nothing to do except abort.
+            # Race the adapter invocation against the control channel so a
+            # CANCEL / STEER / PAUSE arriving mid-task can cancel (or at
+            # least observe) the in-flight task. The helper returns
+            # ``(kind, payload)``:
+            #   ("result", InvocationResult | None)   normal completion
+            #   ("adapter_error", BaseException)      invoke raised
+            #   ("cancelled", reason_str)             CANCEL interrupted
+            #   ("steer", ControlMessage)             STEER interrupted
+            outcome_kind, outcome_payload = await self._invoke_with_control(
+                adapter=adapter,
+                task=task,
+                session=session,
+                steerer=steerer,
+                sinks=sinks,
+                control=control,
+            )
+
+            if outcome_kind == "cancelled":
+                await self._mark_cancelled_if_live(
+                    task_id=task.id, steerer=steerer, session=session
+                )
+                failure_reason = str(outcome_payload) or "cancelled by control"
+                run_failed = True
+                break
+
+            if outcome_kind == "adapter_error":
+                exc = outcome_payload
                 log.exception(
                     "SequentialExecutor: adapter.invoke raised for task=%s",
                     task.id,
@@ -183,6 +239,18 @@ class SequentialExecutor(Executor):
                 failure_reason = f"adapter.invoke raised for task={task.id}: {exc}"
                 run_failed = True
                 break
+
+            if outcome_kind == "steer":
+                await self._mark_cancelled_if_live(
+                    task_id=task.id, steerer=steerer, session=session
+                )
+                await self._apply_steer(
+                    outcome_payload, steerer=steerer, session=session
+                )
+                continue
+
+            # outcome_kind == "result"
+            result = outcome_payload
 
             # If the adapter reported an error on the invocation envelope
             # (but didn't raise), record it; the auto-transition block
@@ -313,6 +381,239 @@ class SequentialExecutor(Executor):
             ),
         )
         return ExecutionOutcome(success=True, session=session)
+
+    # ------------------------------------------------------------------
+    # Control helpers
+    # ------------------------------------------------------------------
+
+    async def _apply_pre_task_controls(
+        self,
+        *,
+        control: ControlChannel | None,
+        session: Session,
+        steerer: Steerer,
+        sinks: list[EventSink],
+    ) -> tuple[bool, object | None]:
+        """Drain queued controls before the next task; honour PAUSE.
+
+        Returns ``(cancel_run, steer_message)``. The steer message is
+        the last STEER control observed (the steerer consumes them one
+        at a time, so queued STEERs after the first are applied in
+        order on subsequent loop iterations).
+
+        A PAUSE here blocks on ``channel.receive()`` until a RESUME (or
+        CANCEL) arrives.
+        """
+        if control is None:
+            return False, None
+
+        outcomes = await drain_controls(
+            control, session=session, steerer=steerer, sinks=sinks
+        )
+
+        cancel_run = False
+        cancel_reason = ""
+        steer_msg: object | None = None
+        paused = False
+        for o in outcomes:
+            if o.cancel_run:
+                cancel_run = True
+                cancel_reason = o.cancel_reason
+                break
+            if o.steer_message is not None:
+                steer_msg = o.steer_message
+            if o.request_pause:
+                paused = True
+            if o.request_resume:
+                paused = False
+
+        if cancel_run:
+            raise _ControlCancelled(cancel_reason or "cancelled by control")
+
+        # Honour PAUSE by blocking on the channel until a RESUME /
+        # CANCEL / STEER arrives.
+        while paused:
+            msg = await control.receive()
+            if msg is None:
+                # Channel closed — treat as resume so we don't wedge.
+                paused = False
+                break
+            outcome = await dispatch_control(
+                msg, session=session, steerer=steerer, sinks=sinks
+            )
+            try:
+                await control.ack(outcome.ack)
+            except Exception:  # noqa: BLE001
+                pass
+            if outcome.cancel_run:
+                raise _ControlCancelled(
+                    outcome.cancel_reason or "cancelled by control"
+                )
+            if outcome.request_resume:
+                paused = False
+            if outcome.steer_message is not None:
+                steer_msg = outcome.steer_message
+                paused = False
+            if outcome.rewind_task_id:
+                paused = False
+
+        return False, steer_msg
+
+    async def _invoke_with_control(
+        self,
+        *,
+        adapter: AgentAdapter,
+        task: Task,
+        session: Session,
+        steerer: Steerer,
+        sinks: list[EventSink],
+        control: ControlChannel | None,
+    ) -> tuple[str, object | None]:
+        """Run ``adapter.invoke(task, session)`` while watching ``control``.
+
+        Returns ``(kind, payload)`` where ``kind`` is one of
+        ``"result"`` (normal completion), ``"adapter_error"``,
+        ``"cancelled"`` (CANCEL received), or ``"steer"`` (STEER
+        received). Non-cancelling controls (PAUSE, RESUME, REWIND_TO,
+        STATUS_QUERY, INTERCEPT_TRANSFER) are acked and do not
+        interrupt the task.
+        """
+        invoke_task: asyncio.Task = asyncio.create_task(
+            adapter.invoke(task, session),
+            name=f"goldfive-invoke-{task.id}",
+        )
+
+        if control is None:
+            try:
+                result = await invoke_task
+            except BaseException as exc:  # noqa: BLE001
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return ("adapter_error", exc)
+            return ("result", result)
+
+        while True:
+            recv_task = asyncio.create_task(control.receive(), name="control-recv")
+            done, _pending = await asyncio.wait(
+                {invoke_task, recv_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if invoke_task in done:
+                if not recv_task.done():
+                    recv_task.cancel()
+                    try:
+                        await recv_task
+                    except BaseException:  # noqa: BLE001
+                        pass
+                try:
+                    result = invoke_task.result()
+                except asyncio.CancelledError:
+                    return ("cancelled", "invoke cancelled")
+                except BaseException as exc:  # noqa: BLE001
+                    return ("adapter_error", exc)
+                return ("result", result)
+
+            # recv_task completed first: a control message arrived.
+            try:
+                msg = recv_task.result()
+            except BaseException:  # noqa: BLE001
+                msg = None
+            if msg is None:
+                # Channel closed; fall back to awaiting the adapter task.
+                try:
+                    result = await invoke_task
+                except BaseException as exc:  # noqa: BLE001
+                    if isinstance(exc, asyncio.CancelledError):
+                        return ("cancelled", "invoke cancelled")
+                    return ("adapter_error", exc)
+                return ("result", result)
+
+            outcome = await dispatch_control(
+                msg, session=session, steerer=steerer, sinks=sinks
+            )
+            try:
+                await control.ack(outcome.ack)
+            except Exception:  # noqa: BLE001
+                pass
+
+            if outcome.cancel_run:
+                await self._cancel_invoke_task(invoke_task)
+                return ("cancelled", outcome.cancel_reason or "cancelled by control")
+
+            if outcome.steer_message is not None:
+                await self._cancel_invoke_task(invoke_task)
+                return ("steer", outcome.steer_message)
+
+            # Non-cancelling control: keep waiting on the adapter task.
+            # (PAUSE mid-task lets the current task finish per spec;
+            # REWIND_TO / STATUS_QUERY / INTERCEPT_TRANSFER are applied
+            # in-line and execution continues.)
+
+    @staticmethod
+    async def _cancel_invoke_task(invoke_task: asyncio.Task) -> None:
+        """Cancel ``invoke_task`` with a 5s grace window.
+
+        Defensive: adapters that ignore ``task.cancel()`` shouldn't wedge
+        the run. Polls for up to 5s; if the task still isn't done, we
+        log a warning and return (the orphaned task is left for the
+        event loop to reap).
+        """
+        if invoke_task.done():
+            return
+        invoke_task.cancel()
+        import time as _time
+
+        deadline = _time.monotonic() + 5.0
+        while _time.monotonic() < deadline:
+            if invoke_task.done():
+                return
+            await asyncio.sleep(0.05)
+        log.warning(
+            "SequentialExecutor: adapter ignored task.cancel(); "
+            "abandoning after 5s grace window"
+        )
+
+    @staticmethod
+    async def _mark_cancelled_if_live(
+        *,
+        task_id: str,
+        steerer: Steerer,
+        session: Session,
+    ) -> None:
+        """Transition a not-yet-terminal task to CANCELLED."""
+        if session.plan is None:
+            return
+        for t in session.plan.tasks:
+            if t.id == task_id:
+                if t.status in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                ):
+                    return
+                await steerer.transition(
+                    task_id,
+                    TaskStatus.CANCELLED,
+                    detail="cancelled by control",
+                    session=session,
+                )
+                return
+
+    @staticmethod
+    async def _apply_steer(
+        message: object,
+        *,
+        steerer: Steerer,
+        session: Session,
+    ) -> None:
+        """Feed a STEER :class:`ControlMessage` to the steerer."""
+        try:
+            await steerer.observe(message, session)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "SequentialExecutor: steerer.observe(STEER) raised: %s", exc
+            )
 
 
 # ---------------------------------------------------------------------------
