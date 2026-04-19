@@ -34,6 +34,11 @@ members and their raw string equivalents — ``ControlKind`` is a
   recognized if an external caller sends the string).
 * ``INTERCEPT_TRANSFER`` — toggle ``session._intercept_transfer`` so
   adapters that honour the flag refuse transfers.
+* ``APPROVE`` / ``REJECT`` — resolve a pending human-in-the-loop
+  approval registered on ``session.pending_approvals`` (either a
+  ``report_awaiting_approval`` task-level waiter, Flow A, or an ADK
+  ``require_confirmation=True`` tool-level waiter, Flow B). Emits
+  ``ApprovalGranted`` / ``ApprovalRejected`` through the sinks.
 """
 
 from __future__ import annotations
@@ -266,6 +271,43 @@ async def dispatch_control(
             ),
         )
 
+    if kind in ("APPROVE", "REJECT"):
+        decision = "approve" if kind == "APPROVE" else "reject"
+        target_id = str(msg.payload.get("target_id", ""))
+        detail = str(msg.payload.get("detail", ""))
+        if not target_id:
+            return ControlOutcome(
+                ack=_build_ack(
+                    msg,
+                    result=AckResult.FAILURE,
+                    detail=f"{kind.lower()} requires payload.target_id",
+                ),
+            )
+        resolved = await _resolve_approval(
+            session=session,
+            sinks=sinks,
+            target_id=target_id,
+            decision=decision,
+            detail=detail,
+        )
+        if not resolved:
+            return ControlOutcome(
+                ack=_build_ack(
+                    msg,
+                    result=AckResult.FAILURE,
+                    detail=(
+                        f"no pending approval for target_id={target_id!r}"
+                    ),
+                ),
+            )
+        return ControlOutcome(
+            ack=_build_ack(
+                msg,
+                result=AckResult.SUCCESS,
+                detail=f"{decision} dispatched to {target_id}",
+            ),
+        )
+
     # Unknown / unsupported kind.
     return ControlOutcome(
         ack=_build_ack(
@@ -309,6 +351,61 @@ async def drain_controls(
         except Exception as exc:  # noqa: BLE001
             log.debug("drain_controls: channel.ack raised: %s", exc)
     return outcomes
+
+
+async def _resolve_approval(
+    *,
+    session: Session,
+    sinks: list[EventSink],
+    target_id: str,
+    decision: str,
+    detail: str,
+) -> bool:
+    """Resolve a pending approval waiter and emit the resolution event.
+
+    Returns ``True`` if the ``target_id`` was registered on
+    ``session.pending_approvals`` and the waiter was set. Returns
+    ``False`` if no waiter exists — the caller turns that into a
+    FAILURE ack so UIs know their button click did not land.
+
+    Emits ``ApprovalGranted`` / ``ApprovalRejected`` through the sinks
+    before setting the event so the stream ordering is "resolution
+    event visible → waiter releases → tool-call returns".
+    """
+    waiter = session.pending_approvals.get(target_id)
+    if waiter is None:
+        return False
+    meta = session.pending_approvals_meta.setdefault(target_id, {})
+    meta["decision"] = decision
+    meta["detail"] = detail
+
+    try:
+        from goldfive.events import (
+            approval_granted_event,
+            approval_rejected_event,
+            emit,
+        )
+
+        if decision == "approve":
+            evt = approval_granted_event(
+                run_id=session.run_id,
+                sequence=session.next_sequence(),
+                target_id=target_id,
+                detail=detail,
+            )
+        else:
+            evt = approval_rejected_event(
+                run_id=session.run_id,
+                sequence=session.next_sequence(),
+                target_id=target_id,
+                detail=detail,
+            )
+        await emit(sinks, evt)
+    except Exception as exc:  # noqa: BLE001 — proto/sink failure shouldn't block resolution
+        log.debug("_resolve_approval: event emit failed: %s", exc)
+
+    waiter.set()
+    return True
 
 
 def _rewind_plan(session: Session, target_task_id: str) -> bool:

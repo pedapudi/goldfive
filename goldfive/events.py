@@ -345,6 +345,50 @@ def conversation_ended_event(
     return evt
 
 
+def approval_requested_event(
+    run_id: str,
+    sequence: int,
+    *,
+    target_id: str,
+    kind: str,
+    prompt: str = "",
+    task_id: str = "",
+    metadata: dict[str, str] | None = None,
+) -> Any:
+    """Build an ``ApprovalRequested`` envelope.
+
+    ``kind`` is ``"task"`` (Flow A, `report_awaiting_approval`) or ``"tool"``
+    (Flow B, ADK `require_confirmation=True`). ``target_id`` is what an
+    incoming ``ControlMessage(APPROVE|REJECT)`` must quote back.
+    """
+    evt = new_event(run_id, sequence)
+    evt.approval_requested.target_id = target_id
+    evt.approval_requested.kind = kind
+    evt.approval_requested.prompt = prompt
+    evt.approval_requested.task_id = task_id
+    for k, v in (metadata or {}).items():
+        evt.approval_requested.metadata[str(k)] = str(v)
+    return evt
+
+
+def approval_granted_event(
+    run_id: str, sequence: int, *, target_id: str, detail: str = ""
+) -> Any:
+    evt = new_event(run_id, sequence)
+    evt.approval_granted.target_id = target_id
+    evt.approval_granted.detail = detail
+    return evt
+
+
+def approval_rejected_event(
+    run_id: str, sequence: int, *, target_id: str, detail: str = ""
+) -> Any:
+    evt = new_event(run_id, sequence)
+    evt.approval_rejected.target_id = target_id
+    evt.approval_rejected.detail = detail
+    return evt
+
+
 def drift_detected_event(run_id: str, sequence: int, drift: Any) -> Any:
     pb = _events_pb_module()
     evt = new_event(run_id, sequence)

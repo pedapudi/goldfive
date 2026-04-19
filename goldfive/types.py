@@ -6,6 +6,7 @@ pure data — mutation of live state happens only through a ``Steerer``.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from collections.abc import Callable
 from enum import StrEnum
@@ -179,6 +180,19 @@ class Session:
     divergence_flag: bool = False
     history: list[Any] = dataclasses.field(default_factory=list)
     started_at_ms: int = 0
+    # Waiters for outstanding human-in-the-loop approvals. Keyed by
+    # ``target_id``: task_id for Flow A (report_awaiting_approval) and the
+    # ADK function_call_id for Flow B (ADK require_confirmation). The event
+    # is set by the control dispatcher when APPROVE / REJECT arrives.
+    pending_approvals: dict[str, asyncio.Event] = dataclasses.field(
+        default_factory=dict
+    )
+    # Per-approval metadata. Populated when the waiter is registered; the
+    # dispatcher adds ``decision`` ("approve" | "reject") and optional
+    # ``detail`` before setting the event.
+    pending_approvals_meta: dict[str, dict[str, Any]] = dataclasses.field(
+        default_factory=dict
+    )
     # monotonic event sequence counter for sinks
     _next_sequence: int = 0
 
