@@ -22,10 +22,12 @@ install hint.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from goldfive.control import ControlChannel
+    from goldfive.protocols import EventSink
     from goldfive.results import ExecutionOutcome
     from goldfive.runner import Runner
     from goldfive.types import Goal
@@ -279,10 +281,23 @@ class GoldfiveADKAgent(BaseAgent):
         """Expose the inner :class:`Runner`'s sink list (mutable)."""
         return self._runner.sinks
 
+    def add_sink(self, sink: EventSink) -> None:
+        """Register an additional sink on the inner :class:`Runner`."""
+        self._runner.add_sink(sink)
+
+    def add_close_hook(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Register an async close hook on the inner :class:`Runner`."""
+        self._runner.add_close_hook(hook)
+
     @property
-    def control(self) -> Any:
+    def control(self) -> ControlChannel | None:
         """Expose the inner :class:`Runner`'s optional ControlChannel."""
         return self._runner.control
+
+    @control.setter
+    def control(self, value: ControlChannel) -> None:
+        """Attach a :class:`ControlChannel` on the inner :class:`Runner`."""
+        self._runner.control = value
 
     @property
     def inner_agent(self) -> Any:

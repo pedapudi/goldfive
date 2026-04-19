@@ -166,7 +166,18 @@ class Runner:
         persistence_path: str,
     ) -> ExecutionOutcome: ...  # best-effort JSONL replay
 
-    async def close(self) -> None: ...  # close every sink
+    async def close(self) -> None: ...  # close every sink, then run hooks
+
+    # Post-construction extension API. See "Extension API" below.
+    def add_sink(self, sink: EventSink) -> None: ...
+    def add_close_hook(
+        self, hook: Callable[[], Awaitable[None]]
+    ) -> None: ...
+
+    @property
+    def control(self) -> ControlChannel | None: ...
+    @control.setter
+    def control(self, value: ControlChannel) -> None: ...
 ```
 
 `Runner.resume(persistence_path)` loads a JSONL log written by
@@ -185,8 +196,32 @@ recovered goals. Tracked in issue #15.
 | `goal_deriver` | `PassthroughGoalDeriver("run")` | Optional. When `None`, the Runner substitutes a passthrough deriver that emits a single `Goal(id="g1", summary="run")`. |
 | `steerer` | `DefaultSteerer()` | Optional. |
 | `sinks` | `[]` | Optional. Recommended: at least `InMemorySink` in tests and `JSONLPersistenceSink` in prod. |
-| `control` | `None` | Optional `ControlChannel` for live pause / cancel / steer / rewind / approve / reject. When `None`, the run has no live-steering surface. See [../design/CONTROL.md](../design/CONTROL.md). |
+| `control` | `None` | Optional `ControlChannel` for live pause / cancel / steer / rewind / approve / reject. When `None`, the run has no live-steering surface. May also be attached post-construction via the `control` setter; see "Extension API" below. See [../design/CONTROL.md](../design/CONTROL.md). |
 | `max_plan_reinvocations` | `3` | Stamped onto the planner context so executors that honour it can cap refine loops. |
+
+### Extension API
+
+Three post-construction hooks let external integrations attach
+additional behaviour without subclassing or attribute mutation:
+
+- **`add_sink(sink)`** — append an `EventSink` after construction.
+  Takes effect for events emitted by subsequent `run()` calls;
+  in-flight runs keep the sink list they started with.
+- **`add_close_hook(hook)`** — register an async callable invoked by
+  `close()` *after* sinks are closed. Hooks fire in registration
+  order; an exception in one hook is logged and does not prevent the
+  rest from running. `close()` is idempotent — a second call is a
+  no-op and hooks fire exactly once.
+- **`control` setter** — attach a `ControlChannel` after construction.
+  Idempotent on identity (`is`) re-attach; raises `RuntimeError` if a
+  different channel is already attached. The constructor kwarg
+  `control=...` is unchanged; the setter is the post-construction
+  path.
+
+`GoldfiveADKAgent` (returned by `goldfive.wrap(adk_agent)`) mirrors
+the same contract and delegates to the inner `Runner`, so callers
+can use the extension API uniformly whether they hold a plain
+`Runner` or an ADK-wrapped one.
 
 ## Data types (`goldfive.types`)
 

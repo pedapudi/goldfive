@@ -36,7 +36,7 @@ and are loaded lazily by callers.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive.conversation import Conversation
@@ -123,7 +123,9 @@ class Runner:
         self.goal_deriver: GoalDeriver = goal_deriver or PassthroughGoalDeriver("run")
         self.steerer: Steerer = steerer or DefaultSteerer()
         self.sinks: list[EventSink] = list(sinks) if sinks else []
-        self.control: ControlChannel | None = control
+        self._control: ControlChannel | None = control
+        self._close_hooks: list[Callable[[], Awaitable[None]]] = []
+        self._closed: bool = False
         self.max_plan_reinvocations = max_plan_reinvocations
         self._conversation: Conversation = conversation or Conversation.new()
         # Tracks whether we've emitted the ConversationStarted event for
@@ -374,12 +376,18 @@ class Runner:
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Close every sink. Best-effort — individual errors are logged.
+        """Close every sink, then invoke registered close hooks. Idempotent.
 
         Emits ``ConversationEnded`` for the active Conversation (if any
         turns ran) before closing sinks, so persisted logs have a clean
-        terminal marker.
+        terminal marker. Close hooks registered via
+        :meth:`add_close_hook` run in registration order AFTER sinks are
+        closed; a raising hook is logged and does not prevent subsequent
+        hooks from running. A second call to :meth:`close` is a no-op.
         """
+        if self._closed:
+            return
+        self._closed = True
         if self._conversation_announced and self._last_session is not None:
             try:
                 await self._emit_conversation_ended(
@@ -395,6 +403,57 @@ class Runner:
                 await sink.close()
             except Exception as exc:  # noqa: BLE001
                 log.warning("sink.close() raised: %s", exc)
+        for hook in self._close_hooks:
+            try:
+                await hook()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("close hook raised: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Extension API — post-construction wiring for sinks, hooks, control
+    # ------------------------------------------------------------------
+
+    def add_sink(self, sink: EventSink) -> None:
+        """Register an additional :class:`EventSink`.
+
+        Takes effect for events emitted by subsequent calls to
+        :meth:`run`. In-flight runs continue with whatever sink list
+        they were handed to the executor at kickoff.
+        """
+        self.sinks.append(sink)
+
+    def add_close_hook(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Register an async callable invoked by :meth:`close` after sinks.
+
+        Hooks fire in registration order, AFTER the Runner's internal
+        teardown (sinks closed). An exception in one hook is logged
+        via :mod:`logging` and does not prevent subsequent hooks from
+        running — failing cleanup must not hang a process.
+        """
+        self._close_hooks.append(hook)
+
+    @property
+    def control(self) -> ControlChannel | None:
+        """The attached :class:`~goldfive.control.ControlChannel`, if any."""
+        return self._control
+
+    @control.setter
+    def control(self, value: ControlChannel) -> None:
+        """Attach a :class:`ControlChannel` post-construction.
+
+        Idempotent when the same channel (by identity, ``is``) is
+        re-attached. Raises :class:`RuntimeError` if a different
+        channel is already attached — callers must construct a fresh
+        Runner rather than swap channels mid-lifetime.
+        """
+        if self._control is value:
+            return
+        if self._control is not None:
+            raise RuntimeError(
+                "Runner already has a control channel attached; "
+                "detach it first or construct the runner with a specific one."
+            )
+        self._control = value
 
     # ------------------------------------------------------------------
     # internals
