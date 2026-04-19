@@ -27,6 +27,8 @@ class ControlKind(StrEnum):
     CANCEL = "CANCEL"
     STEER = "STEER"            # payload: {"note": "...", "suggested_action": "..."}
     REWIND_TO = "REWIND_TO"    # payload: {"task_id": "..."}
+    APPROVE = "APPROVE"        # payload: {"target_id": "...", "detail": "..."}
+    REJECT = "REJECT"          # payload: {"target_id": "...", "detail": "..."}
 
 
 class AckResult(StrEnum):

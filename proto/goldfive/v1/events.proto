@@ -56,6 +56,9 @@ message Event {
     RunAborted run_aborted = 22;
     ConversationStarted conversation_started = 23;
     ConversationEnded conversation_ended = 24;
+    ApprovalRequested approval_requested = 25;
+    ApprovalGranted approval_granted = 26;
+    ApprovalRejected approval_rejected = 27;
   }
 }
 
@@ -192,4 +195,48 @@ message ConversationEnded {
   string conversation_id = 1;
   uint32 turn_count = 2;
   string reason = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Human-in-the-loop approval events
+// ---------------------------------------------------------------------------
+
+// A human yes/no is required before the run can proceed. Surfaced by:
+//   * the `report_awaiting_approval` reporting tool (task-level, Flow A),
+//     where `target_id` is the task id and `kind` = "task";
+//   * the ADKAdapter's before_tool_callback on a `require_confirmation=True`
+//     tool (tool-level, Flow B), where `target_id` is the ADK function-call
+//     id and `kind` = "tool".
+// Either flow resolves with a ControlMessage(APPROVE|REJECT, {"target_id": ...})
+// which the executor dispatches back onto `session.pending_approvals`.
+message ApprovalRequested {
+  // Target the APPROVE/REJECT control must quote back: task_id for Flow A,
+  // ADK function-call id (e.g. "adk-<uuid>") for Flow B.
+  string target_id = 1;
+  // "task" or "tool".
+  string kind = 2;
+  // Human-readable question the UI should render to the human ("ok to spend
+  // $500?", "Run write_file(path='/etc/passwd')?").
+  string prompt = 3;
+  // The goldfive task context in which the approval arose. Same as
+  // `target_id` for Flow A; the task the agent was working on for Flow B.
+  string task_id = 4;
+  // Free-form metadata. Tool-level approvals set "tool_name" and
+  // "args_json"; task-level approvals may set custom keys.
+  map<string, string> metadata = 5;
+}
+
+// APPROVE resolution for an ApprovalRequested. Emitted after the control
+// dispatcher sets the pending-approval waiter.
+message ApprovalGranted {
+  string target_id = 1;
+  string detail = 2;
+}
+
+// REJECT resolution for an ApprovalRequested. The agent (Flow A) decides
+// whether this maps to TaskFailed; the adapter (Flow B) returns a skipped-
+// tool response to the model.
+message ApprovalRejected {
+  string target_id = 1;
+  string detail = 2;
 }
