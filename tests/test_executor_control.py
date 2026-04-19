@@ -612,8 +612,11 @@ async def test_sequential_cancel_abandons_uncooperative_adapter() -> None:
     executor = SequentialExecutor(max_plan_reinvocations=5)
 
     # Shrink the grace window via a targeted monkey-patch so the test
-    # runs in ~0.3s, not 5s.
-    original = SequentialExecutor._cancel_invoke_task
+    # runs in ~0.3s, not 5s. Grab the original from __dict__ so the
+    # restore preserves the staticmethod descriptor (attribute access
+    # would unwrap it and the subsequent `self._cancel_invoke_task(...)`
+    # calls would pass `self` as a stray first positional arg).
+    original = SequentialExecutor.__dict__["_cancel_invoke_task"]
 
     @staticmethod
     async def _quick_cancel(invoke_task: asyncio.Task) -> None:
