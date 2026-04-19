@@ -52,72 +52,34 @@ Optional extras:
 
 ## Hello goldfive
 
+The fastest path to a goldfive-wrapped agent is a single call to
+`goldfive.run`. It picks the right adapter for your agent, reuses
+the agent's LLM when it can detect one, and returns an
+`ExecutionOutcome`:
+
 ```python
 import asyncio
+import goldfive
 
-from goldfive import (
-    CallableAdapter,
-    InMemorySink,
-    InvocationResult,
-    Plan,
-    ReportingToolSpec,
-    Runner,
-    SequentialExecutor,
-    Session,
-    StaticPlanner,
-    Task,
-    TaskEdge,
-)
-
-
-async def greeter(
-    task: Task,
-    session: Session,
-    tools: list[ReportingToolSpec],
-) -> InvocationResult:
-    text = {
-        "greet": "Hello!",
-        "ask": "What's your name?",
-        "thank": "Thanks for chatting!",
-    }.get(task.id, "")
-    return InvocationResult(task_id=task.id, text=text)
-
-
-async def main() -> None:
-    plan = Plan(
-        id="hello",
-        run_id="",
-        goal_ids=["g1"],
-        tasks=[
-            Task(id="greet", title="Greet", assignee_agent_id="greeter"),
-            Task(id="ask", title="Ask for a name", assignee_agent_id="greeter"),
-            Task(id="thank", title="Thank the user", assignee_agent_id="greeter"),
-        ],
-        edges=[
-            TaskEdge(from_task_id="greet", to_task_id="ask"),
-            TaskEdge(from_task_id="ask", to_task_id="thank"),
-        ],
-        summary="Greet, ask, thank.",
-    )
-
-    sink = InMemorySink()
-    runner = Runner(
-        agent=CallableAdapter(greeter, available_agents=["greeter"]),
-        planner=StaticPlanner(plan),
-        executor=SequentialExecutor(),
-        sinks=[sink],
-    )
-
-    outcome = await runner.run("run the greeter workflow")
-    await runner.close()
-
-    print(f"success={outcome.success} events={len(sink.events)}")
-
-
-asyncio.run(main())
+# `agent` is any of: an ADK BaseAgent, a Claude SDK client factory,
+# an async (task, session, tools) -> InvocationResult callable, or
+# anything implementing goldfive.AgentAdapter.
+outcome = await goldfive.run(agent, "make a presentation about waffles")
 ```
 
-A runnable copy of this example lives in
+Prefer to keep the runner around (for `.resume()`, custom sinks, or
+multiple runs)? Use `goldfive.wrap`:
+
+```python
+runner = goldfive.wrap(agent, sinks=[my_sink])
+outcome = await runner.run("make a presentation about waffles")
+```
+
+Every default component is overridable — pass `planner=`,
+`executor=`, `sinks=`, `call_llm=`, `model=`, or
+`max_plan_reinvocations=` as keyword arguments to either function.
+
+A runnable demo lives in
 [`examples/hello_callable.py`](examples/hello_callable.py).
 
 ## Docs
