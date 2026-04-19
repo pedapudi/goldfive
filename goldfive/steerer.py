@@ -300,14 +300,59 @@ class DefaultSteerer:
     async def observe(self, event: Any, session: Session) -> None:
         """Inspect ``event``, classify drift, and refine if severe enough.
 
-        Never raises on a normal event — a detector returning ``None``
-        simply means "nothing to report". Only explicit classifier
-        mis-behaviour would surface here, and we let that propagate.
+        ``ControlMessage`` values are handled first — they carry explicit
+        user intent (STEER / CANCEL / PAUSE) and map directly to the
+        corresponding ``USER_*`` drift kinds without going through the
+        heuristic classifiers. Every other event falls through to
+        :meth:`detect_drift`.
         """
-        drift = self.detect_drift(event, session)
+        drift = self._drift_from_control(event, session)
+        if drift is None:
+            drift = self.detect_drift(event, session)
         if drift is None:
             return
         await self._handle_drift(drift, session)
+
+    @staticmethod
+    def _drift_from_control(event: Any, session: Session) -> DriftEvent | None:
+        """Map a :class:`ControlMessage` to the matching ``USER_*`` drift.
+
+        Returns ``None`` for anything that is not a ``ControlMessage`` so
+        the caller can fall through to the classifier pipeline. Unknown
+        control kinds return ``None`` as well — they are dispatched by
+        the executor, not the steerer.
+        """
+        from goldfive.control import ControlKind, ControlMessage
+
+        if not isinstance(event, ControlMessage):
+            return None
+        raw_kind = getattr(event, "kind", None)
+        kind_str = str(getattr(raw_kind, "value", raw_kind) or "").upper()
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        note = str(payload.get("note", "") or "")
+        reason = str(payload.get("reason", "") or "")
+        if kind_str == ControlKind.STEER.value:
+            return DriftEvent(
+                kind=DriftKind.USER_STEER,
+                severity=DriftSeverity.WARNING,
+                detail=note,
+                current_task_id=session.current_task_id,
+            )
+        if kind_str == ControlKind.CANCEL.value:
+            return DriftEvent(
+                kind=DriftKind.USER_CANCEL,
+                severity=DriftSeverity.CRITICAL,
+                detail=reason,
+                current_task_id=session.current_task_id,
+            )
+        if kind_str == ControlKind.PAUSE.value:
+            return DriftEvent(
+                kind=DriftKind.USER_PAUSE,
+                severity=DriftSeverity.INFO,
+                detail=note,
+                current_task_id=session.current_task_id,
+            )
+        return None
 
     def detect_drift(
         self,
