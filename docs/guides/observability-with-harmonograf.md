@@ -288,17 +288,25 @@ including the sinks list, is unchanged. See
 wrap a new framework.
 
 If you just want the shortest possible Runner construction, the
-`goldfive.quickstart()` factory wires a `SequentialExecutor`, a
-`PassthroughGoalDeriver`, a `StaticPlanner` with one task per goal,
-and a single `InMemorySink`:
+one-line `goldfive.wrap` / `goldfive.run` helpers auto-detect the
+adapter and wire every default for you:
 
 ```python
-from goldfive import quickstart
+import goldfive
 
-runner = quickstart(my_agent, "summarise the notes")
-runner.sinks.append(HarmonografSink(client))  # if needed
-outcome = await runner.run("summarise the notes")
+runner = goldfive.wrap(root_agent, sinks=[HarmonografSink(client), LoggingSink()])
+outcome = await runner.run("make a presentation about waffles")
 ```
+
+`goldfive.wrap` picks `ADKAdapter`, `ClaudeAgentSDKAdapter`, or
+`CallableAdapter` automatically based on `root_agent`'s shape, and
+reuses the ADK agent's `.model` to configure `LLMPlanner` and
+`LLMGoalDeriver`. Override any default (`planner=`, `executor=`,
+`call_llm=`, `model=`, ...) by passing it as a keyword argument.
+
+The lower-level `goldfive.quickstart()` factory is still available
+for callers who want a ready-to-run `StaticPlanner` with one task per
+goal — see the source of `goldfive/quickstart.py`.
 
 ### Add persistence
 

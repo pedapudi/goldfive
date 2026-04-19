@@ -43,6 +43,42 @@ uv sync --extra dev       # dev tools (pytest, ruff, mypy)
 uv sync --extra examples  # example-specific deps
 ```
 
+## One-line wrapping
+
+For the common case — "I already have an agent, wrap it with goldfive
+planning" — two helpers skip the hand-wired `Runner` construction:
+
+```python
+import goldfive
+
+# One line: wrap + run, get an ExecutionOutcome back.
+outcome = await goldfive.run(my_agent, "make a presentation about waffles")
+
+# Or, keep the Runner around:
+runner = goldfive.wrap(my_agent, sinks=[my_sink])
+outcome = await runner.run("make a presentation about waffles")
+```
+
+`wrap` auto-detects the adapter from the agent's shape:
+
+| Agent shape | Adapter chosen |
+|---|---|
+| Implements `goldfive.AgentAdapter` | passed through as-is |
+| `google.adk.agents.BaseAgent` (or an ADK `Runner`) | `ADKAdapter` (requires `goldfive[adk]`) |
+| Zero-arg factory returning `claude_agent_sdk.ClaudeSDKClient` | `ClaudeAgentSDKAdapter` (requires `goldfive[claude]`) |
+| `async (task, session, tools) -> InvocationResult` | `CallableAdapter` |
+
+It also tries to reuse the agent's LLM. For ADK agents, `wrap` walks
+the agent tree, finds the first `.model`, and wires a matching
+`LLMPlanner` + `LLMGoalDeriver`. For non-ADK agents you can supply
+`call_llm=` / `model=` yourself; if neither is provided, `wrap`
+degrades to `PassthroughPlanner` + `LiteralGoalDeriver` and logs a
+DEBUG line explaining the drop.
+
+Every default is overridable via keyword argument — `planner=`,
+`goal_deriver=`, `executor=`, `steerer=`, `sinks=`, and
+`max_plan_reinvocations=` all win over the auto-wiring when passed.
+
 ## Mental model in five sentences
 
 goldfive wraps an agent and runs it against an explicit plan.
@@ -243,14 +279,31 @@ agent primitive you have.
 ## Using an LLM planner instead
 
 `PassthroughPlanner` is great for demos because you hand it a plan
-up-front. For real workloads, let the LLM decompose:
+up-front. For real workloads, let the LLM decompose. If you already
+have a `call_llm` async binding, hand it to `goldfive.wrap` — it
+builds the `LLMPlanner` + `LLMGoalDeriver` pair for you:
 
 ```python
-from goldfive.planner import LLMPlanner
+import goldfive
 
 async def call_llm(system_prompt: str, user_prompt: str, model: str) -> str:
     # wire this to your LLM of choice.
     ...
+
+runner = goldfive.wrap(
+    my_agent,
+    call_llm=call_llm,
+    model="claude-opus-4-5-20251101",
+)
+outcome = await runner.run("build me a slide deck about Python")
+```
+
+Or the explicit form with `Runner(...)`:
+
+```python
+from goldfive import Runner, SequentialExecutor
+from goldfive.adapters.callable import CallableAdapter
+from goldfive.planner import LLMPlanner
 
 runner = Runner(
     agent=CallableAdapter(my_agent),

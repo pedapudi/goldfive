@@ -5,6 +5,7 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 from goldfive.adapters.callable import CallableAdapter
+from goldfive.convenience import run, wrap
 from goldfive.drift import classify_refusal, classify_stop_reason, classify_tool_error
 from goldfive.executors.parallel import ParallelDAGExecutor
 from goldfive.executors.sequential import SequentialExecutor
@@ -87,4 +88,6 @@ __all__ = [
     "classify_stop_reason",
     "classify_tool_error",
     "quickstart",
+    "run",
+    "wrap",
 ]
