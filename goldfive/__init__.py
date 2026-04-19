@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 from goldfive.adapters.callable import CallableAdapter
 from goldfive.drift import classify_refusal, classify_stop_reason, classify_tool_error

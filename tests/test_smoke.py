@@ -9,4 +9,4 @@ def test_version_is_set() -> None:
 
 
 def test_version_matches_pyproject() -> None:
-    assert goldfive.__version__ == "0.0.1"
+    assert goldfive.__version__ == "0.1.0"
