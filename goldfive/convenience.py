@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from goldfive._llm_detect import CallLLM, detect_llm
 from goldfive.adapters.auto import auto_adapter
@@ -43,6 +43,9 @@ from goldfive.sinks import LoggingSink
 from goldfive.steerer import DefaultSteerer
 from goldfive.types import Goal
 
+if TYPE_CHECKING:
+    from goldfive.control import ControlChannel
+
 log = logging.getLogger("goldfive.wrap")
 
 
@@ -54,6 +57,7 @@ def wrap(
     executor: Executor | None = None,
     steerer: Steerer | None = None,
     sinks: list[EventSink] | None = None,
+    control: ControlChannel | None = None,
     call_llm: CallLLM | None = None,
     model: str | None = None,
     max_plan_reinvocations: int = 32,
@@ -82,6 +86,10 @@ def wrap(
     sinks:
         Optional sink list override. Defaults to ``[LoggingSink()]``.
         Passing an explicit empty list suppresses all sinks.
+    control:
+        Optional :class:`~goldfive.control.ControlChannel` forwarded
+        into the :class:`Runner`. Enables live pause / resume / cancel /
+        steer / rewind from an external controller.
     call_llm:
         Optional async ``(system, user, model) -> str`` callable. When
         provided, it is used for both the default planner and the
@@ -157,6 +165,7 @@ def wrap(
         goal_deriver=resolved_goal_deriver,
         steerer=resolved_steerer,
         sinks=resolved_sinks,
+        control=control,
         max_plan_reinvocations=max_plan_reinvocations,
     )
 
