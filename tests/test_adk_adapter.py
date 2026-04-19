@@ -421,6 +421,67 @@ async def test_register_reporting_tools_propagates_across_three_level_tree() -> 
     } <= discovered
 
 
+# ---------------------------------------------------------------------------
+# add_plugin — post-construction plugin install
+# ---------------------------------------------------------------------------
+
+
+async def test_add_plugin_installs_on_inner_runner() -> None:
+    """ADKAdapter.add_plugin must attach the plugin to the InMemoryRunner."""
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    class _FakePlugin(BasePlugin):
+        def __init__(self) -> None:
+            super().__init__(name="fake_plugin")
+
+    adapter = ADKAdapter(_make_agent())
+    plugin = _FakePlugin()
+    adapter.add_plugin(plugin)
+
+    installed = list(getattr(adapter._runner.plugin_manager, "plugins", []))
+    assert plugin in installed
+
+
+async def test_add_plugin_no_op_when_runner_lacks_plugin_manager() -> None:
+    """add_plugin must not raise when the inner runner has no plugin support."""
+    from goldfive.adapters.adk import ADKAdapter
+
+    # Build the adapter normally, then swap in a runner stub with no
+    # plugin_manager. ADKAdapter.add_plugin should DEBUG-log + no-op.
+    adapter = ADKAdapter(_make_agent())
+
+    class _BareRunner:
+        agent = adapter._agent
+        run_async = adapter._runner.run_async
+        session_service = adapter._runner.session_service
+
+    adapter._runner = _BareRunner()
+    adapter.add_plugin(object())  # must not raise
+
+
+async def test_goldfive_adk_agent_add_plugin_delegates() -> None:
+    """GoldfiveADKAgent.add_plugin routes through ADKAdapter on the inner Runner."""
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+
+    import goldfive
+    from goldfive.adapters.adk_wrap import GoldfiveADKAgent
+
+    class _FakePlugin(BasePlugin):
+        def __init__(self) -> None:
+            super().__init__(name="wrap_fake_plugin")
+
+    wrapped = goldfive.wrap(_make_agent())
+    assert isinstance(wrapped, GoldfiveADKAgent)
+    plugin = _FakePlugin()
+    wrapped.add_plugin(plugin)
+
+    adapter = wrapped._runner.agent
+    installed = list(getattr(adapter._runner.plugin_manager, "plugins", []))
+    assert plugin in installed
+
+
 async def test_register_reporting_tools_is_idempotent() -> None:
     """Registering twice must not duplicate the reporting tools on any agent."""
     from google.adk.agents.llm_agent import LlmAgent  # type: ignore
