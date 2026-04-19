@@ -13,7 +13,6 @@ mutated task state via the Steerer.
 
 Key behaviors
 -------------
-* Emit :class:`RunStarted` once, then iterate tasks.
 * Honor the plan's topological order: only invoke tasks whose predecessors
   are ``COMPLETED``. Walk tasks one-at-a-time (no parallelism).
 * After each invocation, re-read plan state: tasks may have moved to
@@ -23,6 +22,11 @@ Key behaviors
   so a stuck agent cannot spin forever.
 * Terminate with :class:`RunCompleted` on success or :class:`RunAborted`
   when ``fail_fast`` is set and a task fails fatally.
+
+Lifecycle ownership: the executor does NOT emit ``RunStarted``. The
+:class:`Runner` owns ``Run*`` lifecycle events; the executor owns the
+terminal ``RunCompleted`` / ``RunAborted`` plus ``PlanRevised`` and the
+per-task ``Task*`` events (the latter via the steerer).
 """
 
 from __future__ import annotations
@@ -34,7 +38,6 @@ from goldfive.events import (
     plan_revised_event,
     run_aborted_event,
     run_completed_event,
-    run_started_event,
 )
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome
@@ -98,15 +101,8 @@ class SequentialExecutor(Executor):
         # can emit events and trigger planner.refine on drift.
         steerer.bind(sinks=sinks, planner=planner)
 
-        # Emit RunStarted.
-        await emit(
-            sinks,
-            run_started_event(
-                run_id=session.run_id,
-                sequence=session.next_sequence(),
-                goal_summary=_goal_summary(session, plan),
-            ),
-        )
+        # NOTE: RunStarted is emitted by Runner, not by the executor. See
+        # Runner._emit_run_started.
 
         invocations = 0
         failure_reason = ""
@@ -344,16 +340,6 @@ def _find_task(plan: Plan, task_id: str) -> Task | None:
 
 def _any_failed(plan: Plan) -> bool:
     return any(t.status == TaskStatus.FAILED for t in plan.tasks)
-
-
-def _goal_summary(session: Session, plan: Plan) -> str:
-    """Best-effort one-line summary for the RunStarted event."""
-    if session.goals:
-        first = session.goals[0]
-        summary = getattr(first, "summary", "") or ""
-        if summary:
-            return summary
-    return plan.summary or f"plan {plan.id}"
 
 
 def _outcome_summary(session: Session) -> str:

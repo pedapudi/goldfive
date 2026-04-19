@@ -178,6 +178,22 @@ def _new_session() -> Session:
     return Session(run_id="run-1")
 
 
+def _proto_kinds(events: list[Any]) -> list[str]:
+    """Return PascalCase kind names for proto Event envelopes."""
+    out: list[str] = []
+    for e in events:
+        if hasattr(e, "WhichOneof"):
+            name = e.WhichOneof("payload") or ""
+            out.append(
+                "".join(part.capitalize() for part in name.split("_")) if name else ""
+            )
+        elif isinstance(e, dict):
+            out.append(e.get("kind", ""))
+        else:
+            out.append(getattr(e, "kind", ""))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -224,12 +240,12 @@ async def test_diamond_dag_runs_middle_stage_concurrently() -> None:
     for tid in ("A", "B", "C", "D", "E"):
         assert session.completed_results[tid] == f"result:{tid}"
 
-    # Sink saw RunStarted -> StageStarted/Completed pairs -> RunCompleted.
-    kinds = [ev["kind"] for ev in sink.events]
-    assert kinds[0] == "RunStarted"
+    # The executor only emits the terminal RunCompleted (Runner owns
+    # RunStarted; Stage* events were dropped because they have no proto
+    # equivalent and would have broken proto-wrapping sinks).
+    kinds = _proto_kinds(sink.events)
     assert kinds[-1] == "RunCompleted"
-    assert kinds.count("StageStarted") == 3
-    assert kinds.count("StageCompleted") == 3
+    assert "RunStarted" not in kinds
 
 
 @pytest.mark.asyncio
@@ -305,7 +321,7 @@ async def test_drift_in_parallel_task_finish_stage_then_refine() -> None:
     assert len(planner.refine_calls) == 1
     assert planner.refine_calls[0] is drift
     # A PlanRevised event was emitted.
-    kinds = [ev["kind"] for ev in sink.events]
+    kinds = _proto_kinds(sink.events)
     assert "PlanRevised" in kinds
 
 

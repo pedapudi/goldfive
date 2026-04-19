@@ -15,6 +15,19 @@ binds the steerer to the sinks+planner, and hands everything to the
 executor. The returned :class:`ExecutionOutcome` carries the final live
 :class:`Session` so callers can inspect completed tasks / artifacts.
 
+Event lifecycle ownership
+-------------------------
+* The Runner owns ``Run*`` lifecycle events (``RunStarted``,
+  ``GoalDerived``, ``PlanSubmitted``, and pre-executor ``RunAborted``).
+* Executors own ``Task*`` events, ``PlanRevised``, and the terminal
+  ``RunCompleted`` / ``RunAborted`` they emit when their own state
+  machine reaches the end of the run.
+* The Steerer owns ``DriftDetected`` and the per-task ``mark_task_*``
+  emissions.
+
+All sink emissions are proto :class:`Event` envelopes — built via the
+typed factories in :mod:`goldfive.events`.
+
 No ADK or Claude Agent SDK imports live in this module. Optional
 adapter implementations live under ``goldfive.adapters.<framework>``
 and are loaded lazily by callers.
@@ -28,7 +41,13 @@ import uuid
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from goldfive.events import emit, make_event
+from goldfive.events import (
+    emit,
+    goal_derived_event,
+    plan_submitted_event,
+    run_aborted_event,
+    run_started_event,
+)
 from goldfive.goal_deriver import PassthroughGoalDeriver
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS
 from goldfive.results import ExecutionOutcome
@@ -119,14 +138,7 @@ class Runner:
         )
 
         # 2. Emit RunStarted before anything else.
-        await self._emit(
-            session,
-            "RunStarted",
-            {
-                "started_at_ms": session.started_at_ms,
-                "input_kind": _input_kind(user_input),
-            },
-        )
+        await self._emit_run_started(session, user_input)
 
         # 3. Derive (or accept) goals.
         try:
@@ -134,15 +146,11 @@ class Runner:
         except Exception as exc:  # noqa: BLE001
             reason = f"goal derivation failed: {exc}"
             log.exception("goal derivation failed")
-            await self._emit(session, "RunAborted", {"reason": reason})
+            await self._emit_run_aborted(session, reason)
             return ExecutionOutcome(success=False, session=session, reason=reason)
         session.goals = list(goals)
 
-        await self._emit(
-            session,
-            "GoalDerived",
-            {"goals": [{"id": g.id, "summary": g.summary} for g in session.goals]},
-        )
+        await self._emit_goal_derived(session)
 
         # Build the context passed to the planner — stamp run_id so LLM
         # planners can include it in the plan envelope.
@@ -160,12 +168,12 @@ class Runner:
         except Exception as exc:  # noqa: BLE001
             reason = f"planner.generate raised: {exc}"
             log.exception("planner.generate raised")
-            await self._emit(session, "RunAborted", {"reason": reason})
+            await self._emit_run_aborted(session, reason)
             return ExecutionOutcome(success=False, session=session, reason=reason)
 
         if plan is None:
             reason = "no plan generated"
-            await self._emit(session, "RunAborted", {"reason": reason})
+            await self._emit_run_aborted(session, reason)
             return ExecutionOutcome(success=False, session=session, reason=reason)
 
         # Planners may leave run_id blank; stamp ours so downstream sinks
@@ -174,17 +182,7 @@ class Runner:
             plan.run_id = session.run_id
         session.plan = plan
 
-        await self._emit(
-            session,
-            "PlanSubmitted",
-            {
-                "plan_id": plan.id,
-                "summary": plan.summary,
-                "task_count": len(plan.tasks),
-                "edge_count": len(plan.edges),
-                "revision_index": plan.revision_index,
-            },
-        )
+        await self._emit_plan_submitted(session, plan)
 
         # 5. Register the seven canonical reporting tools on the adapter.
         try:
@@ -192,7 +190,7 @@ class Runner:
         except Exception as exc:  # noqa: BLE001
             reason = f"register_reporting_tools raised: {exc}"
             log.exception("register_reporting_tools raised")
-            await self._emit(session, "RunAborted", {"reason": reason})
+            await self._emit_run_aborted(session, reason)
             return ExecutionOutcome(success=False, session=session, reason=reason)
 
         # 6. Bind the steerer. (The executor may re-bind — that's fine.)
@@ -201,7 +199,7 @@ class Runner:
         except Exception as exc:  # noqa: BLE001
             reason = f"steerer.bind raised: {exc}"
             log.exception("steerer.bind raised")
-            await self._emit(session, "RunAborted", {"reason": reason})
+            await self._emit_run_aborted(session, reason)
             return ExecutionOutcome(success=False, session=session, reason=reason)
 
         # 7. Hand off to the executor.
@@ -217,7 +215,7 @@ class Runner:
         except Exception as exc:  # noqa: BLE001
             reason = f"executor.run raised: {exc}"
             log.exception("executor.run raised")
-            await self._emit(session, "RunAborted", {"reason": reason})
+            await self._emit_run_aborted(session, reason)
             return ExecutionOutcome(success=False, session=session, reason=reason)
 
         return outcome
@@ -306,22 +304,49 @@ class Runner:
             raise ValueError("GoalDeriver returned an empty goals list")
         return list(goals)
 
-    async def _emit(self, session: Session, kind: str, payload: dict[str, Any]) -> None:
-        evt = make_event(
+    async def _emit_run_started(
+        self, session: Session, user_input: str | list[Goal]
+    ) -> None:
+        evt = run_started_event(
             run_id=session.run_id,
             sequence=session.next_sequence(),
-            kind=kind,
-            payload=payload,
+            goal_summary=_initial_goal_summary(user_input),
+        )
+        await emit(self.sinks, evt)
+
+    async def _emit_goal_derived(self, session: Session) -> None:
+        evt = goal_derived_event(
+            run_id=session.run_id,
+            sequence=session.next_sequence(),
+            goals=list(session.goals),
+        )
+        await emit(self.sinks, evt)
+
+    async def _emit_plan_submitted(self, session: Session, plan: Any) -> None:
+        evt = plan_submitted_event(
+            run_id=session.run_id,
+            sequence=session.next_sequence(),
+            plan=plan,
+        )
+        await emit(self.sinks, evt)
+
+    async def _emit_run_aborted(self, session: Session, reason: str) -> None:
+        evt = run_aborted_event(
+            run_id=session.run_id,
+            sequence=session.next_sequence(),
+            reason=reason,
         )
         await emit(self.sinks, evt)
 
 
-def _input_kind(user_input: Any) -> str:
+def _initial_goal_summary(user_input: str | list[Goal]) -> str:
+    """Best-effort one-liner for the RunStarted event before goals derive."""
     if isinstance(user_input, str):
-        return "str"
-    if isinstance(user_input, list):
-        return "list[Goal]"
-    return type(user_input).__name__
+        return user_input
+    if isinstance(user_input, list) and user_input:
+        first = user_input[0]
+        return getattr(first, "summary", "") or ""
+    return ""
 
 
 __all__ = ["Runner"]

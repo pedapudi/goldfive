@@ -132,22 +132,21 @@ async def test_runner_end_to_end_event_sequence() -> None:
 
     kinds = _kinds(sink.events)
 
-    # Lifecycle envelope up-front. The runner emits RunStarted +
-    # GoalDerived + PlanSubmitted; SequentialExecutor then emits its own
-    # RunStarted before driving tasks (it's also usable standalone, and
-    # its own tests assert it emits RunStarted on entry).
+    # Lifecycle envelope up-front. The Runner owns the Run* lifecycle
+    # events: RunStarted then GoalDerived then PlanSubmitted. The
+    # executor no longer emits its own RunStarted (that would duplicate
+    # the Runner's emission and produce a second event for sinks).
     assert kinds[0] == "RunStarted"
     assert kinds[1] == "GoalDerived"
     assert kinds[2] == "PlanSubmitted"
-    assert kinds[3] == "RunStarted"
 
     # For each of the three tasks: TaskStarted → TaskCompleted.
-    task_kinds = kinds[4:-1]  # strip initial quartet and trailing RunCompleted
+    task_kinds = kinds[3:-1]  # strip initial triple and trailing RunCompleted
     assert len(task_kinds) == 6, kinds
     assert task_kinds[0::2] == ["TaskStarted"] * 3
     assert task_kinds[1::2] == ["TaskCompleted"] * 3
 
-    # Run terminates with a RunCompleted.
+    # Run terminates with a RunCompleted from the executor.
     assert kinds[-1] == "RunCompleted"
 
     # Sequence numbers are strictly monotonic from zero.
