@@ -329,6 +329,54 @@ both). Full failure-mode walkthrough in
 [persistence-and-recovery.md](persistence-and-recovery.md); full sink
 matrix in [choosing-a-sink.md](choosing-a-sink.md).
 
+## Live steering — pause, cancel, redirect
+
+Long runs benefit from an operator who can reach in and steer
+mid-flight. goldfive ships a single primitive for this: a
+`ControlChannel` passed into `Runner(control=...)`. Here is the
+smallest possible PAUSE / RESUME demo, still against the three-task
+`hello.py` plan:
+
+```python
+import asyncio
+
+from goldfive import ControlChannel, ControlKind, ControlMessage
+
+
+async def drive(channel: ControlChannel) -> None:
+    # Give the run a moment, then PAUSE, then RESUME.
+    await asyncio.sleep(0.05)
+    await channel.send(ControlMessage(kind=ControlKind.PAUSE))
+    await asyncio.sleep(0.1)
+    await channel.send(ControlMessage(kind=ControlKind.RESUME))
+
+
+async def main() -> None:
+    channel = ControlChannel()
+    runner = Runner(
+        agent=CallableAdapter(my_agent, available_agents=["default"]),
+        planner=StaticPlanner(plan),
+        executor=SequentialExecutor(),
+        control=channel,
+    )
+    # Run the agent and the controller concurrently.
+    _, outcome = await asyncio.gather(
+        drive(channel),
+        runner.run("demo run"),
+    )
+    await runner.close()
+    channel.close()
+    print(f"success={outcome.success}")
+```
+
+Beyond PAUSE / RESUME, `ControlKind` supports `CANCEL` (abort the run),
+`STEER` (redirect via planner refine), `REWIND_TO` (reset a task and
+its downstream), and `APPROVE` / `REJECT` (resolve pending approvals).
+Full semantics and the end-to-end UI path are in
+[../design/CONTROL.md](../design/CONTROL.md). A runnable demo covering
+PAUSE, STEER, and CANCEL against an offline canned-LLM planner is at
+[`examples/live_steering.py`](../../examples/live_steering.py).
+
 ## Running in parallel
 
 Swap `SequentialExecutor` for `ParallelDAGExecutor`:
@@ -362,6 +410,8 @@ Tasks whose dependencies are satisfied run concurrently via
   recovery with `JSONLPersistenceSink` / `SQLitePersistenceSink`.
 - [grpc-transport.md](grpc-transport.md) — streaming events to an
   out-of-process observer.
+- [../design/CONTROL.md](../design/CONTROL.md) — live steering and the
+  control channel.
 - [troubleshooting.md](troubleshooting.md) — common install / run-time
   failures.
 - [tool-protocol.md](../reference/tool-protocol.md) — the seven
