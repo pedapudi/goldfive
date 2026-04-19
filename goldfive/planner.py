@@ -30,11 +30,19 @@ from typing import Any
 
 from goldfive.types import (
     DriftEvent,
+    DriftKind,
+    DriftSeverity,
     Goal,
     Plan,
     Task,
     TaskEdge,
     TaskStatus,
+)
+
+# Task statuses that are "done" from a steering perspective — they are
+# preserved verbatim across a USER_STEER delete-and-replan.
+_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
 
 log = logging.getLogger("goldfive.planner")
@@ -100,6 +108,59 @@ markdown fences. Schema:
   "edges": [
     {"from_task_id": "research", "to_task_id": "draft"}
   ]
+}
+"""
+
+
+_USER_STEER_SYSTEM_PROMPT = """\
+You are a task-planning assistant for a multi-agent system. A human
+operator has just issued a STEERING directive against an in-flight
+plan: they want the remaining work reshaped to incorporate their note,
+while the work that has already finished must be preserved verbatim
+for auditability.
+
+You will receive:
+
+* The set of GOALS the plan is trying to satisfy.
+* A list of COMPLETED / FAILED / CANCELLED tasks (status history) —
+  these are shown to you purely as CONTEXT so you understand what has
+  already happened. You MUST NOT remove them, renumber them, or alter
+  their ids / titles / assignees / statuses. They belong verbatim at
+  the start of the returned plan's task list.
+* The operator's STEERING NOTE describing the change in direction.
+
+Your job is to produce the REMAINING work (fresh PENDING tasks) that
+satisfies the goals in light of the steering note. Existing pending
+tasks should be treated as DELETED — the operator's steer overrides
+whatever was pending. Design the new tasks from the ground up.
+
+Requirements:
+
+1. DO NOT repeat the completed tasks in your response. The caller
+   will prepend them to your task list. Respond only with the NEW
+   PENDING tasks and their edges.
+2. Any edge whose ``from_task_id`` is one of the completed tasks is
+   allowed — the caller will preserve those and wire them through.
+3. Stable ids: new task ids must be short, unique, and must not
+   collide with any completed-task id.
+4. GOAL COVERAGE: every unsatisfied goal must still be addressed.
+5. Honour the steering note: if it says "skip review", don't add a
+   review task; if it says "focus on X", center the remaining work
+   on X.
+
+Respond with a single JSON object and NOTHING ELSE:
+
+{
+  "summary": "...",
+  "tasks": [
+    {
+      "id": "...",
+      "title": "...",
+      "description": "...",
+      "assignee_agent_id": "..."
+    }
+  ],
+  "edges": [{"from_task_id": "...", "to_task_id": "..."}]
 }
 """
 
@@ -383,11 +444,15 @@ class LLMPlanner:
         model: str = "",
         system_prompt: str | None = None,
         refine_system_prompt: str | None = None,
+        user_steer_system_prompt: str | None = None,
     ) -> None:
         self._call_llm = call_llm
         self._model = model
         self._system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
         self._refine_system_prompt = refine_system_prompt or _REFINE_SYSTEM_PROMPT
+        self._user_steer_system_prompt = (
+            user_steer_system_prompt or _USER_STEER_SYSTEM_PROMPT
+        )
 
     @property
     def model(self) -> str:
@@ -431,6 +496,43 @@ class LLMPlanner:
             f"Goals:\n{goals_block}\n"
             f"{context_block}\n"
             "Respond with a single JSON object following the schema."
+        )
+
+    def _build_user_steer_prompt(
+        self,
+        completed: list[Task],
+        drift: DriftEvent,
+        goals: list[Goal],
+    ) -> str:
+        """Build the delete-and-replan user prompt for a USER_STEER drift.
+
+        Completed tasks are shown as read-only context; the LLM is told
+        to produce only the remaining pending work in light of the
+        steering note. The caller prepends the completed tasks back onto
+        the returned plan so lineage is preserved verbatim.
+        """
+        history = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "description": t.description,
+                "assignee_agent_id": t.assignee_agent_id,
+                "status": str(t.status),
+            }
+            for t in completed
+        ]
+        history_json = json.dumps(history, default=str)
+        goals_block = self._render_goals_block(goals)
+        note = drift.detail or "(no steering note provided)"
+        return (
+            f"Goals:\n{goals_block}\n\n"
+            f"Completed/Failed/Cancelled tasks (READ-ONLY CONTEXT — "
+            "preserve these verbatim at the start of the returned plan; "
+            f"do NOT repeat them in your response):\n{history_json}\n\n"
+            f"Operator steering note:\n{note}\n\n"
+            "Generate only the NEW PENDING tasks (and their edges) that "
+            "should run from here, taking the steering note into account. "
+            "Respond with JSON only."
         )
 
     def _build_refine_prompt(
@@ -530,6 +632,8 @@ class LLMPlanner:
     ) -> Plan | None:
         if plan is None:
             return None
+        if drift.kind is DriftKind.USER_STEER:
+            return await self._refine_user_steer(plan, drift, goals)
         try:
             user_prompt = self._build_refine_prompt(plan, drift, goals)
         except (TypeError, ValueError) as exc:
@@ -564,6 +668,106 @@ class LLMPlanner:
         revised.revision_severity = str(drift.severity)
         revised.revision_index = plan.revision_index + 1
         return revised
+
+    async def _refine_user_steer(
+        self,
+        plan: Plan,
+        drift: DriftEvent,
+        goals: list[Goal],
+    ) -> Plan | None:
+        """Delete-and-replan path for ``USER_STEER`` drift.
+
+        Completed/failed/cancelled tasks are preserved verbatim (same
+        ids, titles, assignees, statuses). Pending/running/blocked
+        tasks are dropped; the LLM produces a fresh set of PENDING
+        tasks that honour the operator's steering note. The returned
+        plan reuses ``plan.id`` and ``plan.run_id`` so lineage stays
+        intact.
+        """
+        completed = [t for t in plan.tasks if t.status in _TERMINAL_STATUSES]
+        completed_ids = {t.id for t in completed}
+        try:
+            user_prompt = self._build_user_steer_prompt(completed, drift, goals)
+        except (TypeError, ValueError) as exc:
+            log.warning(
+                "LLMPlanner._refine_user_steer: failed to serialise inputs (%s)",
+                exc,
+            )
+            return None
+        try:
+            raw = await self._call_llm(
+                self._user_steer_system_prompt, user_prompt, self._model
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("LLMPlanner._refine_user_steer: call_llm raised %s", exc)
+            return None
+        if not raw or not isinstance(raw, str):
+            log.warning(
+                "LLMPlanner._refine_user_steer: empty/non-string LLM response"
+            )
+            return None
+        cleaned = _strip_code_fences(raw).strip()
+        try:
+            parsed = json.loads(cleaned)
+        except (ValueError, TypeError) as exc:
+            log.warning(
+                "LLMPlanner._refine_user_steer: failed to parse LLM output "
+                "as JSON (%s)",
+                exc,
+            )
+            return None
+        fresh = _plan_from_json(
+            parsed,
+            run_id=plan.run_id,
+            goal_ids=[g.id for g in goals if g.id] or list(plan.goal_ids),
+            plan_id=plan.id,
+        )
+        if fresh is None:
+            log.warning(
+                "LLMPlanner._refine_user_steer: parsed JSON did not contain "
+                "a usable plan"
+            )
+            return None
+
+        # Prepend completed tasks verbatim; drop any new task whose id
+        # collides with a completed id so lineage ids stay stable.
+        new_pending = [t for t in fresh.tasks if t.id not in completed_ids]
+        merged_tasks = list(completed) + new_pending
+        # Edges: keep original edges that are still fully satisfiable
+        # (both endpoints either completed or new-pending), plus every
+        # new edge from the LLM.
+        known_ids = completed_ids | {t.id for t in new_pending}
+        preserved_edges = [
+            TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
+            for e in plan.edges
+            if e.from_task_id in known_ids and e.to_task_id in known_ids
+        ]
+        new_edges = [
+            TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
+            for e in fresh.edges
+        ]
+        # Deduplicate (same from/to pair) while preserving order.
+        seen: set[tuple[str, str]] = set()
+        merged_edges: list[TaskEdge] = []
+        for e in preserved_edges + new_edges:
+            key = (e.from_task_id, e.to_task_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_edges.append(e)
+
+        return Plan(
+            id=plan.id,
+            run_id=plan.run_id,
+            goal_ids=list(fresh.goal_ids) or list(plan.goal_ids),
+            tasks=merged_tasks,
+            edges=merged_edges,
+            summary=fresh.summary or plan.summary,
+            revision_reason=f"user steering: {drift.detail}",
+            revision_kind=DriftKind.USER_STEER.value,
+            revision_severity=DriftSeverity.WARNING.value,
+            revision_index=plan.revision_index + 1,
+        )
 
 
 __all__ = [
