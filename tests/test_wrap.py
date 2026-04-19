@@ -276,10 +276,17 @@ def _has_adk() -> bool:
 
 @pytest.mark.skipif(not _has_adk(), reason="goldfive[adk] extra not installed")
 async def test_wrap_adk_agent_chooses_adk_adapter() -> None:
-    """An ADK ``BaseAgent`` dispatches to :class:`ADKAdapter`."""
+    """An ADK ``BaseAgent`` dispatches to :class:`ADKAdapter`.
+
+    Since Phase 2 (issue #77) :func:`goldfive.wrap` returns a
+    polymorphic :class:`GoldfiveADKAgent` for ADK inputs. The underlying
+    :class:`Runner` — reachable via ``.runner`` — still carries an
+    :class:`ADKAdapter`, which is what this test verifies.
+    """
     from google.adk.agents.llm_agent import LlmAgent
 
     from goldfive.adapters.adk import ADKAdapter
+    from goldfive.adapters.adk_wrap import GoldfiveADKAgent
 
     adk_agent = LlmAgent(
         name="test_agent",
@@ -287,8 +294,9 @@ async def test_wrap_adk_agent_chooses_adk_adapter() -> None:
         description="Test agent",
         instruction="Test.",
     )
-    runner = goldfive.wrap(adk_agent, sinks=[InMemorySink()])
-    assert isinstance(runner.agent, ADKAdapter)
+    wrapped = goldfive.wrap(adk_agent, sinks=[InMemorySink()])
+    assert isinstance(wrapped, GoldfiveADKAgent)
+    assert isinstance(wrapped.runner.agent, ADKAdapter)
 
 
 @pytest.mark.skipif(not _has_adk(), reason="goldfive[adk] extra not installed")
