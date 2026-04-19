@@ -197,6 +197,19 @@ class SequentialExecutor(Executor):
                     result.error, task.id,
                 )
 
+            # Route the invocation result through the steerer's observer so
+            # drift classification runs on the sequential path too. This
+            # mirrors ParallelDAGExecutor and lets drift enter via the raw
+            # invocation envelope (not only via reporting-tool handlers).
+            if result is not None:
+                try:
+                    await steerer.observe(result, session)
+                except Exception as observe_exc:  # noqa: BLE001
+                    log.debug(
+                        "SequentialExecutor: steerer.observe raised: %s",
+                        observe_exc,
+                    )
+
             # Re-read the task's tracked status after the invocation.
             tracked = _find_task(session.plan or current_plan, task.id)
             tracked_status = (
