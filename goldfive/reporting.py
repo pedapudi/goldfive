@@ -1,6 +1,6 @@
 """Reporting-tool specs and handlers.
 
-The seven canonical reporting tools — the agent-facing contract for
+The eight canonical reporting tools — the agent-facing contract for
 driving the plan's task state machine and signalling plan mutations.
 Each :class:`ReportingToolSpec` pairs a stable tool name with a JSON-schema
 parameters block and an async handler. Handlers receive the decoded
@@ -9,17 +9,26 @@ route the call into the steerer's transition / drift pipeline.
 
 Adapters materialise these specs into whatever native tool shape their
 framework wants (ADK ``FunctionTool``, Claude Agent SDK tool blocks, …).
+
+The eighth tool, ``report_awaiting_approval``, is the task-level half of
+the human-in-the-loop approval flow described in
+``docs/design/APPROVAL.md``. Its handler blocks the calling tool-call
+until the control dispatcher lands an ``APPROVE`` or ``REJECT``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
     from goldfive.types import Session
+
+log = logging.getLogger(__name__)
 
 
 # Framework-agnostic async handler signature.
@@ -47,7 +56,7 @@ class ReportingToolSpec:
     handler: ReportingHandler
 
 
-# The seven canonical reporting tool names. These are a stable contract: the
+# The eight canonical reporting tool names. These are a stable contract: the
 # adapter must surface tools with exactly these names so that the Steerer can
 # interpret them uniformly across frameworks. Do not rename.
 REPORTING_TOOL_NAMES: tuple[str, ...] = (
@@ -58,6 +67,7 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
     "report_task_blocked",
     "report_new_work_discovered",
     "report_plan_divergence",
+    "report_awaiting_approval",
 )
 
 
@@ -91,6 +101,14 @@ def _bool(args: dict[str, Any], key: str, default: bool = True) -> bool:
     if isinstance(v, str):
         return v.lower() in {"true", "1", "yes"}
     return bool(v) if v is not None else default
+
+
+def _int(args: dict[str, Any], key: str, default: int = 0) -> int:
+    v = args.get(key, default)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
 async def _handle_task_started(
@@ -191,6 +209,114 @@ async def _handle_plan_divergence(
     return dict(_ACK)
 
 
+async def _handle_awaiting_approval(
+    args: dict[str, Any], session: Session, steerer: Steerer
+) -> dict[str, Any]:
+    """Block the current task until APPROVE / REJECT arrives on the control channel.
+
+    Transitions the task to ``BLOCKED`` (so sinks see a concrete status
+    for the "awaiting approval" card), emits ``ApprovalRequested``, and
+    awaits the per-task ``asyncio.Event`` the control dispatcher sets
+    when the matching ``ControlMessage(APPROVE|REJECT)`` lands.
+
+    Returns ``{"decision": "approve" | "reject", "detail": ...}`` so the
+    agent can decide whether to proceed or transition the task to
+    ``FAILED`` itself. A ``timeout_ms > 0`` that elapses before a
+    decision lands returns ``{"decision": "timeout", "detail": ...}``
+    and leaves the task blocked (the caller may re-prompt or fail).
+    """
+    task_id = _str(args, "task_id")
+    prompt = _str(args, "prompt")
+    timeout_ms = _int(args, "timeout_ms", 0)
+    if not task_id:
+        return {"acknowledged": False, "error": "task_id is required"}
+
+    # Idempotency: reuse an existing waiter if one is already pending.
+    waiter = session.pending_approvals.get(task_id)
+    if waiter is None:
+        waiter = asyncio.Event()
+        session.pending_approvals[task_id] = waiter
+    meta = session.pending_approvals_meta.setdefault(
+        task_id,
+        {"kind": "task", "prompt": prompt, "task_id": task_id},
+    )
+    # Refresh prompt in case it changed — the dispatcher only reads
+    # ``decision`` and ``detail`` so this is safe.
+    meta["prompt"] = prompt
+
+    await steerer.mark_task_blocked(
+        task_id,
+        session=session,
+        blocker="awaiting_approval",
+        needed=prompt,
+    )
+    await _emit_approval_requested(
+        session=session,
+        steerer=steerer,
+        target_id=task_id,
+        kind="task",
+        prompt=prompt,
+        task_id=task_id,
+        metadata={},
+    )
+
+    try:
+        if timeout_ms > 0:
+            await asyncio.wait_for(waiter.wait(), timeout=timeout_ms / 1000.0)
+        else:
+            await waiter.wait()
+    except TimeoutError:
+        return {
+            "acknowledged": True,
+            "decision": "timeout",
+            "detail": f"no decision after {timeout_ms}ms",
+        }
+
+    decision = str(meta.get("decision", "")) or "approve"
+    detail = str(meta.get("detail", ""))
+    return {"acknowledged": True, "decision": decision, "detail": detail}
+
+
+async def _emit_approval_requested(
+    *,
+    session: Session,
+    steerer: Steerer,
+    target_id: str,
+    kind: str,
+    prompt: str,
+    task_id: str,
+    metadata: dict[str, str],
+) -> None:
+    """Emit an ``ApprovalRequested`` through the steerer's bound sinks.
+
+    Falls back to a no-op if the steerer lacks a sinks list (test stubs
+    may drop the ``bind`` attribute). Proto-build errors are logged and
+    swallowed — losing the event is better than failing the tool call.
+    """
+    sinks = getattr(steerer, "_sinks", None) or []
+    if not sinks:
+        return
+    from goldfive.events import approval_requested_event, emit
+
+    try:
+        evt = approval_requested_event(
+            run_id=session.run_id,
+            sequence=session.next_sequence(),
+            target_id=target_id,
+            kind=kind,
+            prompt=prompt,
+            task_id=task_id,
+            metadata=metadata,
+        )
+    except Exception as exc:  # noqa: BLE001 — proto stubs may be missing in unit tests
+        log.debug("approval_requested: proto event build failed: %s", exc)
+        return
+    try:
+        await emit(sinks, evt)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("approval_requested: sink emit raised: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Parameter schemas (JSON Schema draft-07 style)
 # ---------------------------------------------------------------------------
@@ -272,6 +398,15 @@ _SCHEMA_PLAN_DIVERGENCE = _object_schema(
     },
 )
 
+_SCHEMA_AWAITING_APPROVAL = _object_schema(
+    required=["task_id", "prompt"],
+    properties={
+        "task_id": {"type": "string"},
+        "prompt": {"type": "string"},
+        "timeout_ms": {"type": "integer", "minimum": 0},
+    },
+)
+
 
 # ---------------------------------------------------------------------------
 # Built-in tool specs
@@ -347,6 +482,22 @@ BUILTIN_REPORTING_TOOLS: list[ReportingToolSpec] = [
         ),
         parameters=_SCHEMA_PLAN_DIVERGENCE,
         handler=_handle_plan_divergence,
+    ),
+    ReportingToolSpec(
+        name="report_awaiting_approval",
+        description=(
+            "Block the current task until a human approves or rejects via "
+            "the control channel. Use this when the task has a side effect "
+            "that needs sign-off (spending money, writing to a shared "
+            "system, sending a message). The call blocks until the UI "
+            "dispatches an APPROVE or REJECT and returns "
+            "{'decision': 'approve' | 'reject' | 'timeout', 'detail': ...}. "
+            "The agent decides what to do with the decision: on approve, "
+            "proceed; on reject, typically report_task_failed with a "
+            "user-rejection reason."
+        ),
+        parameters=_SCHEMA_AWAITING_APPROVAL,
+        handler=_handle_awaiting_approval,
     ),
 ]
 
