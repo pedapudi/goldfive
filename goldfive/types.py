@@ -1,6 +1,6 @@
 """Core dataclasses and enums for goldfive.
 
-Pinned by ``INTERFACE_SPEC.md`` (v0.1). See issue #4. Types in this module are
+Pinned by ``docs/design/PROTOCOLS.md`` (v0.1). Types in this module are
 pure data — mutation of live state happens only through a ``Steerer``.
 """
 

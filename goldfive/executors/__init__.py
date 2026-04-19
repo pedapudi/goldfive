@@ -1,7 +1,7 @@
 """Built-in executors.
 
 Each executor drives a :class:`Plan` to completion against an
-:class:`AgentAdapter`. See ``INTERFACE_SPEC.md`` for the contract.
+:class:`AgentAdapter`. See ``docs/design/PROTOCOLS.md`` for the contract.
 """
 
 from __future__ import annotations

@@ -26,7 +26,7 @@ Key design points:
 * The system prompt template is public and overrideable — see
   :mod:`goldfive.adapters._claude_prompt`.
 
-This module is pinned to the shapes in ``INTERFACE_SPEC.md``.
+This module is pinned to the shapes in ``docs/design/PROTOCOLS.md``.
 """
 
 from __future__ import annotations
