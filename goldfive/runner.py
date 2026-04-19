@@ -55,6 +55,7 @@ from goldfive.steerer import DefaultSteerer
 from goldfive.types import Goal, Session
 
 if TYPE_CHECKING:
+    from goldfive.control import ControlChannel
     from goldfive.protocols import (
         AgentAdapter,
         EventSink,
@@ -94,6 +95,12 @@ class Runner:
         Optional — defaults to :class:`DefaultSteerer`.
     sinks:
         Optional list of :class:`EventSink` instances. Defaults to ``[]``.
+    control:
+        Optional :class:`~goldfive.control.ControlChannel` for live
+        pause / resume / cancel / steer / rewind from an external
+        controller (harmonograf UI, CLI, tests). When provided, the
+        Runner forwards it into the executor, which polls the channel
+        between tasks and races against adapter invocations mid-task.
     max_plan_reinvocations:
         Safety cap on plan refinement cycles. Passed through to the
         executor (via ``context``) so executors that honour it can
@@ -109,6 +116,7 @@ class Runner:
         goal_deriver: GoalDeriver | None = None,
         steerer: Steerer | None = None,
         sinks: list[EventSink] | None = None,
+        control: ControlChannel | None = None,
         max_plan_reinvocations: int = 3,
     ) -> None:
         self.agent = agent
@@ -117,6 +125,7 @@ class Runner:
         self.goal_deriver: GoalDeriver = goal_deriver or PassthroughGoalDeriver("run")
         self.steerer: Steerer = steerer or DefaultSteerer()
         self.sinks: list[EventSink] = list(sinks) if sinks else []
+        self.control: ControlChannel | None = control
         self.max_plan_reinvocations = max_plan_reinvocations
 
     # ------------------------------------------------------------------
@@ -204,7 +213,7 @@ class Runner:
 
         # 7. Hand off to the executor.
         try:
-            outcome = await self.executor.run(
+            executor_kwargs: dict[str, Any] = dict(
                 plan=session.plan,
                 session=session,
                 adapter=self.agent,
@@ -212,6 +221,9 @@ class Runner:
                 planner=self.planner,
                 sinks=list(self.sinks),
             )
+            if self.control is not None:
+                executor_kwargs["control"] = self.control
+            outcome = await self.executor.run(**executor_kwargs)
         except Exception as exc:  # noqa: BLE001
             reason = f"executor.run raised: {exc}"
             log.exception("executor.run raised")
