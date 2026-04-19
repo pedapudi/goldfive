@@ -13,6 +13,10 @@ This document covers:
 - How to build a custom sink.
 
 Related: [ARCHITECTURE.md](ARCHITECTURE.md), [PROTOCOLS.md](PROTOCOLS.md#eventsink),
+[VOCABULARY.md §6 — Event payload kinds](VOCABULARY.md#6-event-payload-kinds)
+(exhaustive factory-to-emitter reference for every `oneof` variant),
+[RATIONALE.md §"Why `EventSink` protocol is proto-Event-shaped, not
+dict-shaped"](RATIONALE.md#why-eventsink-protocol-is-proto-event-shaped-not-dict-shaped),
 and the [writing-an-event-sink guide](../guides/writing-an-event-sink.md).
 
 ## Event envelope
