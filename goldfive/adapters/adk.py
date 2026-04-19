@@ -319,6 +319,26 @@ class ADKAdapter:
         self._steerer: Steerer | None = None
 
     # ------------------------------------------------------------------
+    # Post-construction plugin install
+    # ------------------------------------------------------------------
+
+    def add_plugin(self, plugin: Any) -> None:
+        """Install an ADK ``BasePlugin`` on the inner ``Runner``.
+
+        Tolerant of runners that don't expose a plugin manager (e.g. a
+        custom ``Runner`` shape) — logs at DEBUG and returns. Used by
+        observability integrations that need to attach a plugin after
+        the adapter has already been built.
+        """
+        if not _register_plugin_on_runner(self._runner, plugin):
+            log.debug(
+                "ADKAdapter.add_plugin: runner %r has no plugin manager; "
+                "plugin %r not installed",
+                type(self._runner).__name__,
+                type(plugin).__name__,
+            )
+
+    # ------------------------------------------------------------------
     # AgentAdapter protocol
     # ------------------------------------------------------------------
 
