@@ -10,19 +10,19 @@ more (`LoggingSink`, `JSONLPersistenceSink`, `SQLitePersistenceSink`,
 
 ## Quick decision matrix
 
-| Sink | In-process? | Persistent? | Cross-process? | Proto+dict? | Install |
+| Sink | In-process? | Persistent? | Cross-process? | Accepts | Install |
 | --- | --- | --- | --- | --- | --- |
-| `InMemorySink` | yes | no | no | both | stdlib |
-| `LoggingSink` | yes | via logging config | no | proto cleanly, else `repr` | `proto` extra |
-| `JSONLPersistenceSink` | yes | yes (file) | no | both | `proto` extra |
-| `SQLitePersistenceSink` | yes | yes (DB) | via DB reads | both | `proto` extra |
-| `GRPCSink` | no (streams out) | no (the server persists) | yes | proto only | `proto` extra + `grpcio` |
-| `HarmonografSink` | no (streams out) | no (harmonograf persists) | yes | proto only | `harmonograf_client` |
+| `InMemorySink` | yes | no | no | any | stdlib |
+| `LoggingSink` | yes | via logging config | no | proto `Event` (dicts render via `repr`) | `proto` extra |
+| `JSONLPersistenceSink` | yes | yes (file) | no | proto `Event` (and dicts, via `json.dumps`) | `proto` extra |
+| `SQLitePersistenceSink` | yes | yes (DB) | via DB reads | proto `Event` (and dicts) | `proto` extra |
+| `GRPCSink` | no (streams out) | no (the server persists) | yes | proto `Event` only | `proto` extra + `grpcio` |
+| `HarmonografSink` | no (streams out) | no (harmonograf persists) | yes | proto `Event` only | `harmonograf_client` |
 
-"Proto+dict" means the sink accepts both the Runner's dict lifecycle
-envelopes and the executor's proto `Event` messages. `GRPCSink` and
-`HarmonografSink` drop non-proto events with a debug log — the wire
-formats are strictly proto.
+Since #55 the goldfive Runner/executor/steerer all emit proto
+`Event` envelopes. Custom components that hand dict envelopes (from
+`goldfive.events.make_event`) to `GRPCSink` / `HarmonografSink` have
+them dropped with a debug log — both transports are proto-only.
 
 ## Comparison
 
@@ -292,11 +292,13 @@ the exception; the remaining sinks still see the event; the run keeps
 going. Design your sink for graceful degradation — see
 [writing-an-event-sink.md](writing-an-event-sink.md).
 
-**Which sinks accept dict events?** All local sinks accept both shapes.
-The Runner emits dict envelopes for lifecycle markers; executors emit
-proto `Event` messages for per-task state. `GRPCSink` and
-`HarmonografSink` are proto-only and drop non-proto events with a
-debug log.
+**Which sinks accept dict events?** All local sinks (`InMemorySink`,
+`LoggingSink`, `JSONLPersistenceSink`, `SQLitePersistenceSink`)
+tolerate both proto `Event` envelopes and dict envelopes built via
+`goldfive.events.make_event`. Since #55 the built-in components only
+emit proto, so the dict path is dormant unless a custom sink /
+component hands one in. `GRPCSink` and `HarmonografSink` are
+proto-only and drop non-proto events with a debug log.
 
 **I want a new sink — where do I start?**
 [writing-an-event-sink.md](writing-an-event-sink.md). The protocol is
