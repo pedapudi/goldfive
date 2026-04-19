@@ -272,6 +272,39 @@ def task_cancelled_event(run_id: str, sequence: int, task_id: str, reason: str =
     return evt
 
 
+def control_received_event(
+    run_id: str,
+    sequence: int,
+    control_kind: Any,
+    control_id: str,
+) -> Any:
+    """Build a ``DriftDetected`` envelope for a received ControlMessage.
+
+    Phase 1 reuses the ``DriftDetected`` oneof (no proto regen). The mapping
+    from :class:`goldfive.control.ControlKind` to :class:`DriftKind` is:
+    ``PAUSE`` -> ``USER_PAUSE``, ``CANCEL`` -> ``USER_CANCEL``, everything
+    else (``STEER``, ``RESUME``, ``REWIND_TO``) -> ``USER_STEER``. The raw
+    control kind name is preserved in ``detail`` along with the control id
+    so downstream consumers can disambiguate.
+    """
+    from goldfive.types import DriftEvent, DriftKind, DriftSeverity
+
+    kind_name = str(getattr(control_kind, "value", control_kind)).upper()
+    if kind_name == "PAUSE":
+        drift_kind = DriftKind.USER_PAUSE
+    elif kind_name == "CANCEL":
+        drift_kind = DriftKind.USER_CANCEL
+    else:
+        drift_kind = DriftKind.USER_STEER
+
+    drift = DriftEvent(
+        kind=drift_kind,
+        severity=DriftSeverity.WARNING,
+        detail=f"control:{kind_name}:{control_id}",
+    )
+    return drift_detected_event(run_id, sequence, drift)
+
+
 def drift_detected_event(run_id: str, sequence: int, drift: Any) -> Any:
     pb = _events_pb_module()
     evt = new_event(run_id, sequence)

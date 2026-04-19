@@ -5,6 +5,13 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 from goldfive.adapters.callable import CallableAdapter
+from goldfive.control import (
+    AckResult,
+    ControlAck,
+    ControlChannel,
+    ControlKind,
+    ControlMessage,
+)
 from goldfive.convenience import run, wrap
 from goldfive.drift import classify_refusal, classify_stop_reason, classify_tool_error
 from goldfive.executors.parallel import ParallelDAGExecutor
@@ -49,9 +56,14 @@ from goldfive.types import (
 
 __all__ = [
     "__version__",
+    "AckResult",
     "AgentAdapter",
     "BUILTIN_REPORTING_TOOLS",
     "CallableAdapter",
+    "ControlAck",
+    "ControlChannel",
+    "ControlKind",
+    "ControlMessage",
     "DefaultSteerer",
     "DriftEvent",
     "DriftKind",
