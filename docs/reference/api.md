@@ -24,6 +24,8 @@ from goldfive import (
     InvocationResult, ExecutionOutcome,
     # reporting
     ReportingToolSpec, BUILTIN_REPORTING_TOOLS,
+    # live steering
+    ControlChannel, ControlMessage, ControlAck, ControlKind, AckResult,
     # default implementations re-exported at the package root
     CallableAdapter,
     SequentialExecutor, ParallelDAGExecutor,
@@ -148,6 +150,7 @@ class Runner:
         goal_deriver: Optional[GoalDeriver] = None,
         steerer: Optional[Steerer] = None,
         sinks: Optional[list[EventSink]] = None,
+        control: Optional[ControlChannel] = None,
         max_plan_reinvocations: int = 3,
     ) -> None: ...
 
@@ -182,6 +185,7 @@ recovered goals. Tracked in issue #15.
 | `goal_deriver` | `PassthroughGoalDeriver("run")` | Optional. When `None`, the Runner substitutes a passthrough deriver that emits a single `Goal(id="g1", summary="run")`. |
 | `steerer` | `DefaultSteerer()` | Optional. |
 | `sinks` | `[]` | Optional. Recommended: at least `InMemorySink` in tests and `JSONLPersistenceSink` in prod. |
+| `control` | `None` | Optional `ControlChannel` for live pause / cancel / steer / rewind / approve / reject. When `None`, the run has no live-steering surface. See [../design/CONTROL.md](../design/CONTROL.md). |
 | `max_plan_reinvocations` | `3` | Stamped onto the planner context so executors that honour it can cap refine loops. |
 
 ## Data types (`goldfive.types`)
@@ -568,6 +572,77 @@ The companion server for `GRPCSink`. Receives proto `Event` messages
 over the `GoldfiveIngress.StreamEvents` RPC (defined in
 `proto/goldfive/v1/service.proto`) and fans them out to local
 sinks. See [grpc-transport.md](../guides/grpc-transport.md).
+
+## Live steering (`goldfive.control`)
+
+Primitive for external pause / resume / cancel / steer / rewind /
+approve / reject. Full design in
+[../design/CONTROL.md](../design/CONTROL.md).
+
+### `ControlKind`
+
+```python
+class ControlKind(StrEnum):
+    PAUSE = "PAUSE"
+    RESUME = "RESUME"
+    CANCEL = "CANCEL"
+    STEER = "STEER"          # payload: {"note": "...", "suggested_action": "..."}
+    REWIND_TO = "REWIND_TO"  # payload: {"task_id": "..."}
+    APPROVE = "APPROVE"      # payload: {"target_id": "...", "detail": "..."}
+    REJECT = "REJECT"        # payload: {"target_id": "...", "detail": "..."}
+```
+
+`STATUS_QUERY` and `INTERCEPT_TRANSFER` are not in the Phase-1 enum
+but are accepted as raw strings by the executor's dispatcher.
+
+### `AckResult`
+
+```python
+class AckResult(StrEnum):
+    SUCCESS
+    FAILURE
+    UNSUPPORTED
+```
+
+### `ControlMessage`
+
+```python
+@dataclass
+class ControlMessage:
+    kind: ControlKind
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    payload: dict[str, Any] = field(default_factory=dict)
+    issued_at_ms: int = 0
+```
+
+### `ControlAck`
+
+```python
+@dataclass
+class ControlAck:
+    control_id: str
+    result: AckResult
+    detail: str = ""
+    acked_at_ms: int = 0
+```
+
+### `ControlChannel`
+
+```python
+class ControlChannel:
+    def __init__(self) -> None: ...
+
+    async def send(self, msg: ControlMessage) -> None: ...
+    async def receive(self, timeout: float | None = None) -> ControlMessage | None: ...
+    async def ack(self, ack: ControlAck) -> None: ...
+    def acks(self) -> AsyncIterator[ControlAck]: ...
+    def close(self) -> None: ...
+```
+
+Bidirectional: external callers push via `send` and iterate acks via
+`acks()`; the runner consumes via `receive()` and publishes via
+`ack()`. Dependency-light (`asyncio.Queue` under the hood) — tests
+instantiate directly.
 
 ## Reporting (`goldfive.reporting`)
 

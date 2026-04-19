@@ -166,6 +166,47 @@ print(f"success={outcome.success}  reason={outcome.reason!r}")
 print(f"{len(sink.events)} events")
 ```
 
+## Control channel (live steering)
+
+When `Runner(control=channel)` is wired, a new class of failure modes
+shows up. Triage tree:
+
+```
+control message sent, nothing happens →
+├─ channel.acks() never yields anything
+│    → channel is not the same instance the Runner got. Print
+│      id(channel) on both ends to verify.
+├─ ack.result == AckResult.UNSUPPORTED
+│    → dispatcher doesn't recognize the kind. Phase-1 enum:
+│      PAUSE, RESUME, CANCEL, STEER, REWIND_TO, APPROVE, REJECT.
+│      STATUS_QUERY + INTERCEPT_TRANSFER accepted as string-kind.
+│      Anything else → you need a custom dispatcher (CONTROL.md §7).
+├─ ack.result == AckResult.FAILURE
+│    → the specific kind rejected the payload. Common causes:
+│        REWIND_TO with missing / unknown payload.task_id
+│        APPROVE/REJECT with target_id not in pending_approvals
+│      The ack.detail string names the exact reason.
+├─ STEER sent but plan never revises
+│    → planner.refine raised or returned None. Enable DEBUG on
+│      goldfive.planner. For LLMPlanner check call_llm output parses.
+├─ PAUSE sent, executor keeps running tasks
+│    → expected mid-task — the current task finishes, then pause
+│      takes effect. PAUSE never cancels in-flight work; only CANCEL
+│      and STEER do (both via invoke_task.cancel() with 5 s grace).
+├─ CANCEL sent, adapter keeps running after 5 s
+│    → adapter is ignoring asyncio.CancelledError. The run is
+│      unwedged (orphaned task + warning log) but the adapter process
+│      is leaking. Fix the adapter's cancellation handling.
+└─ APPROVE sent, report_awaiting_approval tool still blocked
+     → target_id mismatch. Flow A uses the task_id; Flow B uses
+       tool_context.function_call_id (shape `adk-<uuid>`). Check
+       session.pending_approvals keys against payload.target_id.
+```
+
+Full protocol and kind-by-kind behaviour:
+[docs/design/CONTROL.md](../docs/design/CONTROL.md). Approval-specific
+design: [docs/design/APPROVAL.md](../docs/design/APPROVAL.md).
+
 ## Common pitfalls
 
 - Reading `sink.events` before `await runner.close()` — buffered sinks
@@ -183,6 +224,7 @@ print(f"{len(sink.events)} events")
 ## Related
 
 - [docs/guides/troubleshooting.md](../docs/guides/troubleshooting.md) — detailed symptom → fix catalogue.
+- [docs/design/CONTROL.md](../docs/design/CONTROL.md) — live-steering protocol, per-kind behaviour, custom dispatcher hook.
 - [docs/design/VOCABULARY.md](../docs/design/VOCABULARY.md) — exhaustive type-system reference (start here when a name is confusing).
 - [docs/design/RATIONALE.md](../docs/design/RATIONALE.md) — design-rationale docs (start here when a choice feels arbitrary).
 - [docs/design/DRIFT.md](../docs/design/DRIFT.md) — drift taxonomy.

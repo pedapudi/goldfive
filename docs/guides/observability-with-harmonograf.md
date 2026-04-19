@@ -331,6 +331,51 @@ complement cleanly. See
 recovery protocol and [choosing-a-sink.md](choosing-a-sink.md) for
 the full sink matrix.
 
+### Live steering from the harmonograf UI
+
+Observability goes two ways. Once the harmonograf UI is rendering
+your run, the same connection carries control *back* — pause,
+cancel, steer, rewind, approve/reject buttons on the frontend
+become `ControlMessage` values on a goldfive `ControlChannel`.
+
+The bridge wiring:
+
+```python
+from goldfive import ControlChannel, Runner
+
+channel = ControlChannel()
+runner = Runner(
+    agent=...,
+    planner=...,
+    executor=SequentialExecutor(),
+    control=channel,
+    sinks=[HarmonografSink(client)],
+)
+
+# In a companion task, drain client.observe() and translate harmonograf
+# ControlEvents to goldfive ControlMessages:
+#
+#   async for control_event in client.observe():
+#       await channel.send(bridge_to_goldfive(control_event))
+#
+# The ack path is the mirror — iterate channel.acks() and forward
+# them back to harmonograf.
+```
+
+End-to-end, a single STEER click in the browser travels:
+
+```
+UI click → harmonograf server (:7531) → harmonograf_client.observe →
+  goldfive ControlChannel → executor.dispatch_control →
+    steerer.observe → DriftEvent(USER_STEER) → planner.refine →
+      PlanRevised event on sinks → UI re-renders
+```
+
+Round-trip is typically sub-100 ms on the transport; total latency is
+dominated by the LLM refine (seconds). Full protocol walkthrough,
+per-kind behaviour, and approval flows are in
+[../design/CONTROL.md](../design/CONTROL.md).
+
 ### Read the architectural depth
 
 - [harmonograf-integration.md](harmonograf-integration.md) — why the
