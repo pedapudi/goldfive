@@ -58,9 +58,10 @@ cd goldfive
 uv sync --extra proto
 ```
 
-The `proto` extra pulls in `grpcio` and `protobuf`, which the example
-needs to emit proto `Event` messages. A plain `uv sync` works if you
-only want the dict-event path, but `HarmonografSink` is proto-only.
+The `proto` extra pulls in `grpcio` and `protobuf`. Since #55 every
+goldfive event is a proto `Event`, so the extra is required for the
+`LoggingSink` / `JSONLPersistenceSink` / `SQLitePersistenceSink` /
+`GRPCSink` / `HarmonografSink` paths.
 
 Verify the import surface:
 
@@ -234,16 +235,17 @@ markers. For the full ADK walkthrough, see harmonograf's
 What travels on the wire when you hit run:
 
 1. `Runner.run(user_input)` starts a new session and emits
-   `RunStarted` (a dict lifecycle envelope) to every sink.
-2. `PassthroughGoalDeriver` turns `user_input` into one `Goal`; the
+   `RunStarted` (a proto `Event`) to every sink.
+2. `PassthroughGoalDeriver` returns its pre-configured `Goal`; the
    Runner emits `GoalDerived`.
 3. `StaticPlanner.generate` returns the four-task plan; the Runner
    emits `PlanSubmitted`.
-4. `SequentialExecutor` walks the DAG. For each task it emits a proto
-   `TaskStarted` before invoking the adapter and a `TaskCompleted`
+4. `SequentialExecutor` walks the DAG. For each task it emits
+   `TaskStarted` before invoking the adapter and `TaskCompleted`
    (or `TaskFailed`) after.
-5. On run termination the Runner emits `RunCompleted` or
-   `RunAborted`.
+5. On run termination the executor emits `RunCompleted` (success) or
+   `RunAborted` (surrender); setup failures surface a `RunAborted`
+   emitted by the Runner itself.
 
 Inside `HarmonografSink.emit` the work is non-blocking: each proto
 `Event` is pushed onto the `Client`'s ring buffer and returns
@@ -322,9 +324,9 @@ sinks = [
 ]
 ```
 
-`JSONLPersistenceSink` accepts both the Runner's dict envelopes and
-the executor's proto events; `HarmonografSink` only forwards proto.
-They complement cleanly. See
+`JSONLPersistenceSink` writes every proto `Event` to disk;
+`HarmonografSink` streams the same events to the live UI. They
+complement cleanly. See
 [persistence-and-recovery.md](persistence-and-recovery.md) for the
 recovery protocol and [choosing-a-sink.md](choosing-a-sink.md) for
 the full sink matrix.

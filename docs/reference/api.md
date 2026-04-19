@@ -14,7 +14,7 @@ Everything documented here is re-exported from `goldfive.__init__`
 
 ```python
 from goldfive import (
-    Runner,
+    Runner, wrap, run, quickstart,
     # types
     Goal, Plan, Task, TaskEdge, TaskStatus, DriftKind, DriftSeverity,
     DriftEvent, Session,
@@ -30,37 +30,28 @@ from goldfive import (
     PassthroughPlanner, StaticPlanner, LLMPlanner,
     PassthroughGoalDeriver, LiteralGoalDeriver, LLMGoalDeriver,
     DefaultSteerer,
-    InMemorySink,
+    InMemorySink, LoggingSink,
+    JSONLPersistenceSink, SQLitePersistenceSink, GRPCSink,
     # drift helpers
     classify_tool_error, classify_refusal, classify_stop_reason,
 )
 ```
 
-Subpackages for implementations not included in the package-root
-re-exports (adapters gated behind optional extras, the heavier sinks
-that require the `proto` extra, etc.):
+Subpackages for framework adapters gated behind optional extras:
 
 ```python
 from goldfive.adapters.callable import CallableAdapter
 from goldfive.adapters.adk import ADKAdapter          # extra: adk
 from goldfive.adapters.claude import ClaudeAgentSDKAdapter  # extra: claude
-
-from goldfive.executors.sequential import SequentialExecutor
-from goldfive.executors.parallel import ParallelDAGExecutor
-
-from goldfive.planner import PassthroughPlanner, StaticPlanner, LLMPlanner
-from goldfive.goal_deriver import (
-    PassthroughGoalDeriver, LiteralGoalDeriver, LLMGoalDeriver,
-)
-from goldfive.steerer import DefaultSteerer
-
-from goldfive.sinks import (
-    InMemorySink,
-    LoggingSink,
-    JSONLPersistenceSink,
-    SQLitePersistenceSink,
-)
+from goldfive.adapters.auto import auto_adapter
 ```
+
+`LoggingSink`, `JSONLPersistenceSink`, `SQLitePersistenceSink`, and
+`GRPCSink` require the `proto` extra at runtime (they import
+`google.protobuf` eagerly; `GRPCSink` also needs `grpcio`). They
+appear in `goldfive.__all__` unconditionally; when the extra is
+missing the module attribute resolves to `None` at import time,
+surfacing the missing dependency at construction rather than import.
 
 ## `goldfive.wrap` / `goldfive.run`
 
@@ -117,6 +108,30 @@ from goldfive.adapters.auto import auto_adapter
 
 adapter: AgentAdapter = auto_adapter(agent)
 ```
+
+## `quickstart`
+
+One-call `Runner` factory for the common case. Complements `wrap` —
+`quickstart` always uses a static one-task-per-goal plan rather than
+an LLM-driven planner.
+
+```python
+def quickstart(
+    agent: Any,
+    goals: str | Goal | list[str | Goal],
+    *,
+    planner: Planner | None = None,
+    sinks: list[EventSink] | None = None,
+) -> Runner: ...
+```
+
+- `agent` — either an existing `AgentAdapter` (used verbatim) or a
+  `CallableAdapter`-compatible async callable (wrapped).
+- `goals` — a single string, a single `Goal`, or a list of either.
+  Each entry becomes one task in the default plan.
+- `planner` / `sinks` — optional overrides. Defaults to a
+  `StaticPlanner` whose plan has one task per goal and
+  `[InMemorySink()]` respectively.
 
 ## `Runner`
 
@@ -491,6 +506,16 @@ class SQLitePersistenceSink(EventSink):
         table: str = "goldfive_events",
     ) -> None: ...
 
+class GRPCSink(EventSink):
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        credentials: Optional[grpc.ChannelCredentials] = None,
+        reconnect: bool = True,
+        max_queue: int = 0,  # 0 = unbounded
+    ) -> None: ...
+
 
 # Module-level replay / reconstruction helpers.
 def replay_from_jsonl(path: str | Path) -> list[Any]:
@@ -517,10 +542,32 @@ def reconstruct_session(events: list[Any]) -> Session:
     """Replay events to rebuild a best-effort :class:`Session`."""
 ```
 
-`LoggingSink`, `JSONLPersistenceSink`, `SQLitePersistenceSink`, and
-the replay helpers require the `proto` extra (they lean on
-`google.protobuf`). When the extra is missing the symbols resolve to
-``None`` at import time so the rest of the package stays usable.
+`LoggingSink`, `JSONLPersistenceSink`, `SQLitePersistenceSink`,
+`GRPCSink`, and the replay helpers require the `proto` extra (they
+lean on `google.protobuf`; `GRPCSink` also requires `grpcio`). When
+the extra is missing the symbols resolve to `None` at import time
+so the rest of the package stays usable.
+
+### Ingress server (`goldfive.server`)
+
+```python
+class GoldfiveIngressServer:
+    def __init__(
+        self,
+        sinks: list[EventSink],
+        *,
+        credentials: Any = None,
+        server_options: list[tuple[str, Any]] | None = None,
+    ) -> None: ...
+    async def start(self, host: str = "127.0.0.1", port: int = 50051) -> int: ...
+    async def stop(self, grace: float | None = 1.0) -> None: ...
+    async def run(self, host: str = "127.0.0.1", port: int = 50051) -> None: ...
+```
+
+The companion server for `GRPCSink`. Receives proto `Event` messages
+over the `GoldfiveIngress.StreamEvents` RPC (defined in
+`proto/goldfive/v1/service.proto`) and fans them out to local
+sinks. See [grpc-transport.md](../guides/grpc-transport.md).
 
 ## Reporting (`goldfive.reporting`)
 

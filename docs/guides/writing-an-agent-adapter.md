@@ -302,23 +302,26 @@ reference implementation.
 
 ## The steerer reference
 
-In the example above, `self._steerer` is accessed but never set. In
-the real adapters, the executor injects the steerer via a protocol
-method or a framework-specific hook. For v0.1, the shape is under
-active iteration; check `goldfive.adapters.callable.CallableAdapter`
-for the current idiom and mirror it.
+In the example above, `self._steerer` is accessed but never set. The
+`AgentAdapter` protocol deliberately does not mandate how the steerer
+reaches the adapter — different frameworks need different wiring:
 
-A robust pattern:
+- **CallableAdapter** — the shipped reference adapter does not bind a
+  steerer at all. Reporting-tool handlers close over the steerer
+  (the `Runner` stamps them in via `register_reporting_tools`) and
+  the callable forwards the tool list to user code.
+- **ClaudeAgentSDKAdapter** — exposes `bind_steerer(steerer)`
+  explicitly so the adapter can install `before_model` / observer
+  hooks against it.
+- **ADKAdapter** — the executor / plugin injects the steerer through
+  ADK's own plugin callbacks; the adapter doesn't need a setter.
 
-```python
-class AwesomeAdapter:
-    def bind_steerer(self, steerer):
-        self._steerer = steerer
-```
-
-The executor calls `adapter.bind_steerer(steerer)` before the first
-`invoke`. The `CallableAdapter` in `goldfive/adapters/callable.py` is
-the reference implementation.
+If your framework wants per-turn drift observation, expose a public
+`bind_steerer` (or accept the `Steerer` at construction) and have
+the executor hand in the `Steerer` before the first `invoke`.
+Otherwise, rely on the closure that `register_reporting_tools`
+establishes: the reporting-tool handlers already carry a reference
+to the steerer wired up by the `Runner`.
 
 ## Mapping drift-relevant signals
 

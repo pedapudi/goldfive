@@ -240,16 +240,19 @@ finally:
 
 ### Symptom: `GRPCSink` appears to drop events
 
-**What you see.** The upstream server sees fewer events than expected
-— typically no `RunStarted`, `GoalDerived`, or `PlanSubmitted`.
+**What you see.** The upstream server sees fewer events than expected.
 
 **Why it happens.** `GRPCSink` only forwards objects with a proto
-`DESCRIPTOR` attribute. The Runner's lifecycle envelopes in v0.1 are
-dicts (built by `goldfive.events.make_event`) and are silently dropped
-with a debug log. See [grpc-transport.md](grpc-transport.md#proto-only).
+`DESCRIPTOR` attribute. Since #55 every goldfive component emits
+proto, so the full lifecycle crosses the wire — but a custom sink
+or caller that hands a dict (e.g. built via
+`goldfive.events.make_event`) to `GRPCSink.emit` has it silently
+dropped with a debug log. See
+[grpc-transport.md](grpc-transport.md#proto-only).
 
-**Fix.** Pair `GRPCSink` with a local `JSONLPersistenceSink` (which
-accepts both shapes):
+**Fix.** Either ensure the upstream component emits proto, or pair
+`GRPCSink` with a local `JSONLPersistenceSink` as a durable
+fallback:
 
 ```python
 runner = Runner(..., sinks=[

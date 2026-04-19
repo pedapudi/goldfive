@@ -2,6 +2,40 @@
 
 All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
+## Unreleased
+
+### Added
+
+- #57 `goldfive.quickstart(agent, goals)` — one-call `Runner` factory
+  wiring `SequentialExecutor`, `PassthroughGoalDeriver`, a
+  one-task-per-goal `StaticPlanner`, and an `InMemorySink`.
+- #58 `examples/harmonograf_observed/` — minimal `CallableAdapter`
+  agent wired to `InMemorySink` + `HarmonografSink`.
+- #59 `bench/run_100_tasks.py` orchestration-only benchmark and
+  `docs/performance.md` baseline (v0.1 snapshot).
+- #60 `docs/guides/choosing-a-sink.md` — decision matrix across all
+  shipped sinks.
+- #61 `examples/multi_sink_fanout.py`, `examples/drift_refinement.py`,
+  `examples/parallel_dag.py`.
+- #62 `docs/guides/troubleshooting.md`.
+- #63 README pointer to the 10-minute observability walkthrough.
+- #64 `docs/guides/observability-with-harmonograf.md`.
+- #67 `goldfive.wrap(agent)` / `goldfive.run(agent, input)` — one-line
+  wrapping with auto-detected `AgentAdapter` (callable, ADK, Claude
+  SDK), LLM auto-detection from ADK agent trees, and `LLMPlanner` /
+  `LLMGoalDeriver` by default. `goldfive.adapters.auto.auto_adapter`
+  exposes the dispatch standalone.
+- #68 `.agents/` — agent-facing skill folder.
+
+### Changed
+
+- #65 Follow-up cleanup from the Team Lead A drift audit
+  (`SequentialExecutor.max_plan_reinvocations` default raised
+  from 3 to 32; minor doc fixes).
+- #69 Reconciled `HarmonografSink` API docs with the shipped
+  `harmonograf_client.HarmonografSink(client)` shape and canonical
+  `:7531` port.
+
 ## 0.1.0 — 2026-04-18
 
 Initial public release. goldfive v0.1 is a framework-agnostic control loop
