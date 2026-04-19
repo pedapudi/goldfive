@@ -131,23 +131,27 @@ async def test_runner_end_to_end_event_sequence() -> None:
     assert outcome.success, outcome.reason
 
     kinds = _kinds(sink.events)
+    # Filter out the Conversation lifecycle events (ConversationStarted
+    # prepends, ConversationEnded appends on close) — this test
+    # pre-dates Phase 3 and exercises the per-run lifecycle only.
+    run_kinds = [k for k in kinds if not k.startswith("Conversation")]
 
     # Lifecycle envelope up-front. The Runner owns the Run* lifecycle
     # events: RunStarted then GoalDerived then PlanSubmitted. The
     # executor no longer emits its own RunStarted (that would duplicate
     # the Runner's emission and produce a second event for sinks).
-    assert kinds[0] == "RunStarted"
-    assert kinds[1] == "GoalDerived"
-    assert kinds[2] == "PlanSubmitted"
+    assert run_kinds[0] == "RunStarted"
+    assert run_kinds[1] == "GoalDerived"
+    assert run_kinds[2] == "PlanSubmitted"
 
     # For each of the three tasks: TaskStarted → TaskCompleted.
-    task_kinds = kinds[3:-1]  # strip initial triple and trailing RunCompleted
-    assert len(task_kinds) == 6, kinds
+    task_kinds = run_kinds[3:-1]  # strip initial triple and trailing RunCompleted
+    assert len(task_kinds) == 6, run_kinds
     assert task_kinds[0::2] == ["TaskStarted"] * 3
     assert task_kinds[1::2] == ["TaskCompleted"] * 3
 
     # Run terminates with a RunCompleted from the executor.
-    assert kinds[-1] == "RunCompleted"
+    assert run_kinds[-1] == "RunCompleted"
 
     # Sequence numbers are strictly monotonic from zero.
     seqs = _sequences(sink.events)
@@ -205,7 +209,8 @@ async def test_runner_aborts_when_planner_returns_none() -> None:
     assert not outcome.success
     assert "no plan" in outcome.reason
 
-    assert _kinds(sink.events) == ["RunStarted", "GoalDerived", "RunAborted"]
+    run_kinds = [k for k in _kinds(sink.events) if not k.startswith("Conversation")]
+    assert run_kinds == ["RunStarted", "GoalDerived", "RunAborted"]
 
 
 async def test_runner_registers_builtin_reporting_tools() -> None:
@@ -280,8 +285,8 @@ async def test_runner_input_type_errors() -> None:
     await runner.close()
     assert not outcome.success
     assert "str or list[Goal]" in outcome.reason
-    kinds = _kinds(sink.events)
-    assert kinds == ["RunStarted", "RunAborted"]
+    run_kinds = [k for k in _kinds(sink.events) if not k.startswith("Conversation")]
+    assert run_kinds == ["RunStarted", "RunAborted"]
 
 
 @pytest.mark.asyncio

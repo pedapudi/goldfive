@@ -305,6 +305,46 @@ def control_received_event(
     return drift_detected_event(run_id, sequence, drift)
 
 
+def conversation_started_event(
+    run_id: str,
+    sequence: int,
+    conversation_id: str,
+    started_at: Any | None = None,
+) -> Any:
+    """Build a ``ConversationStarted`` envelope.
+
+    Emitted once per :class:`~goldfive.conversation.Conversation` on
+    the first turn that uses it. ``run_id`` on the envelope carries
+    the first turn's run id; the ``conversation_id`` field inside the
+    payload is the stable identifier shared by every turn.
+    """
+    evt = new_event(run_id, sequence)
+    evt.conversation_started.conversation_id = conversation_id
+    evt.conversation_started.started_at.CopyFrom(started_at or now_ts())
+    return evt
+
+
+def conversation_ended_event(
+    run_id: str,
+    sequence: int,
+    conversation_id: str,
+    turn_count: int = 0,
+    reason: str = "",
+) -> Any:
+    """Build a ``ConversationEnded`` envelope.
+
+    Emitted when a caller resets the Runner's conversation (via
+    :meth:`Runner.new_conversation`) or tears the Runner down. ``run_id``
+    on the envelope is the last turn's run id so sinks can anchor the
+    event in the run timeline.
+    """
+    evt = new_event(run_id, sequence)
+    evt.conversation_ended.conversation_id = conversation_id
+    evt.conversation_ended.turn_count = int(turn_count)
+    evt.conversation_ended.reason = reason
+    return evt
+
+
 def drift_detected_event(run_id: str, sequence: int, drift: Any) -> Any:
     pb = _events_pb_module()
     evt = new_event(run_id, sequence)

@@ -36,12 +36,13 @@ and are loaded lazily by callers.
 from __future__ import annotations
 
 import logging
-import time
-import uuid
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
+from goldfive.conversation import Conversation
 from goldfive.events import (
+    conversation_ended_event,
+    conversation_started_event,
     emit,
     goal_derived_event,
     plan_submitted_event,
@@ -66,10 +67,6 @@ if TYPE_CHECKING:
     )
 
 log = logging.getLogger("goldfive.runner")
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 
 class Runner:
@@ -118,6 +115,7 @@ class Runner:
         sinks: list[EventSink] | None = None,
         control: ControlChannel | None = None,
         max_plan_reinvocations: int = 3,
+        conversation: Conversation | None = None,
     ) -> None:
         self.agent = agent
         self.planner = planner
@@ -127,6 +125,15 @@ class Runner:
         self.sinks: list[EventSink] = list(sinks) if sinks else []
         self.control: ControlChannel | None = control
         self.max_plan_reinvocations = max_plan_reinvocations
+        self._conversation: Conversation = conversation or Conversation.new()
+        # Tracks whether we've emitted the ConversationStarted event for
+        # the current Conversation. Flips back to False on new_conversation().
+        self._conversation_announced: bool = False
+        # Last turn's Session, held past the turn so that ConversationEnded
+        # can piggy-back on its ``next_sequence()`` counter (sequence must
+        # be monotonic within a run_id, so the terminal marker needs the
+        # session that produced the run's other events).
+        self._last_session: Session | None = None
 
     # ------------------------------------------------------------------
     # run
@@ -140,32 +147,59 @@ class Runner:
     ) -> ExecutionOutcome:
         """Execute one end-to-end goldfive run and return the outcome."""
 
-        # 1. Build Session with a fresh run_id.
-        session = Session(
-            run_id=uuid.uuid4().hex,
-            started_at_ms=_now_ms(),
-        )
+        # 1. Build Session seeded by the Conversation. The Session's
+        #    run_id is fresh for this turn; conversation_id is stable
+        #    across turns; goals / completed_results are pre-populated
+        #    with prior-turn state.
+        session = self._conversation.next_turn_session()
+        self._last_session = session
 
-        # 2. Emit RunStarted before anything else.
+        # 2. Announce the Conversation on the first turn.
+        if not self._conversation_announced:
+            await self._emit_conversation_started(session)
+            self._conversation_announced = True
+
+        # 3. Emit RunStarted before anything else for this turn.
         await self._emit_run_started(session, user_input)
 
-        # 3. Derive (or accept) goals.
+        # 4. Derive (or accept) goals for this turn. Cross-turn state
+        #    lives on ``session.goals`` already (seeded by the
+        #    Conversation); we append newly-derived goals that weren't
+        #    already present by id so the planner sees the full history.
         try:
-            goals = await self._resolve_goals(user_input, context)
+            new_goals = await self._resolve_goals(user_input, context)
         except Exception as exc:  # noqa: BLE001
             reason = f"goal derivation failed: {exc}"
             log.exception("goal derivation failed")
             await self._emit_run_aborted(session, reason)
-            return ExecutionOutcome(success=False, session=session, reason=reason)
-        session.goals = list(goals)
+            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+            self._conversation.absorb_turn(
+                outcome, user_input_summary=_initial_goal_summary(user_input)
+            )
+            return outcome
+
+        existing_ids = {g.id for g in session.goals if g.id}
+        for g in new_goals:
+            if g.id and g.id in existing_ids:
+                continue
+            session.goals.append(g)
+            if g.id:
+                existing_ids.add(g.id)
 
         await self._emit_goal_derived(session)
 
-        # Build the context passed to the planner — stamp run_id so LLM
-        # planners can include it in the plan envelope.
-        planner_context: dict[str, Any] = dict(context) if context else {}
-        planner_context.setdefault("run_id", session.run_id)
-        planner_context.setdefault("max_plan_reinvocations", self.max_plan_reinvocations)
+        # Build the context passed to the planner. Stamp run_id (so LLM
+        # planners can include it in the plan envelope), max
+        # reinvocations, and cross-turn context from the Conversation.
+        # Caller-supplied context wins on key collisions.
+        planner_context: dict[str, Any] = {
+            "run_id": session.run_id,
+            "max_plan_reinvocations": self.max_plan_reinvocations,
+        }
+        planner_context.update(self._conversation.prior_turn_context())
+        if context:
+            planner_context.update(context)
+        planner_context["run_id"] = session.run_id
 
         # 4. Generate the plan.
         try:
@@ -178,12 +212,20 @@ class Runner:
             reason = f"planner.generate raised: {exc}"
             log.exception("planner.generate raised")
             await self._emit_run_aborted(session, reason)
-            return ExecutionOutcome(success=False, session=session, reason=reason)
+            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+            self._conversation.absorb_turn(
+                outcome, user_input_summary=_initial_goal_summary(user_input)
+            )
+            return outcome
 
         if plan is None:
             reason = "no plan generated"
             await self._emit_run_aborted(session, reason)
-            return ExecutionOutcome(success=False, session=session, reason=reason)
+            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+            self._conversation.absorb_turn(
+                outcome, user_input_summary=_initial_goal_summary(user_input)
+            )
+            return outcome
 
         # Planners may leave run_id blank; stamp ours so downstream sinks
         # correlate cleanly.
@@ -200,7 +242,11 @@ class Runner:
             reason = f"register_reporting_tools raised: {exc}"
             log.exception("register_reporting_tools raised")
             await self._emit_run_aborted(session, reason)
-            return ExecutionOutcome(success=False, session=session, reason=reason)
+            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+            self._conversation.absorb_turn(
+                outcome, user_input_summary=_initial_goal_summary(user_input)
+            )
+            return outcome
 
         # 6. Bind the steerer. (The executor may re-bind — that's fine.)
         try:
@@ -209,7 +255,11 @@ class Runner:
             reason = f"steerer.bind raised: {exc}"
             log.exception("steerer.bind raised")
             await self._emit_run_aborted(session, reason)
-            return ExecutionOutcome(success=False, session=session, reason=reason)
+            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+            self._conversation.absorb_turn(
+                outcome, user_input_summary=_initial_goal_summary(user_input)
+            )
+            return outcome
 
         # 7. Hand off to the executor.
         try:
@@ -228,8 +278,15 @@ class Runner:
             reason = f"executor.run raised: {exc}"
             log.exception("executor.run raised")
             await self._emit_run_aborted(session, reason)
-            return ExecutionOutcome(success=False, session=session, reason=reason)
+            aborted = ExecutionOutcome(success=False, session=session, reason=reason)
+            self._conversation.absorb_turn(
+                aborted, user_input_summary=_initial_goal_summary(user_input)
+            )
+            return aborted
 
+        self._conversation.absorb_turn(
+            outcome, user_input_summary=_initial_goal_summary(user_input)
+        )
         return outcome
 
     # ------------------------------------------------------------------
@@ -280,11 +337,59 @@ class Runner:
         return ExecutionOutcome(success=success, session=session, reason=reason)
 
     # ------------------------------------------------------------------
+    # cross-turn conversation
+    # ------------------------------------------------------------------
+
+    @property
+    def conversation_id(self) -> str:
+        """The current Conversation's stable id. Changes only via :meth:`new_conversation`."""
+        return self._conversation.id
+
+    @property
+    def conversation(self) -> Conversation:
+        """The live :class:`Conversation` object. Read-only handle for inspection."""
+        return self._conversation
+
+    async def new_conversation(self, *, reason: str = "") -> None:
+        """Reset cross-turn state. The next :meth:`run` starts a fresh Conversation.
+
+        Emits a ``ConversationEnded`` event for the outgoing Conversation
+        (if it had any turns), then installs a fresh one. The new
+        Conversation is announced lazily — ``ConversationStarted`` fires
+        on the next :meth:`run` call.
+        """
+        outgoing = self._conversation
+        if self._conversation_announced and self._last_session is not None:
+            await self._emit_conversation_ended(
+                conversation=outgoing,
+                session_anchor=self._last_session,
+                reason=reason or "new_conversation",
+            )
+        self._conversation = Conversation.new()
+        self._conversation_announced = False
+        self._last_session = None
+
+    # ------------------------------------------------------------------
     # close
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Close every sink. Best-effort — individual errors are logged."""
+        """Close every sink. Best-effort — individual errors are logged.
+
+        Emits ``ConversationEnded`` for the active Conversation (if any
+        turns ran) before closing sinks, so persisted logs have a clean
+        terminal marker.
+        """
+        if self._conversation_announced and self._last_session is not None:
+            try:
+                await self._emit_conversation_ended(
+                    conversation=self._conversation,
+                    session_anchor=self._last_session,
+                    reason="runner_close",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("conversation_ended emission raised: %s", exc)
+            self._conversation_announced = False
         for sink in self.sinks:
             try:
                 await sink.close()
@@ -346,6 +451,32 @@ class Runner:
         evt = run_aborted_event(
             run_id=session.run_id,
             sequence=session.next_sequence(),
+            reason=reason,
+        )
+        await emit(self.sinks, evt)
+
+    async def _emit_conversation_started(self, session: Session) -> None:
+        evt = conversation_started_event(
+            run_id=session.run_id,
+            sequence=session.next_sequence(),
+            conversation_id=self._conversation.id,
+        )
+        await emit(self.sinks, evt)
+
+    async def _emit_conversation_ended(
+        self,
+        *,
+        conversation: Conversation,
+        session_anchor: Session,
+        reason: str,
+    ) -> None:
+        # Piggy-back on the last turn's sequence counter so the
+        # envelope's sequence field stays monotonic within its run_id.
+        evt = conversation_ended_event(
+            run_id=session_anchor.run_id,
+            sequence=session_anchor.next_sequence(),
+            conversation_id=conversation.id,
+            turn_count=len(conversation.turns),
             reason=reason,
         )
         await emit(self.sinks, evt)

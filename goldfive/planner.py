@@ -475,6 +475,52 @@ class LLMPlanner:
     def _render_agents_block(available_agents: list[str]) -> str:
         return "\n".join(f"- {a}" for a in available_agents) or "- (none listed)"
 
+    @staticmethod
+    def _render_prior_turns_block(context: Mapping[str, Any] | None) -> str:
+        """Render cross-turn context from a Conversation into a prompt block.
+
+        Reads ``prior_completed_results`` and ``prior_turns`` off the
+        planner context (see :class:`~goldfive.conversation.Conversation`)
+        and produces a human-readable section for the planner to reason
+        about. Returns ``""`` when the caller is not running inside a
+        multi-turn Conversation (first turn, or single-turn use).
+        """
+        if not context:
+            return ""
+        turns = context.get("prior_turns") or []
+        prior_results = context.get("prior_completed_results") or {}
+        if not turns and not prior_results:
+            return ""
+        lines: list[str] = ["\nPrior-turn context (this is a multi-turn conversation):"]
+        if turns:
+            lines.append("\nEarlier turns (most recent last):")
+            for i, t in enumerate(turns, start=1):
+                if not isinstance(t, Mapping):
+                    continue
+                ui = str(t.get("user_input_summary") or "")
+                plan_summary = str(t.get("plan_summary") or "")
+                success = bool(t.get("outcome_success", True))
+                status = "succeeded" if success else "failed"
+                reason = str(t.get("outcome_reason") or "")
+                reason_frag = f" ({reason})" if (not success and reason) else ""
+                lines.append(
+                    f"  {i}. user: {ui!r} -> {status}{reason_frag}"
+                    f"{f'; plan: {plan_summary}' if plan_summary else ''}"
+                )
+        if prior_results:
+            lines.append(
+                "\nResults already produced in earlier turns "
+                "(task_id -> summary):"
+            )
+            for task_id, summary in prior_results.items():
+                lines.append(f"  - {task_id}: {summary}")
+        lines.append(
+            "\nWhen planning this turn, treat the user's current input as a "
+            "follow-up. Reuse prior results where relevant, and only "
+            "re-do work that the user's new input actually requires."
+        )
+        return "\n".join(lines) + "\n"
+
     def _build_generate_prompt(
         self,
         goals: list[Goal],
@@ -483,17 +529,34 @@ class LLMPlanner:
     ) -> str:
         goals_block = self._render_goals_block(goals)
         agents_block = self._render_agents_block(available_agents)
+        prior_block = self._render_prior_turns_block(context)
         context_block = ""
         if context:
-            try:
-                context_block = (
-                    f"\nAdditional context (JSON):\n{json.dumps(dict(context), default=str)}\n"
-                )
-            except (TypeError, ValueError):
-                context_block = ""
+            # Exclude the verbose cross-turn fields from the raw JSON
+            # dump — they're already rendered as a human-readable
+            # block above. Keep everything else.
+            filtered = {
+                k: v
+                for k, v in dict(context).items()
+                if k
+                not in {
+                    "prior_completed_results",
+                    "prior_turns",
+                    "turn_index",
+                    "conversation_id",
+                }
+            }
+            if filtered:
+                try:
+                    context_block = (
+                        f"\nAdditional context (JSON):\n{json.dumps(filtered, default=str)}\n"
+                    )
+                except (TypeError, ValueError):
+                    context_block = ""
         return (
             f"Available agents:\n{agents_block}\n\n"
             f"Goals:\n{goals_block}\n"
+            f"{prior_block}"
             f"{context_block}\n"
             "Respond with a single JSON object following the schema."
         )

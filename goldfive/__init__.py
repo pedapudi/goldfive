@@ -13,6 +13,7 @@ from goldfive.control import (
     ControlMessage,
 )
 from goldfive.convenience import run, wrap
+from goldfive.conversation import Conversation, TurnRecord
 from goldfive.drift import classify_refusal, classify_stop_reason, classify_tool_error
 from goldfive.executors.parallel import ParallelDAGExecutor
 from goldfive.executors.sequential import SequentialExecutor
@@ -64,6 +65,7 @@ __all__ = [
     "ControlChannel",
     "ControlKind",
     "ControlMessage",
+    "Conversation",
     "DefaultSteerer",
     "DriftEvent",
     "DriftKind",
@@ -96,6 +98,7 @@ __all__ = [
     "Task",
     "TaskEdge",
     "TaskStatus",
+    "TurnRecord",
     "classify_refusal",
     "classify_stop_reason",
     "classify_tool_error",
