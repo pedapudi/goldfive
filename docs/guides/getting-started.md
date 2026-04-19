@@ -111,14 +111,19 @@ from __future__ import annotations
 
 import asyncio
 
-from goldfive import Runner
-from goldfive.adapters.callable import CallableAdapter
-from goldfive.executors.sequential import SequentialExecutor
-from goldfive.planner import StaticPlanner
-from goldfive.results import InvocationResult
-from goldfive.sinks import InMemorySink
-from goldfive.steerer import DefaultSteerer
-from goldfive.types import Plan, Session, Task, TaskEdge
+from goldfive import (
+    CallableAdapter,
+    DefaultSteerer,
+    InMemorySink,
+    InvocationResult,
+    Plan,
+    Runner,
+    SequentialExecutor,
+    Session,
+    StaticPlanner,
+    Task,
+    TaskEdge,
+)
 
 
 # -- the "agent" --------------------------------------------------------
@@ -160,34 +165,22 @@ plan = Plan(
 
 # -- the Runner ---------------------------------------------------------
 
-def event_kind(event) -> str:
-    # Runner emits dict events; executors/steerers emit proto Event
-    # messages whose payload is a oneof. Handle both shapes.
-    if isinstance(event, dict):
-        return event.get("kind", "?")
-    return event.WhichOneof("payload") or "?"
-
-
-def event_sequence(event) -> int:
-    if isinstance(event, dict):
-        return int(event.get("sequence", 0))
-    return int(getattr(event, "sequence", 0))
-
-
 async def main() -> None:
     sink = InMemorySink()
     runner = Runner(
-        agent=CallableAdapter(my_agent),
+        agent=CallableAdapter(my_agent, available_agents=["default"]),
         planner=StaticPlanner(plan),
         executor=SequentialExecutor(),
         steerer=DefaultSteerer(),
         sinks=[sink],
     )
     outcome = await runner.run("demo run")
+    await runner.close()
 
     print(f"success={outcome.success}, tasks={len(outcome.session.plan.tasks)}")
     for event in sink.events:
-        print(f"  [{event_sequence(event):2d}] {event_kind(event)}")
+        kind = event.WhichOneof("payload")
+        print(f"  [{event.sequence:2d}] {kind}")
 
 
 if __name__ == "__main__":
@@ -197,6 +190,7 @@ if __name__ == "__main__":
 ### Step 2 — Run it
 
 ```bash
+uv sync --extra proto
 uv run python hello.py
 ```
 
@@ -204,47 +198,42 @@ Expected output:
 
 ```
 success=True, tasks=3
-  [ 0] RunStarted
-  [ 1] GoalDerived
-  [ 2] PlanSubmitted
-  [ 3] run_started
-  [ 4] task_started
-  [ 5] task_completed
-  [ 6] task_started
-  [ 7] task_completed
-  [ 8] task_started
-  [ 9] task_completed
-  [10] run_completed
+  [ 0] run_started
+  [ 1] goal_derived
+  [ 2] plan_submitted
+  [ 3] task_started
+  [ 4] task_completed
+  [ 5] task_started
+  [ 6] task_completed
+  [ 7] task_started
+  [ 8] task_completed
+  [ 9] run_completed
 ```
 
-Sequences 0–2 come from the Runner (it emits dict envelopes with a
-``kind`` field) and the rest come from the executor and steerer (proto
-``Event`` messages whose oneof payload is matched by ``WhichOneof``).
-You'll see a second ``run_started`` at sequence 3 because the
-executor also announces its start — treat the two together as the
-run's start marker.
+Every event is a proto `Event` with a `oneof payload` you extract via
+`WhichOneof("payload")`. Sequences are a monotonic per-run counter
+produced by `Session.next_sequence()`.
 
 That's it. You have a full goldfive run, observable via the in-memory
 sink, walking a 3-task plan end-to-end.
 
 ### Step 3 — Inspect what happened
 
-Everything you'd want to know is in `sink.events`. The executor and
-steerer emit proto ``Event`` messages — use ``WhichOneof`` to pick out
-the payload, skipping the dict envelopes the Runner emits:
+Everything you'd want to know is in `sink.events`. Every entry is a
+proto `Event`; dispatch on the `oneof payload`:
 
 ```python
 for event in sink.events:
-    if isinstance(event, dict):
-        continue  # Runner envelope: RunStarted / GoalDerived / PlanSubmitted
     kind = event.WhichOneof("payload")
     if kind == "task_completed":
         tc = event.task_completed
         print(f"task {tc.task_id}: {tc.summary}")
 ```
 
-For a run that was persisted to disk, use `JSONLPersistenceSink` —
-see [persistence-and-recovery.md](persistence-and-recovery.md).
+For a run that was persisted to disk, use `JSONLPersistenceSink` or
+`SQLitePersistenceSink` — see
+[persistence-and-recovery.md](persistence-and-recovery.md) and
+[choosing-a-sink.md](choosing-a-sink.md).
 
 ## Wiring a real agent
 
@@ -266,8 +255,14 @@ Swapping adapters is a one-line change:
 
 # now:
 from goldfive.adapters.claude import ClaudeAgentSDKAdapter
-agent=ClaudeAgentSDKAdapter(
-    system_prompt="You are a helpful assistant.",
+
+def make_client():
+    from claude_agent_sdk import ClaudeSDKClient
+    return ClaudeSDKClient(...)  # your client config
+
+agent = ClaudeAgentSDKAdapter(
+    client_factory=make_client,
+    system_prompt_template="You are a helpful assistant.",
     model="claude-opus-4-5-20251101",
 )
 ```
@@ -301,12 +296,10 @@ outcome = await runner.run("build me a slide deck about Python")
 Or the explicit form with `Runner(...)`:
 
 ```python
-from goldfive import Runner, SequentialExecutor
-from goldfive.adapters.callable import CallableAdapter
-from goldfive.planner import LLMPlanner
+from goldfive import CallableAdapter, LLMPlanner, Runner, SequentialExecutor
 
 runner = Runner(
-    agent=CallableAdapter(my_agent),
+    agent=CallableAdapter(my_agent, available_agents=["default"]),
     planner=LLMPlanner(call_llm=call_llm, model="claude-opus-4-5-20251101"),
     executor=SequentialExecutor(),
 )
@@ -321,29 +314,31 @@ format and how to customize it.
 One line to make runs crash-recoverable:
 
 ```python
-from goldfive.sinks import JSONLPersistenceSink
+from goldfive import JSONLPersistenceSink
 
 runner = Runner(
-    agent=CallableAdapter(my_agent),
-    planner=PassthroughPlanner(plan),
+    agent=CallableAdapter(my_agent, available_agents=["default"]),
+    planner=StaticPlanner(plan),
     executor=SequentialExecutor(),
     sinks=[JSONLPersistenceSink(path=f"./runs/{run_id}.jsonl")],
 )
 ```
 
-Full failure-mode walkthrough in
-[persistence-and-recovery.md](persistence-and-recovery.md).
+For cross-run queries, swap in `SQLitePersistenceSink` (or pair
+both). Full failure-mode walkthrough in
+[persistence-and-recovery.md](persistence-and-recovery.md); full sink
+matrix in [choosing-a-sink.md](choosing-a-sink.md).
 
 ## Running in parallel
 
 Swap `SequentialExecutor` for `ParallelDAGExecutor`:
 
 ```python
-from goldfive.executors.parallel import ParallelDAGExecutor
+from goldfive import ParallelDAGExecutor
 
 runner = Runner(
-    agent=CallableAdapter(my_agent),
-    planner=PassthroughPlanner(plan),
+    agent=CallableAdapter(my_agent, available_agents=["default"]),
+    planner=StaticPlanner(plan),
     executor=ParallelDAGExecutor(max_concurrency=4),
 )
 ```
@@ -353,14 +348,22 @@ Tasks whose dependencies are satisfied run concurrently via
 
 ## What's next
 
+- [observability-with-harmonograf.md](observability-with-harmonograf.md) —
+  end-to-end: boot the harmonograf UI and watch this same run animate.
 - [writing-an-agent-adapter.md](writing-an-agent-adapter.md) — wrap a
   new framework.
 - [writing-an-event-sink.md](writing-an-event-sink.md) — send events
   to your own observability backend.
+- [choosing-a-sink.md](choosing-a-sink.md) — picking between the five
+  shipped sinks.
 - [goals-and-plans.md](goals-and-plans.md) — author custom
   GoalDerivers and Planners.
 - [persistence-and-recovery.md](persistence-and-recovery.md) — crash
-  recovery with `JSONLPersistenceSink`.
+  recovery with `JSONLPersistenceSink` / `SQLitePersistenceSink`.
+- [grpc-transport.md](grpc-transport.md) — streaming events to an
+  out-of-process observer.
+- [troubleshooting.md](troubleshooting.md) — common install / run-time
+  failures.
 - [tool-protocol.md](../reference/tool-protocol.md) — the seven
   reporting tools that drive task state.
 - [ARCHITECTURE.md](../design/ARCHITECTURE.md) — the full design

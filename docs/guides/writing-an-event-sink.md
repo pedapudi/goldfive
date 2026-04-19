@@ -41,12 +41,12 @@ Two methods. `emit(event)` is called once per event, in per-run
 sequence order. `close()` is called once when the run ends. That's
 the entire contract.
 
-One wrinkle: v0.1 emits two event shapes on the same stream. The
-Runner emits dict envelopes (``{"run_id", "sequence", "emitted_at",
-"kind", "payload"}``) for run-lifecycle markers, and executors/
-steerers emit proto ``Event`` messages for per-task state changes.
-Sinks must accept both. ``JSONLPersistenceSink`` is the reference for
-how to fan out: proto via ``MessageToJson``, dict via ``json.dumps``.
+Since #55 the Runner, executor, and steerer all emit proto `Event`
+envelopes — a sink only needs to handle that one shape. Dispatch on
+`event.WhichOneof("payload")` to branch on kind.
+`goldfive.events.make_event` still returns a dict envelope for
+callers who want the simpler shape without proto, but no shipped
+goldfive component feeds dicts to sinks today.
 
 ## A minimal stdout sink
 
@@ -58,15 +58,9 @@ from typing import Any
 
 class StdoutSink:
     async def emit(self, event: Any) -> None:
-        if isinstance(event, dict):
-            seq = int(event.get("sequence", 0))
-            kind = event.get("kind", "?")
-            run_id = event.get("run_id", "")
-        else:
-            seq = int(getattr(event, "sequence", 0))
-            kind = event.WhichOneof("payload") or "?"
-            run_id = getattr(event, "run_id", "")
-        print(f"[{seq:04d}] {kind} (run={run_id})")
+        seq = int(getattr(event, "sequence", 0))
+        kind = event.WhichOneof("payload") or "?"
+        print(f"[{seq:04d}] {kind} (run={event.run_id})")
 
     async def close(self) -> None:
         pass
@@ -133,12 +127,9 @@ class HttpBackendSink:
             item = await self._queue.get()
             if item is None:
                 return
-            if isinstance(item, dict):
-                payload = item
-            else:
-                payload = json.loads(
-                    MessageToJson(item, preserving_proto_field_name=True)
-                )
+            payload = json.loads(
+                MessageToJson(item, preserving_proto_field_name=True)
+            )
             try:
                 await self._client.post(self._endpoint, json=payload)
             except httpx.HTTPError:
@@ -249,10 +240,7 @@ class FilteringSink:
         self._kinds = set(kinds)
 
     async def emit(self, event) -> None:
-        if isinstance(event, dict):
-            kind = event.get("kind", "")
-        else:
-            kind = event.WhichOneof("payload") or ""
+        kind = event.WhichOneof("payload") or ""
         if kind in self._kinds:
             await self._inner.emit(event)
 

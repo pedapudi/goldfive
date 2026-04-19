@@ -113,13 +113,11 @@ sink = GRPCSink("observer.internal:443", credentials=creds)
 
 ### Proto only
 
-`GRPCSink` forwards **only** proto `Event` messages. The executor's
-typed event factories (`task_started_event`, `task_completed_event`,
-etc.) return proto; those cross the wire. The Runner's own lifecycle
-emits — built by `make_event` — are dicts today and are silently
-dropped by `GRPCSink`. If you need the full lifecycle log on the wire,
-pair `GRPCSink` with `JSONLPersistenceSink` locally and ship the log
-out-of-band. Unifying the emit path is tracked for a future release.
+`GRPCSink` forwards **only** proto `Event` messages. Since #55 the
+Runner, executor, and steerer all emit proto, so the full lifecycle
+crosses the wire. If a caller (or a custom component) hands a dict
+envelope to the sink, it is silently dropped with a debug log —
+pair with `JSONLPersistenceSink` locally if you need that path.
 
 ### Reconnect semantics
 

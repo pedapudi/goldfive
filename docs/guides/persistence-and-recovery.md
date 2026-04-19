@@ -54,13 +54,13 @@ runner = Runner(
 outcome = await runner.run("do the thing")
 ```
 
-The sink writes one JSON-encoded event per line: proto ``Event``
-messages from the executor and steerer go through
-``google.protobuf.json_format.MessageToJson`` and Runner-level dict
-envelopes go through plain ``json.dumps``. The ``path`` is a literal
-string — pick a filename yourself (for example, by generating a
-``run_id`` up-front and formatting it in) since the sink does not
-substitute placeholders.
+The sink writes one JSON-encoded event per line via
+`google.protobuf.json_format.MessageToJson(..., sort_keys=True)`
+(since #55 every event on the stream is a proto `Event`). The
+`path` is a literal string — pick a filename yourself (for
+example, by generating a `run_id` up-front and formatting it in)
+since the sink does not substitute placeholders. Pass `mode="write"`
+to truncate on open; the default is append.
 
 On-disk shape:
 

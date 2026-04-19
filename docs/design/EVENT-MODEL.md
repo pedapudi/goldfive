@@ -46,15 +46,17 @@ await emit(sinks, event)
 
 ## Event taxonomy
 
-Ten event kinds are defined in v0.1, grouped by the phase they fire in.
+Thirteen event kinds are defined in v0.1, grouped by the phase they
+fire in. Since #55 every event on the stream is a proto `Event`
+envelope — there is no mixed-shape stream on the sink side.
 
 ### Run lifecycle
 
 | Event | Fired by | When |
 |---|---|---|
-| `RunStarted` | `Runner` | At the very top of `run()` before goal derivation. Carries `user_input` (truncated if long) and `started_at`. |
-| `RunCompleted` | `Runner` | When the executor returns `success=True`. Carries `outcome_summary` and `completed_task_ids`. |
-| `RunAborted` | `Runner`, `Executor` | When the executor surrenders or the runner catches an exception. Carries `reason` and `drift` (optional) explaining why. |
+| `RunStarted` | `Runner` | At the very top of `run()` before goal derivation. Carries `goal_summary` (the incoming `user_input` or the first goal's summary) and `started_at`. |
+| `RunCompleted` | `Executor` | When every task has reached a terminal state and the plan is fully realized. Carries `outcome_summary`. |
+| `RunAborted` | `Runner`, `Executor` | The `Runner` emits it when setup fails (goal derivation, plan generation, tool registration, steerer bind); the executor emits it when the plan cannot be driven to completion (e.g. `max_plan_reinvocations` exhausted, unrecoverable drift). Carries `reason`. |
 
 ### Goal and plan
 
@@ -178,6 +180,10 @@ before returning.
 
 ## Built-in sinks
 
+Five sinks ship in `goldfive.sinks`. Pick per use-case; they compose
+freely. See [choosing-a-sink.md](../guides/choosing-a-sink.md) for the
+full decision matrix.
+
 ### `InMemorySink`
 
 ```python
@@ -217,9 +223,36 @@ from goldfive.sinks import JSONLPersistenceSink
 sink = JSONLPersistenceSink(path="./runs/example-run.jsonl")
 ```
 
-Writes one JSON-encoded proto message per line. Paired with
+Writes one proto-canonical JSON line per event. Paired with
 `replay_from_jsonl(path)` for crash recovery. See the full
 [persistence guide](../guides/persistence-and-recovery.md).
+
+### `SQLitePersistenceSink`
+
+```python
+from goldfive.sinks import SQLitePersistenceSink
+
+sink = SQLitePersistenceSink("./runs/goldfive.db")
+```
+
+Inserts each event into a `goldfive_events` table keyed by
+`(run_id, sequence)`. Pairs with `replay_from_sqlite(path, run_id)`
+and `list_runs(path)`. Useful when you want cross-run SQL queries or
+a single shared store for many runs.
+
+### `GRPCSink`
+
+```python
+from goldfive.sinks import GRPCSink
+
+sink = GRPCSink("observer.internal:50051")
+```
+
+Streams proto `Event` messages to a `GoldfiveIngressServer` over a
+client-streaming RPC. Enqueues on an `asyncio.Queue`, drains in the
+background, reconnects on transient RPC errors by default. See
+[grpc-transport.md](../guides/grpc-transport.md) for TLS, reconnect
+semantics, and the server side.
 
 ## Building a custom sink
 

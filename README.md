@@ -11,9 +11,10 @@ It does not ship an LLM client, a prompt DSL, or a tool registry. It wraps
 whatever agent runtime you already use (Google ADK, the Anthropic SDK, a
 plain callable, ...) behind a narrow `AgentAdapter` protocol and gives you:
 
-- a `Runner` that drives the agent turn by turn against a `Goal`
-- pluggable `Planner`, `DriftAnalyzer`, and `Steerer` components
-- a `TelemetrySink` stream of structured events you can log, render, or
+- a `Runner` (or one-line `goldfive.wrap` / `goldfive.run`) that drives
+  the agent turn by turn against a `Goal`
+- pluggable `GoalDeriver`, `Planner`, `Executor`, and `Steerer` components
+- an `EventSink` stream of proto-encoded events you can log, persist, or
   ship to an observability console
 
 goldfive is the orchestration half of
@@ -99,11 +100,15 @@ inspect the event stream. Concrete and runnable.
 ### Guides
 
 - [`docs/guides/getting-started.md`](docs/guides/getting-started.md) — install + first agent.
+- [`docs/guides/observability-with-harmonograf.md`](docs/guides/observability-with-harmonograf.md) — ten-minute end-to-end with the harmonograf UI.
 - [`docs/guides/writing-an-agent-adapter.md`](docs/guides/writing-an-agent-adapter.md) — wrap a new framework.
 - [`docs/guides/writing-an-event-sink.md`](docs/guides/writing-an-event-sink.md) — build a custom sink.
+- [`docs/guides/choosing-a-sink.md`](docs/guides/choosing-a-sink.md) — decision matrix across the five shipped sinks.
 - [`docs/guides/goals-and-plans.md`](docs/guides/goals-and-plans.md) — authoring custom `GoalDeriver` / `Planner`.
-- [`docs/guides/persistence-and-recovery.md`](docs/guides/persistence-and-recovery.md) — JSONL persistence + `Runner.resume()`.
+- [`docs/guides/persistence-and-recovery.md`](docs/guides/persistence-and-recovery.md) — JSONL + SQLite persistence, `Runner.resume()`.
+- [`docs/guides/grpc-transport.md`](docs/guides/grpc-transport.md) — `GRPCSink` + `GoldfiveIngressServer` for out-of-process observers.
 - [`docs/guides/harmonograf-integration.md`](docs/guides/harmonograf-integration.md) — plugging harmonograf in as a sink.
+- [`docs/guides/troubleshooting.md`](docs/guides/troubleshooting.md) — common setup / runtime failures.
 
 ### Reference
 

@@ -36,14 +36,14 @@ event, and optionally drives a replan.
 
 ## The six primitives
 
-| Primitive | Role | Default implementation |
+| Primitive | Role | Shipped implementations |
 |---|---|---|
-| `GoalDeriver` | Converts user input into an explicit list of `Goal`s. | `PassthroughGoalDeriver`, `LLMGoalDeriver` |
-| `Planner` | Produces and refines a `Plan` from goals. | `PassthroughPlanner`, `LLMPlanner` |
+| `GoalDeriver` | Converts user input into an explicit list of `Goal`s. | `PassthroughGoalDeriver`, `LiteralGoalDeriver`, `LLMGoalDeriver` |
+| `Planner` | Produces and refines a `Plan` from goals. | `PassthroughPlanner`, `StaticPlanner`, `LLMPlanner` |
 | `Executor` | Drives plan execution task-by-task. | `SequentialExecutor`, `ParallelDAGExecutor` |
 | `Steerer` | Owns the task state machine and classifies drift. | `DefaultSteerer` |
 | `AgentAdapter` | Wraps a specific agent framework. | `CallableAdapter`, `ADKAdapter`, `ClaudeAgentSDKAdapter` |
-| `EventSink` | Receives proto-encoded orchestration events. | `InMemorySink`, `LoggingSink`, `JSONLPersistenceSink` |
+| `EventSink` | Receives proto-encoded orchestration events. | `InMemorySink`, `LoggingSink`, `JSONLPersistenceSink`, `SQLitePersistenceSink`, `GRPCSink` |
 
 Each primitive is a `Protocol` (see [PROTOCOLS.md](PROTOCOLS.md)).
 goldfive ships default implementations but any conforming class can be
@@ -81,10 +81,13 @@ whatever), invokes the agent, and routes intercepted tool calls and
 observed events back to the steerer.
 
 **EventSink** — consumes the proto-encoded event stream. goldfive
-ships three sinks (in-memory for tests, logging for dev,
-JSONL-persistence for crash recovery) and is designed to hand off to
-external observability systems. harmonograf is the canonical external
-sink (see [harmonograf-integration guide](../guides/harmonograf-integration.md)).
+ships five sinks: `InMemorySink` for tests, `LoggingSink` for dev,
+`JSONLPersistenceSink` / `SQLitePersistenceSink` for durable
+per-run / cross-run storage, and `GRPCSink` for streaming events to
+an out-of-process observer. harmonograf is the canonical external
+sink (see the
+[harmonograf-integration guide](../guides/harmonograf-integration.md)
+and [choosing-a-sink.md](../guides/choosing-a-sink.md)).
 
 ## How they compose
 
@@ -103,8 +106,8 @@ sink (see [harmonograf-integration guide](../guides/harmonograf-integration.md))
                                 │                  │                      │
                                 │                  ▼                      │
                                 │             EventSinks                  │
-                                │        (InMemory, Logging,              │
-                                │         JSONL, harmonograf, …)         │
+                                │      (InMemory, Logging, JSONL,         │
+                                │       SQLite, gRPC, harmonograf, …)     │
                                 └────────────────────────────────────────┘
                                                    │
                                                    ▼
@@ -157,11 +160,22 @@ outcome = await runner.run("build me a slide deck about Python")
 When the caller omits `goal_deriver`, `steerer`, or `sinks`, the
 `Runner` substitutes sane defaults:
 
-- `goal_deriver` → `PassthroughGoalDeriver()` (wraps the string in a
-  single `Goal`).
+- `goal_deriver` → `PassthroughGoalDeriver("run")` — returns a single
+  pre-configured `Goal(id="g1", summary="run")` regardless of the
+  `user_input`. Use `LiteralGoalDeriver` (or pass
+  `PassthroughGoalDeriver(user_input)`) if you want the input text to
+  flow through.
 - `steerer` → `DefaultSteerer()`.
 - `sinks` → `[]` (events go nowhere; recommended to supply at least
-  `InMemorySink` in dev and `JSONLPersistenceSink` in prod).
+  `InMemorySink` in dev and `JSONLPersistenceSink` /
+  `SQLitePersistenceSink` in prod).
+
+For the shortest possible construction, call `goldfive.wrap(agent)`
+or `goldfive.quickstart(agent, goals)`. `wrap` auto-detects the
+adapter for ADK / Claude SDK / callable agents and wires an
+LLM-backed planner when it can detect the agent's model;
+`quickstart` returns a `Runner` with a one-task-per-goal static plan
+and an `InMemorySink` already configured.
 
 ## The full lifecycle
 
@@ -169,22 +183,28 @@ One call to `runner.run(user_input)` walks the following steps. Every
 step emits one or more events (see [EVENT-MODEL.md](EVENT-MODEL.md) for
 the full taxonomy).
 
+**Event ownership.** The Runner owns the `Run*` lifecycle events —
+`RunStarted`, `GoalDerived`, `PlanSubmitted`, and a pre-executor
+`RunAborted` when setup fails. Executors own `Task*` events,
+`PlanRevised`, and the terminal `RunCompleted` / `RunAborted`. The
+steerer owns `DriftDetected` and per-task transitions. Every
+emission is a proto `Event` envelope built via the typed factories
+in `goldfive.events`.
+
 ### 1. Setup
 
-- Generate a fresh `run_id` (UUIDv7-style).
+- Generate a fresh `run_id` (`uuid.uuid4().hex`).
 - Construct a `Session(run_id=...)`. `Session` holds all live state for
   this invocation.
-- Emit `RunStarted(run_id, user_input, started_at)`.
+- Emit `RunStarted(run_id, goal_summary, started_at)`.
 
 ### 2. Goal derivation
 
-- Call `goal_deriver.derive(user_input, context=...)`.
+- If the caller passed a `list[Goal]` directly, skip derivation and
+  use it verbatim.
+- Otherwise call `goal_deriver.derive(user_input, context=...)`.
 - Store the returned `list[Goal]` in `session.goals`.
 - Emit `GoalDerived(goals=...)`.
-
-If the caller passed a `list[Goal]` directly to `runner.run(...)`, the
-`PassthroughGoalDeriver` returns it verbatim and goal derivation is a
-no-op.
 
 ### 3. Plan generation
 
