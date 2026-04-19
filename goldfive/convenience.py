@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive._llm_detect import CallLLM, detect_llm
-from goldfive.adapters.auto import auto_adapter
+from goldfive.adapters.auto import auto_adapter, is_adk_agent
 from goldfive.executors.sequential import SequentialExecutor
 from goldfive.goal_deriver import LiteralGoalDeriver, LLMGoalDeriver
 from goldfive.planner import LLMPlanner, PassthroughPlanner
@@ -109,6 +109,15 @@ def wrap(
     Runner
         A ready-to-use :class:`Runner`. Call ``await runner.run(...)``
         or use :func:`goldfive.run` for the one-line variant.
+
+        When ``agent`` is an ADK ``BaseAgent``, the returned object is
+        a :class:`~goldfive.adapters.adk_wrap.GoldfiveADKAgent` — a
+        ``BaseAgent`` subclass that *also* exposes the Runner surface,
+        so the same call site works both programmatically and as the
+        ``root_agent`` of an ``adk web`` app. The declared return type
+        stays :class:`Runner` for ergonomics; callers who rely on the
+        ``BaseAgent`` side can annotate
+        ``cast(GoldfiveADKAgent, goldfive.wrap(...))`` themselves.
     """
     adapter = auto_adapter(agent)
 
@@ -158,7 +167,7 @@ def wrap(
         list(sinks) if sinks is not None else [LoggingSink()]
     )
 
-    return Runner(
+    runner = Runner(
         agent=adapter,
         planner=resolved_planner,
         executor=resolved_executor,
@@ -168,6 +177,14 @@ def wrap(
         control=control,
         max_plan_reinvocations=max_plan_reinvocations,
     )
+
+    if is_adk_agent(agent):
+        # Lazy import so callers without the ADK extra don't pay for it.
+        from goldfive.adapters.adk_wrap import GoldfiveADKAgent
+
+        return GoldfiveADKAgent(inner=agent, runner=runner)
+
+    return runner
 
 
 async def run(
