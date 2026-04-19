@@ -55,8 +55,11 @@ class SequentialExecutor(Executor):
         Upper bound on the number of adapter ``invoke()`` calls a single
         :meth:`run` may issue. Each eligible task consumes one invocation;
         when drift triggers a plan revision, the new plan's remaining tasks
-        share the same budget. Defaults to ``3`` to mirror the harmonograf
-        re-invocation cap.
+        share the same budget. Defaults to ``32`` — comfortably covers a
+        plan with 10+ tasks plus a few refinement cycles. A stuck agent
+        still aborts via ``fail_fast`` or (in pathological cases) the
+        budget; the old default of ``3`` was tuned to the harmonograf
+        re-invocation cap and surprised callers running realistic plans.
     fail_fast:
         When ``True`` (default), the first task that ends up ``FAILED`` causes
         the executor to emit ``RunAborted`` and stop. When ``False``, failed
@@ -67,7 +70,7 @@ class SequentialExecutor(Executor):
     def __init__(
         self,
         *,
-        max_plan_reinvocations: int = 3,
+        max_plan_reinvocations: int = 32,
         fail_fast: bool = True,
     ) -> None:
         self.max_plan_reinvocations = int(max_plan_reinvocations)

@@ -351,7 +351,7 @@ class SequentialExecutor(Executor):
     def __init__(
         self,
         *,
-        max_plan_reinvocations: int = 3,
+        max_plan_reinvocations: int = 32,
         fail_fast: bool = True,
     ) -> None: ...
 
