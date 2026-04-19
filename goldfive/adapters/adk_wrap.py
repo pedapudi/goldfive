@@ -289,6 +289,16 @@ class GoldfiveADKAgent(BaseAgent):
         """Register an async close hook on the inner :class:`Runner`."""
         self._runner.add_close_hook(hook)
 
+    def add_plugin(self, plugin: Any) -> None:
+        """Install an ADK ``BasePlugin`` on the underlying ADK Runner.
+
+        Delegates to :meth:`ADKAdapter.add_plugin` on the wrapped
+        adapter. Used by observability integrations (e.g.
+        ``harmonograf_client.observe()``) to attach telemetry plugins
+        after ``goldfive.wrap(...)`` has built the adapter.
+        """
+        self._runner.agent.add_plugin(plugin)
+
     @property
     def control(self) -> ControlChannel | None:
         """Expose the inner :class:`Runner`'s optional ControlChannel."""
