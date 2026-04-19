@@ -15,6 +15,21 @@ decisions behind each protocol.
 All method signatures in this doc track `goldfive/protocols.py`. When
 they disagree, the source wins.
 
+The on-the-wire shapes referenced throughout this doc live under
+`proto/goldfive/v1/`:
+
+- `types.proto` — `Task`, `Plan`, `Goal`, `TaskStatus`, `DriftKind`,
+  `DriftSeverity`.
+- `events.proto` — `Event` envelope + the per-event payloads sinks
+  consume (`RunStarted`, `TaskCompleted`, `DriftDetected`, …).
+- `control.proto` — `ControlEvent`, `ControlKind`, `ControlAck`,
+  `ControlAckResult`, and the typed payload messages (`SteerPayload`,
+  `RewindPayload`, `ApprovePayload`, `RejectPayload`,
+  `InjectMessagePayload`). This is the **single source of truth** for
+  the control plane; harmonograf and any other bridge import these
+  messages rather than defining their own. See
+  [CONTROL.md §1.a](CONTROL.md#1a-single-source-of-truth--the-wire-format-lives-in-goldfives-proto).
+
 ## GoalDeriver
 
 ```python
