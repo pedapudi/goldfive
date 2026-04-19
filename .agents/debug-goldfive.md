@@ -121,6 +121,31 @@ aborted — check `outcome.reason`.
 pure functions; call them on your own upstream signals to mint drift
 events outside the built-in detector.
 
+## Consulting VOCABULARY to diagnose
+
+When a bug is shaped like "two names that sound similar behave
+differently" or "I can't tell which enum value to reach for",
+[docs/design/VOCABULARY.md](../docs/design/VOCABULARY.md) is the
+single-source answer. It enumerates every `TaskStatus`, `DriftKind`,
+`DriftSeverity`, `ControlKind`, every `Event` payload variant, and the
+bridges between them — with emitter + consumer listed for each.
+
+Quick triage table:
+
+| Symptom | VOCABULARY section |
+|---|---|
+| "I sent a STEER but saw `DriftKind.USER_STEER`, is that right?" | [§2](../docs/design/VOCABULARY.md#2-controlkind-vs-driftkind--a-worked-example) — the STEER → USER_STEER flow diagram |
+| "Which `DriftKind` should I synthesize for X?" | [§5](../docs/design/VOCABULARY.md#5-driftkind-taxonomy) — all 26 kinds grouped by trigger |
+| "Who emits `PlanRevised`?" | [§6](../docs/design/VOCABULARY.md#6-event-payload-kinds) — event factory + emitter + "when" table |
+| "Can a task go from BLOCKED to COMPLETED?" | [§4](../docs/design/VOCABULARY.md#4-taskstatus-state-machine) — transition ownership table + state diagram |
+| "Does severity WARN trigger refine, or just log?" | [§7](../docs/design/VOCABULARY.md#7-severity-ladder) — severity ladder with the exact `_severity_ge` comparison |
+| "What are all the ControlKinds and which ones touch the planner?" | [§3](../docs/design/VOCABULARY.md#3-all-control--drift-bridges) — control → drift bridge table |
+
+For the "why is it this way" questions that pair with the vocabulary
+answers — e.g. *why* does STEER delete-and-replan, *why* is there both
+a status and a drift kind named `BLOCKED` — see
+[docs/design/RATIONALE.md](../docs/design/RATIONALE.md).
+
 ## Quick reference
 
 ```python
@@ -158,6 +183,8 @@ print(f"{len(sink.events)} events")
 ## Related
 
 - [docs/guides/troubleshooting.md](../docs/guides/troubleshooting.md) — detailed symptom → fix catalogue.
+- [docs/design/VOCABULARY.md](../docs/design/VOCABULARY.md) — exhaustive type-system reference (start here when a name is confusing).
+- [docs/design/RATIONALE.md](../docs/design/RATIONALE.md) — design-rationale docs (start here when a choice feels arbitrary).
 - [docs/design/DRIFT.md](../docs/design/DRIFT.md) — drift taxonomy.
 - [docs/design/EVENT-MODEL.md](../docs/design/EVENT-MODEL.md) — event ownership, sequence semantics.
 - [events.md](events.md) — emitting a new event.

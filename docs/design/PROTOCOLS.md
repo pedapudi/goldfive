@@ -7,7 +7,10 @@ the contract of each protocol — the shape, the semantics, and the
 invariants a correct implementation must uphold — plus minimal
 working implementations.
 
-Related: [ARCHITECTURE.md](ARCHITECTURE.md), [api.md](../reference/api.md).
+Related: [ARCHITECTURE.md](ARCHITECTURE.md), [api.md](../reference/api.md),
+[VOCABULARY.md](VOCABULARY.md) for the enums and dataclasses these
+signatures reference, [RATIONALE.md](RATIONALE.md) for the design
+decisions behind each protocol.
 
 All method signatures in this doc track `goldfive/protocols.py`. When
 they disagree, the source wins.
@@ -267,6 +270,13 @@ class MinimalSteerer:
 The production `DefaultSteerer` in `goldfive/steerer.py` adds the full
 drift classifier and event emission.
 
+> See [RATIONALE.md §"Why `Steerer` is a protocol, and what
+> `DefaultSteerer` does"](RATIONALE.md#why-steerer-is-a-protocol-and-what-defaultsteerer-does)
+> for the state-vs-observation-vs-drift split rationale, and
+> [RATIONALE.md §"Why the Steerer invokes `planner.refine` and not the
+> Executor"](RATIONALE.md#why-the-steerer-invokes-plannerrefine-and-not-the-executor)
+> for why refine lives here.
+
 ## AgentAdapter
 
 ```python
@@ -363,6 +373,10 @@ class CallableAdapter:
 See [writing-an-agent-adapter.md](../guides/writing-an-agent-adapter.md)
 for a full worked example that wraps a hypothetical new framework.
 
+> See [RATIONALE.md §"Why `AgentAdapter` exists and isn't the agent
+> itself"](RATIONALE.md#why-agentadapter-exists-and-isnt-the-agent-itself)
+> for the "how to invoke" vs "how to be invoked" split.
+
 ## Executor
 
 ```python
@@ -450,6 +464,10 @@ The production executors (`SequentialExecutor`, `ParallelDAGExecutor`)
 add topological scheduling, drift handling, refine, and the
 reinvocation loop.
 
+> See [RATIONALE.md §"Why `Executor` is a protocol instead of a
+> function"](RATIONALE.md#why-executor-is-a-protocol-instead-of-a-function)
+> for why this shape was chosen.
+
 ## EventSink
 
 ```python
@@ -472,6 +490,13 @@ class EventSink(Protocol):
 See [EVENT-MODEL.md](EVENT-MODEL.md#the-eventsink-contract) for the
 full semantics and [writing-an-event-sink.md](../guides/writing-an-event-sink.md)
 for a walkthrough.
+
+> See [RATIONALE.md §"Why `EventSink` protocol is proto-Event-shaped,
+> not dict-shaped"](RATIONALE.md#why-eventsink-protocol-is-proto-event-shaped-not-dict-shaped)
+> for why the contract is proto, and
+> [RATIONALE.md §"Why `make_event` (dict) coexists with typed
+> factories"](RATIONALE.md#why-make_event-dict-coexists-with-typed-factories-proto)
+> for why the dict escape hatch stays.
 
 ### Minimal implementation
 
