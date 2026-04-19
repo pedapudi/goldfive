@@ -18,7 +18,7 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Optional
+from typing import Any
 
 
 class ControlKind(StrEnum):
@@ -71,7 +71,7 @@ class ControlChannel:
         """External caller pushes a control message to the runner."""
         await self._inbox.put(msg)
 
-    async def receive(self, timeout: float | None = None) -> Optional[ControlMessage]:
+    async def receive(self, timeout: float | None = None) -> ControlMessage | None:
         """Runner polls for the next control message.
 
         Returns ``None`` on timeout or when the channel is closed.
@@ -82,7 +82,7 @@ class ControlChannel:
             if timeout is None:
                 return await self._inbox.get()
             return await asyncio.wait_for(self._inbox.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
     async def ack(self, ack: ControlAck) -> None:

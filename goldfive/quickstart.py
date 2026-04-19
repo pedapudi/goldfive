@@ -20,7 +20,6 @@ from goldfive.runner import Runner
 from goldfive.sinks.memory import InMemorySink
 from goldfive.types import Goal, Plan, Task
 
-
 _DEFAULT_AGENT_ID = "default"
 
 
