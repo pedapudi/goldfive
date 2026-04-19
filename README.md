@@ -20,6 +20,20 @@ goldfive is the orchestration half of
 [harmonograf](https://github.com/pedapudi/harmonograf), extracted so you
 can use the control loop without the console.
 
+## Get running in 10 minutes
+
+The fastest way to see goldfive work end-to-end is with its observability
+console, [harmonograf](https://github.com/pedapudi/harmonograf). The
+walkthrough installs both, boots a local stack, runs the
+`examples/harmonograf_observed/` agent, and shows every event flowing
+into the UI — no LLM credentials required.
+
+1. `uv sync` in this repo (Python 3.11+, `uv` on your PATH).
+2. Clone and `make demo` in harmonograf (server + UI on :7531 and :5173).
+3. `uv run python examples/harmonograf_observed/agent.py`.
+
+Full walkthrough: **[observability-with-harmonograf.md](docs/guides/observability-with-harmonograf.md)**.
+
 ## Install
 
 ```bash
