@@ -9,7 +9,11 @@ This document enumerates every drift kind, covers classification
 rules, and explains when `planner.refine(...)` runs.
 
 Related: [ARCHITECTURE.md](ARCHITECTURE.md#control-direction),
-[STATE-MACHINE.md](STATE-MACHINE.md), [PROTOCOLS.md](PROTOCOLS.md#steerer).
+[STATE-MACHINE.md](STATE-MACHINE.md), [PROTOCOLS.md](PROTOCOLS.md#steerer),
+[VOCABULARY.md §5 — DriftKind taxonomy](VOCABULARY.md#5-driftkind-taxonomy)
+(the authoritative per-kind reference; this doc covers classification
+logic and severity bands),
+[RATIONALE.md §"Why drift severity is a 3-level enum"](RATIONALE.md#why-drift-severity-is-a-3-level-enum-infowarningcritical-not-a-number).
 
 ## The `DriftEvent` shape
 

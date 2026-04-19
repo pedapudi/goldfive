@@ -7,7 +7,12 @@ through `Steerer.transition(task_id, to, *, session)` and emits an
 event to every sink.
 
 Related: [DRIFT.md](DRIFT.md), [PROTOCOLS.md](PROTOCOLS.md#steerer),
-[EVENT-MODEL.md](EVENT-MODEL.md).
+[EVENT-MODEL.md](EVENT-MODEL.md),
+[VOCABULARY.md §4 — TaskStatus state machine](VOCABULARY.md#4-taskstatus-state-machine)
+(enum-value reference, owner-per-transition table, and rationale for
+why BLOCKED is a status rather than a drift kind),
+[RATIONALE.md §"Why `BLOCKED` is a task status rather than a drift
+kind"](RATIONALE.md#why-blocked-is-a-task-status-rather-than-a-drift-kind).
 
 ## States
 

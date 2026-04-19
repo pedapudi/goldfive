@@ -11,6 +11,10 @@ of one `Runner.run()` invocation. Downstream documents go deep on
 individual pieces:
 
 - [PROTOCOLS.md](PROTOCOLS.md) — the protocol contracts in detail.
+- [VOCABULARY.md](VOCABULARY.md) — exhaustive type-system reference:
+  every enum value, every bridge between types.
+- [RATIONALE.md](RATIONALE.md) — design-rationale "why" document for
+  each major abstraction.
 - [EVENT-MODEL.md](EVENT-MODEL.md) — the proto event taxonomy and the
   EventSink contract.
 - [DRIFT.md](DRIFT.md) — the drift-kind taxonomy and refine policy.
@@ -297,14 +301,78 @@ Four invariants hold across every `Runner.run(...)` invocation:
   Streaming live progress is expected to happen through a caller-
   supplied `EventSink`, not through an async generator.
 
+## Layering: goldfive inside, harmonograf outside
+
+goldfive and [harmonograf](https://github.com/pedapudi/harmonograf) are
+two cooperating layers, not one product split awkwardly in two.
+Understanding the boundary between them keeps contributions on the
+right side of the line.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ harmonograf (observability + UI)                            │
+│                                                             │
+│  - harmonograf server — gRPC ingest of Event streams        │
+│  - harmonograf UI — React console for live runs             │
+│  - harmonograf_client.observe(runner) — attaches a Sink +   │
+│    an optional ControlChannel bridge for live steering      │
+│                                                             │
+│  Reads: proto Event stream (via GRPCSink or HarmonografSink)│
+│  Writes back: ControlMessages into goldfive.ControlChannel  │
+└──────────────────────┬──────────────────────────────────────┘
+                       │   Event stream ▲    Control msgs ▼
+                       │                │                 │
+┌──────────────────────▼─────────────────────────────────────┐
+│ goldfive (orchestration: planning, steering, dispatch)     │
+│                                                            │
+│  - Runner / Executor / Steerer / Planner / Adapter / Sink  │
+│  - Runs one Session against one Plan                       │
+│  - Emits proto Events on every state change                │
+│  - Accepts ControlMessages on an optional ControlChannel   │
+│                                                            │
+│  Knows nothing about: UI frameworks, dashboards, gRPC      │
+│  servers, React, harmonograf proto                         │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Invariants:**
+
+- **goldfive never imports harmonograf.** Every observer-side concern
+  is implementable against the public `EventSink` and `ControlChannel`
+  primitives.
+- **harmonograf never edits goldfive's Session.** Control flows only
+  through `ControlChannel.send()`; state mutation only happens inside
+  goldfive (via the Steerer).
+- **Events are the contract.** A proto `Event` written against the v1
+  schema is readable by both layers; future versions add fields only.
+
+**`wrap` vs `observe`.** Two orthogonal verbs:
+
+- `goldfive.wrap(agent, ...)` — wraps an agent as an adapter + picks a
+  planner/deriver/executor/steerer. *Inside* goldfive's layer.
+- `harmonograf_client.observe(runner, ...)` — attaches a sink (and
+  optionally a control bridge) to a `Runner`. *Outside* goldfive's
+  layer.
+
+Callers often use both: `runner = goldfive.wrap(agent); observe(runner)`.
+
+For the full "why" behind this split, see
+[RATIONALE.md §"Why harmonograf is a sink rather than an executor
+plugin"](RATIONALE.md#why-harmonograf-is-a-sink-rather-than-an-executor-plugin).
+For the type-system view of what flows across the boundary, see
+[VOCABULARY.md](VOCABULARY.md).
+
 ## Reading order
 
 If you're new, read this doc in order with:
 
-1. [PROTOCOLS.md](PROTOCOLS.md) — the shape contracts.
-2. [STATE-MACHINE.md](STATE-MACHINE.md) — how one task moves through
+1. [VOCABULARY.md](VOCABULARY.md) — the vocabulary (enums, types,
+   bridges) the rest of the docs assume.
+2. [PROTOCOLS.md](PROTOCOLS.md) — the shape contracts.
+3. [STATE-MACHINE.md](STATE-MACHINE.md) — how one task moves through
    the lifecycle.
-3. [DRIFT.md](DRIFT.md) — what counts as drift and what to do about it.
-4. [EVENT-MODEL.md](EVENT-MODEL.md) — how observability flows out.
+4. [DRIFT.md](DRIFT.md) — what counts as drift and what to do about it.
+5. [EVENT-MODEL.md](EVENT-MODEL.md) — how observability flows out.
+6. [RATIONALE.md](RATIONALE.md) — why each piece is the way it is.
 
 For hands-on, jump to [getting-started.md](../guides/getting-started.md).

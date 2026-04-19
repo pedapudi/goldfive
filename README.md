@@ -97,6 +97,11 @@ inspect the event stream. Concrete and runnable.
 - [`docs/design/DRIFT.md`](docs/design/DRIFT.md) — full drift-kind taxonomy (25+), classification rules, refine policy.
 - [`docs/design/EVENT-MODEL.md`](docs/design/EVENT-MODEL.md) — proto event taxonomy, sequence semantics, `EventSink` contract.
 
+### Further reading — the "why" docs
+
+- [`docs/design/VOCABULARY.md`](docs/design/VOCABULARY.md) — exhaustive type-system reference. Every enum value, every bridge between types, side-by-side. Start here if `ControlKind.STEER` vs `DriftKind.USER_STEER` ever confuses you.
+- [`docs/design/RATIONALE.md`](docs/design/RATIONALE.md) — design-rationale "why is it this way?" for each major abstraction. Read when a choice feels arbitrary.
+
 ### Guides
 
 - [`docs/guides/getting-started.md`](docs/guides/getting-started.md) — install + first agent.
