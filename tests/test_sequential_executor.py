@@ -219,9 +219,12 @@ async def test_linear_plan_runs_to_completion() -> None:
     for t in plan.tasks:
         assert t.status == TaskStatus.COMPLETED
 
+    # The executor itself owns only the terminal RunCompleted (Runner
+    # owns RunStarted / GoalDerived / PlanSubmitted). The StubSteerer
+    # emits nothing, so the only event the sink sees is run_completed.
     kinds = sink.payload_kinds()
-    assert kinds[0] == "run_started"
     assert kinds[-1] == "run_completed"
+    assert "run_started" not in kinds
 
 
 # ---------------------------------------------------------------------------

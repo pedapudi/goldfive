@@ -81,9 +81,19 @@ async def main() -> None:
     print(f"goals={[g.summary for g in outcome.session.goals]}")
     print(f"{len(sink.events)} events:")
     for e in sink.events:
-        seq = e["sequence"] if isinstance(e, dict) else getattr(e, "sequence", "?")
-        kind = e["kind"] if isinstance(e, dict) else getattr(e, "kind", "?")
-        payload = e.get("payload") if isinstance(e, dict) else getattr(e, "payload", {})
+        if isinstance(e, dict):
+            seq = e.get("sequence", "?")
+            kind = e.get("kind", "?")
+            payload = e.get("payload", {})
+        else:
+            seq = getattr(e, "sequence", "?")
+            oneof = e.WhichOneof("payload") if hasattr(e, "WhichOneof") else None
+            kind = (
+                "".join(part.capitalize() for part in oneof.split("_"))
+                if oneof
+                else "?"
+            )
+            payload = getattr(e, oneof) if oneof else "{}"
         print(f"  seq={seq:>3}  {kind:<16}  {payload}")
 
 

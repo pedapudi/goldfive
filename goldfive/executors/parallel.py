@@ -15,16 +15,27 @@ bound ``Steerer``; on a drift whose severity is at or above WARNING the
 tasks in the stage or (b) let siblings finish before refining. Plan
 refinement never happens mid-stage — that matches the harmonograf
 walker's semantics and keeps the DAG walk deterministic.
+
+Lifecycle ownership: ``RunStarted`` is emitted by :class:`~goldfive.Runner`,
+not by the executor. The executor owns the terminal ``RunCompleted`` /
+``RunAborted`` and the ``PlanRevised`` events it generates when the
+walker swaps in a refined plan.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Literal
+from typing import Literal
 
-from goldfive.events import emit as emit_event
-from goldfive.events import make_event
+from goldfive.events import (
+    emit as emit_event,
+)
+from goldfive.events import (
+    plan_revised_event,
+    run_aborted_event,
+    run_completed_event,
+)
 from goldfive.protocols import (
     AgentAdapter,
     EventSink,
@@ -119,12 +130,8 @@ class ParallelDAGExecutor:
         except Exception as exc:  # noqa: BLE001
             log.debug("ParallelDAGExecutor: steerer.bind raised: %s", exc)
 
-        await self._emit(
-            session,
-            sinks,
-            kind="RunStarted",
-            payload={"plan_id": plan.id, "goal_ids": list(plan.goal_ids)},
-        )
+        # NOTE: RunStarted is emitted by Runner, not by the executor. See
+        # Runner._emit_run_started.
 
         refinements_used = 0
         completed_stage_ids: set[str] = set()
@@ -154,17 +161,6 @@ class ParallelDAGExecutor:
                 stage_tasks = [t for t in stage if t.id not in completed_stage_ids]
                 if not stage_tasks:
                     continue
-
-                stage_index = len(completed_stage_ids)  # ordinal-ish, for logs
-                await self._emit(
-                    session,
-                    sinks,
-                    kind="StageStarted",
-                    payload={
-                        "stage_index": stage_index,
-                        "task_ids": [t.id for t in stage_tasks],
-                    },
-                )
 
                 stage_results, drift = await self._run_stage(
                     stage_tasks, session, adapter, steerer, sinks
@@ -209,16 +205,6 @@ class ParallelDAGExecutor:
                             session.completed_results[task.id] = inv.text
                     completed_stage_ids.add(task.id)
 
-                await self._emit(
-                    session,
-                    sinks,
-                    kind="StageCompleted",
-                    payload={
-                        "stage_index": stage_index,
-                        "task_ids": [t.id for t, *_ in stage_results],
-                    },
-                )
-
                 if drift is not None:
                     if refinements_used >= self.max_plan_reinvocations:
                         log.warning(
@@ -238,17 +224,14 @@ class ParallelDAGExecutor:
                     if refined is not None and refined is not (session.plan or plan):
                         refinements_used += 1
                         session.plan = refined
-                        await self._emit(
-                            session,
+                        await emit_event(
                             sinks,
-                            kind="PlanRevised",
-                            payload={
-                                "plan_id": refined.id,
-                                "revision_index": refined.revision_index,
-                                "reason": refined.revision_reason,
-                                "kind": refined.revision_kind,
-                                "severity": refined.revision_severity,
-                            },
+                            plan_revised_event(
+                                run_id=session.run_id,
+                                sequence=session.next_sequence(),
+                                plan=refined,
+                                drift=drift,
+                            ),
                         )
                         # Falls through to loop top: stages recomputed.
                         continue
@@ -256,30 +239,36 @@ class ParallelDAGExecutor:
                 # No drift (or no refinement): continue to next stage.
         except BaseException as exc:  # noqa: BLE001 — propagate reason, then re-raise
             abort_reason = f"{type(exc).__name__}: {exc}"
-            await self._emit(
-                session,
+            await emit_event(
                 sinks,
-                kind="RunAborted",
-                payload={"reason": abort_reason},
+                run_aborted_event(
+                    run_id=session.run_id,
+                    sequence=session.next_sequence(),
+                    reason=abort_reason,
+                ),
             )
             if isinstance(exc, asyncio.CancelledError):
                 raise
             return ExecutionOutcome(success=False, session=session, reason=abort_reason)
 
         if abort_reason:
-            await self._emit(
-                session,
+            await emit_event(
                 sinks,
-                kind="RunAborted",
-                payload={"reason": abort_reason},
+                run_aborted_event(
+                    run_id=session.run_id,
+                    sequence=session.next_sequence(),
+                    reason=abort_reason,
+                ),
             )
             return ExecutionOutcome(success=False, session=session, reason=abort_reason)
 
-        await self._emit(
-            session,
+        await emit_event(
             sinks,
-            kind="RunCompleted",
-            payload={"completed_task_ids": sorted(completed_stage_ids)},
+            run_completed_event(
+                run_id=session.run_id,
+                sequence=session.next_sequence(),
+                outcome_summary=_outcome_summary(completed_stage_ids),
+            ),
         )
         return ExecutionOutcome(success=True, session=session)
 
@@ -435,25 +424,13 @@ class ParallelDAGExecutor:
             return None
         return refined
 
-    # ------------------------------------------------------------------
-    # Event emission
-    # ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    async def _emit(
-        self,
-        session: Session,
-        sinks: list[EventSink],
-        *,
-        kind: str,
-        payload: dict[str, Any],
-    ) -> None:
-        ev = make_event(
-            run_id=session.run_id,
-            sequence=session.next_sequence(),
-            kind=kind,
-            payload=payload,
-        )
-        await emit_event(sinks, ev)
+
+def _outcome_summary(completed_task_ids: set[str]) -> str:
+    return f"{len(completed_task_ids)} tasks completed"
 
 
 # Runtime conformance check — the class must satisfy the Executor protocol.
