@@ -42,6 +42,19 @@ def _looks_like_adk_agent(agent: Any) -> bool:
     return False
 
 
+def is_adk_agent(agent: Any) -> bool:
+    """Return True when ``agent`` looks like a Google ADK ``BaseAgent``.
+
+    Public wrapper over the internal duck-type check. Used by
+    :func:`goldfive.wrap` to decide whether to return a plain
+    :class:`~goldfive.runner.Runner` or a polymorphic
+    :class:`~goldfive.adapters.adk_wrap.GoldfiveADKAgent` that also
+    satisfies the ``BaseAgent`` contract. Runs without importing ADK,
+    so callers that never install the extra don't pay the import cost.
+    """
+    return _looks_like_adk_agent(agent)
+
+
 def _looks_like_adk_runner(agent: Any) -> bool:
     """Duck-type check for an ADK ``Runner``."""
     return (
@@ -147,4 +160,4 @@ def auto_adapter(agent: Any) -> AgentAdapter:
     )
 
 
-__all__ = ["auto_adapter"]
+__all__ = ["auto_adapter", "is_adk_agent"]
