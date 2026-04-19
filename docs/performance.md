@@ -1,0 +1,106 @@
+# Performance baseline
+
+This page records goldfive's **orchestration-only** performance baseline:
+how fast and how memory-efficient the runner / executor / sink path is
+when the agent itself does no real work. It is documentation, not a CI
+gate — the numbers below give us a yardstick to notice future
+regressions when we look.
+
+## Baseline workload
+
+The benchmark in `bench/run_100_tasks.py` runs:
+
+- A **100-task linear plan** (`t000 → t001 → … → t099`) built directly
+  and handed to `StaticPlanner` so no LLM planning round-trip is in the
+  measurement.
+- A **trivial no-op `CallableAdapter` agent** that returns
+  `InvocationResult(task_id=task.id, text="ok")` immediately. There is
+  no LLM call, no network I/O, and no compute beyond constructing the
+  result.
+- The **`SequentialExecutor`** (single-threaded; one task at a time)
+  with `max_plan_reinvocations=101` so the budget cannot trip on the
+  100-task plan.
+- A single **`JSONLPersistenceSink`** writing proto-encoded events to a
+  temporary file. JSONL is the highest-fidelity sink we ship and is the
+  most realistic single-sink choice for a production deployment that
+  wants crash recovery.
+
+The point is to isolate **orchestration overhead** — runner setup,
+sequential walking of the DAG, steerer transitions, event construction
+and serialisation, file writes — from anything that depends on a real
+agent.
+
+## How to run
+
+```sh
+uv run --extra proto --extra dev python bench/run_100_tasks.py
+```
+
+The `proto` extra is required because `JSONLPersistenceSink` serialises
+proto event messages. The script prints a single block of measurements
+to stdout and unlinks its temp file before exiting. Total runtime is
+well under a second on commodity hardware.
+
+## Recorded baseline (v0.1.0)
+
+Median of five consecutive runs on **2026-04-18**, commodity Linux
+laptop, single core, no parallelism, CPython 3.12.13:
+
+| Metric             | Value          |
+| ------------------ | -------------- |
+| Wall time          | **0.107 s**    |
+| Throughput         | **937 tasks/s** |
+| Peak memory        | **0.29 MiB**   |
+| JSONL file size    | **51.28 KiB**  |
+| Python             | 3.12.13        |
+| goldfive           | 0.1.0          |
+
+Run-to-run variance over the five samples was roughly ±10 % on
+wall-time and effectively zero on peak memory and JSONL size.
+
+## Methodology notes
+
+- **Wall-clock** is `time.perf_counter()` deltas around `Runner.run`
+  (after sink + runner construction; that constructor work is excluded
+  to keep the measurement focused on the run path).
+- **Peak memory** is `tracemalloc.get_traced_memory()[1]` — the high-
+  water mark of Python-allocated memory between `tracemalloc.start()`
+  and the snapshot taken immediately after `Runner.run` returns. It
+  does not include C-extension allocations (e.g. inside `protobuf`),
+  but it captures the dataclass and event churn that goldfive itself
+  is responsible for.
+- **JSONL file size** is `Path.stat().st_size` of the persistence file
+  immediately before unlink. Each event is one proto-canonical JSON
+  line with sorted keys.
+- The agent is a no-op, so this measures **orchestration overhead
+  only**. Real workloads will be dominated by LLM and tool latency,
+  which goldfive does not control.
+
+## Known limitations
+
+- **Single-threaded**: `SequentialExecutor` walks one task at a time.
+  The `ParallelDAGExecutor` will have a different profile and should
+  get its own baseline once it stabilises.
+- **No LLM, no network**: the headline numbers say nothing about how
+  goldfive performs against real models. They are a floor on
+  orchestration overhead, not a ceiling on end-to-end run time.
+- **Single sink**: real deployments often fan events out to multiple
+  sinks (logging + persistence + gRPC). Each additional sink adds its
+  own serialisation cost.
+- **Linear plan**: a 100-stage chain stresses sequential walking but
+  not the topological-sort path that wide DAGs exercise.
+- **CPython only**: numbers measured under CPython 3.12; PyPy and
+  newer CPython releases may differ.
+
+## Regression policy
+
+If a future change pushes wall-time past **2× baseline** (~0.21 s) or
+peak memory past **2× baseline** (~0.58 MiB) on this exact workload,
+that warrants investigation before merge. We do **not** gate CI on the
+benchmark — it is a tripwire for human reviewers, not infrastructure.
+
+To check after a change, simply re-run the benchmark a handful of times
+and compare the medians against the table above. If the workload
+itself changes (different sink, different plan shape, different
+adapter), record a new baseline rather than comparing apples to
+oranges.
