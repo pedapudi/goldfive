@@ -26,7 +26,13 @@ from goldfive.quickstart import quickstart
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS, ReportingToolSpec
 from goldfive.results import ExecutionOutcome, InvocationResult
 from goldfive.runner import Runner
-from goldfive.sinks import GRPCSink, InMemorySink
+from goldfive.sinks import (
+    GRPCSink,
+    InMemorySink,
+    JSONLPersistenceSink,
+    LoggingSink,
+    SQLitePersistenceSink,
+)
 from goldfive.steerer import DefaultSteerer
 from goldfive.types import (
     DriftEvent,
@@ -57,9 +63,11 @@ __all__ = [
     "GoalDeriver",
     "InMemorySink",
     "InvocationResult",
+    "JSONLPersistenceSink",
     "LLMGoalDeriver",
     "LLMPlanner",
     "LiteralGoalDeriver",
+    "LoggingSink",
     "ParallelDAGExecutor",
     "PassthroughGoalDeriver",
     "PassthroughPlanner",
@@ -67,6 +75,7 @@ __all__ = [
     "Planner",
     "ReportingToolSpec",
     "Runner",
+    "SQLitePersistenceSink",
     "SequentialExecutor",
     "Session",
     "StaticPlanner",

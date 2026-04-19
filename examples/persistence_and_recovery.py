@@ -94,7 +94,7 @@ async def main() -> None:
     runner = Runner(
         agent=CallableAdapter(crashy_agent, available_agents=["worker"]),
         planner=StaticPlanner(build_plan()),
-        executor=SequentialExecutor(stop_on_failure=True),
+        executor=SequentialExecutor(fail_fast=True),
         goal_deriver=PassthroughGoalDeriver("Persist and recover"),
         sinks=[sink],
     )
