@@ -158,9 +158,16 @@ class DriftEvent:
 
 @dataclasses.dataclass
 class Session:
-    """Live state for one Runner.run() invocation."""
+    """Live state for one Runner.run() invocation.
+
+    ``conversation_id`` links this turn to the owning :class:`~goldfive.conversation.Conversation`
+    and is stable across successive turns on the same Runner. It
+    defaults to ``""`` for legacy callers that build Sessions directly
+    without going through a Conversation.
+    """
 
     run_id: str
+    conversation_id: str = ""
     goals: list[Goal] = dataclasses.field(default_factory=list)
     plan: Plan | None = None
     current_task_id: str = ""

@@ -54,6 +54,8 @@ message Event {
     DriftDetected drift_detected = 20;
     RunCompleted run_completed = 21;
     RunAborted run_aborted = 22;
+    ConversationStarted conversation_started = 23;
+    ConversationEnded conversation_ended = 24;
   }
 }
 
@@ -170,4 +172,24 @@ message RunCompleted {
 // cancel, or a TaskFailed with recoverable=false).
 message RunAborted {
   string reason = 1;
+}
+
+// Emitted once per Conversation on the first turn that uses it. Sinks
+// that render cross-turn chat history use this to open a new
+// conversation context. `run_id` on the envelope is the first turn's
+// run_id; `conversation_id` below is the stable identifier shared by
+// every turn in the conversation.
+message ConversationStarted {
+  string conversation_id = 1;
+  google.protobuf.Timestamp started_at = 2;
+}
+
+// Emitted when a caller invokes `Runner.new_conversation()` or closes
+// the Runner. Signals that no further turns will share this
+// conversation_id. `turn_count` is the number of turns that ran before
+// the reset, so sinks can render "3-turn conversation ended".
+message ConversationEnded {
+  string conversation_id = 1;
+  uint32 turn_count = 2;
+  string reason = 3;
 }

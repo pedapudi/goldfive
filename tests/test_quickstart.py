@@ -75,10 +75,13 @@ async def test_quickstart_string_goal_runs_to_completion() -> None:
     assert outcome.success, outcome.reason
 
     kinds = _kinds(sink.events)
-    assert kinds[0] == "RunStarted"
-    assert "GoalDerived" in kinds
-    assert "PlanSubmitted" in kinds
-    assert kinds[-1] == "RunCompleted"
+    # ConversationStarted precedes the per-run lifecycle; ConversationEnded
+    # is emitted by runner.close() when turns ran.
+    run_kinds = [k for k in kinds if not k.startswith("Conversation")]
+    assert run_kinds[0] == "RunStarted"
+    assert "GoalDerived" in run_kinds
+    assert "PlanSubmitted" in run_kinds
+    assert run_kinds[-1] == "RunCompleted"
 
     # Exactly one task was generated for the single goal.
     assert outcome.session.plan is not None

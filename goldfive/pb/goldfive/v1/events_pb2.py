@@ -26,7 +26,7 @@ from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__
 from goldfive.v1 import types_pb2 as goldfive_dot_v1_dot_types__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18goldfive/v1/events.proto\x12\x0bgoldfive.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17goldfive/v1/types.proto\"\x8e\x06\n\x05\x45vent\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x10\n\x08sequence\x18\x03 \x01(\x04\x12.\n\nemitted_at\x18\x04 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12.\n\x0brun_started\x18\n \x01(\x0b\x32\x17.goldfive.v1.RunStartedH\x00\x12\x30\n\x0cgoal_derived\x18\x0b \x01(\x0b\x32\x18.goldfive.v1.GoalDerivedH\x00\x12\x34\n\x0eplan_submitted\x18\x0c \x01(\x0b\x32\x1a.goldfive.v1.PlanSubmittedH\x00\x12\x30\n\x0cplan_revised\x18\r \x01(\x0b\x32\x18.goldfive.v1.PlanRevisedH\x00\x12\x30\n\x0ctask_started\x18\x0e \x01(\x0b\x32\x18.goldfive.v1.TaskStartedH\x00\x12\x32\n\rtask_progress\x18\x0f \x01(\x0b\x32\x19.goldfive.v1.TaskProgressH\x00\x12\x34\n\x0etask_completed\x18\x10 \x01(\x0b\x32\x1a.goldfive.v1.TaskCompletedH\x00\x12.\n\x0btask_failed\x18\x11 \x01(\x0b\x32\x17.goldfive.v1.TaskFailedH\x00\x12\x30\n\x0ctask_blocked\x18\x12 \x01(\x0b\x32\x18.goldfive.v1.TaskBlockedH\x00\x12\x34\n\x0etask_cancelled\x18\x13 \x01(\x0b\x32\x1a.goldfive.v1.TaskCancelledH\x00\x12\x34\n\x0e\x64rift_detected\x18\x14 \x01(\x0b\x32\x1a.goldfive.v1.DriftDetectedH\x00\x12\x32\n\rrun_completed\x18\x15 \x01(\x0b\x32\x19.goldfive.v1.RunCompletedH\x00\x12.\n\x0brun_aborted\x18\x16 \x01(\x0b\x32\x17.goldfive.v1.RunAbortedH\x00\x42\t\n\x07payload\"b\n\nRunStarted\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x14\n\x0cgoal_summary\x18\x02 \x01(\t\x12.\n\nstarted_at\x18\x03 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\"/\n\x0bGoalDerived\x12 \n\x05goals\x18\x01 \x03(\x0b\x32\x11.goldfive.v1.Goal\"0\n\rPlanSubmitted\x12\x1f\n\x04plan\x18\x01 \x01(\x0b\x32\x11.goldfive.v1.Plan\"\xb0\x01\n\x0bPlanRevised\x12\x1f\n\x04plan\x18\x01 \x01(\x0b\x32\x11.goldfive.v1.Plan\x12*\n\ndrift_kind\x18\x02 \x01(\x0e\x32\x16.goldfive.v1.DriftKind\x12,\n\x08severity\x18\x03 \x01(\x0e\x32\x1a.goldfive.v1.DriftSeverity\x12\x0e\n\x06reason\x18\x04 \x01(\t\x12\x16\n\x0erevision_index\x18\x05 \x01(\r\".\n\x0bTaskStarted\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t\"A\n\x0cTaskProgress\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x10\n\x08\x66raction\x18\x02 \x01(\x02\x12\x0e\n\x06\x64\x65tail\x18\x03 \x01(\t\"\xa1\x01\n\rTaskCompleted\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0f\n\x07summary\x18\x02 \x01(\t\x12<\n\tartifacts\x18\x03 \x03(\x0b\x32).goldfive.v1.TaskCompleted.ArtifactsEntry\x1a\x30\n\x0e\x41rtifactsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"B\n\nTaskFailed\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0e\n\x06reason\x18\x02 \x01(\t\x12\x13\n\x0brecoverable\x18\x03 \x01(\x08\"?\n\x0bTaskBlocked\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0f\n\x07\x62locker\x18\x02 \x01(\t\x12\x0e\n\x06needed\x18\x03 \x01(\t\"0\n\rTaskCancelled\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0e\n\x06reason\x18\x02 \x01(\t\"\xa6\x01\n\rDriftDetected\x12$\n\x04kind\x18\x01 \x01(\x0e\x32\x16.goldfive.v1.DriftKind\x12,\n\x08severity\x18\x02 \x01(\x0e\x32\x1a.goldfive.v1.DriftSeverity\x12\x0e\n\x06\x64\x65tail\x18\x03 \x01(\t\x12\x17\n\x0f\x63urrent_task_id\x18\x04 \x01(\t\x12\x18\n\x10\x63urrent_agent_id\x18\x05 \x01(\t\"\'\n\x0cRunCompleted\x12\x17\n\x0foutcome_summary\x18\x01 \x01(\t\"\x1c\n\nRunAborted\x12\x0e\n\x06reason\x18\x01 \x01(\tB9Z7github.com/pedapudi/goldfive/gen/goldfive/v1;goldfivev1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18goldfive/v1/events.proto\x12\x0bgoldfive.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17goldfive/v1/types.proto\"\x8e\x07\n\x05\x45vent\x12\x10\n\x08\x65vent_id\x18\x01 \x01(\t\x12\x0e\n\x06run_id\x18\x02 \x01(\t\x12\x10\n\x08sequence\x18\x03 \x01(\x04\x12.\n\nemitted_at\x18\x04 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12.\n\x0brun_started\x18\n \x01(\x0b\x32\x17.goldfive.v1.RunStartedH\x00\x12\x30\n\x0cgoal_derived\x18\x0b \x01(\x0b\x32\x18.goldfive.v1.GoalDerivedH\x00\x12\x34\n\x0eplan_submitted\x18\x0c \x01(\x0b\x32\x1a.goldfive.v1.PlanSubmittedH\x00\x12\x30\n\x0cplan_revised\x18\r \x01(\x0b\x32\x18.goldfive.v1.PlanRevisedH\x00\x12\x30\n\x0ctask_started\x18\x0e \x01(\x0b\x32\x18.goldfive.v1.TaskStartedH\x00\x12\x32\n\rtask_progress\x18\x0f \x01(\x0b\x32\x19.goldfive.v1.TaskProgressH\x00\x12\x34\n\x0etask_completed\x18\x10 \x01(\x0b\x32\x1a.goldfive.v1.TaskCompletedH\x00\x12.\n\x0btask_failed\x18\x11 \x01(\x0b\x32\x17.goldfive.v1.TaskFailedH\x00\x12\x30\n\x0ctask_blocked\x18\x12 \x01(\x0b\x32\x18.goldfive.v1.TaskBlockedH\x00\x12\x34\n\x0etask_cancelled\x18\x13 \x01(\x0b\x32\x1a.goldfive.v1.TaskCancelledH\x00\x12\x34\n\x0e\x64rift_detected\x18\x14 \x01(\x0b\x32\x1a.goldfive.v1.DriftDetectedH\x00\x12\x32\n\rrun_completed\x18\x15 \x01(\x0b\x32\x19.goldfive.v1.RunCompletedH\x00\x12.\n\x0brun_aborted\x18\x16 \x01(\x0b\x32\x17.goldfive.v1.RunAbortedH\x00\x12@\n\x14\x63onversation_started\x18\x17 \x01(\x0b\x32 .goldfive.v1.ConversationStartedH\x00\x12<\n\x12\x63onversation_ended\x18\x18 \x01(\x0b\x32\x1e.goldfive.v1.ConversationEndedH\x00\x42\t\n\x07payload\"b\n\nRunStarted\x12\x0e\n\x06run_id\x18\x01 \x01(\t\x12\x14\n\x0cgoal_summary\x18\x02 \x01(\t\x12.\n\nstarted_at\x18\x03 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\"/\n\x0bGoalDerived\x12 \n\x05goals\x18\x01 \x03(\x0b\x32\x11.goldfive.v1.Goal\"0\n\rPlanSubmitted\x12\x1f\n\x04plan\x18\x01 \x01(\x0b\x32\x11.goldfive.v1.Plan\"\xb0\x01\n\x0bPlanRevised\x12\x1f\n\x04plan\x18\x01 \x01(\x0b\x32\x11.goldfive.v1.Plan\x12*\n\ndrift_kind\x18\x02 \x01(\x0e\x32\x16.goldfive.v1.DriftKind\x12,\n\x08severity\x18\x03 \x01(\x0e\x32\x1a.goldfive.v1.DriftSeverity\x12\x0e\n\x06reason\x18\x04 \x01(\t\x12\x16\n\x0erevision_index\x18\x05 \x01(\r\".\n\x0bTaskStarted\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t\"A\n\x0cTaskProgress\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x10\n\x08\x66raction\x18\x02 \x01(\x02\x12\x0e\n\x06\x64\x65tail\x18\x03 \x01(\t\"\xa1\x01\n\rTaskCompleted\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0f\n\x07summary\x18\x02 \x01(\t\x12<\n\tartifacts\x18\x03 \x03(\x0b\x32).goldfive.v1.TaskCompleted.ArtifactsEntry\x1a\x30\n\x0e\x41rtifactsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"B\n\nTaskFailed\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0e\n\x06reason\x18\x02 \x01(\t\x12\x13\n\x0brecoverable\x18\x03 \x01(\x08\"?\n\x0bTaskBlocked\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0f\n\x07\x62locker\x18\x02 \x01(\t\x12\x0e\n\x06needed\x18\x03 \x01(\t\"0\n\rTaskCancelled\x12\x0f\n\x07task_id\x18\x01 \x01(\t\x12\x0e\n\x06reason\x18\x02 \x01(\t\"\xa6\x01\n\rDriftDetected\x12$\n\x04kind\x18\x01 \x01(\x0e\x32\x16.goldfive.v1.DriftKind\x12,\n\x08severity\x18\x02 \x01(\x0e\x32\x1a.goldfive.v1.DriftSeverity\x12\x0e\n\x06\x64\x65tail\x18\x03 \x01(\t\x12\x17\n\x0f\x63urrent_task_id\x18\x04 \x01(\t\x12\x18\n\x10\x63urrent_agent_id\x18\x05 \x01(\t\"\'\n\x0cRunCompleted\x12\x17\n\x0foutcome_summary\x18\x01 \x01(\t\"\x1c\n\nRunAborted\x12\x0e\n\x06reason\x18\x01 \x01(\t\"^\n\x13\x43onversationStarted\x12\x17\n\x0f\x63onversation_id\x18\x01 \x01(\t\x12.\n\nstarted_at\x18\x02 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\"P\n\x11\x43onversationEnded\x12\x17\n\x0f\x63onversation_id\x18\x01 \x01(\t\x12\x12\n\nturn_count\x18\x02 \x01(\r\x12\x0e\n\x06reason\x18\x03 \x01(\tB9Z7github.com/pedapudi/goldfive/gen/goldfive/v1;goldfivev1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -37,33 +37,37 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TASKCOMPLETED_ARTIFACTSENTRY']._loaded_options = None
   _globals['_TASKCOMPLETED_ARTIFACTSENTRY']._serialized_options = b'8\001'
   _globals['_EVENT']._serialized_start=100
-  _globals['_EVENT']._serialized_end=882
-  _globals['_RUNSTARTED']._serialized_start=884
-  _globals['_RUNSTARTED']._serialized_end=982
-  _globals['_GOALDERIVED']._serialized_start=984
-  _globals['_GOALDERIVED']._serialized_end=1031
-  _globals['_PLANSUBMITTED']._serialized_start=1033
-  _globals['_PLANSUBMITTED']._serialized_end=1081
-  _globals['_PLANREVISED']._serialized_start=1084
-  _globals['_PLANREVISED']._serialized_end=1260
-  _globals['_TASKSTARTED']._serialized_start=1262
-  _globals['_TASKSTARTED']._serialized_end=1308
-  _globals['_TASKPROGRESS']._serialized_start=1310
-  _globals['_TASKPROGRESS']._serialized_end=1375
-  _globals['_TASKCOMPLETED']._serialized_start=1378
-  _globals['_TASKCOMPLETED']._serialized_end=1539
-  _globals['_TASKCOMPLETED_ARTIFACTSENTRY']._serialized_start=1491
-  _globals['_TASKCOMPLETED_ARTIFACTSENTRY']._serialized_end=1539
-  _globals['_TASKFAILED']._serialized_start=1541
-  _globals['_TASKFAILED']._serialized_end=1607
-  _globals['_TASKBLOCKED']._serialized_start=1609
-  _globals['_TASKBLOCKED']._serialized_end=1672
-  _globals['_TASKCANCELLED']._serialized_start=1674
-  _globals['_TASKCANCELLED']._serialized_end=1722
-  _globals['_DRIFTDETECTED']._serialized_start=1725
-  _globals['_DRIFTDETECTED']._serialized_end=1891
-  _globals['_RUNCOMPLETED']._serialized_start=1893
-  _globals['_RUNCOMPLETED']._serialized_end=1932
-  _globals['_RUNABORTED']._serialized_start=1934
-  _globals['_RUNABORTED']._serialized_end=1962
+  _globals['_EVENT']._serialized_end=1010
+  _globals['_RUNSTARTED']._serialized_start=1012
+  _globals['_RUNSTARTED']._serialized_end=1110
+  _globals['_GOALDERIVED']._serialized_start=1112
+  _globals['_GOALDERIVED']._serialized_end=1159
+  _globals['_PLANSUBMITTED']._serialized_start=1161
+  _globals['_PLANSUBMITTED']._serialized_end=1209
+  _globals['_PLANREVISED']._serialized_start=1212
+  _globals['_PLANREVISED']._serialized_end=1388
+  _globals['_TASKSTARTED']._serialized_start=1390
+  _globals['_TASKSTARTED']._serialized_end=1436
+  _globals['_TASKPROGRESS']._serialized_start=1438
+  _globals['_TASKPROGRESS']._serialized_end=1503
+  _globals['_TASKCOMPLETED']._serialized_start=1506
+  _globals['_TASKCOMPLETED']._serialized_end=1667
+  _globals['_TASKCOMPLETED_ARTIFACTSENTRY']._serialized_start=1619
+  _globals['_TASKCOMPLETED_ARTIFACTSENTRY']._serialized_end=1667
+  _globals['_TASKFAILED']._serialized_start=1669
+  _globals['_TASKFAILED']._serialized_end=1735
+  _globals['_TASKBLOCKED']._serialized_start=1737
+  _globals['_TASKBLOCKED']._serialized_end=1800
+  _globals['_TASKCANCELLED']._serialized_start=1802
+  _globals['_TASKCANCELLED']._serialized_end=1850
+  _globals['_DRIFTDETECTED']._serialized_start=1853
+  _globals['_DRIFTDETECTED']._serialized_end=2019
+  _globals['_RUNCOMPLETED']._serialized_start=2021
+  _globals['_RUNCOMPLETED']._serialized_end=2060
+  _globals['_RUNABORTED']._serialized_start=2062
+  _globals['_RUNABORTED']._serialized_end=2090
+  _globals['_CONVERSATIONSTARTED']._serialized_start=2092
+  _globals['_CONVERSATIONSTARTED']._serialized_end=2186
+  _globals['_CONVERSATIONENDED']._serialized_start=2188
+  _globals['_CONVERSATIONENDED']._serialized_end=2268
 # @@protoc_insertion_point(module_scope)
