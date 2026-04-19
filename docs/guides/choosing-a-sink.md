@@ -195,7 +195,7 @@ use `GRPCSink` against a `GoldfiveIngressServer` instead.
 from goldfive import Runner
 from harmonograf_client import Client, HarmonografSink
 
-client = Client(name="research", server_addr="localhost:50431")
+client = Client(name="research", server_addr="127.0.0.1:7531")
 sink = HarmonografSink(client)
 runner = Runner(agent=..., planner=..., executor=..., sinks=[sink])
 await runner.run("do the thing")

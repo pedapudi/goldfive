@@ -5,10 +5,11 @@ observing and coordinating multi-agent systems — Gantt timeline,
 drawer inspector, live plan-diff banners. goldfive is designed to feed
 harmonograf as a first-class `EventSink`.
 
-This guide covers how the integration is intended to work. The
-concrete harmonograf sink implementation lands in a harmonograf repo
-PR (not in goldfive itself); this document is forward-looking and
-describes the contract goldfive provides.
+This guide covers how the integration works and the contract
+goldfive provides. The concrete `HarmonografSink` implementation
+lives in the harmonograf repo (`harmonograf_client.HarmonografSink`),
+not in goldfive itself. For the end-to-end runnable walkthrough, see
+[observability-with-harmonograf.md](observability-with-harmonograf.md).
 
 Related: [ARCHITECTURE.md](../design/ARCHITECTURE.md),
 [EVENT-MODEL.md](../design/EVENT-MODEL.md),
@@ -75,36 +76,31 @@ The practical consequence: there is no field-by-field mapping layer.
 A `goldfive.v1.Plan` message is the same bytes harmonograf stores on
 disk and renders on-screen.
 
-## The forthcoming `HarmonografSink`
+## The `HarmonografSink`
 
-Pseudocode for the sink that will ship in the harmonograf repo:
+`HarmonografSink` ships in harmonograf's client library
+(`client/harmonograf_client/sink.py`). It takes a pre-built
+`Client` and forwards each goldfive `Event` through the client's
+telemetry stream:
 
 ```python
 from __future__ import annotations
 
 from typing import Any
 
-from harmonograf_client import Client  # harmonograf's python client
+from harmonograf_client import Client
 from goldfive.protocols import EventSink
 
 
 class HarmonografSink:
     """goldfive EventSink that forwards events to a harmonograf server."""
 
-    def __init__(
-        self,
-        *,
-        server_addr: str = "127.0.0.1:7531",
-        auth_token: str | None = None,
-    ) -> None:
-        self._client = Client.connect(server_addr, auth_token=auth_token)
+    def __init__(self, client: Client) -> None:
+        self._client = client
 
     async def emit(self, event_pb: Any) -> None:
         # harmonograf's telemetry stream expects goldfive events directly
         await self._client.emit_goldfive_event(event_pb)
-
-    async def close(self) -> None:
-        await self._client.close()
 ```
 
 Usage pattern from a goldfive caller:
@@ -112,19 +108,22 @@ Usage pattern from a goldfive caller:
 ```python
 from goldfive import Runner
 from goldfive.sinks import JSONLPersistenceSink
-from harmonograf_goldfive import HarmonografSink  # forthcoming
+from harmonograf_client import Client, HarmonografSink
 
 
+client = Client(name="my-agent", server_addr="127.0.0.1:7531")
 runner = Runner(
     agent=my_agent_adapter,
     planner=my_planner,
     executor=my_executor,
     sinks=[
-        HarmonografSink(server_addr="127.0.0.1:7531"),
+        HarmonografSink(client),
         JSONLPersistenceSink(path=f"./runs/{run_id}.jsonl"),
     ],
 )
 outcome = await runner.run("build me a slide deck about Python")
+await runner.close()
+client.shutdown(flush_timeout=5.0)
 ```
 
 The run emits events to both sinks. harmonograf's UI lights up in
@@ -193,17 +192,15 @@ and hand it to the running steerer). When that lands, harmonograf's
 control actions will flow through it. For now, use the per-agent
 control hooks harmonograf already provides.
 
-## Running the two together (today, pre-sink-implementation)
+## Running the two together
 
-Even without a shipped `HarmonografSink`, you can combine them
-manually:
-
-1. Use goldfive with `JSONLPersistenceSink`.
-2. Write a small bridge that tails the JSONL and forwards to
-   harmonograf via its existing client library.
-
-This is a stepping-stone pattern; the real integration lands once
-harmonograf's sink implementation is published.
+For the end-to-end runnable walkthrough (install harmonograf, boot
+the server and UI, run the bundled example, watch events light up
+the Gantt), see
+[observability-with-harmonograf.md](observability-with-harmonograf.md).
+The bundled example at
+[`examples/harmonograf_observed/`](../../examples/harmonograf_observed/)
+is the reference wiring.
 
 ## FAQ
 
@@ -232,5 +229,7 @@ is intact regardless of harmonograf's health.
 
 - Main vision issue: [goldfive#1](https://github.com/pedapudi/goldfive/issues/1).
 - Proto definition: [goldfive#3](https://github.com/pedapudi/goldfive/issues/3).
-- The `HarmonografSink` itself lands in harmonograf's repo once the
-  goldfive proto is published.
+- `HarmonografSink` ships from harmonograf's client library
+  (`harmonograf_client.HarmonografSink`); see
+  [harmonograf/docs/goldfive-integration.md](https://github.com/pedapudi/harmonograf/blob/main/docs/goldfive-integration.md)
+  for the harmonograf-side reference.
