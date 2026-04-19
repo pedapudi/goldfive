@@ -1,9 +1,17 @@
 """hello_callable — the simplest possible goldfive run.
 
-Wires a :class:`CallableAdapter` to a :class:`StaticPlanner` with a
-hand-built plan, runs it through a :class:`SequentialExecutor`, and
-collects every event in an :class:`InMemorySink` so the full event log
-can be printed at the end.
+Shows the one-line :func:`goldfive.run` convenience wrapper: hand it a
+bare async callable that pretends to be an agent, hand it a user
+prompt, and let goldfive pick every default (auto-adapter,
+:class:`LiteralGoalDeriver`, :class:`PassthroughPlanner`,
+:class:`SequentialExecutor`, :class:`DefaultSteerer`,
+:class:`LoggingSink`).
+
+To see the full orchestration loop — an LLM planner decomposing the
+goal into tasks and the executor walking them — supply a
+``call_llm=`` callable to :func:`goldfive.wrap`. Real agents usually
+bring their own LLM via the ADK adapter path, in which case
+:func:`goldfive.wrap` will reuse the agent's model automatically.
 
 Run with::
 
@@ -13,39 +21,16 @@ Run with::
 from __future__ import annotations
 
 import asyncio
+import json
 
+import goldfive
 from goldfive import (
-    CallableAdapter,
     InMemorySink,
     InvocationResult,
-    PassthroughGoalDeriver,
-    Plan,
     ReportingToolSpec,
-    Runner,
-    SequentialExecutor,
     Session,
-    StaticPlanner,
     Task,
-    TaskEdge,
 )
-
-
-def build_plan() -> Plan:
-    return Plan(
-        id="hello-plan",
-        run_id="",
-        goal_ids=["g1"],
-        tasks=[
-            Task(id="greet", title="Greet the user", assignee_agent_id="greeter"),
-            Task(id="ask", title="Ask for a name", assignee_agent_id="greeter"),
-            Task(id="thank", title="Thank the user", assignee_agent_id="greeter"),
-        ],
-        edges=[
-            TaskEdge(from_task_id="greet", to_task_id="ask"),
-            TaskEdge(from_task_id="ask", to_task_id="thank"),
-        ],
-        summary="Greet, ask, thank.",
-    )
 
 
 async def greeter_agent(
@@ -53,48 +38,73 @@ async def greeter_agent(
     session: Session,
     tools: list[ReportingToolSpec],
 ) -> InvocationResult:
-    """A toy agent that produces one canned reply per task."""
-    _ = tools  # unused in this toy agent
-    text = {
-        "greet": "Hello!",
-        "ask": "What's your name?",
-        "thank": "Thanks for chatting!",
-    }.get(task.id, "(no-op)")
-    return InvocationResult(task_id=task.id, text=text)
+    """Return a short canned reply for the task goldfive assigns."""
+    _ = (session, tools)
+    return InvocationResult(
+        task_id=task.id,
+        text=f"greeted: {task.title}",
+    )
+
+
+def _build_stub_call_llm():
+    """Minimal deterministic ``call_llm`` so the demo needs no network.
+
+    Real callers would drop in their own LLM binding (OpenAI, Anthropic,
+    ADK's ``LLMRegistry``, etc.) — the contract is just
+    ``async (system_prompt, user_prompt, model) -> str`` where the
+    returned string is JSON matching the planner / goal-deriver schema.
+    """
+    plan_json = {
+        "summary": "Greet the user.",
+        "tasks": [
+            {
+                "id": "greet",
+                "title": "Say hello to the user",
+                "description": "Return a short greeting.",
+                "assignee_agent_id": "default",
+            }
+        ],
+        "edges": [],
+    }
+    goals_json = {"goals": [{"id": "g1", "summary": "Say hello"}]}
+    responses = iter([json.dumps(goals_json), json.dumps(plan_json)])
+
+    async def _call(system: str, user: str, model: str) -> str:
+        _ = (system, user, model)
+        try:
+            return next(responses)
+        except StopIteration:
+            return json.dumps({})
+
+    return _call
 
 
 async def main() -> None:
     sink = InMemorySink()
-    runner = Runner(
-        agent=CallableAdapter(greeter_agent, available_agents=["greeter"]),
-        planner=StaticPlanner(build_plan()),
-        executor=SequentialExecutor(),
-        goal_deriver=PassthroughGoalDeriver("Say hello, ask for a name, thank them"),
+    outcome = await goldfive.run(
+        greeter_agent,
+        "say hello to the user",
         sinks=[sink],
+        call_llm=_build_stub_call_llm(),
+        model="stub-model",
     )
 
-    outcome = await runner.run("run the greeter workflow")
-    await runner.close()
-
-    print(f"success={outcome.success}, reason={outcome.reason!r}")
+    print(f"success={outcome.success}  reason={outcome.reason!r}")
     print(f"run_id={outcome.session.run_id}")
     print(f"goals={[g.summary for g in outcome.session.goals]}")
     print(f"{len(sink.events)} events:")
-    for e in sink.events:
-        if isinstance(e, dict):
-            seq = e.get("sequence", "?")
-            kind = e.get("kind", "?")
-            payload = e.get("payload", {})
+    for evt in sink.events:
+        if isinstance(evt, dict):
+            seq = evt.get("sequence", "?")
+            kind = evt.get("kind", "?")
         else:
-            seq = getattr(e, "sequence", "?")
-            oneof = e.WhichOneof("payload") if hasattr(e, "WhichOneof") else None
+            seq = getattr(evt, "sequence", "?")
             kind = (
-                "".join(part.capitalize() for part in oneof.split("_"))
-                if oneof
+                evt.WhichOneof("payload")
+                if hasattr(evt, "WhichOneof")
                 else "?"
-            )
-            payload = getattr(e, oneof) if oneof else "{}"
-        print(f"  seq={seq:>3}  {kind:<16}  {payload}")
+            ) or "?"
+        print(f"  seq={seq:>3}  {kind}")
 
 
 if __name__ == "__main__":

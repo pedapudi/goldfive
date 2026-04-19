@@ -62,6 +62,62 @@ from goldfive.sinks import (
 )
 ```
 
+## `goldfive.wrap` / `goldfive.run`
+
+One-line convenience wrappers over `Runner`. `wrap` returns a
+`Runner` pre-wired with sensible defaults and an auto-detected
+`AgentAdapter`; `run` is `wrap(...).run(user_input)` in a single
+call.
+
+```python
+def wrap(
+    agent: Any,
+    *,
+    planner: Optional[Planner] = None,
+    goal_deriver: Optional[GoalDeriver] = None,
+    executor: Optional[Executor] = None,
+    steerer: Optional[Steerer] = None,
+    sinks: Optional[list[EventSink]] = None,
+    call_llm: Optional[Callable[[str, str, str], Awaitable[str]]] = None,
+    model: Optional[str] = None,
+    max_plan_reinvocations: int = 32,
+) -> Runner: ...
+
+
+async def run(
+    agent: Any,
+    user_input: str | list[Goal],
+    *,
+    context: Optional[Mapping[str, Any]] = None,
+    **wrap_kwargs: Any,
+) -> ExecutionOutcome: ...
+```
+
+`agent` can be any of:
+
+- an object implementing `goldfive.AgentAdapter` (used verbatim),
+- a `google.adk.agents.BaseAgent` or ADK `Runner` (requires `goldfive[adk]`),
+- a zero-arg callable returning `claude_agent_sdk.ClaudeSDKClient` (requires `goldfive[claude]`),
+- an async `(task, session, tools) -> InvocationResult` callable.
+
+Adapter dispatch favours ADK over the async-callable path so ADK
+agents are not misrouted to `CallableAdapter`. Unknown shapes raise
+`TypeError` with a pointer to the supported options.
+
+When no `call_llm` is supplied and the agent does not expose an LLM
+surface `wrap` can detect (currently only ADK), `wrap` falls back to
+`PassthroughPlanner` + `LiteralGoalDeriver` and emits a `DEBUG`
+log line on the `goldfive.wrap` logger.
+
+Direct `auto_adapter` access is available for callers who want the
+dispatch logic without the Runner defaults:
+
+```python
+from goldfive.adapters.auto import auto_adapter
+
+adapter: AgentAdapter = auto_adapter(agent)
+```
+
 ## `Runner`
 
 The single entry point.
