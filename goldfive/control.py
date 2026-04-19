@@ -22,13 +22,19 @@ from typing import Any
 
 
 class ControlKind(StrEnum):
+    # Members here MUST stay in lockstep with the proto enum in
+    # proto/goldfive/v1/control.proto (CONTROL_KIND_<NAME>). A drift
+    # guard in tests/test_control_proto.py enforces both directions.
     PAUSE = "PAUSE"
     RESUME = "RESUME"
     CANCEL = "CANCEL"
-    STEER = "STEER"            # payload: {"note": "...", "suggested_action": "..."}
-    REWIND_TO = "REWIND_TO"    # payload: {"task_id": "..."}
-    APPROVE = "APPROVE"        # payload: {"target_id": "...", "detail": "..."}
-    REJECT = "REJECT"          # payload: {"target_id": "...", "detail": "..."}
+    REWIND_TO = "REWIND_TO"              # payload: {"task_id": "..."}
+    STEER = "STEER"                      # payload: {"note": "...", "suggested_action": "..."}
+    APPROVE = "APPROVE"                  # payload: {"target_id": "...", "detail": "..."}
+    REJECT = "REJECT"                    # payload: {"target_id": "...", "detail": "..."}
+    STATUS_QUERY = "STATUS_QUERY"        # no payload
+    INTERCEPT_TRANSFER = "INTERCEPT_TRANSFER"  # payload: {"enabled": bool}
+    INJECT_MESSAGE = "INJECT_MESSAGE"    # payload: {"role": "...", "text": "..."}
 
 
 class AckResult(StrEnum):

@@ -39,6 +39,36 @@ directly.
 The design constraint: **no polling, anywhere**. Both sides `await`
 queues (`asyncio.Queue` in-process, gRPC streams cross-process).
 
+### 1.a Single source of truth — the wire format lives in goldfive's proto
+
+The on-the-wire control plane (`ControlEvent`, `ControlKind`,
+`ControlAckResult`, `ControlAck`, the typed payload oneof) is defined
+**once**, in `proto/goldfive/v1/control.proto`. harmonograf, any other
+bridge, and any future non-Python language binding imports goldfive's
+proto rather than declaring its own. The bridge becomes a transport
+relay — it moves `ControlEvent` bytes from the UI process into the
+goldfive process and hands the already-decoded message to
+`ControlChannel.send`. No enum translation. No per-kind JSON schema.
+
+This was not always true. Harmonograf used to define a parallel
+`ControlEvent` / `ControlKind` in its own proto and the
+`harmonograf_client` bridge hand-maintained a `_KIND_MAP`. That drifted
+twice — once after goldfive added APPROVE / REJECT (harmonograf #34) —
+so in issue #88 the control types moved under `goldfive.v1`. The
+Python dataclasses in `goldfive/control.py` stay as an ergonomic
+in-process surface; the converters in `goldfive/conv.py`
+(`to_pb_control_event` / `from_pb_control_event` / `to_pb_control_ack`
+/ `from_pb_control_ack`) round-trip between them. A tripwire test
+asserts the Python `ControlKind` StrEnum and the proto enum stay in
+lockstep; adding a member to one without the other fails CI.
+
+Typed payloads replace what was previously `bytes payload`. Each kind
+that carries data has a dedicated message (`SteerPayload`,
+`RewindPayload`, `ApprovePayload`, `RejectPayload`,
+`InjectMessagePayload`) selected by a `oneof`. The dataclass keeps
+`payload: dict[str, Any]` for Python-side ergonomics; the converter is
+the boundary that maps `dict` → oneof branch and back.
+
 ## 2. The `ControlChannel` primitive
 
 One class, two queues, a dozen lines of interface. Lives at
@@ -70,10 +100,13 @@ class ControlKind(StrEnum):
     PAUSE = "PAUSE"
     RESUME = "RESUME"
     CANCEL = "CANCEL"
-    STEER = "STEER"            # payload: {"note": "...", "suggested_action": "..."}
-    REWIND_TO = "REWIND_TO"    # payload: {"task_id": "..."}
-    APPROVE = "APPROVE"        # payload: {"target_id": "...", "detail": "..."}
-    REJECT = "REJECT"          # payload: {"target_id": "...", "detail": "..."}
+    REWIND_TO = "REWIND_TO"              # payload: {"task_id": "..."}
+    STEER = "STEER"                      # payload: {"note": "...", "suggested_action": "..."}
+    APPROVE = "APPROVE"                  # payload: {"target_id": "...", "detail": "..."}
+    REJECT = "REJECT"                    # payload: {"target_id": "...", "detail": "..."}
+    STATUS_QUERY = "STATUS_QUERY"        # no payload
+    INTERCEPT_TRANSFER = "INTERCEPT_TRANSFER"  # payload: {"enabled": bool}
+    INJECT_MESSAGE = "INJECT_MESSAGE"    # payload: {"role": "...", "text": "..."}
 
 
 class AckResult(StrEnum):
@@ -98,9 +131,9 @@ class ControlAck:
     acked_at_ms: int = 0
 ```
 
-`STATUS_QUERY` and `INTERCEPT_TRANSFER` are not yet in the Phase-1
-enum; the dispatcher recognizes them by string value. External
-bridges send them as `ControlMessage(kind="STATUS_QUERY", ...)`.
+Every member above has a matching `CONTROL_KIND_<NAME>` value in
+`proto/goldfive/v1/control.proto`; the alignment test in
+`tests/test_control_proto.py` keeps the two in lockstep.
 
 ### 2.b Send / receive / ack semantics
 
