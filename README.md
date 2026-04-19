@@ -28,7 +28,13 @@ uv add goldfive           # recommended
 pip install goldfive
 ```
 
-Optional extras: `goldfive[adk]`, `goldfive[claude]`, `goldfive[dev]`.
+Optional extras:
+
+- `goldfive[adk]` — Google ADK adapter (`google-adk`).
+- `goldfive[claude]` — Claude Agent SDK adapter (`anthropic`).
+- `goldfive[examples]` — runtime deps for the scripts in [`examples/`](examples/) (`rich`).
+- `goldfive[proto]` — regenerate proto stubs with `make proto` (`grpcio`, `grpcio-tools`, `mypy-protobuf`).
+- `goldfive[dev]` — test + lint tooling used by the repo itself (`pytest`, `ruff`, `mypy`, ...).
 
 ## Hello goldfive
 

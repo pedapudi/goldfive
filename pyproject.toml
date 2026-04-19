@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "goldfive"
-version = "0.0.1"
+version = "0.1.0"
 description = "Agent orchestration: stay on target."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,7 @@ license = { text = "Apache-2.0" }
 authors = [
     { name = "Sunil Pedapudi" },
 ]
-keywords = ["agents", "orchestration", "planning", "llm"]
+keywords = ["agents", "orchestration", "planning", "llm", "drift", "steering", "adk", "anthropic"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -52,6 +52,7 @@ proto = [
 Homepage = "https://github.com/pedapudi/goldfive"
 Repository = "https://github.com/pedapudi/goldfive"
 Issues = "https://github.com/pedapudi/goldfive/issues"
+Changelog = "https://github.com/pedapudi/goldfive/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 include = [
