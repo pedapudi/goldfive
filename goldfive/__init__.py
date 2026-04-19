@@ -22,6 +22,7 @@ from goldfive.protocols import (
     Planner,
     Steerer,
 )
+from goldfive.quickstart import quickstart
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS, ReportingToolSpec
 from goldfive.results import ExecutionOutcome, InvocationResult
 from goldfive.runner import Runner
@@ -76,4 +77,5 @@ __all__ = [
     "classify_refusal",
     "classify_stop_reason",
     "classify_tool_error",
+    "quickstart",
 ]
