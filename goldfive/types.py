@@ -28,6 +28,7 @@ class DriftKind(StrEnum):
     PLAN_DIVERGENCE = "plan_divergence"
     USER_STEER = "user_steer"
     USER_CANCEL = "user_cancel"
+    USER_PAUSE = "user_pause"
     TASK_FAILED_RECOVERABLE = "task_failed_recoverable"
     TASK_FAILED_FATAL = "task_failed_fatal"
     CONTEXT_PRESSURE = "context_pressure"
