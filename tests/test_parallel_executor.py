@@ -23,6 +23,7 @@ from goldfive.types import (
     DriftEvent,
     DriftKind,
     DriftSeverity,
+    Goal,
     Plan,
     Session,
     Task,
@@ -549,3 +550,129 @@ async def test_reinvocation_budget_exhaustion_aborts() -> None:
     assert outcome.success is False
     assert "budget" in outcome.reason
     assert len(planner.refine_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Goal success predicates (PLAN-LIFECYCLE.md §6.1, third clause).
+#
+# Mirrors the sequential executor's coverage: a run is only successful
+# when every ``Goal.success_predicate`` on the session returns True (or
+# is None). The parallel executor must apply the same check before
+# reporting success.
+# ---------------------------------------------------------------------------
+
+
+def _simple_two_task_plan() -> Plan:
+    """A -> B linear plan (simpler than the diamond for goal tests)."""
+    return Plan(
+        id="plan-goals",
+        run_id="run-1",
+        goal_ids=[],
+        tasks=[Task(id="A", title="A"), Task(id="B", title="B")],
+        edges=[TaskEdge("A", "B")],
+    )
+
+
+async def _run_happy_parallel_executor(
+    *,
+    goals: list[Goal],
+) -> tuple[Any, Session, NoopSink]:
+    """Run a 2-task plan that completes cleanly; return outcome + sink."""
+    plan = _simple_two_task_plan()
+    session = _new_session()
+    session.goals = list(goals)
+    adapter = TracingAdapter(delay=0.005)
+    steerer = RecordingSteerer()
+    planner = RecordingPlanner()
+    sink = NoopSink()
+
+    executor = ParallelDAGExecutor(max_concurrency=0)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+    return outcome, session, sink
+
+
+@pytest.mark.asyncio
+async def test_parallel_run_with_unmet_goal_reports_failure() -> None:
+    """Tasks all succeed but a goal predicate returns False -> run fails."""
+    goals = [
+        Goal(
+            id="g1",
+            summary="deliver the thing",
+            success_predicate=lambda _s: False,
+        ),
+    ]
+    outcome, _session, sink = await _run_happy_parallel_executor(goals=goals)
+
+    assert outcome.success is False
+    assert "deliver the thing" in outcome.reason
+    assert "unmet" in outcome.reason.lower()
+    kinds = _proto_kinds(sink.events)
+    assert kinds[-1] == "RunAborted"
+
+
+@pytest.mark.asyncio
+async def test_parallel_run_with_none_predicate_treats_as_met() -> None:
+    """``success_predicate=None`` is vacuously true -> success."""
+    goals = [
+        Goal(id="g1", summary="vacuous goal", success_predicate=None),
+    ]
+    outcome, _session, sink = await _run_happy_parallel_executor(goals=goals)
+
+    assert outcome.success is True
+    assert outcome.reason == ""
+    kinds = _proto_kinds(sink.events)
+    assert kinds[-1] == "RunCompleted"
+
+
+@pytest.mark.asyncio
+async def test_parallel_run_with_raising_predicate_treats_as_unmet() -> None:
+    """A predicate that raises is logged and treated as unmet."""
+
+    def _boom(_session: Session) -> bool:
+        raise RuntimeError("evaluation exploded")
+
+    goals = [
+        Goal(id="g1", summary="raising goal", success_predicate=_boom),
+    ]
+    outcome, _session, sink = await _run_happy_parallel_executor(goals=goals)
+
+    assert outcome.success is False
+    assert "raising goal" in outcome.reason
+    assert "raised" in outcome.reason.lower()
+    assert "evaluation exploded" in outcome.reason
+    kinds = _proto_kinds(sink.events)
+    assert kinds[-1] == "RunAborted"
+
+
+@pytest.mark.asyncio
+async def test_parallel_all_goals_met_returns_success() -> None:
+    """Standard happy path: every predicate returns True -> success."""
+    calls: list[str] = []
+
+    def _met_a(session: Session) -> bool:
+        calls.append("a")
+        assert session.plan is not None
+        return True
+
+    def _met_b(_s: Session) -> bool:
+        calls.append("b")
+        return True
+
+    goals = [
+        Goal(id="g1", summary="goal A", success_predicate=_met_a),
+        Goal(id="g2", summary="goal B", success_predicate=_met_b),
+    ]
+    outcome, _session, sink = await _run_happy_parallel_executor(goals=goals)
+
+    assert outcome.success is True
+    assert outcome.reason == ""
+    assert calls == ["a", "b"]
+    kinds = _proto_kinds(sink.events)
+    assert kinds[-1] == "RunCompleted"
