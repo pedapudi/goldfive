@@ -66,6 +66,12 @@ class DriftKind(StrEnum):
     CONFUSION = "confusion"
     OFF_TOPIC = "off_topic"
     INTENT_DIVERGENCE = "intent_divergence"
+    # Opt-in reflective self-progress check: agent said it *is* making
+    # progress but with low confidence (< 0.5). INFO severity.
+    UNCERTAIN_PROGRESS = "uncertain_progress"
+    # Opt-in reflective self-progress check: agent reported it is *not*
+    # making progress. WARNING severity -- triggers refine.
+    SELF_REPORTED_STUCK = "self_reported_stuck"
 
 
 class DriftSeverity(StrEnum):
@@ -339,6 +345,18 @@ class Session:
     refine_failure_counts: dict[tuple[str, str], int] = dataclasses.field(
         default_factory=dict
     )
+    # Counter of LLM turns observed since the last reflective self-progress
+    # check. Incremented by ``DefaultSteerer.note_llm_call`` (which adapters
+    # call once per LLM invocation when the opt-in reflective check is
+    # enabled) and reset to 0 after a check runs or on task transition. The
+    # steerer fires ``maybe_run_reflective_check`` once this counter reaches
+    # its configured interval. See ``docs/design/DRIFT.md`` §"Reflective
+    # self-progress check" and ``docs/design/PLAN-LIFECYCLE.md`` §8.
+    _llm_calls_since_check: int = 0
+    # Task id for which the counter is currently tracking. Used to reset
+    # the counter cleanly on task transitions without plumbing an explicit
+    # reset call through every ``mark_task_*`` path.
+    _reflective_check_task_id: str = ""
     # monotonic event sequence counter for sinks
     _next_sequence: int = 0
 
