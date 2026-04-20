@@ -5,8 +5,9 @@ description: Index of agent-facing skills for goldfive — what's here and when 
 
 # `.agents/` — agent-facing skills
 
-Canonical "how do I X" guides for agents (Claude Code sessions, internal
-tools, IDE integrations) that need to use, extend, or diagnose goldfive.
+Canonical "how do I X" guides for agents (coding-assistant sessions,
+internal tools, IDE integrations) that need to use, extend, or diagnose
+goldfive.
 Each skill is a short, focused markdown file whose snippets run against
 current `main`.
 
