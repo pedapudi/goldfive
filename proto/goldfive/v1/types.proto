@@ -120,6 +120,17 @@ enum DriftKind {
   // Reasoning-content mentions a goal different from ``session.goals``.
   // CRITICAL severity -- task likely doomed; refine or human-escalate.
   DRIFT_KIND_INTENT_DIVERGENCE = 30;
+  // Reflective self-progress check -- the agent was asked "are you
+  // making progress on task X?" and answered yes, but with low
+  // confidence (< 0.5). INFO severity; observational only. Emitted by
+  // DefaultSteerer.maybe_run_reflective_check when the opt-in
+  // reflective_call_llm is configured.
+  DRIFT_KIND_UNCERTAIN_PROGRESS = 31;
+  // Reflective self-progress check -- the agent was asked "are you
+  // making progress on task X?" and answered no. WARNING severity;
+  // triggers refine. Emitted by DefaultSteerer.maybe_run_reflective_check
+  // when the opt-in reflective_call_llm is configured.
+  DRIFT_KIND_SELF_REPORTED_STUCK = 32;
 }
 
 // Directed edge in a plan's task dependency DAG. `from_task_id` must

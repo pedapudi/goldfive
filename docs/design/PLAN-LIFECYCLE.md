@@ -443,3 +443,41 @@ Violating any of them is a bug in goldfive.
 ## 8. Known gaps (open)
 
 (All previously-listed gaps have been closed: §7.1 terminal-status unification by #98, §7.2 plan validation by #100, §7.3 refine-failure backoff by #99, §7.4 ADK session heal by #101, §7.7 per-task retry cap by #102, cascade cascade by #103, goal predicates by #104, terminal edge preservation by #105, revision-diff sidecar by #106, and cascade codepath unification by #107. Any new gaps discovered during maintenance should be added to this list.)
+
+### 8.1 Reflective self-progress check — graduated-risk tool (opt-in)
+
+The observation-based drift pipeline (tool-loop guard, reasoning
+hash / cosine loops, refusal markers, stop-reason classifiers) cannot
+catch the subtle failure mode where an agent is varying its tool args
+but not actually advancing on the task. For that class of drift,
+`DefaultSteerer` ships an **opt-in** reflective self-progress check:
+every `reflective_check_interval` LLM turns (default 15) the steerer
+asks the model "are you making forward progress on task X?" and
+classifies the JSON reply into one of three outcomes:
+
+- `{"making_progress": true, "confidence": >= 0.5}` → no drift.
+- `{"making_progress": true, "confidence": < 0.5}` →
+  `UNCERTAIN_PROGRESS` (INFO — observational only).
+- `{"making_progress": false}` → `SELF_REPORTED_STUCK` (WARNING;
+  flows through the normal refine pipeline).
+
+The whole feature is off by default. It is enabled by constructing
+the steerer with a `reflective_call_llm` callable:
+
+```python
+DefaultSteerer(reflective_check_interval=15, reflective_call_llm=my_llm)
+```
+
+Operators who don't configure it never trigger the extra LLM call.
+The counter (`Session._llm_calls_since_check`) is incremented by
+`DefaultSteerer.note_llm_call(session)`, which adapters invoke once
+per LLM invocation (the ADK adapter does so from
+`after_model_callback`). The counter resets on task transitions so
+each task gets a fresh assessment window.
+
+This is **graduated-risk**: the cost of an extra LLM call per check
+is non-trivial, and the model's self-assessment can itself be wrong
+— so the feature is offered as a tool operators can opt into when
+their workload justifies it, not as a default. See
+[DRIFT.md §"Reflective self-progress category"](DRIFT.md#reflective-self-progress-category--the-agent-assessing-itself)
+for the full taxonomy and failure-mode handling.

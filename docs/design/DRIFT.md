@@ -147,6 +147,47 @@ processes that never call `observe_reasoning`.
 loop detector compares against. Memory is bounded: 20 × ~2 KB ≈ 40 KB
 per session.
 
+### Reflective self-progress category — the agent assessing itself
+
+Two kinds emitted only when the **opt-in** reflective self-progress
+check is enabled (see below). The check is framework-driven: every N
+LLM turns (default 15) the steerer asks the model "are you making
+forward progress on task X?" and classifies the reply.
+
+| Kind | Trigger | Default severity | Recoverable |
+|---|---|---|---|
+| `UNCERTAIN_PROGRESS` | Model replied "yes" but with `confidence < 0.5`. | `info` | yes |
+| `SELF_REPORTED_STUCK` | Model replied "no" (any confidence). | `warning` | yes |
+
+**Feature gate.** The whole mechanism is off by default. Enable via
+`DefaultSteerer(reflective_check_interval=15, reflective_call_llm=my_llm)`.
+Operators who don't configure `reflective_call_llm` never trigger it
+and pay no LLM cost. The shape of `reflective_call_llm` deliberately
+matches `LLMPlanner`'s `call_llm` — `(system_prompt, user_prompt,
+model) -> str` — so the same callable can be reused.
+
+**Counter placement.** `DefaultSteerer.note_llm_call(session)` is a
+public hook adapters invoke once per LLM invocation; it increments
+`session._llm_calls_since_check` and fires the check when the counter
+reaches `reflective_check_interval`. The ADK adapter calls it from
+`after_model_callback`; adapters that don't ship the hook simply
+forgo the reflective signal. The counter is reset on task transition
+so the assessment is always scoped to the current task.
+
+**Graceful failure.** If the reflective LLM raises, returns empty
+output, or returns unparseable JSON, the steerer emits an INFO
+`CUSTOM` drift with detail prefixed `reflective_check_failed:`. The
+run is never broken by a bad reflective call — this is an
+observability signal, not a gate.
+
+**Why this is graduated-risk.** Observation-based drift detection
+(pattern matches, embedding cosine) cannot catch "agent is varying
+tool args but not actually advancing" — the behaviour isn't repetitive
+enough to match a loop detector and the reasoning content doesn't
+contain confusion markers. Asking the model to self-assess is a
+powerful signal for that failure mode, but it costs an extra LLM call
+per check. Operators opt in when the cost is acceptable.
+
 ### Escape hatch
 
 | Kind | Trigger | Default severity |
@@ -155,7 +196,9 @@ per session.
 
 `CUSTOM` exists to let external sinks or callers feed domain-specific
 drift signals without forcing a proto change. Prefer a named kind
-when one fits.
+when one fits. The opt-in reflective self-progress check also emits
+`CUSTOM` (INFO severity) when the reflective LLM itself fails — sinks
+that care can match on the ``reflective_check_failed:`` detail prefix.
 
 ## Classification
 

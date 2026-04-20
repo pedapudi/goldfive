@@ -19,7 +19,10 @@ sinks list and planner at run start.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from goldfive.drift import (
@@ -40,6 +43,12 @@ from goldfive.types import (
 
 if TYPE_CHECKING:
     from goldfive.protocols import EventSink, Planner
+
+# Shape of the opt-in reflective LLM callable. Matches the signature of
+# the ``call_llm`` used by ``LLMPlanner`` (``(system, user, model) ->
+# str``) so operators can pass the same callable they already configure
+# for planning.
+ReflectiveCallLLM = Callable[[str, str, str], Awaitable[str]]
 
 log = logging.getLogger(__name__)
 
@@ -81,12 +90,49 @@ class DefaultSteerer:
     classify drift and (optionally) trigger a plan refine.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        reflective_check_interval: int = 15,
+        reflective_call_llm: ReflectiveCallLLM | None = None,
+        reflective_model: str = "",
+    ) -> None:
+        """Build a steerer.
+
+        Parameters
+        ----------
+        reflective_check_interval:
+            Number of LLM invocations (as reported via
+            :meth:`note_llm_call`) between reflective self-progress
+            checks. Defaults to ``15``. Ignored when
+            ``reflective_call_llm`` is ``None``.
+        reflective_call_llm:
+            Optional async callable ``(system_prompt, user_prompt,
+            model) -> str`` used to ask the agent "are you making
+            progress?" once the counter reaches the configured
+            interval. The whole feature is **off by default** — pass a
+            callable to opt in. Operators who don't want the extra LLM
+            cost never trigger it. The shape deliberately matches
+            :class:`~goldfive.planner.LLMPlanner` so the same callable
+            can be reused.
+        reflective_model:
+            Model name forwarded to ``reflective_call_llm``. Empty
+            string is permitted; the callable may substitute its own
+            default.
+
+        See ``docs/design/DRIFT.md`` §"Reflective self-progress check"
+        for the full feature-gate semantics.
+        """
         self._sinks: list[Any] = []
         self._planner: Any | None = None
         # Per-session, per-kind last-refine bookkeeping. Purely advisory:
         # callers can subclass to throttle on top of this if needed.
         self._last_refine_kind: dict[tuple[str, DriftKind], int] = {}
+        # Reflective check wiring. When ``_reflective_call_llm`` is None
+        # every entry point short-circuits so the feature is inert.
+        self._reflective_call_llm: ReflectiveCallLLM | None = reflective_call_llm
+        self._reflective_check_interval = max(1, int(reflective_check_interval))
+        self._reflective_model = reflective_model
 
     # ------------------------------------------------------------------
     # Protocol-required: wiring
@@ -445,6 +491,279 @@ class DefaultSteerer:
         if drift is None:
             return
         await self._handle_drift(drift, session)
+
+    # ------------------------------------------------------------------
+    # Reflective self-progress check (opt-in)
+    # ------------------------------------------------------------------
+
+    # Prompt templates. Pulled out as class attributes so subclasses can
+    # override the wording without re-implementing the full check.
+    REFLECTIVE_SYSTEM_PROMPT: str = (
+        "You are assessing your own progress on a task. Answer truthfully. "
+        "Reply with a single JSON object and nothing else."
+    )
+
+    REFLECTIVE_USER_PROMPT_TEMPLATE: str = (
+        "You are assessing your own progress on a task.\n\n"
+        "CURRENT TASK:\n"
+        "id: {task_id}\n"
+        "title: {task_title}\n"
+        "description: {task_description}\n\n"
+        "WHAT YOU HAVE DONE IN THE LAST {window} LLM TURNS (summarized):\n"
+        "- recent tool calls: {tool_call_summary}\n"
+        "- recent reasoning (last 3 blocks): {reasoning_summary}\n\n"
+        "Q: Are you making forward progress on the task? Reply with a "
+        "single JSON object:\n"
+        '{{"making_progress": true|false, "confidence": 0.0-1.0, '
+        '"reason": "one-sentence explanation"}}'
+    )
+
+    async def note_llm_call(self, session: Session) -> None:
+        """Record one LLM invocation against ``session``.
+
+        Adapters call this once per LLM turn. Increments
+        ``session._llm_calls_since_check``. When the counter reaches the
+        configured ``reflective_check_interval`` (and a
+        ``reflective_call_llm`` is configured), fires
+        :meth:`maybe_run_reflective_check` and resets the counter.
+
+        The counter is also reset (without firing a check) when the
+        session's ``current_task_id`` changes — a new task gets a fresh
+        window so the check is always scoped to the current task.
+
+        No-ops when ``reflective_call_llm`` was not configured. The
+        counter is only updated when the feature is enabled, so
+        operators who never opt in pay no memory or call cost.
+        """
+        if self._reflective_call_llm is None:
+            return
+        # Reset window on task transitions so the check is always scoped
+        # to the current task. Tracks the task id the counter currently
+        # belongs to; when it changes (including the first call after a
+        # session starts with no current task), we start fresh.
+        current = session.current_task_id
+        if current != session._reflective_check_task_id:
+            session._reflective_check_task_id = current
+            session._llm_calls_since_check = 0
+        session._llm_calls_since_check += 1
+        if session._llm_calls_since_check < self._reflective_check_interval:
+            return
+        # Reset before running so a check that itself triggers further
+        # LLM calls in the agent loop doesn't double-fire.
+        session._llm_calls_since_check = 0
+        await self.maybe_run_reflective_check(session)
+
+    async def maybe_run_reflective_check(self, session: Session) -> None:
+        """Ask the agent "are you making progress?" and emit a drift.
+
+        Opt-in, feature-gated by ``reflective_call_llm``. Does NOT
+        advance the counter — callers that want counter-driven
+        scheduling go through :meth:`note_llm_call`. This method is
+        public so operators can also trigger a one-shot check from
+        outside the interval (e.g. on a long-running task boundary).
+
+        Outcomes:
+
+        * ``making_progress=true`` with ``confidence >= 0.5`` → no drift.
+        * ``making_progress=true`` with ``confidence < 0.5`` →
+          ``UNCERTAIN_PROGRESS`` (INFO severity, observational only).
+        * ``making_progress=false`` → ``SELF_REPORTED_STUCK`` (WARNING
+          severity; flows through :meth:`_handle_drift` and may trigger
+          ``planner.refine``).
+        * Reflective LLM raises, returns empty/unparseable JSON, or
+          returns JSON missing the expected keys → INFO ``CUSTOM``
+          drift noting the reflective check itself failed. The run is
+          never broken by a bad reflective call.
+        """
+        call_llm = self._reflective_call_llm
+        if call_llm is None or session.plan is None:
+            return
+        task = self._find_task(session, session.current_task_id)
+        if task is None:
+            # No task to assess. Nothing useful to ask the model.
+            return
+        tool_call_summary = self._summarize_recent_tool_calls(session)
+        reasoning_summary = self._summarize_recent_reasoning(session)
+        user_prompt = self.REFLECTIVE_USER_PROMPT_TEMPLATE.format(
+            task_id=task.id,
+            task_title=task.title or "",
+            task_description=task.description or "",
+            window=self._reflective_check_interval,
+            tool_call_summary=tool_call_summary,
+            reasoning_summary=reasoning_summary,
+        )
+        try:
+            raw = await call_llm(
+                self.REFLECTIVE_SYSTEM_PROMPT,
+                user_prompt,
+                self._reflective_model,
+            )
+        except Exception as exc:  # noqa: BLE001 - never break the run
+            log.warning("DefaultSteerer.maybe_run_reflective_check: call_llm raised %s", exc)
+            await self._emit_reflective_failure(
+                session,
+                task_id=task.id,
+                reason=f"reflective call_llm raised: {exc}",
+            )
+            return
+        parsed = self._parse_reflective_response(raw)
+        if parsed is None:
+            await self._emit_reflective_failure(
+                session,
+                task_id=task.id,
+                reason=f"reflective response was not valid JSON: {raw!r:.200}",
+            )
+            return
+        making_progress = parsed.get("making_progress")
+        confidence = parsed.get("confidence")
+        reason = str(parsed.get("reason", "") or "")
+        if not isinstance(making_progress, bool):
+            await self._emit_reflective_failure(
+                session,
+                task_id=task.id,
+                reason=(f"reflective response missing boolean 'making_progress': {raw!r:.200}"),
+            )
+            return
+        try:
+            conf_val = float(confidence) if confidence is not None else 0.0
+        except (TypeError, ValueError):
+            conf_val = 0.0
+        if not making_progress:
+            drift = DriftEvent(
+                kind=DriftKind.SELF_REPORTED_STUCK,
+                severity=DriftSeverity.WARNING,
+                detail=(
+                    f"self-reported stuck on task {task.id}"
+                    + (f": {reason}" if reason else "")
+                    + f" (confidence={conf_val:.2f})"
+                ),
+                current_task_id=task.id,
+                current_agent_id=task.assignee_agent_id,
+            )
+            await self._handle_drift(drift, session)
+            return
+        if conf_val < 0.5:
+            drift = DriftEvent(
+                kind=DriftKind.UNCERTAIN_PROGRESS,
+                severity=DriftSeverity.INFO,
+                detail=(
+                    f"uncertain progress on task {task.id} "
+                    f"(confidence={conf_val:.2f})" + (f": {reason}" if reason else "")
+                ),
+                current_task_id=task.id,
+                current_agent_id=task.assignee_agent_id,
+            )
+            await self._handle_drift(drift, session)
+            return
+        # making_progress=true, confidence >= 0.5 -- no drift.
+        return
+
+    async def _emit_reflective_failure(
+        self, session: Session, *, task_id: str, reason: str
+    ) -> None:
+        """Emit an INFO ``CUSTOM`` drift when the reflective check itself
+        could not be interpreted.
+
+        Uses ``CUSTOM`` (rather than a new kind) because this is not a
+        property of the agent's behaviour — it's a plumbing failure in
+        the reflective check. Sinks that want to surface it specifically
+        can look for the ``reflective_check_failed:`` prefix on detail.
+        """
+        drift = DriftEvent(
+            kind=DriftKind.CUSTOM,
+            severity=DriftSeverity.INFO,
+            detail=f"reflective_check_failed: {reason}",
+            current_task_id=task_id,
+        )
+        # INFO drifts never trigger refine; emit directly.
+        await self._emit_drift_detected(session, drift)
+
+    # --- Reflective prompt helpers -----------------------------------
+
+    # Liberal JSON extractor: tolerates markdown code fences and leading /
+    # trailing prose around the object.
+    _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+    @classmethod
+    def _parse_reflective_response(cls, raw: Any) -> dict[str, Any] | None:
+        """Extract the first JSON object from ``raw`` or return None.
+
+        Tolerates markdown code fences (``\\`\\`\\`json ... \\`\\`\\``) and
+        prose wrapping, which real LLMs emit even with strong "reply JSON
+        only" instructions. Returns ``None`` for any shape that is not a
+        dict once parsed, so downstream code can check one failure mode.
+        """
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        stripped = raw.strip()
+        # Fast path: parse verbatim.
+        try:
+            decoded = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            # Try extracting the first {...} block.
+            match = cls._JSON_OBJECT_RE.search(stripped)
+            if match is None:
+                return None
+            try:
+                decoded = json.loads(match.group(0))
+            except (json.JSONDecodeError, ValueError):
+                return None
+        if not isinstance(decoded, dict):
+            return None
+        return decoded
+
+    @staticmethod
+    def _summarize_recent_tool_calls(session: Session, *, limit: int = 10) -> str:
+        """Build a short human-readable summary of the last N tool calls.
+
+        Reads from ``session.history`` when the adapter writes tool-call
+        observations there; falls back to "(no recent tool calls)" when
+        no tool-call-shaped entries are found. Args are trimmed to 120
+        chars per call to keep the prompt bounded.
+
+        Adapters that want richer summaries can subclass and override.
+        """
+        hist = getattr(session, "history", None)
+        if not hist:
+            return "(no recent tool calls)"
+        lines: list[str] = []
+        for entry in reversed(list(hist)):
+            name = ""
+            args: Any = None
+            if isinstance(entry, dict):
+                if entry.get("kind") == "tool_call":
+                    name = str(entry.get("name", "") or "")
+                    args = entry.get("args")
+            else:
+                kind = getattr(entry, "kind", "") or ""
+                if kind == "tool_call":
+                    name = str(getattr(entry, "name", "") or "")
+                    args = getattr(entry, "args", None)
+            if not name:
+                continue
+            args_str = repr(args)[:120] if args is not None else ""
+            lines.append(f"{name}({args_str})")
+            if len(lines) >= limit:
+                break
+        if not lines:
+            return "(no recent tool calls)"
+        # Oldest first for readability.
+        return ", ".join(reversed(lines))
+
+    @staticmethod
+    def _summarize_recent_reasoning(session: Session, *, limit: int = 3) -> str:
+        """Return the last ``limit`` reasoning blocks, truncated.
+
+        Pulls directly from ``session.reasoning_history`` (populated by
+        :meth:`observe_reasoning`). Each block is capped at 240 chars so
+        the prompt stays bounded for long chains of thought.
+        """
+        hist = getattr(session, "reasoning_history", None) or []
+        if not hist:
+            return "(no recent reasoning)"
+        tail = list(hist)[-limit:]
+        trimmed = [r[:240] + ("…" if len(r) > 240 else "") for r in tail]
+        return " | ".join(trimmed)
 
     @staticmethod
     def _drift_from_control(event: Any, session: Session) -> DriftEvent | None:
