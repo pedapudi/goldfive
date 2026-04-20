@@ -461,3 +461,324 @@ def test_build_task_nudge_includes_id_title_and_description() -> None:
     assert "Do the thing" in nudge
     assert "Carefully and thoroughly." in nudge
     assert nudge.startswith("Continue executing the plan.")
+
+
+# ---------------------------------------------------------------------------
+# Per-task retry-lineage cap (TASK-LIFECYCLE.md §7.7).
+#
+# The executor bounds how many times any one "task lineage" may be sent to
+# the adapter inside a single run. A lineage is identified by stripping
+# chained ``retry_`` / ``retry<N>_`` prefixes from the task id, so
+# ``t0``, ``retry_t0``, ``retry2_retry_t0`` all share the same root ``t0``
+# and share one invocation budget. This caps blast radius when a
+# misbehaving planner keeps regenerating ``retry_<task>`` clones.
+# ---------------------------------------------------------------------------
+
+
+def test_retry_lineage_cap_default_is_3() -> None:
+    """Sanity: the default lineage cap is 3 (see TASK-LIFECYCLE.md §7.7)."""
+    executor = SequentialExecutor()
+    assert executor.max_retries_per_task_lineage == 3
+
+
+async def test_retry_lineage_cap_fails_task_after_N_retries() -> None:
+    """With cap=2, the 3rd invocation on the same lineage is skipped.
+
+    We simulate a refine loop that keeps producing ``retry_<prev>``
+    versions of a failing task. After 2 invocations on the lineage the
+    executor should refuse to invoke the 3rd clone and transition it
+    to FAILED in place. We run with ``fail_fast=False`` to keep the
+    run going long enough to observe the 3rd clone being refused
+    (fail_fast=True would abort after the first task failure).
+    """
+    # Start with a single task t0. After each failed invocation, the
+    # adapter simulates a refine by swapping session.plan to a new plan
+    # whose only pending task is a ``retry_<prev>`` clone.
+    initial_plan = Plan(
+        id="p0",
+        run_id="run-1",
+        goal_ids=[],
+        tasks=[Task(id="t0", title="Task 0")],
+        edges=[],
+    )
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _fail_and_spawn_retry(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        # Fail the current task, then swap in a new plan whose only
+        # pending task is a retry clone. This mirrors what a misbehaving
+        # planner.refine would do.
+        await steerer.transition(task.id, TaskStatus.FAILED, session=session)
+        new_id = f"retry_{task.id}"
+        # Keep prior tasks (all FAILED) so the plan history stays
+        # consistent; append the fresh PENDING retry clone.
+        new_tasks = [
+            Task(id=t.id, title=t.title, status=TaskStatus.FAILED)
+            for t in (session.plan.tasks if session.plan else [])
+        ]
+        new_tasks.append(Task(id=new_id, title=f"retry of {task.title}"))
+        session.plan = Plan(
+            id="p0",
+            run_id=session.run_id,
+            goal_ids=[],
+            tasks=new_tasks,
+            edges=[],
+            revision_index=(session.plan.revision_index if session.plan else 0) + 1,
+        )
+        return InvocationResult(task_id=task.id, text="", stop_reason="failed")
+
+    adapter = StubAdapter(
+        steerer=steerer, planner=planner, on_invoke=_fail_and_spawn_retry
+    )
+
+    # cap=2 -> allow 2 invocations on lineage root "t0"; the 3rd clone
+    # is refused before the adapter is called.
+    executor = SequentialExecutor(
+        max_plan_reinvocations=32,
+        max_retries_per_task_lineage=2,
+        fail_fast=False,
+    )
+    outcome = await executor.run(
+        plan=initial_plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    # Adapter saw t0 and retry_t0 only; retry_retry_t0 was refused.
+    assert adapter.invocations == ["t0", "retry_t0"]
+    assert outcome.success is False
+    # The skipped lineage task must be marked FAILED in the session's
+    # current plan without ever hitting the adapter.
+    final = session.plan
+    assert final is not None
+    by_id = {t.id: t.status for t in final.tasks}
+    assert by_id.get("retry_retry_t0") == TaskStatus.FAILED
+
+
+async def test_retry_lineage_cap_is_per_task_not_global() -> None:
+    """Two independent lineages each get their own budget.
+
+    Plan ``a`` and ``b`` are independent roots. With cap=2 each lineage
+    may burn 2 invocations; a cross-lineage invocation must NOT count
+    against a sibling lineage's budget.
+    """
+    tasks = [
+        Task(id="a", title="A"),
+        Task(id="b", title="B"),
+    ]
+    plan = Plan(id="p0", run_id="run-1", goal_ids=[], tasks=tasks, edges=[])
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    # Per-lineage state held outside the closure: each lineage fails
+    # exactly once, then the retry succeeds. Both lineages therefore
+    # spend exactly 2 invocations each and both complete.
+    fail_once: dict[str, bool] = {"a": False, "b": False}
+
+    async def _fail_first_then_succeed(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        # Derive the lineage root by stripping a single "retry_" prefix;
+        # good enough for this 2-deep test.
+        root = task.id[len("retry_"):] if task.id.startswith("retry_") else task.id
+        if not fail_once[root]:
+            fail_once[root] = True
+            await steerer.transition(task.id, TaskStatus.FAILED, session=session)
+            # Add a retry clone so the plan still has work to do.
+            new_tasks = list(session.plan.tasks) if session.plan else []
+            new_tasks.append(
+                Task(id=f"retry_{task.id}", title=f"retry of {task.title}")
+            )
+            session.plan = Plan(
+                id="p0",
+                run_id=session.run_id,
+                goal_ids=[],
+                tasks=new_tasks,
+                edges=list(session.plan.edges) if session.plan else [],
+                revision_index=(session.plan.revision_index if session.plan else 0) + 1,
+            )
+            return InvocationResult(task_id=task.id, text="", stop_reason="failed")
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id=task.id, text=f"done:{task.id}")
+
+    adapter = StubAdapter(
+        steerer=steerer, planner=planner, on_invoke=_fail_first_then_succeed
+    )
+
+    executor = SequentialExecutor(
+        max_plan_reinvocations=32,
+        max_retries_per_task_lineage=2,
+        fail_fast=False,
+    )
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    # Each lineage got its own budget: we saw exactly four invocations
+    # (original + one retry for each of the two lineages). Neither
+    # lineage was throttled by the other's spending. The original
+    # ``a`` / ``b`` tasks stay FAILED (that's how the retry was
+    # spawned) so ``outcome.success`` is False, but the point of the
+    # test is the invocation count and retry completion below — we
+    # specifically did NOT let one lineage exhaust the cap because the
+    # other's invocations don't count against it.
+    assert adapter.invocations == ["a", "b", "retry_a", "retry_b"]
+    # Both retry clones were invoked and completed — no lineage hit
+    # the cap.
+    final = session.plan
+    assert final is not None
+    by_id = {t.id: t.status for t in final.tasks}
+    assert by_id["retry_a"] == TaskStatus.COMPLETED
+    assert by_id["retry_b"] == TaskStatus.COMPLETED
+    # Nothing was lineage-capped: had the cap been global at 2,
+    # ``retry_b`` would have been refused (4 > 2) and ended FAILED.
+    _ = outcome  # explicitly acknowledge we don't gate on success
+
+
+async def test_retry_lineage_cap_passes_on_successful_retry() -> None:
+    """If a task fails once and its retry succeeds, the cap must not impede.
+
+    With cap=3, a lineage that consumes only 2 invocations (original +
+    one successful retry) should run cleanly to completion — the cap
+    only bites when a lineage exhausts its budget.
+    """
+    initial_plan = Plan(
+        id="p0",
+        run_id="run-1",
+        goal_ids=[],
+        tasks=[Task(id="t0", title="Task 0")],
+        edges=[],
+    )
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    attempts = {"n": 0}
+
+    async def _fail_then_retry_succeeds(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        attempts["n"] += 1
+        if task.id == "t0" and attempts["n"] == 1:
+            await steerer.transition(task.id, TaskStatus.FAILED, session=session)
+            # Spawn a retry clone.
+            session.plan = Plan(
+                id="p0",
+                run_id=session.run_id,
+                goal_ids=[],
+                tasks=[
+                    Task(id="t0", title="Task 0", status=TaskStatus.FAILED),
+                    Task(id="retry_t0", title="retry of Task 0"),
+                ],
+                edges=[],
+                revision_index=1,
+            )
+            return InvocationResult(task_id=task.id, text="", stop_reason="failed")
+        # retry_t0 (second invocation in the lineage) succeeds.
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id=task.id, text="ok")
+
+    adapter = StubAdapter(
+        steerer=steerer, planner=planner, on_invoke=_fail_then_retry_succeeds
+    )
+
+    executor = SequentialExecutor(
+        max_plan_reinvocations=32,
+        max_retries_per_task_lineage=3,
+        fail_fast=False,
+    )
+    outcome = await executor.run(
+        plan=initial_plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    # Exactly two invocations: the original failing call plus the
+    # successful retry. The cap (3) is never exhausted, so the retry
+    # was allowed through and completed.
+    assert adapter.invocations == ["t0", "retry_t0"]
+    final = session.plan
+    assert final is not None
+    by_id = {t.id: t.status for t in final.tasks}
+    assert by_id["retry_t0"] == TaskStatus.COMPLETED
+    # The original ``t0`` is FAILED (that was how the retry got
+    # spawned) so ``outcome.success`` is False under fail_fast=False;
+    # the behavior under test is that the retry survived the cap, not
+    # that the run summary is a clean pass.
+    _ = outcome
+
+
+async def test_retry_lineage_cap_collapses_nested_retry_prefixes() -> None:
+    """``retry_retry_t0`` and ``retry2_t0`` share lineage root ``t0``.
+
+    Explicit coverage for the prefix-stripping convention so a future
+    change to the regex doesn't silently let nested retry ids escape
+    the lineage cap.
+    """
+    # Construct a plan where all three tasks share the same lineage
+    # root ``t0``. With cap=2 exactly two of them may be invoked; the
+    # third must be skipped.
+    tasks = [
+        Task(id="t0", title="Task 0"),
+        Task(id="retry_t0", title="retry of Task 0"),
+        Task(id="retry_retry_t0", title="retry of retry of Task 0"),
+    ]
+    # Chain them so the executor sees them in order: t0 -> retry_t0 -> retry_retry_t0.
+    edges = [
+        TaskEdge(from_task_id="t0", to_task_id="retry_t0"),
+        TaskEdge(from_task_id="retry_t0", to_task_id="retry_retry_t0"),
+    ]
+    plan = Plan(id="p0", run_id="run-1", goal_ids=[], tasks=tasks, edges=edges)
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _complete_task(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id=task.id, text="ok")
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_task)
+
+    executor = SequentialExecutor(
+        max_plan_reinvocations=32,
+        max_retries_per_task_lineage=2,
+        fail_fast=False,
+    )
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    # Only t0 and retry_t0 are invoked; retry_retry_t0 is refused by the
+    # lineage cap and marked FAILED without hitting the adapter.
+    assert adapter.invocations == ["t0", "retry_t0"]
+    assert outcome.success is False  # one task ended FAILED (retry_retry_t0)
+    by_id = {t.id: t.status for t in plan.tasks}
+    assert by_id["t0"] == TaskStatus.COMPLETED
+    assert by_id["retry_t0"] == TaskStatus.COMPLETED
+    assert by_id["retry_retry_t0"] == TaskStatus.FAILED
