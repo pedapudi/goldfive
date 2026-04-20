@@ -272,11 +272,13 @@ flowchart TD
     C9 -->|no| R9[AGENT_TRANSFER / info]
 ```
 
-The helper classifiers live in `goldfive/drift.py`:
+The helper classifiers live in `goldfive/drift/__init__.py` (the
+`goldfive.drift` package; the reasoning-drift pipeline lives in
+`goldfive/drift/reasoning.py`):
 
 ```python
 # pseudo-code: signature-only view. Live definitions are in
-# ``goldfive/drift.py``.
+# ``goldfive/drift/__init__.py``.
 def classify_tool_error(event: Any) -> DriftEvent | None: ...
 def classify_refusal(text: Any) -> DriftEvent | None: ...
 def classify_stop_reason(reason: Any) -> DriftEvent | None: ...
@@ -322,16 +324,30 @@ session.plan = revised
 await emit_plan_revised(sinks, plan=revised, drift=drift, session=session)
 ```
 
-Three invariants govern the refine path:
+Four invariants govern the refine path:
 
 1. **Completed tasks are preserved.** `planner.refine()` implementations
-   must not return a plan that deletes or re-runs completed tasks.
+   must not return a plan that deletes or re-runs completed tasks. The
+   terminal-task and terminal→terminal-edge preservation rules
+   (PLAN-LIFECYCLE §3.1–§3.2) are enforced by `Plan.validate()` on
+   every revision install.
 2. **Revision metadata is stamped.** The revised plan's
    `revision_reason`, `revision_kind`, `revision_severity`, and
    `revision_index` fields are set by the executor before emission.
+   The emitted `PlanRevised` event also carries a `PlanRevisionDiff`
+   sidecar (added / removed / modified task ids + edges) so sinks can
+   render "what changed" without re-fetching the prior plan.
 3. **Refine is throttled.** Multiple drifts of the same kind within
    `DEFAULT_REFINE_THROTTLE_SECONDS` (2s) collapse into one refine
    call. `critical` drifts bypass the throttle.
+4. **Refine failures back off.** `session.refine_failure_counts`
+   tracks consecutive `planner.refine()` failures per
+   `(drift.kind, current_task_id)`. Once the counter crosses
+   `DefaultSteerer.REFINE_FAILURE_THRESHOLD` (default `2`), the
+   steerer marks the current task FAILED and emits a CRITICAL
+   `REPEATED_FAILURE` drift — the run does not loop forever on a
+   refine that cannot make progress. The counter resets on a
+   successful refine.
 
 ## How drifts become events
 
