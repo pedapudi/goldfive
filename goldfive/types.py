@@ -65,6 +65,13 @@ class DriftKind(StrEnum):
     LOOPING_REASONING = "looping_reasoning"
     CONFUSION = "confusion"
     OFF_TOPIC = "off_topic"
+    # INTENT_DIVERGENCE fires at a *variable* severity
+    # (INFO / WARNING / CRITICAL) based on how far the reasoning has
+    # drifted from ``session.goals`` + the current task topic. The
+    # kind is stable so callers filtering by kind see one signal;
+    # severity differentiates. See
+    # ``goldfive/drift/reasoning.py::detect_intent_divergence`` and
+    # ``docs/design/DRIFT.md`` for the graduated similarity bands.
     INTENT_DIVERGENCE = "intent_divergence"
     # Opt-in reflective self-progress check: agent said it *is* making
     # progress but with low confidence (< 0.5). INFO severity.

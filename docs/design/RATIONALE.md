@@ -847,15 +847,22 @@ on models that are merely verbose about their process (GPT-4o's
 contexts). We mitigate by leaving it at `INFO` severity so it does
 not trigger refine by default — callers that want action can
 subclass `DefaultSteerer` and override `should_refine`.
-`INTENT_DIVERGENCE` is `CRITICAL`, so its detector is intentionally
-conservative (requires an explicit "let's change goals" phrasing
-*and* a token-overlap check against `session.goals`) to avoid
-false-positive run aborts.
+`INTENT_DIVERGENCE` uses *graduated* severity
+(`INFO` / `WARNING` / `CRITICAL`) based on cosine similarity to the
+goals + task topic. That keeps the kind stable (callers that filter
+by kind see one signal) while letting refine policy hinge on
+`severity` — a 0.5 similarity is worth surfacing but not worth
+aborting over, whereas a 0.1 similarity plus an unrelated-keyword
+hit is. The pattern fallback still requires an explicit "let's
+change goals" phrasing *and* a token-overlap check against
+`session.goals`, so false-positive run aborts remain rare without
+embeddings.
 
 **Signals this might be wrong.** If users report
-`INTENT_DIVERGENCE` false positives we should tighten the marker
-regex. If `LOOPING_REASONING` fires on models whose reasoning is
-legitimately iterative (e.g. chain-of-thought enumerating
+`INTENT_DIVERGENCE` false positives at `CRITICAL` we should raise
+the `INTENT_DIVERGENCE_WARNING_SIMILARITY` floor or tighten the
+marker regex. If `LOOPING_REASONING` fires on models whose reasoning
+is legitimately iterative (e.g. chain-of-thought enumerating
 hypotheses), we should increase the hash-window or add a
 "distinct-tokens" guard before firing.
 

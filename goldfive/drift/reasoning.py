@@ -16,11 +16,16 @@ Four drift kinds live in this module:
 * :data:`~goldfive.types.DriftKind.OFF_TOPIC` -- reasoning topic is
   far from the task description (requires the ``embedding`` extra).
 * :data:`~goldfive.types.DriftKind.INTENT_DIVERGENCE` -- reasoning
-  mentions goals that are not in ``session.goals``.
+  has drifted away from ``session.goals`` + the current task. Severity
+  is graduated by cosine distance when embeddings are available and
+  falls back to a pattern-based WARNING when they are not.
 
 The pipeline emits at most one drift per call to keep cost bounded.
-Detectors run in severity order: INTENT_DIVERGENCE (CRITICAL) ->
+Detectors run in severity order: INTENT_DIVERGENCE (up to CRITICAL) ->
 LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING) -> CONFUSION (INFO).
+When INTENT_DIVERGENCE resolves to a non-CRITICAL severity (INFO /
+WARNING), the pipeline still returns it first -- the kind is stable,
+severity differentiates.
 """
 
 from __future__ import annotations
@@ -39,6 +44,9 @@ if TYPE_CHECKING:
 __all__ = [
     "CONFUSION_MARKERS",
     "CONFUSION_MIN_HITS",
+    "INTENT_DIVERGENCE_HEALTHY_SIMILARITY",
+    "INTENT_DIVERGENCE_MINOR_SIMILARITY",
+    "INTENT_DIVERGENCE_WARNING_SIMILARITY",
     "LOOPING_REASONING_HASH_WINDOW",
     "LOOPING_REASONING_SIMILARITY_THRESHOLD",
     "OFF_TOPIC_DISTANCE_THRESHOLD",
@@ -91,8 +99,9 @@ LOOPING_REASONING_SIMILARITY_THRESHOLD: float = 0.9
 OFF_TOPIC_DISTANCE_THRESHOLD: float = 0.7
 
 # Regex looking for explicit "my goal is / let me change goals / new
-# objective" style phrasing. Proof-by-wording only; embedding coverage
-# is deferred to a follow-up.
+# objective" style phrasing. Used by the pattern-based fallback path
+# when embeddings are unavailable, and also to surface off-goal
+# proposals the embedding path may dilute over a long reasoning block.
 _INTENT_DIVERGENCE_MARKERS: re.Pattern[str] = re.compile(
     r"\b("
     r"my (?:real )?goal (?:is|should be)|"
@@ -105,6 +114,18 @@ _INTENT_DIVERGENCE_MARKERS: re.Pattern[str] = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+# Cosine-similarity bands for graduated INTENT_DIVERGENCE severity.
+# Similarity is measured between the reasoning block and the goals +
+# current task topic text.
+#   sim >= HEALTHY            -> no drift
+#   MINOR <= sim < HEALTHY    -> INFO
+#   WARNING <= sim < MINOR    -> WARNING
+#   sim < WARNING             -> CRITICAL
+INTENT_DIVERGENCE_HEALTHY_SIMILARITY: float = 0.6
+INTENT_DIVERGENCE_MINOR_SIMILARITY: float = 0.4
+INTENT_DIVERGENCE_WARNING_SIMILARITY: float = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -156,22 +177,88 @@ def detect_intent_divergence(
     text: str, session: Session
 ) -> DriftEvent | None:
     """Return :data:`DriftKind.INTENT_DIVERGENCE` when the reasoning
-    text proposes a goal that is not in ``session.goals``.
+    text has drifted from ``session.goals`` + the current task topic.
 
-    Pattern-based only: looks for explicit "my goal is X / let's focus
-    on Y" phrases and confirms that the mentioned focus does not
-    overlap with any existing goal summary token. Conservative by
-    design -- false positives here are costly (CRITICAL severity).
+    Graduated severity by cosine similarity (embedding path):
+
+    =====================  ===========
+    similarity             severity
+    =====================  ===========
+    >= 0.6                 no drift
+    0.4 <= sim < 0.6       INFO
+    0.2 <= sim < 0.4       WARNING
+    < 0.2                  CRITICAL
+    =====================  ===========
+
+    When embeddings are unavailable we fall back to the pattern path:
+    an explicit "my goal is / let's focus on" phrase whose proposal
+    tokens do not overlap with any goal summary fires at WARNING.
+
+    Either path may be bumped one step (INFO -> WARNING -> CRITICAL)
+    when the reasoning text mentions a significant noun / keyword that
+    does not appear in ``session.goals`` OR in the current task's
+    title / description -- a cheap "talking about something unrelated"
+    signal that catches soft divergence the cosine score alone may
+    smooth over.
+
+    The kind is stable. Severity differentiates -- callers that filter
+    by kind see one signal, callers that care about urgency read the
+    ``severity`` field.
     """
     if not text:
         return None
+
+    goals_text = _goals_text(session)
+    task_topic = _task_topic(_current_task(session))
+    reference = " ".join(p for p in (goals_text, task_topic) if p).strip()
+    if not reference:
+        # No goals or task to compare against -- cannot determine
+        # divergence with any confidence.
+        return None
+
+    # Embedding path -- graduated similarity bands. Only engage when the
+    # encoder is loadable; otherwise fall through to the pattern path.
+    if _embed.available():
+        sim = _embed.max_similarity(text, [reference])
+        severity = _severity_from_similarity(sim)
+        if severity is None:
+            return None
+        if _has_unreferenced_keyword(text, goals_text, task_topic):
+            severity = _bump_severity(severity)
+        detail = (
+            f"reasoning diverged from goals (cosine={sim:.2f}): "
+            f"reference={reference[:80]!r}"
+        )
+        return DriftEvent(
+            kind=DriftKind.INTENT_DIVERGENCE,
+            severity=severity,
+            detail=detail,
+            current_task_id=session.current_task_id,
+            raw=text,
+        )
+
+    # Pattern-based fallback (no embeddings).
+    return _pattern_intent_divergence(text, session, goals_text, task_topic)
+
+
+def _pattern_intent_divergence(
+    text: str,
+    session: Session,
+    goals_text: str,
+    task_topic: str,
+) -> DriftEvent | None:
+    """Return an INTENT_DIVERGENCE drift from regex-only signals.
+
+    Fires at WARNING by default when an off-goal "focus on X" phrase
+    sits next to tokens that do not appear in the goal summary. An
+    unreferenced-keyword mismatch elsewhere in the text bumps severity
+    to CRITICAL.
+    """
     match = _INTENT_DIVERGENCE_MARKERS.search(text)
     if match is None:
         return None
-    goals_text = _goals_text(session).lower()
-    if not goals_text:
-        # No goals to compare against -- cannot determine divergence
-        # with any confidence. Skip rather than fire a CRITICAL.
+    goals_lower = goals_text.lower()
+    if not goals_lower:
         return None
     # Use the 120 chars after the marker as a cheap proxy for the
     # proposed new goal. If any significant token (>=4 chars) also
@@ -186,16 +273,71 @@ def detect_intent_divergence(
     }
     if not tokens:
         return None
-    if any(tok in goals_text for tok in tokens):
+    if any(tok in goals_lower for tok in tokens):
         return None
+    severity = DriftSeverity.WARNING
+    if _has_unreferenced_keyword(text, goals_text, task_topic):
+        severity = _bump_severity(severity)
     snippet = (text[max(0, match.start() - 40) : match.end() + 80]).strip()
     return DriftEvent(
         kind=DriftKind.INTENT_DIVERGENCE,
-        severity=DriftSeverity.CRITICAL,
+        severity=severity,
         detail=f"reasoning proposes off-goal focus: {snippet!r}",
         current_task_id=session.current_task_id,
         raw=text,
     )
+
+
+def _severity_from_similarity(sim: float) -> DriftSeverity | None:
+    """Map a cosine-similarity score to an INTENT_DIVERGENCE severity.
+
+    Returns ``None`` for "healthy" scores (>= ``HEALTHY``) so the
+    caller can suppress the drift entirely.
+    """
+    if sim >= INTENT_DIVERGENCE_HEALTHY_SIMILARITY:
+        return None
+    if sim >= INTENT_DIVERGENCE_MINOR_SIMILARITY:
+        return DriftSeverity.INFO
+    if sim >= INTENT_DIVERGENCE_WARNING_SIMILARITY:
+        return DriftSeverity.WARNING
+    return DriftSeverity.CRITICAL
+
+
+def _bump_severity(sev: DriftSeverity) -> DriftSeverity:
+    """Return the next-higher severity, saturating at CRITICAL."""
+    if sev is DriftSeverity.INFO:
+        return DriftSeverity.WARNING
+    if sev is DriftSeverity.WARNING:
+        return DriftSeverity.CRITICAL
+    return DriftSeverity.CRITICAL
+
+
+def _has_unreferenced_keyword(
+    text: str, goals_text: str, task_topic: str
+) -> bool:
+    """Return True if the reasoning mentions a keyword not in goals or task.
+
+    A "keyword" is any 5+ char alphabetic token from ``text`` that is
+    not a stopword. If at least one such keyword is absent from both
+    ``goals_text`` and ``task_topic`` (lower-cased, substring match),
+    we treat the reasoning as talking about something unrelated.
+
+    We require a 5-char minimum to avoid matching on generic English
+    (``with``, ``from``); stopwords strip the common connectives that
+    slip past the length gate. The check is deliberately conservative
+    -- one odd token can bump severity by one step, never more.
+    """
+    if not text:
+        return False
+    reference = (goals_text + " " + task_topic).lower()
+    if not reference.strip():
+        return False
+    for tok in re.findall(r"[a-z]{5,}", text.lower()):
+        if tok in _STOPWORDS:
+            continue
+        if tok not in reference:
+            return True
+    return False
 
 
 def detect_looping_reasoning(
@@ -300,10 +442,13 @@ def detect_confusion(text: str, session: Session) -> DriftEvent | None:
 def analyze_reasoning(text: str, session: Session) -> DriftEvent | None:
     """Run the reasoning-drift pipeline against ``text``.
 
-    Emits at most one drift per call. Detectors are tried in severity
-    order so the worst signal wins: INTENT_DIVERGENCE (CRITICAL) ->
+    Emits at most one drift per call. Detectors are tried in the order
+    that preserves the worst-signal-wins invariant:
+    INTENT_DIVERGENCE (graduated INFO/WARNING/CRITICAL) ->
     LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING) -> CONFUSION
-    (INFO).
+    (INFO). INTENT_DIVERGENCE runs first even at INFO severity so its
+    kind is stable; callers that only care about warning-and-up simply
+    filter by ``severity``.
     """
     if not text:
         return None

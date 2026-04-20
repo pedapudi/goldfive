@@ -349,9 +349,12 @@ predicate that raises is logged at WARNING and treated as unmet.
 
 ### 6.2 Unrecoverable cascade (ABORTED)
 
-When a drift fires with `recoverable=False` — today only
-`TASK_FAILED_FATAL`, `USER_CANCEL`, and `INTENT_DIVERGENCE` — the
-unrecoverable cascade runs (STATE-MACHINE.md §"Cascade semantics"):
+When a drift fires with `recoverable=False` — today
+`TASK_FAILED_FATAL`, `USER_CANCEL`, and `INTENT_DIVERGENCE` **at
+`CRITICAL` severity** (see DRIFT.md for the graduated
+`INTENT_DIVERGENCE` bands; `INFO` / `WARNING` intent-divergence
+drifts are recoverable and refine normally) — the unrecoverable
+cascade runs (STATE-MACHINE.md §"Cascade semantics"):
 
 1. Mark the current task FAILED (if not already terminal). Owned by
    `Steerer.mark_task_failed(..., recoverable=False)`.
