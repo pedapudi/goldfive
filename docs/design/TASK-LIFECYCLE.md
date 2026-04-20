@@ -1,0 +1,453 @@
+# Task lifecycle & protocol choreography
+
+This document reviews how the goldfive protocols (Planner, Executor,
+Adapter, Steerer, reporting-tool handlers) interact across a task's
+end-to-end lifecycle. It is the companion to
+[STATE-MACHINE.md](STATE-MACHINE.md), which focuses on *what* the
+states are; this doc focuses on *how* the protocols move a task
+through them and where the contracts between them sit.
+
+Audiences:
+- implementers writing a new adapter / executor / sink who need to
+  know what a correct implementation looks like,
+- operators triaging a stuck run who need to know which layer owns
+  which behaviour,
+- reviewers validating that a proposed change doesn't break an
+  invariant another layer depends on.
+
+Citations are file:line into `goldfive/` unless otherwise noted.
+
+---
+
+## 1. Creation protocol
+
+A Plan is the unit of work and a Task is an entry in a Plan. Two
+paths produce one.
+
+### 1.1 Planner.generate — initial plan
+
+`LLMPlanner.generate` (`planner.py:397–455`) takes `Goal[]` +
+available agent list, calls the configured LLM, parses the JSON
+response, and returns a `Plan`. Defaults:
+
+- Every task starts at `TaskStatus.PENDING` (`types.py`, `Task`
+  dataclass default).
+- `Plan.revision_index = 0`, `revision_reason = ""`.
+- `Plan.edges` are `TaskEdge(from_task_id, to_task_id)`. Topological
+  order is computed on demand by
+  `Plan.topological_stages()` (`types.py`), not cached.
+
+### 1.2 Planner.refine — revised plan
+
+`LLMPlanner.refine` (`planner.py:743–850`) branches on `drift.kind`
+and dispatches to one of three paths:
+
+- `USER_STEER` → `_refine_user_steer` (`planner.py:1010–1115`):
+  delete-and-replan. Completed / failed / cancelled tasks are
+  preserved verbatim by id; PENDING / RUNNING / BLOCKED tasks are
+  dropped. LLM generates fresh PENDING work. Final plan =
+  `done_tasks + fresh_pending`.
+- `LOOPING_TOOL_CALL` / `LOOPING_REASONING` →
+  `_refine_looping_tool_call` (`planner.py:849–945`): the looping
+  task is forced to FAILED (framework overrides the LLM if it
+  forgets). There is a **deterministic fallback** (`planner.py:948–1015`)
+  that marks the looper FAILED locally if the LLM is unreachable
+  entirely — refine cannot soft-fail into "no change."
+- All other drift kinds → generic refine prompt. The LLM may rewrite
+  arbitrarily, subject to the invariants enforced by
+  `_apply_revision` below.
+
+### 1.3 Invariants the steerer enforces on any refined plan
+
+`DefaultSteerer._apply_revision` (`steerer.py:512–531`):
+
+- `revision_index` monotonically increases: `new_index ≥
+  old_index + 1`.
+- `revision_kind` / `revision_severity` / `revision_reason` are
+  stamped from the triggering drift if the planner didn't set them.
+- `session.plan` is replaced as a single atomic assignment — readers
+  in the adapter / executor see either the old plan or the new plan,
+  never a half-merged state.
+
+**Soundness gap (open):** `Plan` has no structural validation at
+creation or revision — duplicate task IDs, edges referencing missing
+tasks, or cycles are silently accepted. `topological_stages()`
+tolerates cycles by appending un-placeable tasks to a final stage.
+See §7.
+
+---
+
+## 2. Assignment protocol
+
+Once a Plan exists, tasks move from `PENDING` to `RUNNING` via one of
+two entry points, and execution is driven by the Executor.
+
+### 2.1 Who picks the next task
+
+`SequentialExecutor._pick_next_task` (`executors/sequential.py:~624`)
+walks topological stages and returns the first task that is `PENDING`
+**and** whose incoming-edge predecessors are all `COMPLETED`.
+`BLOCKED` tasks are never picked — they can only return to `RUNNING`
+through a refine-driven transition (see STATE-MACHINE.md §"Blocked
+vs non-blocked resume").
+
+`ParallelDAGExecutor` (`executors/parallel_dag.py`) picks all
+ready-to-run tasks within a stage and invokes them concurrently; the
+Steerer's state mutations are serialised through an asyncio lock so
+concurrent `report_task_*` calls don't interleave state writes.
+
+### 2.2 Who drives PENDING → RUNNING
+
+Two entry points, reconciled by the terminal-status guard:
+
+1. **Executor pre-invoke transition.** Before calling
+   `adapter.invoke(...)`, the executor calls
+   `steerer.transition(task_id, RUNNING, ...)` so observability sinks
+   see a `TaskStarted` event even for adapters whose agent never
+   calls `report_task_started`.
+2. **Agent-driven transition.** When the agent calls
+   `report_task_started(task_id)`, the reporting-tool handler routes
+   through `DefaultSteerer.mark_task_running`
+   (`steerer.py:142–159`). If the task is already `RUNNING`, the
+   `_TERMINAL_TASK_STATUSES` check falls through harmlessly (RUNNING
+   is not terminal) and the second call is a no-op.
+
+These two entries converge on `DefaultSteerer.mark_task_running`,
+which is idempotent by design (`if task.status in _TERMINAL_…:
+return` + re-emit-suppression on same-status writes).
+
+### 2.3 The adapter contract for `invoke`
+
+`adapter.invoke(task, session) -> InvocationResult` is the single
+boundary between goldfive and the agent framework.
+
+- **Input:** exactly one task, plus the live session (so the adapter
+  can read the current plan / completed results / agent notes).
+- **Output:** `InvocationResult(task_id, text, stop_reason, error,
+  raw)`. `stop_reason` is a short string — see §3 for the set of
+  values the ADK adapter returns.
+- **During the call:** the agent may issue any number of LLM turns
+  and tool calls. Reporting-tool calls route through
+  `goldfive.adapters._tool_invocation.invoke_tool` (`§5`) which
+  mutates `session.plan` in place.
+- **Lifetime:** the adapter must return when the task is done.
+  "Done" means one of: the agent produced a final response, the
+  agent reported the task terminal (COMPLETED / FAILED / CANCELLED),
+  an exception propagated, or the executor cancelled the invoke
+  coroutine.
+
+---
+
+## 3. Quiescence protocol
+
+When does an invocation end? This is where symptomatic bugs have
+historically crept in — "the agent keeps running after it reports
+the task done" is a quiescence failure, not a reporting-tool bug.
+
+### 3.1 The ADK adapter's loop exits on four conditions
+
+`ADKAdapter.invoke` (`adapters/adk.py:463–537`) iterates events from
+`self._runner.run_async(...)` and stops when:
+
+| Exit | `stop_reason` | Cause |
+|---|---|---|
+| Final event | `final_response` | `_is_final_event(event)` returns True (the agent emitted a final response). |
+| Terminal task | `task_terminal` | `_task_is_terminal(task, session)` returns True — the agent reported the task COMPLETED/FAILED/CANCELLED via a reporting tool. *This is the structural fix for the call-budget-burn pattern — without it, the adapter would keep feeding events and let the agent spam reporting tools until ADK's 500-call ceiling triggers an error.* See `adapters/adk.py:~540–560`. |
+| Exception | `error:<ExcName>` | The generator raised; caught, logged, and stored in `InvocationResult.error`. |
+| Cancellation | (executor-driven) | The executor cancelled the invoke coroutine via `_cancel_invoke_task` (see §6). |
+
+### 3.2 Post-invoke reconciliation
+
+After `adapter.invoke` returns, the executor reads the *live* task
+status from `session.plan` (not from the `task` object passed in —
+it may be stale) and:
+
+- If status is already terminal (reporting-tool drove it), the
+  executor only emits a `TaskEnded`-style event for observability and
+  moves on.
+- If status is still `PENDING` or `RUNNING`, the executor
+  auto-transitions:
+  - `COMPLETED` if `result.error is None`,
+  - `FAILED` if `result.error is not None`.
+
+This means a correctly-written adapter never has to actively mark
+its task done — the executor will do it if the agent forgets.
+
+### 3.3 No goldfive-level timeout
+
+There is no goldfive-level wall-clock timeout on `invoke`. The ADK
+framework has its own per-invocation max-LLM-call ceiling (default
+500). If the agent hangs or stalls silently, the run relies on ADK's
+timeout, or the `LOOPING_TOOL_CALL` guard (§5), or a CANCEL on the
+control channel.
+
+**Soundness gap (open):** there is no cap on the number of
+invocations per task. A task can be re-invoked indirectly through a
+refine that produces a `retry_<task>` task; if the retry also loops,
+a new refine is triggered, and so on up to
+`SequentialExecutor.max_plan_reinvocations` (default 32). This
+bounds the blast radius at ~32 × 500 = 16 000 LLM calls per run
+worst case. See §7.
+
+---
+
+## 4. Revision protocol
+
+A drift event with `severity ≥ WARNING` triggers refine via
+`DefaultSteerer._handle_drift` (`steerer.py:492–555`). Drifts come
+from two places:
+
+- **Observed drift:** `Steerer.observe(event, session)` runs the
+  drift classifiers on raw adapter output (tool errors, refusals,
+  stop reasons).
+- **Reporting-tool drift:** the tool handlers call
+  `_handle_drift` directly — `mark_task_failed`,
+  `mark_task_blocked`, `report_new_work_discovered`,
+  `report_plan_divergence`, `report_awaiting_approval` (on timeout).
+
+### 4.1 What refine preserves
+
+All done tasks (`COMPLETED`, `FAILED`, `CANCELLED`) are preserved
+verbatim — same id, title, assignee, status, bound_span_id. This is
+enforced by:
+
+- The prompt to the LLM (don't rewrite done tasks).
+- `_refine_user_steer`'s explicit merge step
+  (`planner.py:~1080–1100`).
+- `_refine_looping_tool_call`'s deterministic fallback plan
+  (`planner.py:948–1015`).
+
+### 4.2 In-flight invocation during refine
+
+A refine that fires inside a reporting-tool handler does not cancel
+the ADK generator. The in-flight invocation keeps running but:
+
+- Reads from `session.plan` see the new plan (atomic swap).
+- The early-break quiescence check (§3.1) catches the case where
+  the refine marked the currently-running task terminal — the
+  adapter loop exits on the next event.
+- Subsequent tool calls from the still-running agent are checked
+  against the new plan by the terminal-task rejection layer (§5.1).
+
+### 4.3 Refine-failure surfacing
+
+If `planner.refine` raises **or** returns `None`,
+`_handle_drift` no longer silently swallows the failure. It logs a
+WARNING and emits a follow-up `DriftDetected` with `severity =
+CRITICAL` and `detail = "refine failed (<kind>): <reason>"`. This
+lets sinks (and the harmonograf UI) render the refine failure
+rather than hiding it behind a stale plan.
+
+**Soundness gap (open):** refine failures do not themselves
+terminate the run. If the LLM is down entirely, the same drift can
+retrigger → refine fails → drift emitted again. The executor's
+`max_plan_reinvocations` cap eventually stops the loop, but there
+is no per-drift-kind backoff or dedup. See §7.
+
+---
+
+## 5. Reporting-tool dispatch
+
+The three-layer defence in `_tool_invocation.invoke_tool`
+(`adapters/_tool_invocation.py:91–179`), in order:
+
+### 5.1 Layer 1 — terminal-task rejection (prevention)
+
+If the tool carries a `task_id` and the task is already in a
+terminal state (`COMPLETED` / `FAILED` / `CANCELLED`), the
+dispatcher returns a structured error:
+
+```python
+{
+    "acknowledged": False,
+    "error": "task_already_terminal",
+    "task_id": "<id>",
+    "current_status": "FAILED",
+    "message": "Task '<id>' is already FAILED. Do not call further "
+               "reporting tools for this task; wait for the "
+               "orchestrator to route you to the next task.",
+}
+```
+
+**Why a structured error and not a silent ACK.** `{"acknowledged":
+True}` cannot be read by the model as "stop." The structured error
+gives the agent clear, model-readable feedback that loops can
+respect. This is the primary line of defence; §3's quiescence check
+prevents the loop at the invocation level, but this layer is the
+fallback for tools that fire *before* the adapter has observed the
+terminal transition.
+
+### 5.2 Layer 2 — idempotency (silent dedup)
+
+If `(task_id, tool_name, args_hash)` has already been dispatched for
+this Session, return `{"acknowledged": True, "duplicate": True}`
+without invoking the handler.
+
+`report_awaiting_approval` is exempt — polling the same approval
+arguments is expected behaviour.
+
+### 5.3 Layer 3 — loop guard (safety net)
+
+Two triggers, either one fires a one-shot `LOOPING_TOOL_CALL` drift:
+
+- **Exact-signature burst** — the same `(name, args_hash)` appears
+  ≥ 6 times in the last 8 dispatches for this task.
+- **Per-tool volume cap** — cumulative calls to the same tool name
+  for this task cross 15. Catches loops where the agent varies
+  `reason` / `detail` strings on every call (defeating the
+  signature match).
+
+`report_awaiting_approval` is exempt from the volume cap because
+polling is its design.
+
+Once fired, `state.loop_flagged = True` prevents re-firing for the
+same task until refine resets the guard state.
+
+---
+
+## 6. Cancellation protocol
+
+Cancellation arrives on the control channel as
+`ControlKind.CANCEL` (or is induced by `USER_STEER` that the refine
+translates). The executor handles it at two points:
+
+- **Between tasks** (`sequential.py:137–155`): the executor drains
+  the control inbox before picking the next task. A CANCEL at this
+  point aborts the run cleanly.
+- **Mid-task** (`sequential.py:468–575`): the executor races
+  `adapter.invoke(...)` against the control channel via
+  `asyncio.wait(FIRST_COMPLETED)`. On CANCEL, it calls
+  `_cancel_invoke_task(invoke_task)` — `task.cancel()` + up to 5s
+  grace, then warning-log + move on.
+
+### 6.1 Known cleanup gap: orphaned tool_call_ids
+
+ADK's `run_async` may be mid-turn with an assistant message carrying
+`tool_calls` when the cancel raises `CancelledError`. The matching
+`tool_result` messages never get appended. The ADK session's
+conversation history is now malformed. On the next invocation, ADK's
+engine flags this as `"Missing tool results for tool_call_id(s): [...]"`
+(observable in driver logs) and/or LiteLLM's
+`heal_missing_tool_results` auto-inserts synthetic placeholders.
+
+This is the structural reason a USER_STEER refine on a still-running
+task can produce a truncated/malformed JSON response — the refine
+LLM call inherits a poisoned session history. The early-break
+quiescence fix (§3.1) addresses the happy path (agent reports
+terminal cleanly); it does not address the ADK session repair
+needed after a mid-tool-call cancel. See §7.
+
+---
+
+## 7. Known soundness gaps
+
+Open issues against the design, ranked by impact. The current
+implementation is sound for the common happy path; these are edge
+cases or failure-mode ergonomics.
+
+### 7.1 Multiple sources of truth for `_TERMINAL_TASK_STATUSES`
+
+Three modules each define the same frozenset:
+
+- `steerer.py:47–55`
+- `adapters/_tool_invocation.py:30–37`
+- `adapters/adk.py:239–244`
+
+Each carries a comment warning maintainers to update all three in
+lockstep. No automated check enforces it.
+
+**Fix direction:** extract to a single module (e.g.
+`goldfive.types._constants`) and import from it. Low effort, high
+impact.
+
+### 7.2 Weak plan validation at creation and revision
+
+`Plan.__post_init__` / `_apply_revision` do not check for:
+
+- duplicate task IDs,
+- edges referencing missing tasks,
+- cycles (topological_stages silently appends leftover tasks),
+- `TaskStatus` values that are not `PENDING` at creation time.
+
+**Fix direction:** add `Plan.validate()` called from
+`LLMPlanner.generate` before return and from
+`DefaultSteerer._apply_revision` before install. Emit a
+`PLAN_DIVERGENCE` drift (severity CRITICAL) if validation fails.
+
+### 7.3 Refine failure retry backoff
+
+If the configured LLM is down, the same drift re-fires → refine
+fails → drift re-emitted (now with "refine failed" surface, §4.3)
+→ but the underlying condition is unchanged → drift fires again on
+next tick. Eventually bounded by `max_plan_reinvocations`, but the
+budget is burned without forward progress.
+
+**Fix direction:** per-`(drift.kind, task_id)` refine-attempt
+counter. After N consecutive failures, mark the task FAILED
+directly (skip refine entirely) and emit a CRITICAL
+`REPEATED_FAILURE` drift. 2–3 attempts is probably right.
+
+### 7.4 Orphaned tool_call_ids on mid-invocation cancel
+
+Cancelling ADK mid-tool-call leaves the assistant message with
+`tool_calls` unmatched by `tool_result` messages. Described in §6.1.
+
+**Fix direction:** `ADKAdapter._cancel_and_heal(task_id,
+tool_call_ids)` — after `task.cancel()`, append synthetic
+`tool_result` messages (status="cancelled") for each pending
+tool_call_id. Requires ADK internals knowledge; medium-high effort,
+high impact for live-steering scenarios.
+
+### 7.5 Cross-task ADK session history pollution
+
+The ADK adapter reuses one `session_id` for the entire goldfive
+run. Agent conversation history (including turns from failed/
+cancelled tasks) carries forward into every subsequent invocation.
+Without truncation, the agent's context window grows linearly with
+the run and can see references to tasks that no longer exist in the
+plan (after a USER_STEER delete-and-replan).
+
+**Fix direction:** optional `truncate_conversation_on_revision`
+flag on the executor/adapter that trims the ADK session history at
+revision boundaries. Medium effort, medium impact.
+
+### 7.6 Soft reject vs hard stop on terminal-task reporting
+
+Layer 1 (§5.1) returns a structured error, but does not actively
+prevent the agent from calling again. A misbehaving agent can
+ignore the error and call `report_task_failed` 100 times; each call
+is cheap (no handler, no drift) but still consumes an ADK turn. The
+loop guard (§5.3) catches this at the 15-call threshold, so the
+worst-case wasted turns is bounded at 14 — acceptable.
+
+**Fix direction:** none required in the short term; the observed
+worst case is bounded.
+
+### 7.7 No per-task invocation cap
+
+If a refine produces a `retry_<task>` task and the retry also
+loops, another refine fires — bounded only by
+`max_plan_reinvocations` (default 32). For long runs on flaky
+agents this is ~32 × 500 = 16 000 LLM calls worst case.
+
+**Fix direction:** add a `max_retries_per_task_id` (default 3) to
+the executor. After N refines that target the same task id's
+lineage, mark the task FAILED and cascade CANCEL downstream.
+
+---
+
+## Appendix: event emission guarantees
+
+Every terminal transition in the state machine emits exactly one
+event. See [STATE-MACHINE.md §"Invariant 3"](STATE-MACHINE.md#invariant-3--transitions-emit-exactly-one-event)
+for the full table.
+
+Every drift triggers exactly one `DriftDetected` event, regardless
+of severity. A refine-failed follow-up (§4.3) emits a *second*
+`DriftDetected` of severity CRITICAL — sinks should treat this as
+"the prior drift was not handled" rather than a new distinct drift.
+
+A plan revision emits `PlanRevised(old_plan_id, new_plan_id,
+revision_index, kind, severity, reason)` after
+`_apply_revision` completes. Sinks that cache plan state should
+re-read `session.plan` on every `PlanRevised`.

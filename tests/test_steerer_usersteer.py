@@ -189,9 +189,10 @@ async def test_observe_cancel_triggers_critical_user_cancel_drift() -> None:
     assert drift.severity is DriftSeverity.CRITICAL
     assert drift.detail == "operator abort"
 
-    # DriftDetected emitted; no PlanRevised (planner returned None).
+    # Original DriftDetected + refine-failure follow-up DriftDetected
+    # (planner returned None); no PlanRevised.
     kinds = [e.WhichOneof("payload") for e in sink.events]
-    assert kinds.count("drift_detected") == 1
+    assert kinds.count("drift_detected") == 2
     assert "plan_revised" not in kinds
 
 
