@@ -207,6 +207,52 @@ Full protocol and kind-by-kind behaviour:
 [docs/design/CONTROL.md](../docs/design/CONTROL.md). Approval-specific
 design: [docs/design/APPROVAL.md](../docs/design/APPROVAL.md).
 
+## "Why is a `LOOPING_REASONING` drift firing?"
+
+```
+A LOOPING_REASONING drift appeared on the stream — what triggered it?
+│
+├─ Always ask first: is the session running with an adapter that
+│  surfaces reasoning? Only OpenAI-compat models with
+│  `reasoning_content`, Anthropic extended-thinking, and Google
+│  thought-part responses feed the detector. If none fire,
+│  chain-of-thought never enters the pipeline.
+│
+├─ Check which detector fired (the drift.detail carries the reason):
+│   detail contains "hash=" → byte-identical loop detection tripped
+│   detail contains "cosine=" → embedding-based similarity tripped
+│
+├─ Byte-identical hash match:
+│     goldfive/drift/reasoning.py::reasoning_hash normalises
+│     whitespace + case before hashing. Two "reasoning" blocks that
+│     look different but trim to the same tokens collide. Inspect
+│     ``session.reasoning_history[-5:]`` — the previous 5 entries are
+│     what the detector compared against.
+│
+├─ Semantic (cosine) match:
+│     Only fires when `goldfive[embedding]` is installed and the
+│     model loaded. Threshold is
+│     `LOOPING_REASONING_SIMILARITY_THRESHOLD` = 0.9. If you're seeing
+│     false positives on legitimately iterative reasoning (e.g. the
+│     model enumerating sub-hypotheses), subclass `DefaultSteerer`
+│     and override `observe_reasoning` to raise the threshold or
+│     shrink the window (`LOOPING_REASONING_HASH_WINDOW`, default 5).
+│
+└─ Not firing when you expect a loop?
+     goldfive/drift/reasoning.py slices
+     ``session.reasoning_history[-WINDOW-1 : -1]`` — it excludes the
+     most recent entry because the steerer appends the current text
+     before analysis. A manual caller must append current-to-history
+     first.
+```
+
+For `CONFUSION` / `OFF_TOPIC` / `INTENT_DIVERGENCE` the same detail
+field explains which pattern or distance threshold tripped. The four
+kinds live in `goldfive/drift/reasoning.py`; tune the module-level
+constants (`CONFUSION_MIN_HITS`, `OFF_TOPIC_DISTANCE_THRESHOLD`,
+`CONFUSION_MARKERS` regex, `_INTENT_DIVERGENCE_MARKERS` regex) to
+project needs.
+
 ## Common pitfalls
 
 - Reading `sink.events` before `await runner.close()` — buffered sinks

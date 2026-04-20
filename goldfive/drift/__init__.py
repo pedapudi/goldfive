@@ -30,7 +30,37 @@ __all__ = [
     "classify_tool_error",
     "classify_refusal",
     "classify_stop_reason",
+    "analyze_reasoning",
+    "detect_confusion",
+    "detect_intent_divergence",
+    "detect_looping_reasoning",
+    "detect_off_topic",
 ]
+
+
+_REASONING_EXPORTS = frozenset(
+    {
+        "analyze_reasoning",
+        "detect_confusion",
+        "detect_intent_divergence",
+        "detect_looping_reasoning",
+        "detect_off_topic",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy re-export of the reasoning-drift helpers.
+
+    Defers the regex / optional-embedding imports in
+    :mod:`goldfive.drift.reasoning` until first access, so
+    ``from goldfive.drift import classify_tool_error`` stays cheap.
+    """
+    if name in _REASONING_EXPORTS:
+        from goldfive.drift import reasoning as _reasoning
+
+        return getattr(_reasoning, name)
+    raise AttributeError(f"module 'goldfive.drift' has no attribute {name!r}")
 
 
 # ---------------------------------------------------------------------------

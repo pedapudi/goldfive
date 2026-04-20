@@ -751,7 +751,14 @@ class LLMPlanner:
             return None
         if drift.kind is DriftKind.USER_STEER:
             return await self._refine_user_steer(plan, drift, goals)
-        if drift.kind is DriftKind.LOOPING_TOOL_CALL:
+        if drift.kind in (
+            DriftKind.LOOPING_TOOL_CALL,
+            DriftKind.LOOPING_REASONING,
+        ):
+            # LOOPING_REASONING shares the "fail the current task, route
+            # around it" shape with LOOPING_TOOL_CALL: the symptom is a
+            # stuck loop on the currently-running task, and the repair
+            # is to mark it FAILED and regenerate the rest.
             return await self._refine_looping_tool_call(plan, drift, goals)
         try:
             user_prompt = self._build_refine_prompt(plan, drift, goals)
@@ -932,7 +939,7 @@ class LLMPlanner:
                     ),
                 )
         revised.revision_reason = drift.detail
-        revised.revision_kind = DriftKind.LOOPING_TOOL_CALL.value
+        revised.revision_kind = drift.kind.value
         revised.revision_severity = str(drift.severity)
         revised.revision_index = plan.revision_index + 1
         return revised
@@ -1002,7 +1009,7 @@ class LLMPlanner:
             ],
             summary=plan.summary,
             revision_reason=drift.detail,
-            revision_kind=DriftKind.LOOPING_TOOL_CALL.value,
+            revision_kind=drift.kind.value,
             revision_severity=str(drift.severity),
             revision_index=plan.revision_index + 1,
         )

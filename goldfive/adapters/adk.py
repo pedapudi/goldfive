@@ -435,6 +435,31 @@ class ADKAdapter:
         """
         self._steerer = steerer
 
+    async def emit_reasoning(
+        self,
+        text: str,
+        *,
+        task: Task | None = None,
+        session: Session,
+        provider: str = "",
+        call_id: str = "",  # noqa: ARG002 -- part of the protocol
+    ) -> None:
+        """Forward an extracted reasoning block to the bound steerer.
+
+        Normally the ADK plugin's ``after_model_callback`` extracts
+        reasoning and calls ``steerer.observe_reasoning`` directly; this
+        method is the public protocol-level entry point so callers that
+        wire reasoning through the adapter (tests, custom executors)
+        don't need to reach into the plugin internals.
+        """
+        steerer = self._steerer
+        if steerer is None or not text:
+            return
+        observe = getattr(steerer, "observe_reasoning", None)
+        if observe is None:
+            return
+        await observe(text, task=task, session=session, provider=provider)
+
     async def invoke(
         self, task: Task, session: Session
     ) -> InvocationResult:

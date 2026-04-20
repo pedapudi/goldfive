@@ -313,6 +313,40 @@ class DefaultSteerer:
             return
         await self._handle_drift(drift, session)
 
+    async def observe_reasoning(
+        self,
+        text: str,
+        *,
+        task: Task | None = None,  # noqa: ARG002 -- reserved for future detectors
+        session: Session,
+        provider: str = "",  # noqa: ARG002 -- reserved for per-provider dispatch
+    ) -> None:
+        """Feed a chain-of-thought / reasoning block into the drift pipeline.
+
+        Appends ``text`` to ``session.reasoning_history`` (bounded by
+        ``session.reasoning_history_max``), then runs the reasoning
+        detectors. Emits at most one drift per call.
+
+        Adapters call this from their model-response callback once they
+        have extracted reasoning_content (OpenAI), thinking blocks
+        (Anthropic), or thought parts (Google). Safe to call with empty
+        text -- the pipeline no-ops.
+        """
+        if not text:
+            return
+        history = session.reasoning_history
+        history.append(text)
+        cap = getattr(session, "reasoning_history_max", 20) or 20
+        overflow = len(history) - cap
+        if overflow > 0:
+            del history[:overflow]
+        from goldfive.drift.reasoning import analyze_reasoning
+
+        drift = analyze_reasoning(text, session)
+        if drift is None:
+            return
+        await self._handle_drift(drift, session)
+
     @staticmethod
     def _drift_from_control(event: Any, session: Session) -> DriftEvent | None:
         """Map a :class:`ControlMessage` to the matching ``USER_*`` drift.

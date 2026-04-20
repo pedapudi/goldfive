@@ -105,6 +105,21 @@ enum DriftKind {
   // arguments repeatedly without making forward progress. Detected by the
   // adapter-level loop guard after a window threshold is exceeded.
   DRIFT_KIND_LOOPING_TOOL_CALL = 26;
+  // Consecutive reasoning-content blocks are semantically identical --
+  // the model's chain-of-thought is looping before the tool calls show
+  // it. Detected via hash-of-reasoning (always on) or embedding cosine
+  // similarity (opt-in). WARNING severity; triggers refine.
+  DRIFT_KIND_LOOPING_REASONING = 27;
+  // Reasoning-content expresses uncertainty ("I'm not sure", "unclear",
+  // repeated self-directed questions). INFO severity; observational only.
+  DRIFT_KIND_CONFUSION = 28;
+  // Reasoning-content topic is distant from the current task description
+  // or plan goals. Detected via embedding-based cosine distance when the
+  // `embedding` extra is installed. WARNING severity.
+  DRIFT_KIND_OFF_TOPIC = 29;
+  // Reasoning-content mentions a goal different from ``session.goals``.
+  // CRITICAL severity -- task likely doomed; refine or human-escalate.
+  DRIFT_KIND_INTENT_DIVERGENCE = 30;
 }
 
 // Directed edge in a plan's task dependency DAG. `from_task_id` must

@@ -805,3 +805,59 @@ enough.
 
 **Related.** `goldfive/steerer.py::DefaultSteerer._handle_drift`,
 [STATE-MACHINE.md](STATE-MACHINE.md).
+
+## Why reasoning-based drift detection is its own channel
+
+**Decision.** `Steerer.observe_reasoning(text, session)` is separate
+from `observe(event, session)`, and the reasoning detectors live in
+`goldfive/drift/reasoning.py` rather than being merged into the
+event-shape classifiers in `goldfive/drift/__init__.py`.
+
+**Why.** Tool-level drift detection (what `observe` handles) is a
+half-loop too late. By the time an adapter surfaces a `TOOL_ERROR`
+or a `LOOPING_TOOL_CALL` the model has already burned a full
+inference round and spent a tool call. Reasoning content
+(`reasoning_content` on OpenAI-compat surfaces, `thinking` blocks on
+Anthropic, `thought` parts on Google) exposes the model's
+chain-of-thought *before* the tool calls resolve — catching a loop
+there costs half as many tokens per intervention. The four kinds
+(`LOOPING_REASONING`, `CONFUSION`, `OFF_TOPIC`,
+`INTENT_DIVERGENCE`) map one-for-one onto the most common reasoning
+pathologies we see in practice.
+
+The separation also keeps the existing classifier contract
+(framework-neutral `event` shapes; no session state required) clean.
+Reasoning detectors need `session.reasoning_history` to detect loops
+and `session.current_task_id` / `session.goals` for off-topic and
+intent-divergence checks. Shoehorning those into the generic
+classifier signature would force every classifier to take a
+`Session` argument it does not use.
+
+**Cost envelope.** Pattern + hash detectors are O(1) per call, so
+the default path pays nothing. The optional embedding path
+(`goldfive[embedding]`) loads `all-MiniLM-L6-v2` once per process
+(~23 MB, ~200 ms warm-up) and runs a single encode per observation
+(~5 ms). The pipeline short-circuits on the first hit and caps at
+one drift per call, so cost does not scale with reasoning-block
+size.
+
+**Tradeoffs.** Pattern-based `CONFUSION` detection will false-fire
+on models that are merely verbose about their process (GPT-4o's
+"Let me think about this again…" pattern is benign in many
+contexts). We mitigate by leaving it at `INFO` severity so it does
+not trigger refine by default — callers that want action can
+subclass `DefaultSteerer` and override `should_refine`.
+`INTENT_DIVERGENCE` is `CRITICAL`, so its detector is intentionally
+conservative (requires an explicit "let's change goals" phrasing
+*and* a token-overlap check against `session.goals`) to avoid
+false-positive run aborts.
+
+**Signals this might be wrong.** If users report
+`INTENT_DIVERGENCE` false positives we should tighten the marker
+regex. If `LOOPING_REASONING` fires on models whose reasoning is
+legitimately iterative (e.g. chain-of-thought enumerating
+hypotheses), we should increase the hash-window or add a
+"distinct-tokens" guard before firing.
+
+**Related.** `goldfive/drift/reasoning.py`,
+[DRIFT.md](DRIFT.md#reasoning-category-the-models-chain-of-thought-exposes-drift-before-the-tool-calls-do).
