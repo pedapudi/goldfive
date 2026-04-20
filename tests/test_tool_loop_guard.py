@@ -195,20 +195,42 @@ async def test_progress_with_distinct_args_is_not_duplicate() -> None:
 
 
 async def test_eight_identical_calls_fires_drift_exactly_once() -> None:
-    """6+/8 identical calls → one CRITICAL LOOPING_TOOL_CALL drift."""
+    """6+/8 identical calls → one CRITICAL LOOPING_TOOL_CALL drift, and
+    calls 7-8 are hard-rejected with ``loop_detected`` (new behaviour).
+
+    Pre-hardening, the sixth call fired the one-shot drift and then
+    subsequent calls fell through to the handler with a plain
+    duplicate ACK — giving the agent no signal to stop. Now every
+    call after the flag flips gets the structured ``loop_detected``
+    error so a misbehaving agent gets a clear stop signal on EVERY
+    further attempt.
+    """
     steerer = _RecordingSteerer()
     session = _session_with_task()
     tools = [_spec("report_task_progress")]
 
     args = {"task_id": "t1", "fraction": 0.5, "detail": "stuck"}
+    results: list[dict[str, Any]] = []
     for _ in range(8):
-        await invoke_tool(tools, "report_task_progress", args, session, steerer)
+        results.append(await invoke_tool(tools, "report_task_progress", args, session, steerer))
 
     assert len(steerer.drifts) == 1
     drift = steerer.drifts[0]
     assert drift.kind is DriftKind.LOOPING_TOOL_CALL
     assert drift.current_task_id == "t1"
     assert "report_task_progress" in drift.detail
+
+    # Call 1 = fresh ACK; calls 2..5 = duplicate ACK; call 6 triggers
+    # the drift and is itself rejected; calls 7-8 are rejected without
+    # re-firing drift.
+    assert results[0] == {"acknowledged": True}
+    for r in results[1:5]:
+        assert r == {"acknowledged": True, "duplicate": True}
+    for r in results[5:]:
+        assert r["acknowledged"] is False
+        assert r["error"] == "loop_detected"
+        assert r["tool"] == "report_task_progress"
+        assert r["scope"] == "per_task"
 
 
 async def test_loop_drift_does_not_re_fire_after_first_emission() -> None:
@@ -467,6 +489,338 @@ async def test_frontier_style_progression_does_not_fire_drift() -> None:
 
     assert steerer.drifts == []
     assert session.plan.tasks[0].status is TaskStatus.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# Schema rejections (Layer 1) and hardening against adversarial agents
+# ---------------------------------------------------------------------------
+
+
+async def test_missing_task_id_is_rejected() -> None:
+    """A task-scoped reporting call with no ``task_id`` must be rejected
+    with the structured ``missing_task_id`` error, and MUST NOT reach
+    the underlying handler.
+
+    Pre-hardening, ``invoke_tool`` silently skipped the terminal-task
+    layer whenever ``task_id`` was empty and then passed the call
+    straight through to the handler — which would quietly do nothing
+    (the handler's own ``if not task_id`` short-circuit kicks in). The
+    agent received a bland ``{"acknowledged": True}`` back and
+    cheerfully kept hammering the tool.
+    """
+    steerer = _RecordingSteerer()
+    session = _session_with_task()
+    spec_template = _spec("report_task_failed")
+
+    # Spec the handler to raise so a regression immediately fails this
+    # test — if the rejection is skipped, we hit this handler.
+    async def _boom(args, session, steerer):
+        raise AssertionError("handler must not run when task_id is missing")
+
+    spec = ReportingToolSpec(
+        name=spec_template.name,
+        description=spec_template.description,
+        parameters=spec_template.parameters,
+        handler=_boom,
+    )
+
+    # Try a variety of "no task_id" shapes to cover every bypass route.
+    for bad_args in (
+        {},
+        {"task_id": ""},
+        {"task_id": "   "},  # whitespace → stripped to empty
+        {"task_id": None, "reason": "x"},
+        {"reason": "x"},
+    ):
+        result = await invoke_tool([spec], "report_task_failed", bad_args, session, steerer)
+        assert result["acknowledged"] is False
+        assert result["error"] == "missing_task_id"
+        assert result["tool"] == "report_task_failed"
+        assert "task_id" in result["message"].lower()
+
+    # No drift fires for this class of error — it's a schema problem,
+    # not a loop.
+    assert steerer.drifts == []
+    assert steerer.transitions == []
+
+
+async def test_unknown_task_id_is_rejected() -> None:
+    """A reporting call that names a ``task_id`` not present in the plan
+    must be rejected with ``unknown_task_id``; handler must not run.
+    """
+    steerer = _RecordingSteerer()
+    session = _session_with_task()
+
+    async def _boom(args, session, steerer):
+        raise AssertionError("handler must not run when task_id is unknown")
+
+    template = _spec("report_task_failed")
+    spec = ReportingToolSpec(
+        name=template.name,
+        description=template.description,
+        parameters=template.parameters,
+        handler=_boom,
+    )
+
+    result = await invoke_tool(
+        [spec],
+        "report_task_failed",
+        {"task_id": "bogus_does_not_exist", "reason": "lost in space"},
+        session,
+        steerer,
+    )
+    assert result["acknowledged"] is False
+    assert result["error"] == "unknown_task_id"
+    assert result["task_id"] == "bogus_does_not_exist"
+    assert result["tool"] == "report_task_failed"
+    # No drift — it's a schema problem, not a loop.
+    assert steerer.drifts == []
+    assert steerer.transitions == []
+
+
+async def test_plan_level_tools_still_work_without_task_id() -> None:
+    """``report_plan_divergence`` is plan-level and MUST NOT be
+    rejected for missing task_id — the Layer 1 schema check is
+    scoped to task-level tools only.
+    """
+    steerer = _RecordingSteerer()
+    session = _session_with_task()
+    tools = [_spec("report_plan_divergence")]
+
+    result = await invoke_tool(
+        tools,
+        "report_plan_divergence",
+        {"note": "the plan drifted", "suggested_action": "replan"},
+        session,
+        steerer,
+    )
+    # The plan-level handler runs successfully → plain ACK.
+    assert result == {"acknowledged": True}
+    assert any(t[1] == "DIVERGENCE" for t in steerer.transitions)
+
+
+async def test_loop_flagged_short_circuits_subsequent_calls() -> None:
+    """After the per-task loop guard trips, every subsequent call to
+    the SAME tool on the SAME task is hard-rejected with
+    ``loop_detected``.
+
+    This is the direct fix for the live-run failure: pre-hardening,
+    ``detect_loop`` set ``loop_flagged=True`` on the first crossing
+    and returned False forever after — so the dispatcher fell through
+    to the idempotency check (which misses when args vary) and on to
+    the handler. With the fix, the ``(task, tool)`` bucket stays
+    hard-rejecting until refine resets it.
+    """
+    steerer = _RecordingSteerer()
+    session = _session_with_task()
+    tools = [_spec("report_task_progress")]
+
+    args = {"task_id": "t1", "fraction": 0.5, "detail": "stuck"}
+    results: list[dict[str, Any]] = []
+    for _ in range(20):
+        results.append(await invoke_tool(tools, "report_task_progress", args, session, steerer))
+
+    # Drift fires exactly once — the bucket is flagged on call 6 and
+    # every call after that is hard-rejected without re-firing.
+    assert len(steerer.drifts) == 1
+
+    # Handler is invoked EXACTLY once (first call); the rest are a
+    # mix of duplicate ACKs and hard rejections — none reach the
+    # handler / steerer transition.
+    progress_transitions = [t for t in steerer.transitions if t[1] == "PROGRESS"]
+    assert len(progress_transitions) == 1
+
+    # Call 1 → fresh ACK.
+    assert results[0] == {"acknowledged": True}
+    # Calls 2..5 → duplicate ACK (under threshold, seen in table).
+    for r in results[1:5]:
+        assert r == {"acknowledged": True, "duplicate": True}
+    # Calls 6..20 → all hard-rejected with ``loop_detected``.
+    for r in results[5:]:
+        assert r["acknowledged"] is False
+        assert r["error"] == "loop_detected"
+        assert r["task_id"] == "t1"
+        assert r["tool"] == "report_task_progress"
+        assert r["scope"] == "per_task"
+
+
+async def test_session_wide_volume_cap_fires_on_varying_task_ids() -> None:
+    """An adversarial agent that invents a FRESH task_id on every
+    call distributes 1 call per per-task bucket — the per-task volume
+    cap (15) never fires. The session-wide cap (50) is the safety net
+    for this pattern.
+
+    This is the exact live-run failure scenario (237 calls to
+    ``report_task_failed`` that all returned plain ACK).
+    """
+    steerer = _RecordingSteerer()
+
+    # Build a plan with 60 pre-existing task ids so ``unknown_task_id``
+    # doesn't short-circuit before the session counter increments.
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[Task(id=f"t{i}", title=f"task-{i}") for i in range(60)],
+        edges=[],
+    )
+    session = Session(
+        run_id="r1",
+        goals=[Goal(id="g1", summary="do it")],
+        plan=plan,
+    )
+    tools = [_spec("report_task_failed")]
+
+    results: list[dict[str, Any]] = []
+    for i in range(60):
+        results.append(
+            await invoke_tool(
+                tools,
+                "report_task_failed",
+                {"task_id": f"t{i}", "reason": f"fresh reason #{i}"},
+                session,
+                steerer,
+            )
+        )
+
+    # Exactly one drift — the session-wide cap fired on call 50 and
+    # did not re-fire afterwards.
+    assert len(steerer.drifts) == 1
+    assert steerer.drifts[0].kind is DriftKind.LOOPING_TOOL_CALL
+    assert "session-wide" in steerer.drifts[0].detail.lower()
+
+    # Calls 1..49 → handler runs (marks each distinct task as FAILED).
+    failed_transitions = [t for t in steerer.transitions if t[1] == "FAILED"]
+    assert len(failed_transitions) == 49
+
+    # Calls 50..60 → all rejected with loop_detected (scope=session).
+    for r in results[:49]:
+        assert r == {"acknowledged": True}
+    for r in results[49:]:
+        assert r["acknowledged"] is False
+        assert r["error"] == "loop_detected"
+        assert r["scope"] == "session"
+        assert r["tool"] == "report_task_failed"
+
+
+async def test_session_wide_cap_is_per_tool_not_cross_tool() -> None:
+    """The session-wide cap counts per tool name. 30 progress + 30
+    blocked = 60 total calls, but neither tool alone crosses the 50
+    threshold, so nothing is flagged.
+    """
+    steerer = _RecordingSteerer()
+
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[Task(id=f"t{i}", title=f"task-{i}") for i in range(30)],
+        edges=[],
+    )
+    session = Session(
+        run_id="r1",
+        goals=[Goal(id="g1", summary="do it")],
+        plan=plan,
+    )
+    tools = [_spec("report_task_progress"), _spec("report_task_blocked")]
+
+    for i in range(30):
+        r = await invoke_tool(
+            tools,
+            "report_task_progress",
+            {"task_id": f"t{i}", "fraction": 0.1, "detail": f"p{i}"},
+            session,
+            steerer,
+        )
+        assert r == {"acknowledged": True}
+        r = await invoke_tool(
+            tools,
+            "report_task_blocked",
+            {"task_id": f"t{i}", "blocked_on": f"dep-{i}"},
+            session,
+            steerer,
+        )
+        assert r == {"acknowledged": True}
+
+    # Neither tool crossed its own 50-call threshold → no drift.
+    assert steerer.drifts == []
+
+
+async def test_missing_task_id_does_not_count_toward_session_cap() -> None:
+    """Rejections at the missing/unknown task_id layer MUST happen
+    BEFORE the session counter increments — otherwise an adversarial
+    spam of malformed calls would poison the session counter and
+    trigger a false session-wide drift against the next legitimate
+    call.
+    """
+    from goldfive.adapters._tool_loop_guard import guard_for
+
+    steerer = _RecordingSteerer()
+    session = _session_with_task()
+    tools = [_spec("report_task_failed")]
+
+    # 200 calls with no task_id — way above the session threshold.
+    for _ in range(200):
+        r = await invoke_tool(tools, "report_task_failed", {}, session, steerer)
+        assert r["error"] == "missing_task_id"
+
+    # 200 calls with unknown task_id.
+    for _ in range(200):
+        r = await invoke_tool(
+            tools,
+            "report_task_failed",
+            {"task_id": "no_such_task", "reason": "spam"},
+            session,
+            steerer,
+        )
+        assert r["error"] == "unknown_task_id"
+
+    # Neither path touched the session counter.
+    guard = guard_for(session)
+    assert guard.session_tool_count.get("report_task_failed", 0) == 0
+    assert "report_task_failed" not in guard.session_tool_flagged
+    # No drift was emitted for schema errors.
+    assert steerer.drifts == []
+
+
+async def test_session_wide_cap_exempts_awaiting_approval() -> None:
+    """``report_awaiting_approval`` polls by design — the session-wide
+    cap must not fire for it no matter how many times it's invoked.
+    """
+    from goldfive.adapters._tool_loop_guard import guard_for
+
+    steerer = _RecordingSteerer()
+    session = _session_with_task()
+
+    # ``report_awaiting_approval`` is a builtin that blocks on a
+    # control-channel waiter, which we don't want to drive in this
+    # test — swap in a stub spec that just ACKs.
+    async def _ack_handler(args, session, steerer):
+        return {"acknowledged": True}
+
+    template = _spec("report_awaiting_approval")
+    spec = ReportingToolSpec(
+        name=template.name,
+        description=template.description,
+        parameters=template.parameters,
+        handler=_ack_handler,
+    )
+
+    # 200 polls with varying prompts — well above the session cap.
+    for i in range(200):
+        r = await invoke_tool(
+            [spec],
+            "report_awaiting_approval",
+            {"task_id": "t1", "prompt": f"check #{i}"},
+            session,
+            steerer,
+        )
+        assert r == {"acknowledged": True}
+
+    # The counter does tick (for observability) but the flag never trips.
+    guard = guard_for(session)
+    assert "report_awaiting_approval" not in guard.session_tool_flagged
+    assert steerer.drifts == []
 
 
 # ---------------------------------------------------------------------------

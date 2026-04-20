@@ -1092,3 +1092,102 @@ async def test_reporting_tool_duplicate_returns_duplicate_ack(state_ctx_cls) -> 
         "bypassed (before_tool_callback is routing around invoke_tool)."
     )
     assert len(handler_calls) == 1
+
+
+async def test_adversarial_agent_with_varying_task_ids_is_stopped_at_session_cap(
+    state_ctx_cls,
+) -> None:
+    """Live-run regression: an adversarial agent fires
+    ``report_task_failed`` over and over, inventing a FRESH
+    ``task_id`` each time so the per-task volume cap never trips
+    (each per-task bucket stays at 1 call). The session-wide volume
+    cap (Layer 4 in ``docs/design/TASK-LIFECYCLE.md`` §5) must catch
+    this before ADK's 500-LLM-call ceiling bites — observed in the
+    wild as 237 consecutive plain ACKs and no intervention.
+    """
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+    )
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.reporting import BUILTIN_REPORTING_TOOLS
+    from goldfive.types import DriftEvent, DriftKind, Plan
+
+    handler_calls: list[dict[str, Any]] = []
+
+    # Use a permissive handler (not the built-in that would need a
+    # functioning Steerer) so we can count invocations directly.
+    async def _recording_handler(args, session, steerer):
+        handler_calls.append(dict(args))
+        return {"acknowledged": True}
+
+    template = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_failed")
+    spec = ReportingToolSpec(
+        name=template.name,
+        description=template.description,
+        parameters=template.parameters,
+        handler=_recording_handler,
+    )
+
+    class _Steerer:
+        def __init__(self) -> None:
+            self.drifts: list[DriftEvent] = []
+
+        async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+            self.drifts.append(drift)
+
+    agent = _make_agent()
+    adapter = ADKAdapter(agent)
+    await adapter.register_reporting_tools([spec])
+    steerer = _Steerer()
+
+    # 60 distinct tasks pre-populated so the ``unknown_task_id`` check
+    # doesn't short-circuit before the session counter increments.
+    tasks = [Task(id=f"t{i}", title=f"task-{i}") for i in range(60)]
+    session = Session(
+        run_id="r1",
+        plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=tasks, edges=[]),
+    )
+
+    ctx = SessionContext(
+        session=session,
+        steerer=steerer,
+        task=tasks[0],
+        tools=[spec],
+        host_agent_name="test_agent",
+    )
+    state = {SESSION_CONTEXT_STATE_KEY: ctx}
+
+    class _Tool:
+        name = "report_task_failed"
+
+    results: list[dict[str, Any]] = []
+    for i in range(60):
+        result = await adapter._plugin.before_tool_callback(
+            tool=_Tool(),
+            tool_args={"task_id": f"t{i}", "reason": f"fresh #{i}"},
+            tool_context=state_ctx_cls(state),
+        )
+        assert isinstance(result, dict)
+        results.append(result)
+
+    # The session-wide cap fires exactly one drift — not ADK's 500-call
+    # ceiling, and not per-task drifts (each per-task bucket stayed at 1).
+    assert len(steerer.drifts) == 1, (
+        f"expected session-wide LOOPING_TOOL_CALL drift; got {len(steerer.drifts)}. "
+        "If this fails, the session-wide volume cap is not wired through "
+        "invoke_tool (the live-run failure from 237 passes of report_task_failed)."
+    )
+    assert steerer.drifts[0].kind is DriftKind.LOOPING_TOOL_CALL
+    assert "session-wide" in steerer.drifts[0].detail.lower()
+
+    # Handler runs for the first 49 (below the 50 threshold); call 50
+    # trips the drift and is itself rejected; calls 51..60 stay rejected.
+    assert len(handler_calls) == 49
+    for r in results[:49]:
+        assert r == {"acknowledged": True}
+    for r in results[49:]:
+        assert r["acknowledged"] is False
+        assert r["error"] == "loop_detected"
+        assert r["scope"] == "session"
+        assert r["tool"] == "report_task_failed"
