@@ -72,7 +72,33 @@ A `Plan` (see `types.py::Plan`) carries revision metadata:
 - `new.revision_index ≥ old.revision_index + 1` (bumps if the planner returned a smaller number).
 - `revision_kind` / `revision_severity` / `revision_reason` default to the triggering drift's values if the planner didn't set them.
 
-**Observability.** Every revision emits one `PlanRevised(old_id=..., new_id=..., revision_index=..., kind=..., severity=..., reason=...)` event on the sink channel. Sinks that cache plan structure MUST re-read `session.plan` on every `PlanRevised`.
+**Observability.** Every revision emits one `PlanRevised(plan=..., revision_index=..., drift_kind=..., severity=..., reason=..., diff=...)` event on the sink channel. Sinks that cache plan structure MUST re-read `session.plan` on every `PlanRevised`.
+
+### 2.1 Cross-revision diff sidecar (`PlanRevisionDiff`)
+
+`PlanRevised.diff` (proto `goldfive.v1.PlanRevisionDiff`) is a minimal
+change-set attached to every `PlanRevised` event so sinks that want to
+render "what changed" don't have to re-fetch and diff the two plans
+client-side. It carries:
+
+- `added_task_ids: list[str]` — tasks present in the new plan but not
+  the old plan, in new-plan order.
+- `removed_task_ids: list[str]` — tasks present in the old plan but
+  not the new plan, in old-plan order.
+- `modified_task_ids: list[str]` — tasks present in both plans where
+  at least one of `title`, `description`, `assignee_agent_id`, or
+  `status` changed. (Pure status-only transitions are *also* covered by
+  the `Task*` events on the stream; `modified_task_ids` is the
+  authoritative per-revision set keyed by id.)
+- `added_edges: list[TaskEdge]` / `removed_edges: list[TaskEdge]` —
+  edges keyed by the `(from_task_id, to_task_id)` pair. An edge
+  re-target shows up as one removed + one added entry.
+
+Identity rules match §3.0: tasks are keyed by `id`, edges by the pair
+of endpoints. The diff is built by `goldfive.events.build_plan_revision_diff(old, new)`
+and populated in `DefaultSteerer._emit_plan_revised` before the event is
+fanned out. `diff` is optional at the proto layer (proto3 default) so
+older sinks that haven't updated yet continue to ignore it.
 
 ---
 
@@ -405,4 +431,3 @@ Violating any of them is a bug in goldfive.
 ## 8. Known gaps (open)
 
 - **Unrecoverable cascade (§6.2) does not currently use the same cascade primitive as §6.3** — they're two different code paths that happen to do similar work. Unify once both are implemented.
-- **No cross-revision lineage view.** Sinks receive `PlanRevised` events but the proto doesn't carry the full diff. Harmonograf's UI currently has to stitch revisions by plan_id + revision_index. A dedicated `revision_diff` sidecar would simplify the UI.

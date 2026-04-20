@@ -80,19 +80,35 @@ class PlanSubmitted(_message.Message):
     plan: _types_pb2.Plan
     def __init__(self, plan: _Optional[_Union[_types_pb2.Plan, _Mapping]] = ...) -> None: ...
 
+class PlanRevisionDiff(_message.Message):
+    __slots__ = ("added_task_ids", "removed_task_ids", "modified_task_ids", "added_edges", "removed_edges")
+    ADDED_TASK_IDS_FIELD_NUMBER: _ClassVar[int]
+    REMOVED_TASK_IDS_FIELD_NUMBER: _ClassVar[int]
+    MODIFIED_TASK_IDS_FIELD_NUMBER: _ClassVar[int]
+    ADDED_EDGES_FIELD_NUMBER: _ClassVar[int]
+    REMOVED_EDGES_FIELD_NUMBER: _ClassVar[int]
+    added_task_ids: _containers.RepeatedScalarFieldContainer[str]
+    removed_task_ids: _containers.RepeatedScalarFieldContainer[str]
+    modified_task_ids: _containers.RepeatedScalarFieldContainer[str]
+    added_edges: _containers.RepeatedCompositeFieldContainer[_types_pb2.TaskEdge]
+    removed_edges: _containers.RepeatedCompositeFieldContainer[_types_pb2.TaskEdge]
+    def __init__(self, added_task_ids: _Optional[_Iterable[str]] = ..., removed_task_ids: _Optional[_Iterable[str]] = ..., modified_task_ids: _Optional[_Iterable[str]] = ..., added_edges: _Optional[_Iterable[_Union[_types_pb2.TaskEdge, _Mapping]]] = ..., removed_edges: _Optional[_Iterable[_Union[_types_pb2.TaskEdge, _Mapping]]] = ...) -> None: ...
+
 class PlanRevised(_message.Message):
-    __slots__ = ("plan", "drift_kind", "severity", "reason", "revision_index")
+    __slots__ = ("plan", "drift_kind", "severity", "reason", "revision_index", "diff")
     PLAN_FIELD_NUMBER: _ClassVar[int]
     DRIFT_KIND_FIELD_NUMBER: _ClassVar[int]
     SEVERITY_FIELD_NUMBER: _ClassVar[int]
     REASON_FIELD_NUMBER: _ClassVar[int]
     REVISION_INDEX_FIELD_NUMBER: _ClassVar[int]
+    DIFF_FIELD_NUMBER: _ClassVar[int]
     plan: _types_pb2.Plan
     drift_kind: _types_pb2.DriftKind
     severity: _types_pb2.DriftSeverity
     reason: str
     revision_index: int
-    def __init__(self, plan: _Optional[_Union[_types_pb2.Plan, _Mapping]] = ..., drift_kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., reason: _Optional[str] = ..., revision_index: _Optional[int] = ...) -> None: ...
+    diff: PlanRevisionDiff
+    def __init__(self, plan: _Optional[_Union[_types_pb2.Plan, _Mapping]] = ..., drift_kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., reason: _Optional[str] = ..., revision_index: _Optional[int] = ..., diff: _Optional[_Union[PlanRevisionDiff, _Mapping]] = ...) -> None: ...
 
 class TaskStarted(_message.Message):
     __slots__ = ("task_id", "detail")

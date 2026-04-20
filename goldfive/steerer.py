@@ -631,8 +631,12 @@ class DefaultSteerer:
         # Successful refine — reset the back-off counter for this key
         # so a future drift of the same kind starts fresh.
         session.refine_failure_counts.pop(counter_key, None)
+        # Capture the outgoing plan BEFORE _apply_revision installs the
+        # revised one; _emit_plan_revised diffs the two to populate the
+        # PlanRevisionDiff sidecar (PLAN-LIFECYCLE.md §2, §8 gap #4).
+        prev_plan = session.plan
         self._apply_revision(session, revised, drift)
-        await self._emit_plan_revised(session, revised, drift)
+        await self._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
 
     # Consecutive refine failures tolerated per (drift_kind, task_id)
     # before we give up and mark the task FAILED. Class attribute so
@@ -814,8 +818,16 @@ class DefaultSteerer:
         evt.drift_detected.current_agent_id = drift.current_agent_id
         await self._emit(evt)
 
-    async def _emit_plan_revised(self, session: Session, revised: Plan, drift: DriftEvent) -> None:
+    async def _emit_plan_revised(
+        self,
+        session: Session,
+        revised: Plan,
+        drift: DriftEvent,
+        *,
+        prev_plan: Plan | None = None,
+    ) -> None:
         from goldfive.conv import to_pb_plan
+        from goldfive.events import build_plan_revision_diff
 
         evt = self._new_envelope(session)
         evt.plan_revised.plan.CopyFrom(to_pb_plan(revised))
@@ -823,4 +835,10 @@ class DefaultSteerer:
         evt.plan_revised.severity = self._drift_severity_pb_value(drift.severity)
         evt.plan_revised.reason = drift.detail
         evt.plan_revised.revision_index = revised.revision_index
+        # Populate the minimal cross-revision diff so sinks that want a
+        # "what changed" view don't have to re-fetch and diff the two
+        # plans client-side. prev_plan may be None on the first revision
+        # of a run that never received an initial plan — the helper
+        # treats that as "everything in revised is newly added".
+        evt.plan_revised.diff.CopyFrom(build_plan_revision_diff(prev_plan, revised))
         await self._emit(evt)
