@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from goldfive.events import (
@@ -70,6 +71,20 @@ class SequentialExecutor(Executor):
         still aborts via ``fail_fast`` or (in pathological cases) the
         budget; the old default of ``3`` was tuned to the harmonograf
         re-invocation cap and surprised callers running realistic plans.
+    max_retries_per_task_lineage:
+        Upper bound on the number of adapter ``invoke()`` calls that may
+        be spent on any one task "lineage" — the original task plus any
+        refine-spawned retries of it. A lineage is identified by stripping
+        ``retry_`` / ``retry2_`` / ``retryN_`` prefixes from the task id,
+        so e.g. ``t0``, ``retry_t0``, and ``retry2_retry_t0`` all share
+        the lineage root ``t0``. When the cap is reached, the next task
+        in that lineage is skipped (never sent to the adapter) and marked
+        ``FAILED`` in place; downstream tasks then block naturally via
+        ``_pick_next_task``'s dependency check. Defaults to ``3``, which
+        bounds worst-case blast radius to a small constant multiple of
+        the plan size even when a misbehaving refine keeps spawning
+        ``retry_<task>`` clones. Set to a very large number to disable.
+        See ``TASK-LIFECYCLE.md §7.7``.
     fail_fast:
         When ``True`` (default), the first task that ends up ``FAILED`` causes
         the executor to emit ``RunAborted`` and stop. When ``False``, failed
@@ -81,9 +96,11 @@ class SequentialExecutor(Executor):
         self,
         *,
         max_plan_reinvocations: int = 32,
+        max_retries_per_task_lineage: int = 3,
         fail_fast: bool = True,
     ) -> None:
         self.max_plan_reinvocations = int(max_plan_reinvocations)
+        self.max_retries_per_task_lineage = int(max_retries_per_task_lineage)
         self.fail_fast = bool(fail_fast)
 
     # ------------------------------------------------------------------
@@ -121,6 +138,15 @@ class SequentialExecutor(Executor):
         invocations = 0
         failure_reason = ""
         run_failed = False
+
+        # Per-lineage invocation count. The "lineage root" of a task is
+        # its id with any chain of ``retry_`` / ``retryN_`` prefixes
+        # stripped, so ``t0``, ``retry_t0``, and ``retry2_retry_t0`` all
+        # collapse to the same root ``t0``. Bounding this per-run bounds
+        # the worst-case cost of an LLM that keeps refining a failing
+        # task into new ``retry_<...>`` tasks forever. See
+        # ``max_retries_per_task_lineage``.
+        lineage_invocations: dict[str, int] = {}
 
         # Track the plan identity so we detect mid-run revisions by the steerer.
         last_plan_id = plan.id
@@ -188,12 +214,58 @@ class SequentialExecutor(Executor):
                 # and let the post-loop block decide success.
                 break
 
+            # Per-task-lineage cap. Before we spend an invocation on
+            # ``task``, check how many invocations we have already spent
+            # on tasks that share its lineage root. If the cap is
+            # already reached, do not invoke the adapter: transition
+            # ``task`` to FAILED in place and let the outer loop pick up
+            # the next eligible task (or abort if fail_fast). This keeps
+            # a runaway refine loop (``t0`` -> ``retry_t0`` -> ``retry2_retry_t0``
+            # -> ...) from ever reaching the adapter more than N times
+            # per lineage, independent of how many plan revisions happen.
+            lineage_root = _lineage_root(task.id)
+            lineage_count = lineage_invocations.get(lineage_root, 0)
+            if lineage_count >= self.max_retries_per_task_lineage:
+                log.warning(
+                    "SequentialExecutor: lineage cap reached for task=%s "
+                    "(lineage_root=%s, count=%d, cap=%d); marking FAILED "
+                    "without invoking adapter",
+                    task.id, lineage_root, lineage_count,
+                    self.max_retries_per_task_lineage,
+                )
+                await steerer.transition(
+                    task.id,
+                    TaskStatus.FAILED,
+                    detail=(
+                        f"retry-lineage cap reached: "
+                        f"{lineage_count} invocations already spent on "
+                        f"lineage root '{lineage_root}' "
+                        f"(cap={self.max_retries_per_task_lineage})"
+                    ),
+                    session=session,
+                )
+                failure_reason = (
+                    f"task {task.id} skipped: retry-lineage cap "
+                    f"({self.max_retries_per_task_lineage}) reached for "
+                    f"lineage root '{lineage_root}'"
+                )
+                if self.fail_fast:
+                    run_failed = True
+                    break
+                # fail_fast=False: loop around; downstream tasks that
+                # depended on this one will be blocked by _pick_next_task.
+                continue
+
             session.current_task_id = task.id
             invocations += 1
+            lineage_invocations[lineage_root] = lineage_count + 1
 
             log.debug(
-                "SequentialExecutor: invoking task=%s (invocation %d/%d)",
+                "SequentialExecutor: invoking task=%s (invocation %d/%d, "
+                "lineage_root=%s, lineage_count=%d/%d)",
                 task.id, invocations, self.max_plan_reinvocations,
+                lineage_root, lineage_count + 1,
+                self.max_retries_per_task_lineage,
             )
 
             # Auto-announce the task as RUNNING before invoke so agents
@@ -653,6 +725,37 @@ def _find_task(plan: Plan, task_id: str) -> Task | None:
         if t.id == task_id:
             return t
     return None
+
+
+# Precompiled once-per-module: matches a single ``retry_`` or
+# ``retry<N>_`` prefix (N >= 1), e.g. ``retry_``, ``retry2_``, ``retry42_``.
+_RETRY_PREFIX_RE = re.compile(r"^retry(?:\d+)?_")
+
+
+def _lineage_root(task_id: str) -> str:
+    """Return ``task_id`` with any chain of retry prefixes stripped.
+
+    Goldfive does not pin a single spelling for retry-task ids — an LLM
+    planner may emit ``retry_t0``, ``retry2_t0``, or even nested forms
+    like ``retry_retry_t0`` when regenerating a plan after a failure.
+    For per-lineage budgeting we collapse all of those to the same root
+    (here: ``t0``) by repeatedly stripping a leading ``retry_`` or
+    ``retry<N>_`` prefix.
+
+    Empty / None-like ids pass through unchanged so we do not crash on
+    malformed plans.
+    """
+    if not task_id:
+        return task_id
+    root = task_id
+    # Bound the loop so a pathological id like
+    # "retry_retry_retry_..." can't spin forever.
+    for _ in range(16):
+        stripped = _RETRY_PREFIX_RE.sub("", root, count=1)
+        if stripped == root:
+            break
+        root = stripped
+    return root
 
 
 def _any_failed(plan: Plan) -> bool:
