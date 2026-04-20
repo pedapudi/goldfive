@@ -430,6 +430,13 @@ class ADKAdapter:
 
         # tool_name -> handler. Populated by register_reporting_tools.
         self._tool_handlers: dict[str, Any] = {}
+        # Full reporting-tool specs, in registration order. The plugin's
+        # ``before_tool_callback`` routes each call through
+        # :func:`goldfive.adapters._tool_invocation.invoke_tool` so the
+        # terminal-rejection / idempotency / loop-guard layers fire.
+        # Keeping the full spec list (not just handlers) is what wires
+        # those protections in — a bare handler map would bypass them.
+        self._tool_specs: list[ReportingToolSpec] = []
         # The current Steerer. Set by bind_steerer() before invoke().
         self._steerer: Steerer | None = None
         # Pending ADK function_call ids observed in the current invoke()'s
@@ -513,6 +520,9 @@ class ADKAdapter:
             self._tool_handlers[name] = handler
             function_tools.append(_build_function_tool(spec))
             names.add(name)
+        # Replace the spec list on every call so repeated registrations
+        # (re-bind on a new run) stay consistent with the handler map.
+        self._tool_specs = list(tools)
 
         # Attach to the inner agent itself (root), then the whole subtree.
         root_tools = getattr(self._agent, "tools", None)
@@ -588,6 +598,7 @@ class ADKAdapter:
             steerer=self._steerer,
             task=task,
             tool_handlers=self._tool_handlers,
+            tools=self._tool_specs,
             host_agent_name=str(getattr(self._agent, "name", "") or ""),
         )
 
