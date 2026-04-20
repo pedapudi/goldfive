@@ -22,6 +22,18 @@ class TaskStatus(StrEnum):
     BLOCKED = "BLOCKED"
 
 
+# Terminal statuses — a task in any of these cannot transition further
+# and must not be re-invoked. This set is the **single source of truth**
+# used by the steerer (state-transition guards), the tool-dispatch layer
+# (terminal-task rejection), and the ADK adapter (invoke-loop early
+# break). Do not duplicate this set; import from here. If ``TaskStatus``
+# gains a new terminal member, add it here and every consumer sees it.
+# See ``docs/design/TASK-LIFECYCLE.md`` §7.1 for the rationale.
+TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+
+
 class DriftKind(StrEnum):
     TOOL_ERROR = "tool_error"
     AGENT_REFUSAL = "agent_refusal"

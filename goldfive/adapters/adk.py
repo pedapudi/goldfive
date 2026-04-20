@@ -43,11 +43,12 @@ from goldfive.adapters._adk_plugin import (
     make_adk_plugin,
 )
 from goldfive.results import InvocationResult
+from goldfive.types import TERMINAL_TASK_STATUSES
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
     from goldfive.reporting import ReportingToolSpec
-    from goldfive.types import Session, Task
+    from goldfive.types import Session, Task, TaskStatus  # noqa: F401
 
 log = logging.getLogger("goldfive.adapters.adk")
 
@@ -234,6 +235,29 @@ def _is_final_event(event: Any) -> bool:
         except Exception:
             return False
     return bool(attr)
+
+
+def _task_is_terminal(task: Task, session: Session) -> bool:
+    """Return True if ``task``'s status in the session's plan is terminal.
+
+    Reads status off the live ``session.plan`` entry (not the snapshot
+    ``task`` object passed into ``invoke``) so transitions driven by
+    reporting-tool handlers during the in-flight invocation are seen.
+
+    Uses :data:`goldfive.types.TERMINAL_TASK_STATUSES` — the single
+    source of truth shared with the steerer and the dispatch layer so a
+    new terminal status cannot silently diverge across modules.
+    """
+    task_id = getattr(task, "id", "") or ""
+    if not task_id:
+        return False
+    plan = getattr(session, "plan", None)
+    if plan is None:
+        return False
+    for live in getattr(plan, "tasks", ()) or ():
+        if getattr(live, "id", None) == task_id:
+            return getattr(live, "status", None) in TERMINAL_TASK_STATUSES
+    return False
 
 
 def _new_message_parts(task: Task) -> Any:
@@ -517,6 +541,17 @@ class ADKAdapter:
                     final_text = text
                 if _is_final_event(event):
                     stop_reason = "final_response"
+                # Early termination when the agent has reported this task
+                # as terminal (COMPLETED/FAILED/CANCELLED) via a reporting
+                # tool. Without this, the ADK generator keeps running —
+                # letting the agent take more LLM turns on an already-done
+                # task and burn through ADK's 500-LLM-call ceiling
+                # reporting redundant status. Breaking closes the
+                # generator cleanly so control returns to the executor
+                # which routes to the next pending task.
+                if _task_is_terminal(task, session):
+                    stop_reason = "task_terminal"
+                    break
         except Exception as exc:  # noqa: BLE001
             err = exc
             stop_reason = f"error:{type(exc).__name__}"

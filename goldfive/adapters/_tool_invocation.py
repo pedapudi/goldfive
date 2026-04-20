@@ -32,10 +32,11 @@ from goldfive.adapters._tool_loop_guard import (
     guard_for,
 )
 from goldfive.reporting import ReportingToolSpec
+from goldfive.types import TERMINAL_TASK_STATUSES
 
 if TYPE_CHECKING:  # pragma: no cover - type-only
     from goldfive.protocols import Steerer
-    from goldfive.types import Session
+    from goldfive.types import Session, Task
 
 
 # Tools that carry no task_id and represent plan-level signals — they
@@ -105,6 +106,31 @@ async def invoke_tool(
     is_plan_level = name in _PLAN_LEVEL_TOOLS
     sig = (name, args_signature(args))
 
+    # Terminal-task rejection (root-cause prevention). Models that have
+    # already reported a task as COMPLETED/FAILED/CANCELLED sometimes
+    # keep calling reporting tools for that task — the first call moved
+    # the task to a terminal status (the Steerer's ``mark_task_*``
+    # guards make subsequent transitions no-ops), but a bland ``ACK``
+    # back to the agent doesn't communicate "stop." Without this check,
+    # a model can burn dozens of reporting calls after the task is
+    # already done. We return a structured error response so the model
+    # has clear, actionable feedback to stop reporting against that
+    # task. Plan-level tools (no ``task_id``) bypass this path.
+    if not is_plan_level and task_id:
+        task = _find_task(session, task_id)
+        if task is not None and task.status in TERMINAL_TASK_STATUSES:
+            return {
+                "acknowledged": False,
+                "error": "task_already_terminal",
+                "task_id": task_id,
+                "current_status": task.status.value,
+                "message": (
+                    f"Task {task_id!r} is already {task.status.value}. Do not "
+                    "call further reporting tools for this task; wait for the "
+                    "orchestrator to route you to the next task."
+                ),
+            }
+
     guard = guard_for(session)
     state = guard.state_for(guard_key)
     state.window.append(sig)
@@ -127,6 +153,17 @@ async def invoke_tool(
 
     state.seen.add(sig)
     return await tool.handler(args, session, steerer)
+
+
+def _find_task(session: Session, task_id: str) -> Task | None:
+    """Return the task with ``task_id`` from ``session.plan``, or ``None``."""
+    plan = session.plan
+    if plan is None:
+        return None
+    for task in plan.tasks:
+        if task.id == task_id:
+            return task
+    return None
 
 
 __all__ = ["find_tool", "invoke_tool"]

@@ -49,6 +49,23 @@ if TYPE_CHECKING:  # pragma: no cover - type-only
 _LOOP_WINDOW = 8
 _LOOP_THRESHOLD = 6
 
+# Volume-based fallback: fire a loop drift once a single reporting tool
+# has been invoked this many times within one task, regardless of
+# whether the args repeat. Catches args-varying spam (e.g. a model
+# looping on ``report_task_failed`` with a fresh ``reason`` each call) —
+# the signature-based window misses this because every call hashes to a
+# different signature. Threshold is set well above any realistic
+# lifecycle count (start → 3 progress → complete = 5) but below the
+# point where the surrounding runtime (ADK's 500-LLM-call ceiling) will
+# burn out the whole task.
+_VOLUME_THRESHOLD = 15
+
+# Reporting tools that are expected to be polled — the agent legitimately
+# re-invokes them while waiting for an external decision, and the volume
+# cap would falsely fire on normal use. The exact-signature guard still
+# applies.
+_VOLUME_EXEMPT_TOOLS: frozenset[str] = frozenset({"report_awaiting_approval"})
+
 
 @dataclass
 class _TaskGuardState:
@@ -63,6 +80,11 @@ class _TaskGuardState:
     window: deque[tuple[str, str]] = field(
         default_factory=lambda: deque(maxlen=_LOOP_WINDOW)
     )
+    # Cumulative per-tool call count for this task. Used by the volume
+    # cap to catch loops where the agent varies args on every call
+    # (common in practice — e.g. a fresh ``reason`` string each time —
+    # which defeats the exact-signature window check).
+    per_tool_count: dict[str, int] = field(default_factory=dict)
     # Set once a LOOPING_TOOL_CALL drift has been emitted for this task,
     # so we don't pile on identical drifts every subsequent call. Cleared
     # by the planner when it refines/fails the task.
@@ -131,21 +153,45 @@ def guard_for(session: Session) -> ToolLoopGuard:
 
 
 def detect_loop(state: _TaskGuardState, signature: tuple[str, str]) -> bool:
-    """Return True iff the current window crosses the loop threshold for ``signature``.
+    """Return True iff the current call should fire a loop drift.
 
-    Counts occurrences of ``signature`` in the sliding window (which the
-    caller has already updated to include the current call). Sets
-    :attr:`_TaskGuardState.loop_flagged` so subsequent calls don't
-    re-fire the drift.
+    Two independent triggers, either one fires the one-shot drift:
+
+    * **Exact-signature burst** — the same ``(name, args_hash)`` appears
+      at least :data:`_LOOP_THRESHOLD` times within the last
+      :data:`_LOOP_WINDOW` calls. Catches byte-identical loops quickly.
+    * **Per-tool volume cap** — cumulative calls to the same tool name
+      for this task cross :data:`_VOLUME_THRESHOLD`. Catches loops that
+      vary their args on every call (a fresh ``reason`` / ``detail``
+      string etc.) which never collide in the signature window but
+      equally indicate no forward progress.
+
+    Callers have already appended ``signature`` to ``state.window``.
+    Sets :attr:`_TaskGuardState.loop_flagged` so subsequent calls don't
+    re-fire the drift for the same task.
     """
+    name = signature[0]
+    state.per_tool_count[name] = state.per_tool_count.get(name, 0) + 1
+
     if state.loop_flagged:
         return False
-    if len(state.window) < _LOOP_THRESHOLD:
-        return False
-    matching = sum(1 for s in state.window if s == signature)
-    if matching >= _LOOP_THRESHOLD:
+
+    # Volume cap: catches args-varying loops (the exact-signature check
+    # below misses these because every call hashes differently).
+    if (
+        name not in _VOLUME_EXEMPT_TOOLS
+        and state.per_tool_count[name] >= _VOLUME_THRESHOLD
+    ):
         state.loop_flagged = True
         return True
+
+    # Exact-signature burst: fastest path for byte-identical loops.
+    if len(state.window) >= _LOOP_THRESHOLD:
+        matching = sum(1 for s in state.window if s == signature)
+        if matching >= _LOOP_THRESHOLD:
+            state.loop_flagged = True
+            return True
+
     return False
 
 
@@ -168,9 +214,10 @@ async def emit_loop_drift(
         kind=DriftKind.LOOPING_TOOL_CALL,
         severity=DriftSeverity.CRITICAL,
         detail=(
-            f"task {task_id} kept calling {tool_name!r} with the same "
-            f"arguments ({_LOOP_THRESHOLD}+ of last {_LOOP_WINDOW} calls); "
-            "no forward progress detected"
+            f"task {task_id} kept calling {tool_name!r} without forward "
+            f"progress (either {_LOOP_THRESHOLD}+ identical signatures in "
+            f"the last {_LOOP_WINDOW} calls, or {_VOLUME_THRESHOLD}+ total "
+            "calls to this tool within the task)"
         ),
         current_task_id=task_id,
     )

@@ -19,6 +19,7 @@ sinks list and planner at run start.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from goldfive.drift import (
@@ -26,7 +27,10 @@ from goldfive.drift import (
     classify_stop_reason,
     classify_tool_error,
 )
+
+log = logging.getLogger(__name__)
 from goldfive.types import (
+    TERMINAL_TASK_STATUSES,
     DriftEvent,
     DriftKind,
     DriftSeverity,
@@ -44,13 +48,11 @@ __all__ = ["DefaultSteerer"]
 
 
 # Task statuses that are terminal (no further transitions allowed).
-_TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
-    {
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-    }
-)
+# Re-exported from :mod:`goldfive.types` — the canonical definition —
+# under the historical private name so existing imports in this module
+# keep working. Do NOT redefine; new consumers should import
+# ``TERMINAL_TASK_STATUSES`` from ``goldfive.types`` directly.
+_TERMINAL_TASK_STATUSES = TERMINAL_TASK_STATUSES
 
 
 # Ordered severities so we can compare with ``>=``.
@@ -502,12 +504,54 @@ class DefaultSteerer:
                 drift=drift,
                 goals=list(session.goals),
             )
-        except Exception:  # noqa: BLE001 — refine errors must not break the run
+        except Exception as exc:  # noqa: BLE001 — refine errors must not break the run
+            # Surface the failure via logging + a synthetic follow-up
+            # drift so operators don't silently see the same plan loop
+            # forever. Without this, a refine that raises (e.g. malformed
+            # LLM JSON after a mid-invocation cancel poisons the session)
+            # leaves session.plan unchanged and the executor re-enters
+            # the same state on the next tick.
+            log.warning(
+                "DefaultSteerer._handle_drift: planner.refine(kind=%s) raised %s; "
+                "plan unchanged",
+                drift.kind.value,
+                exc,
+            )
+            await self._emit_refine_failure(session, drift, reason=str(exc))
             return
         if revised is None:
+            log.warning(
+                "DefaultSteerer._handle_drift: planner.refine(kind=%s) returned None; "
+                "plan unchanged",
+                drift.kind.value,
+            )
+            await self._emit_refine_failure(
+                session, drift, reason="planner returned no revised plan"
+            )
             return
         self._apply_revision(session, revised, drift)
         await self._emit_plan_revised(session, revised, drift)
+
+    async def _emit_refine_failure(
+        self, session: Session, source: DriftEvent, *, reason: str
+    ) -> None:
+        """Surface a failed refine as a follow-up CRITICAL drift.
+
+        Reuses the source drift's kind and prefixes ``detail`` with
+        ``refine failed`` so sinks (and the harmonograf UI) get a durable,
+        CRITICAL signal that a prior drift's refine did not succeed —
+        without this event, a silently-swallowed refine leaves the
+        session pinned to the stale plan and the executor re-enters the
+        same state on the next tick.
+        """
+        failure = DriftEvent(
+            kind=source.kind,
+            severity=DriftSeverity.CRITICAL,
+            detail=f"refine failed ({source.kind.value}): {reason}",
+            current_task_id=source.current_task_id,
+            current_agent_id=source.current_agent_id,
+        )
+        await self._emit_drift_detected(session, failure)
 
     @staticmethod
     def _apply_revision(
