@@ -249,16 +249,17 @@ is no per-drift-kind backoff or dedup. See §7.
 ## 5. Reporting-tool dispatch
 
 **Invariant — all adapters route reporting-tool calls through
-`invoke_tool`.** The three protection layers below live inside
+`invoke_tool`.** The four protection layers below live inside
 `goldfive.adapters._tool_invocation.invoke_tool` and are the ONLY
 path that picks them up. Adapters MUST NOT short-circuit by calling
 `spec.handler(...)` directly — doing so silently bypasses every
 layer. The regression guards for this invariant are:
 
 - ADK adapter: `tests/test_adk_adapter.py::test_reporting_tool_dispatch_routes_through_invoke_tool`
-  and the two companion tests
+  and the companion tests
   (`test_reporting_tool_on_terminal_task_returns_structured_rejection`,
-  `test_reporting_tool_duplicate_returns_duplicate_ack`).
+  `test_reporting_tool_duplicate_returns_duplicate_ack`,
+  `test_adversarial_agent_with_varying_task_ids_is_stopped_at_session_cap`).
 - Claude adapter: `tests/test_claude_adapter.py::test_pretooluse_hook_on_terminal_task_returns_structured_rejection`
   and `test_pretooluse_hook_volume_cap_fires_drift`.
 - Callable adapter: the user callable is expected to call
@@ -267,14 +268,35 @@ layer. The regression guards for this invariant are:
   The adapter itself does not dispatch — it just forwards the spec
   list to the user's callable.
 
-The three-layer defence in `_tool_invocation.invoke_tool`
+The four-layer defence in `_tool_invocation.invoke_tool`
 (`adapters/_tool_invocation.py`), in order:
 
-### 5.1 Layer 1 — terminal-task rejection (prevention)
+### 5.1 Layer 1 — schema + terminal-task rejection (prevention)
 
-If the tool carries a `task_id` and the task is already in a
-terminal state (`COMPLETED` / `FAILED` / `CANCELLED`), the
-dispatcher returns a structured error:
+**Schema rejections.** For task-scoped tools (every canonical tool
+except `report_plan_divergence`), the dispatcher first validates
+the call carries a usable `task_id`:
+
+- **Missing task_id** — if `task_id` is absent / empty / whitespace:
+  ```python
+  {"acknowledged": False, "error": "missing_task_id", "tool": "<name>",
+   "message": "Tool '<name>' requires a task_id; ..."}
+  ```
+- **Unknown task_id** — if the id doesn't appear in the current
+  `session.plan.tasks`:
+  ```python
+  {"acknowledged": False, "error": "unknown_task_id", "tool": "<name>",
+   "task_id": "<id>",
+   "message": "Task with id '<id>' does not exist in the current plan ..."}
+  ```
+
+These rejections fire **before** the session counter (Layer 4)
+increments — so a malformed-call flood cannot poison session-wide
+state or create a false session drift against the next legitimate
+call.
+
+**Terminal-task rejection.** If the task exists and is already
+terminal (`COMPLETED` / `FAILED` / `CANCELLED`):
 
 ```python
 {
@@ -305,22 +327,73 @@ without invoking the handler.
 `report_awaiting_approval` is exempt — polling the same approval
 arguments is expected behaviour.
 
-### 5.3 Layer 3 — loop guard (safety net)
+### 5.3 Layer 3 — per-task loop guard (safety net)
 
 Two triggers, either one fires a one-shot `LOOPING_TOOL_CALL` drift:
 
 - **Exact-signature burst** — the same `(name, args_hash)` appears
   ≥ 6 times in the last 8 dispatches for this task.
-- **Per-tool volume cap** — cumulative calls to the same tool name
+- **Per-task volume cap** — cumulative calls to the same tool name
   for this task cross 15. Catches loops where the agent varies
   `reason` / `detail` strings on every call (defeating the
   signature match).
 
-`report_awaiting_approval` is exempt from the volume cap because
-polling is its design.
+`report_awaiting_approval` is exempt from the per-task volume cap
+because polling is its design.
 
-Once fired, `state.loop_flagged = True` prevents re-firing for the
-same task until refine resets the guard state.
+Once fired, the `(task, tool)` bucket is flagged and every
+subsequent call is **hard-rejected** with a structured error:
+
+```python
+{"acknowledged": False, "error": "loop_detected",
+ "task_id": "<id>", "tool": "<name>",
+ "reason": "exact_signature_burst" | "per_task_volume_cap",
+ "scope": "per_task",
+ "message": "Repeated calls to '<name>' ... Do not retry; wait for "
+            "the orchestrator to route you to the next task."}
+```
+
+Pre-hardening this layer was a one-shot: the drift fired on first
+crossing, then `detect_loop` returned False forever after and the
+dispatcher silently fell through to the handler on every subsequent
+call. A misbehaving agent could burn through ADK's 500-LLM-call
+ceiling with 100+ plain ACKs. The hard-reject behaviour keeps the
+rejection loud on every single call until a refine resets the
+bucket via `ToolLoopGuard.reset_task`.
+
+### 5.4 Layer 4 — session-wide volume cap
+
+A final safety net against adversarial callers that invent a fresh
+`task_id` on every call — a pattern which distributes 1-2 calls per
+per-task bucket and defeats Layer 3 entirely (the live-run failure
+that motivated this layer: 237 consecutive `report_task_failed`
+calls all returned plain ACK).
+
+The guard maintains a per-session, per-tool-name counter across
+ALL task_ids. Once a tool is called **50+ times** across the whole
+session, it is flagged session-wide and every subsequent call is
+hard-rejected with the same `loop_detected` response shape —
+`scope` is `"session"` and the drift detail identifies the
+session-wide trigger:
+
+```python
+{"acknowledged": False, "error": "loop_detected",
+ "tool": "<name>", "reason": "session_volume_cap",
+ "scope": "session",
+ "message": "Tool '<name>' has been called too many times across "
+            "all tasks in this session ..."}
+```
+
+One `LOOPING_TOOL_CALL` drift is emitted on the crossing call; the
+rejection continues silently for the rest of the session.
+
+`report_awaiting_approval` is exempt (polling by design).
+
+**Why 50.** The per-task cap is 15; a legitimate multi-task run
+making ~15 calls per task on three tasks in a row would hit ~45.
+Setting the session cap at 50 leaves just enough headroom for
+normal use while catching the 200+-call pathologies observed in
+live runs well before ADK's 500-LLM-call ceiling bites.
 
 ---
 
@@ -472,17 +545,18 @@ plan (after a USER_STEER delete-and-replan).
 flag on the executor/adapter that trims the ADK session history at
 revision boundaries. Medium effort, medium impact.
 
-### 7.6 Soft reject vs hard stop on terminal-task reporting
+### 7.6 Soft reject vs hard stop on terminal-task reporting (narrowed)
 
 Layer 1 (§5.1) returns a structured error, but does not actively
 prevent the agent from calling again. A misbehaving agent can
 ignore the error and call `report_task_failed` 100 times; each call
 is cheap (no handler, no drift) but still consumes an ADK turn. The
-loop guard (§5.3) catches this at the 15-call threshold, so the
-worst-case wasted turns is bounded at 14 — acceptable.
+per-task cap (§5.3, 15 calls) bounds this for single-task spam; the
+session-wide cap (§5.4, 50 calls) bounds the adversarial
+varying-`task_id` pattern that defeats the per-task cap. Worst-case
+wasted turns is now 49 across the whole session — acceptable.
 
-**Fix direction:** none required in the short term; the observed
-worst case is bounded.
+**Fix direction:** none required; bounded by Layer 3 + Layer 4.
 
 ### 7.7 No per-task invocation cap
 
