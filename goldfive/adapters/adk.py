@@ -31,6 +31,7 @@ module is gated so ``import goldfive.adapters.adk`` raises a clear
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Mapping
@@ -251,6 +252,105 @@ def _task_is_terminal(task: Task, session: Session) -> bool:
     return False
 
 
+def _function_call_ids_in_event(event: Any) -> list[tuple[str, str]]:
+    """Return ``(id, name)`` pairs for every function call in ``event``.
+
+    Tolerates events that don't expose the helper method (fake events in
+    tests) by walking ``event.content.parts`` directly.
+    """
+    getter = getattr(event, "get_function_calls", None)
+    if callable(getter):
+        try:
+            calls = getter() or []
+        except Exception:  # noqa: BLE001
+            calls = []
+    else:
+        calls = []
+        content = getattr(event, "content", None)
+        for part in getattr(content, "parts", None) or ():
+            fc = getattr(part, "function_call", None)
+            if fc is not None:
+                calls.append(fc)
+    out: list[tuple[str, str]] = []
+    for fc in calls:
+        fc_id = getattr(fc, "id", None)
+        if fc_id:
+            out.append((str(fc_id), str(getattr(fc, "name", "") or "")))
+    return out
+
+
+def _function_response_ids_in_event(event: Any) -> list[str]:
+    """Return the ``function_response.id`` values in ``event``.
+
+    Mirrors :func:`_function_call_ids_in_event` but for responses.
+    """
+    getter = getattr(event, "get_function_responses", None)
+    if callable(getter):
+        try:
+            responses = getter() or []
+        except Exception:  # noqa: BLE001
+            responses = []
+    else:
+        responses = []
+        content = getattr(event, "content", None)
+        for part in getattr(content, "parts", None) or ():
+            fr = getattr(part, "function_response", None)
+            if fr is not None:
+                responses.append(fr)
+    out: list[str] = []
+    for fr in responses:
+        fr_id = getattr(fr, "id", None)
+        if fr_id:
+            out.append(str(fr_id))
+    return out
+
+
+def _build_cancelled_response_event(
+    *,
+    function_call_id: str,
+    tool_name: str,
+    author: str,
+    invocation_id: str,
+    reason: str,
+) -> Any:
+    """Synthesize a ``function_response`` ADK :class:`Event` for ``function_call_id``.
+
+    Used on mid-invocation cancel: ADK's session conversation history would
+    otherwise contain an assistant event with a ``function_call`` that never
+    receives a matching ``function_response``, which confuses subsequent LLM
+    turns (the "Missing tool results for tool_call_id(s): [...]" symptom in
+    driver logs). This builder produces a minimally-shaped response event
+    that the next turn's request assembler will pair with the orphan call.
+    """
+    from google.adk.events.event import Event  # type: ignore
+    from google.genai import types  # type: ignore
+
+    part = types.Part.from_function_response(
+        name=tool_name or "unknown_tool",
+        response={
+            "goldfive_cancelled": True,
+            "reason": reason,
+            "detail": (
+                "Tool call was cancelled mid-invocation by goldfive "
+                "(USER_STEER / USER_CANCEL control). This synthetic "
+                "response was appended to preserve session history "
+                "well-formedness."
+            ),
+        },
+    )
+    # Preserve the pairing so ADK's find_event_by_function_call_id
+    # correctly matches this response to the orphan function_call.
+    if part.function_response is not None:
+        part.function_response.id = function_call_id
+
+    content = types.Content(role="user", parts=[part])
+    return Event(
+        invocation_id=invocation_id or "",
+        author=author or "user",
+        content=content,
+    )
+
+
 def _new_message_parts(task: Task) -> Any:
     """Build the ADK user ``Content`` the adapter sends for a task turn.
 
@@ -332,6 +432,15 @@ class ADKAdapter:
         self._tool_handlers: dict[str, Any] = {}
         # The current Steerer. Set by bind_steerer() before invoke().
         self._steerer: Steerer | None = None
+        # Pending ADK function_call ids observed in the current invoke()'s
+        # event stream that have not yet received a matching
+        # function_response. Maintained so _heal_pending_tool_calls can
+        # synthesize "cancelled" responses on mid-invocation cancel /
+        # unexpected exception and keep the ADK session's conversation
+        # history well-formed. Paired with _pending_tool_call_names so
+        # the synthetic response can name its tool.
+        self._pending_tool_call_ids: set[str] = set()
+        self._pending_tool_call_names: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Post-construction plugin install
@@ -510,6 +619,15 @@ class ADKAdapter:
         stop_reason = "completed"
         err: Exception | None = None
         last_event: Any = None
+        last_invocation_id = ""
+        # Reset per-invocation pending-id bookkeeping. An adapter is
+        # typically single-shot per invoke() so there shouldn't be
+        # leftover state, but be defensive — if a prior invoke()
+        # returned early without healing (shouldn't happen), we'd
+        # otherwise synthesize stale responses now.
+        self._pending_tool_call_ids.clear()
+        self._pending_tool_call_names.clear()
+        was_cancelled = False
         try:
             new_message = _new_message_parts(task)
             async for event in self._runner.run_async(
@@ -518,6 +636,18 @@ class ADKAdapter:
                 new_message=new_message,
             ):
                 last_event = event
+                inv_id = getattr(event, "invocation_id", "") or ""
+                if inv_id:
+                    last_invocation_id = inv_id
+                # Track outstanding function_call ids so we can heal
+                # history on mid-invocation cancel (see _heal_pending_tool_calls).
+                for fc_id, fc_name in _function_call_ids_in_event(event):
+                    self._pending_tool_call_ids.add(fc_id)
+                    if fc_name:
+                        self._pending_tool_call_names[fc_id] = fc_name
+                for fr_id in _function_response_ids_in_event(event):
+                    self._pending_tool_call_ids.discard(fr_id)
+                    self._pending_tool_call_names.pop(fr_id, None)
                 text = _extract_text_from_event(event)
                 if text:
                     final_text = text
@@ -534,11 +664,48 @@ class ADKAdapter:
                 if _task_is_terminal(task, session):
                     stop_reason = "task_terminal"
                     break
+        except asyncio.CancelledError:
+            was_cancelled = True
+            stop_reason = "cancelled"
+            # Heal session history BEFORE re-raising so the next
+            # invoke() doesn't hit a "Missing tool results for
+            # tool_call_id(s)" from LiteLLM / underlying providers.
+            await self._heal_pending_tool_calls(
+                session_id=session_id,
+                invocation_id=last_invocation_id,
+                reason="cancelled_mid_invocation",
+            )
+            raise
         except Exception as exc:  # noqa: BLE001
             err = exc
             stop_reason = f"error:{type(exc).__name__}"
             log.debug("ADKAdapter.invoke: runner.run_async raised: %s", exc)
+            # Also heal on non-cancel exceptions — the same malformed-
+            # history symptom can surface if the runner raises partway
+            # through a tool round-trip (e.g. provider 5xx between
+            # function_call and function_response).
+            await self._heal_pending_tool_calls(
+                session_id=session_id,
+                invocation_id=last_invocation_id,
+                reason=f"error:{type(exc).__name__}",
+            )
         finally:
+            if not was_cancelled:
+                # On normal completion there should be nothing pending,
+                # but if the stream ended with an orphan call (unusual —
+                # e.g. runner yielded a final event without the matching
+                # tool response) heal it so the next turn isn't poisoned.
+                if self._pending_tool_call_ids:
+                    log.warning(
+                        "ADKAdapter.invoke: %d function_call id(s) ended without "
+                        "responses on normal exit; healing session history",
+                        len(self._pending_tool_call_ids),
+                    )
+                    await self._heal_pending_tool_calls(
+                        session_id=session_id,
+                        invocation_id=last_invocation_id,
+                        reason="unexpected_orphan_on_normal_exit",
+                    )
             if isinstance(state, Mapping):
                 try:
                     state.pop(SESSION_CONTEXT_STATE_KEY, None)  # type: ignore[attr-defined]
@@ -582,6 +749,125 @@ class ADKAdapter:
             log.debug("ADKAdapter._ensure_session: create_session raised: %s", exc)
         self._session_id = new_id
         return new_id
+
+    async def _heal_pending_tool_calls(
+        self,
+        *,
+        session_id: str,
+        invocation_id: str,
+        reason: str,
+    ) -> None:
+        """Append synthetic ``function_response`` events for orphan tool calls.
+
+        Called from :meth:`invoke`'s cancel / exception paths. For every
+        ``function_call`` id still pending in :attr:`_pending_tool_call_ids`,
+        build a matching response event (see
+        :func:`_build_cancelled_response_event`) and append it to the ADK
+        session via ``session_service.append_event``. Best-effort: logs and
+        swallows individual failures so healing one orphan doesn't block
+        the others.
+
+        Investigated alternatives:
+
+        * ADK does not expose a higher-level "heal session" helper.
+          ``BaseSessionService.append_event`` is the public path used by
+          :class:`~google.adk.runners.Runner` itself (see
+          ``runners.py:1024`` and ``:857``).
+        * We intentionally don't re-enter ``runner.run_async`` with a
+          synthetic user message because the runner would then try to
+          drive another LLM turn, which is exactly what we're trying to
+          avoid after a cancel.
+        """
+        if not self._pending_tool_call_ids:
+            return
+
+        session_service = getattr(self._runner, "session_service", None)
+        if session_service is None:
+            log.debug(
+                "ADKAdapter._heal_pending_tool_calls: runner has no "
+                "session_service; cannot heal %d orphan tool call(s)",
+                len(self._pending_tool_call_ids),
+            )
+            self._pending_tool_call_ids.clear()
+            self._pending_tool_call_names.clear()
+            return
+
+        append = getattr(session_service, "append_event", None)
+        get = getattr(session_service, "get_session", None)
+        if not callable(append) or not callable(get):
+            log.debug(
+                "ADKAdapter._heal_pending_tool_calls: session_service lacks "
+                "append_event/get_session; cannot heal %d orphan tool call(s)",
+                len(self._pending_tool_call_ids),
+            )
+            self._pending_tool_call_ids.clear()
+            self._pending_tool_call_names.clear()
+            return
+
+        try:
+            coro = get(
+                app_name=self._app_name,
+                user_id=self._user_id,
+                session_id=session_id,
+            )
+            adk_session = await coro if hasattr(coro, "__await__") else coro
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "ADKAdapter._heal_pending_tool_calls: get_session raised: %s",
+                exc,
+            )
+            self._pending_tool_call_ids.clear()
+            self._pending_tool_call_names.clear()
+            return
+
+        if adk_session is None:
+            self._pending_tool_call_ids.clear()
+            self._pending_tool_call_names.clear()
+            return
+
+        host_author = str(getattr(self._agent, "name", "") or "") or "user"
+        pending_ids = sorted(self._pending_tool_call_ids)
+        healed = 0
+        for fc_id in pending_ids:
+            tool_name = self._pending_tool_call_names.get(fc_id, "")
+            try:
+                synth = _build_cancelled_response_event(
+                    function_call_id=fc_id,
+                    tool_name=tool_name,
+                    author=host_author,
+                    invocation_id=invocation_id,
+                    reason=reason,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "ADKAdapter._heal_pending_tool_calls: could not build "
+                    "synthetic event for %s: %s",
+                    fc_id,
+                    exc,
+                )
+                continue
+            try:
+                coro = append(session=adk_session, event=synth)
+                if hasattr(coro, "__await__"):
+                    await coro
+                healed += 1
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "ADKAdapter._heal_pending_tool_calls: append_event for %s raised: %s",
+                    fc_id,
+                    exc,
+                )
+
+        if healed:
+            log.info(
+                "goldfive ADKAdapter: healed %d orphan tool_call_id(s) after %s (pending=%s)",
+                healed,
+                reason,
+                pending_ids,
+            )
+
+        self._pending_tool_call_ids.clear()
+        self._pending_tool_call_names.clear()
 
     async def _get_session_state(self, session_id: str) -> Any:
         """Fetch the ADK session's mutable state dict for ``session_id``."""

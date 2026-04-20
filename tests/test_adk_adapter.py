@@ -596,3 +596,225 @@ async def test_register_reporting_tools_is_idempotent() -> None:
             assert names.count(reporting_name) == 1, (
                 f"{agent.name}: {reporting_name} registered {names.count(reporting_name)} times"
             )
+
+
+# ---------------------------------------------------------------------------
+# Mid-invocation cancel — heal ADK session history for orphan tool_call_ids
+# (TASK-LIFECYCLE.md §7.4). See goldfive.adapters.adk._heal_pending_tool_calls.
+# ---------------------------------------------------------------------------
+
+
+class _FakeADKSession:
+    """Minimal stand-in for ``google.adk.sessions.Session`` for heal tests.
+
+    Only the attributes ``events`` and ``state`` that
+    :meth:`BaseSessionService.append_event` needs are provided.
+    """
+
+    def __init__(self) -> None:
+        self.events: list = []
+        self.state: dict = {}
+
+
+class _FakeSessionService:
+    """Records ``append_event`` calls so heal-path tests can assert on them."""
+
+    def __init__(self) -> None:
+        self._session = _FakeADKSession()
+        self.appended: list = []
+
+    async def create_session(self, **_kwargs) -> _FakeADKSession:
+        return self._session
+
+    async def get_session(self, **_kwargs) -> _FakeADKSession:
+        return self._session
+
+    async def append_event(self, *, session, event):
+        self.appended.append(event)
+        session.events.append(event)
+        return event
+
+
+class _FakeRunner:
+    """Runner stub whose ``run_async`` yields a scripted sequence of events.
+
+    ``events_factory(cancel_event)`` is a zero-arg callable returning an async
+    generator (or an async function). The fixture tests pass a coroutine-like
+    factory that yields function_call events, optionally pauses on a
+    :class:`asyncio.Event`, and can raise :class:`asyncio.CancelledError` to
+    simulate the sequential executor's mid-invocation cancel.
+    """
+
+    def __init__(self, run_async_impl, agent) -> None:
+        self._run_async_impl = run_async_impl
+        self.agent = agent
+        self.app_name = getattr(agent, "name", "fake-app")
+        self.session_service = _FakeSessionService()
+        self.plugin_manager = None
+        self.plugins: list = []
+
+    async def run_async(self, **kwargs):  # noqa: ARG002 — runner signature
+        async for event in self._run_async_impl():
+            yield event
+
+
+def _mk_function_call_event(*, call_id: str, name: str, invocation_id: str = "inv-1"):
+    """Build an ADK ``Event`` carrying a single ``function_call`` part."""
+    from google.adk.events.event import Event  # type: ignore
+    from google.genai import types  # type: ignore
+
+    part = types.Part(function_call=types.FunctionCall(id=call_id, name=name))
+    return Event(
+        invocation_id=invocation_id,
+        author="test_agent",
+        content=types.Content(role="model", parts=[part]),
+    )
+
+
+def _mk_function_response_event(*, call_id: str, name: str, invocation_id: str = "inv-1"):
+    """Build an ADK ``Event`` carrying a matching ``function_response`` part."""
+    from google.adk.events.event import Event  # type: ignore
+    from google.genai import types  # type: ignore
+
+    part = types.Part.from_function_response(name=name, response={"ok": True})
+    part.function_response.id = call_id
+    return Event(
+        invocation_id=invocation_id,
+        author="test_agent",
+        content=types.Content(role="user", parts=[part]),
+    )
+
+
+async def test_cancel_mid_tool_call_heals_session() -> None:
+    """Cancellation mid-tool-round-trip must synthesize a function_response.
+
+    Scenario: runner yields a function_call event for ``call-1`` then the
+    task is cancelled (simulating SequentialExecutor._cancel_invoke_task on
+    a USER_STEER). ADKAdapter must append a synthetic function_response
+    event whose ``id`` matches ``call-1`` so the next invoke() doesn't hit
+    "Missing tool results for tool_call_id".
+    """
+    import asyncio
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Session, Task
+
+    agent = _make_agent()
+
+    async def _run():
+        yield _mk_function_call_event(call_id="call-1", name="search")
+        # Hang forever; the outer task.cancel() will inject CancelledError.
+        await asyncio.Event().wait()
+        # Unreachable.
+        yield None  # pragma: no cover
+
+    runner = _FakeRunner(_run, agent)
+    adapter = ADKAdapter(runner, session_id="sess-1")
+
+    invoke_task = asyncio.create_task(adapter.invoke(Task(id="t1", title="x"), Session(run_id="r")))
+    # Give the runner a moment to emit the function_call event and start
+    # awaiting the never-set asyncio.Event, then cancel.
+    await asyncio.sleep(0.01)
+    invoke_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invoke_task
+
+    appended = runner.session_service.appended
+    assert len(appended) == 1, f"expected 1 synthetic response; got {len(appended)}"
+    synth = appended[0]
+    responses = synth.get_function_responses()
+    assert len(responses) == 1
+    assert responses[0].id == "call-1"
+    # The payload flags this as goldfive-synthesized so downstream tools can
+    # tell it apart from a real tool return.
+    assert responses[0].response.get("goldfive_cancelled") is True
+
+
+async def test_multiple_pending_tool_calls_all_healed() -> None:
+    """When multiple function_calls are outstanding at cancel time, all heal.
+
+    Three parallel function_calls are yielded on a single "model turn" event.
+    Cancelling before any response arrives must produce three synthetic
+    function_response events, one per id.
+    """
+    import asyncio
+
+    from google.adk.events.event import Event  # type: ignore
+    from google.genai import types  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Session, Task
+
+    agent = _make_agent()
+
+    # Single event carrying three parallel function_call parts, mimicking
+    # ADK's "parallel tool call" shape.
+    multi_parts = [
+        types.Part(function_call=types.FunctionCall(id=f"call-{i}", name=f"t{i}"))
+        for i in (1, 2, 3)
+    ]
+    multi_event = Event(
+        invocation_id="inv-multi",
+        author="test_agent",
+        content=types.Content(role="model", parts=multi_parts),
+    )
+
+    async def _run():
+        yield multi_event
+        await asyncio.Event().wait()
+        yield None  # pragma: no cover
+
+    runner = _FakeRunner(_run, agent)
+    adapter = ADKAdapter(runner, session_id="sess-multi")
+
+    invoke_task = asyncio.create_task(adapter.invoke(Task(id="t1", title="x"), Session(run_id="r")))
+    await asyncio.sleep(0.01)
+    invoke_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invoke_task
+
+    appended = runner.session_service.appended
+    healed_ids = set()
+    for ev in appended:
+        for fr in ev.get_function_responses():
+            healed_ids.add(fr.id)
+    assert healed_ids == {"call-1", "call-2", "call-3"}, (
+        f"expected all three orphan ids healed; got {healed_ids}"
+    )
+
+
+async def test_heal_is_noop_when_no_pending_calls() -> None:
+    """Clean exit with no orphan function_calls appends nothing.
+
+    Also covers the case where every emitted function_call received a
+    matching function_response before the stream ended — _pending_tool_call_ids
+    should be empty at exit and no synthetic event should be appended.
+    """
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Session, Task
+
+    agent = _make_agent()
+
+    async def _run_clean():
+        # Paired call/response, then quiet exit.
+        yield _mk_function_call_event(call_id="call-ok", name="search")
+        yield _mk_function_response_event(call_id="call-ok", name="search")
+
+    runner_clean = _FakeRunner(_run_clean, agent)
+    adapter_clean = ADKAdapter(runner_clean, session_id="sess-clean")
+    result = await adapter_clean.invoke(Task(id="t1", title="x"), Session(run_id="r"))
+    assert runner_clean.session_service.appended == [], (
+        "healed-path should not fire on a clean exit"
+    )
+    assert result.stop_reason != "cancelled"
+
+    # Also: a truly empty stream (no function_calls at all) — heal must no-op.
+    async def _run_empty():
+        if False:  # pragma: no cover — never yields
+            yield None
+        return
+
+    runner_empty = _FakeRunner(_run_empty, agent)
+    adapter_empty = ADKAdapter(runner_empty, session_id="sess-empty")
+    await adapter_empty.invoke(Task(id="t1", title="x"), Session(run_id="r"))
+    assert runner_empty.session_service.appended == []
