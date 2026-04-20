@@ -118,7 +118,7 @@ class Plan:
     revision_severity: str = ""  # DriftSeverity value (str) or ""
     revision_index: int = 0
 
-    def validate(self, for_revision: bool = False) -> None:
+    def validate(self, for_revision: bool = False, *, prior: Plan | None = None) -> None:
         """Structurally validate this plan. Raise ``ValueError`` on failure.
 
         Checks, in order:
@@ -135,6 +135,19 @@ class Plan:
            COMPLETED / FAILED / CANCELLED tasks preserved from the prior
            plan, so this check is skipped when ``for_revision`` is
            ``True``.
+        6. When ``for_revision`` is ``True`` and a ``prior`` plan is
+           supplied, enforce the cross-revision preservation contract
+           from ``docs/design/PLAN-LIFECYCLE.md`` §3.1 and §3.2:
+
+           - **Terminal task preservation (§3.1).** Every task in
+             ``prior.tasks`` whose status is terminal must appear in
+             ``self.tasks`` with the same id AND the same terminal
+             status — no regression from COMPLETED back to PENDING is
+             allowed, and dropping a terminal task is forbidden.
+           - **Terminal→terminal edge preservation (§3.2).** Every
+             edge in ``prior.edges`` where both endpoints were terminal
+             in ``prior`` must appear in ``self.edges``. Historical
+             topology between frozen tasks is frozen.
 
         This is a pure-data validator: it does not mutate the plan. It
         is intended to be called at plan creation (``LLMPlanner.generate``)
@@ -191,6 +204,36 @@ class Plan:
                 if t.status is not TaskStatus.PENDING:
                     raise ValueError(
                         f"task {t.id!r} has non-PENDING status {t.status.value!r} at plan creation"
+                    )
+
+        # 6. revision-time with a prior plan: enforce terminal-task and
+        # terminal->terminal-edge preservation (PLAN-LIFECYCLE.md §3.1,
+        # §3.2). Skipped when ``prior`` is None — callers that do not
+        # supply the outgoing plan get the legacy structural checks only.
+        if for_revision and prior is not None:
+            new_by_id: dict[str, Task] = {t.id: t for t in self.tasks}
+            prior_terminal_ids: set[str] = set()
+            for t in prior.tasks:
+                if t.status not in TERMINAL_TASK_STATUSES:
+                    continue
+                prior_terminal_ids.add(t.id)
+                new_t = new_by_id.get(t.id)
+                if new_t is None:
+                    raise ValueError(f"terminal task {t.id!r} missing in revision")
+                if new_t.status is not t.status:
+                    raise ValueError(f"terminal task {t.id!r} regressed to {new_t.status.value!r}")
+            # Every terminal->terminal edge in the outgoing plan must
+            # appear verbatim in the revision.
+            new_edges: set[tuple[str, str]] = {(e.from_task_id, e.to_task_id) for e in self.edges}
+            for e in prior.edges:
+                if (
+                    e.from_task_id in prior_terminal_ids
+                    and e.to_task_id in prior_terminal_ids
+                    and (e.from_task_id, e.to_task_id) not in new_edges
+                ):
+                    raise ValueError(
+                        "terminal->terminal edge "
+                        f"{e.from_task_id!r} -> {e.to_task_id!r} missing in revision"
                     )
 
     def topological_stages(self) -> list[list[Task]]:

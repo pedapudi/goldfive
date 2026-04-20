@@ -423,9 +423,20 @@ async def test_llm_planner_refine_handles_call_llm_exception() -> None:
 
 
 async def test_llm_planner_refine_increments_revision_index() -> None:
+    # Must preserve the COMPLETED ``research`` task from ``_running_plan``
+    # verbatim so PLAN-LIFECYCLE.md §3.1 terminal-preservation holds at
+    # validation time.
     payload = {
         "summary": "same",
-        "tasks": [{"id": "draft", "title": "Draft", "status": "RUNNING"}],
+        "tasks": [
+            {
+                "id": "research",
+                "title": "Research goldfish facts",
+                "assignee_agent_id": "researcher",
+                "status": "COMPLETED",
+            },
+            {"id": "draft", "title": "Draft", "status": "RUNNING"},
+        ],
         "edges": [],
     }
     stub = _StubLLM(json.dumps(payload))
