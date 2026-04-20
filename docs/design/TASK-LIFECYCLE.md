@@ -338,13 +338,20 @@ things on every legal cancel:
    `FAILED` / already-`CANCELLED`) are preserved verbatim and not
    traversed past — a diamond DAG does not double-cancel.
 
-This mirrors the "unrecoverable drift" cascade documented in
-[STATE-MACHINE.md §"Cascade semantics on unrecoverable drift"](STATE-MACHINE.md#cascade-semantics-on-unrecoverable-drift).
+Both this cascade and the "unrecoverable drift" cascade share the
+same downstream-CANCEL primitive —
+`Steerer.cascade_cancel_downstream(session, task_id)` — so they
+emit identical `TaskCancelled` event streams for the same downstream
+set. The unrecoverable path differs only in the *initiator*
+transition (FAILED instead of CANCELLED); the fan-out is identical.
+See [STATE-MACHINE.md §"Cascade semantics on unrecoverable drift"](STATE-MACHINE.md#cascade-semantics-on-unrecoverable-drift)
+and [STATE-MACHINE.md §"Shared downstream-CANCEL primitive"](STATE-MACHINE.md#shared-downstream-cancel-primitive).
 Whether the cancel arrives via (a) a control-channel `CANCEL`,
 (b) a `USER_STEER` whose refine returns no new plan (so the executor
-preserves the CANCELLED current task without replacing it), or
-(c) an explicit `mark_task_cancelled` call, the cascade fires at the
-same boundary in the steerer.
+preserves the CANCELLED current task without replacing it),
+(c) an explicit `mark_task_cancelled` call, or
+(d) a `mark_task_failed(..., recoverable=False)` fatal failure,
+the cascade fans out through the same steerer primitive.
 
 The `SequentialExecutor` additionally runs a **reachability audit**
 at loop exit: if `_pick_next_task` returns None but some tasks are
