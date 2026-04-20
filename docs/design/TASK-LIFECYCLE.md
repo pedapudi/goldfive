@@ -320,7 +320,42 @@ translates). The executor handles it at two points:
   `_cancel_invoke_task(invoke_task)` — `task.cancel()` + up to 5s
   grace, then warning-log + move on.
 
-### 6.1 Known cleanup gap: orphaned tool_call_ids
+### 6.1 Cancellation cascade
+
+Cancelling a task is **not** a leaf operation: the task's downstream
+dependents have to end up cancelled too, otherwise the executor's
+dependency check (`_pick_next_task`: "all predecessors COMPLETED")
+silently orphans them.
+
+`DefaultSteerer.mark_task_cancelled` (`steerer.py`) therefore does two
+things on every legal cancel:
+
+1. Transition ``task_id`` to `CANCELLED` and emit `TaskCancelled`.
+2. BFS forward through ``session.plan.edges``; every reachable
+   non-terminal task (PENDING / RUNNING / BLOCKED) is transitioned to
+   `CANCELLED` with reason `"cascade from <task_id>"`, one
+   `TaskCancelled` event per task. Terminal tasks (`COMPLETED` /
+   `FAILED` / already-`CANCELLED`) are preserved verbatim and not
+   traversed past — a diamond DAG does not double-cancel.
+
+This mirrors the "unrecoverable drift" cascade documented in
+[STATE-MACHINE.md §"Cascade semantics on unrecoverable drift"](STATE-MACHINE.md#cascade-semantics-on-unrecoverable-drift).
+Whether the cancel arrives via (a) a control-channel `CANCEL`,
+(b) a `USER_STEER` whose refine returns no new plan (so the executor
+preserves the CANCELLED current task without replacing it), or
+(c) an explicit `mark_task_cancelled` call, the cascade fires at the
+same boundary in the steerer.
+
+The `SequentialExecutor` additionally runs a **reachability audit**
+at loop exit: if `_pick_next_task` returns None but some tasks are
+still `PENDING`, each is transitioned to `CANCELLED` with reason
+`"orphaned by plan revision failure"`, a CRITICAL `PLAN_DIVERGENCE`
+drift is emitted, and the run ends with `success=False`. This is a
+belt-and-suspenders catch for any cancellation path that fails to
+cascade (e.g. a future control-channel variant that bypasses the
+steerer).
+
+### 6.2 Known cleanup gap: orphaned tool_call_ids
 
 ADK's `run_async` may be mid-turn with an assistant message carrying
 `tool_calls` when the cancel raises `CancelledError`. The matching
@@ -433,6 +468,27 @@ agents this is ~32 × 500 = 16 000 LLM calls worst case.
 **Fix direction:** add a `max_retries_per_task_id` (default 3) to
 the executor. After N refines that target the same task id's
 lineage, mark the task FAILED and cascade CANCEL downstream.
+
+### 7.8 CANCELLED cascade to downstream PENDING tasks (closed)
+
+Historically, `mark_task_cancelled` transitioned only the target
+task and emitted a single `TaskCancelled` event. This implicitly
+assumed CANCELLED predecessors were non-terminal — but
+`_pick_next_task` only picks tasks whose predecessors are all
+`COMPLETED`, so a CANCELLED predecessor silently orphaned every
+descendant. Combined with a `USER_STEER` refine that returned no new
+plan, the sequential executor would run only the independent
+branches and exit with `success=True`, leaving the dependent branch
+stuck in `PENDING`. The "make a presentation about waffles" regression
+run (`research_history` cancelled by STEER; refine produced empty
+JSON; 7 downstream tasks left PENDING; executor reported success)
+was the in-the-wild trigger.
+
+**Fix (see §6.1):** `mark_task_cancelled` now BFS-cancels all
+downstream non-terminal tasks, and `SequentialExecutor` runs a
+reachability audit at loop exit that flips any remaining PENDING
+tasks to CANCELLED, emits a CRITICAL `PLAN_DIVERGENCE` drift, and
+fails the run. Closed by `fix/cancel-cascade`.
 
 ---
 
