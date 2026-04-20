@@ -112,6 +112,56 @@ markdown fences. Schema:
 """
 
 
+_LOOPING_TOOL_CALL_SYSTEM_PROMPT = """\
+You are a task-planning assistant for a multi-agent system. The
+adapter's loop detector has just flagged a task whose agent is stuck
+calling the same tool with identical arguments without making forward
+progress. Treat that task as FAILED — its current shape is unworkable
+— and regenerate the remaining plan so the goals can still be met.
+
+You will receive:
+
+* The set of GOALS the plan is trying to satisfy.
+* A list of tasks that have already finished (COMPLETED / FAILED /
+  CANCELLED) — preserve these verbatim at the start of the returned
+  task list.
+* The id of the LOOPING task, which you MUST include in the returned
+  plan with status FAILED (use the original id, title, and assignee).
+* A list of OTHER PENDING / RUNNING / BLOCKED tasks. You may keep,
+  drop, or rework these; the goal is to route around the failure.
+
+Requirements:
+
+1. KEEP HISTORY VERBATIM. Already-finished tasks (COMPLETED / FAILED /
+   CANCELLED) must appear with the same id, title, assignee, and status.
+2. FAIL THE LOOPER. Emit the looping task with status=FAILED. Do NOT
+   leave it PENDING/RUNNING and do NOT rename it.
+3. REPLACE OR DROP the looping work as needed. If the work is still
+   required, add a fresh PENDING task (with a new id) that approaches
+   it differently — split it smaller, hand it to a different agent, or
+   precede it with a clarifying step.
+4. PRESERVE OR REWORK other non-finished tasks at your discretion.
+5. GOAL COVERAGE: every unsatisfied goal must still be addressed by at
+   least one task in the returned plan.
+
+Respond with a single JSON object and NOTHING ELSE:
+
+{
+  "summary": "...",
+  "tasks": [
+    {
+      "id": "...",
+      "title": "...",
+      "description": "...",
+      "assignee_agent_id": "...",
+      "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED"
+    }
+  ],
+  "edges": [{"from_task_id": "...", "to_task_id": "..."}]
+}
+"""
+
+
 _USER_STEER_SYSTEM_PROMPT = """\
 You are a task-planning assistant for a multi-agent system. A human
 operator has just issued a STEERING directive against an in-flight
@@ -445,6 +495,7 @@ class LLMPlanner:
         system_prompt: str | None = None,
         refine_system_prompt: str | None = None,
         user_steer_system_prompt: str | None = None,
+        looping_tool_call_system_prompt: str | None = None,
     ) -> None:
         self._call_llm = call_llm
         self._model = model
@@ -452,6 +503,9 @@ class LLMPlanner:
         self._refine_system_prompt = refine_system_prompt or _REFINE_SYSTEM_PROMPT
         self._user_steer_system_prompt = (
             user_steer_system_prompt or _USER_STEER_SYSTEM_PROMPT
+        )
+        self._looping_tool_call_system_prompt = (
+            looping_tool_call_system_prompt or _LOOPING_TOOL_CALL_SYSTEM_PROMPT
         )
 
     @property
@@ -697,6 +751,8 @@ class LLMPlanner:
             return None
         if drift.kind is DriftKind.USER_STEER:
             return await self._refine_user_steer(plan, drift, goals)
+        if drift.kind is DriftKind.LOOPING_TOOL_CALL:
+            return await self._refine_looping_tool_call(plan, drift, goals)
         try:
             user_prompt = self._build_refine_prompt(plan, drift, goals)
         except (TypeError, ValueError) as exc:
@@ -731,6 +787,225 @@ class LLMPlanner:
         revised.revision_severity = str(drift.severity)
         revised.revision_index = plan.revision_index + 1
         return revised
+
+    def _build_looping_tool_call_prompt(
+        self,
+        plan: Plan,
+        drift: DriftEvent,
+        goals: list[Goal],
+        looping_task: Task | None,
+    ) -> str:
+        """Build the regenerate-around-failure prompt for a LOOPING_TOOL_CALL."""
+        completed = [t for t in plan.tasks if t.status in _TERMINAL_STATUSES]
+        loop_id = drift.current_task_id or (looping_task.id if looping_task else "")
+        history = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "description": t.description,
+                "assignee_agent_id": t.assignee_agent_id,
+                "status": str(t.status),
+            }
+            for t in completed
+        ]
+        others = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "description": t.description,
+                "assignee_agent_id": t.assignee_agent_id,
+                "status": str(t.status),
+            }
+            for t in plan.tasks
+            if t.status not in _TERMINAL_STATUSES and t.id != loop_id
+        ]
+        looper_block = (
+            json.dumps(
+                {
+                    "id": looping_task.id,
+                    "title": looping_task.title,
+                    "description": looping_task.description,
+                    "assignee_agent_id": looping_task.assignee_agent_id,
+                    "status": str(looping_task.status),
+                },
+                default=str,
+            )
+            if looping_task is not None
+            else json.dumps({"id": loop_id})
+        )
+        goals_block = self._render_goals_block(goals)
+        return (
+            f"Goals:\n{goals_block}\n\n"
+            f"Already-finished tasks (preserve verbatim):\n"
+            f"{json.dumps(history, default=str)}\n\n"
+            f"LOOPING task (must appear in the returned plan with "
+            f"status=FAILED, same id):\n{looper_block}\n\n"
+            f"Other unfinished tasks (you may keep, drop, or rework):\n"
+            f"{json.dumps(others, default=str)}\n\n"
+            f"Drift detail:\n{drift.detail}\n\n"
+            "Generate the updated plan. Respond with JSON only."
+        )
+
+    async def _refine_looping_tool_call(
+        self,
+        plan: Plan,
+        drift: DriftEvent,
+        goals: list[Goal],
+    ) -> Plan | None:
+        """Fail-and-regenerate path for ``LOOPING_TOOL_CALL`` drift.
+
+        The looping task is forced to ``FAILED`` so the rest of the plan
+        can route around it; non-looping completed tasks are preserved
+        verbatim. The LLM regenerates the remaining work in light of the
+        failure. If the LLM cannot be reached or returns garbage, we
+        still return a deterministic fallback plan that fails the
+        looping task in place — losing the looper's slot is better than
+        leaving it in a re-loop.
+        """
+        loop_id = drift.current_task_id
+        looping_task = next(
+            (t for t in plan.tasks if t.id == loop_id), None
+        )
+        try:
+            user_prompt = self._build_looping_tool_call_prompt(
+                plan, drift, goals, looping_task
+            )
+        except (TypeError, ValueError) as exc:
+            log.warning(
+                "LLMPlanner._refine_looping_tool_call: serialise failed (%s)",
+                exc,
+            )
+            return self._fallback_fail_loop_plan(plan, drift, looping_task)
+        try:
+            raw = await self._call_llm(
+                self._looping_tool_call_system_prompt, user_prompt, self._model
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "LLMPlanner._refine_looping_tool_call: call_llm raised %s", exc
+            )
+            return self._fallback_fail_loop_plan(plan, drift, looping_task)
+        if not raw or not isinstance(raw, str):
+            log.warning(
+                "LLMPlanner._refine_looping_tool_call: empty/non-string LLM "
+                "response"
+            )
+            return self._fallback_fail_loop_plan(plan, drift, looping_task)
+        cleaned = _strip_code_fences(raw).strip()
+        try:
+            parsed = json.loads(cleaned)
+        except (ValueError, TypeError) as exc:
+            log.warning(
+                "LLMPlanner._refine_looping_tool_call: failed to parse LLM "
+                "output as JSON (%s)",
+                exc,
+            )
+            return self._fallback_fail_loop_plan(plan, drift, looping_task)
+        revised = _plan_from_json(
+            parsed,
+            run_id=plan.run_id,
+            goal_ids=[g.id for g in goals if g.id] or list(plan.goal_ids),
+            plan_id=plan.id,
+        )
+        if revised is None:
+            log.warning(
+                "LLMPlanner._refine_looping_tool_call: parsed JSON did not "
+                "contain a usable plan"
+            )
+            return self._fallback_fail_loop_plan(plan, drift, looping_task)
+        # Force the looping task to FAILED in the revised plan even if
+        # the LLM forgot — the protocol contract is that the looper
+        # cannot survive its own drift.
+        if loop_id:
+            for t in revised.tasks:
+                if t.id == loop_id and t.status not in _TERMINAL_STATUSES:
+                    t.status = TaskStatus.FAILED
+            if not any(t.id == loop_id for t in revised.tasks) and looping_task is not None:
+                revised.tasks.insert(
+                    0,
+                    Task(
+                        id=looping_task.id,
+                        title=looping_task.title,
+                        description=looping_task.description,
+                        assignee_agent_id=looping_task.assignee_agent_id,
+                        status=TaskStatus.FAILED,
+                    ),
+                )
+        revised.revision_reason = drift.detail
+        revised.revision_kind = DriftKind.LOOPING_TOOL_CALL.value
+        revised.revision_severity = str(drift.severity)
+        revised.revision_index = plan.revision_index + 1
+        return revised
+
+    @staticmethod
+    def _fallback_fail_loop_plan(
+        plan: Plan,
+        drift: DriftEvent,
+        looping_task: Task | None,
+    ) -> Plan:
+        """Deterministic fallback when the LLM can't help.
+
+        Preserves all existing tasks/edges and just stamps the looping
+        task as FAILED so the executor stops retrying it. Other PENDING
+        tasks proceed; the goal may be unsatisfied but the run no
+        longer burns calls in the loop.
+        """
+        loop_id = drift.current_task_id
+        new_tasks: list[Task] = []
+        found = False
+        for t in plan.tasks:
+            if t.id == loop_id and t.status not in _TERMINAL_STATUSES:
+                new_tasks.append(
+                    Task(
+                        id=t.id,
+                        title=t.title,
+                        description=t.description,
+                        assignee_agent_id=t.assignee_agent_id,
+                        status=TaskStatus.FAILED,
+                        predicted_start_ms=t.predicted_start_ms,
+                        predicted_duration_ms=t.predicted_duration_ms,
+                        bound_span_id=t.bound_span_id,
+                    )
+                )
+                found = True
+            else:
+                new_tasks.append(
+                    Task(
+                        id=t.id,
+                        title=t.title,
+                        description=t.description,
+                        assignee_agent_id=t.assignee_agent_id,
+                        status=t.status,
+                        predicted_start_ms=t.predicted_start_ms,
+                        predicted_duration_ms=t.predicted_duration_ms,
+                        bound_span_id=t.bound_span_id,
+                    )
+                )
+        if not found and looping_task is not None and loop_id:
+            new_tasks.append(
+                Task(
+                    id=looping_task.id,
+                    title=looping_task.title,
+                    description=looping_task.description,
+                    assignee_agent_id=looping_task.assignee_agent_id,
+                    status=TaskStatus.FAILED,
+                )
+            )
+        return Plan(
+            id=plan.id,
+            run_id=plan.run_id,
+            goal_ids=list(plan.goal_ids),
+            tasks=new_tasks,
+            edges=[
+                TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
+                for e in plan.edges
+            ],
+            summary=plan.summary,
+            revision_reason=drift.detail,
+            revision_kind=DriftKind.LOOPING_TOOL_CALL.value,
+            revision_severity=str(drift.severity),
+            revision_index=plan.revision_index + 1,
+        )
 
     async def _refine_user_steer(
         self,
