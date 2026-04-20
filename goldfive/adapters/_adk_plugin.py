@@ -712,6 +712,16 @@ def make_adk_plugin(
                             "after_model_callback: observe_reasoning raised: %s",
                             exc,
                         )
+            # Note this turn for the opt-in reflective self-progress check.
+            # ``note_llm_call`` is a no-op unless the steerer was
+            # constructed with ``reflective_call_llm``; adapters that
+            # don't ship this hook simply skip the counter.
+            note_llm_call = getattr(ctx.steerer, "note_llm_call", None)
+            if note_llm_call is not None:
+                try:
+                    await note_llm_call(ctx.session)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("after_model_callback: note_llm_call raised: %s", exc)
             return None
 
         async def on_event_callback(self, *, invocation_context: Any, event: Any) -> None:

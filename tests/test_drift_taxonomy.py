@@ -50,6 +50,8 @@ EXPECTED_DRIFT_KINDS = {
     "CONFUSION": "confusion",
     "OFF_TOPIC": "off_topic",
     "INTENT_DIVERGENCE": "intent_divergence",
+    "UNCERTAIN_PROGRESS": "uncertain_progress",
+    "SELF_REPORTED_STUCK": "self_reported_stuck",
 }
 
 
