@@ -88,6 +88,33 @@ message PlanSubmitted {
   Plan plan = 1;
 }
 
+// Minimal cross-revision diff payload attached to `PlanRevised` so
+// sinks that render "what changed" can do so without re-fetching and
+// diff'ing the two plans client-side. Closes PLAN-LIFECYCLE.md §8
+// gap #4.
+//
+// Identity rules mirror PLAN-LIFECYCLE.md §3.0: a task/edge is identified
+// by its id (tasks) or its (from_task_id, to_task_id) pair (edges). The
+// diff is advisory — the authoritative plan lives in the enclosing
+// `PlanRevised.plan` field; `diff` just saves consumers the work of
+// computing the delta themselves.
+message PlanRevisionDiff {
+  // Task ids present in the new plan but not in the old plan.
+  repeated string added_task_ids = 1;
+  // Task ids present in the old plan but not in the new plan.
+  repeated string removed_task_ids = 2;
+  // Task ids present in both plans where at least one tracked
+  // metadata field changed (title, description, assignee, status).
+  // Pure status-only transitions that are already covered by the
+  // Task* events are still listed here so sinks have a single
+  // authoritative "modified" set keyed by task id.
+  repeated string modified_task_ids = 3;
+  // Edges present in the new plan but not in the old plan.
+  repeated TaskEdge added_edges = 4;
+  // Edges present in the old plan but not in the new plan.
+  repeated TaskEdge removed_edges = 5;
+}
+
 // A revised plan, emitted by the observer in response to drift. The
 // plan's `revision_index` is monotonically greater than the previous
 // plan on this run. `drift_kind`, `severity`, and `reason` duplicate
@@ -99,6 +126,11 @@ message PlanRevised {
   DriftSeverity severity = 3;
   string reason = 4;
   uint32 revision_index = 5;
+  // Minimal diff between the previous plan and `plan`. Optional for
+  // back-compat with older producers; sinks that don't need the diff
+  // can ignore it. Consumers that want a no-fetch "what changed" view
+  // should read this field. See :class:`PlanRevisionDiff` above.
+  PlanRevisionDiff diff = 6;
 }
 
 // Task transitioned PENDING -> RUNNING.

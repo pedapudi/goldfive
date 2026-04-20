@@ -921,6 +921,96 @@ async def test_apply_revision_emits_schema_violation_on_missing_terminal_edge() 
     assert "terminal->terminal edge 't1' -> 't2'" in second.detail
 
 
+async def test_plan_revised_carries_diff() -> None:
+    """The ``PlanRevised`` event populates ``diff`` with add/remove/modify deltas.
+
+    Closes PLAN-LIFECYCLE.md §8 gap #4: sinks should not have to re-fetch
+    the old plan to render "what changed". The steerer's
+    ``_emit_plan_revised`` captures the outgoing plan before
+    ``_apply_revision`` swaps it in, so the emitted event carries a
+    populated ``PlanRevisionDiff`` covering tasks added, removed,
+    modified, and edges added / removed.
+    """
+    # Outgoing plan: t1 -> t2, with t2's title about to change.
+    old = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="t1", title="T1"),
+            Task(id="t2", title="old title"),
+        ],
+        edges=[TaskEdge(from_task_id="t1", to_task_id="t2")],
+    )
+    # Revised plan: t1 preserved; t2 re-titled (modified); t3 added;
+    # original t1->t2 edge dropped in favour of t1->t3.
+    revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="t1", title="T1"),
+            Task(id="t2", title="new title"),
+            Task(id="t3", title="T3"),
+        ],
+        edges=[TaskEdge(from_task_id="t1", to_task_id="t3")],
+    )
+    planner = StubPlanner(revised=revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session(old)
+
+    await steerer.observe({"error": "trigger refine"}, session)
+
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert kinds == ["drift_detected", "plan_revised"]
+    pr = sink.events[1].plan_revised
+    assert list(pr.diff.added_task_ids) == ["t3"]
+    assert list(pr.diff.removed_task_ids) == []
+    assert list(pr.diff.modified_task_ids) == ["t2"]
+    added = [(e.from_task_id, e.to_task_id) for e in pr.diff.added_edges]
+    removed = [(e.from_task_id, e.to_task_id) for e in pr.diff.removed_edges]
+    assert added == [("t1", "t3")]
+    assert removed == [("t1", "t2")]
+
+
+async def test_plan_revised_diff_empty_on_identity_revision() -> None:
+    """Revised plan structurally identical to the old → all diff lists empty.
+
+    The steerer still emits the ``PlanRevised`` event (because
+    ``planner.refine`` returned a non-None plan that passed validation),
+    but its ``diff`` fields must all be empty so sinks render a
+    no-op revision without a spurious "what changed" row.
+    """
+    # Build the "revised" plan so it is structurally equal to the
+    # outgoing plan but is a distinct object (so the helper doesn't
+    # short-circuit on identity).
+    tasks_a = [Task(id="t1", title="T1"), Task(id="t2", title="T2")]
+    tasks_b = [Task(id="t1", title="T1"), Task(id="t2", title="T2")]
+    edges_a = [TaskEdge(from_task_id="t1", to_task_id="t2")]
+    edges_b = [TaskEdge(from_task_id="t1", to_task_id="t2")]
+    old = Plan(id="p1", run_id="r1", goal_ids=["g1"], tasks=tasks_a, edges=edges_a)
+    revised = Plan(id="p1", run_id="r1", goal_ids=["g1"], tasks=tasks_b, edges=edges_b)
+
+    planner = StubPlanner(revised=revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session(old)
+
+    await steerer.observe({"error": "trigger refine"}, session)
+
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert kinds == ["drift_detected", "plan_revised"]
+    pr = sink.events[1].plan_revised
+    assert list(pr.diff.added_task_ids) == []
+    assert list(pr.diff.removed_task_ids) == []
+    assert list(pr.diff.modified_task_ids) == []
+    assert list(pr.diff.added_edges) == []
+    assert list(pr.diff.removed_edges) == []
+
+
 async def test_bind_replaces_sinks() -> None:
     steerer = DefaultSteerer()
     planner = StubPlanner()

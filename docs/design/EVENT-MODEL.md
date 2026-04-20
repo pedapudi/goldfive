@@ -68,7 +68,7 @@ envelope — there is no mixed-shape stream on the sink side.
 |---|---|---|
 | `GoalDerived` | `Runner` | After `goal_deriver.derive()` returns. Carries the `list[Goal]`. Fired once per run. |
 | `PlanSubmitted` | `Runner` | After initial `planner.generate()` succeeds. Carries the full `Plan`. |
-| `PlanRevised` | `Executor` | After a successful `planner.refine()` swap. Carries the revised `Plan`, the `revision_reason`, the triggering `DriftKind`, severity, and a monotonically increasing `revision_index`. |
+| `PlanRevised` | `Executor` | After a successful `planner.refine()` swap. Carries the revised `Plan`, the `revision_reason`, the triggering `DriftKind`, severity, a monotonically increasing `revision_index`, and a `PlanRevisionDiff` sidecar (`added_task_ids`, `removed_task_ids`, `modified_task_ids`, `added_edges`, `removed_edges`) so sinks can render "what changed" without re-fetching the prior plan. See PLAN-LIFECYCLE.md §2.1. |
 
 ### Task lifecycle
 
