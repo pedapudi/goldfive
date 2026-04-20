@@ -131,6 +131,14 @@ enum DriftKind {
   // triggers refine. Emitted by DefaultSteerer.maybe_run_reflective_check
   // when the opt-in reflective_call_llm is configured.
   DRIFT_KIND_SELF_REPORTED_STUCK = 32;
+  // Early-warning tier for the reasoning-similarity ladder: recent
+  // reasoning blocks are clustering tighter (max cosine similarity in
+  // [0.75, 0.9) against the last N=5 blocks) but have not yet crossed
+  // the LOOPING_REASONING cliff at 0.9. INFO severity; informational
+  // only. Requires the ``goldfive[embedding]`` extra; hash-based
+  // detection is deliberately not used here because the signal is
+  // semantic "tightening," not byte-identical repetition.
+  DRIFT_KIND_REASONING_CLUSTER_TIGHTENING = 33;
 }
 
 // Directed edge in a plan's task dependency DAG. `from_task_id` must

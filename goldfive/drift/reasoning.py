@@ -6,11 +6,16 @@ adapter captures those blocks and hands them to
 :meth:`goldfive.steerer.DefaultSteerer.observe_reasoning`, which runs
 the pipeline defined here.
 
-Four drift kinds live in this module:
+Five drift kinds live in this module:
 
 * :data:`~goldfive.types.DriftKind.LOOPING_REASONING` -- consecutive
   reasoning blocks semantically identical (hash-exact fallback; cosine
-  similarity when the ``embedding`` extra is installed).
+  similarity >= 0.9 when the ``embedding`` extra is installed). The
+  "cliff" tier that triggers refine.
+* :data:`~goldfive.types.DriftKind.REASONING_CLUSTER_TIGHTENING` --
+  graduated early-warning tier, fires when cosine similarity is in
+  ``[0.75, 0.9)`` against any of the last N reasoning blocks. INFO
+  severity; informational only, no refine. One-shot per task.
 * :data:`~goldfive.types.DriftKind.CONFUSION` -- uncertainty markers
   in the reasoning text.
 * :data:`~goldfive.types.DriftKind.OFF_TOPIC` -- reasoning topic is
@@ -22,9 +27,10 @@ Four drift kinds live in this module:
 
 The pipeline emits at most one drift per call to keep cost bounded.
 Detectors run in severity order: INTENT_DIVERGENCE (up to CRITICAL) ->
-LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING) -> CONFUSION (INFO).
+LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING) ->
+REASONING_CLUSTER_TIGHTENING (INFO) -> CONFUSION (INFO).
 When INTENT_DIVERGENCE resolves to a non-CRITICAL severity (INFO /
-WARNING), the pipeline still returns it first -- the kind is stable,
+WARNING), the pipeline still returns it first — the kind is stable,
 severity differentiates.
 """
 
@@ -50,11 +56,13 @@ __all__ = [
     "LOOPING_REASONING_HASH_WINDOW",
     "LOOPING_REASONING_SIMILARITY_THRESHOLD",
     "OFF_TOPIC_DISTANCE_THRESHOLD",
+    "REASONING_CLUSTER_SIMILARITY_THRESHOLD",
     "analyze_reasoning",
     "detect_confusion",
     "detect_intent_divergence",
     "detect_looping_reasoning",
     "detect_off_topic",
+    "detect_reasoning_cluster_tightening",
     "reasoning_hash",
 ]
 
@@ -93,6 +101,13 @@ LOOPING_REASONING_HASH_WINDOW: int = 5
 # Cosine-similarity threshold for semantic loop detection. Lower values
 # flag looser similarity as a loop; 0.9 keeps false positives rare.
 LOOPING_REASONING_SIMILARITY_THRESHOLD: float = 0.9
+
+# Lower-tier cosine-similarity threshold for the graduated early-warning
+# signal ``REASONING_CLUSTER_TIGHTENING``. Fires in the half-open band
+# ``[REASONING_CLUSTER_SIMILARITY_THRESHOLD, LOOPING_REASONING_SIMILARITY_THRESHOLD)``;
+# above the upper bound the cliff detector (LOOPING_REASONING) owns the
+# signal and the tightening tier stays quiet.
+REASONING_CLUSTER_SIMILARITY_THRESHOLD: float = 0.75
 
 # Cosine-distance threshold for OFF_TOPIC. ``1 - cosine >= threshold``
 # means the reasoning is far from the task description.
@@ -386,6 +401,65 @@ def detect_looping_reasoning(
     return None
 
 
+def detect_reasoning_cluster_tightening(
+    text: str, session: Session
+) -> DriftEvent | None:
+    """Return :data:`DriftKind.REASONING_CLUSTER_TIGHTENING` when recent
+    reasoning blocks are semantically clustering tight -- max cosine
+    similarity against the last :data:`LOOPING_REASONING_HASH_WINDOW`
+    prior blocks falls in the half-open band
+    ``[REASONING_CLUSTER_SIMILARITY_THRESHOLD,
+    LOOPING_REASONING_SIMILARITY_THRESHOLD)``.
+
+    This is the graduated early-warning tier below the LOOPING_REASONING
+    "cliff" at 0.9: the agent's chain-of-thought is repeating concepts
+    but has not yet collapsed into a loop. INFO severity, so sinks see
+    it but the planner is not disturbed.
+
+    Embedding-only -- skipped silently when the embedding model is
+    unavailable (same rule as :func:`detect_off_topic`), because the
+    signal is semantic tightening rather than byte-identical repetition.
+
+    One-shot per task: the detector fires at most once for any given
+    ``session.current_task_id`` value, tracked via
+    ``session.reasoning_cluster_flagged``. Avoids drift-spam when a run
+    stays in the tight-cluster regime for many consecutive turns.
+    """
+    if not text:
+        return None
+    task_id = session.current_task_id or ""
+    if task_id and task_id in session.reasoning_cluster_flagged:
+        return None
+    history = [
+        h for h in session.reasoning_history[-LOOPING_REASONING_HASH_WINDOW - 1 : -1]
+        if h
+    ]
+    if not history:
+        return None
+    sim = _embed.max_similarity(text, history)
+    # max_similarity returns 0.0 both when the model is unavailable and
+    # when the genuine cosine is zero; either way the early-warning tier
+    # stays silent. This matches ``detect_off_topic``'s graceful-degrade
+    # contract.
+    if sim < REASONING_CLUSTER_SIMILARITY_THRESHOLD:
+        return None
+    if sim >= LOOPING_REASONING_SIMILARITY_THRESHOLD:
+        # Cliff tier owns this regime -- do not double-fire.
+        return None
+    if task_id:
+        session.reasoning_cluster_flagged.add(task_id)
+    return DriftEvent(
+        kind=DriftKind.REASONING_CLUSTER_TIGHTENING,
+        severity=DriftSeverity.INFO,
+        detail=(
+            f"recent reasoning clustering (max cosine={sim:.2f}); "
+            "agent may be looping soon"
+        ),
+        current_task_id=session.current_task_id,
+        raw=text,
+    )
+
+
 def detect_off_topic(text: str, session: Session) -> DriftEvent | None:
     """Return :data:`DriftKind.OFF_TOPIC` when the reasoning vector is
     far from the current task topic vector.
@@ -445,10 +519,19 @@ def analyze_reasoning(text: str, session: Session) -> DriftEvent | None:
     Emits at most one drift per call. Detectors are tried in the order
     that preserves the worst-signal-wins invariant:
     INTENT_DIVERGENCE (graduated INFO/WARNING/CRITICAL) ->
-    LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING) -> CONFUSION
-    (INFO). INTENT_DIVERGENCE runs first even at INFO severity so its
-    kind is stable; callers that only care about warning-and-up simply
-    filter by ``severity``.
+    LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING) ->
+    REASONING_CLUSTER_TIGHTENING (INFO) -> CONFUSION (INFO).
+
+    INTENT_DIVERGENCE runs first even at INFO severity so its kind is
+    stable; callers that only care about warning-and-up simply filter
+    by ``severity``.
+
+    LOOPING_REASONING (cosine >= 0.9) must run before
+    REASONING_CLUSTER_TIGHTENING (0.75 <= cosine < 0.9) so that a
+    tight-loop observation emits the cliff drift and never the INFO
+    tier — the two are mutually exclusive by construction, and running
+    LOOPING_REASONING first keeps the "no double-fire" invariant
+    cheap to reason about.
     """
     if not text:
         return None
@@ -459,6 +542,9 @@ def analyze_reasoning(text: str, session: Session) -> DriftEvent | None:
     if drift is not None:
         return drift
     drift = detect_off_topic(text, session)
+    if drift is not None:
+        return drift
+    drift = detect_reasoning_cluster_tightening(text, session)
     if drift is not None:
         return drift
     drift = detect_confusion(text, session)

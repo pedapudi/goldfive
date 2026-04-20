@@ -63,6 +63,7 @@ class DriftKind(StrEnum):
     CUSTOM = "custom"
     LOOPING_TOOL_CALL = "looping_tool_call"
     LOOPING_REASONING = "looping_reasoning"
+    REASONING_CLUSTER_TIGHTENING = "reasoning_cluster_tightening"
     CONFUSION = "confusion"
     OFF_TOPIC = "off_topic"
     # INTENT_DIVERGENCE fires at a *variable* severity
@@ -343,6 +344,18 @@ class Session:
     # Consumed by the reasoning-drift detectors (see ``goldfive.drift_reasoning``).
     reasoning_history: list[str] = dataclasses.field(default_factory=list)
     reasoning_history_max: int = 20
+    # Per-task one-shot flags for the graduated reasoning-similarity
+    # ladder. ``REASONING_CLUSTER_TIGHTENING`` (INFO, 0.75 <= cosine <
+    # 0.9) fires AT MOST ONCE per ``current_task_id`` to avoid flooding
+    # the event stream when a run stays in a tight-cluster regime for
+    # many turns. ``reasoning_loop_flagged`` is reserved for an analogous
+    # one-shot dedup on the ``LOOPING_REASONING`` WARNING tier (the
+    # "cliff"); it is declared here so the two flags live as a pair,
+    # though the cliff detector does not consult it today. Keys are task
+    # ids that have already emitted the corresponding drift on this
+    # session.
+    reasoning_cluster_flagged: set[str] = dataclasses.field(default_factory=set)
+    reasoning_loop_flagged: set[str] = dataclasses.field(default_factory=set)
     # Per-(drift_kind_value, task_id) consecutive refine-failure counter.
     # Incremented each time ``planner.refine`` raises or returns ``None``
     # for the given (kind, task) tuple; reset on a successful refine.
