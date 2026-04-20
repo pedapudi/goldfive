@@ -32,13 +32,14 @@ This module is pinned to the shapes in ``docs/design/PROTOCOLS.md``.
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive.adapters._claude_prompt import (
     DEFAULT_SYSTEM_PROMPT_TEMPLATE,
     render_system_prompt,
 )
+from goldfive.adapters._tool_invocation import invoke_tool
 from goldfive.drift import classify_stop_reason
 from goldfive.reporting import REPORTING_TOOL_NAMES, ReportingToolSpec
 from goldfive.results import InvocationResult
@@ -367,8 +368,7 @@ class ClaudeAgentSDKAdapter:
         ) -> dict[str, Any]:
             tool_name = input_data.get("tool_name", "") or ""
             bare = _strip_mcp_prefix(tool_name)
-            spec = specs.get(bare)
-            if spec is None:
+            if bare not in specs:
                 # Not a reporting tool — let the SDK run it normally.
                 return {}
 
@@ -386,8 +386,19 @@ class ClaudeAgentSDKAdapter:
                 session,
             )
 
+            # Route through ``invoke_tool`` (NOT ``spec.handler`` direct)
+            # so every reporting-tool dispatch picks up the three
+            # protection layers: terminal-task rejection, idempotency,
+            # and loop-guard. See
+            # ``docs/design/TASK-LIFECYCLE.md`` §5 for the contract.
             try:
-                ack = await spec.handler(tool_input, session, steerer)
+                ack = await invoke_tool(
+                    list(specs.values()),
+                    bare,
+                    dict(tool_input) if isinstance(tool_input, Mapping) else {},
+                    session,
+                    steerer,
+                )
             except Exception as exc:  # noqa: BLE001 - surface to agent
                 ack = {"ok": False, "error": str(exc)}
 

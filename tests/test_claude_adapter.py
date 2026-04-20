@@ -142,8 +142,7 @@ def test_prompt_render_override_template() -> None:
     """A custom template is honored — placeholders are resolved."""
 
     template = (
-        "GOALS:\n{goal_block}\nPLAN:{plan_summary}\nDONE:{completed_block}\n"
-        "TASK:{task_block}\n"
+        "GOALS:\n{goal_block}\nPLAN:{plan_summary}\nDONE:{completed_block}\nTASK:{task_block}\n"
     )
     rendered = render_system_prompt(
         template,
@@ -358,3 +357,141 @@ def test_pretooluse_hook_passes_through_non_reporting_tools() -> None:
 
     result = asyncio.run(_run())
     assert result == {}
+
+
+# --------------------------------------------------------------------------- #
+# Regression guard — every reporting-tool dispatch MUST route through
+# :func:`goldfive.adapters._tool_invocation.invoke_tool` so the three
+# protection layers (terminal-task rejection, idempotency, loop guard)
+# fire. The Claude adapter's pre-tool-use hook previously invoked
+# ``spec.handler(...)`` directly, silently bypassing all three. See
+# ``docs/design/TASK-LIFECYCLE.md`` §5.
+# --------------------------------------------------------------------------- #
+
+
+def test_pretooluse_hook_on_terminal_task_returns_structured_rejection() -> None:
+    """A reporting call on an already-FAILED task must surface the
+    structured ``task_already_terminal`` error inside the hook's
+    ``permissionDecisionReason`` — proof the hook routes through
+    ``invoke_tool``.
+    """
+    import json as _json
+
+    from goldfive.types import TaskStatus
+
+    async def _boom_handler(args, session, steerer):
+        raise AssertionError(
+            "handler must not run on a terminal task; dispatch should "
+            "short-circuit via invoke_tool's terminal rejection"
+        )
+
+    spec = ReportingToolSpec(
+        name="report_task_progress",
+        description="progress",
+        parameters={"type": "object", "properties": {}},
+        handler=_boom_handler,
+    )
+
+    adapter = ClaudeAgentSDKAdapter(client_factory=lambda: _StubClient([]))
+
+    async def _run() -> dict[str, Any]:
+        await adapter.register_reporting_tools([spec])
+        task = Task(id="t1", title="x", status=TaskStatus.FAILED)
+        session = Session(
+            run_id="r",
+            plan=Plan(
+                id="p",
+                run_id="r",
+                goal_ids=[],
+                tasks=[task],
+                edges=[],
+            ),
+        )
+        hook = adapter._make_pretooluse_hook(session)  # noqa: SLF001
+        return await hook(
+            {
+                "tool_name": "mcp__goldfive_reporting__report_task_progress",
+                "tool_input": {"task_id": "t1", "fraction": 0.3},
+            },
+            "tu_x",
+            None,
+        )
+
+    result = asyncio.run(_run())
+    spec_out = result.get("hookSpecificOutput", {})
+    assert spec_out.get("permissionDecision") == "deny"
+    reason = spec_out.get("permissionDecisionReason", "")
+    # The hook encodes the ACK dict as JSON in the reason; parse it back
+    # to inspect the structured rejection payload.
+    parsed = _json.loads(reason)
+    assert parsed.get("acknowledged") is False, (
+        "expected structured rejection; got acknowledged=true. If this "
+        "fails, _make_pretooluse_hook is bypassing invoke_tool."
+    )
+    assert parsed.get("error") == "task_already_terminal"
+    assert parsed.get("task_id") == "t1"
+    assert parsed.get("current_status") == "FAILED"
+
+
+def test_pretooluse_hook_volume_cap_fires_drift() -> None:
+    """15+ calls to the same reporting tool for one task must fire a
+    ``LOOPING_TOOL_CALL`` drift — proves the hook's dispatch runs
+    through ``invoke_tool``'s loop-guard layer.
+    """
+    from goldfive.reporting import BUILTIN_REPORTING_TOOLS
+    from goldfive.types import DriftEvent, TaskEdge
+
+    class _Steerer:
+        def __init__(self) -> None:
+            self.events: list[Any] = []
+            self.drifts: list[DriftEvent] = []
+
+        async def observe(self, event: Any, session: Session) -> None:
+            self.events.append(event)
+
+        async def mark_task_blocked(self, task_id: str, *, session: Any, **kwargs: Any) -> None:
+            return None
+
+        async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+            self.drifts.append(drift)
+
+    spec = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_blocked")
+    steerer = _Steerer()
+    adapter = ClaudeAgentSDKAdapter(
+        client_factory=lambda: _StubClient([]),
+        steerer=steerer,
+    )
+
+    task = Task(id="t1", title="x")
+    session = Session(
+        run_id="r",
+        plan=Plan(
+            id="p",
+            run_id="r",
+            goal_ids=[],
+            tasks=[task, Task(id="t2", title="y")],
+            edges=[TaskEdge(from_task_id="t1", to_task_id="t2")],
+        ),
+    )
+
+    async def _run() -> None:
+        await adapter.register_reporting_tools([spec])
+        hook = adapter._make_pretooluse_hook(session)  # noqa: SLF001
+        for i in range(16):
+            await hook(
+                {
+                    "tool_name": "mcp__goldfive_reporting__report_task_blocked",
+                    "tool_input": {"task_id": "t1", "blocked_on": f"dep-{i}"},
+                },
+                f"tu-{i}",
+                None,
+            )
+
+    asyncio.run(_run())
+
+    assert len(steerer.drifts) == 1, (
+        f"expected one LOOPING_TOOL_CALL drift; got {len(steerer.drifts)}. "
+        "If this fails, _make_pretooluse_hook is bypassing invoke_tool's "
+        "loop-guard layer."
+    )
+    assert steerer.drifts[0].kind is DriftKind.LOOPING_TOOL_CALL
