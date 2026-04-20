@@ -389,6 +389,87 @@ def approval_rejected_event(
     return evt
 
 
+def build_plan_revision_diff(old_plan: Any, new_plan: Any) -> Any:
+    """Build a ``PlanRevisionDiff`` pb comparing ``old_plan`` to ``new_plan``.
+
+    Both arguments are :class:`goldfive.types.Plan` dataclasses (not pb
+    messages). Either may be ``None`` — a ``None`` old plan treats every
+    task/edge in ``new_plan`` as added, and vice versa — so this helper
+    is safe to call even before the first revision.
+
+    Identity rules (PLAN-LIFECYCLE.md §3.0):
+
+    * Tasks are identified by ``id``. ``added_task_ids`` / ``removed_task_ids``
+      are set difference on id sets. ``modified_task_ids`` is the id-
+      intersection with at least one differing tracked metadata field
+      (title, description, assignee_agent_id, status).
+    * Edges are identified by the ``(from_task_id, to_task_id)`` pair.
+
+    The returned message is a bare ``PlanRevisionDiff`` (not wrapped in
+    an ``Event`` envelope). Callers splice it into
+    ``plan_revised.diff.CopyFrom(...)`` themselves — this keeps the
+    helper usable in tests without constructing a full envelope.
+    """
+    pb = _events_pb_module()
+    diff = pb.PlanRevisionDiff()
+
+    old_tasks = list(getattr(old_plan, "tasks", []) or []) if old_plan is not None else []
+    new_tasks = list(getattr(new_plan, "tasks", []) or []) if new_plan is not None else []
+    old_by_id = {t.id: t for t in old_tasks if getattr(t, "id", "")}
+    new_by_id = {t.id: t for t in new_tasks if getattr(t, "id", "")}
+
+    old_ids = set(old_by_id.keys())
+    new_ids = set(new_by_id.keys())
+
+    # Preserve the order tasks appear in new_plan / old_plan respectively —
+    # sinks that render added-first, removed-next benefit from stable order
+    # matching the authoritative plan layout.
+    added = [t.id for t in new_tasks if t.id in (new_ids - old_ids)]
+    removed = [t.id for t in old_tasks if t.id in (old_ids - new_ids)]
+    modified: list[str] = []
+    for tid in (t.id for t in new_tasks if t.id in (old_ids & new_ids)):
+        old_t = old_by_id[tid]
+        new_t = new_by_id[tid]
+        if (
+            getattr(old_t, "title", "") != getattr(new_t, "title", "")
+            or getattr(old_t, "description", "") != getattr(new_t, "description", "")
+            or getattr(old_t, "assignee_agent_id", "")
+            != getattr(new_t, "assignee_agent_id", "")
+            or str(getattr(old_t, "status", "")) != str(getattr(new_t, "status", ""))
+        ):
+            modified.append(tid)
+
+    diff.added_task_ids.extend(added)
+    diff.removed_task_ids.extend(removed)
+    diff.modified_task_ids.extend(modified)
+
+    def _edge_key(e: Any) -> tuple[str, str]:
+        return (getattr(e, "from_task_id", ""), getattr(e, "to_task_id", ""))
+
+    old_edges = list(getattr(old_plan, "edges", []) or []) if old_plan is not None else []
+    new_edges = list(getattr(new_plan, "edges", []) or []) if new_plan is not None else []
+    old_edge_keys = {_edge_key(e) for e in old_edges}
+    new_edge_keys = {_edge_key(e) for e in new_edges}
+
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    for e in new_edges:
+        if _edge_key(e) not in old_edge_keys:
+            diff.added_edges.append(
+                types_pb2.TaskEdge(
+                    from_task_id=e.from_task_id, to_task_id=e.to_task_id
+                )
+            )
+    for e in old_edges:
+        if _edge_key(e) not in new_edge_keys:
+            diff.removed_edges.append(
+                types_pb2.TaskEdge(
+                    from_task_id=e.from_task_id, to_task_id=e.to_task_id
+                )
+            )
+    return diff
+
+
 def drift_detected_event(run_id: str, sequence: int, drift: Any) -> Any:
     pb = _events_pb_module()
     evt = new_event(run_id, sequence)
