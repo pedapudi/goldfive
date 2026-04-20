@@ -46,6 +46,16 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 - #69 Reconciled `HarmonografSink` API docs with the shipped
   `harmonograf_client.HarmonografSink(client)` shape and canonical
   `:7531` port.
+- `INTENT_DIVERGENCE` now fires at **graduated severity**
+  (`INFO` / `WARNING` / `CRITICAL`) based on cosine similarity
+  between the reasoning block and `session.goals` + the current
+  task topic. Bands: `sim >= 0.6` healthy, `>= 0.4` INFO, `>= 0.2`
+  WARNING, `< 0.2` CRITICAL. An unreferenced-keyword mismatch bumps
+  severity one step. The pattern-based fallback (no embeddings)
+  now fires at `WARNING` with the same keyword-mismatch bump. The
+  drift kind is stable; only `severity` changes. See
+  `docs/design/DRIFT.md` for the full table and
+  `goldfive/drift/reasoning.py` for thresholds.
 
 ## 0.1.0 — 2026-04-18
 

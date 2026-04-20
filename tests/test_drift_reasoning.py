@@ -102,10 +102,21 @@ def _session_with_task(
 
 @pytest.fixture(autouse=True)
 def _clear_embedding_model() -> Any:
-    """Ensure each test starts with no custom encoder installed."""
+    """Ensure each test starts with embeddings *unavailable*.
+
+    ``set_model(None)`` clears any cached encoder, and flipping
+    ``_MODEL_UNAVAILABLE`` true short-circuits the lazy import in
+    :func:`goldfive.drift._embed._get_model`. Tests that want the
+    embedding path install a stub via ``set_model(<encoder>)``, which
+    resets the flag.
+    """
+    from goldfive.drift import _embed as _embed_mod
+
     set_model(None)
+    _embed_mod._MODEL_UNAVAILABLE = True
     yield
     set_model(None)
+    _embed_mod._MODEL_UNAVAILABLE = True
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +145,16 @@ def test_confusion_suppressed_below_threshold() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pattern-based INTENT_DIVERGENCE
+# Pattern-based INTENT_DIVERGENCE (fallback path, no embedding model)
 # ---------------------------------------------------------------------------
 
 
-def test_intent_divergence_fires_when_goal_proposes_unrelated_focus() -> None:
+def test_intent_divergence_pattern_path_fires_when_goal_proposes_unrelated_focus() -> None:
+    # No embedding model -> pattern-based fallback. Default severity is
+    # WARNING; a keyword mismatch elsewhere in the text bumps it to
+    # CRITICAL (covered in the dedicated test below). The "cryptocurrency
+    # trading dashboard" text here has several 5+ char tokens absent
+    # from the goal summary, so severity bumps to CRITICAL.
     session = _session_with_task(
         goals=[Goal(id="g1", summary="write a slide review report")]
     )
@@ -149,7 +165,29 @@ def test_intent_divergence_fires_when_goal_proposes_unrelated_focus() -> None:
     drift = dreason.detect_intent_divergence(text, session)
     assert drift is not None
     assert drift.kind is DriftKind.INTENT_DIVERGENCE
+    # Proposal tokens disjoint AND unrelated keywords present -> bumped
+    # from WARNING up to CRITICAL.
     assert drift.severity is DriftSeverity.CRITICAL
+
+
+def test_intent_divergence_pattern_path_warning_without_keyword_mismatch() -> None:
+    # The unreferenced-keyword bump only fires on 5+ char non-stopword
+    # tokens that appear in the reasoning but not in goals+task. Here
+    # every 5+ char token in the reasoning also shows up in the task
+    # description, so the bump is suppressed and severity stays at
+    # WARNING. Meanwhile the proposal tokens ("tactics", "champion",
+    # "shortly") are disjoint from the goal summary, so the pattern
+    # detector still fires.
+    session = _session_with_task(
+        title="pivot actually focus report",
+        description="pivot actually focus report tactics champion shortly goal",
+        goals=[Goal(id="g1", summary="write a slide review report")],
+    )
+    text = "pivot to tactics champion shortly"
+    drift = dreason.detect_intent_divergence(text, session)
+    assert drift is not None
+    assert drift.kind is DriftKind.INTENT_DIVERGENCE
+    assert drift.severity is DriftSeverity.WARNING
 
 
 def test_intent_divergence_suppressed_when_focus_overlaps_goals() -> None:
@@ -264,12 +302,178 @@ def test_embedding_based_off_topic_no_fire_when_on_topic() -> None:
 
 
 def test_embedding_based_off_topic_silent_without_model() -> None:
-    # No model installed; graceful degradation.
+    # No model installed; graceful degradation. The autouse fixture
+    # already forces embeddings unavailable, but we re-assert here so
+    # the intent of the test is explicit: ``set_model(None)`` alone
+    # is not sufficient because it resets the lazy-load gate, which
+    # then allows the real sentence-transformers model to load when
+    # the ``embedding`` extra is installed.
+    from goldfive.drift import _embed as _embed_mod
+
     set_model(None)
+    _embed_mod._MODEL_UNAVAILABLE = True
     session = _session_with_task()
     text = "wildly unrelated reasoning content goes here"
     drift = dreason.detect_off_topic(text, session)
     assert drift is None
+
+
+# ---------------------------------------------------------------------------
+# Graduated INTENT_DIVERGENCE (embedding path)
+#
+# We use a fixed-similarity encoder so cosine(text, reference) is exactly
+# ``cos(angle_text - angle_reference)``. This keeps the tests independent
+# of the hash-bucket distribution in ``_StubEncoder``.
+# ---------------------------------------------------------------------------
+
+
+class _FixedSimilarityEncoder:
+    """Encoder that maps registered texts to pre-chosen unit vectors.
+
+    All vectors live on a 2-D unit circle so cosine between two texts
+    equals ``cos(theta_a - theta_b)``. Unregistered texts land at angle
+    0 (cosine 1 against each other). Use ``set(text, angle_rad)`` to
+    control the angle per text.
+    """
+
+    def __init__(self) -> None:
+        import math
+
+        self._math = math
+        self._by_text: dict[str, tuple[float, float]] = {}
+
+    def set(self, text: str, angle_rad: float) -> None:
+        self._by_text[text] = (self._math.cos(angle_rad), self._math.sin(angle_rad))
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        return [list(self._by_text.get(t, (1.0, 0.0))) for t in texts]
+
+
+def _intent_session(
+    *,
+    reasoning_text: str,
+    reasoning_angle: float,
+    goals_summary: str = "alpha bravo charlie delta",
+    task_title: str = "echo foxtrot",
+    task_description: str = "golf hotel india juliet",
+) -> Session:
+    """Build a session whose reference-text vector sits at angle 0 and
+    whose reasoning vector sits at ``reasoning_angle``. Cosine becomes
+    ``cos(reasoning_angle)``.
+
+    Default goals / task topic use NATO-style placeholder tokens so
+    tests can craft a reasoning text whose 5+ char tokens all appear
+    in the reference (suppressing the unreferenced-keyword bump) and
+    dial severity purely through the encoder angle. Tests that want
+    the keyword bump should override the defaults with a reasoning
+    text that includes an off-reference token.
+    """
+    import math
+
+    encoder = _FixedSimilarityEncoder()
+    # The detector concatenates goals_summary + task_title + task_description
+    # with single spaces (see ``reasoning._goals_text`` + ``_task_topic``).
+    # We register the exact concatenation at angle 0.
+    reference = " ".join(
+        p for p in (goals_summary, f"{task_title} {task_description}") if p
+    ).strip()
+    encoder.set(reference, 0.0)
+    encoder.set(reasoning_text, reasoning_angle)
+    set_model(encoder)
+    session = _session_with_task(
+        title=task_title,
+        description=task_description,
+        goals=[Goal(id="g1", summary=goals_summary)],
+    )
+    # Sanity: make sure our calibration matches what the detector will
+    # see. If this assert ever trips a reviewer has changed the
+    # _goals_text / _task_topic concatenation contract.
+    assert math.isclose(
+        math.cos(reasoning_angle),
+        dreason._embed.max_similarity(reasoning_text, [reference]),
+        abs_tol=1e-6,
+    )
+    return session
+
+
+def test_intent_divergence_healthy_above_0_6() -> None:
+    import math
+
+    # cos(theta) = 0.8 -> healthy, no drift. Every 5+ char token in
+    # ``reasoning_text`` already appears in the reference, so the
+    # keyword-mismatch bump cannot fire.
+    reasoning_text = "alpha bravo charlie"
+    session = _intent_session(
+        reasoning_text=reasoning_text,
+        reasoning_angle=math.acos(0.8),
+    )
+    drift = dreason.detect_intent_divergence(reasoning_text, session)
+    assert drift is None
+
+
+def test_intent_divergence_minor_fires_info_at_0_4_0_6() -> None:
+    import math
+
+    # cos(theta) = 0.5 -> in [0.4, 0.6) -> INFO.
+    reasoning_text = "alpha bravo charlie"
+    session = _intent_session(
+        reasoning_text=reasoning_text,
+        reasoning_angle=math.acos(0.5),
+    )
+    drift = dreason.detect_intent_divergence(reasoning_text, session)
+    assert drift is not None
+    assert drift.kind is DriftKind.INTENT_DIVERGENCE
+    assert drift.severity is DriftSeverity.INFO
+
+
+def test_intent_divergence_warning_at_0_2_0_4() -> None:
+    import math
+
+    # cos(theta) = 0.3 -> in [0.2, 0.4) -> WARNING.
+    reasoning_text = "alpha bravo charlie"
+    session = _intent_session(
+        reasoning_text=reasoning_text,
+        reasoning_angle=math.acos(0.3),
+    )
+    drift = dreason.detect_intent_divergence(reasoning_text, session)
+    assert drift is not None
+    assert drift.kind is DriftKind.INTENT_DIVERGENCE
+    assert drift.severity is DriftSeverity.WARNING
+
+
+def test_intent_divergence_critical_below_0_2() -> None:
+    import math
+
+    # cos(theta) = 0.0 -> < 0.2 -> CRITICAL.
+    reasoning_text = "alpha bravo charlie"
+    session = _intent_session(
+        reasoning_text=reasoning_text,
+        reasoning_angle=math.acos(0.0),
+    )
+    drift = dreason.detect_intent_divergence(reasoning_text, session)
+    assert drift is not None
+    assert drift.kind is DriftKind.INTENT_DIVERGENCE
+    assert drift.severity is DriftSeverity.CRITICAL
+
+
+def test_intent_divergence_keyword_mismatch_upgrades_severity() -> None:
+    import math
+
+    # Cosine sits in the INFO band (0.5). The reasoning text mentions
+    # "blockchain" -- a 5+ char non-stopword absent from both the goal
+    # summary and the task topic -> severity bumps INFO -> WARNING.
+    # All other 5+ char reasoning tokens DO appear in the reference, so
+    # only the off-topic keyword drives the bump.
+    reasoning_text = "alpha bravo blockchain charlie"
+    session = _intent_session(
+        reasoning_text=reasoning_text,
+        reasoning_angle=math.acos(0.5),
+    )
+    drift = dreason.detect_intent_divergence(reasoning_text, session)
+    assert drift is not None
+    assert drift.kind is DriftKind.INTENT_DIVERGENCE
+    # INFO (cosine band) + unreferenced keyword "blockchain" -> WARNING.
+    assert drift.severity is DriftSeverity.WARNING
 
 
 # ---------------------------------------------------------------------------

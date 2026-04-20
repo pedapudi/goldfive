@@ -124,12 +124,49 @@ parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
 | `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). | `warning` | yes |
 | `CONFUSION` | Reasoning text has ≥ 3 uncertainty markers ("I'm not sure", "wait", "hmm", …). | `info` | yes |
 | `OFF_TOPIC` | Reasoning cosine-distance from the current task description ≥ `0.7` (requires `goldfive[embedding]`). | `warning` | yes |
-| `INTENT_DIVERGENCE` | Reasoning proposes a new goal that does not overlap with `session.goals`. | `critical` | no |
+| `INTENT_DIVERGENCE` | Reasoning has drifted from `session.goals` + the current task topic. Severity is **graduated** — see table below. | `info` · `warning` · `critical` | depends on severity |
 
 Each observation produces at most one drift (the first match wins) in
 severity order: `INTENT_DIVERGENCE` → `LOOPING_REASONING` → `OFF_TOPIC`
 → `CONFUSION`. Detectors short-circuit so the pipeline cost stays
-bounded regardless of reasoning block size.
+bounded regardless of reasoning block size. `INTENT_DIVERGENCE` runs
+first even when it resolves to `info` severity, because the kind is
+stable — callers that only care about warning-and-up simply filter on
+the `severity` field.
+
+#### Graduated `INTENT_DIVERGENCE` severity
+
+When the `goldfive[embedding]` extra is installed, the detector
+computes cosine similarity between the current reasoning block and
+`session.goals` + the current task's `title + description`, then maps
+the score into a severity band:
+
+| Cosine similarity | Severity | Meaning |
+|---|---|---|
+| `sim >= 0.6` | _(no drift)_ | reasoning aligned with goals |
+| `0.4 <= sim < 0.6` | `info` | minor drift — surface, don't refine |
+| `0.2 <= sim < 0.4` | `warning` | notable drift — refine |
+| `sim < 0.2` | `critical` | far off-goal — refine urgently |
+
+When embeddings are unavailable the detector falls back to the
+pattern path: an explicit "my goal is X / let's focus on Y / pivot to
+Z" phrase whose proposal tokens do not overlap with any goal summary
+fires at `warning`.
+
+Either path may be bumped one step (`info` → `warning` → `critical`,
+saturating at `critical`) when the reasoning text mentions a 5+ char
+non-stopword keyword that is absent from both `session.goals` AND the
+current task's `title / description` — a cheap "talking about
+something unrelated" signal that catches soft divergence the cosine
+score alone may smooth over.
+
+The drift **kind** stays `INTENT_DIVERGENCE` across all severity
+bands: callers filtering by kind see one stable signal; the
+`severity` field differentiates urgency. Thresholds live in
+`goldfive/drift/reasoning.py` as
+`INTENT_DIVERGENCE_HEALTHY_SIMILARITY`,
+`INTENT_DIVERGENCE_MINOR_SIMILARITY`, and
+`INTENT_DIVERGENCE_WARNING_SIMILARITY`.
 
 The reasoning channel is additive: adapters that cannot surface
 chain-of-thought (e.g. classic GPT-4o) simply never call
