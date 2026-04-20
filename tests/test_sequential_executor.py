@@ -23,6 +23,7 @@ from goldfive.types import (
     DriftEvent,
     DriftKind,
     DriftSeverity,
+    Goal,
     Plan,
     Session,
     Task,
@@ -916,3 +917,162 @@ async def test_executor_skips_audit_when_all_tasks_terminal() -> None:
         e.drift_detected.kind == types_pb2.DRIFT_KIND_PLAN_DIVERGENCE for e in drift_payloads
     )
     assert sink.payload_kinds()[-1] == "run_completed"
+
+
+# ---------------------------------------------------------------------------
+# Goal success predicates (PLAN-LIFECYCLE.md §6.1, third clause).
+#
+# A run is only successful when every ``Goal.success_predicate`` on the
+# session returns True (or is None, vacuously met). If all tasks finish
+# but a goal predicate reports the semantic outcome as unmet, the run
+# must end with ``success=False`` and a reason that names the goal.
+# ---------------------------------------------------------------------------
+
+
+async def _run_happy_executor(
+    *,
+    goals: list[Goal],
+) -> tuple[Any, Session, RecordingSink]:
+    """Helper: run a 2-task linear plan that completes cleanly.
+
+    All goal-predicate tests share the same "all tasks succeed" setup;
+    what varies is ``session.goals``. Returns the outcome, the session,
+    and the recording sink so tests can assert on both the Outcome and
+    the terminal event.
+    """
+    plan = _linear_plan(2)
+    session = _fresh_session()
+    session.goals = list(goals)
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _complete_current(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id=task.id, text="ok")
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_current)
+    executor = SequentialExecutor(max_plan_reinvocations=5)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+    return outcome, session, sink
+
+
+async def test_run_with_unmet_goal_reports_failure() -> None:
+    """Tasks all succeed but a goal predicate returns False -> run fails.
+
+    The happy-path "every task terminal + no orphans" gate passes, but
+    the goal predicate tells us the semantic outcome wasn't reached.
+    The executor must fail the run and name the goal in the reason.
+    """
+    goals = [
+        Goal(id="g1", summary="deliver the thing", success_predicate=lambda _s: False),
+    ]
+    outcome, _session, sink = await _run_happy_executor(goals=goals)
+
+    assert outcome.success is False
+    # Reason names the goal by its summary so operators can triage.
+    assert "deliver the thing" in outcome.reason
+    assert "unmet" in outcome.reason.lower()
+    # Terminal event is RunAborted (not RunCompleted).
+    assert sink.payload_kinds()[-1] == "run_aborted"
+
+
+async def test_run_with_none_predicate_treats_as_met() -> None:
+    """``success_predicate=None`` is vacuously true — run reports success."""
+    goals = [
+        Goal(id="g1", summary="vacuous goal", success_predicate=None),
+    ]
+    outcome, _session, sink = await _run_happy_executor(goals=goals)
+
+    assert outcome.success is True
+    assert outcome.reason == ""
+    assert sink.payload_kinds()[-1] == "run_completed"
+
+
+async def test_run_with_raising_predicate_treats_as_unmet() -> None:
+    """A predicate that raises is logged and treated as unmet."""
+
+    def _boom(_session: Session) -> bool:
+        raise RuntimeError("evaluation exploded")
+
+    goals = [
+        Goal(id="g1", summary="raising goal", success_predicate=_boom),
+    ]
+    outcome, _session, sink = await _run_happy_executor(goals=goals)
+
+    assert outcome.success is False
+    # Reason carries both the goal name and the exception message.
+    assert "raising goal" in outcome.reason
+    assert "raised" in outcome.reason.lower()
+    assert "evaluation exploded" in outcome.reason
+    assert sink.payload_kinds()[-1] == "run_aborted"
+
+
+async def test_all_goals_met_returns_success() -> None:
+    """Standard happy path: every predicate returns True -> success."""
+    calls: list[str] = []
+
+    def _met_a(session: Session) -> bool:
+        calls.append("a")
+        # Predicate sees the actual session (tasks terminal by now).
+        assert session.plan is not None
+        return True
+
+    def _met_b(session: Session) -> bool:
+        calls.append("b")
+        return True
+
+    goals = [
+        Goal(id="g1", summary="goal A", success_predicate=_met_a),
+        Goal(id="g2", summary="goal B", success_predicate=_met_b),
+    ]
+    outcome, _session, sink = await _run_happy_executor(goals=goals)
+
+    assert outcome.success is True
+    assert outcome.reason == ""
+    # Both predicates were evaluated.
+    assert calls == ["a", "b"]
+    assert sink.payload_kinds()[-1] == "run_completed"
+
+
+async def test_run_with_empty_goals_returns_success() -> None:
+    """No goals at all: vacuously met -> success."""
+    outcome, _session, sink = await _run_happy_executor(goals=[])
+    assert outcome.success is True
+    assert outcome.reason == ""
+    assert sink.payload_kinds()[-1] == "run_completed"
+
+
+async def test_unmet_goal_short_circuits_on_first_false() -> None:
+    """Goals are evaluated in order; the first unmet goal short-circuits."""
+    calls: list[str] = []
+
+    def _first_fails(_s: Session) -> bool:
+        calls.append("first")
+        return False
+
+    def _second(_s: Session) -> bool:
+        calls.append("second")
+        return True
+
+    goals = [
+        Goal(id="g1", summary="first goal", success_predicate=_first_fails),
+        Goal(id="g2", summary="second goal", success_predicate=_second),
+    ]
+    outcome, _session, _sink = await _run_happy_executor(goals=goals)
+
+    assert outcome.success is False
+    # Only the first predicate ran; we short-circuited on its False.
+    assert calls == ["first"]
+    # Reason names the first goal, not the second.
+    assert "first goal" in outcome.reason
+    assert "second goal" not in outcome.reason

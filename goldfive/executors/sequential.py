@@ -49,7 +49,7 @@ from goldfive.executors._control import (
     drain_controls,
 )
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
-from goldfive.results import ExecutionOutcome
+from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
 from goldfive.types import DriftKind, DriftSeverity, Plan, Session, Task, TaskStatus
 
 if TYPE_CHECKING:
@@ -482,6 +482,22 @@ class SequentialExecutor(Executor):
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=reason)
+
+        # Goal success-predicate gate (PLAN-LIFECYCLE.md §6.1, third
+        # clause). Tasks are terminal and no orphans remain — now
+        # verify the caller's semantic goals. A predicate that returns
+        # False or raises fails the run with a descriptive reason.
+        unmet = evaluate_goal_predicates(session)
+        if unmet is not None:
+            await emit(
+                sinks,
+                run_aborted_event(
+                    run_id=session.run_id,
+                    sequence=session.next_sequence(),
+                    reason=unmet,
+                ),
+            )
+            return ExecutionOutcome(success=False, session=session, reason=unmet)
 
         await emit(
             sinks,
