@@ -287,6 +287,15 @@ class Session:
     # Consumed by the reasoning-drift detectors (see ``goldfive.drift_reasoning``).
     reasoning_history: list[str] = dataclasses.field(default_factory=list)
     reasoning_history_max: int = 20
+    # Per-(drift_kind_value, task_id) consecutive refine-failure counter.
+    # Incremented each time ``planner.refine`` raises or returns ``None``
+    # for the given (kind, task) tuple; reset on a successful refine.
+    # Consumed by :class:`~goldfive.steerer.DefaultSteerer` to back off
+    # and mark the task FAILED after N consecutive failures, preventing
+    # the same drift from looping until ``max_plan_reinvocations`` trips.
+    refine_failure_counts: dict[tuple[str, str], int] = dataclasses.field(
+        default_factory=dict
+    )
     # monotonic event sequence counter for sinks
     _next_sequence: int = 0
 
