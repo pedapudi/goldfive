@@ -116,8 +116,7 @@ async def test_reporting_tools_registered_on_root_agent() -> None:
     await adapter.register_reporting_tools([spec])
 
     names = [
-        getattr(t, "name", None)
-        or getattr(getattr(t, "func", None), "__name__", None)
+        getattr(t, "name", None) or getattr(getattr(t, "func", None), "__name__", None)
         for t in getattr(agent, "tools", None) or ()
     ]
     assert "report_task_started" in names
@@ -248,9 +247,7 @@ async def test_before_model_writes_goldfive_state_keys(state_ctx_cls) -> None:
         )
     }
 
-    await plugin.before_model_callback(
-        callback_context=state_ctx_cls(state), llm_request=None
-    )
+    await plugin.before_model_callback(callback_context=state_ctx_cls(state), llm_request=None)
 
     assert state.get(KEY_RUN_ID) == "run-abc"
     assert state.get(KEY_PLAN_ID) == "plan-1"
@@ -325,9 +322,7 @@ async def test_on_event_transfer_calls_steerer_observe(state_ctx_cls) -> None:
     class _Event:
         actions = _Actions()
 
-    await plugin.on_event_callback(
-        invocation_context=state_ctx_cls(state), event=_Event()
-    )
+    await plugin.on_event_callback(invocation_context=state_ctx_cls(state), event=_Event())
 
     assert len(steerer.events) == 1
     assert steerer.events[0]["kind"] == "agent_transfer"
@@ -358,9 +353,7 @@ def test_adapter_conforms_to_protocol() -> None:
 def _tool_names(agent: Any) -> set[str]:
     names: set[str] = set()
     for t in getattr(agent, "tools", None) or ():
-        n = getattr(t, "name", None) or getattr(
-            getattr(t, "func", None), "__name__", None
-        )
+        n = getattr(t, "name", None) or getattr(getattr(t, "func", None), "__name__", None)
         if n:
             names.add(str(n))
     return names
@@ -384,9 +377,7 @@ async def test_register_reporting_tools_propagates_across_three_level_tree() -> 
     from goldfive.reporting import BUILTIN_REPORTING_TOOLS, REPORTING_TOOL_NAMES
 
     def _mk(name: str) -> Any:
-        return LlmAgent(
-            name=name, model="fake-model", description=name, instruction="x"
-        )
+        return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
 
     grandchild_a = _mk("grandchild_a")
     grandchild_b = _mk("grandchild_b")
@@ -406,9 +397,7 @@ async def test_register_reporting_tools_propagates_across_three_level_tree() -> 
     for agent in (root, child_a, grandchild_a, child_b_as_tool, grandchild_b):
         have = _tool_names(agent)
         missing = expected - have
-        assert not missing, (
-            f"agent {agent.name!r} missing reporting tools: {sorted(missing)}"
-        )
+        assert not missing, f"agent {agent.name!r} missing reporting tools: {sorted(missing)}"
 
     # available_agents discovers every node in the tree.
     discovered = set(adapter.available_agents)
@@ -482,6 +471,107 @@ async def test_goldfive_adk_agent_add_plugin_delegates() -> None:
     assert plugin in installed
 
 
+async def test_invoke_breaks_when_task_reported_terminal_mid_stream() -> None:
+    """Adapter must stop driving the ADK runner once the agent has
+    reported the current task as terminal.
+
+    Without this, the ADK generator keeps running — letting the agent
+    take more LLM turns on an already-done task and burn through ADK's
+    500-LLM-call ceiling reporting redundant status. The fix checks
+    ``session.plan.tasks[task_id].status`` after each streamed event
+    and exits the ``async for`` loop as soon as it's terminal.
+    """
+    from dataclasses import dataclass, field
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Plan, Session, Task, TaskStatus
+
+    @dataclass
+    class _Event:
+        # ADK duck-types: no is_final_response → _is_final_event returns False.
+        marker: int = 0
+        content: Any = None
+
+    # A run_async that yields 5 events. On event #2, a "tool call" flips
+    # the task status to FAILED. The adapter should break at event #2 —
+    # events #3, #4, #5 must never be observed.
+    observed: list[int] = []
+
+    @dataclass
+    class _FakeRunner:
+        session_service: Any = None
+        plugin_manager: Any = field(default=None)
+
+        async def run_async(self, **kwargs: Any):  # noqa: ARG002
+            for i in range(5):
+                observed.append(i)
+                if i == 2:
+                    # Simulate a reporting-tool handler marking the task terminal.
+                    session.plan.tasks[0].status = TaskStatus.FAILED
+                yield _Event(marker=i)
+
+    task = Task(id="t1", title="do the thing")
+    session = Session(
+        run_id="r1",
+        goals=[],
+        plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[]),
+    )
+
+    adapter = ADKAdapter(_make_agent())
+    adapter._runner = _FakeRunner()
+    adapter._session_id = "stub-session"
+
+    result = await adapter.invoke(task=task, session=session)
+
+    # Events 0, 1, 2 should be observed; 3 and 4 must not be.
+    assert observed == [0, 1, 2], (
+        f"adapter should have broken after event #2 (terminal transition); observed {observed}"
+    )
+    assert result.stop_reason == "task_terminal"
+    assert result.task_id == "t1"
+
+
+async def test_invoke_runs_to_completion_when_task_stays_non_terminal() -> None:
+    """If the task is never reported terminal, the adapter drains all
+    events — the new break must not short-circuit normal runs.
+    """
+    from dataclasses import dataclass, field
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Plan, Session, Task
+
+    @dataclass
+    class _Event:
+        marker: int = 0
+        content: Any = None
+
+    observed: list[int] = []
+
+    @dataclass
+    class _FakeRunner:
+        session_service: Any = None
+        plugin_manager: Any = field(default=None)
+
+        async def run_async(self, **kwargs: Any):  # noqa: ARG002
+            for i in range(3):
+                observed.append(i)
+                yield _Event(marker=i)
+
+    task = Task(id="t2", title="normal run")
+    session = Session(
+        run_id="r1",
+        goals=[],
+        plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[]),
+    )
+
+    adapter = ADKAdapter(_make_agent())
+    adapter._runner = _FakeRunner()
+    adapter._session_id = "stub-session"
+
+    await adapter.invoke(task=task, session=session)
+    assert observed == [0, 1, 2]
+
+
 async def test_register_reporting_tools_is_idempotent() -> None:
     """Registering twice must not duplicate the reporting tools on any agent."""
     from google.adk.agents.llm_agent import LlmAgent  # type: ignore
@@ -489,12 +579,8 @@ async def test_register_reporting_tools_is_idempotent() -> None:
     from goldfive.adapters.adk import ADKAdapter
     from goldfive.reporting import BUILTIN_REPORTING_TOOLS, REPORTING_TOOL_NAMES
 
-    child = LlmAgent(
-        name="child", model="fake-model", description="c", instruction="x"
-    )
-    root = LlmAgent(
-        name="root", model="fake-model", description="r", instruction="x"
-    )
+    child = LlmAgent(name="child", model="fake-model", description="c", instruction="x")
+    root = LlmAgent(name="root", model="fake-model", description="r", instruction="x")
     root.sub_agents = [child]
 
     adapter = ADKAdapter(root)
@@ -503,12 +589,10 @@ async def test_register_reporting_tools_is_idempotent() -> None:
 
     for agent in (root, child):
         names = [
-            getattr(t, "name", None)
-            or getattr(getattr(t, "func", None), "__name__", None)
+            getattr(t, "name", None) or getattr(getattr(t, "func", None), "__name__", None)
             for t in getattr(agent, "tools", None) or ()
         ]
         for reporting_name in REPORTING_TOOL_NAMES:
             assert names.count(reporting_name) == 1, (
-                f"{agent.name}: {reporting_name} registered "
-                f"{names.count(reporting_name)} times"
+                f"{agent.name}: {reporting_name} registered {names.count(reporting_name)} times"
             )
