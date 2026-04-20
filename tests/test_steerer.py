@@ -558,6 +558,109 @@ async def test_event_sequence_is_monotonic_and_run_id_stamped() -> None:
         assert e.emitted_at.seconds > 0 or e.emitted_at.nanos > 0
 
 
+async def test_observe_rejects_invalid_revised_plan() -> None:
+    """A refine() that returns a structurally-broken plan is rejected.
+
+    The steerer must not install a plan with duplicate ids / cycles /
+    unknown edges. Instead it emits a CRITICAL ``SCHEMA_VIOLATION``
+    DriftDetected carrying the validator's reason, and the session
+    keeps its original plan.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    # Revised plan with duplicate task ids — validate() will reject it.
+    bad_revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="dup", title="first", status=TaskStatus.PENDING),
+            Task(id="dup", title="second", status=TaskStatus.PENDING),
+        ],
+        edges=[],
+    )
+    planner = StubPlanner(revised=bad_revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+    original_plan = session.plan
+
+    await steerer.observe({"error": "trigger refine"}, session)
+
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    # The initial TOOL_ERROR drift, then a CRITICAL validation-failure
+    # drift when the bad revised plan is rejected. No PlanRevised is
+    # emitted because the revision was not installed.
+    assert kinds == ["drift_detected", "drift_detected"]
+    # Original plan is still in place.
+    assert session.plan is original_plan
+    # The second drift is the validation-failure signal.
+    second = sink.events[1].drift_detected
+    assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
+    assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert "plan validation failed" in second.detail
+    assert "duplicate task id" in second.detail
+
+
+async def test_observe_rejects_revised_plan_with_cycle() -> None:
+    """Cycle in the revised plan is rejected with a CRITICAL drift."""
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    bad_revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="a", title="A", status=TaskStatus.PENDING),
+            Task(id="b", title="B", status=TaskStatus.PENDING),
+        ],
+        edges=[TaskEdge("a", "b"), TaskEdge("b", "a")],
+    )
+    planner = StubPlanner(revised=bad_revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+    original_plan = session.plan
+
+    await steerer.observe({"error": "trigger refine"}, session)
+
+    assert session.plan is original_plan
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert kinds == ["drift_detected", "drift_detected"]
+    second = sink.events[1].drift_detected
+    assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
+    assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert "cycle" in second.detail
+
+
+async def test_observe_rejects_revised_plan_with_unknown_edge() -> None:
+    """An edge referencing a missing task id is rejected."""
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    bad_revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[Task(id="t1", title="1", status=TaskStatus.PENDING)],
+        edges=[TaskEdge("t1", "ghost")],
+    )
+    planner = StubPlanner(revised=bad_revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+    original_plan = session.plan
+
+    await steerer.observe({"error": "trigger refine"}, session)
+
+    assert session.plan is original_plan
+    second = sink.events[1].drift_detected
+    assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
+    assert "unknown task id" in second.detail
+
+
 async def test_bind_replaces_sinks() -> None:
     steerer = DefaultSteerer()
     planner = StubPlanner()
