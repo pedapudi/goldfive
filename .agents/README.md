@@ -27,6 +27,10 @@ action.
 | know what events exist and how to emit one | [events.md](events.md) |
 | write a goldfive test | [testing.md](testing.md) |
 | cut a release | [release.md](release.md) |
+| add a new `AgentAdapter` wrapping a new framework | [how-to-add-a-new-adapter.md](how-to-add-a-new-adapter.md) |
+| debug the "guards defined but not firing" class of bug | [how-to-debug-a-filler-loop.md](how-to-debug-a-filler-loop.md) |
+| add a new `DriftKind` | [how-to-add-a-drift-kind.md](how-to-add-a-drift-kind.md) |
+| drive a goldfive end-to-end run with harmonograf locally | [how-to-run-the-e2e.md](how-to-run-the-e2e.md) |
 
 ## How these get referenced
 
