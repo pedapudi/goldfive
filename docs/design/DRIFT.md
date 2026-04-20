@@ -112,6 +112,41 @@ kinds group naturally into six categories.
 | `GOAL_UNREACHABLE` | Planner returned `None` from refine; no further progress possible. | `critical` | no |
 | `AMBIGUOUS_INTENT` | Multiple plausible goal interpretations; needs clarification. | `warning` | yes |
 
+### Reasoning category — the model's chain-of-thought exposes drift before the tool calls do
+
+These four kinds are emitted by `Steerer.observe_reasoning(text, session)`,
+which adapters call once per LLM response that carries reasoning content
+(OpenAI `reasoning_content`, Anthropic `thinking` blocks, Google thought
+parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
+
+| Kind | Trigger | Default severity | Recoverable |
+|---|---|---|---|
+| `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). | `warning` | yes |
+| `CONFUSION` | Reasoning text has ≥ 3 uncertainty markers ("I'm not sure", "wait", "hmm", …). | `info` | yes |
+| `OFF_TOPIC` | Reasoning cosine-distance from the current task description ≥ `0.7` (requires `goldfive[embedding]`). | `warning` | yes |
+| `INTENT_DIVERGENCE` | Reasoning proposes a new goal that does not overlap with `session.goals`. | `critical` | no |
+
+Each observation produces at most one drift (the first match wins) in
+severity order: `INTENT_DIVERGENCE` → `LOOPING_REASONING` → `OFF_TOPIC`
+→ `CONFUSION`. Detectors short-circuit so the pipeline cost stays
+bounded regardless of reasoning block size.
+
+The reasoning channel is additive: adapters that cannot surface
+chain-of-thought (e.g. classic GPT-4o) simply never call
+`observe_reasoning`, and the other drift paths continue to fire
+normally.
+
+**Opt-in embedding model.** Pattern / hash detectors run with zero
+extra dependencies. Semantic loop detection and off-topic detection
+light up when `sentence-transformers` is installed (via the
+`goldfive[embedding]` extra). Model load is lazy — no import cost on
+processes that never call `observe_reasoning`.
+
+**Session state.** `Session.reasoning_history` stores the last
+`reasoning_history_max` (default 20) reasoning blocks and is what the
+loop detector compares against. Memory is bounded: 20 × ~2 KB ≈ 40 KB
+per session.
+
 ### Escape hatch
 
 | Kind | Trigger | Default severity |

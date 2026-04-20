@@ -46,6 +46,10 @@ EXPECTED_DRIFT_KINDS = {
     "AMBIGUOUS_INTENT": "ambiguous_intent",
     "CUSTOM": "custom",
     "LOOPING_TOOL_CALL": "looping_tool_call",
+    "LOOPING_REASONING": "looping_reasoning",
+    "CONFUSION": "confusion",
+    "OFF_TOPIC": "off_topic",
+    "INTENT_DIVERGENCE": "intent_divergence",
 }
 
 

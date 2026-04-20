@@ -55,6 +55,15 @@ class Steerer(Protocol):
 
     async def observe(self, event: Any, session: Session) -> None: ...
 
+    async def observe_reasoning(
+        self,
+        text: str,
+        *,
+        task: Task | None = None,
+        session: Session,
+        provider: str = "",
+    ) -> None: ...
+
     async def transition(
         self,
         task_id: str,
@@ -93,6 +102,16 @@ class AgentAdapter(Protocol):
         task: Task,
         session: Session,
     ) -> InvocationResult: ...
+
+    async def emit_reasoning(
+        self,
+        text: str,
+        *,
+        task: Task | None = None,
+        session: Session,
+        provider: str = "",
+        call_id: str = "",
+    ) -> None: ...
 
     @property
     def available_agents(self) -> list[str]: ...

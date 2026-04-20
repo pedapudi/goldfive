@@ -6,6 +6,17 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ### Added
 
+- #96 Reasoning-based drift detection — `Steerer.observe_reasoning()`
+  + `AgentAdapter.emit_reasoning()` feed chain-of-thought from the
+  model into the drift pipeline. Four new `DriftKind` values
+  (`LOOPING_REASONING`, `CONFUSION`, `OFF_TOPIC`,
+  `INTENT_DIVERGENCE`) catch loops and off-goal drift before the
+  tool calls resolve. Pattern + hash detectors ship by default;
+  install `goldfive[embedding]` to light up cosine-similarity
+  detectors. `Session.reasoning_history` keeps the last 20 blocks.
+  ADK `after_model_callback` extracts per-provider reasoning
+  content (OpenAI `reasoning_content`, Anthropic `thinking` blocks,
+  Google thought parts).
 - #57 `goldfive.quickstart(agent, goals)` — one-call `Runner` factory
   wiring `SequentialExecutor`, `PassthroughGoalDeriver`, a
   one-task-per-goal `StaticPlanner`, and an `InMemorySink`.
