@@ -39,6 +39,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from goldfive._llm import maybe_close_call_llm
 from goldfive.conversation import Conversation
 from goldfive.events import (
     conversation_ended_event,
@@ -403,6 +404,17 @@ class Runner:
                 await sink.close()
             except Exception as exc:  # noqa: BLE001
                 log.warning("sink.close() raised: %s", exc)
+        # Auto-close LLM callables on the planner and goal-deriver if they
+        # implement the optional ``close`` shape (see goldfive._llm).
+        # Standard SDK clients (OpenAI AsyncOpenAI, ADK LiteLlm, …) own
+        # an aiohttp session that leaks unless explicitly closed.
+        await maybe_close_call_llm(
+            getattr(self.planner, "_call_llm", None), label="planner.call_llm"
+        )
+        await maybe_close_call_llm(
+            getattr(self.goal_deriver, "_call_llm", None),
+            label="goal_deriver.call_llm",
+        )
         for hook in self._close_hooks:
             try:
                 await hook()

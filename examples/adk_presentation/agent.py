@@ -323,6 +323,12 @@ def _make_openai_call_llm() -> Any:
     ``pip install openai``. Model identifiers default to
     ``gpt-4o-mini`` but can be overridden via
     ``GOLDFIVE_EXAMPLE_PLANNER_MODEL``.
+
+    The returned callable carries an async ``close`` attribute that
+    shuts down the underlying ``aiohttp`` session. Goldfive's
+    :class:`Runner.close` discovers and awaits it via the duck-typed
+    :class:`goldfive._llm.ClosableCallLLM` protocol, so callers don't
+    need to register a separate close hook.
     """
     try:
         from openai import AsyncOpenAI  # type: ignore
@@ -347,6 +353,10 @@ def _make_openai_call_llm() -> Any:
         )
         return resp.choices[0].message.content or ""
 
+    async def _close() -> None:
+        await client.close()
+
+    _call.close = _close  # type: ignore[attr-defined]
     return _call
 
 
