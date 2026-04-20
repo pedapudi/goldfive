@@ -814,6 +814,113 @@ async def test_observe_rejects_revised_plan_with_unknown_edge() -> None:
     assert "unknown task id" in second.detail
 
 
+async def test_apply_revision_emits_schema_violation_on_terminal_regression() -> None:
+    """A refine that regresses a terminal task's status is rejected.
+
+    PLAN-LIFECYCLE.md §3.1: terminal tasks are frozen — once a task
+    lands in COMPLETED / FAILED / CANCELLED, subsequent revisions must
+    preserve id AND status. The steerer must reject a revision that
+    flips a previously-COMPLETED task back to PENDING, emit a CRITICAL
+    SCHEMA_VIOLATION drift with the validator's reason, and keep the
+    original plan installed.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    # Seed the session with a plan where t1 is COMPLETED, t2 is PENDING.
+    prior = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="t1", title="done", status=TaskStatus.COMPLETED),
+            Task(id="t2", title="next", status=TaskStatus.PENDING),
+        ],
+        edges=[TaskEdge("t1", "t2")],
+    )
+    # Bad revision: t1 has regressed from COMPLETED -> PENDING.
+    bad_revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="t1", title="done", status=TaskStatus.PENDING),
+            Task(id="t2", title="next", status=TaskStatus.PENDING),
+        ],
+        edges=[TaskEdge("t1", "t2")],
+    )
+    planner = StubPlanner(revised=bad_revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session(plan=prior)
+
+    await steerer.observe({"error": "trigger refine"}, session)
+
+    # Plan unchanged; two drift events (the original trigger + the
+    # schema-violation report); no PlanRevised emitted.
+    assert session.plan is prior
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert kinds == ["drift_detected", "drift_detected"]
+    second = sink.events[1].drift_detected
+    assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
+    assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert "plan validation failed" in second.detail
+    assert "terminal task 't1' regressed" in second.detail
+
+
+async def test_apply_revision_emits_schema_violation_on_missing_terminal_edge() -> None:
+    """A refine that drops a terminal->terminal edge is rejected.
+
+    PLAN-LIFECYCLE.md §3.2: edges whose both endpoints were terminal in
+    the outgoing plan are frozen and must appear verbatim in any
+    revision. The steerer must reject a revision that drops such an
+    edge, emit a CRITICAL SCHEMA_VIOLATION, and keep the prior plan.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    # Seed the session with a plan where both t1 and t2 are terminal
+    # with an edge between them.
+    prior = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="t1", title="1", status=TaskStatus.COMPLETED),
+            Task(id="t2", title="2", status=TaskStatus.COMPLETED),
+            Task(id="t3", title="3", status=TaskStatus.PENDING),
+        ],
+        edges=[TaskEdge("t1", "t2"), TaskEdge("t2", "t3")],
+    )
+    # Bad revision: preserves terminals but drops the t1 -> t2 edge.
+    bad_revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="t1", title="1", status=TaskStatus.COMPLETED),
+            Task(id="t2", title="2", status=TaskStatus.COMPLETED),
+            Task(id="t3", title="3", status=TaskStatus.PENDING),
+        ],
+        edges=[TaskEdge("t2", "t3")],
+    )
+    planner = StubPlanner(revised=bad_revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session(plan=prior)
+
+    await steerer.observe({"error": "trigger refine"}, session)
+
+    assert session.plan is prior
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert kinds == ["drift_detected", "drift_detected"]
+    second = sink.events[1].drift_detected
+    assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
+    assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert "plan validation failed" in second.detail
+    assert "terminal->terminal edge 't1' -> 't2'" in second.detail
+
+
 async def test_bind_replaces_sinks() -> None:
     steerer = DefaultSteerer()
     planner = StubPlanner()
