@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from goldfive.types import (
     DriftEvent,
     DriftKind,
@@ -230,3 +232,179 @@ class TestTopologicalStages:
         # No stage 0 because no task has in-degree 0.
         assert len(stages) == 1
         assert {t.id for t in stages[0]} == {"t1", "t2"}
+
+
+# ---------------------------------------------------------------------------
+# Plan.validate() — structural validation at creation and revision.
+# ---------------------------------------------------------------------------
+
+
+class TestPlanValidate:
+    def test_empty_plan_is_valid(self) -> None:
+        # No tasks and no edges is structurally fine (the planner treats
+        # an empty plan as "no plan", but validate() itself should not
+        # raise).
+        _mk_plan([], []).validate()
+        _mk_plan([], []).validate(for_revision=True)
+
+    def test_well_formed_pending_plan_is_valid(self) -> None:
+        tasks = [
+            Task(id="research", title="R"),
+            Task(id="draft", title="D"),
+            Task(id="review", title="V"),
+        ]
+        edges = [TaskEdge("research", "draft"), TaskEdge("draft", "review")]
+        plan = _mk_plan(tasks, edges)
+        plan.validate()
+        plan.validate(for_revision=True)
+
+    def test_duplicate_task_ids_rejected(self) -> None:
+        tasks = [
+            Task(id="a", title="A"),
+            Task(id="a", title="A2"),
+        ]
+        plan = _mk_plan(tasks, [])
+        with pytest.raises(ValueError, match="duplicate task id"):
+            plan.validate()
+        with pytest.raises(ValueError, match="duplicate task id"):
+            plan.validate(for_revision=True)
+
+    def test_empty_task_id_rejected(self) -> None:
+        plan = _mk_plan([Task(id="", title="no id")], [])
+        with pytest.raises(ValueError, match="empty id"):
+            plan.validate()
+
+    def test_edge_from_unknown_task_rejected(self) -> None:
+        plan = _mk_plan(
+            [Task(id="t1", title="1")],
+            [TaskEdge("ghost", "t1")],
+        )
+        with pytest.raises(ValueError, match="unknown task id"):
+            plan.validate()
+
+    def test_edge_to_unknown_task_rejected(self) -> None:
+        plan = _mk_plan(
+            [Task(id="t1", title="1")],
+            [TaskEdge("t1", "ghost")],
+        )
+        with pytest.raises(ValueError, match="unknown task id"):
+            plan.validate()
+
+    def test_simple_two_cycle_rejected(self) -> None:
+        plan = _mk_plan(
+            [Task(id="t1", title="1"), Task(id="t2", title="2")],
+            [TaskEdge("t1", "t2"), TaskEdge("t2", "t1")],
+        )
+        with pytest.raises(ValueError, match="cycle"):
+            plan.validate()
+
+    def test_self_loop_rejected(self) -> None:
+        plan = _mk_plan(
+            [Task(id="t1", title="1")],
+            [TaskEdge("t1", "t1")],
+        )
+        with pytest.raises(ValueError, match="cycle"):
+            plan.validate()
+
+    def test_three_cycle_rejected(self) -> None:
+        plan = _mk_plan(
+            [
+                Task(id="t1", title="1"),
+                Task(id="t2", title="2"),
+                Task(id="t3", title="3"),
+            ],
+            [
+                TaskEdge("t1", "t2"),
+                TaskEdge("t2", "t3"),
+                TaskEdge("t3", "t1"),
+            ],
+        )
+        with pytest.raises(ValueError, match="cycle"):
+            plan.validate()
+
+    def test_partial_cycle_with_independent_task_rejected(self) -> None:
+        # t3 is independent; t1 <-> t2 form a cycle. The cycle members
+        # must still be flagged even though t3 is placeable.
+        plan = _mk_plan(
+            [
+                Task(id="t1", title="1"),
+                Task(id="t2", title="2"),
+                Task(id="t3", title="3"),
+            ],
+            [TaskEdge("t1", "t2"), TaskEdge("t2", "t1")],
+        )
+        with pytest.raises(ValueError, match="cycle"):
+            plan.validate()
+
+    def test_creation_rejects_non_pending_task(self) -> None:
+        plan = _mk_plan(
+            [
+                Task(id="t1", title="1", status=TaskStatus.COMPLETED),
+            ],
+            [],
+        )
+        with pytest.raises(ValueError, match="non-PENDING"):
+            plan.validate()
+
+    def test_creation_rejects_running_task(self) -> None:
+        plan = _mk_plan(
+            [Task(id="t1", title="1", status=TaskStatus.RUNNING)],
+            [],
+        )
+        with pytest.raises(ValueError, match="non-PENDING"):
+            plan.validate()
+
+    def test_revision_allows_completed_tasks(self) -> None:
+        plan = _mk_plan(
+            [
+                Task(id="done", title="D", status=TaskStatus.COMPLETED),
+                Task(id="next", title="N", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("done", "next")],
+        )
+        # Raises at creation.
+        with pytest.raises(ValueError, match="non-PENDING"):
+            plan.validate(for_revision=False)
+        # Allowed at revision.
+        plan.validate(for_revision=True)
+
+    def test_revision_allows_failed_and_cancelled(self) -> None:
+        plan = _mk_plan(
+            [
+                Task(id="f", title="F", status=TaskStatus.FAILED),
+                Task(id="c", title="C", status=TaskStatus.CANCELLED),
+                Task(id="p", title="P", status=TaskStatus.PENDING),
+            ],
+            [],
+        )
+        plan.validate(for_revision=True)
+
+    def test_revision_still_rejects_duplicate_ids(self) -> None:
+        plan = _mk_plan(
+            [
+                Task(id="t", title="1", status=TaskStatus.COMPLETED),
+                Task(id="t", title="2", status=TaskStatus.PENDING),
+            ],
+            [],
+        )
+        with pytest.raises(ValueError, match="duplicate task id"):
+            plan.validate(for_revision=True)
+
+    def test_revision_still_rejects_cycles(self) -> None:
+        plan = _mk_plan(
+            [
+                Task(id="a", title="A", status=TaskStatus.PENDING),
+                Task(id="b", title="B", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("a", "b"), TaskEdge("b", "a")],
+        )
+        with pytest.raises(ValueError, match="cycle"):
+            plan.validate(for_revision=True)
+
+    def test_revision_still_rejects_unknown_edges(self) -> None:
+        plan = _mk_plan(
+            [Task(id="t1", title="1", status=TaskStatus.COMPLETED)],
+            [TaskEdge("t1", "ghost")],
+        )
+        with pytest.raises(ValueError, match="unknown task id"):
+            plan.validate(for_revision=True)
