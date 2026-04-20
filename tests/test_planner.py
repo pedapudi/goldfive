@@ -451,3 +451,162 @@ async def test_llm_planner_refine_custom_system_prompt_is_used() -> None:
     await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
     assert stub.calls[0][0] == "GEN PROMPT SENTINEL"
     assert stub.calls[1][0] == "REFINE PROMPT SENTINEL"
+
+
+# ---------------------------------------------------------------------------
+# Plan validation at creation / revision (TASK-LIFECYCLE.md §7.2)
+# ---------------------------------------------------------------------------
+
+
+async def test_llm_planner_generate_rejects_duplicate_task_ids() -> None:
+    """A plan with duplicate task ids is a soundness violation.
+
+    ``Plan.validate()`` flags duplicate ids; the planner must return
+    ``None`` so the caller treats the turn as "no plan" rather than
+    silently installing a malformed DAG.
+    """
+    duplicate = json.dumps(
+        {
+            "summary": "dup",
+            "tasks": [
+                {"id": "same", "title": "first", "assignee_agent_id": "a"},
+                {"id": "same", "title": "second", "assignee_agent_id": "a"},
+            ],
+            "edges": [],
+        }
+    )
+    stub = _StubLLM(duplicate)
+    planner = LLMPlanner(call_llm=stub)
+    result = await planner.generate(goals=_goals(), available_agents=["a"])
+    assert result is None
+
+
+async def test_llm_planner_generate_rejects_cycle() -> None:
+    cyclic = json.dumps(
+        {
+            "summary": "cyclic",
+            "tasks": [
+                {"id": "a", "title": "A", "assignee_agent_id": "x"},
+                {"id": "b", "title": "B", "assignee_agent_id": "x"},
+            ],
+            "edges": [
+                {"from_task_id": "a", "to_task_id": "b"},
+                {"from_task_id": "b", "to_task_id": "a"},
+            ],
+        }
+    )
+    stub = _StubLLM(cyclic)
+    planner = LLMPlanner(call_llm=stub)
+    result = await planner.generate(goals=_goals(), available_agents=["x"])
+    assert result is None
+
+
+async def test_llm_planner_generate_rejects_unknown_edge() -> None:
+    bad = json.dumps(
+        {
+            "summary": "bad edge",
+            "tasks": [{"id": "t1", "title": "T1", "assignee_agent_id": "x"}],
+            "edges": [{"from_task_id": "t1", "to_task_id": "ghost"}],
+        }
+    )
+    stub = _StubLLM(bad)
+    planner = LLMPlanner(call_llm=stub)
+    result = await planner.generate(goals=_goals(), available_agents=["x"])
+    assert result is None
+
+
+async def test_llm_planner_generate_rejects_non_pending_task_at_creation() -> None:
+    # Newly generated plan must not carry COMPLETED/FAILED/... tasks.
+    non_pending = json.dumps(
+        {
+            "summary": "ok",
+            "tasks": [
+                {
+                    "id": "t1",
+                    "title": "T1",
+                    "assignee_agent_id": "x",
+                    "status": "COMPLETED",
+                }
+            ],
+            "edges": [],
+        }
+    )
+    stub = _StubLLM(non_pending)
+    planner = LLMPlanner(call_llm=stub)
+    result = await planner.generate(goals=_goals(), available_agents=["x"])
+    assert result is None
+
+
+async def test_llm_planner_refine_allows_preserved_completed_tasks() -> None:
+    """Refine is the revision path — COMPLETED tasks are legitimate."""
+    refined = json.dumps(
+        {
+            "summary": "after drift",
+            "tasks": [
+                {
+                    "id": "research",
+                    "title": "Research goldfish facts",
+                    "assignee_agent_id": "researcher",
+                    "status": "COMPLETED",
+                },
+                {
+                    "id": "draft",
+                    "title": "Draft the post",
+                    "assignee_agent_id": "writer",
+                    "status": "PENDING",
+                },
+            ],
+            "edges": [{"from_task_id": "research", "to_task_id": "draft"}],
+        }
+    )
+    stub = _StubLLM(refined)
+    planner = LLMPlanner(call_llm=stub)
+    drift = DriftEvent(kind=DriftKind.TOOL_ERROR, severity=DriftSeverity.WARNING)
+    result = await planner.refine(
+        plan=_running_plan(), drift=drift, goals=_goals()
+    )
+    assert result is not None
+    assert {t.id for t in result.tasks} == {"research", "draft"}
+
+
+async def test_llm_planner_refine_rejects_duplicate_ids() -> None:
+    bad = json.dumps(
+        {
+            "summary": "dup",
+            "tasks": [
+                {"id": "d", "title": "1", "assignee_agent_id": "x"},
+                {"id": "d", "title": "2", "assignee_agent_id": "x"},
+            ],
+            "edges": [],
+        }
+    )
+    stub = _StubLLM(bad)
+    planner = LLMPlanner(call_llm=stub)
+    drift = DriftEvent(kind=DriftKind.TOOL_ERROR, severity=DriftSeverity.WARNING)
+    result = await planner.refine(
+        plan=_running_plan(), drift=drift, goals=_goals()
+    )
+    assert result is None
+
+
+async def test_llm_planner_refine_rejects_cycle() -> None:
+    bad = json.dumps(
+        {
+            "summary": "cyclic",
+            "tasks": [
+                {"id": "a", "title": "A", "assignee_agent_id": "x"},
+                {"id": "b", "title": "B", "assignee_agent_id": "x"},
+            ],
+            "edges": [
+                {"from_task_id": "a", "to_task_id": "b"},
+                {"from_task_id": "b", "to_task_id": "a"},
+            ],
+        }
+    )
+    stub = _StubLLM(bad)
+    planner = LLMPlanner(call_llm=stub)
+    drift = DriftEvent(kind=DriftKind.TOOL_ERROR, severity=DriftSeverity.WARNING)
+    result = await planner.refine(
+        plan=_running_plan(), drift=drift, goals=_goals()
+    )
+    assert result is None

@@ -118,6 +118,81 @@ class Plan:
     revision_severity: str = ""  # DriftSeverity value (str) or ""
     revision_index: int = 0
 
+    def validate(self, for_revision: bool = False) -> None:
+        """Structurally validate this plan. Raise ``ValueError`` on failure.
+
+        Checks, in order:
+
+        1. Every task has a non-empty ``id``.
+        2. Task ids are unique within ``tasks``.
+        3. Every edge's ``from_task_id`` and ``to_task_id`` reference a
+           task that exists in ``tasks``.
+        4. The task graph is acyclic (every task must be placeable by
+           ``topological_stages``; any leftover is a cycle member).
+        5. When ``for_revision`` is ``False`` (the default — the
+           creation path), every task's ``status`` must be
+           ``TaskStatus.PENDING``. Revised plans legitimately carry
+           COMPLETED / FAILED / CANCELLED tasks preserved from the prior
+           plan, so this check is skipped when ``for_revision`` is
+           ``True``.
+
+        This is a pure-data validator: it does not mutate the plan. It
+        is intended to be called at plan creation (``LLMPlanner.generate``)
+        and at plan revision (``LLMPlanner.refine`` /
+        ``DefaultSteerer._apply_revision``) so malformed plans are
+        rejected before they are installed on a ``Session``.
+        """
+        # 1. & 2. ids present and unique.
+        seen: set[str] = set()
+        for t in self.tasks:
+            if not t.id:
+                raise ValueError("plan contains a task with an empty id")
+            if t.id in seen:
+                raise ValueError(f"duplicate task id in plan: {t.id!r}")
+            seen.add(t.id)
+
+        # 3. edges reference known tasks.
+        for e in self.edges:
+            if e.from_task_id not in seen:
+                raise ValueError(
+                    f"edge references unknown task id (from_task_id={e.from_task_id!r})"
+                )
+            if e.to_task_id not in seen:
+                raise ValueError(f"edge references unknown task id (to_task_id={e.to_task_id!r})")
+
+        # 4. no cycles. topological_stages places every non-cycle task;
+        # any task left over is part of a cycle. We compute placement
+        # locally (rather than calling topological_stages) so we can
+        # avoid its edge-tolerance behaviour — validation wants a clean
+        # signal.
+        indeg: dict[str, int] = {tid: 0 for tid in seen}
+        children: dict[str, list[str]] = {tid: [] for tid in seen}
+        for e in self.edges:
+            children[e.from_task_id].append(e.to_task_id)
+            indeg[e.to_task_id] += 1
+        ready = [tid for tid, d in indeg.items() if d == 0]
+        placed: set[str] = set()
+        while ready:
+            tid = ready.pop()
+            if tid in placed:
+                continue
+            placed.add(tid)
+            for child in children[tid]:
+                indeg[child] -= 1
+                if indeg[child] == 0:
+                    ready.append(child)
+        unplaced = seen - placed
+        if unplaced:
+            raise ValueError(f"plan contains a cycle among tasks: {sorted(unplaced)!r}")
+
+        # 5. creation-time: all tasks must be PENDING.
+        if not for_revision:
+            for t in self.tasks:
+                if t.status is not TaskStatus.PENDING:
+                    raise ValueError(
+                        f"task {t.id!r} has non-PENDING status {t.status.value!r} at plan creation"
+                    )
+
     def topological_stages(self) -> list[list[Task]]:
         """Return tasks grouped into topological stages (Kahn's algorithm).
 

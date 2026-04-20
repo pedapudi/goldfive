@@ -738,6 +738,14 @@ class LLMPlanner:
         if plan is None:
             log.warning("LLMPlanner.generate: parsed JSON did not contain a usable plan; skipping")
             return None
+        try:
+            plan.validate(for_revision=False)
+        except ValueError as exc:
+            log.warning(
+                "LLMPlanner.generate: plan failed validation (%s); skipping",
+                exc,
+            )
+            return None
         return plan
 
     async def refine(
@@ -787,6 +795,14 @@ class LLMPlanner:
         )
         if revised is None:
             log.warning("LLMPlanner.refine: parsed JSON did not contain a usable plan")
+            return None
+        try:
+            revised.validate(for_revision=True)
+        except ValueError as exc:
+            log.warning(
+                "LLMPlanner.refine: revised plan failed validation (%s)",
+                exc,
+            )
             return None
         # Stamp revision metadata so downstream sinks can render it.
         revised.revision_reason = drift.detail
@@ -938,6 +954,15 @@ class LLMPlanner:
                         status=TaskStatus.FAILED,
                     ),
                 )
+        try:
+            revised.validate(for_revision=True)
+        except ValueError as exc:
+            log.warning(
+                "LLMPlanner._refine_looping_tool_call: revised plan failed "
+                "validation (%s); using fallback",
+                exc,
+            )
+            return self._fallback_fail_loop_plan(plan, drift, looping_task)
         revised.revision_reason = drift.detail
         revised.revision_kind = drift.kind.value
         revised.revision_severity = str(drift.severity)
@@ -1101,7 +1126,7 @@ class LLMPlanner:
             seen.add(key)
             merged_edges.append(e)
 
-        return Plan(
+        merged_plan = Plan(
             id=plan.id,
             run_id=plan.run_id,
             goal_ids=list(fresh.goal_ids) or list(plan.goal_ids),
@@ -1113,6 +1138,15 @@ class LLMPlanner:
             revision_severity=DriftSeverity.WARNING.value,
             revision_index=plan.revision_index + 1,
         )
+        try:
+            merged_plan.validate(for_revision=True)
+        except ValueError as exc:
+            log.warning(
+                "LLMPlanner._refine_user_steer: merged plan failed validation (%s)",
+                exc,
+            )
+            return None
+        return merged_plan
 
 
 __all__ = [

@@ -505,6 +505,22 @@ class DefaultSteerer:
                 session, drift, reason="planner returned no revised plan"
             )
             return
+        try:
+            revised.validate(for_revision=True)
+        except ValueError as exc:
+            # Reject the revision and surface the failure as a CRITICAL
+            # DriftDetected so operators can see the bad plan upstream.
+            # The session keeps its old plan.
+            await self._emit_drift_detected(
+                session,
+                DriftEvent(
+                    kind=DriftKind.SCHEMA_VIOLATION,
+                    severity=DriftSeverity.CRITICAL,
+                    detail=f"plan validation failed: {exc}",
+                    current_task_id=session.current_task_id,
+                ),
+            )
+            return
         self._apply_revision(session, revised, drift)
         await self._emit_plan_revised(session, revised, drift)
 
