@@ -183,6 +183,20 @@ This is why `FAILED` and `CANCELLED` must be absorbing: the cascade
 relies on being able to call `transition(..., CANCELLED)` on any
 downstream task without re-checking its history.
 
+### Cascade on task cancellation
+
+The same cascade rule applies when **any single task** is
+transitioned to `CANCELLED` — not only as part of the unrecoverable
+FAILED cascade above. `DefaultSteerer.mark_task_cancelled` BFS-walks
+forward from the cancelled task through `Plan.edges` and transitions
+every reachable non-terminal task (PENDING / RUNNING / BLOCKED) to
+`CANCELLED` with reason `"cascade from <task_id>"`. This closes the
+soundness gap where a `USER_STEER` whose refine produces no new plan
+would cancel the current task but leave downstream PENDING tasks
+silently orphaned (they never satisfy `_pick_next_task`'s "all
+predecessors COMPLETED" check). See
+[TASK-LIFECYCLE.md §6.1 — Cancellation cascade](TASK-LIFECYCLE.md#61-cancellation-cascade).
+
 ## Implementation notes
 
 The reference implementation is `DefaultSteerer` in
