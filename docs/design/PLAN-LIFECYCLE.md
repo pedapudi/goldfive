@@ -293,9 +293,14 @@ A run completes successfully when **all three** hold:
 If all three hold: `Outcome.success = True`.
 
 If only the first two hold (everything is terminal, no orphans, but
-some goal predicates returned False): `Outcome.success = False`
-with `reason="goals unmet"`. This is a new verdict the current
-executor does not emit; see TASK-LIFECYCLE.md §7 follow-up.
+some goal predicates returned False or raised): `Outcome.success =
+False` with `reason="goal '<summary>' unmet"` (or `"goal '<summary>'
+predicate raised: <exc>"` for an exception). Implemented by
+`goldfive.results.evaluate_goal_predicates` (`results.py:42`), called
+from `sequential.py:490` and `parallel.py:327` before each executor's
+`run_completed_event` emission. Predicates are evaluated in
+`session.goals` order and short-circuit on the first unmet goal; a
+predicate that raises is logged at WARNING and treated as unmet.
 
 ### 6.2 Unrecoverable cascade (ABORTED)
 
@@ -380,7 +385,6 @@ Violating any of them is a bug in goldfive.
 
 ## 8. Known gaps (open)
 
-- **Goal success predicates are not evaluated.** `Goal.success_predicate` is defined on the type but never called. §6.1's third clause is specified but not yet implemented.
 - **Terminal→terminal edge preservation is not currently enforced.** `_apply_revision` does not yet check edge preservation; a buggy planner could silently drop terminal edges. Add to `Plan.validate(for_revision=True)`.
 - **Unrecoverable cascade (§6.2) does not currently use the same cascade primitive as §6.3** — they're two different code paths that happen to do similar work. Unify once both are implemented.
 - **No cross-revision lineage view.** Sinks receive `PlanRevised` events but the proto doesn't carry the full diff. Harmonograf's UI currently has to stitch revisions by plan_id + revision_index. A dedicated `revision_diff` sidecar would simplify the UI.

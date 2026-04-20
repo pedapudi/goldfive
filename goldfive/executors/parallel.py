@@ -49,7 +49,7 @@ from goldfive.protocols import (
     Planner,
     Steerer,
 )
-from goldfive.results import ExecutionOutcome, InvocationResult
+from goldfive.results import ExecutionOutcome, InvocationResult, evaluate_goal_predicates
 from goldfive.types import (
     DriftEvent,
     DriftSeverity,
@@ -319,6 +319,22 @@ class ParallelDAGExecutor:
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=abort_reason)
+
+        # Goal success-predicate gate (PLAN-LIFECYCLE.md §6.1, third
+        # clause). Every stage has completed — now verify the caller's
+        # semantic goals. A predicate that returns False or raises
+        # fails the run.
+        unmet = evaluate_goal_predicates(session)
+        if unmet is not None:
+            await emit_event(
+                sinks,
+                run_aborted_event(
+                    run_id=session.run_id,
+                    sequence=session.next_sequence(),
+                    reason=unmet,
+                ),
+            )
+            return ExecutionOutcome(success=False, session=session, reason=unmet)
 
         await emit_event(
             sinks,
