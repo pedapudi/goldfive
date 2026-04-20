@@ -1,48 +1,45 @@
-# ADK presentation example
+# Minimal goldfive + ADK example
 
-A reference implementation showing how `goldfive.Runner` wraps a multi-subagent
-Google ADK tree. Ported from harmonograf's `presentation_agent` demo, with the
-orchestration layer swapped from `HarmonografAgent` to
-`goldfive.adapters.adk.ADKAdapter`.
+The smallest possible demo showing how `goldfive.wrap(agent, ...)` plugs a
+plain Google ADK agent into goldfive's planner + executor + steerer stack.
+
+```python
+agent  = <your ADK Agent>                 # any BaseAgent
+runner = goldfive.wrap(                   # goldfive handles decomposition,
+    agent,                                # dispatch, drift, and steering
+    planner=LLMPlanner(call_llm=...),
+    goal_deriver=LLMGoalDeriver(call_llm=...),
+)
+await runner.run("make a presentation about waffles")
+```
+
+One agent, no coordinator, no hand-rolled delegation. If you need a
+multi-specialist reference see the "richer example" section below.
 
 ## What this demonstrates
 
-- **A coordinator that delegates to four specialists** — researcher, web
-  developer, reviewer, and debugger — via `AgentTool`.
-- **One wrap covers the whole tree.** Only the root `coordinator_agent`
-  is handed to `ADKAdapter(...)`. The adapter walks the tree (`sub_agents`,
-  `inner_agent`, and nested `AgentTool.agent`) and attaches goldfive's
-  seven canonical reporting tools to every subagent automatically.
-- **Planner + goal deriver are pluggable.** The example wires
-  `LLMPlanner` and `LLMGoalDeriver` behind a `call_llm` callable so you
-  can swap in any model provider without touching goldfive internals.
-- **Events per subagent.** Goldfive's executor emits `TaskStarted` /
-  `TaskCompleted` events for each of the four specialist tasks, even
-  though the adapter only invokes the coordinator root.
-
-## Agent tree
-
-```
-coordinator_agent
-├── research_agent         (AgentTool)
-├── web_developer_agent    (AgentTool, tool: write_webpage)
-├── reviewer_agent         (AgentTool, tool: read_presentation_files)
-└── debugger_agent         (AgentTool, tool: patch_file)
-```
+- **One ADK `Agent`, goldfive does the rest.** The planner emits a task
+  DAG; the executor invokes the same agent for each task in turn. No
+  subagent tree, no `AgentTool`s, no coordinator with hardcoded routing.
+- **Planner + goal deriver are pluggable.** Wire any model provider
+  behind a `call_llm` callable with signature
+  `(system_prompt, user_prompt, model) -> str`.
+- **Events per task.** Goldfive's executor emits `TaskStarted` /
+  `TaskCompleted` for each planner-generated task. Drop in a
+  `HarmonografSink` to watch the run live in harmonograf's UI.
 
 ## Running
 
-### Mock mode — no credentials required
+### Mock mode — no credentials
 
 ```bash
 uv pip install -e '.[adk]'
 uv run python examples/adk_presentation/agent.py --mock
 ```
 
-In this mode every ADK agent's model is a deterministic in-process
-`BaseLlm` subclass, and the planner / goal deriver use canned JSON. The
-run completes with `success=True` and emits a 13-event stream
-culminating in `run_completed`.
+Canned planner / goal deriver + in-process `_MockLlm` for the agent.
+The run walks three sequential tasks (research → outline → writeup) and
+exits with `success=True`.
 
 ### Live mode — OpenAI
 
@@ -53,25 +50,34 @@ export OPENAI_API_KEY=sk-...
 uv run python examples/adk_presentation/agent.py --topic "the Voyager missions"
 ```
 
-Live mode uses the `openai` Python SDK for the planner / goal deriver
-and a LiteLLM model string (default `openai/gpt-4o-mini`) for the ADK
-subagents. Override the models via:
+Live mode uses the `openai` SDK for planner + goal deriver and a LiteLLM
+model string (default `openai/gpt-4o-mini`) for the ADK agent. Overrides:
 
-- `GOLDFIVE_EXAMPLE_MODEL` — ADK agent model (LiteLLM format, e.g.
-  `openai/gpt-4o-mini`).
-- `GOLDFIVE_EXAMPLE_PLANNER_MODEL` — model id passed to the planner's
-  `call_llm`. Defaults to `gpt-4o-mini`.
-- `GOLDFIVE_EXAMPLE_GOAL_MODEL` — model id for the goal deriver.
-  Defaults to `gpt-4o-mini`.
-
-Generated slideshow files land under
-`examples/adk_presentation/output/<topic>/` (`index.html`,
-`styles.css`, `script.js`).
+| Env var | What it controls |
+|---|---|
+| `GOLDFIVE_EXAMPLE_MODEL` | ADK agent model (LiteLLM format) |
+| `GOLDFIVE_EXAMPLE_PLANNER_MODEL` | Planner `call_llm` model id |
 
 ## Flags
 
 | Flag | Effect |
 |---|---|
 | `--mock` | Replace every LLM with an in-process mock. No network. |
-| `--topic TEXT` | Override the presentation topic. |
-| `--verbose`, `-v` | Enable INFO logging from goldfive's `LoggingSink`. |
+| `--topic TEXT` | Override the presentation topic. Default: `waffles`. |
+| `--verbose`, `-v` | INFO-level logs from goldfive's `LoggingSink`. |
+
+## A richer example
+
+For a production-shaped multi-agent ADK tree (coordinator + research /
+developer / reviewer / debugger specialists with real file tools) see
+**harmonograf's `presentation_agent`** at
+`tests/reference_agents/presentation_agent/agent.py` in the
+[harmonograf repo](https://github.com/pedapudi/harmonograf). That module
+already exports a `build_goldfive_runner` helper that assembles the same
+goldfive `Runner` shape as this example, but over the full subagent
+tree, so you can compare the two side-by-side.
+
+The split is deliberate: this repo's example shows you *how to wrap*;
+harmonograf's example shows you *how to structure a real multi-agent
+ADK tree*. The two concerns compose but live in different files so
+neither obscures the other.
