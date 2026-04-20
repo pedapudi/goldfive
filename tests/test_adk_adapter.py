@@ -818,3 +818,277 @@ async def test_heal_is_noop_when_no_pending_calls() -> None:
     adapter_empty = ADKAdapter(runner_empty, session_id="sess-empty")
     await adapter_empty.invoke(Task(id="t1", title="x"), Session(run_id="r"))
     assert runner_empty.session_service.appended == []
+
+
+# ---------------------------------------------------------------------------
+# Regression guard — every reporting-tool dispatch MUST route through
+# :func:`goldfive.adapters._tool_invocation.invoke_tool` so the three
+# protection layers (terminal-task rejection, idempotency, loop guard)
+# fire. A prior version of ``before_tool_callback`` called the handler
+# directly and silently bypassed all three — 500-LLM-call ceilings were
+# being hit on already-terminal tasks with nothing but bland
+# ``{"acknowledged": True}`` responses reaching the agent. These tests
+# are the regression guard for that wiring. See
+# ``docs/design/TASK-LIFECYCLE.md`` §5.
+# ---------------------------------------------------------------------------
+
+
+async def test_reporting_tool_dispatch_routes_through_invoke_tool(state_ctx_cls) -> None:
+    """15 calls to the same reporting tool on one task must trip the
+    volume-cap loop guard (15+ cumulative calls → LOOPING_TOOL_CALL
+    drift), proving the plugin's ``before_tool_callback`` runs the
+    dispatch through :func:`invoke_tool` and not the handler directly.
+
+    If the wiring regresses (callback calls ``handler(...)`` directly),
+    no drift will be emitted and the 15th call will return a plain
+    ``{"acknowledged": True}`` — this test catches that.
+    """
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+    )
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.reporting import BUILTIN_REPORTING_TOOLS
+    from goldfive.types import DriftEvent, DriftKind, Plan, TaskEdge
+
+    # _RecordingSteerer-shaped double that the tool-loop-guard's
+    # ``emit_loop_drift`` can push a DriftEvent into. The builtin
+    # reporting handlers call ``mark_task_*`` on the steerer, so we
+    # implement the two we need.
+    class _Steerer:
+        def __init__(self) -> None:
+            self.drifts: list[DriftEvent] = []
+            self.blocked_calls: int = 0
+
+        async def mark_task_blocked(self, task_id: str, *, session: Any, **kwargs: Any) -> None:
+            self.blocked_calls += 1
+
+        async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+            self.drifts.append(drift)
+
+    spec = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_blocked")
+
+    agent = _make_agent()
+    adapter = ADKAdapter(agent)
+    await adapter.register_reporting_tools([spec])
+
+    steerer = _Steerer()
+    task = Task(id="t1", title="x")
+    session = Session(
+        run_id="r1",
+        plan=Plan(
+            id="p1",
+            run_id="r1",
+            goal_ids=[],
+            tasks=[task, Task(id="t2", title="y")],
+            edges=[TaskEdge(from_task_id="t1", to_task_id="t2")],
+        ),
+    )
+
+    ctx = SessionContext(
+        session=session,
+        steerer=steerer,
+        task=task,
+        tools=[spec],
+        host_agent_name="test_agent",
+    )
+    state = {SESSION_CONTEXT_STATE_KEY: ctx}
+
+    class _Tool:
+        name = "report_task_blocked"
+
+    # Fire 16 calls on the same task, with varied ``blocked_on`` strings
+    # so every signature is unique — the volume cap (>= 15 cumulative
+    # calls) is the layer that catches this pattern. If the dispatch
+    # bypasses invoke_tool, no drift ever fires and the handler is
+    # invoked all 16 times.
+    results: list[dict[str, Any]] = []
+    for i in range(16):
+        result = await adapter._plugin.before_tool_callback(
+            tool=_Tool(),
+            tool_args={"task_id": "t1", "blocked_on": f"dep-{i}"},
+            tool_context=state_ctx_cls(state),
+        )
+        assert isinstance(result, dict)
+        results.append(result)
+
+    # The loop guard must have emitted exactly one LOOPING_TOOL_CALL
+    # drift — proof that invoke_tool's loop-detection layer ran.
+    assert len(steerer.drifts) == 1, (
+        f"expected one LOOPING_TOOL_CALL drift; got {len(steerer.drifts)}. "
+        "If this fails, before_tool_callback is bypassing invoke_tool "
+        "(the regression from PR #94/#98)."
+    )
+    assert steerer.drifts[0].kind is DriftKind.LOOPING_TOOL_CALL
+    assert steerer.drifts[0].current_task_id == "t1"
+
+    # Calls 1..14 reach the handler; call 15 is the one that trips the
+    # volume cap — it STILL reaches the handler (the drift is a side
+    # effect, not a short-circuit). The handler count therefore ends at
+    # 15 (first 15 calls) because the 16th call has the same task_id
+    # so is NOT subject to further short-circuiting by the volume
+    # check. The exact arithmetic is less important than: the drift
+    # fired at all. The regression-catching assertion is the drift
+    # count above; the handler count here is a secondary sanity check.
+    assert steerer.blocked_calls >= 1, (
+        "handler should have run at least once on a non-terminal task"
+    )
+
+
+async def test_reporting_tool_on_terminal_task_returns_structured_rejection(
+    state_ctx_cls,
+) -> None:
+    """A reporting call on an already-terminal task must get the
+    structured ``task_already_terminal`` error response — NOT a bland
+    ``{"acknowledged": True}``.
+
+    This is the terminal-task rejection layer (layer 1 in
+    ``docs/design/TASK-LIFECYCLE.md`` §5). Fires from inside
+    ``invoke_tool``; this test proves the ADK plugin's dispatch path
+    reaches that layer.
+    """
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+    )
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.reporting import BUILTIN_REPORTING_TOOLS
+    from goldfive.types import Plan, TaskStatus
+
+    # The handler must NEVER run when the task is already terminal —
+    # route the call through a spec whose handler raises, to catch a
+    # regression where invoke_tool's short-circuit is skipped.
+    invoked_count = [0]
+
+    async def _boom_handler(args, session, steerer):
+        invoked_count[0] += 1
+        raise AssertionError(
+            "handler must not run on a terminal task; dispatch should "
+            "short-circuit via invoke_tool's terminal rejection"
+        )
+
+    spec_template = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_progress")
+    spec = ReportingToolSpec(
+        name=spec_template.name,
+        description=spec_template.description,
+        parameters=spec_template.parameters,
+        handler=_boom_handler,
+    )
+
+    agent = _make_agent()
+    adapter = ADKAdapter(agent)
+    await adapter.register_reporting_tools([spec])
+
+    task = Task(id="t1", title="x", status=TaskStatus.FAILED)
+    session = Session(
+        run_id="r1",
+        plan=Plan(
+            id="p1",
+            run_id="r1",
+            goal_ids=[],
+            tasks=[task],
+            edges=[],
+        ),
+    )
+
+    ctx = SessionContext(
+        session=session,
+        steerer=None,
+        task=task,
+        tools=[spec],
+        host_agent_name="test_agent",
+    )
+    state = {SESSION_CONTEXT_STATE_KEY: ctx}
+
+    class _Tool:
+        name = "report_task_progress"
+
+    result = await adapter._plugin.before_tool_callback(
+        tool=_Tool(),
+        tool_args={"task_id": "t1", "fraction": 0.5, "detail": "too late"},
+        tool_context=state_ctx_cls(state),
+    )
+
+    assert isinstance(result, dict)
+    assert result.get("acknowledged") is False, (
+        "expected structured rejection; got acknowledged=true. If this "
+        "fails, before_tool_callback is bypassing invoke_tool's "
+        "terminal-task rejection layer."
+    )
+    assert result.get("error") == "task_already_terminal"
+    assert result.get("task_id") == "t1"
+    assert result.get("current_status") == "FAILED"
+    # Handler must have stayed cold.
+    assert invoked_count[0] == 0
+
+
+async def test_reporting_tool_duplicate_returns_duplicate_ack(state_ctx_cls) -> None:
+    """A byte-identical follow-up call must get the idempotency ACK
+    ``{"acknowledged": True, "duplicate": True}`` instead of re-entering
+    the handler — proof that layer 2 (idempotency) is wired.
+    """
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+    )
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.reporting import BUILTIN_REPORTING_TOOLS
+    from goldfive.types import Plan, TaskEdge
+
+    handler_calls: list[dict[str, Any]] = []
+
+    async def _recording_handler(args, session, steerer):
+        handler_calls.append(dict(args))
+        return {"acknowledged": True}
+
+    spec_template = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_started")
+    spec = ReportingToolSpec(
+        name=spec_template.name,
+        description=spec_template.description,
+        parameters=spec_template.parameters,
+        handler=_recording_handler,
+    )
+
+    agent = _make_agent()
+    adapter = ADKAdapter(agent)
+    await adapter.register_reporting_tools([spec])
+
+    task = Task(id="t1", title="x")
+    session = Session(
+        run_id="r1",
+        plan=Plan(
+            id="p1",
+            run_id="r1",
+            goal_ids=[],
+            tasks=[task, Task(id="t2", title="y")],
+            edges=[TaskEdge(from_task_id="t1", to_task_id="t2")],
+        ),
+    )
+    ctx = SessionContext(
+        session=session,
+        steerer=None,
+        task=task,
+        tools=[spec],
+        host_agent_name="test_agent",
+    )
+    state = {SESSION_CONTEXT_STATE_KEY: ctx}
+
+    class _Tool:
+        name = "report_task_started"
+
+    args = {"task_id": "t1", "detail": "kick"}
+    first = await adapter._plugin.before_tool_callback(
+        tool=_Tool(), tool_args=args, tool_context=state_ctx_cls(state)
+    )
+    second = await adapter._plugin.before_tool_callback(
+        tool=_Tool(), tool_args=args, tool_context=state_ctx_cls(state)
+    )
+
+    # First call: handler runs, plain ACK.
+    assert first == {"acknowledged": True}
+    # Second call: handler must NOT re-run; duplicate ACK returned.
+    assert second == {"acknowledged": True, "duplicate": True}, (
+        "expected duplicate ACK; if this fails, idempotency layer is "
+        "bypassed (before_tool_callback is routing around invoke_tool)."
+    )
+    assert len(handler_calls) == 1

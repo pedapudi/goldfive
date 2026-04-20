@@ -41,9 +41,11 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive.adapters import _adk_state_protocol as _sp
+from goldfive.adapters._tool_invocation import invoke_tool
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
+    from goldfive.reporting import ReportingToolSpec
     from goldfive.types import Session
 
 
@@ -63,9 +65,21 @@ class SessionContext:
 
     Carries the goldfive :class:`~goldfive.types.Session`, the active
     :class:`~goldfive.protocols.Steerer`, the task the adapter is about
-    to invoke, and the registered reporting-tool handler map. The
-    plugin picks it up from the ADK callback's ``callback_context``
-    via :func:`_session_context_from_callback`.
+    to invoke, the registered reporting-tool handler map, and the full
+    :class:`~goldfive.reporting.ReportingToolSpec` list. The plugin
+    picks it up from the ADK callback's ``callback_context`` via
+    :func:`_session_context_from_callback`.
+
+    The ``tools`` field is the authoritative source the plugin's
+    ``before_tool_callback`` uses to route calls through
+    :func:`~goldfive.adapters._tool_invocation.invoke_tool` — that
+    routing is what picks up the terminal-task rejection, idempotency,
+    and loop-guard layers. ``tool_handlers`` is kept for backward
+    compatibility with callers that construct a ``SessionContext``
+    directly (examples + test stubs) without a full spec list; when
+    only ``tool_handlers`` is supplied the plugin synthesizes minimal
+    ``ReportingToolSpec`` shims so the dispatch path still flows
+    through ``invoke_tool``.
     """
 
     __slots__ = (
@@ -73,6 +87,7 @@ class SessionContext:
         "steerer",
         "task",
         "tool_handlers",
+        "tools",
         "host_agent_name",
     )
 
@@ -82,14 +97,61 @@ class SessionContext:
         session: Session,
         steerer: Steerer | None,
         task: Any,
-        tool_handlers: Mapping[str, Any],
+        tool_handlers: Mapping[str, Any] | None = None,
+        tools: list[ReportingToolSpec] | None = None,
         host_agent_name: str,
     ) -> None:
         self.session = session
         self.steerer = steerer
         self.task = task
-        self.tool_handlers = dict(tool_handlers)
         self.host_agent_name = host_agent_name
+
+        # Prefer an explicit ``tools`` list (the adapter constructs
+        # ``SessionContext`` that way). Fall back to materialising
+        # lightweight specs from ``tool_handlers`` so existing external
+        # callers (approval_gated_agent example, legacy tests) still
+        # route through ``invoke_tool`` and get the protection layers.
+        if tools is not None:
+            self.tools = list(tools)
+            # Keep ``tool_handlers`` populated as a legacy read-only
+            # view for any code that introspected it (e.g.
+            # ``before_model_callback`` used to surface the list of
+            # reporting-tool names to the state protocol).
+            self.tool_handlers = {spec.name: spec.handler for spec in tools}
+        else:
+            self.tool_handlers = dict(tool_handlers or {})
+            self.tools = _tools_from_handlers(self.tool_handlers)
+
+
+def _tools_from_handlers(
+    tool_handlers: Mapping[str, Any],
+) -> list[ReportingToolSpec]:
+    """Materialise a list of ``ReportingToolSpec`` from a name→handler map.
+
+    Used when a caller builds :class:`SessionContext` with just a
+    handler map (legacy path — examples / test stubs). We fabricate
+    minimal specs so the dispatch path still routes through
+    :func:`invoke_tool` and picks up the terminal-task rejection,
+    idempotency, and loop-guard layers.
+
+    The synthesized specs carry empty ``description`` / ``parameters``
+    — the plugin only needs ``name`` + ``handler`` at dispatch time;
+    the rich schema is surfaced through the native SDK tool wrapping
+    done earlier in the adapter's ``register_reporting_tools``.
+    """
+    from goldfive.reporting import ReportingToolSpec
+
+    specs: list[ReportingToolSpec] = []
+    for name, handler in tool_handlers.items():
+        specs.append(
+            ReportingToolSpec(
+                name=str(name),
+                description="",
+                parameters={"type": "object", "properties": {}},
+                handler=handler,
+            )
+        )
+    return specs
 
 
 def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
@@ -271,29 +333,6 @@ def _extract_function_calls(llm_response: Any) -> list[dict]:
     return calls
 
 
-async def _invoke_handler(
-    handler: Any,
-    args: Mapping[str, Any],
-    session: Session,
-    steerer: Steerer | None,
-) -> dict[str, Any]:
-    """Invoke a reporting-tool handler, tolerating sync or async shapes."""
-    import asyncio
-
-    try:
-        call = handler(dict(args), session, steerer)
-    except TypeError:
-        # Some handler implementations accept keyword-style signatures.
-        call = handler(args=dict(args), session=session, steerer=steerer)
-    if asyncio.iscoroutine(call):
-        result = await call
-    else:
-        result = call
-    if isinstance(result, dict):
-        return result
-    return {"acknowledged": True}
-
-
 def _as_observation(
     *,
     kind: str,
@@ -397,9 +436,7 @@ async def _emit_approval_requested_from_plugin(
         )
         await emit(sinks, evt)
     except Exception as exc:  # noqa: BLE001
-        log.debug(
-            "_emit_approval_requested_from_plugin: sink emit failed: %s", exc
-        )
+        log.debug("_emit_approval_requested_from_plugin: sink emit failed: %s", exc)
 
 
 def _jsonable(v: Any) -> Any:
@@ -461,9 +498,7 @@ async def _await_tool_approval(
         prompt=prompt,
         tool_name=tool_name,
         tool_args=tool_args if isinstance(tool_args, Mapping) else {},
-        task_id=(
-            session_ctx.task.id if session_ctx.task is not None else ""
-        ),
+        task_id=(session_ctx.task.id if session_ctx.task is not None else ""),
     )
 
     await waiter.wait()
@@ -482,9 +517,7 @@ async def _await_tool_approval(
     return None
 
 
-def _tool_approval_prompt(
-    tool: Any, tool_name: str, tool_args: Any
-) -> str:
+def _tool_approval_prompt(tool: Any, tool_name: str, tool_args: Any) -> str:
     """Human-readable prompt the UI shows to the human.
 
     Prefers an explicit ``approval_prompt`` attribute on the tool so
@@ -520,9 +553,7 @@ def make_adk_plugin(
     try:
         from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
     except ImportError as exc:  # pragma: no cover — tested via importorskip
-        raise ImportError(
-            "goldfive.adapters.adk requires 'pip install goldfive[adk]'"
-        ) from exc
+        raise ImportError("goldfive.adapters.adk requires 'pip install goldfive[adk]'") from exc
 
     class _GoldfiveADKPlugin(BasePlugin):  # type: ignore[misc, valid-type]
         """Routes ADK callbacks into the goldfive steerer + state protocol."""
@@ -533,9 +564,7 @@ def make_adk_plugin(
 
         # --- Plan + current-task context -------------------------------
 
-        async def before_model_callback(
-            self, *, callback_context: Any, llm_request: Any
-        ) -> None:
+        async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> None:
             ctx = _session_context_from_callback(callback_context)
             if ctx is None:
                 return None
@@ -582,16 +611,35 @@ def make_adk_plugin(
             # e.g. report_task_started should never also be gated by
             # confirmation — the protocol handlers are control-plane
             # calls, not side-effects.
-            handler = ctx.tool_handlers.get(tool_name)
-            if handler is not None:
-                args_map: Mapping[str, Any]
+            #
+            # Route through ``invoke_tool`` (NOT a direct handler call)
+            # so every reporting-tool dispatch picks up the three
+            # protection layers defined in
+            # ``goldfive.adapters._tool_invocation``:
+            #
+            #   1. terminal-task rejection — structured error response
+            #      once a task has reached COMPLETED/FAILED/CANCELLED,
+            #   2. idempotency — duplicate (task_id, name, args) calls
+            #      return ``{"acknowledged": True, "duplicate": True}``,
+            #   3. loop guard — a sustained burst of identical calls
+            #      fires a ``LOOPING_TOOL_CALL`` drift so the planner
+            #      can intervene.
+            #
+            # See ``docs/design/TASK-LIFECYCLE.md`` §5 for the contract.
+            tool_names_registered = {spec.name for spec in ctx.tools}
+            if tool_name in tool_names_registered:
+                args_map: dict[str, Any]
                 if isinstance(tool_args, Mapping):
-                    args_map = tool_args
+                    args_map = dict(tool_args)
                 else:
                     args_map = {}
                 try:
-                    result = await _invoke_handler(
-                        handler, args_map, ctx.session, ctx.steerer
+                    result = await invoke_tool(
+                        ctx.tools,
+                        tool_name,
+                        args_map,
+                        ctx.session,
+                        ctx.steerer,
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.debug(
@@ -603,7 +651,12 @@ def make_adk_plugin(
                     # agent doesn't see a tool error for a protocol call.
                     return {"acknowledged": True, "error": str(exc)}
                 # Return a non-None result to short-circuit ADK tool dispatch.
-                return result or {"acknowledged": True}
+                # ``invoke_tool`` always returns a dict; preserve it verbatim
+                # so the terminal-rejection / duplicate-ACK payloads reach
+                # the agent unchanged.
+                if isinstance(result, dict):
+                    return result
+                return {"acknowledged": True}
 
             # Tool-level approval (Flow B). If the tool opts into
             # confirmation via ADK's native `require_confirmation` flag,
@@ -620,9 +673,7 @@ def make_adk_plugin(
 
         # --- Drift observation -----------------------------------------
 
-        async def after_model_callback(
-            self, *, callback_context: Any, llm_response: Any
-        ) -> None:
+        async def after_model_callback(self, *, callback_context: Any, llm_response: Any) -> None:
             ctx = _session_context_from_callback(callback_context)
             if ctx is None or ctx.steerer is None:
                 return None
@@ -647,9 +698,7 @@ def make_adk_plugin(
             except Exception as exc:  # noqa: BLE001
                 log.debug("after_model_callback: steerer.observe raised: %s", exc)
             if reasoning:
-                observe_reasoning = getattr(
-                    ctx.steerer, "observe_reasoning", None
-                )
+                observe_reasoning = getattr(ctx.steerer, "observe_reasoning", None)
                 if observe_reasoning is not None:
                     try:
                         await observe_reasoning(
@@ -665,9 +714,7 @@ def make_adk_plugin(
                         )
             return None
 
-        async def on_event_callback(
-            self, *, invocation_context: Any, event: Any
-        ) -> None:
+        async def on_event_callback(self, *, invocation_context: Any, event: Any) -> None:
             ctx = _session_context_from_callback(invocation_context)
             if ctx is None or ctx.steerer is None:
                 return None
@@ -678,9 +725,7 @@ def make_adk_plugin(
             if not transfer_to and not escalate:
                 return None
             kind = "agent_transfer" if transfer_to else "agent_escalation"
-            detail = (
-                f"transfer -> {transfer_to}" if transfer_to else "escalate"
-            )
+            detail = f"transfer -> {transfer_to}" if transfer_to else "escalate"
             observation = _as_observation(
                 kind=kind,
                 detail=detail,
@@ -716,9 +761,7 @@ def make_adk_plugin(
             try:
                 await ctx.steerer.observe(observation, ctx.session)
             except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "on_tool_error_callback: steerer.observe raised: %s", exc
-                )
+                log.debug("on_tool_error_callback: steerer.observe raised: %s", exc)
             return None
 
     return _GoldfiveADKPlugin()

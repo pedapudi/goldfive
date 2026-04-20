@@ -248,8 +248,27 @@ is no per-drift-kind backoff or dedup. See §7.
 
 ## 5. Reporting-tool dispatch
 
+**Invariant — all adapters route reporting-tool calls through
+`invoke_tool`.** The three protection layers below live inside
+`goldfive.adapters._tool_invocation.invoke_tool` and are the ONLY
+path that picks them up. Adapters MUST NOT short-circuit by calling
+`spec.handler(...)` directly — doing so silently bypasses every
+layer. The regression guards for this invariant are:
+
+- ADK adapter: `tests/test_adk_adapter.py::test_reporting_tool_dispatch_routes_through_invoke_tool`
+  and the two companion tests
+  (`test_reporting_tool_on_terminal_task_returns_structured_rejection`,
+  `test_reporting_tool_duplicate_returns_duplicate_ack`).
+- Claude adapter: `tests/test_claude_adapter.py::test_pretooluse_hook_on_terminal_task_returns_structured_rejection`
+  and `test_pretooluse_hook_volume_cap_fires_drift`.
+- Callable adapter: the user callable is expected to call
+  `invoke_tool(tools, name, args, session, steerer)` directly
+  (see `tests/test_callable_adapter.py::test_tool_routing_drives_session_transitions`).
+  The adapter itself does not dispatch — it just forwards the spec
+  list to the user's callable.
+
 The three-layer defence in `_tool_invocation.invoke_tool`
-(`adapters/_tool_invocation.py:91–179`), in order:
+(`adapters/_tool_invocation.py`), in order:
 
 ### 5.1 Layer 1 — terminal-task rejection (prevention)
 
