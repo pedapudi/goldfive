@@ -265,11 +265,19 @@ async def test_mark_task_blocked_transitions_and_emits_drift() -> None:
 
 async def test_mark_task_cancelled_transitions() -> None:
     steerer, session, sink, _ = _fresh()
+    # The default fixture plan has t1 -> t2; the cascade emits a
+    # TaskCancelled for t2 as well. Verify both the primary transition
+    # and the cascaded one; detailed cascade behaviour is exercised in
+    # the dedicated cascade tests below.
     await steerer.mark_task_cancelled("t1", session=session, reason="user cancelled")
     assert _task(session, "t1").status is TaskStatus.CANCELLED
-    assert len(sink.events) == 1
+    assert _task(session, "t2").status is TaskStatus.CANCELLED
+    assert len(sink.events) == 2
     assert sink.events[0].WhichOneof("payload") == "task_cancelled"
+    assert sink.events[0].task_cancelled.task_id == "t1"
     assert sink.events[0].task_cancelled.reason == "user cancelled"
+    assert sink.events[1].WhichOneof("payload") == "task_cancelled"
+    assert sink.events[1].task_cancelled.task_id == "t2"
 
 
 async def test_transition_dispatches_to_mark_methods() -> None:
@@ -817,3 +825,135 @@ async def test_bind_replaces_sinks() -> None:
     await steerer.mark_task_running("t1", session=session)
     assert sink_a.events == []
     assert len(sink_b.events) == 1
+
+
+# ---------------------------------------------------------------------------
+# Cancellation cascade (TASK-LIFECYCLE.md §6.1, STATE-MACHINE.md
+# §"Cascade on task cancellation")
+# ---------------------------------------------------------------------------
+
+
+async def test_mark_task_cancelled_cascades_to_downstream_pending() -> None:
+    """t1 -> t2 -> t3 linear chain; cancelling t1 cascades to t2 and t3.
+
+    Regression guard for the "make a presentation about waffles" bug:
+    a USER_STEER that cancels the current task while refine fails must
+    still end up cancelling downstream PENDING tasks, otherwise the
+    executor silently runs only the independent branches and reports
+    success while leaving the dependent branch stuck PENDING forever.
+    """
+    steerer = DefaultSteerer()
+    plan = _make_plan(("t1", "t2", "t3"))
+    session = _make_session(plan)
+    sink = ListSink()
+    steerer.bind(sinks=[sink], planner=StubPlanner())
+
+    await steerer.mark_task_cancelled("t1", session=session, reason="user cancelled")
+
+    # All three tasks end up CANCELLED.
+    assert _task(session, "t1").status is TaskStatus.CANCELLED
+    assert _task(session, "t2").status is TaskStatus.CANCELLED
+    assert _task(session, "t3").status is TaskStatus.CANCELLED
+
+    # One TaskCancelled event per task, in cascade order (t1 first,
+    # then BFS downstream).
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert kinds == ["task_cancelled", "task_cancelled", "task_cancelled"]
+    reasons = [e.task_cancelled.reason for e in sink.events]
+    ids = [e.task_cancelled.task_id for e in sink.events]
+    assert ids == ["t1", "t2", "t3"]
+    # The initiator keeps the caller's reason; the cascaded tasks
+    # carry a "cascade from <initiator>" reason so operators can
+    # trace the blast radius back to the trigger.
+    assert reasons[0] == "user cancelled"
+    for r in reasons[1:]:
+        assert "cascade" in r
+        assert "t1" in r
+
+
+async def test_mark_task_cancelled_does_not_cascade_to_completed() -> None:
+    """t1 -> t2 where t2 is already COMPLETED: t2 stays COMPLETED.
+
+    Terminal statuses absorb. A late cancel on an upstream task must
+    not retroactively un-complete a downstream done-task — all
+    refines already preserve completed tasks verbatim and the cascade
+    here must do the same.
+    """
+    steerer = DefaultSteerer()
+    plan = _make_plan(("t1", "t2"))
+    session = _make_session(plan)
+    _task(session, "t2").status = TaskStatus.COMPLETED
+    sink = ListSink()
+    steerer.bind(sinks=[sink], planner=StubPlanner())
+
+    await steerer.mark_task_cancelled("t1", session=session, reason="steer")
+
+    assert _task(session, "t1").status is TaskStatus.CANCELLED
+    assert _task(session, "t2").status is TaskStatus.COMPLETED
+    # Exactly one TaskCancelled event (for t1). t2 was preserved.
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert kinds == ["task_cancelled"]
+    assert sink.events[0].task_cancelled.task_id == "t1"
+
+
+async def test_mark_task_cancelled_multiple_downstream_paths() -> None:
+    """Diamond DAG t1 -> {t2, t3} -> t4: all three downstream cancel.
+
+    Confirms the BFS de-duplicates: t4 is reachable via both t2 and
+    t3 but must be cancelled (and emit TaskCancelled) exactly once.
+    """
+    steerer = DefaultSteerer()
+    plan = Plan(
+        id="p-diamond",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[Task(id=tid, title=tid.upper()) for tid in ("t1", "t2", "t3", "t4")],
+        edges=[
+            TaskEdge(from_task_id="t1", to_task_id="t2"),
+            TaskEdge(from_task_id="t1", to_task_id="t3"),
+            TaskEdge(from_task_id="t2", to_task_id="t4"),
+            TaskEdge(from_task_id="t3", to_task_id="t4"),
+        ],
+    )
+    session = _make_session(plan)
+    sink = ListSink()
+    steerer.bind(sinks=[sink], planner=StubPlanner())
+
+    await steerer.mark_task_cancelled("t1", session=session, reason="steer")
+
+    for tid in ("t1", "t2", "t3", "t4"):
+        assert _task(session, tid).status is TaskStatus.CANCELLED, tid
+
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert kinds == ["task_cancelled"] * 4
+    ids = [e.task_cancelled.task_id for e in sink.events]
+    # t1 first; then its direct children (t2, t3 in edge-order); then t4.
+    # De-duplication: t4 appears exactly once despite two paths.
+    assert ids[0] == "t1"
+    assert set(ids[1:3]) == {"t2", "t3"}
+    assert ids[3] == "t4"
+    assert ids.count("t4") == 1
+
+
+async def test_mark_task_cancelled_does_not_re_cancel() -> None:
+    """Cancelling an already-CANCELLED task is a full no-op.
+
+    No re-emission of TaskCancelled for the task itself and — critically
+    — no re-cascade into downstream tasks, which would double-emit
+    TaskCancelled events on every redundant call.
+    """
+    steerer = DefaultSteerer()
+    plan = _make_plan(("t1", "t2"))
+    session = _make_session(plan)
+    sink = ListSink()
+    steerer.bind(sinks=[sink], planner=StubPlanner())
+
+    await steerer.mark_task_cancelled("t1", session=session, reason="first")
+    first_event_count = len(sink.events)
+    assert first_event_count == 2  # t1 + cascaded t2
+
+    # Second call on the same already-terminal task: no new events.
+    await steerer.mark_task_cancelled("t1", session=session, reason="again")
+    assert len(sink.events) == first_event_count
+    assert _task(session, "t1").status is TaskStatus.CANCELLED
+    assert _task(session, "t2").status is TaskStatus.CANCELLED

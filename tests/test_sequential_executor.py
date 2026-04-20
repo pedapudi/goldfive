@@ -171,7 +171,7 @@ class StubAdapter:
 def _linear_plan(n: int = 3, run_id: str = "run-1") -> Plan:
     """Return a linear plan t0 -> t1 -> ... -> t(n-1)."""
     tasks = [Task(id=f"t{i}", title=f"Task {i}") for i in range(n)]
-    edges = [TaskEdge(from_task_id=f"t{i}", to_task_id=f"t{i+1}") for i in range(n - 1)]
+    edges = [TaskEdge(from_task_id=f"t{i}", to_task_id=f"t{i + 1}") for i in range(n - 1)]
     return Plan(id="p0", run_id=run_id, goal_ids=[], tasks=tasks, edges=edges)
 
 
@@ -279,9 +279,7 @@ async def test_drift_mid_run_applies_refined_plan() -> None:
                 detail="found extra work",
                 current_task_id=task.id,
             )
-            revised = await planner.refine(
-                plan=session.plan, drift=drift, goals=session.goals
-            )
+            revised = await planner.refine(plan=session.plan, drift=drift, goals=session.goals)
             if revised is not None:
                 session.plan = revised
             return InvocationResult(task_id=task.id, text="done-with-drift")
@@ -425,9 +423,7 @@ async def test_budget_terminates_stuck_run() -> None:
         # executor auto-fails the task on its behalf (matching the
         # "InvocationResult.error is set" branch of the auto-transition
         # logic) so fail_fast aborts after the first invocation.
-        return InvocationResult(
-            task_id=task.id, text="", error=RuntimeError("stuck")
-        )
+        return InvocationResult(task_id=task.id, text="", error=RuntimeError("stuck"))
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_stuck)
 
@@ -531,9 +527,7 @@ async def test_retry_lineage_cap_fails_task_after_N_retries() -> None:
         )
         return InvocationResult(task_id=task.id, text="", stop_reason="failed")
 
-    adapter = StubAdapter(
-        steerer=steerer, planner=planner, on_invoke=_fail_and_spawn_retry
-    )
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_fail_and_spawn_retry)
 
     # cap=2 -> allow 2 invocations on lineage root "t0"; the 3rd clone
     # is refused before the adapter is called.
@@ -589,15 +583,13 @@ async def test_retry_lineage_cap_is_per_task_not_global() -> None:
     ) -> InvocationResult:
         # Derive the lineage root by stripping a single "retry_" prefix;
         # good enough for this 2-deep test.
-        root = task.id[len("retry_"):] if task.id.startswith("retry_") else task.id
+        root = task.id[len("retry_") :] if task.id.startswith("retry_") else task.id
         if not fail_once[root]:
             fail_once[root] = True
             await steerer.transition(task.id, TaskStatus.FAILED, session=session)
             # Add a retry clone so the plan still has work to do.
             new_tasks = list(session.plan.tasks) if session.plan else []
-            new_tasks.append(
-                Task(id=f"retry_{task.id}", title=f"retry of {task.title}")
-            )
+            new_tasks.append(Task(id=f"retry_{task.id}", title=f"retry of {task.title}"))
             session.plan = Plan(
                 id="p0",
                 run_id=session.run_id,
@@ -610,9 +602,7 @@ async def test_retry_lineage_cap_is_per_task_not_global() -> None:
         await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
         return InvocationResult(task_id=task.id, text=f"done:{task.id}")
 
-    adapter = StubAdapter(
-        steerer=steerer, planner=planner, on_invoke=_fail_first_then_succeed
-    )
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_fail_first_then_succeed)
 
     executor = SequentialExecutor(
         max_plan_reinvocations=32,
@@ -693,9 +683,7 @@ async def test_retry_lineage_cap_passes_on_successful_retry() -> None:
         await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
         return InvocationResult(task_id=task.id, text="ok")
 
-    adapter = StubAdapter(
-        steerer=steerer, planner=planner, on_invoke=_fail_then_retry_succeeds
-    )
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_fail_then_retry_succeeds)
 
     executor = SequentialExecutor(
         max_plan_reinvocations=32,
@@ -782,3 +770,149 @@ async def test_retry_lineage_cap_collapses_nested_retry_prefixes() -> None:
     assert by_id["t0"] == TaskStatus.COMPLETED
     assert by_id["retry_t0"] == TaskStatus.COMPLETED
     assert by_id["retry_retry_t0"] == TaskStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Reachability audit: orphaned PENDING tasks at loop exit.
+#
+# Belt-and-suspenders for the cancellation cascade (TASK-LIFECYCLE.md §6.1,
+# §7.8). If _pick_next_task returns None but PENDING tasks remain, the
+# executor must NOT report success=True — it must cancel the orphans,
+# emit a CRITICAL PLAN_DIVERGENCE drift, and return success=False.
+# ---------------------------------------------------------------------------
+
+
+async def test_executor_run_with_orphaned_pending_reports_failure() -> None:
+    """A cancelled task with a downstream PENDING dep ends the run as failure.
+
+    Reproduces the 'waffles' regression at the executor boundary: the
+    first task is cancelled (simulating USER_STEER whose refine failed
+    to produce a new plan). The downstream PENDING task has a
+    CANCELLED predecessor, so _pick_next_task refuses to pick it. The
+    executor must not reach run_completed with success=True; it must
+    cascade-cancel the orphan and emit RunAborted.
+    """
+    plan = _linear_plan(2)  # t0 -> t1
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _cancel_t0(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        # Simulate a STEER-cancel on the current task without any
+        # cascade and without a refine that replaces the plan. The
+        # StubSteerer.transition flips status directly; this mirrors
+        # what the real system used to do before the cascade fix.
+        await steerer.transition(task.id, TaskStatus.CANCELLED, session=session)
+        return InvocationResult(task_id=task.id, text="cancelled")
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_cancel_t0)
+
+    executor = SequentialExecutor(max_plan_reinvocations=5)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    # Only t0 was invoked (t1 is blocked by CANCELLED predecessor).
+    assert adapter.invocations == ["t0"]
+    # Reachability audit flipped t1 from PENDING to CANCELLED and
+    # ended the run as failure. Without the audit, outcome.success
+    # would be True and t1 would stay PENDING forever.
+    assert outcome.success is False
+    by_id = {t.id: t.status for t in plan.tasks}
+    assert by_id["t0"] == TaskStatus.CANCELLED
+    assert by_id["t1"] == TaskStatus.CANCELLED
+    # Terminal event is RunAborted (not RunCompleted).
+    assert sink.payload_kinds()[-1] == "run_aborted"
+
+
+async def test_executor_emits_plan_divergence_when_pending_orphaned() -> None:
+    """Audit emits a CRITICAL PLAN_DIVERGENCE drift before RunAborted."""
+    plan = _linear_plan(3)  # t0 -> t1 -> t2
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _cancel_t0(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        await steerer.transition(task.id, TaskStatus.CANCELLED, session=session)
+        return InvocationResult(task_id=task.id, text="cancelled")
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_cancel_t0)
+
+    executor = SequentialExecutor(max_plan_reinvocations=5)
+    await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    # The sink saw a DriftDetected(PLAN_DIVERGENCE, CRITICAL) before
+    # RunAborted. Match by poking the drift_detected payload fields.
+    drift_events = [
+        e
+        for e in sink.events
+        if hasattr(e, "WhichOneof") and e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert drift_events, "expected at least one DriftDetected event"
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    audit_drifts = [
+        e for e in drift_events if e.drift_detected.kind == types_pb2.DRIFT_KIND_PLAN_DIVERGENCE
+    ]
+    assert audit_drifts, "expected a PLAN_DIVERGENCE drift from the audit"
+    assert audit_drifts[-1].drift_detected.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert "orphaned" in audit_drifts[-1].drift_detected.detail.lower()
+
+
+async def test_executor_skips_audit_when_all_tasks_terminal() -> None:
+    """Audit is a no-op when no PENDING tasks remain — success stays True."""
+    plan = _linear_plan(2)
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _complete_current(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id=task.id, text="ok")
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_current)
+
+    executor = SequentialExecutor(max_plan_reinvocations=5)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    assert outcome.success is True
+    # No PLAN_DIVERGENCE drift was emitted (no orphans).
+    drift_payloads = [
+        e
+        for e in sink.events
+        if hasattr(e, "WhichOneof") and e.WhichOneof("payload") == "drift_detected"
+    ]
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    assert not any(
+        e.drift_detected.kind == types_pb2.DRIFT_KIND_PLAN_DIVERGENCE for e in drift_payloads
+    )
+    assert sink.payload_kinds()[-1] == "run_completed"

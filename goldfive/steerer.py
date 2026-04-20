@@ -268,14 +268,94 @@ class DefaultSteerer:
         session: Session,
         reason: str = "",
     ) -> None:
-        """Transition ``task_id`` to ``CANCELLED`` and emit ``TaskCancelled``."""
+        """Transition ``task_id`` to ``CANCELLED`` and emit ``TaskCancelled``.
+
+        Also **cascades** the cancellation forward through the plan's
+        edges: every non-terminal task reachable from ``task_id`` is
+        transitioned to ``CANCELLED`` with a "cascade from <task_id>"
+        reason. Without this cascade, downstream PENDING tasks with a
+        CANCELLED predecessor would never satisfy the executor's
+        "all deps COMPLETED" check — they would sit PENDING forever and
+        the executor would report the run as successful while leaving
+        them orphaned. See TASK-LIFECYCLE.md §"Cancellation cascade" and
+        STATE-MACHINE.md §"Cascade semantics on unrecoverable drift".
+        """
         task = self._find_task(session, task_id)
         if task is None:
             return
         if task.status in _TERMINAL_TASK_STATUSES:
+            # Already terminal (including already CANCELLED) — no-op, and
+            # crucially do NOT re-run the cascade: we would double-emit
+            # TaskCancelled events for downstream tasks on every call.
             return
         task.status = TaskStatus.CANCELLED
         await self._emit_task_cancelled(session, task_id, reason)
+        await self._cascade_cancel_downstream(session, task_id)
+
+    async def _cascade_cancel_downstream(
+        self,
+        session: Session,
+        cancelled_id: str,
+    ) -> None:
+        """BFS-cancel every downstream non-terminal task of ``cancelled_id``.
+
+        Walks ``session.plan.edges`` forward from ``cancelled_id`` and
+        transitions every reachable non-terminal task to ``CANCELLED``
+        in-place, emitting one ``TaskCancelled`` event per transition.
+        Terminal tasks (COMPLETED / FAILED / CANCELLED) are skipped so a
+        diamond DAG does not re-cancel a task through two paths and so
+        already-COMPLETED dependents are preserved verbatim.
+
+        Implemented as an iterative BFS on a precomputed adjacency list
+        (rather than recursing into :meth:`mark_task_cancelled`) so a
+        single top-level cancel produces one summary log line and a
+        predictable number of emitted events, independent of graph shape.
+        """
+        plan = session.plan
+        if plan is None:
+            return
+        # Precompute forward adjacency once.
+        downstream: dict[str, list[str]] = {}
+        for e in plan.edges:
+            downstream.setdefault(e.from_task_id, []).append(e.to_task_id)
+        tasks_by_id: dict[str, Task] = {t.id: t for t in plan.tasks if t.id}
+
+        cascade_reason = f"cascade from {cancelled_id}"
+        cascaded: list[str] = []
+        queue: list[str] = list(downstream.get(cancelled_id, []))
+        visited: set[str] = set()
+        while queue:
+            next_id = queue.pop(0)
+            if next_id in visited:
+                continue
+            visited.add(next_id)
+            dep = tasks_by_id.get(next_id)
+            if dep is None:
+                continue
+            if dep.status in _TERMINAL_TASK_STATUSES:
+                # Already terminal (COMPLETED/FAILED/CANCELLED) — preserve
+                # and do not traverse its children. A COMPLETED task that
+                # sits downstream of a late-cancelled ancestor keeps its
+                # completion; cascading past it would mean cancelling
+                # tasks whose preserved prerequisite is still valid.
+                continue
+            # Transition in place and emit. We deliberately do NOT
+            # recurse through ``mark_task_cancelled`` here; we fan out
+            # via our own BFS queue so the surrounding summary log and
+            # emission count stay deterministic.
+            dep.status = TaskStatus.CANCELLED
+            await self._emit_task_cancelled(session, next_id, cascade_reason)
+            cascaded.append(next_id)
+            for grandchild in downstream.get(next_id, []):
+                if grandchild not in visited:
+                    queue.append(grandchild)
+        if cascaded:
+            log.info(
+                "DefaultSteerer: cascade-cancelled %d downstream task(s) from %s: %s",
+                len(cascaded),
+                cancelled_id,
+                ", ".join(cascaded),
+            )
 
     # ------------------------------------------------------------------
     # Observer: drift detection + refine

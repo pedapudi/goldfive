@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 
 from goldfive.events import (
     emit,
+    new_event,
     plan_revised_event,
     run_aborted_event,
     run_completed_event,
@@ -49,7 +50,7 @@ from goldfive.executors._control import (
 )
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome
-from goldfive.types import Plan, Session, Task, TaskStatus
+from goldfive.types import DriftKind, DriftSeverity, Plan, Session, Task, TaskStatus
 
 if TYPE_CHECKING:
     from goldfive.control import ControlChannel
@@ -176,9 +177,7 @@ class SequentialExecutor(Executor):
                 run_failed = True
                 break
             if steer_msg is not None:
-                await self._apply_steer(
-                    steer_msg, steerer=steerer, session=session
-                )
+                await self._apply_steer(steer_msg, steerer=steerer, session=session)
                 # The steerer swapped session.plan; pick up the revision
                 # on the next outer iteration.
 
@@ -230,7 +229,9 @@ class SequentialExecutor(Executor):
                     "SequentialExecutor: lineage cap reached for task=%s "
                     "(lineage_root=%s, count=%d, cap=%d); marking FAILED "
                     "without invoking adapter",
-                    task.id, lineage_root, lineage_count,
+                    task.id,
+                    lineage_root,
+                    lineage_count,
                     self.max_retries_per_task_lineage,
                 )
                 await steerer.transition(
@@ -263,8 +264,11 @@ class SequentialExecutor(Executor):
             log.debug(
                 "SequentialExecutor: invoking task=%s (invocation %d/%d, "
                 "lineage_root=%s, lineage_count=%d/%d)",
-                task.id, invocations, self.max_plan_reinvocations,
-                lineage_root, lineage_count + 1,
+                task.id,
+                invocations,
+                self.max_plan_reinvocations,
+                lineage_root,
+                lineage_count + 1,
                 self.max_retries_per_task_lineage,
             )
 
@@ -273,9 +277,7 @@ class SequentialExecutor(Executor):
             # case) still produce a TaskStarted event. The steerer's
             # transition is idempotent once the task leaves PENDING.
             if task.status == TaskStatus.PENDING:
-                await steerer.transition(
-                    task.id, TaskStatus.RUNNING, session=session
-                )
+                await steerer.transition(task.id, TaskStatus.RUNNING, session=session)
 
             # Race the adapter invocation against the control channel so a
             # CANCEL / STEER / PAUSE arriving mid-task can cancel (or at
@@ -316,9 +318,7 @@ class SequentialExecutor(Executor):
                 await self._mark_cancelled_if_live(
                     task_id=task.id, steerer=steerer, session=session
                 )
-                await self._apply_steer(
-                    outcome_payload, steerer=steerer, session=session
-                )
+                await self._apply_steer(outcome_payload, steerer=steerer, session=session)
                 continue
 
             # outcome_kind == "result"
@@ -328,13 +328,12 @@ class SequentialExecutor(Executor):
             # (but didn't raise), record it; the auto-transition block
             # below routes that through steerer.mark_task_failed unless
             # the agent already transitioned the task itself.
-            invocation_error = (
-                result is not None and getattr(result, "error", None) is not None
-            )
+            invocation_error = result is not None and getattr(result, "error", None) is not None
             if invocation_error:
                 log.warning(
                     "SequentialExecutor: InvocationResult.error=%s task=%s",
-                    result.error, task.id,
+                    result.error,
+                    task.id,
                 )
 
             # Route the invocation result through the steerer's observer so
@@ -352,9 +351,7 @@ class SequentialExecutor(Executor):
 
             # Re-read the task's tracked status after the invocation.
             tracked = _find_task(session.plan or current_plan, task.id)
-            tracked_status = (
-                tracked.status if tracked is not None else TaskStatus.PENDING
-            )
+            tracked_status = tracked.status if tracked is not None else TaskStatus.PENDING
 
             # If the agent returned without emitting a terminal reporting
             # call, auto-transition on its behalf: complete on a clean
@@ -380,9 +377,7 @@ class SequentialExecutor(Executor):
                         session=session,
                     )
                 tracked = _find_task(session.plan or current_plan, task.id)
-                tracked_status = (
-                    tracked.status if tracked is not None else TaskStatus.PENDING
-                )
+                tracked_status = tracked.status if tracked is not None else TaskStatus.PENDING
 
             if tracked_status == TaskStatus.FAILED:
                 failure_reason = f"task {task.id} failed"
@@ -444,6 +439,50 @@ class SequentialExecutor(Executor):
             )
             return ExecutionOutcome(success=False, session=session, reason=reason)
 
+        # Reachability audit: belt-and-suspenders for any cancellation path
+        # that failed to cascade. If we are about to report success but
+        # there are still PENDING tasks — and ``_pick_next_task`` already
+        # declined to return any of them — those tasks are orphaned (e.g.
+        # every path to them crosses a CANCELLED or FAILED predecessor
+        # and no refine produced a replacement plan). Mark them CANCELLED
+        # in place, emit a CRITICAL PLAN_DIVERGENCE drift so sinks see
+        # the incomplete ending, and fail the run. This catches cases
+        # the Steerer's cascade missed (and is a cheap safety net even
+        # when the cascade worked correctly).
+        orphaned = _pending_task_ids(session.plan or plan)
+        if orphaned:
+            log.warning(
+                "SequentialExecutor: %d task(s) still PENDING with no "
+                "eligible next task — run ending incomplete: %s",
+                len(orphaned),
+                ", ".join(orphaned),
+            )
+            for orphan_id in orphaned:
+                await steerer.transition(
+                    orphan_id,
+                    TaskStatus.CANCELLED,
+                    detail="orphaned by plan revision failure",
+                    session=session,
+                )
+            reason = (
+                f"{len(orphaned)} task(s) left PENDING with no eligible "
+                f"next task (orphaned by plan revision failure): "
+                f"{', '.join(orphaned)}"
+            )
+            await emit(
+                sinks,
+                _plan_divergence_drift_event(session, reason),
+            )
+            await emit(
+                sinks,
+                run_aborted_event(
+                    run_id=session.run_id,
+                    sequence=session.next_sequence(),
+                    reason=reason,
+                ),
+            )
+            return ExecutionOutcome(success=False, session=session, reason=reason)
+
         await emit(
             sinks,
             run_completed_event(
@@ -479,9 +518,7 @@ class SequentialExecutor(Executor):
         if control is None:
             return False, None
 
-        outcomes = await drain_controls(
-            control, session=session, steerer=steerer, sinks=sinks
-        )
+        outcomes = await drain_controls(control, session=session, steerer=steerer, sinks=sinks)
 
         cancel_run = False
         cancel_reason = ""
@@ -510,17 +547,13 @@ class SequentialExecutor(Executor):
                 # Channel closed — treat as resume so we don't wedge.
                 paused = False
                 break
-            outcome = await dispatch_control(
-                msg, session=session, steerer=steerer, sinks=sinks
-            )
+            outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=sinks)
             try:
                 await control.ack(outcome.ack)
             except Exception:  # noqa: BLE001
                 pass
             if outcome.cancel_run:
-                raise _ControlCancelled(
-                    outcome.cancel_reason or "cancelled by control"
-                )
+                raise _ControlCancelled(outcome.cancel_reason or "cancelled by control")
             if outcome.request_resume:
                 paused = False
             if outcome.steer_message is not None:
@@ -601,9 +634,7 @@ class SequentialExecutor(Executor):
                     return ("adapter_error", exc)
                 return ("result", result)
 
-            outcome = await dispatch_control(
-                msg, session=session, steerer=steerer, sinks=sinks
-            )
+            outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=sinks)
             try:
                 await control.ack(outcome.ack)
             except Exception:  # noqa: BLE001
@@ -642,8 +673,7 @@ class SequentialExecutor(Executor):
                 return
             await asyncio.sleep(0.05)
         log.warning(
-            "SequentialExecutor: adapter ignored task.cancel(); "
-            "abandoning after 5s grace window"
+            "SequentialExecutor: adapter ignored task.cancel(); abandoning after 5s grace window"
         )
 
     @staticmethod
@@ -683,9 +713,7 @@ class SequentialExecutor(Executor):
         try:
             await steerer.observe(message, session)
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "SequentialExecutor: steerer.observe(STEER) raised: %s", exc
-            )
+            log.warning("SequentialExecutor: steerer.observe(STEER) raised: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +788,46 @@ def _lineage_root(task_id: str) -> str:
 
 def _any_failed(plan: Plan) -> bool:
     return any(t.status == TaskStatus.FAILED for t in plan.tasks)
+
+
+def _pending_task_ids(plan: Plan) -> list[str]:
+    """Return the ids of every task still in PENDING state.
+
+    Used by the reachability audit at loop exit: if ``_pick_next_task``
+    returned None but some tasks are still PENDING, those tasks are
+    orphaned (every path to them crosses a CANCELLED / FAILED predecessor
+    that no refine replaced). The audit then cancels them in place so
+    sinks see a coherent plan-end state instead of "stuck PENDING forever."
+    """
+    return [t.id for t in plan.tasks if t.status == TaskStatus.PENDING and t.id]
+
+
+def _plan_divergence_drift_event(session: Session, detail: str) -> object:
+    """Build a CRITICAL PLAN_DIVERGENCE ``DriftDetected`` envelope.
+
+    Mirrors ``DefaultSteerer._emit_drift_detected`` but built here so
+    the reachability audit can emit a drift event from the executor
+    directly (without routing through the steerer, which would
+    otherwise try to re-refine). Uses ``types_pb2``'s named enum
+    constants so the emitted event carries the real ``PLAN_DIVERGENCE``
+    / ``CRITICAL`` enum values rather than ``UNSPECIFIED``.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    evt = new_event(session.run_id, session.next_sequence())
+    evt.drift_detected.kind = getattr(
+        types_pb2,
+        f"DRIFT_KIND_{DriftKind.PLAN_DIVERGENCE.name}",
+        0,
+    )
+    evt.drift_detected.severity = getattr(
+        types_pb2,
+        f"DRIFT_SEVERITY_{DriftSeverity.CRITICAL.name}",
+        0,
+    )
+    evt.drift_detected.detail = detail
+    evt.drift_detected.current_task_id = session.current_task_id or ""
+    return evt
 
 
 def _outcome_summary(session: Session) -> str:
