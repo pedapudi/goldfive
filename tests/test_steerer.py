@@ -239,7 +239,19 @@ async def test_mark_task_failed_recoverable_fires_drift() -> None:
 async def test_mark_task_failed_fatal_fires_critical_drift() -> None:
     steerer, session, sink, _planner = _fresh()
     await steerer.mark_task_failed("t1", session=session, reason="unrecoverable", recoverable=False)
-    drift_evt = sink.events[1]
+    # Event order: TaskFailed(t1) → TaskCancelled(t2, cascade) → DriftDetected(TASK_FAILED_FATAL) →
+    # refine-failure DriftDetected (stub planner returns None). The
+    # cascade fires before the fatal drift so planner.refine (if it ran)
+    # would see the post-cascade plan shape.
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert kinds == ["task_failed", "task_cancelled", "drift_detected", "drift_detected"]
+    assert sink.events[0].task_failed.task_id == "t1"
+    assert sink.events[0].task_failed.recoverable is False
+    # Downstream cascade picked up t2 via the shared primitive.
+    assert sink.events[1].task_cancelled.task_id == "t2"
+    assert "cascade" in sink.events[1].task_cancelled.reason
+    assert "t1" in sink.events[1].task_cancelled.reason
+    drift_evt = sink.events[2]
     from goldfive.pb.goldfive.v1 import types_pb2
 
     assert drift_evt.drift_detected.kind == types_pb2.DRIFT_KIND_TASK_FAILED_FATAL
@@ -564,10 +576,14 @@ async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
     from goldfive.pb.goldfive.v1 import types_pb2
 
     kinds = [e.WhichOneof("payload") for e in sink.events]
-    # Expected stream across both ticks:
+    # Expected stream across both ticks (inclusive of the unrecoverable
+    # downstream cascade — PLAN-LIFECYCLE.md §6.2 step 3 — that
+    # mark_task_failed(recoverable=False) now drives through the shared
+    # cascade_cancel_downstream primitive):
     #   tick 1: drift_detected (TOOL_ERROR)
     #   tick 2: drift_detected (TOOL_ERROR),
-    #           task_failed,
+    #           task_failed(t1),
+    #           task_cancelled(t2, cascade from t1),
     #           drift_detected (TASK_FAILED_FATAL — from mark_task_failed),
     #           drift_detected (REPEATED_FAILURE).
     assert "task_failed" in kinds
@@ -1154,3 +1170,83 @@ async def test_mark_task_cancelled_does_not_re_cancel() -> None:
     assert len(sink.events) == first_event_count
     assert _task(session, "t1").status is TaskStatus.CANCELLED
     assert _task(session, "t2").status is TaskStatus.CANCELLED
+
+
+async def test_cascade_primitive_shared_between_recoverable_and_unrecoverable_paths() -> None:
+    """Both cascade paths fan out CANCELs through the same primitive.
+
+    Closes PLAN-LIFECYCLE.md §8 gap #3: the recoverable cascade (§6.3 —
+    driven by ``mark_task_cancelled``) and the unrecoverable cascade
+    (§6.2 — driven by ``mark_task_failed(recoverable=False)``) share
+    :meth:`DefaultSteerer.cascade_cancel_downstream`. Both paths must
+    therefore emit ``TaskCancelled`` events for the same downstream set
+    with identical reasons.
+
+    This is the regression guard against future divergence: if somebody
+    adds a second BFS-cancel implementation (e.g. an "unrecoverable
+    cascade" method on the executor that mutates status directly), the
+    downstream event stream for the two paths will drift and this test
+    will flag it.
+    """
+
+    # Diamond DAG t1 -> {t2, t3} -> t4 so the test exercises both
+    # forward-BFS and the dedup-across-paths guarantee on both paths.
+    def _build() -> tuple[DefaultSteerer, Session, ListSink]:
+        plan = Plan(
+            id="p-cascade-parity",
+            run_id="r1",
+            goal_ids=["g1"],
+            tasks=[Task(id=tid, title=tid.upper()) for tid in ("t1", "t2", "t3", "t4")],
+            edges=[
+                TaskEdge(from_task_id="t1", to_task_id="t2"),
+                TaskEdge(from_task_id="t1", to_task_id="t3"),
+                TaskEdge(from_task_id="t2", to_task_id="t4"),
+                TaskEdge(from_task_id="t3", to_task_id="t4"),
+            ],
+        )
+        session = _make_session(plan)
+        sink = ListSink()
+        steerer = DefaultSteerer()
+        steerer.bind(sinks=[sink], planner=StubPlanner())
+        return steerer, session, sink
+
+    # --- Recoverable path: mark_task_cancelled("t1") -------------------
+    rec_steerer, rec_session, rec_sink = _build()
+    await rec_steerer.mark_task_cancelled("t1", session=rec_session, reason="steer")
+    rec_cancelled = [
+        e.task_cancelled for e in rec_sink.events if e.WhichOneof("payload") == "task_cancelled"
+    ]
+    # Initiator t1 + downstream {t2, t3, t4} = 4 TaskCancelled events.
+    assert [c.task_id for c in rec_cancelled][0] == "t1"
+    rec_downstream_ids = sorted(c.task_id for c in rec_cancelled[1:])
+    assert rec_downstream_ids == ["t2", "t3", "t4"]
+    rec_downstream_reasons = {c.task_id: c.reason for c in rec_cancelled[1:]}
+
+    # --- Unrecoverable path: mark_task_failed("t1", recoverable=False) -
+    fat_steerer, fat_session, fat_sink = _build()
+    await fat_steerer.mark_task_failed("t1", session=fat_session, reason="fatal", recoverable=False)
+    fat_cancelled = [
+        e.task_cancelled for e in fat_sink.events if e.WhichOneof("payload") == "task_cancelled"
+    ]
+    # Initiator t1 is FAILED (not CANCELLED), so only the *downstream*
+    # set shows up as TaskCancelled events — same three tasks as the
+    # recoverable path produced downstream.
+    fat_downstream_ids = sorted(c.task_id for c in fat_cancelled)
+    assert fat_downstream_ids == ["t2", "t3", "t4"]
+    fat_downstream_reasons = {c.task_id: c.reason for c in fat_cancelled}
+
+    # Core parity assertion: the downstream TaskCancelled events emitted
+    # by the two paths carry the same reason strings ("cascade from t1"
+    # shape), proving both paths funnel through cascade_cancel_downstream.
+    assert rec_downstream_reasons == fat_downstream_reasons
+    for tid, reason in fat_downstream_reasons.items():
+        assert "cascade" in reason, (tid, reason)
+        assert "t1" in reason, (tid, reason)
+
+    # Final plan shape parity on the downstream set (initiator differs:
+    # CANCELLED on the recoverable path, FAILED on the unrecoverable).
+    for tid in ("t2", "t3", "t4"):
+        assert _task(rec_session, tid).status is TaskStatus.CANCELLED, tid
+        assert _task(fat_session, tid).status is TaskStatus.CANCELLED, tid
+    assert _task(rec_session, "t1").status is TaskStatus.CANCELLED
+    assert _task(fat_session, "t1").status is TaskStatus.FAILED
