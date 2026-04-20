@@ -190,7 +190,7 @@ async def test_cancel_mid_task_aborts_run() -> None:
     runner = Runner(
         agent=CallableAdapter(_slow_agent, available_agents=["writer"]),
         planner=planner,
-        executor=SequentialExecutor(max_plan_reinvocations=5),
+        executor=SequentialExecutor(max_task_invocations=5),
         goal_deriver=PassthroughGoalDeriver("cancel-demo"),
         steerer=DefaultSteerer(),
         sinks=[sink],
@@ -274,7 +274,7 @@ async def test_steer_mid_task_triggers_refine_and_continues() -> None:
     runner = Runner(
         agent=CallableAdapter(_agent, available_agents=["writer"]),
         planner=planner,
-        executor=SequentialExecutor(max_plan_reinvocations=10),
+        executor=SequentialExecutor(max_task_invocations=10),
         goal_deriver=PassthroughGoalDeriver("steer-demo"),
         steerer=DefaultSteerer(),
         sinks=[sink],
@@ -353,7 +353,7 @@ async def test_pause_blocks_next_task_until_resume() -> None:
     runner = Runner(
         agent=CallableAdapter(_agent, available_agents=["writer"]),
         planner=planner,
-        executor=SequentialExecutor(max_plan_reinvocations=8),
+        executor=SequentialExecutor(max_task_invocations=8),
         goal_deriver=PassthroughGoalDeriver("pause-demo"),
         steerer=DefaultSteerer(),
         sinks=[sink],
@@ -414,7 +414,7 @@ async def test_rewind_resets_target_and_downstream_tasks() -> None:
     runner = Runner(
         agent=CallableAdapter(_agent, available_agents=["writer"]),
         planner=planner,
-        executor=SequentialExecutor(max_plan_reinvocations=12),
+        executor=SequentialExecutor(max_task_invocations=12),
         goal_deriver=PassthroughGoalDeriver("rewind-demo"),
         steerer=DefaultSteerer(),
         sinks=[sink],
@@ -473,7 +473,7 @@ async def test_status_query_emits_synthetic_report() -> None:
     runner = Runner(
         agent=CallableAdapter(_agent, available_agents=["writer"]),
         planner=planner,
-        executor=SequentialExecutor(max_plan_reinvocations=8),
+        executor=SequentialExecutor(max_task_invocations=8),
         goal_deriver=PassthroughGoalDeriver("status-demo"),
         steerer=DefaultSteerer(),
         sinks=[sink],

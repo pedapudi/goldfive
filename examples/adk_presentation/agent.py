@@ -206,7 +206,7 @@ async def run(*, topic: str, mock: bool) -> None:
         _build_agent(agent_model),
         planner=LLMPlanner(call_llm=planner_call_llm, model=model_tag),
         goal_deriver=LLMGoalDeriver(call_llm=goal_call_llm, model=model_tag),
-        executor=SequentialExecutor(max_plan_reinvocations=8),
+        executor=SequentialExecutor(max_task_invocations=8),
         sinks=[LoggingSink()],
     )
 

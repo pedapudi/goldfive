@@ -913,7 +913,7 @@ class DefaultSteerer:
         ``FAILED`` (non-recoverable), and emit a CRITICAL
         ``REPEATED_FAILURE`` drift so sinks see the back-off. This
         bounds the loop that would otherwise re-fire the same drift
-        every tick until ``SequentialExecutor.max_plan_reinvocations``
+        every tick until ``SequentialExecutor.max_task_invocations``
         tripped (see TASK-LIFECYCLE.md §7.3).
         """
         await self._emit_drift_detected(session, drift)

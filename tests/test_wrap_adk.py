@@ -134,7 +134,7 @@ async def test_run_programmatically_returns_outcome(stub_call_llm: Any) -> None:
         return InvocationResult(task_id=task.id, text=f"ok: {task.title}")
 
     wrapped.runner.agent.invoke = AsyncMock(side_effect=_fake_invoke)
-    wrapped.runner.executor = SequentialExecutor(max_plan_reinvocations=3)
+    wrapped.runner.executor = SequentialExecutor(max_task_invocations=3)
 
     outcome = await wrapped.run(
         [goldfive.Goal(id="g1", summary="say hi")],
@@ -190,7 +190,7 @@ async def test_run_async_yields_events_for_user_turn(stub_call_llm: Any) -> None
         return InvocationResult(task_id=task.id, text=f"ok: {task.title}")
 
     wrapped.runner.agent.invoke = AsyncMock(side_effect=_fake_invoke)
-    wrapped.runner.executor = SequentialExecutor(max_plan_reinvocations=3)
+    wrapped.runner.executor = SequentialExecutor(max_task_invocations=3)
 
     ctx = _FakeCtx("make a thing")
     events = [evt async for evt in wrapped._run_async_impl(ctx)]

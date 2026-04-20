@@ -182,12 +182,15 @@ timeout, or the `LOOPING_TOOL_CALL` guard (§5), or a CANCEL on the
 control channel.
 
 **Soundness gap (open):** there is no cap on the number of
-invocations per task. A task can be re-invoked indirectly through a
-refine that produces a `retry_<task>` task; if the retry also loops,
-a new refine is triggered, and so on up to
-`SequentialExecutor.max_plan_reinvocations` (default 32). This
-bounds the blast radius at ~32 × 500 = 16 000 LLM calls per run
-worst case. See §7.
+invocations per task by default. A task can be re-invoked indirectly
+through a refine that produces a `retry_<task>` task; if the retry
+also loops, a new refine is triggered, and so on. Blast radius is
+bounded primarily by `max_retries_per_task_lineage` (default 3,
+see §7.7) and by the per-tool / per-ADK turn caps inside the
+adapter; `SequentialExecutor.max_task_invocations` (default
+`None` == unbounded) can be set to a finite integer as a
+belt-and-suspenders run-wide cap when you want a hard ceiling on
+total adapter invocations. See §7.
 
 ---
 
@@ -240,8 +243,9 @@ rather than hiding it behind a stale plan.
 
 **Soundness gap (open):** refine failures do not themselves
 terminate the run. If the LLM is down entirely, the same drift can
-retrigger → refine fails → drift emitted again. The executor's
-`max_plan_reinvocations` cap eventually stops the loop, but there
+retrigger → refine fails → drift emitted again. The per-lineage
+cap (`max_retries_per_task_lineage`) and the optional
+`max_task_invocations` ceiling eventually stop the loop, but there
 is no per-drift-kind backoff or dedup. See §7.
 
 ---
@@ -513,8 +517,10 @@ impact.
 If the configured LLM is down, the same drift re-fires → refine
 fails → drift re-emitted (now with "refine failed" surface, §4.3)
 → but the underlying condition is unchanged → drift fires again on
-next tick. Eventually bounded by `max_plan_reinvocations`, but the
-budget is burned without forward progress.
+next tick. Eventually bounded by the per-lineage cap
+(`max_retries_per_task_lineage`) or by an explicit
+`max_task_invocations` ceiling when configured, but any budget is
+burned without forward progress.
 
 **Fix direction:** per-`(drift.kind, task_id)` refine-attempt
 counter. After N consecutive failures, mark the task FAILED
@@ -561,13 +567,17 @@ wasted turns is now 49 across the whole session — acceptable.
 ### 7.7 No per-task invocation cap
 
 If a refine produces a `retry_<task>` task and the retry also
-loops, another refine fires — bounded only by
-`max_plan_reinvocations` (default 32). For long runs on flaky
-agents this is ~32 × 500 = 16 000 LLM calls worst case.
+loops, another refine fires. The primary bound on blast radius is
+now the per-lineage cap `max_retries_per_task_lineage` (default 3),
+which refuses to invoke the adapter on the N+1st clone of any
+lineage root. `max_task_invocations` (default `None` == unbounded)
+can be set to a finite integer as an additional run-wide ceiling on
+adapter invocations when a hard budget is desired.
 
-**Fix direction:** add a `max_retries_per_task_id` (default 3) to
-the executor. After N refines that target the same task id's
-lineage, mark the task FAILED and cascade CANCEL downstream.
+**Fix direction:** implemented — `max_retries_per_task_lineage`
+applies the per-lineage cap. After N invocations on the same
+lineage, the next clone is refused and transitioned to FAILED in
+place; downstream tasks then block via dependency cascade.
 
 ### 7.8 CANCELLED cascade to downstream PENDING tasks (closed)
 

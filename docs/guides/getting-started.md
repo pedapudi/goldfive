@@ -77,7 +77,7 @@ DEBUG line explaining the drop.
 
 Every default is overridable via keyword argument — `planner=`,
 `goal_deriver=`, `executor=`, `steerer=`, `sinks=`, and
-`max_plan_reinvocations=` all win over the auto-wiring when passed.
+`max_task_invocations=` all win over the auto-wiring when passed.
 
 ## Mental model in five sentences
 

@@ -36,6 +36,7 @@ and are loaded lazily by callers.
 from __future__ import annotations
 
 import logging
+import warnings
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -99,10 +100,11 @@ class Runner:
         controller (harmonograf UI, CLI, tests). When provided, the
         Runner forwards it into the executor, which polls the channel
         between tasks and races against adapter invocations mid-task.
-    max_plan_reinvocations:
-        Safety cap on plan refinement cycles. Passed through to the
-        executor (via ``context``) so executors that honour it can
-        enforce the cap.
+    max_task_invocations:
+        Optional safety cap on adapter invocations per run. Stamped onto
+        the planner context so executors that honour it can enforce the
+        cap. Defaults to ``None`` (unbounded); per-task / per-tool caps
+        are the primary guards against runaway loops.
     """
 
     def __init__(
@@ -115,9 +117,23 @@ class Runner:
         steerer: Steerer | None = None,
         sinks: list[EventSink] | None = None,
         control: ControlChannel | None = None,
-        max_plan_reinvocations: int = 3,
+        max_task_invocations: int | None = None,
         conversation: Conversation | None = None,
+        **legacy_kwargs: Any,
     ) -> None:
+        if "max_plan_reinvocations" in legacy_kwargs:
+            legacy_value = legacy_kwargs.pop("max_plan_reinvocations")
+            warnings.warn(
+                "Runner(max_plan_reinvocations=...) is deprecated; use "
+                "max_task_invocations=... instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if max_task_invocations is None:
+                max_task_invocations = legacy_value
+        if legacy_kwargs:
+            unexpected = ", ".join(sorted(legacy_kwargs))
+            raise TypeError(f"Runner got unexpected keyword argument(s): {unexpected}")
         self.agent = agent
         self.planner = planner
         self.executor = executor
@@ -127,7 +143,7 @@ class Runner:
         self._control: ControlChannel | None = control
         self._close_hooks: list[Callable[[], Awaitable[None]]] = []
         self._closed: bool = False
-        self.max_plan_reinvocations = max_plan_reinvocations
+        self.max_task_invocations: int | None = max_task_invocations
         self._conversation: Conversation = conversation or Conversation.new()
         # Tracks whether we've emitted the ConversationStarted event for
         # the current Conversation. Flips back to False on new_conversation().
@@ -197,7 +213,7 @@ class Runner:
         # Caller-supplied context wins on key collisions.
         planner_context: dict[str, Any] = {
             "run_id": session.run_id,
-            "max_plan_reinvocations": self.max_plan_reinvocations,
+            "max_task_invocations": self.max_task_invocations,
         }
         planner_context.update(self._conversation.prior_turn_context())
         if context:

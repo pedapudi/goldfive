@@ -206,11 +206,11 @@ async def test_wrap_goal_deriver_override_wins() -> None:
 
 
 async def test_wrap_forwards_kwargs_to_runner() -> None:
-    """``max_plan_reinvocations`` flows into the constructed Runner."""
-    runner = goldfive.wrap(_happy_agent, max_plan_reinvocations=7)
-    assert runner.max_plan_reinvocations == 7
+    """``max_task_invocations`` flows into the constructed Runner."""
+    runner = goldfive.wrap(_happy_agent, max_task_invocations=7)
+    assert runner.max_task_invocations == 7
     assert isinstance(runner.executor, SequentialExecutor)
-    assert runner.executor.max_plan_reinvocations == 7
+    assert runner.executor.max_task_invocations == 7
 
 
 # ---------------------------------------------------------------------------
