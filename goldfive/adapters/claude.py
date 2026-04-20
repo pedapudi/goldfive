@@ -161,6 +161,31 @@ class ClaudeAgentSDKAdapter:
 
         self._steerer = steerer
 
+    async def emit_reasoning(
+        self,
+        text: str,
+        *,
+        task: Task | None = None,
+        session: Session,
+        provider: str = "anthropic",
+        call_id: str = "",  # noqa: ARG002 -- part of the protocol
+    ) -> None:
+        """Route an Anthropic ``thinking`` block to the bound steerer.
+
+        Called opportunistically; the Claude SDK currently surfaces
+        thinking blocks via the same assistant-message channel the
+        observation hook already listens to. Dedicated extraction
+        lives in the hook; this method keeps the adapter protocol
+        uniform across backends.
+        """
+        steerer = getattr(self, "_steerer", None)
+        if steerer is None or not text:
+            return
+        observe = getattr(steerer, "observe_reasoning", None)
+        if observe is None:
+            return
+        await observe(text, task=task, session=session, provider=provider)
+
     async def register_reporting_tools(
         self,
         tools: list[ReportingToolSpec],

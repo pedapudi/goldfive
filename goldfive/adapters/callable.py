@@ -65,6 +65,38 @@ class CallableAdapter:
         """Invoke the wrapped callable and return its :class:`InvocationResult`."""
         return await self._agent(task, session, self._tools)
 
+    async def emit_reasoning(
+        self,
+        text: str,
+        *,
+        task: Task | None = None,
+        session: Session,
+        provider: str = "",
+        call_id: str = "",  # noqa: ARG002 -- part of the protocol
+    ) -> None:
+        """Route a reasoning-content block to the bound steerer (if any).
+
+        :class:`CallableAdapter` has no intrinsic way to capture reasoning
+        (the wrapped callable is opaque), so this entry point is exposed
+        for tests and for callables that choose to forward reasoning
+        themselves.
+        """
+        steerer = getattr(self, "_steerer", None)
+        if steerer is None:
+            return
+        observe = getattr(steerer, "observe_reasoning", None)
+        if observe is None:
+            return
+        await observe(text, task=task, session=session, provider=provider)
+
+    def bind_steerer(self, steerer: object | None) -> None:
+        """Attach the active :class:`~goldfive.protocols.Steerer`.
+
+        Enables :meth:`emit_reasoning` to route into the steerer. Safe
+        to call with ``None`` to unbind.
+        """
+        self._steerer = steerer
+
     @property
     def available_agents(self) -> list[str]:
         """Return the configured list of available agent identifiers."""

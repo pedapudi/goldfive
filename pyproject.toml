@@ -39,6 +39,9 @@ dev = [
     "protobuf>=4.25",
     "grpcio-tools>=1.60",
 ]
+embedding = [
+    "sentence-transformers>=3.0",
+]
 examples = [
     "rich>=13.0",
 ]

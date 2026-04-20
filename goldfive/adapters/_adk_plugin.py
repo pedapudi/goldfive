@@ -152,6 +152,106 @@ def _extract_text_parts(llm_response: Any) -> list[str]:
     return texts
 
 
+def _infer_provider(llm_response: Any) -> str:
+    """Guess which backend produced ``llm_response`` for observability.
+
+    Returns one of ``"openai"`` / ``"anthropic"`` / ``"google"`` /
+    ``""``. Used only to tag reasoning-drift events, so an approximate
+    answer is fine -- misclassification does not change detector
+    behavior.
+    """
+    module = type(llm_response).__module__ if llm_response is not None else ""
+    module_lower = module.lower()
+    if "anthropic" in module_lower:
+        return "anthropic"
+    if "openai" in module_lower or "litellm" in module_lower:
+        return "openai"
+    if "google" in module_lower or "genai" in module_lower:
+        return "google"
+    # ADK's LlmResponse carries a Content with parts that include
+    # thought-flagged entries: treat as google when no better signal.
+    content = _safe_attr(llm_response, "content", None)
+    if content is not None and _safe_attr(content, "parts", None) is not None:
+        return "google"
+    if _safe_attr(llm_response, "choices", None) is not None:
+        return "openai"
+    return ""
+
+
+def _extract_reasoning(llm_response: Any) -> str:
+    """Best-effort per-provider reasoning extraction.
+
+    Reasoning-content / thinking blocks live in different places on
+    different providers. This helper walks the known shapes in
+    priority order and returns the first non-empty reasoning text it
+    finds, or ``""`` when the response carries none.
+
+    Shapes handled:
+
+    * ADK ``content.parts[i]`` with ``thought=True`` -- Google's
+      Gemini surface (thought blocks are standard parts flagged as
+      such).
+    * OpenAI-compat ``response.choices[0].message.reasoning_content``
+      -- Qwen3.5 via LiteLLM, some o1-series models, Deepseek.
+    * Anthropic ``response.content[i].type == "thinking"`` blocks
+      -- Claude extended thinking.
+    * Plain string fields ``reasoning`` / ``reasoning_content`` on
+      the response itself (tolerant fallback).
+
+    Returns the concatenated reasoning text. Callers downstream treat
+    empty strings as "no reasoning available".
+    """
+    # ADK thought parts: parts with .thought=True carry the
+    # chain-of-thought when Google's Gemini returns one.
+    content = _safe_attr(llm_response, "content", None)
+    if content is not None:
+        parts = _safe_attr(content, "parts", None) or []
+        thoughts: list[str] = []
+        for part in parts:
+            if not _safe_attr(part, "thought", False):
+                continue
+            text = _safe_attr(part, "text", "") or ""
+            if text:
+                thoughts.append(str(text))
+        if thoughts:
+            return "\n".join(thoughts)
+
+    # OpenAI-compat: response.choices[0].message.reasoning_content.
+    # Used by LiteLLM-fronted Qwen3.5 and some o1 / Deepseek models.
+    try:
+        choices = _safe_attr(llm_response, "choices", None) or []
+        if choices:
+            msg = _safe_attr(choices[0], "message", None)
+            if msg is not None:
+                rc = _safe_attr(msg, "reasoning_content", None) or _safe_attr(
+                    msg, "reasoning", None
+                )
+                if rc:
+                    return str(rc)
+    except Exception:  # noqa: BLE001 -- best-effort extraction
+        pass
+
+    # Anthropic: content blocks with type="thinking".
+    try:
+        blocks = _safe_attr(llm_response, "content", None)
+        if isinstance(blocks, list):
+            for block in blocks:
+                if _safe_attr(block, "type", "") == "thinking":
+                    t = _safe_attr(block, "thinking", "") or ""
+                    if t:
+                        return str(t)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Fallback: a flat attribute on the response itself.
+    for attr in ("reasoning_content", "reasoning", "thinking"):
+        v = _safe_attr(llm_response, attr, None)
+        if isinstance(v, str) and v:
+            return v
+
+    return ""
+
+
 def _extract_function_calls(llm_response: Any) -> list[dict]:
     content = _safe_attr(llm_response, "content", None)
     if content is None:
@@ -528,6 +628,7 @@ def make_adk_plugin(
                 return None
             texts = _extract_text_parts(llm_response)
             calls = _extract_function_calls(llm_response)
+            reasoning = _extract_reasoning(llm_response)
             finish = _safe_attr(llm_response, "finish_reason", None)
             observation = _as_observation(
                 kind="llm_response",
@@ -535,6 +636,7 @@ def make_adk_plugin(
                 raw={
                     "texts": texts,
                     "function_calls": calls,
+                    "reasoning": reasoning,
                     "finish_reason": str(finish) if finish is not None else "",
                 },
                 task=ctx.task,
@@ -544,6 +646,23 @@ def make_adk_plugin(
                 await ctx.steerer.observe(observation, ctx.session)
             except Exception as exc:  # noqa: BLE001
                 log.debug("after_model_callback: steerer.observe raised: %s", exc)
+            if reasoning:
+                observe_reasoning = getattr(
+                    ctx.steerer, "observe_reasoning", None
+                )
+                if observe_reasoning is not None:
+                    try:
+                        await observe_reasoning(
+                            reasoning,
+                            task=ctx.task,
+                            session=ctx.session,
+                            provider=_infer_provider(llm_response),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "after_model_callback: observe_reasoning raised: %s",
+                            exc,
+                        )
             return None
 
         async def on_event_callback(

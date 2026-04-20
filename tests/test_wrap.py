@@ -64,6 +64,17 @@ class _MinimalAdapter:
     async def invoke(self, task: Task, session: Session) -> InvocationResult:
         return InvocationResult(task_id=task.id, text=f"minimal: {task.title}")
 
+    async def emit_reasoning(
+        self,
+        text: str,
+        *,
+        task: Task | None = None,
+        session: Session,
+        provider: str = "",
+        call_id: str = "",
+    ) -> None:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Callable agents

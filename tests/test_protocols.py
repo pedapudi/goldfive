@@ -62,6 +62,16 @@ class _SteererStub:
     async def observe(self, event: Any, session: Any) -> None:
         return None
 
+    async def observe_reasoning(
+        self,
+        text: str,
+        *,
+        task: Any = None,
+        session: Any,
+        provider: str = "",
+    ) -> None:
+        return None
+
     async def transition(
         self,
         task_id: str,
@@ -84,6 +94,17 @@ class _AgentAdapterStub:
         return None
 
     async def invoke(self, task: Any, session: Any) -> Any:
+        return None
+
+    async def emit_reasoning(
+        self,
+        text: str,
+        *,
+        task: Any = None,
+        session: Any,
+        provider: str = "",
+        call_id: str = "",
+    ) -> None:
         return None
 
     @property

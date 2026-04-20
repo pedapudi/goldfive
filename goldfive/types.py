@@ -50,6 +50,10 @@ class DriftKind(StrEnum):
     AMBIGUOUS_INTENT = "ambiguous_intent"
     CUSTOM = "custom"
     LOOPING_TOOL_CALL = "looping_tool_call"
+    LOOPING_REASONING = "looping_reasoning"
+    CONFUSION = "confusion"
+    OFF_TOPIC = "off_topic"
+    INTENT_DIVERGENCE = "intent_divergence"
 
 
 class DriftSeverity(StrEnum):
@@ -194,6 +198,12 @@ class Session:
     pending_approvals_meta: dict[str, dict[str, Any]] = dataclasses.field(
         default_factory=dict
     )
+    # Recent reasoning-content blocks emitted by the adapter's
+    # ``emit_reasoning`` hook. Bounded to the last ``reasoning_history_max``
+    # entries so long runs do not accumulate chain-of-thought forever.
+    # Consumed by the reasoning-drift detectors (see ``goldfive.drift_reasoning``).
+    reasoning_history: list[str] = dataclasses.field(default_factory=list)
+    reasoning_history_max: int = 20
     # monotonic event sequence counter for sinks
     _next_sequence: int = 0
 
