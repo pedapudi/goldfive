@@ -101,6 +101,10 @@ enum DriftKind {
   DRIFT_KIND_RESOURCE_EXHAUSTED = 23;
   DRIFT_KIND_AMBIGUOUS_INTENT = 24;
   DRIFT_KIND_CUSTOM = 25;
+  // The agent is calling the same tool with the same (or near-identical)
+  // arguments repeatedly without making forward progress. Detected by the
+  // adapter-level loop guard after a window threshold is exceeded.
+  DRIFT_KIND_LOOPING_TOOL_CALL = 26;
 }
 
 // Directed edge in a plan's task dependency DAG. `from_task_id` must

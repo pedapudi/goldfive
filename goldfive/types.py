@@ -49,6 +49,7 @@ class DriftKind(StrEnum):
     RESOURCE_EXHAUSTED = "resource_exhausted"
     AMBIGUOUS_INTENT = "ambiguous_intent"
     CUSTOM = "custom"
+    LOOPING_TOOL_CALL = "looping_tool_call"
 
 
 class DriftSeverity(StrEnum):
