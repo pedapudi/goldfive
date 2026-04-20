@@ -254,7 +254,7 @@ One of three terminal events is emitted:
 - `RunCompleted(run_id, outcome_summary)` — all tasks reached a
   terminal state and the plan is fully realized.
 - `RunAborted(run_id, reason)` — executor surrendered (e.g. hit
-  `max_plan_reinvocations` with tasks still PENDING, planner returned
+  `max_task_invocations` with tasks still PENDING, planner returned
   `None` during refine, unrecoverable drift).
 - Exception propagation — uncaught exceptions surface to
   `runner.run()`'s caller. Sinks still receive a `RunAborted` event

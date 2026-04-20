@@ -422,8 +422,10 @@ class Executor(Protocol):
     returns.
 - On drift ≥ warning: calls `planner.refine(...)`, swaps the plan,
   emits `PlanRevised`, and restarts the loop.
-- Enforces `max_plan_reinvocations` (typically 3): if the loop runs
-  that many times without net progress, aborts with `RunAborted`.
+- Optionally enforces `max_task_invocations` (default `None` ==
+  unbounded): if a finite integer is configured and the loop runs
+  that many adapter invocations without completing the plan, aborts
+  with `RunAborted`.
 - Emits `RunStarted` at entry and `RunCompleted` / `RunAborted` at
   exit.
 

@@ -126,7 +126,7 @@ async def main() -> None:
     runner = Runner(
         agent=CallableAdapter(_slow_agent, available_agents=["writer"]),
         planner=LLMPlanner(call_llm=_call_llm, model="stub"),
-        executor=SequentialExecutor(max_plan_reinvocations=10),
+        executor=SequentialExecutor(max_task_invocations=10),
         goal_deriver=PassthroughGoalDeriver("live-steering-demo"),
         steerer=DefaultSteerer(),
         sinks=[sink],

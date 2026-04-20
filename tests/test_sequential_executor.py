@@ -203,8 +203,8 @@ async def test_linear_plan_runs_to_completion() -> None:
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_current)
 
-    # Default max_plan_reinvocations=3; allow exactly 3 tasks.
-    executor = SequentialExecutor(max_plan_reinvocations=3)
+    # Default max_task_invocations=3; allow exactly 3 tasks.
+    executor = SequentialExecutor(max_task_invocations=3)
     outcome = await executor.run(
         plan=plan,
         session=session,
@@ -290,7 +290,7 @@ async def test_drift_mid_run_applies_refined_plan() -> None:
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_maybe_drift)
 
-    executor = SequentialExecutor(max_plan_reinvocations=5)
+    executor = SequentialExecutor(max_task_invocations=5)
     outcome = await executor.run(
         plan=plan,
         session=session,
@@ -334,7 +334,7 @@ async def test_fail_fast_stops_on_task_failure() -> None:
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_fail_middle)
 
-    executor = SequentialExecutor(max_plan_reinvocations=5, fail_fast=True)
+    executor = SequentialExecutor(max_task_invocations=5, fail_fast=True)
     outcome = await executor.run(
         plan=plan,
         session=session,
@@ -379,7 +379,7 @@ async def test_fail_fast_false_continues_past_failure() -> None:
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_fail_b)
 
-    executor = SequentialExecutor(max_plan_reinvocations=5, fail_fast=False)
+    executor = SequentialExecutor(max_task_invocations=5, fail_fast=False)
     outcome = await executor.run(
         plan=plan,
         session=session,
@@ -428,7 +428,7 @@ async def test_budget_terminates_stuck_run() -> None:
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_stuck)
 
-    executor = SequentialExecutor(max_plan_reinvocations=2, fail_fast=True)
+    executor = SequentialExecutor(max_task_invocations=2, fail_fast=True)
     outcome = await executor.run(
         plan=plan,
         session=session,
@@ -533,7 +533,7 @@ async def test_retry_lineage_cap_fails_task_after_N_retries() -> None:
     # cap=2 -> allow 2 invocations on lineage root "t0"; the 3rd clone
     # is refused before the adapter is called.
     executor = SequentialExecutor(
-        max_plan_reinvocations=32,
+        max_task_invocations=32,
         max_retries_per_task_lineage=2,
         fail_fast=False,
     )
@@ -606,7 +606,7 @@ async def test_retry_lineage_cap_is_per_task_not_global() -> None:
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_fail_first_then_succeed)
 
     executor = SequentialExecutor(
-        max_plan_reinvocations=32,
+        max_task_invocations=32,
         max_retries_per_task_lineage=2,
         fail_fast=False,
     )
@@ -687,7 +687,7 @@ async def test_retry_lineage_cap_passes_on_successful_retry() -> None:
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_fail_then_retry_succeeds)
 
     executor = SequentialExecutor(
-        max_plan_reinvocations=32,
+        max_task_invocations=32,
         max_retries_per_task_lineage=3,
         fail_fast=False,
     )
@@ -750,7 +750,7 @@ async def test_retry_lineage_cap_collapses_nested_retry_prefixes() -> None:
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_task)
 
     executor = SequentialExecutor(
-        max_plan_reinvocations=32,
+        max_task_invocations=32,
         max_retries_per_task_lineage=2,
         fail_fast=False,
     )
@@ -811,7 +811,7 @@ async def test_executor_run_with_orphaned_pending_reports_failure() -> None:
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_cancel_t0)
 
-    executor = SequentialExecutor(max_plan_reinvocations=5)
+    executor = SequentialExecutor(max_task_invocations=5)
     outcome = await executor.run(
         plan=plan,
         session=session,
@@ -850,7 +850,7 @@ async def test_executor_emits_plan_divergence_when_pending_orphaned() -> None:
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_cancel_t0)
 
-    executor = SequentialExecutor(max_plan_reinvocations=5)
+    executor = SequentialExecutor(max_task_invocations=5)
     await executor.run(
         plan=plan,
         session=session,
@@ -894,7 +894,7 @@ async def test_executor_skips_audit_when_all_tasks_terminal() -> None:
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_current)
 
-    executor = SequentialExecutor(max_plan_reinvocations=5)
+    executor = SequentialExecutor(max_task_invocations=5)
     outcome = await executor.run(
         plan=plan,
         session=session,
@@ -954,7 +954,7 @@ async def _run_happy_executor(
         return InvocationResult(task_id=task.id, text="ok")
 
     adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_current)
-    executor = SequentialExecutor(max_plan_reinvocations=5)
+    executor = SequentialExecutor(max_task_invocations=5)
     outcome = await executor.run(
         plan=plan,
         session=session,
@@ -1076,3 +1076,105 @@ async def test_unmet_goal_short_circuits_on_first_false() -> None:
     # Reason names the first goal, not the second.
     assert "first goal" in outcome.reason
     assert "second goal" not in outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# max_task_invocations: rename + unbounded default + deprecation shim.
+# ---------------------------------------------------------------------------
+
+
+async def test_max_task_invocations_unbounded_default_completes_large_plan() -> None:
+    """With the new default (``None`` == unbounded), a plan with more
+    tasks than the old default cap (32) still runs to completion.
+
+    The executor must not abort with "exhausted max_task_invocations=..."
+    when no cap was configured; only the natural plan completion
+    terminates the run.
+    """
+    n = 40  # comfortably above the old default of 32.
+    plan = _linear_plan(n)
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _complete_current(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id=task.id, text=f"done:{task.id}")
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_current)
+
+    # Default: no cap passed. Must still complete all 40 tasks.
+    executor = SequentialExecutor(max_retries_per_task_lineage=n + 1)
+    assert executor.max_task_invocations is None
+
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    assert outcome.success is True
+    assert len(adapter.invocations) == n
+    for t in plan.tasks:
+        assert t.status == TaskStatus.COMPLETED
+    assert sink.payload_kinds()[-1] == "run_completed"
+
+
+async def test_max_task_invocations_explicit_cap_honored() -> None:
+    """An explicit ``max_task_invocations=3`` aborts the run after
+    exactly 3 adapter invocations when work remains, with a reason
+    that names the new parameter.
+    """
+    plan = _linear_plan(5)
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _complete_current(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id=task.id, text=f"done:{task.id}")
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_current)
+
+    executor = SequentialExecutor(max_task_invocations=3)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    assert outcome.success is False
+    assert len(adapter.invocations) == 3
+    assert "max_task_invocations=3" in outcome.reason
+    assert sink.payload_kinds()[-1] == "run_aborted"
+
+
+def test_deprecation_warning_fires_for_old_kwarg() -> None:
+    """Passing ``max_plan_reinvocations=`` emits a :class:`DeprecationWarning`
+    and maps to the new attribute name.
+    """
+    import warnings as _warnings
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        executor = SequentialExecutor(max_plan_reinvocations=5)
+
+    deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert deprecations, "expected a DeprecationWarning for max_plan_reinvocations"
+    assert "max_task_invocations" in str(deprecations[0].message)
+    # The legacy value is mapped onto the new attribute.
+    assert executor.max_task_invocations == 5
+    # The old attribute is no longer exposed on the instance.
+    assert not hasattr(executor, "max_plan_reinvocations")

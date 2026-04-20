@@ -229,7 +229,7 @@ async def test_sequential_cancel_mid_task_aborts_run() -> None:
             )
         )
 
-    executor = SequentialExecutor(max_plan_reinvocations=5)
+    executor = SequentialExecutor(max_task_invocations=5)
 
     runner_task = asyncio.create_task(
         executor.run(
@@ -316,7 +316,7 @@ async def test_sequential_steer_mid_task_cancels_and_replans() -> None:
             )
         )
 
-    executor = SequentialExecutor(max_plan_reinvocations=8)
+    executor = SequentialExecutor(max_task_invocations=8)
 
     runner_task = asyncio.create_task(
         executor.run(
@@ -383,7 +383,7 @@ async def test_sequential_pause_blocks_next_task_until_resume() -> None:
     # Send PAUSE before anything starts; pre-task drain picks it up.
     await channel.send(ControlMessage(kind=ControlKind.PAUSE))
 
-    executor = SequentialExecutor(max_plan_reinvocations=8)
+    executor = SequentialExecutor(max_task_invocations=8)
 
     runner_task = asyncio.create_task(
         executor.run(
@@ -455,7 +455,7 @@ async def test_sequential_rewind_between_tasks_re_executes_target() -> None:
 
     adapter = StubAdapter(on_invoke=_handler)
 
-    executor = SequentialExecutor(max_plan_reinvocations=12)
+    executor = SequentialExecutor(max_task_invocations=12)
     outcome = await asyncio.wait_for(
         executor.run(
             plan=plan,
@@ -548,7 +548,7 @@ async def test_sequential_status_query_emits_event_and_acks_success() -> None:
 
     adapter = StubAdapter(on_invoke=_handler)
 
-    executor = SequentialExecutor(max_plan_reinvocations=8)
+    executor = SequentialExecutor(max_task_invocations=8)
     outcome = await asyncio.wait_for(
         executor.run(
             plan=plan,
@@ -609,7 +609,7 @@ async def test_sequential_cancel_abandons_uncooperative_adapter() -> None:
 
     adapter = StubAdapter(on_invoke=_uncooperative)
 
-    executor = SequentialExecutor(max_plan_reinvocations=5)
+    executor = SequentialExecutor(max_task_invocations=5)
 
     # Shrink the grace window via a targeted monkey-patch so the test
     # runs in ~0.3s, not 5s. Grab the original from __dict__ so the

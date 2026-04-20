@@ -60,7 +60,7 @@ envelope — there is no mixed-shape stream on the sink side.
 |---|---|---|
 | `RunStarted` | `Runner` | At the very top of `run()` before goal derivation. Carries `goal_summary` (the incoming `user_input` or the first goal's summary) and `started_at`. |
 | `RunCompleted` | `Executor` | When every task has reached a terminal state and the plan is fully realized. Carries `outcome_summary`. |
-| `RunAborted` | `Runner`, `Executor` | The `Runner` emits it when setup fails (goal derivation, plan generation, tool registration, steerer bind); the executor emits it when the plan cannot be driven to completion (e.g. `max_plan_reinvocations` exhausted, unrecoverable drift). Carries `reason`. |
+| `RunAborted` | `Runner`, `Executor` | The `Runner` emits it when setup fails (goal derivation, plan generation, tool registration, steerer bind); the executor emits it when the plan cannot be driven to completion (e.g. `max_task_invocations` exhausted, unrecoverable drift). Carries `reason`. |
 
 ### Goal and plan
 

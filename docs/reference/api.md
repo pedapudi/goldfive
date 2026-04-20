@@ -73,7 +73,7 @@ def wrap(
     sinks: Optional[list[EventSink]] = None,
     call_llm: Optional[Callable[[str, str, str], Awaitable[str]]] = None,
     model: Optional[str] = None,
-    max_plan_reinvocations: int = 32,
+    max_task_invocations: Optional[int] = None,
 ) -> Runner: ...
 
 
@@ -151,7 +151,7 @@ class Runner:
         steerer: Optional[Steerer] = None,
         sinks: Optional[list[EventSink]] = None,
         control: Optional[ControlChannel] = None,
-        max_plan_reinvocations: int = 3,
+        max_task_invocations: Optional[int] = None,
     ) -> None: ...
 
     async def run(
@@ -197,7 +197,7 @@ recovered goals. Tracked in issue #15.
 | `steerer` | `DefaultSteerer()` | Optional. |
 | `sinks` | `[]` | Optional. Recommended: at least `InMemorySink` in tests and `JSONLPersistenceSink` in prod. |
 | `control` | `None` | Optional `ControlChannel` for live pause / cancel / steer / rewind / approve / reject. When `None`, the run has no live-steering surface. May also be attached post-construction via the `control` setter; see "Extension API" below. See [../design/CONTROL.md](../design/CONTROL.md). |
-| `max_plan_reinvocations` | `3` | Stamped onto the planner context so executors that honour it can cap refine loops. |
+| `max_task_invocations` | `None` (unbounded) | Optional cap on adapter invocations per run, stamped onto the planner context so executors that honour it can cap refine / task-invocation loops. Accepts the deprecated `max_plan_reinvocations` kwarg for one release with a `DeprecationWarning`. |
 
 ### Extension API
 
@@ -461,7 +461,8 @@ class SequentialExecutor(Executor):
     def __init__(
         self,
         *,
-        max_plan_reinvocations: int = 32,
+        max_task_invocations: Optional[int] = None,  # None = unbounded
+        max_retries_per_task_lineage: int = 3,
         fail_fast: bool = True,
     ) -> None: ...
 
@@ -470,7 +471,7 @@ class ParallelDAGExecutor(Executor):
         self,
         max_concurrency: int = 0,  # 0 = unbounded fan-out
         drift_policy: Literal["cancel_stage", "finish_stage"] = "finish_stage",
-        max_plan_reinvocations: int = 3,
+        max_task_invocations: Optional[int] = None,  # None = unbounded
     ) -> None: ...
 ```
 

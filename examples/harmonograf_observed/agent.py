@@ -100,7 +100,7 @@ async def main() -> None:
     runner = Runner(
         agent=CallableAdapter(worker_agent, available_agents=["worker"]),
         planner=StaticPlanner(build_plan()),
-        executor=SequentialExecutor(max_plan_reinvocations=8),
+        executor=SequentialExecutor(max_task_invocations=8),
         goal_deriver=PassthroughGoalDeriver("Research, draft, review, publish"),
         sinks=sinks,
     )

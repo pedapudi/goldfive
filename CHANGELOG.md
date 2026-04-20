@@ -40,9 +40,19 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ### Changed
 
+- Renamed `max_plan_reinvocations` to `max_task_invocations` on
+  `SequentialExecutor`, `ParallelDAGExecutor`, `Runner`, and
+  `goldfive.wrap()` / `goldfive.run()`. The default is now
+  `None` (unbounded) — per-task / per-tool caps
+  (`max_retries_per_task_lineage`, adapter-level loop guards) are
+  the primary guards against runaway invocations. The old kwarg is
+  still accepted for one release and emits a
+  `DeprecationWarning` that maps to the new parameter. Callers that
+  relied on the old 32 default should pass `max_task_invocations=32`
+  explicitly, or an appropriate ceiling for their workload.
 - #65 Follow-up cleanup from the Team Lead A drift audit
   (`SequentialExecutor.max_plan_reinvocations` default raised
-  from 3 to 32; minor doc fixes).
+  from 3 to 32; minor doc fixes). Superseded by the rename above.
 - #69 Reconciled `HarmonografSink` API docs with the shipped
   `harmonograf_client.HarmonografSink(client)` shape and canonical
   `:7531` port.
