@@ -41,9 +41,7 @@ try:
     from google.adk.tools import AgentTool, FunctionTool
     from google.genai import types as genai_types
 except ImportError as _adk_err:  # pragma: no cover
-    raise SystemExit(
-        "install goldfive[adk] to run this example"
-    ) from _adk_err
+    raise SystemExit("install goldfive[adk] to run this example") from _adk_err
 
 from goldfive import (
     InMemorySink,
@@ -63,46 +61,83 @@ log = logging.getLogger("examples.adk_presentation")
 # ---------------------------------------------------------------------------
 
 
-def write_webpage(
-    topic: str, html_content: str, css_content: str, js_content: str
-) -> str:
-    """Write an interactive webpage (HTML + CSS + JS) under ``output/``."""
-    topic_filename = topic.lower().replace(" ", "_").replace("/", "_")
-    output_dir = os.path.join(os.path.dirname(__file__), "output", topic_filename)
-    os.makedirs(output_dir, exist_ok=True)
+# All three file tools share one canonical directory so the writer, the
+# reviewer, and the debugger always agree on which presentation they are
+# operating on. The previous design threaded a ``topic`` string through
+# each call and derived the directory name by slugifying it — but the
+# writer, reviewer, and debugger each invented their own ``topic`` string
+# from local context, and the slugs rarely matched. The reviewer would
+# look in ``output/pandas/`` while the writer had saved to
+# ``output/giant_pandas:_icons_of_conservation/``; ``read_presentation_files``
+# returned error strings, the reviewer reported the task blocked, the
+# planner refined, and the loop repeated. Root-caused during a live-run
+# investigation; see ``docs/design/PLAN-LIFECYCLE.md`` §6.1 for the
+# termination predicate this bug was exposing.
+#
+# Canonical path keeps the demo single-run-at-a-time (each run overwrites
+# the prior). For multi-run isolation, a future enhancement can scope the
+# path by ``session_id``.
+_PRESENTATION_DIR = os.path.join(os.path.dirname(__file__), "output", "current")
+
+
+def write_webpage(html_content: str, css_content: str, js_content: str) -> str:
+    """Write the interactive webpage (HTML + CSS + JS) into the canonical
+    presentation directory. Overwrites any prior files there.
+
+    The reviewer and debugger read from the same canonical directory, so
+    ``write_webpage`` does not accept a topic argument — the agent tree
+    operates on exactly one presentation at a time per run.
+    """
+    os.makedirs(_PRESENTATION_DIR, exist_ok=True)
     try:
-        with open(os.path.join(output_dir, "index.html"), "w") as f:
+        with open(os.path.join(_PRESENTATION_DIR, "index.html"), "w") as f:
             f.write(html_content)
-        with open(os.path.join(output_dir, "styles.css"), "w") as f:
+        with open(os.path.join(_PRESENTATION_DIR, "styles.css"), "w") as f:
             f.write(css_content)
-        with open(os.path.join(output_dir, "script.js"), "w") as f:
+        with open(os.path.join(_PRESENTATION_DIR, "script.js"), "w") as f:
             f.write(js_content)
-        return f"Successfully created presentation on '{topic}' at {output_dir}"
+        return f"Successfully wrote presentation to {_PRESENTATION_DIR}"
     except OSError as e:
         return f"Error writing file: {e}"
 
 
-def read_presentation_files(topic: str) -> dict[str, str]:
-    """Read the generated presentation files and return a name → content map."""
-    topic_filename = topic.lower().replace(" ", "_").replace("/", "_")
-    output_dir = os.path.join(os.path.dirname(__file__), "output", topic_filename)
+def read_presentation_files() -> dict[str, str]:
+    """Read the current presentation files and return a name → content map.
+
+    Reads from the canonical presentation directory that ``write_webpage``
+    populated. No topic argument — writer and reader share one location so
+    the reviewer cannot miss the file the writer just produced.
+
+    If the writer hasn't run yet, each value carries a ``<not yet written>``
+    marker so the reviewer can detect that state cleanly and report the
+    task blocked (rather than silently "reviewing" an empty presentation).
+    """
     files: dict[str, str] = {}
     for name in ("index.html", "styles.css", "script.js"):
-        path = os.path.join(output_dir, name)
+        path = os.path.join(_PRESENTATION_DIR, name)
         try:
             with open(path) as f:
                 files[name] = f.read()
+        except FileNotFoundError:
+            files[name] = "<not yet written>"
         except OSError as e:
             files[name] = f"<error reading {path}: {e}>"
     return files
 
 
-def patch_file(path: str, new_content: str) -> str:
-    """Overwrite ``path`` with ``new_content`` (rooted under ``output/``)."""
-    if not os.path.isabs(path):
-        path = os.path.join(os.path.dirname(__file__), "output", path)
+def patch_file(filename: str, new_content: str) -> str:
+    """Overwrite ``filename`` inside the canonical presentation directory.
+
+    ``filename`` is the base name (e.g. ``index.html``); paths are always
+    rooted at the canonical presentation directory so the debugger cannot
+    write outside it or target a presentation the reviewer never saw.
+    """
+    safe_name = os.path.basename(filename)
+    if not safe_name:
+        return "Error: filename is empty"
+    path = os.path.join(_PRESENTATION_DIR, safe_name)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(_PRESENTATION_DIR, exist_ok=True)
         with open(path, "w") as f:
             f.write(new_content)
         return f"Successfully patched {path}"
@@ -130,9 +165,7 @@ def _build_agent_tree(model: str | BaseLlm) -> Any:
             "provides and synthesise them into concise bullet points suitable "
             "for a short presentation."
         ),
-        description=(
-            "Agent that synthesises research bullet points for a topic."
-        ),
+        description=("Agent that synthesises research bullet points for a topic."),
         tools=[],
     )
 
@@ -142,11 +175,14 @@ def _build_agent_tree(model: str | BaseLlm) -> Any:
         instruction=(
             "You are an expert frontend developer. Given research notes, "
             "generate a single-page HTML slideshow plus CSS and JavaScript, "
-            "then call the write_webpage tool to save the files."
+            "then call the write_webpage tool to save the files. "
+            "write_webpage takes ONLY (html_content, css_content, js_content) "
+            "— there is no topic argument. All presentations are written "
+            "to a shared canonical location that the reviewer and debugger "
+            "read from."
         ),
         description=(
-            "Frontend agent that produces and saves an interactive "
-            "HTML/CSS/JS slideshow."
+            "Frontend agent that produces and saves an interactive HTML/CSS/JS slideshow."
         ),
         tools=[write_webpage_tool],
     )
@@ -155,14 +191,16 @@ def _build_agent_tree(model: str | BaseLlm) -> Any:
         name="reviewer_agent",
         model=model,
         instruction=(
-            "You are a senior frontend reviewer. Call read_presentation_files "
-            "with the topic, then return a structured list of issues "
+            "You are a senior frontend reviewer. Call read_presentation_files() "
+            "(no arguments — it reads from the canonical location the web "
+            "developer wrote to) and return a structured list of issues "
             "(each with a severity of critical / major / minor) or an empty "
-            "list if the output looks clean."
+            "list if the output looks clean. If any file returns "
+            "'<not yet written>', the web developer hasn't produced the "
+            "presentation yet; report that as a blocker instead of reviewing "
+            "an empty presentation."
         ),
-        description=(
-            "Reviewer agent that critiques the generated presentation files."
-        ),
+        description=("Reviewer agent that critiques the generated presentation files."),
         tools=[read_presentation_files_tool],
     )
 
@@ -171,13 +209,13 @@ def _build_agent_tree(model: str | BaseLlm) -> Any:
         model=model,
         instruction=(
             "You are a debugging agent. Given a list of issues flagged by "
-            "the reviewer, call patch_file with the corrected contents for "
-            "each affected file."
+            "the reviewer, call patch_file(filename, new_content) with "
+            "the corrected contents for each affected file. "
+            "filename is the base name only (index.html, styles.css, or "
+            "script.js); paths are always rooted at the canonical "
+            "presentation directory."
         ),
-        description=(
-            "Debugger agent that patches presentation files flagged by the "
-            "reviewer."
-        ),
+        description=("Debugger agent that patches presentation files flagged by the reviewer."),
         tools=[patch_file_tool],
     )
 
@@ -225,10 +263,7 @@ class _MockLlm(BaseLlm):
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
-        text = (
-            f"[mock:{self.model}] acknowledged task and deferred real work to "
-            "a production run."
-        )
+        text = f"[mock:{self.model}] acknowledged task and deferred real work to a production run."
         yield LlmResponse(
             content=genai_types.Content(
                 role="model",
@@ -333,16 +368,12 @@ def _make_openai_call_llm() -> Any:
     try:
         from openai import AsyncOpenAI  # type: ignore
     except ImportError as exc:  # pragma: no cover
-        raise SystemExit(
-            "pip install openai to run this example without --mock"
-        ) from exc
+        raise SystemExit("pip install openai to run this example without --mock") from exc
 
     client = AsyncOpenAI()
 
     async def _call(system: str, prompt: str, model: str) -> str:
-        resolved = model or os.environ.get(
-            "GOLDFIVE_EXAMPLE_PLANNER_MODEL", "gpt-4o-mini"
-        )
+        resolved = model or os.environ.get("GOLDFIVE_EXAMPLE_PLANNER_MODEL", "gpt-4o-mini")
         resp = await client.chat.completions.create(
             model=resolved,
             messages=[
@@ -379,18 +410,12 @@ async def run(
         planner_model = "mock/planner"
         goal_model = "mock/goal-deriver"
     else:
-        model = os.environ.get(
-            "GOLDFIVE_EXAMPLE_MODEL", "openai/gpt-4o-mini"
-        )
+        model = os.environ.get("GOLDFIVE_EXAMPLE_MODEL", "openai/gpt-4o-mini")
         openai_call_llm = _make_openai_call_llm()
         planner_call_llm = openai_call_llm
         goal_call_llm = openai_call_llm
-        planner_model = os.environ.get(
-            "GOLDFIVE_EXAMPLE_PLANNER_MODEL", "gpt-4o-mini"
-        )
-        goal_model = os.environ.get(
-            "GOLDFIVE_EXAMPLE_GOAL_MODEL", "gpt-4o-mini"
-        )
+        planner_model = os.environ.get("GOLDFIVE_EXAMPLE_PLANNER_MODEL", "gpt-4o-mini")
+        goal_model = os.environ.get("GOLDFIVE_EXAMPLE_GOAL_MODEL", "gpt-4o-mini")
 
     root_agent = _build_agent_tree(model)
     adapter = ADKAdapter(root_agent)
@@ -406,9 +431,7 @@ async def run(
         max_plan_reinvocations=8,
     )
 
-    outcome = await runner.run(
-        f"Create a short interactive slideshow presentation on {topic}."
-    )
+    outcome = await runner.run(f"Create a short interactive slideshow presentation on {topic}.")
     await runner.close()
 
     print(f"\nsuccess={outcome.success}  reason={outcome.reason!r}")
@@ -419,9 +442,7 @@ async def run(
             run_id = evt.get("run_id", "")
             seq = evt.get("sequence", 0)
         else:
-            kind = (
-                getattr(evt, "WhichOneof", lambda _: None)("payload") or "?"
-            )
+            kind = getattr(evt, "WhichOneof", lambda _: None)("payload") or "?"
             run_id = getattr(evt, "run_id", "")
             seq = getattr(evt, "sequence", 0)
         print(f"  seq={seq:>3}  run={run_id[:8]:<8}  {kind}")
