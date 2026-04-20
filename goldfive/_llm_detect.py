@@ -130,6 +130,45 @@ def make_default_adk_call_llm(model: Any) -> CallLLM | None:
                     chunks.append(str(text))
         return "".join(chunks).strip()
 
+    async def _close() -> None:
+        # ADK's BaseLlm doesn't pin a uniform close protocol, but several
+        # subclasses (LiteLlm, custom HTTP-backed adapters) wrap an
+        # aiohttp / httpx client. Probe a few known attribute names and
+        # await whichever exists. Silently no-op if nothing is found.
+        for attr_name in ("aclose", "close"):
+            target = getattr(llm, attr_name, None)
+            if callable(target):
+                try:
+                    result = target()
+                    if hasattr(result, "__await__"):
+                        await result
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("ADK call_llm.%s raised %s", attr_name, exc)
+                    return
+        # Some LiteLlm versions stash the client as ._client / .client.
+        for client_attr in ("_client", "client"):
+            client = getattr(llm, client_attr, None)
+            if client is None:
+                continue
+            for attr_name in ("aclose", "close"):
+                target = getattr(client, attr_name, None)
+                if callable(target):
+                    try:
+                        result = target()
+                        if hasattr(result, "__await__"):
+                            await result
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "ADK call_llm.%s.%s raised %s",
+                            client_attr,
+                            attr_name,
+                            exc,
+                        )
+                        return
+
+    _call_llm.close = _close  # type: ignore[attr-defined]
     return _call_llm
 
 
