@@ -152,7 +152,7 @@ The full trace is logged at `ERROR` on `goldfive.runner`.
 
 **What you see.** `RunStarted` and `PlanSubmitted` fire, but no
 `TaskStarted` ever does. The run terminates with reason
-`"exhausted max_plan_reinvocations=... with pending task <id>"` or
+`"exhausted max_task_invocations=... with pending task <id>"` or
 completes with zero tasks run.
 
 **Why it happens.** The executor only picks tasks whose predecessors
@@ -179,7 +179,7 @@ assert not missing, f"plan references unknown agents: {missing}"
 
 **What you see.** The adapter calls `report_task_started`, does work,
 returns — but the task never reaches `COMPLETED`. The executor loops
-until `max_plan_reinvocations` trips.
+until `max_task_invocations` trips.
 
 **Why it happens.** `SequentialExecutor` auto-transitions a task to
 `COMPLETED` (or `FAILED` if `InvocationResult.error` is set) only when

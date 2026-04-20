@@ -163,7 +163,7 @@ async def main() -> None:
     runner = Runner(
         agent=CallableAdapter(worker_agent, available_agents=["worker"]),
         planner=planner,
-        executor=SequentialExecutor(fail_fast=False, max_plan_reinvocations=6),
+        executor=SequentialExecutor(fail_fast=False, max_task_invocations=6),
         goal_deriver=PassthroughGoalDeriver("Produce a report from API data"),
         steerer=steerer,
         sinks=[sink],

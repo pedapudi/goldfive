@@ -26,7 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Literal
+import warnings
+from typing import TYPE_CHECKING, Any, Literal
 
 from goldfive.events import (
     emit as emit_event,
@@ -93,28 +94,49 @@ class ParallelDAGExecutor:
           before the next stage.
         * ``"finish_stage"`` (default) — the stage is allowed to
           complete; refinement runs before the next stage.
-    max_plan_reinvocations:
-        Safety cap on the number of times the planner may replace the
-        plan during a single ``run()``. Protects against refine loops.
+    max_task_invocations:
+        Optional safety cap on the number of times the planner may replace
+        the plan during a single ``run()``. Protects against refine loops.
+        Defaults to ``None`` (unbounded); per-task / per-tool caps are the
+        primary guards.
+
+        Note: in the parallel executor this counter increments on plan
+        refinement (not per task invocation as in
+        :class:`SequentialExecutor`); the parameter is unified for naming
+        consistency and backwards compatibility.
     """
 
     def __init__(
         self,
         max_concurrency: int = 0,
         drift_policy: Literal["cancel_stage", "finish_stage"] = "finish_stage",
-        max_plan_reinvocations: int = 3,
+        max_task_invocations: int | None = None,
+        **legacy_kwargs: Any,
     ) -> None:
+        if "max_plan_reinvocations" in legacy_kwargs:
+            legacy_value = legacy_kwargs.pop("max_plan_reinvocations")
+            warnings.warn(
+                "ParallelDAGExecutor(max_plan_reinvocations=...) is deprecated; "
+                "use max_task_invocations=... instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if max_task_invocations is None:
+                max_task_invocations = legacy_value
+        if legacy_kwargs:
+            unexpected = ", ".join(sorted(legacy_kwargs))
+            raise TypeError(f"ParallelDAGExecutor got unexpected keyword argument(s): {unexpected}")
         if max_concurrency < 0:
             raise ValueError("max_concurrency must be >= 0")
         if drift_policy not in ("cancel_stage", "finish_stage"):
             raise ValueError(
                 f"drift_policy must be 'cancel_stage' or 'finish_stage', got {drift_policy!r}"
             )
-        if max_plan_reinvocations < 0:
-            raise ValueError("max_plan_reinvocations must be >= 0")
+        if max_task_invocations is not None and max_task_invocations < 0:
+            raise ValueError("max_task_invocations must be >= 0")
         self.max_concurrency = max_concurrency
         self.drift_policy: Literal["cancel_stage", "finish_stage"] = drift_policy
-        self.max_plan_reinvocations = max_plan_reinvocations
+        self.max_task_invocations: int | None = max_task_invocations
 
     # ------------------------------------------------------------------
     # Executor protocol
@@ -264,15 +286,18 @@ class ParallelDAGExecutor:
                     drift = None
 
                 if drift is not None:
-                    if refinements_used >= self.max_plan_reinvocations:
+                    if (
+                        self.max_task_invocations is not None
+                        and refinements_used >= self.max_task_invocations
+                    ):
                         log.warning(
                             "ParallelDAGExecutor: drift detected but reinvocation "
                             "budget exhausted (%d) — aborting",
-                            self.max_plan_reinvocations,
+                            self.max_task_invocations,
                         )
                         abort_reason = (
                             f"plan reinvocation budget exhausted "
-                            f"({self.max_plan_reinvocations})"
+                            f"({self.max_task_invocations})"
                         )
                         break
 

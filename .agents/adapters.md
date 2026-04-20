@@ -113,7 +113,8 @@ class MyFrameworkAdapter:
   `report_task_completed` / `_failed` / `_blocked` / `_cancelled`, the
   auto-complete is a no-op. But if the agent transitioned the task
   mid-flight to a non-terminal state without a terminal call, the
-  executor keeps re-invoking until `max_plan_reinvocations`.
+  executor keeps re-invoking until `max_task_invocations` (if set) or
+  the per-task-lineage cap trips.
 - **`invoke` must not crash on well-formed input.** If the underlying
   framework raises, catch and return `InvocationResult(..., error=...)`
   so the executor can surface it as a `TaskFailed`.

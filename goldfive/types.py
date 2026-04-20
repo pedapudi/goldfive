@@ -348,7 +348,7 @@ class Session:
     # for the given (kind, task) tuple; reset on a successful refine.
     # Consumed by :class:`~goldfive.steerer.DefaultSteerer` to back off
     # and mark the task FAILED after N consecutive failures, preventing
-    # the same drift from looping until ``max_plan_reinvocations`` trips.
+    # the same drift from looping until ``max_task_invocations`` trips.
     refine_failure_counts: dict[tuple[str, str], int] = dataclasses.field(
         default_factory=dict
     )

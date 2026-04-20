@@ -204,8 +204,8 @@ async def test_runner_accepts_prebuilt_goals_list() -> None:
     assert outcome.session.goals and outcome.session.goals[0].id == "g0"
 
 
-async def test_runner_respects_max_plan_reinvocations() -> None:
-    """``max_plan_reinvocations`` caps refine() calls; after the cap the
+async def test_runner_respects_max_task_invocations() -> None:
+    """``max_task_invocations`` caps refine() calls; after the cap the
     run should terminate rather than loop forever."""
 
     runner_mod = pytest.importorskip("goldfive.runner")
@@ -221,7 +221,7 @@ async def test_runner_respects_max_plan_reinvocations() -> None:
         pytest.skip("Required goldfive modules not yet implemented")
 
     # A planner that always requests a new refine; the runner must still
-    # terminate because max_plan_reinvocations caps the loop.
+    # terminate because max_task_invocations caps the loop.
     class _LoopingPlanner(_DAGPlanner):
         async def refine(self, *, plan, drift, goals):
             self.refine_calls += 1
@@ -244,7 +244,7 @@ async def test_runner_respects_max_plan_reinvocations() -> None:
         executor=SequentialExecutor(),
         steerer=DefaultSteerer(),
         sinks=[],
-        max_plan_reinvocations=2,
+        max_task_invocations=2,
     )
     outcome = await runner.run([types.Goal(id="g1", summary="cap me")])
     # Whatever the final outcome, refine_calls must not exceed the cap.

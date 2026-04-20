@@ -18,7 +18,7 @@ The benchmark in `bench/run_100_tasks.py` runs:
   no LLM call, no network I/O, and no compute beyond constructing the
   result.
 - The **`SequentialExecutor`** (single-threaded; one task at a time)
-  with `max_plan_reinvocations=101` so the budget cannot trip on the
+  with `max_task_invocations=101` so the budget cannot trip on the
   100-task plan.
 - A single **`JSONLPersistenceSink`** writing proto-encoded events to a
   temporary file. JSONL is the highest-fidelity sink we ship and is the

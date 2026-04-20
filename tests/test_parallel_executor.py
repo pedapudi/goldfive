@@ -474,11 +474,11 @@ async def test_info_severity_drift_does_not_trigger_refine() -> None:
 
 @pytest.mark.asyncio
 async def test_reinvocation_budget_exhaustion_aborts() -> None:
-    """After ``max_plan_reinvocations`` refinements the walker aborts.
+    """After ``max_task_invocations`` refinements the walker aborts.
 
     We simulate an adversarial refine loop: each refined plan injects a
     brand-new task that itself drifts, so the planner is asked to refine
-    again. After ``max_plan_reinvocations`` rounds the walker gives up.
+    again. After ``max_task_invocations`` rounds the walker gives up.
     """
 
     def make_plan(round_: int) -> Plan:
@@ -537,7 +537,7 @@ async def test_reinvocation_budget_exhaustion_aborts() -> None:
     planner = AlwaysRefiningPlanner()
     adapter = AlwaysDriftingAdapter(delay=0.005)
     executor = ParallelDAGExecutor(
-        max_concurrency=0, max_plan_reinvocations=2
+        max_concurrency=0, max_task_invocations=2
     )
     outcome = await executor.run(
         plan=make_plan(1),

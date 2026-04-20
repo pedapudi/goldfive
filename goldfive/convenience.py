@@ -22,6 +22,7 @@ keyword argument.
 from __future__ import annotations
 
 import logging
+import warnings
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -60,7 +61,8 @@ def wrap(
     control: ControlChannel | None = None,
     call_llm: CallLLM | None = None,
     model: str | None = None,
-    max_plan_reinvocations: int = 32,
+    max_task_invocations: int | None = None,
+    **legacy_kwargs: Any,
 ) -> Runner:
     """Build a :class:`Runner` that drives ``agent`` with goldfive.
 
@@ -79,7 +81,7 @@ def wrap(
         :class:`LLMGoalDeriver` / :class:`LiteralGoalDeriver`.
     executor:
         Optional :class:`Executor` override. Defaults to
-        :class:`SequentialExecutor(max_plan_reinvocations=...)`.
+        :class:`SequentialExecutor(max_task_invocations=...)`.
     steerer:
         Optional :class:`Steerer` override. Defaults to
         :class:`DefaultSteerer`.
@@ -99,10 +101,12 @@ def wrap(
         Optional model name passed to :class:`LLMPlanner` /
         :class:`LLMGoalDeriver`. Ignored when ``call_llm`` is omitted
         and no LLM is detected on the agent.
-    max_plan_reinvocations:
-        Cap on how many times the executor may re-invoke the planner
-        for refine loops. Default ``32``; flowed into both the
+    max_task_invocations:
+        Optional cap on total adapter invocations per run. Defaults to
+        ``None`` (unbounded); flowed into both the
         :class:`SequentialExecutor` default and the :class:`Runner`.
+        Accepts the deprecated ``max_plan_reinvocations`` kwarg for one
+        release with a :class:`DeprecationWarning`.
 
     Returns
     -------
@@ -159,8 +163,22 @@ def wrap(
         )
         resolved_goal_deriver = LiteralGoalDeriver()
 
+    if "max_plan_reinvocations" in legacy_kwargs:
+        legacy_value = legacy_kwargs.pop("max_plan_reinvocations")
+        warnings.warn(
+            "goldfive.wrap(max_plan_reinvocations=...) is deprecated; use "
+            "max_task_invocations=... instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if max_task_invocations is None:
+            max_task_invocations = legacy_value
+    if legacy_kwargs:
+        unexpected = ", ".join(sorted(legacy_kwargs))
+        raise TypeError(f"goldfive.wrap got unexpected keyword argument(s): {unexpected}")
+
     resolved_executor: Executor = executor or SequentialExecutor(
-        max_plan_reinvocations=max_plan_reinvocations
+        max_task_invocations=max_task_invocations
     )
     resolved_steerer: Steerer = steerer or DefaultSteerer()
     resolved_sinks: list[EventSink] = (
@@ -175,7 +193,7 @@ def wrap(
         steerer=resolved_steerer,
         sinks=resolved_sinks,
         control=control,
-        max_plan_reinvocations=max_plan_reinvocations,
+        max_task_invocations=max_task_invocations,
     )
 
     if is_adk_agent(agent):

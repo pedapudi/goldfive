@@ -78,7 +78,7 @@ outcome = await runner.run("make a presentation about waffles")
 
 Every default component is overridable — pass `planner=`,
 `executor=`, `sinks=`, `call_llm=`, `model=`, or
-`max_plan_reinvocations=` as keyword arguments to either function.
+`max_task_invocations=` as keyword arguments to either function.
 
 A runnable demo lives in
 [`examples/hello_callable.py`](examples/hello_callable.py).

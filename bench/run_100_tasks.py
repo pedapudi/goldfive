@@ -88,12 +88,12 @@ async def run_benchmark(jsonl_path: Path) -> tuple[float, int, bool]:
         agent=CallableAdapter(noop_agent, available_agents=["bench-agent"]),
         planner=StaticPlanner(plan),
         executor=SequentialExecutor(
-            max_plan_reinvocations=NUM_TASKS + 1,
+            max_task_invocations=NUM_TASKS + 1,
             fail_fast=True,
         ),
         goal_deriver=PassthroughGoalDeriver("100-task benchmark"),
         sinks=[sink],
-        max_plan_reinvocations=NUM_TASKS + 1,
+        max_task_invocations=NUM_TASKS + 1,
     )
 
     tracemalloc.start()

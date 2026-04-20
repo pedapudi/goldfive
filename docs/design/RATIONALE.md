@@ -448,7 +448,7 @@ in-place edits and want first-class support, we'd revisit.
 
 **Observation.** `Runner.__init__` requires five named pieces:
 `agent`, `planner`, `executor`, plus the optional `goal_deriver`,
-`steerer`, `sinks`, `control`, `max_plan_reinvocations`. Most callers
+`steerer`, `sinks`, `control`, `max_task_invocations`. Most callers
 have one of {`BaseAgent`, `Client`, `callable`} and want to say "just
 run this with sensible defaults." `goldfive.wrap(agent)` does that in
 one call.
@@ -605,30 +605,44 @@ not — `make_event` is called from several test scenarios and from
 **Related.** [EVENT-MODEL.md §"Forward compatibility"](EVENT-MODEL.md#forward-compatibility),
 [.agents/debug-goldfive.md §"Common pitfalls"](../../.agents/debug-goldfive.md#common-pitfalls).
 
-## Why `max_plan_reinvocations` is a budget, not a time limit
+## Why `max_task_invocations` is a budget, not a time limit
 
-**Observation.** `Runner(..., max_plan_reinvocations=32)` and its
-per-executor equivalent cap the **number** of times the executor may
-re-invoke the planner (or, in the sequential executor, dispatch a
-task) before the run aborts. There is no wall-clock timeout at this
-layer.
+**Observation.** `Runner(..., max_task_invocations=N)` and its
+per-executor equivalent cap the **number** of adapter invocations
+(in the sequential executor) or plan refinements (in the parallel
+executor) that a single run may issue before aborting. The default
+is `None` — unbounded. There is no wall-clock timeout at this layer.
 
 **Intent.** Differentiate **stuck** from **slow**. An agent that takes
 ten minutes per task is slow (fine, maybe). An agent that loops
 through five refines per minute is stuck (not fine). A time budget
 would punish the slow case; an invocation budget only punishes the
-loopy case.
+loopy case. The unbounded default reflects that the primary guards
+against runaway loops live closer to the work: per-task-lineage
+caps (`max_retries_per_task_lineage`), per-tool-loop caps inside
+the adapter, and the adapter's own max-LLM-call ceilings.
 
 **Alternatives considered.**
 
 1. Wall-clock timeout. Rejected: too blunt for mixed workloads.
 2. Exponential-backoff between refines. Rejected: doesn't bound total
    work, just spaces it.
-3. No cap. Rejected: loops happen.
+3. Finite default (historically 32). Rejected: the old name
+   `max_plan_reinvocations` misled callers into thinking the value
+   was a refine-count cap and some set it to the number of expected
+   refinements (e.g. 8), which then tripped on routine large plans.
+   Unbounded-by-default plus explicit opt-in avoids that footgun.
 
-**Tradeoffs.** A stuck agent can still burn 32 refines before we
-notice. The cap is intentionally generous because the signal "we hit
-the cap" is more important than the signal "we hit it fast."
+**Tradeoffs.** Without a configured cap a truly stuck agent keeps
+burning invocations until the per-lineage cap or `fail_fast`
+catches it. Callers who want a belt-and-suspenders ceiling can set
+a finite integer.
+
+**Historical note.** The parameter was formerly called
+`max_plan_reinvocations`; that name implied a refine-count semantic
+that did not match the sequential executor's "total adapter
+invocations" behaviour. The rename is backwards-compatible for one
+release via a deprecation shim.
 
 **Signals this might be wrong.** If callers regularly want wall-clock
 timeouts, we may need a sibling knob. Today none do.

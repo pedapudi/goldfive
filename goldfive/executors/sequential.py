@@ -18,8 +18,10 @@ Key behaviors
 * After each invocation, re-read plan state: tasks may have moved to
   ``COMPLETED`` / ``FAILED`` / ``BLOCKED`` via reporting tools; the steerer
   may also have mutated the plan in response to drift (``PlanRevised``).
-* Budget the total number of adapter invocations with ``max_plan_reinvocations``
-  so a stuck agent cannot spin forever.
+* Optionally budget the total number of adapter invocations with
+  ``max_task_invocations`` so a stuck agent cannot spin forever. The
+  default is ``None`` (unbounded); per-task / per-tool caps are the
+  primary guards against runaway loops.
 * Terminate with :class:`RunCompleted` on success or :class:`RunAborted`
   when ``fail_fast`` is set and a task fails fatally.
 
@@ -34,7 +36,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import TYPE_CHECKING
+import warnings
+from typing import TYPE_CHECKING, Any
 
 from goldfive.events import (
     emit,
@@ -63,15 +66,16 @@ class SequentialExecutor(Executor):
 
     Parameters
     ----------
-    max_plan_reinvocations:
-        Upper bound on the number of adapter ``invoke()`` calls a single
-        :meth:`run` may issue. Each eligible task consumes one invocation;
-        when drift triggers a plan revision, the new plan's remaining tasks
-        share the same budget. Defaults to ``32`` — comfortably covers a
-        plan with 10+ tasks plus a few refinement cycles. A stuck agent
-        still aborts via ``fail_fast`` or (in pathological cases) the
-        budget; the old default of ``3`` was tuned to the harmonograf
-        re-invocation cap and surprised callers running realistic plans.
+    max_task_invocations:
+        Optional upper bound on the number of adapter ``invoke()`` calls
+        a single :meth:`run` may issue. Each eligible task consumes one
+        invocation; when drift triggers a plan revision, the new plan's
+        remaining tasks share the same budget. Defaults to ``None``
+        (unbounded) — the run proceeds until every task reaches a
+        terminal state or a drift / ``fail_fast`` / per-task-lineage
+        cap terminates it. Set to an integer to enforce a ceiling on
+        total adapter invocations for defensive, belt-and-suspenders
+        containment.
     max_retries_per_task_lineage:
         Upper bound on the number of adapter ``invoke()`` calls that may
         be spent on any one task "lineage" — the original task plus any
@@ -96,11 +100,32 @@ class SequentialExecutor(Executor):
     def __init__(
         self,
         *,
-        max_plan_reinvocations: int = 32,
+        max_task_invocations: int | None = None,
         max_retries_per_task_lineage: int = 3,
         fail_fast: bool = True,
+        **legacy_kwargs: Any,
     ) -> None:
-        self.max_plan_reinvocations = int(max_plan_reinvocations)
+        # Backwards-compatible alias: accept the old name for one release
+        # and emit a DeprecationWarning mapping it to the new one. Remove
+        # in a future release.
+        if "max_plan_reinvocations" in legacy_kwargs:
+            legacy_value = legacy_kwargs.pop("max_plan_reinvocations")
+            warnings.warn(
+                "SequentialExecutor(max_plan_reinvocations=...) is deprecated; "
+                "use max_task_invocations=... instead. The parameter has been "
+                "renamed for clarity — it caps total adapter invocations per "
+                "run, not plan refinements.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if max_task_invocations is None:
+                max_task_invocations = legacy_value
+        if legacy_kwargs:
+            unexpected = ", ".join(sorted(legacy_kwargs))
+            raise TypeError(f"SequentialExecutor got unexpected keyword argument(s): {unexpected}")
+        self.max_task_invocations: int | None = (
+            None if max_task_invocations is None else int(max_task_invocations)
+        )
         self.max_retries_per_task_lineage = int(max_retries_per_task_lineage)
         self.fail_fast = bool(fail_fast)
 
@@ -153,10 +178,12 @@ class SequentialExecutor(Executor):
         last_plan_id = plan.id
         last_revision_index = plan.revision_index
 
-        # Cap by max_plan_reinvocations: this is the number of adapter
+        # Cap by max_task_invocations: this is the number of adapter
         # invocations we'll allow for the whole run. Each eligible task
-        # burns one; mid-run plan revisions do not refund any.
-        while invocations < self.max_plan_reinvocations:
+        # burns one; mid-run plan revisions do not refund any. ``None``
+        # means unbounded — the loop exits when no eligible task remains
+        # or when ``fail_fast`` / the per-lineage cap trips.
+        while self.max_task_invocations is None or invocations < self.max_task_invocations:
             # ------------------------------------------------------------------
             # Control channel: drain any pending messages before picking
             # the next task. PAUSE here blocks until RESUME arrives.
@@ -262,11 +289,13 @@ class SequentialExecutor(Executor):
             lineage_invocations[lineage_root] = lineage_count + 1
 
             log.debug(
-                "SequentialExecutor: invoking task=%s (invocation %d/%d, "
+                "SequentialExecutor: invoking task=%s (invocation %d/%s, "
                 "lineage_root=%s, lineage_count=%d/%d)",
                 task.id,
                 invocations,
-                self.max_plan_reinvocations,
+                "unbounded"
+                if self.max_task_invocations is None
+                else str(self.max_task_invocations),
                 lineage_root,
                 lineage_count + 1,
                 self.max_retries_per_task_lineage,
@@ -406,11 +435,16 @@ class SequentialExecutor(Executor):
             )
 
         # If we exhausted the invocation budget with work still pending,
-        # that is also a failure (stuck agent).
+        # that is also a failure (stuck agent). Only applies when a
+        # finite cap was configured.
         remaining = _pick_next_task(session.plan or plan)
-        if invocations >= self.max_plan_reinvocations and remaining is not None:
+        if (
+            self.max_task_invocations is not None
+            and invocations >= self.max_task_invocations
+            and remaining is not None
+        ):
             reason = (
-                f"exhausted max_plan_reinvocations={self.max_plan_reinvocations} "
+                f"exhausted max_task_invocations={self.max_task_invocations} "
                 f"with pending task {remaining.id}"
             )
             await emit(
