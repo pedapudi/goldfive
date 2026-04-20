@@ -107,13 +107,23 @@ with:
 If a refined plan is missing a terminal task from the outgoing plan,
 or its status has regressed, the steerer rejects the revision and
 emits a CRITICAL `SCHEMA_VIOLATION` drift (see #100 /
-`_apply_revision`).
+`_apply_revision`). Enforced by `Plan.validate(for_revision=True,
+prior=session.plan)` in `types.py`, called from
+`DefaultSteerer._apply_revision`; id / status preservation is the
+machine-checked half of this invariant. Title / description /
+assignee / `bound_span_id` preservation remains a planner-semantic
+contract.
 
 ### 3.2 Terminal→terminal edges are frozen
 
 If both endpoints of an edge in the outgoing plan were terminal,
 that edge **must** appear in the new plan. This preserves the
 historical topology so a later forensic replay is faithful.
+Enforced by `Plan.validate(for_revision=True, prior=session.plan)`
+in `types.py`: a revision that drops a terminal→terminal edge is
+rejected with a `ValueError`, which the steerer surfaces as a
+CRITICAL `SCHEMA_VIOLATION` drift while leaving the prior plan
+installed.
 
 ### 3.3 Terminal→mutable edges may be re-drawn
 
@@ -266,6 +276,15 @@ Called by `LLMPlanner.generate` (creation) and
 - **At creation only** (`for_revision=False`): every task is
   `PENDING`. At revision (`for_revision=True`), terminal tasks are
   allowed (expected, per §3.1).
+- **At revision with a `prior` plan supplied**
+  (`for_revision=True, prior=old_plan`): every terminal task in
+  `prior` appears in the revision with the same id and the same
+  terminal status (no regression, no drop) — §3.1 — and every
+  terminal→terminal edge in `prior` appears in the revision — §3.2.
+  The steerer calls `validate(for_revision=True, prior=session.plan)`
+  in `_apply_revision`, and `LLMPlanner.refine` / `_refine_user_steer`
+  / `_refine_looping_tool_call` likewise thread `prior=plan` so the
+  planner catches its own violations before the steerer does.
 
 On failure: `ValueError` with a descriptive message. `generate`
 returns `None`; `_apply_revision` rejects the revision and emits
@@ -385,6 +404,5 @@ Violating any of them is a bug in goldfive.
 
 ## 8. Known gaps (open)
 
-- **Terminal→terminal edge preservation is not currently enforced.** `_apply_revision` does not yet check edge preservation; a buggy planner could silently drop terminal edges. Add to `Plan.validate(for_revision=True)`.
 - **Unrecoverable cascade (§6.2) does not currently use the same cascade primitive as §6.3** — they're two different code paths that happen to do similar work. Unify once both are implemented.
 - **No cross-revision lineage view.** Sinks receive `PlanRevised` events but the proto doesn't carry the full diff. Harmonograf's UI currently has to stitch revisions by plan_id + revision_index. A dedicated `revision_diff` sidecar would simplify the UI.

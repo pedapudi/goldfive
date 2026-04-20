@@ -797,7 +797,7 @@ class LLMPlanner:
             log.warning("LLMPlanner.refine: parsed JSON did not contain a usable plan")
             return None
         try:
-            revised.validate(for_revision=True)
+            revised.validate(for_revision=True, prior=plan)
         except ValueError as exc:
             log.warning(
                 "LLMPlanner.refine: revised plan failed validation (%s)",
@@ -955,7 +955,7 @@ class LLMPlanner:
                     ),
                 )
         try:
-            revised.validate(for_revision=True)
+            revised.validate(for_revision=True, prior=plan)
         except ValueError as exc:
             log.warning(
                 "LLMPlanner._refine_looping_tool_call: revised plan failed "
@@ -1139,7 +1139,7 @@ class LLMPlanner:
             revision_index=plan.revision_index + 1,
         )
         try:
-            merged_plan.validate(for_revision=True)
+            merged_plan.validate(for_revision=True, prior=plan)
         except ValueError as exc:
             log.warning(
                 "LLMPlanner._refine_user_steer: merged plan failed validation (%s)",

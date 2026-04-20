@@ -408,3 +408,134 @@ class TestPlanValidate:
         )
         with pytest.raises(ValueError, match="unknown task id"):
             plan.validate(for_revision=True)
+
+    # ------------------------------------------------------------------
+    # Cross-revision preservation (PLAN-LIFECYCLE.md §3.1, §3.2). When
+    # ``prior`` is supplied, ``validate`` enforces that terminal tasks
+    # survive the revision with the same id + status, and that every
+    # terminal->terminal edge in ``prior`` appears in the revision.
+    # ------------------------------------------------------------------
+
+    def test_validate_revision_rejects_terminal_task_missing(self) -> None:
+        prior = _mk_plan(
+            [
+                Task(id="t1", title="done", status=TaskStatus.COMPLETED),
+                Task(id="t2", title="next", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("t1", "t2")],
+        )
+        # Revision drops the terminal t1 entirely — that is forbidden.
+        revision = _mk_plan(
+            [Task(id="t2", title="next", status=TaskStatus.PENDING)],
+            [],
+        )
+        with pytest.raises(
+            ValueError, match=r"terminal task 't1' missing in revision"
+        ):
+            revision.validate(for_revision=True, prior=prior)
+
+    def test_validate_revision_rejects_terminal_task_status_regression(self) -> None:
+        prior = _mk_plan(
+            [Task(id="t1", title="done", status=TaskStatus.COMPLETED)],
+            [],
+        )
+        # Revision keeps the id but regresses status to PENDING.
+        revision = _mk_plan(
+            [Task(id="t1", title="done", status=TaskStatus.PENDING)],
+            [],
+        )
+        with pytest.raises(
+            ValueError, match=r"terminal task 't1' regressed to 'PENDING'"
+        ):
+            revision.validate(for_revision=True, prior=prior)
+
+    def test_validate_revision_rejects_terminal_task_status_flip(self) -> None:
+        # A terminal task whose status flips COMPLETED -> FAILED also
+        # breaks the monotonic-terminal invariant (a terminal status is
+        # absorbing; the only allowed "transition" is identity).
+        prior = _mk_plan(
+            [Task(id="t1", title="done", status=TaskStatus.COMPLETED)],
+            [],
+        )
+        revision = _mk_plan(
+            [Task(id="t1", title="done", status=TaskStatus.FAILED)],
+            [],
+        )
+        with pytest.raises(
+            ValueError, match=r"terminal task 't1' regressed to 'FAILED'"
+        ):
+            revision.validate(for_revision=True, prior=prior)
+
+    def test_validate_revision_accepts_terminal_task_unchanged(self) -> None:
+        prior = _mk_plan(
+            [
+                Task(id="t1", title="done", status=TaskStatus.COMPLETED),
+                Task(id="t2", title="next", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("t1", "t2")],
+        )
+        revision = _mk_plan(
+            [
+                Task(id="t1", title="done", status=TaskStatus.COMPLETED),
+                Task(id="t2", title="next", status=TaskStatus.PENDING),
+                Task(id="t3", title="added", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("t1", "t2"), TaskEdge("t2", "t3")],
+        )
+        # Does not raise.
+        revision.validate(for_revision=True, prior=prior)
+
+    def test_validate_revision_rejects_missing_terminal_edge(self) -> None:
+        prior = _mk_plan(
+            [
+                Task(id="t1", title="1", status=TaskStatus.COMPLETED),
+                Task(id="t2", title="2", status=TaskStatus.COMPLETED),
+            ],
+            [TaskEdge("t1", "t2")],
+        )
+        # Revision keeps both terminal tasks but drops the
+        # terminal->terminal edge — forbidden by §3.2.
+        revision = _mk_plan(
+            [
+                Task(id="t1", title="1", status=TaskStatus.COMPLETED),
+                Task(id="t2", title="2", status=TaskStatus.COMPLETED),
+            ],
+            [],
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"terminal->terminal edge 't1' -> 't2' missing in revision",
+        ):
+            revision.validate(for_revision=True, prior=prior)
+
+    def test_validate_revision_accepts_missing_mutable_edge(self) -> None:
+        # terminal -> PENDING edge in ``prior`` may be dropped freely;
+        # only terminal->terminal edges are frozen by §3.2.
+        prior = _mk_plan(
+            [
+                Task(id="t1", title="1", status=TaskStatus.COMPLETED),
+                Task(id="t2", title="2", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("t1", "t2")],
+        )
+        revision = _mk_plan(
+            [
+                Task(id="t1", title="1", status=TaskStatus.COMPLETED),
+                Task(id="t2", title="2", status=TaskStatus.PENDING),
+            ],
+            [],
+        )
+        # Does not raise — the dropped edge's ``to`` endpoint was
+        # non-terminal in ``prior``.
+        revision.validate(for_revision=True, prior=prior)
+
+    def test_validate_revision_without_prior_skips_preservation(self) -> None:
+        # Backwards-compat: callers that do not supply ``prior`` get the
+        # legacy structural checks only; a revision that would violate
+        # §3.1/§3.2 still validates as long as it is structurally sound.
+        revision = _mk_plan(
+            [Task(id="t1", title="done", status=TaskStatus.PENDING)],
+            [],
+        )
+        # No prior supplied -> no terminal-preservation check.
+        revision.validate(for_revision=True)

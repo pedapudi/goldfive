@@ -606,14 +606,17 @@ class DefaultSteerer:
             await self._register_refine_failure(session, drift, counter_key)
             return
         try:
-            revised.validate(for_revision=True)
+            revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
             # Reject the revision and surface the failure as a CRITICAL
             # DriftDetected so operators can see the bad plan upstream.
             # The session keeps its old plan. A bad revision also counts
             # as a refine failure for backoff purposes — the planner
             # produced an unusable plan, which is functionally the same
-            # as returning None.
+            # as returning None. Passing ``prior=session.plan`` enables
+            # PLAN-LIFECYCLE.md §3.1 (terminal task preservation) and
+            # §3.2 (terminal->terminal edge preservation) on top of the
+            # usual structural checks.
             await self._emit_drift_detected(
                 session,
                 DriftEvent(
