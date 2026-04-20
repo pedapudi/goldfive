@@ -43,17 +43,13 @@ if TYPE_CHECKING:  # pragma: no cover - type-only
 # are exempt from the per-task idempotency guard, but still feed the
 # loop detector under a synthetic "(plan)" task key so a runaway
 # divergence-spam loop is still caught.
-_PLAN_LEVEL_TOOLS: frozenset[str] = frozenset(
-    {"report_plan_divergence"}
-)
+_PLAN_LEVEL_TOOLS: frozenset[str] = frozenset({"report_plan_divergence"})
 
 # Tools that are intentionally allowed to be called multiple times with
 # the same args (the dispatch is the entire point — e.g. blocking on an
 # approval decision). These bypass the idempotency table but still
 # count toward the loop detector window.
-_NON_IDEMPOTENT_TOOLS: frozenset[str] = frozenset(
-    {"report_awaiting_approval"}
-)
+_NON_IDEMPOTENT_TOOLS: frozenset[str] = frozenset({"report_awaiting_approval"})
 
 
 def find_tool(
@@ -143,12 +139,7 @@ async def invoke_tool(
             tool_name=name,
         )
 
-    if (
-        not is_plan_level
-        and name not in _NON_IDEMPOTENT_TOOLS
-        and task_id
-        and sig in state.seen
-    ):
+    if not is_plan_level and name not in _NON_IDEMPOTENT_TOOLS and task_id and sig in state.seen:
         return {"acknowledged": True, "duplicate": True}
 
     state.seen.add(sig)

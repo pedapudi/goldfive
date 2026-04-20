@@ -56,9 +56,7 @@ log = logging.getLogger("goldfive.adapters.adk")
 try:  # noqa: SIM105 — explicit import-time guard with install hint
     import google.adk  # type: ignore  # noqa: F401
 except ImportError:  # pragma: no cover — covered in tests via importorskip
-    raise ImportError(
-        "goldfive.adapters.adk requires 'pip install goldfive[adk]'"
-    ) from None
+    raise ImportError("goldfive.adapters.adk requires 'pip install goldfive[adk]'") from None
 
 
 def _build_ack_shim(name: str, description: str):
@@ -87,9 +85,7 @@ def _build_function_tool(spec: ReportingToolSpec) -> Any:
     return FunctionTool(shim)
 
 
-def _augment_subtree_with_reporting(
-    root_agent: Any, tools: list[Any], tool_names: set[str]
-) -> int:
+def _augment_subtree_with_reporting(root_agent: Any, tools: list[Any], tool_names: set[str]) -> int:
     """Append reporting ``tools`` to every agent reachable from ``root_agent``.
 
     Ported from harmonograf's ``_register_harmonograf_reporting_tools_for_test``.
@@ -131,9 +127,7 @@ def _augment_subtree_with_reporting(
             continue
         existing_names: set[str] = set()
         for t in existing:
-            n = getattr(t, "name", None) or getattr(
-                getattr(t, "func", None), "__name__", None
-            )
+            n = getattr(t, "name", None) or getattr(getattr(t, "func", None), "__name__", None)
             if n:
                 existing_names.add(str(n))
         if any(n in existing_names for n in tool_names):
@@ -204,10 +198,7 @@ def _looks_like_runner(obj: Any) -> bool:
     Runners expose ``run_async`` / ``agent`` / ``session_service``;
     agents may expose ``run_async_impl`` but not the session service.
     """
-    return (
-        callable(getattr(obj, "run_async", None))
-        and getattr(obj, "agent", None) is not None
-    )
+    return callable(getattr(obj, "run_async", None)) and getattr(obj, "agent", None) is not None
 
 
 def _extract_text_from_event(event: Any) -> str:
@@ -356,8 +347,7 @@ class ADKAdapter:
         """
         if not _register_plugin_on_runner(self._runner, plugin):
             log.debug(
-                "ADKAdapter.add_plugin: runner %r has no plugin manager; "
-                "plugin %r not installed",
+                "ADKAdapter.add_plugin: runner %r has no plugin manager; plugin %r not installed",
                 type(self._runner).__name__,
                 type(plugin).__name__,
             )
@@ -391,9 +381,7 @@ class ADKAdapter:
                     stack.append(nested)
         return names
 
-    async def register_reporting_tools(
-        self, tools: list[ReportingToolSpec]
-    ) -> None:
+    async def register_reporting_tools(self, tools: list[ReportingToolSpec]) -> None:
         """Register goldfive reporting tools with the wrapped agent tree.
 
         Each spec is wrapped as a ``google.adk.tools.FunctionTool`` (via
@@ -412,9 +400,7 @@ class ADKAdapter:
                 raise ValueError(f"ReportingToolSpec has no name: {spec!r}")
             handler = getattr(spec, "handler", None)
             if handler is None:
-                raise ValueError(
-                    f"ReportingToolSpec '{name}' missing handler"
-                )
+                raise ValueError(f"ReportingToolSpec '{name}' missing handler")
             self._tool_handlers[name] = handler
             function_tools.append(_build_function_tool(spec))
             names.add(name)
@@ -433,9 +419,7 @@ class ADKAdapter:
         else:
             existing_names: set[str] = set()
             for t in root_tools:
-                n = getattr(t, "name", None) or getattr(
-                    getattr(t, "func", None), "__name__", None
-                )
+                n = getattr(t, "name", None) or getattr(getattr(t, "func", None), "__name__", None)
                 if n:
                     existing_names.add(str(n))
             if not any(n in existing_names for n in names):
@@ -484,9 +468,7 @@ class ADKAdapter:
             return
         await observe(text, task=task, session=session, provider=provider)
 
-    async def invoke(
-        self, task: Task, session: Session
-    ) -> InvocationResult:
+    async def invoke(self, task: Task, session: Session) -> InvocationResult:
         """Drive one ADK turn for ``task`` and return the result."""
         task_id = getattr(task, "id", "") or ""
         session_id = await self._ensure_session()

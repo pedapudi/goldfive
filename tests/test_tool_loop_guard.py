@@ -45,9 +45,7 @@ class _RecordingSteerer:
         self.drifts: list[DriftEvent] = []
         self._sinks: list[Any] = []
 
-    async def mark_task_running(
-        self, task_id: str, *, session: Session, detail: str = ""
-    ) -> None:
+    async def mark_task_running(self, task_id: str, *, session: Session, detail: str = "") -> None:
         self.transitions.append((task_id, "RUNNING", {"detail": detail}))
         task = next(
             (t for t in (session.plan.tasks if session.plan else []) if t.id == task_id),
@@ -68,9 +66,7 @@ class _RecordingSteerer:
         fraction: float = 0.0,
         detail: str = "",
     ) -> None:
-        self.transitions.append(
-            (task_id, "PROGRESS", {"fraction": fraction, "detail": detail})
-        )
+        self.transitions.append((task_id, "PROGRESS", {"fraction": fraction, "detail": detail}))
         session.task_progress[task_id] = fraction
 
     async def mark_task_completed(
@@ -148,16 +144,22 @@ async def test_duplicate_call_returns_ack_and_skips_steerer() -> None:
     tools = [_spec("report_task_started")]
 
     first = await invoke_tool(
-        tools, "report_task_started", {"task_id": "t1", "detail": "kick"},
-        session, steerer,
+        tools,
+        "report_task_started",
+        {"task_id": "t1", "detail": "kick"},
+        session,
+        steerer,
     )
     assert first == {"acknowledged": True}
     assert session.plan.tasks[0].status is TaskStatus.RUNNING
 
     # Second identical call: should ACK as duplicate, no re-transition.
     second = await invoke_tool(
-        tools, "report_task_started", {"task_id": "t1", "detail": "kick"},
-        session, steerer,
+        tools,
+        "report_task_started",
+        {"task_id": "t1", "detail": "kick"},
+        session,
+        steerer,
     )
     assert second == {"acknowledged": True, "duplicate": True}
     # Only one transition recorded — handler was not re-entered.
@@ -446,9 +448,7 @@ async def test_frontier_style_progression_does_not_fire_drift() -> None:
         _spec("report_task_completed"),
     ]
 
-    await invoke_tool(
-        tools, "report_task_started", {"task_id": "t1"}, session, steerer
-    )
+    await invoke_tool(tools, "report_task_started", {"task_id": "t1"}, session, steerer)
     for frac, detail in [(0.2, "research"), (0.5, "draft"), (0.9, "review")]:
         await invoke_tool(
             tools,
@@ -505,9 +505,7 @@ async def test_llmplanner_refine_loops_drift_falls_back_when_llm_fails() -> None
         current_task_id="loop",
     )
     planner = LLMPlanner(call_llm=boom)
-    revised = await planner.refine(
-        plan=plan, drift=drift, goals=[Goal(id="g1", summary="do it")]
-    )
+    revised = await planner.refine(plan=plan, drift=drift, goals=[Goal(id="g1", summary="do it")])
     assert revised is not None
     by_id = {t.id: t for t in revised.tasks}
     assert by_id["loop"].status is TaskStatus.FAILED
@@ -553,9 +551,7 @@ async def test_llmplanner_refine_loops_drift_uses_llm_response() -> None:
         current_task_id="loop",
     )
     planner = LLMPlanner(call_llm=llm)
-    revised = await planner.refine(
-        plan=plan, drift=drift, goals=[Goal(id="g1", summary="do it")]
-    )
+    revised = await planner.refine(plan=plan, drift=drift, goals=[Goal(id="g1", summary="do it")])
     assert revised is not None
     by_id = {t.id: t for t in revised.tasks}
     # The planner forgot to mark it FAILED; the framework forces it.

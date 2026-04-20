@@ -92,9 +92,7 @@ class StubPlanner:
         drift: DriftEvent,
         goals: list[Goal],
     ) -> Plan | None:
-        self.refine_calls.append(
-            {"plan": plan, "drift": drift, "goals": goals}
-        )
+        self.refine_calls.append({"plan": plan, "drift": drift, "goals": goals})
         if self.raise_exc is not None:
             raise self.raise_exc
         return self.revised
@@ -179,9 +177,7 @@ async def test_mark_task_running_unknown_task_is_noop() -> None:
 
 async def test_mark_task_progress_records_and_emits() -> None:
     steerer, session, sink, _ = _fresh()
-    await steerer.mark_task_progress(
-        "t1", session=session, fraction=0.42, detail="halfway"
-    )
+    await steerer.mark_task_progress("t1", session=session, fraction=0.42, detail="halfway")
     assert session.task_progress["t1"] == pytest.approx(0.42)
     assert session.agent_notes["t1"] == "halfway"
     # Status is untouched by progress updates.
@@ -222,9 +218,7 @@ async def test_mark_task_completed_transitions_and_emits() -> None:
 
 async def test_mark_task_failed_recoverable_fires_drift() -> None:
     steerer, session, sink, planner = _fresh()
-    await steerer.mark_task_failed(
-        "t1", session=session, reason="boom", recoverable=True
-    )
+    await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
     assert _task(session, "t1").status is TaskStatus.FAILED
     kinds = [e.WhichOneof("payload") for e in sink.events]
     # TaskFailed + DriftDetected + refine-failure DriftDetected (planner
@@ -244,9 +238,7 @@ async def test_mark_task_failed_recoverable_fires_drift() -> None:
 
 async def test_mark_task_failed_fatal_fires_critical_drift() -> None:
     steerer, session, sink, _planner = _fresh()
-    await steerer.mark_task_failed(
-        "t1", session=session, reason="unrecoverable", recoverable=False
-    )
+    await steerer.mark_task_failed("t1", session=session, reason="unrecoverable", recoverable=False)
     drift_evt = sink.events[1]
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -273,9 +265,7 @@ async def test_mark_task_blocked_transitions_and_emits_drift() -> None:
 
 async def test_mark_task_cancelled_transitions() -> None:
     steerer, session, sink, _ = _fresh()
-    await steerer.mark_task_cancelled(
-        "t1", session=session, reason="user cancelled"
-    )
+    await steerer.mark_task_cancelled("t1", session=session, reason="user cancelled")
     assert _task(session, "t1").status is TaskStatus.CANCELLED
     assert len(sink.events) == 1
     assert sink.events[0].WhichOneof("payload") == "task_cancelled"
@@ -284,9 +274,7 @@ async def test_mark_task_cancelled_transitions() -> None:
 
 async def test_transition_dispatches_to_mark_methods() -> None:
     steerer, session, sink, _ = _fresh()
-    await steerer.transition(
-        "t1", TaskStatus.RUNNING, session=session, detail="go"
-    )
+    await steerer.transition("t1", TaskStatus.RUNNING, session=session, detail="go")
     assert _task(session, "t1").status is TaskStatus.RUNNING
     assert sink.events[0].WhichOneof("payload") == "task_started"
 
@@ -373,10 +361,7 @@ def test_detect_drift_prefers_tool_error_then_refusal_then_stop_reason() -> None
         is DriftKind.AGENT_REFUSAL
     )
     # Pure stop_reason goes to CONTEXT_PRESSURE.
-    assert (
-        s.detect_drift({"stop_reason": "MAX_TOKENS"}, sess).kind
-        is DriftKind.CONTEXT_PRESSURE
-    )
+    assert s.detect_drift({"stop_reason": "MAX_TOKENS"}, sess).kind is DriftKind.CONTEXT_PRESSURE
     # Nothing → None.
     assert s.detect_drift({"text": "all good"}, sess) is None
 
@@ -538,10 +523,7 @@ async def test_report_new_work_discovered_fires_drift() -> None:
     assert sink.events[0].WhichOneof("payload") == "drift_detected"
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    assert (
-        sink.events[0].drift_detected.kind
-        == types_pb2.DRIFT_KIND_NEW_WORK_DISCOVERED
-    )
+    assert sink.events[0].drift_detected.kind == types_pb2.DRIFT_KIND_NEW_WORK_DISCOVERED
     assert planner.refine_calls[0]["drift"].kind is DriftKind.NEW_WORK_DISCOVERED
 
 
@@ -555,10 +537,7 @@ async def test_report_plan_divergence_sets_flag_and_fires_drift() -> None:
     assert session.divergence_flag is True
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    assert (
-        sink.events[0].drift_detected.kind
-        == types_pb2.DRIFT_KIND_PLAN_DIVERGENCE
-    )
+    assert sink.events[0].drift_detected.kind == types_pb2.DRIFT_KIND_PLAN_DIVERGENCE
     assert planner.refine_calls[0]["drift"].kind is DriftKind.PLAN_DIVERGENCE
 
 

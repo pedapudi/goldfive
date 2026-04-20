@@ -77,9 +77,7 @@ class _TaskGuardState:
     # signatures observed for this task. Includes both first-time and
     # duplicate calls — the loop signal we care about is volume of
     # matching calls in flight, not whether the first one already ran.
-    window: deque[tuple[str, str]] = field(
-        default_factory=lambda: deque(maxlen=_LOOP_WINDOW)
-    )
+    window: deque[tuple[str, str]] = field(default_factory=lambda: deque(maxlen=_LOOP_WINDOW))
     # Cumulative per-tool call count for this task. Used by the volume
     # cap to catch loops where the agent varies args on every call
     # (common in practice — e.g. a fresh ``reason`` string each time —
@@ -178,10 +176,7 @@ def detect_loop(state: _TaskGuardState, signature: tuple[str, str]) -> bool:
 
     # Volume cap: catches args-varying loops (the exact-signature check
     # below misses these because every call hashes differently).
-    if (
-        name not in _VOLUME_EXEMPT_TOOLS
-        and state.per_tool_count[name] >= _VOLUME_THRESHOLD
-    ):
+    if name not in _VOLUME_EXEMPT_TOOLS and state.per_tool_count[name] >= _VOLUME_THRESHOLD:
         state.loop_flagged = True
         return True
 

@@ -27,8 +27,6 @@ from goldfive.drift import (
     classify_stop_reason,
     classify_tool_error,
 )
-
-log = logging.getLogger(__name__)
 from goldfive.types import (
     TERMINAL_TASK_STATUSES,
     DriftEvent,
@@ -42,6 +40,8 @@ from goldfive.types import (
 
 if TYPE_CHECKING:
     from goldfive.protocols import EventSink, Planner
+
+log = logging.getLogger(__name__)
 
 
 __all__ = ["DefaultSteerer"]
@@ -116,21 +116,13 @@ class DefaultSteerer:
         if to is TaskStatus.RUNNING:
             await self.mark_task_running(task_id, session=session, detail=detail)
         elif to is TaskStatus.COMPLETED:
-            await self.mark_task_completed(
-                task_id, summary=detail, session=session
-            )
+            await self.mark_task_completed(task_id, summary=detail, session=session)
         elif to is TaskStatus.FAILED:
-            await self.mark_task_failed(
-                task_id, reason=detail, session=session
-            )
+            await self.mark_task_failed(task_id, reason=detail, session=session)
         elif to is TaskStatus.BLOCKED:
-            await self.mark_task_blocked(
-                task_id, blocker=detail, session=session
-            )
+            await self.mark_task_blocked(task_id, blocker=detail, session=session)
         elif to is TaskStatus.CANCELLED:
-            await self.mark_task_cancelled(
-                task_id, reason=detail, session=session
-            )
+            await self.mark_task_cancelled(task_id, reason=detail, session=session)
         # PENDING and UNSPECIFIED are intentionally not reachable from
         # here; transitions are always forward in the lifecycle.
 
@@ -224,14 +216,8 @@ class DefaultSteerer:
             return
         task.status = TaskStatus.FAILED
         await self._emit_task_failed(session, task_id, reason, recoverable)
-        kind = (
-            DriftKind.TASK_FAILED_RECOVERABLE
-            if recoverable
-            else DriftKind.TASK_FAILED_FATAL
-        )
-        severity = (
-            DriftSeverity.WARNING if recoverable else DriftSeverity.CRITICAL
-        )
+        kind = DriftKind.TASK_FAILED_RECOVERABLE if recoverable else DriftKind.TASK_FAILED_FATAL
+        severity = DriftSeverity.WARNING if recoverable else DriftSeverity.CRITICAL
         drift = DriftEvent(
             kind=kind,
             severity=severity,
@@ -262,15 +248,11 @@ class DefaultSteerer:
         # re-blocking a task that's already blocked (idempotent).
         task.status = TaskStatus.BLOCKED
         if blocker or needed:
-            session.agent_notes[task_id] = (
-                f"blocked: {blocker}"
-                + (f" (needed: {needed})" if needed else "")
+            session.agent_notes[task_id] = f"blocked: {blocker}" + (
+                f" (needed: {needed})" if needed else ""
             )
         await self._emit_task_blocked(session, task_id, blocker, needed)
-        detail = (
-            f"task {task_id} blocked: {blocker}"
-            + (f" (needed: {needed})" if needed else "")
-        )
+        detail = f"task {task_id} blocked: {blocker}" + (f" (needed: {needed})" if needed else "")
         drift = DriftEvent(
             kind=DriftKind.BLOCKED,
             severity=DriftSeverity.WARNING,
@@ -439,9 +421,8 @@ class DefaultSteerer:
         assignee: str = "",
     ) -> None:
         """Fire a ``NEW_WORK_DISCOVERED`` drift event → triggers refine."""
-        detail = (
-            f"new work under {parent_task_id}: {title}: {description}"
-            + (f" (assignee={assignee})" if assignee else "")
+        detail = f"new work under {parent_task_id}: {title}: {description}" + (
+            f" (assignee={assignee})" if assignee else ""
         )
         drift = DriftEvent(
             kind=DriftKind.NEW_WORK_DISCOVERED,
@@ -461,11 +442,7 @@ class DefaultSteerer:
     ) -> None:
         """Fire a ``PLAN_DIVERGENCE`` drift event → triggers refine."""
         session.divergence_flag = True
-        detail = (
-            f"{note} (suggested: {suggested_action})"
-            if suggested_action
-            else note
-        )
+        detail = f"{note} (suggested: {suggested_action})" if suggested_action else note
         drift = DriftEvent(
             kind=DriftKind.PLAN_DIVERGENCE,
             severity=DriftSeverity.WARNING,
@@ -512,8 +489,7 @@ class DefaultSteerer:
             # leaves session.plan unchanged and the executor re-enters
             # the same state on the next tick.
             log.warning(
-                "DefaultSteerer._handle_drift: planner.refine(kind=%s) raised %s; "
-                "plan unchanged",
+                "DefaultSteerer._handle_drift: planner.refine(kind=%s) raised %s; plan unchanged",
                 drift.kind.value,
                 exc,
             )
@@ -554,9 +530,7 @@ class DefaultSteerer:
         await self._emit_drift_detected(session, failure)
 
     @staticmethod
-    def _apply_revision(
-        session: Session, revised: Plan, drift: DriftEvent
-    ) -> None:
+    def _apply_revision(session: Session, revised: Plan, drift: DriftEvent) -> None:
         """Stamp revision metadata and install ``revised`` on the session.
 
         Preserves the existing ``revision_index`` monotonicity: the new
@@ -592,24 +566,18 @@ class DefaultSteerer:
         from goldfive.pb.goldfive.v1 import types_pb2
 
         name = f"DRIFT_KIND_{kind.name}"
-        return getattr(
-            types_pb2, name, getattr(types_pb2, "DRIFT_KIND_CUSTOM", 0)
-        )
+        return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_KIND_CUSTOM", 0))
 
     @staticmethod
     def _drift_severity_pb_value(severity: DriftSeverity) -> int:
         from goldfive.pb.goldfive.v1 import types_pb2
 
         name = f"DRIFT_SEVERITY_{severity.name}"
-        return getattr(
-            types_pb2, name, getattr(types_pb2, "DRIFT_SEVERITY_UNSPECIFIED", 0)
-        )
+        return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_SEVERITY_UNSPECIFIED", 0))
 
     # --- Concrete emitters -------------------------------------------
 
-    async def _emit_task_started(
-        self, session: Session, task_id: str, detail: str
-    ) -> None:
+    async def _emit_task_started(self, session: Session, task_id: str, detail: str) -> None:
         evt = self._new_envelope(session)
         evt.task_started.task_id = task_id
         evt.task_started.detail = detail
@@ -656,38 +624,28 @@ class DefaultSteerer:
         evt.task_blocked.needed = needed
         await self._emit(evt)
 
-    async def _emit_task_cancelled(
-        self, session: Session, task_id: str, reason: str
-    ) -> None:
+    async def _emit_task_cancelled(self, session: Session, task_id: str, reason: str) -> None:
         evt = self._new_envelope(session)
         evt.task_cancelled.task_id = task_id
         evt.task_cancelled.reason = reason
         await self._emit(evt)
 
-    async def _emit_drift_detected(
-        self, session: Session, drift: DriftEvent
-    ) -> None:
+    async def _emit_drift_detected(self, session: Session, drift: DriftEvent) -> None:
         evt = self._new_envelope(session)
         evt.drift_detected.kind = self._drift_kind_pb_value(drift.kind)
-        evt.drift_detected.severity = self._drift_severity_pb_value(
-            drift.severity
-        )
+        evt.drift_detected.severity = self._drift_severity_pb_value(drift.severity)
         evt.drift_detected.detail = drift.detail
         evt.drift_detected.current_task_id = drift.current_task_id
         evt.drift_detected.current_agent_id = drift.current_agent_id
         await self._emit(evt)
 
-    async def _emit_plan_revised(
-        self, session: Session, revised: Plan, drift: DriftEvent
-    ) -> None:
+    async def _emit_plan_revised(self, session: Session, revised: Plan, drift: DriftEvent) -> None:
         from goldfive.conv import to_pb_plan
 
         evt = self._new_envelope(session)
         evt.plan_revised.plan.CopyFrom(to_pb_plan(revised))
         evt.plan_revised.drift_kind = self._drift_kind_pb_value(drift.kind)
-        evt.plan_revised.severity = self._drift_severity_pb_value(
-            drift.severity
-        )
+        evt.plan_revised.severity = self._drift_severity_pb_value(drift.severity)
         evt.plan_revised.reason = drift.detail
         evt.plan_revised.revision_index = revised.revision_index
         await self._emit(evt)

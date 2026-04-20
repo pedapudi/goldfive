@@ -116,8 +116,7 @@ async def test_reporting_tools_registered_on_root_agent() -> None:
     await adapter.register_reporting_tools([spec])
 
     names = [
-        getattr(t, "name", None)
-        or getattr(getattr(t, "func", None), "__name__", None)
+        getattr(t, "name", None) or getattr(getattr(t, "func", None), "__name__", None)
         for t in getattr(agent, "tools", None) or ()
     ]
     assert "report_task_started" in names
@@ -248,9 +247,7 @@ async def test_before_model_writes_goldfive_state_keys(state_ctx_cls) -> None:
         )
     }
 
-    await plugin.before_model_callback(
-        callback_context=state_ctx_cls(state), llm_request=None
-    )
+    await plugin.before_model_callback(callback_context=state_ctx_cls(state), llm_request=None)
 
     assert state.get(KEY_RUN_ID) == "run-abc"
     assert state.get(KEY_PLAN_ID) == "plan-1"
@@ -325,9 +322,7 @@ async def test_on_event_transfer_calls_steerer_observe(state_ctx_cls) -> None:
     class _Event:
         actions = _Actions()
 
-    await plugin.on_event_callback(
-        invocation_context=state_ctx_cls(state), event=_Event()
-    )
+    await plugin.on_event_callback(invocation_context=state_ctx_cls(state), event=_Event())
 
     assert len(steerer.events) == 1
     assert steerer.events[0]["kind"] == "agent_transfer"
@@ -358,9 +353,7 @@ def test_adapter_conforms_to_protocol() -> None:
 def _tool_names(agent: Any) -> set[str]:
     names: set[str] = set()
     for t in getattr(agent, "tools", None) or ():
-        n = getattr(t, "name", None) or getattr(
-            getattr(t, "func", None), "__name__", None
-        )
+        n = getattr(t, "name", None) or getattr(getattr(t, "func", None), "__name__", None)
         if n:
             names.add(str(n))
     return names
@@ -384,9 +377,7 @@ async def test_register_reporting_tools_propagates_across_three_level_tree() -> 
     from goldfive.reporting import BUILTIN_REPORTING_TOOLS, REPORTING_TOOL_NAMES
 
     def _mk(name: str) -> Any:
-        return LlmAgent(
-            name=name, model="fake-model", description=name, instruction="x"
-        )
+        return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
 
     grandchild_a = _mk("grandchild_a")
     grandchild_b = _mk("grandchild_b")
@@ -406,9 +397,7 @@ async def test_register_reporting_tools_propagates_across_three_level_tree() -> 
     for agent in (root, child_a, grandchild_a, child_b_as_tool, grandchild_b):
         have = _tool_names(agent)
         missing = expected - have
-        assert not missing, (
-            f"agent {agent.name!r} missing reporting tools: {sorted(missing)}"
-        )
+        assert not missing, f"agent {agent.name!r} missing reporting tools: {sorted(missing)}"
 
     # available_agents discovers every node in the tree.
     discovered = set(adapter.available_agents)
@@ -536,8 +525,7 @@ async def test_invoke_breaks_when_task_reported_terminal_mid_stream() -> None:
 
     # Events 0, 1, 2 should be observed; 3 and 4 must not be.
     assert observed == [0, 1, 2], (
-        f"adapter should have broken after event #2 (terminal transition); "
-        f"observed {observed}"
+        f"adapter should have broken after event #2 (terminal transition); observed {observed}"
     )
     assert result.stop_reason == "task_terminal"
     assert result.task_id == "t1"
@@ -591,12 +579,8 @@ async def test_register_reporting_tools_is_idempotent() -> None:
     from goldfive.adapters.adk import ADKAdapter
     from goldfive.reporting import BUILTIN_REPORTING_TOOLS, REPORTING_TOOL_NAMES
 
-    child = LlmAgent(
-        name="child", model="fake-model", description="c", instruction="x"
-    )
-    root = LlmAgent(
-        name="root", model="fake-model", description="r", instruction="x"
-    )
+    child = LlmAgent(name="child", model="fake-model", description="c", instruction="x")
+    root = LlmAgent(name="root", model="fake-model", description="r", instruction="x")
     root.sub_agents = [child]
 
     adapter = ADKAdapter(root)
@@ -605,12 +589,10 @@ async def test_register_reporting_tools_is_idempotent() -> None:
 
     for agent in (root, child):
         names = [
-            getattr(t, "name", None)
-            or getattr(getattr(t, "func", None), "__name__", None)
+            getattr(t, "name", None) or getattr(getattr(t, "func", None), "__name__", None)
             for t in getattr(agent, "tools", None) or ()
         ]
         for reporting_name in REPORTING_TOOL_NAMES:
             assert names.count(reporting_name) == 1, (
-                f"{agent.name}: {reporting_name} registered "
-                f"{names.count(reporting_name)} times"
+                f"{agent.name}: {reporting_name} registered {names.count(reporting_name)} times"
             )

@@ -114,8 +114,8 @@ class Plan:
     edges: list[TaskEdge]
     summary: str = ""
     revision_reason: str = ""
-    revision_kind: str = ""           # DriftKind value (str) or ""
-    revision_severity: str = ""       # DriftSeverity value (str) or ""
+    revision_kind: str = ""  # DriftKind value (str) or ""
+    revision_severity: str = ""  # DriftSeverity value (str) or ""
     revision_index: int = 0
 
     def topological_stages(self) -> list[list[Task]]:
@@ -171,7 +171,7 @@ class DriftEvent:
     detail: str = ""
     current_task_id: str = ""
     current_agent_id: str = ""
-    raw: Any = None   # original event that triggered detection
+    raw: Any = None  # original event that triggered detection
 
 
 @dataclasses.dataclass
@@ -201,15 +201,11 @@ class Session:
     # ``target_id``: task_id for Flow A (report_awaiting_approval) and the
     # ADK function_call_id for Flow B (ADK require_confirmation). The event
     # is set by the control dispatcher when APPROVE / REJECT arrives.
-    pending_approvals: dict[str, asyncio.Event] = dataclasses.field(
-        default_factory=dict
-    )
+    pending_approvals: dict[str, asyncio.Event] = dataclasses.field(default_factory=dict)
     # Per-approval metadata. Populated when the waiter is registered; the
     # dispatcher adds ``decision`` ("approve" | "reject") and optional
     # ``detail`` before setting the event.
-    pending_approvals_meta: dict[str, dict[str, Any]] = dataclasses.field(
-        default_factory=dict
-    )
+    pending_approvals_meta: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
     # Recent reasoning-content blocks emitted by the adapter's
     # ``emit_reasoning`` hook. Bounded to the last ``reasoning_history_max``
     # entries so long runs do not accumulate chain-of-thought forever.
