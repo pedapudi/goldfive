@@ -254,6 +254,17 @@ terminates.
 **Preservation:** §3.1-3.5 plus the offender's transition to FAILED
 is a hard constraint.
 
+**Early-warning ladder (`REASONING_CLUSTER_TIGHTENING`).** The
+`LOOPING_REASONING` cliff at cosine similarity `>= 0.9` is paired
+with a graduated INFO-severity tier `REASONING_CLUSTER_TIGHTENING`
+that fires in the `[0.75, 0.9)` band. The INFO tier is **not** a
+refinement mode — it does not mark tasks FAILED, does not reach
+`planner.refine`, and does not move the plan out of `EXECUTING`.
+Sinks surface it as a "may be looping soon" hint so operators can
+intervene before the cliff fires. See
+[DRIFT.md](DRIFT.md#reasoning-category--the-models-chain-of-thought-exposes-drift-before-the-tool-calls-do)
+for the ladder table.
+
 ### 4.4 Refine-within-refine is illegal
 
 While a refine is in flight (`REVISING` state), another drift MAY

@@ -114,7 +114,7 @@ kinds group naturally into six categories.
 
 ### Reasoning category — the model's chain-of-thought exposes drift before the tool calls do
 
-These four kinds are emitted by `Steerer.observe_reasoning(text, session)`,
+These five kinds are emitted by `Steerer.observe_reasoning(text, session)`,
 which adapters call once per LLM response that carries reasoning content
 (OpenAI `reasoning_content`, Anthropic `thinking` blocks, Google thought
 parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
@@ -122,12 +122,14 @@ parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
 | `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). | `warning` | yes |
+| `REASONING_CLUSTER_TIGHTENING` | Max cosine similarity between current reasoning and the last N=5 blocks falls in `[0.75, 0.9)` (opt-in, `goldfive[embedding]`). Graduated early-warning tier below the `LOOPING_REASONING` cliff. One-shot per task. | `info` | yes |
 | `CONFUSION` | Reasoning text has ≥ 3 uncertainty markers ("I'm not sure", "wait", "hmm", …). | `info` | yes |
 | `OFF_TOPIC` | Reasoning cosine-distance from the current task description ≥ `0.7` (requires `goldfive[embedding]`). | `warning` | yes |
 | `INTENT_DIVERGENCE` | Reasoning has drifted from `session.goals` + the current task topic. Severity is **graduated** — see table below. | `info` · `warning` · `critical` | depends on severity |
 
 Each observation produces at most one drift (the first match wins) in
 severity order: `INTENT_DIVERGENCE` → `LOOPING_REASONING` → `OFF_TOPIC`
+<<<<<<< HEAD
 → `CONFUSION`. Detectors short-circuit so the pipeline cost stays
 bounded regardless of reasoning block size. `INTENT_DIVERGENCE` runs
 first even when it resolves to `info` severity, because the kind is
@@ -167,6 +169,29 @@ bands: callers filtering by kind see one stable signal; the
 `INTENT_DIVERGENCE_HEALTHY_SIMILARITY`,
 `INTENT_DIVERGENCE_MINOR_SIMILARITY`, and
 `INTENT_DIVERGENCE_WARNING_SIMILARITY`.
+=======
+→ `REASONING_CLUSTER_TIGHTENING` → `CONFUSION`. Detectors short-circuit
+so the pipeline cost stays bounded regardless of reasoning block size.
+
+**Graduated reasoning-similarity ladder.** `LOOPING_REASONING` and
+`REASONING_CLUSTER_TIGHTENING` together form a two-rung early-warning
+ladder on the same underlying signal (cosine similarity of the current
+reasoning block against recent history):
+
+| Max cosine | Tier | Fires what |
+|---|---|---|
+| `>= 0.9` | cliff | `LOOPING_REASONING` (WARNING) — the agent's chain-of-thought is looping; refine. |
+| `[0.75, 0.9)` | tightening | `REASONING_CLUSTER_TIGHTENING` (INFO) — blocks are clustering tighter; observational only. One-shot per task so a long tight-cluster run does not flood the stream. |
+| `< 0.75` | silent | no drift. |
+
+The INFO tier is deliberately below the WARNING threshold so sinks
+(harmonograf UI, custom dashboards) see the signal but
+`DefaultSteerer._handle_drift` does not trigger `planner.refine` —
+the planner is only woken up once the cliff fires. The INFO tier is
+skipped entirely when the current observation would also trip the
+cliff (i.e., `LOOPING_REASONING` runs first in the pipeline), so the
+two tiers never double-fire on the same observation.
+>>>>>>> f6d3daf (Add REASONING_CLUSTER_TIGHTENING graduated drift signal)
 
 The reasoning channel is additive: adapters that cannot surface
 chain-of-thought (e.g. classic GPT-4o) simply never call

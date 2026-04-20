@@ -6,6 +6,12 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ### Added
 
+- `REASONING_CLUSTER_TIGHTENING` — graduated INFO-severity early-warning
+  drift below the `LOOPING_REASONING` cliff. Fires once per task when
+  max cosine similarity against the last N=5 reasoning blocks falls in
+  `[0.75, 0.9)`, giving sinks a "may be looping soon" signal before the
+  WARNING-tier cliff at `>= 0.9`. Embedding-only; silent when
+  `sentence-transformers` is unavailable. No refine side-effects.
 - #96 Reasoning-based drift detection — `Steerer.observe_reasoning()`
   + `AgentAdapter.emit_reasoning()` feed chain-of-thought from the
   model into the drift pipeline. Four new `DriftKind` values

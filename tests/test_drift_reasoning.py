@@ -102,13 +102,17 @@ def _session_with_task(
 
 @pytest.fixture(autouse=True)
 def _clear_embedding_model() -> Any:
-    """Ensure each test starts with embeddings *unavailable*.
+    """Ensure each test starts with no custom encoder installed, and the
+    lazy-load path disabled.
 
-    ``set_model(None)`` clears any cached encoder, and flipping
-    ``_MODEL_UNAVAILABLE`` true short-circuits the lazy import in
-    :func:`goldfive.drift._embed._get_model`. Tests that want the
-    embedding path install a stub via ``set_model(<encoder>)``, which
-    resets the flag.
+    ``set_model(None)`` alone resets the cached model but leaves the
+    ``_MODEL_UNAVAILABLE`` flag False, so the next
+    :func:`goldfive.drift._embed._get_model` call will attempt to import
+    ``sentence-transformers`` and — when the ``embedding`` extra is
+    installed — load the real MiniLM model. The fixture pins
+    ``_MODEL_UNAVAILABLE = True`` too so the default environment is
+    "no model"; tests that want the stub encoder call
+    ``set_model(_StubEncoder())``, which flips the flag back.
     """
     from goldfive.drift import _embed as _embed_mod
 
@@ -301,17 +305,17 @@ def test_embedding_based_off_topic_no_fire_when_on_topic() -> None:
     assert drift is None
 
 
-def test_embedding_based_off_topic_silent_without_model() -> None:
-    # No model installed; graceful degradation. The autouse fixture
-    # already forces embeddings unavailable, but we re-assert here so
-    # the intent of the test is explicit: ``set_model(None)`` alone
-    # is not sufficient because it resets the lazy-load gate, which
-    # then allows the real sentence-transformers model to load when
-    # the ``embedding`` extra is installed.
+def test_embedding_based_off_topic_silent_without_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No model installed; graceful degradation. Force the lazy-load
+    # path off so the real sentence-transformers model cannot be
+    # pulled in when the ``embedding`` extra happens to be active —
+    # the scenario under test is explicitly "embedding stack absent."
     from goldfive.drift import _embed as _embed_mod
 
     set_model(None)
-    _embed_mod._MODEL_UNAVAILABLE = True
+    monkeypatch.setattr(_embed_mod, "_MODEL_UNAVAILABLE", True, raising=False)
     session = _session_with_task()
     text = "wildly unrelated reasoning content goes here"
     drift = dreason.detect_off_topic(text, session)
@@ -474,6 +478,180 @@ def test_intent_divergence_keyword_mismatch_upgrades_severity() -> None:
     assert drift.kind is DriftKind.INTENT_DIVERGENCE
     # INFO (cosine band) + unreferenced keyword "blockchain" -> WARNING.
     assert drift.severity is DriftSeverity.WARNING
+
+
+# ---------------------------------------------------------------------------
+# REASONING_CLUSTER_TIGHTENING — graduated early-warning tier below the
+# LOOPING_REASONING cliff. Uses ``_StubEncoder`` for deterministic
+# cosine values: each text becomes a unit-normalised count vector over
+# hashed tokens, so for current/past blocks with disjoint-besides-shared
+# token sets of size N each, ``cos = shared / N``.
+# ---------------------------------------------------------------------------
+
+
+def _pad_tokens(prefix: str, n: int) -> str:
+    """Return a whitespace-joined string of ``n`` unique-ish tokens sharing
+    ``prefix``. Token ids are zero-padded so tokens hash distinctly.
+    """
+    return " ".join(f"{prefix}{i:03d}" for i in range(n))
+
+
+def _cluster_session() -> Session:
+    """Return a session whose task topic already overlaps with the
+    ``shared*`` tokens the cluster-tightening tests use, so OFF_TOPIC
+    (which runs before REASONING_CLUSTER_TIGHTENING in the pipeline)
+    stays silent and the tightening detector owns the signal.
+    """
+    topic = _pad_tokens("shared", 10)
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[Task(id="t1", title=topic, description=topic)],
+        edges=[],
+    )
+    return Session(
+        run_id="r1",
+        goals=[Goal(id="g1", summary=topic)],
+        plan=plan,
+        current_task_id="t1",
+    )
+
+
+def test_reasoning_cluster_tightening_fires_at_0_75() -> None:
+    set_model(_StubEncoder())
+    session = _cluster_session()
+    # Current: 10 unique tokens (all shared-prefix).
+    current = _pad_tokens("shared", 10)
+    # Each of 5 priors shares 8 tokens with current and adds 2 unique
+    # tokens -> cos = 8 / sqrt(10 * 10) = 0.8, inside [0.75, 0.9).
+    priors = [
+        _pad_tokens("shared", 8) + f" unique{block:02d}00 unique{block:02d}01"
+        for block in range(5)
+    ]
+    # Steerer contract: current text lives at position -1; priors are
+    # everything before it.
+    session.reasoning_history = [*priors, current]
+    drift = dreason.detect_reasoning_cluster_tightening(current, session)
+    assert drift is not None
+    assert drift.kind is DriftKind.REASONING_CLUSTER_TIGHTENING
+    assert drift.severity is DriftSeverity.INFO
+    assert "max cosine" in drift.detail
+    assert "0.80" in drift.detail
+    # The one-shot flag is now set on the session.
+    assert session.current_task_id in session.reasoning_cluster_flagged
+
+
+def test_reasoning_cluster_tightening_does_not_fire_below_0_75() -> None:
+    set_model(_StubEncoder())
+    session = _cluster_session()
+    current = _pad_tokens("shared", 10)
+    # Each prior shares 1 token with current -> cos = 1/sqrt(10*10) = 0.1,
+    # well below the 0.75 floor.
+    priors = [
+        "shared000 " + _pad_tokens(f"alien{block:02d}", 9) for block in range(5)
+    ]
+    session.reasoning_history = [*priors, current]
+    drift = dreason.detect_reasoning_cluster_tightening(current, session)
+    assert drift is None
+    assert session.current_task_id not in session.reasoning_cluster_flagged
+
+
+async def test_reasoning_cluster_tightening_is_one_shot_per_task() -> None:
+    set_model(_StubEncoder())
+    steerer = DefaultSteerer()
+    session = _cluster_session()
+    sink = ListSink()
+    planner = NullPlanner()
+    steerer.bind(sinks=[sink], planner=planner)
+
+    # Prime priors once; they stay in history throughout the loop. Each
+    # prior has 10 tokens: 8 shared + 2 prior-specific unique tokens.
+    priors = [
+        _pad_tokens("shared", 8) + f" uniqueprior{i:02d}00 uniqueprior{i:02d}01"
+        for i in range(5)
+    ]
+    session.reasoning_history = list(priors)
+    # Keep the cap generous so priors + 10 observations all fit.
+    session.reasoning_history_max = 100
+
+    for turn in range(10):
+        # Each observation has the same 8 shared tokens plus 2 turn-
+        # specific unique tokens so cos(current, any_prior) = 8/sqrt(10*10)
+        # = 0.8 deterministically -- in the tightening band on every
+        # turn. Hashes differ because the uniques rotate, so the
+        # hash-based LOOPING_REASONING path stays silent.
+        current = (
+            _pad_tokens("shared", 8) + f" uniqueturn{turn:02d}00 uniqueturn{turn:02d}01"
+        )
+        await steerer.observe_reasoning(current, session=session)
+
+    drift_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+    ]
+    # Exactly one INFO REASONING_CLUSTER_TIGHTENING drift across all 10
+    # observations, and no spurious cliff drifts either.
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    tightening = [
+        e
+        for e in drift_events
+        if e.drift_detected.kind == types_pb2.DRIFT_KIND_REASONING_CLUSTER_TIGHTENING
+    ]
+    assert len(tightening) == 1
+    assert tightening[0].drift_detected.severity == types_pb2.DRIFT_SEVERITY_INFO
+    looping = [
+        e
+        for e in drift_events
+        if e.drift_detected.kind == types_pb2.DRIFT_KIND_LOOPING_REASONING
+    ]
+    assert looping == []
+
+
+def test_reasoning_high_similarity_skips_tightening_fires_loop() -> None:
+    set_model(_StubEncoder())
+    session = _cluster_session()
+    current = _pad_tokens("shared", 10)
+    # Priors share all 10 current tokens plus one distinctive filler:
+    # cos = 10 / sqrt(10 * 11) ~= 0.953, well above the 0.9 cliff. The
+    # filler keeps each prior's hash distinct from current so the
+    # hash-based LOOPING_REASONING path stays silent and the semantic
+    # >= 0.9 path owns the detection.
+    priors = [
+        _pad_tokens("shared", 10) + f" filler{block:02d}" for block in range(3)
+    ]
+    session.reasoning_history = [*priors, current]
+    drift = dreason.analyze_reasoning(current, session)
+    assert drift is not None
+    # Cliff owns the signal; tightening must not steal it.
+    assert drift.kind is DriftKind.LOOPING_REASONING
+    assert drift.severity is DriftSeverity.WARNING
+    # And calling the tightening detector directly in this regime is a
+    # no-op -- the cliff band is exclusive.
+    tightening = dreason.detect_reasoning_cluster_tightening(current, session)
+    assert tightening is None
+
+
+def test_reasoning_cluster_skipped_when_embeddings_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Simulate "sentence-transformers not installed" by forcing the
+    # embed helper's lazy-load path to short-circuit to None, matching
+    # the detector's graceful-degrade contract.
+    from goldfive.drift import _embed as embed_mod
+
+    set_model(None)
+    monkeypatch.setattr(embed_mod, "_MODEL_UNAVAILABLE", True, raising=False)
+
+    session = _cluster_session()
+    current = _pad_tokens("shared", 10)
+    priors = [
+        _pad_tokens("shared", 8) + f" unique{block:02d}00 unique{block:02d}01"
+        for block in range(5)
+    ]
+    session.reasoning_history = [*priors, current]
+    drift = dreason.detect_reasoning_cluster_tightening(current, session)
+    assert drift is None
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,7 @@ EXPECTED_DRIFT_KINDS = {
     "CUSTOM": "custom",
     "LOOPING_TOOL_CALL": "looping_tool_call",
     "LOOPING_REASONING": "looping_reasoning",
+    "REASONING_CLUSTER_TIGHTENING": "reasoning_cluster_tightening",
     "CONFUSION": "confusion",
     "OFF_TOPIC": "off_topic",
     "INTENT_DIVERGENCE": "intent_divergence",
