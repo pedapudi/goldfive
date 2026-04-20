@@ -167,14 +167,14 @@ detected via elapsed time, not via progress gaps).
 
 ## Cascade semantics on unrecoverable drift
 
-When a drift carries `recoverable=False`, the executor runs the
-**unrecoverable cascade**:
+When a drift carries `recoverable=False`, the **unrecoverable
+cascade** runs:
 
 ```
 1. Mark the current task FAILED (if not already terminal).
 2. Mark every RUNNING task FAILED.
 3. BFS downstream from each just-FAILED task and mark every
-   reachable PENDING task CANCELLED.
+   reachable non-terminal task CANCELLED.
 4. Clear any adapter-bound task context (ContextVars).
 5. Emit RunAborted(reason=drift.kind, drift=drift).
 ```
@@ -196,6 +196,30 @@ would cancel the current task but leave downstream PENDING tasks
 silently orphaned (they never satisfy `_pick_next_task`'s "all
 predecessors COMPLETED" check). See
 [TASK-LIFECYCLE.md §6.1 — Cancellation cascade](TASK-LIFECYCLE.md#61-cancellation-cascade).
+
+### Shared downstream-CANCEL primitive
+
+Both cascades (the unrecoverable case above and the cancel-cascade
+below) fan out to downstream tasks through **one shared primitive**:
+`Steerer.cascade_cancel_downstream(session, cancelled_id)` on
+`goldfive/protocols.py` (reference impl on
+`DefaultSteerer.cascade_cancel_downstream` in
+`goldfive/steerer.py`). The primitive:
+
+- walks `session.plan.edges` forward from the initiator,
+- transitions every reachable non-terminal task to `CANCELLED`,
+- emits exactly one `TaskCancelled` event per transition with
+  reason `"cascade from <cancelled_id>"`,
+- skips already-terminal tasks (diamond-DAG-safe).
+
+Having a single primitive means the §6.2 and §6.3 downstream event
+streams are identical — sinks (and harmonograf's UI) see the same
+shape regardless of whether the cascade was seeded by a CANCEL or a
+fatal FAILED. The "mark every RUNNING task FAILED" step of the
+unrecoverable cascade is *not* part of this primitive; that stays
+separate because the unrecoverable path explicitly wants `FAILED`
+status (not `CANCELLED`) on running work that the fatal drift
+invalidated.
 
 ## Implementation notes
 

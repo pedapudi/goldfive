@@ -73,6 +73,32 @@ class Steerer(Protocol):
         session: Session,
     ) -> None: ...
 
+    async def cascade_cancel_downstream(
+        self,
+        session: Session,
+        cancelled_id: str,
+    ) -> None:
+        """BFS-cancel every downstream non-terminal task of ``cancelled_id``.
+
+        Shared cancellation-fanout primitive for both PLAN-LIFECYCLE.md
+        §6.2 (unrecoverable cascade) and §6.3 (cancel cascade). A
+        conforming Steerer MUST:
+
+        - Walk the current plan's forward edges from ``cancelled_id``.
+        - Transition every reachable non-terminal task to CANCELLED.
+        - Emit exactly one ``TaskCancelled`` event per transitioned
+          task, with a reason that identifies ``cancelled_id`` as the
+          cascade source.
+        - Skip tasks already in a terminal status (no re-cancellation,
+          no event re-emission).
+        - De-duplicate diamond-DAG reachability (emit at most one event
+          per downstream task per call).
+
+        The initiator (``cancelled_id``) itself is *not* transitioned
+        or emitted here — callers own that transition before invoking
+        this primitive.
+        """
+
     def detect_drift(
         self,
         event: Any,

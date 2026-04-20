@@ -82,6 +82,9 @@ class _SteererStub:
     ) -> None:
         return None
 
+    async def cascade_cancel_downstream(self, session: Any, cancelled_id: str) -> None:
+        return None
+
     def detect_drift(self, event: Any, session: Any) -> Any | None:
         return None
 

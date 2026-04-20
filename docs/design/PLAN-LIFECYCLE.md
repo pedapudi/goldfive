@@ -351,22 +351,26 @@ predicate that raises is logged at WARNING and treated as unmet.
 
 When a drift fires with `recoverable=False` — today only
 `TASK_FAILED_FATAL`, `USER_CANCEL`, and `INTENT_DIVERGENCE` — the
-executor runs the unrecoverable cascade (STATE-MACHINE.md
-§"Cascade semantics"):
+unrecoverable cascade runs (STATE-MACHINE.md §"Cascade semantics"):
 
-1. Mark the current task FAILED (if not already terminal).
-2. Mark every RUNNING task FAILED.
+1. Mark the current task FAILED (if not already terminal). Owned by
+   `Steerer.mark_task_failed(..., recoverable=False)`.
+2. Mark every RUNNING task FAILED. Sequential executors have at most
+   one RUNNING task so this step is vacuous for them; parallel
+   executors own this step explicitly.
 3. BFS downstream from each just-FAILED task; every reachable
-   PENDING → CANCELLED.
+   non-terminal task → CANCELLED. **This step funnels through the
+   same shared primitive as §6.3** —
+   `Steerer.cascade_cancel_downstream(session, task_id)` — so both
+   cascades emit the same `TaskCancelled` event stream and share the
+   terminal-skip / diamond-dedup guards. `mark_task_failed` calls the
+   primitive itself when `recoverable=False`.
 4. Clear adapter-bound task context.
 5. Emit `RunAborted(reason=drift.kind, drift=drift)`.
 
 Outcome: `success=False`, reason carries the triggering drift.
 
 ### 6.3 Cancellation cascade (recoverable path)
-
-Previously undocumented; implemented by the cascade worker
-(fix/cancel-cascade PR).
 
 When a task transitions to CANCELLED by any means —
 `mark_task_cancelled` from the executor, `mark_task_cancelled` from
@@ -375,6 +379,14 @@ steerer walks the plan's edges forward from the cancelled task and
 cancels every reachable PENDING task with
 `reason="cascade from <original_task_id>"`. Already-terminal
 downstream tasks are left alone.
+
+The downstream walk is the shared primitive
+`Steerer.cascade_cancel_downstream(session, task_id)`: the same
+method the unrecoverable path (§6.2) invokes from
+`mark_task_failed(..., recoverable=False)`. Both cascades therefore
+produce the same `TaskCancelled` event stream for the downstream
+set, share the terminal-skip / diamond-dedup guards, and share
+observability.
 
 This makes the CANCEL the primitive that delete-and-replan relies
 on (§4.2): the cancel alone gets the plan to a terminal-only shape;
@@ -430,4 +442,4 @@ Violating any of them is a bug in goldfive.
 
 ## 8. Known gaps (open)
 
-- **Unrecoverable cascade (§6.2) does not currently use the same cascade primitive as §6.3** — they're two different code paths that happen to do similar work. Unify once both are implemented.
+(All previously-listed gaps have been closed: §7.1 terminal-status unification by #98, §7.2 plan validation by #100, §7.3 refine-failure backoff by #99, §7.4 ADK session heal by #101, §7.7 per-task retry cap by #102, cascade cascade by #103, goal predicates by #104, terminal edge preservation by #105, revision-diff sidecar by #106, and cascade codepath unification by #107. Any new gaps discovered during maintenance should be added to this list.)

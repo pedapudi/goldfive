@@ -208,6 +208,19 @@ class DefaultSteerer:
         ``TASK_FAILED_FATAL``. The drift event is dispatched through the
         same drift pipeline as observer-detected drift: if severity is
         ``>= WARNING`` (both of these are) we invoke ``planner.refine``.
+
+        When ``recoverable=False`` the failure is fatal for this task
+        lineage: **cascade-cancel every reachable downstream non-terminal
+        task** via :meth:`cascade_cancel_downstream`, so the plan lands
+        in a consistent terminal-only shape instead of orphaning
+        dependents that would sit PENDING forever. This is the
+        implementation of PLAN-LIFECYCLE.md §6.2 step 3 and it shares
+        its primitive with the §6.3 cancel cascade path
+        (:meth:`mark_task_cancelled`). The downstream cascade fires
+        *before* we dispatch the fatal drift through ``_handle_drift``
+        so that planner.refine sees the post-cascade plan shape and a
+        refine-failure back-off does not leave orphans behind. See
+        ``STATE-MACHINE.md §"Cascade semantics on unrecoverable drift"``.
         """
         task = self._find_task(session, task_id)
         if task is None:
@@ -216,6 +229,11 @@ class DefaultSteerer:
             return
         task.status = TaskStatus.FAILED
         await self._emit_task_failed(session, task_id, reason, recoverable)
+        # Fatal failures cascade downstream via the same primitive used
+        # by mark_task_cancelled, so both §6.2 and §6.3 produce the
+        # same TaskCancelled event stream and share rejection guards.
+        if not recoverable:
+            await self.cascade_cancel_downstream(session, task_id)
         kind = DriftKind.TASK_FAILED_RECOVERABLE if recoverable else DriftKind.TASK_FAILED_FATAL
         severity = DriftSeverity.WARNING if recoverable else DriftSeverity.CRITICAL
         drift = DriftEvent(
@@ -290,14 +308,31 @@ class DefaultSteerer:
             return
         task.status = TaskStatus.CANCELLED
         await self._emit_task_cancelled(session, task_id, reason)
-        await self._cascade_cancel_downstream(session, task_id)
+        await self.cascade_cancel_downstream(session, task_id)
 
-    async def _cascade_cancel_downstream(
+    async def cascade_cancel_downstream(
         self,
         session: Session,
         cancelled_id: str,
     ) -> None:
         """BFS-cancel every downstream non-terminal task of ``cancelled_id``.
+
+        Shared primitive for both cascade codepaths
+        (PLAN-LIFECYCLE.md §6.2 unrecoverable cascade and §6.3
+        cancellation cascade):
+
+        - The recoverable path
+          (:meth:`mark_task_cancelled`) calls it after transitioning
+          the initiator to ``CANCELLED``.
+        - The unrecoverable path
+          (:meth:`mark_task_failed` with ``recoverable=False``) calls
+          it after transitioning the initiator to ``FAILED``.
+
+        Both paths therefore produce the same ``TaskCancelled`` event
+        stream for the downstream set and share the rejection guards
+        (terminal tasks are skipped; diamond DAGs are de-duplicated).
+        The initiator's own transition-emission is caller-controlled —
+        this method only emits for the *downstream* set.
 
         Walks ``session.plan.edges`` forward from ``cancelled_id`` and
         transitions every reachable non-terminal task to ``CANCELLED``
