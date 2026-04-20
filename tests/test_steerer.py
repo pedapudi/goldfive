@@ -430,9 +430,9 @@ async def test_observe_swallows_planner_exceptions() -> None:
 
     # Must not raise even though refine() blows up.
     await steerer.observe({"error": "x"}, session)
-    # We emit the original drift and a follow-up CRITICAL drift that
-    # surfaces the refine failure so sinks can render it — we never
-    # emit plan_revised because the refine errored.
+    # First failure: emit original drift + refine-failure visibility
+    # drift. Counter bumps to 1 (below the threshold), so we stay in
+    # visibility-only mode — no REPEATED_FAILURE, no mark_task_failed.
     kinds = [e.WhichOneof("payload") for e in sink.events]
     assert kinds == ["drift_detected", "drift_detected"]
     from goldfive.pb.goldfive.v1 import types_pb2
@@ -471,6 +471,148 @@ async def test_observe_surfaces_refine_none_return() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Refine-failure retry backoff (TASK-LIFECYCLE.md §7.3)
+# ---------------------------------------------------------------------------
+
+
+def _tool_error_drift(task_id: str = "t1") -> DriftEvent:
+    """Build a canned WARNING-severity drift routed through _handle_drift."""
+    return DriftEvent(
+        kind=DriftKind.TOOL_ERROR,
+        severity=DriftSeverity.WARNING,
+        detail="simulated tool error",
+        current_task_id=task_id,
+    )
+
+
+async def test_refine_failure_counter_increments_on_exception() -> None:
+    planner = StubPlanner(raise_exc=RuntimeError("planner down"))
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    key = (DriftKind.TOOL_ERROR.value, "t1")
+    assert session.refine_failure_counts.get(key, 0) == 0
+
+    # Same drift is classified by detect_drift — use a dict the tool-error
+    # classifier picks up and that carries a task via current_task_id.
+    # Simpler: drive _handle_drift directly so the drift identity is stable.
+    await steerer._handle_drift(_tool_error_drift(), session)
+    assert session.refine_failure_counts[key] == 1
+    assert len(planner.refine_calls) == 1
+
+    await steerer._handle_drift(_tool_error_drift(), session)
+    # Second failure hits the threshold: _register_refine_failure calls
+    # mark_task_failed, which fires a TASK_FAILED_FATAL drift that routes
+    # through _handle_drift and triggers one more refine attempt (keyed
+    # on a different (kind, task) tuple, so the TOOL_ERROR counter stays
+    # at 2 and the TASK_FAILED_FATAL counter reaches 1).
+    assert session.refine_failure_counts[key] == 2
+    fatal_key = (DriftKind.TASK_FAILED_FATAL.value, "t1")
+    assert session.refine_failure_counts.get(fatal_key, 0) == 1
+
+
+async def test_refine_failure_counter_increments_on_none_return() -> None:
+    # revised=None is the default — refine returns None without raising.
+    planner = StubPlanner(revised=None)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    key = (DriftKind.TOOL_ERROR.value, "t1")
+    assert session.refine_failure_counts.get(key, 0) == 0
+
+    await steerer._handle_drift(_tool_error_drift(), session)
+    assert session.refine_failure_counts[key] == 1
+    assert len(planner.refine_calls) == 1
+
+    await steerer._handle_drift(_tool_error_drift(), session)
+    # Same cascade as the exception case: the TOOL_ERROR counter is
+    # clamped at the threshold (2), the cascaded TASK_FAILED_FATAL drift
+    # kicks off its own independent counter at 1.
+    assert session.refine_failure_counts[key] == 2
+    fatal_key = (DriftKind.TASK_FAILED_FATAL.value, "t1")
+    assert session.refine_failure_counts.get(fatal_key, 0) == 1
+
+
+async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
+    planner = StubPlanner(raise_exc=RuntimeError("planner down"))
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    # First failure: visibility-only, task stays PENDING.
+    await steerer._handle_drift(_tool_error_drift(), session)
+    assert _task(session, "t1").status is TaskStatus.PENDING
+
+    # Second failure: backoff trips — task marked FAILED, REPEATED_FAILURE
+    # drift emitted.
+    await steerer._handle_drift(_tool_error_drift(), session)
+    assert _task(session, "t1").status is TaskStatus.FAILED
+
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    # Expected stream across both ticks:
+    #   tick 1: drift_detected (TOOL_ERROR)
+    #   tick 2: drift_detected (TOOL_ERROR),
+    #           task_failed,
+    #           drift_detected (TASK_FAILED_FATAL — from mark_task_failed),
+    #           drift_detected (REPEATED_FAILURE).
+    assert "task_failed" in kinds
+    drift_kinds = [
+        e.drift_detected.kind for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert types_pb2.DRIFT_KIND_REPEATED_FAILURE in drift_kinds
+    # The REPEATED_FAILURE drift should be CRITICAL severity.
+    repeated_events = [
+        e
+        for e in sink.events
+        if e.WhichOneof("payload") == "drift_detected"
+        and e.drift_detected.kind == types_pb2.DRIFT_KIND_REPEATED_FAILURE
+    ]
+    assert len(repeated_events) == 1
+    assert repeated_events[0].drift_detected.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    # After the threshold trip, a *third* trigger of the same drift must
+    # short-circuit without calling refine again — the counter wall
+    # prevents the loop that §7.3 targets.
+    calls_before = len(planner.refine_calls)
+    await steerer._handle_drift(_tool_error_drift(), session)
+    assert len(planner.refine_calls) == calls_before
+
+
+async def test_successful_refine_resets_failure_counter() -> None:
+    # Planner that we can flip between "raise" and "succeed" modes.
+    revised = _make_plan(("t1", "t2", "t3"))
+    planner = StubPlanner(raise_exc=RuntimeError("planner down"))
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    key = (DriftKind.TOOL_ERROR.value, "t1")
+
+    await steerer._handle_drift(_tool_error_drift(), session)
+    assert session.refine_failure_counts[key] == 1
+
+    # Flip planner to success mode BEFORE the counter hits the threshold
+    # so the next call takes the happy path and must clear the counter.
+    planner.raise_exc = None
+    planner.revised = revised
+
+    await steerer._handle_drift(_tool_error_drift(), session)
+    # Successful refine clears the key entirely (pop) — the counter is
+    # reset, not decremented, so a fresh run of failures starts at 0.
+    assert key not in session.refine_failure_counts
+    # And the plan actually got revised on the success.
+    assert session.plan is not None
+    assert [t.id for t in session.plan.tasks] == ["t1", "t2", "t3"]
+
+
+# ---------------------------------------------------------------------------
 # Drift kind coverage — every DriftKind either has a classifier, a
 # transition that fires it, or is a reserved value that the steerer
 # itself doesn't emit (e.g., USER_STEER, AGENT_TRANSFER, CUSTOM).
@@ -486,6 +628,9 @@ def test_every_drift_kind_has_a_known_origin() -> None:
         DriftKind.BLOCKED,
         DriftKind.NEW_WORK_DISCOVERED,
         DriftKind.PLAN_DIVERGENCE,
+        # Emitted by the refine-failure backoff in _handle_drift once the
+        # per-(kind, task) counter hits REFINE_FAILURE_THRESHOLD.
+        DriftKind.REPEATED_FAILURE,
     }
     # Kinds the detect_drift classifiers produce.
     classifier_emits = {

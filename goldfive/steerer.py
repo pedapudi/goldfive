@@ -469,11 +469,29 @@ class DefaultSteerer:
     # --- Drift dispatch ----------------------------------------------
 
     async def _handle_drift(self, drift: DriftEvent, session: Session) -> None:
-        """Emit a ``DriftDetected`` event and (if severe enough) refine."""
+        """Emit a ``DriftDetected`` event and (if severe enough) refine.
+
+        Refine failures (either a raised exception or a ``None`` return)
+        are tracked per ``(drift.kind.value, drift.current_task_id)`` on
+        ``session.refine_failure_counts``. After
+        :attr:`REFINE_FAILURE_THRESHOLD` consecutive failures for the
+        same key we skip refine entirely, mark the offending task
+        ``FAILED`` (non-recoverable), and emit a CRITICAL
+        ``REPEATED_FAILURE`` drift so sinks see the back-off. This
+        bounds the loop that would otherwise re-fire the same drift
+        every tick until ``SequentialExecutor.max_plan_reinvocations``
+        tripped (see TASK-LIFECYCLE.md §7.3).
+        """
         await self._emit_drift_detected(session, drift)
         if not _severity_ge(drift.severity, DriftSeverity.WARNING):
             return
         if self._planner is None or session.plan is None:
+            return
+        counter_key = (drift.kind.value, drift.current_task_id)
+        # If this (kind, task) already tripped the threshold on a prior
+        # tick, stop trying to refine. The task is FAILED by now so any
+        # further drift for it will short-circuit at ``mark_task_failed``.
+        if session.refine_failure_counts.get(counter_key, 0) >= self.REFINE_FAILURE_THRESHOLD:
             return
         try:
             revised = await self._planner.refine(
@@ -494,6 +512,7 @@ class DefaultSteerer:
                 exc,
             )
             await self._emit_refine_failure(session, drift, reason=str(exc))
+            await self._register_refine_failure(session, drift, counter_key)
             return
         if revised is None:
             log.warning(
@@ -504,13 +523,17 @@ class DefaultSteerer:
             await self._emit_refine_failure(
                 session, drift, reason="planner returned no revised plan"
             )
+            await self._register_refine_failure(session, drift, counter_key)
             return
         try:
             revised.validate(for_revision=True)
         except ValueError as exc:
             # Reject the revision and surface the failure as a CRITICAL
             # DriftDetected so operators can see the bad plan upstream.
-            # The session keeps its old plan.
+            # The session keeps its old plan. A bad revision also counts
+            # as a refine failure for backoff purposes — the planner
+            # produced an unusable plan, which is functionally the same
+            # as returning None.
             await self._emit_drift_detected(
                 session,
                 DriftEvent(
@@ -520,9 +543,62 @@ class DefaultSteerer:
                     current_task_id=session.current_task_id,
                 ),
             )
+            await self._register_refine_failure(session, drift, counter_key)
             return
+        # Successful refine — reset the back-off counter for this key
+        # so a future drift of the same kind starts fresh.
+        session.refine_failure_counts.pop(counter_key, None)
         self._apply_revision(session, revised, drift)
         await self._emit_plan_revised(session, revised, drift)
+
+    # Consecutive refine failures tolerated per (drift_kind, task_id)
+    # before we give up and mark the task FAILED. Class attribute so
+    # subclasses / tests can tune it without poking at instance state.
+    REFINE_FAILURE_THRESHOLD: int = 2
+
+    async def _register_refine_failure(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        counter_key: tuple[str, str],
+    ) -> None:
+        """Bump the per-(kind, task) refine-failure counter and, if we
+        just crossed :attr:`REFINE_FAILURE_THRESHOLD`, mark the task
+        ``FAILED`` and emit a ``REPEATED_FAILURE`` drift.
+
+        Below the threshold this is a no-op beyond the increment:
+        callers return normally so the next trigger of the same drift
+        gets another chance to refine. See TASK-LIFECYCLE.md §7.3.
+        """
+        count = session.refine_failure_counts.get(counter_key, 0) + 1
+        session.refine_failure_counts[counter_key] = count
+        if count < self.REFINE_FAILURE_THRESHOLD:
+            return
+        task_id = drift.current_task_id
+        reason = f"refine repeatedly failed for {drift.kind.value}"
+        # mark_task_failed routes through _handle_drift for the TASK_FAILED
+        # drift; that path keys on a different drift kind so it cannot
+        # feed back into *this* counter and recurse.
+        if task_id:
+            await self.mark_task_failed(
+                task_id,
+                reason=reason,
+                recoverable=False,
+                session=session,
+            )
+        repeated = DriftEvent(
+            kind=DriftKind.REPEATED_FAILURE,
+            severity=DriftSeverity.CRITICAL,
+            detail=(
+                f"refine failed {count} consecutive times for "
+                f"{drift.kind.value} (task {task_id or 'n/a'})"
+            ),
+            current_task_id=task_id,
+            current_agent_id=drift.current_agent_id,
+        )
+        # Emit directly — do NOT go back through _handle_drift, which
+        # would try to refine again on the fresh drift.
+        await self._emit_drift_detected(session, repeated)
 
     async def _emit_refine_failure(
         self, session: Session, source: DriftEvent, *, reason: str
