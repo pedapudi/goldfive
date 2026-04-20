@@ -1191,3 +1191,311 @@ async def test_adversarial_agent_with_varying_task_ids_is_stopped_at_session_cap
         assert r["error"] == "loop_detected"
         assert r["scope"] == "session"
         assert r["tool"] == "report_task_failed"
+
+
+# ---------------------------------------------------------------------------
+# Live-run regression: the SessionContext handoff must survive ADK's
+# ``InMemorySessionService`` state-copying semantics.
+# ---------------------------------------------------------------------------
+
+
+async def test_reporting_tool_guards_fire_under_real_adk_runner() -> None:
+    """Drive a REAL ``google.adk.runners.InMemoryRunner`` end-to-end and
+    verify the reporting-tool handler (and therefore every guard layer)
+    is actually invoked.
+
+    This is the regression test for the filler-loop outage: every
+    reporting-tool call in a live ADK run was silently falling through
+    to the :func:`_build_ack_shim` because the adapter's session-context
+    handoff relied on mutating the dict returned by
+    ``InMemorySessionService.get_session`` — which returns a shallow
+    *copy* of the stored session state on every call. The copy the
+    adapter wrote to was discarded; the runner's own
+    ``get_session`` produced a second, empty copy for the invocation;
+    ``before_tool_callback`` saw no goldfive SessionContext and returned
+    ``None``; ADK then called the shim which returned
+    ``{"acknowledged": true}`` — bypassing terminal rejection,
+    idempotency, per-task and session-wide loop guards entirely.
+
+    The fix hands the context to the goldfive plugin instance directly,
+    sidestepping ADK state. This test exercises that path by running
+    the *actual* ADK runner with a scripted LLM so the copy-state
+    behaviour is real, not simulated. A regression here would once again
+    produce 500+ plain ACKs per run with every protection layer silent.
+    """
+    from google.adk.agents import Agent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types as genai_types
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    # A scripted LLM that: turn 1 — emits a report_task_completed
+    # function call with concrete args; turn 2 — responds "done" and
+    # ends. If the guards were bypassed, step 1 would still return an
+    # ACK but the handler below would never be called.
+    class _ScriptedLLM(BaseLlm):
+        model: str = "fake-model"
+        _step: int = 0
+
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
+            self._step += 1
+            if self._step == 1:
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[
+                            genai_types.Part(
+                                function_call=genai_types.FunctionCall(
+                                    id="call_1",
+                                    name="report_task_completed",
+                                    args={
+                                        "task_id": "raccoon_research",
+                                        "summary": "done",
+                                    },
+                                )
+                            ),
+                        ],
+                    ),
+                )
+            else:
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[genai_types.Part(text="ok")],
+                    ),
+                    turn_complete=True,
+                )
+
+    agent = Agent(name="presenter", model=_ScriptedLLM(), instruction="")
+    adapter = ADKAdapter(agent)
+
+    handler_calls: list[dict[str, Any]] = []
+
+    async def _handler(args: dict[str, Any], session: Any, steerer: Any) -> dict:
+        handler_calls.append(dict(args))
+        # Mirror what the real handler does: mark the task COMPLETED so
+        # the adapter's post-event check tears the run-loop down cleanly.
+        from goldfive.types import TaskStatus
+
+        for t in session.plan.tasks:
+            if t.id == args.get("task_id"):
+                t.status = TaskStatus.COMPLETED
+        return {"acknowledged": True, "routed_via_invoke_tool": True}
+
+    spec = ReportingToolSpec(
+        name="report_task_completed",
+        description="Mark a task completed.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+        },
+        handler=_handler,
+    )
+    await adapter.register_reporting_tools([spec])
+
+    class _StubSteerer:
+        async def observe(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def transition(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def detect_drift(self, *a: Any, **kw: Any) -> None:
+            return None
+
+        def bind(self, **kw: Any) -> None:
+            pass
+
+    adapter.bind_steerer(_StubSteerer())
+
+    task = Task(id="raccoon_research", title="research raccoons")
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[task],
+        edges=[],
+    )
+    session = Session(run_id="r1", plan=plan)
+
+    result = await adapter.invoke(task=task, session=session)
+
+    # If the fix regresses, handler_calls stays empty (the shim swallows
+    # the call) and the task status never flips to COMPLETED.
+    assert handler_calls == [{"task_id": "raccoon_research", "summary": "done"}], (
+        "handler never ran: reporting-tool dispatch fell through to the "
+        "ACK shim, so every guard layer (terminal rejection, idempotency, "
+        "per-task loop cap, session volume cap) was silently bypassed. "
+        "This is the regression from the live run that produced 500+ "
+        "plain ACKs on a single task."
+    )
+    assert result.stop_reason in {"final_response", "task_terminal"}
+
+
+async def test_reporting_tool_guards_fire_across_back_to_back_invocations() -> None:
+    """Two sequential ``adapter.invoke`` calls must BOTH route through
+    the handler — the plugin-instance handoff must be correctly reset
+    between invocations so the second invocation gets its own ctx.
+
+    Specifically covers the filler-loop pattern from the live outage:
+    after a mid-run STEER cancels the first invocation and the
+    sequential executor starts a fresh invocation on the refined plan,
+    the NEW invocation's reporting-tool calls must still reach the
+    real handler (not the ACK shim). A regression where
+    ``clear_active_context`` is called too aggressively — or where the
+    second ``invoke`` fails to re-set the active ctx — would look
+    identical in the sink stream: first task healthy, second task
+    emits N plain ACKs with no handler invocation.
+    """
+    from google.adk.agents import Agent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types as genai_types
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    class _ScriptedLLM(BaseLlm):
+        model: str = "fake-model"
+
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
+            # Inspect the LAST event in the conversation to decide:
+            # * If the last event is a user turn with a "Task: X" nudge
+            #   we haven't acted on yet (no matching function_response
+            #   after it), emit a function_call for that task id.
+            # * Otherwise (the last event is a function_response, meaning
+            #   the handler just acked), close out with ``turn_complete``.
+            contents = getattr(llm_request, "contents", None) or []
+            last_user_task_id = ""
+            last_was_function_response_for_task: str | None = None
+            for c in contents:
+                role = getattr(c, "role", "")
+                parts = getattr(c, "parts", None) or []
+                for p in parts:
+                    text = getattr(p, "text", None)
+                    fr = getattr(p, "function_response", None)
+                    if text and role == "user":
+                        # Extract "Task: <id>" from the adapter's nudge.
+                        for line in text.splitlines():
+                            stripped = line.strip()
+                            if stripped.startswith("Task: "):
+                                last_user_task_id = (
+                                    stripped.split("Task: ", 1)[1].split("\n", 1)[0].strip()
+                                )
+                        last_was_function_response_for_task = None
+                    if fr is not None:
+                        last_was_function_response_for_task = getattr(fr, "name", "") or ""
+            if last_was_function_response_for_task is None and last_user_task_id:
+                # Map the nudge title back to the task id we expect. The
+                # adapter's nudge text is "Task: <title>" — our test
+                # creates tasks whose title spells out the topic.
+                task_id = {
+                    "waffles": "waffle_research",
+                    "raccoons": "raccoon_research",
+                }.get(last_user_task_id, last_user_task_id)
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[
+                            genai_types.Part(
+                                function_call=genai_types.FunctionCall(
+                                    id="call_" + task_id,
+                                    name="report_task_completed",
+                                    args={
+                                        "task_id": task_id,
+                                        "summary": "done",
+                                    },
+                                )
+                            ),
+                        ],
+                    ),
+                )
+            else:
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[genai_types.Part(text="ok")],
+                    ),
+                    turn_complete=True,
+                )
+
+    agent = Agent(name="presenter", model=_ScriptedLLM(), instruction="")
+    adapter = ADKAdapter(agent)
+
+    handler_calls: list[dict[str, Any]] = []
+
+    async def _handler(args: dict[str, Any], session: Any, steerer: Any) -> dict:
+        handler_calls.append(dict(args))
+        from goldfive.types import TaskStatus
+
+        for t in session.plan.tasks:
+            if t.id == args.get("task_id"):
+                t.status = TaskStatus.COMPLETED
+        return {"acknowledged": True}
+
+    spec = ReportingToolSpec(
+        name="report_task_completed",
+        description="Mark a task completed.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+        },
+        handler=_handler,
+    )
+    await adapter.register_reporting_tools([spec])
+
+    class _StubSteerer:
+        async def observe(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def transition(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def detect_drift(self, *a: Any, **kw: Any) -> None:
+            return None
+
+        def bind(self, **kw: Any) -> None:
+            pass
+
+    adapter.bind_steerer(_StubSteerer())
+
+    # First invocation: the "pre-STEER" task.
+    t_waffle = Task(id="waffle_research", title="waffles")
+    plan_rev0 = Plan(id="p0", run_id="r1", goal_ids=[], tasks=[t_waffle], edges=[])
+    session = Session(run_id="r1", plan=plan_rev0)
+    await adapter.invoke(task=t_waffle, session=session)
+    assert len(handler_calls) == 1
+    assert handler_calls[0]["task_id"] == "waffle_research"
+
+    # Simulate the STEER-driven plan revision: swap the plan on the
+    # session to rev 1 with a new task, which is exactly what
+    # ``steerer._apply_revision`` does mid-run.
+    t_raccoon = Task(id="raccoon_research", title="raccoons")
+    plan_rev1 = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[t_raccoon],
+        edges=[],
+        revision_index=1,
+    )
+    session.plan = plan_rev1
+
+    # Second invocation: the "post-STEER" task. This is the one the
+    # live run filler-looped on because the plugin-instance handoff
+    # was previously via ADK state, which the session-service copy
+    # discarded.
+    await adapter.invoke(task=t_raccoon, session=session)
+
+    assert len(handler_calls) == 2, (
+        "second invocation's reporting-tool call never reached the "
+        "handler — the plugin-instance handoff is not being re-set "
+        "across back-to-back invocations (the filler-loop regression)."
+    )
+    assert handler_calls[1]["task_id"] == "raccoon_research"

@@ -561,11 +561,64 @@ def make_adk_plugin(
         def __init__(self) -> None:
             super().__init__(name=name)
             self._host_agent_name = host_agent_name
+            # Active :class:`SessionContext` for the invocation that is
+            # currently driving this plugin's runner. Set by
+            # :meth:`ADKAdapter.invoke` before ``run_async`` and cleared
+            # in its ``finally`` block. Callbacks prefer this field over
+            # the ADK-state lookup because ADK's
+            # :class:`~google.adk.sessions.in_memory_session_service.InMemorySessionService`
+            # returns a **shallow copy** of the stored session on every
+            # ``get_session`` call (see ``_light_copy`` /
+            # ``copy.copy(session.state)``) — so a SessionContext written
+            # into the adapter's own ``get_session`` copy never reaches
+            # the fresh copy that ``runner.run_async`` materialises for
+            # the invocation, and the callbacks would see an empty state
+            # and silently fall through to the ACK shim.
+            #
+            # A module-level fallback path (``_session_context_from_callback``)
+            # is kept so unit tests that stash a ``SessionContext`` in a
+            # plain dict they control still work — the state-based lookup
+            # there is authoritative for those synthetic harnesses.
+            self._active_ctx: SessionContext | None = None
+
+        def set_active_context(self, ctx: SessionContext) -> None:
+            """Attach the ``SessionContext`` for the running invocation.
+
+            Called once per :meth:`ADKAdapter.invoke` before
+            ``runner.run_async``. The plugin's five callback methods
+            prefer this context over any value stashed in ADK session
+            state (which is an unreliable channel because InMemorySessionService
+            copies state on every get). Overwriting a non-``None`` value
+            is accepted — sequential invocations reuse the adapter.
+            """
+            self._active_ctx = ctx
+
+        def clear_active_context(self) -> None:
+            """Release the active ``SessionContext`` reference.
+
+            Called from ``ADKAdapter.invoke``'s ``finally`` block. Safe
+            to call when no context is active.
+            """
+            self._active_ctx = None
+
+        def _resolve_ctx(self, adk_ctx: Any) -> SessionContext | None:
+            """Return the live ``SessionContext`` or ``None`` if unbound.
+
+            Prefers the plugin-local ``_active_ctx`` (authoritative for
+            real ADK runs) but falls through to the state-dict lookup
+            for unit tests that drive the plugin with a hand-built
+            ``tool_context`` holding a populated state mapping. The two
+            paths are never inconsistent in production — only one is
+            populated at a time.
+            """
+            if self._active_ctx is not None:
+                return self._active_ctx
+            return _session_context_from_callback(adk_ctx)
 
         # --- Plan + current-task context -------------------------------
 
         async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> None:
-            ctx = _session_context_from_callback(callback_context)
+            ctx = self._resolve_ctx(callback_context)
             if ctx is None:
                 return None
             state = _session_state_from_callback(callback_context)
@@ -599,7 +652,7 @@ def make_adk_plugin(
         async def before_tool_callback(
             self, *, tool: Any, tool_args: Any, tool_context: Any
         ) -> dict[str, Any] | None:
-            ctx = _session_context_from_callback(tool_context)
+            ctx = self._resolve_ctx(tool_context)
             if ctx is None:
                 return None
             tool_name = str(_safe_attr(tool, "name", "") or "")
@@ -674,7 +727,7 @@ def make_adk_plugin(
         # --- Drift observation -----------------------------------------
 
         async def after_model_callback(self, *, callback_context: Any, llm_response: Any) -> None:
-            ctx = _session_context_from_callback(callback_context)
+            ctx = self._resolve_ctx(callback_context)
             if ctx is None or ctx.steerer is None:
                 return None
             texts = _extract_text_parts(llm_response)
@@ -725,7 +778,7 @@ def make_adk_plugin(
             return None
 
         async def on_event_callback(self, *, invocation_context: Any, event: Any) -> None:
-            ctx = _session_context_from_callback(invocation_context)
+            ctx = self._resolve_ctx(invocation_context)
             if ctx is None or ctx.steerer is None:
                 return None
             # Detect transfer / escalation actions on the event payload.
@@ -757,7 +810,7 @@ def make_adk_plugin(
             tool_context: Any,
             error: Any,
         ) -> None:
-            ctx = _session_context_from_callback(tool_context)
+            ctx = self._resolve_ctx(tool_context)
             if ctx is None or ctx.steerer is None:
                 return None
             tool_name = str(_safe_attr(tool, "name", "") or "")

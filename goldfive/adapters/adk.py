@@ -602,9 +602,38 @@ class ADKAdapter:
             host_agent_name=str(getattr(self._agent, "name", "") or ""),
         )
 
-        # Stash the per-invocation context on ADK state so plugin
-        # callbacks can pick it up. Written directly rather than via
-        # the state protocol because this is an adapter-internal handoff.
+        # Hand the per-invocation context to the goldfive plugin. This
+        # is the AUTHORITATIVE handoff for real ADK runs — the plugin's
+        # callbacks read the active context off its own instance, not
+        # from ADK session state.
+        #
+        # Historical note: earlier versions stashed the context in ADK
+        # session state under :data:`SESSION_CONTEXT_STATE_KEY` and let
+        # ``before_tool_callback`` fish it back out of
+        # ``tool_context.session.state``. That silently broke every real
+        # run: ``InMemorySessionService.get_session`` returns a shallow
+        # copy of the stored session (see ``_light_copy`` in
+        # ``in_memory_session_service.py``), so this adapter's
+        # ``_get_session_state`` returned a fresh copy whose
+        # ``[SESSION_CONTEXT_STATE_KEY] = ctx`` assignment never reached
+        # the *second* copy the ADK runner materialised for the
+        # invocation via its own ``get_session`` call. Callbacks then
+        # saw an empty state, returned ``None`` from
+        # ``before_tool_callback``, and every reporting-tool call fell
+        # through to the ``_build_ack_shim`` — producing 500+ plain
+        # ``{"acknowledged": true}`` ACKs per run with every protection
+        # layer bypassed. The plugin-instance handoff below sidesteps
+        # the copy entirely: the plugin is a direct reference and the
+        # adapter owns its lifecycle, so the active context is always
+        # exactly the one the invocation is driving.
+        if self._plugin is not None:
+            self._plugin.set_active_context(ctx)
+
+        # Also mirror into ADK state as a best-effort fallback for
+        # legacy unit tests that construct a plain ``tool_context``
+        # holding a populated state dict and drive the plugin directly
+        # (see ``tests/test_adk_adapter.py``). The live-run path does
+        # not depend on this write succeeding.
         try:
             state[SESSION_CONTEXT_STATE_KEY] = ctx  # type: ignore[index]
         except Exception:
@@ -717,6 +746,12 @@ class ADKAdapter:
                         invocation_id=last_invocation_id,
                         reason="unexpected_orphan_on_normal_exit",
                     )
+            # Release the plugin-instance handoff so a subsequent
+            # ``invoke`` on a different task gets a clean setup and a
+            # stray callback arriving after the generator closes does
+            # not see a stale ctx. Mirrors the state-dict cleanup below.
+            if self._plugin is not None:
+                self._plugin.clear_active_context()
             if isinstance(state, Mapping):
                 try:
                     state.pop(SESSION_CONTEXT_STATE_KEY, None)  # type: ignore[attr-defined]
