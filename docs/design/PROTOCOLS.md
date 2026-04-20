@@ -135,10 +135,23 @@ class Planner(Protocol):
 
 1. Generated plans are acyclic. `Plan.topological_stages()` raises on
    a cycle; planners are responsible for producing valid DAGs.
+   `Plan.validate()` is called on every installed plan (creation and
+   revision) and will reject cyclic / dangling / duplicate-id plans
+   before they land on the session.
 2. `plan.goal_ids` lists every goal the plan intends to satisfy.
-3. `refine()` preserves `Task.id` for completed tasks; it may add,
-   remove, or edit `PENDING` tasks freely.
+3. `refine()` preserves `Task.id` AND terminal status for every
+   terminal task in the outgoing plan (PLAN-LIFECYCLE §3.1). It may
+   add, remove, or edit `PENDING` tasks freely, and it may re-draw
+   edges that touch at least one mutable endpoint, but every
+   terminal→terminal edge in the outgoing plan must reappear verbatim
+   in the revision (PLAN-LIFECYCLE §3.2).
 4. `refine()` monotonically increments `plan.revision_index`.
+5. When `refine()` returns `None` twice consecutively for the same
+   `(drift.kind, current_task_id)` pair, the steerer marks the task
+   FAILED and emits a CRITICAL `REPEATED_FAILURE` drift — the run
+   does not loop forever on a refine that cannot make progress. The
+   threshold is the class attribute
+   `DefaultSteerer.REFINE_FAILURE_THRESHOLD` (default `2`).
 
 ### Minimal implementation
 
@@ -192,6 +205,15 @@ response, see `goldfive/planner.py` or
 class Steerer(Protocol):
     async def observe(self, event: Any, session: Session) -> None: ...
 
+    async def observe_reasoning(
+        self,
+        text: str,
+        *,
+        task: Task | None = None,
+        session: Session,
+        provider: str = "",
+    ) -> None: ...
+
     async def transition(
         self,
         task_id: str,
@@ -199,6 +221,12 @@ class Steerer(Protocol):
         *,
         detail: str = "",
         session: Session,
+    ) -> None: ...
+
+    async def cascade_cancel_downstream(
+        self,
+        session: Session,
+        cancelled_id: str,
     ) -> None: ...
 
     def detect_drift(self, event: Any, session: Session) -> Optional[DriftEvent]: ...
@@ -217,10 +245,26 @@ class Steerer(Protocol):
   events (LLM text, tool calls, stream chunks) here. The steerer may
   classify drift, update per-task progress, or no-op. Must not mutate
   `event`.
+- `observe_reasoning(text, *, task=, session, provider="")` — called
+  once per LLM response that carries chain-of-thought (OpenAI
+  `reasoning_content`, Anthropic `thinking`, Google thought parts).
+  Feeds `Session.reasoning_history` and the reasoning-drift pipeline
+  (`LOOPING_REASONING`, `CONFUSION`, `OFF_TOPIC`, `INTENT_DIVERGENCE`).
+  Adapters that cannot surface reasoning simply never call this.
 - `transition(task_id, to, session)` — the single source-of-truth
   state-mutating method. Enforces monotonicity (see
   [STATE-MACHINE.md](STATE-MACHINE.md)) and emits one event per
   successful transition.
+- `cascade_cancel_downstream(session, cancelled_id)` — shared
+  cancellation-fanout primitive. BFS-walks `session.plan.edges`
+  forward from `cancelled_id`, transitions every reachable
+  non-terminal task to CANCELLED, and emits exactly one
+  `TaskCancelled` per transitioned task. De-duplicates diamond-DAG
+  reachability and skips already-terminal downstream tasks. Used by
+  both the unrecoverable-failure cascade
+  (`mark_task_failed(recoverable=False)`) and the
+  cancellation-cascade path. The initiator itself is *not*
+  transitioned by this method; callers own that.
 - `detect_drift(event, session)` — pure classifier. Returns a
   `DriftEvent` or `None`. No state mutation, no event emission.
 - `bind(sinks, planner)` — called once by the executor before the
@@ -310,6 +354,16 @@ class AgentAdapter(Protocol):
         session: Session,
     ) -> InvocationResult: ...
 
+    async def emit_reasoning(
+        self,
+        text: str,
+        *,
+        task: Task | None = None,
+        session: Session,
+        provider: str = "",
+        call_id: str = "",
+    ) -> None: ...
+
     @property
     def available_agents(self) -> list[str]: ...
 ```
@@ -319,8 +373,18 @@ class AgentAdapter(Protocol):
 - `register_reporting_tools(tools)` — called once before the first
   invoke. Adapter translates `ReportingToolSpec` into whatever form
   its framework uses (ADK `FunctionTool`, Claude SDK inline tool,
-  etc.) and wires a hook that intercepts calls and routes them
-  through the steerer.
+  etc.), stores the full spec list, and wires a hook that routes
+  calls through
+  `goldfive.adapters._tool_invocation.invoke_tool(specs, name, args, session, steerer)`.
+  The `invoke_tool` helper runs four guard layers — schema
+  rejection (missing / unknown `task_id`), terminal-task rejection,
+  per-task loop detection, session-wide volume cap — and then
+  dispatches to the spec's `handler`. All in-tree adapters
+  (`CallableAdapter`, `ADKAdapter`, `ClaudeAgentSDKAdapter`) funnel
+  dispatch through this helper; any new adapter MUST do the same,
+  or the filler-loop / duplicate-ack / terminal-task protections
+  won't fire for calls it forwards. See
+  [TASK-LIFECYCLE.md §5](TASK-LIFECYCLE.md).
 - `invoke(task, session)` — runs the wrapped agent for one task.
   Must render current-task context (task id, description, completed
   results) into the agent's input channel. Returns an

@@ -498,45 +498,36 @@ lockstep. No automated check enforces it.
 `goldfive.types._constants`) and import from it. Low effort, high
 impact.
 
-### 7.2 Weak plan validation at creation and revision
+### 7.2 Plan validation at creation and revision (closed)
 
-`Plan.__post_init__` / `_apply_revision` do not check for:
+Closed by #100 and #105. `Plan.validate(for_revision=..., prior=...)`
+runs at plan creation (`LLMPlanner.generate`) and on every plan
+revision (`DefaultSteerer._apply_revision` and `LLMPlanner.refine`).
+Checks duplicate task ids, edge referential integrity, acyclicity,
+PENDING-only tasks on creation, and — when a `prior` plan is
+supplied — terminal-task and terminal→terminal-edge preservation
+(PLAN-LIFECYCLE §3.1–§3.2). Malformed plans are rejected with
+`ValueError` before they are installed on the session.
 
-- duplicate task IDs,
-- edges referencing missing tasks,
-- cycles (topological_stages silently appends leftover tasks),
-- `TaskStatus` values that are not `PENDING` at creation time.
+### 7.3 Refine failure retry backoff (closed)
 
-**Fix direction:** add `Plan.validate()` called from
-`LLMPlanner.generate` before return and from
-`DefaultSteerer._apply_revision` before install. Emit a
-`PLAN_DIVERGENCE` drift (severity CRITICAL) if validation fails.
+Closed by #99. `session.refine_failure_counts: dict[(kind, task),
+int]` tracks consecutive `planner.refine()` failures per drift
+key. When the counter crosses
+`DefaultSteerer.REFINE_FAILURE_THRESHOLD` (default `2`), the
+steerer marks the task FAILED, emits a CRITICAL `REPEATED_FAILURE`
+drift, and resets the counter. A successful refine also resets the
+counter so a future drift of the same kind starts fresh.
 
-### 7.3 Refine failure retry backoff
+### 7.4 Orphaned tool_call_ids on mid-invocation cancel (closed)
 
-If the configured LLM is down, the same drift re-fires → refine
-fails → drift re-emitted (now with "refine failed" surface, §4.3)
-→ but the underlying condition is unchanged → drift fires again on
-next tick. Eventually bounded by the per-lineage cap
-(`max_retries_per_task_lineage`) or by an explicit
-`max_task_invocations` ceiling when configured, but any budget is
-burned without forward progress.
-
-**Fix direction:** per-`(drift.kind, task_id)` refine-attempt
-counter. After N consecutive failures, mark the task FAILED
-directly (skip refine entirely) and emit a CRITICAL
-`REPEATED_FAILURE` drift. 2–3 attempts is probably right.
-
-### 7.4 Orphaned tool_call_ids on mid-invocation cancel
-
-Cancelling ADK mid-tool-call leaves the assistant message with
-`tool_calls` unmatched by `tool_result` messages. Described in §6.1.
-
-**Fix direction:** `ADKAdapter._cancel_and_heal(task_id,
-tool_call_ids)` — after `task.cancel()`, append synthetic
-`tool_result` messages (status="cancelled") for each pending
-tool_call_id. Requires ADK internals knowledge; medium-high effort,
-high impact for live-steering scenarios.
+Closed by #101. `ADKAdapter` tracks pending `function_call_id`s
+observed in the current `invoke()`'s event stream in
+`self._pending_tool_call_ids` / `self._pending_tool_call_names`.
+On mid-invocation cancel (or unexpected exception), the adapter
+synthesises `{"cancelled": true}` function-response messages for
+every pending id so the ADK session history stays well-formed and
+the next turn does not see an orphaned `function_call`.
 
 ### 7.5 Cross-task ADK session history pollution
 

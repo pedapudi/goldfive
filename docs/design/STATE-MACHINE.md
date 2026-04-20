@@ -94,11 +94,13 @@ harmonograf integration) assumes it.
 
 In v0.1, the canonical path into the state machine is through
 **reporting tools** (see [tool-protocol.md](../reference/tool-protocol.md)).
-When an agent calls `report_task_started("t3")`, the adapter
-intercepts, and the steerer applies `PENDING → RUNNING` for task
-`t3`.
+When an agent calls `report_task_started("t3")`, the adapter routes
+the call through `goldfive.adapters._tool_invocation.invoke_tool`
+(which runs the schema / terminal / loop / volume guards), the
+spec's handler fires, and the steerer applies `PENDING → RUNNING`
+for task `t3`.
 
-There are three non-reporting-tool paths in:
+There are four non-reporting-tool paths in:
 
 - **Executor-driven transitions.** When the executor first picks up a
   `PENDING` task, it calls `steerer.transition(task_id, RUNNING, ...)`
@@ -107,9 +109,18 @@ There are three non-reporting-tool paths in:
 - **Adapter-observed failures.** If `adapter.invoke()` raises, the
   executor catches, classifies the error as `TOOL_ERROR` or
   `TASK_FAILED_FATAL`, and calls `steerer.transition(task_id, FAILED, ...)`.
-- **Cascade cancellations.** On an unrecoverable drift, the executor
-  walks downstream PENDING tasks via `Plan.topological_stages()` and
-  transitions each to `CANCELLED`.
+- **Cascade cancellations.** `Steerer.cascade_cancel_downstream(session, id)`
+  BFS-walks forward along `plan.edges` from a cancelled or fatally-failed
+  task and transitions every reachable non-terminal task to `CANCELLED`.
+  Used by both the unrecoverable-failure cascade
+  (`mark_task_failed(recoverable=False)`) and the cancellation
+  cascade on `mark_task_cancelled`. See §"Cascade semantics" below.
+- **Reachability audit on executor exit.** If the executor loop
+  exits with PENDING tasks still remaining and `_pick_next_task`
+  returns `None` (orphans whose every predecessor path crosses a
+  terminal task), the executor cancels them in place and emits a
+  CRITICAL `PLAN_DIVERGENCE` drift. See
+  [PLAN-LIFECYCLE.md §6.4](PLAN-LIFECYCLE.md).
 
 ### Invariant 3 — Transitions emit exactly one event
 

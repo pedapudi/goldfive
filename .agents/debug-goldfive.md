@@ -267,13 +267,81 @@ project needs.
   downstream-regenerated copy) → `isinstance` fails. See
   `docs/guides/troubleshooting.md` § "Proto and types".
 
+## Inspecting a stuck run
+
+The first thing to check for "the run didn't die but no task is
+moving" is the plan/task state and the guard counters:
+
+```python
+# after await runner.run(...) returns or timed out
+s = outcome.session
+print(f"success={outcome.success} reason={outcome.reason!r}")
+if s.plan is not None:
+    for t in s.plan.tasks:
+        print(f"  {t.status.value:<10} {t.id}  deps={[e.from_task_id for e in s.plan.edges if e.to_task_id == t.id]}")
+print("refine_failure_counts:", dict(s.refine_failure_counts))
+print("current_task:", s.current_task_id)
+print("reasoning_history_len:", len(s.reasoning_history))
+```
+
+Orthogonal bits that accumulate on the session:
+
+- `session.plan.tasks[*].status` — source of truth for what the
+  executor thinks is done / running / stuck.
+- `session.refine_failure_counts` — `(drift_kind, task_id) -> int`
+  incremented every time `planner.refine()` raised or returned
+  `None`. Hitting `DefaultSteerer.REFINE_FAILURE_THRESHOLD` (default
+  `2`) is what should be marking a task FAILED instead of looping.
+- `session.reasoning_history` — last 20 reasoning blocks; what the
+  reasoning-drift detectors run against.
+- `session.pending_approvals` — open APPROVE / REJECT waiters; a
+  non-empty dict after a run ended means some steer never arrived.
+
+For the plan lifecycle (who owns what transition, termination
+predicate, cascade primitive), see
+[docs/design/PLAN-LIFECYCLE.md](../docs/design/PLAN-LIFECYCLE.md) §6.
+
+## Structural vs symptomatic debugging
+
+Postmortem heuristic from this week's filler-loop sprint: every
+time a patch looked correct in isolation but the bug came back
+under a slightly different trigger, the fix was symptomatic (added
+a cap, added a check, lowered a threshold). The real fix was always
+structural — one of:
+
+- **A guard was defined but not wired.** #108: the ADK plugin
+  called `spec.handler` directly from `before_tool_callback` instead
+  of routing through `invoke_tool`, so the terminal-task rejection,
+  idempotency, and loop detection layers never ran even though the
+  code existed.
+- **Two things owned the same state and disagreed.** The pre-#103
+  cascade: `mark_task_cancelled` transitioned one task but
+  `_pick_next_task` required every predecessor COMPLETED — so a
+  CANCELLED predecessor silently orphaned its descendants. Fix was
+  a single shared primitive (`cascade_cancel_downstream`) that both
+  paths use.
+- **A data-path copy broke an invariant.** #116 (local): the ADK
+  plugin was reading `SessionContext` out of `session.state`, which
+  ADK deep-copies between turns. Mutations to the context didn't
+  survive; the fix was plumbing the context through the plugin
+  instance directly.
+
+Decision rule: when a "correct" patch doesn't hold, stop adding
+caps and instead look for the data path where the guard was meant
+to live. If the path touches a copy boundary, a framework-managed
+state store, or a callback registration hook, the structural fix
+is one of those three shapes.
+
 ## Related
 
 - [docs/guides/troubleshooting.md](../docs/guides/troubleshooting.md) — detailed symptom → fix catalogue.
+- [docs/guides/common-failure-modes.md](../docs/guides/common-failure-modes.md) — catalog of observed failure modes with signatures.
+- [docs/design/PLAN-LIFECYCLE.md](../docs/design/PLAN-LIFECYCLE.md) — plan-level state machine; run-termination predicate.
 - [docs/design/CONTROL.md](../docs/design/CONTROL.md) — live-steering protocol, per-kind behaviour, custom dispatcher hook.
 - [docs/design/VOCABULARY.md](../docs/design/VOCABULARY.md) — exhaustive type-system reference (start here when a name is confusing).
 - [docs/design/RATIONALE.md](../docs/design/RATIONALE.md) — design-rationale docs (start here when a choice feels arbitrary).
 - [docs/design/DRIFT.md](../docs/design/DRIFT.md) — drift taxonomy.
 - [docs/design/EVENT-MODEL.md](../docs/design/EVENT-MODEL.md) — event ownership, sequence semantics.
+- [how-to-debug-a-filler-loop.md](how-to-debug-a-filler-loop.md) — filler-loop playbook.
 - [events.md](events.md) — emitting a new event.
 - [sinks.md](sinks.md) — sink contract.

@@ -76,11 +76,23 @@ your adapter must:
 
 1. Recognize the tool name (it's in `REPORTING_TOOL_NAMES`).
 2. Parse the arguments.
-3. Invoke the spec's `handler(args, session, steerer)`.
-4. Return the handler's return value as the tool result.
+3. Route through
+   `goldfive.adapters._tool_invocation.invoke_tool(specs, name, args, session, steerer)`
+   — **not** `spec.handler` directly. `invoke_tool` runs four guard
+   layers (schema / terminal-task / per-task loop / session-wide
+   volume cap) before dispatching the spec's handler. Skipping this
+   is the root cause of the filler-loop class of bugs (#108): the
+   handler runs, the state updates, but the adapter keeps
+   re-invoking the agent past a task that already completed.
+4. Return the helper's return value as the tool result.
 
 The handler is where the steerer applies the state transition.
-`{"acknowledged": True}` is the conventional response body.
+`{"acknowledged": True}` is the conventional response body; the
+guard layers may instead return `{"acknowledged": False, "error":
+"task_already_terminal" | "loop_detected" | "missing_task_id" |
+"unknown_task_id", ...}` — return those payloads verbatim to the
+agent as the tool response. They are designed to be model-readable
+so the agent can course-correct.
 
 ### Forward observed events to the steerer
 
@@ -150,6 +162,7 @@ from typing import Any
 
 from awesome_agent_sdk import AwesomeClient, ToolDef  # fictional
 
+from goldfive.adapters._tool_invocation import invoke_tool
 from goldfive.protocols import AgentAdapter
 from goldfive.reporting import ReportingToolSpec
 from goldfive.results import InvocationResult
@@ -223,7 +236,12 @@ class AwesomeAdapter:
 
     def _wrap_tool(self, spec: ReportingToolSpec, session: Session):
         async def handler(args: dict[str, Any]) -> dict[str, Any]:
-            return await spec.handler(args, session, self._steerer)
+            # Route through ``invoke_tool`` — NOT ``spec.handler`` direct —
+            # so the schema / terminal / loop / volume-cap guards fire.
+            # Skipping this is the pre-#108 bug class.
+            return await invoke_tool(
+                self._tools, spec.name, args, session, self._steerer
+            )
 
         return ToolDef(
             name=spec.name,

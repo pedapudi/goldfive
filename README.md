@@ -94,8 +94,12 @@ inspect the event stream. Concrete and runnable.
 - [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md) — overview of the six primitives, how they compose, full lifecycle.
 - [`docs/design/PROTOCOLS.md`](docs/design/PROTOCOLS.md) — the six protocol contracts with minimal implementations.
 - [`docs/design/STATE-MACHINE.md`](docs/design/STATE-MACHINE.md) — task lifecycle state diagram, transition rules, invariants.
+- [`docs/design/TASK-LIFECYCLE.md`](docs/design/TASK-LIFECYCLE.md) — per-task lifecycle, reporting-tool dispatch layering, cancellation protocol.
+- [`docs/design/PLAN-LIFECYCLE.md`](docs/design/PLAN-LIFECYCLE.md) — plan-level state machine: revision modes, run-termination predicate, cascade semantics.
 - [`docs/design/DRIFT.md`](docs/design/DRIFT.md) — full drift-kind taxonomy (25+), classification rules, refine policy.
 - [`docs/design/EVENT-MODEL.md`](docs/design/EVENT-MODEL.md) — proto event taxonomy, sequence semantics, `EventSink` contract.
+- [`docs/design/CONTROL.md`](docs/design/CONTROL.md) — live-steering control channel protocol (PAUSE / RESUME / CANCEL / STEER / REWIND_TO / APPROVE / REJECT).
+- [`docs/design/APPROVAL.md`](docs/design/APPROVAL.md) — human-in-the-loop approval flows (Flow A: goldfive-native; Flow B: ADK tool confirmation).
 
 ### Further reading — the "why" docs
 
@@ -106,6 +110,9 @@ inspect the event stream. Concrete and runnable.
 
 - [`docs/guides/getting-started.md`](docs/guides/getting-started.md) — install + first agent.
 - [`docs/guides/observability-with-harmonograf.md`](docs/guides/observability-with-harmonograf.md) — ten-minute end-to-end with the harmonograf UI.
+- [`docs/guides/telemetry-with-harmonograf.md`](docs/guides/telemetry-with-harmonograf.md) — reading the UI: Gantt, span popovers, Inspector Drawer, live steering, plan revisions.
+- [`docs/guides/insight-from-logs.md`](docs/guides/insight-from-logs.md) — operators without the UI: raw event stream, session state after a run, post-mortem from JSONL / SQLite.
+- [`docs/guides/common-failure-modes.md`](docs/guides/common-failure-modes.md) — catalog of observed failure shapes, each with its signature and recovery path.
 - [`docs/guides/writing-an-agent-adapter.md`](docs/guides/writing-an-agent-adapter.md) — wrap a new framework.
 - [`docs/guides/writing-an-event-sink.md`](docs/guides/writing-an-event-sink.md) — build a custom sink.
 - [`docs/guides/choosing-a-sink.md`](docs/guides/choosing-a-sink.md) — decision matrix across the five shipped sinks.

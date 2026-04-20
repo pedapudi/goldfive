@@ -81,8 +81,14 @@ crosses a severity threshold it invokes `planner.refine(...)`.
 agent framework (ADK, Claude Agent SDK, a bare callable, ...). It
 registers reporting tools, renders current-task context into whatever
 form the framework expects (shared session state, a system prompt,
-whatever), invokes the agent, and routes intercepted tool calls and
-observed events back to the steerer.
+whatever), invokes the agent, and routes tool calls and observed
+events back to the steerer. All adapters funnel reporting-tool
+dispatch through the shared
+`goldfive.adapters._tool_invocation.invoke_tool` helper, which runs
+four guard layers (schema rejection, terminal-task rejection,
+per-task loop detection, session-wide volume cap) before calling the
+`ReportingToolSpec.handler` — see [TASK-LIFECYCLE.md §5](TASK-LIFECYCLE.md)
+for the layering.
 
 **EventSink** — consumes the proto-encoded event stream. goldfive
 ships five sinks: `InMemorySink` for tests, `LoggingSink` for dev,
@@ -231,16 +237,29 @@ while session.plan has unfinished tasks:
         if any dep of task is not COMPLETED: skip
         steerer.transition(task.id, RUNNING, session=session)
         result = await adapter.invoke(task, session)    # agent runs here
-        # adapter has been forwarding reporting-tool calls
-        # to steerer throughout the invocation
+        # adapter has been forwarding reporting-tool calls through
+        # invoke_tool (four-layer guard) to the steerer throughout.
         drift = steerer.detect_drift(result, session)
         if drift and drift.severity >= WARNING:
             revised = await planner.refine(plan=session.plan, drift=drift, goals=session.goals)
             if revised:
+                # PlanRevised carries a PlanRevisionDiff sidecar
+                # (added / removed / modified task ids + edges).
                 session.plan = revised
-                emit PlanRevised(plan=revised, revision_metadata=...)
+                emit PlanRevised(plan=revised, diff=<PlanRevisionDiff>, …)
                 break to outer loop  # restart walk with revised plan
+            else:
+                # register (drift_kind, task_id) refine failure;
+                # 2 consecutive failures → mark task FAILED and emit
+                # CRITICAL REPEATED_FAILURE drift. See PLAN-LIFECYCLE.md §4.5.
 ```
+
+Cancellation and unrecoverable drift fan out to downstream tasks
+through the shared `Steerer.cascade_cancel_downstream(session, id)`
+primitive — both cascades emit the same `TaskCancelled` event
+stream for the downstream set. See
+[PLAN-LIFECYCLE.md §6.2 / §6.3](PLAN-LIFECYCLE.md) and
+[STATE-MACHINE.md §"Cascade semantics"](STATE-MACHINE.md).
 
 ParallelDAGExecutor differs only in that each topological *stage* is
 an `asyncio.gather` over the stage's tasks; refine runs between
@@ -292,14 +311,17 @@ Four invariants hold across every `Runner.run(...)` invocation:
 - **CLI.** goldfive is a library. Callers build CLIs on top.
 - **Multi-run coordination.** One `Runner.run()` = one `run_id`. For
   resuming a crashed run, see [persistence-and-recovery.md](../guides/persistence-and-recovery.md).
-- **Human-in-the-loop mid-run steering.** Control actions (pause,
-  resume, external steer) are on the roadmap but not implemented in
-  v0.1. External systems can emit drift by synthesizing a
-  `DriftEvent(kind=USER_STEER)` and handing it to the steerer, but
-  there is no in-box protocol yet.
 - **Streaming to the caller.** `Runner.run()` is a batch call.
   Streaming live progress is expected to happen through a caller-
   supplied `EventSink`, not through an async generator.
+
+**Live steering is in-box.** Human-in-the-loop mid-run steering
+(PAUSE, RESUME, CANCEL, STEER, REWIND_TO, APPROVE, REJECT) is
+implemented. Pass a `ControlChannel` to `Runner(control=...)` and
+an external process can drive the run through it. See
+[CONTROL.md](CONTROL.md) for the wire format and
+[`examples/live_steering.py`](../../examples/live_steering.py) for
+a runnable demo.
 
 ## Layering: goldfive inside, harmonograf outside
 
