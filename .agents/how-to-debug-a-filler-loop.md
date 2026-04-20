@@ -104,9 +104,9 @@ If the adapter uses a `ContextVar` to carry per-invoke state
   3.11+) copies the current context into each child; mutations to
   a `ContextVar` inside a child task are invisible to the parent.
 
-The fix, as landed in this week's #116 (local) for the ADK
-plugin: stop routing state through `ContextVar` / `session.state`
-and bind the state to the adapter/plugin instance directly. A
+The fix, as landed in #116 for the ADK plugin: stop routing
+state through `ContextVar` / `session.state` and bind the state
+to the adapter/plugin instance directly. A
 Python reference held by the adapter survives every SDK-internal
 copy boundary.
 
@@ -139,7 +139,7 @@ and the fix pattern: bind state to the adapter / plugin instance
 | #98 | Adapter kept invoking agent past `COMPLETED`; 500-call ADK ceiling | The invoke-loop didn't early-break on terminal status. Reporting-tool dispatch didn't reject calls on terminal tasks. |
 | #108 | All guards "correctly defined", none firing under load | ADK plugin called `spec.handler` direct, bypassing `invoke_tool` and the four guard layers. |
 | #109 | Guard fired once per task; agents that invented fresh `task_id` each call defeated it | No session-wide cap, and the per-task guard's "flag and continue" ack looked like a pass to the model, which then kept calling. |
-| #116 (local) | Post-#108 regression under ADK load; SessionContext kept vanishing | The plugin was reading its context out of `session.state`, which ADK copied between turns. Rebinding to the plugin instance fixed it. |
+| #116 | Post-#108 regression under ADK load; SessionContext kept vanishing | The plugin was reading its context out of `session.state`, which ADK copied between turns. Rebinding to the plugin instance fixed it. |
 | harmonograf #45 | Reasoning content not appearing on spans despite #43 wiring | The span attribute name mismatch: server wrote `llm.reasoning`, client read `reasoning`. Not a goldfive bug but the same "two sides of the same wire" pattern. |
 
 Common thread: each "fix" before the real structural fix added
