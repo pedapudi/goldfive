@@ -58,7 +58,7 @@ real_agent = Agent(
 root_agent = goldfive.wrap(real_agent)
 
 # ADK web discovers `app` at module level.
-app = App(name="goldfive-wrapped-demo", root_agent=root_agent)
+app = App(name="goldfive_wrapped_demo", root_agent=root_agent)
 
 
 # ---------------------------------------------------------------------------
