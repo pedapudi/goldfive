@@ -24,7 +24,13 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dev dependencies
-        run: uv sync --extra dev
+        # Include adk + proto so the full test suite (including the
+        # adk-web e2e test under tests/examples/) actually runs in CI
+        # rather than silently importorskip-ing. The adk-web e2e exists
+        # specifically to catch regressions in the coordinator+AgentTool
+        # dispatch path under real ``adk web`` — importorskip would let
+        # that bug ship unnoticed, which is the opposite of the point.
+        run: uv sync --extra dev --extra adk --extra proto
 
       - name: Ruff
         run: uv run ruff check .
