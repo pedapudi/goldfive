@@ -225,17 +225,28 @@ def _register_plugin_on_runner(runner: Any, plugin: Any) -> bool:
     return False
 
 
-def _build_runner(agent: Any) -> Any:
+def _build_runner(agent: Any, plugins: list[Any] | None = None) -> Any:
     """Construct an ADK ``InMemoryRunner`` around a ``BaseAgent``.
 
     Used by :class:`ADKAdapter` when the caller passes an agent rather
     than a runner. ``app_name`` defaults to the agent's name for tidy
     session-service bookkeeping.
+
+    When ``plugins`` is a non-empty iterable, the plugin list is forwarded
+    to :class:`InMemoryRunner` via its ``plugins=`` kwarg. This is the
+    path goldfive uses to propagate caller-supplied observability plugins
+    (e.g. ``HarmonografTelemetryPlugin``) onto every per-agent sub-runner,
+    not just the coordinator — goldfive#121. Passing ``None`` or an empty
+    list omits the kwarg so we stay compatible with ADK versions that
+    constructed ``InMemoryRunner`` without a ``plugins`` parameter.
     """
     from google.adk.runners import InMemoryRunner  # type: ignore
 
     app_name = str(getattr(agent, "name", "") or "goldfive")
-    return InMemoryRunner(agent=agent, app_name=app_name)
+    kwargs: dict[str, Any] = {"agent": agent, "app_name": app_name}
+    if plugins:
+        kwargs["plugins"] = list(plugins)
+    return InMemoryRunner(**kwargs)
 
 
 def _looks_like_runner(obj: Any) -> bool:
@@ -435,6 +446,15 @@ class ADKAdapter:
     app_name:
         Optional ADK app_name override. Defaults to the runner's own
         ``app_name`` or the agent's ``name``.
+    plugins:
+        Optional list of ADK ``BasePlugin`` instances to install on
+        every per-agent ``InMemoryRunner`` built by this adapter.
+        Observability plugins (e.g. ``HarmonografTelemetryPlugin``)
+        must land on sub-agent runners too — the top-level
+        ``App(plugins=[...])`` only covers the root runner, so
+        coordinator + ``AgentTool`` trees would otherwise emit
+        telemetry only for the coordinator's own invocations. See
+        goldfive#121.
     """
 
     def __init__(
@@ -444,6 +464,7 @@ class ADKAdapter:
         user_id: str = "goldfive_user",
         session_id: str | None = None,
         app_name: str | None = None,
+        plugins: list[Any] | None = None,
     ) -> None:
         # ------------------------------------------------------------------
         # Registry-dispatch model (see docs/design/DISPATCH.md and the
@@ -461,6 +482,14 @@ class ADKAdapter:
         self._user_id = user_id
         self._session_id = session_id  # legacy single-runner id; per-runner ids below
         self._degraded_prebuilt_runner = False
+        # Caller-supplied ADK plugins (e.g. HarmonografTelemetryPlugin).
+        # Stored so EVERY per-agent runner constructed by this adapter
+        # receives them at ``InMemoryRunner`` construction time. Without
+        # this, the ADK ``App(plugins=[...])`` level only covers the
+        # coordinator's root runner and sub-agent dispatches (via
+        # ``AgentTool``) run through bare ``InMemoryRunner`` instances
+        # with no plugins attached — goldfive#121.
+        self._plugins: list[Any] = list(plugins) if plugins else []
 
         if _looks_like_runner(agent_or_runner):
             # Caller handed us an already-built Runner. We cannot derive
@@ -478,7 +507,7 @@ class ADKAdapter:
             )
         else:
             self._agent = agent_or_runner
-            self._runner = _build_runner(agent_or_runner)
+            self._runner = _build_runner(agent_or_runner, plugins=self._plugins)
 
         self._app_name = (
             app_name
@@ -513,7 +542,9 @@ class ADKAdapter:
                 if agent_name == root_name and agent_ref is self._agent:
                     self._runners[agent_name] = self._runner
                 else:
-                    self._runners[agent_name] = _build_runner(agent_ref)
+                    self._runners[agent_name] = _build_runner(
+                        agent_ref, plugins=self._plugins
+                    )
 
         # Install the goldfive plugin on EVERY runner. The plugin is a
         # single shared instance — set_active_context() handoff works
