@@ -295,6 +295,7 @@ class SequentialExecutor(Executor):
                         severity=current_plan.revision_severity,
                         reason=current_plan.revision_reason,
                         revision_index=current_plan.revision_index,
+                        session_id=session.id,
                     ),
                 )
                 last_plan_id = current_plan.id
@@ -509,6 +510,7 @@ class SequentialExecutor(Executor):
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=failure_reason or "run aborted",
+                    session_id=session.id,
                 ),
             )
             return ExecutionOutcome(
@@ -534,6 +536,7 @@ class SequentialExecutor(Executor):
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=reason,
+                    session_id=session.id,
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=reason)
@@ -550,6 +553,7 @@ class SequentialExecutor(Executor):
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=reason,
+                    session_id=session.id,
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=reason)
@@ -594,6 +598,7 @@ class SequentialExecutor(Executor):
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=reason,
+                    session_id=session.id,
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=reason)
@@ -610,6 +615,7 @@ class SequentialExecutor(Executor):
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=unmet,
+                    session_id=session.id,
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=unmet)
@@ -620,6 +626,7 @@ class SequentialExecutor(Executor):
                 run_id=session.run_id,
                 sequence=session.next_sequence(),
                 outcome_summary=_outcome_summary(session),
+                session_id=session.id,
             ),
         )
         return ExecutionOutcome(success=True, session=session)
@@ -711,6 +718,7 @@ class SequentialExecutor(Executor):
                         run_id=session.run_id,
                         sequence=session.next_sequence(),
                         reason=failure_reason,
+                        session_id=session.id,
                     ),
                 )
                 return ExecutionOutcome(success=False, session=session, reason=failure_reason)
@@ -724,6 +732,7 @@ class SequentialExecutor(Executor):
                         run_id=session.run_id,
                         sequence=session.next_sequence(),
                         reason=failure_reason,
+                        session_id=session.id,
                     ),
                 )
                 return ExecutionOutcome(success=False, session=session, reason=failure_reason)
@@ -794,6 +803,7 @@ class SequentialExecutor(Executor):
                             run_id=session.run_id,
                             sequence=session.next_sequence(),
                             reason=failure_reason,
+                            session_id=session.id,
                         ),
                     )
                     return ExecutionOutcome(success=False, session=session, reason=failure_reason)
@@ -855,6 +865,7 @@ class SequentialExecutor(Executor):
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=reason,
+                    session_id=session.id,
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=reason)
@@ -867,6 +878,7 @@ class SequentialExecutor(Executor):
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=unmet,
+                    session_id=session.id,
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=unmet)
@@ -877,6 +889,7 @@ class SequentialExecutor(Executor):
                 run_id=session.run_id,
                 sequence=session.next_sequence(),
                 outcome_summary=_outcome_summary(session),
+                session_id=session.id,
             ),
         )
         return ExecutionOutcome(success=True, session=session)
@@ -1357,7 +1370,7 @@ async def _emit_pipeline_failure_drift(
     """
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    evt = new_event(session.run_id, session.next_sequence())
+    evt = new_event(session.run_id, session.next_sequence(), session_id=session.id)
     evt.drift_detected.kind = getattr(
         types_pb2,
         f"DRIFT_KIND_{DriftKind.CUSTOM.name}",
@@ -1388,7 +1401,7 @@ def _plan_divergence_drift_event(session: Session, detail: str) -> object:
     """
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    evt = new_event(session.run_id, session.next_sequence())
+    evt = new_event(session.run_id, session.next_sequence(), session_id=session.id)
     evt.drift_detected.kind = getattr(
         types_pb2,
         f"DRIFT_KIND_{DriftKind.PLAN_DIVERGENCE.name}",

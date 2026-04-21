@@ -341,6 +341,7 @@ class ParallelDAGExecutor:
                                 sequence=session.next_sequence(),
                                 plan=refined,
                                 drift=drift,
+                                session_id=session.id,
                             ),
                         )
                         # Falls through to loop top: stages recomputed.
@@ -376,6 +377,7 @@ class ParallelDAGExecutor:
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=abort_reason,
+                    session_id=session.id,
                 ),
             )
             if isinstance(exc, asyncio.CancelledError):
@@ -389,6 +391,7 @@ class ParallelDAGExecutor:
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=abort_reason,
+                    session_id=session.id,
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=abort_reason)
@@ -405,6 +408,7 @@ class ParallelDAGExecutor:
                     run_id=session.run_id,
                     sequence=session.next_sequence(),
                     reason=unmet,
+                    session_id=session.id,
                 ),
             )
             return ExecutionOutcome(success=False, session=session, reason=unmet)
@@ -415,6 +419,7 @@ class ParallelDAGExecutor:
                 run_id=session.run_id,
                 sequence=session.next_sequence(),
                 outcome_summary=_outcome_summary(completed_stage_ids),
+                session_id=session.id,
             ),
         )
         return ExecutionOutcome(success=True, session=session)
@@ -936,7 +941,7 @@ async def _emit_drift_event(
     from goldfive.events import new_event
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    evt = new_event(session.run_id, session.next_sequence())
+    evt = new_event(session.run_id, session.next_sequence(), session_id=session.id)
     evt.drift_detected.kind = getattr(
         types_pb2,
         f"DRIFT_KIND_{drift.kind.name}",

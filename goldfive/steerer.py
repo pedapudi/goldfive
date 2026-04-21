@@ -1825,7 +1825,7 @@ class DefaultSteerer:
         """Build a fresh ``Event`` envelope via :mod:`goldfive.events`."""
         from goldfive.events import new_event
 
-        return new_event(session.run_id, session.next_sequence())
+        return new_event(session.run_id, session.next_sequence(), session_id=session.id)
 
     async def _emit(self, event_pb: Any) -> None:
         from goldfive.events import emit

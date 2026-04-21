@@ -46,17 +46,25 @@ def _events_pb_module() -> Any:
     return events_pb2
 
 
-def new_event(run_id: str, sequence: int) -> Any:
+def new_event(run_id: str, sequence: int, session_id: str = "") -> Any:
     """Build a fresh ``Event`` envelope with run_id/sequence/emitted_at set.
 
     The per-event payload (RunStarted, TaskCompleted, etc.) is assigned by
     the caller on the returned message's oneof field.
+
+    ``session_id`` (goldfive#155) is an optional stable identifier for the
+    goldfive ``Session`` this event belongs to. Defaults to the empty
+    string — consumers that don't need per-event session routing (e.g.
+    single-session streams) keep the pre-#155 behavior and route via the
+    stream Hello session.
     """
     pb = _events_pb_module()
     evt = pb.Event()
     evt.run_id = run_id
     evt.sequence = sequence
     evt.emitted_at.CopyFrom(now_ts())
+    if session_id:
+        evt.session_id = session_id
     return evt
 
 
@@ -84,13 +92,16 @@ def make_event(
     sequence: int,
     kind: str,
     payload: dict[str, Any] | None = None,
+    *,
+    session_id: str = "",
 ) -> dict[str, Any]:
     """Build a dict event envelope for callers that don't need the proto.
 
-    Returns ``{run_id, sequence, kind, payload}``. Sinks type their
-    ``emit`` argument as ``Any`` so both the proto envelope (from
+    Returns ``{run_id, sequence, session_id, kind, payload}``. Sinks type
+    their ``emit`` argument as ``Any`` so both the proto envelope (from
     :func:`new_event`) and this dict envelope round-trip through the
-    same fan-out machinery.
+    same fan-out machinery. ``session_id`` mirrors the proto field added
+    in goldfive#155.
     """
     import time
 
@@ -98,6 +109,7 @@ def make_event(
     return {
         "run_id": run_id,
         "sequence": sequence,
+        "session_id": session_id,
         "emitted_at": {"seconds": t // 1_000_000_000, "nanos": t % 1_000_000_000},
         "kind": kind,
         "payload": dict(payload or {}),
@@ -120,39 +132,65 @@ def run_started_event(
     sequence: int,
     goal_summary: str = "",
     started_at: Any | None = None,
+    *,
+    session_id: str = "",
 ) -> Any:
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.run_started.run_id = run_id
     evt.run_started.goal_summary = goal_summary
     evt.run_started.started_at.CopyFrom(started_at or now_ts())
     return evt
 
 
-def run_completed_event(run_id: str, sequence: int, outcome_summary: str = "") -> Any:
-    evt = new_event(run_id, sequence)
+def run_completed_event(
+    run_id: str,
+    sequence: int,
+    outcome_summary: str = "",
+    *,
+    session_id: str = "",
+) -> Any:
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.run_completed.outcome_summary = outcome_summary
     return evt
 
 
-def run_aborted_event(run_id: str, sequence: int, reason: str = "") -> Any:
-    evt = new_event(run_id, sequence)
+def run_aborted_event(
+    run_id: str,
+    sequence: int,
+    reason: str = "",
+    *,
+    session_id: str = "",
+) -> Any:
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.run_aborted.reason = reason
     return evt
 
 
-def goal_derived_event(run_id: str, sequence: int, goals: list[Any]) -> Any:
+def goal_derived_event(
+    run_id: str,
+    sequence: int,
+    goals: list[Any],
+    *,
+    session_id: str = "",
+) -> Any:
     from goldfive.conv import to_pb_goal
 
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     for g in goals:
         evt.goal_derived.goals.add().CopyFrom(to_pb_goal(g))
     return evt
 
 
-def plan_submitted_event(run_id: str, sequence: int, plan: Any) -> Any:
+def plan_submitted_event(
+    run_id: str,
+    sequence: int,
+    plan: Any,
+    *,
+    session_id: str = "",
+) -> Any:
     from goldfive.conv import to_pb_plan
 
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.plan_submitted.plan.CopyFrom(to_pb_plan(plan))
     return evt
 
@@ -167,10 +205,11 @@ def plan_revised_event(
     severity: str = "",
     reason: str = "",
     revision_index: int | None = None,
+    session_id: str = "",
 ) -> Any:
     from goldfive.conv import to_pb_plan
 
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.plan_revised.plan.CopyFrom(to_pb_plan(plan))
 
     if drift is not None:
@@ -201,8 +240,15 @@ def plan_revised_event(
     return evt
 
 
-def task_started_event(run_id: str, sequence: int, task_id: str, detail: str = "") -> Any:
-    evt = new_event(run_id, sequence)
+def task_started_event(
+    run_id: str,
+    sequence: int,
+    task_id: str,
+    detail: str = "",
+    *,
+    session_id: str = "",
+) -> Any:
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.task_started.task_id = task_id
     evt.task_started.detail = detail
     return evt
@@ -214,8 +260,10 @@ def task_progress_event(
     task_id: str,
     fraction: float = 0.0,
     detail: str = "",
+    *,
+    session_id: str = "",
 ) -> Any:
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.task_progress.task_id = task_id
     evt.task_progress.fraction = float(fraction)
     evt.task_progress.detail = detail
@@ -228,8 +276,10 @@ def task_completed_event(
     task_id: str,
     summary: str = "",
     artifacts: dict[str, str] | None = None,
+    *,
+    session_id: str = "",
 ) -> Any:
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.task_completed.task_id = task_id
     evt.task_completed.summary = summary
     for k, v in (artifacts or {}).items():
@@ -243,8 +293,10 @@ def task_failed_event(
     task_id: str,
     reason: str = "",
     recoverable: bool = True,
+    *,
+    session_id: str = "",
 ) -> Any:
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.task_failed.task_id = task_id
     evt.task_failed.reason = reason
     evt.task_failed.recoverable = bool(recoverable)
@@ -257,16 +309,25 @@ def task_blocked_event(
     task_id: str,
     blocker: str = "",
     needed: str = "",
+    *,
+    session_id: str = "",
 ) -> Any:
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.task_blocked.task_id = task_id
     evt.task_blocked.blocker = blocker
     evt.task_blocked.needed = needed
     return evt
 
 
-def task_cancelled_event(run_id: str, sequence: int, task_id: str, reason: str = "") -> Any:
-    evt = new_event(run_id, sequence)
+def task_cancelled_event(
+    run_id: str,
+    sequence: int,
+    task_id: str,
+    reason: str = "",
+    *,
+    session_id: str = "",
+) -> Any:
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.task_cancelled.task_id = task_id
     evt.task_cancelled.reason = reason
     return evt
@@ -277,6 +338,8 @@ def control_received_event(
     sequence: int,
     control_kind: Any,
     control_id: str,
+    *,
+    session_id: str = "",
 ) -> Any:
     """Build a ``DriftDetected`` envelope for a received ControlMessage.
 
@@ -302,7 +365,7 @@ def control_received_event(
         severity=DriftSeverity.WARNING,
         detail=f"control:{kind_name}:{control_id}",
     )
-    return drift_detected_event(run_id, sequence, drift)
+    return drift_detected_event(run_id, sequence, drift, session_id=session_id)
 
 
 def conversation_started_event(
@@ -310,6 +373,8 @@ def conversation_started_event(
     sequence: int,
     conversation_id: str,
     started_at: Any | None = None,
+    *,
+    session_id: str = "",
 ) -> Any:
     """Build a ``ConversationStarted`` envelope.
 
@@ -318,7 +383,7 @@ def conversation_started_event(
     the first turn's run id; the ``conversation_id`` field inside the
     payload is the stable identifier shared by every turn.
     """
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.conversation_started.conversation_id = conversation_id
     evt.conversation_started.started_at.CopyFrom(started_at or now_ts())
     return evt
@@ -330,6 +395,8 @@ def conversation_ended_event(
     conversation_id: str,
     turn_count: int = 0,
     reason: str = "",
+    *,
+    session_id: str = "",
 ) -> Any:
     """Build a ``ConversationEnded`` envelope.
 
@@ -338,7 +405,7 @@ def conversation_ended_event(
     on the envelope is the last turn's run id so sinks can anchor the
     event in the run timeline.
     """
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.conversation_ended.conversation_id = conversation_id
     evt.conversation_ended.turn_count = int(turn_count)
     evt.conversation_ended.reason = reason
@@ -354,6 +421,7 @@ def approval_requested_event(
     prompt: str = "",
     task_id: str = "",
     metadata: dict[str, str] | None = None,
+    session_id: str = "",
 ) -> Any:
     """Build an ``ApprovalRequested`` envelope.
 
@@ -361,7 +429,7 @@ def approval_requested_event(
     (Flow B, ADK `require_confirmation=True`). ``target_id`` is what an
     incoming ``ControlMessage(APPROVE|REJECT)`` must quote back.
     """
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.approval_requested.target_id = target_id
     evt.approval_requested.kind = kind
     evt.approval_requested.prompt = prompt
@@ -371,15 +439,29 @@ def approval_requested_event(
     return evt
 
 
-def approval_granted_event(run_id: str, sequence: int, *, target_id: str, detail: str = "") -> Any:
-    evt = new_event(run_id, sequence)
+def approval_granted_event(
+    run_id: str,
+    sequence: int,
+    *,
+    target_id: str,
+    detail: str = "",
+    session_id: str = "",
+) -> Any:
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.approval_granted.target_id = target_id
     evt.approval_granted.detail = detail
     return evt
 
 
-def approval_rejected_event(run_id: str, sequence: int, *, target_id: str, detail: str = "") -> Any:
-    evt = new_event(run_id, sequence)
+def approval_rejected_event(
+    run_id: str,
+    sequence: int,
+    *,
+    target_id: str,
+    detail: str = "",
+    session_id: str = "",
+) -> Any:
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.approval_rejected.target_id = target_id
     evt.approval_rejected.detail = detail
     return evt
@@ -394,6 +476,7 @@ def agent_invocation_started_event(
     invocation_id: str = "",
     parent_invocation_id: str = "",
     started_at: Any | None = None,
+    session_id: str = "",
 ) -> Any:
     """Build an ``AgentInvocationStarted`` envelope.
 
@@ -403,7 +486,7 @@ def agent_invocation_started_event(
     ``parent_invocation_id`` is empty for top-level and populated for
     nested invocations so sinks can reconstruct the delegation tree.
     """
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.agent_invocation_started.agent_name = agent_name
     evt.agent_invocation_started.task_id = task_id
     evt.agent_invocation_started.invocation_id = invocation_id
@@ -421,6 +504,7 @@ def agent_invocation_completed_event(
     invocation_id: str = "",
     summary: str = "",
     completed_at: Any | None = None,
+    session_id: str = "",
 ) -> Any:
     """Build an ``AgentInvocationCompleted`` envelope.
 
@@ -429,7 +513,7 @@ def agent_invocation_completed_event(
     ``summary`` is optional and may carry the final assistant text for
     sinks that render a timeline.
     """
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.agent_invocation_completed.agent_name = agent_name
     evt.agent_invocation_completed.task_id = task_id
     evt.agent_invocation_completed.invocation_id = invocation_id
@@ -447,6 +531,7 @@ def delegation_observed_event(
     task_id: str = "",
     invocation_id: str = "",
     observed_at: Any | None = None,
+    session_id: str = "",
 ) -> Any:
     """Build a ``DelegationObserved`` envelope.
 
@@ -454,7 +539,7 @@ def delegation_observed_event(
     an ADK ``AgentTool`` — the host agent is about to delegate to the
     wrapped sub-agent. Observability only; the tool still runs.
     """
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     evt.delegation_observed.from_agent = from_agent
     evt.delegation_observed.to_agent = to_agent
     evt.delegation_observed.task_id = task_id
@@ -539,9 +624,15 @@ def build_plan_revision_diff(old_plan: Any, new_plan: Any) -> Any:
     return diff
 
 
-def drift_detected_event(run_id: str, sequence: int, drift: Any) -> Any:
+def drift_detected_event(
+    run_id: str,
+    sequence: int,
+    drift: Any,
+    *,
+    session_id: str = "",
+) -> Any:
     pb = _events_pb_module()
-    evt = new_event(run_id, sequence)
+    evt = new_event(run_id, sequence, session_id=session_id)
     kind_name = str(getattr(drift, "kind", ""))
     sev_name = str(getattr(drift, "severity", ""))
     if kind_name:
