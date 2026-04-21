@@ -23,7 +23,6 @@ pytest.importorskip("google.adk")
 
 from goldfive.types import Plan, Session, Task
 
-
 # ---------------------------------------------------------------------------
 # Scripted LLMs used to trigger AgentTool dispatch
 # ---------------------------------------------------------------------------
@@ -35,7 +34,6 @@ def _make_agent_a(tool_name: str) -> Any:
     Turn 1: emit a ``function_call`` for ``tool_name``.
     Turn 2: return ``turn_complete=True`` after the sub-agent responds.
     """
-    from google.adk.agents import Agent
     from google.adk.models.base_llm import BaseLlm
     from google.adk.models.llm_response import LlmResponse
     from google.genai import types as genai_types
