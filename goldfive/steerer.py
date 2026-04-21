@@ -411,6 +411,8 @@ class DefaultSteerer:
             await self.mark_task_blocked(task_id, blocker=detail, session=session)
         elif to is TaskStatus.CANCELLED:
             await self.mark_task_cancelled(task_id, reason=detail, session=session)
+        elif to is TaskStatus.NOT_NEEDED:
+            await self.mark_task_not_needed(task_id, reason=detail, session=session)
         # PENDING and UNSPECIFIED are intentionally not reachable from
         # here; transitions are always forward in the lifecycle.
 
@@ -597,6 +599,43 @@ class DefaultSteerer:
         task.status = TaskStatus.CANCELLED
         await self._emit_task_cancelled(session, task_id, reason)
         await self.cascade_cancel_downstream(session, task_id)
+
+    async def mark_task_not_needed(
+        self,
+        task_id: str,
+        *,
+        session: Session,
+        reason: str = "",
+    ) -> None:
+        """Transition ``task_id`` to ``NOT_NEEDED`` terminally.
+
+        Introduced by the overlay-model refactor (goldfive#141). Unlike
+        :meth:`mark_task_cancelled` this path does NOT cascade — a task
+        the :class:`~goldfive.reconciler.PlanReconciler` deemed "not
+        needed" post-invocation is an observation about that specific
+        plan entry, not a signal that downstream work is invalid. The
+        reconciler independently evaluates each PENDING task.
+
+        Idempotent on terminal tasks. Emits ``TaskCancelled`` at the
+        proto level (there's no dedicated NOT_NEEDED event — the
+        status lives on the task itself and sinks can distinguish via
+        ``task.status`` on the next ``TaskCancelled`` / ``PlanRevised``
+        envelope). The reason string carries the distinguishing
+        context ("not needed: superseded by ...").
+        """
+        task = self._find_task(session, task_id)
+        if task is None:
+            return
+        if task.status in _TERMINAL_TASK_STATUSES:
+            return
+        task.status = TaskStatus.NOT_NEEDED
+        # There is no dedicated ``TaskNotNeeded`` proto message;
+        # reuse TaskCancelled with the reason prefix so sinks that
+        # inspect reason can differentiate if they wish. The live
+        # ``task.status`` on the plan is the authoritative signal.
+        await self._emit_task_cancelled(
+            session, task_id, f"not_needed: {reason}" if reason else "not_needed"
+        )
 
     async def cascade_cancel_downstream(
         self,

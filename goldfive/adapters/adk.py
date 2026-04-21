@@ -528,25 +528,63 @@ def _build_user_steer_primer_event(
 
 
 def _new_message_parts(task: Task) -> Any:
-    """Build the ADK user ``Content`` the adapter sends for a task turn.
+    """DEPRECATED — kept for back-compat with the pre-overlay path.
 
-    The agent already reads the richer task metadata from
-    ``session.state`` under the ``goldfive.*`` keys; the message body
-    is just a short imperative nudge so the model has a user turn to
-    respond to.
+    Equivalent to :func:`_follow_up_message_parts`. Under the
+    overlay model (goldfive#141) primary dispatch happens via
+    :func:`_passthrough_message_parts` against the user's original
+    request; per-task nudges only fire for PENDING tasks the tree
+    missed and use the gentler "Also, please" phrasing below.
+
+    Callers that need the old jargon-heavy shape must retire —
+    "Task: X. Use the goldfive.* session-state keys..." messages
+    cause coordinator agents with flow-oriented prompts to treat
+    every plan task as a new user request and run their full
+    pipeline for each one. See goldfive#141 for the root cause.
+    """
+    return _follow_up_message_parts(task)
+
+
+def _passthrough_message_parts(user_input: str) -> Any:
+    """Build the ADK user ``Content`` for an overlay-model passthrough.
+
+    Used by :meth:`ADKAdapter.invoke_passthrough` — sends the
+    user's original request verbatim so the agent tree sees the
+    same input plain ADK would. No goldfive jargon; no task
+    framing. The tree runs naturally and goldfive observes via
+    the plugin callbacks.
+    """
+    from google.genai.types import Content, Part  # type: ignore
+
+    text = user_input or ""
+    return Content(role="user", parts=[Part(text=text)])
+
+
+def _follow_up_message_parts(task: Task) -> Any:
+    """Build the gentle follow-up user turn for a missed plan task.
+
+    Used by :meth:`ADKAdapter.invoke_follow_up` — fires only when
+    the PlanReconciler determined the tree legitimately missed
+    ``task`` during the passthrough invocation. Phrased as a
+    natural follow-up ("Also, please: ...") so coordinator agents
+    don't re-run their full pipeline; the agent treats it as a
+    small additional request on top of the conversation history.
+
+    No mention of "goldfive.*" session-state keys — users bring
+    their own trees and the overlay model lets those trees run
+    with their native prompts intact.
     """
     from google.genai.types import Content, Part  # type: ignore
 
     title = getattr(task, "title", "") or ""
     description = getattr(task, "description", "") or ""
-    body_lines = [f"Task: {title}"]
-    if description:
-        body_lines.append(description)
-    body_lines.append(
-        "Use the goldfive.* session-state keys for plan context and call "
-        "the report_task_* tools to report outcome."
-    )
-    return Content(role="user", parts=[Part(text="\n".join(body_lines))])
+    if title and description:
+        body = f"Also, please: {title}. {description}"
+    elif title:
+        body = f"Also, please: {title}."
+    else:
+        body = f"Also, please: {description}" if description else "Also, please continue."
+    return Content(role="user", parts=[Part(text=body)])
 
 
 class ADKAdapter:
@@ -690,6 +728,12 @@ class ADKAdapter:
         # goldfive#139 and
         # :func:`_build_cancelled_response_event` for the content map.
         self._next_cancel_reason: str = ""
+        # Outer session id pinned by :class:`GoldfiveADKAgent` when the
+        # adapter runs inside adk-web. ``None`` for programmatic callers
+        # and test harnesses; the adapter falls back to the lazy-uuid
+        # mint in :meth:`_ensure_session`. Live tests in
+        # tests/test_live_steering_e2e.py set this explicitly.
+        self._outer_session_id: str | None = None
 
         # Wrap-time integrity check: the one runner must carry the
         # goldfive plugin. In degraded mode we skip because the caller
@@ -877,29 +921,113 @@ class ADKAdapter:
         await observe(text, task=task, session=session, provider=provider)
 
     async def invoke(self, task: Task, session: Session) -> InvocationResult:
-        """Drive one ADK turn for ``task`` and return the result.
+        """DEPRECATED — drive one ADK turn for a single ``task``.
 
-        Single-Runner model: the one runner around the root agent is
-        driven for every task. Delegation within the tree happens via
-        ADK's native ``AgentTool`` / ``transfer_to_agent`` / ``sub_agents``
-        mechanisms. ``task.assignee_agent_id`` is carried on the task
-        but not used for routing — the planner may populate it for
-        observability and for delegation hints inside the agent's
-        prompt, but the adapter does not route.
+        Retained for back-compat with legacy executors and tests
+        that predate the goldfive#141 overlay refactor. New code
+        should call :meth:`invoke_passthrough` for the initial
+        invocation and :meth:`invoke_follow_up` for soft per-task
+        nudges when the reconciler detects missed work.
 
-        Three break conditions preserved:
-
-        * ``_task_is_terminal(task, session)`` — the agent reported
-          terminal via a reporting tool. Early-exit optimization.
-        * ``_is_final_event(event)`` — ADK's final-response flag.
-        * Generator end on ``runner.run_async`` natural completion —
-          the authoritative termination signal.
-
-        Cancellation: the asyncio task running ``invoke()`` has its
-        cancellation propagate naturally through ``runner.run_async()``
-        generator awaits, INCLUDING nested AgentTool sub-Runner awaits.
+        This method now uses the gentler "Also, please: {title}."
+        phrasing (see :func:`_follow_up_message_parts`) rather than
+        the jargon-heavy "Task: X. Use the goldfive.* session-state
+        keys ..." shape that caused coordinator agents with flow
+        prompts to treat every plan task as a full new pipeline
+        trigger. See goldfive#141 for the root cause.
         """
-        task_id = getattr(task, "id", "") or ""
+        return await self._invoke_internal(
+            task=task,
+            session=session,
+            new_message=_follow_up_message_parts(task),
+            reconciler=None,
+        )
+
+    async def invoke_passthrough(
+        self,
+        user_message: str,
+        *,
+        session: Session,
+        reconciler: Any = None,
+        ctx: Any = None,  # noqa: ARG002 -- reserved for future invocation-context plumbing
+    ) -> InvocationResult:
+        """Drive ONE ADK turn with the user's original request (overlay path).
+
+        Primary overlay-model dispatch (goldfive#141). Sends
+        ``user_message`` verbatim — no task framing, no goldfive
+        jargon — so coordinator agents with flow-oriented prompts
+        run their natural pipeline exactly as they would under
+        plain ADK. Observation happens via the plugin's callback
+        surface and, when supplied, a :class:`PlanReconciler` maps
+        observed agent turns back to plan-task transitions.
+
+        The ``task`` field on :class:`SessionContext` is ``None``
+        for this path — there is no single "current task" during
+        a passthrough invocation. The plugin's state-protocol writes
+        still run (``before_run_callback``) but write no current-task
+        metadata; reporting tools, if called, route through the
+        reconciler's observation pipeline instead of per-task
+        attribution.
+
+        Returns an :class:`InvocationResult` whose ``task_id`` is
+        empty (no single task owns the whole invocation) and
+        ``text`` is the final assistant text.
+        """
+        return await self._invoke_internal(
+            task=None,
+            session=session,
+            new_message=_passthrough_message_parts(user_message),
+            reconciler=reconciler,
+        )
+
+    async def invoke_follow_up(self, task: Task, session: Session) -> InvocationResult:
+        """Drive a gentle follow-up for a plan ``task`` missed during passthrough.
+
+        Used by the overlay-model executor (goldfive#141) after
+        :meth:`invoke_passthrough` finishes and the
+        :class:`PlanReconciler` reports PENDING tasks the tree did
+        not exercise. Sends a natural-language "Also, please: ..."
+        user turn on top of the existing conversation so the tree
+        picks up the missed work without re-running its full
+        pipeline.
+        """
+        return await self._invoke_internal(
+            task=task,
+            session=session,
+            new_message=_follow_up_message_parts(task),
+            reconciler=None,
+        )
+
+    async def _invoke_internal(
+        self,
+        *,
+        task: Task | None,
+        session: Session,
+        new_message: Any,
+        reconciler: Any = None,
+    ) -> InvocationResult:
+        """Shared driver behind :meth:`invoke`, :meth:`invoke_passthrough`,
+        and :meth:`invoke_follow_up`.
+
+        Handles session creation, plugin context install, the
+        ``runner.run_async`` event loop, pending-tool-call healing,
+        and the plugin-context release. The only inputs that differ
+        between the three public entry points are:
+
+        * ``task`` — the current-task pin or ``None`` for passthrough
+        * ``new_message`` — the pre-built ADK ``Content`` body
+        * ``reconciler`` — overlay-mode reconciler or ``None``
+
+        Preserves every behaviour the legacy :meth:`invoke` exposed:
+
+        * ``_task_is_terminal(task, session)`` early-break (skipped
+          when ``task`` is ``None``)
+        * ``_is_final_event(event)`` check
+        * runaway-delegation cap short-circuit
+        * ``_heal_pending_tool_calls`` on cancel / error / orphaned
+          normal exit
+        """
+        task_id = getattr(task, "id", "") if task is not None else ""
 
         session_id = await self._ensure_session()
         state = await self._get_session_state(session_id)
@@ -918,10 +1046,17 @@ class ADKAdapter:
         # active context off its own instance, not from ADK session
         # state. The state-protocol write (run_id, plan, current task,
         # tools) happens inside the plugin's ``before_run_callback``
-        # against the LIVE invocation session — which is the #120 state-
-        # protocol fix, preserved here.
+        # against the LIVE invocation session — which is the #120
+        # state-protocol fix, preserved here.
         if self._plugin is not None:
             self._plugin.set_active_context(ctx)
+            # Overlay path: attach the PlanReconciler so the plugin
+            # forwards before/after_agent observations. Cleared in
+            # the ``finally`` block via clear_active_context.
+            if reconciler is not None:
+                set_rec = getattr(self._plugin, "set_reconciler", None)
+                if callable(set_rec):
+                    set_rec(reconciler)
 
         # Mirror into ADK state as a best-effort fallback for legacy
         # unit tests that construct a plain ``tool_context`` holding a
@@ -943,7 +1078,6 @@ class ADKAdapter:
         self._pending_tool_call_names.clear()
         was_cancelled = False
         try:
-            new_message = _new_message_parts(task)
             async for event in self._runner.run_async(
                 user_id=self._user_id,
                 session_id=session_id,
@@ -975,9 +1109,11 @@ class ADKAdapter:
                     final_text = text
                 if _is_final_event(event):
                     stop_reason = "final_response"
-                # Early termination when the agent has reported this task
-                # as terminal via a reporting tool.
-                if _task_is_terminal(task, session):
+                # Early termination when the agent has reported this
+                # task as terminal via a reporting tool. Skipped when
+                # ``task`` is None (passthrough path has no single
+                # "current task" to break on).
+                if task is not None and _task_is_terminal(task, session):
                     stop_reason = "task_terminal"
                     break
         except asyncio.CancelledError:
@@ -1024,6 +1160,8 @@ class ADKAdapter:
                 # invoke's cancel (if any) doesn't pick up leftover state.
                 self._next_cancel_reason = ""
             if self._plugin is not None:
+                # ``clear_active_context`` also clears any attached
+                # reconciler — overlay-mode is strictly per-invocation.
                 self._plugin.clear_active_context()
             if isinstance(state, Mapping):
                 try:

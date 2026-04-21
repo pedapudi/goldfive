@@ -147,7 +147,13 @@ class AgentAdapter(Protocol):
 
 @runtime_checkable
 class Executor(Protocol):
-    """Executes a ``Plan`` by dispatching tasks to the adapter and steerer."""
+    """Executes a ``Plan`` by dispatching tasks to the adapter and steerer.
+
+    Overlay-model executors (goldfive#141) additionally accept a
+    ``user_input`` kwarg carrying the caller's original string input
+    so they can forward it verbatim to ``adapter.invoke_passthrough``.
+    Legacy per-task executors simply ignore the kwarg.
+    """
 
     async def run(
         self,

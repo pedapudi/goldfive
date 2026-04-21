@@ -129,6 +129,8 @@ class SequentialExecutor(Executor):
         max_task_invocations: int | None = None,
         max_retries_per_task_lineage: int = 3,
         fail_fast: bool = True,
+        overlay_mode: bool = False,
+        max_follow_up_rounds: int = 3,
         **legacy_kwargs: Any,
     ) -> None:
         # Backwards-compatible alias: accept the old name for one release
@@ -154,6 +156,22 @@ class SequentialExecutor(Executor):
         )
         self.max_retries_per_task_lineage = int(max_retries_per_task_lineage)
         self.fail_fast = bool(fail_fast)
+        # Overlay model (goldfive#141). When ``overlay_mode`` is True:
+        #   1. Call ``adapter.invoke_passthrough(goal_text)`` ONCE
+        #      with the user's original request and a plugin-attached
+        #      :class:`~goldfive.reconciler.PlanReconciler` watching
+        #      the agent tree run its natural flow.
+        #   2. After the invocation ends, ask the reconciler for
+        #      PENDING tasks the tree missed and fire one
+        #      ``adapter.invoke_follow_up(task)`` per missed task.
+        #   3. Repeat up to ``max_follow_up_rounds`` times or until
+        #      every task reaches a terminal status.
+        # When False (default for direct SequentialExecutor() callers)
+        # we keep the legacy per-task loop so tests and callers that
+        # already encode that model keep working. The ``goldfive.wrap``
+        # convenience flips this to True by default.
+        self.overlay_mode = bool(overlay_mode)
+        self.max_follow_up_rounds = int(max_follow_up_rounds)
 
     # ------------------------------------------------------------------
     # Executor protocol
@@ -169,12 +187,20 @@ class SequentialExecutor(Executor):
         planner: Planner,
         sinks: list[EventSink],
         control: ControlChannel | None = None,
+        user_input: str = "",
     ) -> ExecutionOutcome:
         """Walk ``plan`` end-to-end, driving ``adapter`` once per eligible task.
 
         Returns an :class:`ExecutionOutcome` summarizing whether the run
         succeeded and carrying the final ``session`` so callers can inspect
         completed results / agent notes.
+
+        When :attr:`overlay_mode` is True the executor switches to the
+        goldfive#141 overlay path: one
+        :meth:`AgentAdapter.invoke_passthrough` with ``user_input``
+        followed by :meth:`AgentAdapter.invoke_follow_up` for each
+        task the reconciler flags as missed. Falls through to the
+        legacy per-task loop when ``overlay_mode`` is False.
         """
         # Pin the plan onto the session so the steerer / reporting handlers
         # see the same object the executor is iterating.
@@ -183,6 +209,23 @@ class SequentialExecutor(Executor):
         # Wire sinks + planner into the steerer so reporting-tool handlers
         # can emit events and trigger planner.refine on drift.
         steerer.bind(sinks=sinks, planner=planner)
+
+        # Overlay-mode dispatch: single passthrough + reconciled follow-ups.
+        # Only engages when the adapter exposes ``invoke_passthrough`` —
+        # duck-typed so third-party AgentAdapter implementations that
+        # predate the overlay refactor still work under ``overlay_mode=False``
+        # (the caller's choice).
+        if self.overlay_mode and callable(getattr(adapter, "invoke_passthrough", None)):
+            return await self._run_overlay(
+                plan=plan,
+                session=session,
+                adapter=adapter,
+                steerer=steerer,
+                planner=planner,
+                sinks=sinks,
+                control=control,
+                user_input=user_input,
+            )
 
         # NOTE: RunStarted is emitted by Runner, not by the executor. See
         # Runner._emit_run_started.
@@ -580,6 +623,320 @@ class SequentialExecutor(Executor):
             ),
         )
         return ExecutionOutcome(success=True, session=session)
+
+    # ------------------------------------------------------------------
+    # Overlay dispatch (goldfive#141)
+    # ------------------------------------------------------------------
+
+    async def _run_overlay(
+        self,
+        *,
+        plan: Plan,
+        session: Session,
+        adapter: AgentAdapter,
+        steerer: Steerer,
+        planner: Planner,  # noqa: ARG002 -- reserved for future refine hooks
+        sinks: list[EventSink],
+        control: ControlChannel | None,
+        user_input: str,
+    ) -> ExecutionOutcome:
+        """Overlay-model run loop: single passthrough + reconciled follow-ups.
+
+        See :meth:`run` for the high-level contract. In order:
+
+        1. Instantiate a :class:`~goldfive.reconciler.PlanReconciler`
+           bound to the session and steerer.
+        2. Call ``adapter.invoke_passthrough(user_input, session=...,
+           reconciler=...)`` ONCE. While the generator runs, the
+           plugin forwards before/after_agent observations to the
+           reconciler, which transitions plan tasks.
+        3. When the invocation ends, ask the reconciler for missed
+           PENDING tasks. For each missed task, fire
+           ``adapter.invoke_follow_up(task, session)`` and let the
+           plugin's legacy per-task attribution path close it out.
+        4. Repeat missed-task discovery up to
+           :attr:`max_follow_up_rounds` times.
+        5. If any tasks remain PENDING after the last round, mark
+           them NOT_NEEDED (not CANCELLED — the tree intentionally
+           did not run them and a re-invoke would not help).
+        6. Emit terminal RunCompleted / RunAborted.
+        """
+        from goldfive.reconciler import PlanReconciler
+
+        # Belt-and-suspenders: a caller that passed overlay_mode=True
+        # with no user_input can still fall back to an empty string;
+        # the passthrough message will just be empty and the tree
+        # runs off the last user turn in the session.
+        user_input = user_input or ""
+
+        host_agent_name = ""
+        agent_obj = getattr(adapter, "_agent", None)
+        if agent_obj is not None:
+            host_agent_name = str(getattr(agent_obj, "name", "") or "")
+
+        reconciler = PlanReconciler(
+            session=session,
+            steerer=steerer,
+            host_agent_name=host_agent_name,
+        )
+
+        # --- Single passthrough invocation. ------------------------
+        # Control channel + control-cancel semantics for the overlay
+        # path mirror the per-task loop's _invoke_with_control shape,
+        # but with only one invocation instead of a loop.
+        invoke_coro = self._invoke_passthrough_with_control(
+            adapter=adapter,
+            session=session,
+            steerer=steerer,
+            sinks=sinks,
+            control=control,
+            reconciler=reconciler,
+            user_input=user_input,
+        )
+        kind, payload = await invoke_coro
+        failure_reason = ""
+        if kind == "cancelled":
+            failure_reason = str(payload) or "cancelled by control"
+            await emit(
+                sinks,
+                run_aborted_event(
+                    run_id=session.run_id,
+                    sequence=session.next_sequence(),
+                    reason=failure_reason,
+                ),
+            )
+            return ExecutionOutcome(success=False, session=session, reason=failure_reason)
+        if kind == "adapter_error":
+            exc = payload
+            failure_reason = f"adapter.invoke_passthrough raised: {exc}"
+            log.exception("SequentialExecutor._run_overlay: passthrough raised")
+            await emit(
+                sinks,
+                run_aborted_event(
+                    run_id=session.run_id,
+                    sequence=session.next_sequence(),
+                    reason=failure_reason,
+                ),
+            )
+            return ExecutionOutcome(success=False, session=session, reason=failure_reason)
+
+        # --- Missed-task follow-up rounds. -------------------------
+        rounds = 0
+        while rounds < self.max_follow_up_rounds:
+            missed = reconciler.get_missed_tasks(session.plan)
+            if not missed:
+                break
+            rounds += 1
+            log.info(
+                "SequentialExecutor._run_overlay: round %d follow-up for %d missed task(s): %s",
+                rounds,
+                len(missed),
+                ", ".join(t.id for t in missed),
+            )
+            for task in missed:
+                # Re-check: a previous follow-up in this round may have
+                # pulled the task through a dependency side effect.
+                live = _find_task(session.plan or plan, task.id)
+                if live is None or live.status is not TaskStatus.PENDING:
+                    continue
+                # Announce the task as RUNNING before the follow-up
+                # invocation so TaskStarted lands in the sink stream
+                # exactly like the legacy per-task path. Idempotent
+                # via the steerer's terminal-status guard.
+                await steerer.transition(
+                    task.id,
+                    TaskStatus.RUNNING,
+                    session=session,
+                )
+                # Attempt a gentle follow-up. We tolerate adapters that
+                # don't expose ``invoke_follow_up`` by falling back to
+                # the legacy ``invoke`` (same gentle phrasing now).
+                invoke_fn = getattr(adapter, "invoke_follow_up", None) or adapter.invoke
+                try:
+                    result = await invoke_fn(task, session)
+                except asyncio.CancelledError:
+                    failure_reason = "cancelled during follow-up"
+                    await emit(
+                        sinks,
+                        run_aborted_event(
+                            run_id=session.run_id,
+                            sequence=session.next_sequence(),
+                            reason=failure_reason,
+                        ),
+                    )
+                    return ExecutionOutcome(success=False, session=session, reason=failure_reason)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "SequentialExecutor._run_overlay: follow-up for %s raised: %s",
+                        task.id,
+                        exc,
+                    )
+                    await steerer.transition(
+                        task.id,
+                        TaskStatus.FAILED,
+                        detail=f"follow-up adapter raised: {exc}",
+                        session=session,
+                    )
+                    continue
+                # If the follow-up didn't complete the task, let the
+                # auto-transition logic decide: invocation error →
+                # FAILED, otherwise COMPLETED. Idempotent on already-
+                # terminal tasks.
+                live_after = _find_task(session.plan or plan, task.id)
+                live_status = live_after.status if live_after is not None else TaskStatus.PENDING
+                if live_status in (TaskStatus.PENDING, TaskStatus.RUNNING):
+                    if result is not None and getattr(result, "error", None) is not None:
+                        await steerer.transition(
+                            task.id,
+                            TaskStatus.FAILED,
+                            detail=str(result.error),
+                            session=session,
+                        )
+                    else:
+                        summary = (result.text if result is not None else "") or ""
+                        await steerer.transition(
+                            task.id,
+                            TaskStatus.COMPLETED,
+                            detail=summary,
+                            session=session,
+                        )
+
+        # --- Any remaining PENDING tasks are "not needed". --------
+        # The tree legitimately did not run them, the follow-up
+        # rounds didn't resurrect them; mark terminal so sinks don't
+        # see stale PENDING entries and downstream runs don't wedge.
+        for t in list(getattr(session.plan, "tasks", None) or ()):
+            if t.status is TaskStatus.PENDING:
+                await steerer.transition(
+                    t.id,
+                    TaskStatus.NOT_NEEDED,
+                    detail="overlay: tree did not exercise; no follow-up needed",
+                    session=session,
+                )
+
+        # --- Terminal emission: success if no failures. -----------
+        if _any_failed(session.plan or plan) and self.fail_fast:
+            reason = "one or more tasks failed"
+            await emit(
+                sinks,
+                run_aborted_event(
+                    run_id=session.run_id,
+                    sequence=session.next_sequence(),
+                    reason=reason,
+                ),
+            )
+            return ExecutionOutcome(success=False, session=session, reason=reason)
+
+        unmet = evaluate_goal_predicates(session)
+        if unmet is not None:
+            await emit(
+                sinks,
+                run_aborted_event(
+                    run_id=session.run_id,
+                    sequence=session.next_sequence(),
+                    reason=unmet,
+                ),
+            )
+            return ExecutionOutcome(success=False, session=session, reason=unmet)
+
+        await emit(
+            sinks,
+            run_completed_event(
+                run_id=session.run_id,
+                sequence=session.next_sequence(),
+                outcome_summary=_outcome_summary(session),
+            ),
+        )
+        return ExecutionOutcome(success=True, session=session)
+
+    async def _invoke_passthrough_with_control(
+        self,
+        *,
+        adapter: AgentAdapter,
+        session: Session,
+        steerer: Steerer,
+        sinks: list[EventSink],
+        control: ControlChannel | None,
+        reconciler: Any,
+        user_input: str,
+    ) -> tuple[str, object | None]:
+        """Drive one ``invoke_passthrough`` while watching the control channel.
+
+        Mirrors :meth:`_invoke_with_control` for the overlay path.
+        Returns ``(kind, payload)`` where ``kind`` is ``"result"``,
+        ``"adapter_error"``, ``"cancelled"``, or ``"steer"``.
+        """
+        invoke_task: asyncio.Task = asyncio.create_task(
+            adapter.invoke_passthrough(
+                user_input,
+                session=session,
+                reconciler=reconciler,
+            ),
+            name="goldfive-invoke-passthrough",
+        )
+
+        if control is None:
+            try:
+                result = await invoke_task
+            except BaseException as exc:  # noqa: BLE001
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return ("adapter_error", exc)
+            return ("result", result)
+
+        while True:
+            recv_task = asyncio.create_task(control.receive(), name="control-recv")
+            done, _pending = await asyncio.wait(
+                {invoke_task, recv_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if invoke_task in done:
+                if not recv_task.done():
+                    recv_task.cancel()
+                    try:
+                        await recv_task
+                    except BaseException:  # noqa: BLE001
+                        pass
+                try:
+                    result = invoke_task.result()
+                except asyncio.CancelledError:
+                    return ("cancelled", "invoke cancelled")
+                except BaseException as exc:  # noqa: BLE001
+                    return ("adapter_error", exc)
+                return ("result", result)
+
+            try:
+                msg = recv_task.result()
+            except BaseException:  # noqa: BLE001
+                msg = None
+            if msg is None:
+                try:
+                    result = await invoke_task
+                except BaseException as exc:  # noqa: BLE001
+                    if isinstance(exc, asyncio.CancelledError):
+                        return ("cancelled", "invoke cancelled")
+                    return ("adapter_error", exc)
+                return ("result", result)
+
+            outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=sinks)
+            try:
+                await control.ack(outcome.ack)
+            except Exception:  # noqa: BLE001
+                pass
+
+            if outcome.cancel_run:
+                await self._cancel_invoke_task(invoke_task)
+                return ("cancelled", outcome.cancel_reason or "cancelled by control")
+
+            if outcome.steer_message is not None:
+                await self._cancel_invoke_task(invoke_task)
+                # For overlay-mode we don't loop on steer here — the
+                # caller (Runner) will pick up session.plan (which the
+                # steerer swapped) and re-enter on the next run() cycle.
+                return ("steer", outcome.steer_message)
+
+            # Non-cancelling controls: keep waiting.
 
     # ------------------------------------------------------------------
     # Control helpers

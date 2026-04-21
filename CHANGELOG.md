@@ -6,6 +6,23 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ### Added
 
+- #141 Overlay execution model — `goldfive.wrap(...)` no longer drives
+  per-task `"Task: X"` messages through the wrapped agent tree.
+  Instead, one `adapter.invoke_passthrough(user_input)` sends the
+  caller's original request verbatim and the new
+  `goldfive.reconciler.PlanReconciler` maps observed `before_agent` /
+  `after_agent` / `DelegationObserved` callbacks to plan-task
+  transitions. A post-invocation follow-up loop fires
+  `adapter.invoke_follow_up(task)` (gentle "Also, please: ..."
+  phrasing) for PENDING tasks the tree missed; tasks still PENDING
+  after the follow-up rounds land in the new terminal
+  `TaskStatus.NOT_NEEDED` state. Off-plan agents emit a
+  `PLAN_DIVERGENCE` drift at INFO severity (the #142 intervention
+  ladder decides escalation). `ADKAdapter` gains `invoke_passthrough`
+  and `invoke_follow_up`; the legacy `invoke(task)` is preserved
+  for back-compat and now also uses the gentle phrasing.
+  `SequentialExecutor(overlay_mode=True)` opts a caller into the new
+  path; `goldfive.wrap(...)` flips it on by default.
 - `REASONING_CLUSTER_TIGHTENING` — graduated INFO-severity early-warning
   drift below the `LOOPING_REASONING` cliff. Fires once per task when
   max cosine similarity against the last N=5 reasoning blocks falls in

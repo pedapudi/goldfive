@@ -21,6 +21,15 @@ class TaskStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     BLOCKED = "BLOCKED"
+    # Overlay-model (goldfive#141): a task the :class:`PlanReconciler`
+    # determined was legitimately skipped by the tree. Post-invocation
+    # the reconciler looks at PENDING tasks that were never exercised
+    # and marks those it deems optional / superseded as NOT_NEEDED
+    # rather than COMPLETED / FAILED. Terminal; distinct from CANCELLED
+    # so sinks can distinguish "user/system cancelled" from "tree
+    # chose not to run because the plan-to-execution mapping made it
+    # redundant".
+    NOT_NEEDED = "NOT_NEEDED"
 
 
 # Terminal statuses — a task in any of these cannot transition further
@@ -31,7 +40,7 @@ class TaskStatus(StrEnum):
 # gains a new terminal member, add it here and every consumer sees it.
 # See ``docs/design/TASK-LIFECYCLE.md`` §7.1 for the rationale.
 TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
-    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.NOT_NEEDED}
 )
 
 
@@ -337,7 +346,9 @@ class Plan:
         # (``for_revision=False``) already requires all tasks to be
         # PENDING (step 5) so no CANCELLED/FAILED task exists as a
         # predecessor.
-        _UNREACHABLE_PREDECESSOR_STATUSES = frozenset({TaskStatus.CANCELLED, TaskStatus.FAILED})
+        _UNREACHABLE_PREDECESSOR_STATUSES = frozenset(
+            {TaskStatus.CANCELLED, TaskStatus.FAILED, TaskStatus.NOT_NEEDED}
+        )
         tasks_by_id: dict[str, Task] = {t.id: t for t in self.tasks}
         for e in self.edges:
             from_task = tasks_by_id.get(e.from_task_id)
