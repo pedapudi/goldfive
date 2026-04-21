@@ -687,47 +687,79 @@ class SequentialExecutor(Executor):
             host_agent_name=host_agent_name,
         )
 
-        # --- Single passthrough invocation. ------------------------
-        # Control channel + control-cancel semantics for the overlay
-        # path mirror the per-task loop's _invoke_with_control shape,
-        # but with only one invocation instead of a loop.
-        invoke_coro = self._invoke_passthrough_with_control(
-            adapter=adapter,
-            session=session,
-            steerer=steerer,
-            sinks=sinks,
-            control=control,
-            reconciler=reconciler,
-            user_input=user_input,
-        )
-        kind, payload = await invoke_coro
+        # --- Passthrough invocation loop. --------------------------
+        # STEER control messages arriving mid-invocation require us
+        # to (a) feed the STEER through the steerer so USER_STEER
+        # drift → cascade-cancel + planner.refine runs and the
+        # session's plan is swapped in place, then (b) re-invoke the
+        # passthrough with the steer body as the new user input so
+        # the tree runs the revised plan. This is why the loop is a
+        # ``while True`` — a steer restarts the invocation against
+        # the new plan; ``cancelled`` / ``adapter_error`` terminates
+        # the run; ``result`` falls through to the follow-up rounds.
+        # See goldfive#149 for the regression this guards against.
+        current_user_input = user_input
         failure_reason = ""
-        if kind == "cancelled":
-            failure_reason = str(payload) or "cancelled by control"
-            await emit(
-                sinks,
-                run_aborted_event(
-                    run_id=session.run_id,
-                    sequence=session.next_sequence(),
-                    reason=failure_reason,
-                    session_id=session.id,
-                ),
+        while True:
+            kind, payload = await self._invoke_passthrough_with_control(
+                adapter=adapter,
+                session=session,
+                steerer=steerer,
+                sinks=sinks,
+                control=control,
+                reconciler=reconciler,
+                user_input=current_user_input,
             )
-            return ExecutionOutcome(success=False, session=session, reason=failure_reason)
-        if kind == "adapter_error":
-            exc = payload
-            failure_reason = f"adapter.invoke_passthrough raised: {exc}"
-            log.exception("SequentialExecutor._run_overlay: passthrough raised")
-            await emit(
-                sinks,
-                run_aborted_event(
-                    run_id=session.run_id,
-                    sequence=session.next_sequence(),
-                    reason=failure_reason,
-                    session_id=session.id,
-                ),
-            )
-            return ExecutionOutcome(success=False, session=session, reason=failure_reason)
+            if kind == "cancelled":
+                failure_reason = str(payload) or "cancelled by control"
+                await emit(
+                    sinks,
+                    run_aborted_event(
+                        run_id=session.run_id,
+                        sequence=session.next_sequence(),
+                        reason=failure_reason,
+                        session_id=session.id,
+                    ),
+                )
+                return ExecutionOutcome(success=False, session=session, reason=failure_reason)
+            if kind == "adapter_error":
+                exc = payload
+                failure_reason = f"adapter.invoke_passthrough raised: {exc}"
+                log.exception("SequentialExecutor._run_overlay: passthrough raised")
+                await emit(
+                    sinks,
+                    run_aborted_event(
+                        run_id=session.run_id,
+                        sequence=session.next_sequence(),
+                        reason=failure_reason,
+                        session_id=session.id,
+                    ),
+                )
+                return ExecutionOutcome(success=False, session=session, reason=failure_reason)
+            if kind == "steer":
+                # Feed the STEER through the steerer so USER_STEER
+                # drift fires → cascade-cancel + planner.refine runs
+                # → session.plan is replaced with the revised plan.
+                # Without this call the overlay would just re-enter
+                # the missed-task follow-up loop on the ORIGINAL plan,
+                # which is the goldfive#149 regression.
+                log.info(
+                    "SequentialExecutor._run_overlay: STEER received; "
+                    "feeding steerer.observe for USER_STEER drift + refine",
+                )
+                await self._apply_steer(payload, steerer=steerer, session=session)
+                current_user_input = self._extract_steer_body(
+                    payload, fallback=current_user_input
+                )
+                # Reset reconciler bookkeeping so the revised plan's
+                # tasks map fresh — stale task_id → agent claims from
+                # the pre-steer plan must not leak into the replay.
+                reconciler.reset_for_new_plan(session.plan)
+                # Restart the invocation with the steer body as the
+                # new user input.
+                continue
+            # kind == "result": fall through to the follow-up rounds.
+            break
 
         # --- Missed-task follow-up rounds. -------------------------
         rounds = 0
@@ -1202,6 +1234,30 @@ class SequentialExecutor(Executor):
             await steerer.observe(message, session)
         except Exception as exc:  # noqa: BLE001
             log.warning("SequentialExecutor: steerer.observe(STEER) raised: %s", exc)
+
+    @staticmethod
+    def _extract_steer_body(msg: object, *, fallback: str) -> str:
+        """Pull the user-authored steer text out of a STEER ControlMessage.
+
+        The STEER payload shape on the goldfive side is
+        ``{"note": str, "suggested_action": str}`` — the harmonograf
+        server maps ``PostAnnotation(body=...)`` onto
+        ``ControlEvent.steer.note`` (see
+        ``server/harmonograf_server/rpc/frontend.py``), and the
+        control bridge rehydrates that into
+        ``ControlMessage.payload["note"]``. We also accept
+        ``payload["body"]`` as a courtesy for callers building STEER
+        messages directly from annotation shapes, so either key works.
+
+        Falls back to ``fallback`` when the extracted text is empty,
+        so the re-invocation after a USER_STEER refine still has a
+        non-empty user message to work from.
+        """
+        payload = getattr(msg, "payload", None)
+        if not isinstance(payload, dict):
+            return fallback
+        body = str(payload.get("note", "") or payload.get("body", "") or "")
+        return body or fallback
 
 
 # ---------------------------------------------------------------------------
