@@ -54,6 +54,10 @@ _TASK_STATUS_TO_PB: dict[TaskStatus, str] = {
     TaskStatus.FAILED: "TASK_STATUS_FAILED",
     TaskStatus.CANCELLED: "TASK_STATUS_CANCELLED",
     TaskStatus.BLOCKED: "TASK_STATUS_BLOCKED",
+    # Overlay-model (goldfive#141): PlanReconciler marks PENDING tasks
+    # the tree legitimately skipped as NOT_NEEDED so sinks can tell
+    # "chose not to run" apart from a user/system-initiated CANCELLED.
+    TaskStatus.NOT_NEEDED: "TASK_STATUS_NOT_NEEDED",
 }
 _PB_TO_TASK_STATUS: dict[str, TaskStatus] = {v: k for k, v in _TASK_STATUS_TO_PB.items()}
 
@@ -78,9 +82,7 @@ _DRIFT_SEVERITY_TO_PB: dict[DriftSeverity, str] = {
     DriftSeverity.WARNING: "DRIFT_SEVERITY_WARNING",
     DriftSeverity.CRITICAL: "DRIFT_SEVERITY_CRITICAL",
 }
-_PB_TO_DRIFT_SEVERITY: dict[str, DriftSeverity] = {
-    v: k for k, v in _DRIFT_SEVERITY_TO_PB.items()
-}
+_PB_TO_DRIFT_SEVERITY: dict[str, DriftSeverity] = {v: k for k, v in _DRIFT_SEVERITY_TO_PB.items()}
 
 
 def _drift_severity_to_pb(severity: DriftSeverity, pb: Any) -> int:
@@ -110,7 +112,7 @@ def _drift_kind_from_pb(value: int, pb: Any) -> DriftKind:
         return DriftKind.CUSTOM
     # Strip the "DRIFT_KIND_" prefix and look up by enum member name.
     if name.startswith("DRIFT_KIND_"):
-        member = name[len("DRIFT_KIND_"):]
+        member = name[len("DRIFT_KIND_") :]
         try:
             return DriftKind[member]
         except KeyError:
@@ -358,9 +360,7 @@ _CONTROL_KIND_TO_PB: dict[ControlKind, str] = {
     ControlKind.INTERCEPT_TRANSFER: "CONTROL_KIND_INTERCEPT_TRANSFER",
     ControlKind.INJECT_MESSAGE: "CONTROL_KIND_INJECT_MESSAGE",
 }
-_PB_TO_CONTROL_KIND: dict[str, ControlKind] = {
-    v: k for k, v in _CONTROL_KIND_TO_PB.items()
-}
+_PB_TO_CONTROL_KIND: dict[str, ControlKind] = {v: k for k, v in _CONTROL_KIND_TO_PB.items()}
 
 
 def _control_kind_to_pb(kind: ControlKind, pb: Any) -> int:
@@ -386,9 +386,7 @@ _ACK_RESULT_TO_PB: dict[AckResult, str] = {
     AckResult.FAILURE: "CONTROL_ACK_RESULT_FAILURE",
     AckResult.UNSUPPORTED: "CONTROL_ACK_RESULT_UNSUPPORTED",
 }
-_PB_TO_ACK_RESULT: dict[str, AckResult] = {
-    v: k for k, v in _ACK_RESULT_TO_PB.items()
-}
+_PB_TO_ACK_RESULT: dict[str, AckResult] = {v: k for k, v in _ACK_RESULT_TO_PB.items()}
 
 
 def _ack_result_to_pb(result: AckResult, pb: Any) -> int:

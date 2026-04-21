@@ -35,6 +35,7 @@ and are loaded lazily by callers.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import warnings
 from collections.abc import Awaitable, Callable, Mapping
@@ -351,6 +352,16 @@ class Runner:
             )
             if self.control is not None:
                 executor_kwargs["control"] = self.control
+            # Overlay model (goldfive#141): pass the original user
+            # request through to the executor so an overlay-capable
+            # :class:`SequentialExecutor` can hand it verbatim to
+            # ``adapter.invoke_passthrough``. Best-effort via
+            # inspection — executors that don't accept
+            # ``user_input=`` keep working with the legacy kwargs.
+            if isinstance(user_input, str):
+                run_sig = inspect.signature(self.executor.run)
+                if "user_input" in run_sig.parameters:
+                    executor_kwargs["user_input"] = user_input
             outcome = await self.executor.run(**executor_kwargs)
         except Exception as exc:  # noqa: BLE001
             reason = f"executor.run raised: {exc}"

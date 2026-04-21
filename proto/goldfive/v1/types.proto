@@ -57,6 +57,13 @@ enum TaskStatus {
   TASK_STATUS_FAILED = 4;
   TASK_STATUS_CANCELLED = 5;
   TASK_STATUS_BLOCKED = 6;
+  // Overlay-model (goldfive#141): terminal status the PlanReconciler
+  // stamps on a PENDING task that was never exercised by the tree
+  // and was deemed legitimately skipped (e.g. optional work the
+  // coordinator chose not to route through). Distinct from CANCELLED
+  // so sinks can render "tree chose not to run" vs
+  // "user/system cancelled" differently.
+  TASK_STATUS_NOT_NEEDED = 7;
 }
 
 // Severity of a drift event or of the drift that triggered a plan

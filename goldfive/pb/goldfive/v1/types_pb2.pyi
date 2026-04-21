@@ -19,6 +19,7 @@ class TaskStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     TASK_STATUS_FAILED: _ClassVar[TaskStatus]
     TASK_STATUS_CANCELLED: _ClassVar[TaskStatus]
     TASK_STATUS_BLOCKED: _ClassVar[TaskStatus]
+    TASK_STATUS_NOT_NEEDED: _ClassVar[TaskStatus]
 
 class DriftSeverity(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -75,6 +76,7 @@ TASK_STATUS_COMPLETED: TaskStatus
 TASK_STATUS_FAILED: TaskStatus
 TASK_STATUS_CANCELLED: TaskStatus
 TASK_STATUS_BLOCKED: TaskStatus
+TASK_STATUS_NOT_NEEDED: TaskStatus
 DRIFT_SEVERITY_UNSPECIFIED: DriftSeverity
 DRIFT_SEVERITY_INFO: DriftSeverity
 DRIFT_SEVERITY_WARNING: DriftSeverity

@@ -186,13 +186,16 @@ def wrap(
         unexpected = ", ".join(sorted(legacy_kwargs))
         raise TypeError(f"goldfive.wrap got unexpected keyword argument(s): {unexpected}")
 
+    # Default executor: overlay mode ON for the wrap() convenience
+    # because :class:`ADKAdapter` exposes ``invoke_passthrough`` and
+    # that's the safe path for coordinator trees (goldfive#141).
+    # Callers supplying their own executor keep full control.
     resolved_executor: Executor = executor or SequentialExecutor(
-        max_task_invocations=max_task_invocations
+        max_task_invocations=max_task_invocations,
+        overlay_mode=True,
     )
     resolved_steerer: Steerer = steerer or DefaultSteerer()
-    resolved_sinks: list[EventSink] = (
-        list(sinks) if sinks is not None else [LoggingSink()]
-    )
+    resolved_sinks: list[EventSink] = list(sinks) if sinks is not None else [LoggingSink()]
 
     runner = Runner(
         agent=adapter,

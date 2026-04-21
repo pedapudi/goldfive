@@ -1905,9 +1905,10 @@ async def test_reporting_tool_guards_fire_across_back_to_back_invocations() -> N
 
         async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
             # Inspect the LAST event in the conversation to decide:
-            # * If the last event is a user turn with a "Task: X" nudge
-            #   we haven't acted on yet (no matching function_response
-            #   after it), emit a function_call for that task id.
+            # * If the last event is a user turn carrying an
+            #   "Also, please: <title>" follow-up (goldfive#141 overlay
+            #   phrasing) that hasn't been acted on yet, emit a
+            #   function_call for that task id.
             # * Otherwise (the last event is a function_response, meaning
             #   the handler just acked), close out with ``turn_complete``.
             contents = getattr(llm_request, "contents", None) or []
@@ -1920,20 +1921,29 @@ async def test_reporting_tool_guards_fire_across_back_to_back_invocations() -> N
                     text = getattr(p, "text", None)
                     fr = getattr(p, "function_response", None)
                     if text and role == "user":
-                        # Extract "Task: <id>" from the adapter's nudge.
+                        # Extract the title from the adapter's gentle
+                        # follow-up prompt "Also, please: <title>. <desc>"
+                        # (goldfive#141). Falls back to the legacy
+                        # "Task: X" prefix so older test harnesses keep
+                        # working.
                         for line in text.splitlines():
                             stripped = line.strip()
-                            if stripped.startswith("Task: "):
-                                last_user_task_id = (
-                                    stripped.split("Task: ", 1)[1].split("\n", 1)[0].strip()
-                                )
+                            for prefix in ("Also, please: ", "Task: "):
+                                if stripped.startswith(prefix):
+                                    tail = stripped[len(prefix):]
+                                    # Drop trailing punctuation / descriptions.
+                                    for sep in (". ", "\n"):
+                                        idx = tail.find(sep)
+                                        if idx >= 0:
+                                            tail = tail[:idx]
+                                            break
+                                    last_user_task_id = tail.rstrip(".").strip()
+                                    break
                         last_was_function_response_for_task = None
                     if fr is not None:
                         last_was_function_response_for_task = getattr(fr, "name", "") or ""
             if last_was_function_response_for_task is None and last_user_task_id:
-                # Map the nudge title back to the task id we expect. The
-                # adapter's nudge text is "Task: <title>" — our test
-                # creates tasks whose title spells out the topic.
+                # Map the nudge title back to the task id we expect.
                 task_id = {
                     "waffles": "waffle_research",
                     "raccoons": "raccoon_research",

@@ -589,6 +589,16 @@ def make_adk_plugin(
             # plain dict they control still work — the state-based lookup
             # there is authoritative for those synthetic harnesses.
             self._active_ctx: SessionContext | None = None
+            # Overlay-model reconciler (goldfive#141). Attached by
+            # :meth:`ADKAdapter.invoke_passthrough` before ``run_async``;
+            # cleared in its ``finally``. When present, the plugin
+            # forwards ``before_agent_callback`` / ``after_agent_callback``
+            # and delegation observations to the reconciler so it can
+            # transition plan tasks based on observed agent activity.
+            # None outside the overlay path — ``invoke(task)`` and
+            # ``invoke_follow_up`` keep the per-task model and do NOT
+            # attach a reconciler.
+            self._reconciler: Any = None
             # Track the top-level invocation_id on the current dispatch so
             # AgentTool-spawned sub-Runners' before_run_callbacks can
             # attribute themselves with a ``parent_invocation_id``.
@@ -642,6 +652,17 @@ def make_adk_plugin(
             self._top_invocation_id = ""
             self._agent_tool_spawn_count = 0
             self.runaway_delegation_tripped = False
+            self._reconciler = None
+
+        def set_reconciler(self, reconciler: Any) -> None:
+            """Attach a :class:`~goldfive.reconciler.PlanReconciler`.
+
+            Set by :meth:`ADKAdapter.invoke_passthrough` for the
+            duration of a single overlay-model invocation. The plugin
+            will forward before/after-agent + delegation observations
+            to the reconciler's hooks. Pass ``None`` to detach.
+            """
+            self._reconciler = reconciler
 
         def _resolve_ctx(self, adk_ctx: Any) -> SessionContext | None:
             """Return the live ``SessionContext`` or ``None`` if unbound.
@@ -753,6 +774,62 @@ def make_adk_plugin(
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.debug("before_run_callback: note_agent_activity raised: %s", exc)
+            return None
+
+        async def before_agent_callback(self, *, agent: Any, callback_context: Any) -> None:
+            """Forward an agent-turn start to the overlay reconciler.
+
+            Fires once per agent invocation (including sub-agents
+            inside AgentTool sub-Runners). When a
+            :class:`~goldfive.reconciler.PlanReconciler` is attached,
+            we forward ``agent.name`` and the invocation id so it
+            can transition the matching plan task to RUNNING. When
+            no reconciler is attached (legacy ``invoke(task)`` path),
+            this is a no-op.
+            """
+            reconciler = self._reconciler
+            if reconciler is None:
+                return None
+            agent_name = str(_safe_attr(agent, "name", "") or "")
+            inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
+                callback_context, "invocation_context", None
+            )
+            inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+            try:
+                await reconciler.on_before_agent(
+                    agent_name=agent_name,
+                    invocation_id=inv_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "before_agent_callback: reconciler.on_before_agent raised: %s",
+                    exc,
+                )
+            return None
+
+        async def after_agent_callback(self, *, agent: Any, callback_context: Any) -> None:
+            """Forward an agent-turn end to the overlay reconciler."""
+            reconciler = self._reconciler
+            if reconciler is None:
+                return None
+            agent_name = str(_safe_attr(agent, "name", "") or "")
+            inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
+                callback_context, "invocation_context", None
+            )
+            inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+            summary = self._invocation_last_text.get(inv_id, "") if inv_id else ""
+            try:
+                await reconciler.on_after_agent(
+                    agent_name=agent_name,
+                    invocation_id=inv_id,
+                    error=None,
+                    summary=summary,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "after_agent_callback: reconciler.on_after_agent raised: %s",
+                    exc,
+                )
             return None
 
         async def after_run_callback(self, *, invocation_context: Any) -> None:
@@ -1168,6 +1245,18 @@ def make_adk_plugin(
                     task_id=task_id,
                     invocation_id=inv_id,
                 )
+                if self._reconciler is not None:
+                    try:
+                        await self._reconciler.on_delegation_observed(
+                            from_agent=from_agent,
+                            to_agent=to_agent,
+                            invocation_id=inv_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "before_tool_callback: reconciler.on_delegation_observed raised: %s",
+                            exc,
+                        )
 
                 # Runaway-delegation cap. Count BEFORE short-circuiting
                 # so the drift fires exactly once at the threshold
