@@ -580,6 +580,10 @@ def make_adk_plugin(
             # plain dict they control still work — the state-based lookup
             # there is authoritative for those synthetic harnesses.
             self._active_ctx: SessionContext | None = None
+            # Track the top-level invocation_id on the current dispatch so
+            # AgentTool-spawned sub-Runners' before_run_callbacks can
+            # attribute themselves with a ``parent_invocation_id``.
+            self._top_invocation_id: str = ""
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
@@ -600,6 +604,7 @@ def make_adk_plugin(
             to call when no context is active.
             """
             self._active_ctx = None
+            self._top_invocation_id = ""
 
         def _resolve_ctx(self, adk_ctx: Any) -> SessionContext | None:
             """Return the live ``SessionContext`` or ``None`` if unbound.
@@ -615,18 +620,167 @@ def make_adk_plugin(
                 return self._active_ctx
             return _session_context_from_callback(adk_ctx)
 
+        # --- Invocation lifecycle --------------------------------------
+
+        async def before_run_callback(self, *, invocation_context: Any) -> None:
+            """Seed ``goldfive.*`` state on the LIVE invocation session and
+            emit :class:`AgentInvocationStarted`.
+
+            This is the RELIABILITY-CRITICAL state-protocol write path.
+            ``invocation_context.session`` is the session ADK is actually
+            running the invocation against — writes here are visible to
+            every subsequent callback and tool on the same session,
+            including AgentTool-spawned sub-Runners (whose own
+            ``before_run_callback`` fires with their own session and
+            therefore gets its own authoritative seed).
+
+            Previously the adapter wrote these keys against a session
+            fetched via ``session_service.get_session`` — which
+            ``InMemorySessionService`` returns as a shallow copy, so the
+            writes landed on a stranded dict the runner never saw. That
+            was flagged "best-effort" and left the state-protocol keys
+            unreliable, which is unacceptable for correctness — see
+            docs/design/TASK-LIFECYCLE.md §5.
+            """
+            ctx = self._resolve_ctx(invocation_context)
+            if ctx is None:
+                return None
+
+            # Determine parent_invocation_id: if a top-level one is
+            # already pinned on this plugin, we're in a nested AgentTool
+            # sub-Runner. The top-level adapter invocation is the first
+            # one to fire before_run_callback.
+            inv_id = str(_safe_attr(invocation_context, "invocation_id", "") or "")
+            parent_inv_id = ""
+            if self._top_invocation_id:
+                parent_inv_id = self._top_invocation_id
+            else:
+                # First before_run for this dispatch — pin it so nested
+                # AgentTool sub-Runners can attribute themselves below.
+                self._top_invocation_id = inv_id
+
+            # Write state-protocol keys onto the LIVE session the
+            # invocation is actually running against — not a copy.
+            session_obj = _safe_attr(invocation_context, "session", None)
+            state = _safe_attr(session_obj, "state", None)
+            if state is not None:
+                try:
+                    _sp.write_run_id(state, _safe_attr(ctx.session, "run_id", "") or "")
+                    _sp.write_plan_context(
+                        state,
+                        _safe_attr(ctx.session, "plan", None),
+                        _safe_attr(ctx.session, "completed_results", {}) or {},
+                        self._host_agent_name,
+                    )
+                    _sp.write_current_task(state, ctx.task)
+                    _sp.write_tools_available(state, list(ctx.tool_handlers.keys()))
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("before_run_callback: state write failed: %s", exc)
+
+            # Emit AgentInvocationStarted. Best-effort: observability
+            # only, so a sink / proto issue must not block the run.
+            agent_name = str(_safe_attr(ctx, "host_agent_name", "") or "") or self._host_agent_name
+            running_agent = _safe_attr(invocation_context, "agent", None)
+            running_agent_name = str(_safe_attr(running_agent, "name", "") or "")
+            if running_agent_name:
+                agent_name = running_agent_name
+            await self._emit_observability(
+                "agent_invocation_started",
+                agent_name=agent_name,
+                task_id=str(_safe_attr(ctx.task, "id", "") or ""),
+                invocation_id=inv_id,
+                parent_invocation_id=parent_inv_id,
+            )
+            return None
+
+        async def after_run_callback(self, *, invocation_context: Any) -> None:
+            """Emit :class:`AgentInvocationCompleted` when an invocation ends.
+
+            Fires once per runner invocation: top-level (goldfive
+            dispatch) and per-AgentTool sub-Runner.
+            """
+            ctx = self._resolve_ctx(invocation_context)
+            if ctx is None:
+                return None
+            inv_id = str(_safe_attr(invocation_context, "invocation_id", "") or "")
+            # If the finishing invocation is the top-level one, release
+            # the pin so a subsequent invoke() on the same plugin gets a
+            # fresh dispatch.
+            if self._top_invocation_id and self._top_invocation_id == inv_id:
+                self._top_invocation_id = ""
+            agent_name = str(_safe_attr(ctx, "host_agent_name", "") or "") or self._host_agent_name
+            running_agent = _safe_attr(invocation_context, "agent", None)
+            running_agent_name = str(_safe_attr(running_agent, "name", "") or "")
+            if running_agent_name:
+                agent_name = running_agent_name
+            await self._emit_observability(
+                "agent_invocation_completed",
+                agent_name=agent_name,
+                task_id=str(_safe_attr(ctx.task, "id", "") or ""),
+                invocation_id=inv_id,
+                summary="",
+            )
+            return None
+
+        async def _emit_observability(self, kind: str, **fields: Any) -> None:
+            """Fan out an observability event to the session's sinks.
+
+            Sinks live on the steerer (``steerer._sinks``) — same
+            channel the approval-requested path uses. Failures are
+            swallowed: observability cannot block an invocation.
+            """
+            ctx = self._active_ctx
+            if ctx is None:
+                return
+            steerer = ctx.steerer
+            if steerer is None:
+                return
+            sinks = getattr(steerer, "_sinks", None) or []
+            if not sinks:
+                return
+            session = ctx.session
+            run_id = str(_safe_attr(session, "run_id", "") or "")
+            try:
+                seq = session.next_sequence()
+            except Exception:  # noqa: BLE001
+                seq = 0
+            try:
+                from goldfive.events import (  # noqa: PLC0415 — lazy
+                    agent_invocation_completed_event,
+                    agent_invocation_started_event,
+                    delegation_observed_event,
+                    emit,
+                )
+
+                if kind == "agent_invocation_started":
+                    evt = agent_invocation_started_event(run_id, seq, **fields)
+                elif kind == "agent_invocation_completed":
+                    evt = agent_invocation_completed_event(run_id, seq, **fields)
+                elif kind == "delegation_observed":
+                    evt = delegation_observed_event(run_id, seq, **fields)
+                else:
+                    return
+                await emit(sinks, evt)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("_emit_observability: failed to emit %s: %s", kind, exc)
+
         # --- Plan + current-task context -------------------------------
 
         async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> None:
+            """Best-effort re-seed goldfive.* state for legacy test harnesses.
+
+            The authoritative state write happens in
+            :meth:`before_run_callback` against the live invocation
+            session. This callback retained its historic write-through
+            for unit tests that drive the plugin with a minimal
+            callback-context stub without a matching ``before_run``
+            lifecycle (see ``tests/test_adk_adapter.py``).
+            """
             ctx = self._resolve_ctx(callback_context)
             if ctx is None:
                 return None
             state = _session_state_from_callback(callback_context)
             if not isinstance(state, dict):
-                # Some ADK session state objects are dict-likes. We only
-                # write when we can mutate — otherwise the agent just
-                # sees no goldfive.* context, which is a survivable
-                # degraded mode.
                 try:
                     state[_sp.KEY_RUN_ID] = state.get(_sp.KEY_RUN_ID, "")  # type: ignore[index]
                 except Exception:
@@ -710,6 +864,30 @@ def make_adk_plugin(
                 if isinstance(result, dict):
                     return result
                 return {"acknowledged": True}
+
+            # AgentTool detection: emit DelegationObserved. We look both
+            # at the tool's class name (avoids an unconditional ADK
+            # import on module load) and its ``agent`` attribute so we
+            # catch wrapper / subclass shapes. Observability only — the
+            # tool still runs, so return None below.
+            nested_agent = _safe_attr(tool, "agent", None)
+            tool_cls_name = type(tool).__name__
+            if nested_agent is not None or tool_cls_name == "AgentTool":
+                to_agent = str(_safe_attr(nested_agent, "name", "") or "") or tool_name
+                from_agent = str(_safe_attr(ctx, "host_agent_name", "") or "")
+                task_id = str(_safe_attr(ctx.task, "id", "") or "")
+                inv_id = ""
+                inv_ctx = _safe_attr(tool_context, "_invocation_context", None)
+                if inv_ctx is not None:
+                    inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+                await self._emit_observability(
+                    "delegation_observed",
+                    from_agent=from_agent,
+                    to_agent=to_agent,
+                    task_id=task_id,
+                    invocation_id=inv_id,
+                )
+                # Fall through: AgentTool still runs, we're just observing.
 
             # Tool-level approval (Flow B). If the tool opts into
             # confirmation via ADK's native `require_confirmation` flag,
