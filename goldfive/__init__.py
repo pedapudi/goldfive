@@ -44,6 +44,7 @@ from goldfive.sinks import (
 )
 from goldfive.steerer import DefaultSteerer
 from goldfive.types import (
+    GOAL_SOURCE_USER_STEER,
     DriftEvent,
     DriftKind,
     DriftSeverity,
@@ -74,6 +75,7 @@ __all__ = [
     "EventSink",
     "ExecutionOutcome",
     "Executor",
+    "GOAL_SOURCE_USER_STEER",
     "GRPCSink",
     "Goal",
     "GoalDeriver",
