@@ -62,6 +62,7 @@ def wrap(
     call_llm: CallLLM | None = None,
     model: str | None = None,
     max_task_invocations: int | None = None,
+    plugins: list[Any] | None = None,
     **legacy_kwargs: Any,
 ) -> Runner:
     """Build a :class:`Runner` that drives ``agent`` with goldfive.
@@ -107,6 +108,14 @@ def wrap(
         :class:`SequentialExecutor` default and the :class:`Runner`.
         Accepts the deprecated ``max_plan_reinvocations`` kwarg for one
         release with a :class:`DeprecationWarning`.
+    plugins:
+        Optional list of ADK ``BasePlugin`` instances to install on
+        every per-agent runner built for an ADK wrap target. Forwards
+        to :class:`~goldfive.adapters.adk.ADKAdapter` so sub-agent
+        dispatches (``AgentTool(...)``, ``sub_agents``) observe the
+        same plugins as the coordinator — not just the
+        ``App(plugins=[...])``-level root runner. Ignored for
+        non-ADK agents. See goldfive#121.
 
     Returns
     -------
@@ -123,7 +132,7 @@ def wrap(
         ``BaseAgent`` side can annotate
         ``cast(GoldfiveADKAgent, goldfive.wrap(...))`` themselves.
     """
-    adapter = auto_adapter(agent)
+    adapter = auto_adapter(agent, plugins=plugins)
 
     resolved_call_llm: CallLLM | None = call_llm
     resolved_model: str = model or ""

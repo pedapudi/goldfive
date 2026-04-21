@@ -2064,3 +2064,228 @@ async def test_delegation_observed_emitted_on_agent_tool_call() -> None:
     assert first.from_agent == "agent_a"
     assert first.to_agent == "agent_b"
     assert first.task_id == "t1"
+
+
+# ---------------------------------------------------------------------------
+# Caller-supplied plugin propagation (goldfive#121)
+# ---------------------------------------------------------------------------
+
+
+def test_build_runner_without_plugins() -> None:
+    """``_build_runner(agent)`` must not pass a ``plugins`` kwarg to
+    ``InMemoryRunner`` when the caller didn't supply any.
+
+    Without the ``if plugins:`` guard, callers would always pay for a
+    ``plugins=[]`` kwarg which also masks ADK versions that omit the
+    parameter from their ``__init__``.
+    """
+    from goldfive.adapters import adk as adk_mod
+
+    captured: dict[str, Any] = {}
+
+    class _FakeRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    import google.adk.runners as adk_runners  # type: ignore
+
+    orig = adk_runners.InMemoryRunner
+    adk_runners.InMemoryRunner = _FakeRunner  # type: ignore[assignment]
+    try:
+        adk_mod._build_runner(_make_agent())
+    finally:
+        adk_runners.InMemoryRunner = orig  # type: ignore[assignment]
+
+    assert "plugins" not in captured, (
+        "no plugins supplied — _build_runner must omit the kwarg entirely"
+    )
+    assert captured["app_name"] == "test_agent"
+
+
+def test_build_runner_with_plugins() -> None:
+    """``_build_runner(agent, plugins=[...])`` must forward the plugin
+    list into :class:`InMemoryRunner` via the ``plugins=`` kwarg.
+    """
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+
+    from goldfive.adapters import adk as adk_mod
+
+    class _StubPlugin(BasePlugin):
+        def __init__(self) -> None:
+            super().__init__(name="stub")
+
+    captured: dict[str, Any] = {}
+
+    class _FakeRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    plugin = _StubPlugin()
+    import google.adk.runners as adk_runners  # type: ignore
+
+    orig = adk_runners.InMemoryRunner
+    adk_runners.InMemoryRunner = _FakeRunner  # type: ignore[assignment]
+    try:
+        adk_mod._build_runner(_make_agent(), plugins=[plugin])
+    finally:
+        adk_runners.InMemoryRunner = orig  # type: ignore[assignment]
+
+    assert captured.get("plugins") == [plugin]
+
+
+def test_adk_adapter_init_accepts_plugins() -> None:
+    """``ADKAdapter(tree, plugins=[...])`` stores the plugin list and
+    propagates it onto EVERY per-agent runner's plugin manager.
+
+    This is the goldfive#121 fix: without this, caller-supplied
+    observability plugins only land on the coordinator's runner because
+    the ADK ``App(plugins=[...])`` surface only covers the root.
+    """
+    from google.adk.agents.llm_agent import LlmAgent  # type: ignore
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+    from google.adk.tools.agent_tool import AgentTool  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    class _StubPlugin(BasePlugin):
+        def __init__(self) -> None:
+            super().__init__(name="adapter_init_stub")
+
+    def _mk(name: str) -> Any:
+        return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
+
+    research = _mk("research")
+    web = _mk("web")
+    coordinator = _mk("coordinator")
+    coordinator.tools = [AgentTool(research), AgentTool(web)]
+
+    plugin = _StubPlugin()
+    adapter = ADKAdapter(coordinator, plugins=[plugin])
+
+    assert adapter._plugins == [plugin]
+    # Every per-agent runner — not just the coordinator — must carry
+    # the caller-supplied plugin on its plugin_manager.
+    for agent_name, runner in adapter._runners.items():
+        installed = list(getattr(runner.plugin_manager, "plugins", []))
+        assert plugin in installed, (
+            f"caller-supplied plugin did not land on runner for {agent_name!r}; "
+            f"goldfive#121 regression"
+        )
+
+
+def test_wrap_accepts_plugins() -> None:
+    """``goldfive.wrap(tree, plugins=[...])`` must forward the plugin
+    list through to the underlying :class:`ADKAdapter`.
+    """
+    from google.adk.agents.llm_agent import LlmAgent  # type: ignore
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+    from google.adk.tools.agent_tool import AgentTool  # type: ignore
+
+    import goldfive
+    from goldfive.adapters.adk_wrap import GoldfiveADKAgent
+
+    class _StubPlugin(BasePlugin):
+        def __init__(self) -> None:
+            super().__init__(name="wrap_stub")
+
+    def _mk(name: str) -> Any:
+        return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
+
+    sub = _mk("sub")
+    coordinator = _mk("coordinator")
+    coordinator.tools = [AgentTool(sub)]
+
+    plugin = _StubPlugin()
+    wrapped = goldfive.wrap(coordinator, plugins=[plugin])
+    assert isinstance(wrapped, GoldfiveADKAgent)
+
+    adapter = wrapped._runner.agent
+    assert adapter._plugins == [plugin]
+    for agent_name, runner in adapter._runners.items():
+        installed = list(getattr(runner.plugin_manager, "plugins", []))
+        assert plugin in installed, (
+            f"wrap(plugins=[...]) did not propagate onto runner for {agent_name!r}"
+        )
+
+
+async def test_dispatch_uses_plugins_in_sub_agent_runner() -> None:
+    """Dispatching to a sub-agent must exercise caller-supplied plugins.
+
+    Regression guard for goldfive#121: previously only the coordinator's
+    runner received ``App(plugins=[...])`` plugins; sub-agent dispatches
+    (via ``AgentTool``/registry lookup) ran through a bare
+    ``InMemoryRunner`` with no plugins, so harmonograf only saw
+    telemetry for the outermost coordinator.
+    """
+    from google.adk.agents import Agent  # type: ignore
+    from google.adk.models.base_llm import BaseLlm  # type: ignore
+    from google.adk.models.llm_response import LlmResponse  # type: ignore
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+    from google.adk.tools.agent_tool import AgentTool  # type: ignore
+    from google.genai import types as genai_types  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    class _RecordingPlugin(BasePlugin):
+        def __init__(self) -> None:
+            super().__init__(name="recording")
+            self.agents_seen: list[str] = []
+
+        async def before_run_callback(self, *, invocation_context: Any) -> None:  # noqa: ARG002
+            agent = getattr(invocation_context, "agent", None)
+            name = getattr(agent, "name", "") if agent is not None else ""
+            self.agents_seen.append(str(name))
+
+    class _ScriptedLlm(BaseLlm):
+        model: str = "fake-model"
+
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
+            yield LlmResponse(
+                content=genai_types.Content(
+                    role="model",
+                    parts=[genai_types.Part(text="ok")],
+                ),
+                turn_complete=True,
+            )
+
+    # Coordinator with an AgentTool(sub) so both agents are reachable
+    # in the registry and can be dispatched to independently.
+    sub = Agent(name="sub_agent", model=_ScriptedLlm(), instruction="")
+    coordinator = Agent(
+        name="coordinator",
+        model=_ScriptedLlm(),
+        instruction="",
+        tools=[AgentTool(sub)],
+    )
+
+    plugin = _RecordingPlugin()
+    adapter = ADKAdapter(coordinator, plugins=[plugin])
+
+    class _StubSteerer:
+        async def observe(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def transition(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def detect_drift(self, *a: Any, **kw: Any) -> None:
+            return None
+
+        def bind(self, **kw: Any) -> None:
+            pass
+
+    adapter.bind_steerer(_StubSteerer())
+
+    # Dispatch directly to the sub-agent. Before the fix, the sub
+    # agent's runner had no plugin manager entries so the recording
+    # plugin's before_run_callback would never fire for this invoke().
+    task = Task(id="t1", title="do it", assignee_agent_id="sub_agent")
+    plan = Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[])
+    session = Session(run_id="r1", plan=plan)
+    await adapter.invoke(task=task, session=session)
+
+    assert "sub_agent" in plugin.agents_seen, (
+        "caller-supplied plugin was never invoked when dispatching to the "
+        "sub-agent; goldfive#121 regression — plugins must propagate "
+        f"onto the sub-agent runner. Saw: {plugin.agents_seen!r}"
+    )

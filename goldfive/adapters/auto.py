@@ -114,7 +114,7 @@ def _looks_like_async_agent_callable(agent: Any) -> bool:
     return asyncio.iscoroutinefunction(call_attr)
 
 
-def auto_adapter(agent: Any) -> AgentAdapter:
+def auto_adapter(agent: Any, *, plugins: list[Any] | None = None) -> AgentAdapter:
     """Return a concrete :class:`AgentAdapter` for ``agent``.
 
     Dispatch order:
@@ -130,6 +130,11 @@ def auto_adapter(agent: Any) -> AgentAdapter:
        :class:`~goldfive.adapters.callable.CallableAdapter`.
     5. Otherwise, raise :class:`TypeError` with a list of the shapes
        goldfive recognises.
+
+    ``plugins`` is forwarded to :class:`ADKAdapter` when the dispatch
+    target is an ADK agent/runner. It is ignored for the other shapes —
+    there is no analogous plugin surface in the Claude SDK or callable
+    adapters today. See goldfive#121.
     """
     if isinstance(agent, AgentAdapter):
         return agent
@@ -137,7 +142,7 @@ def auto_adapter(agent: Any) -> AgentAdapter:
     if _looks_like_adk_agent(agent) or _looks_like_adk_runner(agent):
         from goldfive.adapters.adk import ADKAdapter  # lazy: requires extra
 
-        return ADKAdapter(agent)
+        return ADKAdapter(agent, plugins=plugins)
 
     if _looks_like_claude_client_factory(agent):
         from goldfive.adapters.claude import ClaudeAgentSDKAdapter  # lazy
