@@ -80,6 +80,18 @@ Every default component is overridable — pass `planner=`,
 `executor=`, `sinks=`, `call_llm=`, `model=`, or
 `max_task_invocations=` as keyword arguments to either function.
 
+`goldfive.wrap(any_adk_tree)` works regardless of tree shape —
+single agent, coordinator with `AgentTool`-wrapped specialists,
+deep `sub_agents` nesting, `inner_agent` wrappers. goldfive walks
+the tree once at wrap time, builds a `name -> BaseAgent` registry,
+and dispatches each task to the per-agent runner for its
+`task.assignee_agent_id`. The tree is **respected, never rewritten
+or flattened**. See
+[`docs/design/ARCHITECTURE.md §"Registry dispatch"`](docs/design/ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)
+for the model and
+[`docs/guides/adk-web-integration.md`](docs/guides/adk-web-integration.md)
+for a coordinator+AgentTool example under `adk web`.
+
 A runnable demo lives in
 [`examples/hello_callable.py`](examples/hello_callable.py).
 
