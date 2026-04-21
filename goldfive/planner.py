@@ -1898,6 +1898,118 @@ class LLMPlanner:
             return None, goal_error
         return merged_plan, ""
 
+    # ------------------------------------------------------------------
+    # Goal synthesis from USER_STEER body (goldfive#152)
+    # ------------------------------------------------------------------
+
+    #: System prompt for :meth:`synthesize_goal_from_steer`. Asks the
+    #: LLM to turn a free-form steer body into a durable Goal and
+    #: classify whether the steer is additive (APPEND) or a
+    #: scrap-and-pivot (REPLACE). Keep the shape tight so a minimal
+    #: response is enough.
+    _SYNTHESIZE_GOAL_SYSTEM_PROMPT: str = (
+        "You are a goal extractor for a multi-agent orchestration system. "
+        "A human operator has just issued a STEERING directive mid-run. "
+        "Convert the directive into a single durable Goal and decide "
+        "whether it REPLACES the existing goals (scrap-and-pivot) or is "
+        "ADDITIVE (append alongside existing goals).\n\n"
+        "Reply with a single JSON object and NOTHING ELSE:\n"
+        '{"goal": {"id": "<short-id>", "summary": "<one-sentence>"}, '
+        '"mode": "append" | "replace", '
+        '"reason": "<one-sentence why>"}\n\n'
+        "Guidelines:\n"
+        "- Use 'replace' when the steer contradicts or supersedes prior "
+        "goals (e.g. 'actually, just do X instead', 'skip the rest', "
+        "'change direction to Y').\n"
+        "- Use 'append' when the steer adds a new concern alongside "
+        "existing goals (e.g. 'also include X', 'while you're at it, Y').\n"
+        "- The id should be short (<=16 chars) and unique-looking; "
+        "'steer' is an acceptable default when no better label fits."
+    )
+
+    async def synthesize_goal_from_steer(
+        self,
+        steer_body: str,
+    ) -> tuple[Goal, str] | None:
+        """Synthesize a ``Goal`` from a USER_STEER body via one LLM call.
+
+        Returns ``(goal, mode)`` where ``mode`` is ``"append"`` or
+        ``"replace"``. Returns ``None`` on LLM error / parse failure so
+        the caller can fall back to a passthrough Goal. The steerer
+        handles the fallback (see
+        :meth:`goldfive.steerer.DefaultSteerer._synthesize_goal_from_steer`);
+        this method is deliberately strict so a misbehaving LLM doesn't
+        silently append nonsense goals.
+
+        One-shot: no retry loop (unlike refine), because the failure
+        mode of a bad synthesis is recoverable by the caller's
+        fallback, whereas a bad refine leaves the plan mis-shaped.
+        """
+        body = (steer_body or "").strip()
+        if not body:
+            return None
+        user_prompt = (
+            f"STEERING DIRECTIVE:\n{body}\n\n"
+            "Extract the durable Goal and classify the mode. Reply JSON only."
+        )
+        try:
+            raw = await self._call_llm(
+                self._SYNTHESIZE_GOAL_SYSTEM_PROMPT,
+                user_prompt,
+                self._model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "LLMPlanner.synthesize_goal_from_steer: call_llm raised %s",
+                exc,
+            )
+            return None
+        if not isinstance(raw, str) or not raw.strip():
+            log.warning(
+                "LLMPlanner.synthesize_goal_from_steer: empty / non-str response"
+            )
+            return None
+        cleaned = _strip_code_fences(raw).strip()
+        try:
+            parsed = json.loads(cleaned)
+        except (ValueError, TypeError) as exc:
+            log.warning(
+                "LLMPlanner.synthesize_goal_from_steer: JSON parse failed: %s",
+                exc,
+            )
+            return None
+        if not isinstance(parsed, dict):
+            log.warning(
+                "LLMPlanner.synthesize_goal_from_steer: response was not an "
+                "object; got %r",
+                type(parsed),
+            )
+            return None
+        goal_raw = parsed.get("goal")
+        if not isinstance(goal_raw, dict):
+            log.warning(
+                "LLMPlanner.synthesize_goal_from_steer: missing 'goal' object"
+            )
+            return None
+        summary = goal_raw.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            log.warning(
+                "LLMPlanner.synthesize_goal_from_steer: goal missing non-empty "
+                "'summary'"
+            )
+            return None
+        gid = goal_raw.get("id")
+        if not isinstance(gid, str) or not gid.strip():
+            gid = "steer"
+        mode = parsed.get("mode")
+        if not isinstance(mode, str) or mode.strip().lower() not in (
+            "append",
+            "replace",
+        ):
+            mode = "append"
+        goal = Goal(id=gid.strip(), summary=summary.strip())
+        return goal, mode.strip().lower()
+
 
 __all__ = [
     "LLMPlanner",

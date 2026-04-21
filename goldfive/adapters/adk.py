@@ -1312,6 +1312,7 @@ class ADKAdapter:
                 session_id=session_id,
                 invocation_id=last_invocation_id,
                 reason=reason,
+                session=session,
             )
             raise
         except Exception as exc:  # noqa: BLE001
@@ -1323,6 +1324,7 @@ class ADKAdapter:
                 session_id=session_id,
                 invocation_id=last_invocation_id,
                 reason=f"error:{type(exc).__name__}",
+                session=session,
             )
         finally:
             if not was_cancelled:
@@ -1337,6 +1339,7 @@ class ADKAdapter:
                         session_id=session_id,
                         invocation_id=last_invocation_id,
                         reason="unexpected_orphan_on_normal_exit",
+                        session=session,
                     )
                 # No cancel fired — drop any stale tag so the NEXT
                 # invoke's cancel (if any) doesn't pick up leftover state.
@@ -1419,6 +1422,7 @@ class ADKAdapter:
         session_id: str,
         invocation_id: str,
         reason: str,
+        session: Session | None = None,
     ) -> None:
         """Append synthetic ``function_response`` events for orphan tool calls.
 
@@ -1429,9 +1433,33 @@ class ADKAdapter:
         session via ``session_service.append_event``. Best-effort: logs and
         swallows individual failures so healing one orphan doesn't block
         the others.
+
+        goldfive#152: when ``session`` is provided, the orchestration-state
+        dict at ``session.state`` is stamped with the healed function_call
+        ids under ``goldfive.cancelled_function_call_ids`` (append-only,
+        de-duplicated) so downstream planners / prompt templates can see
+        which tool-call ids were cancelled mid-invocation without poking
+        adapter internals.
         """
         if not self._pending_tool_call_ids:
             return
+        # goldfive#152: snapshot the ids we're about to heal BEFORE we
+        # clear the set so the orchestration-state stamp reflects the
+        # full heal even if an early return fires below.
+        snapshot_ids = sorted(self._pending_tool_call_ids)
+        if session is not None and snapshot_ids:
+            try:
+                from goldfive import orchestration_state as _ostate
+
+                _ostate.append_cancelled_function_call_ids(
+                    session.state, snapshot_ids
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "ADKAdapter._heal_pending_tool_calls: could not stamp "
+                    "goldfive.cancelled_function_call_ids: %s",
+                    exc,
+                )
 
         session_service = getattr(runner, "session_service", None)
         if session_service is None:

@@ -50,6 +50,7 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+from goldfive import orchestration_state as _ostate
 from goldfive.drift import (
     classify_refusal,
     classify_stop_reason,
@@ -60,6 +61,7 @@ from goldfive.types import (
     DriftEvent,
     DriftKind,
     DriftSeverity,
+    Goal,
     Plan,
     Session,
     Task,
@@ -437,6 +439,11 @@ class DefaultSteerer:
         session.current_task_id = task_id
         if detail:
             session.agent_notes[task_id] = detail
+        # goldfive#152: stamp current_task_* on the orchestration-state
+        # dict so downstream prompt templates / refine paths see it.
+        _ostate.sync_current_task_from_transition(
+            session.state, task, TaskStatus.RUNNING
+        )
         await self._emit_task_started(session, task_id, detail)
 
     async def mark_task_progress(
@@ -482,6 +489,10 @@ class DefaultSteerer:
         task.status = TaskStatus.COMPLETED
         if summary:
             session.completed_results[task_id] = summary
+        # goldfive#152: clear current_task_* if we were the active task.
+        _ostate.sync_current_task_from_transition(
+            session.state, task, TaskStatus.COMPLETED
+        )
         await self._emit_task_completed(session, task_id, summary, artifacts or {})
 
     async def mark_task_failed(
@@ -518,6 +529,9 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         task.status = TaskStatus.FAILED
+        _ostate.sync_current_task_from_transition(
+            session.state, task, TaskStatus.FAILED
+        )
         await self._emit_task_failed(session, task_id, reason, recoverable)
         # Fatal failures cascade downstream via the same primitive used
         # by mark_task_cancelled, so both §6.2 and §6.3 produce the
@@ -597,6 +611,9 @@ class DefaultSteerer:
             # TaskCancelled events for downstream tasks on every call.
             return
         task.status = TaskStatus.CANCELLED
+        _ostate.sync_current_task_from_transition(
+            session.state, task, TaskStatus.CANCELLED
+        )
         await self._emit_task_cancelled(session, task_id, reason)
         await self.cascade_cancel_downstream(session, task_id)
 
@@ -629,6 +646,9 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         task.status = TaskStatus.NOT_NEEDED
+        _ostate.sync_current_task_from_transition(
+            session.state, task, TaskStatus.NOT_NEEDED
+        )
         # There is no dedicated ``TaskNotNeeded`` proto message;
         # reuse TaskCancelled with the reason prefix so sinks that
         # inspect reason can differentiate if they wish. The live
@@ -1326,6 +1346,17 @@ class DefaultSteerer:
         # goldfive#139 and
         # :func:`goldfive.adapters.adk._build_cancelled_response_event`.
         self._tag_adapter_cancel_reason(drift)
+        # goldfive#152: USER_STEER-specific side effects -- write the
+        # active-steer bookkeeping onto the orchestration-state dict
+        # and synthesize a durable Goal from the steer body so
+        # subsequent refines see the pivot as a first-class goal,
+        # not a one-shot user message. Done BEFORE the drift event
+        # is emitted (the state writes are cheap) and BEFORE the
+        # ladder dispatches to planner.refine (which reads
+        # ``session.goals`` we just mutated) so the refine sees the
+        # new goal shape in the same dispatch.
+        if drift.kind is DriftKind.USER_STEER:
+            await self._apply_user_steer_state(drift, session)
         await self._emit_drift_detected(session, drift)
         # Route through the intervention ladder. The per-(kind, task)
         # occurrence count drives the "first vs repeat" distinction in
@@ -1730,6 +1761,134 @@ class DefaultSteerer:
                 exc,
             )
 
+    # ------------------------------------------------------------------
+    # USER_STEER state handler (goldfive#152)
+    # ------------------------------------------------------------------
+
+    async def _apply_user_steer_state(
+        self,
+        drift: DriftEvent,
+        session: Session,
+    ) -> None:
+        """Side-effects for USER_STEER drift that aren't refine: state
+        bookkeeping + goal synthesis.
+
+        Called from :meth:`_handle_drift` just before ``_emit_drift_detected``
+        and well before ``planner.refine`` runs, so:
+
+        1. The ``goldfive.active_steer.*`` keys are set so downstream
+           observers see the steer before the drift event.
+        2. The synthesized Goal is appended / replaced onto
+           ``session.goals`` BEFORE ``planner.refine`` reads
+           ``list(session.goals)``, so the refined plan sees the
+           pivot as a goal, not only as a drift detail string.
+
+        Never raises: a planner that doesn't implement
+        ``synthesize_goal_from_steer`` or a synthesis call that fails
+        falls through to a minimal passthrough (wrap the steer body as
+        a Goal, mode APPEND). The steerer must never break the run on
+        a missing optional hook.
+        """
+        body = (drift.detail or "").strip()
+        # Stamp the active_steer keys regardless of synthesis outcome
+        # so readers see "a steer is active as of turn N" even when
+        # the planner can't synthesize. ``at_turn`` uses the session's
+        # monotonic sequence counter which increments on every emitted
+        # event — a cheap, always-available "turn" proxy.
+        at_turn = getattr(session, "_next_sequence", 0) or 0
+        try:
+            _ostate.set_active_steer(session.state, body=body, at_turn=at_turn)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "DefaultSteerer._apply_user_steer_state: set_active_steer raised: %s",
+                exc,
+            )
+        if not body:
+            # Empty steer body: nothing to synthesize into a goal. The
+            # active_steer.* keys still landed (readers may want to know
+            # "a steer was fired even if empty"). Keep goals as-is.
+            return
+        synth_goal, mode = await self._synthesize_goal_from_steer(body)
+        if synth_goal is None:
+            return
+        mode_norm = (mode or "append").strip().lower()
+        if mode_norm == "replace":
+            session.goals.clear()
+            session.goals.append(synth_goal)
+        else:
+            # Default / "append" mode: add unless an id collision
+            # exists (belt-and-braces if the synthesizer reuses an id).
+            existing = {g.id for g in session.goals if g.id}
+            if synth_goal.id and synth_goal.id in existing:
+                # Replace the colliding goal in-place so the synthesizer
+                # can refine a previously-appended steer goal.
+                for i, g in enumerate(session.goals):
+                    if g.id == synth_goal.id:
+                        session.goals[i] = synth_goal
+                        break
+            else:
+                session.goals.append(synth_goal)
+        # Refresh the goals_summary so downstream consumers (refine
+        # prompt templates, GoldfivePlanner in goldfive#153) see the
+        # new shape immediately.
+        try:
+            _ostate.refresh_goals_summary(session.state, session.goals)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "DefaultSteerer._apply_user_steer_state: refresh_goals_summary raised: %s",
+                exc,
+            )
+
+    async def _synthesize_goal_from_steer(
+        self,
+        steer_body: str,
+    ) -> tuple[Goal | None, str]:
+        """Call ``planner.synthesize_goal_from_steer`` if available.
+
+        Returns ``(goal, mode)`` where ``mode`` is ``"append"`` or
+        ``"replace"``. Falls back to a passthrough goal (APPEND) when
+        the planner doesn't implement the hook or the call fails.
+        The fallback keeps the steer body durable on
+        ``session.goals`` even when the planner is a minimal stub
+        (PassthroughPlanner / StaticPlanner / tests).
+        """
+        planner = self._planner
+        synth = getattr(planner, "synthesize_goal_from_steer", None)
+        if not callable(synth):
+            return Goal(id="steer", summary=steer_body), "append"
+        try:
+            result = await synth(steer_body)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "DefaultSteerer: planner.synthesize_goal_from_steer raised "
+                "%s; falling back to passthrough append",
+                exc,
+            )
+            return Goal(id="steer", summary=steer_body), "append"
+        if result is None:
+            return Goal(id="steer", summary=steer_body), "append"
+        # Accept two shapes: a bare Goal (mode defaults to "append") or
+        # a ``(Goal, mode)`` tuple. The tuple shape is what the
+        # synthesizer should emit in the common case; the bare form is
+        # a courtesy for callers / tests that only care about the goal.
+        if isinstance(result, tuple) and len(result) == 2:
+            goal, mode = result
+            if not isinstance(goal, Goal):
+                log.warning(
+                    "DefaultSteerer: synthesize_goal_from_steer returned "
+                    "tuple without Goal; falling back"
+                )
+                return Goal(id="steer", summary=steer_body), "append"
+            return goal, str(mode or "append")
+        if isinstance(result, Goal):
+            return result, "append"
+        log.warning(
+            "DefaultSteerer: synthesize_goal_from_steer returned "
+            "unrecognised shape %r; falling back",
+            type(result),
+        )
+        return Goal(id="steer", summary=steer_body), "append"
+
     # Consecutive refine failures tolerated per (drift_kind, task_id)
     # before we give up and mark the task FAILED. Class attribute so
     # subclasses / tests can tune it without poking at instance state.
@@ -1818,6 +1977,9 @@ class DefaultSteerer:
         if not revised.revision_reason:
             revised.revision_reason = drift.detail
         session.plan = revised
+        # goldfive#152: refresh the orchestration-state current plan id
+        # so downstream reads see the revised id, not the stale one.
+        _ostate.set_current_plan(session.state, revised)
 
     # --- Event construction ------------------------------------------
 

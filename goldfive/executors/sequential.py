@@ -748,7 +748,11 @@ class SequentialExecutor(Executor):
                     "feeding steerer.observe for USER_STEER drift + refine",
                 )
                 await self._apply_steer(payload, steerer=steerer, session=session)
-                current_user_input = self._extract_steer_body(
+                # goldfive#152: wrap the steer body in a goldfive-authored
+                # override header so the LLM sees it as a USER STEERING
+                # CONTROL directive, not a fresh user turn. Supersedes
+                # goldfive#149's raw-body handoff.
+                current_user_input = self._compose_steer_restart_message(
                     payload, fallback=current_user_input
                 )
                 # Reset reconciler bookkeeping so the revised plan's
@@ -1236,8 +1240,8 @@ class SequentialExecutor(Executor):
             log.warning("SequentialExecutor: steerer.observe(STEER) raised: %s", exc)
 
     @staticmethod
-    def _extract_steer_body(msg: object, *, fallback: str) -> str:
-        """Pull the user-authored steer text out of a STEER ControlMessage.
+    def _compose_steer_restart_message(msg: object, *, fallback: str) -> str:
+        """Wrap a STEER body in a goldfive-authored override header.
 
         The STEER payload shape on the goldfive side is
         ``{"note": str, "suggested_action": str}`` — the harmonograf
@@ -1249,15 +1253,41 @@ class SequentialExecutor(Executor):
         ``payload["body"]`` as a courtesy for callers building STEER
         messages directly from annotation shapes, so either key works.
 
+        Replaces goldfive#149's ``_extract_steer_body`` which handed
+        the raw body to the adapter. Post-#152 we wrap the body in an
+        ``[USER STEERING CONTROL — supersedes prior task context]``
+        header plus a notes block so the LLM has an explicit signal
+        that: (a) this is an operator override, not a fresh user turn,
+        and (b) prior research / partial work / pending tasks are
+        superseded unless the steer references them. Clean framing
+        without wiping conversation history — the LLM can still see
+        earlier turns, but the framing makes it unambiguous that the
+        steer is the new north star.
+
         Falls back to ``fallback`` when the extracted text is empty,
-        so the re-invocation after a USER_STEER refine still has a
-        non-empty user message to work from.
+        then wraps that fallback in the same header so the re-invocation
+        always shows the override semantics.
         """
         payload = getattr(msg, "payload", None)
-        if not isinstance(payload, dict):
-            return fallback
-        body = str(payload.get("note", "") or payload.get("body", "") or "")
-        return body or fallback
+        body = ""
+        if isinstance(payload, dict):
+            body = str(payload.get("note", "") or payload.get("body", "") or "")
+        effective = body or fallback
+        # Build the override-framing message. Keep the header line
+        # short and machine-readable so prompt templates / tests can
+        # match on the prefix ("[USER STEERING CONTROL").
+        return (
+            "[USER STEERING CONTROL — supersedes prior task context]\n"
+            "\n"
+            f"{effective}\n"
+            "\n"
+            "Notes:\n"
+            "- Prior research, partial work, or planned tasks from the pre-steer "
+            "conversation are superseded unless this message explicitly "
+            "references them.\n"
+            "- Proceed with the new direction. Do not continue prior work unless "
+            "doing so directly serves this steer."
+        )
 
 
 # ---------------------------------------------------------------------------

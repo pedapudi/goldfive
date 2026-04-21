@@ -69,6 +69,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from goldfive import orchestration_state as _ostate
 from goldfive.types import (
     TERMINAL_TASK_STATUSES,
     DriftEvent,
@@ -192,6 +193,15 @@ class PlanReconciler:
                 "PlanReconciler.on_before_agent: transition(RUNNING) raised: %s",
                 exc,
             )
+        # goldfive#152: stamp the orchestration-state current_task_*
+        # keys so downstream refine paths / prompt templates /
+        # sinks see a single source of truth for the active task.
+        # Done AFTER the steerer transition so a steerer stub that
+        # refuses the transition (e.g. test doubles) doesn't leak
+        # into these reads.
+        _ostate.sync_current_task_from_transition(
+            self._session.state, task, TaskStatus.RUNNING
+        )
 
     async def on_after_agent(
         self,
@@ -228,6 +238,13 @@ class PlanReconciler:
                     "PlanReconciler.on_after_agent: transition(FAILED) raised: %s",
                     exc,
                 )
+            # goldfive#152: clear the current_task_* stamp if it was
+            # pointing at this task. A FAILED transition retires the
+            # task even if a follow-up refine re-spawns it under a
+            # different id.
+            _ostate.sync_current_task_from_transition(
+                self._session.state, task, TaskStatus.FAILED
+            )
             return
         try:
             await self._steerer.transition(
@@ -241,6 +258,11 @@ class PlanReconciler:
                 "PlanReconciler.on_after_agent: transition(COMPLETED) raised: %s",
                 exc,
             )
+        # goldfive#152: clear the current_task_* stamp when the active
+        # task terminates. A later before_agent will repopulate.
+        _ostate.sync_current_task_from_transition(
+            self._session.state, task, TaskStatus.COMPLETED
+        )
 
     async def on_delegation_observed(
         self,

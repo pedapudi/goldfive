@@ -419,7 +419,12 @@ async def test_overlay_steer_restarts_invocation_with_steer_body() -> None:
         f"expected 2 invoke_passthrough calls, got {adapter.passthrough_calls}"
     )
     assert adapter.passthrough_calls[0] == "original user input"
-    assert adapter.passthrough_calls[1] == steer_body
+    # goldfive#152: the post-steer user input is now wrapped in a
+    # goldfive-authored override header instead of handed raw. The
+    # steer body still appears verbatim inside the framed message.
+    second = adapter.passthrough_calls[1]
+    assert second.startswith("[USER STEERING CONTROL"), second
+    assert steer_body in second
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +485,13 @@ async def test_overlay_steer_empty_body_falls_back_to_previous_input() -> None:
     outcome = await asyncio.wait_for(runner_task, timeout=5.0)
 
     assert outcome.success is True
-    assert adapter.passthrough_calls == ["the original", "the original"]
+    # goldfive#152: empty-body steer still wraps the fallback in the
+    # override header so the LLM sees the override semantics even
+    # when the operator's note is empty.
+    assert adapter.passthrough_calls[0] == "the original"
+    second = adapter.passthrough_calls[1]
+    assert second.startswith("[USER STEERING CONTROL"), second
+    assert "the original" in second
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +641,12 @@ async def test_overlay_steer_after_steer() -> None:
 
     assert outcome.success is True
     # Three invocations: v0 (steered), v1 (steered), v2 (completed).
-    assert adapter.passthrough_calls == ["v0", "pivot to v1", "now pivot to v2"]
+    # goldfive#152: post-steer inputs wrapped in the override header.
+    assert adapter.passthrough_calls[0] == "v0"
+    assert adapter.passthrough_calls[1].startswith("[USER STEERING CONTROL")
+    assert "pivot to v1" in adapter.passthrough_calls[1]
+    assert adapter.passthrough_calls[2].startswith("[USER STEERING CONTROL")
+    assert "now pivot to v2" in adapter.passthrough_calls[2]
     # Two USER_STEER drift events, two refine calls.
     user_steer_drifts = [
         d for d in steerer.drift_events if d.kind is DriftKind.USER_STEER
