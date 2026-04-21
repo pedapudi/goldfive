@@ -223,6 +223,165 @@ def _collect_reachable_agent_names(root_agent: Any) -> list[str]:
     return sorted(names)
 
 
+GOLDFIVE_PLANNER_OPT_OUT_ATTR = "_goldfive_planner_opt_out"
+"""Attribute users can set on an agent to skip GoldfivePlanner attachment.
+
+When ``getattr(agent, "_goldfive_planner_opt_out", False)`` is truthy
+the auto-attachment pass leaves that agent's ``planner`` untouched.
+Applies per-agent — a sibling in the same tree without the marker
+still gets a GoldfivePlanner. Rarely needed; the planner is designed
+to be compose-safe with any user-supplied ``BasePlanner``, so the
+opt-out is reserved for cases where even the additive injection is
+undesired (e.g. a highly constrained research agent that must emit
+only tool calls in a specific shape).
+"""
+
+
+def _attach_goldfive_planner_to_tree(root_agent: Any) -> int:
+    """Attach :class:`~goldfive.planners.goldfive_planner.GoldfivePlanner`
+    to every ``LlmAgent`` reachable from ``root_agent``.
+
+    Traverses the same three edges :func:`_augment_subtree_with_reporting`
+    uses (``sub_agents`` / ``inner_agent`` / ``AgentTool.agent``). For
+    every node that looks like an ``LlmAgent`` (duck-typed via the
+    presence of a ``planner`` attribute — LlmAgents have it as an
+    optional pydantic field):
+
+    * If :data:`GOLDFIVE_PLANNER_OPT_OUT_ATTR` is set and truthy on
+      the agent, skip.
+    * If ``agent.planner`` is ``None``: attach a fresh
+      :class:`GoldfivePlanner`.
+    * If ``agent.planner`` is already a :class:`GoldfivePlanner`: skip
+      (idempotent — re-wrap on a re-binded adapter should not stack).
+    * Otherwise compose: replace with
+      ``GoldfivePlanner(user_planner=agent.planner)``.
+
+    Non-LlmAgents (``SequentialAgent``, ``ParallelAgent``, custom
+    ``BaseAgent`` subclasses without a ``planner`` field) have no
+    ``planner`` attribute and are skipped silently.
+
+    Returns the number of agents where an attachment happened (not
+    counting opt-outs / already-goldfive cases).
+
+    Deliberately silent on individual failures: assigning to
+    ``agent.planner`` may raise if the agent's pydantic model has
+    frozen configuration; in that case we log and continue so one
+    bad agent doesn't block the rest of the tree.
+    """
+    if root_agent is None:
+        return 0
+    try:
+        from goldfive.planners.goldfive_planner import GoldfivePlanner
+    except ImportError:  # pragma: no cover
+        return 0
+
+    touched = 0
+    seen: set[int] = set()
+    stack: list[Any] = [root_agent]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+
+        # Push children BEFORE the skip-checks so opted-out / non-LlmAgent
+        # nodes still propagate the walk to their children.
+        for sub in getattr(cur, "sub_agents", None) or ():
+            stack.append(sub)
+        inner = getattr(cur, "inner_agent", None)
+        if inner is not None:
+            stack.append(inner)
+        for t in getattr(cur, "tools", None) or ():
+            nested = getattr(t, "agent", None)
+            if nested is not None:
+                stack.append(nested)
+
+        if getattr(cur, GOLDFIVE_PLANNER_OPT_OUT_ATTR, False):
+            continue
+        # LlmAgent carries a ``planner: Optional[BasePlanner]`` field;
+        # other BaseAgent subclasses (Sequential/Parallel/custom) do
+        # not expose one. Duck-type by presence + settability.
+        if not hasattr(cur, "planner"):
+            continue
+        existing = getattr(cur, "planner", None)
+        if isinstance(existing, GoldfivePlanner):
+            # Idempotent: a re-wrap on the same tree (e.g. a test that
+            # constructs two adapters over the same agent) should not
+            # stack GoldfivePlanners on top of each other.
+            continue
+        try:
+            if existing is None:
+                cur.planner = GoldfivePlanner()
+            else:
+                cur.planner = GoldfivePlanner(user_planner=existing)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "could not attach GoldfivePlanner to %s: %s",
+                getattr(cur, "name", "?"),
+                exc,
+            )
+            continue
+        touched += 1
+
+    if touched:
+        log.debug("goldfive: attached GoldfivePlanner to %d agent(s)", touched)
+    return touched
+
+
+def _rebind_goldfive_planners(
+    root_agent: Any,
+    *,
+    agent_registry: list[str],
+    steerer: Any,
+    session: Any,
+) -> None:
+    """Rebind every :class:`GoldfivePlanner` in the tree to the live collaborators.
+
+    Called from :meth:`ADKAdapter._invoke_internal` right before
+    ``runner.run_async`` so the planner sees the current steerer,
+    session, and the authoritative agent registry. Cheap walk — the
+    tree is small and this runs once per invocation.
+    """
+    if root_agent is None:
+        return
+    try:
+        from goldfive.planners.goldfive_planner import GoldfivePlanner
+    except ImportError:  # pragma: no cover
+        return
+
+    seen: set[int] = set()
+    stack: list[Any] = [root_agent]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        for sub in getattr(cur, "sub_agents", None) or ():
+            stack.append(sub)
+        inner = getattr(cur, "inner_agent", None)
+        if inner is not None:
+            stack.append(inner)
+        for t in getattr(cur, "tools", None) or ():
+            nested = getattr(t, "agent", None)
+            if nested is not None:
+                stack.append(nested)
+
+        planner = getattr(cur, "planner", None)
+        if isinstance(planner, GoldfivePlanner):
+            try:
+                planner.bind(
+                    agent_registry=agent_registry,
+                    steerer=steerer,
+                    session=session,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "could not rebind GoldfivePlanner on %s: %s",
+                    getattr(cur, "name", "?"),
+                    exc,
+                )
+
+
 def _register_plugin_on_runner(runner: Any, plugin: Any) -> bool:
     """Install ``plugin`` on ``runner``'s plugin manager if one exists.
 
@@ -701,6 +860,18 @@ class ADKAdapter:
         else:
             self._available_agents = _collect_reachable_agent_names(self._agent)
 
+        # Auto-attach GoldfivePlanner to every LlmAgent in the tree
+        # (goldfive#153). Idempotent: skipped for agents already
+        # carrying a GoldfivePlanner, and for agents opting out via
+        # the ``_goldfive_planner_opt_out = True`` marker. A pre-existing
+        # user-supplied planner is COMPOSED (wrapped as
+        # ``user_planner=...``) rather than replaced. Skipped in
+        # degraded mode because the caller has taken over runner
+        # construction and may have its own planner conventions we
+        # don't want to stomp on.
+        if not self._degraded_prebuilt_runner:
+            _attach_goldfive_planner_to_tree(self._agent)
+
         # tool_name -> handler. Populated by register_reporting_tools.
         self._tool_handlers: dict[str, Any] = {}
         # Full reporting-tool specs, in registration order. The plugin's
@@ -1057,6 +1228,17 @@ class ADKAdapter:
                 set_rec = getattr(self._plugin, "set_reconciler", None)
                 if callable(set_rec):
                     set_rec(reconciler)
+
+        # Rebind every GoldfivePlanner in the tree to the live
+        # collaborators for this invocation (goldfive#153). Cheap walk
+        # — the tree is small and this lets the structural filters
+        # emit PLAN_DIVERGENCE drifts through the bound steerer.
+        _rebind_goldfive_planners(
+            self._agent,
+            agent_registry=list(self._available_agents),
+            steerer=self._steerer,
+            session=session,
+        )
 
         # Mirror into ADK state as a best-effort fallback for legacy
         # unit tests that construct a plain ``tool_context`` holding a

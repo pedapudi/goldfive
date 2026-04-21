@@ -533,6 +533,140 @@ def _tool_approval_prompt(tool: Any, tool_name: str, tool_args: Any) -> str:
     return f"Run {tool_name}()?"
 
 
+async def _inject_goldfive_planner_instruction(
+    *,
+    callback_context: Any,
+    llm_request: Any,
+) -> None:
+    """Append :class:`GoldfivePlanner` output to ``llm_request.config.system_instruction``.
+
+    ADK's ``flows/llm_flows/_nl_planning.py`` request-side processor
+    gates instruction injection on ``isinstance(planner,
+    PlanReActPlanner)`` — so a ``BasePlanner`` subclass that is NOT a
+    PlanReAct subclass gets its ``build_planning_instruction`` called
+    on the RESPONSE side (via ``process_planning_response``) but never
+    on the REQUEST side. That's fine for response filtering but it
+    starves the model of goldfive's orchestration context block on
+    the turn that matters.
+
+    This helper is the workaround: it detects when the running
+    agent's ``.planner`` is a :class:`~goldfive.planners.goldfive_planner.GoldfivePlanner`
+    (NOT a ``PlanReActPlanner`` or ``BuiltInPlanner`` — ADK handles
+    those on its own via ``_nl_planning``) and appends the planner's
+    :meth:`build_planning_instruction` output to the request's system
+    instruction using ADK's own ``append_instructions`` method.
+
+    Silent fall-throughs in priority order:
+
+    * ADK not installed or ``BasePlanner`` import fails → skip.
+    * Running agent has no ``planner`` attribute or planner is None
+      → skip (plain ADK LlmAgent with no goldfive attachment).
+    * Planner is a ``PlanReActPlanner`` / ``BuiltInPlanner`` subclass
+      → skip (ADK will handle it natively).
+    * ``build_planning_instruction`` returns ``None`` / empty →
+      skip (planner opted out for this turn).
+    * ``llm_request`` lacks ``append_instructions`` → skip (unit-test
+      request stubs).
+    """
+    try:
+        from goldfive.planners.goldfive_planner import GoldfivePlanner
+    except ImportError:  # pragma: no cover — ADK not installed
+        return
+    try:
+        from google.adk.planners.base_planner import BasePlanner  # type: ignore
+        from google.adk.planners.built_in_planner import BuiltInPlanner  # type: ignore
+        from google.adk.planners.plan_re_act_planner import (  # type: ignore
+            PlanReActPlanner,
+        )
+    except ImportError:  # pragma: no cover — ADK not installed
+        return
+
+    # Find the running agent on the callback_context. ADK exposes it
+    # through the invocation context; tests may supply a context that
+    # carries ``.agent`` directly.
+    inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
+        callback_context, "invocation_context", None
+    )
+    agent = _safe_attr(inv_ctx, "agent", None)
+    if agent is None:
+        agent = _safe_attr(callback_context, "agent", None)
+    if agent is None:
+        return
+
+    planner = _safe_attr(agent, "planner", None)
+    if planner is None:
+        return
+    # If ADK itself will inject for this planner type, skip. ``BuiltInPlanner``
+    # never emits a text instruction (it configures thinking on the
+    # request instead), ``PlanReActPlanner`` is the one ADK gates on.
+    if isinstance(planner, (PlanReActPlanner, BuiltInPlanner)):
+        return
+    if not isinstance(planner, BasePlanner):
+        return
+    # Narrow further: the adapter attaches GoldfivePlanner specifically.
+    # A custom BasePlanner subclass that is not GoldfivePlanner should
+    # be respected by ADK's own (response-side) dispatch only, not
+    # re-injected here. This keeps the hook behaviour predictable for
+    # users who subclass BasePlanner themselves.
+    if not isinstance(planner, GoldfivePlanner):
+        return
+
+    # Build the ReadonlyContext ADK expects. When invocation_context
+    # is available we use ADK's real class; otherwise we fall back to
+    # ``callback_context`` itself (test stubs carrying ``.state`` work
+    # through GoldfivePlanner's tolerant _extract_state).
+    readonly = callback_context
+    try:
+        from google.adk.agents.readonly_context import ReadonlyContext  # type: ignore
+
+        if inv_ctx is not None:
+            readonly = ReadonlyContext(inv_ctx)
+    except Exception as exc:  # noqa: BLE001 — use fallback
+        log.debug(
+            "_inject_goldfive_planner_instruction: ReadonlyContext unavailable: %s",
+            exc,
+        )
+
+    instruction = planner.build_planning_instruction(readonly, llm_request)
+    if not instruction:
+        return
+
+    append = getattr(llm_request, "append_instructions", None)
+    if not callable(append):
+        # Best-effort write directly into ``config.system_instruction``
+        # when the test stub doesn't carry the helper. Preserves the
+        # existing value if it's a string.
+        config = getattr(llm_request, "config", None)
+        if config is None:
+            return
+        existing = getattr(config, "system_instruction", None)
+        if not existing:
+            try:
+                config.system_instruction = instruction
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_inject_goldfive_planner_instruction: could not set system_instruction: %s",
+                    exc,
+                )
+        elif isinstance(existing, str):
+            try:
+                config.system_instruction = existing + "\n\n" + instruction
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_inject_goldfive_planner_instruction: could not append system_instruction: %s",
+                    exc,
+                )
+        return
+
+    try:
+        append([instruction])
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "_inject_goldfive_planner_instruction: append_instructions raised: %s",
+            exc,
+        )
+
+
 def make_adk_plugin(
     *,
     name: str = "goldfive_adk_plugin",
@@ -1123,7 +1257,8 @@ def make_adk_plugin(
         # --- Plan + current-task context -------------------------------
 
         async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> None:
-            """Best-effort re-seed goldfive.* state for legacy test harnesses.
+            """Best-effort re-seed goldfive.* state for legacy test harnesses
+            + GoldfivePlanner request-side instruction injection.
 
             The authoritative state write happens in
             :meth:`before_run_callback` against the live invocation
@@ -1131,6 +1266,17 @@ def make_adk_plugin(
             for unit tests that drive the plugin with a minimal
             callback-context stub without a matching ``before_run``
             lifecycle (see ``tests/test_adk_adapter.py``).
+
+            It ALSO performs GoldfivePlanner request-side instruction
+            injection (goldfive#153): ADK's ``_nl_planning.py``
+            request-side gate fires only for ``PlanReActPlanner``
+            subclasses, not every ``BasePlanner``. Since goldfive
+            deliberately subclasses ``BasePlanner`` directly (we don't
+            want PlanReAct's response filtering), we invoke
+            :meth:`GoldfivePlanner.build_planning_instruction` ourselves
+            here and append the returned string to
+            ``llm_request.config.system_instruction`` via the same
+            ``append_instructions`` helper ADK uses internally.
             """
             ctx = self._resolve_ctx(callback_context)
             if ctx is None:
@@ -1155,6 +1301,22 @@ def make_adk_plugin(
                 _sp.write_tools_available(state, ctx.tool_handlers.keys())
             except Exception as exc:  # noqa: BLE001
                 log.debug("before_model_callback: state write failed: %s", exc)
+
+            # GoldfivePlanner request-side injection (goldfive#153).
+            # Best-effort: never raise from this path; injection failure
+            # degrades to "LLM runs without goldfive's orchestration
+            # context block" which is safe — ADK state still carries
+            # the same keys via the write above.
+            try:
+                await _inject_goldfive_planner_instruction(
+                    callback_context=callback_context,
+                    llm_request=llm_request,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "before_model_callback: goldfive planner injection raised: %s",
+                    exc,
+                )
             return None
 
         # --- Reporting-tool interception + tool-confirmation bridge ---
