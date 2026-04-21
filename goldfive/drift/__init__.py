@@ -25,11 +25,13 @@ __all__ = [
     "DriftKind",
     "DriftSeverity",
     "DriftEvent",
+    "CONFABULATION_TRIGGER_KEYWORDS",
     "LLM_REFUSAL_MARKERS",
     "LLM_REFUSAL_MARKERS_INFO",
     "LLM_REFUSAL_MARKERS_WARNING",
     "LLM_REFUSAL_MARKERS_CRITICAL",
     "CONTEXT_PRESSURE_STOP_REASONS",
+    "classify_confabulation_risk",
     "classify_tool_error",
     "classify_refusal",
     "classify_stop_reason",
@@ -236,9 +238,7 @@ def classify_tool_error(event: Any) -> DriftEvent | None:
         return None
 
     detail = (
-        f"tool {tool_name!r} errored: {err_detail}"
-        if tool_name
-        else f"tool error: {err_detail}"
+        f"tool {tool_name!r} errored: {err_detail}" if tool_name else f"tool error: {err_detail}"
     )
     return DriftEvent(
         kind=DriftKind.TOOL_ERROR,
@@ -281,6 +281,114 @@ def classify_refusal(text: Any) -> DriftEvent | None:
             raw=text,
         )
     return None
+
+
+# Keyword set for :func:`classify_confabulation_risk`. A task whose
+# ``title`` or ``description`` contains any of these phrases (case-
+# insensitive, substring match) is treated as "external-data-access
+# shaped" and therefore suspicious when the invocation produces
+# non-empty output with zero tool calls.
+#
+# The set is **conservative by design**: false positives here annoy
+# operators because the drift surfaces in the UI on every clean run of
+# a research-shaped task. Only include phrases that strongly imply the
+# agent must go fetch / consult something external. Generic verbs
+# ("write", "summarize", "format", "draft") are deliberately omitted —
+# those often describe pure-synthesis work where zero tool calls is the
+# expected shape.
+#
+# Add phrases here as empirical evidence accumulates; do not add whole-
+# word verbs that routinely appear in synthesis prompts. The set is a
+# module constant so tests can pin the contract explicitly.
+CONFABULATION_TRIGGER_KEYWORDS: tuple[str, ...] = (
+    "research",
+    "gather",
+    "look up",
+    "lookup",
+    "verify",
+    "review",
+    "fetch",
+    "search",
+    "analyze the file",
+    "analyze the document",
+    "check the",
+    "find information about",
+    "find information on",
+    "read the file",
+    "read the document",
+    "investigate",
+    "consult",
+    "cross-reference",
+    "cross reference",
+)
+
+
+def classify_confabulation_risk(
+    *,
+    task: Any,
+    tool_call_count: int,
+    output_text: str,
+) -> DriftEvent | None:
+    """Flag research / verification tasks that finished with zero tool calls.
+
+    The cheap structural heuristic for confabulation risk (issue #128):
+    if the task description reads like the agent was supposed to fetch,
+    look up, or verify something external, but the invocation produced
+    **non-empty output** without calling a single tool, that's the
+    fishy pattern worth surfacing. The model may have fabricated the
+    external observations wholesale.
+
+    Returns a ``DriftEvent`` of kind
+    :data:`~goldfive.types.DriftKind.CONFABULATION_RISK` at
+    :data:`~goldfive.types.DriftSeverity.INFO` when:
+
+    * The task's ``title`` or ``description`` contains any phrase in
+      :data:`CONFABULATION_TRIGGER_KEYWORDS` (case-insensitive), AND
+    * ``tool_call_count == 0``, AND
+    * ``output_text`` is non-empty after stripping whitespace.
+
+    Returns ``None`` otherwise. The severity is intentionally INFO —
+    the steerer records the signal for the operator's UI but does not
+    refine the plan on its own. A human can choose to cancel or let
+    the run proceed.
+
+    ``task`` may be a :class:`~goldfive.types.Task` or any duck-typed
+    shape exposing ``title`` / ``description`` string attributes;
+    missing attributes are treated as empty so adapter stubs that omit
+    one field still work.
+    """
+    if task is None:
+        return None
+    if tool_call_count != 0:
+        return None
+    if not isinstance(output_text, str) or not output_text.strip():
+        return None
+    title = str(getattr(task, "title", "") or "")
+    description = str(getattr(task, "description", "") or "")
+    haystack = f"{title}\n{description}".lower()
+    if not haystack.strip():
+        return None
+    matched: str | None = None
+    for keyword in CONFABULATION_TRIGGER_KEYWORDS:
+        if keyword in haystack:
+            matched = keyword
+            break
+    if matched is None:
+        return None
+    task_id = str(getattr(task, "id", "") or "")
+    assignee = str(getattr(task, "assignee_agent_id", "") or "")
+    detail = (
+        f"task {task_id!r} description implies external data access "
+        f"(matched {matched!r}) but invocation produced output with "
+        f"zero tool calls"
+    )
+    return DriftEvent(
+        kind=DriftKind.CONFABULATION_RISK,
+        severity=DriftSeverity.INFO,
+        detail=detail,
+        current_task_id=task_id,
+        current_agent_id=assignee,
+    )
 
 
 def classify_stop_reason(reason: Any) -> DriftEvent | None:
