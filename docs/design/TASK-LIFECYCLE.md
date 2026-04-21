@@ -136,6 +136,59 @@ boundary between goldfive and the agent framework.
   an exception propagated, or the executor cancelled the invoke
   coroutine.
 
+### 2.4 Registry dispatch (ADK adapter)
+
+`ADKAdapter.invoke` does not always drive the tree root. At wrap
+time the adapter built a `name -> BaseAgent` registry covering
+every reachable agent and constructed one `InMemoryRunner` per
+registered agent (see [ARCHITECTURE.md §"Registry dispatch"](ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)).
+Every `invoke` looks up `task.assignee_agent_id` in that map and
+dispatches to the matching per-agent runner:
+
+| `task.assignee_agent_id` | Dispatch target |
+|---|---|
+| Empty string | Wrap-target root's runner (preserves single-agent wrap contract). |
+| In the registry | `registry[assignee]`'s per-agent runner. |
+| Set but not in the registry | `ValueError("plan assigned task <id> to unknown agent <name>; available: [...]")` — fail fast on the planner. |
+| Caller passed a pre-built `Runner` (degraded mode) | The pre-built runner, regardless of assignee; a DEBUG log notes any mismatch. |
+
+The dispatched agent runs with its **full subtree intact**. If the
+dispatched agent has `sub_agents` or its own `AgentTool`-wrapped
+helpers, those are still available to its invocation — goldfive
+never rewrites the tree. ADK's plugin-inheritance mechanism carries
+the goldfive plugin into any AgentTool-spawned sub-Runner, so
+nested invocations still see the state-protocol keys and emit
+`AgentInvocationStarted` / `AgentInvocationCompleted` /
+`DelegationObserved` events ([EVENT-MODEL.md §"Agent-invocation events"](EVENT-MODEL.md#agent-invocation-events)).
+
+### 2.5 State-protocol writes live in the plugin's `before_run_callback`
+
+The authoritative write of the `goldfive.*` session-state keys
+(`run_id`, `plan_context`, `current_task`, `tools_available`)
+happens inside the goldfive plugin's `before_run_callback`, *not*
+in `ADKAdapter.invoke`. This is the reliability-critical path:
+`invocation_context.session` inside the callback is the **live**
+session ADK is running against, so writes are visible to every
+subsequent callback and tool on the same session — including
+AgentTool-spawned sub-Runners, whose own `before_run_callback`
+fires with their own live session and therefore gets its own
+authoritative seed.
+
+Previously the adapter wrote these keys against a session fetched
+via `session_service.get_session`, which ADK's `InMemorySessionService`
+returns as a shallow copy. The writes landed on a stranded dict
+the runner never saw. That made state-protocol keys unreliable
+(the user-memory note ["Verify plugin callback state handoff is
+read-readable"](..) covers the class of bug). The relocation to
+`before_run_callback` closes the gap structurally — the only
+session state write that matters is the one on the live session,
+so that is where goldfive writes it.
+
+`adapter.invoke` still mirrors the SessionContext into ADK state
+as a best-effort fallback for legacy unit-test harnesses that
+drive callbacks with a hand-built state dict; the live-run path
+does not depend on that write succeeding.
+
 ---
 
 ## 3. Quiescence protocol

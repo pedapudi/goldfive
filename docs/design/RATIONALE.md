@@ -444,6 +444,109 @@ in-place edits and want first-class support, we'd revisit.
 **Related.** `DriftKind.USER_STEER` in
 [VOCABULARY.md §5.d](VOCABULARY.md#5d-user-driven--an-external-verb-entered-the-pipeline).
 
+## Why per-agent runners, not always-root-dispatch
+
+**Observation.** `ADKAdapter.__init__` walks the wrap-target tree,
+builds a `name -> BaseAgent` registry, and constructs one
+`InMemoryRunner` per registered agent. `invoke(task, session)`
+dispatches to `registry[task.assignee_agent_id]`'s runner, not to
+the tree root. The obvious simpler design — one runner built
+against the wrap-target root, always — was rejected.
+
+**Intent.** When the caller wraps a tree like "coordinator with
+three `AgentTool` specialists", goldfive's planner assigns each
+task to a specific agent by name (`task.assignee_agent_id`).
+Dispatch to the assignee is what the rest of goldfive assumes: the
+planner picks from `adapter.available_agents`, the steerer's drift
+classifiers tag events with the dispatched agent, and sinks render
+agent-scoped rows on the Gantt.
+
+The always-root-dispatch design could not honour this contract. It
+would invoke the coordinator on every task and rely on the
+coordinator's LLM to decide routing on every turn — which is
+exactly the loop we're trying to avoid.
+
+**The bug it fixes.** Under a real LLM, a coordinator whose tools
+are `AgentTool(researcher)` + `AgentTool(writer)` will, for each
+task goldfive dispatches:
+
+1. Read the current task (visible in `session.state` via the state
+   protocol).
+2. Reason about which specialist is appropriate.
+3. Call `AgentTool(specialist)`, which spawns a sub-runner.
+4. Receive the specialist's reply.
+5. Often decide it is *not quite right* and call another
+   `AgentTool`, because the coordinator is trained to compose.
+6. Eventually emit a final response.
+
+Steps 3–5 burn ADK's 500-LLM-call ceiling. The coordinator's
+instruction text cannot be surgically edited (tree-respect) and
+prompt-engineering around "please don't re-route" is fragile
+across models. Live runs hit `max_turns_exceeded` with plugin
+registrations piling up and no `TaskCompleted`. The `adk web` UI
+hangs waiting for the coordinator to finish a turn that never
+comes.
+
+Registry dispatch makes the failure mode **structurally
+impossible**: if the task is assigned to `researcher`, goldfive
+invokes `researcher`'s runner directly. The coordinator's "route
+via AgentTool" LLM turn is skipped entirely because the
+coordinator is not the dispatch target for that task.
+
+**Alternatives considered.**
+
+1. **Always dispatch to the tree root and intercept `AgentTool`
+   calls in `before_tool_callback`.** Rejected: ADK's plugin
+   callback gets the tool and args but doesn't compose easily with
+   goldfive's per-task lifecycle — the "which task is this
+   sub-invocation for?" question cannot be answered without
+   per-task runners anyway. And an intercept can only fire *after*
+   the coordinator has decided to call the tool, which is the LLM
+   turn we want to avoid.
+2. **Hard-cap the number of AgentTool calls per invocation.**
+   Rejected: the cap catches the symptom, not the cause. A
+   coordinator that calls two `AgentTool`s correctly per turn
+   looks indistinguishable from one that loops indefinitely until
+   the cap trips. And any cap is either too low (fails normal
+   multi-tool turns) or too high (fails slowly, after many minutes
+   of wasted inference).
+3. **Prompt-engineer the coordinator not to route.** Rejected:
+   violates tree-respect (we would have to rewrite the
+   coordinator's instruction), fragile across providers, and
+   doesn't generalise — the user may genuinely want the
+   coordinator to compose specialists within its own invocation
+   when it *is* the dispatch target.
+4. **Flatten the tree to just the set of leaf agents and ignore
+   the coordinator.** Rejected: destroys the caller's authoring
+   intent. A writer that has an `editor` sub-agent should still
+   have that editor available when invoked — flattening erases
+   the nesting.
+
+**Tradeoffs.**
+
+- One `InMemoryRunner` per registered agent costs memory.
+  `InMemoryRunner` is cheap (a session service + some state) but
+  it is not free. For typical trees (< 20 agents) the footprint
+  is negligible.
+- Each per-agent runner owns its own session service, so the ADK
+  session id is per-runner. Cross-runner state sharing (if ever
+  needed) would have to go through `goldfive.Session`, not ADK
+  session state.
+- Callers who only have a pre-built ADK `Runner` (not a
+  `BaseAgent`) fall back to the degraded single-entry mode with a
+  WARNING log — registry-by-name is unavailable because we cannot
+  walk a tree we never saw.
+
+**Signals this might be wrong.** If future ADK versions expose a
+way to drive "run this specific named agent" through a single
+shared runner, per-agent runners become unnecessary duplication.
+We would keep the registry as a dispatch map but point every key
+at the same shared runner.
+
+**Related.** [ARCHITECTURE.md §"Registry dispatch"](ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes),
+[common-failure-modes §"coordinator+AgentTool loop under real LLM"](../guides/common-failure-modes.md#8-coordinatoragenttool-loop-under-real-llm-fixed-by-registry-dispatch),
+`goldfive/adapters/adk.py::ADKAdapter.__init__`.
+
 ## Why `goldfive.wrap()` exists when `Runner(...)` would do
 
 **Observation.** `Runner.__init__` requires five named pieces:

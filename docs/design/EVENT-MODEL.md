@@ -50,9 +50,9 @@ await emit(sinks, event)
 
 ## Event taxonomy
 
-Thirteen event kinds are defined in v0.1, grouped by the phase they
-fire in. Since #55 every event on the stream is a proto `Event`
-envelope — there is no mixed-shape stream on the sink side.
+Event kinds are grouped by the phase they fire in. Since #55 every
+event on the stream is a proto `Event` envelope — there is no
+mixed-shape stream on the sink side.
 
 ### Run lifecycle
 
@@ -94,6 +94,103 @@ string, and an optional `artifacts` map for `TaskCompleted`.
 | `DriftDetected` | `Steerer` | Whenever `detect_drift()` returns a non-None `DriftEvent`. Always fired before the corresponding `PlanRevised` (if refine runs). Carries `kind`, `severity`, `detail`, `current_task_id`, and a summarized `raw` trigger. |
 
 See [DRIFT.md](DRIFT.md) for the full drift-kind taxonomy.
+
+### Agent-invocation events
+
+Three observability-only events describe the **dispatch and
+delegation** shape of a run under the ADK registry-dispatch model
+(see [ARCHITECTURE.md §"Registry dispatch"](ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)).
+They do not change task state and the framework does not interpret
+them; sinks (harmonograf in particular) surface them to make the
+"who actually ran what" story visible on a Gantt, especially when a
+coordinator invokes `AgentTool`-wrapped specialists.
+
+| Event | Fired by | When |
+|---|---|---|
+| `AgentInvocationStarted` | ADK plugin `before_run_callback` | At the top of every runner invocation — both the top-level goldfive dispatch and any nested AgentTool-spawned sub-Runner. |
+| `AgentInvocationCompleted` | ADK plugin `after_run_callback` | When a runner invocation finishes. One per `AgentInvocationStarted`. |
+| `DelegationObserved` | ADK plugin `before_tool_callback` | When the host agent is about to invoke a tool that wraps another agent (ADK's `AgentTool`). |
+
+#### `AgentInvocationStarted`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `agent_name` | `string` | The dispatched agent — `task.assignee_agent_id` for top-level, the wrapped agent's name for AgentTool-spawned sub-invocations. |
+| `task_id` | `string` | The goldfive-dispatched task id. Propagates unchanged into nested invocations — see "Nested ordering" below. |
+| `invocation_id` | `string` | ADK's per-run invocation id. Unique per runner invocation. |
+| `parent_invocation_id` | `string` | Empty for the top-level dispatch; set to the outer `invocation_id` when the plugin fires on an AgentTool-spawned sub-Runner. |
+| `started_at` | `Timestamp` | Emission wall-clock. |
+
+#### `AgentInvocationCompleted`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `agent_name` | `string` | Matches the corresponding `AgentInvocationStarted`. |
+| `task_id` | `string` | Same as the matching Started event. |
+| `invocation_id` | `string` | Matches the Started event's `invocation_id`. |
+| `summary` | `string` | Optional short description of the outcome (final assistant text, for sinks that render a timeline). |
+| `completed_at` | `Timestamp` | Emission wall-clock. |
+
+#### `DelegationObserved`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `from_agent` | `string` | The host agent whose `before_tool_callback` fired — the one about to call the AgentTool. |
+| `to_agent` | `string` | The wrapped agent the AgentTool will invoke. |
+| `task_id` | `string` | The goldfive-dispatched task id. |
+| `invocation_id` | `string` | The host agent's invocation id at the moment the AgentTool was called. |
+| `observed_at` | `Timestamp` | Emission wall-clock. |
+
+#### Nested ordering and the shared `task_id`
+
+In a delegation chain, the events arrive in nested parentheses-like
+order and all carry the **same `task_id`** — the goldfive-dispatched
+task. This is how harmonograf reconstructs delegation chains on the
+Gantt:
+
+```
+                time ──────────────────────────▶
+  outer:  started ─────────────────────────────── completed
+  inner:          started ─── completed
+  delegation:     observed (from=outer, to=inner)
+```
+
+For a coordinator with an `AgentTool(specialist)` called once,
+given a task assigned to the coordinator:
+
+1. `AgentInvocationStarted(agent_name="coordinator",
+   task_id="t_42", invocation_id="inv_A", parent_invocation_id="")`
+2. `DelegationObserved(from_agent="coordinator",
+   to_agent="specialist", task_id="t_42", invocation_id="inv_A")`
+3. `AgentInvocationStarted(agent_name="specialist",
+   task_id="t_42", invocation_id="inv_B",
+   parent_invocation_id="inv_A")`
+4. `AgentInvocationCompleted(agent_name="specialist",
+   task_id="t_42", invocation_id="inv_B")`
+5. `AgentInvocationCompleted(agent_name="coordinator",
+   task_id="t_42", invocation_id="inv_A")`
+
+#### What consumers should do
+
+- **Timeline renderers** (harmonograf Gantt) should treat
+  `AgentInvocationStarted` / `AgentInvocationCompleted` as a pair
+  of brackets defining a span, use `parent_invocation_id` to nest
+  spans, and draw a delegation edge from `from_agent`'s active
+  span to `to_agent`'s span when a `DelegationObserved` arrives
+  between a Started + its Completed.
+- **Log-only sinks** can treat the events as informational lines;
+  they carry no state-affecting semantics.
+- **Steerers and drift classifiers** should ignore these events —
+  they are emitted by the plugin and never round-trip through the
+  steerer.
+- **Correlation with other events.** All events emitted during a
+  dispatch share the envelope's `run_id`, so pair them with
+  `TaskStarted` / `TaskCompleted` for the same `task_id` to get
+  the full per-task story.
+
+Emission is best-effort: a failure in the plugin's observability
+path is swallowed and logged at DEBUG — the run never blocks on
+observability.
 
 ## Sequence semantics
 
