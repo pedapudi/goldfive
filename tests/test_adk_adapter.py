@@ -936,9 +936,13 @@ async def test_cancel_mid_tool_call_heals_session() -> None:
     responses = synth.get_function_responses()
     assert len(responses) == 1
     assert responses[0].id == "call-1"
-    # The payload flags this as goldfive-synthesized so downstream tools can
-    # tell it apart from a real tool return.
-    assert responses[0].response.get("goldfive_cancelled") is True
+    # Reason-differentiated content (goldfive#139). A bare
+    # task.cancel() without a steerer-set _next_cancel_reason falls
+    # through to the generic content variant — LLM-actionable, not
+    # goldfive-internal jargon.
+    payload = responses[0].response
+    assert payload.get("status") == "cancelled"
+    assert "Do NOT retry" in payload.get("instruction", "")
 
 
 async def test_multiple_pending_tool_calls_all_healed() -> None:
@@ -1029,6 +1033,333 @@ async def test_heal_is_noop_when_no_pending_calls() -> None:
     adapter_empty = ADKAdapter(runner_empty, session_id="sess-empty")
     await adapter_empty.invoke(Task(id="t1", title="x"), Session(run_id="r"))
     assert runner_empty.session_service.appended == []
+
+
+# ---------------------------------------------------------------------------
+# goldfive#139 — reason-differentiated synthetic response content +
+# USER_STEER user-role primer event. The prior generic content shape
+# ("goldfive_cancelled" / "preserve session history well-formedness")
+# was written for human log viewers and confused Qwen + other smaller
+# LLMs reading it on the next turn, triggering retry loops and
+# reasoning spirals. These tests pin the new content variants and the
+# primer-event append behaviour.
+# ---------------------------------------------------------------------------
+
+
+def test_build_cancelled_response_event_user_steer_content() -> None:
+    """``reason=user_steer`` → status/instruction aimed at the next LLM turn.
+
+    The content must carry the "prior task abandoned" instruction and
+    not leak goldfive-internal jargon ("goldfive_cancelled",
+    "preserve session history well-formedness", etc.) the prior
+    generic shape emitted. See goldfive#139.
+    """
+    from goldfive.adapters.adk import (
+        SYMBOLIC_REASON_USER_STEER,
+        _build_cancelled_response_event,
+    )
+
+    event = _build_cancelled_response_event(
+        function_call_id="call-x",
+        tool_name="search",
+        author="agent",
+        invocation_id="inv-1",
+        reason=SYMBOLIC_REASON_USER_STEER,
+    )
+    responses = event.get_function_responses()
+    assert len(responses) == 1
+    fr = responses[0]
+    assert fr.id == "call-x"
+    payload = fr.response
+    assert payload.get("status") == "cancelled_by_user_steering"
+    instruction = payload.get("instruction", "")
+    assert "ABANDONED" in instruction
+    assert "Do NOT retry" in instruction
+    # No goldfive-internal jargon leaks into the LLM-visible payload.
+    assert "goldfive_cancelled" not in payload
+    assert "session history" not in instruction
+
+
+def test_build_cancelled_response_event_replan_content() -> None:
+    """``reason=replan`` → status/instruction describing a plan update.
+
+    Milder wording than USER_STEER — a replan is expected to reference
+    prior context the agent may still need.
+    """
+    from goldfive.adapters.adk import (
+        SYMBOLIC_REASON_REPLAN,
+        _build_cancelled_response_event,
+    )
+
+    event = _build_cancelled_response_event(
+        function_call_id="call-x",
+        tool_name="search",
+        author="agent",
+        invocation_id="inv-1",
+        reason=SYMBOLIC_REASON_REPLAN,
+    )
+    fr = event.get_function_responses()[0]
+    assert fr.response.get("status") == "cancelled_by_replan"
+    instruction = fr.response.get("instruction", "")
+    assert "plan was updated" in instruction.lower()
+    assert "Do NOT retry" in instruction
+
+
+def test_build_cancelled_response_event_generic_content() -> None:
+    """Legacy / unknown reasons fall through to the neutral variant."""
+    from goldfive.adapters.adk import _build_cancelled_response_event
+
+    for legacy_reason in (
+        "cancelled_mid_invocation",
+        "error:ConnectionError",
+        "unexpected_orphan_on_normal_exit",
+        "",
+    ):
+        event = _build_cancelled_response_event(
+            function_call_id="call-x",
+            tool_name="search",
+            author="agent",
+            invocation_id="inv-1",
+            reason=legacy_reason,
+        )
+        fr = event.get_function_responses()[0]
+        assert fr.response.get("status") == "cancelled", (
+            f"reason {legacy_reason!r} should resolve to generic content"
+        )
+        assert "Do NOT retry" in fr.response.get("instruction", "")
+
+
+async def test_user_steer_primer_appended_after_function_response() -> None:
+    """USER_STEER cancel with 2 orphan calls → 2 function_response + 1 primer.
+
+    Covers the belt-and-braces primer-event append that reinforces the
+    pivot for the next LLM turn. Primer must come AFTER the
+    function_response events (ordering matters for ADK's chronological
+    replay).
+    """
+    import asyncio
+
+    from google.adk.events.event import Event  # type: ignore
+    from google.genai import types  # type: ignore
+
+    from goldfive.adapters.adk import SYMBOLIC_REASON_USER_STEER, ADKAdapter
+    from goldfive.types import Session, Task
+
+    agent = _make_agent()
+
+    multi_parts = [
+        types.Part(function_call=types.FunctionCall(id=f"call-{i}", name=f"t{i}"))
+        for i in (1, 2)
+    ]
+    multi_event = Event(
+        invocation_id="inv-steer",
+        author="test_agent",
+        content=types.Content(role="model", parts=multi_parts),
+    )
+
+    async def _run():
+        yield multi_event
+        await asyncio.Event().wait()
+        yield None  # pragma: no cover
+
+    runner = _FakeRunner(_run, agent)
+    adapter = ADKAdapter(runner, session_id="sess-steer")
+
+    invoke_task = asyncio.create_task(
+        adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
+    )
+    await asyncio.sleep(0.01)
+    # Simulate the executor tagging the adapter before triggering cancel.
+    adapter._next_cancel_reason = SYMBOLIC_REASON_USER_STEER
+    invoke_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invoke_task
+
+    appended = runner.session_service.appended
+    # Exactly 3 events: 2 function_response + 1 user-role primer, in that order.
+    assert len(appended) == 3, f"expected 3 events; got {len(appended)}"
+    # First two events are function_response pairings for the orphans.
+    fr_ids = set()
+    for ev in appended[:2]:
+        for fr in ev.get_function_responses():
+            fr_ids.add(fr.id)
+    assert fr_ids == {"call-1", "call-2"}
+    # Third event is the user-role primer reinforcing the pivot.
+    primer = appended[2]
+    assert primer.content is not None
+    assert primer.content.role == "user"
+    # Primer is plain text, not a function_response.
+    assert primer.get_function_responses() == []
+    text = "".join((p.text or "") for p in (primer.content.parts or []))
+    assert "STEERING NOTICE" in text
+    assert "cancelled by user steering" in text
+    assert "supersedes" in text.lower()
+
+
+async def test_replan_cancel_does_not_append_primer() -> None:
+    """REPLAN cancel heals orphans but does NOT append a primer event.
+
+    The replan variant is a less-jolting pivot — the function_response
+    content is sufficient signal; adding a primer would be noise.
+    """
+    import asyncio
+
+    from goldfive.adapters.adk import SYMBOLIC_REASON_REPLAN, ADKAdapter
+    from goldfive.types import Session, Task
+
+    agent = _make_agent()
+
+    async def _run():
+        yield _mk_function_call_event(call_id="call-r", name="search")
+        await asyncio.Event().wait()
+        yield None  # pragma: no cover
+
+    runner = _FakeRunner(_run, agent)
+    adapter = ADKAdapter(runner, session_id="sess-replan")
+
+    invoke_task = asyncio.create_task(
+        adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
+    )
+    await asyncio.sleep(0.01)
+    adapter._next_cancel_reason = SYMBOLIC_REASON_REPLAN
+    invoke_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invoke_task
+
+    appended = runner.session_service.appended
+    # Exactly 1 event — the function_response pairing. No primer.
+    assert len(appended) == 1
+    fr = appended[0].get_function_responses()[0]
+    assert fr.response.get("status") == "cancelled_by_replan"
+
+
+async def test_generic_cancel_does_not_append_primer() -> None:
+    """A bare (untagged) cancel also gets no primer event."""
+    import asyncio
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Session, Task
+
+    agent = _make_agent()
+
+    async def _run():
+        yield _mk_function_call_event(call_id="call-g", name="search")
+        await asyncio.Event().wait()
+        yield None  # pragma: no cover
+
+    runner = _FakeRunner(_run, agent)
+    adapter = ADKAdapter(runner, session_id="sess-generic")
+
+    invoke_task = asyncio.create_task(
+        adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
+    )
+    await asyncio.sleep(0.01)
+    # Do NOT set _next_cancel_reason — simulate the legacy code path
+    # where the cancel arrives without a symbolic tag.
+    invoke_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invoke_task
+
+    appended = runner.session_service.appended
+    # Exactly 1 event — the function_response pairing. No primer.
+    assert len(appended) == 1
+    fr = appended[0].get_function_responses()[0]
+    assert fr.response.get("status") == "cancelled"
+
+
+async def test_pending_tool_call_pairing_preserved_under_new_content() -> None:
+    """Regression: the function_response.id MUST still match the
+    orphan function_call.id across all content variants.
+
+    ADK's ``find_event_by_function_call_id`` pairs on the id, not the
+    content; if we ever broke the pairing the next turn would still
+    see "Missing tool results for tool_call_id". Pin the invariant
+    across USER_STEER, REPLAN, and generic reasons.
+    """
+    from goldfive.adapters.adk import (
+        SYMBOLIC_REASON_REPLAN,
+        SYMBOLIC_REASON_USER_STEER,
+        _build_cancelled_response_event,
+    )
+
+    for reason in (
+        SYMBOLIC_REASON_USER_STEER,
+        SYMBOLIC_REASON_REPLAN,
+        "cancelled_mid_invocation",
+        "error:SomeError",
+    ):
+        event = _build_cancelled_response_event(
+            function_call_id="call-paired",
+            tool_name="whatever",
+            author="agent",
+            invocation_id="inv-1",
+            reason=reason,
+        )
+        fr = event.get_function_responses()[0]
+        assert fr.id == "call-paired", (
+            f"reason {reason!r} broke the function_call/function_response "
+            f"pairing — ADK would see an orphan call on next turn"
+        )
+
+
+async def test_next_cancel_reason_cleared_after_consumption() -> None:
+    """After a cancel fires, ``_next_cancel_reason`` is cleared.
+
+    A stale tag would bleed into the NEXT cancel (of a different
+    invocation), causing the wrong content variant to be emitted.
+    """
+    import asyncio
+
+    from goldfive.adapters.adk import SYMBOLIC_REASON_USER_STEER, ADKAdapter
+    from goldfive.types import Session, Task
+
+    agent = _make_agent()
+
+    async def _run():
+        yield _mk_function_call_event(call_id="call-c", name="search")
+        await asyncio.Event().wait()
+        yield None  # pragma: no cover
+
+    runner = _FakeRunner(_run, agent)
+    adapter = ADKAdapter(runner, session_id="sess-clear")
+
+    invoke_task = asyncio.create_task(
+        adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
+    )
+    await asyncio.sleep(0.01)
+    adapter._next_cancel_reason = SYMBOLIC_REASON_USER_STEER
+    invoke_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invoke_task
+
+    # Tag was consumed during _heal_pending_tool_calls and cleared.
+    assert adapter._next_cancel_reason == ""
+
+
+async def test_next_cancel_reason_cleared_on_clean_exit() -> None:
+    """A clean (non-cancelled) exit also clears any stale tag.
+
+    Defensive: if someone sets the tag speculatively and the invoke
+    then finishes normally, we don't want the tag to leak into the
+    next cancel.
+    """
+    from goldfive.adapters.adk import SYMBOLIC_REASON_USER_STEER, ADKAdapter
+    from goldfive.types import Session, Task
+
+    agent = _make_agent()
+
+    async def _run_clean():
+        if False:  # pragma: no cover
+            yield None
+        return
+
+    runner_clean = _FakeRunner(_run_clean, agent)
+    adapter = ADKAdapter(runner_clean, session_id="sess-clean-clear")
+    adapter._next_cancel_reason = SYMBOLIC_REASON_USER_STEER
+
+    await adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
+
+    assert adapter._next_cancel_reason == ""
 
 
 # ---------------------------------------------------------------------------

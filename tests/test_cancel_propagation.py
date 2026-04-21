@@ -125,7 +125,12 @@ async def test_cancel_invoke_raises_cancelled_and_heals_orphan_tool_calls() -> N
     responses = appended[0].get_function_responses()
     assert len(responses) == 1
     assert responses[0].id == "pending-1"
-    assert responses[0].response.get("goldfive_cancelled") is True
+    # Reason-differentiated content (goldfive#139). A bare task.cancel()
+    # without a steerer-set _next_cancel_reason resolves to the generic
+    # content variant.
+    payload = responses[0].response
+    assert payload.get("status") == "cancelled"
+    assert "Do NOT retry" in payload.get("instruction", "")
 
 
 async def test_after_cancel_pending_tool_call_bookkeeping_is_empty() -> None:

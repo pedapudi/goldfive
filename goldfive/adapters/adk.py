@@ -389,6 +389,74 @@ def _function_response_ids_in_event(event: Any) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Symbolic reasons for mid-invocation tool-call cancellation.
+#
+# These are the semantic tags the synthetic ``function_response`` content is
+# differentiated on. The content below each variant is written for the LLM
+# that will read this history on the next turn — NOT for a human reading
+# goldfive's logs. Qwen and similar small/quantized models choke on the
+# prior "goldfive_cancelled / preserve session history well-formedness"
+# phrasing and either retry the cancelled call or enter a reasoning loop
+# trying to reconcile the jargon. See goldfive#139.
+# ---------------------------------------------------------------------------
+
+SYMBOLIC_REASON_USER_STEER = "user_steer"
+"""Cancel was caused by a user steering command (USER_STEER drift)."""
+
+SYMBOLIC_REASON_REPLAN = "replan"
+"""Cancel was caused by goldfive updating the plan mid-flight."""
+
+SYMBOLIC_REASON_ERROR = "error"
+"""Cancel / heal was caused by an unexpected error / disconnect."""
+
+
+_USER_STEER_RESPONSE_CONTENT: dict[str, str] = {
+    "status": "cancelled_by_user_steering",
+    "instruction": (
+        "The user issued a steering command during this tool call. "
+        "The prior task has been ABANDONED. Do NOT retry this call. "
+        "Do NOT continue the prior plan. The next user message "
+        "contains your new task — respond to it fresh."
+    ),
+}
+
+_REPLAN_RESPONSE_CONTENT: dict[str, str] = {
+    "status": "cancelled_by_replan",
+    "instruction": (
+        "The plan was updated by goldfive. This tool call is no longer "
+        "part of the plan. Do NOT retry. Await the next task message."
+    ),
+}
+
+_GENERIC_RESPONSE_CONTENT: dict[str, str] = {
+    "status": "cancelled",
+    "instruction": "This call was cancelled. Do NOT retry. Await next instruction.",
+}
+
+
+_USER_STEER_PRIMER_TEXT = (
+    "\u26a0 STEERING NOTICE: Your prior task was cancelled by user steering. "
+    "The task below supersedes all prior work. Do not retry or reference "
+    "the cancelled tool call."
+)
+
+
+def _resolve_response_content(reason: str) -> dict[str, str]:
+    """Map ``reason`` onto one of the three content variants.
+
+    Unknown or legacy reasons (``"cancelled_mid_invocation"``,
+    ``"error:<ExceptionName>"``, ``"unexpected_orphan_on_normal_exit"``)
+    fall through to the generic bucket — the earlier callers didn't
+    differentiate, and the content there is neutral and LLM-actionable.
+    """
+    if reason == SYMBOLIC_REASON_USER_STEER:
+        return dict(_USER_STEER_RESPONSE_CONTENT)
+    if reason == SYMBOLIC_REASON_REPLAN:
+        return dict(_REPLAN_RESPONSE_CONTENT)
+    return dict(_GENERIC_RESPONSE_CONTENT)
+
+
 def _build_cancelled_response_event(
     *,
     function_call_id: str,
@@ -405,22 +473,20 @@ def _build_cancelled_response_event(
     turns (the "Missing tool results for tool_call_id(s): [...]" symptom in
     driver logs). This builder produces a minimally-shaped response event
     that the next turn's request assembler will pair with the orphan call.
+
+    The response payload is reason-differentiated (see goldfive#139): the
+    prior generic "goldfive_cancelled" jargon caused Qwen and similar
+    smaller models to either retry the cancelled call or enter a
+    reasoning loop. The new content is short, model-actionable, and
+    selected based on the symbolic ``reason`` (USER_STEER / REPLAN /
+    generic) passed from the cancel trigger.
     """
     from google.adk.events.event import Event  # type: ignore
     from google.genai import types  # type: ignore
 
     part = types.Part.from_function_response(
         name=tool_name or "unknown_tool",
-        response={
-            "goldfive_cancelled": True,
-            "reason": reason,
-            "detail": (
-                "Tool call was cancelled mid-invocation by goldfive "
-                "(USER_STEER / USER_CANCEL control). This synthetic "
-                "response was appended to preserve session history "
-                "well-formedness."
-            ),
-        },
+        response=_resolve_response_content(reason),
     )
     # Preserve the pairing so ADK's find_event_by_function_call_id
     # correctly matches this response to the orphan function_call.
@@ -431,6 +497,32 @@ def _build_cancelled_response_event(
     return Event(
         invocation_id=invocation_id or "",
         author=author or "user",
+        content=content,
+    )
+
+
+def _build_user_steer_primer_event(
+    *,
+    invocation_id: str,
+) -> Any:
+    """Synthesize a user-role primer event reinforcing the USER_STEER pivot.
+
+    Appended after the per-tool ``function_response`` heals when the
+    cancel reason is ``user_steer``. Belt-and-braces: even if the LLM
+    skims the function_response content, the subsequent user-role
+    message with the ⚠ STEERING NOTICE is impossible to miss on the
+    next turn. See goldfive#139.
+    """
+    from google.adk.events.event import Event  # type: ignore
+    from google.genai import types  # type: ignore
+
+    content = types.Content(
+        role="user",
+        parts=[types.Part(text=_USER_STEER_PRIMER_TEXT)],
+    )
+    return Event(
+        invocation_id=invocation_id or "",
+        author="user",
         content=content,
     )
 
@@ -589,6 +681,15 @@ class ADKAdapter:
         # the synthetic response can name its tool.
         self._pending_tool_call_ids: set[str] = set()
         self._pending_tool_call_names: dict[str, str] = {}
+        # Short-lived tag for the NEXT mid-invocation cancel. Set by the
+        # Steerer (on USER_STEER drift) or by refine-triggered paths
+        # BEFORE they cancel the in-flight invoke so
+        # _heal_pending_tool_calls knows which content variant to emit
+        # in the synthetic function_response. Cleared after consumption
+        # so a stale tag can't bleed into the next cancel. See
+        # goldfive#139 and
+        # :func:`_build_cancelled_response_event` for the content map.
+        self._next_cancel_reason: str = ""
 
         # Wrap-time integrity check: the one runner must carry the
         # goldfive plugin. In degraded mode we skip because the caller
@@ -882,11 +983,17 @@ class ADKAdapter:
         except asyncio.CancelledError:
             was_cancelled = True
             stop_reason = "cancelled"
+            # Consume the tag the steerer / executor stashed on us before
+            # triggering the cancel (see goldfive#139). An unset tag
+            # falls through to the legacy generic reason so existing
+            # heal paths keep the neutral content variant.
+            reason = self._next_cancel_reason or "cancelled_mid_invocation"
+            self._next_cancel_reason = ""
             await self._heal_pending_tool_calls(
                 runner=self._runner,
                 session_id=session_id,
                 invocation_id=last_invocation_id,
-                reason="cancelled_mid_invocation",
+                reason=reason,
             )
             raise
         except Exception as exc:  # noqa: BLE001
@@ -913,6 +1020,9 @@ class ADKAdapter:
                         invocation_id=last_invocation_id,
                         reason="unexpected_orphan_on_normal_exit",
                     )
+                # No cancel fired — drop any stale tag so the NEXT
+                # invoke's cancel (if any) doesn't pick up leftover state.
+                self._next_cancel_reason = ""
             if self._plugin is not None:
                 self._plugin.clear_active_context()
             if isinstance(state, Mapping):
@@ -1080,6 +1190,34 @@ class ADKAdapter:
                     fc_id,
                     exc,
                 )
+
+        # After the per-call function_response heals, append a user-role
+        # primer event for USER_STEER cancels only. Belt-and-braces so
+        # the next LLM turn sees the pivot reinforced even if the model
+        # skims the function_response content. REPLAN and generic
+        # cancels keep the function_response content as the sole signal
+        # — those pivots are less jolting and don't need the extra
+        # framing (see goldfive#139).
+        if healed and reason == SYMBOLIC_REASON_USER_STEER:
+            try:
+                primer = _build_user_steer_primer_event(invocation_id=invocation_id)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "ADKAdapter._heal_pending_tool_calls: could not build "
+                    "user_steer primer event: %s",
+                    exc,
+                )
+            else:
+                try:
+                    coro = append(session=adk_session, event=primer)
+                    if hasattr(coro, "__await__"):
+                        await coro
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "ADKAdapter._heal_pending_tool_calls: append_event "
+                        "for user_steer primer raised: %s",
+                        exc,
+                    )
 
         if healed:
             log.info(

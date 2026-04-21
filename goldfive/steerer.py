@@ -125,6 +125,12 @@ class DefaultSteerer:
         """
         self._sinks: list[Any] = []
         self._planner: Any | None = None
+        # Optional adapter back-reference. Wired via :meth:`bind_adapter`
+        # so the steerer can tag the next mid-invocation cancel with a
+        # symbolic reason (``user_steer``) before the executor triggers
+        # ``task.cancel()`` on the invoke task. See goldfive#139 and
+        # :attr:`goldfive.adapters.adk.ADKAdapter._next_cancel_reason`.
+        self._adapter: Any | None = None
         # Per-session, per-kind last-refine bookkeeping. Purely advisory:
         # callers can subclass to throttle on top of this if needed.
         self._last_refine_kind: dict[tuple[str, DriftKind], int] = {}
@@ -157,6 +163,20 @@ class DefaultSteerer:
         setter = getattr(planner, "set_drift_emitter", None)
         if callable(setter):
             setter(self._emit_planner_refine_validation_failed)
+
+    def bind_adapter(self, adapter: Any) -> None:
+        """Attach the active adapter for cancel-reason tagging.
+
+        Optional wiring (goldfive#139). When set, the steerer tags the
+        adapter's next mid-invocation cancel with a symbolic reason
+        (``user_steer``) so the synthetic ``function_response`` event
+        the adapter appends on cancel carries LLM-actionable content
+        instead of the legacy goldfive-internal jargon. Adapters that
+        don't expose ``_next_cancel_reason`` are tolerated: the setter
+        is a no-op and the cancel falls through to the generic content
+        variant.
+        """
+        self._adapter = adapter
 
     async def _emit_planner_refine_validation_failed(self, drift: DriftEvent) -> None:
         """Emit a planner-side drift through the DriftDetected pipeline.
@@ -956,6 +976,15 @@ class DefaultSteerer:
         every tick until ``SequentialExecutor.max_task_invocations``
         tripped (see TASK-LIFECYCLE.md §7.3).
         """
+        # Tag the bound adapter's next cancel with a symbolic reason so
+        # the synthetic function_response the adapter appends on cancel
+        # carries LLM-actionable content. Done BEFORE the drift event
+        # is emitted so a sink that reacts by cancelling the invoke
+        # sees the tag. Harmless if the adapter doesn't expose the
+        # attribute (duck-typed) or no adapter is bound. See
+        # goldfive#139 and
+        # :func:`goldfive.adapters.adk._build_cancelled_response_event`.
+        self._tag_adapter_cancel_reason(drift)
         await self._emit_drift_detected(session, drift)
         if not _severity_ge(drift.severity, DriftSeverity.WARNING):
             return
@@ -1048,6 +1077,38 @@ class DefaultSteerer:
         prev_plan = session.plan
         self._apply_revision(session, revised, drift)
         await self._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
+
+    # Symbolic cancel-reason tags — mirror
+    # :mod:`goldfive.adapters.adk` constants but duplicated as plain
+    # strings here to avoid a hard import of the optional ADK adapter
+    # module from the provider-agnostic steerer. Keep in sync with
+    # :data:`goldfive.adapters.adk.SYMBOLIC_REASON_USER_STEER` etc.
+    _ADAPTER_CANCEL_REASON_USER_STEER: str = "user_steer"
+
+    def _tag_adapter_cancel_reason(self, drift: DriftEvent) -> None:
+        """Set ``adapter._next_cancel_reason`` based on ``drift.kind``.
+
+        USER_STEER drift -> ``"user_steer"``. Other kinds currently leave
+        the tag unset so the adapter falls through to the generic
+        content variant. Tolerates adapters that don't carry the
+        attribute (no-op) and an unbound adapter (no-op). See
+        goldfive#139.
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return
+        if drift.kind is DriftKind.USER_STEER:
+            reason = self._ADAPTER_CANCEL_REASON_USER_STEER
+        else:
+            return
+        try:
+            adapter._next_cancel_reason = reason
+        except Exception as exc:  # noqa: BLE001
+            # Adapter doesn't expose the attribute — tolerated.
+            log.debug(
+                "DefaultSteerer: could not tag adapter cancel reason: %s",
+                exc,
+            )
 
     # Consecutive refine failures tolerated per (drift_kind, task_id)
     # before we give up and mark the task FAILED. Class attribute so
