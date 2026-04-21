@@ -227,3 +227,137 @@ def test_degraded_prebuilt_runner_yields_single_entry_registry() -> None:
     assert adapter._degraded_prebuilt_runner is True
     assert set(adapter._runners) == {"solo_inner"}
     assert adapter._runners["solo_inner"] is prebuilt
+
+
+# ---------------------------------------------------------------------------
+# Shared outer session id (goldfive#123)
+# ---------------------------------------------------------------------------
+#
+# Before goldfive#123 each per-agent ``InMemoryRunner`` minted its own
+# ``uuid.uuid4()`` session id on first ``_ensure_session_for(...)`` call.
+# :class:`HarmonografTelemetryPlugin` stamps ``ctx.session.id`` onto every
+# span, so a single adk-web run's spans landed under 3+ distinct
+# harmonograf session ids in the UI — the Gantt for the outer coordinator
+# session only showed the coordinator row, and the sub-agent rows lived
+# under sibling ids the user had to hunt for.
+#
+# The fix: one shared outer session id string, broadcast to every
+# per-agent runner. Each runner still has its own
+# ``InMemorySessionService`` so there is no cross-service collision.
+
+
+async def test_ensure_session_for_shares_one_id_across_all_agents() -> None:
+    """``_ensure_session_for(...)`` returns the SAME string for every agent.
+
+    Regression guard for goldfive#123: sub-agent runners must not
+    mint their own uuids — all dispatches of a single adapter roll up
+    under one harmonograf session.
+    """
+    from google.adk.tools.agent_tool import AgentTool
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    a = _mk("a")
+    b = _mk("b")
+    c = _mk("c")
+    coord = _mk("coord")
+    coord.sub_agents = [b]
+    coord.tools = [AgentTool(a), AgentTool(c)]
+
+    adapter = ADKAdapter(coord)
+
+    sid_a = await adapter._ensure_session_for("a")
+    sid_b = await adapter._ensure_session_for("b")
+    sid_c = await adapter._ensure_session_for("c")
+    sid_coord = await adapter._ensure_session_for("coord")
+
+    assert sid_a == sid_b == sid_c == sid_coord, (
+        "per-agent runners must share ONE outer session id so "
+        "telemetry plugins (HarmonografTelemetryPlugin) stamp the "
+        "SAME ctx.session.id on every span — the adk-web UI then "
+        "rolls coordinator + sub-agent rows into a single Gantt."
+    )
+    # And the id is cached on the adapter for stable reuse.
+    assert adapter._outer_session_id == sid_a
+
+
+async def test_ensure_session_for_is_idempotent_per_agent() -> None:
+    """Calling ``_ensure_session_for(name)`` twice yields the same id
+    (both for the same agent AND across agents)."""
+    from google.adk.tools.agent_tool import AgentTool
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    a = _mk("a")
+    coord = _mk("coord")
+    coord.tools = [AgentTool(a)]
+
+    adapter = ADKAdapter(coord)
+
+    first = await adapter._ensure_session_for("a")
+    second = await adapter._ensure_session_for("a")
+    third = await adapter._ensure_session_for("coord")
+    fourth = await adapter._ensure_session_for("a")
+
+    assert first == second == third == fourth
+
+
+async def test_outer_session_id_kwarg_pins_shared_id() -> None:
+    """``ADKAdapter(..., outer_session_id="pinned")`` pins the shared id.
+
+    Callers that want to anchor an adk-web run's telemetry under a
+    specific harmonograf session id pass the outer runner's id here.
+    """
+    from google.adk.tools.agent_tool import AgentTool
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    a = _mk("a")
+    b = _mk("b")
+    coord = _mk("coord")
+    coord.tools = [AgentTool(a), AgentTool(b)]
+
+    adapter = ADKAdapter(coord, outer_session_id="pinned-outer-abc")
+    assert adapter._outer_session_id == "pinned-outer-abc"
+
+    sid_a = await adapter._ensure_session_for("a")
+    sid_b = await adapter._ensure_session_for("b")
+    sid_coord = await adapter._ensure_session_for("coord")
+
+    assert sid_a == sid_b == sid_coord == "pinned-outer-abc"
+
+
+async def test_legacy_session_id_kwarg_pins_shared_id() -> None:
+    """Legacy ``session_id=...`` kwarg still works and now broadcasts
+    to every per-agent runner (previously only the first-touched agent
+    honored it).
+    """
+    from google.adk.tools.agent_tool import AgentTool
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    a = _mk("a")
+    b = _mk("b")
+    coord = _mk("coord")
+    coord.tools = [AgentTool(a), AgentTool(b)]
+
+    adapter = ADKAdapter(coord, session_id="legacy-outer-xyz")
+
+    sid_a = await adapter._ensure_session_for("a")
+    sid_b = await adapter._ensure_session_for("b")
+    sid_coord = await adapter._ensure_session_for("coord")
+
+    assert sid_a == sid_b == sid_coord == "legacy-outer-xyz"
+
+
+async def test_outer_session_id_wins_over_legacy_session_id() -> None:
+    """When both are set, ``outer_session_id`` beats ``session_id``."""
+    from goldfive.adapters.adk import ADKAdapter
+
+    adapter = ADKAdapter(
+        _mk("solo"),
+        session_id="legacy",
+        outer_session_id="outer-wins",
+    )
+    assert adapter._outer_session_id == "outer-wins"
+    assert await adapter._ensure_session_for("solo") == "outer-wins"

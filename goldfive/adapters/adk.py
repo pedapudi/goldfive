@@ -442,7 +442,18 @@ class ADKAdapter:
         ``"goldfive_user"`` which is fine for local / single-user runs.
     session_id:
         Optional stable session id. When omitted the adapter mints a
-        fresh session id on first :meth:`invoke`.
+        fresh session id on first :meth:`invoke`. When set, the same id
+        is broadcast to every per-agent runner so telemetry / span
+        session-id stamping rolls up under one logical session (see
+        ``outer_session_id`` for the preferred spelling).
+    outer_session_id:
+        Optional preferred-spelling alias for ``session_id``. When
+        provided, pins the SHARED session id used for every per-agent
+        runner this adapter builds. Callers that want to anchor a full
+        adk-web run's telemetry under one harmonograf session id pass
+        the outer runner's session id here. Exactly one of
+        ``session_id`` / ``outer_session_id`` should be set; if both
+        are, ``outer_session_id`` wins.
     app_name:
         Optional ADK app_name override. Defaults to the runner's own
         ``app_name`` or the agent's ``name``.
@@ -463,6 +474,7 @@ class ADKAdapter:
         *,
         user_id: str = "goldfive_user",
         session_id: str | None = None,
+        outer_session_id: str | None = None,
         app_name: str | None = None,
         plugins: list[Any] | None = None,
     ) -> None:
@@ -480,6 +492,17 @@ class ADKAdapter:
         # its AgentTool calls looped forever.
         # ------------------------------------------------------------------
         self._user_id = user_id
+        # Caller-pinned outer session id, if any. ``outer_session_id``
+        # wins over the legacy ``session_id`` spelling when both are
+        # set. This id — or one minted lazily on first
+        # ``_ensure_session_for`` — is broadcast to every per-agent
+        # runner so telemetry rolls up under a single harmonograf
+        # session id (goldfive#123). Previously each per-agent runner
+        # got its OWN ``uuid.uuid4()`` session id, which the
+        # HarmonografTelemetryPlugin stamped onto spans — scattering
+        # one adk-web run's spans across 3+ UI sessions.
+        pinned_outer = outer_session_id if outer_session_id is not None else session_id
+        self._outer_session_id: str | None = pinned_outer
         self._session_id = session_id  # legacy single-runner id; per-runner ids below
         self._degraded_prebuilt_runner = False
         # Caller-supplied ADK plugins (e.g. HarmonografTelemetryPlugin).
@@ -1001,27 +1024,53 @@ class ADKAdapter:
     async def _ensure_session_for(self, agent_name: str) -> str:
         """Return the ADK session id for ``agent_name``'s runner.
 
-        Per-runner session ids because each :class:`InMemoryRunner`
-        carries its own :class:`InMemorySessionService`. Built on
-        demand so agents that never get dispatched to never get an
-        empty ADK session created for them.
+        All per-agent runners share ONE logical session id string
+        (goldfive#123). Each :class:`InMemoryRunner` still carries its
+        own :class:`InMemorySessionService`, so session objects remain
+        distinct per service — they just share an id string. This is
+        safe because ADK looks sessions up as
+        ``(app_name, user_id, session_id)`` against a single
+        per-runner service; sharing the id across runners does NOT
+        create cross-service collisions.
 
-        Legacy back-compat: callers (older tests) that set
-        ``adapter._session_id = "stub-session"`` before the first
-        invoke() pin a session id. We map that single id to every
-        requested agent on first access so the legacy assignment still
-        drives the dispatch target's session. Once an agent has its
-        own entry in ``_session_ids`` it is authoritative.
+        Why uniform: :class:`HarmonografTelemetryPlugin` (and similar
+        telemetry plugins) stamp ``ctx.session.id`` onto every span.
+        When sub-agent runners each minted their own ``uuid.uuid4()``
+        id, a single adk-web run's spans scattered across 3+ UI
+        session ids — breaking the Gantt roll-up. With a shared id,
+        all of a run's spans land under one harmonograf session.
+
+        The shared id is resolved in this order:
+
+        1. A caller-pinned ``outer_session_id`` / legacy
+           ``session_id`` (``self._outer_session_id``) — used as-is.
+        2. Otherwise, lazily mint ONE ``uuid.uuid4()`` on first call
+           and cache it on ``self._outer_session_id``. Subsequent
+           ``_ensure_session_for(...)`` calls reuse it.
+
+        For each distinct ``agent_name``, we still call
+        ``create_session`` once on that runner's session service
+        (which is what ADK's ``run_async`` needs for a successful
+        dispatch). We just pass the SHARED id as the ``session_id``
+        kwarg.
         """
         existing = self._session_ids.get(agent_name)
         if existing:
             return existing
 
-        # Honor a pre-seeded legacy id exactly once per agent. After
-        # that, each agent's entry is authoritative and independent.
-        if self._session_id and not self._session_ids:
-            self._session_ids[agent_name] = self._session_id
-            return self._session_id
+        # Resolve the shared outer session id exactly once per adapter.
+        # After this block ``self._outer_session_id`` is non-empty.
+        #
+        # Legacy back-compat: older tests set
+        # ``adapter._session_id = "stub-session"`` AFTER construction,
+        # before the first invoke(). Honor that post-ctor mutation
+        # when no outer id has been resolved yet.
+        if not self._outer_session_id:
+            if self._session_id:
+                self._outer_session_id = self._session_id
+            else:
+                self._outer_session_id = str(uuid.uuid4())
+        shared_id = self._outer_session_id
 
         runner = self._runners.get(agent_name, self._runner)
         # IMPORTANT: use the per-runner app_name for session creation,
@@ -1035,18 +1084,16 @@ class ADKAdapter:
         app_name = str(getattr(runner, "app_name", "") or "") or self._app_name
         session_service = getattr(runner, "session_service", None)
         if session_service is None:
-            new_id = str(uuid.uuid4())
-            self._session_ids[agent_name] = new_id
-            return new_id
+            self._session_ids[agent_name] = shared_id
+            return shared_id
 
-        new_id = str(uuid.uuid4())
         try:
             create = getattr(session_service, "create_session", None)
             if callable(create):
                 coro = create(
                     app_name=app_name,
                     user_id=self._user_id,
-                    session_id=new_id,
+                    session_id=shared_id,
                 )
                 if hasattr(coro, "__await__"):
                     await coro
@@ -1056,8 +1103,8 @@ class ADKAdapter:
                 agent_name,
                 exc,
             )
-        self._session_ids[agent_name] = new_id
-        return new_id
+        self._session_ids[agent_name] = shared_id
+        return shared_id
 
     # Legacy shim for tests that called ``_ensure_session()`` directly
     # before the registry-dispatch refactor. Maps to the root agent's
