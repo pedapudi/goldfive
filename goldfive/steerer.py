@@ -128,6 +128,13 @@ class DefaultSteerer:
         # Per-session, per-kind last-refine bookkeeping. Purely advisory:
         # callers can subclass to throttle on top of this if needed.
         self._last_refine_kind: dict[tuple[str, DriftKind], int] = {}
+        # Scratchpad the steerer uses to plumb the active session into
+        # the planner's drift-emitter callback. Set just before calling
+        # ``planner.refine`` and cleared afterwards in ``_handle_drift``;
+        # ``None`` outside that window. Only consulted by the emitter
+        # the planner calls when its retry budget is spent
+        # (goldfive#133).
+        self._active_session: Session | None = None
         # Reflective check wiring. When ``_reflective_call_llm`` is None
         # every entry point short-circuits so the feature is inert.
         self._reflective_call_llm: ReflectiveCallLLM | None = reflective_call_llm
@@ -141,6 +148,39 @@ class DefaultSteerer:
     def bind(self, *, sinks: list[EventSink], planner: Planner) -> None:
         self._sinks = list(sinks)
         self._planner = planner
+        # If the planner supports the optional drift-emitter hook (see
+        # :class:`~goldfive.planner.LLMPlanner.set_drift_emitter`), wire
+        # it up now so the planner can signal ``REFINE_VALIDATION_FAILED``
+        # through the normal event pipeline when its retry budget is
+        # spent. Duck-typed on purpose so custom ``Planner``
+        # implementations don't have to implement the hook.
+        setter = getattr(planner, "set_drift_emitter", None)
+        if callable(setter):
+            setter(self._emit_planner_refine_validation_failed)
+
+    async def _emit_planner_refine_validation_failed(self, drift: DriftEvent) -> None:
+        """Emit a planner-side drift through the DriftDetected pipeline.
+
+        Dispatched as the drift emitter passed to
+        :meth:`~goldfive.planner.LLMPlanner.set_drift_emitter` in
+        :meth:`bind`. The planner calls this when it exhausts its
+        refine retry budget with a ``REFINE_VALIDATION_FAILED``
+        ``DriftEvent`` pre-built; we emit it but deliberately do NOT go
+        back through :meth:`_handle_drift` (the steerer must not try to
+        refine again on this kind -- infinite-loop risk).
+        """
+        # The planner's emitter isn't bound to a specific session, so
+        # we route through the most recently-active session -- which in
+        # practice is the only session a single-threaded planner is
+        # handling. Store it on the instance when _handle_drift runs.
+        session = self._active_session
+        if session is None:
+            log.warning(
+                "DefaultSteerer: planner emitted %s but no active session bound; dropping signal",
+                drift.kind.value,
+            )
+            return
+        await self._emit_drift_detected(session, drift)
 
     # ------------------------------------------------------------------
     # Protocol-required: transition (generic)
@@ -921,33 +961,50 @@ class DefaultSteerer:
             return
         if self._planner is None or session.plan is None:
             return
+        # REFINE_VALIDATION_FAILED is a terminal signal emitted by the
+        # planner itself when its retry budget is spent (goldfive#133).
+        # Refining on it would risk the planner re-refining on its own
+        # failure signal; leave the choice (steer again, cancel, let
+        # execution proceed with the existing plan) to the operator.
+        if drift.kind is DriftKind.REFINE_VALIDATION_FAILED:
+            return
         counter_key = (drift.kind.value, drift.current_task_id)
         # If this (kind, task) already tripped the threshold on a prior
         # tick, stop trying to refine. The task is FAILED by now so any
         # further drift for it will short-circuit at ``mark_task_failed``.
         if session.refine_failure_counts.get(counter_key, 0) >= self.REFINE_FAILURE_THRESHOLD:
             return
+        # Plumb the session into the planner's drift-emitter callback
+        # for the duration of this refine call so the planner can emit
+        # REFINE_VALIDATION_FAILED drifts through the normal event
+        # pipeline. Cleared in a ``finally`` so exceptions don't leave
+        # a stale session pointer. See goldfive#133.
+        self._active_session = session
         try:
-            revised = await self._planner.refine(
-                plan=session.plan,
-                drift=drift,
-                goals=list(session.goals),
-            )
-        except Exception as exc:  # noqa: BLE001 — refine errors must not break the run
-            # Surface the failure via logging + a synthetic follow-up
-            # drift so operators don't silently see the same plan loop
-            # forever. Without this, a refine that raises (e.g. malformed
-            # LLM JSON after a mid-invocation cancel poisons the session)
-            # leaves session.plan unchanged and the executor re-enters
-            # the same state on the next tick.
-            log.warning(
-                "DefaultSteerer._handle_drift: planner.refine(kind=%s) raised %s; plan unchanged",
-                drift.kind.value,
-                exc,
-            )
-            await self._emit_refine_failure(session, drift, reason=str(exc))
-            await self._register_refine_failure(session, drift, counter_key)
-            return
+            try:
+                revised = await self._planner.refine(
+                    plan=session.plan,
+                    drift=drift,
+                    goals=list(session.goals),
+                )
+            except Exception as exc:  # noqa: BLE001 — refine errors must not break the run
+                # Surface the failure via logging + a synthetic follow-up
+                # drift so operators don't silently see the same plan loop
+                # forever. Without this, a refine that raises (e.g. malformed
+                # LLM JSON after a mid-invocation cancel poisons the session)
+                # leaves session.plan unchanged and the executor re-enters
+                # the same state on the next tick.
+                log.warning(
+                    "DefaultSteerer._handle_drift: planner.refine(kind=%s) raised "
+                    "%s; plan unchanged",
+                    drift.kind.value,
+                    exc,
+                )
+                await self._emit_refine_failure(session, drift, reason=str(exc))
+                await self._register_refine_failure(session, drift, counter_key)
+                return
+        finally:
+            self._active_session = None
         if revised is None:
             log.warning(
                 "DefaultSteerer._handle_drift: planner.refine(kind=%s) returned None; "

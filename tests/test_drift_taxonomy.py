@@ -55,6 +55,7 @@ EXPECTED_DRIFT_KINDS = {
     "SELF_REPORTED_STUCK": "self_reported_stuck",
     "CONFABULATION_RISK": "confabulation_risk",
     "RUNAWAY_DELEGATION": "runaway_delegation",
+    "REFINE_VALIDATION_FAILED": "refine_validation_failed",
 }
 
 
