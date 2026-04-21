@@ -501,6 +501,17 @@ class ADKAdapter(AgentAdapter):
         app_name: Optional[str] = None,
     ) -> None: ...
 
+    @property
+    def available_agents(self) -> list[str]:
+        """Sorted names of every agent reachable from the wrap target.
+
+        Source of truth is the registry built at ``__init__`` time by
+        walking ``sub_agents`` / ``inner_agent`` / ``AgentTool.agent``
+        edges. Planner consumes this at ``generate()`` time;
+        ``invoke(task, ...)`` strict-matches ``task.assignee_agent_id``
+        against this list at dispatch.
+        """
+
 # Requires `goldfive[claude]`
 class ClaudeAgentSDKAdapter(AgentAdapter):
     def __init__(
@@ -516,6 +527,22 @@ class ClaudeAgentSDKAdapter(AgentAdapter):
     def bind_steerer(self, steerer: Steerer) -> None:
         """Wire a :class:`Steerer` in after construction."""
 ```
+
+`ADKAdapter.__init__` raises `ValueError` when two reachable agents
+share a name (`"duplicate agent name in tree: <name>"`) — the
+registry keys on name, so collisions make strict-match dispatch
+ambiguous.
+
+`ADKAdapter.invoke(task, session)` raises `ValueError` when
+`task.assignee_agent_id` is set but not in the registry
+(`"plan assigned task <id> to unknown agent <name>; available:
+[...]"`). Callers who want silent fallback to the root must leave
+`task.assignee_agent_id` empty.
+
+See [ARCHITECTURE.md §"Registry dispatch"](../design/ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)
+for the model and [adk-web-integration.md §"Pre-built Runner degrade mode"](../guides/adk-web-integration.md#pre-built-runner-degrade-mode)
+for the degraded-mode contract when the caller passes a
+pre-built `Runner` instead of a `BaseAgent`.
 
 ### Sinks (`goldfive.sinks`)
 
@@ -744,6 +771,80 @@ Per-event builders (`run_started_event`, `run_completed_event`,
 `task_cancelled_event`, `drift_detected_event`) are also available in
 `goldfive.events` as convenience constructors for sink implementations.
 
+### Agent-invocation events (ADK registry dispatch)
+
+Three observability-only events emitted by the goldfive ADK plugin
+on every dispatch. They describe the "who actually ran what"
+shape of a run — both goldfive's top-level dispatch and any
+AgentTool-spawned sub-Runner invocations. See
+[EVENT-MODEL.md §"Agent-invocation events"](../design/EVENT-MODEL.md#agent-invocation-events)
+for the nesting rules and consumer guidance.
+
+```python
+def agent_invocation_started_event(
+    run_id: str,
+    sequence: int,
+    *,
+    agent_name: str,
+    task_id: str = "",
+    invocation_id: str = "",
+    parent_invocation_id: str = "",
+    started_at: Any | None = None,
+) -> Any: ...
+
+def agent_invocation_completed_event(
+    run_id: str,
+    sequence: int,
+    *,
+    agent_name: str,
+    task_id: str = "",
+    invocation_id: str = "",
+    summary: str = "",
+    completed_at: Any | None = None,
+) -> Any: ...
+
+def delegation_observed_event(
+    run_id: str,
+    sequence: int,
+    *,
+    from_agent: str,
+    to_agent: str,
+    task_id: str = "",
+    invocation_id: str = "",
+    observed_at: Any | None = None,
+) -> Any: ...
+```
+
+`AgentInvocationStarted` payload fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `agent_name` | `string` | Dispatched agent. `task.assignee_agent_id` for top-level; wrapped agent's name for AgentTool sub-Runners. |
+| `task_id` | `string` | Goldfive-dispatched task id. Propagates into nested invocations. |
+| `invocation_id` | `string` | ADK's per-run invocation id. |
+| `parent_invocation_id` | `string` | Empty on top-level; set to outer `invocation_id` on AgentTool sub-Runners. |
+| `started_at` | `Timestamp` | Emission time. |
+
+`AgentInvocationCompleted` payload fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `agent_name` | `string` | Matches the corresponding Started event. |
+| `task_id` | `string` | Same as the Started event. |
+| `invocation_id` | `string` | Matches the Started event. |
+| `summary` | `string` | Optional outcome summary (final assistant text). |
+| `completed_at` | `Timestamp` | Emission time. |
+
+`DelegationObserved` payload fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `from_agent` | `string` | Host agent about to call the AgentTool. |
+| `to_agent` | `string` | Wrapped agent the AgentTool will invoke. |
+| `task_id` | `string` | Goldfive-dispatched task id. |
+| `invocation_id` | `string` | Host agent's invocation id. |
+| `observed_at` | `Timestamp` | Emission time. |
+
 ## Proto (`goldfive.pb.goldfive.v1`)
 
 Generated stubs committed to git. Key messages:
@@ -755,7 +856,8 @@ Goal, Plan, Task, TaskEdge, TaskStatus, DriftKind, PlanRevision
 # events_pb2
 Event, RunStarted, GoalDerived, PlanSubmitted, PlanRevised,
 TaskStarted, TaskProgress, TaskCompleted, TaskFailed,
-TaskBlocked, TaskCancelled, DriftDetected, RunCompleted, RunAborted
+TaskBlocked, TaskCancelled, DriftDetected, RunCompleted, RunAborted,
+AgentInvocationStarted, AgentInvocationCompleted, DelegationObserved
 ```
 
 The `Event` envelope has a `oneof payload` with one field per
