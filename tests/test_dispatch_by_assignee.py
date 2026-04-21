@@ -246,9 +246,18 @@ async def test_sequential_dispatch_plugin_active_ctx_cleared_between_invokes() -
     assert adapter._plugin._top_invocation_id == ""
 
 
-async def test_sequential_dispatch_creates_separate_session_ids_per_agent() -> None:
-    """Per-agent runners each get their own ADK session id on first
-    dispatch — no session bleed between runners.
+async def test_sequential_dispatch_shares_one_session_id_across_agents() -> None:
+    """Per-agent runners all share the SAME ADK session id string
+    (goldfive#123). The HarmonografTelemetryPlugin stamps
+    ``ctx.session.id`` onto every span, so a uniform id across runners
+    rolls an adk-web run's spans up under one harmonograf session
+    (before the fix, sub-agent runners minted their own uuids and the
+    UI scattered one run across 3+ sessions).
+
+    Safety: each :class:`InMemoryRunner` has its own
+    :class:`InMemorySessionService`; ADK looks sessions up as
+    ``(app_name, user_id, session_id)`` on the PER-RUNNER service, so
+    sharing the id string across runners does NOT collide.
     """
     from google.adk.tools.agent_tool import AgentTool
 
@@ -267,6 +276,7 @@ async def test_sequential_dispatch_creates_separate_session_ids_per_agent() -> N
     # on first dispatch (exercising the real _ensure_session_for flow
     # against our recording runners, which have no session_service).
     adapter._session_ids = {}
+    adapter._outer_session_id = None
 
     session = Session(
         run_id="r1",
@@ -285,11 +295,13 @@ async def test_sequential_dispatch_creates_separate_session_ids_per_agent() -> N
     for task in session.plan.tasks:
         await adapter.invoke(task=task, session=session)
 
-    # Each agent got its own session id.
+    # Both agents got the SAME shared session id.
     assert "a" in adapter._session_ids
     assert "b" in adapter._session_ids
-    assert adapter._session_ids["a"] != adapter._session_ids["b"], (
-        "per-agent session ids collided — ADK would look sessions up "
-        "by the wrong app_name/session_id combo and pick the other "
-        "agent's conversation history"
+    assert adapter._session_ids["a"] == adapter._session_ids["b"], (
+        "per-agent session ids must share ONE outer id so telemetry "
+        "plugins that stamp ctx.session.id onto spans roll up under a "
+        "single harmonograf session (goldfive#123)"
     )
+    # And that id is cached on the adapter for reuse.
+    assert adapter._outer_session_id == adapter._session_ids["a"]
