@@ -63,7 +63,7 @@ kinds group naturally into six categories.
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
 | `TOOL_ERROR` | Adapter observed a tool raising an exception or returning an error payload. | `warning` | yes |
-| `AGENT_REFUSAL` | LLM refused to proceed with polite language ("I can't help with that"). | `warning` | yes |
+| `AGENT_REFUSAL` | LLM refused to proceed; severity graded by tier — `info` for hedging ("I'm not confident"), `warning` for capability refusals ("I can't help with that"), `critical` for policy/safety refusals ("I must decline"). | tiered (`info`/`warning`/`critical`) | usually (INFO is observational, WARNING retries via refine, CRITICAL typically not) |
 | `MODEL_REFUSAL` | Hard refusal — safety-filter style. | `critical` | no |
 | `SAFETY_CONCERN` | Detected content policy / safety trigger from the model. | `critical` | no |
 | `TASK_FAILED_RECOVERABLE` | `report_task_failed(task_id, reason, recoverable=True)` | `warning` | yes |

@@ -344,7 +344,7 @@ Kinds synthesized from signals coming out of the model or adapter layer.
 | `DriftKind` | Value | Default severity | Trigger |
 |---|---|---|---|
 | `TOOL_ERROR` | `"tool_error"` | `WARNING` | `classify_tool_error(event)` matched a tool-result shape with a truthy error / `status=FAILED`/`ok=False`. |
-| `AGENT_REFUSAL` | `"agent_refusal"` | `WARNING` | `classify_refusal(text)` found an `LLM_REFUSAL_MARKERS` substring ("I cannot", "I refuse", ...). |
+| `AGENT_REFUSAL` | `"agent_refusal"` | tier-graded (`INFO` / `WARNING` / `CRITICAL`) | `classify_refusal(text)` matched a marker in one of `LLM_REFUSAL_MARKERS_CRITICAL` (policy/safety, e.g. "I must decline"), `LLM_REFUSAL_MARKERS_WARNING` (capability, e.g. "I cannot"), or `LLM_REFUSAL_MARKERS_INFO` (hedging, e.g. "I'm not confident"). Scan order is CRITICAL -> WARNING -> INFO, first match wins. |
 | `MODEL_REFUSAL` | `"model_refusal"` | `CRITICAL` | Adapter-specific hard refusal path (safety-filter style). Not classified by default; adapters synthesize directly. |
 | `HALLUCINATION_SUSPECTED` | `"hallucination_suspected"` | `WARNING` | Output references entities the session never produced. Caller-supplied heuristic; no default classifier. |
 | `STOPPED_EARLY` | `"stopped_early"` | `WARNING` | Agent emitted nothing before exiting its turn. Adapter-detected. |

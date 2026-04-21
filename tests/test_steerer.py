@@ -343,6 +343,83 @@ def test_classify_refusal_none_on_normal_text() -> None:
     assert classify_refusal("OK, I will do that.") is None
 
 
+@pytest.mark.parametrize(
+    ("text", "expected_severity"),
+    [
+        # CRITICAL — policy / safety refusals.
+        ("I must decline to answer this.", DriftSeverity.CRITICAL),
+        ("I cannot assist with that request.", DriftSeverity.CRITICAL),
+        ("That request is against my guidelines.", DriftSeverity.CRITICAL),
+        ("For safety reasons, I won't elaborate.", DriftSeverity.CRITICAL),
+        ("I will not proceed with this task.", DriftSeverity.CRITICAL),
+        # WARNING — capability / scope refusals.
+        ("I cannot help with that, sorry.", DriftSeverity.WARNING),
+        ("That is beyond my capabilities right now.", DriftSeverity.WARNING),
+        ("That's outside my scope as a planner.", DriftSeverity.WARNING),
+        ("I was unable to find the file.", DriftSeverity.WARNING),
+        ("No viable approach presents itself.", DriftSeverity.WARNING),
+        ("This is not something I can do.", DriftSeverity.WARNING),
+        # INFO — hedging / deferral.
+        ("I may not be the best fit for this.", DriftSeverity.INFO),
+        ("I think this might be the wrong approach.", DriftSeverity.INFO),
+        ("I'm not particularly well suited for image work.", DriftSeverity.INFO),
+        ("I'm not confident this will succeed.", DriftSeverity.INFO),
+    ],
+)
+def test_classify_refusal_severity_tiers(
+    text: str, expected_severity: DriftSeverity
+) -> None:
+    """Each tier maps to its documented ``DriftSeverity``."""
+    d = classify_refusal(text)
+    assert d is not None
+    assert d.kind is DriftKind.AGENT_REFUSAL
+    assert d.severity is expected_severity
+
+
+def test_classify_refusal_critical_wins_over_warning_substring() -> None:
+    """First-match-wins across tiers: a CRITICAL marker in the same
+    text must not be downgraded because a WARNING marker also
+    happens to appear.
+    """
+    # "i cannot" (WARNING) appears before "i must decline" (CRITICAL)
+    # in the raw string, but the scan order is tier-first, not
+    # position-first, so CRITICAL must win.
+    text = "I cannot continue here; I must decline on policy grounds."
+    d = classify_refusal(text)
+    assert d is not None
+    assert d.kind is DriftKind.AGENT_REFUSAL
+    assert d.severity is DriftSeverity.CRITICAL
+
+
+def test_classify_refusal_warning_wins_over_info_substring() -> None:
+    """WARNING tier beats INFO when both markers coexist."""
+    text = "I'm not confident, and in fact I cannot do this."
+    d = classify_refusal(text)
+    assert d is not None
+    assert d.kind is DriftKind.AGENT_REFUSAL
+    assert d.severity is DriftSeverity.WARNING
+
+
+def test_classify_refusal_flat_markers_back_compat() -> None:
+    """The deprecated flat ``LLM_REFUSAL_MARKERS`` tuple still exposes
+    every tiered marker so external callers that imported the name
+    continue to work.
+    """
+    from goldfive.drift import (
+        LLM_REFUSAL_MARKERS,
+        LLM_REFUSAL_MARKERS_CRITICAL,
+        LLM_REFUSAL_MARKERS_INFO,
+        LLM_REFUSAL_MARKERS_WARNING,
+    )
+
+    expected = set(
+        LLM_REFUSAL_MARKERS_CRITICAL
+        + LLM_REFUSAL_MARKERS_WARNING
+        + LLM_REFUSAL_MARKERS_INFO
+    )
+    assert set(LLM_REFUSAL_MARKERS) == expected
+
+
 def test_classify_stop_reason_max_tokens() -> None:
     d = classify_stop_reason("MAX_TOKENS")
     assert d is not None and d.kind is DriftKind.CONTEXT_PRESSURE
