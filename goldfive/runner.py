@@ -105,6 +105,17 @@ class Runner:
         the planner context so executors that honour it can enforce the
         cap. Defaults to ``None`` (unbounded); per-task / per-tool caps
         are the primary guards against runaway loops.
+    goal_drift_enabled:
+        Opt-in switch for the trajectory-level GOAL_DRIFT periodic
+        check (goldfive#143). ``True`` (default) leaves the steerer's
+        own ``goal_drift_call_llm`` wiring intact -- operators who
+        pass a steerer configured with a judge callable get the
+        check. ``False`` forcibly disables it by detaching
+        ``_goal_drift_call_llm`` on the steerer, which is the shape
+        unit tests driving mock runners want so they never see
+        spurious GOAL_DRIFT firings from the bookkeeping path.
+        Has no effect when the steerer was never configured with a
+        ``goal_drift_call_llm`` (the feature is already inert).
     """
 
     def __init__(
@@ -119,6 +130,7 @@ class Runner:
         control: ControlChannel | None = None,
         max_task_invocations: int | None = None,
         conversation: Conversation | None = None,
+        goal_drift_enabled: bool = True,
         **legacy_kwargs: Any,
     ) -> None:
         if "max_plan_reinvocations" in legacy_kwargs:
@@ -139,6 +151,17 @@ class Runner:
         self.executor = executor
         self.goal_deriver: GoalDeriver = goal_deriver or PassthroughGoalDeriver("run")
         self.steerer: Steerer = steerer or DefaultSteerer()
+        # goldfive#143: opt-in gate for the trajectory-level GOAL_DRIFT
+        # periodic check. ``True`` (default) is a no-op -- the steerer's
+        # own ``goal_drift_call_llm`` wiring governs whether the check
+        # fires. ``False`` forcibly detaches the callable so mock-only
+        # runs never see GOAL_DRIFT firings, even if a test accidentally
+        # wires a callable through. Guarded on ``hasattr`` so custom
+        # ``Steerer`` implementations that predate this attribute still
+        # construct cleanly.
+        self.goal_drift_enabled: bool = goal_drift_enabled
+        if not goal_drift_enabled and hasattr(self.steerer, "_goal_drift_call_llm"):
+            self.steerer._goal_drift_call_llm = None
         self.sinks: list[EventSink] = list(sinks) if sinks else []
         self._control: ControlChannel | None = control
         self._close_hooks: list[Callable[[], Awaitable[None]]] = []
@@ -296,9 +319,7 @@ class Runner:
                 reason = f"adapter.bind_steerer raised: {exc}"
                 log.exception("adapter.bind_steerer raised")
                 await self._emit_run_aborted(session, reason)
-                outcome = ExecutionOutcome(
-                    success=False, session=session, reason=reason
-                )
+                outcome = ExecutionOutcome(success=False, session=session, reason=reason)
                 self._conversation.absorb_turn(
                     outcome, user_input_summary=_initial_goal_summary(user_input)
                 )
@@ -538,17 +559,14 @@ class Runner:
             return list(user_input)
         if not isinstance(user_input, str):
             raise TypeError(
-                f"Runner.run: user_input must be str or list[Goal], "
-                f"got {type(user_input).__name__}"
+                f"Runner.run: user_input must be str or list[Goal], got {type(user_input).__name__}"
             )
         goals = await self.goal_deriver.derive(user_input, context=context)
         if not goals:
             raise ValueError("GoalDeriver returned an empty goals list")
         return list(goals)
 
-    async def _emit_run_started(
-        self, session: Session, user_input: str | list[Goal]
-    ) -> None:
+    async def _emit_run_started(self, session: Session, user_input: str | list[Goal]) -> None:
         evt = run_started_event(
             run_id=session.run_id,
             sequence=session.next_sequence(),

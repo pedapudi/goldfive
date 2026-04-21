@@ -31,7 +31,10 @@ __all__ = [
     "LLM_REFUSAL_MARKERS_WARNING",
     "LLM_REFUSAL_MARKERS_CRITICAL",
     "CONTEXT_PRESSURE_STOP_REASONS",
+    "GOAL_DRIFT_CHECK_INTERVAL",
+    "GOAL_DRIFT_IDLE_SECONDS",
     "classify_confabulation_risk",
+    "classify_goal_drift",
     "classify_tool_error",
     "classify_refusal",
     "classify_stop_reason",
@@ -54,17 +57,31 @@ _REASONING_EXPORTS = frozenset(
 )
 
 
+_GOALS_EXPORTS = frozenset(
+    {
+        "classify_goal_drift",
+        "GOAL_DRIFT_CHECK_INTERVAL",
+        "GOAL_DRIFT_IDLE_SECONDS",
+    }
+)
+
+
 def __getattr__(name: str) -> Any:
-    """Lazy re-export of the reasoning-drift helpers.
+    """Lazy re-export of the reasoning-drift and goal-drift helpers.
 
     Defers the regex / optional-embedding imports in
     :mod:`goldfive.drift.reasoning` until first access, so
     ``from goldfive.drift import classify_tool_error`` stays cheap.
+    The ``goals`` submodule is also lazy-loaded for parity.
     """
     if name in _REASONING_EXPORTS:
         from goldfive.drift import reasoning as _reasoning
 
         return getattr(_reasoning, name)
+    if name in _GOALS_EXPORTS:
+        from goldfive.drift import goals as _goals
+
+        return getattr(_goals, name)
     raise AttributeError(f"module 'goldfive.drift' has no attribute {name!r}")
 
 
@@ -131,9 +148,7 @@ LLM_REFUSAL_MARKERS_CRITICAL: tuple[str, ...] = (
 #: :data:`LLM_REFUSAL_MARKERS_CRITICAL`) and scan via
 #: :func:`classify_refusal`, which graduates severity per tier.
 LLM_REFUSAL_MARKERS: tuple[str, ...] = (
-    LLM_REFUSAL_MARKERS_CRITICAL
-    + LLM_REFUSAL_MARKERS_WARNING
-    + LLM_REFUSAL_MARKERS_INFO
+    LLM_REFUSAL_MARKERS_CRITICAL + LLM_REFUSAL_MARKERS_WARNING + LLM_REFUSAL_MARKERS_INFO
 )
 
 # Stop-reason / finish-reason values that indicate the model hit a length

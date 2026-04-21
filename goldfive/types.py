@@ -107,6 +107,18 @@ class DriftKind(StrEnum):
     # leaves the choice (steer again, cancel, or accept the fallback) to
     # the operator. See goldfive#133.
     REFINE_VALIDATION_FAILED = "refine_validation_failed"
+    # Periodic trajectory-level goal-alignment check. Unlike the other
+    # event-driven drift kinds (which classify one LLM response or one
+    # tool result at a time), GOAL_DRIFT fires after a configurable
+    # number of agent invocations when an LLM-judge concludes the tree's
+    # accumulated activity is not advancing ``session.goals``. CRITICAL
+    # severity -- routed to the #142 Level 4 intervention tier (pause +
+    # HUMAN_INTERVENTION_REQUIRED). Gated behind
+    # ``Runner(goal_drift_enabled=...)`` and a ``goal_drift_call_llm``
+    # callable on :class:`DefaultSteerer`; mock-only runs never see it.
+    # See :func:`goldfive.drift.goals.classify_goal_drift` and
+    # goldfive#143.
+    GOAL_DRIFT = "goal_drift"
 
 
 class DriftSeverity(StrEnum):
@@ -461,6 +473,22 @@ class Session:
     # the counter cleanly on task transitions without plumbing an explicit
     # reset call through every ``mark_task_*`` path.
     _reflective_check_task_id: str = ""
+    # Counter of agent invocations observed since the last GOAL_DRIFT
+    # trajectory-level check (goldfive#143). Incremented by
+    # ``DefaultSteerer.note_agent_turn`` (which adapters call once per
+    # ``after_run_callback`` / equivalent completion hook when the opt-in
+    # goal-drift judge is configured) and reset to 0 after a check fires.
+    # No task-id scoping: GOAL_DRIFT is a trajectory-level signal, so the
+    # counter persists across task transitions.
+    _agent_turns_since_goal_check: int = 0
+    # Ring buffer of recent agent activity summaries fed to the
+    # :func:`goldfive.drift.classify_goal_drift` judge. Adapters push
+    # entries via ``DefaultSteerer.note_agent_activity``; the steerer
+    # trims to ``goal_drift_activity_window`` entries to bound the
+    # prompt. Each entry is a small dict (``kind``, ``agent_name``,
+    # ``task_id``, ``detail``) rather than a full event proto to keep
+    # this framework-neutral.
+    recent_agent_activity: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     # monotonic event sequence counter for sinks
     _next_sequence: int = 0
 
