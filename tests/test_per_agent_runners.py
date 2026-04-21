@@ -361,3 +361,178 @@ async def test_outer_session_id_wins_over_legacy_session_id() -> None:
     )
     assert adapter._outer_session_id == "outer-wins"
     assert await adapter._ensure_session_for("solo") == "outer-wins"
+
+
+# ---------------------------------------------------------------------------
+# Outer session id pinned from adk-web InvocationContext (goldfive#125)
+# ---------------------------------------------------------------------------
+#
+# goldfive#123 fixed the "sub-agent runners mint their own uuids" symptom but
+# the SHARED id was still a goldfive-minted uuid distinct from adk-web's
+# outer session id ``X``. HarmonografTelemetryPlugin stamps ctx.session.id
+# onto spans — adk-web's own root-runner spans landed under ``X`` while
+# goldfive's per-agent runners landed under the shared internal uuid ``Y``.
+# Users saw two harmonograf sessions per adk-web run.
+#
+# goldfive#125 fixes that by pinning the adapter's ``_outer_session_id`` to
+# ``ctx.session.id`` on the first ``_run_async_impl`` invocation from
+# adk-web. Every subsequent ``_ensure_session_for(...)`` then returns the
+# same adk-web id, so all spans roll up under one harmonograf session.
+
+
+async def test_run_async_impl_pins_outer_session_id_from_ctx() -> None:
+    """First ``_run_async_impl`` call adopts ``ctx.session.id`` onto adapter.
+
+    Regression guard for goldfive#125: without this, adk-web's own
+    session id ``X`` diverges from the adapter's lazy-minted uuid ``Y``
+    and harmonograf splits one run across two UI sessions.
+    """
+    import goldfive
+    from goldfive.adapters.adk_wrap import GoldfiveADKAgent
+    from goldfive.sinks.memory import InMemorySink
+
+    inner = _mk("inner_agent")
+    wrapped = goldfive.wrap(inner, sinks=[InMemorySink()])
+    assert isinstance(wrapped, GoldfiveADKAgent)
+    adapter = wrapped.runner.agent
+
+    # Sanity: no outer id yet — pre-invocation, lazy fallback is still
+    # in play.
+    assert adapter._outer_session_id is None
+
+    # Fake an InvocationContext carrying adk-web's outer session id.
+    # We only need the two attributes the pin helper reads.
+    from unittest.mock import MagicMock
+
+    ctx = MagicMock()
+    ctx.session.id = "outer-abc"
+
+    wrapped._pin_outer_session_from_ctx(ctx)
+
+    # Adapter now holds adk-web's session id, and every per-agent
+    # runner's _ensure_session_for returns the SAME id.
+    assert adapter._outer_session_id == "outer-abc"
+    for agent_name in adapter._runners:
+        assert await adapter._ensure_session_for(agent_name) == "outer-abc"
+
+
+async def test_run_async_impl_does_not_overwrite_caller_pinned_outer_id() -> None:
+    """A constructor-pinned ``outer_session_id`` survives a subsequent
+    adk-web invocation — we do NOT clobber the caller's authoritative
+    pin with whatever adk-web hands us.
+    """
+    import goldfive
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.adapters.adk_wrap import GoldfiveADKAgent
+    from goldfive.sinks.memory import InMemorySink
+
+    inner = _mk("inner_agent")
+    # Build adapter with a pinned outer id, then drop it through goldfive.wrap
+    # by pre-constructing the adapter. The simplest path is to pin via the
+    # adapter's kwarg directly — but goldfive.wrap builds the adapter
+    # internally, so we pin post-construction on the wrapped object.
+    wrapped = goldfive.wrap(inner, sinks=[InMemorySink()])
+    assert isinstance(wrapped, GoldfiveADKAgent)
+    adapter: ADKAdapter = wrapped.runner.agent
+    adapter._outer_session_id = "caller-pinned"
+
+    from unittest.mock import MagicMock
+
+    ctx = MagicMock()
+    ctx.session.id = "outer-abc"
+
+    wrapped._pin_outer_session_from_ctx(ctx)
+
+    # Caller's pin is authoritative — adk-web's id does not overwrite.
+    assert adapter._outer_session_id == "caller-pinned"
+
+
+async def test_run_async_impl_ignores_missing_session_id() -> None:
+    """When ctx has no usable ``session.id`` (bare Runner / test shapes),
+    the pin helper is a no-op and the goldfive#123 lazy-uuid4 fallback
+    still kicks in on the next ``_ensure_session_for`` call.
+    """
+    import goldfive
+    from goldfive.adapters.adk_wrap import GoldfiveADKAgent
+    from goldfive.sinks.memory import InMemorySink
+
+    inner = _mk("inner_agent")
+    wrapped = goldfive.wrap(inner, sinks=[InMemorySink()])
+    assert isinstance(wrapped, GoldfiveADKAgent)
+    adapter = wrapped.runner.agent
+
+    # Context with no session attribute at all.
+    class _NoSessionCtx:
+        pass
+
+    wrapped._pin_outer_session_from_ctx(_NoSessionCtx())
+    assert adapter._outer_session_id is None
+
+    # Context with a session but no id attribute.
+    class _NoIdSession:
+        pass
+
+    class _NoIdCtx:
+        session = _NoIdSession()
+
+    wrapped._pin_outer_session_from_ctx(_NoIdCtx())
+    assert adapter._outer_session_id is None
+
+    # Context whose session.id is non-string (defensive).
+    class _BadIdCtx:
+        class session:  # noqa: N801 — test shim
+            id = 42
+
+    wrapped._pin_outer_session_from_ctx(_BadIdCtx())
+    assert adapter._outer_session_id is None
+
+    # Context with an empty-string session.id.
+    class _EmptyIdCtx:
+        class session:  # noqa: N801
+            id = ""
+
+    wrapped._pin_outer_session_from_ctx(_EmptyIdCtx())
+    assert adapter._outer_session_id is None
+
+    # After all no-ops, the goldfive#123 lazy fallback still kicks in
+    # and produces a non-empty id on first _ensure_session_for.
+    sid = await adapter._ensure_session_for("inner_agent")
+    assert isinstance(sid, str) and sid
+    # And it's not one of the garbage values we tried to pin.
+    assert sid not in {"", "42"}
+
+
+async def test_per_agent_runners_share_pinned_outer_session_after_wrap() -> None:
+    """End-to-end: wrapped coordinator+AgentTool tree — after pinning
+    from ctx, EVERY per-agent runner returns adk-web's id.
+
+    This is the full-shape regression for goldfive#125: a realistic
+    tree (coordinator + two AgentTool specialists) must roll up under
+    adk-web's outer session id, not a goldfive-minted uuid.
+    """
+    from unittest.mock import MagicMock
+
+    from google.adk.tools.agent_tool import AgentTool
+
+    import goldfive
+    from goldfive.adapters.adk_wrap import GoldfiveADKAgent
+    from goldfive.sinks.memory import InMemorySink
+
+    a = _mk("a")
+    b = _mk("b")
+    coord = _mk("coord")
+    coord.tools = [AgentTool(a), AgentTool(b)]
+
+    wrapped = goldfive.wrap(coord, sinks=[InMemorySink()])
+    assert isinstance(wrapped, GoldfiveADKAgent)
+    adapter = wrapped.runner.agent
+
+    ctx = MagicMock()
+    ctx.session.id = "outer-abc"
+    wrapped._pin_outer_session_from_ctx(ctx)
+
+    sid_a = await adapter._ensure_session_for("a")
+    sid_b = await adapter._ensure_session_for("b")
+    sid_coord = await adapter._ensure_session_for("coord")
+
+    assert sid_a == sid_b == sid_coord == "outer-abc"

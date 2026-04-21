@@ -237,6 +237,25 @@ class GoldfiveADKAgent(BaseAgent):
         :meth:`BaseAgent.run_async` is ``@final`` — overriding this
         protected hook is ADK's documented extension seam.
         """
+        # Pin the outer adk-web session id onto the ADKAdapter BEFORE
+        # any sub-agent dispatch kicks in (goldfive#125). adk-web creates
+        # its own session ``X`` and invokes us via this hook; without
+        # pinning, ``ADKAdapter._ensure_session_for`` would lazily mint
+        # a fresh uuid ``Y`` that all per-agent runners share — but
+        # ``Y != X``, so :class:`HarmonografTelemetryPlugin` stamps the
+        # coordinator's spans under ``X`` (adk-web's own runner) and
+        # every sub-agent span under ``Y`` (the adapter's internal
+        # shared id). Users see two harmonograf sessions per run.
+        #
+        # Pinning here anchors the adapter's shared outer id to
+        # adk-web's real session id so coordinator + sub-agent spans
+        # roll up to ONE harmonograf session. Idempotent: we only set
+        # it if nothing has been pinned yet (constructor path, prior
+        # invocation), and we skip entirely when the context lacks a
+        # usable string session id (bare-Runner / test-harness ctx
+        # shapes fall back to the lazy-uuid path from goldfive#123).
+        self._pin_outer_session_from_ctx(ctx)
+
         user_input = _extract_user_input(ctx)
         if not user_input:
             yield _text_event(
@@ -253,6 +272,43 @@ class GoldfiveADKAgent(BaseAgent):
             outcome, ctx, author=self.name
         ):
             yield adk_event
+
+    def _pin_outer_session_from_ctx(self, ctx: InvocationContext) -> None:
+        """Adopt ``ctx.session.id`` as the ADKAdapter's outer session id.
+
+        On the first adk-web invocation, ``ctx`` carries adk-web's own
+        session id (the one users see in the harmonograf UI). Pinning
+        it onto :attr:`ADKAdapter._outer_session_id` makes every
+        per-agent runner's ``_ensure_session_for`` return that same id,
+        so :class:`HarmonografTelemetryPlugin` stamps the SAME
+        ``ctx.session.id`` onto coordinator AND sub-agent spans. See
+        goldfive#125.
+
+        No-op when:
+
+        * The adapter already has a pinned outer id (constructor
+          ``outer_session_id=`` / ``session_id=``, or a previous
+          invocation already pinned one). We never OVERWRITE — the
+          caller's constructor value is authoritative.
+        * The context does not carry a usable string session id (bare
+          ``Runner`` callers, fake contexts in tests that skip
+          ``ctx.session``). The lazy-uuid4 fallback from goldfive#123
+          then still kicks in on the next ``_ensure_session_for``.
+        """
+        adapter = getattr(self._runner, "agent", None)
+        if adapter is None:
+            return
+        # Guard against non-ADKAdapter adapters (custom AgentAdapter
+        # implementations under the same wrap path) that don't carry
+        # the shared-outer-session attribute.
+        if not hasattr(adapter, "_outer_session_id"):
+            return
+        if adapter._outer_session_id:
+            return
+        sid = getattr(getattr(ctx, "session", None), "id", None)
+        if not isinstance(sid, str) or not sid:
+            return
+        adapter._outer_session_id = sid
 
     # ------------------------------------------------------------------
     # Runner passthrough — keeps the programmatic entry point working.
