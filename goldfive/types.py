@@ -189,6 +189,19 @@ class Plan:
              edge in ``prior.edges`` where both endpoints were terminal
              in ``prior`` must appear in ``self.edges``. Historical
              topology between frozen tasks is frozen.
+        7. No CANCELLED/FAILED→PENDING edges (reachability invariant,
+           goldfive#137). A PENDING task whose predecessor is
+           ``CANCELLED`` or ``FAILED`` is definitionally unexecutable:
+           the executor only schedules a PENDING task when every
+           predecessor reaches ``COMPLETED``, and these absorbing
+           terminal states never fire that transition. Revisions that
+           graft new PENDING tasks onto the graveyard of the prior
+           plan are rejected here -- new work must form an independent
+           sub-DAG with its own root(s) (or chain off a COMPLETED
+           predecessor, which is immediately eligible and therefore
+           safe). ``COMPLETED`` predecessors are *allowed* because
+           that is the natural in-flight DAG shape: a finished stage
+           feeding into a still-PENDING next stage.
 
         This is a pure-data validator: it does not mutate the plan. It
         is intended to be called at plan creation (``LLMPlanner.generate``)
@@ -276,6 +289,52 @@ class Plan:
                         "terminal->terminal edge "
                         f"{e.from_task_id!r} -> {e.to_task_id!r} missing in revision"
                     )
+
+        # 7. reachability invariant (goldfive#137): no edge from an
+        # *absorbing* terminal task (CANCELLED / FAILED) to a PENDING
+        # task. The executor only schedules a PENDING task once every
+        # predecessor has reached COMPLETED; CANCELLED and FAILED
+        # states never transition to COMPLETED, so a PENDING task
+        # hanging off a CANCELLED/FAILED predecessor is definitionally
+        # unexecutable -- the entire sub-DAG stalls. This catches the
+        # shape LLMs emit when they "graft" new work onto the end of
+        # the prior plan (e.g. ``research -> r1`` where ``research`` is
+        # CANCELLED and ``r1`` is the new PENDING root). New tasks must
+        # form an independent sub-DAG starting from no predecessors (or
+        # from predecessors that are PENDING/RUNNING/BLOCKED and can
+        # still progress to COMPLETED).
+        #
+        # COMPLETED predecessors are *explicitly allowed* here because
+        # the executor's eligibility rule is "all predecessors must be
+        # COMPLETED", so a PENDING task whose predecessor is COMPLETED
+        # is immediately eligible. The natural in-flight snapshot of a
+        # running plan -- a done stage feeding into a still-PENDING
+        # stage -- is the archetype the validator must accept.
+        #
+        # This check is safe to run on every plan: the creation path
+        # (``for_revision=False``) already requires all tasks to be
+        # PENDING (step 5) so no CANCELLED/FAILED task exists as a
+        # predecessor.
+        _UNREACHABLE_PREDECESSOR_STATUSES = frozenset({TaskStatus.CANCELLED, TaskStatus.FAILED})
+        tasks_by_id: dict[str, Task] = {t.id: t for t in self.tasks}
+        for e in self.edges:
+            from_task = tasks_by_id.get(e.from_task_id)
+            to_task = tasks_by_id.get(e.to_task_id)
+            if from_task is None or to_task is None:
+                # step 3 guarantees both endpoints resolve; belt-and-braces.
+                continue
+            if (
+                from_task.status in _UNREACHABLE_PREDECESSOR_STATUSES
+                and to_task.status is TaskStatus.PENDING
+            ):
+                raise ValueError(
+                    f"edge {e.from_task_id!r} -> {e.to_task_id!r} would make PENDING "
+                    f"task unexecutable: from-task is {from_task.status.value}. "
+                    f"New tasks must form an independent sub-DAG starting from no "
+                    f"predecessors — do not graft new work onto CANCELLED or "
+                    f"FAILED tasks (their status never transitions to COMPLETED, "
+                    f"so downstream PENDING tasks can never become eligible)."
+                )
 
     def topological_stages(self) -> list[list[Task]]:
         """Return tasks grouped into topological stages (Kahn's algorithm).

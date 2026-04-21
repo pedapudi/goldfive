@@ -365,7 +365,9 @@ class TestPlanValidate:
         # Raises at creation.
         with pytest.raises(ValueError, match="non-PENDING"):
             plan.validate(for_revision=False)
-        # Allowed at revision.
+        # Allowed at revision. COMPLETED->PENDING edges are fine under
+        # goldfive#137's step-7 check because COMPLETED is exactly the
+        # state that fires PENDING child eligibility.
         plan.validate(for_revision=True)
 
     def test_revision_allows_failed_and_cancelled(self) -> None:
@@ -429,9 +431,7 @@ class TestPlanValidate:
             [Task(id="t2", title="next", status=TaskStatus.PENDING)],
             [],
         )
-        with pytest.raises(
-            ValueError, match=r"terminal task 't1' missing in revision"
-        ):
+        with pytest.raises(ValueError, match=r"terminal task 't1' missing in revision"):
             revision.validate(for_revision=True, prior=prior)
 
     def test_validate_revision_rejects_terminal_task_status_regression(self) -> None:
@@ -444,9 +444,7 @@ class TestPlanValidate:
             [Task(id="t1", title="done", status=TaskStatus.PENDING)],
             [],
         )
-        with pytest.raises(
-            ValueError, match=r"terminal task 't1' regressed to 'PENDING'"
-        ):
+        with pytest.raises(ValueError, match=r"terminal task 't1' regressed to 'PENDING'"):
             revision.validate(for_revision=True, prior=prior)
 
     def test_validate_revision_rejects_terminal_task_status_flip(self) -> None:
@@ -461,9 +459,7 @@ class TestPlanValidate:
             [Task(id="t1", title="done", status=TaskStatus.FAILED)],
             [],
         )
-        with pytest.raises(
-            ValueError, match=r"terminal task 't1' regressed to 'FAILED'"
-        ):
+        with pytest.raises(ValueError, match=r"terminal task 't1' regressed to 'FAILED'"):
             revision.validate(for_revision=True, prior=prior)
 
     def test_validate_revision_accepts_terminal_task_unchanged(self) -> None:
@@ -539,3 +535,131 @@ class TestPlanValidate:
         )
         # No prior supplied -> no terminal-preservation check.
         revision.validate(for_revision=True)
+
+    # ------------------------------------------------------------------
+    # Reachability invariant (goldfive#137). The executor only schedules
+    # a PENDING task once every predecessor reaches COMPLETED; terminal
+    # states (CANCELLED / FAILED / COMPLETED) never fire that
+    # transition, so a PENDING task hanging off a terminal predecessor
+    # is definitionally unexecutable. Step 7 of ``validate`` rejects
+    # these shapes before they reach the executor.
+    # ------------------------------------------------------------------
+
+    def test_validator_rejects_terminal_to_pending_edge(self) -> None:
+        # The exact Qwen pathology observed in the live session on #137:
+        # a CANCELLED task feeding into a fresh PENDING root task. The
+        # executor would stall because ``r1`` can never become eligible.
+        revision = _mk_plan(
+            [
+                Task(id="research", title="R", status=TaskStatus.CANCELLED),
+                Task(id="r1", title="R1", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("research", "r1")],
+        )
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"edge 'research' -> 'r1' would make PENDING task unexecutable: "
+                r"from-task is CANCELLED"
+            ),
+        ):
+            revision.validate(for_revision=True)
+
+    def test_validator_rejects_failed_to_pending_edge(self) -> None:
+        revision = _mk_plan(
+            [
+                Task(id="bad", title="B", status=TaskStatus.FAILED),
+                Task(id="next", title="N", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("bad", "next")],
+        )
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"edge 'bad' -> 'next' would make PENDING task unexecutable: "
+                r"from-task is FAILED"
+            ),
+        ):
+            revision.validate(for_revision=True)
+
+    def test_validator_accepts_completed_to_pending_edge(self) -> None:
+        # COMPLETED predecessors are safe for PENDING children: the
+        # executor schedules a PENDING task as soon as every
+        # predecessor reaches COMPLETED, so a COMPLETED->PENDING edge
+        # means the child is *immediately* eligible. This is the
+        # natural in-flight snapshot of a running plan -- a done stage
+        # feeding into a still-PENDING stage. goldfive#137 only
+        # forbids CANCELLED/FAILED->PENDING, where the predecessor's
+        # status is absorbing and the child can never become eligible.
+        revision = _mk_plan(
+            [
+                Task(id="done", title="D", status=TaskStatus.COMPLETED),
+                Task(id="next", title="N", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("done", "next")],
+        )
+        # Does not raise.
+        revision.validate(for_revision=True)
+
+    def test_validator_accepts_terminal_to_terminal_edge(self) -> None:
+        # Regression guard: the existing §3.2 preservation check is
+        # untouched. Terminal->terminal edges are frozen history and
+        # must continue to validate cleanly in revision mode.
+        prior = _mk_plan(
+            [
+                Task(id="t1", title="1", status=TaskStatus.COMPLETED),
+                Task(id="t2", title="2", status=TaskStatus.COMPLETED),
+            ],
+            [TaskEdge("t1", "t2")],
+        )
+        revision = _mk_plan(
+            [
+                Task(id="t1", title="1", status=TaskStatus.COMPLETED),
+                Task(id="t2", title="2", status=TaskStatus.COMPLETED),
+            ],
+            [TaskEdge("t1", "t2")],
+        )
+        # Does not raise.
+        revision.validate(for_revision=True, prior=prior)
+
+    def test_validator_accepts_new_subdag_with_no_terminal_predecessors(
+        self,
+    ) -> None:
+        # The shape the LLM *should* emit after a post-steer refine:
+        # terminal tasks preserved verbatim, and the new sub-DAG rooted
+        # at a fresh PENDING task with no predecessors from the prior
+        # graveyard. Edges within the new sub-DAG (PENDING->PENDING)
+        # are fine because they can all progress to COMPLETED.
+        prior = _mk_plan(
+            [
+                Task(id="research", title="R", status=TaskStatus.CANCELLED),
+                Task(id="draft", title="D", status=TaskStatus.CANCELLED),
+            ],
+            [TaskEdge("research", "draft")],
+        )
+        revision = _mk_plan(
+            [
+                Task(id="research", title="R", status=TaskStatus.CANCELLED),
+                Task(id="draft", title="D", status=TaskStatus.CANCELLED),
+                Task(id="r1", title="R1", status=TaskStatus.PENDING),
+                Task(id="o1", title="O1", status=TaskStatus.PENDING),
+            ],
+            # §3.2 edge preserved; new sub-DAG is independent.
+            [TaskEdge("research", "draft"), TaskEdge("r1", "o1")],
+        )
+        # Does not raise.
+        revision.validate(for_revision=True, prior=prior)
+
+    def test_validator_accepts_pending_to_pending_edge(self) -> None:
+        # Pure PENDING->PENDING edges are always fine — no reachability
+        # stall is possible because both endpoints can still progress
+        # to COMPLETED.
+        revision = _mk_plan(
+            [
+                Task(id="a", title="A", status=TaskStatus.PENDING),
+                Task(id="b", title="B", status=TaskStatus.PENDING),
+            ],
+            [TaskEdge("a", "b")],
+        )
+        revision.validate(for_revision=True)
+        revision.validate(for_revision=False)

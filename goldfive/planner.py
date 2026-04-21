@@ -682,8 +682,22 @@ class LLMPlanner:
             "2. Every edge's `from_task_id` and `to_task_id` must "
             "reference either a reserved history id or a new-task id "
             "from your own `tasks` array.\n"
-            "3. Your task ids must be unique within your response.\n"
-            "4. Do not introduce edges that create a cycle."
+            "3. FORBIDDEN EDGES: no edges from history task ids whose "
+            "status is CANCELLED or FAILED to your new PENDING task "
+            "ids. A PENDING task whose predecessor is CANCELLED or "
+            "FAILED is unexecutable: the executor only schedules a "
+            "PENDING task once every predecessor reaches COMPLETED, "
+            "and CANCELLED/FAILED never fire that transition, so "
+            "grafting onto them stalls the whole sub-DAG. New work "
+            "must start fresh — do NOT add edges like "
+            '"cancelled_research -> new_research" to "chain" from '
+            "the prior plan to your new one. Your new tasks must form "
+            "an independent sub-DAG with their own root task (a new "
+            "task whose predecessors, if any, are themselves new "
+            "PENDING tasks from your response or COMPLETED history "
+            "tasks).\n"
+            "4. Your task ids must be unique within your response.\n"
+            "5. Do not introduce edges that create a cycle."
         )
         return (
             f"Goals:\n{goals_block}\n\n"
@@ -770,11 +784,27 @@ class LLMPlanner:
             "validation.",
             f"   Required edges: {tt_edges_json}",
             "",
-            "3. TASK IDS must be unique within `tasks`. Every edge's "
+            "3. FORBIDDEN EDGES: no edges from CANCELLED or FAILED "
+            "tasks to new PENDING tasks. New work must start fresh — "
+            'do NOT add edges like "old_research -> new_research" '
+            "where ``old_research`` is CANCELLED or FAILED. A PENDING "
+            "task whose predecessor is CANCELLED/FAILED is unexecutable "
+            "because the executor only schedules a PENDING task once "
+            "every predecessor reaches COMPLETED, and CANCELLED/FAILED "
+            "states never fire that transition; the whole downstream "
+            "sub-DAG would stall. Your new tasks must form an "
+            "independent sub-DAG with their own root task (a task "
+            "whose `id` appears in no edge's `to_task_id`, or whose "
+            "only predecessors within the new sub-DAG are themselves "
+            "new PENDING tasks). Edges from COMPLETED tasks to new "
+            "PENDING tasks are allowed -- those are immediately "
+            "eligible because the predecessor has already completed.",
+            "",
+            "4. TASK IDS must be unique within `tasks`. Every edge's "
             "`from_task_id` and `to_task_id` must reference a task id "
             "that exists in your `tasks` array.",
             "",
-            "4. The task graph must be ACYCLIC. Do not introduce edges that would create a cycle.",
+            "5. The task graph must be ACYCLIC. Do not introduce edges that would create a cycle.",
         ]
         return "\n".join(lines)
 
@@ -795,8 +825,9 @@ class LLMPlanner:
             f"    {error}\n\n"
             "Re-read the STRUCTURAL INVARIANTS section above. Emit a "
             "corrected JSON plan that preserves every terminal task and "
-            "every terminal->terminal edge verbatim. Respond with JSON "
-            "only; no prose, no markdown fences."
+            "every terminal->terminal edge verbatim, and does NOT add "
+            "any edge from a CANCELLED or FAILED task to a new PENDING "
+            "task. Respond with JSON only; no prose, no markdown fences."
         )
 
     async def _emit_refine_validation_failed(
