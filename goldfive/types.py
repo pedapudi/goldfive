@@ -80,6 +80,14 @@ class DriftKind(StrEnum):
     # Opt-in reflective self-progress check: agent reported it is *not*
     # making progress. WARNING severity -- triggers refine.
     SELF_REPORTED_STUCK = "self_reported_stuck"
+    # Cheap structural confabulation-risk signal: the current task's
+    # title/description implies external data access (research, lookup,
+    # verify, review, fetch, etc.) but the agent produced non-empty
+    # output without calling a single tool. INFO severity -- record-only,
+    # does not trigger refine. Surfaced to the user so they can decide
+    # whether to cancel or let the run proceed. See
+    # :func:`goldfive.drift.classify_confabulation_risk`.
+    CONFABULATION_RISK = "confabulation_risk"
 
 
 class DriftSeverity(StrEnum):
@@ -362,9 +370,7 @@ class Session:
     # Consumed by :class:`~goldfive.steerer.DefaultSteerer` to back off
     # and mark the task FAILED after N consecutive failures, preventing
     # the same drift from looping until ``max_task_invocations`` trips.
-    refine_failure_counts: dict[tuple[str, str], int] = dataclasses.field(
-        default_factory=dict
-    )
+    refine_failure_counts: dict[tuple[str, str], int] = dataclasses.field(default_factory=dict)
     # Counter of LLM turns observed since the last reflective self-progress
     # check. Incremented by ``DefaultSteerer.note_llm_call`` (which adapters
     # call once per LLM invocation when the opt-in reflective check is

@@ -296,6 +296,214 @@ async def test_on_tool_error_calls_steerer_observe(state_ctx_cls) -> None:
     assert "web_search" in evt["detail"]
 
 
+async def test_after_run_emits_confabulation_risk_on_zero_tools(state_ctx_cls) -> None:
+    """Research-shaped task + non-empty final text + 0 tool calls → INFO drift.
+
+    Plugin-level integration test for issue #128: drives the plugin's
+    before_run → after_model (no tool calls in the llm response) →
+    after_run callback chain by hand and asserts that
+    CONFABULATION_RISK fires through the same path AGENT_REFUSAL uses.
+    """
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+        make_adk_plugin,
+    )
+    from goldfive.types import DriftEvent, DriftKind, DriftSeverity
+
+    plugin = make_adk_plugin(host_agent_name="research_agent")
+
+    class _ConfabulationAwareSteerer(_RecordingSteerer):
+        """Steerer stub that records drift emitted via _handle_drift."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.drifts: list[DriftEvent] = []
+
+        async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+            self.drifts.append(drift)
+
+    steerer = _ConfabulationAwareSteerer()
+    session = Session(run_id="run-confab")
+    task = Task(
+        id="t1",
+        title="Research the latest exchange rates",
+        description="Look up current USD/EUR and USD/JPY rates.",
+        assignee_agent_id="research_agent",
+    )
+    state: dict = {
+        SESSION_CONTEXT_STATE_KEY: SessionContext(
+            session=session,
+            steerer=steerer,
+            task=task,
+            tool_handlers={},
+            host_agent_name="research_agent",
+        )
+    }
+
+    class _InvContext:
+        def __init__(self, invocation_id: str) -> None:
+            self.invocation_id = invocation_id
+            self.session = state_ctx_cls(state).session
+            self.agent = type("_A", (), {"name": "research_agent"})()
+
+    class _CbContext:
+        """Minimal callback-context that also exposes ``_invocation_context``.
+
+        The after_model_callback path reads ``_invocation_context`` off
+        the callback context to attribute the turn to an invocation_id;
+        without it, the plugin cannot correlate tool-call counts to the
+        invocation in after_run.
+        """
+
+        def __init__(self, state: dict, invocation_id: str) -> None:
+            self._state = state
+            self._invocation_context = _InvContext(invocation_id)
+
+        @property
+        def session(self):
+            return self._invocation_context.session
+
+    # LLM response shape: non-empty text, NO function calls.
+    class _Part:
+        def __init__(self, text: str = "", thought: bool = False) -> None:
+            self.text = text
+            self.thought = thought
+            self.function_call = None
+
+    class _Content:
+        def __init__(self, parts: list[_Part]) -> None:
+            self.parts = parts
+
+    class _LlmResponse:
+        def __init__(self, text: str) -> None:
+            self.content = _Content([_Part(text=text)])
+            self.finish_reason = None
+
+    inv_id = "inv-research-1"
+
+    # Drive the full lifecycle.
+    await plugin.before_run_callback(invocation_context=_InvContext(inv_id))
+    await plugin.after_model_callback(
+        callback_context=_CbContext(state, inv_id),
+        llm_response=_LlmResponse("The current USD/EUR rate is 1.08 and USD/JPY is 151.4."),
+    )
+    await plugin.after_run_callback(invocation_context=_InvContext(inv_id))
+
+    assert len(steerer.drifts) == 1, (
+        f"expected exactly one CONFABULATION_RISK drift, got {steerer.drifts!r}"
+    )
+    drift = steerer.drifts[0]
+    assert drift.kind is DriftKind.CONFABULATION_RISK
+    assert drift.severity is DriftSeverity.INFO
+    assert drift.current_task_id == "t1"
+    assert drift.current_agent_id == "research_agent"
+
+
+async def test_after_run_no_confabulation_when_tool_was_called(state_ctx_cls) -> None:
+    """Research task that called a tool → no CONFABULATION_RISK drift.
+
+    Counterpart to ``test_after_run_emits_confabulation_risk_on_zero_tools``:
+    the tool call in after_model bumps the per-invocation counter above
+    zero, so the after_run check falls through silently.
+    """
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+        make_adk_plugin,
+    )
+    from goldfive.types import DriftEvent
+
+    plugin = make_adk_plugin(host_agent_name="research_agent")
+
+    class _Steerer(_RecordingSteerer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.drifts: list[DriftEvent] = []
+
+        async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+            self.drifts.append(drift)
+
+    steerer = _Steerer()
+    session = Session(run_id="run-ok")
+    task = Task(
+        id="t2",
+        title="Research the latest exchange rates",
+        description="",
+        assignee_agent_id="research_agent",
+    )
+    state: dict = {
+        SESSION_CONTEXT_STATE_KEY: SessionContext(
+            session=session,
+            steerer=steerer,
+            task=task,
+            tool_handlers={},
+            host_agent_name="research_agent",
+        )
+    }
+
+    class _InvContext:
+        def __init__(self, invocation_id: str) -> None:
+            self.invocation_id = invocation_id
+            self.session = state_ctx_cls(state).session
+            self.agent = type("_A", (), {"name": "research_agent"})()
+
+    class _CbContext:
+        def __init__(self, state: dict, invocation_id: str) -> None:
+            self._state = state
+            self._invocation_context = _InvContext(invocation_id)
+
+        @property
+        def session(self):
+            return self._invocation_context.session
+
+    class _FunctionCall:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.args = {"q": "USD EUR rate"}
+
+    class _Part:
+        def __init__(
+            self,
+            text: str = "",
+            thought: bool = False,
+            function_call: Any = None,
+        ) -> None:
+            self.text = text
+            self.thought = thought
+            self.function_call = function_call
+
+    class _Content:
+        def __init__(self, parts: list[_Part]) -> None:
+            self.parts = parts
+
+    class _LlmResponse:
+        def __init__(self, parts: list[_Part]) -> None:
+            self.content = _Content(parts)
+            self.finish_reason = None
+
+    inv_id = "inv-ok-1"
+
+    await plugin.before_run_callback(invocation_context=_InvContext(inv_id))
+    # Turn 1: the model calls a web_search tool.
+    await plugin.after_model_callback(
+        callback_context=_CbContext(state, inv_id),
+        llm_response=_LlmResponse([_Part(function_call=_FunctionCall("web_search"))]),
+    )
+    # Turn 2: the model returns its final answer as text.
+    await plugin.after_model_callback(
+        callback_context=_CbContext(state, inv_id),
+        llm_response=_LlmResponse(
+            [_Part(text="The USD/EUR rate is 1.08 according to the search results.")]
+        ),
+    )
+    await plugin.after_run_callback(invocation_context=_InvContext(inv_id))
+
+    # No CONFABULATION_RISK drift — a tool was called so the pattern is
+    # exactly the expected shape for a research task.
+    assert steerer.drifts == [], f"no drift expected when a tool was called; got {steerer.drifts!r}"
+
+
 async def test_on_event_transfer_calls_steerer_observe(state_ctx_cls) -> None:
     from goldfive.adapters._adk_plugin import (
         SESSION_CONTEXT_STATE_KEY,

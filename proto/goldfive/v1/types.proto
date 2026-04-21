@@ -139,6 +139,13 @@ enum DriftKind {
   // detection is deliberately not used here because the signal is
   // semantic "tightening," not byte-identical repetition.
   DRIFT_KIND_REASONING_CLUSTER_TIGHTENING = 33;
+  // Cheap structural confabulation-risk signal: the current task's
+  // title/description implies external data access (research, lookup,
+  // verify, review, fetch, etc.) but the agent produced non-empty
+  // output without calling a single tool. INFO severity; record-only.
+  // Emitted by the ADK plugin's ``after_run_callback`` via
+  // ``goldfive.drift.classify_confabulation_risk``. See issue #128.
+  DRIFT_KIND_CONFABULATION_RISK = 34;
 }
 
 // Directed edge in a plan's task dependency DAG. `from_task_id` must

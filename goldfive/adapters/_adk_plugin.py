@@ -584,6 +584,15 @@ def make_adk_plugin(
             # AgentTool-spawned sub-Runners' before_run_callbacks can
             # attribute themselves with a ``parent_invocation_id``.
             self._top_invocation_id: str = ""
+            # Per-invocation tool-call counters and last-text buffers
+            # keyed by ADK ``invocation_id``. Feeds the
+            # CONFABULATION_RISK classifier in ``after_run_callback``:
+            # a research-shaped task that completes with zero tool calls
+            # and non-empty text is the suspicious pattern worth
+            # surfacing. Reset per invocation so nested AgentTool
+            # sub-Runners get their own counters.
+            self._invocation_tool_calls: dict[str, int] = {}
+            self._invocation_last_text: dict[str, str] = {}
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
@@ -659,6 +668,15 @@ def make_adk_plugin(
                 # AgentTool sub-Runners can attribute themselves below.
                 self._top_invocation_id = inv_id
 
+            # Reset the per-invocation counters so the CONFABULATION_RISK
+            # check in ``after_run_callback`` sees only the tool calls
+            # and final text produced by THIS invocation. Nested
+            # AgentTool sub-Runners fire their own before_run_callback
+            # with a fresh ``invocation_id`` so they get their own slot.
+            if inv_id:
+                self._invocation_tool_calls[inv_id] = 0
+                self._invocation_last_text[inv_id] = ""
+
             # Write state-protocol keys onto the LIVE session the
             # invocation is actually running against — not a copy.
             session_obj = _safe_attr(invocation_context, "session", None)
@@ -698,21 +716,50 @@ def make_adk_plugin(
 
             Fires once per runner invocation: top-level (goldfive
             dispatch) and per-AgentTool sub-Runner.
+
+            Also runs the cheap structural CONFABULATION_RISK classifier
+            (issue #128) before cleanup: if the current task's
+            description reads like external-data work but the
+            invocation produced non-empty text with zero tool calls, a
+            goldfive.drift.classify_confabulation_risk call surfaces the
+            suspicious pattern as an INFO drift through the same path
+            AGENT_REFUSAL uses.
             """
             ctx = self._resolve_ctx(invocation_context)
             if ctx is None:
                 return None
             inv_id = str(_safe_attr(invocation_context, "invocation_id", "") or "")
-            # If the finishing invocation is the top-level one, release
-            # the pin so a subsequent invoke() on the same plugin gets a
-            # fresh dispatch.
-            if self._top_invocation_id and self._top_invocation_id == inv_id:
-                self._top_invocation_id = ""
             agent_name = str(_safe_attr(ctx, "host_agent_name", "") or "") or self._host_agent_name
             running_agent = _safe_attr(invocation_context, "agent", None)
             running_agent_name = str(_safe_attr(running_agent, "name", "") or "")
             if running_agent_name:
                 agent_name = running_agent_name
+
+            # Confabulation-risk check. We run this BEFORE emitting
+            # "agent_invocation_completed" so the drift lands in the
+            # event stream adjacent to the invocation it describes,
+            # matching the AGENT_REFUSAL ordering. Gated on:
+            #   * a live steerer + task,
+            #   * assignee on the task matching the agent that just
+            #     finished (so nested AgentTool sub-Runners do not
+            #     misattribute their inner text to the outer task),
+            #   * the counters we tracked per invocation_id.
+            await self._maybe_emit_confabulation_risk(
+                ctx=ctx,
+                inv_id=inv_id,
+                finishing_agent_name=agent_name,
+            )
+
+            # If the finishing invocation is the top-level one, release
+            # the pin so a subsequent invoke() on the same plugin gets a
+            # fresh dispatch.
+            if self._top_invocation_id and self._top_invocation_id == inv_id:
+                self._top_invocation_id = ""
+            # Drop the per-invocation counters now that the check has
+            # run — keeps the dict bounded across long-lived plugins.
+            if inv_id:
+                self._invocation_tool_calls.pop(inv_id, None)
+                self._invocation_last_text.pop(inv_id, None)
             await self._emit_observability(
                 "agent_invocation_completed",
                 agent_name=agent_name,
@@ -721,6 +768,84 @@ def make_adk_plugin(
                 summary="",
             )
             return None
+
+        async def _maybe_emit_confabulation_risk(
+            self,
+            *,
+            ctx: SessionContext,
+            inv_id: str,
+            finishing_agent_name: str,
+        ) -> None:
+            """Fire ``CONFABULATION_RISK`` if the invocation shape is suspicious.
+
+            See :func:`goldfive.drift.classify_confabulation_risk` for
+            the exact trigger conditions. Silent when any precondition
+            fails — tasks without a clear assignee, sub-agent
+            invocations whose assignee does not match, or invocations
+            with no tracked state all fall through to no-op so we never
+            over-report.
+            """
+            if ctx.steerer is None or ctx.task is None:
+                return
+            task = ctx.task
+            task_id = str(_safe_attr(task, "id", "") or "")
+            if not task_id:
+                # Out-of-scope per issue #128: tasks without a clear id
+                # / assignee fall through to no-op.
+                return
+            assignee = str(_safe_attr(task, "assignee_agent_id", "") or "")
+            if assignee and finishing_agent_name and assignee != finishing_agent_name:
+                # Nested AgentTool sub-Runner whose agent is not the
+                # task's owner — let the outer runner's after_run fire
+                # the check against the outer text.
+                return
+            tool_calls = self._invocation_tool_calls.get(inv_id, 0)
+            final_text = self._invocation_last_text.get(inv_id, "")
+            from goldfive.drift import classify_confabulation_risk
+
+            drift = classify_confabulation_risk(
+                task=task,
+                tool_call_count=tool_calls,
+                output_text=final_text,
+            )
+            if drift is None:
+                return
+            observation = _as_observation(
+                kind="confabulation_risk",
+                detail=drift.detail,
+                raw={
+                    "tool_call_count": tool_calls,
+                    "output_text": final_text[:500],
+                },
+                task=task,
+                agent_id=finishing_agent_name or self._host_agent_name,
+            )
+            # Route through steerer.observe so the drift hits the same
+            # pipeline AGENT_REFUSAL uses (DriftDetected sink event,
+            # severity-based refine decision). We pre-classified above
+            # so the steerer's classify_* cascade will no-op on the
+            # observation dict — we still fire it explicitly by calling
+            # _handle_drift directly when the steerer exposes it.
+            handle = getattr(ctx.steerer, "_handle_drift", None)
+            if handle is not None:
+                try:
+                    await handle(drift, ctx.session)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "_maybe_emit_confabulation_risk: _handle_drift raised: %s",
+                        exc,
+                    )
+            # Fallback for steerer stubs without _handle_drift: feed the
+            # observation through observe() so custom steerers still
+            # see the signal.
+            try:
+                await ctx.steerer.observe(observation, ctx.session)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_maybe_emit_confabulation_risk: steerer.observe raised: %s",
+                    exc,
+                )
 
         async def _emit_observability(self, kind: str, **fields: Any) -> None:
             """Fan out an observability event to the session's sinks.
@@ -912,6 +1037,26 @@ def make_adk_plugin(
             calls = _extract_function_calls(llm_response)
             reasoning = _extract_reasoning(llm_response)
             finish = _safe_attr(llm_response, "finish_reason", None)
+            # Feed the per-invocation counters used by the
+            # CONFABULATION_RISK check in after_run_callback. We track:
+            #   * tool-call count: cumulative across the invocation's
+            #     LLM turns so we only fire if NO tool was ever used,
+            #   * last non-empty text: used as the output signal — an
+            #     invocation that ended with empty text is not
+            #     suspicious regardless of tool calls.
+            inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
+                callback_context, "invocation_context", None
+            )
+            inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+            if inv_id:
+                if calls:
+                    self._invocation_tool_calls[inv_id] = self._invocation_tool_calls.get(
+                        inv_id, 0
+                    ) + len(calls)
+                if texts:
+                    joined = " ".join(texts).strip()
+                    if joined:
+                        self._invocation_last_text[inv_id] = joined
             observation = _as_observation(
                 kind="llm_response",
                 detail=" ".join(texts)[:500],
