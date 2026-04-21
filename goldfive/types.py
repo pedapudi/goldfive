@@ -120,6 +120,15 @@ class DriftKind(StrEnum):
     # See :func:`goldfive.drift.goals.classify_goal_drift` and
     # goldfive#143.
     GOAL_DRIFT = "goal_drift"
+    # The run is stuck in a way the planner's refine cannot fix and the
+    # user's judgment is required. Emitted by :class:`DefaultSteerer` at
+    # Level 4 of the intervention ladder (goldfive#142) on persistent
+    # refine failures, GOAL_DRIFT (CRITICAL), REFINE_VALIDATION_FAILED,
+    # and other terminal drifts that shouldn't auto-recover. CRITICAL
+    # severity only. Puts the Runner into a paused state
+    # (``session.paused_for_human_intervention``) until a user-initiated
+    # ``CONTROL_RESUME`` or ``CONTROL_STEER`` arrives.
+    HUMAN_INTERVENTION_REQUIRED = "human_intervention_required"
 
 
 class DriftSeverity(StrEnum):
@@ -532,6 +541,31 @@ class Session:
     # ``task_id``, ``detail``) rather than a full event proto to keep
     # this framework-neutral.
     recent_agent_activity: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # Set to ``True`` by :class:`DefaultSteerer` when it escalates a
+    # drift to Level 4 of the intervention ladder (goldfive#142).
+    # Executors honour this flag the same way they honour a PAUSE
+    # control: the pre-task loop blocks on the control channel until the
+    # user issues a CONTROL_RESUME or CONTROL_STEER, which clears the
+    # flag. Independent of the control-channel's own paused state so a
+    # Runner without a bound control channel can still reflect the
+    # pause to its sinks.
+    paused_for_human_intervention: bool = False
+    # Level 2 ladder handoff (goldfive#142). Set by :class:`DefaultSteerer`
+    # when a WARNING-tier drift maps to Level 2 (NUDGE). The Runner /
+    # overlay loop introduced by goldfive#141 picks this up after the
+    # current invocation ends and issues a soft follow-up user message.
+    # Plain list so two drifts in the same turn can queue independently;
+    # the consumer pops from the front. Each entry is a short human-readable
+    # directive; serialization not required.
+    pending_nudges: list[str] = dataclasses.field(default_factory=list)
+    # Level 3 ladder handoff (goldfive#142). Set by :class:`DefaultSteerer`
+    # when a Level 3 escalation wants the Runner / overlay loop (goldfive#141)
+    # to cancel the in-flight invocation and re-invoke with a composed
+    # corrective user message. ``None`` outside a pending dispatch. The
+    # consumer reads the value and clears it. Using a single slot (rather
+    # than a queue) is deliberate: a second Level 3 while one is pending
+    # overwrites the first -- the more-recent directive wins.
+    pending_corrective_message: str | None = None
     # monotonic event sequence counter for sinks
     _next_sequence: int = 0
 

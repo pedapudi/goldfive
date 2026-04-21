@@ -15,10 +15,35 @@ stripped out. The steerer's job is:
 The steerer holds no gRPC / client references and touches no adapter
 internals. Executors call :meth:`DefaultSteerer.bind` to wire in the
 sinks list and planner at run start.
+
+Intervention ladder
+-------------------
+Drift handling routes through an explicit six-level ladder (goldfive#142)
+so "when does goldfive interrupt the tree" is a single table, not a
+tangle of conditionals. Levels, ordered by intrusiveness:
+
+* Level 0 — OBSERVE: record the drift, no action.
+* Level 1 — ABSORB: call ``planner.refine``; continue.
+* Level 2 — NUDGE: queue a soft follow-up message on the session for
+  the Runner's overlay loop to pick up at the next invocation boundary.
+* Level 3 — CANCEL_REINVOKE: cancel in-flight, refine, and compose a
+  corrective user message for the overlay loop to re-invoke with.
+* Level 4 — PAUSE_ESCALATE: emit ``HUMAN_INTERVENTION_REQUIRED``, set
+  ``session.paused_for_human_intervention``, and wait for user action.
+* Level 5 — TERMINATE: run-level abort (currently only reached when an
+  unhandled Level 4 times out; actual termination is driven by the
+  executor, not the steerer).
+
+The mapping from (drift_kind, severity, occurrence_count) to level
+lives in :meth:`DefaultSteerer._ladder_level_for`. Level dispatch is
+handled by :meth:`DefaultSteerer._dispatch_ladder_level`, which wraps
+the existing refine flow for Level 1 and short-circuits the other
+levels. See goldfive#142 for the full table.
 """
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import re
@@ -53,7 +78,132 @@ ReflectiveCallLLM = Callable[[str, str, str], Awaitable[str]]
 log = logging.getLogger(__name__)
 
 
-__all__ = ["DefaultSteerer"]
+__all__ = [
+    "DefaultSteerer",
+    "InterventionLevel",
+    "compose_corrective_user_message",
+]
+
+
+class InterventionLevel(enum.IntEnum):
+    """The graduated intervention ladder (goldfive#142).
+
+    Ordered by intrusiveness. Every drift handled by
+    :class:`DefaultSteerer` maps to exactly one level via
+    :meth:`DefaultSteerer._ladder_level_for`; the level dictates what
+    the steerer does in response.
+    """
+
+    OBSERVE = 0
+    ABSORB = 1
+    NUDGE = 2
+    CANCEL_REINVOKE = 3
+    PAUSE_ESCALATE = 4
+    TERMINATE = 5
+
+
+# Default drift messages per kind, used by
+# :func:`compose_corrective_user_message` when the drift carries no
+# kind-specific override. Keep SHORT, action-focused; no goldfive jargon
+# ("synthetic", "healed", "orphan", "drift") in user-facing copy.
+_CORRECTIVE_TEMPLATES: dict[DriftKind, str] = {
+    DriftKind.LOOPING_REASONING: (
+        "The prior attempt looped on {current_task_id}. "
+        "Refined plan: {next_task_title}. Please try a different approach."
+    ),
+    DriftKind.LOOPING_TOOL_CALL: (
+        "The prior attempt kept retrying the same tool call on "
+        "{current_task_id} without progress. Refined plan: "
+        "{next_task_title}. Please try a different approach."
+    ),
+    DriftKind.PLAN_DIVERGENCE: (
+        "The tree's prior activity diverged from the plan. "
+        "Refined plan: proceed with {next_task_title}."
+    ),
+    DriftKind.AGENT_REFUSAL: (
+        "The prior attempt could not complete {current_task_id}. "
+        "Refined plan: try {next_task_title}."
+    ),
+    DriftKind.MODEL_REFUSAL: (
+        "The model declined to proceed on {current_task_id}. Refined plan: try {next_task_title}."
+    ),
+    DriftKind.INTENT_DIVERGENCE: (
+        "The prior attempt strayed from the stated intent for "
+        "{current_task_id}. Refined plan: proceed with "
+        "{next_task_title}."
+    ),
+    DriftKind.TOOL_ERROR: (
+        "The prior attempt hit a tool error on {current_task_id}. "
+        "Refined plan: proceed with {next_task_title}."
+    ),
+    DriftKind.RUNAWAY_DELEGATION: (
+        "The prior attempt kept delegating without finishing "
+        "{current_task_id}. Refined plan: proceed with "
+        "{next_task_title} directly."
+    ),
+    DriftKind.SELF_REPORTED_STUCK: (
+        "The prior attempt reported being stuck on {current_task_id}. "
+        "Refined plan: try {next_task_title}."
+    ),
+    DriftKind.CONFUSION: (
+        "The prior attempt showed uncertainty on {current_task_id}. "
+        "Refined plan: proceed with {next_task_title}."
+    ),
+    DriftKind.CONFABULATION_RISK: (
+        "The prior attempt may have produced {current_task_id} "
+        "without consulting external data. Refined plan: "
+        "{next_task_title}."
+    ),
+}
+
+
+def compose_corrective_user_message(
+    *,
+    drift: DriftEvent,
+    refined_plan: Plan | None,
+    observed_actions: list[Any] | None = None,  # noqa: ARG001
+) -> str:
+    """Build a short directive user message for Level 3 re-invoke.
+
+    Shape varies by drift kind (see :data:`_CORRECTIVE_TEMPLATES`). The
+    message is deliberately short, action-focused, and avoids goldfive
+    jargon -- the consumer is the agent's LLM, which should read a
+    natural instruction rather than a framework postmortem.
+
+    ``observed_actions`` is accepted for forward-compat with
+    goldfive#144 (PLAN_DIVERGENCE refine with observed_actions=...) but
+    is NOT interpolated today -- the planner owns action summarization
+    and the composer just stitches drift + refined plan. Adding the
+    parameter now keeps the signature stable when #144 lands.
+    """
+    current = drift.current_task_id or "the current task"
+    next_title = _next_pending_task_title(refined_plan) or "the next planned step"
+    template = _CORRECTIVE_TEMPLATES.get(drift.kind)
+    if template is None:
+        # Generic fallback for drift kinds that didn't get a
+        # custom shape. Keep it tight and action-focused.
+        template = (
+            "The prior attempt on {current_task_id} did not complete "
+            "successfully. Refined plan: proceed with {next_task_title}."
+        )
+    return template.format(
+        current_task_id=current,
+        next_task_title=next_title,
+    )
+
+
+def _next_pending_task_title(plan: Plan | None) -> str:
+    """Return the title of the next PENDING task in topological order.
+
+    Falls back to the task id if no title is set. Returns an empty
+    string when there is no eligible task.
+    """
+    if plan is None:
+        return ""
+    for t in plan.tasks:
+        if t.status is TaskStatus.PENDING:
+            return (t.title or t.id or "").strip()
+    return ""
 
 
 # Task statuses that are terminal (no further transitions allowed).
@@ -1107,10 +1257,18 @@ class DefaultSteerer:
     # --- Drift dispatch ----------------------------------------------
 
     async def _handle_drift(self, drift: DriftEvent, session: Session) -> None:
-        """Emit a ``DriftDetected`` event and (if severe enough) refine.
+        """Emit a ``DriftDetected`` event and dispatch via the intervention ladder.
+
+        The ladder (goldfive#142) maps (drift_kind, severity,
+        occurrence_count) to one of six :class:`InterventionLevel`
+        values and dispatches accordingly. Level 1 (ABSORB) preserves
+        the historical refine-on-WARNING behaviour; other levels
+        short-circuit, queue follow-ups, or escalate to a paused state
+        for user intervention.
 
         Refine failures (either a raised exception or a ``None`` return)
-        are tracked per ``(drift.kind.value, drift.current_task_id)`` on
+        from Level 1 dispatch are tracked per
+        ``(drift.kind.value, drift.current_task_id)`` on
         ``session.refine_failure_counts``. After
         :attr:`REFINE_FAILURE_THRESHOLD` consecutive failures for the
         same key we skip refine entirely, mark the offending task
@@ -1130,21 +1288,47 @@ class DefaultSteerer:
         # :func:`goldfive.adapters.adk._build_cancelled_response_event`.
         self._tag_adapter_cancel_reason(drift)
         await self._emit_drift_detected(session, drift)
-        if not _severity_ge(drift.severity, DriftSeverity.WARNING):
+        # Route through the intervention ladder. The per-(kind, task)
+        # occurrence count drives the "first vs repeat" distinction in
+        # the ladder table -- we read it BEFORE any mutation so the
+        # mapping sees the state at drift-fire time.
+        counter_key = (drift.kind.value, drift.current_task_id)
+        occurrence_count = session.refine_failure_counts.get(counter_key, 0)
+        level = self._ladder_level_for(drift.kind, drift.severity, occurrence_count)
+        log.debug(
+            "DefaultSteerer._handle_drift: kind=%s severity=%s occurrence=%d -> level=%s",
+            drift.kind.value,
+            drift.severity.value,
+            occurrence_count,
+            level.name,
+        )
+        if level is InterventionLevel.OBSERVE:
             return
+        if level is InterventionLevel.NUDGE:
+            await self._dispatch_nudge(drift, session)
+            return
+        if level is InterventionLevel.PAUSE_ESCALATE:
+            await self._dispatch_pause_escalate(drift, session)
+            return
+        if level is InterventionLevel.TERMINATE:
+            # Level 5 is reserved for a future Runner-side timeout on a
+            # stuck Level 4 pause. Today we fall back to PAUSE_ESCALATE
+            # so no code path silently drops the drift.
+            await self._dispatch_pause_escalate(drift, session)
+            return
+        # ABSORB and CANCEL_REINVOKE both call ``planner.refine`` and
+        # install the revised plan. CANCEL_REINVOKE additionally queues
+        # a corrective message on the session for the overlay loop
+        # (goldfive#141). The refine call itself is identical so we
+        # share the implementation below and read the level at the end
+        # to decide whether to emit the follow-up handoff.
         if self._planner is None or session.plan is None:
             return
-        # REFINE_VALIDATION_FAILED is a terminal signal emitted by the
-        # planner itself when its retry budget is spent (goldfive#133).
-        # Refining on it would risk the planner re-refining on its own
-        # failure signal; leave the choice (steer again, cancel, let
-        # execution proceed with the existing plan) to the operator.
         if drift.kind is DriftKind.REFINE_VALIDATION_FAILED:
+            # Terminal planner signal (goldfive#133). Do NOT call refine
+            # again on it. The ladder already routes this to Level 4 so
+            # control flow normally won't reach here, but belt-and-braces.
             return
-        counter_key = (drift.kind.value, drift.current_task_id)
-        # If this (kind, task) already tripped the threshold on a prior
-        # tick, stop trying to refine. The task is FAILED by now so any
-        # further drift for it will short-circuit at ``mark_task_failed``.
         if session.refine_failure_counts.get(counter_key, 0) >= self.REFINE_FAILURE_THRESHOLD:
             return
         # Plumb the session into the planner's drift-emitter callback
@@ -1221,6 +1405,259 @@ class DefaultSteerer:
         prev_plan = session.plan
         self._apply_revision(session, revised, drift)
         await self._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
+        # Level 3 (CANCEL_REINVOKE) handoff: compose a corrective user
+        # message from the drift + refined plan and stash it on the
+        # session so the Runner's overlay loop (goldfive#141) can cancel
+        # the in-flight invocation and re-invoke with the composed text.
+        # Until #141 lands, this slot is inert -- nobody reads it -- but
+        # the data is durably attached to the session and a later-landing
+        # overlay will pick it up automatically.
+        if level is InterventionLevel.CANCEL_REINVOKE:
+            session.pending_corrective_message = compose_corrective_user_message(
+                drift=drift,
+                refined_plan=session.plan,
+            )
+
+    # --- Intervention ladder -----------------------------------------
+    #
+    # Mapping table for :meth:`_ladder_level_for`. Keys are
+    # :class:`DriftKind` values. Each value is a 3-tuple
+    # ``(info_level, warning_level, critical_level)`` holding the level
+    # for that severity tier. CRITICAL uses a (first, repeat) pair --
+    # repeat applies once the refine-failure counter has crossed
+    # :attr:`REFINE_FAILURE_THRESHOLD` for the (kind, task) pair. A
+    # level of ``None`` means "not applicable at this severity -- drop
+    # through to OBSERVE". See goldfive#142 for the rationale.
+    #
+    # Drifts without an entry here fall through to a conservative
+    # default that preserves the pre-ladder behaviour: WARNING -> ABSORB,
+    # CRITICAL -> ABSORB first, CANCEL_REINVOKE on repeat.
+    #
+    # A note on INFO-tier preservation: the pre-ladder steerer
+    # short-circuited every INFO-severity drift at "no refine" (the
+    # early return below ``_severity_ge(drift.severity, WARNING)``).
+    # The ladder preserves that invariant by mapping every INFO entry
+    # to :data:`InterventionLevel.OBSERVE`. The issue's suggested
+    # table labels some INFO tiers as "Level 1 (absorb)" but a Level 1
+    # at INFO would trigger refine for every INFO hint (CONFUSION
+    # detector, CONFABULATION_RISK, etc.), which regresses existing
+    # behaviour. If an operator later wants a refine-on-hint policy,
+    # they subclass and override :meth:`_ladder_level_for`.
+    _LADDER: dict[
+        DriftKind,
+        tuple[
+            InterventionLevel | None,  # INFO
+            InterventionLevel | None,  # WARNING
+            tuple[InterventionLevel, InterventionLevel],  # CRITICAL (first, repeat)
+        ],
+    ] = {
+        DriftKind.CONFUSION: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.CONFABULATION_RISK: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.AGENT_REFUSAL: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.MODEL_REFUSAL: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.LOOPING_REASONING: (
+            None,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.LOOPING_TOOL_CALL: (
+            None,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.REASONING_CLUSTER_TIGHTENING: (
+            InterventionLevel.OBSERVE,
+            None,
+            (InterventionLevel.OBSERVE, InterventionLevel.OBSERVE),
+        ),
+        DriftKind.PLAN_DIVERGENCE: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.INTENT_DIVERGENCE: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.PAUSE_ESCALATE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.TOOL_ERROR: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.RUNAWAY_DELEGATION: (
+            None,
+            None,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        DriftKind.REFINE_VALIDATION_FAILED: (
+            None,
+            None,
+            (InterventionLevel.PAUSE_ESCALATE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        # HUMAN_INTERVENTION_REQUIRED is always CRITICAL. First fire =>
+        # PAUSE_ESCALATE. A repeat fire (occurrence_count crosses the
+        # threshold) escalates to TERMINATE because it means the pause
+        # was already issued and the situation didn't resolve.
+        DriftKind.HUMAN_INTERVENTION_REQUIRED: (
+            None,
+            None,
+            (InterventionLevel.PAUSE_ESCALATE, InterventionLevel.TERMINATE),
+        ),
+        # GOAL_DRIFT (goldfive#143) -- trajectory-level judgment that
+        # the tree is no longer advancing ``session.goals``. CRITICAL
+        # severity only; routed to Level 4 both on first occurrence
+        # and on repeat because goal drift is structural and refine
+        # cannot recover from it. Per the goldfive#142 table.
+        DriftKind.GOAL_DRIFT: (
+            None,
+            None,
+            (InterventionLevel.PAUSE_ESCALATE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        # Self-reported stuck (from reflective check). WARNING by
+        # default -- preserve pre-ladder behaviour (ABSORB / refine).
+        DriftKind.SELF_REPORTED_STUCK: (
+            None,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
+        # BLOCKED, NEW_WORK_DISCOVERED, and user-control derived drifts
+        # go through the default fallback below (WARNING -> ABSORB,
+        # CRITICAL -> ABSORB first, PAUSE_ESCALATE on repeat), which
+        # matches the pre-ladder refine-on-WARNING behaviour verbatim.
+    }
+
+    # Ladder entries keyed by drift-kind *value* so future siblings can
+    # register entries without depending on a newly-introduced enum
+    # member. Consulted BEFORE the enum-keyed table in
+    # :meth:`_ladder_level_for` and takes precedence when both match.
+    # Empty today -- goldfive#143's GOAL_DRIFT has landed as a real
+    # enum member, so the enum-keyed table suffices. Left in place for
+    # future cross-PR coordination.
+    _LADDER_BY_VALUE: dict[
+        str,
+        tuple[
+            InterventionLevel | None,
+            InterventionLevel | None,
+            tuple[InterventionLevel, InterventionLevel],
+        ],
+    ] = {}
+
+    def _ladder_level_for(
+        self,
+        kind: DriftKind,
+        severity: DriftSeverity,
+        occurrence_count: int,
+    ) -> InterventionLevel:
+        """Return the intervention level for ``(kind, severity, count)``.
+
+        The mapping is the single source of truth for the ladder table
+        documented on this module's docstring and goldfive#142. Drifts
+        with no explicit entry fall through to a safe default that
+        preserves the pre-ladder behaviour:
+
+        * INFO -> OBSERVE (no action)
+        * WARNING -> ABSORB (refine)
+        * CRITICAL, first occurrence -> ABSORB (refine)
+        * CRITICAL, repeat occurrence -> PAUSE_ESCALATE
+
+        Subclasses can override this method to tune the table without
+        re-implementing :meth:`_handle_drift`.
+        """
+        entry = self._LADDER_BY_VALUE.get(kind.value)
+        if entry is None:
+            entry = self._LADDER.get(kind)
+        is_repeat = occurrence_count >= self.REFINE_FAILURE_THRESHOLD
+        if entry is not None:
+            info_level, warning_level, critical_pair = entry
+            if severity is DriftSeverity.INFO:
+                return info_level or InterventionLevel.OBSERVE
+            if severity is DriftSeverity.WARNING:
+                return warning_level or InterventionLevel.OBSERVE
+            # CRITICAL
+            return critical_pair[1] if is_repeat else critical_pair[0]
+        # Default fallback for drifts not explicitly in the table.
+        if severity is DriftSeverity.INFO:
+            return InterventionLevel.OBSERVE
+        if severity is DriftSeverity.WARNING:
+            return InterventionLevel.ABSORB
+        # CRITICAL with no explicit entry -- ABSORB first, escalate on repeat.
+        return InterventionLevel.PAUSE_ESCALATE if is_repeat else InterventionLevel.ABSORB
+
+    async def _dispatch_nudge(self, drift: DriftEvent, session: Session) -> None:
+        """Level 2 dispatch: queue a soft follow-up message on the session.
+
+        The Runner's overlay loop (goldfive#141) picks up the queued
+        nudge at the next invocation boundary and sends it as a gentle
+        corrective user message. Until #141 lands, the queue is
+        observable but inert; nothing consumes it.
+        """
+        msg = compose_corrective_user_message(
+            drift=drift,
+            refined_plan=session.plan,
+        )
+        session.pending_nudges.append(msg)
+        log.debug(
+            "DefaultSteerer: queued nudge for kind=%s task=%s: %s",
+            drift.kind.value,
+            drift.current_task_id or "-",
+            msg,
+        )
+
+    async def _dispatch_pause_escalate(
+        self,
+        drift: DriftEvent,
+        session: Session,
+    ) -> None:
+        """Level 4 dispatch: emit HUMAN_INTERVENTION_REQUIRED and pause.
+
+        Does NOT call ``planner.refine`` -- Level 4 signals that the
+        planner cannot recover. Sets
+        ``session.paused_for_human_intervention`` so the Runner's loop
+        blocks before the next task, and emits a CRITICAL
+        ``HUMAN_INTERVENTION_REQUIRED`` drift so sinks / the UI can
+        surface the pause and let the user decide what to do.
+
+        When the drift reaching Level 4 is *already* a
+        ``HUMAN_INTERVENTION_REQUIRED`` (e.g. landed here via the
+        generic fallback), we pause but do not re-emit the same drift
+        a second time -- the original DriftDetected emission at the
+        top of :meth:`_handle_drift` already carried the signal.
+        """
+        session.paused_for_human_intervention = True
+        if drift.kind is DriftKind.HUMAN_INTERVENTION_REQUIRED:
+            # Already emitted at the top of _handle_drift; just pause.
+            return
+        escalation = DriftEvent(
+            kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
+            severity=DriftSeverity.CRITICAL,
+            detail=(
+                f"escalated from {drift.kind.value}: {drift.detail}"
+                if drift.detail
+                else f"escalated from {drift.kind.value}"
+            ),
+            current_task_id=drift.current_task_id,
+            current_agent_id=drift.current_agent_id,
+        )
+        # Emit directly; do NOT go back through _handle_drift (would
+        # infinite-loop at CRITICAL).
+        await self._emit_drift_detected(session, escalation)
 
     # Symbolic cancel-reason tags — mirror
     # :mod:`goldfive.adapters.adk` constants but duplicated as plain

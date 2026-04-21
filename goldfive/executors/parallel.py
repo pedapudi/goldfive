@@ -214,9 +214,7 @@ class ParallelDAGExecutor:
                     abort_reason = "cancelled by control"
                     break
                 if pending_steer is not None:
-                    await self._apply_steer(
-                        pending_steer, steerer=steerer, session=session
-                    )
+                    await self._apply_steer(pending_steer, steerer=steerer, session=session)
                     # Fall through: refresh plan on next iteration.
 
                 # Recompute stages from current plan each outer iteration;
@@ -229,9 +227,7 @@ class ParallelDAGExecutor:
                 # Drop any stage composed entirely of tasks we already ran
                 # (defensive — planner.refine may leave older tasks in).
                 pending_stages = [
-                    stage
-                    for stage in stages
-                    if any(t.id not in completed_stage_ids for t in stage)
+                    stage for stage in stages if any(t.id not in completed_stage_ids for t in stage)
                 ]
                 if not pending_stages:
                     break
@@ -248,9 +244,7 @@ class ParallelDAGExecutor:
                 )
 
                 if control_outcome is not None and control_outcome.cancel_run:
-                    abort_reason = (
-                        control_outcome.cancel_reason or "cancelled by control"
-                    )
+                    abort_reason = control_outcome.cancel_reason or "cancelled by control"
                     for task, _inv, _drift, _err in stage_results:
                         await self._mark_cancelled_if_live(
                             task_id=task.id, steerer=steerer, session=session
@@ -299,10 +293,7 @@ class ParallelDAGExecutor:
                 # If a STEER arrived mid-stage, apply it now (stage was
                 # cancelled by _run_stage, so the fold-back above has
                 # already recorded the tasks as CANCELLED).
-                if (
-                    control_outcome is not None
-                    and control_outcome.steer_message is not None
-                ):
+                if control_outcome is not None and control_outcome.steer_message is not None:
                     await self._apply_steer(
                         control_outcome.steer_message,
                         steerer=steerer,
@@ -323,8 +314,7 @@ class ParallelDAGExecutor:
                             self.max_task_invocations,
                         )
                         abort_reason = (
-                            f"plan reinvocation budget exhausted "
-                            f"({self.max_task_invocations})"
+                            f"plan reinvocation budget exhausted ({self.max_task_invocations})"
                         )
                         break
 
@@ -363,9 +353,7 @@ class ParallelDAGExecutor:
                     # with the same plan is the exact stall goldfive#134
                     # targets.
                     if refined is None:
-                        failure_count = self._bump_refine_failure(
-                            session=session, drift=drift
-                        )
+                        failure_count = self._bump_refine_failure(session=session, drift=drift)
                         if failure_count >= self.REFINE_FAILURE_THRESHOLD:
                             abort_reason = (
                                 f"refine failed {failure_count} consecutive "
@@ -373,9 +361,7 @@ class ParallelDAGExecutor:
                                 f"(task {drift.current_task_id or 'n/a'}); "
                                 f"aborting to avoid silent loop"
                             )
-                            log.warning(
-                                "ParallelDAGExecutor: %s", abort_reason
-                            )
+                            log.warning("ParallelDAGExecutor: %s", abort_reason)
                             break
                         # Below threshold: fall through to the next stage
                         # and give the planner another chance on the next
@@ -502,8 +488,7 @@ class ParallelDAGExecutor:
                     # continues but operators can see the failure in
                     # the event stream. See goldfive#134.
                     log.warning(
-                        "ParallelDAGExecutor: steerer.observe/detect_drift "
-                        "raised for task=%s: %s",
+                        "ParallelDAGExecutor: steerer.observe/detect_drift raised for task=%s: %s",
                         task.id,
                         detect_exc,
                     )
@@ -525,8 +510,7 @@ class ParallelDAGExecutor:
         # Create tasks in deterministic order so cancellation and gather
         # ordering match the input stage ordering.
         aio_tasks: list[asyncio.Task[_StageResult]] = [
-            asyncio.create_task(run_one(t), name=f"goldfive-task-{t.id}")
-            for t in stage_tasks
+            asyncio.create_task(run_one(t), name=f"goldfive-task-{t.id}") for t in stage_tasks
         ]
         task_by_aio: dict[asyncio.Task[_StageResult], Task] = dict(
             zip(aio_tasks, stage_tasks, strict=True)
@@ -544,9 +528,7 @@ class ParallelDAGExecutor:
             if control is None:
                 return None
             if recv_task is None or recv_task.done():
-                recv_task = asyncio.create_task(
-                    control.receive(), name="goldfive-stage-control"
-                )
+                recv_task = asyncio.create_task(control.receive(), name="goldfive-stage-control")
             return recv_task
 
         async def _cancel_stage_tasks() -> None:
@@ -554,9 +536,7 @@ class ParallelDAGExecutor:
                 return
             for p in pending:
                 p.cancel()
-            cancelled_done, _still = await asyncio.wait(
-                pending, return_when=asyncio.ALL_COMPLETED
-            )
+            cancelled_done, _still = await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
             for cd in cancelled_done:
                 t2 = task_by_aio[cd]
                 try:
@@ -605,9 +585,7 @@ class ParallelDAGExecutor:
                                 try:
                                     results[task.id] = d.result()
                                 except asyncio.CancelledError:
-                                    results[task.id] = (
-                                        task, None, None, asyncio.CancelledError()
-                                    )
+                                    results[task.id] = (task, None, None, asyncio.CancelledError())
                                 except BaseException as exc:  # noqa: BLE001
                                     results[task.id] = (task, None, None, exc)
                             stage_control_outcome = outcome
@@ -666,9 +644,7 @@ class ParallelDAGExecutor:
                     pass
 
         # Preserve stage-input order in the return.
-        ordered: list[_StageResult] = [
-            results[t.id] for t in stage_tasks if t.id in results
-        ]
+        ordered: list[_StageResult] = [results[t.id] for t in stage_tasks if t.id in results]
         return ordered, first_drift, stage_control_outcome
 
     # ------------------------------------------------------------------
@@ -708,9 +684,7 @@ class ParallelDAGExecutor:
         See goldfive#134.
         """
         try:
-            refined = await planner.refine(
-                plan=plan, drift=drift, goals=list(session.goals)
-            )
+            refined = await planner.refine(plan=plan, drift=drift, goals=list(session.goals))
         except Exception as exc:  # noqa: BLE001
             log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
             await self._emit_refine_failure(
@@ -722,8 +696,7 @@ class ParallelDAGExecutor:
             return None
         if refined is None:
             log.warning(
-                "ParallelDAGExecutor: planner.refine(kind=%s) returned None; "
-                "plan unchanged",
+                "ParallelDAGExecutor: planner.refine(kind=%s) returned None; plan unchanged",
                 drift.kind.value,
             )
             await self._emit_refine_failure(
@@ -737,8 +710,7 @@ class ParallelDAGExecutor:
             refined.validate(for_revision=True, prior=plan)
         except ValueError as exc:
             log.warning(
-                "ParallelDAGExecutor: revised plan failed validation (%s); "
-                "keeping prior plan",
+                "ParallelDAGExecutor: revised plan failed validation (%s); keeping prior plan",
                 exc,
             )
             await self._emit_refine_failure(
@@ -776,9 +748,7 @@ class ParallelDAGExecutor:
         )
         await _emit_drift_event(session=session, sinks=sinks, drift=failure)
 
-    def _bump_refine_failure(
-        self, *, session: Session, drift: DriftEvent
-    ) -> int:
+    def _bump_refine_failure(self, *, session: Session, drift: DriftEvent) -> int:
         """Bump the per-``(kind, task_id)`` refine-failure counter.
 
         Returns the new count. Callers compare against
@@ -807,14 +777,25 @@ class ParallelDAGExecutor:
 
         Returns ``(cancel_run, steer_message)``. Pre-stage PAUSE blocks
         on :meth:`ControlChannel.receive` until RESUME / CANCEL / STEER
-        arrives.
+        arrives. The steerer's intervention-ladder Level 4 pause
+        (goldfive#142) triggers the same blocking wait via
+        ``session.paused_for_human_intervention``.
         """
         if control is None:
+            # Without a control channel the ladder-initiated pause has
+            # nowhere to wait. Clear the flag so the run doesn't wedge;
+            # the HUMAN_INTERVENTION_REQUIRED drift the steerer emitted
+            # remains on the sink stream as the durable signal.
+            if session.paused_for_human_intervention:
+                log.warning(
+                    "ParallelDAGExecutor: session.paused_for_human_intervention "
+                    "is set but no control channel is attached; clearing flag "
+                    "so the run does not wedge."
+                )
+                session.paused_for_human_intervention = False
             return False, None
 
-        outcomes = await drain_controls(
-            control, session=session, steerer=steerer, sinks=sinks
-        )
+        outcomes = await drain_controls(control, session=session, steerer=steerer, sinks=sinks)
 
         cancel_reason = ""
         cancel_run = False
@@ -835,22 +816,23 @@ class ParallelDAGExecutor:
         if cancel_run:
             raise _ControlCancelled(cancel_reason or "cancelled by control")
 
+        # Intervention-ladder pause (goldfive#142). See the Sequential
+        # executor for the matching hook.
+        if session.paused_for_human_intervention:
+            paused = True
+
         while paused:
             msg = await control.receive()
             if msg is None:
                 paused = False
                 break
-            outcome = await dispatch_control(
-                msg, session=session, steerer=steerer, sinks=sinks
-            )
+            outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=sinks)
             try:
                 await control.ack(outcome.ack)
             except Exception:  # noqa: BLE001
                 pass
             if outcome.cancel_run:
-                raise _ControlCancelled(
-                    outcome.cancel_reason or "cancelled by control"
-                )
+                raise _ControlCancelled(outcome.cancel_reason or "cancelled by control")
             if outcome.request_resume:
                 paused = False
             if outcome.steer_message is not None:
@@ -900,9 +882,7 @@ class ParallelDAGExecutor:
         try:
             await steerer.observe(message, session)
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "ParallelDAGExecutor: steerer.observe(STEER) raised: %s", exc
-            )
+            log.warning("ParallelDAGExecutor: steerer.observe(STEER) raised: %s", exc)
 
 
 # ---------------------------------------------------------------------------

@@ -57,6 +57,7 @@ EXPECTED_DRIFT_KINDS = {
     "RUNAWAY_DELEGATION": "runaway_delegation",
     "REFINE_VALIDATION_FAILED": "refine_validation_failed",
     "GOAL_DRIFT": "goal_drift",
+    "HUMAN_INTERVENTION_REQUIRED": "human_intervention_required",
 }
 
 
