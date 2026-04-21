@@ -88,6 +88,15 @@ class DriftKind(StrEnum):
     # whether to cancel or let the run proceed. See
     # :func:`goldfive.drift.classify_confabulation_risk`.
     CONFABULATION_RISK = "confabulation_risk"
+    # AgentTool-per-invoke cap exceeded. Fires once per invocation when
+    # a coordinator's LLM delegates via ADK AgentTool more times than
+    # ``ADKAdapter(agent_tool_cap=N)`` allows (default 16). The backstop
+    # for user-supplied coordinator prompts that describe a pipeline
+    # and keep delegating forever instead of letting goldfive drive
+    # the next task round. CRITICAL severity: the current task is
+    # marked failed and the Steerer is given a chance to refine /
+    # retry. See goldfive#130.
+    RUNAWAY_DELEGATION = "runaway_delegation"
 
 
 class DriftSeverity(StrEnum):

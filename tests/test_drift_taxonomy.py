@@ -54,6 +54,7 @@ EXPECTED_DRIFT_KINDS = {
     "UNCERTAIN_PROGRESS": "uncertain_progress",
     "SELF_REPORTED_STUCK": "self_reported_stuck",
     "CONFABULATION_RISK": "confabulation_risk",
+    "RUNAWAY_DELEGATION": "runaway_delegation",
 }
 
 

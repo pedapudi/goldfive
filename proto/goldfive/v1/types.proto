@@ -146,6 +146,14 @@ enum DriftKind {
   // Emitted by the ADK plugin's ``after_run_callback`` via
   // ``goldfive.drift.classify_confabulation_risk``. See issue #128.
   DRIFT_KIND_CONFABULATION_RISK = 34;
+  // AgentTool-per-invoke cap exceeded. Fires once per invocation when
+  // a coordinator's LLM delegates via ADK AgentTool more times than
+  // ``ADKAdapter(agent_tool_cap=N)`` allows (default 16). Backstop
+  // for user-supplied coordinator prompts that describe a pipeline
+  // and keep delegating instead of letting goldfive drive the next
+  // task. CRITICAL severity; the adapter cancels the invocation and
+  // the Steerer's refine hook gets a chance. See goldfive#130.
+  DRIFT_KIND_RUNAWAY_DELEGATION = 35;
 }
 
 // Directed edge in a plan's task dependency DAG. `from_task_id` must

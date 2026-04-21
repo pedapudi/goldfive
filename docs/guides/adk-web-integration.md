@@ -22,25 +22,26 @@ just works.
 
 ## The any-tree guarantee
 
-`goldfive.wrap(any_adk_tree)` works regardless of tree shape. The
-adapter walks the wrap target once and builds a `name -> BaseAgent`
-registry covering every reachable agent via `sub_agents`,
-`inner_agent`, and `AgentTool.agent` edges. The registry is the
-dispatch map the executor uses for every task:
+`goldfive.wrap(any_adk_tree)` works regardless of tree shape.
+Goldfive builds one `InMemoryRunner` around the tree root; ADK's
+native mechanisms (`AgentTool`, `transfer_to_agent`, `sub_agents`)
+resolve delegation inside the tree. The tree is **respected, never
+rewritten or flattened**:
 
 | Tree shape | What wrap does |
 |---|---|
-| Single agent — `Agent(name="worker", ...)` | Single-entry registry; every dispatch goes to `worker`. |
-| Coordinator with `sub_agents` | Registry lists coordinator and every sub-agent; planner may assign tasks to any of them. |
-| Coordinator with `AgentTool`-wrapped specialists | Registry lists coordinator and every wrapped specialist; planner may route to a specialist directly, or route to the coordinator to let it compose specialists within its own turn. |
-| Deep nesting (`inner_agent` wrappers, `AgentTool` inside an agent whose parent is itself an `AgentTool`, ...) | Every reachable agent is in the registry; cycles are skipped by id. |
+| Single agent — `Agent(name="worker", ...)` | One runner around `worker`; every invoke drives it. |
+| Coordinator with `sub_agents` | One runner around the coordinator. ADK's `transfer_to_agent` handles delegation within a turn. |
+| Coordinator with `AgentTool`-wrapped specialists | One runner around the coordinator. AgentTool calls spawn sub-Runners that inherit the goldfive plugin. |
+| Deep nesting (`inner_agent` wrappers, `AgentTool` inside an agent whose parent is itself an `AgentTool`, …) | One runner at the root; ADK handles arbitrary-depth delegation. `available_agents` walks the tree to expose every reachable name for the planner. |
 
-The tree is **respected, never rewritten or flattened**. A writer
-that has an `editor` sub-agent still has that editor when goldfive
-dispatches a task to the writer. A coordinator that has three
-`AgentTool`s as tools still has those tools when goldfive dispatches
-a task to the coordinator. See
-[ARCHITECTURE.md §"Registry dispatch"](../design/ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)
+A writer that has an `editor` sub-agent still has that editor when
+the writer's invocation drives it. A coordinator that has three
+`AgentTool`s as tools still has those tools. `available_agents` is
+an advisory list the planner uses to populate
+`task.assignee_agent_id` as a delegation hint; goldfive does not
+route on it. See
+[ARCHITECTURE.md §"Single-Runner dispatch"](../design/ARCHITECTURE.md#single-runner-dispatch-goldfive-drives-the-root-adk-delegates-within)
 for the underlying model.
 
 ## The recipe
@@ -133,9 +134,9 @@ app = App(name="observed-demo", root_agent=root_agent)
 ## What is and is not shared with the adk-web session
 
 The goldfive pipeline that runs for each turn uses its own internal
-per-agent `InMemoryRunner`s (via `ADKAdapter` — see
-[ARCHITECTURE.md §"Registry dispatch"](../design/ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)).
-Those runners are independent of the ADK session that `adk web`
+`InMemoryRunner` (via `ADKAdapter` — see
+[ARCHITECTURE.md §"Single-Runner dispatch"](../design/ARCHITECTURE.md#single-runner-dispatch-goldfive-drives-the-root-adk-delegates-within)).
+That runner is independent of the ADK session that `adk web`
 hosts. In practice this means:
 
 - Per-turn goldfive state (plan, drift history, reporting tool calls)
@@ -145,48 +146,40 @@ hosts. In practice this means:
   the Phase 3 roadmap (the sibling agent currently wires
   conversation-level continuity through `run()`; see issue #71).
 
-## Coordinator + AgentTool: how dispatch interacts with the tree
+## Coordinator + AgentTool: delegation happens inside the turn
 
 A common shape: a coordinator whose `tools` list contains
 `AgentTool(specialist_a)`, `AgentTool(specialist_b)`, etc. The
-coordinator's instruction text will typically tell it to call the
+coordinator's instruction text typically tells it to call the
 appropriate specialist as a tool based on the user request.
 
-**What goldfive does with this tree.**
+**What goldfive does with this tree.** Builds one `InMemoryRunner`
+around the coordinator with the goldfive plugin installed. Every
+`invoke(task, session)` drives that one runner. The coordinator's
+LLM decides whether to answer directly or delegate via
+`AgentTool(specialist_a)`; ADK spawns a sub-Runner for the
+specialist and propagates the plugin manager into it automatically.
 
-- Registers every reachable agent (coordinator, specialist_a,
-  specialist_b, plus any sub-agents of those) in the registry.
-- Builds one `InMemoryRunner` per registered agent, with the
-  goldfive plugin installed on each.
-- The LLM planner sees every name in `available_agents` and may
-  route tasks directly to a specialist.
+**What the planner sees.** `available_agents` lists every reachable
+agent name — the planner may populate `task.assignee_agent_id` with
+a specific agent name to hint the coordinator toward a specialist.
+Under the single-Runner model this is advisory only: the hint rides
+in the task context the coordinator reads but does not force
+routing.
 
-**What changes for users wrapping a coordinator+AgentTool tree:**
-when goldfive's planner assigns a task to `specialist_a`,
-`ADKAdapter.invoke` dispatches directly to `specialist_a`'s runner.
-The coordinator's instruction text that says "call the right
-specialist via AgentTool" is effectively **superseded** for that
-task, *but is not modified* — goldfive never edits the tree. If a
-later task is assigned to the coordinator, the coordinator will
-run with its instruction text unchanged and its AgentTools still
-bound.
-
-**What doesn't change.** When an agent is dispatched, its **full
-subtree is available to it**. An AgentTool the dispatched agent
-owns still fires when the agent calls it. A `sub_agent` still
-resolves. ADK's plugin-inheritance carries the goldfive plugin
-into the AgentTool-spawned sub-Runner so the nested invocation
-still sees the state-protocol keys and emits observability events
-([EVENT-MODEL.md §"Agent-invocation events"](../design/EVENT-MODEL.md#agent-invocation-events)).
-
-This rules out a class of failure mode that plagued earlier
-versions — the coordinator-loop-under-real-LLM that burned through
-ADK's 500-call ceiling because every task re-entered the
-coordinator's routing LLM turn. See
-[RATIONALE.md §"Why per-agent runners, not always-root-dispatch"](../design/RATIONALE.md#why-per-agent-runners-not-always-root-dispatch)
-for the detailed "why" and
-[common-failure-modes §"coordinator+AgentTool loop under real LLM"](common-failure-modes.md#8-coordinatoragenttool-loop-under-real-llm-fixed-by-registry-dispatch)
-for the signature and recovery path.
+**The runaway-delegation cap.** A coordinator whose prompt
+describes a pipeline ("first research, then build, then review…")
+can enter a self-delegating loop. Goldfive cannot require prompt
+cooperation (users bring their own trees), so the plugin enforces
+a per-invocation cap on AgentTool spawns — default 16, configurable
+via `ADKAdapter(agent_tool_cap=N)` (set to 0 to disable). When the
+cap trips, the plugin emits a `RUNAWAY_DELEGATION` drift and
+cancels the invocation; the Steerer's refine hook gets a chance to
+salvage the run. See
+[common-failure-modes §"coordinator+AgentTool loop under real LLM"](common-failure-modes.md#8-coordinatoragenttool-loop-under-real-llm)
+for the detailed signature and
+[RATIONALE.md §"Why single-Runner, not registry-dispatch"](../design/RATIONALE.md#why-single-runner-not-registry-dispatch)
+for the design history.
 
 ### End-to-end example: coordinator + AgentTool under `adk web`
 
@@ -227,15 +220,14 @@ coordinator = Agent(
     ),
 )
 
-# Wrap the coordinator — goldfive discovers all three agents.
+# Wrap the coordinator — goldfive builds one runner around it.
 root_agent = goldfive.wrap(coordinator)
 
 # goldfive.adapters.adk.ADKAdapter.available_agents is
-# ['coordinator', 'researcher', 'writer']. An LLMPlanner with these
-# three names may assign one task to 'researcher' and a dependent
-# task to 'writer' — each goes directly to the assigned agent's
-# per-agent runner. The coordinator is still available for tasks
-# that legitimately require composition.
+# ['coordinator', 'researcher', 'writer'] — advisory for the
+# planner. Every task drives the coordinator; delegation to
+# researcher / writer happens via the AgentTool calls the
+# coordinator makes inside its turn.
 
 app = App(name="multi-agent-demo", root_agent=root_agent)
 ```
@@ -248,32 +240,24 @@ adk web agent.py
 ```
 
 Each user turn, the UI submits a request; goldfive's planner
-produces a two-task plan (research → write) and the executor
-dispatches each task to its assignee directly. No coordinator
-routing loop, no 500-call ceiling, no wasted inference.
+produces a two-task plan (research → write) and the executor drives
+the coordinator for each task. The coordinator's AgentTool calls
+delegate to the specialists; the per-invocation cap catches any
+runaway loop.
 
 ## Pre-built Runner degrade mode
 
 If you construct your own `InMemoryRunner` and hand it to
 `goldfive.wrap(...)` (or to `ADKAdapter(...)` directly), goldfive
-cannot walk a tree it never saw. It falls back to a **single-entry
-registry** pointing at the runner's root agent and emits a WARNING
-log at wrap time:
+uses the runner verbatim. `available_agents` reports just the
+runner's root agent name; the wrap-time plugin-installed integrity
+check is skipped because the caller may have passed a runner shape
+we don't fully control.
 
-```text
-ADKAdapter: caller passed a pre-built Runner; per-task-assignee
-dispatch is unavailable, all tasks will invoke the runner's
-root_agent
-```
-
-Every `invoke(task, session)` drives that one runner regardless of
-`task.assignee_agent_id`. If the planner assigns to an agent name
-different from the root's name, the mismatch is logged at DEBUG
-and the dispatch proceeds to the root anyway.
-
-This mode is supported for backwards compatibility. The full
-registry model requires passing a `BaseAgent` (the tree root) so
-goldfive can discover the tree itself.
+Every `invoke(task, session)` drives that one runner — which is
+the same behaviour as the non-degraded path under the single-Runner
+model, the only difference being that goldfive didn't construct the
+runner itself.
 
 ## Limitations
 

@@ -1,25 +1,21 @@
 """Graceful-degrade tests for pre-built-Runner callers.
 
-Phase 1 preserves a graceful-degrade path: if the caller passes a
-pre-built ``InMemoryRunner`` (instead of a BaseAgent tree), ``ADKAdapter``
-cannot build a meaningful registry — there's only the one runner and
-its one root agent. The adapter:
+When the caller passes a pre-built ``InMemoryRunner`` (instead of a
+BaseAgent tree), ``ADKAdapter`` uses the caller-supplied runner
+verbatim. Under the single-Runner model (goldfive#130) there is no
+"dispatch" behaviour to degrade — the adapter always drives the one
+runner — so the degraded path is thin:
 
-* Builds a single-entry registry (the root agent's name → the root agent).
-* Builds a single-entry runners dict pointing at the caller's runner.
-* Logs a warning exactly once at wrap time so the caller knows
-  per-assignee dispatch is off.
-* Routes EVERY invoke to that single runner regardless of
-  ``task.assignee_agent_id`` (with a DEBUG log on mismatch).
-* Skips the wrap-time plugin-installed integrity check (the caller may
-  have passed a runner shape we don't fully control).
+* ``available_agents`` reports just the runner's root agent name
+  (goldfive cannot see deeper without walking a tree it doesn't own).
+* The wrap-time plugin-installed integrity check is skipped because
+  the caller may have passed a runner shape we don't fully control.
 
 Skipped entirely when ``google.adk`` is not installed.
 """
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,14 +38,7 @@ class _Event:
 
 @dataclass
 class _PrebuiltRunner:
-    """Pre-built runner duck-type the adapter accepts in degraded mode.
-
-    Mirrors the Phase 1 ``test_degraded_mode_prebuilt_runner_ignores_assignee``
-    fake, extended with plugin-manager plumbing so
-    ``_register_plugin_on_runner`` can still attach the plugin (degraded
-    mode doesn't assume it fails — only that the integrity check is
-    skipped afterwards).
-    """
+    """Pre-built runner duck-type the adapter accepts in degraded mode."""
 
     agent: Any = None
     session_service: Any = None
@@ -68,8 +57,8 @@ class _PrebuiltRunner:
 # ---------------------------------------------------------------------------
 
 
-def test_prebuilt_runner_yields_single_entry_registry_and_runners() -> None:
-    """Pre-built Runner → ``_registry`` and ``_runners`` each have exactly one entry."""
+def test_prebuilt_runner_uses_caller_supplied_runner_verbatim() -> None:
+    """Pre-built Runner → ``adapter._runner is the caller's runner``."""
     from goldfive.adapters.adk import ADKAdapter
 
     inner = _mk("solo")
@@ -77,38 +66,20 @@ def test_prebuilt_runner_yields_single_entry_registry_and_runners() -> None:
     adapter = ADKAdapter(runner)
 
     assert adapter._degraded_prebuilt_runner is True
-    assert set(adapter._registry) == {"solo"}
-    assert adapter._registry["solo"] is inner
-    assert set(adapter._runners) == {"solo"}
-    assert adapter._runners["solo"] is runner
+    assert adapter._runner is runner
+    assert adapter._agent is inner
 
 
-def test_prebuilt_runner_emits_wrap_time_warning_exactly_once(caplog) -> None:
-    """Wrap-time warning fires exactly once — per-assignee dispatch is off.
-
-    We assert the warning is present and the log record's logger name is
-    the goldfive adapter logger so a downstream filter can silence it
-    narrowly if the caller intentionally opts into degraded mode.
+def test_prebuilt_runner_available_agents_is_single_root() -> None:
+    """``available_agents`` in degraded mode is just the root agent name —
+    goldfive cannot see deeper without walking a tree it doesn't own.
     """
     from goldfive.adapters.adk import ADKAdapter
 
     inner = _mk("solo")
     runner = _PrebuiltRunner(agent=inner)
-
-    with caplog.at_level(logging.WARNING, logger="goldfive.adapters.adk"):
-        ADKAdapter(runner)
-
-    degrade_warnings = [
-        rec
-        for rec in caplog.records
-        if rec.name == "goldfive.adapters.adk"
-        and rec.levelno == logging.WARNING
-        and "pre-built Runner" in rec.getMessage()
-    ]
-    assert len(degrade_warnings) == 1, (
-        f"expected exactly one degrade warning; got {len(degrade_warnings)}. "
-        f"records={[r.getMessage() for r in caplog.records]}"
-    )
+    adapter = ADKAdapter(runner)
+    assert adapter.available_agents == ["solo"]
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +88,12 @@ def test_prebuilt_runner_emits_wrap_time_warning_exactly_once(caplog) -> None:
 
 
 async def test_prebuilt_runner_invokes_regardless_of_assignee() -> None:
-    """A task with any assignee routes to the single runner — NO ValueError."""
+    """A task with any assignee routes to the single runner — NO ValueError.
+
+    Single-Runner model: the assignee is a hint carried on the task, not a
+    routing key. Every task drives the one runner; delegation happens via
+    ADK's native mechanisms inside the tree.
+    """
     from goldfive.adapters.adk import ADKAdapter
     from goldfive.types import Plan, Session, Task
 
@@ -125,8 +101,6 @@ async def test_prebuilt_runner_invokes_regardless_of_assignee() -> None:
     runner = _PrebuiltRunner(agent=inner)
     adapter = ADKAdapter(runner)
 
-    # Assignee names we never registered. Must not raise; routes to
-    # the single runner regardless.
     for assignee in ("not_in_registry", "also_not_here", "definitely_missing"):
         task = Task(id=f"t-{assignee}", title="x", assignee_agent_id=assignee)
         await adapter.invoke(
@@ -137,43 +111,6 @@ async def test_prebuilt_runner_invokes_regardless_of_assignee() -> None:
             ),
         )
     assert runner.called == 3
-
-
-async def test_prebuilt_runner_invoke_logs_debug_on_assignee_mismatch(caplog) -> None:
-    """DEBUG log on assignee mismatch — visible but non-fatal.
-
-    Callers that opt into degraded mode may still populate
-    ``task.assignee_agent_id`` (e.g. because the planner is shared with
-    the multi-agent tree path). The mismatch shouldn't crash but it
-    should be diagnosable via logging.
-    """
-    from goldfive.adapters.adk import ADKAdapter
-    from goldfive.types import Plan, Session, Task
-
-    inner = _mk("solo")
-    runner = _PrebuiltRunner(agent=inner)
-    adapter = ADKAdapter(runner)
-
-    task = Task(id="t1", title="x", assignee_agent_id="mismatch_assignee")
-    with caplog.at_level(logging.DEBUG, logger="goldfive.adapters.adk"):
-        await adapter.invoke(
-            task=task,
-            session=Session(
-                run_id="r1",
-                plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[]),
-            ),
-        )
-    mismatch_debug = [
-        rec
-        for rec in caplog.records
-        if rec.name == "goldfive.adapters.adk"
-        and rec.levelno == logging.DEBUG
-        and "degraded pre-built Runner" in rec.getMessage()
-    ]
-    assert mismatch_debug, (
-        "expected a DEBUG log on assignee-mismatch in degraded mode; "
-        "callers rely on it to trace unexpected plan/adapter pairings"
-    )
 
 
 async def test_prebuilt_runner_skips_plugin_installed_integrity_check() -> None:
@@ -192,16 +129,3 @@ async def test_prebuilt_runner_skips_plugin_installed_integrity_check() -> None:
     runner = _PrebuiltRunner(agent=inner)
     adapter = ADKAdapter(runner)
     assert adapter._degraded_prebuilt_runner is True
-
-
-async def test_prebuilt_runner_available_agents_is_single_root() -> None:
-    """``available_agents`` in degraded mode is just the root agent name —
-    no sub-agents are discovered because goldfive can only see the
-    runner's top-level agent.
-    """
-    from goldfive.adapters.adk import ADKAdapter
-
-    inner = _mk("solo")
-    runner = _PrebuiltRunner(agent=inner)
-    adapter = ADKAdapter(runner)
-    assert adapter.available_agents == ["solo"]

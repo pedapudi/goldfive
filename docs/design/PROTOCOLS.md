@@ -397,42 +397,40 @@ class AgentAdapter(Protocol):
 
 ### The `available_agents` discovery contract
 
-`available_agents` is the authoritative list of names the planner
-may assign tasks to. Its shape is framework-neutral, but its
-semantics are strict:
+`available_agents` is the advisory list of names the planner may
+populate `task.assignee_agent_id` with. Its shape is framework-
+neutral:
 
 1. **Discovery at wrap time.** The adapter walks whatever nested
    structure its framework supports (ADK trees via `sub_agents` /
    `inner_agent` / `AgentTool.agent`, or a flat list, or a
-   singleton) and materialises a stable `name -> agent` map.
-2. **Sorted for determinism.** Return a sorted list so the planner
-   context (and any test snapshot) is reproducible.
-3. **No duplicates.** Name collisions make strict-match dispatch
-   ambiguous; the adapter MUST raise at wrap time rather than
-   quietly collapse two agents under one name.
-4. **Every name must be dispatchable.** If `"foo"` is in
-   `available_agents`, then `invoke(Task(..., assignee_agent_id="foo"))`
-   MUST route to that agent. No exceptions.
+   singleton) and returns a stable sorted list of reachable names.
+2. **Sorted for determinism.** Planner context (and any test
+   snapshot) is reproducible.
+3. **No duplicates.** Name collisions make the hint ambiguous.
 
-### Strict-match dispatch
+### Assignee as a delegation hint
 
-Adapters MUST enforce strict matching when they dispatch by
-assignee:
+`task.assignee_agent_id` rides on the task as a **hint** — part
+of the task context the agent can read from session state. Under
+the ADK adapter's single-Runner model (goldfive#130) goldfive
+drives the root runner for every task; delegation within the tree
+is ADK's job via `AgentTool` / `transfer_to_agent` / `sub_agents`.
+The adapter does not route on the assignee:
 
-- An empty `task.assignee_agent_id` is legal; it means "dispatch to
-  the default/root agent" (the same agent the framework would use
-  in a single-agent wrap).
-- A set `task.assignee_agent_id` that matches a name in the
-  registry dispatches to that agent.
-- A set `task.assignee_agent_id` that does NOT match any registry
-  name MUST raise `ValueError("plan assigned task <id> to unknown
-  agent <name>; available: [...]")`. Silent fallback to the root
-  agent is **forbidden** — it masks planner bugs and produces
-  runs that look like they succeeded but drove the wrong agent.
+- An empty `task.assignee_agent_id` is the common case for
+  single-agent wraps and for unassigned work.
+- A set `task.assignee_agent_id` that matches a name in
+  `available_agents` flows through to the agent's prompt via the
+  state protocol; the coordinator's LLM (if present) can use it
+  to pick the right specialist.
+- A set `task.assignee_agent_id` that does NOT match any name in
+  `available_agents` is a no-op hint — the runner still drives
+  the root. Callers should still populate the field correctly for
+  observability and for drift classifiers that correlate on it.
 
-`ADKAdapter.invoke` implements this contract. `CallableAdapter`
-exposes a caller-supplied `available_agents` list and relies on
-the user callable to honour the assignee — see
+`CallableAdapter` exposes a caller-supplied `available_agents`
+list and relies on the user callable to honour the assignee — see
 [writing-an-agent-adapter.md](../guides/writing-an-agent-adapter.md)
 for the per-adapter expectations.
 

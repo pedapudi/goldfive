@@ -726,12 +726,9 @@ async def test_invoke_breaks_when_task_reported_terminal_mid_stream() -> None:
     )
 
     adapter = ADKAdapter(_make_agent())
-    # Registry-dispatch refactor: ``adapter._runners`` holds one runner
-    # per reachable agent. Empty-assignee dispatch resolves to the root
-    # agent's runner, so monkey-patches must update the registry entry
-    # for the root agent too (not just the legacy ``_runner`` attribute).
+    # Single-Runner model: one runner drives everything; monkey-patch
+    # it directly.
     adapter._runner = _FakeRunner()
-    adapter._runners["test_agent"] = adapter._runner
     adapter._session_id = "stub-session"
 
     result = await adapter.invoke(task=task, session=session)
@@ -778,10 +775,8 @@ async def test_invoke_runs_to_completion_when_task_stays_non_terminal() -> None:
     )
 
     adapter = ADKAdapter(_make_agent())
-    # See dispatch note in test_invoke_breaks_when_task_reported_terminal_mid_stream:
-    # monkey-patch the registry entry as well as the legacy attribute.
+    # Single-Runner model: monkey-patch the one runner.
     adapter._runner = _FakeRunner()
-    adapter._runners["test_agent"] = adapter._runner
     adapter._session_id = "stub-session"
 
     await adapter.invoke(task=task, session=session)
@@ -1718,13 +1713,16 @@ async def test_reporting_tool_guards_fire_across_back_to_back_invocations() -> N
 
 
 # ---------------------------------------------------------------------------
-# Registry-dispatch model (feat/registry-dispatch-model)
+# Single-Runner model (goldfive#130)
 # ---------------------------------------------------------------------------
 
 
-def test_registry_collects_every_reachable_agent() -> None:
-    """Wrapping a coordinator tree builds a registry of every reachable
-    agent — via ``sub_agents``, ``inner_agent``, and ``AgentTool.agent``.
+def test_single_runner_built_around_root_agent() -> None:
+    """``wrap(root)`` produces ONE ``InMemoryRunner`` around the root.
+
+    Under the single-Runner model (goldfive#130) the adapter doesn't
+    build per-agent runners — delegation within the tree is ADK's job
+    (AgentTool, transfer_to_agent, sub_agents).
     """
     from google.adk.agents.llm_agent import LlmAgent
     from google.adk.tools.agent_tool import AgentTool
@@ -1741,38 +1739,43 @@ def test_registry_collects_every_reachable_agent() -> None:
     coordinator.tools = [AgentTool(research), AgentTool(web), AgentTool(reviewer)]
 
     adapter = ADKAdapter(coordinator)
-    assert set(adapter._registry) == {"coordinator", "research", "web", "reviewer"}
-    # available_agents is sorted for deterministic planner output.
-    assert adapter.available_agents == sorted(adapter._registry)
-    # Registry values are REFERENCES to the original agent objects.
-    assert adapter._registry["research"] is research
-    assert adapter._registry["coordinator"] is coordinator
-    # One runner per registry entry; root shares the legacy _runner.
-    assert set(adapter._runners) == set(adapter._registry)
-    assert adapter._runners["coordinator"] is adapter._runner
+    # Exactly one runner exists and it wraps the coordinator (the root).
+    assert adapter._agent is coordinator
+    # available_agents reports every reachable agent name — advisory for
+    # the planner, not a dispatch registry.
+    assert adapter.available_agents == sorted(["coordinator", "research", "web", "reviewer"])
 
 
-def test_registry_raises_on_duplicate_agent_name() -> None:
-    """Two agents with the same name in the tree is ambiguous for
-    dispatch — raise at wrap time."""
+def test_available_agents_reports_reachable_names() -> None:
+    """``available_agents`` walks ``sub_agents`` / ``inner_agent`` /
+    ``AgentTool.agent`` edges so the planner can see delegation targets.
+    """
     from google.adk.agents.llm_agent import LlmAgent
     from google.adk.tools.agent_tool import AgentTool
 
     from goldfive.adapters.adk import ADKAdapter
 
-    dup1 = LlmAgent(name="dup", model="fake-model", description="a", instruction="x")
-    dup2 = LlmAgent(name="dup", model="fake-model", description="b", instruction="x")
-    root = LlmAgent(name="root", model="fake-model", description="r", instruction="x")
-    root.sub_agents = [dup1]
-    root.tools = [AgentTool(dup2)]
+    def _mk(name: str) -> Any:
+        return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
 
-    with pytest.raises(ValueError, match="duplicate agent name"):
-        ADKAdapter(root)
+    leaf = _mk("leaf")
+    mid = _mk("mid")
+    mid.tools = [AgentTool(leaf)]
+    root = _mk("root")
+    root.sub_agents = [mid]
+
+    adapter = ADKAdapter(root)
+    assert adapter.available_agents == ["leaf", "mid", "root"]
 
 
-async def test_invoke_dispatches_to_assignee_runner() -> None:
-    """When a task's assignee_agent_id is populated, goldfive must drive
-    the assignee's own per-agent runner — not the wrap-target root.
+async def test_invoke_always_drives_the_one_runner() -> None:
+    """Every ``invoke`` drives the one runner around the root, regardless
+    of ``task.assignee_agent_id``.
+
+    Delegation within the tree happens via ADK's native mechanisms —
+    goldfive does not route on assignee. The assignee field is still
+    carried on the task for observability + the planner's delegation
+    hints in prompts.
     """
     from dataclasses import dataclass, field
 
@@ -1787,18 +1790,18 @@ async def test_invoke_dispatches_to_assignee_runner() -> None:
         marker: str = ""
         content: Any = None
 
-    dispatched_to: list[str] = []
+    called_count = {"n": 0}
 
     @dataclass
     class _FakeRunner:
-        name: str = ""
         session_service: Any = None
         plugin_manager: Any = field(default=None)
-        app_name: str = ""
+        app_name: str = "coordinator"
+        agent: Any = None
 
         async def run_async(self, **kwargs: Any):  # noqa: ARG002
-            dispatched_to.append(self.name)
-            yield _Event(marker=self.name)
+            called_count["n"] += 1
+            yield _Event(marker="tick")
 
     def _mk(name: str) -> Any:
         return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
@@ -1809,13 +1812,8 @@ async def test_invoke_dispatches_to_assignee_runner() -> None:
     coordinator.tools = [AgentTool(research), AgentTool(web)]
 
     adapter = ADKAdapter(coordinator)
-    # Replace each per-agent runner with a fake that records who got dispatched.
-    for agent_name in adapter._runners:
-        adapter._runners[agent_name] = _FakeRunner(name=agent_name, app_name=agent_name)
-    # Legacy attr for _heal_pending_tool_calls (unused here, but kept consistent).
-    adapter._runner = adapter._runners["coordinator"]
-    # Skip real ADK session creation by pre-seeding session ids.
-    adapter._session_ids = {name: f"sess-{name}" for name in adapter._runners}
+    adapter._runner = _FakeRunner(agent=coordinator)
+    adapter._session_id = "sess-1"
 
     session = Session(
         run_id="r1",
@@ -1827,6 +1825,7 @@ async def test_invoke_dispatches_to_assignee_runner() -> None:
             edges=[],
         ),
     )
+    # Even with a non-empty, non-root assignee the one runner is driven.
     await adapter.invoke(
         task=Task(id="t1", title="do research", assignee_agent_id="research"),
         session=session,
@@ -1835,115 +1834,12 @@ async def test_invoke_dispatches_to_assignee_runner() -> None:
         task=Task(id="t2", title="build ui", assignee_agent_id="web"),
         session=session,
     )
-
-    assert dispatched_to == ["research", "web"], (
-        "registry dispatch routed to the wrong runners; the whole point "
-        "of feat/registry-dispatch-model is that goldfive picks the "
-        "assignee's runner, not the wrap target's root."
-    )
-
-
-async def test_invoke_raises_on_unknown_assignee() -> None:
-    """A plan that assigns a task to an unknown agent is a planner bug —
-    fail fast with a clear ``available:`` hint."""
-    from google.adk.agents.llm_agent import LlmAgent
-    from google.adk.tools.agent_tool import AgentTool
-
-    from goldfive.adapters.adk import ADKAdapter
-    from goldfive.types import Plan, Session, Task
-
-    def _mk(name: str) -> Any:
-        return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
-
-    research = _mk("research")
-    coordinator = _mk("coordinator")
-    coordinator.tools = [AgentTool(research)]
-
-    adapter = ADKAdapter(coordinator)
-    task = Task(id="t1", title="x", assignee_agent_id="does_not_exist")
-    session = Session(
-        run_id="r1",
-        plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[]),
-    )
-
-    with pytest.raises(ValueError, match="unknown agent"):
-        await adapter.invoke(task=task, session=session)
-
-
-async def test_invoke_empty_assignee_falls_back_to_root() -> None:
-    """An empty assignee keeps the single-agent wrap contract — dispatch
-    to the wrap-target root."""
-    from dataclasses import dataclass, field
-
-    from goldfive.adapters.adk import ADKAdapter
-    from goldfive.types import Plan, Session, Task
-
-    @dataclass
-    class _FakeRunner:
-        name: str = ""
-        session_service: Any = None
-        plugin_manager: Any = field(default=None)
-        app_name: str = ""
-        called: bool = False
-
-        async def run_async(self, **kwargs: Any):  # noqa: ARG002
-            self.called = True
-            if False:  # pragma: no cover — empty stream
-                yield None
-
-    adapter = ADKAdapter(_make_agent())
-    adapter._runner = _FakeRunner(name="test_agent", app_name="test_agent")
-    adapter._runners["test_agent"] = adapter._runner
-    adapter._session_ids = {"test_agent": "sess"}
-
-    task = Task(id="t1", title="x")  # assignee_agent_id default ""
+    # Even an unknown assignee does not raise — the assignee isn't routed.
     await adapter.invoke(
-        task=task,
-        session=Session(
-            run_id="r1",
-            plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[]),
-        ),
+        task=Task(id="t3", title="x", assignee_agent_id="does_not_exist"),
+        session=session,
     )
-    assert adapter._runner.called is True
-
-
-async def test_degraded_mode_prebuilt_runner_ignores_assignee() -> None:
-    """When caller passes a pre-built Runner, per-assignee dispatch is
-    not available — all tasks invoke the single runner regardless of
-    assignee_agent_id. The adapter logs once at wrap time."""
-    from dataclasses import dataclass, field
-
-    from goldfive.adapters.adk import ADKAdapter
-    from goldfive.types import Plan, Session, Task
-
-    @dataclass
-    class _PrebuiltRunner:
-        agent: Any = None
-        session_service: Any = None
-        plugin_manager: Any = field(default=None)
-        app_name: str = "prebuilt"
-        plugins: list = field(default_factory=list)
-        called: int = 0
-
-        async def run_async(self, **kwargs: Any):  # noqa: ARG002
-            self.called += 1
-            if False:  # pragma: no cover
-                yield None
-
-    inner = _make_agent()
-    runner = _PrebuiltRunner(agent=inner)
-    adapter = ADKAdapter(runner)
-    assert adapter._degraded_prebuilt_runner is True
-
-    task = Task(id="t1", title="x", assignee_agent_id="not_in_registry")
-    await adapter.invoke(
-        task=task,
-        session=Session(
-            run_id="r1",
-            plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[]),
-        ),
-    )
-    assert runner.called == 1
+    assert called_count["n"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -2371,14 +2267,11 @@ def test_adk_adapter_init_accepts_plugins() -> None:
     adapter = ADKAdapter(coordinator, plugins=[plugin])
 
     assert adapter._plugins == [plugin]
-    # Every per-agent runner — not just the coordinator — must carry
-    # the caller-supplied plugin on its plugin_manager.
-    for agent_name, runner in adapter._runners.items():
-        installed = list(getattr(runner.plugin_manager, "plugins", []))
-        assert plugin in installed, (
-            f"caller-supplied plugin did not land on runner for {agent_name!r}; "
-            f"goldfive#121 regression"
-        )
+    # Single-Runner model: the caller plugin is installed on the one
+    # runner. ADK's AgentTool propagates the plugin_manager into sub-
+    # Runners automatically, so coverage across the tree is inherent.
+    installed = list(getattr(adapter._runner.plugin_manager, "plugins", []))
+    assert plugin in installed, "caller-supplied plugin did not land on the runner"
 
 
 def test_wrap_accepts_plugins() -> None:
@@ -2409,21 +2302,18 @@ def test_wrap_accepts_plugins() -> None:
 
     adapter = wrapped._runner.agent
     assert adapter._plugins == [plugin]
-    for agent_name, runner in adapter._runners.items():
-        installed = list(getattr(runner.plugin_manager, "plugins", []))
-        assert plugin in installed, (
-            f"wrap(plugins=[...]) did not propagate onto runner for {agent_name!r}"
-        )
+    installed = list(getattr(adapter._runner.plugin_manager, "plugins", []))
+    assert plugin in installed, "wrap(plugins=[...]) did not propagate onto the runner"
 
 
-async def test_dispatch_uses_plugins_in_sub_agent_runner() -> None:
-    """Dispatching to a sub-agent must exercise caller-supplied plugins.
+async def test_caller_plugin_fires_on_sub_agent_invocation_via_agent_tool() -> None:
+    """ADK propagates the runner's plugin_manager into AgentTool sub-
+    Runners, so a caller plugin's ``before_run_callback`` fires for
+    both the coordinator and for any sub-agent spawned via AgentTool.
 
-    Regression guard for goldfive#121: previously only the coordinator's
-    runner received ``App(plugins=[...])`` plugins; sub-agent dispatches
-    (via ``AgentTool``/registry lookup) ran through a bare
-    ``InMemoryRunner`` with no plugins, so harmonograf only saw
-    telemetry for the outermost coordinator.
+    This is what lets harmonograf observe the entire delegation tree
+    under the single-Runner model (goldfive#130) with no special
+    registration path — the ADK plugin manager is the propagation seam.
     """
     from google.adk.agents import Agent  # type: ignore
     from google.adk.models.base_llm import BaseLlm  # type: ignore
@@ -2444,24 +2334,52 @@ async def test_dispatch_uses_plugins_in_sub_agent_runner() -> None:
             name = getattr(agent, "name", "") if agent is not None else ""
             self.agents_seen.append(str(name))
 
-    class _ScriptedLlm(BaseLlm):
+    class _SubLlm(BaseLlm):
         model: str = "fake-model"
 
         async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
             yield LlmResponse(
                 content=genai_types.Content(
                     role="model",
-                    parts=[genai_types.Part(text="ok")],
+                    parts=[genai_types.Part(text="sub done")],
                 ),
                 turn_complete=True,
             )
 
-    # Coordinator with an AgentTool(sub) so both agents are reachable
-    # in the registry and can be dispatched to independently.
-    sub = Agent(name="sub_agent", model=_ScriptedLlm(), instruction="")
+    class _CoordLlm(BaseLlm):
+        model: str = "fake-model"
+        _step: int = 0
+
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
+            self._step += 1
+            if self._step == 1:
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[
+                            genai_types.Part(
+                                function_call=genai_types.FunctionCall(
+                                    id="call_sub",
+                                    name="sub_agent",
+                                    args={"request": "do it"},
+                                )
+                            ),
+                        ],
+                    ),
+                )
+            else:
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[genai_types.Part(text="coord done")],
+                    ),
+                    turn_complete=True,
+                )
+
+    sub = Agent(name="sub_agent", model=_SubLlm(), instruction="")
     coordinator = Agent(
         name="coordinator",
-        model=_ScriptedLlm(),
+        model=_CoordLlm(),
         instruction="",
         tools=[AgentTool(sub)],
     )
@@ -2484,16 +2402,20 @@ async def test_dispatch_uses_plugins_in_sub_agent_runner() -> None:
 
     adapter.bind_steerer(_StubSteerer())
 
-    # Dispatch directly to the sub-agent. Before the fix, the sub
-    # agent's runner had no plugin manager entries so the recording
-    # plugin's before_run_callback would never fire for this invoke().
-    task = Task(id="t1", title="do it", assignee_agent_id="sub_agent")
+    task = Task(id="t1", title="do it")
     plan = Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[])
     session = Session(run_id="r1", plan=plan)
     await adapter.invoke(task=task, session=session)
 
+    # The caller plugin fires on BOTH the coordinator invocation and
+    # the AgentTool-spawned sub-Runner invocation — ADK propagates its
+    # plugin_manager through AgentTool automatically, so the same
+    # observability plugin sees the whole delegation tree.
+    assert "coordinator" in plugin.agents_seen, (
+        f"plugin never fired for the coordinator; saw {plugin.agents_seen!r}"
+    )
     assert "sub_agent" in plugin.agents_seen, (
-        "caller-supplied plugin was never invoked when dispatching to the "
-        "sub-agent; goldfive#121 regression — plugins must propagate "
-        f"onto the sub-agent runner. Saw: {plugin.agents_seen!r}"
+        "plugin never fired for the AgentTool-spawned sub-Runner — ADK's "
+        "plugin_manager propagation broke. Saw: "
+        f"{plugin.agents_seen!r}"
     )

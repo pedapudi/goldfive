@@ -537,18 +537,26 @@ def make_adk_plugin(
     *,
     name: str = "goldfive_adk_plugin",
     host_agent_name: str = "",
+    agent_tool_cap: int = 16,
 ) -> Any:
     """Build the ADK plugin class bound to goldfive's protocol.
 
     The class is built lazily so this module can be imported without
-    ``google.adk`` installed. The plugin routes the five callbacks we
-    care about (``before_model``, ``before_tool``, ``after_model``,
-    ``on_event``, ``on_tool_error``) through the
-    :class:`SessionContext` stashed on ADK state.
+    ``google.adk`` installed. The plugin routes the callbacks we care
+    about (``before_run``, ``after_run``, ``before_model``,
+    ``before_tool``, ``after_model``, ``on_event``, ``on_tool_error``)
+    through the :class:`SessionContext` stashed on ADK state.
 
     ``host_agent_name`` is the fallback name rendered into
     ``goldfive.available_tasks`` entries whose task has no explicit
     assignee — typically the wrapped root agent's name.
+
+    ``agent_tool_cap`` is the maximum number of ``AgentTool`` spawns
+    the plugin will tolerate in a single top-level invocation before
+    emitting a ``RUNAWAY_DELEGATION`` drift and signalling cancel.
+    Set to ``0`` or a negative value to disable. See goldfive#130 —
+    the cap is the backstop against a coordinator whose prompt
+    describes a pipeline and keeps delegating forever.
     """
     try:
         from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
@@ -561,6 +569,7 @@ def make_adk_plugin(
         def __init__(self) -> None:
             super().__init__(name=name)
             self._host_agent_name = host_agent_name
+            self._agent_tool_cap = agent_tool_cap
             # Active :class:`SessionContext` for the invocation that is
             # currently driving this plugin's runner. Set by
             # :meth:`ADKAdapter.invoke` before ``run_async`` and cleared
@@ -593,18 +602,35 @@ def make_adk_plugin(
             # sub-Runners get their own counters.
             self._invocation_tool_calls: dict[str, int] = {}
             self._invocation_last_text: dict[str, str] = {}
+            # AgentTool-per-invoke counter (goldfive#130). Scoped to
+            # the current top-level invocation; reset in
+            # :meth:`clear_active_context`. When the counter exceeds
+            # :attr:`_agent_tool_cap` the plugin sets
+            # :attr:`runaway_delegation_tripped`, emits a
+            # ``RUNAWAY_DELEGATION`` drift, and short-circuits
+            # subsequent AgentTool calls in the same invocation.
+            self._agent_tool_spawn_count: int = 0
+            # One-shot flag: True once the cap has been exceeded in the
+            # current invocation. The adapter's ``invoke`` loop reads
+            # this to break out of ``run_async`` cleanly — the drift
+            # event has already been emitted.
+            self.runaway_delegation_tripped: bool = False
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
 
             Called once per :meth:`ADKAdapter.invoke` before
-            ``runner.run_async``. The plugin's five callback methods
-            prefer this context over any value stashed in ADK session
-            state (which is an unreliable channel because InMemorySessionService
+            ``runner.run_async``. The plugin's callback methods prefer
+            this context over any value stashed in ADK session state
+            (which is an unreliable channel because InMemorySessionService
             copies state on every get). Overwriting a non-``None`` value
             is accepted — sequential invocations reuse the adapter.
             """
             self._active_ctx = ctx
+            # Reset the runaway-delegation bookkeeping for the new
+            # invocation so a prior trip doesn't leak into this one.
+            self._agent_tool_spawn_count = 0
+            self.runaway_delegation_tripped = False
 
         def clear_active_context(self) -> None:
             """Release the active ``SessionContext`` reference.
@@ -614,6 +640,8 @@ def make_adk_plugin(
             """
             self._active_ctx = None
             self._top_invocation_id = ""
+            self._agent_tool_spawn_count = 0
+            self.runaway_delegation_tripped = False
 
         def _resolve_ctx(self, adk_ctx: Any) -> SessionContext | None:
             """Return the live ``SessionContext`` or ``None`` if unbound.
@@ -847,6 +875,91 @@ def make_adk_plugin(
                     exc,
                 )
 
+        async def _emit_runaway_delegation_drift(
+            self,
+            *,
+            ctx: SessionContext,
+            from_agent: str,
+            to_agent: str,
+            task_id: str,
+            invocation_id: str,
+            spawn_count: int,
+        ) -> None:
+            """Emit a ``RUNAWAY_DELEGATION`` drift at CRITICAL severity.
+
+            Built and dispatched directly (not through
+            ``steerer.observe`` → ``detect_drift``) because the cap is
+            an observed invariant violation, not a heuristic. Routes
+            through ``steerer._handle_drift`` when available so the
+            planner gets a refine hook; falls back to a direct
+            ``_emit_drift_detected`` if the steerer doesn't expose
+            ``_handle_drift``. Failures swallowed — observability
+            cannot block the invocation, and the adapter's invoke loop
+            will break out on ``runaway_delegation_tripped`` regardless.
+            """
+            steerer = ctx.steerer
+            if steerer is None:
+                return
+            try:
+                from goldfive.types import (  # noqa: PLC0415 — lazy
+                    DriftEvent,
+                    DriftKind,
+                    DriftSeverity,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_emit_runaway_delegation_drift: cannot import types: %s",
+                    exc,
+                )
+                return
+
+            detail = (
+                f"AgentTool-per-invoke cap of {self._agent_tool_cap} "
+                f"exceeded (spawn #{spawn_count}); last delegation "
+                f"{from_agent or '?'} -> {to_agent or '?'} at invocation "
+                f"{invocation_id or '?'}"
+            )
+            drift = DriftEvent(
+                kind=DriftKind.RUNAWAY_DELEGATION,
+                severity=DriftSeverity.CRITICAL,
+                detail=detail,
+                current_task_id=task_id,
+                current_agent_id=from_agent or self._host_agent_name,
+            )
+            # Prefer _handle_drift so the full refine/emit path fires.
+            handle = getattr(steerer, "_handle_drift", None)
+            if callable(handle):
+                try:
+                    await handle(drift, ctx.session)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "_emit_runaway_delegation_drift: _handle_drift raised: %s",
+                        exc,
+                    )
+            # Fallback: direct sink emission.
+            sinks = getattr(steerer, "_sinks", None) or []
+            if not sinks:
+                return
+            try:
+                from goldfive.events import (  # noqa: PLC0415 — lazy
+                    drift_detected_event,
+                    emit,
+                )
+
+                run_id = str(_safe_attr(ctx.session, "run_id", "") or "")
+                try:
+                    seq = ctx.session.next_sequence()
+                except Exception:  # noqa: BLE001
+                    seq = 0
+                evt = drift_detected_event(run_id, seq, drift)
+                await emit(sinks, evt)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_emit_runaway_delegation_drift: direct sink emit failed: %s",
+                    exc,
+                )
+
         async def _emit_observability(self, kind: str, **fields: Any) -> None:
             """Fan out an observability event to the session's sinks.
 
@@ -990,11 +1103,13 @@ def make_adk_plugin(
                     return result
                 return {"acknowledged": True}
 
-            # AgentTool detection: emit DelegationObserved. We look both
-            # at the tool's class name (avoids an unconditional ADK
-            # import on module load) and its ``agent`` attribute so we
-            # catch wrapper / subclass shapes. Observability only — the
-            # tool still runs, so return None below.
+            # AgentTool detection. We look both at the tool's class
+            # name (avoids an unconditional ADK import on module load)
+            # and its ``agent`` attribute so we catch wrapper / subclass
+            # shapes. Two jobs here:
+            #   1. Emit DelegationObserved (observability).
+            #   2. Count toward the per-invocation AgentTool cap
+            #      (goldfive#130 runaway-delegation backstop).
             nested_agent = _safe_attr(tool, "agent", None)
             tool_cls_name = type(tool).__name__
             if nested_agent is not None or tool_cls_name == "AgentTool":
@@ -1012,6 +1127,42 @@ def make_adk_plugin(
                     task_id=task_id,
                     invocation_id=inv_id,
                 )
+
+                # Runaway-delegation cap. Count BEFORE short-circuiting
+                # so the drift fires exactly once at the threshold
+                # crossing; subsequent AgentTool calls in the same
+                # invocation return a short-circuit skipped dict so
+                # the runner wraps up quickly.
+                if self._agent_tool_cap > 0:
+                    self._agent_tool_spawn_count += 1
+                    if (
+                        self._agent_tool_spawn_count > self._agent_tool_cap
+                        and not self.runaway_delegation_tripped
+                    ):
+                        self.runaway_delegation_tripped = True
+                        await self._emit_runaway_delegation_drift(
+                            ctx=ctx,
+                            from_agent=from_agent,
+                            to_agent=to_agent,
+                            task_id=task_id,
+                            invocation_id=inv_id,
+                            spawn_count=self._agent_tool_spawn_count,
+                        )
+                    if self.runaway_delegation_tripped:
+                        # Short-circuit the spawn: return a skipped dict
+                        # so ADK does not drive the sub-agent. The
+                        # adapter's invoke loop notices the tripped
+                        # flag between events and breaks out.
+                        return {
+                            "skipped": True,
+                            "reason": "goldfive_runaway_delegation_cap",
+                            "tool_name": tool_name,
+                            "detail": (
+                                f"AgentTool-per-invoke cap of "
+                                f"{self._agent_tool_cap} exceeded "
+                                f"(spawn #{self._agent_tool_spawn_count})"
+                            ),
+                        }
                 # Fall through: AgentTool still runs, we're just observing.
 
             # Tool-level approval (Flow B). If the tool opts into

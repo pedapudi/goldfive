@@ -4,22 +4,38 @@ Wraps an ADK ``BaseAgent`` (or an existing ``Runner``) and conforms it
 to goldfive's :class:`~goldfive.protocols.AgentAdapter` protocol so
 goldfive's runner / executor / steerer can drive it uniformly.
 
+Single-Runner model (goldfive#130)
+----------------------------------
+
+``wrap(root)`` produces ONE :class:`~google.adk.runners.InMemoryRunner`
+around the caller-supplied root agent. ``ADKAdapter.invoke(task, ...)``
+drives that one runner. Delegation within the tree happens via ADK's
+native mechanisms (``AgentTool``, ``transfer_to_agent``, ``sub_agents``)
+— goldfive does not route tasks to per-agent runners.
+
+This is the revert of goldfive#120's registry-dispatch model. The
+dispatch-by-assignee approach broke the "one tree, one Runner" invariant
+that adk-web and harmonograf rely on, and the cascade of integration
+fixes (#121-#126, harmonograf#55/#57/#58) never fully closed the seam.
+The real root cause of the coordinator-looping regression that prompted
+#120 was the coordinator's **prompt** describing a pipeline — which is
+outside goldfive's control because users bring their own trees. The
+backstop is now an AgentTool-per-invoke cap enforced by the plugin
+(:class:`_GoldfiveADKPlugin`) — see ``agent_tool_cap`` below.
+
 Responsibilities:
 
 * **Reporting tool registration** — :meth:`ADKAdapter.register_reporting_tools`
   accepts goldfive :class:`~goldfive.reporting.ReportingToolSpec` values,
   wraps each as a ``google.adk.tools.FunctionTool`` around a thin sync
-  shim that just returns an acknowledgment, and attaches the tools to
-  the inner agent (plus every sub-agent reachable via ``sub_agents`` /
-  ``inner_agent`` / nested ``AgentTool.agent``). The plugin intercepts
-  calls to these tools in ``before_tool_callback`` and routes their
-  arguments to the spec's real handler — the in-process shim is never
-  actually executed by ADK.
-* **Invocation** — :meth:`ADKAdapter.invoke` stashes a
-  :class:`~._adk_plugin.SessionContext` onto ADK session state,
-  drives one turn via ``runner.run_async(...)``, consumes the event
-  stream to assemble an :class:`~goldfive.results.InvocationResult`,
-  and cleans the context back off.
+  shim, and attaches the tools to the root agent plus every sub-agent
+  reachable via ``sub_agents`` / ``inner_agent`` / nested ``AgentTool.agent``.
+  The plugin intercepts the calls in ``before_tool_callback`` and routes
+  their arguments to the spec's real handler.
+* **Invocation** — :meth:`ADKAdapter.invoke` hands a per-invocation
+  :class:`~._adk_plugin.SessionContext` to the plugin, drives one turn
+  via ``runner.run_async(...)``, consumes the event stream, and
+  returns an :class:`~goldfive.results.InvocationResult`.
 
 Optional dependency
 -------------------
@@ -59,6 +75,18 @@ except ImportError:  # pragma: no cover — covered in tests via importorskip
     raise ImportError("goldfive.adapters.adk requires 'pip install goldfive[adk]'") from None
 
 
+DEFAULT_AGENT_TOOL_CAP = 16
+"""Default per-invocation AgentTool-spawn cap for a single ``invoke``.
+
+The cap is enforced by :class:`~goldfive.adapters._adk_plugin._GoldfiveADKPlugin`
+and short-circuits an invocation that delegates more than this many
+times in a single turn. Picked to be comfortably higher than any
+legitimate coordinator pattern but well below ADK's 500-LLM-call
+ceiling — a runaway coordinator hits the cap in a handful of loops, not
+minutes of wasted LLM calls.
+"""
+
+
 def _build_ack_shim(name: str, description: str):
     """Return a sync function named ``name`` that returns an ACK dict.
 
@@ -88,7 +116,6 @@ def _build_function_tool(spec: ReportingToolSpec) -> Any:
 def _augment_subtree_with_reporting(root_agent: Any, tools: list[Any], tool_names: set[str]) -> int:
     """Append reporting ``tools`` to every agent reachable from ``root_agent``.
 
-    Ported from harmonograf's ``_register_harmonograf_reporting_tools_for_test``.
     Traverses three edges to cover the shapes goldfive must support:
 
     * ``sub_agents`` — native ADK agent tree.
@@ -97,6 +124,13 @@ def _augment_subtree_with_reporting(root_agent: Any, tools: list[Any], tool_name
 
     Idempotent: agents that already carry any of the canonical reporting
     tool names are skipped. Returns the number of agents touched.
+
+    This survives the goldfive#130 single-Runner revert because the
+    reporting-tool coverage contract is independent of runner topology —
+    every reachable agent needs to be able to call ``report_task_*``
+    regardless of who drives it. The augmentation is also what makes
+    early-exit on ``_task_is_terminal`` work inside an AgentTool
+    sub-invocation.
     """
     if root_agent is None or not tools:
         return 0
@@ -149,22 +183,22 @@ def _augment_subtree_with_reporting(root_agent: Any, tools: list[Any], tool_name
     return touched
 
 
-def _build_agent_registry(root_agent: Any) -> dict[str, Any]:
-    """Return ``name -> agent`` for every agent reachable from ``root_agent``.
+def _collect_reachable_agent_names(root_agent: Any) -> list[str]:
+    """Return the sorted unique names of every agent reachable from ``root_agent``.
 
-    Uses the same traversal :func:`_augment_subtree_with_reporting` uses
-    — follows ``sub_agents``, ``inner_agent``, and ``AgentTool.agent``
-    edges. Values are **references** to the caller's original agent
-    objects; the tree is never flattened or copied.
+    Follows ``sub_agents`` / ``inner_agent`` / ``AgentTool.agent`` edges
+    — the same traversal :func:`_augment_subtree_with_reporting` uses.
+    Used only to populate :attr:`ADKAdapter.available_agents` so the
+    planner can see the delegation targets available in the tree.
 
-    Raises :class:`ValueError` when two reachable agents share a name
-    (cannot disambiguate for assignee dispatch) or when an agent has no
-    usable ``name`` attribute.
+    Does NOT build a dispatch registry — under the single-Runner model
+    (goldfive#130) the adapter drives one runner and ADK handles
+    delegation. This is a shallow observation, not a routing seam.
     """
     if root_agent is None:
-        return {}
+        return []
 
-    registry: dict[str, Any] = {}
+    names: set[str] = set()
     seen: set[int] = set()
     stack: list[Any] = [root_agent]
     while stack:
@@ -174,14 +208,8 @@ def _build_agent_registry(root_agent: Any) -> dict[str, Any]:
         seen.add(id(cur))
 
         name = getattr(cur, "name", None)
-        if not isinstance(name, str) or not name:
-            raise ValueError(
-                f"ADKAdapter: agent {type(cur).__name__} has no usable "
-                f"name attribute — cannot register for dispatch"
-            )
-        if name in registry and registry[name] is not cur:
-            raise ValueError(f"duplicate agent name in tree: {name}")
-        registry[name] = cur
+        if isinstance(name, str) and name:
+            names.add(name)
 
         for sub in getattr(cur, "sub_agents", None) or ():
             stack.append(sub)
@@ -192,7 +220,7 @@ def _build_agent_registry(root_agent: Any) -> dict[str, Any]:
             nested = getattr(t, "agent", None)
             if nested is not None:
                 stack.append(nested)
-    return registry
+    return sorted(names)
 
 
 def _register_plugin_on_runner(runner: Any, plugin: Any) -> bool:
@@ -233,12 +261,11 @@ def _build_runner(agent: Any, plugins: list[Any] | None = None) -> Any:
     session-service bookkeeping.
 
     When ``plugins`` is a non-empty iterable, the plugin list is forwarded
-    to :class:`InMemoryRunner` via its ``plugins=`` kwarg. This is the
-    path goldfive uses to propagate caller-supplied observability plugins
-    (e.g. ``HarmonografTelemetryPlugin``) onto every per-agent sub-runner,
-    not just the coordinator — goldfive#121. Passing ``None`` or an empty
-    list omits the kwarg so we stay compatible with ADK versions that
-    constructed ``InMemoryRunner`` without a ``plugins`` parameter.
+    to :class:`InMemoryRunner` via its ``plugins=`` kwarg. Under the
+    single-Runner model there is exactly one runner, and ADK propagates
+    its plugin manager into any AgentTool-spawned sub-Runners
+    automatically — so installing the plugin here is sufficient for the
+    whole tree.
     """
     from google.adk.runners import InMemoryRunner  # type: ignore
 
@@ -291,10 +318,11 @@ def _task_is_terminal(task: Task, session: Session) -> bool:
     Reads status off the live ``session.plan`` entry (not the snapshot
     ``task`` object passed into ``invoke``) so transitions driven by
     reporting-tool handlers during the in-flight invocation are seen.
-
-    Uses :data:`goldfive.types.TERMINAL_TASK_STATUSES` — the single
-    source of truth shared with the steerer and the dispatch layer so a
-    new terminal status cannot silently diverge across modules.
+    Used as an early-exit optimization inside :meth:`ADKAdapter.invoke`
+    — generator-end on the runner is the authoritative termination
+    signal under the single-Runner model, but breaking early when the
+    agent reports terminal avoids letting an otherwise-chatty agent
+    keep driving LLM turns for a task it has already marked done.
     """
     task_id = getattr(task, "id", "") or ""
     if not task_id:
@@ -432,40 +460,41 @@ def _new_message_parts(task: Task) -> Any:
 class ADKAdapter:
     """``AgentAdapter`` for Google's Agent Development Kit.
 
+    Single-Runner model (goldfive#130). One ADK ``InMemoryRunner`` is
+    built around the caller-supplied root agent (or the caller's own
+    pre-built ``Runner`` in degraded mode). :meth:`invoke` drives that
+    one runner for every task; delegation within the tree happens via
+    ADK's native ``AgentTool`` / ``transfer_to_agent`` / ``sub_agents``
+    mechanisms.
+
     Parameters
     ----------
     agent_or_runner:
         Either an ADK ``BaseAgent`` (in which case an ``InMemoryRunner``
-        is constructed and used) or an already-built ``Runner``.
+        is constructed around it) or an already-built ``Runner``.
     user_id:
         Stable user id for ADK session lookup. Defaults to
         ``"goldfive_user"`` which is fine for local / single-user runs.
     session_id:
         Optional stable session id. When omitted the adapter mints a
-        fresh session id on first :meth:`invoke`. When set, the same id
-        is broadcast to every per-agent runner so telemetry / span
-        session-id stamping rolls up under one logical session (see
-        ``outer_session_id`` for the preferred spelling).
-    outer_session_id:
-        Optional preferred-spelling alias for ``session_id``. When
-        provided, pins the SHARED session id used for every per-agent
-        runner this adapter builds. Callers that want to anchor a full
-        adk-web run's telemetry under one harmonograf session id pass
-        the outer runner's session id here. Exactly one of
-        ``session_id`` / ``outer_session_id`` should be set; if both
-        are, ``outer_session_id`` wins.
+        fresh session id on first :meth:`invoke`.
     app_name:
         Optional ADK app_name override. Defaults to the runner's own
         ``app_name`` or the agent's ``name``.
     plugins:
-        Optional list of ADK ``BasePlugin`` instances to install on
-        every per-agent ``InMemoryRunner`` built by this adapter.
-        Observability plugins (e.g. ``HarmonografTelemetryPlugin``)
-        must land on sub-agent runners too — the top-level
-        ``App(plugins=[...])`` only covers the root runner, so
-        coordinator + ``AgentTool`` trees would otherwise emit
-        telemetry only for the coordinator's own invocations. See
-        goldfive#121.
+        Optional list of ADK ``BasePlugin`` instances to install on the
+        runner. Observability plugins (e.g. ``HarmonografTelemetryPlugin``)
+        are installed on the one runner; ADK propagates the plugin
+        manager to any ``AgentTool``-spawned sub-Runner so delegation
+        inherits the same plugin surface automatically.
+    agent_tool_cap:
+        Optional cap on the number of ``AgentTool`` spawns allowed in
+        a single top-level invocation. Defaults to
+        :data:`DEFAULT_AGENT_TOOL_CAP` (16). On exceed, the plugin
+        emits a ``RUNAWAY_DELEGATION`` drift and cancels the
+        invocation — belt-and-braces against runaway coordinators when
+        a user-supplied prompt describes a pipeline rather than a
+        task. Pass ``0`` or a negative value to disable.
     """
 
     def __init__(
@@ -474,59 +503,29 @@ class ADKAdapter:
         *,
         user_id: str = "goldfive_user",
         session_id: str | None = None,
-        outer_session_id: str | None = None,
         app_name: str | None = None,
         plugins: list[Any] | None = None,
+        agent_tool_cap: int | None = None,
     ) -> None:
-        # ------------------------------------------------------------------
-        # Registry-dispatch model (see docs/design/DISPATCH.md and the
-        # commit message for feat/registry-dispatch-model).
-        #
-        # A wrap target may be a tree — coordinator with AgentTool specialists,
-        # sub_agents, inner_agent wrappers, etc. Goldfive is the dispatch
-        # layer: every reachable agent is a dispatch target by name, and
-        # ``invoke(task)`` routes to ``registry[task.assignee_agent_id]``.
-        # The old "always invoke the root" design burned through ADK's
-        # 500-LLM-call ceiling when a coordinator had AgentTools, because
-        # the coordinator's LLM had to decide routing on every task and
-        # its AgentTool calls looped forever.
-        # ------------------------------------------------------------------
         self._user_id = user_id
-        # Caller-pinned outer session id, if any. ``outer_session_id``
-        # wins over the legacy ``session_id`` spelling when both are
-        # set. This id — or one minted lazily on first
-        # ``_ensure_session_for`` — is broadcast to every per-agent
-        # runner so telemetry rolls up under a single harmonograf
-        # session id (goldfive#123). Previously each per-agent runner
-        # got its OWN ``uuid.uuid4()`` session id, which the
-        # HarmonografTelemetryPlugin stamped onto spans — scattering
-        # one adk-web run's spans across 3+ UI sessions.
-        pinned_outer = outer_session_id if outer_session_id is not None else session_id
-        self._outer_session_id: str | None = pinned_outer
-        self._session_id = session_id  # legacy single-runner id; per-runner ids below
+        self._session_id = session_id
         self._degraded_prebuilt_runner = False
         # Caller-supplied ADK plugins (e.g. HarmonografTelemetryPlugin).
-        # Stored so EVERY per-agent runner constructed by this adapter
-        # receives them at ``InMemoryRunner`` construction time. Without
-        # this, the ADK ``App(plugins=[...])`` level only covers the
-        # coordinator's root runner and sub-agent dispatches (via
-        # ``AgentTool``) run through bare ``InMemoryRunner`` instances
-        # with no plugins attached — goldfive#121.
+        # ADK's InMemoryRunner forwards its plugin manager into
+        # AgentTool sub-Runners, so installing here covers the whole
+        # tree for the single-Runner model.
         self._plugins: list[Any] = list(plugins) if plugins else []
 
         if _looks_like_runner(agent_or_runner):
-            # Caller handed us an already-built Runner. We cannot derive
-            # a registry from that (only one runner, one root). Graceful
-            # degrade: single-entry registry, single-entry runners dict.
+            # Caller handed us an already-built Runner — use it verbatim.
             self._runner = agent_or_runner
             self._agent = getattr(agent_or_runner, "agent", None)
             if self._agent is None:
                 raise ValueError("ADKAdapter: could not resolve an inner agent")
             self._degraded_prebuilt_runner = True
-            log.warning(
-                "ADKAdapter: caller passed a pre-built Runner; per-task-"
-                "assignee dispatch is unavailable, all tasks will invoke "
-                "the runner's root_agent",
+            log.debug(
+                "ADKAdapter: caller passed a pre-built Runner; using it verbatim "
+                "(degraded mode — goldfive-specific runner construction skipped)",
             )
         else:
             self._agent = agent_or_runner
@@ -540,56 +539,37 @@ class ADKAdapter:
         )
 
         host_agent_name = str(getattr(self._agent, "name", "") or "")
-        self._plugin = make_adk_plugin(host_agent_name=host_agent_name)
+        cap = DEFAULT_AGENT_TOOL_CAP if agent_tool_cap is None else int(agent_tool_cap)
+        self._plugin = make_adk_plugin(
+            host_agent_name=host_agent_name,
+            agent_tool_cap=cap,
+        )
+        self._agent_tool_cap = cap
 
-        # Build the registry: name -> agent (a reference, not a copy).
-        # Also build the parallel runners dict: name -> InMemoryRunner.
-        # In degraded mode both dicts have exactly one entry pointing at
-        # the provided runner's root agent.
+        # Install the goldfive plugin on the one runner. ADK propagates
+        # the plugin manager into any AgentTool-spawned sub-Runner so the
+        # same ``_active_ctx`` is readable from nested invocations and
+        # ``before_run_callback`` fires against every sub-session's live
+        # state — which is what the state-protocol fix from #120 relies
+        # on (and is preserved here).
+        if not _register_plugin_on_runner(self._runner, self._plugin):
+            log.warning(
+                "ADKAdapter: could not attach plugin to runner — "
+                "reporting callbacks will be inactive",
+            )
+
+        # Collect the names of every reachable agent (via sub_agents /
+        # inner_agent / AgentTool.agent edges). Exposed as
+        # :attr:`available_agents` so the planner can see the
+        # delegation targets available in the tree. Not used for
+        # dispatch — the adapter drives the root runner and ADK handles
+        # delegation.
         if self._degraded_prebuilt_runner:
-            self._registry: dict[str, Any] = {
-                str(getattr(self._agent, "name", "") or host_agent_name or "goldfive"): self._agent,
-            }
-            self._runners: dict[str, Any] = {
-                next(iter(self._registry)): self._runner,
-            }
+            # With a pre-built runner we only know about the root agent.
+            root_name = str(getattr(self._agent, "name", "") or host_agent_name or "goldfive")
+            self._available_agents: list[str] = [root_name]
         else:
-            self._registry = _build_agent_registry(self._agent)
-            self._runners = {}
-            root_name = str(getattr(self._agent, "name", "") or "")
-            for agent_name, agent_ref in self._registry.items():
-                # Reuse the runner we already built for the wrap target
-                # instead of spinning up a fresh one. Avoids duplicating
-                # an InMemoryRunner + session service for the root and
-                # keeps tests that reach into ``adapter._runner`` working.
-                if agent_name == root_name and agent_ref is self._agent:
-                    self._runners[agent_name] = self._runner
-                else:
-                    self._runners[agent_name] = _build_runner(
-                        agent_ref, plugins=self._plugins
-                    )
-
-        # Install the goldfive plugin on EVERY runner. The plugin is a
-        # single shared instance — set_active_context() handoff works
-        # uniformly, and AgentTool sub-Runners inherit the parent's
-        # plugin manager so the same _active_ctx is readable from
-        # nested invocations (ADK's AgentTool passes
-        # ``tool_context._invocation_context.plugin_manager.plugins``
-        # through to the sub-Runner).
-        for agent_name, runner in self._runners.items():
-            if not _register_plugin_on_runner(runner, self._plugin):
-                log.warning(
-                    "ADKAdapter: could not attach plugin to runner for %r — "
-                    "reporting callbacks on that agent will be inactive",
-                    agent_name,
-                )
-
-        # Per-agent session ids. Each per-agent runner has its own
-        # InMemorySessionService (constructed by InMemoryRunner.__init__),
-        # so session lookup must be per-runner. Built lazily on first
-        # invoke() against that runner — avoids eagerly creating ADK
-        # sessions for agents that never get dispatched to.
-        self._session_ids: dict[str, str] = {}
+            self._available_agents = _collect_reachable_agent_names(self._agent)
 
         # tool_name -> handler. Populated by register_reporting_tools.
         self._tool_handlers: dict[str, Any] = {}
@@ -597,8 +577,6 @@ class ADKAdapter:
         # ``before_tool_callback`` routes each call through
         # :func:`goldfive.adapters._tool_invocation.invoke_tool` so the
         # terminal-rejection / idempotency / loop-guard layers fire.
-        # Keeping the full spec list (not just handlers) is what wires
-        # those protections in — a bare handler map would bypass them.
         self._tool_specs: list[ReportingToolSpec] = []
         # The current Steerer. Set by bind_steerer() before invoke().
         self._steerer: Steerer | None = None
@@ -612,51 +590,36 @@ class ADKAdapter:
         self._pending_tool_call_ids: set[str] = set()
         self._pending_tool_call_names: dict[str, str] = {}
 
-        # Wrap-time integrity check: every per-agent runner must carry
-        # the goldfive plugin. Guards against future ADK / goldfive
-        # changes silently shipping broken wrap behaviour where a
-        # runner's plugin_manager shape becomes incompatible with
-        # :func:`_register_plugin_on_runner`. In degraded mode (caller
-        # passed a pre-built Runner) we skip because the caller may have
-        # constructed a runner shape we don't fully control.
+        # Wrap-time integrity check: the one runner must carry the
+        # goldfive plugin. In degraded mode we skip because the caller
+        # may have constructed a runner shape we don't fully control.
         if not self._degraded_prebuilt_runner:
             plugin_name = getattr(self._plugin, "name", "")
-            for agent_name, runner in self._runners.items():
-                installed = list(getattr(getattr(runner, "plugin_manager", None), "plugins", []))
-                if not any(getattr(p, "name", "") == plugin_name for p in installed):
-                    raise RuntimeError(
-                        f"ADKAdapter: goldfive plugin {plugin_name!r} failed to "
-                        f"install on runner for agent {agent_name!r} — "
-                        f"reporting callbacks, state-protocol writes, and drift "
-                        f"observation would all be broken"
-                    )
+            installed = list(getattr(getattr(self._runner, "plugin_manager", None), "plugins", []))
+            if not any(getattr(p, "name", "") == plugin_name for p in installed):
+                raise RuntimeError(
+                    f"ADKAdapter: goldfive plugin {plugin_name!r} failed to "
+                    f"install on the runner — reporting callbacks, "
+                    f"state-protocol writes, and drift observation would all "
+                    f"be broken"
+                )
 
     # ------------------------------------------------------------------
     # Post-construction plugin install
     # ------------------------------------------------------------------
 
     def add_plugin(self, plugin: Any) -> None:
-        """Install an ADK ``BasePlugin`` on every per-agent ``Runner``.
+        """Install an ADK ``BasePlugin`` on the runner.
 
-        Under the registry-dispatch model there is one runner per
-        reachable agent; an observability plugin must install on all of
-        them to see every dispatch. Tolerant of runners that don't
-        expose a plugin manager — logs at DEBUG and continues.
+        Under the single-Runner model there is one runner; caller
+        plugins install once and ADK propagates the plugin manager into
+        any ``AgentTool``-spawned sub-Runner automatically. Tolerant of
+        runners that don't expose a plugin manager — logs at DEBUG and
+        continues.
         """
-        any_installed = False
-        for agent_name, runner in self._runners.items():
-            if _register_plugin_on_runner(runner, plugin):
-                any_installed = True
-            else:
-                log.debug(
-                    "ADKAdapter.add_plugin: runner for %r has no plugin manager; "
-                    "plugin %r not installed",
-                    agent_name,
-                    type(plugin).__name__,
-                )
-        if not any_installed:
+        if not _register_plugin_on_runner(self._runner, plugin):
             log.debug(
-                "ADKAdapter.add_plugin: no runner accepted plugin %r",
+                "ADKAdapter.add_plugin: runner has no plugin manager; plugin %r not installed",
                 type(plugin).__name__,
             )
 
@@ -666,22 +629,27 @@ class ADKAdapter:
 
     @property
     def available_agents(self) -> list[str]:
-        """Return the names of agents reachable from the root agent.
+        """Return the sorted names of agents reachable from the root agent.
 
-        Sorted so callers (planner, UI) see a deterministic list. Source
-        of truth is :attr:`_registry`, populated once at wrap time by
-        :func:`_build_agent_registry`.
+        Reports the names the planner may reference in
+        ``task.assignee_agent_id`` for observability and for the
+        planner's own delegation hints. Under the single-Runner model
+        the field is advisory — goldfive drives the root runner and
+        ADK handles delegation through its native mechanisms
+        (AgentTool, transfer_to_agent, sub_agents).
         """
-        return sorted(self._registry)
+        return list(self._available_agents)
 
     async def register_reporting_tools(self, tools: list[ReportingToolSpec]) -> None:
         """Register goldfive reporting tools with the wrapped agent tree.
 
-        Each spec is wrapped as a ``google.adk.tools.FunctionTool`` (via
-        a stub ACK shim) and attached to the inner agent and every
-        sub-agent reachable via :func:`_augment_subtree_with_reporting`.
-        The spec's handler is stored in :attr:`_tool_handlers`; the
-        plugin's ``before_tool_callback`` routes real calls to it.
+        Each spec is wrapped as a ``google.adk.tools.FunctionTool`` and
+        attached to the root agent plus every sub-agent reachable via
+        :func:`_augment_subtree_with_reporting`. Coverage across the
+        whole tree matters because an AgentTool sub-invocation can
+        itself report terminal status for the outer task — so every
+        reachable agent needs the reporting tools available regardless
+        of which one drives each turn.
         """
         if not tools:
             return
@@ -701,7 +669,7 @@ class ADKAdapter:
         # (re-bind on a new run) stay consistent with the handler map.
         self._tool_specs = list(tools)
 
-        # Attach to the inner agent itself (root), then the whole subtree.
+        # Attach to the root agent itself, then the whole subtree.
         root_tools = getattr(self._agent, "tools", None)
         if root_tools is None:
             try:
@@ -730,39 +698,54 @@ class ADKAdapter:
 
         _augment_subtree_with_reporting(self._agent, function_tools, names)
 
-        # Wrap-time integrity check: every registry agent must carry the
-        # set of names we just registered. A regression here would mean
-        # some agent was reachable in the tree (and could therefore be
-        # dispatched to by task.assignee_agent_id) but couldn't report
-        # terminal status back to goldfive — that task would never
-        # complete and the executor would spin until
-        # max_task_invocations. We check for EVERY registered name, not
-        # just a canonical one, so a partial augmentation is caught.
+        # Integrity: every reachable agent must carry the reporting tool
+        # names we just registered. A partial augmentation leaves a
+        # sub-agent with no way to report terminal status back — if a
+        # coordinator delegates to it via AgentTool, the outer task
+        # cannot finish via the early-exit optimization. Degraded mode
+        # (pre-built Runner) skips this because we only see the root.
         if not self._degraded_prebuilt_runner and names:
             missing: list[tuple[str, set[str]]] = []
-            for agent_name, agent in self._registry.items():
-                agent_tools = list(getattr(agent, "tools", None) or [])
-                tool_names_on_agent: set[str] = set()
-                for t in agent_tools:
-                    n = getattr(t, "name", None) or getattr(
-                        getattr(t, "func", None), "__name__", None
-                    )
-                    if n:
-                        tool_names_on_agent.add(str(n))
-                gap = names - tool_names_on_agent
-                if gap:
-                    missing.append((agent_name, gap))
+            seen: set[int] = set()
+            stack: list[Any] = [self._agent]
+            while stack:
+                cur = stack.pop()
+                if cur is None or id(cur) in seen:
+                    continue
+                seen.add(id(cur))
+                agent_name = str(getattr(cur, "name", "") or "")
+                agent_tools = list(getattr(cur, "tools", None) or [])
+                if agent_tools:
+                    tool_names_on_agent: set[str] = set()
+                    for t in agent_tools:
+                        n = getattr(t, "name", None) or getattr(
+                            getattr(t, "func", None), "__name__", None
+                        )
+                        if n:
+                            tool_names_on_agent.add(str(n))
+                    gap = names - tool_names_on_agent
+                    if gap and agent_name:
+                        missing.append((agent_name, gap))
+                for sub in getattr(cur, "sub_agents", None) or ():
+                    stack.append(sub)
+                inner = getattr(cur, "inner_agent", None)
+                if inner is not None:
+                    stack.append(inner)
+                for t in getattr(cur, "tools", None) or ():
+                    nested = getattr(t, "agent", None)
+                    if nested is not None:
+                        stack.append(nested)
             if missing:
                 details = ", ".join(
                     f"{name}: missing {sorted(gap)}" for name, gap in sorted(missing)
                 )
                 raise RuntimeError(
                     f"ADKAdapter: reporting-tool set did not land on "
-                    f"{len(missing)} registry agent(s): {details}. "
+                    f"{len(missing)} reachable agent(s): {details}. "
                     f"Expected every reachable agent to carry the "
-                    f"reporting tools registered on this adapter so "
-                    f"terminal status can flow back from any dispatch "
-                    f"target. See _augment_subtree_with_reporting."
+                    f"reporting tools so terminal status can flow back "
+                    f"from an AgentTool sub-invocation. See "
+                    f"_augment_subtree_with_reporting."
                 )
 
     def bind_steerer(self, steerer: Steerer | None) -> None:
@@ -783,14 +766,7 @@ class ADKAdapter:
         provider: str = "",
         call_id: str = "",  # noqa: ARG002 -- part of the protocol
     ) -> None:
-        """Forward an extracted reasoning block to the bound steerer.
-
-        Normally the ADK plugin's ``after_model_callback`` extracts
-        reasoning and calls ``steerer.observe_reasoning`` directly; this
-        method is the public protocol-level entry point so callers that
-        wire reasoning through the adapter (tests, custom executors)
-        don't need to reach into the plugin internals.
-        """
+        """Forward an extracted reasoning block to the bound steerer."""
         steerer = self._steerer
         if steerer is None or not text:
             return
@@ -802,24 +778,30 @@ class ADKAdapter:
     async def invoke(self, task: Task, session: Session) -> InvocationResult:
         """Drive one ADK turn for ``task`` and return the result.
 
-        Under the registry-dispatch model, the runner driven is the one
-        registered under ``task.assignee_agent_id``. An empty assignee
-        dispatches to the wrap-target root agent (same agent the
-        coordinator-routing model used as the single invocation target).
+        Single-Runner model: the one runner around the root agent is
+        driven for every task. Delegation within the tree happens via
+        ADK's native ``AgentTool`` / ``transfer_to_agent`` / ``sub_agents``
+        mechanisms. ``task.assignee_agent_id`` is carried on the task
+        but not used for routing — the planner may populate it for
+        observability and for delegation hints inside the agent's
+        prompt, but the adapter does not route.
 
-        Cancellation note: the asyncio task running ``invoke()`` has its
+        Three break conditions preserved:
+
+        * ``_task_is_terminal(task, session)`` — the agent reported
+          terminal via a reporting tool. Early-exit optimization.
+        * ``_is_final_event(event)`` — ADK's final-response flag.
+        * Generator end on ``runner.run_async`` natural completion —
+          the authoritative termination signal.
+
+        Cancellation: the asyncio task running ``invoke()`` has its
         cancellation propagate naturally through ``runner.run_async()``
         generator awaits, INCLUDING nested AgentTool sub-Runner awaits.
-        No code change is needed here — the existing
-        ``except asyncio.CancelledError`` + ``_heal_pending_tool_calls``
-        block handles it.
         """
         task_id = getattr(task, "id", "") or ""
 
-        # Registry dispatch: resolve the assignee to a per-agent runner.
-        runner, dispatched_agent_name = self._resolve_runner_for_task(task)
-        session_id = await self._ensure_session_for(dispatched_agent_name)
-        state = await self._get_session_state_for(dispatched_agent_name, session_id)
+        session_id = await self._ensure_session()
+        state = await self._get_session_state(session_id)
 
         ctx = SessionContext(
             session=session,
@@ -827,26 +809,24 @@ class ADKAdapter:
             task=task,
             tool_handlers=self._tool_handlers,
             tools=self._tool_specs,
-            host_agent_name=dispatched_agent_name,
+            host_agent_name=str(getattr(self._agent, "name", "") or ""),
         )
 
         # Hand the per-invocation context to the goldfive plugin. This
         # is the AUTHORITATIVE handoff — the plugin's callbacks read the
         # active context off its own instance, not from ADK session
-        # state. The authoritative state-protocol write (run_id, plan,
-        # current task, tools) happens inside the plugin's
-        # ``before_run_callback`` against the LIVE invocation session,
-        # not from this method any more. See the commit message for
-        # feat/registry-dispatch-model for the "why".
+        # state. The state-protocol write (run_id, plan, current task,
+        # tools) happens inside the plugin's ``before_run_callback``
+        # against the LIVE invocation session — which is the #120 state-
+        # protocol fix, preserved here.
         if self._plugin is not None:
             self._plugin.set_active_context(ctx)
 
         # Mirror into ADK state as a best-effort fallback for legacy
         # unit tests that construct a plain ``tool_context`` holding a
-        # populated state dict and drive the plugin directly (see
-        # ``tests/test_adk_adapter.py``). The live-run path does not
-        # depend on this write succeeding and will re-seed via
-        # before_run_callback regardless.
+        # populated state dict and drive the plugin directly. Live-run
+        # path does not depend on this write succeeding and will re-seed
+        # via before_run_callback regardless.
         try:
             state[SESSION_CONTEXT_STATE_KEY] = ctx  # type: ignore[index]
         except Exception:
@@ -857,17 +837,13 @@ class ADKAdapter:
         err: Exception | None = None
         last_event: Any = None
         last_invocation_id = ""
-        # Reset per-invocation pending-id bookkeeping. An adapter is
-        # typically single-shot per invoke() so there shouldn't be
-        # leftover state, but be defensive — if a prior invoke()
-        # returned early without healing (shouldn't happen), we'd
-        # otherwise synthesize stale responses now.
+        # Reset per-invocation pending-id bookkeeping.
         self._pending_tool_call_ids.clear()
         self._pending_tool_call_names.clear()
         was_cancelled = False
         try:
             new_message = _new_message_parts(task)
-            async for event in runner.run_async(
+            async for event in self._runner.run_async(
                 user_id=self._user_id,
                 session_id=session_id,
                 new_message=new_message,
@@ -885,30 +861,29 @@ class ADKAdapter:
                 for fr_id in _function_response_ids_in_event(event):
                     self._pending_tool_call_ids.discard(fr_id)
                     self._pending_tool_call_names.pop(fr_id, None)
+                # Runaway-delegation cap: the plugin counts AgentTool
+                # spawns on the current top-level invocation. On exceed
+                # it requests a cancel; detect that signal here so we
+                # break cleanly (the plugin has already emitted the
+                # RUNAWAY_DELEGATION drift).
+                if self._plugin is not None and self._plugin.runaway_delegation_tripped:
+                    stop_reason = "runaway_delegation"
+                    break
                 text = _extract_text_from_event(event)
                 if text:
                     final_text = text
                 if _is_final_event(event):
                     stop_reason = "final_response"
                 # Early termination when the agent has reported this task
-                # as terminal (COMPLETED/FAILED/CANCELLED) via a reporting
-                # tool. Without this, the ADK generator keeps running —
-                # letting the agent take more LLM turns on an already-done
-                # task and burn through ADK's 500-LLM-call ceiling
-                # reporting redundant status. Breaking closes the
-                # generator cleanly so control returns to the executor
-                # which routes to the next pending task.
+                # as terminal via a reporting tool.
                 if _task_is_terminal(task, session):
                     stop_reason = "task_terminal"
                     break
         except asyncio.CancelledError:
             was_cancelled = True
             stop_reason = "cancelled"
-            # Heal session history BEFORE re-raising so the next
-            # invoke() doesn't hit a "Missing tool results for
-            # tool_call_id(s)" from LiteLLM / underlying providers.
             await self._heal_pending_tool_calls(
-                runner=runner,
+                runner=self._runner,
                 session_id=session_id,
                 invocation_id=last_invocation_id,
                 reason="cancelled_mid_invocation",
@@ -918,22 +893,14 @@ class ADKAdapter:
             err = exc
             stop_reason = f"error:{type(exc).__name__}"
             log.debug("ADKAdapter.invoke: runner.run_async raised: %s", exc)
-            # Also heal on non-cancel exceptions — the same malformed-
-            # history symptom can surface if the runner raises partway
-            # through a tool round-trip (e.g. provider 5xx between
-            # function_call and function_response).
             await self._heal_pending_tool_calls(
-                runner=runner,
+                runner=self._runner,
                 session_id=session_id,
                 invocation_id=last_invocation_id,
                 reason=f"error:{type(exc).__name__}",
             )
         finally:
             if not was_cancelled:
-                # On normal completion there should be nothing pending,
-                # but if the stream ended with an orphan call (unusual —
-                # e.g. runner yielded a final event without the matching
-                # tool response) heal it so the next turn isn't poisoned.
                 if self._pending_tool_call_ids:
                     log.warning(
                         "ADKAdapter.invoke: %d function_call id(s) ended without "
@@ -941,15 +908,11 @@ class ADKAdapter:
                         len(self._pending_tool_call_ids),
                     )
                     await self._heal_pending_tool_calls(
-                        runner=runner,
+                        runner=self._runner,
                         session_id=session_id,
                         invocation_id=last_invocation_id,
                         reason="unexpected_orphan_on_normal_exit",
                     )
-            # Release the plugin-instance handoff so a subsequent
-            # ``invoke`` on a different task gets a clean setup and a
-            # stray callback arriving after the generator closes does
-            # not see a stale ctx. Mirrors the state-dict cleanup below.
             if self._plugin is not None:
                 self._plugin.clear_active_context()
             if isinstance(state, Mapping):
@@ -970,150 +933,54 @@ class ADKAdapter:
     # Session plumbing
     # ------------------------------------------------------------------
 
-    def _resolve_runner_for_task(self, task: Task) -> tuple[Any, str]:
-        """Return ``(runner, agent_name)`` for ``task.assignee_agent_id``.
+    async def _ensure_session(self) -> str:
+        """Return the ADK session id for the runner.
 
-        In degraded mode (caller passed a pre-built Runner) the lookup
-        always returns ``self._runner`` regardless of the assignee — the
-        mismatch is logged at DEBUG so it's visible but non-fatal.
-
-        Empty assignee (``task.assignee_agent_id == ""``) falls back to
-        the root agent's runner. This preserves the single-agent wrap
-        contract where a plain ``goldfive.wrap(agent)`` with a planner
-        that doesn't populate assignee still dispatches cleanly to the
-        wrapped agent.
-
-        Raises :class:`ValueError` with an ``available:`` hint when the
-        assignee is set but is not in the registry — fail fast on the
-        planner so the mismatch shows up as a clear error, not as a
-        silent fallback that drives the wrong agent.
+        Mints one lazily on first call when the caller didn't pin one
+        via ``session_id=``. Cached on ``self._session_id`` after the
+        first call so every subsequent :meth:`invoke` reuses it — the
+        whole run rolls up under one logical session.
         """
-        assignee = str(getattr(task, "assignee_agent_id", "") or "")
+        if self._session_id:
+            # Ensure the session exists on the runner's service. Safe to
+            # call repeatedly; create_session is typically idempotent
+            # for a given (app_name, user_id, session_id) triple and we
+            # swallow any conflict so tests that pre-create the session
+            # keep working.
+            await self._touch_session(self._session_id)
+            return self._session_id
 
-        if self._degraded_prebuilt_runner:
-            dispatched = next(iter(self._registry), "")
-            if assignee and assignee != dispatched:
-                log.debug(
-                    "ADKAdapter.invoke: degraded pre-built Runner mode — "
-                    "task %r assignee %r does not match root-agent name %r; "
-                    "dispatching to the pre-built runner regardless",
-                    getattr(task, "id", "?"),
-                    assignee,
-                    dispatched,
-                )
-            return self._runner, dispatched
+        self._session_id = str(uuid.uuid4())
+        await self._touch_session(self._session_id)
+        return self._session_id
 
-        if not assignee:
-            # Empty assignee: dispatch to the wrap-target root.
-            root_name = str(getattr(self._agent, "name", "") or "")
-            if root_name in self._runners:
-                return self._runners[root_name], root_name
-            # Fallback: first registered agent. Should never happen for
-            # a well-formed tree but degrades instead of raising.
-            first = next(iter(self._runners))
-            return self._runners[first], first
+    async def _touch_session(self, session_id: str) -> None:
+        """Best-effort ``create_session`` on the runner's session service.
 
-        runner = self._runners.get(assignee)
-        if runner is None:
-            raise ValueError(
-                f"plan assigned task {getattr(task, 'id', '?')!r} to "
-                f"unknown agent {assignee!r}; available: {sorted(self._runners)}"
-            )
-        return runner, assignee
-
-    async def _ensure_session_for(self, agent_name: str) -> str:
-        """Return the ADK session id for ``agent_name``'s runner.
-
-        All per-agent runners share ONE logical session id string
-        (goldfive#123). Each :class:`InMemoryRunner` still carries its
-        own :class:`InMemorySessionService`, so session objects remain
-        distinct per service — they just share an id string. This is
-        safe because ADK looks sessions up as
-        ``(app_name, user_id, session_id)`` against a single
-        per-runner service; sharing the id across runners does NOT
-        create cross-service collisions.
-
-        Why uniform: :class:`HarmonografTelemetryPlugin` (and similar
-        telemetry plugins) stamp ``ctx.session.id`` onto every span.
-        When sub-agent runners each minted their own ``uuid.uuid4()``
-        id, a single adk-web run's spans scattered across 3+ UI
-        session ids — breaking the Gantt roll-up. With a shared id,
-        all of a run's spans land under one harmonograf session.
-
-        The shared id is resolved in this order:
-
-        1. A caller-pinned ``outer_session_id`` / legacy
-           ``session_id`` (``self._outer_session_id``) — used as-is.
-        2. Otherwise, lazily mint ONE ``uuid.uuid4()`` on first call
-           and cache it on ``self._outer_session_id``. Subsequent
-           ``_ensure_session_for(...)`` calls reuse it.
-
-        For each distinct ``agent_name``, we still call
-        ``create_session`` once on that runner's session service
-        (which is what ADK's ``run_async`` needs for a successful
-        dispatch). We just pass the SHARED id as the ``session_id``
-        kwarg.
+        Idempotent: swallow exceptions so repeated calls against a
+        pre-existing session don't raise. Session services that don't
+        expose ``create_session`` (e.g. some test stubs) are skipped.
         """
-        existing = self._session_ids.get(agent_name)
-        if existing:
-            return existing
-
-        # Resolve the shared outer session id exactly once per adapter.
-        # After this block ``self._outer_session_id`` is non-empty.
-        #
-        # Legacy back-compat: older tests set
-        # ``adapter._session_id = "stub-session"`` AFTER construction,
-        # before the first invoke(). Honor that post-ctor mutation
-        # when no outer id has been resolved yet.
-        if not self._outer_session_id:
-            if self._session_id:
-                self._outer_session_id = self._session_id
-            else:
-                self._outer_session_id = str(uuid.uuid4())
-        shared_id = self._outer_session_id
-
-        runner = self._runners.get(agent_name, self._runner)
-        # IMPORTANT: use the per-runner app_name for session creation,
-        # not the adapter-wide one. Each per-agent ``InMemoryRunner`` is
-        # constructed with its own ``app_name`` (the agent's own name
-        # in ``_build_runner``). ADK's :meth:`Runner.run_async`
-        # internally looks sessions up by the runner's own app_name, so
-        # creating under a different ``app_name`` here produces the
-        # "Session not found" dispatch error we hit during the first
-        # integration pass.
-        app_name = str(getattr(runner, "app_name", "") or "") or self._app_name
-        session_service = getattr(runner, "session_service", None)
+        session_service = getattr(self._runner, "session_service", None)
         if session_service is None:
-            self._session_ids[agent_name] = shared_id
-            return shared_id
-
+            return
+        create = getattr(session_service, "create_session", None)
+        if not callable(create):
+            return
+        app_name = str(getattr(self._runner, "app_name", "") or "") or self._app_name
         try:
-            create = getattr(session_service, "create_session", None)
-            if callable(create):
-                coro = create(
-                    app_name=app_name,
-                    user_id=self._user_id,
-                    session_id=shared_id,
-                )
-                if hasattr(coro, "__await__"):
-                    await coro
+            coro = create(
+                app_name=app_name,
+                user_id=self._user_id,
+                session_id=session_id,
+            )
+            if hasattr(coro, "__await__"):
+                await coro
         except Exception as exc:  # noqa: BLE001
             log.debug(
-                "ADKAdapter._ensure_session_for(%s): create_session raised: %s",
-                agent_name,
+                "ADKAdapter._touch_session: create_session raised: %s",
                 exc,
             )
-        self._session_ids[agent_name] = shared_id
-        return shared_id
-
-    # Legacy shim for tests that called ``_ensure_session()`` directly
-    # before the registry-dispatch refactor. Maps to the root agent's
-    # runner session.
-    async def _ensure_session(self) -> str:
-        root_name = str(getattr(self._agent, "name", "") or "")
-        if root_name not in self._runners:
-            root_name = next(iter(self._runners), "")
-        return await self._ensure_session_for(root_name or "root")
 
     async def _heal_pending_tool_calls(
         self,
@@ -1132,17 +999,6 @@ class ADKAdapter:
         session via ``session_service.append_event``. Best-effort: logs and
         swallows individual failures so healing one orphan doesn't block
         the others.
-
-        Investigated alternatives:
-
-        * ADK does not expose a higher-level "heal session" helper.
-          ``BaseSessionService.append_event`` is the public path used by
-          :class:`~google.adk.runners.Runner` itself (see
-          ``runners.py:1024`` and ``:857``).
-        * We intentionally don't re-enter ``runner.run_async`` with a
-          synthetic user message because the runner would then try to
-          drive another LLM turn, which is exactly what we're trying to
-          avoid after a cancel.
         """
         if not self._pending_tool_call_ids:
             return
@@ -1236,16 +1092,15 @@ class ADKAdapter:
         self._pending_tool_call_ids.clear()
         self._pending_tool_call_names.clear()
 
-    async def _get_session_state_for(self, agent_name: str, session_id: str) -> Any:
-        """Fetch the ADK session's state dict for ``agent_name``'s runner."""
-        runner = self._runners.get(agent_name, self._runner)
-        session_service = getattr(runner, "session_service", None)
+    async def _get_session_state(self, session_id: str) -> Any:
+        """Fetch the ADK session's state dict for the runner."""
+        session_service = getattr(self._runner, "session_service", None)
         if session_service is None:
             return {}
         get = getattr(session_service, "get_session", None)
         if not callable(get):
             return {}
-        app_name = str(getattr(runner, "app_name", "") or "") or self._app_name
+        app_name = str(getattr(self._runner, "app_name", "") or "") or self._app_name
         try:
             coro = get(
                 app_name=app_name,
@@ -1258,8 +1113,7 @@ class ADKAdapter:
                 session = coro
         except Exception as exc:  # noqa: BLE001
             log.debug(
-                "ADKAdapter._get_session_state_for(%s): get_session raised: %s",
-                agent_name,
+                "ADKAdapter._get_session_state: get_session raised: %s",
                 exc,
             )
             return {}
@@ -1267,12 +1121,3 @@ class ADKAdapter:
         if state is None:
             return {}
         return state
-
-    # Legacy shim preserved for tests that called
-    # ``_get_session_state(session_id)`` directly. Maps to the root
-    # agent's runner.
-    async def _get_session_state(self, session_id: str) -> Any:
-        root_name = str(getattr(self._agent, "name", "") or "")
-        if root_name not in self._runners:
-            root_name = next(iter(self._runners), "")
-        return await self._get_session_state_for(root_name or "root", session_id)
