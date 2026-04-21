@@ -676,3 +676,255 @@ async def test_parallel_all_goals_met_returns_success() -> None:
     assert calls == ["a", "b"]
     kinds = _proto_kinds(sink.events)
     assert kinds[-1] == "RunCompleted"
+
+
+# ---------------------------------------------------------------------------
+# Recovery-path hardening (goldfive#134)
+#
+# These tests pin the "silent-fallback no more" contract: when
+# ``planner.refine`` raises, returns None, or returns a plan that fails
+# structural validation, the parallel executor must emit a CRITICAL
+# follow-up DriftDetected and (after REFINE_FAILURE_THRESHOLD
+# consecutive failures for the same (kind, task)) abort the run instead
+# of silently re-entering the next stage with the unchanged plan. A
+# failure inside the steerer's observe path must likewise emit an INFO
+# CUSTOM drift instead of being swallowed.
+# ---------------------------------------------------------------------------
+
+
+def _drift_detected_events(sink: NoopSink) -> list[Any]:
+    return [
+        e
+        for e in sink.events
+        if hasattr(e, "WhichOneof") and e.WhichOneof("payload") == "drift_detected"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refine_raise_emits_critical_follow_up_drift() -> None:
+    """planner.refine raising must emit a CRITICAL ``refine failed`` drift."""
+    drift = DriftEvent(
+        kind=DriftKind.PLAN_DIVERGENCE,
+        severity=DriftSeverity.WARNING,
+        detail="C diverged",
+        current_task_id="C",
+    )
+    adapter = TracingAdapter(delay=0.005, drift_for={"C": drift})
+
+    class RaisingPlanner(RecordingPlanner):
+        async def refine(self, *, plan: Plan, drift: DriftEvent, goals) -> Plan | None:
+            self.refine_calls.append(drift)
+            raise RuntimeError("LLM transient failure")
+
+    planner = RaisingPlanner()
+    sink = NoopSink()
+    executor = ParallelDAGExecutor(max_concurrency=0, drift_policy="finish_stage")
+    outcome = await executor.run(
+        plan=_diamond_plan(),
+        session=_new_session(),
+        adapter=adapter,
+        steerer=RecordingSteerer(),
+        planner=planner,
+        sinks=[sink],
+    )
+
+    # Drift surfaced (WARNING) -> refine raised -> follow-up CRITICAL
+    # DriftDetected should be on the sink.
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    drifts = _drift_detected_events(sink)
+    assert drifts, "expected at least one DriftDetected event"
+    critical = [
+        e
+        for e in drifts
+        if e.drift_detected.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+        and "refine failed" in e.drift_detected.detail
+    ]
+    assert critical, (
+        "expected a CRITICAL 'refine failed' DriftDetected after "
+        "planner.refine raised; got details="
+        f"{[e.drift_detected.detail for e in drifts]}"
+    )
+    assert "LLM transient failure" in critical[-1].drift_detected.detail
+    # Run itself proceeded (the refine failure did not cascade into an
+    # abort because the threshold wasn't exceeded).
+    assert outcome is not None
+
+
+@pytest.mark.asyncio
+async def test_refine_returns_invalid_plan_emits_follow_up_drift() -> None:
+    """planner.refine returning a garbage plan must not be silently applied.
+
+    Mirrors the exact failure mode #133 describes (validation rejects
+    the LLM's revised plan, steerer falls back silently) but at the
+    parallel executor layer, which previously skipped validation
+    entirely.
+    """
+    drift = DriftEvent(
+        kind=DriftKind.PLAN_DIVERGENCE,
+        severity=DriftSeverity.WARNING,
+        detail="C diverged",
+        current_task_id="C",
+    )
+    adapter = TracingAdapter(delay=0.005, drift_for={"C": drift})
+
+    # A structurally broken plan: an edge pointing at an id that
+    # doesn't exist in ``tasks``. ``Plan.validate`` rejects this.
+    bad_plan = Plan(
+        id="plan-bad",
+        run_id="run-1",
+        goal_ids=[],
+        tasks=[Task(id="A", title="A", status=TaskStatus.COMPLETED)],
+        edges=[TaskEdge(from_task_id="A", to_task_id="does-not-exist")],
+        revision_index=1,
+    )
+    planner = RecordingPlanner(refined_plan=bad_plan)
+    sink = NoopSink()
+    executor = ParallelDAGExecutor(max_concurrency=0, drift_policy="finish_stage")
+
+    await executor.run(
+        plan=_diamond_plan(),
+        session=_new_session(),
+        adapter=adapter,
+        steerer=RecordingSteerer(),
+        planner=planner,
+        sinks=[sink],
+    )
+
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    drifts = _drift_detected_events(sink)
+    critical = [
+        e
+        for e in drifts
+        if e.drift_detected.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+        and "refine failed" in e.drift_detected.detail
+        and "validation" in e.drift_detected.detail.lower()
+    ]
+    assert critical, (
+        "expected a CRITICAL 'refine failed: plan validation failed' drift; "
+        f"got details={[e.drift_detected.detail for e in drifts]}"
+    )
+    # The executor did NOT install the garbage plan.
+    kinds = _proto_kinds(sink.events)
+    assert "PlanRevised" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_repeated_refine_failure_aborts_run() -> None:
+    """After REFINE_FAILURE_THRESHOLD consecutive raises, the run aborts.
+
+    Every task in the plan drifts with the same (kind, task_id=""),
+    the planner always raises, so each stage's drift adds another
+    consecutive failure to the counter. After the threshold the
+    executor must break out with an explicit ``RunAborted`` rather
+    than silently looping through the remaining stages.
+    """
+    # Same drift kind for every task, no current_task_id so the
+    # counter key is stable across tasks. This keeps the "consecutive
+    # failures for the same (kind, task)" invariant honoured.
+    drift = DriftEvent(
+        kind=DriftKind.PLAN_DIVERGENCE,
+        severity=DriftSeverity.WARNING,
+        detail="always drift",
+        current_task_id="",
+    )
+
+    class AlwaysDriftingAdapter(TracingAdapter):
+        async def invoke(self, task: Task, session: Session) -> InvocationResult:
+            async with self._lock:
+                self.in_flight += 1
+                self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+                self.order.append(task.id)
+            try:
+                await asyncio.sleep(self.delay)
+            finally:
+                async with self._lock:
+                    self.in_flight -= 1
+                    self.completed.append(task.id)
+            return InvocationResult(
+                task_id=task.id,
+                text=f"result:{task.id}",
+                raw={"_drift_to_surface": drift},
+            )
+
+    class AlwaysRaisingPlanner(RecordingPlanner):
+        async def refine(self, *, plan: Plan, drift: DriftEvent, goals) -> Plan | None:
+            self.refine_calls.append(drift)
+            raise RuntimeError("refine keeps raising")
+
+    adapter = AlwaysDriftingAdapter(delay=0.005)
+    planner = AlwaysRaisingPlanner()
+    sink = NoopSink()
+    executor = ParallelDAGExecutor(
+        max_concurrency=0, drift_policy="finish_stage"
+    )
+    outcome = await executor.run(
+        plan=_diamond_plan(),
+        session=_new_session(),
+        adapter=adapter,
+        steerer=RecordingSteerer(),
+        planner=planner,
+        sinks=[sink],
+    )
+
+    # After REFINE_FAILURE_THRESHOLD consecutive refine failures for
+    # the same (kind, task_id), the run must abort.
+    assert outcome.success is False
+    assert "refine failed" in outcome.reason
+    assert "aborting" in outcome.reason
+    kinds = _proto_kinds(sink.events)
+    assert kinds[-1] == "RunAborted"
+    # The planner was called up to the threshold (exclusive bound: on
+    # crossing the threshold we break before calling again).
+    assert len(planner.refine_calls) == executor.REFINE_FAILURE_THRESHOLD
+
+
+@pytest.mark.asyncio
+async def test_observer_exception_emits_pipeline_failure_drift() -> None:
+    """``steerer.observe`` raising must emit an INFO ``CUSTOM`` drift.
+
+    Previously the executor would ``log.debug`` and set ``drift = None``,
+    leaving sinks unaware the drift pipeline had silently failed for
+    the task. goldfive#134: an INFO ``CUSTOM`` drift with a
+    ``drift_pipeline_failed:`` detail prefix is now emitted so the
+    plumbing failure is durably visible.
+    """
+
+    class RaisingSteerer(RecordingSteerer):
+        async def observe(self, event: Any, session: Session) -> None:
+            raise RuntimeError("classifier exploded")
+
+        def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
+            return None  # pragma: no cover - never reached; observe raises
+
+    adapter = TracingAdapter(delay=0.005)
+    sink = NoopSink()
+    executor = ParallelDAGExecutor(max_concurrency=0)
+    await executor.run(
+        plan=_diamond_plan(),
+        session=_new_session(),
+        adapter=adapter,
+        steerer=RaisingSteerer(),
+        planner=RecordingPlanner(),
+        sinks=[sink],
+    )
+
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    drifts = _drift_detected_events(sink)
+    pipeline_failures = [
+        e
+        for e in drifts
+        if e.drift_detected.kind == types_pb2.DRIFT_KIND_CUSTOM
+        and "drift_pipeline_failed" in e.drift_detected.detail
+    ]
+    assert pipeline_failures, (
+        "expected at least one INFO CUSTOM drift with "
+        "'drift_pipeline_failed:' prefix after steerer.observe raised"
+    )
+    assert (
+        pipeline_failures[0].drift_detected.severity
+        == types_pb2.DRIFT_SEVERITY_INFO
+    )
+    assert "classifier exploded" in pipeline_failures[0].drift_detected.detail

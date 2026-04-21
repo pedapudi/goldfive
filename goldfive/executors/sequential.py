@@ -373,9 +373,22 @@ class SequentialExecutor(Executor):
                 try:
                     await steerer.observe(result, session)
                 except Exception as observe_exc:  # noqa: BLE001
-                    log.debug(
-                        "SequentialExecutor: steerer.observe raised: %s",
+                    # Plumbing failure inside the drift pipeline: surface
+                    # it so sinks see a signal, rather than silently
+                    # treating the task's output as benign. INFO CUSTOM
+                    # so the run continues but the failure is durably
+                    # recorded. See goldfive#134.
+                    log.warning(
+                        "SequentialExecutor: steerer.observe raised for "
+                        "task=%s: %s",
+                        task.id,
                         observe_exc,
+                    )
+                    await _emit_pipeline_failure_drift(
+                        session=session,
+                        sinks=sinks,
+                        task_id=task.id,
+                        reason=f"drift_pipeline_failed: {observe_exc}",
                     )
 
             # Re-read the task's tracked status after the invocation.
@@ -850,6 +863,49 @@ def _pending_task_ids(plan: Plan) -> list[str]:
     sinks see a coherent plan-end state instead of "stuck PENDING forever."
     """
     return [t.id for t in plan.tasks if t.status == TaskStatus.PENDING and t.id]
+
+
+async def _emit_pipeline_failure_drift(
+    *,
+    session: Session,
+    sinks: list[EventSink],
+    task_id: str,
+    reason: str,
+) -> None:
+    """Emit an INFO ``CUSTOM`` drift when the drift pipeline itself raised.
+
+    Mirrors the helper in
+    :mod:`goldfive.executors.parallel`: a bug in the steerer's observe
+    path must not silently disappear. INFO severity so the run does not
+    trigger another refine — the goal is to make the plumbing failure
+    visible, not to recover from it. Sinks that care can filter on
+    the ``drift_pipeline_failed:`` detail prefix. See goldfive#134.
+
+    Uses the steerer's proto-enum mapping shape
+    (``DRIFT_KIND_<NAME>``) so the emitted envelope carries a real
+    enum value rather than UNSPECIFIED — the
+    :func:`goldfive.events.drift_detected_event` helper does a
+    best-effort lookup that silently drops StrEnum-style values.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    evt = new_event(session.run_id, session.next_sequence())
+    evt.drift_detected.kind = getattr(
+        types_pb2,
+        f"DRIFT_KIND_{DriftKind.CUSTOM.name}",
+        0,
+    )
+    evt.drift_detected.severity = getattr(
+        types_pb2,
+        f"DRIFT_SEVERITY_{DriftSeverity.INFO.name}",
+        0,
+    )
+    evt.drift_detected.detail = reason
+    evt.drift_detected.current_task_id = task_id or ""
+    try:
+        await emit(sinks, evt)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("_emit_pipeline_failure_drift: sink emit raised: %s", exc)
 
 
 def _plan_divergence_drift_event(session: Session, detail: str) -> object:
