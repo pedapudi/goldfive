@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from collections.abc import Callable
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -390,6 +391,48 @@ class DriftEvent:
     current_task_id: str = ""
     current_agent_id: str = ""
     raw: Any = None  # original event that triggered detection
+
+
+@dataclasses.dataclass
+class ObservedAction:
+    """One observed agent invocation, reconciled against the plan.
+
+    A snapshot of what the agent tree has actually done so the planner
+    can compare the planned dispatch (``Plan.tasks``) against the
+    observed dispatch. Emitted by the overlay-model ``PlanReconciler``
+    (goldfive#141) and consumed by :meth:`LLMPlanner.refine` when the
+    drift kind is ``DriftKind.PLAN_DIVERGENCE`` (goldfive#144).
+
+    Fields
+    ------
+    agent_name:
+        Display name of the agent that ran (e.g. ``"researcher"``).
+    invocation_id:
+        Stable id of the invocation (usually the ADK ``invocation_id``).
+    parent_invocation_id:
+        Invocation id of the parent span; empty string for top-level
+        invocations (no parent). Lets the planner reconstruct
+        parent/child relationships across the observed trace.
+    started_at / completed_at:
+        Wall-clock timestamps bracketing the invocation.
+        ``completed_at`` is ``None`` while the invocation is still
+        running.
+    status:
+        One of ``"running"``, ``"completed"``, or ``"failed"``.
+    summary:
+        Human-readable summary of what the invocation did — typically
+        from the ``AgentInvocationCompleted.summary`` event, synthesised
+        from partial output when the invocation is still running, or a
+        short failure reason when status is ``"failed"``.
+    """
+
+    agent_name: str
+    invocation_id: str
+    parent_invocation_id: str
+    started_at: datetime
+    completed_at: datetime | None
+    status: str
+    summary: str
 
 
 @dataclasses.dataclass

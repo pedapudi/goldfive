@@ -33,6 +33,7 @@ from goldfive.types import (
     DriftKind,
     DriftSeverity,
     Goal,
+    ObservedAction,
     Plan,
     Task,
     TaskEdge,
@@ -212,6 +213,78 @@ Respond with a single JSON object and NOTHING ELSE:
   ],
   "edges": [{"from_task_id": "...", "to_task_id": "..."}]
 }
+"""
+
+
+_PLAN_DIVERGENCE_SYSTEM_PROMPT = """\
+You are a task-planning assistant maintaining an ACTIVE plan for a
+multi-agent system. The executor's plan reconciler has detected
+PLAN_DIVERGENCE: the agent tree has executed invocations that do not
+match the planned task assignments. Your job is to decide whether the
+observed activity is a legitimate "found a better path" (ABSORB) or a
+goal-diverting excursion (REJECT).
+
+You will receive:
+
+* The set of GOALS the plan is trying to satisfy.
+* The current plan as JSON (each task carries its live ``status``).
+* The drift event that triggered this refine.
+* A list of OBSERVED AGENT ACTIVITY — real invocations the tree has
+  performed (agent name, invocation id, parent invocation id, start /
+  completion timestamps, status, and a short summary).
+
+Decide between two outcomes:
+
+A. ABSORB. If the observed activity plausibly moves the run toward
+   the declared GOALS, emit a revised plan that REFLECTS the observed
+   activity. Existing tasks that correspond to completed invocations
+   should be marked COMPLETED; in-flight invocations may be marked
+   RUNNING. Invocations that do not correspond to any existing task
+   should be added as new tasks (with fresh stable ids) so the Gantt
+   view can show them.
+
+B. REJECT. If the observed activity is clearly off-goal — the tree
+   has wandered into work that doesn't advance any goal — return a
+   JSON object of the form ``{"reject": true, "reason": "..."}`` and
+   NOTHING else. The caller will escalate to human intervention. Only
+   reject when the divergence cannot be squared with the goals; when
+   in doubt, absorb.
+
+Structural invariants (apply to the ABSORB path; REJECT bypasses
+validation):
+
+1. PRESERVE HISTORY. Tasks already COMPLETED / FAILED / CANCELLED
+   must appear verbatim (same id, title, assignee, terminal status).
+2. TERMINAL->TERMINAL EDGES must appear verbatim.
+3. FORBIDDEN EDGES: no edges from a CANCELLED or FAILED task to a
+   new PENDING task (the PENDING task would be definitionally
+   unexecutable; the executor only schedules a PENDING task once
+   every predecessor has COMPLETED).
+4. Task ids unique within ``tasks``; every edge references a known
+   task id.
+5. The task graph must be ACYCLIC.
+6. Every unsatisfied goal must still be addressed by at least one
+   task in the returned plan.
+
+Respond with a single JSON object and NOTHING else. For ABSORB:
+
+{
+  "summary": "...",
+  "tasks": [
+    {
+      "id": "...",
+      "title": "...",
+      "description": "...",
+      "assignee_agent_id": "...",
+      "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED"
+    }
+  ],
+  "edges": [{"from_task_id": "...", "to_task_id": "..."}]
+}
+
+For REJECT:
+
+{"reject": true, "reason": "<why the observed activity is off-goal>"}
 """
 
 
@@ -400,6 +473,7 @@ class PassthroughPlanner:
         plan: Plan,
         drift: DriftEvent,
         goals: list[Goal],
+        observed_actions: list[ObservedAction] | None = None,
     ) -> Plan | None:
         return None
 
@@ -460,6 +534,7 @@ class StaticPlanner:
         plan: Plan,
         drift: DriftEvent,
         goals: list[Goal],
+        observed_actions: list[ObservedAction] | None = None,
     ) -> Plan | None:
         return None
 
@@ -503,6 +578,7 @@ class LLMPlanner:
         refine_system_prompt: str | None = None,
         user_steer_system_prompt: str | None = None,
         looping_tool_call_system_prompt: str | None = None,
+        plan_divergence_system_prompt: str | None = None,
         max_refine_attempts: int | None = None,
     ) -> None:
         self._call_llm = call_llm
@@ -512,6 +588,9 @@ class LLMPlanner:
         self._user_steer_system_prompt = user_steer_system_prompt or _USER_STEER_SYSTEM_PROMPT
         self._looping_tool_call_system_prompt = (
             looping_tool_call_system_prompt or _LOOPING_TOOL_CALL_SYSTEM_PROMPT
+        )
+        self._plan_divergence_system_prompt = (
+            plan_divergence_system_prompt or _PLAN_DIVERGENCE_SYSTEM_PROMPT
         )
         self._max_refine_attempts = (
             int(max_refine_attempts)
@@ -561,6 +640,33 @@ class LLMPlanner:
     @staticmethod
     def _render_agents_block(available_agents: list[str]) -> str:
         return "\n".join(f"- {a}" for a in available_agents) or "- (none listed)"
+
+    @staticmethod
+    def _render_observed_actions_block(observed_actions: list[ObservedAction]) -> str:
+        """Render observed agent activity as a human-readable prompt block.
+
+        Each entry is one line with the agent name, status, timestamps,
+        invocation ids, and summary. An empty list renders as a single
+        ``- (no observed activity)`` line so the prompt shape is
+        invariant — the LLM always sees the header and a body, making
+        structural prompt tests easier.
+        """
+        header = "OBSERVED AGENT ACTIVITY (what the tree has actually done):"
+        if not observed_actions:
+            return f"{header}\n- (no observed activity)"
+        lines: list[str] = [header]
+        for i, a in enumerate(observed_actions, start=1):
+            started = a.started_at.isoformat() if a.started_at else ""
+            completed = a.completed_at.isoformat() if a.completed_at else "(in-flight)"
+            parent_frag = f" parent={a.parent_invocation_id}" if a.parent_invocation_id else ""
+            summary = a.summary or "(no summary)"
+            lines.append(
+                f"{i}. agent={a.agent_name!r} status={a.status} "
+                f"invocation_id={a.invocation_id}{parent_frag} "
+                f"started_at={started} completed_at={completed}\n"
+                f"   summary: {summary}"
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def _render_prior_turns_block(context: Mapping[str, Any] | None) -> str:
@@ -869,21 +975,32 @@ class LLMPlanner:
         goals: list[Goal],
         post_parse: Callable[[Plan], Plan] | None = None,
         log_prefix: str,
-    ) -> tuple[Plan | None, str]:
+        allow_reject: bool = False,
+    ) -> tuple[Plan | None, str, bool]:
         """Run the retry loop for a single refine call.
 
         Calls the LLM up to ``self._max_refine_attempts`` times, parsing
         the response into a ``Plan`` and validating against ``prior_plan``.
         On each failed attempt the user prompt is extended with the
         error message (via :meth:`_build_correction_prompt`) so the LLM
-        gets explicit feedback on what to fix. Returns ``(plan, "")`` on
-        success, ``(None, last_error)`` on exhaustion. Exceptions from
-        ``call_llm`` are treated as retryable.
+        gets explicit feedback on what to fix. Returns
+        ``(plan, "", False)`` on success, ``(None, last_error, False)``
+        on exhaustion, and ``(None, reason, True)`` when the LLM emitted
+        a ``{"reject": true, ...}`` sentinel (only honoured when
+        ``allow_reject`` is True). Exceptions from ``call_llm`` are
+        treated as retryable.
 
         ``post_parse`` (optional) runs after ``_plan_from_json`` succeeds
         but BEFORE validation -- used by ``_refine_looping_tool_call`` to
         force the looper FAILED before the validator decides whether the
         revision honours the invariants.
+
+        ``allow_reject`` (optional, default False): when True, a JSON
+        object shaped ``{"reject": true, "reason": "..."}`` is a valid
+        terminal outcome — the planner returns ``(None, reason, True)``
+        and the caller is expected to treat it as "escalate to human
+        intervention" rather than a validation failure. Used by the
+        PLAN_DIVERGENCE path (goldfive#144).
         """
         user_prompt = base_user_prompt
         last_error = ""
@@ -930,6 +1047,18 @@ class LLMPlanner:
                 if attempt < attempts:
                     user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
                 continue
+            # Honour the reject sentinel: {"reject": true, "reason": "..."}
+            # is a terminal outcome on the plan-divergence path (#144).
+            # The caller escalates to human intervention; we return
+            # immediately without retrying.
+            if allow_reject and isinstance(parsed, Mapping) and bool(parsed.get("reject")):
+                reason = str(parsed.get("reason") or "").strip() or "(no reason provided)"
+                log.info(
+                    "%s: LLM emitted reject sentinel (reason=%s); escalating to human intervention",
+                    log_prefix,
+                    reason,
+                )
+                return None, reason, True
             revised = _plan_from_json(
                 parsed,
                 run_id=prior_plan.run_id,
@@ -977,14 +1106,15 @@ class LLMPlanner:
                 if attempt < attempts:
                     user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
                 continue
-            return revised, ""
-        return None, last_error
+            return revised, "", False
+        return None, last_error, False
 
     def _build_refine_prompt(
         self,
         plan: Plan,
         drift: DriftEvent,
         goals: list[Goal],
+        observed_actions: list[ObservedAction] | None = None,
     ) -> str:
         current = {
             "id": plan.id,
@@ -1016,10 +1146,25 @@ class LLMPlanner:
         drift_json = json.dumps(drift_payload, default=str)
         goals_block = self._render_goals_block(goals)
         invariants_block = self._render_structural_invariants_block(plan)
+        observed_block = ""
+        if observed_actions is not None:
+            observed_block = (
+                f"{self._render_observed_actions_block(observed_actions)}\n\n"
+                "The tree may have diverged from the planned dispatch because it "
+                "found a better path. Decide:\n"
+                "- If the observed activity moves toward the goals: produce a "
+                "revised plan that REFLECTS the observed activity (mark matching "
+                "tasks COMPLETED/RUNNING, add new tasks for agent invocations "
+                "not already in the plan).\n"
+                "- If the observed activity does NOT move toward the goals: "
+                'return a JSON object of the form {"reject": true, "reason": '
+                '"..."} (the caller will escalate to human intervention).\n\n'
+            )
         return (
             f"Goals:\n{goals_block}\n\n"
             f"Current plan:\n{plan_json}\n\n"
             f"Drift event:\n{drift_json}\n\n"
+            f"{observed_block}"
             f"{invariants_block}\n\n"
             "If the plan should change in light of this drift event, respond "
             "with an updated JSON plan using the same schema. If no change "
@@ -1084,7 +1229,20 @@ class LLMPlanner:
         plan: Plan,
         drift: DriftEvent,
         goals: list[Goal],
+        observed_actions: list[ObservedAction] | None = None,
     ) -> Plan | None:
+        """Produce a revised plan in response to a drift event.
+
+        ``observed_actions`` (goldfive#144) is optional and only
+        consulted when ``drift.kind is DriftKind.PLAN_DIVERGENCE`` —
+        every other refine path ignores it so back-compat with existing
+        callers that don't pass the argument is preserved. When present
+        on the divergence path, the reconciler-style prompt asks the
+        LLM to either ABSORB the observed activity into a revised plan
+        or REJECT by emitting ``{"reject": true, "reason": "..."}``. A
+        reject collapses to ``None`` — the steerer then escalates via
+        the intervention ladder (goldfive#142).
+        """
         if plan is None:
             return None
         if drift.kind is DriftKind.USER_STEER:
@@ -1104,18 +1262,43 @@ class LLMPlanner:
         # kind; defending here too is a belt-and-braces guard.
         if drift.kind is DriftKind.REFINE_VALIDATION_FAILED:
             return None
+        # PLAN_DIVERGENCE with observed_actions goes through the
+        # reconciler prompt: the LLM must either ABSORB observed agent
+        # activity into a revised plan or REJECT (emit the reject
+        # sentinel). Without observed_actions we fall through to the
+        # generic refine path so callers that wire PLAN_DIVERGENCE the
+        # old way keep working.
+        is_plan_divergence = drift.kind is DriftKind.PLAN_DIVERGENCE
+        use_divergence_prompt = is_plan_divergence and observed_actions is not None
         try:
-            base_user_prompt = self._build_refine_prompt(plan, drift, goals)
+            base_user_prompt = self._build_refine_prompt(
+                plan,
+                drift,
+                goals,
+                observed_actions=observed_actions if use_divergence_prompt else None,
+            )
         except (TypeError, ValueError) as exc:
             log.warning("LLMPlanner.refine: failed to serialise inputs (%s)", exc)
             return None
-        revised, last_error = await self._call_and_validate_refine(
-            system_prompt=self._refine_system_prompt,
+        system_prompt = (
+            self._plan_divergence_system_prompt
+            if use_divergence_prompt
+            else self._refine_system_prompt
+        )
+        revised, last_error, rejected = await self._call_and_validate_refine(
+            system_prompt=system_prompt,
             base_user_prompt=base_user_prompt,
             prior_plan=plan,
             goals=goals,
             log_prefix="LLMPlanner.refine",
+            allow_reject=use_divergence_prompt,
         )
+        if rejected:
+            # LLM judged the divergence off-goal. Return None so the
+            # steerer escalates via the intervention ladder (#142).
+            # No REFINE_VALIDATION_FAILED emission here -- a reject is
+            # a successful decision, not a validation failure.
+            return None
         if revised is None:
             # Retries exhausted. Emit the REFINE_VALIDATION_FAILED signal
             # so the UI / operator sees that recovery failed, then
@@ -1261,7 +1444,7 @@ class LLMPlanner:
                 )
             return revised
 
-        revised, last_error = await self._call_and_validate_refine(
+        revised, last_error, _rejected = await self._call_and_validate_refine(
             system_prompt=self._looping_tool_call_system_prompt,
             base_user_prompt=base_user_prompt,
             prior_plan=plan,

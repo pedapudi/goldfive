@@ -111,10 +111,7 @@ def _linear_static_plan(task_ids: list[str]) -> Plan:
         id="plan-static",
         run_id="",
         goal_ids=["g1"],
-        tasks=[
-            Task(id=tid, title=tid.title(), assignee_agent_id="writer")
-            for tid in task_ids
-        ],
+        tasks=[Task(id=tid, title=tid.title(), assignee_agent_id="writer") for tid in task_ids],
         edges=[
             TaskEdge(from_task_id=a, to_task_id=b)
             for a, b in zip(task_ids, task_ids[1:], strict=False)
@@ -123,9 +120,7 @@ def _linear_static_plan(task_ids: list[str]) -> Plan:
     )
 
 
-async def _drain_acks(
-    channel: ControlChannel, *, count: int, timeout: float = 1.0
-) -> list[Any]:
+async def _drain_acks(channel: ControlChannel, *, count: int, timeout: float = 1.0) -> list[Any]:
     acks: list[Any] = []
 
     async def _consume() -> None:
@@ -151,9 +146,18 @@ class _PlannerSpy:
     async def generate(self, **kwargs: Any) -> Any:
         return await self._inner.generate(**kwargs)
 
-    async def refine(self, *, plan: Any, drift: DriftEvent, goals: list[Goal]) -> Any:
+    async def refine(
+        self,
+        *,
+        plan: Any,
+        drift: DriftEvent,
+        goals: list[Goal],
+        observed_actions: Any = None,
+    ) -> Any:
         self.refine_calls.append(drift)
-        return await self._inner.refine(plan=plan, drift=drift, goals=goals)
+        return await self._inner.refine(
+            plan=plan, drift=drift, goals=goals, observed_actions=observed_actions
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -201,20 +205,14 @@ async def test_cancel_mid_task_aborts_run() -> None:
 
     await asyncio.wait_for(task_started.wait(), timeout=2.0)
     await asyncio.sleep(0.2)
-    await channel.send(
-        ControlMessage(kind=ControlKind.CANCEL, payload={"reason": "user aborted"})
-    )
+    await channel.send(ControlMessage(kind=ControlKind.CANCEL, payload={"reason": "user aborted"}))
 
     outcome = await asyncio.wait_for(run_task, timeout=5.0)
     await runner.close()
 
     assert outcome.success is False
-    assert "user aborted" in (outcome.reason or "") or "cancel" in (
-        outcome.reason or ""
-    ).lower()
-    assert adapter_was_cancelled.is_set(), (
-        "adapter.invoke should have been cancelled mid-task"
-    )
+    assert "user aborted" in (outcome.reason or "") or "cancel" in (outcome.reason or "").lower()
+    assert adapter_was_cancelled.is_set(), "adapter.invoke should have been cancelled mid-task"
 
     kinds = _event_kinds(sink.events)
     assert "run_started" in kinds
@@ -254,9 +252,7 @@ async def test_steer_mid_task_triggers_refine_and_continues() -> None:
         await asyncio.sleep(0.01)
         return InvocationResult(task_id=task.id, text=f"done:{task.id}")
 
-    initial_plan_json = _plan_json(
-        "plan-init", "Slow initial plan.", ["slow_task"]
-    )
+    initial_plan_json = _plan_json("plan-init", "Slow initial plan.", ["slow_task"])
     refined_plan_json = _plan_json(
         "plan-steered", "Refined after user steer.", ["fast_a", "fast_b"]
     )
@@ -299,12 +295,10 @@ async def test_steer_mid_task_triggers_refine_and_continues() -> None:
         "and called planner.refine exactly once"
     )
     assert any(d.kind == DriftKind.USER_STEER for d in planner.refine_calls), (
-        f"expected USER_STEER drift; got "
-        f"{[d.kind.value for d in planner.refine_calls]}"
+        f"expected USER_STEER drift; got {[d.kind.value for d in planner.refine_calls]}"
     )
     assert all(
-        d.severity in (DriftSeverity.WARNING, DriftSeverity.CRITICAL)
-        for d in planner.refine_calls
+        d.severity in (DriftSeverity.WARNING, DriftSeverity.CRITICAL) for d in planner.refine_calls
     )
 
     kinds = _event_kinds(sink.events)
@@ -403,9 +397,7 @@ async def test_rewind_resets_target_and_downstream_tasks() -> None:
         if task.id == "t0" and counts["t0"] == 1:
             await channel.send(ControlMessage(kind=ControlKind.PAUSE))
             await channel.send(
-                ControlMessage(
-                    kind=ControlKind.REWIND_TO, payload={"task_id": "t0"}
-                )
+                ControlMessage(kind=ControlKind.REWIND_TO, payload={"task_id": "t0"})
             )
             await channel.send(ControlMessage(kind=ControlKind.RESUME))
         return InvocationResult(task_id=task.id, text=f"done:{task.id}")

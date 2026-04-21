@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from goldfive.types import (
         DriftEvent,
         Goal,
+        ObservedAction,
         Plan,
         Session,
         Task,
@@ -46,6 +47,7 @@ class Planner(Protocol):
         plan: Plan,
         drift: DriftEvent,
         goals: list[Goal],
+        observed_actions: list[ObservedAction] | None = None,
     ) -> Plan | None: ...
 
 
