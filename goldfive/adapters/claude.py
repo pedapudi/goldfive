@@ -153,6 +153,26 @@ class ClaudeAgentSDKAdapter:
     def available_agents(self) -> list[str]:
         return list(self._available_agents)
 
+    @property
+    def available_agents_tree(self) -> list[dict[str, Any]]:
+        """Return a flat single-level tree describing the configured agents.
+
+        ClaudeAdapter is a single-model adapter — every configured name
+        is rendered as a depth-0 root leaf so planners that consume
+        :attr:`available_agents_tree` (goldfive#151) see the same shape
+        across adapters.
+        """
+        return [
+            {
+                "name": name,
+                "depth": 0,
+                "parent": "",
+                "role": "root",
+                "kind": "Claude",
+            }
+            for name in self._available_agents
+        ]
+
     def bind_steerer(self, steerer: SteererLike) -> None:
         """Wire a :class:`Steerer` in after construction.
 

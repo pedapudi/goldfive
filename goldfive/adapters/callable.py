@@ -18,6 +18,7 @@ layer because it removes LLM non-determinism from the loop.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from goldfive.reporting import ReportingToolSpec
 from goldfive.results import InvocationResult
@@ -101,3 +102,24 @@ class CallableAdapter:
     def available_agents(self) -> list[str]:
         """Return the configured list of available agent identifiers."""
         return list(self._available_agents)
+
+    @property
+    def available_agents_tree(self) -> list[dict[str, Any]]:
+        """Return a flat single-level tree describing the configured agents.
+
+        CallableAdapter has no real tree — every configured name is
+        rendered as a depth-0 root leaf so planners that consume
+        :attr:`available_agents_tree` (goldfive#151) see a consistent
+        shape. Adapters that model a real tree (ADK) override with a
+        richer walker.
+        """
+        return [
+            {
+                "name": name,
+                "depth": 0,
+                "parent": "",
+                "role": "root",
+                "kind": "Callable",
+            }
+            for name in self._available_agents
+        ]

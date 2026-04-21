@@ -245,10 +245,21 @@ class Runner:
         planner_context["run_id"] = session.run_id
 
         # 4. Generate the plan.
+        # Prefer the richer tree shape (goldfive#151) when the adapter
+        # exposes it so the planner can constrain assignee_agent_id to
+        # real tree names and render the tree in its prompt. Adapters
+        # that don't implement the property fall through to the legacy
+        # flat list — keeps back-compat with custom adapters.
+        available_agents: Any
+        tree = getattr(self.agent, "available_agents_tree", None)
+        if isinstance(tree, list) and tree:
+            available_agents = list(tree)
+        else:
+            available_agents = list(self.agent.available_agents)
         try:
             plan = await self.planner.generate(
                 goals=session.goals,
-                available_agents=list(self.agent.available_agents),
+                available_agents=available_agents,
                 context=planner_context,
             )
         except Exception as exc:  # noqa: BLE001

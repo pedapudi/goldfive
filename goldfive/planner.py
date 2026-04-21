@@ -368,6 +368,21 @@ still as a complete JSON plan, not an empty object).
 
 _VALID_TASK_STATUSES = frozenset(s.value for s in TaskStatus)
 
+
+def _is_tree_entry_list(available_agents: Any) -> bool:
+    """Return True when ``available_agents`` is a structured tree list.
+
+    Structured entries are dicts carrying at least a ``name`` key —
+    see :attr:`goldfive.adapters.adk.ADKAdapter.available_agents_tree`.
+    Plain ``list[str]`` returns False so the legacy code path renders
+    the flat bullet-list form (goldfive#151).
+    """
+    if not isinstance(available_agents, list) or not available_agents:
+        return False
+    first = available_agents[0]
+    return isinstance(first, Mapping) and "name" in first
+
+
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?```\s*$", re.DOTALL)
 
 
@@ -466,7 +481,7 @@ class PassthroughPlanner:
         self,
         *,
         goals: list[Goal],
-        available_agents: list[str],
+        available_agents: list[str] | list[dict[str, Any]] | None,
         context: Mapping[str, Any] | None = None,
     ) -> Plan | None:
         return None
@@ -478,6 +493,7 @@ class PassthroughPlanner:
         drift: DriftEvent,
         goals: list[Goal],
         observed_actions: list[ObservedAction] | None = None,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None:
         return None
 
@@ -502,7 +518,7 @@ class StaticPlanner:
         self,
         *,
         goals: list[Goal],
-        available_agents: list[str],
+        available_agents: list[str] | list[dict[str, Any]] | None,
         context: Mapping[str, Any] | None = None,
     ) -> Plan | None:
         run_id = ""
@@ -539,6 +555,7 @@ class StaticPlanner:
         drift: DriftEvent,
         goals: list[Goal],
         observed_actions: list[ObservedAction] | None = None,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None:
         return None
 
@@ -666,8 +683,104 @@ class LLMPlanner:
         return [g for g in goals if g.source == GOAL_SOURCE_USER_STEER]
 
     @staticmethod
-    def _render_agents_block(available_agents: list[str]) -> str:
+    def _render_agents_block(available_agents: list[str] | list[dict[str, Any]] | None) -> str:
+        """Render the agents/AGENT TREE section for the planner prompt.
+
+        Accepts either a plain ``list[str]`` (back-compat) or a
+        structured ``list[dict]`` as produced by
+        :attr:`goldfive.adapters.adk.ADKAdapter.available_agents_tree`
+        (goldfive#151). The dict form renders as a tree-shape block
+        with name, role, kind, depth, and parent so the LLM can see
+        which agents it may pick and which are intermediate
+        coordinators. Plain strings render as a flat bullet list
+        exactly as before.
+
+        An empty / None value renders as the literal placeholder used
+        today so existing structural prompt assertions keep passing.
+        """
+        if not available_agents:
+            return "- (none listed)"
+        if _is_tree_entry_list(available_agents):
+            lines: list[str] = []
+            for entry in available_agents:
+                name = str(entry.get("name", ""))
+                if not name:
+                    continue
+                role = str(entry.get("role", ""))
+                kind = str(entry.get("kind", ""))
+                depth = int(entry.get("depth", 0) or 0)
+                parent = str(entry.get("parent", ""))
+                parent_frag = f" parent={parent}" if parent else ""
+                lines.append(f"- {name} (role={role}, kind={kind}, depth={depth}{parent_frag})")
+            return "\n".join(lines) or "- (none listed)"
         return "\n".join(f"- {a}" for a in available_agents) or "- (none listed)"
+
+    @staticmethod
+    def _flatten_agent_names(
+        available_agents: list[str] | list[dict[str, Any]] | None,
+    ) -> list[str]:
+        """Return the list of legal ``assignee_agent_id`` values.
+
+        Accepts either the plain-string or tree-entry shape and
+        produces a de-duplicated, order-preserving list of agent
+        names. ``None`` / empty yields ``[]`` — the validator treats
+        an empty registry as "skip the assignee check" so existing
+        callers that don't provide available_agents keep working.
+        """
+        if not available_agents:
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        if _is_tree_entry_list(available_agents):
+            for entry in available_agents:
+                name = str(entry.get("name", ""))
+                if name and name not in seen:
+                    seen.add(name)
+                    names.append(name)
+            return names
+        for a in available_agents:
+            s = str(a)
+            if s and s not in seen:
+                seen.add(s)
+                names.append(s)
+        return names
+
+    @staticmethod
+    def _validate_plan_assignees(
+        plan: Plan,
+        available_agents: list[str] | list[dict[str, Any]] | None,
+    ) -> str:
+        """Return an error string if any task's assignee is off-registry.
+
+        When ``available_agents`` is falsy the check is skipped —
+        callers that did not supply a registry get the legacy
+        "anything goes" behaviour. When non-empty, every task's
+        ``assignee_agent_id`` (if non-empty) must appear in the
+        flattened name list; offenders are enumerated in the error
+        message so the retry-with-correction loop (#133/#136) has
+        concrete feedback to thread back to the LLM.
+        """
+        names = LLMPlanner._flatten_agent_names(available_agents)
+        if not names:
+            return ""
+        registry = set(names)
+        offenders: list[tuple[str, str]] = []
+        for t in plan.tasks:
+            assignee = (t.assignee_agent_id or "").strip()
+            if not assignee:
+                continue
+            if assignee not in registry:
+                offenders.append((t.id, assignee))
+        if not offenders:
+            return ""
+        listed = ", ".join(f"{tid!r}->{a!r}" for tid, a in offenders)
+        return (
+            f"off-registry assignee(s): {listed}. "
+            f"Every task's `assignee_agent_id` must match a name from the "
+            f"AGENT TREE registry: {sorted(registry)}. "
+            f"Re-assign offending tasks to a registry-listed agent or, "
+            f"when no specialised agent fits, to the root/coordinator."
+        )
 
     @staticmethod
     def _render_observed_actions_block(observed_actions: list[ObservedAction]) -> str:
@@ -742,11 +855,16 @@ class LLMPlanner:
     def _build_generate_prompt(
         self,
         goals: list[Goal],
-        available_agents: list[str],
+        available_agents: list[str] | list[dict[str, Any]] | None,
         context: Mapping[str, Any] | None,
     ) -> str:
         goals_block = self._render_goals_block(goals)
         agents_block = self._render_agents_block(available_agents)
+        agents_header = (
+            "AGENT TREE (pick assignee_agent_id from this registry):"
+            if _is_tree_entry_list(available_agents)
+            else "Available agents:"
+        )
         prior_block = self._render_prior_turns_block(context)
         context_block = ""
         if context:
@@ -772,7 +890,7 @@ class LLMPlanner:
                 except (TypeError, ValueError):
                     context_block = ""
         return (
-            f"Available agents:\n{agents_block}\n\n"
+            f"{agents_header}\n{agents_block}\n\n"
             f"Goals:\n{goals_block}\n"
             f"{prior_block}"
             f"{context_block}\n"
@@ -1131,6 +1249,7 @@ class LLMPlanner:
         post_parse: Callable[[Plan], Plan] | None = None,
         log_prefix: str,
         allow_reject: bool = False,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> tuple[Plan | None, str, bool]:
         """Run the retry loop for a single refine call.
 
@@ -1281,6 +1400,22 @@ class LLMPlanner:
                 if attempt < attempts:
                     user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
                 continue
+            # Registry check (goldfive#151): off-registry assignees
+            # are a retryable validator error — the correction loop
+            # feeds the list of legal names back on the next attempt.
+            assignee_error = self._validate_plan_assignees(revised, available_agents)
+            if assignee_error:
+                last_error = assignee_error
+                log.warning(
+                    "%s: attempt %d/%d: %s",
+                    log_prefix,
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
+                continue
             return revised, "", False
         return None, last_error, False
 
@@ -1290,6 +1425,7 @@ class LLMPlanner:
         drift: DriftEvent,
         goals: list[Goal],
         observed_actions: list[ObservedAction] | None = None,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> str:
         current = {
             "id": plan.id,
@@ -1322,6 +1458,14 @@ class LLMPlanner:
         goals_block = self._render_goals_block(goals)
         invariants_block = self._render_structural_invariants_block(plan)
         sticky_block = self._render_sticky_goals_block(goals)
+        agents_block = ""
+        if available_agents:
+            header = (
+                "AGENT TREE (pick assignee_agent_id from this registry):"
+                if _is_tree_entry_list(available_agents)
+                else "Available agents:"
+            )
+            agents_block = f"{header}\n{self._render_agents_block(available_agents)}\n\n"
         observed_block = ""
         if observed_actions is not None:
             observed_block = (
@@ -1339,6 +1483,7 @@ class LLMPlanner:
                 '"..."} (the caller will escalate to human intervention).\n\n'
             )
         return (
+            f"{agents_block}"
             f"CURRENT GOALS (the revision must still advance every goal, "
             f"and MUST NOT silently drop any [STICKY] goal):\n{goals_block}\n\n"
             f"{sticky_block}"
@@ -1383,50 +1528,123 @@ class LLMPlanner:
         self,
         *,
         goals: list[Goal],
-        available_agents: list[str],
+        available_agents: list[str] | list[dict[str, Any]] | None,
         context: Mapping[str, Any] | None = None,
     ) -> Plan | None:
+        """Produce the initial plan for ``goals``.
+
+        ``available_agents`` may be a plain ``list[str]`` (legacy
+        callers) or a structured tree as produced by
+        :attr:`goldfive.adapters.adk.ADKAdapter.available_agents_tree`
+        (goldfive#151). When the tree form is supplied the prompt
+        renders a richer "AGENT TREE" section and the validator
+        rejects any task whose ``assignee_agent_id`` is not in the
+        registry — the retry-with-correction loop (#133/#136) feeds
+        the validator message back to the LLM on the next attempt.
+        An empty / None registry skips the assignee check for
+        back-compat.
+        """
         if not goals:
             log.debug("LLMPlanner.generate: no goals provided; skipping plan")
             return None
-        prompt = self._build_generate_prompt(goals, available_agents, context)
-        try:
-            raw = await self._call_llm(self._system_prompt, prompt, self._model)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("LLMPlanner.generate: call_llm raised %s; skipping plan", exc)
-            return None
-        if not raw or not isinstance(raw, str):
-            log.warning("LLMPlanner.generate: empty/non-string LLM response; skipping plan")
-            return None
-        cleaned = _strip_code_fences(raw).strip()
-        try:
-            parsed = json.loads(cleaned)
-        except (ValueError, TypeError) as exc:
-            log.warning(
-                "LLMPlanner.generate: failed to parse LLM output as JSON (%s); skipping",
-                exc,
-            )
-            return None
+        base_prompt = self._build_generate_prompt(goals, available_agents, context)
         run_id = ""
         if context is not None:
             run_id = str(context.get("run_id") or "")
-        plan = _plan_from_json(
-            parsed,
-            run_id=run_id,
-            goal_ids=[g.id for g in goals if g.id],
-        )
-        if plan is None:
-            log.warning("LLMPlanner.generate: parsed JSON did not contain a usable plan; skipping")
-            return None
-        try:
-            plan.validate(for_revision=False)
-        except ValueError as exc:
-            log.warning(
-                "LLMPlanner.generate: plan failed validation (%s); skipping",
-                exc,
+        user_prompt = base_prompt
+        last_error = ""
+        attempts = max(1, self._max_refine_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                raw = await self._call_llm(self._system_prompt, user_prompt, self._model)
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"call_llm raised: {exc}"
+                log.warning(
+                    "LLMPlanner.generate: attempt %d/%d: %s",
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_prompt, last_error)
+                continue
+            if not raw or not isinstance(raw, str):
+                last_error = "empty or non-string LLM response"
+                log.warning(
+                    "LLMPlanner.generate: attempt %d/%d: %s",
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_prompt, last_error)
+                continue
+            cleaned = _strip_code_fences(raw).strip()
+            try:
+                parsed = json.loads(cleaned)
+            except (ValueError, TypeError) as exc:
+                last_error = f"JSON parse failed: {exc}"
+                log.warning(
+                    "LLMPlanner.generate: attempt %d/%d: %s",
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_prompt, last_error)
+                continue
+            plan = _plan_from_json(
+                parsed,
+                run_id=run_id,
+                goal_ids=[g.id for g in goals if g.id],
             )
-            return None
-        return plan
+            if plan is None:
+                last_error = "parsed JSON did not contain a usable plan"
+                log.warning(
+                    "LLMPlanner.generate: attempt %d/%d: %s",
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_prompt, last_error)
+                continue
+            try:
+                plan.validate(for_revision=False)
+            except ValueError as exc:
+                last_error = f"validator rejected plan: {exc}"
+                log.warning(
+                    "LLMPlanner.generate: attempt %d/%d: %s",
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_prompt, last_error)
+                continue
+            # Registry check (goldfive#151): reject off-registry
+            # assignees so the tree-aware retry loop can ask the LLM
+            # to re-pick a legal name. Skipped when no registry
+            # supplied — preserves back-compat with pre-#151 callers.
+            assignee_error = self._validate_plan_assignees(plan, available_agents)
+            if assignee_error:
+                last_error = assignee_error
+                log.warning(
+                    "LLMPlanner.generate: attempt %d/%d: %s",
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_prompt, last_error)
+                continue
+            return plan
+        log.warning(
+            "LLMPlanner.generate: exhausted %d attempt(s); last_error=%s",
+            attempts,
+            last_error,
+        )
+        return None
 
     async def refine(
         self,
@@ -1435,6 +1653,7 @@ class LLMPlanner:
         drift: DriftEvent,
         goals: list[Goal],
         observed_actions: list[ObservedAction] | None = None,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None:
         """Produce a revised plan in response to a drift event.
 
@@ -1447,11 +1666,19 @@ class LLMPlanner:
         or REJECT by emitting ``{"reject": true, "reason": "..."}``. A
         reject collapses to ``None`` — the steerer then escalates via
         the intervention ladder (goldfive#142).
+
+        ``available_agents`` (goldfive#151) is optional. When provided
+        the refine prompt renders an "AGENT TREE" section so the LLM
+        picks ``assignee_agent_id`` values from the real tree, and the
+        retry-with-correction loop rejects off-registry assignees with
+        a concrete error message feeding the next attempt. Accepts
+        either ``list[str]`` (legacy) or the structured tree form
+        produced by :attr:`ADKAdapter.available_agents_tree`.
         """
         if plan is None:
             return None
         if drift.kind is DriftKind.USER_STEER:
-            return await self._refine_user_steer(plan, drift, goals)
+            return await self._refine_user_steer(plan, drift, goals, available_agents)
         if drift.kind in (
             DriftKind.LOOPING_TOOL_CALL,
             DriftKind.LOOPING_REASONING,
@@ -1460,7 +1687,7 @@ class LLMPlanner:
             # around it" shape with LOOPING_TOOL_CALL: the symptom is a
             # stuck loop on the currently-running task, and the repair
             # is to mark it FAILED and regenerate the rest.
-            return await self._refine_looping_tool_call(plan, drift, goals)
+            return await self._refine_looping_tool_call(plan, drift, goals, available_agents)
         # REFINE_VALIDATION_FAILED is a terminal signal from ourselves --
         # refining on it would risk an infinite loop of validation
         # failures. The steerer is expected to skip refine for this
@@ -1481,6 +1708,7 @@ class LLMPlanner:
                 drift,
                 goals,
                 observed_actions=observed_actions if use_divergence_prompt else None,
+                available_agents=available_agents,
             )
         except (TypeError, ValueError) as exc:
             log.warning("LLMPlanner.refine: failed to serialise inputs (%s)", exc)
@@ -1508,6 +1736,7 @@ class LLMPlanner:
             goals=goals,
             log_prefix="LLMPlanner.refine",
             allow_reject=allow_reject,
+            available_agents=available_agents,
         )
         if rejected:
             # LLM judged the divergence off-goal. Return None so the
@@ -1611,6 +1840,7 @@ class LLMPlanner:
         plan: Plan,
         drift: DriftEvent,
         goals: list[Goal],
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None:
         """Fail-and-regenerate path for ``LOOPING_TOOL_CALL`` drift.
 
@@ -1671,6 +1901,7 @@ class LLMPlanner:
             goals=goals,
             post_parse=_force_looper_failed,
             log_prefix="LLMPlanner._refine_looping_tool_call",
+            available_agents=available_agents,
         )
         if revised is None:
             # Retries exhausted. Signal the failure explicitly, then
@@ -1758,6 +1989,7 @@ class LLMPlanner:
         plan: Plan,
         drift: DriftEvent,
         goals: list[Goal],
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None:
         """Delete-and-replan path for ``USER_STEER`` drift.
 
@@ -1790,6 +2022,7 @@ class LLMPlanner:
                 completed=completed,
                 completed_ids=completed_ids,
                 user_prompt=user_prompt,
+                available_agents=available_agents,
             )
             if merged_plan is not None:
                 return merged_plan
@@ -1816,6 +2049,7 @@ class LLMPlanner:
         completed: list[Task],
         completed_ids: set[str],
         user_prompt: str,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> tuple[Plan | None, str]:
         """Run a single LLM attempt for the USER_STEER refine path.
 
@@ -1896,6 +2130,9 @@ class LLMPlanner:
         goal_error = self._check_user_steer_goals_preserved(merged_plan, goals)
         if goal_error:
             return None, goal_error
+        assignee_error = self._validate_plan_assignees(merged_plan, available_agents)
+        if assignee_error:
+            return None, assignee_error
         return merged_plan, ""
 
 

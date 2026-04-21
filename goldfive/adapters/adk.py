@@ -380,6 +380,86 @@ def _rebind_goldfive_planners(
                     getattr(cur, "name", "?"),
                     exc,
                 )
+def _collect_reachable_agent_tree(root_agent: Any) -> list[dict[str, Any]]:
+    """Return structured metadata for every agent reachable from ``root_agent``.
+
+    Each entry is a dict with ``name``, ``depth``, ``parent``, ``role``
+    and ``kind``:
+
+    * ``depth``: 0 for the root agent, N for depth-N descendants.
+    * ``parent``: the name of the parent agent. Empty string for root.
+    * ``role``: ``"root"`` for the root agent, ``"intermediate"`` for
+      agents that have children, ``"leaf"`` for agents with no
+      children.
+    * ``kind``: the ADK class name — ``LlmAgent``, ``SequentialAgent``,
+      ``ParallelAgent``, ``BaseAgent``, or any custom subclass name.
+      Tree-agnostic: the function does not interpret or rename kinds.
+
+    Follows the same ``sub_agents`` / ``inner_agent`` / ``AgentTool.agent``
+    edges as :func:`_collect_reachable_agent_names` and
+    :func:`_augment_subtree_with_reporting`. First BFS visit wins so
+    depth / parent are minimal; duplicate reachable edges are collapsed
+    by ``id(agent)`` identity to avoid double-counting shared agents.
+
+    Used to populate :attr:`ADKAdapter.available_agents_tree`, which the
+    LLM planner consumes to constrain ``assignee_agent_id`` selection.
+    Under the single-Runner model (goldfive#130) this remains advisory —
+    goldfive drives one runner and ADK handles delegation.
+    """
+    if root_agent is None:
+        return []
+
+    # BFS so depth is minimal (first reachable edge wins). We record
+    # entries keyed by id() so shared sub-tree references don't get
+    # double-appended with a different depth.
+    from collections import deque
+
+    visited: dict[int, dict[str, Any]] = {}
+    order: list[int] = []
+    queue: deque[tuple[Any, int, str]] = deque()
+    queue.append((root_agent, 0, ""))
+    while queue:
+        cur, depth, parent = queue.popleft()
+        if cur is None:
+            continue
+        key = id(cur)
+        if key in visited:
+            continue
+        name = str(getattr(cur, "name", "") or "")
+        if not name:
+            # Agents without a usable name are not routable; skip them
+            # so the planner only ever sees named targets. Children
+            # are still walked so named descendants are not lost.
+            pass
+        kind = type(cur).__name__
+        children: list[Any] = []
+        for sub in getattr(cur, "sub_agents", None) or ():
+            children.append(sub)
+        inner = getattr(cur, "inner_agent", None)
+        if inner is not None:
+            children.append(inner)
+        for t in getattr(cur, "tools", None) or ():
+            nested = getattr(t, "agent", None)
+            if nested is not None:
+                children.append(nested)
+
+        if name:
+            role = "root" if depth == 0 else ("intermediate" if children else "leaf")
+            visited[key] = {
+                "name": name,
+                "depth": depth,
+                "parent": parent,
+                "role": role,
+                "kind": kind,
+            }
+            order.append(key)
+
+        for child in children:
+            child_key = id(child) if child is not None else 0
+            if child_key and child_key not in visited:
+                queue.append((child, depth + 1, name))
+
+    return [visited[k] for k in order]
 
 
 def _register_plugin_on_runner(runner: Any, plugin: Any) -> bool:
@@ -857,8 +937,18 @@ class ADKAdapter:
             # With a pre-built runner we only know about the root agent.
             root_name = str(getattr(self._agent, "name", "") or host_agent_name or "goldfive")
             self._available_agents: list[str] = [root_name]
+            self._available_agents_tree: list[dict[str, Any]] = [
+                {
+                    "name": root_name,
+                    "depth": 0,
+                    "parent": "",
+                    "role": "root",
+                    "kind": type(self._agent).__name__ if self._agent is not None else "BaseAgent",
+                }
+            ]
         else:
             self._available_agents = _collect_reachable_agent_names(self._agent)
+            self._available_agents_tree = _collect_reachable_agent_tree(self._agent)
 
         # Auto-attach GoldfivePlanner to every LlmAgent in the tree
         # (goldfive#153). Idempotent: skipped for agents already
@@ -955,6 +1045,26 @@ class ADKAdapter:
         (AgentTool, transfer_to_agent, sub_agents).
         """
         return list(self._available_agents)
+
+    @property
+    def available_agents_tree(self) -> list[dict[str, Any]]:
+        """Return structured metadata for every reachable agent in the tree.
+
+        Each entry is a dict with the keys ``name`` (str), ``depth``
+        (int; 0 = root), ``parent`` (str; empty for root), ``role``
+        (``"root"`` | ``"intermediate"`` | ``"leaf"``), and ``kind``
+        (the ADK class name — ``LlmAgent``, ``SequentialAgent``,
+        ``ParallelAgent``, ``BaseAgent``, or any custom subclass name;
+        tree-agnostic — no semantic interpretation).
+
+        Used by :class:`goldfive.planner.LLMPlanner` (goldfive#151) to
+        render an "AGENT TREE" section in planner prompts and to
+        validate that every task's ``assignee_agent_id`` is actually
+        reachable in the wrapped tree. A fresh shallow copy is returned
+        on each access so callers cannot mutate the cached list in
+        place.
+        """
+        return [dict(entry) for entry in self._available_agents_tree]
 
     async def register_reporting_tools(self, tools: list[ReportingToolSpec]) -> None:
         """Register goldfive reporting tools with the wrapped agent tree.

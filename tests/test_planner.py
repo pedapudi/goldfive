@@ -269,6 +269,173 @@ async def test_llm_planner_generate_handles_json_without_tasks() -> None:
 
 
 # ---------------------------------------------------------------------------
+# LLMPlanner.generate — tree-aware registry constraints (goldfive#151)
+# ---------------------------------------------------------------------------
+
+
+def _tree_registry() -> list[dict[str, object]]:
+    """A structured tree matching the canned plan's assignees."""
+    return [
+        {"name": "coordinator", "depth": 0, "parent": "", "role": "root", "kind": "LlmAgent"},
+        {
+            "name": "researcher",
+            "depth": 1,
+            "parent": "coordinator",
+            "role": "leaf",
+            "kind": "LlmAgent",
+        },
+        {
+            "name": "writer",
+            "depth": 1,
+            "parent": "coordinator",
+            "role": "leaf",
+            "kind": "LlmAgent",
+        },
+        {
+            "name": "editor",
+            "depth": 1,
+            "parent": "coordinator",
+            "role": "leaf",
+            "kind": "LlmAgent",
+        },
+    ]
+
+
+def _off_registry_plan_json() -> str:
+    """A plan whose assignees don't match the registry names."""
+    return json.dumps(
+        {
+            "summary": "Off-registry plan.",
+            "tasks": [
+                {
+                    "id": "research",
+                    "title": "Research",
+                    "description": "Do research.",
+                    "assignee_agent_id": "agent_researcher",
+                },
+                {
+                    "id": "draft",
+                    "title": "Draft",
+                    "description": "Draft post.",
+                    "assignee_agent_id": "agent_content",
+                },
+            ],
+            "edges": [{"from_task_id": "research", "to_task_id": "draft"}],
+        }
+    )
+
+
+async def test_generate_prompt_renders_agent_tree_when_tree_given() -> None:
+    """Passing the structured tree form renders an AGENT TREE section."""
+    stub = _StubLLM(_canned_plan_json())
+    planner = LLMPlanner(call_llm=stub)
+    await planner.generate(
+        goals=_goals(),
+        available_agents=_tree_registry(),
+    )
+    assert stub.calls, "stub should have been invoked"
+    _sys, user, _model = stub.calls[0]
+    assert "AGENT TREE" in user
+    # Tree metadata surfaces (role / kind / depth).
+    assert "role=root" in user
+    assert "role=leaf" in user
+    assert "kind=LlmAgent" in user
+
+
+async def test_generate_prompt_flat_list_renders_legacy_header() -> None:
+    """Legacy ``list[str]`` callers still see the old 'Available agents:' header."""
+    stub = _StubLLM(_canned_plan_json())
+    planner = LLMPlanner(call_llm=stub)
+    await planner.generate(
+        goals=_goals(),
+        available_agents=["researcher", "writer", "editor"],
+    )
+    _sys, user, _model = stub.calls[0]
+    assert "Available agents:" in user
+    assert "AGENT TREE" not in user
+
+
+async def test_validator_rejects_off_registry_assignee() -> None:
+    """Plans whose assignees aren't in the registry are rejected on every attempt.
+
+    Exhausts the retry budget because the stub always returns the same
+    off-registry JSON; ``generate`` eventually returns ``None``.
+    """
+
+    class _AlwaysOffRegistry:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def __call__(self, system: str, user: str, model: str) -> str:
+            self.calls.append((system, user, model))
+            return _off_registry_plan_json()
+
+    stub = _AlwaysOffRegistry()
+    planner = LLMPlanner(call_llm=stub, max_refine_attempts=2)
+    result = await planner.generate(
+        goals=_goals(),
+        available_agents=_tree_registry(),
+    )
+    assert result is None
+    # The retry loop fired the full budget.
+    assert len(stub.calls) == 2
+    # The retry prompt fed the validator error back to the LLM.
+    _sys, retry_user, _ = stub.calls[1]
+    assert "off-registry assignee" in retry_user
+
+
+async def test_retry_loop_corrects_off_registry_assignee() -> None:
+    """First attempt uses bogus assignees; second attempt picks the real names.
+
+    Demonstrates the #133/#136 retry-with-correction loop wired into
+    the #151 registry check: the validator's error message feeds the
+    second prompt, and the second response validates cleanly.
+    """
+
+    class _Correcting:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def __call__(self, system: str, user: str, model: str) -> str:
+            self.calls.append((system, user, model))
+            if len(self.calls) == 1:
+                return _off_registry_plan_json()
+            return _canned_plan_json()
+
+    stub = _Correcting()
+    planner = LLMPlanner(call_llm=stub, max_refine_attempts=3)
+    plan = await planner.generate(
+        goals=_goals(),
+        available_agents=_tree_registry(),
+    )
+    assert plan is not None
+    # Second attempt used the real registry names.
+    assignees = {t.assignee_agent_id for t in plan.tasks}
+    assert assignees <= {"researcher", "writer", "editor"}
+    # Correction feedback landed in the retry prompt.
+    _sys, retry_user, _ = stub.calls[1]
+    assert "off-registry assignee" in retry_user
+
+
+async def test_generate_accepts_none_registry_backcompat() -> None:
+    """``available_agents=None`` skips the registry check entirely.
+
+    Preserves back-compat with callers that don't supply a registry —
+    the plan validates structurally but no assignee-membership check
+    fires.
+    """
+    stub = _StubLLM(_off_registry_plan_json())
+    planner = LLMPlanner(call_llm=stub, max_refine_attempts=2)
+    plan = await planner.generate(
+        goals=_goals(),
+        available_agents=None,
+    )
+    # With no registry, off-registry names are allowed.
+    assert plan is not None
+    assert len(stub.calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # LLMPlanner.refine
 # ---------------------------------------------------------------------------
 

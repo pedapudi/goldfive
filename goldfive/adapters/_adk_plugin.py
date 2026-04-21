@@ -917,10 +917,11 @@ def make_adk_plugin(
             Fires once per agent invocation (including sub-agents
             inside AgentTool sub-Runners). When a
             :class:`~goldfive.reconciler.PlanReconciler` is attached,
-            we forward ``agent.name`` and the invocation id so it
-            can transition the matching plan task to RUNNING. When
-            no reconciler is attached (legacy ``invoke(task)`` path),
-            this is a no-op.
+            we forward ``agent.name``, the invocation id, and the
+            parent_invocation_id (the outer runner's id, when the
+            current invocation is nested inside an ``AgentTool``
+            sub-Runner) so the reconciler can resolve parent chains
+            for contextual matching (goldfive#151).
             """
             reconciler = self._reconciler
             if reconciler is None:
@@ -930,11 +931,28 @@ def make_adk_plugin(
                 callback_context, "invocation_context", None
             )
             inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+            parent_inv_id = ""
+            if inv_id and self._top_invocation_id and inv_id != self._top_invocation_id:
+                parent_inv_id = self._top_invocation_id
             try:
                 await reconciler.on_before_agent(
                     agent_name=agent_name,
                     invocation_id=inv_id,
+                    parent_invocation_id=parent_inv_id,
                 )
+            except TypeError:
+                # Custom reconciler without the #151 kwarg — fall back
+                # to the pre-#151 signature. Keeps back-compat.
+                try:
+                    await reconciler.on_before_agent(
+                        agent_name=agent_name,
+                        invocation_id=inv_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_agent_callback: reconciler.on_before_agent raised: %s",
+                        exc,
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "before_agent_callback: reconciler.on_before_agent raised: %s",
@@ -952,6 +970,9 @@ def make_adk_plugin(
                 callback_context, "invocation_context", None
             )
             inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+            parent_inv_id = ""
+            if inv_id and self._top_invocation_id and inv_id != self._top_invocation_id:
+                parent_inv_id = self._top_invocation_id
             summary = self._invocation_last_text.get(inv_id, "") if inv_id else ""
             try:
                 await reconciler.on_after_agent(
@@ -959,7 +980,21 @@ def make_adk_plugin(
                     invocation_id=inv_id,
                     error=None,
                     summary=summary,
+                    parent_invocation_id=parent_inv_id,
                 )
+            except TypeError:
+                try:
+                    await reconciler.on_after_agent(
+                        agent_name=agent_name,
+                        invocation_id=inv_id,
+                        error=None,
+                        summary=summary,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "after_agent_callback: reconciler.on_after_agent raised: %s",
+                        exc,
+                    )
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "after_agent_callback: reconciler.on_after_agent raised: %s",

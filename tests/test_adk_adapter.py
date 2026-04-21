@@ -1148,8 +1148,7 @@ async def test_user_steer_primer_appended_after_function_response() -> None:
     agent = _make_agent()
 
     multi_parts = [
-        types.Part(function_call=types.FunctionCall(id=f"call-{i}", name=f"t{i}"))
-        for i in (1, 2)
+        types.Part(function_call=types.FunctionCall(id=f"call-{i}", name=f"t{i}")) for i in (1, 2)
     ]
     multi_event = Event(
         invocation_id="inv-steer",
@@ -1165,9 +1164,7 @@ async def test_user_steer_primer_appended_after_function_response() -> None:
     runner = _FakeRunner(_run, agent)
     adapter = ADKAdapter(runner, session_id="sess-steer")
 
-    invoke_task = asyncio.create_task(
-        adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
-    )
+    invoke_task = asyncio.create_task(adapter.invoke(Task(id="t1", title="x"), Session(run_id="r")))
     await asyncio.sleep(0.01)
     # Simulate the executor tagging the adapter before triggering cancel.
     adapter._next_cancel_reason = SYMBOLIC_REASON_USER_STEER
@@ -1217,9 +1214,7 @@ async def test_replan_cancel_does_not_append_primer() -> None:
     runner = _FakeRunner(_run, agent)
     adapter = ADKAdapter(runner, session_id="sess-replan")
 
-    invoke_task = asyncio.create_task(
-        adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
-    )
+    invoke_task = asyncio.create_task(adapter.invoke(Task(id="t1", title="x"), Session(run_id="r")))
     await asyncio.sleep(0.01)
     adapter._next_cancel_reason = SYMBOLIC_REASON_REPLAN
     invoke_task.cancel()
@@ -1250,9 +1245,7 @@ async def test_generic_cancel_does_not_append_primer() -> None:
     runner = _FakeRunner(_run, agent)
     adapter = ADKAdapter(runner, session_id="sess-generic")
 
-    invoke_task = asyncio.create_task(
-        adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
-    )
+    invoke_task = asyncio.create_task(adapter.invoke(Task(id="t1", title="x"), Session(run_id="r")))
     await asyncio.sleep(0.01)
     # Do NOT set _next_cancel_reason — simulate the legacy code path
     # where the cancel arrives without a symbolic tag.
@@ -1323,9 +1316,7 @@ async def test_next_cancel_reason_cleared_after_consumption() -> None:
     runner = _FakeRunner(_run, agent)
     adapter = ADKAdapter(runner, session_id="sess-clear")
 
-    invoke_task = asyncio.create_task(
-        adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
-    )
+    invoke_task = asyncio.create_task(adapter.invoke(Task(id="t1", title="x"), Session(run_id="r")))
     await asyncio.sleep(0.01)
     adapter._next_cancel_reason = SYMBOLIC_REASON_USER_STEER
     invoke_task.cancel()
@@ -1930,7 +1921,7 @@ async def test_reporting_tool_guards_fire_across_back_to_back_invocations() -> N
                             stripped = line.strip()
                             for prefix in ("Also, please: ", "Task: "):
                                 if stripped.startswith(prefix):
-                                    tail = stripped[len(prefix):]
+                                    tail = stripped[len(prefix) :]
                                     # Drop trailing punctuation / descriptions.
                                     for sep in (". ", "\n"):
                                         idx = tail.find(sep)
@@ -2107,6 +2098,120 @@ def test_available_agents_reports_reachable_names() -> None:
 
     adapter = ADKAdapter(root)
     assert adapter.available_agents == ["leaf", "mid", "root"]
+
+
+# ---------------------------------------------------------------------------
+# available_agents_tree — tree-aware planner constraints (goldfive#151)
+# ---------------------------------------------------------------------------
+
+
+def _mk_llm(name: str) -> Any:
+    from google.adk.agents.llm_agent import LlmAgent  # type: ignore
+
+    return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
+
+
+def test_available_agents_tree_single_llm_agent() -> None:
+    """Fixture 1: single LlmAgent. Tree has one root leaf."""
+    from goldfive.adapters.adk import ADKAdapter
+
+    solo = _mk_llm("solo")
+    adapter = ADKAdapter(solo)
+    tree = adapter.available_agents_tree
+    assert len(tree) == 1
+    entry = tree[0]
+    assert entry["name"] == "solo"
+    assert entry["depth"] == 0
+    assert entry["parent"] == ""
+    assert entry["role"] == "root"
+    assert entry["kind"] == "LlmAgent"
+
+
+def test_available_agents_tree_flat_specialist_tree() -> None:
+    """Fixture 2: coordinator with three specialist sub_agents.
+
+    Tree shape: coordinator (root) -> A, B, C (leaves, depth=1).
+    """
+    from goldfive.adapters.adk import ADKAdapter
+
+    a = _mk_llm("agent_a")
+    b = _mk_llm("agent_b")
+    c = _mk_llm("agent_c")
+    coordinator = _mk_llm("coordinator")
+    coordinator.sub_agents = [a, b, c]
+
+    adapter = ADKAdapter(coordinator)
+    tree = adapter.available_agents_tree
+    by_name = {e["name"]: e for e in tree}
+    assert set(by_name) == {"coordinator", "agent_a", "agent_b", "agent_c"}
+    assert by_name["coordinator"]["depth"] == 0
+    assert by_name["coordinator"]["role"] == "root"
+    assert by_name["coordinator"]["parent"] == ""
+    for leaf_name in ("agent_a", "agent_b", "agent_c"):
+        entry = by_name[leaf_name]
+        assert entry["depth"] == 1
+        assert entry["role"] == "leaf"
+        assert entry["parent"] == "coordinator"
+        assert entry["kind"] == "LlmAgent"
+
+
+def test_available_agents_tree_deep_hierarchy() -> None:
+    """Fixture 3: deep hierarchy (depth >= 3)."""
+    from goldfive.adapters.adk import ADKAdapter
+
+    leaf1 = _mk_llm("leaf1")
+    leaf2 = _mk_llm("leaf2")
+    coord1 = _mk_llm("coord1")
+    coord1.sub_agents = [leaf1, leaf2]
+    root = _mk_llm("root")
+    root.sub_agents = [coord1]
+
+    adapter = ADKAdapter(root)
+    tree = adapter.available_agents_tree
+    by_name = {e["name"]: e for e in tree}
+    assert set(by_name) == {"root", "coord1", "leaf1", "leaf2"}
+    assert by_name["root"]["depth"] == 0
+    assert by_name["root"]["role"] == "root"
+    assert by_name["coord1"]["depth"] == 1
+    assert by_name["coord1"]["role"] == "intermediate"
+    assert by_name["coord1"]["parent"] == "root"
+    assert by_name["leaf1"]["depth"] == 2
+    assert by_name["leaf1"]["parent"] == "coord1"
+    assert by_name["leaf1"]["role"] == "leaf"
+    assert by_name["leaf2"]["depth"] == 2
+    assert by_name["leaf2"]["parent"] == "coord1"
+    assert by_name["leaf2"]["role"] == "leaf"
+
+
+def test_available_agents_tree_agnostic_to_agent_class() -> None:
+    """Custom BaseAgent subclasses pass through ``kind`` unchanged.
+
+    Tree-agnostic invariant (goldfive#151): the walker reports the raw
+    class name of whatever agent is in the tree — it does NOT
+    special-case LlmAgent / SequentialAgent / ParallelAgent / BaseAgent.
+    """
+    from google.adk.agents.base_agent import BaseAgent  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    class CustomAgent(BaseAgent):
+        """A caller-supplied subclass the walker must not interpret."""
+
+        async def _run_async_impl(self, ctx):  # noqa: D401, ANN001
+            return
+            yield  # pragma: no cover - required async generator shape
+
+    custom_leaf = CustomAgent(name="my_custom_leaf", description="x")
+    root = _mk_llm("root")
+    root.sub_agents = [custom_leaf]
+
+    adapter = ADKAdapter(root)
+    tree = adapter.available_agents_tree
+    by_name = {e["name"]: e for e in tree}
+    assert by_name["my_custom_leaf"]["kind"] == "CustomAgent"
+    assert by_name["my_custom_leaf"]["role"] == "leaf"
+    assert by_name["my_custom_leaf"]["parent"] == "root"
+    assert by_name["root"]["kind"] == "LlmAgent"
 
 
 async def test_invoke_always_drives_the_one_runner() -> None:

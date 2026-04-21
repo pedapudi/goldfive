@@ -37,7 +37,7 @@ class Planner(Protocol):
         self,
         *,
         goals: list[Goal],
-        available_agents: list[str],
+        available_agents: list[str] | list[dict[str, Any]] | None,
         context: Mapping[str, Any] | None = None,
     ) -> Plan | None: ...
 
@@ -48,6 +48,7 @@ class Planner(Protocol):
         drift: DriftEvent,
         goals: list[Goal],
         observed_actions: list[ObservedAction] | None = None,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None: ...
 
 
@@ -143,6 +144,14 @@ class AgentAdapter(Protocol):
 
     @property
     def available_agents(self) -> list[str]: ...
+
+    # NOTE: goldfive#151 added a structured ``available_agents_tree``
+    # property on the shipped adapters (ADK, Claude, Callable) for the
+    # tree-aware planner, but it is intentionally *not* part of the
+    # Protocol so custom / legacy adapters that only expose
+    # ``available_agents`` still pass ``isinstance(x, AgentAdapter)``
+    # checks. Call sites look the attribute up via ``getattr`` and
+    # fall back to the flat list when absent.
 
 
 @runtime_checkable
