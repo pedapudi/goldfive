@@ -974,3 +974,271 @@ async def test_refine_rejects_refine_validation_failed_drift() -> None:
 
     assert result is None
     assert scripted.calls == []
+
+
+# ---------------------------------------------------------------------------
+# goldfive#137: CANCELLED/FAILED -> PENDING reachability invariant.
+#
+# The live Qwen run on #137 produced a USER_STEER refinement where the
+# old ``research`` task was CANCELLED but the new plan kept
+# ``research -> r1`` (r1 PENDING). The executor stalled because r1 was
+# never eligible. Part 1 of the fix rejects this shape at validation
+# time; Part 2 teaches the refine prompt to avoid emitting it. These
+# tests cover both.
+# ---------------------------------------------------------------------------
+
+
+def _user_steer_plan_with_cancelled_research() -> Plan:
+    """A plan where ``research`` was CANCELLED by a prior user steer.
+
+    Mirrors the sess_2026-04-21_0021 shape on #137: an operator
+    pivoted away from the original topic, so the research task is
+    terminal-CANCELLED and subsequent tasks were never run.
+    """
+    return Plan(
+        id="plan-steer",
+        run_id="run-steer",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="research",
+                title="Research solar panels",
+                assignee_agent_id="researcher",
+                status=TaskStatus.CANCELLED,
+            ),
+            Task(
+                id="old_structure",
+                title="Structure panels presentation",
+                assignee_agent_id="writer",
+                status=TaskStatus.CANCELLED,
+            ),
+        ],
+        edges=[TaskEdge("research", "old_structure")],
+        summary="Solar panels deck (superseded)",
+        revision_index=0,
+    )
+
+
+def _bad_qwen_shape_revision() -> str:
+    """Pre-fix Qwen pathology: graft new ``r1`` onto CANCELLED ``research``.
+
+    The exact shape observed in the live run -- the LLM "chains" the
+    new PENDING root off the prior CANCELLED task, which makes r1
+    unreachable. Step 7 of ``Plan.validate`` rejects this.
+    """
+    return json.dumps(
+        {
+            "summary": "Replanned for solar flares",
+            "tasks": [
+                {
+                    "id": "research",
+                    "title": "Research solar panels",
+                    "assignee_agent_id": "researcher",
+                    "status": "CANCELLED",
+                },
+                {
+                    "id": "old_structure",
+                    "title": "Structure panels presentation",
+                    "assignee_agent_id": "writer",
+                    "status": "CANCELLED",
+                },
+                {
+                    "id": "r1",
+                    "title": "Research solar flares",
+                    "assignee_agent_id": "researcher",
+                    "status": "PENDING",
+                },
+                {
+                    "id": "o1",
+                    "title": "Outline solar-flare deck",
+                    "assignee_agent_id": "writer",
+                    "status": "PENDING",
+                },
+            ],
+            "edges": [
+                # Terminal->terminal edge preserved (required).
+                {"from_task_id": "research", "to_task_id": "old_structure"},
+                # BUG: CANCELLED -> PENDING graft. r1 will stall.
+                {"from_task_id": "research", "to_task_id": "r1"},
+                {"from_task_id": "r1", "to_task_id": "o1"},
+            ],
+        }
+    )
+
+
+def _good_post_fix_revision() -> str:
+    """Post-fix shape: new sub-DAG is rooted independently.
+
+    ``r1`` is now a root (no incoming edge from a CANCELLED task);
+    the new sub-DAG is self-contained and executable from the get-go.
+    """
+    return json.dumps(
+        {
+            "summary": "Replanned for solar flares",
+            "tasks": [
+                {
+                    "id": "research",
+                    "title": "Research solar panels",
+                    "assignee_agent_id": "researcher",
+                    "status": "CANCELLED",
+                },
+                {
+                    "id": "old_structure",
+                    "title": "Structure panels presentation",
+                    "assignee_agent_id": "writer",
+                    "status": "CANCELLED",
+                },
+                {
+                    "id": "r1",
+                    "title": "Research solar flares",
+                    "assignee_agent_id": "researcher",
+                    "status": "PENDING",
+                },
+                {
+                    "id": "o1",
+                    "title": "Outline solar-flare deck",
+                    "assignee_agent_id": "writer",
+                    "status": "PENDING",
+                },
+            ],
+            "edges": [
+                {"from_task_id": "research", "to_task_id": "old_structure"},
+                {"from_task_id": "r1", "to_task_id": "o1"},
+            ],
+        }
+    )
+
+
+async def test_refine_retry_catches_bad_edges_and_succeeds() -> None:
+    """Attempt 1 emits the live Qwen pathology (CANCELLED->PENDING edge);
+    attempt 2 corrects it. The planner's retry loop must catch the bad
+    edge at validation time, append the error to the prompt, and
+    recover on the second try.
+    """
+    scripted = _ScriptedLLM([_bad_qwen_shape_revision(), _good_post_fix_revision()])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=2)
+    emitted: list[DriftEvent] = []
+
+    async def capture(drift: DriftEvent) -> None:
+        emitted.append(drift)
+
+    planner.set_drift_emitter(capture)
+    drift = DriftEvent(
+        kind=DriftKind.PLAN_DIVERGENCE,
+        severity=DriftSeverity.WARNING,
+        detail="Replan for solar flares",
+        current_task_id="research",
+    )
+
+    revised = await planner.refine(
+        plan=_user_steer_plan_with_cancelled_research(),
+        drift=drift,
+        goals=_goals(),
+    )
+
+    # Recovery succeeds on attempt 2.
+    assert revised is not None
+    assert len(scripted.calls) == 2
+    # No REFINE_VALIDATION_FAILED should fire -- this isn't exhaustion.
+    assert emitted == []
+    # The correction prompt on attempt 2 carries the validator's error
+    # (mentioning the offending edge) so the LLM sees exactly what to fix.
+    _system, second_user_prompt, _model = scripted.calls[1]
+    assert "PREVIOUS ATTEMPT FAILED" in second_user_prompt
+    assert "'research' -> 'r1'" in second_user_prompt
+    assert "PENDING task unexecutable" in second_user_prompt
+    # The final plan has the new PENDING root free of any terminal
+    # predecessor, so the executor can pick it up immediately.
+    by_id = {t.id: t for t in revised.tasks}
+    assert by_id["r1"].status == TaskStatus.PENDING
+    pairs = {(e.from_task_id, e.to_task_id) for e in revised.edges}
+    assert ("research", "r1") not in pairs  # offending edge is gone
+    assert ("r1", "o1") in pairs
+
+
+async def test_refine_prompt_includes_forbidden_edges_section() -> None:
+    """The refine prompt (both the generic and LOOPING variants) must
+    include the FORBIDDEN EDGES guidance so the LLM knows not to graft
+    new PENDING tasks onto CANCELLED/FAILED predecessors. Structural
+    test on the prompt text so the guidance can't silently regress.
+    """
+    # Generic refine path (non-LOOPING, non-USER_STEER).
+    scripted = _ScriptedLLM([_good_post_fix_revision()])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=2)
+    drift = DriftEvent(
+        kind=DriftKind.PLAN_DIVERGENCE,
+        severity=DriftSeverity.WARNING,
+        detail="replan",
+        current_task_id="research",
+    )
+
+    await planner.refine(
+        plan=_user_steer_plan_with_cancelled_research(),
+        drift=drift,
+        goals=_goals(),
+    )
+    _sys, user_prompt, _model = scripted.calls[0]
+    assert "FORBIDDEN EDGES" in user_prompt
+    assert "CANCELLED" in user_prompt and "FAILED" in user_prompt
+    assert "independent sub-DAG" in user_prompt
+
+    # LOOPING_TOOL_CALL refine path.
+    scripted = _ScriptedLLM([_good_looping_revision_json()])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=2)
+    loop_drift = DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="stuck",
+        current_task_id="draft_slides",
+    )
+    await planner.refine(plan=_looping_plan(), drift=loop_drift, goals=_goals())
+    _sys, loop_prompt, _model = scripted.calls[0]
+    assert "FORBIDDEN EDGES" in loop_prompt
+    assert "CANCELLED" in loop_prompt and "FAILED" in loop_prompt
+
+    # USER_STEER refine path has its own inline invariants block.
+    from goldfive.types import Task as _Task  # noqa: PLC0415 -- test-local import
+
+    user_steer_plan = Plan(
+        id="p",
+        run_id="r",
+        goal_ids=["g1"],
+        tasks=[
+            _Task(
+                id="research",
+                title="Research panels",
+                assignee_agent_id="researcher",
+                status=TaskStatus.CANCELLED,
+            ),
+        ],
+        edges=[],
+    )
+    scripted = _ScriptedLLM(
+        [
+            json.dumps(
+                {
+                    "summary": "replan",
+                    "tasks": [
+                        {
+                            "id": "r1",
+                            "title": "Research flares",
+                            "assignee_agent_id": "researcher",
+                            "status": "PENDING",
+                        }
+                    ],
+                    "edges": [],
+                }
+            )
+        ]
+    )
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=1)
+    steer_drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="solar flares",
+        current_task_id="research",
+    )
+    await planner.refine(plan=user_steer_plan, drift=steer_drift, goals=_goals())
+    _sys, steer_prompt, _model = scripted.calls[0]
+    assert "FORBIDDEN EDGES" in steer_prompt
+    assert "CANCELLED" in steer_prompt and "FAILED" in steer_prompt
