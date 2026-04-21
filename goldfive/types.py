@@ -577,6 +577,19 @@ class Session:
     # than a queue) is deliberate: a second Level 3 while one is pending
     # overwrites the first -- the more-recent directive wins.
     pending_corrective_message: str | None = None
+    # Orchestration-level session state dict (goldfive#152). Goldfive
+    # owns keys under the ``goldfive.*`` namespace — see
+    # :mod:`goldfive.orchestration_state` for the documented key names
+    # and helpers. This is NOT the same surface as the ADK
+    # ``session.state`` dict the ADK adapter writes to for agent-side
+    # reads (that lives on the ADK ``Session`` object; see
+    # :mod:`goldfive.adapters._adk_state_protocol`). This dict is
+    # goldfive-orchestration-internal: the PlanReconciler stamps the
+    # current task id/title here, the steerer writes active-steer
+    # bookkeeping, and the ADK heal path records cancelled function
+    # call ids so prompt templates / refine paths / downstream planners
+    # can read a single, framework-agnostic source of truth.
+    state: dict[str, Any] = dataclasses.field(default_factory=dict)
     # monotonic event sequence counter for sinks
     _next_sequence: int = 0
 

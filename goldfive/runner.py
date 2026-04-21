@@ -41,6 +41,7 @@ import warnings
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from goldfive import orchestration_state as _ostate
 from goldfive._llm import maybe_close_call_llm
 from goldfive.conversation import Conversation
 from goldfive.events import (
@@ -229,6 +230,11 @@ class Runner:
             if g.id:
                 existing_ids.add(g.id)
 
+        # goldfive#152: refresh the orchestration-state goals summary
+        # so prompt templates / refine paths / downstream planners
+        # see an up-to-date ``goldfive.goals_summary``.
+        _ostate.refresh_goals_summary(session.state, session.goals)
+
         await self._emit_goal_derived(session)
 
         # Build the context passed to the planner. Stamp run_id (so LLM
@@ -275,6 +281,12 @@ class Runner:
         if not plan.run_id:
             plan.run_id = session.run_id
         session.plan = plan
+
+        # goldfive#152: record the installed plan id on the
+        # orchestration-state dict so downstream components don't
+        # need to reach into ``session.plan`` to read the current
+        # plan id.
+        _ostate.set_current_plan(session.state, plan)
 
         await self._emit_plan_submitted(session, plan)
 
@@ -372,6 +384,12 @@ class Runner:
                 aborted, user_input_summary=_initial_goal_summary(user_input)
             )
             return aborted
+
+        # goldfive#152: clear the current_task_* stamp at run end.
+        # The plan id + goals summary stay (they remain meaningful
+        # cross-turn on the owning Conversation).
+        _ostate.clear_current_task(session.state)
+        _ostate.clear_active_steer(session.state)
 
         self._conversation.absorb_turn(
             outcome, user_input_summary=_initial_goal_summary(user_input)

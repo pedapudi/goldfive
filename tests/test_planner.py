@@ -1242,3 +1242,125 @@ async def test_refine_prompt_includes_forbidden_edges_section() -> None:
     _sys, steer_prompt, _model = scripted.calls[0]
     assert "FORBIDDEN EDGES" in steer_prompt
     assert "CANCELLED" in steer_prompt and "FAILED" in steer_prompt
+
+
+# ---------------------------------------------------------------------------
+# synthesize_goal_from_steer (goldfive#152)
+# ---------------------------------------------------------------------------
+
+
+class _SynthLLM:
+    """Minimal call_llm stub for the synthesize_goal_from_steer tests.
+
+    Named distinctly from the file's existing ``_ScriptedLLM`` (which
+    accepts a list of responses and pops per-call) because the
+    synthesize API is one-shot: a single canned string response.
+    """
+
+    def __init__(self, response: str) -> None:
+        self._response = response
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def __call__(self, system: str, user: str, model: str) -> str:
+        self.calls.append((system, user, model))
+        return self._response
+
+
+async def test_synthesize_goal_from_steer_returns_goal_and_append_mode() -> None:
+    """Minimal well-formed response → (Goal, 'append')."""
+    scripted = _SynthLLM(
+        json.dumps(
+            {
+                "goal": {"id": "steer1", "summary": "also include a summary slide"},
+                "mode": "append",
+                "reason": "additive request",
+            }
+        )
+    )
+    planner = LLMPlanner(call_llm=scripted)
+    result = await planner.synthesize_goal_from_steer(
+        "also include a summary slide"
+    )
+    assert result is not None
+    goal, mode = result
+    assert goal.id == "steer1"
+    assert goal.summary == "also include a summary slide"
+    assert mode == "append"
+    # The system prompt asks for JSON + mode.
+    _sys, user_prompt, _model = scripted.calls[0]
+    assert "STEERING DIRECTIVE" in user_prompt
+    assert "also include a summary slide" in user_prompt
+
+
+async def test_synthesize_goal_from_steer_returns_replace_mode() -> None:
+    """``mode: replace`` propagates through to the caller."""
+    scripted = _SynthLLM(
+        json.dumps(
+            {
+                "goal": {"id": "pivot", "summary": "scrap everything and do Y"},
+                "mode": "replace",
+                "reason": "scrap-and-pivot",
+            }
+        )
+    )
+    planner = LLMPlanner(call_llm=scripted)
+    result = await planner.synthesize_goal_from_steer(
+        "forget everything — just do Y"
+    )
+    assert result is not None
+    _goal, mode = result
+    assert mode == "replace"
+
+
+async def test_synthesize_goal_from_steer_handles_markdown_fences() -> None:
+    """LLM response wrapped in ```json fences parses correctly."""
+    scripted = _SynthLLM(
+        "```json\n"
+        + json.dumps(
+            {
+                "goal": {"id": "g", "summary": "do the thing"},
+                "mode": "append",
+            }
+        )
+        + "\n```"
+    )
+    planner = LLMPlanner(call_llm=scripted)
+    result = await planner.synthesize_goal_from_steer("do the thing")
+    assert result is not None
+    goal, mode = result
+    assert goal.summary == "do the thing"
+    assert mode == "append"
+
+
+async def test_synthesize_goal_from_steer_returns_none_on_empty_body() -> None:
+    """Empty steer body short-circuits before the LLM is called."""
+    scripted = _SynthLLM("should not be called")
+    planner = LLMPlanner(call_llm=scripted)
+    result = await planner.synthesize_goal_from_steer("")
+    assert result is None
+    assert scripted.calls == []
+
+
+async def test_synthesize_goal_from_steer_returns_none_on_malformed_json() -> None:
+    """Unparseable LLM response → None (caller falls back to passthrough)."""
+    scripted = _SynthLLM("not json at all {[")
+    planner = LLMPlanner(call_llm=scripted)
+    result = await planner.synthesize_goal_from_steer("some steer")
+    assert result is None
+
+
+async def test_synthesize_goal_from_steer_defaults_mode_when_invalid() -> None:
+    """Invalid ``mode`` falls back to 'append'."""
+    scripted = _SynthLLM(
+        json.dumps(
+            {
+                "goal": {"id": "g", "summary": "x"},
+                "mode": "nonsense",
+            }
+        )
+    )
+    planner = LLMPlanner(call_llm=scripted)
+    result = await planner.synthesize_goal_from_steer("some steer")
+    assert result is not None
+    _goal, mode = result
+    assert mode == "append"

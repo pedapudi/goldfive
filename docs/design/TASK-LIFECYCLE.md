@@ -659,3 +659,84 @@ A plan revision emits `PlanRevised(old_plan_id, new_plan_id,
 revision_index, kind, severity, reason)` after
 `_apply_revision` completes. Sinks that cache plan state should
 re-read `session.plan` on every `PlanRevised`.
+
+---
+
+## Appendix: orchestration state namespace (goldfive#152)
+
+`Session.state` is a dict goldfive stamps with keys under the
+`goldfive.*` prefix so downstream consumers (prompt templates,
+refine paths, `GoldfivePlanner`, drift detectors) can read
+orchestration context without walking `session.plan` + the drift
+stream. This is **not** the same surface as the ADK adapter's
+`session.state` (which is the ADK runtime's own dict; see
+[`goldfive/adapters/_adk_state_protocol.py`](../../goldfive/adapters/_adk_state_protocol.py)).
+The orchestration namespace is framework-agnostic — every adapter
+goes through `Session.state`, not just ADK.
+
+Keys:
+
+| Key | Owner | Lifecycle |
+|---|---|---|
+| `goldfive.current_plan_id` | `Runner` on plan submit, `DefaultSteerer._apply_revision` on revision | Set when a plan is installed; persists across the run |
+| `goldfive.current_task_id`, `goldfive.current_task_title` | `PlanReconciler` on before/after_agent; `DefaultSteerer.mark_task_*` on legacy transitions | Set on RUNNING; cleared on terminal transition of the same task and at run end |
+| `goldfive.goals_summary` | `Runner` after goal derivation; `DefaultSteerer._apply_user_steer_state` after USER_STEER | Formatted `"- [id] summary\n..."` block; refreshed whenever `session.goals` changes |
+| `goldfive.active_steer.body`, `goldfive.active_steer.at_turn` | `DefaultSteerer._apply_user_steer_state` on USER_STEER drift | `body` is the raw steer text; `at_turn` is the session sequence value at fire time. Cleared at run end |
+| `goldfive.cancelled_function_call_ids` | `ADKAdapter._heal_pending_tool_calls` | Append-only list of function_call ids that were healed mid-invocation. De-duplicated within the run |
+
+Ownership rules:
+
+1. **Only goldfive writes.** Adapters and agents do not write into
+   this namespace — it's orchestration-owned. Agent-side state
+   lives on the ADK `session.state` dict (see `_adk_state_protocol`)
+   or equivalent per-adapter surface.
+2. **Writers go through `goldfive.orchestration_state`.** The
+   helper module enforces the `goldfive.*` prefix and exposes
+   typed writers / readers so consumers don't hand-roll key
+   strings.
+3. **Steering is always active (no cooldown).** `active_steer.*`
+   is a durable read-back of the most recent USER_STEER, not a
+   cooldown window. The `at_turn` field lets consumers reason
+   about "is this a fresh steer or a stale one?" against the
+   session's monotonic sequence counter; they do the comparison
+   themselves.
+
+USER_STEER flow (`DefaultSteerer._apply_user_steer_state`):
+
+1. Stamp `active_steer.body` / `active_steer.at_turn`.
+2. Call `planner.synthesize_goal_from_steer(body)`. The method
+   returns `(Goal, mode)` where `mode` is `"append"` or
+   `"replace"`. Falls back to a passthrough `Goal(id="steer",
+   summary=body)` when the planner doesn't implement the hook.
+3. Mutate `session.goals` accordingly — `append` adds, `replace`
+   clears and sets the sole goal.
+4. Refresh `goldfive.goals_summary`.
+5. The steerer's normal drift flow (`_handle_drift` continuation)
+   then calls `planner.refine` with `list(session.goals)` — which
+   now contains the synthesized steer goal — so the refined plan
+   sees the pivot as a first-class goal, not just a drift detail
+   string.
+
+Steer restart framing (`SequentialExecutor._compose_steer_restart_message`):
+
+When USER_STEER fires mid-invocation under overlay mode, the
+executor cancels the in-flight invocation (goldfive#149) and
+restarts with the steer body as user input. The body is wrapped in
+a goldfive-authored override header:
+
+```
+[USER STEERING CONTROL — supersedes prior task context]
+
+{steer_body}
+
+Notes:
+- Prior research, partial work, or planned tasks from the pre-steer
+  conversation are superseded unless this message explicitly
+  references them.
+- Proceed with the new direction. Do not continue prior work unless
+  doing so directly serves this steer.
+```
+
+Clean framing without wiping conversation history — the LLM can
+still see earlier turns, but the framing makes it unambiguous that
+the steer is the new north star.
