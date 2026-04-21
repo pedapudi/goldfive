@@ -914,9 +914,27 @@ def classify_stop_reason(reason: Any) -> Optional[DriftEvent]: ...
 
 Each returns `None` when the input does not match the classifier's
 signal; callers compose them into a steerer's `detect_drift`
-pipeline. The module also exposes the marker tables
-`LLM_REFUSAL_MARKERS: tuple[str, ...]` and
-`CONTEXT_PRESSURE_STOP_REASONS: tuple[str, ...]` for downstream reuse.
+pipeline.
+
+`classify_refusal` grades severity by matching tier:
+
+| Tier       | Tuple                            | Severity    | Example marker          |
+| ---------- | -------------------------------- | ----------- | ----------------------- |
+| Policy     | `LLM_REFUSAL_MARKERS_CRITICAL`   | `CRITICAL`  | `"i must decline"`      |
+| Capability | `LLM_REFUSAL_MARKERS_WARNING`    | `WARNING`   | `"i cannot"`            |
+| Hedging    | `LLM_REFUSAL_MARKERS_INFO`       | `INFO`      | `"i'm not confident"`   |
+
+The scan order is `CRITICAL -> WARNING -> INFO`; first match wins, so
+a policy/safety refusal is never downgraded when the same text also
+contains a capability or hedging marker. `DefaultSteerer` only
+triggers `planner.refine` for `WARNING`/`CRITICAL` drift; INFO
+matches are emitted to sinks for observability only.
+
+The module also exposes the context-pressure table
+`CONTEXT_PRESSURE_STOP_REASONS: tuple[str, ...]` for downstream
+reuse. The flat `LLM_REFUSAL_MARKERS` tuple is retained as the
+concatenation of the three tiered tuples for back-compat; new code
+should import the tiered names directly.
 
 ## Version compatibility
 

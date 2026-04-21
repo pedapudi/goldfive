@@ -26,6 +26,9 @@ __all__ = [
     "DriftSeverity",
     "DriftEvent",
     "LLM_REFUSAL_MARKERS",
+    "LLM_REFUSAL_MARKERS_INFO",
+    "LLM_REFUSAL_MARKERS_WARNING",
+    "LLM_REFUSAL_MARKERS_CRITICAL",
     "CONTEXT_PRESSURE_STOP_REASONS",
     "classify_tool_error",
     "classify_refusal",
@@ -68,8 +71,27 @@ def __getattr__(name: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
-# Substrings that indicate an LLM-level refusal in free-form text.
-LLM_REFUSAL_MARKERS: tuple[str, ...] = (
+# Tiered refusal markers. ``classify_refusal`` scans the tiers in
+# CRITICAL -> WARNING -> INFO order and returns a ``DriftEvent`` with
+# the matching ``DriftSeverity``. First-match-wins: a substring match
+# in a higher tier short-circuits scans of the lower tiers, so
+# policy/safety refusals never get downgraded to hedging.
+#
+# INFO — hedging / deferral. The model is expressing low confidence
+# but has not refused outright. Emitted as observational drift only;
+# the default steerer does not trigger ``planner.refine`` for INFO.
+LLM_REFUSAL_MARKERS_INFO: tuple[str, ...] = (
+    "i may not be the best fit",
+    "i think this might",
+    "not particularly well suited",
+    "i'm not confident",
+    "i am not confident",
+)
+
+# WARNING — the model has stated it cannot or will not proceed but
+# without invoking a safety policy. Historically the only severity for
+# ``AGENT_REFUSAL``; still the most common tier. Triggers refine.
+LLM_REFUSAL_MARKERS_WARNING: tuple[str, ...] = (
     "i cannot",
     "i can't",
     "i won't",
@@ -77,11 +99,39 @@ LLM_REFUSAL_MARKERS: tuple[str, ...] = (
     "i'm unable",
     "i am unable",
     "i refuse",
-    "i must decline",
     "i'm not able to",
     "i am not able to",
-    "cannot assist",
     "can't help with",
+    "beyond my capabilities",
+    "outside my scope",
+    "cannot proceed",
+    "no viable approach",
+    "unable to locate",
+    "this is not something i can",
+    "i was unable to",
+)
+
+# CRITICAL — policy / safety refusals. These usually mean the model
+# will not produce the requested output no matter how the plan is
+# refined; surface the highest severity so operators see the refusal
+# clearly in sinks.
+LLM_REFUSAL_MARKERS_CRITICAL: tuple[str, ...] = (
+    "i must decline",
+    "cannot assist with",
+    "against my guidelines",
+    "for safety reasons",
+    "i will not proceed",
+)
+
+#: Deprecated: kept for back-compat with external callers that
+#: imported the flat marker tuple. Prefer the tiered tables above
+#: (:data:`LLM_REFUSAL_MARKERS_INFO`, :data:`LLM_REFUSAL_MARKERS_WARNING`,
+#: :data:`LLM_REFUSAL_MARKERS_CRITICAL`) and scan via
+#: :func:`classify_refusal`, which graduates severity per tier.
+LLM_REFUSAL_MARKERS: tuple[str, ...] = (
+    LLM_REFUSAL_MARKERS_CRITICAL
+    + LLM_REFUSAL_MARKERS_WARNING
+    + LLM_REFUSAL_MARKERS_INFO
 )
 
 # Stop-reason / finish-reason values that indicate the model hit a length
@@ -200,23 +250,37 @@ def classify_tool_error(event: Any) -> DriftEvent | None:
 
 
 def classify_refusal(text: Any) -> DriftEvent | None:
-    """Return a ``DriftEvent`` of kind ``AGENT_REFUSAL`` if the text
-    contains any of :data:`LLM_REFUSAL_MARKERS`.
+    """Return a ``DriftEvent`` of kind ``AGENT_REFUSAL`` with a severity
+    graduated from the matching tier.
 
-    ``text`` may be a raw string or any object from which
-    :func:`_extract_text` can pull a text payload. Case-insensitive.
+    Scans :data:`LLM_REFUSAL_MARKERS_CRITICAL`,
+    :data:`LLM_REFUSAL_MARKERS_WARNING`, then
+    :data:`LLM_REFUSAL_MARKERS_INFO` in that order and returns on the
+    first match. This guarantees a policy/safety refusal is never
+    downgraded to a WARNING or INFO just because the text also
+    contains a hedging phrase. ``text`` may be a raw string or any
+    object from which :func:`_extract_text` can pull a text payload.
+    Case-insensitive.
     """
     s = text if isinstance(text, str) else _extract_text(text)
-    marker = _first_marker(s, LLM_REFUSAL_MARKERS)
-    if marker is None:
+    if not s:
         return None
-    snippet = s[:140]
-    return DriftEvent(
-        kind=DriftKind.AGENT_REFUSAL,
-        severity=DriftSeverity.WARNING,
-        detail=f"refusal marker {marker!r}: {snippet!r}",
-        raw=text,
-    )
+    for tier_markers, severity in (
+        (LLM_REFUSAL_MARKERS_CRITICAL, DriftSeverity.CRITICAL),
+        (LLM_REFUSAL_MARKERS_WARNING, DriftSeverity.WARNING),
+        (LLM_REFUSAL_MARKERS_INFO, DriftSeverity.INFO),
+    ):
+        marker = _first_marker(s, tier_markers)
+        if marker is None:
+            continue
+        snippet = s[:140]
+        return DriftEvent(
+            kind=DriftKind.AGENT_REFUSAL,
+            severity=severity,
+            detail=f"refusal marker {marker!r}: {snippet!r}",
+            raw=text,
+        )
+    return None
 
 
 def classify_stop_reason(reason: Any) -> DriftEvent | None:
