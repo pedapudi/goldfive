@@ -14,9 +14,15 @@ The reconciler is instantiated once per invocation (one per
 ``ADKAdapter.invoke_passthrough`` call) and receives three signal
 streams from the goldfive ADK plugin:
 
-* ``on_before_agent(name, invocation_id)`` — an agent in the tree
-  is about to run. Maps ``name`` to the first PENDING plan task
-  whose ``assignee_agent_id == name`` and transitions it RUNNING.
+* ``on_before_agent(name, invocation_id, parent_invocation_id="")``
+  — an agent in the tree is about to run. Maps ``name`` to the
+  first PENDING plan task whose ``assignee_agent_id == name`` and
+  transitions it RUNNING. When no direct match is found, the
+  reconciler walks the parent chain (via the invocation_id → agent
+  map accumulated across observations) and credits a PENDING task
+  assigned to any ancestor — goldfive#151 "contextual match" for
+  deep hierarchies where the plan assigned work to a coordinator
+  the tree routes through.
 * ``on_after_agent(name, invocation_id, error)`` — the agent
   finished. The currently-running task matched to ``name`` moves
   to COMPLETED (or FAILED when ``error`` is non-None).
@@ -132,6 +138,15 @@ class PlanReconciler:
         # — used to avoid emitting the same PLAN_DIVERGENCE drift
         # repeatedly when an off-plan agent loops.
         self._off_plan_seen: set[str] = set()
+        # Invocation bookkeeping for contextual matching (goldfive#151).
+        # ``_invocation_agent`` maps invocation_id → agent_name and is
+        # populated on every ``on_before_agent``; ``_invocation_parent``
+        # maps invocation_id → parent_invocation_id so :meth:`_parent_chain`
+        # can walk up to the root without the reconciler knowing the
+        # tree shape. Tree-agnostic: depth-1, depth-N, flat, and deep
+        # hierarchies all produce a single-edge-per-invocation map here.
+        self._invocation_agent: dict[str, str] = {}
+        self._invocation_parent: dict[str, str] = {}
         # Public counters for tests and observability.
         self.observed_agents: list[str] = []
         self.divergence_events: list[str] = []
@@ -145,11 +160,31 @@ class PlanReconciler:
         *,
         agent_name: str,
         invocation_id: str = "",
+        parent_invocation_id: str = "",
     ) -> None:
-        """An agent is about to run. Claim the matching plan task."""
+        """An agent is about to run. Claim the matching plan task.
+
+        ``parent_invocation_id`` (goldfive#151) is optional and only
+        consulted for contextual fallback matching: when the observed
+        agent has no direct plan task and also no intermediate-turn
+        escape (see below), the reconciler walks the invocation chain
+        using the ``_invocation_agent`` map and tries to match an
+        ancestor's name against the pending plan. This handles deep
+        hierarchies where the plan assigned work to an ancestor
+        coordinator but the tree ran the leaf directly via
+        ``transfer_to_agent`` / ``AgentTool``.
+        """
         if not agent_name:
             return
         self.observed_agents.append(agent_name)
+        # Record the invocation → agent mapping so subsequent
+        # observations can resolve parent chains. Tree-agnostic: the
+        # reconciler has no notion of depth — it just stores what
+        # the plugin tells it.
+        if invocation_id:
+            self._invocation_agent[invocation_id] = agent_name
+            if parent_invocation_id:
+                self._invocation_parent[invocation_id] = parent_invocation_id
         if self._is_host_agent_turn(agent_name, invocation_id):
             # Top-level host-agent before/after wraps the whole
             # dispatch; plan tasks never map to the host itself
@@ -160,6 +195,33 @@ class PlanReconciler:
             return
         task = self._pick_pending_for_agent(agent_name)
         if task is None:
+            # Contextual fallback (goldfive#151): when the observed
+            # agent is a leaf invoked via an ancestor coordinator
+            # delegation, the ancestor's name may carry the plan
+            # task. Walk the parent chain and try to claim the first
+            # ancestor that has a pending plan task. This is the
+            # inverse of the usual leaf-match case and handles plans
+            # that assigned to a coordinator the tree routes through.
+            ancestor_task = self._pick_pending_via_parent_chain(invocation_id)
+            if ancestor_task is not None:
+                self._running_by_agent[agent_name] = ancestor_task.id
+                self._observed_task_ids.add(ancestor_task.id)
+                try:
+                    await self._steerer.transition(
+                        ancestor_task.id,
+                        TaskStatus.RUNNING,
+                        detail=(
+                            f"observed: {agent_name} started (contextual match via "
+                            f"ancestor {ancestor_task.assignee_agent_id!r})"
+                        ),
+                        session=self._session,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "PlanReconciler.on_before_agent: contextual transition(RUNNING) raised: %s",
+                        exc,
+                    )
+                return
             # No PENDING task matches this agent — either an
             # off-plan agent or a plan task that already finished.
             # Emit PLAN_DIVERGENCE once per off-plan agent and
@@ -171,6 +233,22 @@ class PlanReconciler:
             # divergence. A coordinator that delegates to the
             # research agent twice is normal.
             if self._agent_has_any_plan_task(agent_name):
+                return
+            # Contextual-plumbing suppression (goldfive#151): if any
+            # descendant in the parent chain is itself plan-attached,
+            # treat the current agent as intermediate plumbing rather
+            # than divergence. Tree-agnostic — the check is over
+            # invocation bookkeeping, not tree structure.
+            if self._invocation_chain_contains_plan_attached_descendant(invocation_id):
+                return
+            # Symmetric suppression: when the agent is a descendant of
+            # a plan-attached ancestor (i.e. an ancestor coordinator
+            # carries a plan task), the current invocation is the
+            # leaf-side of a coordinator delegation. The ancestor
+            # already claimed its task; the leaf is plumbing here, not
+            # divergence.
+            chain = self._parent_chain(invocation_id)
+            if any(self._agent_has_any_plan_task(name) for name in chain):
                 return
             self._off_plan_seen.add(agent_name)
             await self._emit_divergence(
@@ -210,10 +288,15 @@ class PlanReconciler:
         invocation_id: str = "",
         error: BaseException | None = None,
         summary: str = "",
+        parent_invocation_id: str = "",
     ) -> None:
         """An agent finished. Close out its matched task."""
         if not agent_name:
             return
+        # Keep bookkeeping up to date even on close so parent-chain
+        # lookups from late observations stay resolvable.
+        if invocation_id and parent_invocation_id:
+            self._invocation_parent.setdefault(invocation_id, parent_invocation_id)
         if self._is_host_agent_turn(agent_name, invocation_id):
             return
         task_id = self._running_by_agent.pop(agent_name, "")
@@ -387,6 +470,79 @@ class PlanReconciler:
             if task.assignee_agent_id == agent_name:
                 return task
         return None
+
+    def _parent_chain(self, invocation_id: str) -> list[str]:
+        """Return the ordered list of ancestor agent names for ``invocation_id``.
+
+        Walks ``_invocation_parent`` up to the root. Stops on cycles
+        (shouldn't happen, but defensive) and on missing edges. Returns
+        ``[]`` when no chain is known.
+
+        Tree-agnostic: the reconciler does not read any tree metadata;
+        it composes the chain purely from observations it has already
+        received.
+        """
+        if not invocation_id:
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        cur = self._invocation_parent.get(invocation_id, "")
+        while cur and cur not in seen:
+            seen.add(cur)
+            parent_name = self._invocation_agent.get(cur, "")
+            if parent_name:
+                names.append(parent_name)
+            cur = self._invocation_parent.get(cur, "")
+        return names
+
+    def _pick_pending_via_parent_chain(self, invocation_id: str) -> Task | None:
+        """Return a PENDING task whose assignee is in the parent chain.
+
+        Contextual match (goldfive#151): the leaf observation has no
+        directly-assigned plan task, but an ancestor coordinator on its
+        invocation chain does. Credit the leaf observation to the first
+        pending ancestor task we find walking up the chain.
+        """
+        chain = self._parent_chain(invocation_id)
+        if not chain:
+            return None
+        for ancestor in chain:
+            # Skip the host agent — its task semantics are handled by
+            # the direct-match rules.
+            task = self._pick_pending_for_agent(ancestor)
+            if task is not None:
+                return task
+        return None
+
+    def _invocation_chain_contains_plan_attached_descendant(
+        self,
+        invocation_id: str,
+    ) -> bool:
+        """Return True when any descendant observation already claimed a task.
+
+        Used to suppress PLAN_DIVERGENCE for intermediate coordinators
+        that the planner did not assign tasks to but which merely
+        route through to task-attached leaves. Kept as a small check
+        over the observation history — the reconciler never looks at
+        tree metadata directly (tree-agnostic invariant).
+        """
+        if not invocation_id:
+            return False
+        # Any observed invocation whose parent chain passes through
+        # ``invocation_id`` and whose agent_name has a plan task is a
+        # task-attached descendant.
+        for inv_id, parent in self._invocation_parent.items():
+            cur = parent
+            seen: set[str] = set()
+            while cur and cur not in seen:
+                seen.add(cur)
+                if cur == invocation_id:
+                    desc_name = self._invocation_agent.get(inv_id, "")
+                    if desc_name and self._agent_has_any_plan_task(desc_name):
+                        return True
+                    break
+                cur = self._invocation_parent.get(cur, "")
+        return False
 
     def _agent_has_any_plan_task(self, agent_name: str) -> bool:
         plan = self._session.plan

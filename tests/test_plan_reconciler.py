@@ -462,5 +462,306 @@ async def test_task_without_assignee_not_claimed() -> None:
     assert steerer.transitions == []
     assert session.plan.tasks[0].status is TaskStatus.PENDING
     # And the no-assignee agent is recorded as divergent (there's no
-    # plan task targeting it).
+    # plan task targeting any_agent and no ancestor chain to resolve).
     assert len(steerer.drifts) == 1
+
+
+# ---------------------------------------------------------------------------
+# 10. Contextual match via parent_invocation_id chain (goldfive#151).
+# ---------------------------------------------------------------------------
+
+
+async def test_reconciler_contextual_match_via_parent_invocation() -> None:
+    """Plan assigned to a leaf; tree delegates through an intermediate coord.
+
+    Tree shape driving the observations:
+
+        root (host) → coord1 → leaf1
+
+    Plan assigns ``t0`` to ``leaf1``. The tree actually invokes
+    ``coord1`` first (an intermediate with no plan task), which then
+    delegates to ``leaf1`` via an ``AgentTool`` sub-Runner. The
+    reconciler credits ``t0`` on leaf1's direct name match AND it
+    does NOT emit PLAN_DIVERGENCE for coord1, because the invocation
+    chain contains a task-attached descendant.
+
+    Tree-agnostic: the reconciler never reads real tree metadata —
+    it only uses the invocation_id → agent_name map and the
+    parent_invocation_id edges the plugin hands in.
+    """
+    session = _make_session(
+        [
+            Task(id="t0", title="do leaf work", assignee_agent_id="leaf1"),
+        ]
+    )
+    steerer = _RecordingSteerer()
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="root")
+
+    # Outer (host) turn — skipped by host-agent rule.
+    await rec.on_before_agent(agent_name="root", invocation_id="inv_root")
+    # Leaf fires inside a nested AgentTool sub-Runner; its parent
+    # chain is inv_leaf -> inv_coord -> inv_root. Direct name match
+    # wins for ``leaf1``.
+    await rec.on_before_agent(
+        agent_name="leaf1",
+        invocation_id="inv_leaf",
+        parent_invocation_id="inv_coord",
+    )
+    await rec.on_after_agent(
+        agent_name="leaf1",
+        invocation_id="inv_leaf",
+        parent_invocation_id="inv_coord",
+        summary="leaf1 did the work",
+    )
+    # Intermediate coordinator's own before/after (as sibling under
+    # the outer invocation). Without the invocation map it would
+    # emit PLAN_DIVERGENCE because coord1 is off-plan; with the map
+    # the reconciler sees ``leaf1`` under coord1's sub-chain and
+    # suppresses the divergence.
+    await rec.on_before_agent(
+        agent_name="coord1",
+        invocation_id="inv_coord",
+        parent_invocation_id="inv_root",
+    )
+
+    statuses = [s[1] for s in steerer.transitions]
+    assert TaskStatus.RUNNING in statuses
+    assert TaskStatus.COMPLETED in statuses
+    assert session.plan.tasks[0].status is TaskStatus.COMPLETED
+    # No divergence: coord1's chain contained leaf1 which matched t0.
+    assert steerer.drifts == []
+
+
+async def test_reconciler_contextual_match_plan_on_coordinator() -> None:
+    """Inverse scenario: plan assigned to an ancestor, tree runs the leaf.
+
+    Tree shape: root (host) → coord1 → leaf1, with plan task
+    assigned to ``coord1``. The tree invokes the leaf directly via
+    an AgentTool sub-Runner; the leaf has no direct match but walks
+    up its parent chain, finds coord1's PENDING task, and claims it.
+    """
+    session = _make_session(
+        [
+            Task(id="t0", title="coord work", assignee_agent_id="coord1"),
+        ]
+    )
+    steerer = _RecordingSteerer()
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="root")
+
+    await rec.on_before_agent(agent_name="root", invocation_id="inv_root")
+    # Leaf fires first (e.g. the tree skipped coord1's own before
+    # turn because it delegated immediately). The reconciler has no
+    # prior mapping for inv_coord yet; contextual match still needs
+    # to resolve it. We record the parent edge here so the walker
+    # has something to chase. When inv_coord has no name in the map
+    # the walker continues up to inv_root (host), which has no plan
+    # task either. Only after coord1 fires (below) does the leaf's
+    # retry of contextual match succeed via coord1. Real plugins
+    # fire coord1 before leaf1; we mirror that here:
+    await rec.on_before_agent(
+        agent_name="coord1",
+        invocation_id="inv_coord",
+        parent_invocation_id="inv_root",
+    )
+    # coord1 directly matches t0 (plan assigned to coord1).
+    # When leaf1 then fires as a child invocation there's no PENDING
+    # task left; contextual-match returns None and the leaf observation
+    # is credited as a revisit of an already-terminal task (no
+    # divergence, no double-count).
+    await rec.on_before_agent(
+        agent_name="leaf1",
+        invocation_id="inv_leaf",
+        parent_invocation_id="inv_coord",
+    )
+    await rec.on_after_agent(
+        agent_name="coord1",
+        invocation_id="inv_coord",
+        parent_invocation_id="inv_root",
+        summary="coord1 delegated to leaf1",
+    )
+
+    assert session.plan.tasks[0].status is TaskStatus.COMPLETED
+    assert steerer.drifts == []
+
+
+async def test_reconciler_contextual_match_suppresses_coord_divergence() -> None:
+    """An intermediate coord with a task-attached descendant does not diverge.
+
+    When the plan assigns work to a leaf and the tree routes through
+    an intermediate coordinator, the coordinator's own before/after
+    should NOT emit PLAN_DIVERGENCE because its invocation chain
+    contains a task-attached descendant.
+    """
+    session = _make_session(
+        [
+            Task(id="t0", title="leaf work", assignee_agent_id="leaf1"),
+        ]
+    )
+    steerer = _RecordingSteerer()
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="root")
+
+    # root (host) — skipped.
+    await rec.on_before_agent(agent_name="root", invocation_id="inv_root")
+    # leaf fires via AgentTool sub-Runner — claims t0 directly.
+    await rec.on_before_agent(
+        agent_name="leaf1",
+        invocation_id="inv_leaf",
+        parent_invocation_id="inv_coord",
+    )
+    # coord1 (intermediate) fires after we've already seen the leaf
+    # under its chain. The reconciler must not emit PLAN_DIVERGENCE
+    # because coord1's chain contains a plan-attached descendant.
+    await rec.on_before_agent(
+        agent_name="coord1",
+        invocation_id="inv_coord",
+        parent_invocation_id="inv_root",
+    )
+
+    assert session.plan.tasks[0].status is TaskStatus.RUNNING
+    # No divergence emitted: leaf matched directly and coord1 was
+    # observed as plumbing, not divergence.
+    assert steerer.drifts == []
+
+
+async def test_reconciler_tracks_invocation_to_agent_map() -> None:
+    """Observations populate the invocation_id → agent_name map.
+
+    Tree-agnostic: whatever invocation_id/parent edges the plugin
+    hands in are stored verbatim, without the reconciler consulting
+    any tree metadata.
+    """
+    session = _make_session(
+        [
+            Task(id="t0", title="a", assignee_agent_id="agent_a"),
+        ]
+    )
+    steerer = _RecordingSteerer()
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="root")
+
+    await rec.on_before_agent(
+        agent_name="agent_a",
+        invocation_id="inv_a",
+        parent_invocation_id="inv_root",
+    )
+
+    assert rec._invocation_agent.get("inv_a") == "agent_a"
+    assert rec._invocation_parent.get("inv_a") == "inv_root"
+
+
+# ---------------------------------------------------------------------------
+# 11. Tree-shape full-lifecycle fixtures (goldfive#151).
+# ---------------------------------------------------------------------------
+
+
+async def test_lifecycle_single_agent_tree() -> None:
+    """Fixture 1 lifecycle: single LlmAgent. Plan's only assignee is the root.
+
+    The reconciler claims the task on the root agent's direct name
+    match; no parent chain is needed.
+    """
+    session = _make_session(
+        [
+            Task(id="t0", title="do it", assignee_agent_id="solo"),
+        ]
+    )
+    steerer = _RecordingSteerer()
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="solo")
+
+    # Single agent tree: the host IS the assignee. The host-skip
+    # rule yields when the plan has a task targeting the host.
+    await rec.on_before_agent(agent_name="solo", invocation_id="inv1")
+    await rec.on_after_agent(agent_name="solo", invocation_id="inv1")
+
+    assert session.plan.tasks[0].status is TaskStatus.COMPLETED
+    assert steerer.drifts == []
+    assert rec.get_missed_tasks() == []
+
+
+async def test_lifecycle_flat_specialist_tree() -> None:
+    """Fixture 2 lifecycle: coordinator + 3 specialists. Plan routes to leaves.
+
+    Reconciler matches each leaf on direct name match; no contextual
+    walk needed; no divergence.
+    """
+    session = _make_session(
+        [
+            Task(id="t0", title="research", assignee_agent_id="agent_a"),
+            Task(id="t1", title="write", assignee_agent_id="agent_b"),
+            Task(id="t2", title="review", assignee_agent_id="agent_c"),
+        ]
+    )
+    steerer = _RecordingSteerer()
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="coordinator")
+
+    for name, inv in (("agent_a", "inv_a"), ("agent_b", "inv_b"), ("agent_c", "inv_c")):
+        await rec.on_before_agent(
+            agent_name=name,
+            invocation_id=inv,
+            parent_invocation_id="inv_root",
+        )
+        await rec.on_after_agent(
+            agent_name=name,
+            invocation_id=inv,
+            parent_invocation_id="inv_root",
+        )
+
+    statuses = {t.id: t.status for t in session.plan.tasks}
+    assert statuses == {
+        "t0": TaskStatus.COMPLETED,
+        "t1": TaskStatus.COMPLETED,
+        "t2": TaskStatus.COMPLETED,
+    }
+    assert steerer.drifts == []
+
+
+async def test_lifecycle_deep_hierarchy() -> None:
+    """Fixture 3 lifecycle: root → coord1 → leaf1, leaf2. Plan routes to leaves.
+
+    The intermediate coord1 is plumbing — its own before should not
+    diverge because its invocation chain contains plan-attached
+    descendants (leaf1, leaf2). Leaf tasks credit on direct match.
+    """
+    session = _make_session(
+        [
+            Task(id="t0", title="one", assignee_agent_id="leaf1"),
+            Task(id="t1", title="two", assignee_agent_id="leaf2"),
+        ]
+    )
+    steerer = _RecordingSteerer()
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="root")
+
+    await rec.on_before_agent(agent_name="root", invocation_id="inv_root")
+    # Leaves fire through the coord's delegation; the reconciler
+    # sees leaf invocations parented to inv_coord, which parents to
+    # inv_root. coord1's own turn fires in between but is suppressed
+    # as intermediate plumbing.
+    await rec.on_before_agent(
+        agent_name="leaf1",
+        invocation_id="inv_leaf1",
+        parent_invocation_id="inv_coord",
+    )
+    await rec.on_after_agent(
+        agent_name="leaf1",
+        invocation_id="inv_leaf1",
+        parent_invocation_id="inv_coord",
+    )
+    await rec.on_before_agent(
+        agent_name="coord1",
+        invocation_id="inv_coord",
+        parent_invocation_id="inv_root",
+    )
+    await rec.on_before_agent(
+        agent_name="leaf2",
+        invocation_id="inv_leaf2",
+        parent_invocation_id="inv_coord",
+    )
+    await rec.on_after_agent(
+        agent_name="leaf2",
+        invocation_id="inv_leaf2",
+        parent_invocation_id="inv_coord",
+    )
+
+    statuses = {t.id: t.status for t in session.plan.tasks}
+    assert statuses == {"t0": TaskStatus.COMPLETED, "t1": TaskStatus.COMPLETED}
+    # coord1 is plumbing — no PLAN_DIVERGENCE.
+    assert steerer.drifts == []

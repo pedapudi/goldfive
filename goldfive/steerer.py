@@ -228,6 +228,37 @@ def _severity_ge(a: DriftSeverity, b: DriftSeverity) -> bool:
     return _SEVERITY_ORDER[a] >= _SEVERITY_ORDER[b]
 
 
+def _planner_refine_accepts_available_agents(planner: Any) -> bool:
+    """Return True if ``planner.refine`` accepts ``available_agents=``.
+
+    The #151 registry kwarg is additive — the main goldfive planners
+    (``LLMPlanner``, ``PassthroughPlanner``, ``StaticPlanner``) all
+    accept it, but user-supplied / test-stub planners that predate
+    #151 have a refine signature without the kwarg. We probe the
+    signature once per drift and fall back to the legacy kwarg-set
+    when the kwarg would raise ``TypeError: unexpected keyword
+    argument``. Planners declared with ``**kwargs`` are assumed to
+    accept (the kwarg passes through).
+    """
+    import inspect
+
+    refine = getattr(planner, "refine", None)
+    if refine is None:
+        return False
+    try:
+        sig = inspect.signature(refine)
+    except (TypeError, ValueError):
+        # Unintrospectable callable — safest to not pass the kwarg.
+        return False
+    params = sig.parameters
+    if "available_agents" in params:
+        return True
+    for p in params.values():
+        if p.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # DefaultSteerer
 # ---------------------------------------------------------------------------
@@ -1408,12 +1439,39 @@ class DefaultSteerer:
         # a stale session pointer. See goldfive#133.
         self._active_session = session
         try:
+            # Thread the adapter's available_agents_tree (goldfive#151)
+            # through refine so the LLM is constrained to pick real
+            # tree assignees. Adapters without the property fall back
+            # to ``available_agents`` (list[str]); custom/legacy adapters
+            # without either surface produce ``None`` and the planner
+            # keeps its pre-#151 behaviour. Planners whose refine does
+            # not accept the kwarg (test stubs, pre-#151 custom
+            # planners) are called the old way so nothing breaks.
+            available_agents: Any = None
+            adapter = self._adapter
+            if adapter is not None:
+                tree = getattr(adapter, "available_agents_tree", None)
+                if isinstance(tree, list) and tree:
+                    available_agents = list(tree)
+                else:
+                    flat = getattr(adapter, "available_agents", None)
+                    if flat:
+                        available_agents = list(flat)
+            refine_accepts_registry = _planner_refine_accepts_available_agents(self._planner)
             try:
-                revised = await self._planner.refine(
-                    plan=session.plan,
-                    drift=drift,
-                    goals=list(session.goals),
-                )
+                if refine_accepts_registry:
+                    revised = await self._planner.refine(
+                        plan=session.plan,
+                        drift=drift,
+                        goals=list(session.goals),
+                        available_agents=available_agents,
+                    )
+                else:
+                    revised = await self._planner.refine(
+                        plan=session.plan,
+                        drift=drift,
+                        goals=list(session.goals),
+                    )
             except Exception as exc:  # noqa: BLE001 — refine errors must not break the run
                 # Surface the failure via logging + a synthetic follow-up
                 # drift so operators don't silently see the same plan loop
