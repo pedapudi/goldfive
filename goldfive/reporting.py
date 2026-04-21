@@ -128,9 +128,7 @@ async def _handle_task_progress(
     fraction = _float(args, "fraction")
     detail = _str(args, "detail")
     if task_id:
-        await steerer.mark_task_progress(
-            task_id, session=session, fraction=fraction, detail=detail
-        )
+        await steerer.mark_task_progress(task_id, session=session, fraction=fraction, detail=detail)
     return dict(_ACK)
 
 
@@ -140,9 +138,11 @@ async def _handle_task_completed(
     task_id = _str(args, "task_id")
     summary = _str(args, "summary")
     artifacts_raw = args.get("artifacts")
-    artifacts = {
-        str(k): str(v) for k, v in (artifacts_raw or {}).items()
-    } if isinstance(artifacts_raw, dict) else {}
+    artifacts = (
+        {str(k): str(v) for k, v in (artifacts_raw or {}).items()}
+        if isinstance(artifacts_raw, dict)
+        else {}
+    )
     if task_id:
         await steerer.mark_task_completed(
             task_id, session=session, summary=summary, artifacts=artifacts
@@ -173,9 +173,7 @@ async def _handle_task_blocked(
     blocker = _str(args, "blocker")
     needed = _str(args, "needed")
     if task_id:
-        await steerer.mark_task_blocked(
-            task_id, session=session, blocker=blocker, needed=needed
-        )
+        await steerer.mark_task_blocked(task_id, session=session, blocker=blocker, needed=needed)
     return dict(_ACK)
 
 
@@ -307,6 +305,7 @@ async def _emit_approval_requested(
             prompt=prompt,
             task_id=task_id,
             metadata=metadata,
+            session_id=session.id,
         )
     except Exception as exc:  # noqa: BLE001 — proto stubs may be missing in unit tests
         log.debug("approval_requested: proto event build failed: %s", exc)
@@ -322,9 +321,7 @@ async def _emit_approval_requested(
 # ---------------------------------------------------------------------------
 
 
-def _object_schema(
-    *, required: list[str], properties: dict[str, dict[str, Any]]
-) -> dict[str, Any]:
+def _object_schema(*, required: list[str], properties: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {
         "type": "object",
         "properties": properties,

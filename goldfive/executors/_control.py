@@ -178,6 +178,7 @@ async def emit_status_report(
             run_id=session.run_id,
             sequence=session.next_sequence(),
             drift=drift,
+            session_id=session.id,
         )
     except Exception as exc:  # noqa: BLE001 — proto stubs may be missing
         log.debug("emit_status_report: proto event build failed: %s", exc)
@@ -400,6 +401,7 @@ async def _resolve_approval(
                 sequence=session.next_sequence(),
                 target_id=target_id,
                 detail=detail,
+                session_id=session.id,
             )
         else:
             evt = approval_rejected_event(
@@ -407,6 +409,7 @@ async def _resolve_approval(
                 sequence=session.next_sequence(),
                 target_id=target_id,
                 detail=detail,
+                session_id=session.id,
             )
         await emit(sinks, evt)
     except Exception as exc:  # noqa: BLE001 — proto/sink failure shouldn't block resolution

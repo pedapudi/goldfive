@@ -39,6 +39,14 @@ message Event {
   uint64 sequence = 3;
   // Wall-clock emission time. Advisory only; use `sequence` for order.
   google.protobuf.Timestamp emitted_at = 4;
+  // Session this event belongs to. Stable across all events a single
+  // goldfive ``Session`` (one run / turn) produces — used by downstream
+  // consumers (e.g. harmonograf) to route per-event to the correct
+  // session without relying on stream-level Hello metadata. Empty string
+  // means "route via the stream's Hello session" (the pre-#155 behavior);
+  // populated by the Runner / Steerer / Executors for goldfive-emitted
+  // events so the stream can multiplex multiple sessions.
+  string session_id = 5;
 
   oneof payload {
     RunStarted run_started = 10;

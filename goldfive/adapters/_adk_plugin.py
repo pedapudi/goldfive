@@ -433,6 +433,7 @@ async def _emit_approval_requested_from_plugin(
             prompt=prompt,
             task_id=task_id,
             metadata={"tool_name": tool_name, "args_json": args_json},
+            session_id=getattr(session, "id", ""),
         )
         await emit(sinks, evt)
     except Exception as exc:  # noqa: BLE001
@@ -1066,11 +1067,12 @@ def make_adk_plugin(
                 )
 
                 run_id = str(_safe_attr(ctx.session, "run_id", "") or "")
+                session_id = str(_safe_attr(ctx.session, "id", "") or "") or run_id
                 try:
                     seq = ctx.session.next_sequence()
                 except Exception:  # noqa: BLE001
                     seq = 0
-                evt = drift_detected_event(run_id, seq, drift)
+                evt = drift_detected_event(run_id, seq, drift, session_id=session_id)
                 await emit(sinks, evt)
             except Exception as exc:  # noqa: BLE001
                 log.debug(
@@ -1096,6 +1098,7 @@ def make_adk_plugin(
                 return
             session = ctx.session
             run_id = str(_safe_attr(session, "run_id", "") or "")
+            session_id = str(_safe_attr(session, "id", "") or "") or run_id
             try:
                 seq = session.next_sequence()
             except Exception:  # noqa: BLE001
@@ -1108,6 +1111,10 @@ def make_adk_plugin(
                     emit,
                 )
 
+                # Only thread session_id when caller hasn't supplied it
+                # explicitly, so the plugin's stamping stays back-compat
+                # with callers that set the field themselves.
+                fields.setdefault("session_id", session_id)
                 if kind == "agent_invocation_started":
                     evt = agent_invocation_started_event(run_id, seq, **fields)
                 elif kind == "agent_invocation_completed":

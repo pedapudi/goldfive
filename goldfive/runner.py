@@ -582,6 +582,7 @@ class Runner:
             run_id=session.run_id,
             sequence=session.next_sequence(),
             goal_summary=_initial_goal_summary(user_input),
+            session_id=session.id,
         )
         await emit(self.sinks, evt)
 
@@ -590,6 +591,7 @@ class Runner:
             run_id=session.run_id,
             sequence=session.next_sequence(),
             goals=list(session.goals),
+            session_id=session.id,
         )
         await emit(self.sinks, evt)
 
@@ -598,6 +600,7 @@ class Runner:
             run_id=session.run_id,
             sequence=session.next_sequence(),
             plan=plan,
+            session_id=session.id,
         )
         await emit(self.sinks, evt)
 
@@ -606,6 +609,7 @@ class Runner:
             run_id=session.run_id,
             sequence=session.next_sequence(),
             reason=reason,
+            session_id=session.id,
         )
         await emit(self.sinks, evt)
 
@@ -614,6 +618,7 @@ class Runner:
             run_id=session.run_id,
             sequence=session.next_sequence(),
             conversation_id=self._conversation.id,
+            session_id=session.id,
         )
         await emit(self.sinks, evt)
 
@@ -632,6 +637,7 @@ class Runner:
             conversation_id=conversation.id,
             turn_count=len(conversation.turns),
             reason=reason,
+            session_id=session_anchor.id,
         )
         await emit(self.sinks, evt)
 

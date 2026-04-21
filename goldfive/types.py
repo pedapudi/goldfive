@@ -584,3 +584,15 @@ class Session:
         s = self._next_sequence
         self._next_sequence = s + 1
         return s
+
+    @property
+    def id(self) -> str:
+        """Stable identifier for this :class:`Session`.
+
+        Aliases ``run_id`` for the goldfive#155 ``Event.session_id``
+        stamping contract: a goldfive Session maps 1:1 to a run/turn, so
+        ``run_id`` is the session's identity. Downstream routing
+        consumers (e.g. harmonograf) use this as the multiplex key when
+        a single stream carries events from multiple Sessions.
+        """
+        return self.run_id
