@@ -267,6 +267,36 @@ class PlanReconciler:
     # Missed-task accounting (called by the runner / executor)
     # ------------------------------------------------------------------
 
+    def reset_for_new_plan(self, new_plan: Plan | None) -> None:
+        """Clear per-plan observation state so tasks in ``new_plan`` map fresh.
+
+        Used when the steerer installs a revised plan mid-run
+        (``USER_STEER``, ``PLAN_DIVERGENCE`` refine, etc.). The
+        reconciler's internal mapping of agent invocations to plan
+        tasks is plan-scoped; after the plan changes, existing
+        mappings point at task ids that may no longer exist (or have
+        different semantics) in the revised plan, so before/after
+        agent pairs fired by the re-invoked tree would be attributed
+        incorrectly.
+
+        Clears task-to-observation bookkeeping
+        (``_observed_task_ids``, ``_running_by_agent``,
+        ``_off_plan_seen``) so the re-invoked tree sees a clean
+        slate. Preserves cumulative ``observed_agents`` /
+        ``divergence_events`` — those are historical records the
+        caller may want for replay / introspection (see
+        goldfive#144), not plan-scoped claim state.
+
+        The ``new_plan`` argument is accepted for clarity at the call
+        site (so it's obvious the caller is installing a new plan);
+        this method does not read any tasks from it — the session's
+        live plan remains the source of truth via ``get_missed_tasks``.
+        """
+        _ = new_plan  # reserved: may populate hints from new plan in future
+        self._observed_task_ids.clear()
+        self._running_by_agent.clear()
+        self._off_plan_seen.clear()
+
     def get_missed_tasks(self, plan: Plan | None = None) -> list[Task]:
         """Return PENDING tasks the tree never exercised.
 
