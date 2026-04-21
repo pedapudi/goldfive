@@ -92,14 +92,14 @@ pytest.importorskip("google.protobuf")
 WALL_CLOCK_BUDGET_SECONDS = 30.0
 
 # Expected plugin-registration count. The presentation_agent tree has
-# 5 reachable agents (coordinator + 4 specialists), so the adapter
-# constructs 5 per-agent ``InMemoryRunner`` s and registers the goldfive
-# plugin once on each. AgentTool-spawned sub-Runners inherit the parent
-# runner's plugin_manager, so they do NOT re-register. A hard cap of 10
-# leaves headroom for a small ADK-internal re-registration (e.g. if the
-# fast_api server's own Runner ever installed the plugin a second time)
-# without admitting the 8+-per-task pathology.
-PLUGIN_REGISTRATIONS_MAX = 10
+# Under the single-Runner model (goldfive#130) the adapter builds
+# exactly ONE ``InMemoryRunner`` around the coordinator and registers
+# the goldfive plugin once. ADK's AgentTool propagates the
+# plugin_manager into sub-Runners without a re-registration. A hard
+# cap of 5 leaves headroom for a small ADK-internal re-registration
+# (e.g. if the fast_api server's own Runner ever installed the plugin
+# a second time) without admitting the 8+-per-task pathology.
+PLUGIN_REGISTRATIONS_MAX = 5
 
 
 @pytest.fixture
@@ -338,40 +338,36 @@ def test_presentation_agent_e2e_under_adk_web(
         "registry-dispatch refactor was supposed to eliminate."
     )
 
-    # 4. Per-task dispatch hits the right assignee. The Phase 1 refactor's
-    # core promise: ``adapter.invoke(task)`` routes to
-    # ``registry[task.assignee_agent_id]``, NOT to the coordinator. The
-    # ``AgentInvocationStarted`` emitted from the plugin's
-    # before_run_callback carries the running agent's name.
+    # 4. Top-level dispatch drives the root (coordinator_agent) under the
+    # single-Runner model (goldfive#130). Goldfive does not route tasks
+    # to per-agent runners anymore — delegation to specialists happens
+    # via ADK's native AgentTool / transfer_to_agent / sub_agents
+    # mechanisms inside the coordinator's turn. The top-level
+    # ``AgentInvocationStarted`` (parent_invocation_id empty) always
+    # carries the root agent's name.
     inv_events_by_task: dict[str, str] = {}
     for event, kind in zip(events, kinds, strict=True):
         if kind != "agent_invocation_started":
             continue
         inv = event.agent_invocation_started
-        # Only record top-level invocations (parent empty) — nested
-        # AgentTool sub-Runner invocations also fire this event but
-        # carry a populated parent_invocation_id.
         if inv.parent_invocation_id:
             continue
         if inv.task_id and inv.task_id not in inv_events_by_task:
             inv_events_by_task[inv.task_id] = inv.agent_name
-    expected_dispatch = {
-        "research": "research_agent",
-        "build": "web_developer_agent",
-        "review": "reviewer_agent",
-        "debug": "debugger_agent",
-    }
-    for task_id, expected_agent in expected_dispatch.items():
+    # Every task's top-level invocation is the coordinator.
+    for task_id in ("research", "build", "review", "debug"):
         actual = inv_events_by_task.get(task_id)
-        assert actual == expected_agent, (
-            f"task {task_id!r} dispatched to {actual!r} — expected "
-            f"{expected_agent!r}. Coordinator-routing regression? "
+        assert actual == "coordinator_agent", (
+            f"task {task_id!r} top-level dispatch went to {actual!r}, "
+            f"expected the single-Runner root 'coordinator_agent'. "
             f"invocations: {inv_events_by_task}"
         )
 
-    # 5. Bounded plugin registrations. The pre-refactor bug surfaced as
-    # 8+ registrations for a single task; under registry-dispatch there
-    # should be exactly one per reachable agent (5 for this tree).
+    # 5. Bounded plugin registrations. Under single-Runner there is
+    # exactly ONE runner and the plugin registers once — ADK's AgentTool
+    # propagates the plugin_manager into sub-Runners without a
+    # re-registration. A resurgence of per-task re-registration would
+    # show up as many more registrations than this cap.
     registrations = [
         rec
         for rec in caplog.records

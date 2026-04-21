@@ -98,8 +98,8 @@ See [DRIFT.md](DRIFT.md) for the full drift-kind taxonomy.
 ### Agent-invocation events
 
 Three observability-only events describe the **dispatch and
-delegation** shape of a run under the ADK registry-dispatch model
-(see [ARCHITECTURE.md §"Registry dispatch"](ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)).
+delegation** shape of a run under the ADK single-Runner model
+(see [ARCHITECTURE.md §"Single-Runner dispatch"](ARCHITECTURE.md#single-runner-dispatch-goldfive-drives-the-root-adk-delegates-within)).
 They do not change task state and the framework does not interpret
 them; sinks (harmonograf in particular) surface them to make the
 "who actually ran what" story visible on a Gantt, especially when a
@@ -115,7 +115,7 @@ coordinator invokes `AgentTool`-wrapped specialists.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `agent_name` | `string` | The dispatched agent — `task.assignee_agent_id` for top-level, the wrapped agent's name for AgentTool-spawned sub-invocations. |
+| `agent_name` | `string` | The agent ADK is actually running — the wrap-target root for top-level, the wrapped agent's name for AgentTool-spawned sub-invocations. |
 | `task_id` | `string` | The goldfive-dispatched task id. Propagates unchanged into nested invocations — see "Nested ordering" below. |
 | `invocation_id` | `string` | ADK's per-run invocation id. Unique per runner invocation. |
 | `parent_invocation_id` | `string` | Empty for the top-level dispatch; set to the outer `invocation_id` when the plugin fires on an AgentTool-spawned sub-Runner. |

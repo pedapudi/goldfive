@@ -194,17 +194,12 @@ async def test_next_invoke_after_cancel_runs_cleanly() -> None:
             return
 
     clean = _CleanRunner(agent=agent)
-    # Replace the runner for the dispatched assignee (degraded mode:
-    # there's only one entry keyed off the agent name or the wrap target).
-    root_name = next(iter(adapter._runners))
-    adapter._runners[root_name] = clean
+    # Single-Runner model: swap the one runner.
     adapter._runner = clean
-    # Force a fresh session lookup for the clean runner.
-    adapter._session_ids = {}
+    # Force a fresh session lookup.
+    adapter._session_id = None
 
-    result = await adapter.invoke(
-        task=Task(id="t2", title="clean"), session=Session(run_id="r2")
-    )
+    result = await adapter.invoke(task=Task(id="t2", title="clean"), session=Session(run_id="r2"))
     # Result carries the new task id; no cancel / no orphan healing.
     assert result.task_id == "t2"
     assert result.stop_reason != "cancelled"

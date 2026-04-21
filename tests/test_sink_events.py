@@ -1,6 +1,6 @@
-"""Sink-event emission tests for the registry-dispatch model.
+"""Sink-event emission tests for the single-Runner model.
 
-Phase 1 added three sink events to observe the dispatch tree:
+The plugin emits three sink events to observe the delegation tree:
 
 * ``AgentInvocationStarted`` on every runner entry (top-level + sub-Runner)
 * ``AgentInvocationCompleted`` on every runner exit
@@ -10,6 +10,12 @@ These tests pin the nested shape
 ``started(A) → delegation(A→B) → started(B) → completed(B) → completed(A)``
 and assert key correlation fields (task_id inherited through sub-Runners,
 parent_invocation_id populated on nested started events).
+
+Under the single-Runner model (goldfive#130) delegation happens via
+ADK's native mechanisms (AgentTool, sub_agents, transfer_to_agent) —
+goldfive does not route. So a "single-agent dispatch" test drives the
+root agent directly; a "delegation" test drives the root agent with
+an AgentTool on it and relies on ADK's propagation.
 
 Skipped entirely when ``google.adk`` is not installed.
 """
@@ -128,41 +134,31 @@ def _kinds(events: list[Any]) -> list[str]:
 
 
 async def test_single_agent_dispatch_emits_started_and_completed_pair() -> None:
-    """Leaf-agent invoke → exactly one started + one completed for that agent.
+    """A single-agent wrap emits exactly one started + one completed for the root.
 
-    A 3-agent tree with only the assignee dispatched: NO other agent's
-    started/completed shows up because goldfive does not speculatively
-    drive the others' runners.
+    Under the single-Runner model (goldfive#130) the adapter drives the
+    root agent for every invocation; sub-agents only see events if ADK
+    delegation reaches them. A wrap of a leaf agent produces one started
+    + one completed for that agent.
     """
     from google.adk.agents import Agent
 
     from goldfive.adapters.adk import ADKAdapter
     from goldfive.sinks.memory import InMemorySink
 
-    # Build a tree of three agents: a (assignee), b, c.
     a = Agent(name="a", model=_make_terminal_llm()(), instruction="")
-    b = Agent(name="b", model=_make_terminal_llm()(), instruction="")
-    c = Agent(name="c", model=_make_terminal_llm()(), instruction="")
-    root = Agent(
-        name="root",
-        model=_make_terminal_llm()(),
-        instruction="",
-        sub_agents=[a, b, c],
-    )
 
-    adapter = ADKAdapter(root)
+    adapter = ADKAdapter(a)
     sink = InMemorySink()
     adapter.bind_steerer(_SinkingSteerer(sink))
 
-    task = Task(id="T", title="go", assignee_agent_id="a")
+    task = Task(id="T", title="go")
     plan = Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[])
     session = Session(run_id="r1", plan=plan)
     await adapter.invoke(task=task, session=session)
 
     starts = [e for e in sink.events if e.WhichOneof("payload") == "agent_invocation_started"]
-    completes = [
-        e for e in sink.events if e.WhichOneof("payload") == "agent_invocation_completed"
-    ]
+    completes = [e for e in sink.events if e.WhichOneof("payload") == "agent_invocation_completed"]
 
     assert len(starts) == 1, f"expected 1 start; got {len(starts)}: {_kinds(sink.events)}"
     assert len(completes) == 1

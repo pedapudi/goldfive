@@ -276,73 +276,68 @@ more INFO-severity signals that don't trigger refine.
 - Update any custom `should_refine(drift)` override to inspect
   severity, not kind.
 
-## 8. coordinator+AgentTool loop under real LLM (fixed by registry dispatch)
+## 8. coordinator+AgentTool loop under real LLM
 
-Historical failure mode that affected `goldfive.wrap(coordinator)`
-when the coordinator had `AgentTool`-wrapped specialists as tools.
-The registry-dispatch refactor made it structurally impossible;
-this entry documents the old signature so runs against earlier
-goldfive builds can be recognised and the recovery path confirmed.
+Affects `goldfive.wrap(coordinator)` when the coordinator has
+`AgentTool`-wrapped specialists and its instruction describes a
+pipeline ("first research, then build, then review…"). Under a
+real LLM the coordinator may keep re-routing until ADK's 500-call
+ceiling trips.
 
-**Signature (pre-fix).**
+**Signature.**
 
-- `adk web` UI hangs: the first user turn starts, a `TaskStarted`
-  event appears, but no `TaskCompleted` / `RunCompleted` ever
-  arrives.
-- The adk log shows plugin registrations stacking up — many
-  `ADKAdapter: registered reporting tools on N sub-agents` lines
-  per turn rather than one at wrap time.
-- Eventually a framework-level abort: `max_turns_exceeded` (ADK's
-  500-LLM-call ceiling) with the coordinator still narrating.
-- Reasoning content for the last LLM calls shows the coordinator
-  repeatedly deciding which specialist to invoke — indicating the
-  coordinator's LLM was burning calls on routing decisions that
-  goldfive was supposed to be making.
+- Plan submitted, at least one `TaskStarted` fires, but tasks hang
+  without reaching a terminal state.
+- The adk log shows repeated AgentTool calls under a single
+  invocation — the coordinator is decoding its own instruction each
+  turn and picking the next specialist.
+- A `drift_detected` event with kind `runaway_delegation` fires at
+  CRITICAL severity once the AgentTool-per-invoke cap trips.
+- The current task is marked `task_failed` (the CRITICAL drift
+  flows through the planner's refine path) with the drift detail
+  naming the exceeded cap.
 
-**Root cause (pre-fix).** The old adapter built a single
-`InMemoryRunner` against the tree root and invoked that runner
-for every task, regardless of `task.assignee_agent_id`. Under a
-real LLM:
+**Root cause.** The coordinator's prompt describes a pipeline and
+its LLM keeps delegating. Goldfive cannot require prompt
+cooperation (users bring their own trees).
 
-1. Each task caused a coordinator invocation.
-2. The coordinator's LLM turn decided which specialist to call.
-3. The coordinator called `AgentTool(specialist)`, spawning a
-   sub-Runner.
-4. The specialist replied; the coordinator often composed
-   additional `AgentTool` calls.
-5. ADK's 500-call ceiling tripped before `TaskCompleted` arrived.
+**What catches it.** Three layers, in order of detection:
 
-The coordinator's instruction text could not be surgically edited
-(tree-respect) and prompt engineering around "please don't
-re-route" was unstable across models.
-
-**Fix (registry dispatch).** `ADKAdapter` now builds a
-`name -> BaseAgent` registry at wrap time and constructs one
-`InMemoryRunner` per reachable agent. `invoke(task, session)`
-dispatches to `registry[task.assignee_agent_id]`'s runner —
-goldfive drives the specialist directly, skipping the
-coordinator's routing turn entirely. See
-[ARCHITECTURE.md §"Registry dispatch"](../design/ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)
-and
-[RATIONALE.md §"Why per-agent runners, not always-root-dispatch"](../design/RATIONALE.md#why-per-agent-runners-not-always-root-dispatch).
+1. **Reasoning-content drift detectors.** LOOPING_REASONING (hash-
+   or embedding-based), INTENT_DIVERGENCE, CONFUSION — fire when
+   the coordinator's chain-of-thought shows the pattern. Most
+   cases are caught here before the AgentTool cap kicks in.
+2. **Refine-driven recovery.** A WARNING / CRITICAL drift flows
+   through `DefaultSteerer._handle_drift` into `planner.refine`,
+   which can revise the task (e.g. narrow the assignee hint or
+   split into sub-tasks) before the next invocation.
+3. **AgentTool-per-invoke cap (goldfive#130).** The plugin counts
+   AgentTool spawns scoped to the current invocation. Default 16.
+   On exceed the plugin emits `RUNAWAY_DELEGATION` at CRITICAL
+   severity, cancels the invocation, and short-circuits further
+   AgentTool spawns with a "skipped" dict. Tune via
+   `ADKAdapter(agent_tool_cap=N)` (0 disables).
 
 **Recovery path.**
 
-- Update to a goldfive build that includes the registry-dispatch
-  refactor (this page, commit range around
-  `feat/registry-dispatch-model`). No code change required on
-  the caller side — the existing `goldfive.wrap(coordinator)`
-  call now does the right thing.
-- Verify by inspecting `adapter.available_agents` after wrap: it
-  should list every agent in the tree (coordinator + each
-  specialist + any sub-agents), sorted. A one-entry list means
-  the wrap target was a pre-built `Runner` rather than a
-  `BaseAgent` — see the [degrade-mode section in
-  adk-web-integration.md](adk-web-integration.md#pre-built-runner-degrade-mode).
-- Watch the new `AgentInvocationStarted` / `AgentInvocationCompleted`
-  / `DelegationObserved` events on sinks to confirm each task
-  dispatches to its assignee and any AgentTool delegation is
-  observed (see [EVENT-MODEL.md §"Agent-invocation events"](../design/EVENT-MODEL.md#agent-invocation-events)).
+- Inspect `adapter.available_agents` after wrap: it should list
+  every agent in the tree. A one-entry list means the wrap target
+  was a pre-built `Runner` rather than a `BaseAgent` — see the
+  [degrade-mode section in adk-web-integration.md](adk-web-integration.md#pre-built-runner-degrade-mode).
+- Watch the `AgentInvocationStarted` / `AgentInvocationCompleted`
+  / `DelegationObserved` events on sinks to observe the delegation
+  tree (see [EVENT-MODEL.md §"Agent-invocation events"](../design/EVENT-MODEL.md#agent-invocation-events)).
+- If the cap is firing too often, either (a) tighten the
+  coordinator's prompt to be task-focused rather than pipeline-
+  focused, or (b) raise `agent_tool_cap` if the coordinator
+  legitimately delegates more than 16 times per turn.
+
+See
+[ARCHITECTURE.md §"Single-Runner dispatch"](../design/ARCHITECTURE.md#single-runner-dispatch-goldfive-drives-the-root-adk-delegates-within)
+and
+[RATIONALE.md §"Why single-Runner, not registry-dispatch"](../design/RATIONALE.md#why-single-runner-not-registry-dispatch)
+for the design history — including the goldfive#120 registry-
+dispatch experiment that was reverted in #130.
 
 ## 9. Deprecation warning: `max_plan_reinvocations`
 

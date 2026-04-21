@@ -136,30 +136,28 @@ boundary between goldfive and the agent framework.
   an exception propagated, or the executor cancelled the invoke
   coroutine.
 
-### 2.4 Registry dispatch (ADK adapter)
+### 2.4 Single-Runner dispatch (ADK adapter)
 
-`ADKAdapter.invoke` does not always drive the tree root. At wrap
-time the adapter built a `name -> BaseAgent` registry covering
-every reachable agent and constructed one `InMemoryRunner` per
-registered agent (see [ARCHITECTURE.md §"Registry dispatch"](ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)).
-Every `invoke` looks up `task.assignee_agent_id` in that map and
-dispatches to the matching per-agent runner:
+`ADKAdapter.invoke` drives exactly one runner — the one built
+around the wrap-target root — for every task. Delegation within
+the tree happens via ADK's native `AgentTool`, `transfer_to_agent`,
+and `sub_agents` mechanisms (see [ARCHITECTURE.md §"Single-Runner dispatch"](ARCHITECTURE.md#single-runner-dispatch-goldfive-drives-the-root-adk-delegates-within)).
+`task.assignee_agent_id` rides on the task for observability and
+as a delegation hint the agent's prompt can read via the state
+protocol, but goldfive does not route on it.
 
-| `task.assignee_agent_id` | Dispatch target |
-|---|---|
-| Empty string | Wrap-target root's runner (preserves single-agent wrap contract). |
-| In the registry | `registry[assignee]`'s per-agent runner. |
-| Set but not in the registry | `ValueError("plan assigned task <id> to unknown agent <name>; available: [...]")` — fail fast on the planner. |
-| Caller passed a pre-built `Runner` (degraded mode) | The pre-built runner, regardless of assignee; a DEBUG log notes any mismatch. |
+ADK's plugin manager propagates into any AgentTool-spawned
+sub-Runner, so nested invocations still see the state-protocol
+keys and emit `AgentInvocationStarted` / `AgentInvocationCompleted`
+/ `DelegationObserved` events ([EVENT-MODEL.md §"Agent-invocation events"](EVENT-MODEL.md#agent-invocation-events)).
 
-The dispatched agent runs with its **full subtree intact**. If the
-dispatched agent has `sub_agents` or its own `AgentTool`-wrapped
-helpers, those are still available to its invocation — goldfive
-never rewrites the tree. ADK's plugin-inheritance mechanism carries
-the goldfive plugin into any AgentTool-spawned sub-Runner, so
-nested invocations still see the state-protocol keys and emit
-`AgentInvocationStarted` / `AgentInvocationCompleted` /
-`DelegationObserved` events ([EVENT-MODEL.md §"Agent-invocation events"](EVENT-MODEL.md#agent-invocation-events)).
+A per-invocation AgentTool-spawn cap (default 16, configurable via
+`ADKAdapter(agent_tool_cap=N)`) catches runaway coordinators whose
+prompts describe a pipeline. On exceed the plugin emits a
+`RUNAWAY_DELEGATION` drift at CRITICAL severity and cancels the
+invocation; the current task is marked FAILED (via the Steerer's
+refine path) and the planner's `refine` hook gets a chance to
+salvage the run.
 
 ### 2.5 State-protocol writes live in the plugin's `before_run_callback`
 

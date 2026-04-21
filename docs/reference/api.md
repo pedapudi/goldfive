@@ -499,17 +499,19 @@ class ADKAdapter(AgentAdapter):
         user_id: str = "goldfive_user",
         session_id: Optional[str] = None,
         app_name: Optional[str] = None,
+        plugins: Optional[list[Any]] = None,
+        agent_tool_cap: Optional[int] = None,  # default 16; 0 disables
     ) -> None: ...
 
     @property
     def available_agents(self) -> list[str]:
         """Sorted names of every agent reachable from the wrap target.
 
-        Source of truth is the registry built at ``__init__`` time by
-        walking ``sub_agents`` / ``inner_agent`` / ``AgentTool.agent``
-        edges. Planner consumes this at ``generate()`` time;
-        ``invoke(task, ...)`` strict-matches ``task.assignee_agent_id``
-        against this list at dispatch.
+        Walks ``sub_agents`` / ``inner_agent`` / ``AgentTool.agent``
+        edges at ``__init__`` time. Advisory for the planner, which
+        populates ``task.assignee_agent_id`` as a delegation hint;
+        goldfive does not route on the assignee under the single-
+        Runner model (goldfive#130).
         """
 
 # Requires `goldfive[claude]`
@@ -528,18 +530,14 @@ class ClaudeAgentSDKAdapter(AgentAdapter):
         """Wire a :class:`Steerer` in after construction."""
 ```
 
-`ADKAdapter.__init__` raises `ValueError` when two reachable agents
-share a name (`"duplicate agent name in tree: <name>"`) — the
-registry keys on name, so collisions make strict-match dispatch
-ambiguous.
+`ADKAdapter.invoke(task, session)` drives the one runner regardless
+of `task.assignee_agent_id` — the assignee is a planner hint, not
+a routing key. The plugin enforces a per-invocation cap on
+AgentTool spawns (default 16, `agent_tool_cap=0` disables); on
+exceed the plugin emits a `RUNAWAY_DELEGATION` drift at CRITICAL
+severity and cancels the invocation.
 
-`ADKAdapter.invoke(task, session)` raises `ValueError` when
-`task.assignee_agent_id` is set but not in the registry
-(`"plan assigned task <id> to unknown agent <name>; available:
-[...]"`). Callers who want silent fallback to the root must leave
-`task.assignee_agent_id` empty.
-
-See [ARCHITECTURE.md §"Registry dispatch"](../design/ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)
+See [ARCHITECTURE.md §"Single-Runner dispatch"](../design/ARCHITECTURE.md#single-runner-dispatch-goldfive-drives-the-root-adk-delegates-within)
 for the model and [adk-web-integration.md §"Pre-built Runner degrade mode"](../guides/adk-web-integration.md#pre-built-runner-degrade-mode)
 for the degraded-mode contract when the caller passes a
 pre-built `Runner` instead of a `BaseAgent`.
@@ -771,7 +769,7 @@ Per-event builders (`run_started_event`, `run_completed_event`,
 `task_cancelled_event`, `drift_detected_event`) are also available in
 `goldfive.events` as convenience constructors for sink implementations.
 
-### Agent-invocation events (ADK registry dispatch)
+### Agent-invocation events (ADK single-Runner + AgentTool delegation)
 
 Three observability-only events emitted by the goldfive ADK plugin
 on every dispatch. They describe the "who actually ran what"
