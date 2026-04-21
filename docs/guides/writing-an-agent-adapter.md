@@ -44,9 +44,40 @@ Three responsibilities:
    install a hook that routes calls to the spec's handler.
 2. **Invoke the agent for one task.** Render current-task context,
    run the agent, stream observed events to the steerer, return an
-   `InvocationResult`.
+   `InvocationResult`. **Dispatch is by `task.assignee_agent_id`** —
+   if your framework supports multiple named agents, the adapter
+   MUST route to the one the planner picked.
 3. **Expose `available_agents`.** The names the planner can use as
+   `task.assignee_agent_id`. Must be sorted, unique, and every
+   entry must be dispatchable via a matching
    `task.assignee_agent_id`.
+
+### The `available_agents` and strict-match contract
+
+`available_agents` is the authoritative list the planner uses to
+populate `task.assignee_agent_id`. The contract is strict:
+
+- **Return a sorted list** so planner context is deterministic.
+- **No duplicate names** — if two agents in your framework share a
+  name, raise at wrap time. Silent collision collapses the
+  registry and makes dispatch ambiguous.
+- **Every name must be dispatchable.** If `"foo"` is returned,
+  `invoke(Task(..., assignee_agent_id="foo"))` must route to that
+  agent.
+- **Strict match.** When `task.assignee_agent_id` is set and is
+  NOT in the registry, raise `ValueError` with an `available:`
+  hint. Do NOT silently fall back to a default / root agent — that
+  masks planner bugs and produces runs that drove the wrong agent.
+- **Empty assignee is legal.** `task.assignee_agent_id == ""`
+  means "dispatch to the default/root agent" and is the contract
+  for single-agent wraps.
+
+`ADKAdapter` builds a `name -> BaseAgent` registry at wrap time by
+walking `sub_agents` / `inner_agent` / `AgentTool.agent` edges (see
+`goldfive/adapters/adk.py::_build_agent_registry` for the
+reference implementation) and raises `ValueError` on duplicate
+names. `CallableAdapter` takes `available_agents` as a constructor
+argument and relies on the user callable to honour the assignee.
 
 ## The four things every adapter must do
 
@@ -56,7 +87,10 @@ The agent needs to know what task it's working on. Different
 frameworks expose this differently:
 
 - **ADK** — write `session.state["goldfive.current_task_id"]` and
-  friends in `before_model_callback`; the agent reads them.
+  friends in the plugin's `before_run_callback` (against the live
+  invocation session, not a `get_session` copy — see
+  [TASK-LIFECYCLE.md §2.5](../design/TASK-LIFECYCLE.md#25-state-protocol-writes-live-in-the-plugins-before_run_callback));
+  the agent reads them.
 - **Claude Agent SDK** — inject task context into the system prompt
   or the first user message.
 - **Custom callable** — pass it as a function argument.
@@ -280,8 +314,11 @@ The rule for goldfive adapters: **the caller wraps the root agent; the
 adapter handles subtree propagation itself.** Users should never have to
 attach reporting tools by hand on every node.
 
-`ADKAdapter` implements this by walking the agent graph in
-`register_reporting_tools`. The walk follows three edges:
+`ADKAdapter` implements this by walking the agent graph twice at
+wrap time: once to **register reporting tools** on every reachable
+agent, and once to **build the dispatch registry** (name → agent)
+that `invoke(task, session)` uses to route by
+`task.assignee_agent_id`. Both walks follow three edges:
 
 - `agent.sub_agents` — native ADK child agents.
 - `agent.inner_agent` — wrapper agents that compose a single child.
@@ -293,17 +330,22 @@ appended. The walk is idempotent: agents that already carry the canonical
 reporting tool names are skipped, so double-registration is a no-op.
 
 Because ADK's plugin callbacks are **runner-scoped**, not agent-scoped,
-the `before_tool_callback` / `before_model_callback` installed once on the
-`Runner` fires for tool calls from every sub-agent. That means the shared
-`SessionContext` (session, task, steerer, handler map) routes every
-sub-agent's `report_task_*` call through the same Steerer — no per-agent
-wiring needed.
+the `before_tool_callback` / `before_model_callback` installed once on a
+`Runner` fires for tool calls from every sub-agent of that runner's root.
+`ADKAdapter` constructs one runner **per registered agent** (the
+registry-dispatch model; see [ARCHITECTURE.md §"Registry dispatch"](../design/ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes))
+and installs the shared goldfive plugin on each. That means a
+dispatch to any agent in the tree carries the same state-protocol
+writes and reporting-tool interception — no per-agent wiring needed.
 
 ```python
 from goldfive.adapters.adk import ADKAdapter
 
 # Tree: root -> child -> grandchild, plus a sibling agent-as-tool.
-adapter = ADKAdapter(root_agent)  # that's it — every descendant is wired.
+adapter = ADKAdapter(root_agent)
+# adapter.available_agents is sorted and includes every reachable
+# agent. Planner may assign tasks to any of them; invoke() routes
+# each task to the per-agent runner for its assignee.
 ```
 
 If you are writing an adapter for a different framework with its own
@@ -311,12 +353,17 @@ nested-agent shape, mirror this pattern:
 
 1. Walk the agent graph from the root you were handed.
 2. For each node, attach the reporting tools (dedupe by name).
-3. Install a single shared intercept (plugin / middleware / callback) on
+3. Build a `name -> agent` registry with a strict no-duplicate
+   policy; raise at wrap time on collision.
+4. Install a single shared intercept (plugin / middleware / callback) on
    the framework's outermost runtime so every sub-agent's tool calls route
    through one handler map.
+5. In `invoke(task, session)`, look up
+   `task.assignee_agent_id` in the registry, dispatch to that
+   agent, and raise on unknown names with an `available:` hint.
 
-See `goldfive/adapters/adk.py::_augment_subtree_with_reporting` for the
-reference implementation.
+See `goldfive/adapters/adk.py::_augment_subtree_with_reporting` and
+`::_build_agent_registry` for the reference implementation.
 
 ## The steerer reference
 
