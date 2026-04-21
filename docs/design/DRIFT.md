@@ -111,6 +111,7 @@ kinds group naturally into six categories.
 |---|---|---|---|
 | `GOAL_UNREACHABLE` | Planner returned `None` from refine; no further progress possible. | `critical` | no |
 | `AMBIGUOUS_INTENT` | Multiple plausible goal interpretations; needs clarification. | `warning` | yes |
+| `REFINE_VALIDATION_FAILED` | `LLMPlanner` exhausted its refine retry budget — the LLM's response could not be parsed or pass the structural validator. Emitted via the planner's drift-emitter callback right before the planner falls back to the prior plan (or, for the looping-refine path, the deterministic fail-the-looper plan). The steerer deliberately does NOT trigger another `planner.refine` on this kind (infinite-loop risk); the operator chooses whether to steer again, cancel, or let execution proceed with the fallback. | `critical` | no (terminal signal) |
 
 ### Reasoning category — the model's chain-of-thought exposes drift before the tool calls do
 

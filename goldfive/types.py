@@ -97,6 +97,16 @@ class DriftKind(StrEnum):
     # marked failed and the Steerer is given a chance to refine /
     # retry. See goldfive#130.
     RUNAWAY_DELEGATION = "runaway_delegation"
+    # The planner-LLM's refine response could not be parsed or could not
+    # pass the structural validator after the configured number of retry
+    # attempts. CRITICAL severity; emitted by :class:`LLMPlanner` right
+    # before it falls back to the prior plan (or, for the looping-tool
+    # refine path, the deterministic fail-the-looper plan). This drift
+    # kind is a terminal signal -- DefaultSteerer deliberately does NOT
+    # trigger another ``planner.refine`` on it (infinite-loop risk) and
+    # leaves the choice (steer again, cancel, or accept the fallback) to
+    # the operator. See goldfive#133.
+    REFINE_VALIDATION_FAILED = "refine_validation_failed"
 
 
 class DriftSeverity(StrEnum):

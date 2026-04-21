@@ -487,6 +487,13 @@ class LLMPlanner:
     ``None`` — the host continues without a plan update.
     """
 
+    # Default number of refine attempts before falling back. Two attempts
+    # covers the typical "validator error feedback fixed it" round-trip
+    # without burning too many LLM calls on a structurally confused
+    # planner. Override per-instance via ``max_refine_attempts=`` or
+    # globally by subclassing.
+    DEFAULT_MAX_REFINE_ATTEMPTS: int = 2
+
     def __init__(
         self,
         *,
@@ -496,21 +503,47 @@ class LLMPlanner:
         refine_system_prompt: str | None = None,
         user_steer_system_prompt: str | None = None,
         looping_tool_call_system_prompt: str | None = None,
+        max_refine_attempts: int | None = None,
     ) -> None:
         self._call_llm = call_llm
         self._model = model
         self._system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
         self._refine_system_prompt = refine_system_prompt or _REFINE_SYSTEM_PROMPT
-        self._user_steer_system_prompt = (
-            user_steer_system_prompt or _USER_STEER_SYSTEM_PROMPT
-        )
+        self._user_steer_system_prompt = user_steer_system_prompt or _USER_STEER_SYSTEM_PROMPT
         self._looping_tool_call_system_prompt = (
             looping_tool_call_system_prompt or _LOOPING_TOOL_CALL_SYSTEM_PROMPT
         )
+        self._max_refine_attempts = (
+            int(max_refine_attempts)
+            if max_refine_attempts is not None
+            else self.DEFAULT_MAX_REFINE_ATTEMPTS
+        )
+        # Optional sink for ``REFINE_VALIDATION_FAILED`` drifts. The
+        # ``DefaultSteerer`` wires this in ``bind()`` so the planner can
+        # surface a structured signal when its retry budget is spent
+        # without the planner needing a dependency on the sink pipeline.
+        # When left as ``None`` (e.g. the planner is used standalone in
+        # tests) the fallback still happens -- it is just not emitted.
+        self._drift_emitter: Callable[[DriftEvent], Awaitable[None]] | None = None
 
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def max_refine_attempts(self) -> int:
+        return self._max_refine_attempts
+
+    def set_drift_emitter(self, emitter: Callable[[DriftEvent], Awaitable[None]] | None) -> None:
+        """Install (or remove) the async callback used to signal refine
+        failures.
+
+        The steerer wires this up in ``bind()`` so that when the planner
+        exhausts its refine retry budget it can emit a
+        ``REFINE_VALIDATION_FAILED`` ``DriftEvent`` through the normal
+        event pipeline without the planner owning a sink list itself.
+        """
+        self._drift_emitter = emitter
 
     # ---- prompt builders -------------------------------------------------
 
@@ -562,10 +595,7 @@ class LLMPlanner:
                     f"{f'; plan: {plan_summary}' if plan_summary else ''}"
                 )
         if prior_results:
-            lines.append(
-                "\nResults already produced in earlier turns "
-                "(task_id -> summary):"
-            )
+            lines.append("\nResults already produced in earlier turns (task_id -> summary):")
             for task_id, summary in prior_results.items():
                 lines.append(f"  - {task_id}: {summary}")
         lines.append(
@@ -626,7 +656,9 @@ class LLMPlanner:
         Completed tasks are shown as read-only context; the LLM is told
         to produce only the remaining pending work in light of the
         steering note. The caller prepends the completed tasks back onto
-        the returned plan so lineage is preserved verbatim.
+        the returned plan so lineage is preserved verbatim. The new
+        PENDING task ids must not collide with the history ids; this is
+        stated as an explicit invariant (goldfive#133).
         """
         history = [
             {
@@ -639,18 +671,283 @@ class LLMPlanner:
             for t in completed
         ]
         history_json = json.dumps(history, default=str)
+        history_ids = json.dumps([t.id for t in completed])
         goals_block = self._render_goals_block(goals)
         note = drift.detail or "(no steering note provided)"
+        invariants = (
+            "STRUCTURAL INVARIANTS (the validator will REJECT any response "
+            "that breaks these rules):\n"
+            "1. The new PENDING task ids you emit MUST NOT collide with "
+            f"any history id. Reserved ids: {history_ids}\n"
+            "2. Every edge's `from_task_id` and `to_task_id` must "
+            "reference either a reserved history id or a new-task id "
+            "from your own `tasks` array.\n"
+            "3. Your task ids must be unique within your response.\n"
+            "4. Do not introduce edges that create a cycle."
+        )
         return (
             f"Goals:\n{goals_block}\n\n"
             f"Completed/Failed/Cancelled tasks (READ-ONLY CONTEXT — "
             "preserve these verbatim at the start of the returned plan; "
             f"do NOT repeat them in your response):\n{history_json}\n\n"
             f"Operator steering note:\n{note}\n\n"
+            f"{invariants}\n\n"
             "Generate only the NEW PENDING tasks (and their edges) that "
             "should run from here, taking the steering note into account. "
             "Respond with JSON only."
         )
+
+    # ---- structural-invariant helpers (issue #133) ----------------------
+
+    @staticmethod
+    def _terminal_tasks(plan: Plan) -> list[Task]:
+        """Return the prior plan's tasks whose status is terminal.
+
+        Terminal = COMPLETED / FAILED / CANCELLED. These are the tasks
+        ``Plan.validate(for_revision=True, prior=...)`` requires the
+        revision to preserve verbatim (PLAN-LIFECYCLE.md §3.1).
+        """
+        return [t for t in plan.tasks if t.status in _TERMINAL_STATUSES]
+
+    @staticmethod
+    def _terminal_to_terminal_edges(plan: Plan) -> list[TaskEdge]:
+        """Return edges whose endpoints are both terminal.
+
+        These edges must appear verbatim in any revision
+        (PLAN-LIFECYCLE.md §3.2). The validator's
+        ``terminal->terminal edge 'X' -> 'Y' missing in revision`` error
+        is exactly the one this list guards against.
+        """
+        terminal_ids = {t.id for t in plan.tasks if t.status in _TERMINAL_STATUSES}
+        return [
+            e for e in plan.edges if e.from_task_id in terminal_ids and e.to_task_id in terminal_ids
+        ]
+
+    @classmethod
+    def _render_structural_invariants_block(cls, plan: Plan) -> str:
+        """Render an explicit, verbatim-mandatory invariants section.
+
+        The planner-LLM routinely drops terminal→terminal edges when
+        regenerating a plan in JSON because the "preserve history"
+        instruction is implicit. Listing the tasks AND the required
+        edges as copy-paste-ready JSON drops the first-attempt
+        validation failure rate sharply (see goldfive#133).
+        """
+        terminal = cls._terminal_tasks(plan)
+        tt_edges = cls._terminal_to_terminal_edges(plan)
+        terminal_json = json.dumps(
+            [
+                {
+                    "id": t.id,
+                    "title": t.title,
+                    "description": t.description,
+                    "assignee_agent_id": t.assignee_agent_id,
+                    "status": str(t.status),
+                }
+                for t in terminal
+            ],
+            default=str,
+        )
+        tt_edges_json = json.dumps(
+            [{"from_task_id": e.from_task_id, "to_task_id": e.to_task_id} for e in tt_edges],
+            default=str,
+        )
+        lines: list[str] = [
+            "STRUCTURAL INVARIANTS (the validator will REJECT any response "
+            "that breaks these rules; reread this section before emitting "
+            "JSON):",
+            "",
+            "1. TERMINAL TASKS (status in {COMPLETED, FAILED, CANCELLED}) "
+            "MUST appear verbatim in your `tasks` array. Same `id`, "
+            "`title`, `assignee_agent_id`, and same terminal `status`. "
+            "You MUST NOT drop them, rename them, or regress their status "
+            "back to PENDING/RUNNING/BLOCKED.",
+            f"   Terminal tasks in the current plan: {terminal_json}",
+            "",
+            "2. TERMINAL->TERMINAL EDGES (edges where BOTH endpoints are "
+            "terminal tasks) MUST appear verbatim in your `edges` array. "
+            "These edges are frozen history; dropping even one will fail "
+            "validation.",
+            f"   Required edges: {tt_edges_json}",
+            "",
+            "3. TASK IDS must be unique within `tasks`. Every edge's "
+            "`from_task_id` and `to_task_id` must reference a task id "
+            "that exists in your `tasks` array.",
+            "",
+            "4. The task graph must be ACYCLIC. Do not introduce edges that would create a cycle.",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_correction_prompt(base_prompt: str, error: str) -> str:
+        """Append validator / parser feedback to a refine prompt for retry.
+
+        The retry appends the specific error the previous attempt hit and
+        re-emphasises the structural invariants; keeping the base prompt
+        verbatim means the LLM sees the same goals, history, and drift
+        context, so the retry is a real second attempt, not a cold
+        re-prompt.
+        """
+        return (
+            f"{base_prompt}\n\n"
+            "PREVIOUS ATTEMPT FAILED. The response you just emitted was "
+            "rejected by the validator:\n"
+            f"    {error}\n\n"
+            "Re-read the STRUCTURAL INVARIANTS section above. Emit a "
+            "corrected JSON plan that preserves every terminal task and "
+            "every terminal->terminal edge verbatim. Respond with JSON "
+            "only; no prose, no markdown fences."
+        )
+
+    async def _emit_refine_validation_failed(
+        self, plan: Plan, drift: DriftEvent, last_error: str
+    ) -> None:
+        """Emit a ``REFINE_VALIDATION_FAILED`` drift via the wired emitter.
+
+        A no-op when no emitter is set (e.g. unit tests). The emitter
+        failing itself is logged and swallowed -- the caller still needs
+        to fall back to a deterministic plan regardless.
+        """
+        if self._drift_emitter is None:
+            return
+        signal = DriftEvent(
+            kind=DriftKind.REFINE_VALIDATION_FAILED,
+            severity=DriftSeverity.CRITICAL,
+            detail=(
+                f"refine validation failed after {self._max_refine_attempts} "
+                f"attempts for drift={drift.kind.value}: {last_error}"
+            ),
+            current_task_id=drift.current_task_id,
+            current_agent_id=drift.current_agent_id,
+        )
+        try:
+            await self._drift_emitter(signal)
+        except Exception as exc:  # noqa: BLE001 -- emitter must never break refine
+            log.warning(
+                "LLMPlanner: drift emitter raised while signalling "
+                "REFINE_VALIDATION_FAILED (%s); dropping signal",
+                exc,
+            )
+
+    async def _call_and_validate_refine(
+        self,
+        *,
+        system_prompt: str,
+        base_user_prompt: str,
+        prior_plan: Plan,
+        goals: list[Goal],
+        post_parse: Callable[[Plan], Plan] | None = None,
+        log_prefix: str,
+    ) -> tuple[Plan | None, str]:
+        """Run the retry loop for a single refine call.
+
+        Calls the LLM up to ``self._max_refine_attempts`` times, parsing
+        the response into a ``Plan`` and validating against ``prior_plan``.
+        On each failed attempt the user prompt is extended with the
+        error message (via :meth:`_build_correction_prompt`) so the LLM
+        gets explicit feedback on what to fix. Returns ``(plan, "")`` on
+        success, ``(None, last_error)`` on exhaustion. Exceptions from
+        ``call_llm`` are treated as retryable.
+
+        ``post_parse`` (optional) runs after ``_plan_from_json`` succeeds
+        but BEFORE validation -- used by ``_refine_looping_tool_call`` to
+        force the looper FAILED before the validator decides whether the
+        revision honours the invariants.
+        """
+        user_prompt = base_user_prompt
+        last_error = ""
+        attempts = max(1, self._max_refine_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                raw = await self._call_llm(system_prompt, user_prompt, self._model)
+            except Exception as exc:  # noqa: BLE001 -- retry on transient LLM errors
+                last_error = f"call_llm raised: {exc}"
+                log.warning(
+                    "%s: attempt %d/%d: %s",
+                    log_prefix,
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
+                continue
+            if not raw or not isinstance(raw, str):
+                last_error = "empty or non-string LLM response"
+                log.warning(
+                    "%s: attempt %d/%d: %s",
+                    log_prefix,
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
+                continue
+            cleaned = _strip_code_fences(raw).strip()
+            try:
+                parsed = json.loads(cleaned)
+            except (ValueError, TypeError) as exc:
+                last_error = f"JSON parse failed: {exc}"
+                log.warning(
+                    "%s: attempt %d/%d: %s",
+                    log_prefix,
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
+                continue
+            revised = _plan_from_json(
+                parsed,
+                run_id=prior_plan.run_id,
+                goal_ids=[g.id for g in goals if g.id] or list(prior_plan.goal_ids),
+                plan_id=prior_plan.id,
+            )
+            if revised is None:
+                last_error = "parsed JSON did not contain a usable plan"
+                log.warning(
+                    "%s: attempt %d/%d: %s",
+                    log_prefix,
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
+                continue
+            if post_parse is not None:
+                try:
+                    revised = post_parse(revised)
+                except Exception as exc:  # noqa: BLE001
+                    last_error = f"post-parse adjustment raised: {exc}"
+                    log.warning(
+                        "%s: attempt %d/%d: %s",
+                        log_prefix,
+                        attempt,
+                        attempts,
+                        last_error,
+                    )
+                    if attempt < attempts:
+                        user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
+                    continue
+            try:
+                revised.validate(for_revision=True, prior=prior_plan)
+            except ValueError as exc:
+                last_error = f"validator rejected revision: {exc}"
+                log.warning(
+                    "%s: attempt %d/%d: %s",
+                    log_prefix,
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
+                continue
+            return revised, ""
+        return None, last_error
 
     def _build_refine_prompt(
         self,
@@ -687,10 +984,12 @@ class LLMPlanner:
         plan_json = json.dumps(current, default=str)
         drift_json = json.dumps(drift_payload, default=str)
         goals_block = self._render_goals_block(goals)
+        invariants_block = self._render_structural_invariants_block(plan)
         return (
             f"Goals:\n{goals_block}\n\n"
             f"Current plan:\n{plan_json}\n\n"
             f"Drift event:\n{drift_json}\n\n"
+            f"{invariants_block}\n\n"
             "If the plan should change in light of this drift event, respond "
             "with an updated JSON plan using the same schema. If no change "
             "is warranted, respond with the current plan unchanged. Respond "
@@ -768,41 +1067,36 @@ class LLMPlanner:
             # stuck loop on the currently-running task, and the repair
             # is to mark it FAILED and regenerate the rest.
             return await self._refine_looping_tool_call(plan, drift, goals)
+        # REFINE_VALIDATION_FAILED is a terminal signal from ourselves --
+        # refining on it would risk an infinite loop of validation
+        # failures. The steerer is expected to skip refine for this
+        # kind; defending here too is a belt-and-braces guard.
+        if drift.kind is DriftKind.REFINE_VALIDATION_FAILED:
+            return None
         try:
-            user_prompt = self._build_refine_prompt(plan, drift, goals)
+            base_user_prompt = self._build_refine_prompt(plan, drift, goals)
         except (TypeError, ValueError) as exc:
             log.warning("LLMPlanner.refine: failed to serialise inputs (%s)", exc)
             return None
-        try:
-            raw = await self._call_llm(self._refine_system_prompt, user_prompt, self._model)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("LLMPlanner.refine: call_llm raised %s", exc)
-            return None
-        if not raw or not isinstance(raw, str):
-            log.warning("LLMPlanner.refine: empty/non-string LLM response")
-            return None
-        cleaned = _strip_code_fences(raw).strip()
-        try:
-            parsed = json.loads(cleaned)
-        except (ValueError, TypeError) as exc:
-            log.warning("LLMPlanner.refine: failed to parse LLM output as JSON (%s)", exc)
-            return None
-        revised = _plan_from_json(
-            parsed,
-            run_id=plan.run_id,
-            goal_ids=[g.id for g in goals if g.id] or list(plan.goal_ids),
-            plan_id=plan.id,
+        revised, last_error = await self._call_and_validate_refine(
+            system_prompt=self._refine_system_prompt,
+            base_user_prompt=base_user_prompt,
+            prior_plan=plan,
+            goals=goals,
+            log_prefix="LLMPlanner.refine",
         )
         if revised is None:
-            log.warning("LLMPlanner.refine: parsed JSON did not contain a usable plan")
-            return None
-        try:
-            revised.validate(for_revision=True, prior=plan)
-        except ValueError as exc:
-            log.warning(
-                "LLMPlanner.refine: revised plan failed validation (%s)",
-                exc,
-            )
+            # Retries exhausted. Emit the REFINE_VALIDATION_FAILED signal
+            # so the UI / operator sees that recovery failed, then
+            # return ``None`` -- the steerer's backoff counter takes
+            # over from here (REFINE_FAILURE_THRESHOLD = 2 consecutive
+            # failures marks the task FAILED). We intentionally do NOT
+            # synthesise a clone of the prior plan with a bumped
+            # ``revision_index``: that would masquerade a failed refine
+            # as a successful no-op revision, which is exactly the
+            # silent-fallback behaviour goldfive#133 set out to
+            # eliminate.
+            await self._emit_refine_validation_failed(plan, drift, last_error)
             return None
         # Stamp revision metadata so downstream sinks can render it.
         revised.revision_reason = drift.detail
@@ -818,7 +1112,14 @@ class LLMPlanner:
         goals: list[Goal],
         looping_task: Task | None,
     ) -> str:
-        """Build the regenerate-around-failure prompt for a LOOPING_TOOL_CALL."""
+        """Build the regenerate-around-failure prompt for a LOOPING_TOOL_CALL.
+
+        The prompt explicitly enumerates the structural invariants the
+        validator will enforce (terminal-task preservation,
+        terminal->terminal edge preservation, id uniqueness, acyclicity)
+        so the planner-LLM has no reason to "lose" them silently. See
+        goldfive#133 for the rationale.
+        """
         completed = [t for t in plan.tasks if t.status in _TERMINAL_STATUSES]
         loop_id = drift.current_task_id or (looping_task.id if looping_task else "")
         history = [
@@ -857,6 +1158,7 @@ class LLMPlanner:
             else json.dumps({"id": loop_id})
         )
         goals_block = self._render_goals_block(goals)
+        invariants_block = self._render_structural_invariants_block(plan)
         return (
             f"Goals:\n{goals_block}\n\n"
             f"Already-finished tasks (preserve verbatim):\n"
@@ -866,6 +1168,7 @@ class LLMPlanner:
             f"Other unfinished tasks (you may keep, drop, or rework):\n"
             f"{json.dumps(others, default=str)}\n\n"
             f"Drift detail:\n{drift.detail}\n\n"
+            f"{invariants_block}\n\n"
             "Generate the updated plan. Respond with JSON only."
         )
 
@@ -880,17 +1183,20 @@ class LLMPlanner:
         The looping task is forced to ``FAILED`` so the rest of the plan
         can route around it; non-looping completed tasks are preserved
         verbatim. The LLM regenerates the remaining work in light of the
-        failure. If the LLM cannot be reached or returns garbage, we
-        still return a deterministic fallback plan that fails the
-        looping task in place — losing the looper's slot is better than
-        leaving it in a re-loop.
+        failure.
+
+        Retry loop (goldfive#133): up to ``self._max_refine_attempts``
+        attempts are made, each appending the prior failure's error
+        message to the prompt so the LLM has explicit feedback on what
+        to fix. On exhaustion we emit a ``REFINE_VALIDATION_FAILED``
+        drift (CRITICAL) and fall back to the deterministic
+        :meth:`_fallback_fail_loop_plan` -- losing the looper's slot is
+        still better than leaving the run in a re-loop.
         """
         loop_id = drift.current_task_id
-        looping_task = next(
-            (t for t in plan.tasks if t.id == loop_id), None
-        )
+        looping_task = next((t for t in plan.tasks if t.id == loop_id), None)
         try:
-            user_prompt = self._build_looping_tool_call_prompt(
+            base_user_prompt = self._build_looping_tool_call_prompt(
                 plan, drift, goals, looping_task
             )
         except (TypeError, ValueError) as exc:
@@ -899,47 +1205,15 @@ class LLMPlanner:
                 exc,
             )
             return self._fallback_fail_loop_plan(plan, drift, looping_task)
-        try:
-            raw = await self._call_llm(
-                self._looping_tool_call_system_prompt, user_prompt, self._model
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "LLMPlanner._refine_looping_tool_call: call_llm raised %s", exc
-            )
-            return self._fallback_fail_loop_plan(plan, drift, looping_task)
-        if not raw or not isinstance(raw, str):
-            log.warning(
-                "LLMPlanner._refine_looping_tool_call: empty/non-string LLM "
-                "response"
-            )
-            return self._fallback_fail_loop_plan(plan, drift, looping_task)
-        cleaned = _strip_code_fences(raw).strip()
-        try:
-            parsed = json.loads(cleaned)
-        except (ValueError, TypeError) as exc:
-            log.warning(
-                "LLMPlanner._refine_looping_tool_call: failed to parse LLM "
-                "output as JSON (%s)",
-                exc,
-            )
-            return self._fallback_fail_loop_plan(plan, drift, looping_task)
-        revised = _plan_from_json(
-            parsed,
-            run_id=plan.run_id,
-            goal_ids=[g.id for g in goals if g.id] or list(plan.goal_ids),
-            plan_id=plan.id,
-        )
-        if revised is None:
-            log.warning(
-                "LLMPlanner._refine_looping_tool_call: parsed JSON did not "
-                "contain a usable plan"
-            )
-            return self._fallback_fail_loop_plan(plan, drift, looping_task)
-        # Force the looping task to FAILED in the revised plan even if
-        # the LLM forgot — the protocol contract is that the looper
-        # cannot survive its own drift.
-        if loop_id:
+
+        def _force_looper_failed(revised: Plan) -> Plan:
+            """Stamp the looping task FAILED before validation.
+
+            The protocol contract is that the looper cannot survive its
+            own drift, so even if the LLM forgot we force the status.
+            """
+            if not loop_id:
+                return revised
             for t in revised.tasks:
                 if t.id == loop_id and t.status not in _TERMINAL_STATUSES:
                     t.status = TaskStatus.FAILED
@@ -954,14 +1228,21 @@ class LLMPlanner:
                         status=TaskStatus.FAILED,
                     ),
                 )
-        try:
-            revised.validate(for_revision=True, prior=plan)
-        except ValueError as exc:
-            log.warning(
-                "LLMPlanner._refine_looping_tool_call: revised plan failed "
-                "validation (%s); using fallback",
-                exc,
-            )
+            return revised
+
+        revised, last_error = await self._call_and_validate_refine(
+            system_prompt=self._looping_tool_call_system_prompt,
+            base_user_prompt=base_user_prompt,
+            prior_plan=plan,
+            goals=goals,
+            post_parse=_force_looper_failed,
+            log_prefix="LLMPlanner._refine_looping_tool_call",
+        )
+        if revised is None:
+            # Retries exhausted. Signal the failure explicitly, then
+            # return the deterministic fallback so the looping task
+            # cannot re-fire on the next tick.
+            await self._emit_refine_validation_failed(plan, drift, last_error)
             return self._fallback_fail_loop_plan(plan, drift, looping_task)
         revised.revision_reason = drift.detail
         revised.revision_kind = drift.kind.value
@@ -1029,8 +1310,7 @@ class LLMPlanner:
             goal_ids=list(plan.goal_ids),
             tasks=new_tasks,
             edges=[
-                TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
-                for e in plan.edges
+                TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id) for e in plan.edges
             ],
             summary=plan.summary,
             revision_reason=drift.detail,
@@ -1057,35 +1337,71 @@ class LLMPlanner:
         completed = [t for t in plan.tasks if t.status in _TERMINAL_STATUSES]
         completed_ids = {t.id for t in completed}
         try:
-            user_prompt = self._build_user_steer_prompt(completed, drift, goals)
+            base_user_prompt = self._build_user_steer_prompt(completed, drift, goals)
         except (TypeError, ValueError) as exc:
             log.warning(
                 "LLMPlanner._refine_user_steer: failed to serialise inputs (%s)",
                 exc,
             )
             return None
-        try:
-            raw = await self._call_llm(
-                self._user_steer_system_prompt, user_prompt, self._model
+
+        user_prompt = base_user_prompt
+        attempts = max(1, self._max_refine_attempts)
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            merged_plan, error = await self._user_steer_one_attempt(
+                plan=plan,
+                goals=goals,
+                drift=drift,
+                completed=completed,
+                completed_ids=completed_ids,
+                user_prompt=user_prompt,
             )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("LLMPlanner._refine_user_steer: call_llm raised %s", exc)
-            return None
-        if not raw or not isinstance(raw, str):
+            if merged_plan is not None:
+                return merged_plan
+            last_error = error
             log.warning(
-                "LLMPlanner._refine_user_steer: empty/non-string LLM response"
+                "LLMPlanner._refine_user_steer: attempt %d/%d: %s",
+                attempt,
+                attempts,
+                last_error,
             )
-            return None
+            if attempt < attempts:
+                user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
+        # Retries exhausted -- signal and fall back to None (the steerer
+        # keeps the prior plan and increments its backoff counter).
+        await self._emit_refine_validation_failed(plan, drift, last_error)
+        return None
+
+    async def _user_steer_one_attempt(
+        self,
+        *,
+        plan: Plan,
+        goals: list[Goal],
+        drift: DriftEvent,
+        completed: list[Task],
+        completed_ids: set[str],
+        user_prompt: str,
+    ) -> tuple[Plan | None, str]:
+        """Run a single LLM attempt for the USER_STEER refine path.
+
+        Returns ``(merged_plan, "")`` on success or ``(None, error)`` on
+        any parse / merge / validate failure. The caller drives the
+        retry loop; this helper keeps the merge logic in one place so
+        both the first attempt and every retry apply exactly the same
+        plumbing.
+        """
+        try:
+            raw = await self._call_llm(self._user_steer_system_prompt, user_prompt, self._model)
+        except Exception as exc:  # noqa: BLE001
+            return None, f"call_llm raised: {exc}"
+        if not raw or not isinstance(raw, str):
+            return None, "empty or non-string LLM response"
         cleaned = _strip_code_fences(raw).strip()
         try:
             parsed = json.loads(cleaned)
         except (ValueError, TypeError) as exc:
-            log.warning(
-                "LLMPlanner._refine_user_steer: failed to parse LLM output "
-                "as JSON (%s)",
-                exc,
-            )
-            return None
+            return None, f"JSON parse failed: {exc}"
         fresh = _plan_from_json(
             parsed,
             run_id=plan.run_id,
@@ -1093,11 +1409,7 @@ class LLMPlanner:
             plan_id=plan.id,
         )
         if fresh is None:
-            log.warning(
-                "LLMPlanner._refine_user_steer: parsed JSON did not contain "
-                "a usable plan"
-            )
-            return None
+            return None, "parsed JSON did not contain a usable plan"
 
         # Prepend completed tasks verbatim; drop any new task whose id
         # collides with a completed id so lineage ids stay stable.
@@ -1113,8 +1425,7 @@ class LLMPlanner:
             if e.from_task_id in known_ids and e.to_task_id in known_ids
         ]
         new_edges = [
-            TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
-            for e in fresh.edges
+            TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id) for e in fresh.edges
         ]
         # Deduplicate (same from/to pair) while preserving order.
         seen: set[tuple[str, str]] = set()
@@ -1141,12 +1452,8 @@ class LLMPlanner:
         try:
             merged_plan.validate(for_revision=True, prior=plan)
         except ValueError as exc:
-            log.warning(
-                "LLMPlanner._refine_user_steer: merged plan failed validation (%s)",
-                exc,
-            )
-            return None
-        return merged_plan
+            return None, f"validator rejected revision: {exc}"
+        return merged_plan, ""
 
 
 __all__ = [

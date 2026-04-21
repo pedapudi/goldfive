@@ -65,6 +65,7 @@ class DriftKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     DRIFT_KIND_REASONING_CLUSTER_TIGHTENING: _ClassVar[DriftKind]
     DRIFT_KIND_CONFABULATION_RISK: _ClassVar[DriftKind]
     DRIFT_KIND_RUNAWAY_DELEGATION: _ClassVar[DriftKind]
+    DRIFT_KIND_REFINE_VALIDATION_FAILED: _ClassVar[DriftKind]
 TASK_STATUS_UNSPECIFIED: TaskStatus
 TASK_STATUS_PENDING: TaskStatus
 TASK_STATUS_RUNNING: TaskStatus
@@ -112,6 +113,7 @@ DRIFT_KIND_SELF_REPORTED_STUCK: DriftKind
 DRIFT_KIND_REASONING_CLUSTER_TIGHTENING: DriftKind
 DRIFT_KIND_CONFABULATION_RISK: DriftKind
 DRIFT_KIND_RUNAWAY_DELEGATION: DriftKind
+DRIFT_KIND_REFINE_VALIDATION_FAILED: DriftKind
 
 class Goal(_message.Message):
     __slots__ = ("id", "summary", "metadata", "has_success_predicate")

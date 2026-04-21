@@ -573,9 +573,7 @@ async def test_llm_planner_refine_allows_preserved_completed_tasks() -> None:
     stub = _StubLLM(refined)
     planner = LLMPlanner(call_llm=stub)
     drift = DriftEvent(kind=DriftKind.TOOL_ERROR, severity=DriftSeverity.WARNING)
-    result = await planner.refine(
-        plan=_running_plan(), drift=drift, goals=_goals()
-    )
+    result = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
     assert result is not None
     assert {t.id for t in result.tasks} == {"research", "draft"}
 
@@ -594,9 +592,7 @@ async def test_llm_planner_refine_rejects_duplicate_ids() -> None:
     stub = _StubLLM(bad)
     planner = LLMPlanner(call_llm=stub)
     drift = DriftEvent(kind=DriftKind.TOOL_ERROR, severity=DriftSeverity.WARNING)
-    result = await planner.refine(
-        plan=_running_plan(), drift=drift, goals=_goals()
-    )
+    result = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
     assert result is None
 
 
@@ -617,7 +613,364 @@ async def test_llm_planner_refine_rejects_cycle() -> None:
     stub = _StubLLM(bad)
     planner = LLMPlanner(call_llm=stub)
     drift = DriftEvent(kind=DriftKind.TOOL_ERROR, severity=DriftSeverity.WARNING)
-    result = await planner.refine(
-        plan=_running_plan(), drift=drift, goals=_goals()
-    )
+    result = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Retry-on-validation-failure + REFINE_VALIDATION_FAILED signal (issue #133)
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedLLM:
+    """LLM stub that returns scripted responses in order, one per call."""
+
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def __call__(self, system: str, user: str, model: str) -> str:
+        self.calls.append((system, user, model))
+        if not self.responses:
+            raise AssertionError("scripted LLM called more times than expected")
+        return self.responses.pop(0)
+
+
+def _looping_plan() -> Plan:
+    """A plan with a completed task, a completed task, and a looping task.
+
+    The terminal-task and terminal->terminal-edge preservation invariants
+    both apply here: `research` -> `structure` is a terminal->terminal
+    edge that any revision must preserve verbatim.
+    """
+    return Plan(
+        id="plan-loop",
+        run_id="run-1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="research_installation",
+                title="Research installation",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="structure_presentation",
+                title="Structure presentation",
+                assignee_agent_id="writer",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="draft_slides",
+                title="Draft slides",
+                assignee_agent_id="writer",
+                status=TaskStatus.RUNNING,
+            ),
+        ],
+        edges=[
+            TaskEdge(
+                from_task_id="research_installation",
+                to_task_id="structure_presentation",
+            ),
+            TaskEdge(
+                from_task_id="structure_presentation",
+                to_task_id="draft_slides",
+            ),
+        ],
+        summary="Build the installation presentation.",
+        revision_index=0,
+    )
+
+
+def _bad_looping_revision_json() -> str:
+    """A revision that drops the required terminal->terminal edge.
+
+    This mirrors the exact shape that trips the validator in the e2e
+    run that motivated goldfive#133 -- the LLM keeps both terminal
+    tasks but forgets the edge connecting them.
+    """
+    return json.dumps(
+        {
+            "summary": "fail the looper and try again",
+            "tasks": [
+                {
+                    "id": "research_installation",
+                    "title": "Research installation",
+                    "assignee_agent_id": "researcher",
+                    "status": "COMPLETED",
+                },
+                {
+                    "id": "structure_presentation",
+                    "title": "Structure presentation",
+                    "assignee_agent_id": "writer",
+                    "status": "COMPLETED",
+                },
+                {
+                    "id": "draft_slides",
+                    "title": "Draft slides",
+                    "assignee_agent_id": "writer",
+                    "status": "FAILED",
+                },
+                {
+                    "id": "draft_slides_alt",
+                    "title": "Draft slides with outline",
+                    "assignee_agent_id": "writer",
+                    "status": "PENDING",
+                },
+            ],
+            # Missing research_installation -> structure_presentation edge.
+            "edges": [
+                {
+                    "from_task_id": "structure_presentation",
+                    "to_task_id": "draft_slides_alt",
+                },
+            ],
+        }
+    )
+
+
+def _good_looping_revision_json() -> str:
+    """A revision that preserves the required terminal->terminal edge."""
+    return json.dumps(
+        {
+            "summary": "fail the looper and try again (fixed)",
+            "tasks": [
+                {
+                    "id": "research_installation",
+                    "title": "Research installation",
+                    "assignee_agent_id": "researcher",
+                    "status": "COMPLETED",
+                },
+                {
+                    "id": "structure_presentation",
+                    "title": "Structure presentation",
+                    "assignee_agent_id": "writer",
+                    "status": "COMPLETED",
+                },
+                {
+                    "id": "draft_slides",
+                    "title": "Draft slides",
+                    "assignee_agent_id": "writer",
+                    "status": "FAILED",
+                },
+                {
+                    "id": "draft_slides_alt",
+                    "title": "Draft slides with outline",
+                    "assignee_agent_id": "writer",
+                    "status": "PENDING",
+                },
+            ],
+            "edges": [
+                {
+                    "from_task_id": "research_installation",
+                    "to_task_id": "structure_presentation",
+                },
+                {
+                    "from_task_id": "structure_presentation",
+                    "to_task_id": "draft_slides_alt",
+                },
+            ],
+        }
+    )
+
+
+async def test_refine_retries_on_validation_failure_and_succeeds() -> None:
+    """Attempt 1 emits a plan missing a terminal->terminal edge; attempt 2
+    emits a valid plan. The planner must retry and succeed.
+    """
+    scripted = _ScriptedLLM([_bad_looping_revision_json(), _good_looping_revision_json()])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=2)
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="agent stuck calling read_file",
+        current_task_id="draft_slides",
+    )
+
+    revised = await planner.refine(plan=_looping_plan(), drift=drift, goals=_goals())
+
+    assert revised is not None
+    assert len(scripted.calls) == 2
+    # Second call must include the correction context so the LLM knows
+    # what to fix.
+    _system, second_user_prompt, _model = scripted.calls[1]
+    assert "PREVIOUS ATTEMPT FAILED" in second_user_prompt
+    assert "terminal->terminal edge" in second_user_prompt
+    # The final plan contains the terminal->terminal edge AND the new
+    # PENDING task.
+    by_id = {t.id: t for t in revised.tasks}
+    assert by_id["draft_slides"].status == TaskStatus.FAILED
+    assert "draft_slides_alt" in by_id
+    pairs = {(e.from_task_id, e.to_task_id) for e in revised.edges}
+    assert (
+        "research_installation",
+        "structure_presentation",
+    ) in pairs
+
+
+async def test_refine_exhausts_retries_and_emits_drift() -> None:
+    """When every attempt fails validation, the planner must:
+    1. emit a REFINE_VALIDATION_FAILED drift via the configured emitter
+    2. return the deterministic fail-the-loop fallback (non-None) so
+       the executor stops burning calls on the looper.
+    """
+    scripted = _ScriptedLLM([_bad_looping_revision_json(), _bad_looping_revision_json()])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=2)
+
+    emitted: list[DriftEvent] = []
+
+    async def capture(drift: DriftEvent) -> None:
+        emitted.append(drift)
+
+    planner.set_drift_emitter(capture)
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="agent stuck calling read_file",
+        current_task_id="draft_slides",
+    )
+
+    result = await planner.refine(plan=_looping_plan(), drift=drift, goals=_goals())
+
+    # Exactly one REFINE_VALIDATION_FAILED drift was emitted, at CRITICAL.
+    assert len(emitted) == 1
+    assert emitted[0].kind is DriftKind.REFINE_VALIDATION_FAILED
+    assert emitted[0].severity is DriftSeverity.CRITICAL
+    assert "terminal->terminal edge" in emitted[0].detail
+    # Fallback plan: looper is FAILED and the other tasks / edges remain.
+    assert result is not None
+    by_id = {t.id: t for t in result.tasks}
+    assert by_id["draft_slides"].status == TaskStatus.FAILED
+    assert by_id["research_installation"].status == TaskStatus.COMPLETED
+    assert len(scripted.calls) == 2  # retry budget exhausted exactly
+
+
+async def test_refine_exhausts_retries_and_returns_none_for_generic_path() -> None:
+    """The generic refine path (non-LOOPING, non-USER_STEER) has no
+    deterministic fallback; it returns ``None`` and emits the
+    REFINE_VALIDATION_FAILED signal. The steerer then uses its backoff
+    counter.
+    """
+    # Craft a plan with a completed task and a running one, and have
+    # the LLM emit a revision that drops the completed task (violating
+    # terminal-task preservation).
+    bad = json.dumps(
+        {
+            "summary": "dropped history",
+            "tasks": [
+                # research (COMPLETED in prior plan) is missing -- reject.
+                {
+                    "id": "draft",
+                    "title": "Draft the post",
+                    "status": "RUNNING",
+                },
+            ],
+            "edges": [],
+        }
+    )
+    scripted = _ScriptedLLM([bad, bad])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=2)
+
+    emitted: list[DriftEvent] = []
+
+    async def capture(drift: DriftEvent) -> None:
+        emitted.append(drift)
+
+    planner.set_drift_emitter(capture)
+    drift = DriftEvent(
+        kind=DriftKind.TOOL_ERROR,
+        severity=DriftSeverity.WARNING,
+        detail="tool x failed",
+        current_task_id="draft",
+    )
+
+    result = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
+
+    assert result is None
+    assert len(emitted) == 1
+    assert emitted[0].kind is DriftKind.REFINE_VALIDATION_FAILED
+    assert emitted[0].severity is DriftSeverity.CRITICAL
+
+
+async def test_refine_prompt_enumerates_terminal_tasks_and_edges() -> None:
+    """The LOOPING_TOOL_CALL refine prompt must enumerate the terminal
+    tasks AND the terminal->terminal edges the revision must preserve
+    verbatim -- this is the "teach the LLM about invariants" half of
+    the goldfive#133 fix.
+    """
+    scripted = _ScriptedLLM([_good_looping_revision_json()])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=2)
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="stuck",
+        current_task_id="draft_slides",
+    )
+
+    await planner.refine(plan=_looping_plan(), drift=drift, goals=_goals())
+
+    _system, user_prompt, _model = scripted.calls[0]
+    assert "STRUCTURAL INVARIANTS" in user_prompt
+    # Both terminal task ids appear in the enumerated block.
+    assert "research_installation" in user_prompt
+    assert "structure_presentation" in user_prompt
+    # The required terminal->terminal edge appears as a copy-paste-ready
+    # JSON object; we assert on the key phrase and on the edge endpoints
+    # appearing in the required-edges list.
+    assert "terminal->terminal" in user_prompt.lower() or "TERMINAL->TERMINAL" in user_prompt
+    assert "Required edges" in user_prompt
+    # The required-edge JSON contains the endpoints in the right slot.
+    # (We don't demand exact string formatting so that the edge list can
+    # evolve; we just demand the key tokens appear after the "Required
+    # edges" label.)
+    required_idx = user_prompt.index("Required edges")
+    after = user_prompt[required_idx:]
+    assert "research_installation" in after
+    assert "structure_presentation" in after
+
+
+async def test_refine_first_try_success_unchanged() -> None:
+    """When the LLM emits a valid plan on the first attempt, exactly one
+    call is made -- retries and drift emission stay dormant.
+    """
+    scripted = _ScriptedLLM([_good_looping_revision_json()])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=2)
+
+    emitted: list[DriftEvent] = []
+
+    async def capture(drift: DriftEvent) -> None:
+        emitted.append(drift)
+
+    planner.set_drift_emitter(capture)
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="stuck",
+        current_task_id="draft_slides",
+    )
+
+    revised = await planner.refine(plan=_looping_plan(), drift=drift, goals=_goals())
+
+    assert revised is not None
+    assert len(scripted.calls) == 1
+    assert emitted == []
+
+
+async def test_refine_rejects_refine_validation_failed_drift() -> None:
+    """The planner must refuse to refine on its own signal, defending
+    against an accidental re-refine loop if the steerer ever routed
+    REFINE_VALIDATION_FAILED back through ``_handle_drift``.
+    """
+    scripted = _ScriptedLLM([])  # Must never be called.
+    planner = LLMPlanner(call_llm=scripted)
+    drift = DriftEvent(
+        kind=DriftKind.REFINE_VALIDATION_FAILED,
+        severity=DriftSeverity.CRITICAL,
+        detail="hypothetical re-entrance",
+        current_task_id="draft_slides",
+    )
+
+    result = await planner.refine(plan=_looping_plan(), drift=drift, goals=_goals())
+
+    assert result is None
+    assert scripted.calls == []

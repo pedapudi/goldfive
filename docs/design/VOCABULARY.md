@@ -363,6 +363,7 @@ run."
 | `NEW_WORK_DISCOVERED` | `"new_work_discovered"` | `WARNING` | Reporting tool `report_new_work_discovered(parent_task_id, title, description, assignee)` called. |
 | `GOAL_UNREACHABLE` | `"goal_unreachable"` | `CRITICAL` | Planner returned `None` from `refine`; the plan cannot be revised to reach the goal. |
 | `AMBIGUOUS_INTENT` | `"ambiguous_intent"` | `WARNING` | Multiple plausible goal interpretations; needs user clarification. Typically synthesized at plan-generation time. |
+| `REFINE_VALIDATION_FAILED` | `"refine_validation_failed"` | `CRITICAL` | `LLMPlanner` exhausted its refine retry budget — the LLM response could not be parsed or pass `Plan.validate(for_revision=True, prior=...)`. Emitted via the planner's drift-emitter callback (wired by `DefaultSteerer.bind`). The steerer deliberately does NOT trigger another `planner.refine` on this kind (infinite-loop risk). See goldfive#133. |
 
 ### 5.c Runtime — the environment limited progress
 
@@ -414,10 +415,15 @@ session-state mutation, not drift synthesis.
 
 ### Count check
 
-Categories: 8 (model-driven) + 4 (plan-driven) + 8 (runtime) + 3
-(user-driven) + 2 (transfer, excluding the non-enum `INTERCEPT_TRANSFER`)
-+ 1 (custom) = 26 enum values. This matches the 26 members of
-`DriftKind` in `goldfive/types.py`.
+The table above covers the core trigger-driven kinds. The live
+`DriftKind` in `goldfive/types.py` also carries the reasoning-category
+kinds (`LOOPING_REASONING`, `REASONING_CLUSTER_TIGHTENING`, `CONFUSION`,
+`OFF_TOPIC`, `INTENT_DIVERGENCE`) and the reflective/confabulation
+signals (`UNCERTAIN_PROGRESS`, `SELF_REPORTED_STUCK`,
+`CONFABULATION_RISK`) documented in [DRIFT.md](DRIFT.md), plus the
+looping-signal kinds (`LOOPING_TOOL_CALL`) and `USER_PAUSE`. The
+authoritative per-kind reference lives in [DRIFT.md](DRIFT.md); this
+section groups the kinds by what triggers them in production code.
 
 ## 6. Event payload kinds
 
