@@ -518,7 +518,12 @@ async def test_invoke_breaks_when_task_reported_terminal_mid_stream() -> None:
     )
 
     adapter = ADKAdapter(_make_agent())
+    # Registry-dispatch refactor: ``adapter._runners`` holds one runner
+    # per reachable agent. Empty-assignee dispatch resolves to the root
+    # agent's runner, so monkey-patches must update the registry entry
+    # for the root agent too (not just the legacy ``_runner`` attribute).
     adapter._runner = _FakeRunner()
+    adapter._runners["test_agent"] = adapter._runner
     adapter._session_id = "stub-session"
 
     result = await adapter.invoke(task=task, session=session)
@@ -565,7 +570,10 @@ async def test_invoke_runs_to_completion_when_task_stays_non_terminal() -> None:
     )
 
     adapter = ADKAdapter(_make_agent())
+    # See dispatch note in test_invoke_breaks_when_task_reported_terminal_mid_stream:
+    # monkey-patch the registry entry as well as the legacy attribute.
     adapter._runner = _FakeRunner()
+    adapter._runners["test_agent"] = adapter._runner
     adapter._session_id = "stub-session"
 
     await adapter.invoke(task=task, session=session)
@@ -1499,3 +1507,560 @@ async def test_reporting_tool_guards_fire_across_back_to_back_invocations() -> N
         "across back-to-back invocations (the filler-loop regression)."
     )
     assert handler_calls[1]["task_id"] == "raccoon_research"
+
+
+# ---------------------------------------------------------------------------
+# Registry-dispatch model (feat/registry-dispatch-model)
+# ---------------------------------------------------------------------------
+
+
+def test_registry_collects_every_reachable_agent() -> None:
+    """Wrapping a coordinator tree builds a registry of every reachable
+    agent — via ``sub_agents``, ``inner_agent``, and ``AgentTool.agent``.
+    """
+    from google.adk.agents.llm_agent import LlmAgent
+    from google.adk.tools.agent_tool import AgentTool
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    def _mk(name: str) -> Any:
+        return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
+
+    research = _mk("research")
+    web = _mk("web")
+    reviewer = _mk("reviewer")
+    coordinator = _mk("coordinator")
+    coordinator.tools = [AgentTool(research), AgentTool(web), AgentTool(reviewer)]
+
+    adapter = ADKAdapter(coordinator)
+    assert set(adapter._registry) == {"coordinator", "research", "web", "reviewer"}
+    # available_agents is sorted for deterministic planner output.
+    assert adapter.available_agents == sorted(adapter._registry)
+    # Registry values are REFERENCES to the original agent objects.
+    assert adapter._registry["research"] is research
+    assert adapter._registry["coordinator"] is coordinator
+    # One runner per registry entry; root shares the legacy _runner.
+    assert set(adapter._runners) == set(adapter._registry)
+    assert adapter._runners["coordinator"] is adapter._runner
+
+
+def test_registry_raises_on_duplicate_agent_name() -> None:
+    """Two agents with the same name in the tree is ambiguous for
+    dispatch — raise at wrap time."""
+    from google.adk.agents.llm_agent import LlmAgent
+    from google.adk.tools.agent_tool import AgentTool
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    dup1 = LlmAgent(name="dup", model="fake-model", description="a", instruction="x")
+    dup2 = LlmAgent(name="dup", model="fake-model", description="b", instruction="x")
+    root = LlmAgent(name="root", model="fake-model", description="r", instruction="x")
+    root.sub_agents = [dup1]
+    root.tools = [AgentTool(dup2)]
+
+    with pytest.raises(ValueError, match="duplicate agent name"):
+        ADKAdapter(root)
+
+
+async def test_invoke_dispatches_to_assignee_runner() -> None:
+    """When a task's assignee_agent_id is populated, goldfive must drive
+    the assignee's own per-agent runner — not the wrap-target root.
+    """
+    from dataclasses import dataclass, field
+
+    from google.adk.agents.llm_agent import LlmAgent
+    from google.adk.tools.agent_tool import AgentTool
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Plan, Session, Task
+
+    @dataclass
+    class _Event:
+        marker: str = ""
+        content: Any = None
+
+    dispatched_to: list[str] = []
+
+    @dataclass
+    class _FakeRunner:
+        name: str = ""
+        session_service: Any = None
+        plugin_manager: Any = field(default=None)
+        app_name: str = ""
+
+        async def run_async(self, **kwargs: Any):  # noqa: ARG002
+            dispatched_to.append(self.name)
+            yield _Event(marker=self.name)
+
+    def _mk(name: str) -> Any:
+        return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
+
+    research = _mk("research")
+    web = _mk("web")
+    coordinator = _mk("coordinator")
+    coordinator.tools = [AgentTool(research), AgentTool(web)]
+
+    adapter = ADKAdapter(coordinator)
+    # Replace each per-agent runner with a fake that records who got dispatched.
+    for agent_name in adapter._runners:
+        adapter._runners[agent_name] = _FakeRunner(name=agent_name, app_name=agent_name)
+    # Legacy attr for _heal_pending_tool_calls (unused here, but kept consistent).
+    adapter._runner = adapter._runners["coordinator"]
+    # Skip real ADK session creation by pre-seeding session ids.
+    adapter._session_ids = {name: f"sess-{name}" for name in adapter._runners}
+
+    session = Session(
+        run_id="r1",
+        plan=Plan(
+            id="p1",
+            run_id="r1",
+            goal_ids=[],
+            tasks=[Task(id="t1", title="do research", assignee_agent_id="research")],
+            edges=[],
+        ),
+    )
+    await adapter.invoke(
+        task=Task(id="t1", title="do research", assignee_agent_id="research"),
+        session=session,
+    )
+    await adapter.invoke(
+        task=Task(id="t2", title="build ui", assignee_agent_id="web"),
+        session=session,
+    )
+
+    assert dispatched_to == ["research", "web"], (
+        "registry dispatch routed to the wrong runners; the whole point "
+        "of feat/registry-dispatch-model is that goldfive picks the "
+        "assignee's runner, not the wrap target's root."
+    )
+
+
+async def test_invoke_raises_on_unknown_assignee() -> None:
+    """A plan that assigns a task to an unknown agent is a planner bug —
+    fail fast with a clear ``available:`` hint."""
+    from google.adk.agents.llm_agent import LlmAgent
+    from google.adk.tools.agent_tool import AgentTool
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Plan, Session, Task
+
+    def _mk(name: str) -> Any:
+        return LlmAgent(name=name, model="fake-model", description=name, instruction="x")
+
+    research = _mk("research")
+    coordinator = _mk("coordinator")
+    coordinator.tools = [AgentTool(research)]
+
+    adapter = ADKAdapter(coordinator)
+    task = Task(id="t1", title="x", assignee_agent_id="does_not_exist")
+    session = Session(
+        run_id="r1",
+        plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[]),
+    )
+
+    with pytest.raises(ValueError, match="unknown agent"):
+        await adapter.invoke(task=task, session=session)
+
+
+async def test_invoke_empty_assignee_falls_back_to_root() -> None:
+    """An empty assignee keeps the single-agent wrap contract — dispatch
+    to the wrap-target root."""
+    from dataclasses import dataclass, field
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Plan, Session, Task
+
+    @dataclass
+    class _FakeRunner:
+        name: str = ""
+        session_service: Any = None
+        plugin_manager: Any = field(default=None)
+        app_name: str = ""
+        called: bool = False
+
+        async def run_async(self, **kwargs: Any):  # noqa: ARG002
+            self.called = True
+            if False:  # pragma: no cover — empty stream
+                yield None
+
+    adapter = ADKAdapter(_make_agent())
+    adapter._runner = _FakeRunner(name="test_agent", app_name="test_agent")
+    adapter._runners["test_agent"] = adapter._runner
+    adapter._session_ids = {"test_agent": "sess"}
+
+    task = Task(id="t1", title="x")  # assignee_agent_id default ""
+    await adapter.invoke(
+        task=task,
+        session=Session(
+            run_id="r1",
+            plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[]),
+        ),
+    )
+    assert adapter._runner.called is True
+
+
+async def test_degraded_mode_prebuilt_runner_ignores_assignee() -> None:
+    """When caller passes a pre-built Runner, per-assignee dispatch is
+    not available — all tasks invoke the single runner regardless of
+    assignee_agent_id. The adapter logs once at wrap time."""
+    from dataclasses import dataclass, field
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Plan, Session, Task
+
+    @dataclass
+    class _PrebuiltRunner:
+        agent: Any = None
+        session_service: Any = None
+        plugin_manager: Any = field(default=None)
+        app_name: str = "prebuilt"
+        plugins: list = field(default_factory=list)
+        called: int = 0
+
+        async def run_async(self, **kwargs: Any):  # noqa: ARG002
+            self.called += 1
+            if False:  # pragma: no cover
+                yield None
+
+    inner = _make_agent()
+    runner = _PrebuiltRunner(agent=inner)
+    adapter = ADKAdapter(runner)
+    assert adapter._degraded_prebuilt_runner is True
+
+    task = Task(id="t1", title="x", assignee_agent_id="not_in_registry")
+    await adapter.invoke(
+        task=task,
+        session=Session(
+            run_id="r1",
+            plan=Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[]),
+        ),
+    )
+    assert runner.called == 1
+
+
+# ---------------------------------------------------------------------------
+# State-protocol reliability (feat/registry-dispatch-model §4)
+# ---------------------------------------------------------------------------
+
+
+async def test_state_protocol_writes_propagate_through_agent_tool_subtree() -> None:
+    """RELIABILITY CONTRACT: task T dispatched to agent A with
+    ``AgentTool(B)`` must let B's ``before_model_callback`` see
+    ``state[goldfive.current_task_id] == T.id``.
+
+    Previously these state writes were done against a shallow copy of
+    the session returned by ``InMemorySessionService.get_session`` and
+    were flagged "best-effort". They now happen inside the plugin's
+    ``before_run_callback`` against the LIVE invocation session, so
+    they propagate through AgentTool sub-Runners automatically (each
+    sub-Runner inherits the plugin and fires its own
+    ``before_run_callback`` that seeds the sub-session's live state).
+    """
+    from google.adk.agents import Agent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.adk.tools.agent_tool import AgentTool
+    from google.genai import types as genai_types
+
+    from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
+    from goldfive.adapters.adk import ADKAdapter
+
+    observed_task_ids_in_B: list[str] = []
+
+    class _ScriptedB(BaseLlm):
+        model: str = "fake-model"
+        _step: int = 0
+
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
+            self._step += 1
+            # Check the session state at the time B's LLM is called.
+            # We'll pull it from llm_request.contents is not enough — we
+            # need the live session state. Use the next yielded response
+            # to carry the observation back via a side channel (the
+            # list captured by closure).
+            #
+            # Approach: yield a turn_complete final and rely on
+            # the adapter's callback-driven state writes. The observation
+            # comes from B's ``before_model_callback`` which fires on
+            # the sub-Runner (same goldfive plugin, same ctx) — but our
+            # plugin write happens in before_run_callback on the live
+            # session, which is invisible here. Instead, read state
+            # when we're about to generate by querying via an
+            # injected tool. Simplest path: require B to be directly
+            # dispatched and drive it that way — see test below.
+            yield LlmResponse(
+                content=genai_types.Content(
+                    role="model",
+                    parts=[genai_types.Part(text="done")],
+                ),
+                turn_complete=True,
+            )
+
+    # Simplify: directly register a tool on B whose handler reads the
+    # sub-session's live state so we can assert the seed is there.
+    class _ScriptedA(BaseLlm):
+        model: str = "fake-model"
+        _step: int = 0
+
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
+            self._step += 1
+            if self._step == 1:
+                # Turn 1: call the B AgentTool so ADK spawns a sub-Runner.
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[
+                            genai_types.Part(
+                                function_call=genai_types.FunctionCall(
+                                    id="call_b",
+                                    name="agent_b",
+                                    args={"request": "do it"},
+                                )
+                            ),
+                        ],
+                    ),
+                )
+            else:
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[genai_types.Part(text="ok")],
+                    ),
+                    turn_complete=True,
+                )
+
+    # Agent B — registers a pre-model callback that records the
+    # goldfive.current_task_id on the sub-session's live state.
+    def _b_before_model(callback_context: Any, llm_request: Any) -> None:  # noqa: ARG001
+        state = getattr(getattr(callback_context, "_invocation_context", None), "session", None)
+        if state is not None:
+            state = getattr(state, "state", None)
+        if state is None:
+            state = getattr(getattr(callback_context, "session", None), "state", None)
+        tid = None
+        if state is not None:
+            try:
+                tid = state.get(KEY_CURRENT_TASK_ID)
+            except Exception:
+                tid = None
+        observed_task_ids_in_B.append(str(tid or ""))
+
+    agent_b = Agent(
+        name="agent_b",
+        model=_ScriptedB(),
+        instruction="",
+        before_model_callback=_b_before_model,
+    )
+    agent_a = Agent(
+        name="agent_a",
+        model=_ScriptedA(),
+        instruction="",
+        tools=[AgentTool(agent_b)],
+    )
+
+    adapter = ADKAdapter(agent_a)
+
+    class _StubSteerer:
+        async def observe(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def transition(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def detect_drift(self, *a: Any, **kw: Any) -> None:
+            return None
+
+        def bind(self, **kw: Any) -> None:
+            pass
+
+    adapter.bind_steerer(_StubSteerer())
+
+    task = Task(id="task_xyz", title="compound", assignee_agent_id="agent_a")
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[task],
+        edges=[],
+    )
+    session = Session(run_id="r1", plan=plan)
+
+    await adapter.invoke(task=task, session=session)
+
+    # B's before_model_callback must have observed the goldfive task id
+    # on the sub-session's live state — proof the reliability contract
+    # holds across the AgentTool boundary.
+    assert observed_task_ids_in_B, "B's before_model_callback never fired"
+    assert observed_task_ids_in_B[0] == "task_xyz", (
+        f"B saw current_task_id={observed_task_ids_in_B[0]!r}, expected "
+        "'task_xyz'. This is the state-protocol reliability contract "
+        "for AgentTool sub-Runners: if writes only landed on the "
+        "top-level session (not the sub-Runner's live session), B would "
+        "see an empty id here. See plugin.before_run_callback."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sink events — AgentInvocationStarted / Completed / DelegationObserved
+# ---------------------------------------------------------------------------
+
+
+async def test_agent_invocation_started_and_completed_emitted_to_sinks() -> None:
+    """An invoke() must emit AgentInvocationStarted at run entry and
+    AgentInvocationCompleted at run exit on the session's sinks."""
+    from google.adk.agents import Agent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types as genai_types
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.sinks.memory import InMemorySink
+
+    class _Scripted(BaseLlm):
+        model: str = "fake-model"
+
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
+            yield LlmResponse(
+                content=genai_types.Content(
+                    role="model",
+                    parts=[genai_types.Part(text="hi")],
+                ),
+                turn_complete=True,
+            )
+
+    agent = Agent(name="worker", model=_Scripted(), instruction="")
+    adapter = ADKAdapter(agent)
+
+    sink = InMemorySink()
+
+    class _SinkingSteerer:
+        def __init__(self) -> None:
+            self._sinks = [sink]
+
+        async def observe(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def transition(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def detect_drift(self, *a: Any, **kw: Any) -> None:
+            return None
+
+        def bind(self, **kw: Any) -> None:
+            pass
+
+    adapter.bind_steerer(_SinkingSteerer())
+
+    task = Task(id="t1", title="go", assignee_agent_id="worker")
+    plan = Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[])
+    session = Session(run_id="r1", plan=plan)
+
+    await adapter.invoke(task=task, session=session)
+
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert "agent_invocation_started" in kinds
+    assert "agent_invocation_completed" in kinds
+    started = next(e for e in sink.events if e.WhichOneof("payload") == "agent_invocation_started")
+    assert started.agent_invocation_started.agent_name == "worker"
+    assert started.agent_invocation_started.task_id == "t1"
+    # parent_invocation_id is empty on the top-level dispatch.
+    assert started.agent_invocation_started.parent_invocation_id == ""
+
+
+async def test_delegation_observed_emitted_on_agent_tool_call() -> None:
+    """When an AgentTool is invoked, the plugin emits DelegationObserved
+    with from_agent = host, to_agent = wrapped.
+    """
+    from google.adk.agents import Agent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.adk.tools.agent_tool import AgentTool
+    from google.genai import types as genai_types
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.sinks.memory import InMemorySink
+
+    class _B(BaseLlm):
+        model: str = "fake-model"
+
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
+            yield LlmResponse(
+                content=genai_types.Content(
+                    role="model",
+                    parts=[genai_types.Part(text="b done")],
+                ),
+                turn_complete=True,
+            )
+
+    class _A(BaseLlm):
+        model: str = "fake-model"
+        _step: int = 0
+
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):  # noqa: ARG002
+            self._step += 1
+            if self._step == 1:
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[
+                            genai_types.Part(
+                                function_call=genai_types.FunctionCall(
+                                    id="c1", name="agent_b", args={"q": "go"}
+                                )
+                            ),
+                        ],
+                    ),
+                )
+            else:
+                yield LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[genai_types.Part(text="a done")],
+                    ),
+                    turn_complete=True,
+                )
+
+    agent_b = Agent(name="agent_b", model=_B(), instruction="")
+    agent_a = Agent(
+        name="agent_a",
+        model=_A(),
+        instruction="",
+        tools=[AgentTool(agent_b)],
+    )
+    adapter = ADKAdapter(agent_a)
+
+    sink = InMemorySink()
+
+    class _SinkingSteerer:
+        def __init__(self) -> None:
+            self._sinks = [sink]
+
+        async def observe(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def transition(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def detect_drift(self, *a: Any, **kw: Any) -> None:
+            return None
+
+        def bind(self, **kw: Any) -> None:
+            pass
+
+    adapter.bind_steerer(_SinkingSteerer())
+
+    task = Task(id="t1", title="do a", assignee_agent_id="agent_a")
+    plan = Plan(id="p1", run_id="r1", goal_ids=[], tasks=[task], edges=[])
+    session = Session(run_id="r1", plan=plan)
+    await adapter.invoke(task=task, session=session)
+
+    delegations = [
+        e.delegation_observed
+        for e in sink.events
+        if e.WhichOneof("payload") == "delegation_observed"
+    ]
+    assert len(delegations) >= 1, "expected at least one DelegationObserved"
+    first = delegations[0]
+    assert first.from_agent == "agent_a"
+    assert first.to_agent == "agent_b"
+    assert first.task_id == "t1"

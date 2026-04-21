@@ -59,6 +59,9 @@ message Event {
     ApprovalRequested approval_requested = 25;
     ApprovalGranted approval_granted = 26;
     ApprovalRejected approval_rejected = 27;
+    AgentInvocationStarted agent_invocation_started = 28;
+    AgentInvocationCompleted agent_invocation_completed = 29;
+    DelegationObserved delegation_observed = 30;
   }
 }
 
@@ -271,4 +274,60 @@ message ApprovalGranted {
 message ApprovalRejected {
   string target_id = 1;
   string detail = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Agent dispatch / delegation observability
+// ---------------------------------------------------------------------------
+//
+// These events are emitted by the ADK adapter's plugin lifecycle hooks when
+// goldfive's registry-dispatch model routes a task to a named agent:
+//
+//   * AgentInvocationStarted — before_run_callback fires at the top of the
+//     runner's invocation (either the top-level dispatch from goldfive or
+//     a sub-Runner spawned by an AgentTool).
+//   * AgentInvocationCompleted — after_run_callback fires when the runner
+//     finishes.
+//   * DelegationObserved — before_tool_callback fires and detects the tool
+//     is an AgentTool, so the invocation is about to spawn a sub-agent.
+//
+// They are observability-only: they do NOT change task state and the
+// framework does not interpret them. Sinks surface them to make the
+// "who actually ran what" story visible (for coordinators-with-AgentTools
+// especially).
+
+// Goldfive's executor dispatched a task to an agent, or a sub-Runner was
+// spawned inside an AgentTool invocation and its top-level `before_run`
+// callback fired. `parent_invocation_id` is empty on top-level dispatch
+// and populated for nested AgentTool-spawned invocations so sinks can
+// reconstruct the delegation tree.
+message AgentInvocationStarted {
+  string agent_name = 1;
+  string task_id = 2;
+  string invocation_id = 3;
+  string parent_invocation_id = 4;
+  google.protobuf.Timestamp started_at = 5;
+}
+
+// Paired with AgentInvocationStarted — emitted from `after_run_callback`
+// when the runner finishes. `summary` is an optional short description
+// of the outcome (e.g. the final assistant text) for sinks that render
+// a timeline.
+message AgentInvocationCompleted {
+  string agent_name = 1;
+  string task_id = 2;
+  string invocation_id = 3;
+  string summary = 4;
+  google.protobuf.Timestamp completed_at = 5;
+}
+
+// A tool invocation about to run is an AgentTool — the host agent is
+// delegating to `to_agent`. Sinks render this as an edge from
+// `from_agent` to `to_agent` in the delegation graph.
+message DelegationObserved {
+  string from_agent = 1;
+  string to_agent = 2;
+  string task_id = 3;
+  string invocation_id = 4;
+  google.protobuf.Timestamp observed_at = 5;
 }

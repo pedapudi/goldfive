@@ -371,21 +371,95 @@ def approval_requested_event(
     return evt
 
 
-def approval_granted_event(
-    run_id: str, sequence: int, *, target_id: str, detail: str = ""
-) -> Any:
+def approval_granted_event(run_id: str, sequence: int, *, target_id: str, detail: str = "") -> Any:
     evt = new_event(run_id, sequence)
     evt.approval_granted.target_id = target_id
     evt.approval_granted.detail = detail
     return evt
 
 
-def approval_rejected_event(
-    run_id: str, sequence: int, *, target_id: str, detail: str = ""
-) -> Any:
+def approval_rejected_event(run_id: str, sequence: int, *, target_id: str, detail: str = "") -> Any:
     evt = new_event(run_id, sequence)
     evt.approval_rejected.target_id = target_id
     evt.approval_rejected.detail = detail
+    return evt
+
+
+def agent_invocation_started_event(
+    run_id: str,
+    sequence: int,
+    *,
+    agent_name: str,
+    task_id: str = "",
+    invocation_id: str = "",
+    parent_invocation_id: str = "",
+    started_at: Any | None = None,
+) -> Any:
+    """Build an ``AgentInvocationStarted`` envelope.
+
+    Emitted from the goldfive ADK plugin's ``before_run_callback`` — both
+    on the top-level dispatch (goldfive's registry dispatch to the
+    assignee's runner) and on any nested AgentTool-spawned sub-Runner.
+    ``parent_invocation_id`` is empty for top-level and populated for
+    nested invocations so sinks can reconstruct the delegation tree.
+    """
+    evt = new_event(run_id, sequence)
+    evt.agent_invocation_started.agent_name = agent_name
+    evt.agent_invocation_started.task_id = task_id
+    evt.agent_invocation_started.invocation_id = invocation_id
+    evt.agent_invocation_started.parent_invocation_id = parent_invocation_id
+    evt.agent_invocation_started.started_at.CopyFrom(started_at or now_ts())
+    return evt
+
+
+def agent_invocation_completed_event(
+    run_id: str,
+    sequence: int,
+    *,
+    agent_name: str,
+    task_id: str = "",
+    invocation_id: str = "",
+    summary: str = "",
+    completed_at: Any | None = None,
+) -> Any:
+    """Build an ``AgentInvocationCompleted`` envelope.
+
+    Paired with :func:`agent_invocation_started_event` — emitted from
+    the plugin's ``after_run_callback`` when the runner finishes.
+    ``summary`` is optional and may carry the final assistant text for
+    sinks that render a timeline.
+    """
+    evt = new_event(run_id, sequence)
+    evt.agent_invocation_completed.agent_name = agent_name
+    evt.agent_invocation_completed.task_id = task_id
+    evt.agent_invocation_completed.invocation_id = invocation_id
+    evt.agent_invocation_completed.summary = summary
+    evt.agent_invocation_completed.completed_at.CopyFrom(completed_at or now_ts())
+    return evt
+
+
+def delegation_observed_event(
+    run_id: str,
+    sequence: int,
+    *,
+    from_agent: str,
+    to_agent: str,
+    task_id: str = "",
+    invocation_id: str = "",
+    observed_at: Any | None = None,
+) -> Any:
+    """Build a ``DelegationObserved`` envelope.
+
+    Emitted from the plugin's ``before_tool_callback`` when the tool is
+    an ADK ``AgentTool`` — the host agent is about to delegate to the
+    wrapped sub-agent. Observability only; the tool still runs.
+    """
+    evt = new_event(run_id, sequence)
+    evt.delegation_observed.from_agent = from_agent
+    evt.delegation_observed.to_agent = to_agent
+    evt.delegation_observed.task_id = task_id
+    evt.delegation_observed.invocation_id = invocation_id
+    evt.delegation_observed.observed_at.CopyFrom(observed_at or now_ts())
     return evt
 
 
@@ -433,8 +507,7 @@ def build_plan_revision_diff(old_plan: Any, new_plan: Any) -> Any:
         if (
             getattr(old_t, "title", "") != getattr(new_t, "title", "")
             or getattr(old_t, "description", "") != getattr(new_t, "description", "")
-            or getattr(old_t, "assignee_agent_id", "")
-            != getattr(new_t, "assignee_agent_id", "")
+            or getattr(old_t, "assignee_agent_id", "") != getattr(new_t, "assignee_agent_id", "")
             or str(getattr(old_t, "status", "")) != str(getattr(new_t, "status", ""))
         ):
             modified.append(tid)
@@ -456,16 +529,12 @@ def build_plan_revision_diff(old_plan: Any, new_plan: Any) -> Any:
     for e in new_edges:
         if _edge_key(e) not in old_edge_keys:
             diff.added_edges.append(
-                types_pb2.TaskEdge(
-                    from_task_id=e.from_task_id, to_task_id=e.to_task_id
-                )
+                types_pb2.TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
             )
     for e in old_edges:
         if _edge_key(e) not in new_edge_keys:
             diff.removed_edges.append(
-                types_pb2.TaskEdge(
-                    from_task_id=e.from_task_id, to_task_id=e.to_task_id
-                )
+                types_pb2.TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
             )
     return diff
 

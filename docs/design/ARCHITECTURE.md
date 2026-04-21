@@ -289,6 +289,132 @@ caller captures the same information.
   flushes buffered writes and releases the file lock. See the
   [persistence guide](../guides/persistence-and-recovery.md).
 
+## Registry dispatch: goldfive drives, ADK executes
+
+The `AgentAdapter.invoke(task, session)` boundary is deliberately
+single-task. For the ADK adapter, that single-task contract meets a
+framework that natively supports nested agent *trees* —
+`sub_agents`, `inner_agent` wrappers, and `AgentTool`-wrapped
+specialists exposed to a coordinator as tools. Goldfive's design
+principle here is uncompromising:
+
+> **goldfive is the dispatch layer; ADK is the execution layer.**
+
+The tree the caller hands to `goldfive.wrap(...)` is **respected,
+never rewritten or flattened**. Goldfive's executor picks which
+agent runs for each task; ADK runs whatever agent it was handed
+with its full subtree intact.
+
+### The registry
+
+On wrap, `ADKAdapter.__init__` walks the tree from the root and
+builds a `name -> BaseAgent` registry covering every reachable
+agent. The traversal follows three edges:
+
+- `agent.sub_agents` — native ADK child agents.
+- `agent.inner_agent` — wrapper agents that compose a single child.
+- `tool.agent` for every tool in `agent.tools` — agent-as-tool
+  (`AgentTool`) wrappers.
+
+Values in the registry are **references** to the caller's original
+agent objects. No copies, no flattening — a coordinator that has
+three `AgentTool` specialists as tools still has those tools after
+wrap, and the specialists themselves still carry their own
+`sub_agents` subtrees. The registry is strictly a discovery surface.
+
+Two wrap-time integrity checks make the registry a hard contract:
+
+- Duplicate agent names raise `ValueError("duplicate agent name in
+  tree: <name>")` at construction. The registry keys on name, so a
+  duplicate makes strict-match dispatch ambiguous.
+- Every reachable agent must carry the canonical reporting tools
+  after `register_reporting_tools` — otherwise a task dispatched to
+  that agent could not report terminal status back to goldfive.
+- Every per-agent `Runner` must have the goldfive plugin installed;
+  a runner without the plugin cannot emit state writes, reporting
+  callbacks, or drift observations.
+
+### Per-agent runners
+
+Each registered agent gets its own `google.adk.runners.InMemoryRunner`.
+The goldfive plugin is installed once per per-agent runner at
+construction. `invoke(task, session)` dispatches by looking up
+`task.assignee_agent_id` in the registry, picking the per-agent
+runner for that agent, and driving **that** runner — not always the
+tree root.
+
+An empty `task.assignee_agent_id` falls back to the wrap-target
+root's runner, preserving the single-agent wrap contract. An
+assignee that is set but missing from the registry raises
+`ValueError("plan assigned task <id> to unknown agent <name>;
+available: [...]")` so planner bugs fail loud instead of silently
+dispatching to the wrong agent.
+
+### The shape of a dispatched turn
+
+```mermaid
+flowchart TB
+  subgraph caller["caller ADK tree (untouched)"]
+    direction TB
+    coord["coordinator<br/>tools: AgentTool researcher, AgentTool writer"]
+    res["researcher"]
+    wri["writer<br/>sub_agents: editor"]
+    ed["editor"]
+    coord -.AgentTool.-> res
+    coord -.AgentTool.-> wri
+    wri -->|sub_agent| ed
+  end
+
+  subgraph adapter["ADKAdapter built at goldfive.wrap"]
+    direction TB
+    reg["registry<br/>coordinator, researcher, writer, editor"]
+    run1["InMemoryRunner coordinator + plugin"]
+    run2["InMemoryRunner researcher + plugin"]
+    run3["InMemoryRunner writer + plugin"]
+    run4["InMemoryRunner editor + plugin"]
+    reg --> run1
+    reg --> run2
+    reg --> run3
+    reg --> run4
+  end
+
+  subgraph dispatch["invoke task, session"]
+    direction LR
+    t["task.assignee_agent_id = writer"] --> lookup["registry lookup"]
+    lookup --> run3
+    run3 --> adk["ADK runs writer with its subtree<br/>sub_agent editor visible as expected"]
+  end
+
+  caller -->|walked once on wrap| reg
+```
+
+In the example, goldfive dispatches the current task to `writer`.
+ADK drives the writer runner; the writer's `sub_agents` (here
+`editor`) are still available to the writer's invocation exactly as
+the caller authored them. If the writer calls
+`AgentTool(something)`, ADK's own plugin-inheritance mechanism
+carries the goldfive plugin into the spawned sub-runner — so every
+nested invocation still emits the same state-protocol keys and
+observability events.
+
+### Graceful degrade
+
+Callers who hand `goldfive.wrap` an already-built ADK `Runner`
+instead of a `BaseAgent` get a single-entry registry pointing at
+the runner's root agent, and a one-time WARNING log:
+`ADKAdapter: caller passed a pre-built Runner; per-task-assignee
+dispatch is unavailable, all tasks will invoke the runner's
+root_agent`. Every dispatch targets that one runner regardless of
+`task.assignee_agent_id`. This is a compatibility shim for callers
+who constructed their own runner; the full registry model requires
+handing in the tree root directly.
+
+See [RATIONALE.md §"Why per-agent runners, not always-root-dispatch"](RATIONALE.md#why-per-agent-runners-not-always-root-dispatch)
+for why the single-runner design was rejected, and
+[EVENT-MODEL.md §"Agent-invocation events"](EVENT-MODEL.md#agent-invocation-events)
+for the three observability events the plugin emits on every
+dispatch.
+
 ## Invariants
 
 Four invariants hold across every `Runner.run(...)` invocation:

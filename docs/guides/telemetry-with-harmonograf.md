@@ -97,6 +97,20 @@ marker appears across the timeline at the `PlanRevised` event's
 timestamp. Hover it to see the triggering drift (kind + severity
 + detail) and the diff summary.
 
+**Delegation bars (ADK).** When goldfive wraps an ADK tree with
+`AgentTool`-wrapped specialists, each
+`adapter.invoke(task, session)` dispatch starts a top-level
+`INVOCATION` bar tagged with the dispatched agent's name
+(`AgentInvocationStarted.agent_name`). If that agent calls an
+`AgentTool` mid-turn, a nested bar appears for the wrapped
+agent's sub-Runner invocation, connected to its parent by a
+dashed delegation edge. All bars in the nested chain share the
+same goldfive-dispatched `task_id` — the edge is drawn from the
+`DelegationObserved` event, and the parent / child relationship
+is reconstructed from `AgentInvocationStarted.parent_invocation_id`.
+The three events are documented in
+[EVENT-MODEL.md §"Agent-invocation events"](../design/EVENT-MODEL.md#agent-invocation-events).
+
 ## Clicking on a span
 
 Left-click opens a popover with four actions:

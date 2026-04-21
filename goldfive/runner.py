@@ -280,6 +280,30 @@ class Runner:
             )
             return outcome
 
+        # 6b. Wire the steerer into the adapter. Adapter plugin callbacks
+        # (e.g. ADKAdapter's ``_emit_observability``) short-circuit when
+        # ``SessionContext.steerer`` is ``None`` — without this call the
+        # new sink events (``AgentInvocationStarted`` /
+        # ``AgentInvocationCompleted`` / ``DelegationObserved``) never
+        # fire. Every built-in adapter (ADK, Claude, Callable) exposes
+        # ``bind_steerer``; probe with getattr so third-party adapters
+        # that predate the protocol addition still work.
+        bind_adapter_steerer = getattr(self.agent, "bind_steerer", None)
+        if bind_adapter_steerer is not None:
+            try:
+                bind_adapter_steerer(self.steerer)
+            except Exception as exc:  # noqa: BLE001
+                reason = f"adapter.bind_steerer raised: {exc}"
+                log.exception("adapter.bind_steerer raised")
+                await self._emit_run_aborted(session, reason)
+                outcome = ExecutionOutcome(
+                    success=False, session=session, reason=reason
+                )
+                self._conversation.absorb_turn(
+                    outcome, user_input_summary=_initial_goal_summary(user_input)
+                )
+                return outcome
+
         # 7. Hand off to the executor.
         try:
             executor_kwargs: dict[str, Any] = dict(

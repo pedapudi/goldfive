@@ -11,7 +11,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class Event(_message.Message):
-    __slots__ = ("event_id", "run_id", "sequence", "emitted_at", "run_started", "goal_derived", "plan_submitted", "plan_revised", "task_started", "task_progress", "task_completed", "task_failed", "task_blocked", "task_cancelled", "drift_detected", "run_completed", "run_aborted", "conversation_started", "conversation_ended", "approval_requested", "approval_granted", "approval_rejected")
+    __slots__ = ("event_id", "run_id", "sequence", "emitted_at", "run_started", "goal_derived", "plan_submitted", "plan_revised", "task_started", "task_progress", "task_completed", "task_failed", "task_blocked", "task_cancelled", "drift_detected", "run_completed", "run_aborted", "conversation_started", "conversation_ended", "approval_requested", "approval_granted", "approval_rejected", "agent_invocation_started", "agent_invocation_completed", "delegation_observed")
     EVENT_ID_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
@@ -34,6 +34,9 @@ class Event(_message.Message):
     APPROVAL_REQUESTED_FIELD_NUMBER: _ClassVar[int]
     APPROVAL_GRANTED_FIELD_NUMBER: _ClassVar[int]
     APPROVAL_REJECTED_FIELD_NUMBER: _ClassVar[int]
+    AGENT_INVOCATION_STARTED_FIELD_NUMBER: _ClassVar[int]
+    AGENT_INVOCATION_COMPLETED_FIELD_NUMBER: _ClassVar[int]
+    DELEGATION_OBSERVED_FIELD_NUMBER: _ClassVar[int]
     event_id: str
     run_id: str
     sequence: int
@@ -56,7 +59,10 @@ class Event(_message.Message):
     approval_requested: ApprovalRequested
     approval_granted: ApprovalGranted
     approval_rejected: ApprovalRejected
-    def __init__(self, event_id: _Optional[str] = ..., run_id: _Optional[str] = ..., sequence: _Optional[int] = ..., emitted_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., run_started: _Optional[_Union[RunStarted, _Mapping]] = ..., goal_derived: _Optional[_Union[GoalDerived, _Mapping]] = ..., plan_submitted: _Optional[_Union[PlanSubmitted, _Mapping]] = ..., plan_revised: _Optional[_Union[PlanRevised, _Mapping]] = ..., task_started: _Optional[_Union[TaskStarted, _Mapping]] = ..., task_progress: _Optional[_Union[TaskProgress, _Mapping]] = ..., task_completed: _Optional[_Union[TaskCompleted, _Mapping]] = ..., task_failed: _Optional[_Union[TaskFailed, _Mapping]] = ..., task_blocked: _Optional[_Union[TaskBlocked, _Mapping]] = ..., task_cancelled: _Optional[_Union[TaskCancelled, _Mapping]] = ..., drift_detected: _Optional[_Union[DriftDetected, _Mapping]] = ..., run_completed: _Optional[_Union[RunCompleted, _Mapping]] = ..., run_aborted: _Optional[_Union[RunAborted, _Mapping]] = ..., conversation_started: _Optional[_Union[ConversationStarted, _Mapping]] = ..., conversation_ended: _Optional[_Union[ConversationEnded, _Mapping]] = ..., approval_requested: _Optional[_Union[ApprovalRequested, _Mapping]] = ..., approval_granted: _Optional[_Union[ApprovalGranted, _Mapping]] = ..., approval_rejected: _Optional[_Union[ApprovalRejected, _Mapping]] = ...) -> None: ...
+    agent_invocation_started: AgentInvocationStarted
+    agent_invocation_completed: AgentInvocationCompleted
+    delegation_observed: DelegationObserved
+    def __init__(self, event_id: _Optional[str] = ..., run_id: _Optional[str] = ..., sequence: _Optional[int] = ..., emitted_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., run_started: _Optional[_Union[RunStarted, _Mapping]] = ..., goal_derived: _Optional[_Union[GoalDerived, _Mapping]] = ..., plan_submitted: _Optional[_Union[PlanSubmitted, _Mapping]] = ..., plan_revised: _Optional[_Union[PlanRevised, _Mapping]] = ..., task_started: _Optional[_Union[TaskStarted, _Mapping]] = ..., task_progress: _Optional[_Union[TaskProgress, _Mapping]] = ..., task_completed: _Optional[_Union[TaskCompleted, _Mapping]] = ..., task_failed: _Optional[_Union[TaskFailed, _Mapping]] = ..., task_blocked: _Optional[_Union[TaskBlocked, _Mapping]] = ..., task_cancelled: _Optional[_Union[TaskCancelled, _Mapping]] = ..., drift_detected: _Optional[_Union[DriftDetected, _Mapping]] = ..., run_completed: _Optional[_Union[RunCompleted, _Mapping]] = ..., run_aborted: _Optional[_Union[RunAborted, _Mapping]] = ..., conversation_started: _Optional[_Union[ConversationStarted, _Mapping]] = ..., conversation_ended: _Optional[_Union[ConversationEnded, _Mapping]] = ..., approval_requested: _Optional[_Union[ApprovalRequested, _Mapping]] = ..., approval_granted: _Optional[_Union[ApprovalGranted, _Mapping]] = ..., approval_rejected: _Optional[_Union[ApprovalRejected, _Mapping]] = ..., agent_invocation_started: _Optional[_Union[AgentInvocationStarted, _Mapping]] = ..., agent_invocation_completed: _Optional[_Union[AgentInvocationCompleted, _Mapping]] = ..., delegation_observed: _Optional[_Union[DelegationObserved, _Mapping]] = ...) -> None: ...
 
 class RunStarted(_message.Message):
     __slots__ = ("run_id", "goal_summary", "started_at")
@@ -253,3 +259,45 @@ class ApprovalRejected(_message.Message):
     target_id: str
     detail: str
     def __init__(self, target_id: _Optional[str] = ..., detail: _Optional[str] = ...) -> None: ...
+
+class AgentInvocationStarted(_message.Message):
+    __slots__ = ("agent_name", "task_id", "invocation_id", "parent_invocation_id", "started_at")
+    AGENT_NAME_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_ID_FIELD_NUMBER: _ClassVar[int]
+    PARENT_INVOCATION_ID_FIELD_NUMBER: _ClassVar[int]
+    STARTED_AT_FIELD_NUMBER: _ClassVar[int]
+    agent_name: str
+    task_id: str
+    invocation_id: str
+    parent_invocation_id: str
+    started_at: _timestamp_pb2.Timestamp
+    def __init__(self, agent_name: _Optional[str] = ..., task_id: _Optional[str] = ..., invocation_id: _Optional[str] = ..., parent_invocation_id: _Optional[str] = ..., started_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class AgentInvocationCompleted(_message.Message):
+    __slots__ = ("agent_name", "task_id", "invocation_id", "summary", "completed_at")
+    AGENT_NAME_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_ID_FIELD_NUMBER: _ClassVar[int]
+    SUMMARY_FIELD_NUMBER: _ClassVar[int]
+    COMPLETED_AT_FIELD_NUMBER: _ClassVar[int]
+    agent_name: str
+    task_id: str
+    invocation_id: str
+    summary: str
+    completed_at: _timestamp_pb2.Timestamp
+    def __init__(self, agent_name: _Optional[str] = ..., task_id: _Optional[str] = ..., invocation_id: _Optional[str] = ..., summary: _Optional[str] = ..., completed_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+
+class DelegationObserved(_message.Message):
+    __slots__ = ("from_agent", "to_agent", "task_id", "invocation_id", "observed_at")
+    FROM_AGENT_FIELD_NUMBER: _ClassVar[int]
+    TO_AGENT_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_ID_FIELD_NUMBER: _ClassVar[int]
+    OBSERVED_AT_FIELD_NUMBER: _ClassVar[int]
+    from_agent: str
+    to_agent: str
+    task_id: str
+    invocation_id: str
+    observed_at: _timestamp_pb2.Timestamp
+    def __init__(self, from_agent: _Optional[str] = ..., to_agent: _Optional[str] = ..., task_id: _Optional[str] = ..., invocation_id: _Optional[str] = ..., observed_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...

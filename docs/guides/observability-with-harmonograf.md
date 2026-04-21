@@ -182,6 +182,16 @@ four `TaskStarted` / `TaskCompleted` pairs (one per task), and
 `RunCompleted`. Runner lifecycle envelopes and executor proto events
 both count.
 
+An ADK-driven run emits additional dispatch-level events —
+`AgentInvocationStarted`, `AgentInvocationCompleted`, and (when a
+coordinator invokes an `AgentTool`) `DelegationObserved`. They are
+emitted by the goldfive ADK plugin's `before_run` / `after_run` /
+`before_tool` callbacks and surface on every sink. Harmonograf
+renders them as nested bars with delegation edges on the Agents
+timeline (see [telemetry-with-harmonograf.md](telemetry-with-harmonograf.md)).
+See [EVENT-MODEL.md §"Agent-invocation events"](../design/EVENT-MODEL.md#agent-invocation-events)
+for the schemas.
+
 The two sinks:
 
 - **`InMemorySink`** — local-process list. Cheap sanity check; the

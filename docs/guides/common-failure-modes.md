@@ -276,7 +276,75 @@ more INFO-severity signals that don't trigger refine.
 - Update any custom `should_refine(drift)` override to inspect
   severity, not kind.
 
-## 8. Deprecation warning: `max_plan_reinvocations`
+## 8. coordinator+AgentTool loop under real LLM (fixed by registry dispatch)
+
+Historical failure mode that affected `goldfive.wrap(coordinator)`
+when the coordinator had `AgentTool`-wrapped specialists as tools.
+The registry-dispatch refactor made it structurally impossible;
+this entry documents the old signature so runs against earlier
+goldfive builds can be recognised and the recovery path confirmed.
+
+**Signature (pre-fix).**
+
+- `adk web` UI hangs: the first user turn starts, a `TaskStarted`
+  event appears, but no `TaskCompleted` / `RunCompleted` ever
+  arrives.
+- The adk log shows plugin registrations stacking up — many
+  `ADKAdapter: registered reporting tools on N sub-agents` lines
+  per turn rather than one at wrap time.
+- Eventually a framework-level abort: `max_turns_exceeded` (ADK's
+  500-LLM-call ceiling) with the coordinator still narrating.
+- Reasoning content for the last LLM calls shows the coordinator
+  repeatedly deciding which specialist to invoke — indicating the
+  coordinator's LLM was burning calls on routing decisions that
+  goldfive was supposed to be making.
+
+**Root cause (pre-fix).** The old adapter built a single
+`InMemoryRunner` against the tree root and invoked that runner
+for every task, regardless of `task.assignee_agent_id`. Under a
+real LLM:
+
+1. Each task caused a coordinator invocation.
+2. The coordinator's LLM turn decided which specialist to call.
+3. The coordinator called `AgentTool(specialist)`, spawning a
+   sub-Runner.
+4. The specialist replied; the coordinator often composed
+   additional `AgentTool` calls.
+5. ADK's 500-call ceiling tripped before `TaskCompleted` arrived.
+
+The coordinator's instruction text could not be surgically edited
+(tree-respect) and prompt engineering around "please don't
+re-route" was unstable across models.
+
+**Fix (registry dispatch).** `ADKAdapter` now builds a
+`name -> BaseAgent` registry at wrap time and constructs one
+`InMemoryRunner` per reachable agent. `invoke(task, session)`
+dispatches to `registry[task.assignee_agent_id]`'s runner —
+goldfive drives the specialist directly, skipping the
+coordinator's routing turn entirely. See
+[ARCHITECTURE.md §"Registry dispatch"](../design/ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)
+and
+[RATIONALE.md §"Why per-agent runners, not always-root-dispatch"](../design/RATIONALE.md#why-per-agent-runners-not-always-root-dispatch).
+
+**Recovery path.**
+
+- Update to a goldfive build that includes the registry-dispatch
+  refactor (this page, commit range around
+  `feat/registry-dispatch-model`). No code change required on
+  the caller side — the existing `goldfive.wrap(coordinator)`
+  call now does the right thing.
+- Verify by inspecting `adapter.available_agents` after wrap: it
+  should list every agent in the tree (coordinator + each
+  specialist + any sub-agents), sorted. A one-entry list means
+  the wrap target was a pre-built `Runner` rather than a
+  `BaseAgent` — see the [degrade-mode section in
+  adk-web-integration.md](adk-web-integration.md#pre-built-runner-degrade-mode).
+- Watch the new `AgentInvocationStarted` / `AgentInvocationCompleted`
+  / `DelegationObserved` events on sinks to confirm each task
+  dispatches to its assignee and any AgentTool delegation is
+  observed (see [EVENT-MODEL.md §"Agent-invocation events"](../design/EVENT-MODEL.md#agent-invocation-events)).
+
+## 9. Deprecation warning: `max_plan_reinvocations`
 
 `DeprecationWarning: SequentialExecutor(max_plan_reinvocations=...)
 is deprecated; use max_task_invocations=... instead.`

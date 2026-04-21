@@ -482,6 +482,7 @@ def _build_app() -> Any:
 
     if live:
         call_llm = _openai_call_llm()
+        goal_call_llm = call_llm
         planner_model = os.environ.get(
             "GOLDFIVE_EXAMPLE_PLANNER_MODEL", "gpt-4o-mini"
         )
@@ -491,12 +492,22 @@ def _build_app() -> Any:
             "presentation_agent: OPENAI_API_KEY unset; building App in mock mode "
             "so `adk web` can load offline."
         )
+        # Planner and goal-deriver need different canned JSON shapes in mock
+        # mode: the planner expects ``{"summary","tasks","edges"}``; the
+        # goal-deriver expects ``{"goals": [...]}``. Wiring both to
+        # ``_mock_planner_call_llm`` is a real bug — ``LLMGoalDeriver``
+        # logs a WARNING and falls back to a single passthrough goal. The
+        # e2e run still completes (the plan is deterministic), but the
+        # observability stream drops the ``goal_derived`` detail the
+        # mock was meant to exercise. Use the purpose-built
+        # ``_mock_goal_call_llm`` for the deriver instead.
         call_llm = _mock_planner_call_llm(topic)
+        goal_call_llm = _mock_goal_call_llm(topic)
         planner_model = "mock/planner"
         tree = _build_agent_tree(_MockLlm(model="mock/presentation-agent"))
 
     planner = LLMPlanner(call_llm=call_llm, model=planner_model)
-    goal_deriver = LLMGoalDeriver(call_llm=call_llm, model=planner_model)
+    goal_deriver = LLMGoalDeriver(call_llm=goal_call_llm, model=planner_model)
 
     wrapped = goldfive.wrap(tree, planner=planner, goal_deriver=goal_deriver)
 
