@@ -79,6 +79,32 @@ _TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
 _StageResult = tuple[Task, InvocationResult | None, DriftEvent | None, BaseException | None]
 
 
+# Symbolic cancel-reason for USER_STEER. Mirrors
+# :data:`goldfive.adapters.adk.SYMBOLIC_REASON_USER_STEER` but duplicated
+# as a plain string to avoid importing the optional ADK adapter module
+# from the provider-agnostic executor. Keep in sync. See goldfive#139.
+_CANCEL_REASON_USER_STEER: str = "user_steer"
+
+
+def _tag_adapter_cancel_user_steer(adapter: Any) -> None:
+    """Tag ``adapter._next_cancel_reason`` with the USER_STEER symbolic reason.
+
+    Called just before the executor triggers ``task.cancel()`` on any
+    in-flight stage invoke task so the adapter's mid-invocation cancel
+    handler picks up the tag and appends an LLM-actionable synthetic
+    ``function_response`` (instead of the legacy generic jargon).
+    Adapters that don't expose ``_next_cancel_reason`` are tolerated
+    via a duck-typed write. See goldfive#139.
+    """
+    try:
+        adapter._next_cancel_reason = _CANCEL_REASON_USER_STEER
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "ParallelDAGExecutor: could not tag adapter cancel reason: %s",
+            exc,
+        )
+
+
 class ParallelDAGExecutor:
     """Parallel rigid-DAG executor.
 
@@ -585,6 +611,14 @@ class ParallelDAGExecutor:
                                 except BaseException as exc:  # noqa: BLE001
                                     results[task.id] = (task, None, None, exc)
                             stage_control_outcome = outcome
+                            # Tag the adapter's next mid-invocation
+                            # cancel with USER_STEER when that's the
+                            # control cause, so the synthetic
+                            # function_response carries LLM-actionable
+                            # content instead of the legacy generic
+                            # jargon. See goldfive#139.
+                            if outcome.steer_message is not None:
+                                _tag_adapter_cancel_user_steer(adapter)
                             await _cancel_stage_tasks()
                             break
                         # Non-interrupting control (PAUSE/RESUME/

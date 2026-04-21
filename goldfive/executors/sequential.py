@@ -61,6 +61,32 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+# Symbolic cancel-reason for USER_STEER. Mirrors
+# :data:`goldfive.adapters.adk.SYMBOLIC_REASON_USER_STEER` but duplicated
+# as a plain string to avoid importing the optional ADK adapter module
+# from the provider-agnostic executor. Keep in sync. See goldfive#139.
+_CANCEL_REASON_USER_STEER: str = "user_steer"
+
+
+def _tag_adapter_cancel_user_steer(adapter: Any) -> None:
+    """Tag ``adapter._next_cancel_reason`` with the USER_STEER symbolic reason.
+
+    Called just before the executor triggers ``task.cancel()`` on the
+    in-flight invoke task so the adapter's mid-invocation cancel
+    handler picks up the tag and appends an LLM-actionable synthetic
+    ``function_response`` (instead of the legacy generic jargon). Adapters
+    that don't expose ``_next_cancel_reason`` are tolerated via a
+    duck-typed write. See goldfive#139.
+    """
+    try:
+        adapter._next_cancel_reason = _CANCEL_REASON_USER_STEER
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "SequentialExecutor: could not tag adapter cancel reason: %s",
+            exc,
+        )
+
+
 class SequentialExecutor(Executor):
     """Single-threaded executor that drives one task at a time.
 
@@ -708,6 +734,13 @@ class SequentialExecutor(Executor):
                 return ("cancelled", outcome.cancel_reason or "cancelled by control")
 
             if outcome.steer_message is not None:
+                # Tag the adapter's next mid-invocation cancel with the
+                # USER_STEER symbolic reason BEFORE triggering the
+                # actual cancel, so the adapter's CancelledError
+                # handler (and the synthetic function_response it
+                # appends) carries LLM-actionable content instead of
+                # the legacy generic jargon. See goldfive#139.
+                _tag_adapter_cancel_user_steer(adapter)
                 await self._cancel_invoke_task(invoke_task)
                 return ("steer", outcome.steer_message)
 

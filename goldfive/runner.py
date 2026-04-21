@@ -304,6 +304,20 @@ class Runner:
                 )
                 return outcome
 
+        # 6c. Wire the adapter back into the steerer. Optional hook
+        # (goldfive#139) the steerer uses to tag the adapter's next
+        # mid-invocation cancel with a symbolic reason on USER_STEER
+        # drift, so the synthetic function_response the adapter appends
+        # on cancel carries LLM-actionable content. Duck-typed on
+        # purpose — custom Steerers that don't implement
+        # ``bind_adapter`` skip this silently.
+        bind_steerer_adapter = getattr(self.steerer, "bind_adapter", None)
+        if callable(bind_steerer_adapter):
+            try:
+                bind_steerer_adapter(self.agent)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("steerer.bind_adapter raised: %s", exc)
+
         # 7. Hand off to the executor.
         try:
             executor_kwargs: dict[str, Any] = dict(

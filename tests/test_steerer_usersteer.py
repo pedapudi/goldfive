@@ -226,6 +226,89 @@ async def test_observe_non_control_event_still_uses_classifier() -> None:
 
 
 # ---------------------------------------------------------------------------
+# goldfive#139 — steerer tags the bound adapter's next cancel with a
+# symbolic reason on USER_STEER drift, so the synthetic function_response
+# the adapter appends on cancel carries LLM-actionable content.
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdapter:
+    """Minimal adapter stub that exposes ``_next_cancel_reason``.
+
+    The real ``ADKAdapter`` carries the same attribute; this stub
+    avoids pulling in the ADK optional dep just to verify the steerer
+    side of the wiring.
+    """
+
+    def __init__(self) -> None:
+        self._next_cancel_reason: str = ""
+
+
+async def test_steerer_sets_adapter_next_cancel_reason_on_user_steer() -> None:
+    """USER_STEER drift via ``observe`` → adapter gets tagged ``"user_steer"``.
+
+    Regression for goldfive#139: the steerer must stash the symbolic
+    reason on the bound adapter BEFORE the drift_detected event is
+    emitted, so whatever downstream component reacts by cancelling
+    the in-flight invoke sees a tagged adapter and the adapter's
+    cancel handler picks up the LLM-actionable content variant.
+    """
+    steerer, session, _sink, _planner = _bind_fresh()
+    adapter = _FakeAdapter()
+    steerer.bind_adapter(adapter)
+
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        payload={"note": "pivot to security posture"},
+    )
+    await steerer.observe(msg, session)
+
+    assert adapter._next_cancel_reason == "user_steer"
+
+
+async def test_steerer_does_not_tag_adapter_on_non_user_steer_drift() -> None:
+    """Non-USER_STEER drift leaves the adapter tag untouched.
+
+    Pause (USER_PAUSE, INFO) and other drift kinds must not set the
+    tag — only USER_STEER maps to the explicit content variant. Other
+    cancels fall through to the neutral content.
+    """
+    steerer, session, _sink, _planner = _bind_fresh()
+    adapter = _FakeAdapter()
+    steerer.bind_adapter(adapter)
+
+    # PAUSE → USER_PAUSE drift (INFO severity, no refine).
+    pause_msg = ControlMessage(kind=ControlKind.PAUSE, payload={"note": "wait"})
+    await steerer.observe(pause_msg, session)
+    assert adapter._next_cancel_reason == ""
+
+    # A raw tool-error event also should not tag the adapter.
+    await steerer.observe({"error": "boom"}, session)
+    assert adapter._next_cancel_reason == ""
+
+
+async def test_steerer_bind_adapter_tolerates_adapter_without_attr() -> None:
+    """A third-party adapter that doesn't carry ``_next_cancel_reason``
+    must not break the USER_STEER drift path.
+
+    The steerer's tagging helper swallows the AttributeError / similar
+    and logs at DEBUG. The drift still flows through ``_handle_drift``
+    (refine etc.) normally.
+    """
+    class _FrozenAdapter:
+        __slots__ = ()  # no attributes, no __dict__ — assignment raises.
+
+    steerer, session, _sink, planner = _bind_fresh()
+    steerer.bind_adapter(_FrozenAdapter())
+
+    msg = ControlMessage(kind=ControlKind.STEER, payload={"note": "x"})
+    # Must not raise.
+    await steerer.observe(msg, session)
+    # Refine still ran.
+    assert len(planner.refine_calls) == 1
+
+
+# ---------------------------------------------------------------------------
 # LLMPlanner.refine — USER_STEER delete-and-replan
 # ---------------------------------------------------------------------------
 
