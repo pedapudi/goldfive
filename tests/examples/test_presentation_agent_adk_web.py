@@ -53,14 +53,16 @@ builds the ``App`` with ``_MockLlm`` subagents, ``_mock_planner_call_llm``
 for the planner, and ``_mock_goal_call_llm`` for the goal deriver. No
 network, no LLM, deterministic output.
 
-Known Phase 1 wiring gap: the adapter's ``bind_steerer`` is never
-invoked by the executor, so ``SessionContext.steerer`` is ``None`` in
-the plugin and ``_emit_observability`` short-circuits before emitting
-``AgentInvocationStarted``. The test calls ``adapter.bind_steerer(...)``
-explicitly during setup to exercise the observability path — when the
-wiring is fixed in the Runner / executor, this workaround can be
-deleted without changing the assertions. Noted here so the gap is
-visible on every test run.
+Adapter-steerer wiring: ``goldfive.Runner.run`` now calls
+``adapter.bind_steerer(self.steerer)`` immediately after binding the
+steerer to sinks+planner (see ``Runner.run`` step 6b). That
+populates ``SessionContext.steerer`` on the ADK plugin so
+``_emit_observability`` emits ``AgentInvocationStarted`` /
+``AgentInvocationCompleted`` / ``DelegationObserved`` under normal
+runs — this test exercises the production path and asserts those
+events land. A prior revision of this test manually called
+``adapter.bind_steerer(...)`` as a documented workaround; that line
+has been removed now that the Runner wires it correctly.
 """
 
 from __future__ import annotations
@@ -231,27 +233,11 @@ def test_presentation_agent_e2e_under_adk_web(
     recording_sink = InMemorySink()
     root_agent.add_sink(recording_sink)
 
-    # KNOWN PHASE 1 GAP — bind the adapter's steerer manually.
-    #
-    # ``ADKAdapter.invoke`` constructs ``SessionContext(steerer=self._steerer, ...)``
-    # and the plugin's ``_emit_observability`` short-circuits when
-    # ``ctx.steerer is None``. In production the executor / runner never
-    # call ``adapter.bind_steerer``, so ``_steerer`` stays None and
-    # ``AgentInvocationStarted`` / ``AgentInvocationCompleted`` /
-    # ``DelegationObserved`` events never emit. Binding it here
-    # exercises the observability path so the per-task-dispatch
-    # assertion below can actually fire. When the executor is fixed to
-    # call ``adapter.bind_steerer`` during its setup phase (same shape
-    # as ``steerer.bind``) this workaround becomes a no-op and should
-    # be deleted.
-    inner_runner = root_agent.runner
-    inner_runner.agent.bind_steerer(inner_runner.steerer)
-    # The steerer's ``_sinks`` is populated by ``Runner.run`` via
-    # ``steerer.bind(sinks=..., planner=...)`` at the top of each turn,
-    # and our sink was appended to ``runner.sinks`` before this point,
-    # so there's nothing else to wire — the upcoming ``/run_sse`` call
-    # flows through ``run_async_impl`` → ``self._runner.run(...)`` and
-    # re-binds the steerer with the full sink list including ours.
+    # The adapter's steerer is wired by ``Runner.run`` at turn start
+    # (step 6b in ``goldfive/runner.py``) — nothing to bind here. The
+    # upcoming ``/run_sse`` call flows through ``run_async_impl`` →
+    # ``self._runner.run(...)`` which re-binds both the steerer and the
+    # adapter's steerer with the full sink list including ours.
 
     # Build the FastAPI app using the pre-loaded AgentLoader. ``web=False``
     # skips the Angular asset mount — not needed for programmatic testing
