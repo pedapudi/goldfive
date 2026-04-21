@@ -161,6 +161,22 @@ enum DriftKind {
   // it (infinite-loop risk) and hands control back to the operator.
   // See goldfive#133.
   DRIFT_KIND_REFINE_VALIDATION_FAILED = 36;
+  // Reserved: enum value 37 is owned by goldfive#142 (intervention
+  // ladder). GOAL_DRIFT takes 38 so the two features never collide
+  // on the wire when the sibling PRs merge in either order.
+  reserved 37;
+  // Periodic trajectory-level goal-alignment check. Unlike every other
+  // DriftKind above (which fire on individual LLM responses or tool
+  // calls), GOAL_DRIFT fires after a configurable number of agent
+  // invocations when an LLM-judge determines the tree's accumulated
+  // activity is no longer moving toward ``session.goals``. CRITICAL
+  // severity -- routed to the Level 4 intervention tier by the
+  // #142 ladder (pause + HUMAN_INTERVENTION_REQUIRED). Gated behind
+  // ``Runner(goal_drift_enabled=...)`` and a ``goal_drift_call_llm``
+  // callable on the steerer -- mock-only runs never see it. See
+  // goldfive#143 and
+  // ``goldfive.drift.goals.classify_goal_drift``.
+  DRIFT_KIND_GOAL_DRIFT = 38;
 }
 
 // Directed edge in a plan's task dependency DAG. `from_task_id` must

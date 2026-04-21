@@ -56,6 +56,7 @@ EXPECTED_DRIFT_KINDS = {
     "CONFABULATION_RISK": "confabulation_risk",
     "RUNAWAY_DELEGATION": "runaway_delegation",
     "REFINE_VALIDATION_FAILED": "refine_validation_failed",
+    "GOAL_DRIFT": "goal_drift",
 }
 
 

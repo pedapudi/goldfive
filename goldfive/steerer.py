@@ -96,6 +96,10 @@ class DefaultSteerer:
         reflective_check_interval: int = 15,
         reflective_call_llm: ReflectiveCallLLM | None = None,
         reflective_model: str = "",
+        goal_drift_check_interval: int = 5,
+        goal_drift_call_llm: ReflectiveCallLLM | None = None,
+        goal_drift_model: str = "",
+        goal_drift_activity_window: int = 10,
     ) -> None:
         """Build a steerer.
 
@@ -119,9 +123,31 @@ class DefaultSteerer:
             Model name forwarded to ``reflective_call_llm``. Empty
             string is permitted; the callable may substitute its own
             default.
+        goal_drift_check_interval:
+            Number of agent-invocation turns (as reported via
+            :meth:`note_agent_turn`) between trajectory-level
+            GOAL_DRIFT checks. Defaults to ``5``. Ignored when
+            ``goal_drift_call_llm`` is ``None``.
+        goal_drift_call_llm:
+            Optional async callable ``(system_prompt, user_prompt,
+            model) -> str`` used by
+            :meth:`maybe_run_goal_drift_check` to ask an LLM-judge
+            whether the tree's recent activity is progressing toward
+            ``session.goals``. Opt-in: pass a callable (typically
+            ``Runner`` wires its planner LLM here when
+            ``goal_drift_enabled`` is on). Shape matches
+            ``reflective_call_llm`` so the same callable can be
+            reused.
+        goal_drift_model:
+            Model name forwarded to ``goal_drift_call_llm``.
+        goal_drift_activity_window:
+            Number of recent-activity entries retained on
+            ``session.recent_agent_activity`` and passed to the
+            judge. Bounds the prompt size; defaults to ``10``.
 
         See ``docs/design/DRIFT.md`` §"Reflective self-progress check"
-        for the full feature-gate semantics.
+        for the full feature-gate semantics. The GOAL_DRIFT check
+        follows the same opt-in contract (see goldfive#143).
         """
         self._sinks: list[Any] = []
         self._planner: Any | None = None
@@ -146,6 +172,12 @@ class DefaultSteerer:
         self._reflective_call_llm: ReflectiveCallLLM | None = reflective_call_llm
         self._reflective_check_interval = max(1, int(reflective_check_interval))
         self._reflective_model = reflective_model
+        # GOAL_DRIFT (goldfive#143) wiring. Same opt-in contract as the
+        # reflective check: feature is inert unless a callable is passed.
+        self._goal_drift_call_llm: ReflectiveCallLLM | None = goal_drift_call_llm
+        self._goal_drift_check_interval = max(1, int(goal_drift_check_interval))
+        self._goal_drift_model = goal_drift_model
+        self._goal_drift_activity_window = max(1, int(goal_drift_activity_window))
 
     # ------------------------------------------------------------------
     # Protocol-required: wiring
@@ -717,6 +749,118 @@ class DefaultSteerer:
             return
         # making_progress=true, confidence >= 0.5 -- no drift.
         return
+
+    # ------------------------------------------------------------------
+    # GOAL_DRIFT — trajectory-level periodic check (opt-in, goldfive#143)
+    # ------------------------------------------------------------------
+
+    def note_agent_activity(
+        self,
+        session: Session,
+        *,
+        kind: str,
+        agent_name: str = "",
+        task_id: str = "",
+        detail: str = "",
+    ) -> None:
+        """Record a recent agent-activity entry on ``session``.
+
+        Push-only: adapters (or executors) call this once per
+        ``AgentInvocationStarted`` / ``AgentInvocationCompleted`` so the
+        GOAL_DRIFT judge has a rolling view of the trajectory. The ring
+        buffer is trimmed to ``goal_drift_activity_window`` so the
+        prompt stays bounded regardless of run length.
+
+        Always safe to call (feature-gate is enforced at check time, not
+        at record time) -- unlike :meth:`note_agent_turn`, this method
+        does not short-circuit when ``goal_drift_call_llm`` is
+        unconfigured so that sinks / tests can observe the recorded
+        activity independently.
+        """
+        if not kind:
+            return
+        entry: dict[str, Any] = {"kind": kind}
+        if agent_name:
+            entry["agent_name"] = agent_name
+        if task_id:
+            entry["task_id"] = task_id
+        if detail:
+            # Keep individual entries bounded so a pathological detail
+            # cannot blow up the prompt even before trimming.
+            entry["detail"] = detail[:500]
+        hist = session.recent_agent_activity
+        hist.append(entry)
+        overflow = len(hist) - self._goal_drift_activity_window
+        if overflow > 0:
+            del hist[:overflow]
+
+    async def note_agent_turn(self, session: Session) -> None:
+        """Record one agent invocation against ``session``.
+
+        Adapters call this once per completed agent invocation
+        (``after_run_callback`` on ADK, or the equivalent hook on other
+        frameworks). Increments
+        ``session._agent_turns_since_goal_check``; when the counter
+        reaches ``goal_drift_check_interval`` (and a
+        ``goal_drift_call_llm`` is configured), fires
+        :meth:`maybe_run_goal_drift_check` and resets the counter.
+
+        No-ops when ``goal_drift_call_llm`` was not configured, so
+        operators who never opt in pay no memory or LLM cost. Unlike
+        :meth:`note_llm_call`, the counter is trajectory-level and is
+        NOT reset on task transitions -- GOAL_DRIFT is about the whole
+        tree's direction, not one task's progress.
+        """
+        if self._goal_drift_call_llm is None:
+            return
+        session._agent_turns_since_goal_check += 1
+        if session._agent_turns_since_goal_check < self._goal_drift_check_interval:
+            return
+        # Reset before running so a check that itself triggers further
+        # invocations in the agent loop doesn't double-fire.
+        session._agent_turns_since_goal_check = 0
+        await self.maybe_run_goal_drift_check(session)
+
+    async def maybe_run_goal_drift_check(self, session: Session) -> None:
+        """Run the trajectory-level GOAL_DRIFT judge once, cost-bounded.
+
+        Opt-in, feature-gated by ``goal_drift_call_llm``. Does NOT
+        advance the counter -- callers that want counter-driven
+        scheduling go through :meth:`note_agent_turn`. Public so
+        operators can trigger a one-shot check from outside the
+        interval (e.g. on a long idle period with no task transitions).
+
+        Outcomes:
+
+        * Judge returns ``{"progressing": true}`` → no drift emitted.
+        * Judge returns ``{"progressing": false, "reason": "..."}`` →
+          ``GOAL_DRIFT`` drift at CRITICAL severity; flows through
+          :meth:`_handle_drift` so the #142 ladder (once merged) can
+          route it to Level 4.
+        * Judge raises, returns malformed JSON, or returns a dict
+          missing / with a non-boolean ``progressing`` field → no
+          drift emitted. False positives on plumbing failures would
+          spam operators; see goldfive#143 rationale.
+        """
+        call_llm = self._goal_drift_call_llm
+        if call_llm is None:
+            return
+        from goldfive.drift.goals import classify_goal_drift
+
+        # Snapshot activity so subsequent appends during the await do
+        # not perturb the prompt the judge saw.
+        activity = list(session.recent_agent_activity)
+        drift = await classify_goal_drift(
+            goals=session.goals,
+            plan=session.plan,
+            observed_actions=activity,
+            model=self._goal_drift_model,
+            call_llm=call_llm,
+            current_task_id=session.current_task_id,
+        )
+        if drift is None:
+            return
+        await self._handle_drift(drift, session)
 
     async def _emit_reflective_failure(
         self, session: Session, *, task_id: str, reason: str

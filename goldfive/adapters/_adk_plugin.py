@@ -737,6 +737,22 @@ def make_adk_plugin(
                 invocation_id=inv_id,
                 parent_invocation_id=parent_inv_id,
             )
+            # Feed the trajectory-level activity buffer used by the
+            # GOAL_DRIFT judge (goldfive#143). Duck-typed: custom
+            # steerers without ``note_agent_activity`` fall through to
+            # a no-op. Always safe — the recorder does not itself
+            # trigger an LLM call.
+            note_activity = getattr(ctx.steerer, "note_agent_activity", None)
+            if note_activity is not None:
+                try:
+                    note_activity(
+                        ctx.session,
+                        kind="agent_invocation_started",
+                        agent_name=agent_name,
+                        task_id=str(_safe_attr(ctx.task, "id", "") or ""),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("before_run_callback: note_agent_activity raised: %s", exc)
             return None
 
         async def after_run_callback(self, *, invocation_context: Any) -> None:
@@ -795,6 +811,31 @@ def make_adk_plugin(
                 invocation_id=inv_id,
                 summary="",
             )
+            # Feed the GOAL_DRIFT activity buffer + counter
+            # (goldfive#143). Duck-typed: custom steerers without
+            # these hooks fall through cleanly. The counter is
+            # trajectory-level and persists across task transitions.
+            if ctx.steerer is not None:
+                note_activity = getattr(ctx.steerer, "note_agent_activity", None)
+                if note_activity is not None:
+                    try:
+                        note_activity(
+                            ctx.session,
+                            kind="agent_invocation_completed",
+                            agent_name=agent_name,
+                            task_id=str(_safe_attr(ctx.task, "id", "") or ""),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "after_run_callback: note_agent_activity raised: %s",
+                            exc,
+                        )
+                note_agent_turn = getattr(ctx.steerer, "note_agent_turn", None)
+                if note_agent_turn is not None:
+                    try:
+                        await note_agent_turn(ctx.session)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("after_run_callback: note_agent_turn raised: %s", exc)
             return None
 
         async def _maybe_emit_confabulation_risk(
