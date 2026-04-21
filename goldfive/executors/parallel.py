@@ -53,6 +53,7 @@ from goldfive.protocols import (
 from goldfive.results import ExecutionOutcome, InvocationResult, evaluate_goal_predicates
 from goldfive.types import (
     DriftEvent,
+    DriftKind,
     DriftSeverity,
     Plan,
     Session,
@@ -301,11 +302,21 @@ class ParallelDAGExecutor:
                         )
                         break
 
-                    refined = await self._refine(plan=session.plan or plan,
-                                                 drift=drift, planner=planner,
-                                                 session=session)
+                    refined = await self._refine(
+                        plan=session.plan or plan,
+                        drift=drift,
+                        planner=planner,
+                        session=session,
+                        sinks=sinks,
+                    )
                     if refined is not None and refined is not (session.plan or plan):
                         refinements_used += 1
+                        # Refine succeeded: clear any per-(kind, task)
+                        # failure history so a future drift of the same
+                        # kind on the same task starts fresh.
+                        session.refine_failure_counts.pop(
+                            (drift.kind.value, drift.current_task_id), None
+                        )
                         session.plan = refined
                         await emit_event(
                             sinks,
@@ -319,7 +330,32 @@ class ParallelDAGExecutor:
                         # Falls through to loop top: stages recomputed.
                         continue
 
-                # No drift (or no refinement): continue to next stage.
+                    # Refine returned None: _refine has already emitted a
+                    # CRITICAL follow-up DriftDetected. Bump the per-(kind,
+                    # task) counter and abort the run if we've exceeded
+                    # the threshold — silently re-entering the same stage
+                    # with the same plan is the exact stall goldfive#134
+                    # targets.
+                    if refined is None:
+                        failure_count = self._bump_refine_failure(
+                            session=session, drift=drift
+                        )
+                        if failure_count >= self.REFINE_FAILURE_THRESHOLD:
+                            abort_reason = (
+                                f"refine failed {failure_count} consecutive "
+                                f"times for {drift.kind.value} "
+                                f"(task {drift.current_task_id or 'n/a'}); "
+                                f"aborting to avoid silent loop"
+                            )
+                            log.warning(
+                                "ParallelDAGExecutor: %s", abort_reason
+                            )
+                            break
+                        # Below threshold: fall through to the next stage
+                        # and give the planner another chance on the next
+                        # drift of the same kind.
+
+                # No drift (or refine below threshold): continue to next stage.
         except BaseException as exc:  # noqa: BLE001 — propagate reason, then re-raise
             abort_reason = f"{type(exc).__name__}: {exc}"
             await emit_event(
@@ -431,9 +467,25 @@ class ParallelDAGExecutor:
                 except asyncio.CancelledError:
                     raise
                 except Exception as detect_exc:  # noqa: BLE001
-                    log.debug(
-                        "ParallelDAGExecutor: steerer.detect_drift raised: %s",
+                    # Plumbing failure inside the drift pipeline: surface
+                    # it so sinks see a signal, instead of silently
+                    # treating the task's output as benign. An INFO
+                    # CUSTOM drift mirrors the pattern
+                    # ``DefaultSteerer._emit_reflective_failure`` uses
+                    # for the reflective-check plumbing: the run
+                    # continues but operators can see the failure in
+                    # the event stream. See goldfive#134.
+                    log.warning(
+                        "ParallelDAGExecutor: steerer.observe/detect_drift "
+                        "raised for task=%s: %s",
+                        task.id,
                         detect_exc,
+                    )
+                    await _emit_pipeline_failure_drift(
+                        session=session,
+                        sinks=sinks,
+                        task_id=task.id,
+                        reason=f"drift_pipeline_failed: {detect_exc}",
                     )
                     drift = None
 
@@ -589,6 +641,13 @@ class ParallelDAGExecutor:
     # Plan refinement
     # ------------------------------------------------------------------
 
+    # Consecutive refine failures tolerated per (drift_kind, task_id)
+    # before the parallel executor gives up and aborts the run. Mirrors
+    # ``DefaultSteerer.REFINE_FAILURE_THRESHOLD`` so a stage-level refine
+    # that fails validation or raises does not loop silently. See
+    # goldfive#134.
+    REFINE_FAILURE_THRESHOLD: int = 2
+
     async def _refine(
         self,
         *,
@@ -596,15 +655,107 @@ class ParallelDAGExecutor:
         drift: DriftEvent,
         planner: Planner,
         session: Session,
+        sinks: list[EventSink],
     ) -> Plan | None:
+        """Ask ``planner.refine`` for a revision; validate and signal failures.
+
+        Unlike the previous quiet-null version, every failure mode
+        (``refine`` raises, returns ``None``, or returns a plan that
+        fails structural validation) emits a CRITICAL follow-up
+        ``DriftDetected`` event so sinks see "refine failed" instead of
+        silently observing the old plan. A per-``(kind, task_id)``
+        failure counter is bumped on ``session.refine_failure_counts``
+        and mirrors the steerer's back-off threshold. Returns the
+        validated revised plan on success or ``None`` on any failure;
+        callers should fall through to the next stage when ``None`` is
+        returned (downstream tasks that depended on a replacement still
+        block via ``_pick_next_task`` and the reachability audit).
+
+        See goldfive#134.
+        """
         try:
             refined = await planner.refine(
                 plan=plan, drift=drift, goals=list(session.goals)
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
+            await self._emit_refine_failure(
+                session=session,
+                sinks=sinks,
+                source=drift,
+                reason=f"refine raised: {exc}",
+            )
+            return None
+        if refined is None:
+            log.warning(
+                "ParallelDAGExecutor: planner.refine(kind=%s) returned None; "
+                "plan unchanged",
+                drift.kind.value,
+            )
+            await self._emit_refine_failure(
+                session=session,
+                sinks=sinks,
+                source=drift,
+                reason="planner returned no revised plan",
+            )
+            return None
+        try:
+            refined.validate(for_revision=True, prior=plan)
+        except ValueError as exc:
+            log.warning(
+                "ParallelDAGExecutor: revised plan failed validation (%s); "
+                "keeping prior plan",
+                exc,
+            )
+            await self._emit_refine_failure(
+                session=session,
+                sinks=sinks,
+                source=drift,
+                reason=f"plan validation failed: {exc}",
+            )
             return None
         return refined
+
+    async def _emit_refine_failure(
+        self,
+        *,
+        session: Session,
+        sinks: list[EventSink],
+        source: DriftEvent,
+        reason: str,
+    ) -> None:
+        """Surface a failed refine as a CRITICAL follow-up ``DriftDetected``.
+
+        Mirrors ``DefaultSteerer._emit_refine_failure`` so the parallel
+        executor's direct refine path produces the same sink-level
+        signal the sequential path does. Without this, a planner.refine
+        that raises or returns a garbage plan leaves the session pinned
+        to the stale plan and the next stage re-enters the same state.
+        See goldfive#134.
+        """
+        failure = DriftEvent(
+            kind=source.kind,
+            severity=DriftSeverity.CRITICAL,
+            detail=f"refine failed ({source.kind.value}): {reason}",
+            current_task_id=source.current_task_id,
+            current_agent_id=source.current_agent_id,
+        )
+        await _emit_drift_event(session=session, sinks=sinks, drift=failure)
+
+    def _bump_refine_failure(
+        self, *, session: Session, drift: DriftEvent
+    ) -> int:
+        """Bump the per-``(kind, task_id)`` refine-failure counter.
+
+        Returns the new count. Callers compare against
+        :attr:`REFINE_FAILURE_THRESHOLD` to decide whether to abort the
+        run. Uses ``session.refine_failure_counts`` so the counter is
+        shared with :class:`~goldfive.steerer.DefaultSteerer`.
+        """
+        key = (drift.kind.value, drift.current_task_id)
+        count = session.refine_failure_counts.get(key, 0) + 1
+        session.refine_failure_counts[key] = count
+        return count
 
     # ------------------------------------------------------------------
     # Control helpers
@@ -727,6 +878,68 @@ class ParallelDAGExecutor:
 
 def _outcome_summary(completed_task_ids: set[str]) -> str:
     return f"{len(completed_task_ids)} tasks completed"
+
+
+async def _emit_pipeline_failure_drift(
+    *,
+    session: Session,
+    sinks: list[EventSink],
+    task_id: str,
+    reason: str,
+) -> None:
+    """Emit an INFO ``CUSTOM`` drift when the drift pipeline itself raised.
+
+    Surfaces plumbing failures in ``steerer.observe`` / ``detect_drift``
+    that would otherwise be swallowed. INFO severity so this is
+    record-only and does not trigger another refine. Sinks that care
+    can filter on the ``drift_pipeline_failed:`` detail prefix. See
+    goldfive#134.
+    """
+    drift = DriftEvent(
+        kind=DriftKind.CUSTOM,
+        severity=DriftSeverity.INFO,
+        detail=reason,
+        current_task_id=task_id or "",
+    )
+    await _emit_drift_event(session=session, sinks=sinks, drift=drift)
+
+
+async def _emit_drift_event(
+    *,
+    session: Session,
+    sinks: list[EventSink],
+    drift: DriftEvent,
+) -> None:
+    """Build a DriftDetected envelope with proto enum mapping, then emit.
+
+    Uses the same enum-mapping shape
+    :meth:`DefaultSteerer._emit_drift_detected` uses — the
+    :func:`drift_detected_event` helper in :mod:`goldfive.events` does
+    a best-effort name lookup that silently fails for StrEnum-style
+    kind/severity names (stored as lowercase like ``critical``), which
+    would leave the event with enum value ``0`` (UNSPECIFIED).
+    """
+    from goldfive.events import new_event
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    evt = new_event(session.run_id, session.next_sequence())
+    evt.drift_detected.kind = getattr(
+        types_pb2,
+        f"DRIFT_KIND_{drift.kind.name}",
+        getattr(types_pb2, "DRIFT_KIND_CUSTOM", 0),
+    )
+    evt.drift_detected.severity = getattr(
+        types_pb2,
+        f"DRIFT_SEVERITY_{drift.severity.name}",
+        getattr(types_pb2, "DRIFT_SEVERITY_UNSPECIFIED", 0),
+    )
+    evt.drift_detected.detail = drift.detail
+    evt.drift_detected.current_task_id = drift.current_task_id or ""
+    evt.drift_detected.current_agent_id = drift.current_agent_id or ""
+    try:
+        await emit_event(sinks, evt)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("_emit_drift_event: sink emit raised: %s", exc)
 
 
 # Runtime conformance check — the class must satisfy the Executor protocol.

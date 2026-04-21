@@ -1161,6 +1161,70 @@ async def test_max_task_invocations_explicit_cap_honored() -> None:
     assert sink.payload_kinds()[-1] == "run_aborted"
 
 
+async def test_observer_exception_emits_pipeline_failure_drift() -> None:
+    """``steerer.observe`` raising must emit an INFO ``CUSTOM`` drift.
+
+    goldfive#134: a bug in the drift pipeline used to be swallowed at
+    ``log.debug`` level. The run now surfaces an INFO ``CUSTOM`` drift
+    with a ``drift_pipeline_failed:`` detail prefix so sinks see the
+    plumbing failure instead of silently accepting the task's output
+    as benign.
+    """
+    plan = _linear_plan(1)
+    session = _fresh_session()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    class RaisingSteerer(StubSteerer):
+        async def observe(self, event: Any, session: Session) -> None:
+            raise RuntimeError("classifier exploded")
+
+    steerer = RaisingSteerer()
+
+    async def _complete_current(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id=task.id, text="ok")
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_complete_current)
+    executor = SequentialExecutor(max_task_invocations=5)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    # The run completed (the plumbing failure is record-only), but a
+    # DriftDetected(kind=CUSTOM, severity=INFO) was emitted.
+    assert outcome.success is True
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    drift_events = [
+        e
+        for e in sink.events
+        if hasattr(e, "WhichOneof") and e.WhichOneof("payload") == "drift_detected"
+    ]
+    pipeline_failures = [
+        e
+        for e in drift_events
+        if e.drift_detected.kind == types_pb2.DRIFT_KIND_CUSTOM
+        and "drift_pipeline_failed" in e.drift_detected.detail
+    ]
+    assert pipeline_failures, (
+        "expected an INFO CUSTOM 'drift_pipeline_failed' drift after "
+        "steerer.observe raised"
+    )
+    assert (
+        pipeline_failures[0].drift_detected.severity
+        == types_pb2.DRIFT_SEVERITY_INFO
+    )
+    assert "classifier exploded" in pipeline_failures[0].drift_detected.detail
+
+
 def test_deprecation_warning_fires_for_old_kwarg() -> None:
     """Passing ``max_plan_reinvocations=`` emits a :class:`DeprecationWarning`
     and maps to the new attribute name.
