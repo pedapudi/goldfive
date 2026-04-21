@@ -407,12 +407,26 @@ class Plan:
         return stages
 
 
+#: Conventional value for :attr:`Goal.source` indicating a goal was added
+#: by a ``USER_STEER`` directive (goldfive#152 / #154). Goals carrying
+#: this source are treated as "sticky": ``LLMPlanner.refine`` will
+#: reject any revision whose tasks silently drop the goal, so later
+#: drifts cannot unwind an operator steer by merely refining around it.
+GOAL_SOURCE_USER_STEER: str = "USER_STEER"
+
+
 @dataclasses.dataclass
 class Goal:
     id: str
     summary: str
     success_predicate: Callable[[Session], bool] | None = None
     metadata: dict[str, str] = dataclasses.field(default_factory=dict)
+    #: Provenance of the goal. Empty string for goals derived from the
+    #: original user input; :data:`GOAL_SOURCE_USER_STEER` for goals
+    #: added by a ``USER_STEER`` (operator steer) -- these are "sticky"
+    #: and the planner will reject refines that silently drop them
+    #: (goldfive#154).
+    source: str = ""
 
 
 @dataclasses.dataclass

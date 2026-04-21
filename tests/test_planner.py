@@ -378,8 +378,11 @@ async def test_llm_planner_refine_preserves_completed_tasks() -> None:
     assert revised.revision_index == 1
 
     # The prompt included goals, the current plan JSON, and the drift.
+    # The goals section header was renamed from "Goals:" to
+    # "CURRENT GOALS" by goldfive#154 so the planner-LLM treats the
+    # section as operator-authored rather than informational.
     _system, user_prompt, _model = stub.calls[0]
-    assert "Goals:" in user_prompt
+    assert "CURRENT GOALS" in user_prompt
     assert "Current plan:" in user_prompt
     assert "Drift event:" in user_prompt
     assert "new_work_discovered" in user_prompt

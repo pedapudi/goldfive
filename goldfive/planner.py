@@ -29,6 +29,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from goldfive.types import (
+    GOAL_SOURCE_USER_STEER,
     DriftEvent,
     DriftKind,
     DriftSeverity,
@@ -236,19 +237,22 @@ You will receive:
 Decide between two outcomes:
 
 A. ABSORB. If the observed activity plausibly moves the run toward
-   the declared GOALS, emit a revised plan that REFLECTS the observed
-   activity. Existing tasks that correspond to completed invocations
-   should be marked COMPLETED; in-flight invocations may be marked
-   RUNNING. Invocations that do not correspond to any existing task
-   should be added as new tasks (with fresh stable ids) so the Gantt
-   view can show them.
+   the declared GOALS *and* preserves every STICKY goal (goals marked
+   ``[STICKY — from USER_STEER]`` — the operator has already steered
+   the plan toward them, so they cannot be silently dropped), emit a
+   revised plan that REFLECTS the observed activity. Existing tasks
+   that correspond to completed invocations should be marked
+   COMPLETED; in-flight invocations may be marked RUNNING. Invocations
+   that do not correspond to any existing task should be added as new
+   tasks (with fresh stable ids) so the Gantt view can show them.
 
-B. REJECT. If the observed activity is clearly off-goal — the tree
-   has wandered into work that doesn't advance any goal — return a
-   JSON object of the form ``{"reject": true, "reason": "..."}`` and
-   NOTHING else. The caller will escalate to human intervention. Only
-   reject when the divergence cannot be squared with the goals; when
-   in doubt, absorb.
+B. REJECT. If the observed activity CONTRADICTS the goals — the tree
+   has wandered into work that doesn't advance any goal, or (most
+   importantly) is actively undoing a STICKY goal the operator just
+   steered toward — return a JSON object of the form
+   ``{"reject": true, "reason": "..."}`` and NOTHING else. The caller
+   will escalate to human intervention. Only reject when the divergence
+   cannot be squared with the goals; when in doubt, absorb.
 
 Structural invariants (apply to the ABSORB path; REJECT bypasses
 validation):
@@ -628,14 +632,38 @@ class LLMPlanner:
 
     @staticmethod
     def _render_goals_block(goals: list[Goal]) -> str:
+        """Render goals for prompt consumption.
+
+        Goals sourced from a USER_STEER directive
+        (``source == GOAL_SOURCE_USER_STEER``) are annotated ``[STICKY —
+        from USER_STEER]`` so the planner-LLM sees them as operator-
+        authored and knows the refine validator (goldfive#154) will
+        reject revisions that silently drop them. Goals without an
+        explicit source render unchanged so legacy callers see the
+        exact same prompt shape.
+        """
         if not goals:
             return "- (no goals provided)"
         lines: list[str] = []
         for g in goals:
             gid = g.id or "(no-id)"
             summary = g.summary or "(no summary)"
-            lines.append(f"- [{gid}] {summary}")
+            if g.source == GOAL_SOURCE_USER_STEER:
+                lines.append(f"- [{gid}] {summary}  [STICKY — from USER_STEER]")
+            else:
+                lines.append(f"- [{gid}] {summary}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _user_steer_goals(goals: list[Goal]) -> list[Goal]:
+        """Return the subset of ``goals`` added by a prior ``USER_STEER``.
+
+        Used by the refine validator (goldfive#154) to enforce the
+        "sticky goal" contract: a USER_STEER-sourced goal must remain
+        addressed by the revised plan, so a later drift cannot silently
+        unwind an operator steer by refining around it.
+        """
+        return [g for g in goals if g.source == GOAL_SOURCE_USER_STEER]
 
     @staticmethod
     def _render_agents_block(available_agents: list[str]) -> str:
@@ -779,6 +807,7 @@ class LLMPlanner:
         history_json = json.dumps(history, default=str)
         history_ids = json.dumps([t.id for t in completed])
         goals_block = self._render_goals_block(goals)
+        sticky_block = self._render_sticky_goals_block(goals)
         note = drift.detail or "(no steering note provided)"
         invariants = (
             "STRUCTURAL INVARIANTS (the validator will REJECT any response "
@@ -806,7 +835,10 @@ class LLMPlanner:
             "5. Do not introduce edges that create a cycle."
         )
         return (
-            f"Goals:\n{goals_block}\n\n"
+            f"CURRENT GOALS (the new PENDING tasks must still advance "
+            f"every goal, and MUST NOT silently drop any [STICKY] "
+            f"goal carried from a prior USER_STEER):\n{goals_block}\n\n"
+            f"{sticky_block}"
             f"Completed/Failed/Cancelled tasks (READ-ONLY CONTEXT — "
             "preserve these verbatim at the start of the returned plan; "
             f"do NOT repeat them in your response):\n{history_json}\n\n"
@@ -913,6 +945,129 @@ class LLMPlanner:
             "5. The task graph must be ACYCLIC. Do not introduce edges that would create a cycle.",
         ]
         return "\n".join(lines)
+
+    _GOAL_REFERENCE_STOPWORDS: frozenset[str] = frozenset(
+        {
+            "the",
+            "and",
+            "with",
+            "from",
+            "that",
+            "this",
+            "have",
+            "will",
+            "into",
+            "your",
+            "about",
+            "also",
+            "ensure",
+            "make",
+            "keep",
+            "should",
+            "must",
+            "while",
+            "their",
+            "there",
+            "them",
+            "then",
+            "than",
+            "when",
+            "what",
+            "which",
+            "some",
+            "goal",
+            "goals",
+            "task",
+            "tasks",
+            "plan",
+            "plans",
+            "focus",
+            "draft",
+            "review",
+            "final",
+            "work",
+            "round",
+        }
+    )
+
+    @classmethod
+    def _goal_summary_tokens(cls, goal: Goal) -> set[str]:
+        """Tokenise a goal summary into lowercase words of length >= 4
+        that aren't trivial stopwords. A heuristic by design — see
+        :meth:`_check_user_steer_goals_preserved` for the rationale.
+        """
+        tokens: set[str] = set()
+        summary = goal.summary or ""
+        for raw in re.split(r"[^A-Za-z0-9_]+", summary):
+            w = raw.lower().strip()
+            if len(w) >= 4 and w not in cls._GOAL_REFERENCE_STOPWORDS:
+                tokens.add(w)
+        return tokens
+
+    @classmethod
+    def _check_user_steer_goals_preserved(
+        cls,
+        revised: Plan,
+        goals: list[Goal],
+    ) -> str:
+        """Ensure USER_STEER-sourced goals still appear in the revision.
+
+        Returns ``""`` when every USER_STEER goal is referenced by the
+        revised plan's task titles / descriptions (or is present in
+        ``revised.goal_ids``), and a non-empty error string otherwise.
+        The retry loop feeds that string back into the correction
+        prompt so the LLM gets a precise diagnosis of which goal it
+        silently dropped. See goldfive#154.
+
+        The "reference" check is token-based and uses *discriminative*
+        tokens only: a token from a sticky goal's summary that also
+        appears in a non-sticky goal's summary is too generic to be a
+        signal (e.g. "goldfish" in a post-about-goldfish session is
+        present in every goal and so cannot tell you whether the
+        sticky goal was addressed). Discriminative tokens are summary
+        tokens that DO NOT appear in any non-sticky goal. If a sticky
+        goal has no discriminative tokens (the operator steered in a
+        way indistinguishable from the base goals), we fall back to a
+        lenient "goal id in revised.goal_ids" check -- better to let
+        the revision through than to reject forever on ambiguous text.
+        """
+        sticky = cls._user_steer_goals(goals)
+        if not sticky:
+            return ""
+        non_sticky_tokens: set[str] = set()
+        for g in goals:
+            if g.source == GOAL_SOURCE_USER_STEER:
+                continue
+            non_sticky_tokens |= cls._goal_summary_tokens(g)
+        plan_text = " ".join(f"{t.id} {t.title} {t.description}".lower() for t in revised.tasks)
+        revised_goal_ids = {gid.lower() for gid in revised.goal_ids if gid}
+        dropped: list[str] = []
+        for g in sticky:
+            # Goal-id match on the revised plan envelope is a strong,
+            # unambiguous signal — respect it first.
+            if g.id and g.id.lower() in revised_goal_ids and g.id.lower() in plan_text:
+                continue
+            discriminative = cls._goal_summary_tokens(g) - non_sticky_tokens
+            # Fallback 1: the goal id itself is discriminative.
+            if g.id and g.id.lower() not in non_sticky_tokens:
+                discriminative.add(g.id.lower())
+            if not discriminative:
+                # No tokens unique to this sticky goal; we cannot
+                # distinguish it from the base goals via text alone.
+                # Be lenient and accept the revision.
+                continue
+            if any(tok in plan_text for tok in discriminative):
+                continue
+            dropped.append(f"[{g.id or '(no-id)'}] {g.summary}")
+        if not dropped:
+            return ""
+        joined = "; ".join(dropped)
+        return (
+            "revision silently drops USER_STEER goal(s) (no task "
+            f"references them): {joined}. Operator steers are sticky — "
+            "add PENDING tasks that explicitly advance these goals, "
+            "or emit the reject sentinel if they cannot be reconciled."
+        )
 
     @staticmethod
     def _build_correction_prompt(base_prompt: str, error: str) -> str:
@@ -1106,6 +1261,26 @@ class LLMPlanner:
                 if attempt < attempts:
                     user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
                 continue
+            # Goal-awareness check (#154): any USER_STEER-sourced goals
+            # that the prior plan was carrying must still be addressed
+            # by the revised plan. Silently dropping them would let a
+            # later drift unwind an operator steer -- the very failure
+            # mode this issue was filed against. Treat a drop as a
+            # validator failure so the retry loop feeds the LLM an
+            # explicit correction message.
+            goal_error = self._check_user_steer_goals_preserved(revised, goals)
+            if goal_error:
+                last_error = goal_error
+                log.warning(
+                    "%s: attempt %d/%d: %s",
+                    log_prefix,
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                if attempt < attempts:
+                    user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
+                continue
             return revised, "", False
         return None, last_error, False
 
@@ -1146,22 +1321,27 @@ class LLMPlanner:
         drift_json = json.dumps(drift_payload, default=str)
         goals_block = self._render_goals_block(goals)
         invariants_block = self._render_structural_invariants_block(plan)
+        sticky_block = self._render_sticky_goals_block(goals)
         observed_block = ""
         if observed_actions is not None:
             observed_block = (
                 f"{self._render_observed_actions_block(observed_actions)}\n\n"
                 "The tree may have diverged from the planned dispatch because it "
                 "found a better path. Decide:\n"
-                "- If the observed activity moves toward the goals: produce a "
-                "revised plan that REFLECTS the observed activity (mark matching "
-                "tasks COMPLETED/RUNNING, add new tasks for agent invocations "
-                "not already in the plan).\n"
-                "- If the observed activity does NOT move toward the goals: "
+                "- ABSORB: if the observed activity moves toward the GOALS "
+                "(and preserves every STICKY goal), produce a revised plan "
+                "that REFLECTS the observed activity (mark matching tasks "
+                "COMPLETED/RUNNING, add new tasks for agent invocations not "
+                "already in the plan).\n"
+                "- REJECT: if the observed activity CONTRADICTS any goal -- "
+                "especially any STICKY goal added by a prior USER_STEER -- "
                 'return a JSON object of the form {"reject": true, "reason": '
                 '"..."} (the caller will escalate to human intervention).\n\n'
             )
         return (
-            f"Goals:\n{goals_block}\n\n"
+            f"CURRENT GOALS (the revision must still advance every goal, "
+            f"and MUST NOT silently drop any [STICKY] goal):\n{goals_block}\n\n"
+            f"{sticky_block}"
             f"Current plan:\n{plan_json}\n\n"
             f"Drift event:\n{drift_json}\n\n"
             f"{observed_block}"
@@ -1171,6 +1351,31 @@ class LLMPlanner:
             "is warranted, respond with the current plan unchanged. Respond "
             "with JSON only."
         )
+
+    @classmethod
+    def _render_sticky_goals_block(cls, goals: list[Goal]) -> str:
+        """Render a dedicated STICKY GOALS block when sticky goals exist.
+
+        Returns ``""`` when there are no USER_STEER-sourced goals, so
+        legacy prompts for non-steered sessions are unchanged. When at
+        least one sticky goal is present, surface an explicit section
+        naming them so the LLM cannot "forget" that dropping them will
+        fail validation (goldfive#154).
+        """
+        sticky = cls._user_steer_goals(goals)
+        if not sticky:
+            return ""
+        lines = [
+            "STICKY GOALS (added by USER_STEER — the refine validator will "
+            "REJECT any revision that does not include at least one task "
+            "advancing each of these; if the drift IRRECONCILABLY "
+            'contradicts a sticky goal, emit {"reject": true, "reason": '
+            '"..."} instead of silently dropping it):'
+        ]
+        for g in sticky:
+            gid = g.id or "(no-id)"
+            lines.append(f"- [{gid}] {g.summary}")
+        return "\n".join(lines) + "\n\n"
 
     # ---- Planner protocol ------------------------------------------------
 
@@ -1285,13 +1490,24 @@ class LLMPlanner:
             if use_divergence_prompt
             else self._refine_system_prompt
         )
+        # Allow the reject sentinel whenever the LLM might legitimately
+        # conclude the drift cannot be reconciled with the current goals
+        # (goldfive#154). That's always true on the PLAN_DIVERGENCE +
+        # observed_actions path (it's the reconciler's explicit
+        # ABSORB/REJECT contract from #144), and also true whenever the
+        # session carries a sticky USER_STEER goal -- an unrelated drift
+        # might surface work that irreconcilably contradicts the
+        # operator's steer, and escalating via reject is cleaner than
+        # exhausting retries. Other callers keep the legacy "parse or
+        # bust" semantics.
+        allow_reject = use_divergence_prompt or bool(self._user_steer_goals(goals))
         revised, last_error, rejected = await self._call_and_validate_refine(
             system_prompt=system_prompt,
             base_user_prompt=base_user_prompt,
             prior_plan=plan,
             goals=goals,
             log_prefix="LLMPlanner.refine",
-            allow_reject=use_divergence_prompt,
+            allow_reject=allow_reject,
         )
         if rejected:
             # LLM judged the divergence off-goal. Return None so the
@@ -1372,9 +1588,13 @@ class LLMPlanner:
             else json.dumps({"id": loop_id})
         )
         goals_block = self._render_goals_block(goals)
+        sticky_block = self._render_sticky_goals_block(goals)
         invariants_block = self._render_structural_invariants_block(plan)
         return (
-            f"Goals:\n{goals_block}\n\n"
+            f"CURRENT GOALS (the revised plan must still advance every "
+            f"goal, and MUST NOT silently drop any [STICKY] goal):\n"
+            f"{goals_block}\n\n"
+            f"{sticky_block}"
             f"Already-finished tasks (preserve verbatim):\n"
             f"{json.dumps(history, default=str)}\n\n"
             f"LOOPING task (must appear in the returned plan with "
@@ -1667,6 +1887,15 @@ class LLMPlanner:
             merged_plan.validate(for_revision=True, prior=plan)
         except ValueError as exc:
             return None, f"validator rejected revision: {exc}"
+        # Preserve earlier USER_STEER goals through successive steers
+        # (goldfive#154). The current steer's note is handed in via
+        # ``drift.detail``; any *prior* USER_STEER goals still on
+        # ``session.goals`` must still be addressed by the new PENDING
+        # tasks, otherwise a later steer would silently unwind an
+        # earlier one.
+        goal_error = self._check_user_steer_goals_preserved(merged_plan, goals)
+        if goal_error:
+            return None, goal_error
         return merged_plan, ""
 
 
