@@ -307,8 +307,16 @@ async def test_steerer_counter_fires_at_interval() -> None:
     assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
 
 
-async def test_steerer_off_track_emits_critical_drift_and_refines() -> None:
-    """Judge returns False → CRITICAL GOAL_DRIFT → planner.refine called."""
+async def test_steerer_off_track_emits_critical_drift_and_pauses() -> None:
+    """Judge returns False → CRITICAL GOAL_DRIFT → Level 4 pause.
+
+    goldfive#142's intervention ladder routes CRITICAL GOAL_DRIFT to
+    :data:`InterventionLevel.PAUSE_ESCALATE` rather than calling
+    ``planner.refine`` -- goal drift is a structural signal that refine
+    cannot recover from. The Steerer emits a ``HUMAN_INTERVENTION_REQUIRED``
+    escalation drift and flips ``session.paused_for_human_intervention``;
+    the executor blocks until a user-initiated RESUME / STEER arrives.
+    """
     call_llm = _stub_call_llm([{"progressing": False, "reason": "off in the weeds"}])
     steerer = DefaultSteerer(
         goal_drift_check_interval=2,
@@ -329,10 +337,15 @@ async def test_steerer_off_track_emits_critical_drift_and_refines() -> None:
     assert primary.drift_detected.kind == types_pb2.DRIFT_KIND_GOAL_DRIFT
     assert primary.drift_detected.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
     assert "off in the weeds" in primary.drift_detected.detail
-    # CRITICAL drifts flow through refine.
-    assert len(planner.refine_calls) == 1
-    assert planner.refine_calls[0]["drift"].kind is DriftKind.GOAL_DRIFT
-    assert planner.refine_calls[0]["drift"].severity is DriftSeverity.CRITICAL
+    # Level 4 pause-escalate: no refine, a HUMAN_INTERVENTION_REQUIRED
+    # follow-up drift, and the pause flag is set.
+    assert planner.refine_calls == []
+    assert any(
+        e.WhichOneof("payload") == "drift_detected"
+        and e.drift_detected.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
+        for e in sink.events
+    )
+    assert session.paused_for_human_intervention is True
 
 
 async def test_steerer_disabled_by_default_no_check_ever_fires() -> None:

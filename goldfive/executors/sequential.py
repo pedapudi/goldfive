@@ -405,8 +405,7 @@ class SequentialExecutor(Executor):
                     # so the run continues but the failure is durably
                     # recorded. See goldfive#134.
                     log.warning(
-                        "SequentialExecutor: steerer.observe raised for "
-                        "task=%s: %s",
+                        "SequentialExecutor: steerer.observe raised for task=%s: %s",
                         task.id,
                         observe_exc,
                     )
@@ -602,9 +601,25 @@ class SequentialExecutor(Executor):
         order on subsequent loop iterations).
 
         A PAUSE here blocks on ``channel.receive()`` until a RESUME (or
-        CANCEL) arrives.
+        CANCEL) arrives. The steerer's intervention-ladder Level 4
+        pause (goldfive#142) triggers the same blocking wait via
+        ``session.paused_for_human_intervention``, so a Level 4
+        escalation is indistinguishable from an explicit user-initiated
+        PAUSE from the executor's perspective.
         """
         if control is None:
+            # Without a control channel the ladder-initiated pause has
+            # nothing to wait on -- the run would wedge forever. Clear
+            # the flag and let the drift event the steerer already
+            # emitted stand as the signal.
+            if session.paused_for_human_intervention:
+                log.warning(
+                    "SequentialExecutor: session.paused_for_human_intervention "
+                    "is set but no control channel is attached; clearing flag "
+                    "so the run does not wedge. Sinks still see the "
+                    "HUMAN_INTERVENTION_REQUIRED drift."
+                )
+                session.paused_for_human_intervention = False
             return False, None
 
         outcomes = await drain_controls(control, session=session, steerer=steerer, sinks=sinks)
@@ -627,6 +642,13 @@ class SequentialExecutor(Executor):
 
         if cancel_run:
             raise _ControlCancelled(cancel_reason or "cancelled by control")
+
+        # Intervention-ladder pause (goldfive#142). The steerer sets
+        # this flag from Level 4 PAUSE_ESCALATE dispatch; block the
+        # same way we block on an explicit user PAUSE. RESUME / STEER
+        # handlers clear the flag via dispatch_control.
+        if session.paused_for_human_intervention:
+            paused = True
 
         # Honour PAUSE by blocking on the channel until a RESUME /
         # CANCEL / STEER arrives.

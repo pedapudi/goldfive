@@ -161,10 +161,14 @@ enum DriftKind {
   // it (infinite-loop risk) and hands control back to the operator.
   // See goldfive#133.
   DRIFT_KIND_REFINE_VALIDATION_FAILED = 36;
-  // Reserved: enum value 37 is owned by goldfive#142 (intervention
-  // ladder). GOAL_DRIFT takes 38 so the two features never collide
-  // on the wire when the sibling PRs merge in either order.
-  reserved 37;
+  // The run is stuck in a way the planner's refine cannot fix and the
+  // user's judgment is required. Emitted by :class:`DefaultSteerer` at
+  // Level 4 of the intervention ladder (goldfive#142) -- persistent
+  // refine failures, goal drift, etc. CRITICAL severity only. Puts the
+  // Runner into a paused state until a user-initiated CONTROL_RESUME or
+  // CONTROL_STEER arrives. Sinks should surface this as a badge + pause
+  // state in the session view.
+  DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED = 37;
   // Periodic trajectory-level goal-alignment check. Unlike every other
   // DriftKind above (which fire on individual LLM responses or tool
   // calls), GOAL_DRIFT fires after a configurable number of agent

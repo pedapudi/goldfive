@@ -215,12 +215,24 @@ async def dispatch_control(
         )
 
     if kind == "RESUME":
+        # Clear the steerer-initiated pause flag (goldfive#142). A
+        # RESUME here unwinds both the control-channel's own pause
+        # state (via request_resume) AND any Level 4 intervention-
+        # ladder pause the steerer set on the session. Always reset
+        # even when the flag was never set -- no-op by design.
+        session.paused_for_human_intervention = False
         return ControlOutcome(
             ack=_build_ack(msg, result=AckResult.SUCCESS, detail="resumed"),
             request_resume=True,
         )
 
     if kind == "STEER":
+        # A STEER also clears a steerer-initiated pause (goldfive#142):
+        # user-supplied corrective intent is itself the resolution the
+        # pause was waiting for. The steer message is queued for the
+        # executor to feed through ``steerer.observe`` so the planner
+        # can produce a USER_STEER-driven plan revision.
+        session.paused_for_human_intervention = False
         return ControlOutcome(
             ack=_build_ack(msg, result=AckResult.SUCCESS, detail="steer queued"),
             steer_message=msg,
@@ -295,9 +307,7 @@ async def dispatch_control(
                 ack=_build_ack(
                     msg,
                     result=AckResult.FAILURE,
-                    detail=(
-                        f"no pending approval for target_id={target_id!r}"
-                    ),
+                    detail=(f"no pending approval for target_id={target_id!r}"),
                 ),
             )
         return ControlOutcome(
@@ -342,9 +352,7 @@ async def drain_controls(
             msg = inbox.get_nowait()
         except Exception:  # noqa: BLE001 — empty race is benign
             break
-        outcome = await dispatch_control(
-            msg, session=session, steerer=steerer, sinks=sinks
-        )
+        outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=sinks)
         outcomes.append(outcome)
         try:
             await channel.ack(outcome.ack)
