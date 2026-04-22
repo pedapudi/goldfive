@@ -41,6 +41,24 @@ clears the per-agent buffer so a legitimate burst of the same tool
 (e.g. a scripted lint + build + test pipeline) is not flagged when
 each call completes its step.
 
+.. note::
+
+   The exemption for ``report_task_*`` / ``report_awaiting_approval``
+   calls is **success-conditional**. The ADK plugin's
+   ``after_tool_callback`` only invokes :meth:`on_task_progress` when
+   the tool response indicates an acknowledged success
+   (``{"acknowledged": True, ...}`` with no ``error`` key).
+   Errored progress reports (missing ``task_id``, malformed payload,
+   etc.) are treated as ordinary tool calls and DO count toward
+   loop detection. This closes goldfive#192 where an agent stuck
+   retrying ``report_task_started`` with a bad ``task_id`` received
+   16 consecutive ``missing_task_id`` errors and the detector never
+   fired because the old unconditional-reset behaviour exempted them
+   on the call alone. The classifier here is unchanged; the gate
+   lives in the plugin so ``on_task_progress`` still resets the
+   window unconditionally when called directly (tests and any
+   future direct callers).
+
 Isolation: trackers are keyed on ``(invocation_id, agent_name)`` so
 each ADK invocation gets its own window, and parallel sub-agents
 within the same invocation (via AgentTool) are also isolated. State
@@ -289,6 +307,19 @@ class ToolLoopTracker:
         ``read_file read_file read_file`` that COMPLETES the task is
         not flagged because the next observation starts from an empty
         window.
+
+        .. note::
+
+           This method unconditionally clears the per-key buffer.
+           The **policy** of when to call it lives outside the
+           tracker. In the ADK plugin it is gated on an acknowledged
+           success response from the progress-reporting tool
+           (goldfive#192) so that errored ``report_task_*`` retries
+           accumulate in the ring buffer and trigger loop detection
+           at the configured thresholds. Direct callers (unit tests,
+           alternate adapters) may still invoke this method
+           whenever they have out-of-band knowledge that genuine
+           task progress occurred.
         """
         key = (invocation_id or "", agent_name or "")
         buf = self._buffers.get(key)
