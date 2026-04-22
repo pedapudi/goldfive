@@ -118,12 +118,23 @@ class _RecordingSteerer:
         self.drifts.append(drift)
 
 
-def _session_with_task(task_id: str = "t1") -> Session:
+def _session_with_task(task_id: str = "t1", *, running: bool = False) -> Session:
+    """Build a two-task Session.
+
+    ``running=True`` pre-sets ``t1`` to ``RUNNING`` for tests that
+    exercise handlers which are only legal on a running task (e.g.
+    ``report_task_progress``). See the goldfive#201 handler matrix in
+    :mod:`goldfive.reporting`.
+    """
+    status = TaskStatus.RUNNING if running else TaskStatus.PENDING
     plan = Plan(
         id="p1",
         run_id="r1",
         goal_ids=["g1"],
-        tasks=[Task(id=task_id, title="A"), Task(id="t2", title="B")],
+        tasks=[
+            Task(id=task_id, title="A", status=status),
+            Task(id="t2", title="B"),
+        ],
         edges=[TaskEdge(from_task_id=task_id, to_task_id="t2")],
     )
     return Session(
@@ -169,7 +180,7 @@ async def test_duplicate_call_returns_ack_and_skips_steerer() -> None:
 async def test_progress_with_distinct_args_is_not_duplicate() -> None:
     """Varied progress fractions are real updates, not dupes."""
     steerer = _RecordingSteerer()
-    session = _session_with_task()
+    session = _session_with_task(running=True)
     tools = [_spec("report_task_progress")]
 
     for frac, detail in [(0.2, "early"), (0.5, "midway"), (0.9, "almost")]:
@@ -206,7 +217,7 @@ async def test_eight_identical_calls_fires_drift_exactly_once() -> None:
     further attempt.
     """
     steerer = _RecordingSteerer()
-    session = _session_with_task()
+    session = _session_with_task(running=True)
     tools = [_spec("report_task_progress")]
 
     args = {"task_id": "t1", "fraction": 0.5, "detail": "stuck"}
@@ -236,7 +247,7 @@ async def test_eight_identical_calls_fires_drift_exactly_once() -> None:
 async def test_loop_drift_does_not_re_fire_after_first_emission() -> None:
     """One-shot guard: 16 identical calls still emit only one drift."""
     steerer = _RecordingSteerer()
-    session = _session_with_task()
+    session = _session_with_task(running=True)
     tools = [_spec("report_task_progress")]
 
     args = {"task_id": "t1", "fraction": 0.5, "detail": "stuck"}
@@ -249,7 +260,7 @@ async def test_loop_drift_does_not_re_fire_after_first_emission() -> None:
 async def test_alternating_args_does_not_fire_drift() -> None:
     """Eight calls split between two distinct payloads keep us under threshold."""
     steerer = _RecordingSteerer()
-    session = _session_with_task()
+    session = _session_with_task(running=True)
     tools = [_spec("report_task_progress")]
 
     for i in range(8):
@@ -278,7 +289,7 @@ async def test_volume_cap_fires_on_args_varying_loop() -> None:
     itself hasn't transitioned out of ``RUNNING``.
     """
     steerer = _RecordingSteerer()
-    session = _session_with_task()
+    session = _session_with_task(running=True)
     tools = [_spec("report_task_progress")]
 
     # 14 calls with fresh details should stay below the volume cap.
@@ -310,7 +321,7 @@ async def test_volume_cap_fires_on_args_varying_loop() -> None:
 async def test_volume_cap_is_per_tool_not_cross_tool() -> None:
     """Volume cap counts per tool name; mixing tools stays under the cap."""
     steerer = _RecordingSteerer()
-    session = _session_with_task()
+    session = _session_with_task(running=True)
     tools = [
         _spec("report_task_progress"),
         _spec("report_task_blocked"),
@@ -338,7 +349,7 @@ async def test_volume_cap_is_per_tool_not_cross_tool() -> None:
 async def test_volume_cap_fires_once_per_task() -> None:
     """Once the volume cap fires, further calls do not re-fire drift."""
     steerer = _RecordingSteerer()
-    session = _session_with_task()
+    session = _session_with_task(running=True)
     tools = [_spec("report_task_progress")]
 
     for i in range(30):
@@ -358,12 +369,18 @@ async def test_volume_cap_fires_once_per_task() -> None:
 
 
 async def test_reporting_on_terminal_task_returns_structured_rejection() -> None:
-    """Once a task is terminal, further reporting calls get a clear stop
-    signal — NOT a bland ``acknowledged=true`` that the model would read
-    as "keep going."
+    """Terminal-task retry semantics (goldfive#201).
 
-    The rejection carries the task id and current status so the model can
-    reason about state and route its next turn accordingly.
+    Same-transition retries (e.g. ``report_task_failed`` on an already
+    FAILED task) come back as an idempotent ACK —
+    ``{"acknowledged": True, "idempotent": True}`` — so a confused
+    model's innocent retry no longer masquerades as a tool-loop signal
+    nor triggers a spurious plan revision.
+
+    Cross-transitions on a terminal task (e.g. ``report_task_progress``
+    on a FAILED task) come back as ``invalid_transition`` — a real
+    "agent is confused about state" signal the dispatcher should
+    surface rather than absorb.
     """
     steerer = _RecordingSteerer()
     session = _session_with_task()
@@ -380,7 +397,8 @@ async def test_reporting_on_terminal_task_returns_structured_rejection() -> None
     assert first == {"acknowledged": True}
     assert session.plan.tasks[0].status is TaskStatus.FAILED
 
-    # Second report (on the now-terminal task) must be hard-rejected.
+    # Second report (same transition on the now-terminal task) is an
+    # idempotent no-op ack — handler does NOT re-run the steerer.
     second = await invoke_tool(
         tools,
         "report_task_failed",
@@ -388,13 +406,14 @@ async def test_reporting_on_terminal_task_returns_structured_rejection() -> None
         session,
         steerer,
     )
-    assert second["acknowledged"] is False
-    assert second["error"] == "task_already_terminal"
-    assert second["task_id"] == "t1"
+    assert second["acknowledged"] is True
+    assert second["idempotent"] is True
     assert second["current_status"] == "FAILED"
-    assert "do not" in second["message"].lower()
+    # Only the first call produced a transition; retries did not.
+    assert [t[1] for t in steerer.transitions] == ["FAILED"]
 
-    # A different reporting tool on the same terminal task is also rejected.
+    # A different reporting tool on the same terminal task is a real
+    # invalid-transition signal — not absorbed as idempotent.
     third = await invoke_tool(
         tools,
         "report_task_progress",
@@ -403,40 +422,43 @@ async def test_reporting_on_terminal_task_returns_structured_rejection() -> None
         steerer,
     )
     assert third["acknowledged"] is False
-    assert third["error"] == "task_already_terminal"
+    assert third["error"] == "invalid_transition"
+    assert third["current_status"] == "FAILED"
+    assert third["attempted"] == "RUNNING"
 
 
-async def test_terminal_rejection_does_not_invoke_handler() -> None:
-    """A rejected call does not re-enter the Steerer transition table."""
+async def test_terminal_idempotent_retry_does_not_invoke_handler() -> None:
+    """An idempotent retry does not re-enter the Steerer transition table."""
     steerer = _RecordingSteerer()
     session = _session_with_task()
-    tools = [_spec("report_task_failed")]
+    tools = [_spec("report_task_completed")]
 
     # Pre-mark the task as COMPLETED (e.g., via a prior legitimate call).
     session.plan.tasks[0].status = TaskStatus.COMPLETED
 
     result = await invoke_tool(
         tools,
-        "report_task_failed",
-        {"task_id": "t1", "reason": "late failure report"},
+        "report_task_completed",
+        {"task_id": "t1", "summary": "duplicate report"},
         session,
         steerer,
     )
-    assert result["acknowledged"] is False
-    # Handler was never called → no transitions recorded → task stays COMPLETED.
+    assert result["acknowledged"] is True
+    assert result["idempotent"] is True
+    # Steerer never saw the call.
     assert steerer.transitions == []
     assert session.plan.tasks[0].status is TaskStatus.COMPLETED
 
 
-async def test_terminal_rejection_flood_cannot_burn_llm_budget() -> None:
-    """100 rejected reports cost one lookup each, no handler, no drift.
+async def test_terminal_idempotent_retries_do_not_drive_steerer() -> None:
+    """A modest run of same-transition retries stays cheap.
 
-    This is the scenario we observed in the wild: an agent calls
-    ``report_task_failed`` hundreds of times with fresh ``reason``
-    strings on a task that's already FAILED, burning through ADK's
-    500-LLM-call limit. With the rejection layer, each call bounces
-    cheaply and gives the model a clear ``stop_reporting`` signal — no
-    handler cost, no drift pileup.
+    A confused model that keeps calling ``report_task_failed`` on an
+    already-FAILED task must not (a) drive the steerer repeatedly
+    or (b) emit drift events for the repeat. Each call returns a
+    cheap idempotent ACK. (A runaway flood beyond the per-task
+    volume cap will still trip the loop detector — but that is a
+    separate, legitimate signal handled by the loop guard.)
     """
     steerer = _RecordingSteerer()
     session = _session_with_task()
@@ -445,7 +467,10 @@ async def test_terminal_rejection_flood_cannot_burn_llm_budget() -> None:
     # Mark terminal up front.
     session.plan.tasks[0].status = TaskStatus.FAILED
 
-    for i in range(100):
+    # Stay under the per-task volume cap so the loop detector doesn't
+    # fire — the explicit goal here is that idempotent retries do NOT
+    # themselves trigger loop drift for reasonable repeat counts.
+    for i in range(10):
         result = await invoke_tool(
             tools,
             "report_task_failed",
@@ -453,9 +478,10 @@ async def test_terminal_rejection_flood_cannot_burn_llm_budget() -> None:
             session,
             steerer,
         )
-        assert result["acknowledged"] is False
+        assert result["acknowledged"] is True
+        assert result.get("idempotent") is True
 
-    # No handlers fired, no drift events emitted — rejection is cheap and silent.
+    # No handlers fired, no drift events emitted — retries are cheap.
     assert steerer.transitions == []
     assert steerer.drifts == []
 
@@ -612,7 +638,7 @@ async def test_loop_flagged_short_circuits_subsequent_calls() -> None:
     hard-rejecting until refine resets it.
     """
     steerer = _RecordingSteerer()
-    session = _session_with_task()
+    session = _session_with_task(running=True)
     tools = [_spec("report_task_progress")]
 
     args = {"task_id": "t1", "fraction": 0.5, "detail": "stuck"}
@@ -714,7 +740,9 @@ async def test_session_wide_cap_is_per_tool_not_cross_tool() -> None:
         id="p1",
         run_id="r1",
         goal_ids=["g1"],
-        tasks=[Task(id=f"t{i}", title=f"task-{i}") for i in range(30)],
+        # Start each task RUNNING so ``report_task_progress`` is a
+        # legal transition at the handler layer (goldfive#201).
+        tasks=[Task(id=f"t{i}", title=f"task-{i}", status=TaskStatus.RUNNING) for i in range(30)],
         edges=[],
     )
     session = Session(

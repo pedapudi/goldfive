@@ -128,6 +128,10 @@ async def test_report_task_started_marks_running() -> None:
 
 async def test_report_task_progress_records_progress() -> None:
     steerer, session, sink, _ = _fresh()
+    # goldfive#201: progress ticks are only valid on RUNNING tasks —
+    # transition t1 first so the handler actually records progress
+    # instead of returning invalid_transition.
+    session.plan.tasks[0].status = TaskStatus.RUNNING
     await _tool("report_task_progress").handler(
         {"task_id": "t1", "fraction": 0.75, "detail": "three of four done"},
         session,
@@ -219,9 +223,7 @@ async def test_report_plan_divergence_fires_refine_and_sets_flag() -> None:
 async def test_handler_tolerates_missing_optional_fields() -> None:
     steerer, session, sink, _ = _fresh()
     # Only required fields — should still transition.
-    await _tool("report_task_started").handler(
-        {"task_id": "t1"}, session, steerer
-    )
+    await _tool("report_task_started").handler({"task_id": "t1"}, session, steerer)
     assert session.plan.tasks[0].status is TaskStatus.RUNNING
     assert sink.events[-1].task_started.detail == ""
 
@@ -230,9 +232,7 @@ async def test_handler_ignores_unknown_task_id_gracefully() -> None:
     steerer, session, sink, _ = _fresh()
     # Unknown task_id — the handler ack's but no event is emitted and
     # no existing task is mutated.
-    out = await _tool("report_task_started").handler(
-        {"task_id": "bogus"}, session, steerer
-    )
+    out = await _tool("report_task_started").handler({"task_id": "bogus"}, session, steerer)
     assert out == {"acknowledged": True}
     assert sink.events == []
     assert all(t.status is TaskStatus.PENDING for t in session.plan.tasks)

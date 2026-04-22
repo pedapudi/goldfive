@@ -24,9 +24,11 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+from goldfive.types import TaskStatus
+
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
-    from goldfive.types import Session
+    from goldfive.types import Session, Task
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +121,190 @@ def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Idempotency / invalid-transition machinery (goldfive#201)
+# ---------------------------------------------------------------------------
+#
+# Each task-scoped reporting handler consults the task's current status
+# before driving the steerer. Three outcomes:
+#
+# 1. **Real transition** — current status is a legal source for the
+#    tool's target transition; the handler invokes the steerer and
+#    returns ``{"acknowledged": True}``. Terminal transitions also
+#    rotate ``goldfive.current_task_id`` to the next assigned
+#    PENDING/RUNNING task (or clear it).
+# 2. **Idempotent no-op** — current status already matches what the
+#    call would move the task to (e.g. ``report_task_completed`` on a
+#    COMPLETED task). Handler returns
+#    ``{"acknowledged": True, "idempotent": True, "current_status": ...}``
+#    without mutating state. This is the goldfive#201 fix: retries
+#    from a confused model no longer masquerade as tool-loop spam.
+# 3. **Invalid transition** — current status cannot legally transition
+#    under this tool (e.g. ``report_task_started`` on a COMPLETED
+#    task). Handler returns
+#    ``{"acknowledged": False, "error": "invalid_transition",
+#       "current_status": ..., "attempted": ...}``
+#    as a real "agent is confused about state" signal. Loop-detector
+#    owners can surface this directly; it's distinct from a benign
+#    retry.
+#
+# See ``docs/design/TASK-LIFECYCLE.md`` for the status-machine contract.
+
+
+# Tool-name → the status the call would transition the task INTO
+# (i.e. "what does success look like"). Used to detect idempotent
+# retries: when ``current_status`` already equals the target, the call
+# is an ack-only no-op.
+_TOOL_TARGET_STATUS: dict[str, TaskStatus] = {
+    "report_task_started": TaskStatus.RUNNING,
+    "report_task_progress": TaskStatus.RUNNING,  # progress is a liveness tick on a RUNNING task
+    "report_task_completed": TaskStatus.COMPLETED,
+    "report_task_failed": TaskStatus.FAILED,
+    "report_task_blocked": TaskStatus.BLOCKED,
+    "report_awaiting_approval": TaskStatus.BLOCKED,  # mapped onto BLOCKED by the steerer
+}
+
+# Which source statuses are *legal* starting points for each tool.
+# Anything else is either an idempotent no-op (see above) or an
+# ``invalid_transition``. Built from ``docs/design/TASK-LIFECYCLE.md``
+# §"Status transitions". PENDING/RUNNING bookkeeping statuses are the
+# canonical sources; terminal statuses are never a legal source for a
+# different transition.
+_TOOL_VALID_SOURCES: dict[str, frozenset[TaskStatus]] = {
+    "report_task_started": frozenset({TaskStatus.PENDING, TaskStatus.BLOCKED}),
+    "report_task_progress": frozenset({TaskStatus.RUNNING}),
+    "report_task_completed": frozenset(
+        {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED}
+    ),
+    "report_task_failed": frozenset({TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED}),
+    "report_task_blocked": frozenset({TaskStatus.PENDING, TaskStatus.RUNNING}),
+    "report_awaiting_approval": frozenset(
+        {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED}
+    ),
+}
+
+# Terminal statuses — duplicated here to avoid a runtime import of
+# ``TERMINAL_TASK_STATUSES`` from ``goldfive.types``; the value set is
+# pinned by ``TaskStatus`` and guarded by a test.
+_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.NOT_NEEDED,
+    }
+)
+
+
+def _find_task_in_session(session: Session, task_id: str) -> Task | None:
+    """Return the task in ``session.plan`` with ``task_id``, or ``None``."""
+    plan = getattr(session, "plan", None)
+    if plan is None or not task_id:
+        return None
+    for t in getattr(plan, "tasks", ()) or ():
+        if getattr(t, "id", "") == task_id:
+            return t
+    return None
+
+
+def _idempotent_response(current_status: TaskStatus) -> dict[str, Any]:
+    return {
+        "acknowledged": True,
+        "idempotent": True,
+        "current_status": current_status.value,
+    }
+
+
+def _invalid_transition_response(
+    *,
+    tool_name: str,
+    current_status: TaskStatus,
+    attempted: TaskStatus,
+    task_id: str,
+) -> dict[str, Any]:
+    return {
+        "acknowledged": False,
+        "error": "invalid_transition",
+        "tool": tool_name,
+        "task_id": task_id,
+        "current_status": current_status.value,
+        "attempted": attempted.value,
+        "message": (
+            f"Cannot {tool_name!r} task {task_id!r} from {current_status.value} "
+            f"to {attempted.value}. The task is already in a terminal or "
+            "otherwise-incompatible state; do not retry."
+        ),
+    }
+
+
+def _classify_transition(
+    *,
+    tool_name: str,
+    current_status: TaskStatus,
+) -> str:
+    """Return ``"idempotent"``, ``"invalid"``, or ``"transition"``.
+
+    * ``"idempotent"`` — the call is a no-op because the task is
+      already in the status this tool would move it to (or, for
+      ``report_task_progress``, the task is already RUNNING and a
+      progress tick is always legal there). Handler returns an
+      idempotent ACK without mutating state.
+    * ``"invalid"`` — the call cannot legally transition from
+      ``current_status``. Handler returns an ``invalid_transition``
+      error.
+    * ``"transition"`` — the call is a legitimate transition; the
+      handler drives the steerer normally.
+    """
+    target = _TOOL_TARGET_STATUS.get(tool_name)
+    if target is not None and current_status == target:
+        # Special case: ``report_task_progress`` on a RUNNING task is
+        # always a no-op (a progress tick has no status mutation, but we
+        # treat it as idempotent so the caller sees the same shape).
+        return "idempotent"
+    valid = _TOOL_VALID_SOURCES.get(tool_name)
+    if valid is not None and current_status in valid:
+        return "transition"
+    # Falls through to invalid — covers terminal statuses under every
+    # tool (except when current == target above) and the degenerate
+    # case of ``report_task_progress`` on PENDING etc.
+    return "invalid"
+
+
+def _rotate_after_terminal(
+    session: Session,
+    completed_task: Task,
+) -> None:
+    """Advance ``goldfive.current_task_id`` after a terminal transition.
+
+    Delegates to :func:`goldfive.orchestration_state.rotate_current_task_id`.
+    Imported lazily so this module stays ADK-free and dodges the
+    import-cycle risk between :mod:`goldfive.reporting` and
+    :mod:`goldfive.orchestration_state` (both are imported from
+    :mod:`goldfive.steerer`).
+    """
+    state = getattr(session, "state", None)
+    if not isinstance(state, dict):
+        return
+    plan = getattr(session, "plan", None)
+    agent_name = str(getattr(completed_task, "assignee_agent_id", "") or "")
+
+    # Only rotate if the terminal task was the one we'd been pointing
+    # at — otherwise some other caller owns the pin and we'd clobber
+    # theirs.
+    pinned = state.get(_STATE_KEY_CURRENT_TASK_ID, "")
+    if isinstance(pinned, str):
+        pinned = pinned.strip()
+    else:
+        pinned = str(pinned or "").strip()
+    this_id = str(getattr(completed_task, "id", "") or "")
+    if pinned and pinned != this_id:
+        return
+
+    from goldfive import orchestration_state as _ostate
+
+    _ostate.rotate_current_task_id(state, plan, agent_name)
+
+
 def _missing_task_id_response(tool_name: str) -> dict[str, Any]:
     """Return the canonical ``missing_task_id`` rejection shape.
 
@@ -178,6 +364,18 @@ async def _handle_task_started(
     detail = _str(args, "detail")
     if not task_id:
         return _missing_task_id_response("report_task_started")
+    task = _find_task_in_session(session, task_id)
+    if task is not None:
+        decision = _classify_transition(tool_name="report_task_started", current_status=task.status)
+        if decision == "idempotent":
+            return _idempotent_response(task.status)
+        if decision == "invalid":
+            return _invalid_transition_response(
+                tool_name="report_task_started",
+                current_status=task.status,
+                attempted=TaskStatus.RUNNING,
+                task_id=task_id,
+            )
     await steerer.mark_task_running(task_id, session=session, detail=detail)
     return dict(_ACK)
 
@@ -190,6 +388,24 @@ async def _handle_task_progress(
     detail = _str(args, "detail")
     if not task_id:
         return _missing_task_id_response("report_task_progress")
+    task = _find_task_in_session(session, task_id)
+    if task is not None:
+        # report_task_progress is a liveness tick — only valid on RUNNING.
+        # PENDING / BLOCKED → invalid ("hasn't started or is waiting");
+        # terminal → invalid ("task is done"). RUNNING → always a no-op
+        # style idempotent ACK (the steerer call itself doesn't mutate
+        # status, but we treat it uniformly so the response shape matches
+        # the other handlers).
+        if task.status is TaskStatus.RUNNING:
+            # Legal tick — proceed to steerer (records progress).
+            pass
+        else:
+            return _invalid_transition_response(
+                tool_name="report_task_progress",
+                current_status=task.status,
+                attempted=TaskStatus.RUNNING,
+                task_id=task_id,
+            )
     await steerer.mark_task_progress(task_id, session=session, fraction=fraction, detail=detail)
     return dict(_ACK)
 
@@ -207,9 +423,26 @@ async def _handle_task_completed(
     )
     if not task_id:
         return _missing_task_id_response("report_task_completed")
+    task = _find_task_in_session(session, task_id)
+    if task is not None:
+        decision = _classify_transition(
+            tool_name="report_task_completed", current_status=task.status
+        )
+        if decision == "idempotent":
+            return _idempotent_response(task.status)
+        if decision == "invalid":
+            return _invalid_transition_response(
+                tool_name="report_task_completed",
+                current_status=task.status,
+                attempted=TaskStatus.COMPLETED,
+                task_id=task_id,
+            )
     await steerer.mark_task_completed(
         task_id, session=session, summary=summary, artifacts=artifacts
     )
+    # Rotate the current-task pin now that this one has landed terminal.
+    if task is not None:
+        _rotate_after_terminal(session, task)
     return dict(_ACK)
 
 
@@ -221,12 +454,26 @@ async def _handle_task_failed(
     recoverable = _bool(args, "recoverable", default=True)
     if not task_id:
         return _missing_task_id_response("report_task_failed")
+    task = _find_task_in_session(session, task_id)
+    if task is not None:
+        decision = _classify_transition(tool_name="report_task_failed", current_status=task.status)
+        if decision == "idempotent":
+            return _idempotent_response(task.status)
+        if decision == "invalid":
+            return _invalid_transition_response(
+                tool_name="report_task_failed",
+                current_status=task.status,
+                attempted=TaskStatus.FAILED,
+                task_id=task_id,
+            )
     await steerer.mark_task_failed(
         task_id,
         session=session,
         reason=reason,
         recoverable=recoverable,
     )
+    if task is not None:
+        _rotate_after_terminal(session, task)
     return dict(_ACK)
 
 
@@ -238,6 +485,18 @@ async def _handle_task_blocked(
     needed = _str(args, "needed")
     if not task_id:
         return _missing_task_id_response("report_task_blocked")
+    task = _find_task_in_session(session, task_id)
+    if task is not None:
+        decision = _classify_transition(tool_name="report_task_blocked", current_status=task.status)
+        if decision == "idempotent":
+            return _idempotent_response(task.status)
+        if decision == "invalid":
+            return _invalid_transition_response(
+                tool_name="report_task_blocked",
+                current_status=task.status,
+                attempted=TaskStatus.BLOCKED,
+                task_id=task_id,
+            )
     await steerer.mark_task_blocked(task_id, session=session, blocker=blocker, needed=needed)
     return dict(_ACK)
 
@@ -293,6 +552,19 @@ async def _handle_awaiting_approval(
     timeout_ms = _int(args, "timeout_ms", 0)
     if not task_id:
         return _missing_task_id_response("report_awaiting_approval")
+    # goldfive#201: reject on terminal task up front with the
+    # canonical invalid_transition shape. An already-BLOCKED /
+    # already-RUNNING task falls through to the waiter-reuse path
+    # below (that's the semantic idempotency for approvals — they
+    # block on the existing Event instead of returning a no-op ack).
+    task = _find_task_in_session(session, task_id)
+    if task is not None and task.status in _TERMINAL_STATUSES:
+        return _invalid_transition_response(
+            tool_name="report_awaiting_approval",
+            current_status=task.status,
+            attempted=TaskStatus.BLOCKED,
+            task_id=task_id,
+        )
 
     # Idempotency: reuse an existing waiter if one is already pending.
     waiter = session.pending_approvals.get(task_id)

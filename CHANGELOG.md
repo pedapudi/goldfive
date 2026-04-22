@@ -146,6 +146,26 @@ instrumentation — lands alongside.
   (silent tool success / no-progress), [#185](https://github.com/pedapudi/goldfive/issues/185)
   (wrong-tool-for-job).
 
+### Task-lifecycle
+
+- [#201](https://github.com/pedapudi/goldfive/pull/201) **Idempotent
+  reporting handlers + state rotation on terminal transition.**
+  Reporting-tool retries on a terminal task used to return a single
+  `task_already_terminal` rejection, which conflated benign same-
+  transition retries with real "agent is confused" cross-transitions
+  and tripped the tool-loop detector on both. The handler now owns a
+  per-tool idempotency matrix: same-transition retries (e.g.
+  `report_task_completed` on `COMPLETED`) return
+  `{"acknowledged": True, "idempotent": True, "current_status": ...}`;
+  cross-transitions (e.g. `report_task_started` on `COMPLETED`)
+  return `{"acknowledged": False, "error": "invalid_transition",
+  "current_status": ..., "attempted": ...}`. Terminal transitions
+  additionally rotate `goldfive.current_task_id` via a new
+  `orchestration_state.rotate_current_task_id(state, plan, agent_name)`
+  helper so subsequent tool calls in the same invocation context see
+  a live pointer (stamps the next PENDING/RUNNING task assigned to
+  the same agent when unambiguous; clears otherwise).
+
 ### Earlier
 
 - #163 Overlay executor no longer dispatches soft follow-ups. When

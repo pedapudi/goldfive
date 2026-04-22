@@ -1789,14 +1789,16 @@ async def test_reporting_tool_dispatch_routes_through_invoke_tool(state_ctx_cls)
 async def test_reporting_tool_on_terminal_task_returns_structured_rejection(
     state_ctx_cls,
 ) -> None:
-    """A reporting call on an already-terminal task must get the
-    structured ``task_already_terminal`` error response — NOT a bland
+    """A cross-transition on an already-terminal task (e.g.
+    ``report_task_progress`` on a FAILED task) must return the
+    structured ``invalid_transition`` error — NOT a bland
     ``{"acknowledged": True}``.
 
-    This is the terminal-task rejection layer (layer 1 in
-    ``docs/design/TASK-LIFECYCLE.md`` §5). Fires from inside
-    ``invoke_tool``; this test proves the ADK plugin's dispatch path
-    reaches that layer.
+    goldfive#201 moved this decision out of ``invoke_tool``'s Layer 2
+    and into the handler matrix: same-transition retries become
+    idempotent ACKs, cross-transitions become ``invalid_transition``.
+    This test proves the ADK plugin's dispatch path reaches the
+    handler and the handler surfaces the structured signal.
     """
     from goldfive.adapters._adk_plugin import (
         SESSION_CONTEXT_STATE_KEY,
@@ -1806,25 +1808,9 @@ async def test_reporting_tool_on_terminal_task_returns_structured_rejection(
     from goldfive.reporting import BUILTIN_REPORTING_TOOLS
     from goldfive.types import Plan, TaskStatus
 
-    # The handler must NEVER run when the task is already terminal —
-    # route the call through a spec whose handler raises, to catch a
-    # regression where invoke_tool's short-circuit is skipped.
-    invoked_count = [0]
-
-    async def _boom_handler(args, session, steerer):
-        invoked_count[0] += 1
-        raise AssertionError(
-            "handler must not run on a terminal task; dispatch should "
-            "short-circuit via invoke_tool's terminal rejection"
-        )
-
-    spec_template = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_progress")
-    spec = ReportingToolSpec(
-        name=spec_template.name,
-        description=spec_template.description,
-        parameters=spec_template.parameters,
-        handler=_boom_handler,
-    )
+    # Use the real built-in spec so the handler's idempotency matrix
+    # runs.
+    spec = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_progress")
 
     agent = _make_agent()
     adapter = ADKAdapter(agent)
@@ -1862,15 +1848,16 @@ async def test_reporting_tool_on_terminal_task_returns_structured_rejection(
 
     assert isinstance(result, dict)
     assert result.get("acknowledged") is False, (
-        "expected structured rejection; got acknowledged=true. If this "
-        "fails, before_tool_callback is bypassing invoke_tool's "
-        "terminal-task rejection layer."
+        "expected structured invalid_transition rejection; got "
+        "acknowledged=true. If this fails, the handler's matrix is "
+        "being bypassed."
     )
-    assert result.get("error") == "task_already_terminal"
+    assert result.get("error") == "invalid_transition"
     assert result.get("task_id") == "t1"
     assert result.get("current_status") == "FAILED"
-    # Handler must have stayed cold.
-    assert invoked_count[0] == 0
+    assert result.get("attempted") == "RUNNING"
+    # Task status unchanged.
+    assert task.status is TaskStatus.FAILED
 
 
 async def test_reporting_tool_duplicate_returns_duplicate_ack(state_ctx_cls) -> None:

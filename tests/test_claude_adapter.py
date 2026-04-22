@@ -370,27 +370,22 @@ def test_pretooluse_hook_passes_through_non_reporting_tools() -> None:
 
 
 def test_pretooluse_hook_on_terminal_task_returns_structured_rejection() -> None:
-    """A reporting call on an already-FAILED task must surface the
-    structured ``task_already_terminal`` error inside the hook's
+    """A cross-transition on an already-FAILED task must surface the
+    structured ``invalid_transition`` error inside the hook's
     ``permissionDecisionReason`` — proof the hook routes through
-    ``invoke_tool``.
+    ``invoke_tool`` into the handler's idempotency matrix
+    (goldfive#201).
     """
     import json as _json
 
+    from goldfive.reporting import BUILTIN_REPORTING_TOOLS
     from goldfive.types import TaskStatus
 
-    async def _boom_handler(args, session, steerer):
-        raise AssertionError(
-            "handler must not run on a terminal task; dispatch should "
-            "short-circuit via invoke_tool's terminal rejection"
-        )
-
-    spec = ReportingToolSpec(
-        name="report_task_progress",
-        description="progress",
-        parameters={"type": "object", "properties": {}},
-        handler=_boom_handler,
-    )
+    # Use the real built-in spec so the handler's idempotency matrix
+    # runs. Pre-goldfive#201 this test used a boom-handler to prove
+    # invoke_tool rejected BEFORE the handler; now the handler itself
+    # owns the decision so we exercise the real one.
+    spec = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_progress")
 
     adapter = ClaudeAgentSDKAdapter(client_factory=lambda: _StubClient([]))
 
@@ -428,7 +423,7 @@ def test_pretooluse_hook_on_terminal_task_returns_structured_rejection() -> None
         "expected structured rejection; got acknowledged=true. If this "
         "fails, _make_pretooluse_hook is bypassing invoke_tool."
     )
-    assert parsed.get("error") == "task_already_terminal"
+    assert parsed.get("error") == "invalid_transition"
     assert parsed.get("task_id") == "t1"
     assert parsed.get("current_status") == "FAILED"
 
