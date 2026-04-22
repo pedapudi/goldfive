@@ -464,6 +464,44 @@ def _as_observation(
     }
 
 
+def _is_progress_report_success(response: Any) -> bool:
+    """Return ``True`` iff ``response`` indicates a successful progress report.
+
+    Used by the ADK plugin's ``after_tool_callback`` to decide whether a
+    ``report_task_*`` / ``report_awaiting_approval`` call should reset
+    the tool-loop tracker's per-(invocation, agent) window (goldfive#192).
+
+    Previously the exemption triggered on the **call** regardless of
+    outcome: an agent stuck retrying ``report_task_started`` with a
+    bad ``task_id`` would keep getting ``{"acknowledged": false,
+    "error": "missing_task_id"}`` and every one of those errored calls
+    reset the detector window -- masking an obvious tool-loop. This
+    helper tightens the gate so only acknowledged-success responses
+    reset. Everything else (errored, missing field, unknown shape) is
+    conservatively treated as NOT a legitimate progress report so the
+    loop detector gets to count the call.
+
+    Shape contract: the reporting tools return a dict with
+    ``acknowledged`` set to ``True`` on success and ``False`` on
+    failure (with an ``error`` key describing what went wrong); see
+    :mod:`goldfive.adapters._tool_invocation`. Any other shape
+    (``None``, a string, a bare list, etc.) is treated as "unknown"
+    and does NOT reset the window.
+    """
+    if response is None:
+        return False
+    if isinstance(response, Mapping):
+        # Explicit failure wins: even if ``acknowledged`` is somehow
+        # True alongside an ``error`` key, treat it as errored so we
+        # don't silently reset on half-broken shapes.
+        if "error" in response:
+            return False
+        if response.get("acknowledged") is True:
+            return True
+        return False
+    return False  # unknown shape (str, list, bare value) -- conservative no-reset
+
+
 def _tool_requires_confirmation(tool: Any, tool_args: Any) -> bool:
     """Return True if ``tool`` opts into ADK's require_confirmation flag.
 
@@ -893,9 +931,13 @@ def make_adk_plugin(
                 **_tool_loops.load_thresholds_from_env()
             )
             # Reporting-tool names that indicate forward task progress
-            # and therefore clear the tool-loop tracker's window for
-            # the current (invocation, agent) key. Matches the set
-            # exposed by the adapter's state-transition protocol.
+            # and therefore can clear the tool-loop tracker's window
+            # for the current (invocation, agent) key — SUBJECT to the
+            # acknowledged-success gate in ``after_tool_callback``
+            # (goldfive#192). Matches the set exposed by the adapter's
+            # state-transition protocol, plus the approval-gate
+            # reporter which is the other call an agent uses to signal
+            # forward progress on a running task.
             self._progress_reporting_tools: frozenset[str] = frozenset(
                 {
                     "report_task_started",
@@ -903,6 +945,7 @@ def make_adk_plugin(
                     "report_task_completed",
                     "report_task_failed",
                     "report_task_blocked",
+                    "report_awaiting_approval",
                 }
             )
 
@@ -1996,9 +2039,19 @@ def make_adk_plugin(
             AgentTool delegations, MCP/custom tools) so the detector
             sees the real function_call stream the agent is emitting.
             A reporting-tool progress call (``report_task_started`` /
-            ``_progress`` / ``_completed`` / ``_failed`` / ``_blocked``)
-            additionally clears the per-(invocation, agent) window so
-            mode 2's "no task progress" gate is correct.
+            ``_progress`` / ``_completed`` / ``_failed`` / ``_blocked`` /
+            ``report_awaiting_approval``) additionally clears the
+            per-(invocation, agent) window — but ONLY when the call
+            was acknowledged (``result == {"acknowledged": True, ...}``)
+            so mode 2's "no task progress" gate is correct.
+
+            The acknowledged-success gate (goldfive#192) is the
+            tightening over goldfive#181's original behaviour: errored
+            progress reports (``acknowledged=False`` or responses with
+            an ``error`` key) do NOT reset the window, so an agent
+            stuck retrying a failing ``report_task_*`` with a bad
+            ``task_id`` gets caught as a tool-loop at the normal
+            thresholds.
 
             The detector is deterministic and O(1) per call modulo the
             tracker's ``window`` length; any failure is swallowed so a
@@ -2028,21 +2081,18 @@ def make_adk_plugin(
             agent_name = str(_safe_attr(running_agent, "name", "") or "") or self._host_agent_name
             task_id = str(_safe_attr(ctx.task, "id", "") or "")
 
-            # Progress-reporting tools reset the window BEFORE we
-            # record the call itself. That way a task-completing
-            # sequence (e.g. the fifth `read_file` that finally
-            # answers the question, followed by report_task_completed)
-            # doesn't leave the completing `report_*` call feeding
-            # a window that's about to be cleared. The progress tool
-            # is not appended at all — its job is to reset, not to
-            # feed the detector.
-            if tool_name in self._progress_reporting_tools:
-                self._tool_loop_tracker.on_task_progress(
-                    invocation_id=inv_id,
-                    agent_name=agent_name,
-                )
-                return None
-
+            # Every tool call is observed — regardless of kind. For a
+            # progress-reporting tool (``report_task_*`` /
+            # ``report_awaiting_approval``) we THEN look at the
+            # ``result`` payload and reset the per-(invocation, agent)
+            # window only when the call was *acknowledged* successfully
+            # (goldfive#192). Previously the exemption triggered on the
+            # call alone, so an agent stuck retrying a failing
+            # ``report_task_started`` kept resetting the window and the
+            # loop detector never fired. By observing first and resetting
+            # only on acknowledged success, errored report_* calls
+            # accumulate in the ring buffer and trigger loop detection
+            # at the normal thresholds.
             try:
                 # tool_args may be None / missing on adapter edge cases;
                 # the tracker's hash helper copes with both.
@@ -2060,6 +2110,24 @@ def make_adk_plugin(
                     exc,
                 )
                 return None
+
+            # Post-observation: reset the window only on acknowledged
+            # success for progress-reporting tools. An errored report
+            # (``acknowledged=False`` or a response containing an
+            # ``error`` key) falls through to the regular drift
+            # dispatch path so a stuck retry-loop still lights up.
+            if tool_name in self._progress_reporting_tools:
+                if _is_progress_report_success(result):
+                    try:
+                        self._tool_loop_tracker.on_task_progress(
+                            invocation_id=inv_id,
+                            agent_name=agent_name,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "after_tool_callback: on_task_progress raised: %s",
+                            exc,
+                        )
 
             if not drifts:
                 return None
