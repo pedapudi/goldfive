@@ -288,7 +288,14 @@ def test_goldfive_planner_process_response_noop_when_no_filters_fire() -> None:
 
 
 async def test_goldfive_planner_process_response_emits_divergence_on_off_registry_agent() -> None:
-    """A function_call to an unknown agent name triggers PLAN_DIVERGENCE."""
+    """Three-stage classification: cross-layer → PLAN_DIVERGENCE;
+    hallucinated → CONFABULATION_RISK; report_ prefix → skipped.
+
+    Ctx has no ``_invocation_context`` so ``_extract_own_tool_names``
+    returns an empty set — every function_call falls through stage 1
+    and is classified against the registry (stage 2) or as
+    hallucination (stage 3).
+    """
     steerer = _RecordingSteerer()
     session = Session(run_id="r")
     planner = GoldfivePlanner(
@@ -297,13 +304,17 @@ async def test_goldfive_planner_process_response_emits_divergence_on_off_registr
         session=session,
     )
     parts = [
+        # Stage 2 — name matches a registry agent but wasn't exposed
+        # as a tool to this agent: PLAN_DIVERGENCE.
         _FakePart(
             function_call=_FakeFunctionCall(id="fc-1", name="researcher", args={}),
         ),
+        # Stage 3 — name is neither a tool nor a known agent:
+        # CONFABULATION_RISK.
         _FakePart(
             function_call=_FakeFunctionCall(id="fc-2", name="rogue_agent", args={}),
         ),
-        # Reporting tool — must not trigger divergence.
+        # Reporting tool — must not trigger any drift.
         _FakePart(
             function_call=_FakeFunctionCall(
                 id="fc-3", name="report_task_started", args={"task_id": "t"}
@@ -314,19 +325,250 @@ async def test_goldfive_planner_process_response_emits_divergence_on_off_registr
 
     out = planner.process_planning_response(ctx, parts)
 
-    # All three parts retained; divergence is signal-only.
+    # All three parts retained; classification is signal-only.
     assert out is not None
     names = [p.function_call.name for p in out]
     assert names == ["researcher", "rogue_agent", "report_task_started"]
 
-    # Yield once so the scheduled _handle_drift task runs.
+    # Yield once so the scheduled _handle_drift tasks run.
     await asyncio.sleep(0)
 
-    assert len(steerer.drifts) == 1
+    # Two drifts: stage 2 (PLAN_DIVERGENCE) + stage 3 (CONFABULATION_RISK).
+    by_kind = {d.kind: d for d in steerer.drifts}
+    assert DriftKind.PLAN_DIVERGENCE in by_kind, (
+        f"expected PLAN_DIVERGENCE drift, got {steerer.drifts!r}"
+    )
+    assert DriftKind.CONFABULATION_RISK in by_kind, (
+        f"expected CONFABULATION_RISK drift, got {steerer.drifts!r}"
+    )
+    div = by_kind[DriftKind.PLAN_DIVERGENCE]
+    assert "researcher" in div.detail
+    assert div.current_agent_id == "researcher"
+    assert div.severity.value == "warning"
+
+    conf = by_kind[DriftKind.CONFABULATION_RISK]
+    assert "rogue_agent" in conf.detail
+    assert conf.current_agent_id == "rogue_agent"
+    assert conf.severity.value == "warning"
+
+
+class _FakeTool:
+    """Duck-typed ADK tool exposing a ``.name`` attribute."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeAgent:
+    """Duck-typed ADK agent exposing ``.tools`` for the planner's own-tool lookup."""
+
+    def __init__(self, *, name: str, tool_names: list[str]) -> None:
+        self.name = name
+        self.tools = [_FakeTool(n) for n in tool_names]
+
+
+class _FakeInvocationContextAgent:
+    """Stand-in for ``CallbackContext._invocation_context`` carrying an agent."""
+
+    def __init__(self, *, agent: _FakeAgent, state: dict) -> None:
+        self.agent = agent
+
+        class _S:
+            def __init__(self, st):
+                self.state = st
+
+        self.session = _S(state)
+
+
+class _FakeCallbackContextWithAgent:
+    """CallbackContext stand-in wiring ``_invocation_context.agent.tools``.
+
+    Also satisfies the state-extraction contract via
+    ``._invocation_context.session.state`` so the cancelled-id filter
+    still exercises the real chain.
+    """
+
+    def __init__(self, *, agent: _FakeAgent, state: dict | None = None) -> None:
+        self._invocation_context = _FakeInvocationContextAgent(agent=agent, state=state or {})
+        # Mirror ADK CallbackContext behaviour: a direct ``.state`` alias
+        # for simple readers.
+        self.state = state or {}
+
+
+async def test_own_tool_call_no_drift() -> None:
+    """Stage 1: function_call name in agent's own tools → no drift, part retained.
+
+    A ``web_developer_agent`` exposes ``write_webpage`` directly on its
+    tool list. An LLM turn emitting ``function_call(name="write_webpage")``
+    must NOT fire any drift — this is the over-firing bug #178 fixed.
+    """
+    steerer = _RecordingSteerer()
+    session = Session(run_id="r")
+    planner = GoldfivePlanner(
+        agent_registry=["web_developer_agent", "research_agent", "coordinator_agent"],
+        steerer=steerer,
+        session=session,
+    )
+    agent = _FakeAgent(
+        name="web_developer_agent",
+        tool_names=["write_webpage", "read_presentation_files", "patch_file"],
+    )
+    ctx = _FakeCallbackContextWithAgent(agent=agent)
+    parts = [
+        _FakePart(function_call=_FakeFunctionCall(id="fc-1", name="write_webpage")),
+        _FakePart(function_call=_FakeFunctionCall(id="fc-2", name="patch_file")),
+    ]
+
+    out = planner.process_planning_response(ctx, parts)
+
+    # No drift fired — all function_calls are the agent's own tools.
+    await asyncio.sleep(0)
+    assert steerer.drifts == [], f"expected no drifts for own-tool calls, got {steerer.drifts!r}"
+
+    # Parts retained verbatim. When no cancellations and no drift
+    # classification fired, the planner returns ``None`` (ADK skip-flag)
+    # to preserve the original response untouched.
+    assert out is None
+
+
+async def test_cross_layer_agent_call_fires_plan_divergence() -> None:
+    """Stage 2: name matches a registry agent but is not in this agent's tools.
+
+    ``research_agent`` (the current agent) has its own tools list
+    without ``coordinator_agent``. The coordinator IS in the tree's
+    registry — so emitting ``function_call(name="coordinator_agent")``
+    from research_agent's LLM is a cross-layer delegation attempt →
+    PLAN_DIVERGENCE (WARNING).
+    """
+    steerer = _RecordingSteerer()
+    session = Session(run_id="r")
+    planner = GoldfivePlanner(
+        agent_registry=["research_agent", "coordinator_agent", "writer_agent"],
+        steerer=steerer,
+        session=session,
+    )
+    agent = _FakeAgent(
+        name="research_agent",
+        tool_names=["web_search", "read_file"],  # NOT coordinator_agent
+    )
+    ctx = _FakeCallbackContextWithAgent(agent=agent)
+    parts = [
+        _FakePart(function_call=_FakeFunctionCall(id="fc-1", name="coordinator_agent")),
+    ]
+
+    out = planner.process_planning_response(ctx, parts)
+
+    await asyncio.sleep(0)
+    assert len(steerer.drifts) == 1, f"expected exactly 1 drift, got {steerer.drifts!r}"
     drift = steerer.drifts[0]
     assert drift.kind is DriftKind.PLAN_DIVERGENCE
-    assert "rogue_agent" in drift.detail
-    assert drift.current_agent_id == "rogue_agent"
+    assert drift.severity.value == "warning"
+    assert "coordinator_agent" in drift.detail
+    assert drift.current_agent_id == "coordinator_agent"
+
+    # Part retained; classification is signal-only.
+    assert out is not None
+    assert [p.function_call.name for p in out if p.function_call] == ["coordinator_agent"]
+
+
+async def test_hallucinated_tool_fires_confabulation_risk() -> None:
+    """Stage 3: name is neither a tool nor a known agent → CONFABULATION_RISK.
+
+    ``flux_capacitor_42`` is in no agent's tool list and not in the
+    tree's registry — pure hallucination. Fire CONFABULATION_RISK at
+    WARNING.
+    """
+    steerer = _RecordingSteerer()
+    session = Session(run_id="r")
+    planner = GoldfivePlanner(
+        agent_registry=["research_agent", "writer_agent"],
+        steerer=steerer,
+        session=session,
+    )
+    agent = _FakeAgent(
+        name="writer_agent",
+        tool_names=["write_text", "read_text"],
+    )
+    ctx = _FakeCallbackContextWithAgent(agent=agent)
+    parts = [
+        _FakePart(function_call=_FakeFunctionCall(id="fc-1", name="flux_capacitor_42")),
+    ]
+
+    out = planner.process_planning_response(ctx, parts)
+
+    await asyncio.sleep(0)
+    assert len(steerer.drifts) == 1, f"expected exactly 1 drift, got {steerer.drifts!r}"
+    drift = steerer.drifts[0]
+    assert drift.kind is DriftKind.CONFABULATION_RISK
+    assert drift.severity.value == "warning"
+    assert "flux_capacitor_42" in drift.detail
+    assert drift.current_agent_id == "flux_capacitor_42"
+
+    # Part retained.
+    assert out is not None
+    assert [p.function_call.name for p in out if p.function_call] == ["flux_capacitor_42"]
+
+
+async def test_cancelled_id_stripped_across_all_stages() -> None:
+    """Cancelled-id filter runs regardless of drift stage.
+
+    Mix parts that would fall in stages 1/2/3 AND carry cancelled ids;
+    verify every cancelled id is stripped and the remaining parts flow
+    into the drift classifier exactly once each.
+    """
+    steerer = _RecordingSteerer()
+    session = Session(run_id="r")
+    planner = GoldfivePlanner(
+        agent_registry=["coordinator_agent", "web_developer_agent"],
+        steerer=steerer,
+        session=session,
+    )
+    agent = _FakeAgent(
+        name="web_developer_agent",
+        tool_names=["write_webpage"],
+    )
+    state = {
+        KEY_CANCELLED_FUNCTION_CALL_IDS: [
+            "fc-cancel-stage1",
+            "fc-cancel-stage2",
+            "fc-cancel-stage3",
+        ],
+    }
+    ctx = _FakeCallbackContextWithAgent(agent=agent, state=state)
+
+    parts = [
+        # Cancelled stage-1 (own tool) — stripped.
+        _FakePart(function_call=_FakeFunctionCall(id="fc-cancel-stage1", name="write_webpage")),
+        # Retained stage-1 (own tool) — no drift.
+        _FakePart(function_call=_FakeFunctionCall(id="fc-ok-1", name="write_webpage")),
+        # Cancelled stage-2 (cross-layer agent) — stripped before classification.
+        _FakePart(function_call=_FakeFunctionCall(id="fc-cancel-stage2", name="coordinator_agent")),
+        # Retained stage-2 — PLAN_DIVERGENCE.
+        _FakePart(function_call=_FakeFunctionCall(id="fc-ok-2", name="coordinator_agent")),
+        # Cancelled stage-3 (hallucination) — stripped before classification.
+        _FakePart(function_call=_FakeFunctionCall(id="fc-cancel-stage3", name="made_up_tool")),
+        # Retained stage-3 — CONFABULATION_RISK.
+        _FakePart(function_call=_FakeFunctionCall(id="fc-ok-3", name="made_up_tool")),
+    ]
+
+    out = planner.process_planning_response(ctx, parts)
+
+    # Every cancelled id removed from the output across all three stages.
+    assert out is not None
+    remaining_ids = [p.function_call.id for p in out if p.function_call]
+    assert remaining_ids == ["fc-ok-1", "fc-ok-2", "fc-ok-3"]
+    assert "fc-cancel-stage1" not in remaining_ids
+    assert "fc-cancel-stage2" not in remaining_ids
+    assert "fc-cancel-stage3" not in remaining_ids
+
+    # Drifts fired only for the retained cross-layer + hallucinated
+    # parts — the cancelled ones never reach classification because
+    # the cancelled-id filter runs first.
+    await asyncio.sleep(0)
+    kinds = sorted(d.kind.value for d in steerer.drifts)
+    assert kinds == ["confabulation_risk", "plan_divergence"], (
+        f"expected one PLAN_DIVERGENCE + one CONFABULATION_RISK, got {steerer.drifts!r}"
+    )
 
 
 async def test_goldfive_planner_process_response_composes_user_planner() -> None:

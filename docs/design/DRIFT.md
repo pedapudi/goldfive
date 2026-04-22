@@ -375,6 +375,47 @@ Four invariants govern the refine path:
    refine that cannot make progress. The counter resets on a
    successful refine.
 
+## Tool-call drift classification
+
+`GoldfivePlanner.process_planning_response` (see
+`goldfive/planners/goldfive_planner.py`) classifies every
+`function_call` part an LLM emits via a three-stage gate. The gate
+keys on the currently-running agent's own `tools` list (read from
+`callback_context._invocation_context.agent.tools`) combined with the
+tree-wide agent registry plumbed in by `ADKAdapter`. The three stages
+cleanly separate "legitimate tool call", "cross-layer delegation
+attempt", and "hallucinated tool name" — which the single-stage
+registry check in #178 conflated into PLAN_DIVERGENCE and over-fired
+on.
+
+| Input shape | Drift kind | Detector location |
+|---|---|---|
+| `function_call` name in agent's own tools | *(none — legitimate tool call)* | — |
+| `function_call` name in tree agent registry but not in this agent's tools (cross-layer) | `PLAN_DIVERGENCE` | `GoldfivePlanner.process_planning_response` |
+| `function_call` name nowhere (not a tool, not a known agent) | `CONFABULATION_RISK` | `GoldfivePlanner.process_planning_response` |
+| tool returned an error payload or raised | `TOOL_ERROR` | `after_tool_callback` observer |
+| tool called in a tight loop | `LOOPING_TOOL_CALL` / `LOOPING_REASONING` | sequence-based detector in `goldfive/drift/reasoning.py` |
+| tool misaligned with the current task's intent | `INTENT_DIVERGENCE` / `GOAL_DRIFT` | goal classifier (`goldfive/drift/goals.py`, future extension) |
+
+The last row is intentionally not implemented in this classifier — a
+separate work item extends `goldfive/drift/goals.py` to cover it.
+
+`function_call` names prefixed with `report_` (the reporting-tool
+protocol namespace — `report_task_started`, `report_task_finished`,
+etc.) are always treated as legitimate regardless of tool-list
+contents: they're protocol calls goldfive injects and may not be
+reflected in every agent's `tools` list depending on when the
+augmentation ran.
+
+Cancelled function_call ids (from
+`session.state['goldfive.cancelled_function_call_ids']`, populated on
+USER_STEER / REPLAN cascade-cancel) are stripped BEFORE the three-
+stage classifier runs, so a cancelled part never produces a drift
+signal regardless of which stage its name would have fallen in.
+
+All three stages emit signals only — the call is never blocked. The
+steerer's intervention ladder (#142) decides whether to escalate.
+
 ## How drifts become events
 
 Every `DriftEvent` produces exactly one `DriftDetected` event in the
