@@ -77,6 +77,33 @@ def find_tool(
     return None
 
 
+# Orchestration-state key the adapter stamps at delegation time
+# (goldfive#191). Duplicated here rather than imported from
+# :mod:`goldfive.orchestration_state` to avoid forcing every adapter
+# to pull in the orchestration module just to resolve a fallback.
+_STATE_KEY_CURRENT_TASK_ID = "goldfive.current_task_id"
+
+
+def _resolve_state_task_id(session: Session) -> str:
+    """Return ``session.state["goldfive.current_task_id"]`` or ``""``.
+
+    Tolerant of a missing ``state`` attribute and a non-mapping /
+    non-string value — any degenerate shape yields the empty string
+    so the caller's existing ``missing_task_id`` rejection still
+    fires. Strips whitespace to match the ``task_id`` normalisation
+    :func:`invoke_tool` already applies to the arg.
+    """
+    state = getattr(session, "state", None)
+    if not isinstance(state, dict):
+        return ""
+    raw = state.get(_STATE_KEY_CURRENT_TASK_ID, "")
+    if isinstance(raw, str):
+        return raw.strip()
+    if raw is None:
+        return ""
+    return str(raw).strip()
+
+
 async def invoke_tool(
     tools: Iterable[ReportingToolSpec],
     name: str,
@@ -113,6 +140,19 @@ async def invoke_tool(
         return await tool.handler(args, session, steerer)
 
     task_id = str(args.get("task_id") or "").strip()
+    # goldfive#191 Layer 2: fall back to the orchestration-state pin
+    # when the model's tool call omits ``task_id``. The adapter's
+    # ``before_agent_callback`` stamps ``goldfive.current_task_id`` at
+    # delegation time when the starting sub-agent has an unambiguous
+    # plan task assignment. Mutating ``args`` here (rather than just
+    # using a local) makes the resolved id visible to the handler too,
+    # so all downstream paths (idempotency signature, terminal-task
+    # lookup, handler body) see a single consistent value.
+    if not task_id:
+        fallback = _resolve_state_task_id(session)
+        if fallback:
+            task_id = fallback
+            args["task_id"] = fallback
     guard_key = task_id or "__plan__"
     is_plan_level = name in _PLAN_LEVEL_TOOLS
     sig = (name, args_signature(args))

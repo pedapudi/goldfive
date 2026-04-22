@@ -1226,20 +1226,39 @@ def make_adk_plugin(
             return None
 
         async def before_agent_callback(self, *, agent: Any, callback_context: Any) -> None:
-            """Forward an agent-turn start to the overlay reconciler.
+            """Pin ``goldfive.current_task_id`` for the starting sub-agent and
+            forward an agent-turn start to the overlay reconciler.
 
             Fires once per agent invocation (including sub-agents
-            inside AgentTool sub-Runners). When a
-            :class:`~goldfive.reconciler.PlanReconciler` is attached,
-            we forward ``agent.name``, the invocation id, and the
-            parent_invocation_id (the outer runner's id, when the
-            current invocation is nested inside an ``AgentTool``
-            sub-Runner) so the reconciler can resolve parent chains
-            for contextual matching (goldfive#151).
+            inside AgentTool sub-Runners). Two jobs:
+
+            1. **Task-id pinning (goldfive#191 Layer 1).** At delegation
+               time, find the unique plan task whose
+               ``assignee_agent_id == agent.name`` and whose status is
+               PENDING or RUNNING, and stamp its id onto both the live
+               ADK ``session.state`` and the goldfive orchestration
+               ``session.state`` under the ``goldfive.current_task_id``
+               key. Sub-agents' reporting-tool handlers read this key
+               as a fallback when the model's tool call omits
+               ``task_id``, so delegated work doesn't retry-loop on
+               the structured ``missing_task_id`` error.
+
+               Zero matches (off-plan agent) and multiple matches
+               (ambiguous — a coordinator with two pending siblings
+               for the same assignee) intentionally leave the state
+               unset. The ``missing_task_id`` error path still fires
+               in those cases — better an explicit rejection than a
+               mis-attributed report.
+
+            2. **Overlay reconciler forward.** When a
+               :class:`~goldfive.reconciler.PlanReconciler` is
+               attached, we forward ``agent.name``, the invocation
+               id, and the parent_invocation_id (the outer runner's
+               id, when the current invocation is nested inside an
+               ``AgentTool`` sub-Runner) so the reconciler can
+               resolve parent chains for contextual matching
+               (goldfive#151).
             """
-            reconciler = self._reconciler
-            if reconciler is None:
-                return None
             agent_name = str(_safe_attr(agent, "name", "") or "")
             inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
                 callback_context, "invocation_context", None
@@ -1248,6 +1267,25 @@ def make_adk_plugin(
             parent_inv_id = ""
             if inv_id and self._top_invocation_id and inv_id != self._top_invocation_id:
                 parent_inv_id = self._top_invocation_id
+
+            # Layer 1: pin the starting sub-agent's task_id so its
+            # reporting-tool calls can default the arg from state
+            # (goldfive#191). Best-effort: a raise here must never
+            # break the invocation.
+            try:
+                self._pin_current_task_id_for_agent(
+                    agent_name=agent_name,
+                    callback_context=callback_context,
+                )
+            except Exception as exc:  # noqa: BLE001 — pinning must never raise
+                log.debug(
+                    "before_agent_callback: current_task_id pin raised: %s",
+                    exc,
+                )
+
+            reconciler = self._reconciler
+            if reconciler is None:
+                return None
             try:
                 await reconciler.on_before_agent(
                     agent_name=agent_name,
@@ -1273,6 +1311,106 @@ def make_adk_plugin(
                     exc,
                 )
             return None
+
+        def _pin_current_task_id_for_agent(
+            self,
+            *,
+            agent_name: str,
+            callback_context: Any,
+        ) -> None:
+            """Stamp ``goldfive.current_task_id`` for ``agent_name`` if unambiguous.
+
+            Matching rule: the plan task whose ``assignee_agent_id``
+            equals ``agent_name`` and whose status is PENDING or
+            RUNNING. Exactly-one matches stamp the id onto both the
+            live ADK ``session.state`` (agent-side reads via
+            ``tool_ctx.state``) and the goldfive orchestration
+            ``session.state`` (handler fallback in
+            :mod:`goldfive.reporting` + :mod:`goldfive.adapters._tool_invocation`).
+
+            Zero / multiple matches leave state unset — the handler
+            path will surface the existing ``missing_task_id`` error
+            rather than guess, which is the correct signal for an
+            off-plan agent or an ambiguous coordinator assignment.
+
+            Silent on every failure mode (no agent name, no ctx, no
+            plan, state not a mapping). Instrumentation-class path:
+            a mistake here degrades to the pre-#191 behaviour where
+            the model sees ``missing_task_id`` and retry-loops — bad,
+            but strictly no worse than the baseline.
+            """
+            if not agent_name:
+                return
+            ctx = self._resolve_ctx(callback_context)
+            if ctx is None:
+                return
+            plan = _safe_attr(ctx.session, "plan", None)
+            if plan is None:
+                return
+            tasks = _safe_attr(plan, "tasks", None) or ()
+            # Import here so the type is available without forcing a
+            # top-level import for a rarely-hot-path enum compare.
+            from goldfive.types import TaskStatus
+
+            matches: list[Any] = []
+            for task in tasks:
+                assignee = str(_safe_attr(task, "assignee_agent_id", "") or "")
+                if assignee != agent_name:
+                    continue
+                status = _safe_attr(task, "status", None)
+                if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
+                    matches.append(task)
+                    if len(matches) > 1:
+                        break  # ambiguous — no need to count further
+
+            if len(matches) != 1:
+                # Zero matches (off-plan) or >1 matches (ambiguous).
+                # Leave state unset; the existing ``missing_task_id``
+                # error path remains the explicit signal.
+                log.debug(
+                    "before_agent_callback: not pinning current_task_id for %s "
+                    "(%d PENDING/RUNNING task matches)",
+                    agent_name,
+                    len(matches),
+                )
+                return
+            task = matches[0]
+            task_id = str(_safe_attr(task, "id", "") or "")
+            if not task_id:
+                return
+
+            # Stamp the goldfive orchestration-state key first — the
+            # reporting-tool handler fallback in ``invoke_tool`` +
+            # ``reporting.py`` reads from here.
+            gf_state = _safe_attr(ctx.session, "state", None)
+            if isinstance(gf_state, dict):
+                try:
+                    gf_state[_sp.KEY_CURRENT_TASK_ID] = task_id
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_agent_callback: goldfive session.state pin failed: %s",
+                        exc,
+                    )
+
+            # Stamp the ADK session.state key — the sibling's Layer 3
+            # (before_tool_callback arg-injection) reads from here and
+            # any agent that inspects ``tool_ctx.state`` directly picks
+            # up the same value.
+            adk_state = _session_state_from_callback(callback_context)
+            if isinstance(adk_state, Mapping):
+                try:
+                    _sp.write_current_task_id(adk_state, task_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_agent_callback: ADK session.state pin failed: %s",
+                        exc,
+                    )
+
+            log.info(
+                "goldfive: pinned current_task_id=%s for sub-agent %s",
+                task_id,
+                agent_name,
+            )
 
         async def after_agent_callback(self, *, agent: Any, callback_context: Any) -> None:
             """Forward an agent-turn end to the overlay reconciler."""

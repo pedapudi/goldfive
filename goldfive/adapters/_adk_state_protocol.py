@@ -203,6 +203,24 @@ def read_divergence_flag(state: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def write_current_task_id(state: MutableMapping[str, Any], task_id: str) -> None:
+    """Stamp just ``goldfive.current_task_id`` onto ``state``.
+
+    Narrower than :func:`write_current_task` which rewrites all four
+    ``current_task_*`` keys from a :class:`Task`. Used by the adapter's
+    ``before_agent_callback`` pin path (goldfive#191 Layer 1) where the
+    plugin only knows the id at delegation time and doesn't want to
+    overwrite the title/description/assignee written earlier by the
+    reconciler.
+
+    Empty / None ``task_id`` is a no-op — callers that want to clear
+    the key should use :func:`clear_current_task`.
+    """
+    if not task_id:
+        return
+    _set(state, KEY_CURRENT_TASK_ID, _safe_str(task_id))
+
+
 def write_current_task(state: MutableMapping[str, Any], task: Any) -> None:
     """Mutate state with current_task_* fields from a :class:`goldfive.types.Task`.
 
@@ -223,9 +241,7 @@ def write_current_task(state: MutableMapping[str, Any], task: Any) -> None:
         tid = getattr(task, "id", "")
         title = getattr(task, "title", "")
         description = getattr(task, "description", "")
-        assignee = getattr(task, "assignee_agent_id", "") or getattr(
-            task, "assignee", ""
-        )
+        assignee = getattr(task, "assignee_agent_id", "") or getattr(task, "assignee", "")
 
     _set(state, KEY_CURRENT_TASK_ID, _safe_str(tid))
     _set(state, KEY_CURRENT_TASK_TITLE, _safe_str(title))
@@ -281,9 +297,7 @@ def write_plan_context(
             {
                 "id": tid,
                 "title": _safe_str(getattr(task, "title", "")),
-                "assignee": _safe_str(
-                    getattr(task, "assignee_agent_id", "") or host_agent
-                ),
+                "assignee": _safe_str(getattr(task, "assignee_agent_id", "") or host_agent),
                 "status": status_str,
                 "deps": list(deps_by_task.get(tid, [])),
             }
@@ -305,9 +319,7 @@ def write_run_id(state: MutableMapping[str, Any], run_id: str) -> None:
     _set(state, KEY_RUN_ID, _safe_str(run_id))
 
 
-def write_tools_available(
-    state: MutableMapping[str, Any], tool_names: Iterable[str]
-) -> None:
+def write_tools_available(state: MutableMapping[str, Any], tool_names: Iterable[str]) -> None:
     _set(
         state,
         KEY_TOOLS_AVAILABLE,
@@ -406,14 +418,10 @@ def extract_agent_writes(before: Any, after: Any) -> dict:
     after_map: Mapping[str, Any] = after if isinstance(after, Mapping) else {}
 
     before_g = {
-        k: v
-        for k, v in before_map.items()
-        if isinstance(k, str) and k.startswith(GOLDFIVE_PREFIX)
+        k: v for k, v in before_map.items() if isinstance(k, str) and k.startswith(GOLDFIVE_PREFIX)
     }
     after_g = {
-        k: v
-        for k, v in after_map.items()
-        if isinstance(k, str) and k.startswith(GOLDFIVE_PREFIX)
+        k: v for k, v in after_map.items() if isinstance(k, str) and k.startswith(GOLDFIVE_PREFIX)
     }
 
     changes: dict[str, Any] = {}
