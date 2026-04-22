@@ -311,6 +311,83 @@ async def test_drift_mid_run_applies_refined_plan() -> None:
     assert kinds.index("plan_revised") < kinds.index("run_completed")
 
 
+async def test_out_of_band_plan_revised_carries_annotation_id() -> None:
+    """Out-of-band PlanRevised preserves revision_annotation_id (goldfive#196).
+
+    When the steerer swaps ``session.plan`` mid-run, the sequential
+    executor emits its own PlanRevised envelope to mark the boundary.
+    That envelope must carry the source annotation_id (read off
+    ``plan.revision_annotation_id``) so harmonograf's intervention
+    aggregator can strict-join it to the source annotation — otherwise
+    a slow refine (kikuchi/Qwen, ~14m) strands the plan row outside
+    the time-window fallback and leaks a duplicate STEER card.
+    See harmonograf#95.
+    """
+    plan = _linear_plan(2)
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    # Simulate the post-steerer state: a revised plan stamped with the
+    # source annotation_id (what DefaultSteerer._apply_revision would
+    # produce on a USER_STEER from an annotation-backed ControlMessage).
+    refined = Plan(
+        id="p1",
+        run_id=session.run_id,
+        goal_ids=[],
+        tasks=[
+            Task(id="t0", title="Task 0", status=TaskStatus.COMPLETED),
+            Task(id="t1b", title="Task 1 revised"),
+        ],
+        edges=[TaskEdge(from_task_id="t0", to_task_id="t1b")],
+        revision_reason="by alice: refocus",
+        revision_kind=DriftKind.USER_STEER.value,
+        revision_severity=DriftSeverity.WARNING.value,
+        revision_index=1,
+        revision_annotation_id="ann_seq_mid_run",
+    )
+    planner.set_refine_result(refined)
+
+    call_count = {"n": 0}
+
+    async def _swap_plan(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+            # Mimic the steerer's USER_STEER handoff: swap session.plan
+            # without emitting the steerer-side PlanRevised, so the
+            # executor's out-of-band detector is what fires.
+            session.plan = refined
+            return InvocationResult(task_id=task.id, text="steered")
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id=task.id, text=f"done:{task.id}")
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_swap_plan)
+    executor = SequentialExecutor(max_task_invocations=5)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    assert outcome.success is True
+    revised_events = [
+        e
+        for e in sink.events
+        if getattr(e, "WhichOneof", lambda *_: None)("payload") == "plan_revised"
+    ]
+    assert revised_events, "executor should emit PlanRevised on out-of-band plan swap"
+    evt = revised_events[0]
+    assert evt.plan_revised.annotation_id == "ann_seq_mid_run"
+    assert evt.plan_revised.plan.revision_annotation_id == "ann_seq_mid_run"
+
+
 # ---------------------------------------------------------------------------
 # Scenario 3: fail_fast behavior.
 # ---------------------------------------------------------------------------

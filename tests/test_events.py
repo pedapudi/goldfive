@@ -19,8 +19,17 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
-from goldfive.events import build_plan_revision_diff  # noqa: E402
-from goldfive.types import Plan, Task, TaskEdge, TaskStatus  # noqa: E402
+from goldfive.control import ControlKind, ControlMessage  # noqa: E402
+from goldfive.events import build_plan_revision_diff, plan_revised_event  # noqa: E402
+from goldfive.types import (  # noqa: E402
+    DriftEvent,
+    DriftKind,
+    DriftSeverity,
+    Plan,
+    Task,
+    TaskEdge,
+    TaskStatus,
+)
 
 
 def _plan(
@@ -219,3 +228,124 @@ def test_plan_revision_diff_identity_revision_is_empty() -> None:
     assert list(diff.modified_task_ids) == []
     assert list(diff.added_edges) == []
     assert list(diff.removed_edges) == []
+
+
+# ---------------------------------------------------------------------------
+# plan_revised_event — annotation_id propagation (goldfive#196)
+# ---------------------------------------------------------------------------
+
+
+def _revised_plan(*, annotation_id: str = "") -> Plan:
+    return Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[Task(id="t1", title="T1", status=TaskStatus.PENDING)],
+        edges=[],
+        revision_kind=DriftKind.USER_STEER.value,
+        revision_severity=DriftSeverity.WARNING.value,
+        revision_reason="pivot",
+        revision_index=1,
+        revision_annotation_id=annotation_id,
+    )
+
+
+def test_plan_revised_event_reads_annotation_id_from_plan() -> None:
+    """When ``plan.revision_annotation_id`` is set, the event copies it."""
+    plan = _revised_plan(annotation_id="ann_plan_src")
+    evt = plan_revised_event(
+        run_id="r1",
+        sequence=5,
+        plan=plan,
+        drift_kind=plan.revision_kind,
+        severity=plan.revision_severity,
+        reason=plan.revision_reason,
+        revision_index=plan.revision_index,
+    )
+    assert evt.plan_revised.annotation_id == "ann_plan_src"
+    # Plan sub-message also carries it so persisted plans round-trip.
+    assert evt.plan_revised.plan.revision_annotation_id == "ann_plan_src"
+
+
+def test_plan_revised_event_falls_back_to_drift_raw_control_message() -> None:
+    """When the plan lacks the id but the drift's raw carries it, use that."""
+    plan = _revised_plan(annotation_id="")  # not stamped on plan
+    raw = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-x",
+        payload={"note": "pivot", "annotation_id": "ann_from_drift"},
+    )
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="pivot",
+        raw=raw,
+    )
+    evt = plan_revised_event(
+        run_id="r1",
+        sequence=5,
+        plan=plan,
+        drift=drift,
+    )
+    assert evt.plan_revised.annotation_id == "ann_from_drift"
+
+
+def test_plan_revised_event_explicit_kwarg_wins() -> None:
+    """Explicit ``annotation_id`` kwarg overrides both plan and drift sources."""
+    plan = _revised_plan(annotation_id="ann_plan_src")
+    raw = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-y",
+        payload={"note": "pivot", "annotation_id": "ann_from_drift"},
+    )
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="pivot",
+        raw=raw,
+    )
+    evt = plan_revised_event(
+        run_id="r1",
+        sequence=5,
+        plan=plan,
+        drift=drift,
+        annotation_id="ann_override",
+    )
+    assert evt.plan_revised.annotation_id == "ann_override"
+
+
+def test_plan_revised_event_autonomous_refine_leaves_annotation_id_empty() -> None:
+    """No plan stamp + no ControlMessage in drift.raw → empty field."""
+    plan = _revised_plan(annotation_id="")
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_REASONING,
+        severity=DriftSeverity.WARNING,
+        detail="loop detected",
+        raw={"event": "tool_error"},  # dict, not ControlMessage
+    )
+    evt = plan_revised_event(
+        run_id="r1",
+        sequence=5,
+        plan=plan,
+        drift=drift,
+    )
+    assert evt.plan_revised.annotation_id == ""
+
+
+def test_plan_revised_event_proto_round_trips_annotation_id() -> None:
+    """Serialize + deserialize the envelope — the field survives the wire."""
+    from goldfive.pb.goldfive.v1 import events_pb2
+
+    plan = _revised_plan(annotation_id="ann_roundtrip")
+    evt = plan_revised_event(
+        run_id="r1",
+        sequence=9,
+        plan=plan,
+        drift_kind=plan.revision_kind,
+        revision_index=plan.revision_index,
+    )
+    encoded = evt.SerializeToString()
+    decoded = events_pb2.Event()
+    decoded.ParseFromString(encoded)
+    assert decoded.plan_revised.annotation_id == "ann_roundtrip"
+    assert decoded.plan_revised.plan.revision_annotation_id == "ann_roundtrip"

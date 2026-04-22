@@ -142,6 +142,15 @@ message PlanRevised {
   // can ignore it. Consumers that want a no-fetch "what changed" view
   // should read this field. See :class:`PlanRevisionDiff` above.
   PlanRevisionDiff diff = 6;
+  // Source annotation id when the revision was triggered by a user-control
+  // drift (USER_STEER / USER_CANCEL). Empty for autonomous refines
+  // (LOOPING_REASONING, TOOL_ERROR, GOAL_DRIFT, cascade_cancel, …).
+  // Populated via the drift's annotation_id (goldfive#176) — sinks that
+  // merge plan-revision rows against the source annotation row use this
+  // as the strict join key so a slow refine beyond the time-window
+  // fallback still dedups to a single intervention card. See
+  // harmonograf#95 for the fall-through bug this field closes.
+  string annotation_id = 7;
 }
 
 // Task transitioned PENDING -> RUNNING.
