@@ -78,6 +78,66 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
 
 _ACK: dict[str, Any] = {"acknowledged": True}
 
+# Orchestration-state key the adapter stamps at delegation time
+# (goldfive#191). Handlers fall back to this value when the model's
+# tool call omits ``task_id``. Re-declared here rather than imported
+# from :mod:`goldfive.orchestration_state` to avoid a circular import
+# — the string is a stable contract shared between the adapter's
+# :mod:`._adk_state_protocol`, :mod:`orchestration_state`, and this
+# handler module.
+_STATE_KEY_CURRENT_TASK_ID = "goldfive.current_task_id"
+
+
+def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
+    """Return the task_id to act on, falling back to session state.
+
+    Order of precedence (goldfive#191):
+
+    1. ``args["task_id"]`` — explicit model-provided id always wins.
+    2. ``session.state["goldfive.current_task_id"]`` — the id pinned
+       by the adapter's ``before_agent_callback`` when the current
+       sub-agent has exactly one PENDING/RUNNING task assigned to
+       it. Closes the loop where the LLM's tool call omits the
+       arg but the orchestration layer knew the answer.
+
+    Empty string when neither source supplies a value — caller
+    should short-circuit with the canonical ``missing_task_id``
+    error in that case.
+    """
+    raw = args.get("task_id")
+    if raw is not None:
+        task_id = str(raw).strip()
+        if task_id:
+            return task_id
+    state = getattr(session, "state", None)
+    if isinstance(state, dict):
+        fallback = state.get(_STATE_KEY_CURRENT_TASK_ID, "")
+        if isinstance(fallback, str):
+            return fallback.strip()
+        if fallback is not None:
+            return str(fallback).strip()
+    return ""
+
+
+def _missing_task_id_response(tool_name: str) -> dict[str, Any]:
+    """Return the canonical ``missing_task_id`` rejection shape.
+
+    Mirrors the shape :mod:`goldfive.adapters._tool_invocation`
+    returns so adapters that call the handler directly (legacy paths,
+    custom adapters) surface the same structured error the
+    ``invoke_tool`` dispatcher would.
+    """
+    return {
+        "acknowledged": False,
+        "error": "missing_task_id",
+        "tool": tool_name,
+        "message": (
+            f"Tool {tool_name!r} requires a task_id; call it with the id "
+            "of the task you're reporting on, or ensure the adapter "
+            "has pinned goldfive.current_task_id on session state."
+        ),
+    }
+
 
 def _str(args: dict[str, Any], key: str, default: str = "") -> str:
     v = args.get(key, default)
@@ -114,28 +174,30 @@ def _int(args: dict[str, Any], key: str, default: int = 0) -> int:
 async def _handle_task_started(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _str(args, "task_id")
+    task_id = _resolve_task_id(args, session)
     detail = _str(args, "detail")
-    if task_id:
-        await steerer.mark_task_running(task_id, session=session, detail=detail)
+    if not task_id:
+        return _missing_task_id_response("report_task_started")
+    await steerer.mark_task_running(task_id, session=session, detail=detail)
     return dict(_ACK)
 
 
 async def _handle_task_progress(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _str(args, "task_id")
+    task_id = _resolve_task_id(args, session)
     fraction = _float(args, "fraction")
     detail = _str(args, "detail")
-    if task_id:
-        await steerer.mark_task_progress(task_id, session=session, fraction=fraction, detail=detail)
+    if not task_id:
+        return _missing_task_id_response("report_task_progress")
+    await steerer.mark_task_progress(task_id, session=session, fraction=fraction, detail=detail)
     return dict(_ACK)
 
 
 async def _handle_task_completed(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _str(args, "task_id")
+    task_id = _resolve_task_id(args, session)
     summary = _str(args, "summary")
     artifacts_raw = args.get("artifacts")
     artifacts = (
@@ -143,37 +205,40 @@ async def _handle_task_completed(
         if isinstance(artifacts_raw, dict)
         else {}
     )
-    if task_id:
-        await steerer.mark_task_completed(
-            task_id, session=session, summary=summary, artifacts=artifacts
-        )
+    if not task_id:
+        return _missing_task_id_response("report_task_completed")
+    await steerer.mark_task_completed(
+        task_id, session=session, summary=summary, artifacts=artifacts
+    )
     return dict(_ACK)
 
 
 async def _handle_task_failed(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _str(args, "task_id")
+    task_id = _resolve_task_id(args, session)
     reason = _str(args, "reason")
     recoverable = _bool(args, "recoverable", default=True)
-    if task_id:
-        await steerer.mark_task_failed(
-            task_id,
-            session=session,
-            reason=reason,
-            recoverable=recoverable,
-        )
+    if not task_id:
+        return _missing_task_id_response("report_task_failed")
+    await steerer.mark_task_failed(
+        task_id,
+        session=session,
+        reason=reason,
+        recoverable=recoverable,
+    )
     return dict(_ACK)
 
 
 async def _handle_task_blocked(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _str(args, "task_id")
+    task_id = _resolve_task_id(args, session)
     blocker = _str(args, "blocker")
     needed = _str(args, "needed")
-    if task_id:
-        await steerer.mark_task_blocked(task_id, session=session, blocker=blocker, needed=needed)
+    if not task_id:
+        return _missing_task_id_response("report_task_blocked")
+    await steerer.mark_task_blocked(task_id, session=session, blocker=blocker, needed=needed)
     return dict(_ACK)
 
 
@@ -223,11 +288,11 @@ async def _handle_awaiting_approval(
     decision lands returns ``{"decision": "timeout", "detail": ...}``
     and leaves the task blocked (the caller may re-prompt or fail).
     """
-    task_id = _str(args, "task_id")
+    task_id = _resolve_task_id(args, session)
     prompt = _str(args, "prompt")
     timeout_ms = _int(args, "timeout_ms", 0)
     if not task_id:
-        return {"acknowledged": False, "error": "task_id is required"}
+        return _missing_task_id_response("report_awaiting_approval")
 
     # Idempotency: reuse an existing waiter if one is already pending.
     waiter = session.pending_approvals.get(task_id)
@@ -330,8 +395,16 @@ def _object_schema(*, required: list[str], properties: dict[str, dict[str, Any]]
     }
 
 
+# NOTE: ``task_id`` is intentionally omitted from every schema's
+# ``required`` list (goldfive#191). The adapter stamps
+# ``goldfive.current_task_id`` onto session state at delegation time
+# so the handler can default from state when the model doesn't supply
+# the arg. Handlers still reject with the canonical
+# ``missing_task_id`` shape when neither source resolves a value —
+# so strictness is enforced at the handler layer, not the schema.
+
 _SCHEMA_TASK_STARTED = _object_schema(
-    required=["task_id"],
+    required=[],
     properties={
         "task_id": {"type": "string"},
         "detail": {"type": "string"},
@@ -339,7 +412,7 @@ _SCHEMA_TASK_STARTED = _object_schema(
 )
 
 _SCHEMA_TASK_PROGRESS = _object_schema(
-    required=["task_id"],
+    required=[],
     properties={
         "task_id": {"type": "string"},
         "fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
@@ -348,7 +421,7 @@ _SCHEMA_TASK_PROGRESS = _object_schema(
 )
 
 _SCHEMA_TASK_COMPLETED = _object_schema(
-    required=["task_id", "summary"],
+    required=["summary"],
     properties={
         "task_id": {"type": "string"},
         "summary": {"type": "string"},
@@ -360,7 +433,7 @@ _SCHEMA_TASK_COMPLETED = _object_schema(
 )
 
 _SCHEMA_TASK_FAILED = _object_schema(
-    required=["task_id", "reason"],
+    required=["reason"],
     properties={
         "task_id": {"type": "string"},
         "reason": {"type": "string"},
@@ -369,7 +442,7 @@ _SCHEMA_TASK_FAILED = _object_schema(
 )
 
 _SCHEMA_TASK_BLOCKED = _object_schema(
-    required=["task_id", "blocker"],
+    required=["blocker"],
     properties={
         "task_id": {"type": "string"},
         "blocker": {"type": "string"},
@@ -396,7 +469,7 @@ _SCHEMA_PLAN_DIVERGENCE = _object_schema(
 )
 
 _SCHEMA_AWAITING_APPROVAL = _object_schema(
-    required=["task_id", "prompt"],
+    required=["prompt"],
     properties={
         "task_id": {"type": "string"},
         "prompt": {"type": "string"},
