@@ -231,11 +231,11 @@ def test_plan_revision_diff_identity_revision_is_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
-# plan_revised_event — annotation_id propagation (goldfive#196)
+# plan_revised_event — trigger_event_id propagation (goldfive#199)
 # ---------------------------------------------------------------------------
 
 
-def _revised_plan(*, annotation_id: str = "") -> Plan:
+def _revised_plan(*, trigger_event_id: str = "") -> Plan:
     return Plan(
         id="p1",
         run_id="r1",
@@ -246,13 +246,13 @@ def _revised_plan(*, annotation_id: str = "") -> Plan:
         revision_severity=DriftSeverity.WARNING.value,
         revision_reason="pivot",
         revision_index=1,
-        revision_annotation_id=annotation_id,
+        revision_trigger_event_id=trigger_event_id,
     )
 
 
-def test_plan_revised_event_reads_annotation_id_from_plan() -> None:
-    """When ``plan.revision_annotation_id`` is set, the event copies it."""
-    plan = _revised_plan(annotation_id="ann_plan_src")
+def test_plan_revised_event_reads_trigger_event_id_from_plan() -> None:
+    """When ``plan.revision_trigger_event_id`` is set, the event copies it."""
+    plan = _revised_plan(trigger_event_id="ann_plan_src")
     evt = plan_revised_event(
         run_id="r1",
         sequence=5,
@@ -262,14 +262,14 @@ def test_plan_revised_event_reads_annotation_id_from_plan() -> None:
         reason=plan.revision_reason,
         revision_index=plan.revision_index,
     )
-    assert evt.plan_revised.annotation_id == "ann_plan_src"
+    assert evt.plan_revised.trigger_event_id == "ann_plan_src"
     # Plan sub-message also carries it so persisted plans round-trip.
-    assert evt.plan_revised.plan.revision_annotation_id == "ann_plan_src"
+    assert evt.plan_revised.plan.revision_trigger_event_id == "ann_plan_src"
 
 
-def test_plan_revised_event_falls_back_to_drift_raw_control_message() -> None:
-    """When the plan lacks the id but the drift's raw carries it, use that."""
-    plan = _revised_plan(annotation_id="")  # not stamped on plan
+def test_plan_revised_event_user_steer_uses_annotation_id_from_drift() -> None:
+    """User-control drift: trigger_event_id resolves to ControlMessage.annotation_id."""
+    plan = _revised_plan(trigger_event_id="")  # not stamped on plan
     raw = ControlMessage(
         kind=ControlKind.STEER,
         id="ctl-x",
@@ -287,12 +287,12 @@ def test_plan_revised_event_falls_back_to_drift_raw_control_message() -> None:
         plan=plan,
         drift=drift,
     )
-    assert evt.plan_revised.annotation_id == "ann_from_drift"
+    assert evt.plan_revised.trigger_event_id == "ann_from_drift"
 
 
 def test_plan_revised_event_explicit_kwarg_wins() -> None:
-    """Explicit ``annotation_id`` kwarg overrides both plan and drift sources."""
-    plan = _revised_plan(annotation_id="ann_plan_src")
+    """Explicit ``trigger_event_id`` kwarg overrides both plan and drift sources."""
+    plan = _revised_plan(trigger_event_id="ann_plan_src")
     raw = ControlMessage(
         kind=ControlKind.STEER,
         id="ctl-y",
@@ -309,34 +309,40 @@ def test_plan_revised_event_explicit_kwarg_wins() -> None:
         sequence=5,
         plan=plan,
         drift=drift,
-        annotation_id="ann_override",
+        trigger_event_id="ann_override",
     )
-    assert evt.plan_revised.annotation_id == "ann_override"
+    assert evt.plan_revised.trigger_event_id == "ann_override"
 
 
-def test_plan_revised_event_autonomous_refine_leaves_annotation_id_empty() -> None:
-    """No plan stamp + no ControlMessage in drift.raw → empty field."""
-    plan = _revised_plan(annotation_id="")
+def test_plan_revised_event_autonomous_refine_stamps_drift_id() -> None:
+    """Rescope: autonomous drift → trigger_event_id == drift.id (goldfive#199).
+
+    Previously the field was left empty; harmonograf then relied on a
+    time-window fallback. The rescope removes that guesswork — every
+    refine carries a strict id.
+    """
+    plan = _revised_plan(trigger_event_id="")
     drift = DriftEvent(
         kind=DriftKind.LOOPING_REASONING,
         severity=DriftSeverity.WARNING,
         detail="loop detected",
         raw={"event": "tool_error"},  # dict, not ControlMessage
     )
+    assert drift.id  # DriftEvent defaults id to a UUID4 at construction
     evt = plan_revised_event(
         run_id="r1",
         sequence=5,
         plan=plan,
         drift=drift,
     )
-    assert evt.plan_revised.annotation_id == ""
+    assert evt.plan_revised.trigger_event_id == drift.id
 
 
-def test_plan_revised_event_proto_round_trips_annotation_id() -> None:
+def test_plan_revised_event_proto_round_trips_trigger_event_id() -> None:
     """Serialize + deserialize the envelope — the field survives the wire."""
     from goldfive.pb.goldfive.v1 import events_pb2
 
-    plan = _revised_plan(annotation_id="ann_roundtrip")
+    plan = _revised_plan(trigger_event_id="ann_roundtrip")
     evt = plan_revised_event(
         run_id="r1",
         sequence=9,
@@ -347,5 +353,5 @@ def test_plan_revised_event_proto_round_trips_annotation_id() -> None:
     encoded = evt.SerializeToString()
     decoded = events_pb2.Event()
     decoded.ParseFromString(encoded)
-    assert decoded.plan_revised.annotation_id == "ann_roundtrip"
-    assert decoded.plan_revised.plan.revision_annotation_id == "ann_roundtrip"
+    assert decoded.plan_revised.trigger_event_id == "ann_roundtrip"
+    assert decoded.plan_revised.plan.revision_trigger_event_id == "ann_roundtrip"

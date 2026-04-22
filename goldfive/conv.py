@@ -227,10 +227,11 @@ def to_pb_plan(plan: Plan) -> Any:
         revision_kind=_plan_revision_kind_to_pb(plan.revision_kind, pb),
         revision_severity=_plan_revision_severity_to_pb(plan.revision_severity, pb),
         revision_index=plan.revision_index,
-        # goldfive#196: carry the source annotation id for user-control
-        # refines so sinks can dedup the PlanRevised row against the
-        # source annotation without relying on a time-window fallback.
-        revision_annotation_id=plan.revision_annotation_id,
+        # goldfive#199: carry the trigger_event_id on the Plan so
+        # out-of-band PlanRevised emitters can thread it through without
+        # re-deriving it. Non-empty for every revision (user-control and
+        # autonomous); empty on the initial plan. See harmonograf#95.
+        revision_trigger_event_id=plan.revision_trigger_event_id,
     )
     msg.goal_ids.extend(plan.goal_ids)
     for t in plan.tasks:
@@ -253,9 +254,9 @@ def from_pb_plan(msg: Any) -> Plan:
         revision_kind=_plan_revision_kind_from_pb(msg.revision_kind, pb),
         revision_severity=_plan_revision_severity_from_pb(msg.revision_severity, pb),
         revision_index=msg.revision_index,
-        # goldfive#196: round-trip the source annotation id so persistence
+        # goldfive#199: round-trip the trigger_event_id so persistence
         # sinks that re-emit stored plans don't lose the dedup key.
-        revision_annotation_id=getattr(msg, "revision_annotation_id", "") or "",
+        revision_trigger_event_id=getattr(msg, "revision_trigger_event_id", "") or "",
     )
 
 

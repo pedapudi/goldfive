@@ -767,18 +767,17 @@ async def test_llm_planner_non_user_steer_uses_default_refine_path() -> None:
 
 
 # ---------------------------------------------------------------------------
-# PlanRevised annotation_id stamping (goldfive#196 / harmonograf#95)
+# PlanRevised trigger_event_id stamping (goldfive#199 / harmonograf#95 rescope)
 # ---------------------------------------------------------------------------
 
 
 async def test_plan_revised_stamps_annotation_id_from_user_steer(
 ) -> None:
-    """PlanRevised proto carries the source annotation_id (goldfive#196).
+    """PlanRevised.trigger_event_id uses the source annotation_id for USER_STEER.
 
-    Without this field, harmonograf can't strict-join the plan-revision
-    row to the source annotation when the refine outruns the 5-min
-    time-window fallback. Observed on kikuchi/Qwen3.5-35B at ~14m
-    annotation→plan-revised gap (harmonograf#95).
+    Rescoped from goldfive#196 (harmonograf#95): the strict-id dedup key
+    is now ``trigger_event_id``. For user-control refines, it resolves to
+    the annotation_id carried by the originating ControlMessage.
     """
     steerer, session, sink, _planner = _bind_fresh()
     msg = ControlMessage(
@@ -797,15 +796,21 @@ async def test_plan_revised_stamps_annotation_id_from_user_steer(
         e for e in sink.events if e.WhichOneof("payload") == "plan_revised"
     ]
     assert revised_events, "USER_STEER with successful refine must emit PlanRevised"
-    assert revised_events[0].plan_revised.annotation_id == "ann_pr_123"
+    assert revised_events[0].plan_revised.trigger_event_id == "ann_pr_123"
     # The id is also persisted on the Plan proto itself so out-of-band
     # emitters (SequentialExecutor plan-swap detector) can recover it.
-    assert revised_events[0].plan_revised.plan.revision_annotation_id == "ann_pr_123"
+    assert revised_events[0].plan_revised.plan.revision_trigger_event_id == "ann_pr_123"
 
 
-async def test_plan_revised_without_annotation_id_leaves_field_empty(
+async def test_plan_revised_without_annotation_id_falls_back_to_drift_id(
 ) -> None:
-    """Back-compat: a STEER with no annotation_id → empty on PlanRevised."""
+    """Rescope: a STEER without annotation_id falls back to the drift.id.
+
+    Post-goldfive#199, ``trigger_event_id`` must always be non-empty on
+    refine events. When the originating ControlMessage lacks an
+    annotation_id (edge case — bridge misconfigured), the steerer uses
+    the ``DriftEvent.id`` so harmonograf still has a strict dedup key.
+    """
     steerer, session, sink, _planner = _bind_fresh()
     msg = ControlMessage(
         kind=ControlKind.STEER,
@@ -819,17 +824,20 @@ async def test_plan_revised_without_annotation_id_leaves_field_empty(
         e for e in sink.events if e.WhichOneof("payload") == "plan_revised"
     ]
     assert revised_events
-    assert revised_events[0].plan_revised.annotation_id == ""
-    assert revised_events[0].plan_revised.plan.revision_annotation_id == ""
+    # Non-empty — either annotation_id (absent here) or drift.id.
+    trig = revised_events[0].plan_revised.trigger_event_id
+    assert trig != ""
+    assert revised_events[0].plan_revised.plan.revision_trigger_event_id == trig
 
 
-async def test_apply_revision_stamps_annotation_id_on_plan() -> None:
-    """``_apply_revision`` threads annotation_id from the drift onto the plan.
+async def test_apply_revision_stamps_trigger_event_id_from_annotation(
+) -> None:
+    """``_apply_revision`` uses the source annotation_id as the trigger_event_id
+    for user-control refines (goldfive#199).
 
-    This closes the gap for the SequentialExecutor's out-of-band
-    PlanRevised emission path, which reconstructs metadata from
-    ``session.plan`` rather than from the drift event that triggered
-    the refine (goldfive#196).
+    Previously (#196) this field was only populated for user-control
+    drifts via the raw ControlMessage payload. Rescope keeps that
+    behaviour but the field is now the unified ``trigger_event_id``.
     """
     from goldfive.steerer import DefaultSteerer
 
@@ -855,11 +863,47 @@ async def test_apply_revision_stamps_annotation_id_on_plan() -> None:
     DefaultSteerer._apply_revision(session, revised, drift)
 
     assert session.plan is revised
-    assert revised.revision_annotation_id == "ann_ar_77"
+    assert revised.revision_trigger_event_id == "ann_ar_77"
 
 
-async def test_apply_revision_preserves_prestamped_annotation_id() -> None:
-    """A plan already carrying ``revision_annotation_id`` isn't overwritten."""
+async def test_apply_revision_stamps_drift_id_on_autonomous_drift(
+) -> None:
+    """``_apply_revision`` uses ``drift.id`` when no annotation_id is present.
+
+    goldfive#199: autonomous drifts (LOOPING_REASONING, TOOL_ERROR, …)
+    fall back to ``DriftEvent.id`` — the UUID4 minted at construction —
+    so harmonograf can strict-id-merge the plan-revision row to the
+    drift row without a time-window fallback.
+    """
+    from goldfive.steerer import DefaultSteerer
+    from goldfive.types import DriftEvent, DriftKind, DriftSeverity
+
+    session = _make_session()
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_REASONING,
+        severity=DriftSeverity.WARNING,
+        detail="loop detected",
+    )
+    assert drift.id  # populated by default factory
+
+    revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[Task(id="t1", title="T1", status=TaskStatus.COMPLETED)],
+        edges=[],
+    )
+    DefaultSteerer._apply_revision(session, revised, drift)
+    assert revised.revision_trigger_event_id == drift.id
+
+
+async def test_apply_revision_preserves_prestamped_trigger_event_id() -> None:
+    """A plan already carrying ``revision_trigger_event_id`` isn't overwritten.
+
+    Protects validator-retry chaining: if the planner pre-stamps the
+    retry attempt's plan with the original trigger id, re-applying the
+    revision must not clobber it.
+    """
     from goldfive.steerer import DefaultSteerer
 
     session = _make_session()
@@ -877,22 +921,33 @@ async def test_apply_revision_preserves_prestamped_annotation_id() -> None:
         goal_ids=["g1"],
         tasks=[Task(id="t1", title="T1", status=TaskStatus.COMPLETED)],
         edges=[],
-        revision_annotation_id="ann_prestamped",
+        revision_trigger_event_id="ann_prestamped",
     )
     DefaultSteerer._apply_revision(session, revised, drift)
-    assert revised.revision_annotation_id == "ann_prestamped"
+    assert revised.revision_trigger_event_id == "ann_prestamped"
 
 
-async def test_autonomous_refine_leaves_plan_revised_annotation_id_empty(
+async def test_autonomous_refine_stamps_drift_id_on_plan_revised(
 ) -> None:
-    """Autonomous drift (no ControlMessage.raw) → empty PlanRevised.annotation_id."""
+    """Autonomous drift → PlanRevised.trigger_event_id == drift.id (goldfive#199).
+
+    Previously (#196) autonomous refines left the field empty;
+    harmonograf then relied on a time-window fallback to dedup. Rescope:
+    every PlanRevised carries a strict id — drift.id for autonomous,
+    annotation_id for user-control.
+    """
     steerer, session, sink, _planner = _bind_fresh()
     # Feed an untyped event — classify_tool_error path, no ControlMessage.
     await steerer.observe({"error": "boom"}, session)
     revised_events = [
         e for e in sink.events if e.WhichOneof("payload") == "plan_revised"
     ]
-    # If a refine happened (depends on stub planner.revised), field must be "".
+    # Autonomous refines MUST carry a non-empty trigger_event_id — it
+    # comes from the synthesized DriftEvent.id.
     for evt in revised_events:
-        assert evt.plan_revised.annotation_id == ""
-        assert evt.plan_revised.plan.revision_annotation_id == ""
+        assert evt.plan_revised.trigger_event_id != ""
+        # Plan mirror must match so persistence round-trips the id.
+        assert (
+            evt.plan_revised.plan.revision_trigger_event_id
+            == evt.plan_revised.trigger_event_id
+        )
