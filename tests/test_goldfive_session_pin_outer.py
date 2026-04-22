@@ -39,7 +39,6 @@ from goldfive import (
 )
 from goldfive.types import Plan, Task
 
-
 # ---------------------------------------------------------------------------
 # Fixtures — minimal fakes for the InvocationContext shape the wrapper reads.
 # ---------------------------------------------------------------------------
