@@ -103,22 +103,22 @@ class PlanRevisionDiff(_message.Message):
     def __init__(self, added_task_ids: _Optional[_Iterable[str]] = ..., removed_task_ids: _Optional[_Iterable[str]] = ..., modified_task_ids: _Optional[_Iterable[str]] = ..., added_edges: _Optional[_Iterable[_Union[_types_pb2.TaskEdge, _Mapping]]] = ..., removed_edges: _Optional[_Iterable[_Union[_types_pb2.TaskEdge, _Mapping]]] = ...) -> None: ...
 
 class PlanRevised(_message.Message):
-    __slots__ = ("plan", "drift_kind", "severity", "reason", "revision_index", "diff", "annotation_id")
+    __slots__ = ("plan", "drift_kind", "severity", "reason", "revision_index", "diff", "trigger_event_id")
     PLAN_FIELD_NUMBER: _ClassVar[int]
     DRIFT_KIND_FIELD_NUMBER: _ClassVar[int]
     SEVERITY_FIELD_NUMBER: _ClassVar[int]
     REASON_FIELD_NUMBER: _ClassVar[int]
     REVISION_INDEX_FIELD_NUMBER: _ClassVar[int]
     DIFF_FIELD_NUMBER: _ClassVar[int]
-    ANNOTATION_ID_FIELD_NUMBER: _ClassVar[int]
+    TRIGGER_EVENT_ID_FIELD_NUMBER: _ClassVar[int]
     plan: _types_pb2.Plan
     drift_kind: _types_pb2.DriftKind
     severity: _types_pb2.DriftSeverity
     reason: str
     revision_index: int
     diff: PlanRevisionDiff
-    annotation_id: str
-    def __init__(self, plan: _Optional[_Union[_types_pb2.Plan, _Mapping]] = ..., drift_kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., reason: _Optional[str] = ..., revision_index: _Optional[int] = ..., diff: _Optional[_Union[PlanRevisionDiff, _Mapping]] = ..., annotation_id: _Optional[str] = ...) -> None: ...
+    trigger_event_id: str
+    def __init__(self, plan: _Optional[_Union[_types_pb2.Plan, _Mapping]] = ..., drift_kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., reason: _Optional[str] = ..., revision_index: _Optional[int] = ..., diff: _Optional[_Union[PlanRevisionDiff, _Mapping]] = ..., trigger_event_id: _Optional[str] = ...) -> None: ...
 
 class TaskStarted(_message.Message):
     __slots__ = ("task_id", "detail")
@@ -184,20 +184,22 @@ class TaskCancelled(_message.Message):
     def __init__(self, task_id: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
 
 class DriftDetected(_message.Message):
-    __slots__ = ("kind", "severity", "detail", "current_task_id", "current_agent_id", "annotation_id")
+    __slots__ = ("kind", "severity", "detail", "current_task_id", "current_agent_id", "annotation_id", "id")
     KIND_FIELD_NUMBER: _ClassVar[int]
     SEVERITY_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
     CURRENT_TASK_ID_FIELD_NUMBER: _ClassVar[int]
     CURRENT_AGENT_ID_FIELD_NUMBER: _ClassVar[int]
     ANNOTATION_ID_FIELD_NUMBER: _ClassVar[int]
+    ID_FIELD_NUMBER: _ClassVar[int]
     kind: _types_pb2.DriftKind
     severity: _types_pb2.DriftSeverity
     detail: str
     current_task_id: str
     current_agent_id: str
     annotation_id: str
-    def __init__(self, kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., detail: _Optional[str] = ..., current_task_id: _Optional[str] = ..., current_agent_id: _Optional[str] = ..., annotation_id: _Optional[str] = ...) -> None: ...
+    id: str
+    def __init__(self, kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., detail: _Optional[str] = ..., current_task_id: _Optional[str] = ..., current_agent_id: _Optional[str] = ..., annotation_id: _Optional[str] = ..., id: _Optional[str] = ...) -> None: ...
 
 class RunCompleted(_message.Message):
     __slots__ = ("outcome_summary",)

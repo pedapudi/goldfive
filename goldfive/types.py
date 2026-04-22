@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
@@ -189,16 +190,21 @@ class Plan:
     revision_kind: str = ""  # DriftKind value (str) or ""
     revision_severity: str = ""  # DriftSeverity value (str) or ""
     revision_index: int = 0
-    # Source annotation id stamped onto the plan when the revision was
-    # triggered by a user-control drift (USER_STEER / USER_CANCEL) whose
-    # originating ControlMessage carried a bridge-supplied annotation id
-    # (goldfive#176). Empty on initial plans and on revisions triggered
-    # by autonomous drifts (loop detection, tool error, cascade cancel).
-    # Populated by :meth:`DefaultSteerer._apply_revision` so downstream
-    # PlanRevised emitters — both the steerer's own one and the
-    # out-of-band one in SequentialExecutor — can thread the id through
-    # without needing the drift object in scope. See goldfive#196.
-    revision_annotation_id: str = ""
+    # Opaque identifier of the event that triggered this plan's revision.
+    # Mirrors ``PlanRevised.trigger_event_id`` so out-of-band PlanRevised
+    # emitters (the SequentialExecutor's post-steerer plan-swap detector)
+    # can thread the id through without re-deriving it.
+    #
+    # Non-empty for every revision:
+    #   * User-control refines: source annotation_id from the ControlMessage.
+    #   * Autonomous drift refines: the ``DriftEvent.id`` of the producing drift.
+    #   * Validator-retry refines: chained — same ``trigger_event_id`` as
+    #     the rejected attempt.
+    # Empty on the initial plan (not a revision).
+    #
+    # See goldfive#199 / harmonograf#95 (rescope). Replaces the narrower
+    # ``revision_annotation_id`` from #196/#197 which was user-control only.
+    revision_trigger_event_id: str = ""
 
     def validate(self, for_revision: bool = False, *, prior: Plan | None = None) -> None:
         """Structurally validate this plan. Raise ``ValueError`` on failure.
@@ -447,6 +453,14 @@ class DriftEvent:
     current_task_id: str = ""
     current_agent_id: str = ""
     raw: Any = None  # original event that triggered detection
+    # Stable goldfive-minted UUID4 identifying this drift event. Populated
+    # at construction by default so every ``DriftEvent`` — user-control or
+    # autonomous — carries a strict join key. Downstream consumers
+    # (harmonograf's intervention aggregator) use this as the
+    # ``trigger_event_id`` for a ``PlanRevised`` that the drift produced
+    # when the drift was not minted from a user annotation. See
+    # goldfive#199 / harmonograf#95 (rescope).
+    id: str = dataclasses.field(default_factory=lambda: uuid.uuid4().hex)
 
 
 @dataclasses.dataclass

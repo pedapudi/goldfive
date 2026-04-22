@@ -2157,15 +2157,22 @@ class DefaultSteerer:
             revised.revision_severity = drift.severity.value
         if not revised.revision_reason:
             revised.revision_reason = drift.detail
-        # goldfive#196: stamp the source annotation id from the drift
-        # onto the plan so out-of-band PlanRevised emitters (the
-        # SequentialExecutor's plan-swap detector) can thread it through
-        # without needing the drift in scope. Empty for autonomous
-        # drifts whose raw is not a ControlMessage.
-        if not revised.revision_annotation_id:
-            ann_id = DefaultSteerer._drift_annotation_id(drift)
-            if ann_id:
-                revised.revision_annotation_id = ann_id
+        # goldfive#199: stamp the trigger_event_id from the drift onto the
+        # plan so out-of-band PlanRevised emitters (the SequentialExecutor's
+        # plan-swap detector) can thread it through without needing the
+        # drift in scope. Resolution mirrors
+        # :func:`goldfive.events._trigger_id_from_drift`: source
+        # annotation_id for user-control drifts, ``drift.id`` otherwise.
+        # Non-empty for every revision because every ``DriftEvent``
+        # dataclass defaults to a UUID4 ``id``. Preserves any pre-existing
+        # stamp (e.g. validator-retry chains that re-use the original
+        # attempt's trigger id).
+        if not revised.revision_trigger_event_id:
+            trig_id = DefaultSteerer._drift_annotation_id(drift) or str(
+                getattr(drift, "id", "") or ""
+            )
+            if trig_id:
+                revised.revision_trigger_event_id = trig_id
         session.plan = revised
         # goldfive#152: refresh the orchestration-state current plan id
         # so downstream reads see the revised id, not the stale one.
@@ -2260,6 +2267,13 @@ class DefaultSteerer:
         evt.drift_detected.detail = drift.detail
         evt.drift_detected.current_task_id = drift.current_task_id
         evt.drift_detected.current_agent_id = drift.current_agent_id
+        # goldfive#199: stamp the drift's own id on the wire so a
+        # subsequent ``PlanRevised.trigger_event_id`` can strict-match the
+        # drift row in harmonograf. Always non-empty — ``DriftEvent``
+        # defaults ``id`` to a UUID4.
+        drift_id = str(getattr(drift, "id", "") or "")
+        if drift_id:
+            evt.drift_detected.id = drift_id
         # Stamp the source annotation_id for USER_STEER / USER_CANCEL drifts
         # minted from a ControlMessage with a bridge-supplied annotation_id
         # (goldfive#171). Sinks use this to dedup the drift row against the
@@ -2309,16 +2323,19 @@ class DefaultSteerer:
         evt.plan_revised.severity = self._drift_severity_pb_value(drift.severity)
         evt.plan_revised.reason = drift.detail
         evt.plan_revised.revision_index = revised.revision_index
-        # goldfive#196: stamp the source annotation id on the PlanRevised
-        # envelope for user-control drifts. Harmonograf's intervention
-        # aggregator merges PlanRevised rows against the source annotation
-        # by this id (strict join), falling back to a time window only
-        # when absent. Without this stamp, a slow refine (Qwen ~14m)
-        # stranded the plan row outside the 5-min fallback window and
-        # leaked a duplicate STEER card. See harmonograf#95.
-        ann_id = revised.revision_annotation_id or self._drift_annotation_id(drift)
-        if ann_id:
-            evt.plan_revised.annotation_id = ann_id
+        # goldfive#199: stamp ``trigger_event_id`` on the PlanRevised
+        # envelope for EVERY refine — user-control (via source
+        # annotation_id) and autonomous (via drift.id). Harmonograf's
+        # intervention aggregator merges PlanRevised rows by strict id
+        # only (legacy time-window fallback is behind a disabled env
+        # flag). Priority: pre-stamped ``revision_trigger_event_id`` on
+        # the revised plan (from ``_apply_revision`` or validator-retry
+        # chain) → source annotation_id from the drift → drift.id.
+        trig_id = revised.revision_trigger_event_id or (
+            self._drift_annotation_id(drift) or str(getattr(drift, "id", "") or "")
+        )
+        if trig_id:
+            evt.plan_revised.trigger_event_id = trig_id
         # Populate the minimal cross-revision diff so sinks that want a
         # "what changed" view don't have to re-fetch and diff the two
         # plans client-side. prev_plan may be None on the first revision

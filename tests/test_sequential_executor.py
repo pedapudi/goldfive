@@ -311,17 +311,16 @@ async def test_drift_mid_run_applies_refined_plan() -> None:
     assert kinds.index("plan_revised") < kinds.index("run_completed")
 
 
-async def test_out_of_band_plan_revised_carries_annotation_id() -> None:
-    """Out-of-band PlanRevised preserves revision_annotation_id (goldfive#196).
+async def test_out_of_band_plan_revised_carries_trigger_event_id() -> None:
+    """Out-of-band PlanRevised preserves revision_trigger_event_id (goldfive#199).
 
     When the steerer swaps ``session.plan`` mid-run, the sequential
     executor emits its own PlanRevised envelope to mark the boundary.
-    That envelope must carry the source annotation_id (read off
-    ``plan.revision_annotation_id``) so harmonograf's intervention
-    aggregator can strict-join it to the source annotation — otherwise
-    a slow refine (kikuchi/Qwen, ~14m) strands the plan row outside
-    the time-window fallback and leaks a duplicate STEER card.
-    See harmonograf#95.
+    That envelope must carry the ``trigger_event_id`` (read off
+    ``plan.revision_trigger_event_id``) so harmonograf's intervention
+    aggregator can strict-id-join it to the source annotation / drift —
+    otherwise a slow refine strands the plan row and leaks a duplicate
+    card (harmonograf#95 rescope).
     """
     plan = _linear_plan(2)
     session = _fresh_session()
@@ -330,8 +329,8 @@ async def test_out_of_band_plan_revised_carries_annotation_id() -> None:
     sink = RecordingSink()
 
     # Simulate the post-steerer state: a revised plan stamped with the
-    # source annotation_id (what DefaultSteerer._apply_revision would
-    # produce on a USER_STEER from an annotation-backed ControlMessage).
+    # trigger_event_id (what DefaultSteerer._apply_revision would produce
+    # on a USER_STEER from an annotation-backed ControlMessage).
     refined = Plan(
         id="p1",
         run_id=session.run_id,
@@ -345,7 +344,7 @@ async def test_out_of_band_plan_revised_carries_annotation_id() -> None:
         revision_kind=DriftKind.USER_STEER.value,
         revision_severity=DriftSeverity.WARNING.value,
         revision_index=1,
-        revision_annotation_id="ann_seq_mid_run",
+        revision_trigger_event_id="ann_seq_mid_run",
     )
     planner.set_refine_result(refined)
 
@@ -384,8 +383,8 @@ async def test_out_of_band_plan_revised_carries_annotation_id() -> None:
     ]
     assert revised_events, "executor should emit PlanRevised on out-of-band plan swap"
     evt = revised_events[0]
-    assert evt.plan_revised.annotation_id == "ann_seq_mid_run"
-    assert evt.plan_revised.plan.revision_annotation_id == "ann_seq_mid_run"
+    assert evt.plan_revised.trigger_event_id == "ann_seq_mid_run"
+    assert evt.plan_revised.plan.revision_trigger_event_id == "ann_seq_mid_run"
 
 
 # ---------------------------------------------------------------------------

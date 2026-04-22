@@ -725,6 +725,18 @@ class ParallelDAGExecutor:
                 reason=f"plan validation failed: {exc}",
             )
             return None
+        # goldfive#199: stamp the trigger_event_id on the plan for every
+        # refine so harmonograf can strict-id-merge plan-revision rows
+        # regardless of whether the executor refined via the steerer or
+        # inline here. Resolution mirrors steerer._apply_revision: source
+        # annotation_id (user-control) → drift.id (autonomous). Preserves
+        # any pre-existing stamp from the planner path.
+        if not refined.revision_trigger_event_id:
+            from goldfive.events import _trigger_id_from_drift
+
+            trig_id = _trigger_id_from_drift(drift)
+            if trig_id:
+                refined.revision_trigger_event_id = trig_id
         return refined
 
     async def _emit_refine_failure(

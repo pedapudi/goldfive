@@ -205,25 +205,34 @@ def plan_revised_event(
     severity: str = "",
     reason: str = "",
     revision_index: int | None = None,
-    annotation_id: str = "",
+    trigger_event_id: str = "",
     session_id: str = "",
 ) -> Any:
     """Build a ``PlanRevised`` envelope.
 
-    ``annotation_id`` (goldfive#196) carries the source annotation id when
-    the revision was triggered by a user-control drift (USER_STEER /
-    USER_CANCEL). Three extraction paths, in priority order:
+    ``trigger_event_id`` (goldfive#199) is the strict dedup key every
+    ``PlanRevised`` envelope carries so sinks (harmonograf's intervention
+    aggregator) can match plan-revision rows against their originating
+    event by exact id rather than time-window heuristics. See
+    harmonograf#95 (rescope).
 
-    1. Explicit ``annotation_id`` kwarg from the caller.
-    2. ``plan.revision_annotation_id`` stamped by :meth:`_apply_revision`
-       — the path used by the SequentialExecutor's out-of-band detector
-       where the drift object is not in scope.
-    3. ``drift.raw.payload['annotation_id']`` when a ``drift`` arg was
-       passed — the path used by executors that refine inline.
+    Resolution order (first non-empty wins):
 
-    Empty for autonomous refines (loop detection, tool error, cascade
-    cancel); harmonograf's aggregator falls through to a time-window
-    fallback in that case.
+    1. Explicit ``trigger_event_id`` kwarg from the caller.
+    2. ``plan.revision_trigger_event_id`` stamped by
+       :meth:`DefaultSteerer._apply_revision` — used by the
+       SequentialExecutor's out-of-band plan-swap detector where the
+       drift object is not in scope.
+    3. When a ``drift`` arg is passed: the drift's source annotation
+       (``drift.raw.payload['annotation_id']``) if present, otherwise the
+       drift's own ``id``. This covers user-control drifts (source
+       annotation id) and autonomous drifts / periodic checks (drift id)
+       uniformly.
+
+    The field is expected to be non-empty on every emitted envelope.
+    Callers that cannot supply a trigger id (initial ``PlanSubmitted``
+    events, legacy code paths) use :func:`plan_submitted_event` instead —
+    the initial plan is not a revision.
     """
     from goldfive.conv import to_pb_plan
 
@@ -255,16 +264,33 @@ def plan_revised_event(
     evt.plan_revised.revision_index = int(
         revision_index if revision_index is not None else getattr(plan, "revision_index", 0)
     )
-    # goldfive#196: resolve the source annotation id for user-control drifts.
-    # Explicit kwarg → plan.revision_annotation_id → drift.raw payload.
-    resolved_ann_id = annotation_id or str(
-        getattr(plan, "revision_annotation_id", "") or ""
+    # goldfive#199: resolve the strict trigger_event_id.
+    # Explicit kwarg → plan.revision_trigger_event_id → drift-derived.
+    resolved_trig = trigger_event_id or str(
+        getattr(plan, "revision_trigger_event_id", "") or ""
     )
-    if not resolved_ann_id and drift is not None:
-        resolved_ann_id = _drift_annotation_id_from(drift)
-    if resolved_ann_id:
-        evt.plan_revised.annotation_id = resolved_ann_id
+    if not resolved_trig and drift is not None:
+        resolved_trig = _trigger_id_from_drift(drift)
+    if resolved_trig:
+        evt.plan_revised.trigger_event_id = resolved_trig
     return evt
+
+
+def _trigger_id_from_drift(drift: Any) -> str:
+    """Derive a ``trigger_event_id`` from a ``DriftEvent`` (goldfive#199).
+
+    Priority:
+      1. User-control drift: ``drift.raw.payload['annotation_id']`` (from
+         the originating ControlMessage, goldfive#171).
+      2. Otherwise: ``drift.id`` (UUID4 minted at DriftEvent construction).
+
+    Returns "" only if the drift has neither (should not happen — every
+    ``DriftEvent`` constructed via the dataclass has a default ``id``).
+    """
+    ann_id = _drift_annotation_id_from(drift)
+    if ann_id:
+        return ann_id
+    return str(getattr(drift, "id", "") or "")
 
 
 def _drift_annotation_id_from(drift: Any) -> str:
@@ -699,4 +725,19 @@ def drift_detected_event(
     evt.drift_detected.detail = getattr(drift, "detail", "")
     evt.drift_detected.current_task_id = getattr(drift, "current_task_id", "")
     evt.drift_detected.current_agent_id = getattr(drift, "current_agent_id", "")
+    # goldfive#199: stamp the drift's own id on the wire so downstream
+    # sinks can strict-match an autonomous-drift-triggered PlanRevised
+    # (which carries this same id in ``trigger_event_id``) onto the drift
+    # row. Always non-empty — every ``DriftEvent`` dataclass defaults to
+    # a UUID4 at construction.
+    drift_id = str(getattr(drift, "id", "") or "")
+    if drift_id:
+        evt.drift_detected.id = drift_id
+    # goldfive#177: also stamp the source annotation_id for user-control
+    # drifts minted from a ControlMessage. Mirrors the duplicate
+    # extraction logic in :class:`DefaultSteerer._drift_annotation_id` so
+    # out-of-band emitters (not via the steerer) still flow the id.
+    ann_id = _drift_annotation_id_from(drift)
+    if ann_id:
+        evt.drift_detected.annotation_id = ann_id
     return evt

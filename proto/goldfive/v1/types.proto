@@ -244,14 +244,21 @@ message Plan {
 
   google.protobuf.Timestamp created_at = 11;
 
-  // Source annotation id when the plan was revised in response to a
-  // user-control drift (USER_STEER / USER_CANCEL) minted from a
-  // ControlMessage that carried a bridge-supplied annotation id
-  // (goldfive#176). Empty for the initial plan and for autonomous
-  // refines whose drift goldfive produced itself. Carried on the Plan
-  // so out-of-band PlanRevised emitters that reconstruct from
-  // `session.plan` (e.g. the SequentialExecutor's post-steerer
-  // plan-swap detector) can thread it through without an extra
-  // parameter. See goldfive#196 / harmonograf#95.
-  string revision_annotation_id = 12;
+  // Opaque identifier of the event that triggered this plan's revision.
+  // Mirrors ``PlanRevised.trigger_event_id`` so out-of-band PlanRevised
+  // emitters that reconstruct from ``session.plan`` (e.g. the
+  // SequentialExecutor's post-steerer plan-swap detector) can thread the
+  // id through without re-deriving it.
+  //
+  // Non-empty for every revision:
+  //   * User-control refines: source annotation_id from the originating
+  //     ControlMessage (goldfive#171 / #177).
+  //   * Autonomous drift refines: the DriftDetected.id of the producing
+  //     drift.
+  //   * Validator-retry refines: chained — same trigger_event_id as the
+  //     rejected attempt.
+  // Empty on the initial ``PlanSubmitted`` (not a revision).
+  // See goldfive#199 / harmonograf#95 (rescope). Replaces the narrower
+  // ``revision_annotation_id`` from #197.
+  string revision_trigger_event_id = 12;
 }
