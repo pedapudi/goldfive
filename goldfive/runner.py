@@ -188,14 +188,36 @@ class Runner:
         user_input: str | list[Goal],
         *,
         context: Mapping[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> ExecutionOutcome:
-        """Execute one end-to-end goldfive run and return the outcome."""
+        """Execute one end-to-end goldfive run and return the outcome.
+
+        ``session_id`` optionally overrides the ``Session.run_id`` /
+        ``Session.id`` that :class:`Conversation.next_turn_session`
+        would otherwise mint. Used by :class:`GoldfiveADKAgent` to
+        adopt the outer adk-web ``InvocationContext.session.id`` so
+        every goldfive Event emitted through sinks stamps the same
+        session id that harmonograf spans carry (goldfive#161). Empty
+        / ``None`` preserves the legacy uuid4 mint so bare programmatic
+        Runner callers see no behaviour change.
+        """
 
         # 1. Build Session seeded by the Conversation. The Session's
         #    run_id is fresh for this turn; conversation_id is stable
         #    across turns; goals / completed_results are pre-populated
         #    with prior-turn state.
         session = self._conversation.next_turn_session()
+        # Outer-session pin (goldfive#161): when the caller supplies a
+        # non-empty ``session_id`` (typically ``ctx.session.id`` from
+        # adk-web), override the freshly-minted ``run_id`` so every
+        # Event emitted this turn carries that id. Sinks stamp
+        # ``Event.session_id`` from ``Session.id`` (= ``run_id``), so
+        # this aligns goldfive events with the ADK session that
+        # harmonograf spans already target — resolving the
+        # "plan view has empty Gantt" regression from the overlay
+        # architecture.
+        if session_id:
+            session.run_id = session_id
         self._last_session = session
 
         # 2. Announce the Conversation on the first turn.
