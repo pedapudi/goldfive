@@ -782,7 +782,22 @@ class DefaultSteerer:
         corresponding ``USER_*`` drift kinds without going through the
         heuristic classifiers. Every other event falls through to
         :meth:`detect_drift`.
+
+        STEER ControlMessages are deduped by their source annotation id
+        (goldfive#171): a delivery retry or UI double-fire of the same
+        STEER lands here twice, but cascade-cancel + refine must only
+        happen once. The dedupe set lives on ``session.state`` under
+        :data:`orchestration_state.KEY_PROCESSED_STEER_IDS` with FIFO
+        eviction after :data:`PROCESSED_STEER_IDS_CAP` entries. Content-
+        based drifts (LOOPING_REASONING, tool errors, …) are NOT
+        deduped — they're heuristic signals, not user actions.
         """
+        if self._is_duplicate_steer(event, session):
+            steer_id = self._steer_dedupe_id(event)
+            log.debug(
+                "DefaultSteerer.observe: dropping duplicate STEER id=%s", steer_id
+            )
+            return
         drift = self._drift_from_control(event, session)
         if drift is None:
             drift = self.detect_drift(event, session)
@@ -1210,6 +1225,75 @@ class DefaultSteerer:
         return " | ".join(trimmed)
 
     @staticmethod
+    def _steer_dedupe_id(event: Any) -> str:
+        """Return the dedupe id for a STEER ``ControlMessage``, or ``""``.
+
+        Prefers the source ``annotation_id`` when the bridge forwarded
+        one (goldfive#171), falling back to the ``ControlMessage.id``
+        so callers that don't source annotations still get retry dedupe.
+        Returns ``""`` for non-ControlMessages, non-STEER kinds, or
+        ids the bridge didn't populate — callers treat an empty id as
+        "nothing to dedupe".
+        """
+        from goldfive.control import ControlKind, ControlMessage
+
+        if not isinstance(event, ControlMessage):
+            return ""
+        raw_kind = getattr(event, "kind", None)
+        kind_str = str(getattr(raw_kind, "value", raw_kind) or "").upper()
+        if kind_str != ControlKind.STEER.value:
+            return ""
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        ann_id = str(payload.get("annotation_id", "") or "")
+        if ann_id:
+            return ann_id
+        return str(getattr(event, "id", "") or "")
+
+    @staticmethod
+    def _unpack_steer_context(drift: DriftEvent) -> tuple[str, str, str]:
+        """Extract ``(raw_body, author, dedupe_id)`` from a USER_STEER drift.
+
+        Prefers the originating :class:`ControlMessage` stashed on
+        :attr:`DriftEvent.raw` so the raw body survives the ``"by
+        {author}: {body}"`` rewrite applied to :attr:`DriftEvent.detail`.
+        When ``raw`` is absent (e.g. a test that builds a USER_STEER
+        drift directly), falls back to parsing the detail string — a
+        ``"by X: Y"`` prefix is treated as ``(Y, X, "")``; anything
+        else becomes ``(detail, "", "")``.
+        """
+        from goldfive.control import ControlMessage
+
+        raw = getattr(drift, "raw", None)
+        if isinstance(raw, ControlMessage):
+            payload = raw.payload if isinstance(raw.payload, dict) else {}
+            body = str(payload.get("note", "") or "")
+            author = str(payload.get("author", "") or "").strip()
+            ann_id = str(payload.get("annotation_id", "") or "")
+            dedupe_id = ann_id or str(getattr(raw, "id", "") or "")
+            return body, author, dedupe_id
+        # Fallback: parse "by {author}: {body}" out of detail so the
+        # back-compat DriftEvent-only code path preserves the author in
+        # state writes. No dedupe id is recoverable here.
+        detail = str(getattr(drift, "detail", "") or "")
+        if detail.startswith("by ") and ": " in detail:
+            prefix, _, tail = detail.partition(": ")
+            author = prefix[len("by ") :].strip()
+            return tail, author, ""
+        return detail, "", ""
+
+    @classmethod
+    def _is_duplicate_steer(cls, event: Any, session: Session) -> bool:
+        """True when ``event`` is a STEER ControlMessage already processed.
+
+        See :meth:`_steer_dedupe_id` for the id-selection rules. An
+        empty id always returns ``False`` (nothing to compare against).
+        """
+        steer_id = cls._steer_dedupe_id(event)
+        if not steer_id:
+            return False
+        return _ostate.has_processed_steer_id(session.state, steer_id)
+
+    @staticmethod
     def _drift_from_control(event: Any, session: Session) -> DriftEvent | None:
         """Map a :class:`ControlMessage` to the matching ``USER_*`` drift.
 
@@ -1217,6 +1301,13 @@ class DefaultSteerer:
         the caller can fall through to the classifier pipeline. Unknown
         control kinds return ``None`` as well — they are dispatched by
         the executor, not the steerer.
+
+        For STEER, the operator ``author`` (when the bridge forwarded
+        one) is prefixed onto the drift detail so downstream consumers
+        — prompt templates, sinks, UI — see audit-trail attribution
+        inline without having to peek into ``session.state``
+        (goldfive#171). The raw body still lands on
+        ``goldfive.active_steer.body`` untouched.
         """
         from goldfive.control import ControlKind, ControlMessage
 
@@ -1227,12 +1318,18 @@ class DefaultSteerer:
         payload = event.payload if isinstance(event.payload, dict) else {}
         note = str(payload.get("note", "") or "")
         reason = str(payload.get("reason", "") or "")
+        author = str(payload.get("author", "") or "").strip()
         if kind_str == ControlKind.STEER.value:
+            if author:
+                detail = f"by {author}: {note}"
+            else:
+                detail = note
             return DriftEvent(
                 kind=DriftKind.USER_STEER,
                 severity=DriftSeverity.WARNING,
-                detail=note,
+                detail=detail,
                 current_task_id=session.current_task_id,
+                raw=event,
             )
         if kind_str == ControlKind.CANCEL.value:
             return DriftEvent(
@@ -1840,6 +1937,9 @@ class DefaultSteerer:
            ``session.goals`` BEFORE ``planner.refine`` reads
            ``list(session.goals)``, so the refined plan sees the
            pivot as a goal, not only as a drift detail string.
+        3. The source annotation / control id is appended to
+           ``goldfive.processed_steer_ids`` so a retry or UI double-fire
+           of the same STEER is a no-op (goldfive#171 dedupe).
 
         Never raises: a planner that doesn't implement
         ``synthesize_goal_from_steer`` or a synthesis call that fails
@@ -1847,7 +1947,13 @@ class DefaultSteerer:
         a Goal, mode APPEND). The steerer must never break the run on
         a missing optional hook.
         """
-        body = (drift.detail or "").strip()
+        # Recover the raw body + operator author from the originating
+        # ControlMessage when it's available on drift.raw (goldfive#171).
+        # Falling back to drift.detail preserves back-compat for tests
+        # that synthesize a USER_STEER DriftEvent directly without a
+        # ControlMessage behind it.
+        raw_body, author, steer_id = self._unpack_steer_context(drift)
+        body = raw_body.strip()
         # Stamp the active_steer keys regardless of synthesis outcome
         # so readers see "a steer is active as of turn N" even when
         # the planner can't synthesize. ``at_turn`` uses the session's
@@ -1855,12 +1961,27 @@ class DefaultSteerer:
         # event — a cheap, always-available "turn" proxy.
         at_turn = getattr(session, "_next_sequence", 0) or 0
         try:
-            _ostate.set_active_steer(session.state, body=body, at_turn=at_turn)
+            _ostate.set_active_steer(
+                session.state, body=body, at_turn=at_turn, author=author
+            )
         except Exception as exc:  # noqa: BLE001
             log.debug(
                 "DefaultSteerer._apply_user_steer_state: set_active_steer raised: %s",
                 exc,
             )
+        # Record the dedupe id. Safe to call even with an empty id
+        # (the helper no-ops). Done AFTER the active_steer stamp so a
+        # reader that inspects ``state`` mid-dispatch always sees the
+        # most recent steer is reflected.
+        if steer_id:
+            try:
+                _ostate.record_processed_steer_id(session.state, steer_id)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "DefaultSteerer._apply_user_steer_state: "
+                    "record_processed_steer_id raised: %s",
+                    exc,
+                )
         if not body:
             # Empty steer body: nothing to synthesize into a goal. The
             # active_steer.* keys still landed (readers may want to know

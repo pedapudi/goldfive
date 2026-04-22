@@ -411,6 +411,8 @@ def _build_steer(payload: dict[str, Any], pb: Any) -> Any:
     return pb.SteerPayload(
         note=str(payload.get("note", "")),
         suggested_action=str(payload.get("suggested_action", "")),
+        author=str(payload.get("author", "")),
+        annotation_id=str(payload.get("annotation_id", "")),
     )
 
 
@@ -481,6 +483,8 @@ def from_pb_control_event(pb_msg: Any) -> ControlMessage:
         payload = {
             "note": pb_msg.steer.note,
             "suggested_action": pb_msg.steer.suggested_action,
+            "author": pb_msg.steer.author,
+            "annotation_id": pb_msg.steer.annotation_id,
         }
     elif which == "rewind":
         payload = {"task_id": pb_msg.rewind.task_id}
