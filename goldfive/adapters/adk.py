@@ -462,15 +462,57 @@ def _collect_reachable_agent_tree(root_agent: Any) -> list[dict[str, Any]]:
     return [visited[k] for k in order]
 
 
+def _plugin_already_installed(runner: Any, plugin_name: str) -> bool:
+    """Return True when a plugin of ``plugin_name`` is already on ``runner``.
+
+    Under ``App(plugins=[...])`` the ADK runner already carries the
+    caller-supplied plugin list by the time goldfive's wrap path tries
+    to install anything. Asking the runner before appending is cheap
+    (a walk over a short list) and prevents the duplicate-registration
+    cascade that caused goldfive #166 (every harmonograf span appearing
+    twice).
+
+    Tolerates missing plugin managers and unusual ``plugins`` shapes —
+    returns ``False`` on any lookup error so the caller falls through to
+    the normal install path without masking real errors.
+    """
+    if runner is None or not plugin_name:
+        return False
+    pm = getattr(runner, "plugin_manager", None)
+    plugins = getattr(pm, "plugins", None) if pm is not None else None
+    if plugins is None:
+        plugins = getattr(runner, "plugins", None)
+    if not isinstance(plugins, list):
+        return False
+    return any(getattr(p, "name", None) == plugin_name for p in plugins)
+
+
 def _register_plugin_on_runner(runner: Any, plugin: Any) -> bool:
     """Install ``plugin`` on ``runner``'s plugin manager if one exists.
 
     Tolerates both ``runner.plugin_manager.register(plugin)`` and the
     newer ``runner.plugins.append(plugin)`` shapes. Returns True if the
-    plugin was installed.
+    plugin was installed (or was already present under the same name).
+
+    Idempotent on plugin ``name`` (goldfive #166). When the runner
+    already carries a plugin with the same ``name``, returns ``True``
+    without appending a second instance — ADK's own ``register_plugin``
+    raises on duplicate names and the silent-append fallback path we
+    used to keep as a last resort was precisely what let the duplicate
+    slip through. The dedup is primary; the fallback is belt-and-braces
+    and preserved only for runner shapes without a working
+    ``register_plugin``.
     """
     if runner is None:
         return False
+    plugin_name = getattr(plugin, "name", None)
+    if plugin_name and _plugin_already_installed(runner, plugin_name):
+        log.info(
+            "goldfive.adapters.adk: plugin %r already installed on runner; "
+            "skipping duplicate install (see goldfive #166)",
+            plugin_name,
+        )
+        return True
     pm = getattr(runner, "plugin_manager", None)
     if pm is not None:
         for meth in ("register", "register_plugin", "add"):
@@ -492,6 +534,38 @@ def _register_plugin_on_runner(runner: Any, plugin: Any) -> bool:
     return False
 
 
+def _dedupe_plugins_by_name(plugins: list[Any]) -> list[Any]:
+    """Return ``plugins`` with later same-``name`` instances removed.
+
+    Caller-supplied plugin lists can land duplicates in subtle ways
+    (``App(plugins=[p])`` followed by ``observe()`` or ``add_plugin(p)``
+    both referencing the same plugin class). ADK's own
+    :class:`PluginManager.register_plugin` raises on same-name collisions
+    with a terse ``ValueError`` that is easy to miss in a stack trace —
+    we'd rather normalise the list up front so every downstream install
+    path sees a single instance per name.
+
+    Preserves order: the first plugin at each name wins. Plugins without
+    a ``name`` attribute pass through unfiltered (they can't collide by
+    name). See goldfive #166.
+    """
+    seen: set[str] = set()
+    out: list[Any] = []
+    for plugin in plugins:
+        name = getattr(plugin, "name", None)
+        if isinstance(name, str) and name:
+            if name in seen:
+                log.info(
+                    "goldfive.adapters.adk: dropping duplicate plugin %r from "
+                    "caller-supplied plugins (first instance wins; see goldfive #166)",
+                    name,
+                )
+                continue
+            seen.add(name)
+        out.append(plugin)
+    return out
+
+
 def _build_runner(agent: Any, plugins: list[Any] | None = None) -> Any:
     """Construct an ADK ``InMemoryRunner`` around a ``BaseAgent``.
 
@@ -500,18 +574,20 @@ def _build_runner(agent: Any, plugins: list[Any] | None = None) -> Any:
     session-service bookkeeping.
 
     When ``plugins`` is a non-empty iterable, the plugin list is forwarded
-    to :class:`InMemoryRunner` via its ``plugins=`` kwarg. Under the
-    single-Runner model there is exactly one runner, and ADK propagates
-    its plugin manager into any AgentTool-spawned sub-Runners
-    automatically — so installing the plugin here is sufficient for the
-    whole tree.
+    to :class:`InMemoryRunner` via its ``plugins=`` kwarg. Duplicates by
+    ``name`` are collapsed via :func:`_dedupe_plugins_by_name` so ADK's
+    ``PluginManager.register_plugin`` (which raises on same-name
+    collisions) never sees them. Under the single-Runner model there is
+    exactly one runner, and ADK propagates its plugin manager into any
+    AgentTool-spawned sub-Runners automatically — so installing the
+    plugin here is sufficient for the whole tree.
     """
     from google.adk.runners import InMemoryRunner  # type: ignore
 
     app_name = str(getattr(agent, "name", "") or "goldfive")
     kwargs: dict[str, Any] = {"agent": agent, "app_name": app_name}
     if plugins:
-        kwargs["plugins"] = list(plugins)
+        kwargs["plugins"] = _dedupe_plugins_by_name(list(plugins))
     return InMemoryRunner(**kwargs)
 
 
