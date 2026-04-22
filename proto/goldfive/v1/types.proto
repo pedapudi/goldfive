@@ -243,4 +243,15 @@ message Plan {
   uint32 revision_index = 10;
 
   google.protobuf.Timestamp created_at = 11;
+
+  // Source annotation id when the plan was revised in response to a
+  // user-control drift (USER_STEER / USER_CANCEL) minted from a
+  // ControlMessage that carried a bridge-supplied annotation id
+  // (goldfive#176). Empty for the initial plan and for autonomous
+  // refines whose drift goldfive produced itself. Carried on the Plan
+  // so out-of-band PlanRevised emitters that reconstruct from
+  // `session.plan` (e.g. the SequentialExecutor's post-steerer
+  // plan-swap detector) can thread it through without an extra
+  // parameter. See goldfive#196 / harmonograf#95.
+  string revision_annotation_id = 12;
 }

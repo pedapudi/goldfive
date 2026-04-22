@@ -764,3 +764,135 @@ async def test_llm_planner_non_user_steer_uses_default_refine_path() -> None:
     # Default-path stamping uses str(drift.kind), not "user_steer".
     assert revised.revision_kind == str(DriftKind.TOOL_ERROR)
     assert revised.revision_reason == "api 500"
+
+
+# ---------------------------------------------------------------------------
+# PlanRevised annotation_id stamping (goldfive#196 / harmonograf#95)
+# ---------------------------------------------------------------------------
+
+
+async def test_plan_revised_stamps_annotation_id_from_user_steer(
+) -> None:
+    """PlanRevised proto carries the source annotation_id (goldfive#196).
+
+    Without this field, harmonograf can't strict-join the plan-revision
+    row to the source annotation when the refine outruns the 5-min
+    time-window fallback. Observed on kikuchi/Qwen3.5-35B at ~14m
+    annotation→plan-revised gap (harmonograf#95).
+    """
+    steerer, session, sink, _planner = _bind_fresh()
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-pr",
+        payload={
+            "note": "pivot",
+            "author": "alice",
+            "annotation_id": "ann_pr_123",
+        },
+    )
+
+    await steerer.observe(msg, session)
+
+    revised_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "plan_revised"
+    ]
+    assert revised_events, "USER_STEER with successful refine must emit PlanRevised"
+    assert revised_events[0].plan_revised.annotation_id == "ann_pr_123"
+    # The id is also persisted on the Plan proto itself so out-of-band
+    # emitters (SequentialExecutor plan-swap detector) can recover it.
+    assert revised_events[0].plan_revised.plan.revision_annotation_id == "ann_pr_123"
+
+
+async def test_plan_revised_without_annotation_id_leaves_field_empty(
+) -> None:
+    """Back-compat: a STEER with no annotation_id → empty on PlanRevised."""
+    steerer, session, sink, _planner = _bind_fresh()
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-pr-noann",
+        payload={"note": "pivot"},
+    )
+
+    await steerer.observe(msg, session)
+
+    revised_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "plan_revised"
+    ]
+    assert revised_events
+    assert revised_events[0].plan_revised.annotation_id == ""
+    assert revised_events[0].plan_revised.plan.revision_annotation_id == ""
+
+
+async def test_apply_revision_stamps_annotation_id_on_plan() -> None:
+    """``_apply_revision`` threads annotation_id from the drift onto the plan.
+
+    This closes the gap for the SequentialExecutor's out-of-band
+    PlanRevised emission path, which reconstructs metadata from
+    ``session.plan`` rather than from the drift event that triggered
+    the refine (goldfive#196).
+    """
+    from goldfive.steerer import DefaultSteerer
+
+    session = _make_session()
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-ar",
+        payload={"note": "refocus", "annotation_id": "ann_ar_77"},
+    )
+    drift = DefaultSteerer._drift_from_control(msg, session)
+    assert drift is not None
+
+    revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="t1", title="T1", status=TaskStatus.COMPLETED),
+            Task(id="t2b", title="Replan"),
+        ],
+        edges=[TaskEdge(from_task_id="t1", to_task_id="t2b")],
+    )
+    DefaultSteerer._apply_revision(session, revised, drift)
+
+    assert session.plan is revised
+    assert revised.revision_annotation_id == "ann_ar_77"
+
+
+async def test_apply_revision_preserves_prestamped_annotation_id() -> None:
+    """A plan already carrying ``revision_annotation_id`` isn't overwritten."""
+    from goldfive.steerer import DefaultSteerer
+
+    session = _make_session()
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-ar2",
+        payload={"note": "refocus", "annotation_id": "ann_from_drift"},
+    )
+    drift = DefaultSteerer._drift_from_control(msg, session)
+    assert drift is not None
+
+    revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[Task(id="t1", title="T1", status=TaskStatus.COMPLETED)],
+        edges=[],
+        revision_annotation_id="ann_prestamped",
+    )
+    DefaultSteerer._apply_revision(session, revised, drift)
+    assert revised.revision_annotation_id == "ann_prestamped"
+
+
+async def test_autonomous_refine_leaves_plan_revised_annotation_id_empty(
+) -> None:
+    """Autonomous drift (no ControlMessage.raw) → empty PlanRevised.annotation_id."""
+    steerer, session, sink, _planner = _bind_fresh()
+    # Feed an untyped event — classify_tool_error path, no ControlMessage.
+    await steerer.observe({"error": "boom"}, session)
+    revised_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "plan_revised"
+    ]
+    # If a refine happened (depends on stub planner.revised), field must be "".
+    for evt in revised_events:
+        assert evt.plan_revised.annotation_id == ""
+        assert evt.plan_revised.plan.revision_annotation_id == ""

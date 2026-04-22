@@ -205,8 +205,26 @@ def plan_revised_event(
     severity: str = "",
     reason: str = "",
     revision_index: int | None = None,
+    annotation_id: str = "",
     session_id: str = "",
 ) -> Any:
+    """Build a ``PlanRevised`` envelope.
+
+    ``annotation_id`` (goldfive#196) carries the source annotation id when
+    the revision was triggered by a user-control drift (USER_STEER /
+    USER_CANCEL). Three extraction paths, in priority order:
+
+    1. Explicit ``annotation_id`` kwarg from the caller.
+    2. ``plan.revision_annotation_id`` stamped by :meth:`_apply_revision`
+       — the path used by the SequentialExecutor's out-of-band detector
+       where the drift object is not in scope.
+    3. ``drift.raw.payload['annotation_id']`` when a ``drift`` arg was
+       passed — the path used by executors that refine inline.
+
+    Empty for autonomous refines (loop detection, tool error, cascade
+    cancel); harmonograf's aggregator falls through to a time-window
+    fallback in that case.
+    """
     from goldfive.conv import to_pb_plan
 
     evt = new_event(run_id, sequence, session_id=session_id)
@@ -237,7 +255,36 @@ def plan_revised_event(
     evt.plan_revised.revision_index = int(
         revision_index if revision_index is not None else getattr(plan, "revision_index", 0)
     )
+    # goldfive#196: resolve the source annotation id for user-control drifts.
+    # Explicit kwarg → plan.revision_annotation_id → drift.raw payload.
+    resolved_ann_id = annotation_id or str(
+        getattr(plan, "revision_annotation_id", "") or ""
+    )
+    if not resolved_ann_id and drift is not None:
+        resolved_ann_id = _drift_annotation_id_from(drift)
+    if resolved_ann_id:
+        evt.plan_revised.annotation_id = resolved_ann_id
     return evt
+
+
+def _drift_annotation_id_from(drift: Any) -> str:
+    """Extract ``annotation_id`` from a ``DriftEvent``'s raw ControlMessage.
+
+    Mirror of ``DefaultSteerer._drift_annotation_id`` — duplicated at
+    module scope (and typed weakly) so :func:`plan_revised_event` can
+    reuse it without pulling in the steerer module. Returns "" when
+    ``drift.raw`` is missing, not a ``ControlMessage``, or lacks an
+    ``annotation_id`` in its payload.
+    """
+    try:
+        from goldfive.control import ControlMessage
+    except Exception:  # pragma: no cover - control module always available
+        return ""
+    raw = getattr(drift, "raw", None)
+    if not isinstance(raw, ControlMessage):
+        return ""
+    payload = raw.payload if isinstance(raw.payload, dict) else {}
+    return str(payload.get("annotation_id", "") or "")
 
 
 def task_started_event(

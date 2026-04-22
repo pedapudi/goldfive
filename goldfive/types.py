@@ -189,6 +189,16 @@ class Plan:
     revision_kind: str = ""  # DriftKind value (str) or ""
     revision_severity: str = ""  # DriftSeverity value (str) or ""
     revision_index: int = 0
+    # Source annotation id stamped onto the plan when the revision was
+    # triggered by a user-control drift (USER_STEER / USER_CANCEL) whose
+    # originating ControlMessage carried a bridge-supplied annotation id
+    # (goldfive#176). Empty on initial plans and on revisions triggered
+    # by autonomous drifts (loop detection, tool error, cascade cancel).
+    # Populated by :meth:`DefaultSteerer._apply_revision` so downstream
+    # PlanRevised emitters — both the steerer's own one and the
+    # out-of-band one in SequentialExecutor — can thread the id through
+    # without needing the drift object in scope. See goldfive#196.
+    revision_annotation_id: str = ""
 
     def validate(self, for_revision: bool = False, *, prior: Plan | None = None) -> None:
         """Structurally validate this plan. Raise ``ValueError`` on failure.

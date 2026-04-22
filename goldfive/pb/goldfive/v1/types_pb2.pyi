@@ -169,7 +169,7 @@ class Task(_message.Message):
     def __init__(self, id: _Optional[str] = ..., title: _Optional[str] = ..., description: _Optional[str] = ..., assignee_agent_id: _Optional[str] = ..., status: _Optional[_Union[TaskStatus, str]] = ..., predicted_start_ms: _Optional[int] = ..., predicted_duration_ms: _Optional[int] = ..., bound_span_id: _Optional[str] = ...) -> None: ...
 
 class Plan(_message.Message):
-    __slots__ = ("id", "run_id", "goal_ids", "summary", "tasks", "edges", "revision_reason", "revision_kind", "revision_severity", "revision_index", "created_at")
+    __slots__ = ("id", "run_id", "goal_ids", "summary", "tasks", "edges", "revision_reason", "revision_kind", "revision_severity", "revision_index", "created_at", "revision_annotation_id")
     ID_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     GOAL_IDS_FIELD_NUMBER: _ClassVar[int]
@@ -181,6 +181,7 @@ class Plan(_message.Message):
     REVISION_SEVERITY_FIELD_NUMBER: _ClassVar[int]
     REVISION_INDEX_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
+    REVISION_ANNOTATION_ID_FIELD_NUMBER: _ClassVar[int]
     id: str
     run_id: str
     goal_ids: _containers.RepeatedScalarFieldContainer[str]
@@ -192,4 +193,5 @@ class Plan(_message.Message):
     revision_severity: DriftSeverity
     revision_index: int
     created_at: _timestamp_pb2.Timestamp
-    def __init__(self, id: _Optional[str] = ..., run_id: _Optional[str] = ..., goal_ids: _Optional[_Iterable[str]] = ..., summary: _Optional[str] = ..., tasks: _Optional[_Iterable[_Union[Task, _Mapping]]] = ..., edges: _Optional[_Iterable[_Union[TaskEdge, _Mapping]]] = ..., revision_reason: _Optional[str] = ..., revision_kind: _Optional[_Union[DriftKind, str]] = ..., revision_severity: _Optional[_Union[DriftSeverity, str]] = ..., revision_index: _Optional[int] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    revision_annotation_id: str
+    def __init__(self, id: _Optional[str] = ..., run_id: _Optional[str] = ..., goal_ids: _Optional[_Iterable[str]] = ..., summary: _Optional[str] = ..., tasks: _Optional[_Iterable[_Union[Task, _Mapping]]] = ..., edges: _Optional[_Iterable[_Union[TaskEdge, _Mapping]]] = ..., revision_reason: _Optional[str] = ..., revision_kind: _Optional[_Union[DriftKind, str]] = ..., revision_severity: _Optional[_Union[DriftSeverity, str]] = ..., revision_index: _Optional[int] = ..., created_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., revision_annotation_id: _Optional[str] = ...) -> None: ...

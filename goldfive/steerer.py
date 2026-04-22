@@ -2157,6 +2157,15 @@ class DefaultSteerer:
             revised.revision_severity = drift.severity.value
         if not revised.revision_reason:
             revised.revision_reason = drift.detail
+        # goldfive#196: stamp the source annotation id from the drift
+        # onto the plan so out-of-band PlanRevised emitters (the
+        # SequentialExecutor's plan-swap detector) can thread it through
+        # without needing the drift in scope. Empty for autonomous
+        # drifts whose raw is not a ControlMessage.
+        if not revised.revision_annotation_id:
+            ann_id = DefaultSteerer._drift_annotation_id(drift)
+            if ann_id:
+                revised.revision_annotation_id = ann_id
         session.plan = revised
         # goldfive#152: refresh the orchestration-state current plan id
         # so downstream reads see the revised id, not the stale one.
@@ -2300,6 +2309,16 @@ class DefaultSteerer:
         evt.plan_revised.severity = self._drift_severity_pb_value(drift.severity)
         evt.plan_revised.reason = drift.detail
         evt.plan_revised.revision_index = revised.revision_index
+        # goldfive#196: stamp the source annotation id on the PlanRevised
+        # envelope for user-control drifts. Harmonograf's intervention
+        # aggregator merges PlanRevised rows against the source annotation
+        # by this id (strict join), falling back to a time window only
+        # when absent. Without this stamp, a slow refine (Qwen ~14m)
+        # stranded the plan row outside the 5-min fallback window and
+        # leaked a duplicate STEER card. See harmonograf#95.
+        ann_id = revised.revision_annotation_id or self._drift_annotation_id(drift)
+        if ann_id:
+            evt.plan_revised.annotation_id = ann_id
         # Populate the minimal cross-revision diff so sinks that want a
         # "what changed" view don't have to re-fetch and diff the two
         # plans client-side. prev_plan may be None on the first revision
