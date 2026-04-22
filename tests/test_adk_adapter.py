@@ -504,6 +504,324 @@ async def test_after_run_no_confabulation_when_tool_was_called(state_ctx_cls) ->
     assert steerer.drifts == [], f"no drift expected when a tool was called; got {steerer.drifts!r}"
 
 
+# ---------------------------------------------------------------------------
+# Per-LLM-call instrumentation (goldfive#172)
+# ---------------------------------------------------------------------------
+
+
+async def test_llm_call_instrumentation_emits_chars_and_duration(state_ctx_cls, caplog) -> None:
+    """before/after_model_callback pair yields chars + duration metrics.
+
+    goldfive#172 Phase 1: instrumentation. Drives the callback pair
+    by hand with a minimal LlmRequest / LlmResponse stub and asserts:
+
+    * ``before_model_callback`` logs ``llm.request.chars`` +
+      ``llm.request.messages_count`` at INFO with a matching
+      invocation_id.
+    * ``after_model_callback`` logs ``llm.call.duration_ms`` at INFO
+      and writes a ``metrics`` entry into the steerer observation's
+      raw dict so downstream sinks can surface the numbers without
+      re-parsing the log.
+    * Token usage from ``llm_response.usage_metadata`` flows into
+      ``llm.usage.prompt_tokens`` / ``completion_tokens`` /
+      ``total_tokens``.
+    """
+    import logging
+
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+        make_adk_plugin,
+    )
+
+    plugin = make_adk_plugin(host_agent_name="coord")
+    steerer = _RecordingSteerer()
+    state: dict = {
+        SESSION_CONTEXT_STATE_KEY: SessionContext(
+            session=Session(run_id="run-instr"),
+            steerer=steerer,
+            task=Task(id="t-instr", title="Instrumentation smoke"),
+            tool_handlers={},
+            host_agent_name="coord",
+        )
+    }
+
+    class _InvContext:
+        def __init__(self, invocation_id: str) -> None:
+            self.invocation_id = invocation_id
+
+    class _CbContext:
+        def __init__(self, state: dict, invocation_id: str) -> None:
+            self._state = state
+            self._invocation_context = _InvContext(invocation_id)
+
+        @property
+        def session(self) -> Any:
+            return state_ctx_cls(self._state).session
+
+    # Request stub: three messages, known character counts. A user
+    # turn with text, an assistant turn with a function_call, and a
+    # tool turn with a function_response.
+    class _Part:
+        def __init__(
+            self,
+            text: str = "",
+            function_call: Any = None,
+            function_response: Any = None,
+        ) -> None:
+            self.text = text
+            self.function_call = function_call
+            self.function_response = function_response
+            self.thought = False
+
+    class _FC:
+        def __init__(self, name: str, args: dict) -> None:
+            self.name = name
+            self.args = args
+
+    class _FR:
+        def __init__(self, name: str, response: dict) -> None:
+            self.name = name
+            self.response = response
+
+    class _Content:
+        def __init__(self, role: str, parts: list[_Part]) -> None:
+            self.role = role
+            self.parts = parts
+
+    class _Config:
+        system_instruction = "goldfive planner context: focus on t-instr"
+
+    class _LlmRequest:
+        contents = [
+            _Content("user", [_Part(text="research solar panels")]),
+            _Content(
+                "model",
+                [_Part(function_call=_FC("web_search", {"q": "solar panels"}))],
+            ),
+            _Content(
+                "tool",
+                [_Part(function_response=_FR("web_search", {"results": ["panel"]}))],
+            ),
+        ]
+        config = _Config()
+
+    class _Usage:
+        prompt_token_count = 421
+        candidates_token_count = 97
+        total_token_count = 518
+
+    class _LlmResponseContent:
+        parts = [_Part(text="Solar panels convert sunlight to electricity.")]
+
+    class _LlmResponse:
+        content = _LlmResponseContent()
+        finish_reason = None
+        usage_metadata = _Usage()
+
+    inv_id = "inv-instr-1"
+    caplog.set_level(logging.INFO, logger="goldfive.adapters.adk")
+
+    await plugin.before_model_callback(
+        callback_context=_CbContext(state, inv_id),
+        llm_request=_LlmRequest(),
+    )
+    # The pending entry must be stamped with the chars we measured.
+    pending = plugin._invocation_llm_pending.get(inv_id)
+    assert pending is not None
+    assert pending["messages_count"] == 3
+    # Rough bound: the three contents + system_instruction are at
+    # least ~80 chars combined; we avoid brittle exact asserts but
+    # require it saw something meaningful.
+    assert pending["chars"] > 50
+
+    # Tiny delay so duration_ms is > 0.
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(0.005)
+
+    await plugin.after_model_callback(
+        callback_context=_CbContext(state, inv_id),
+        llm_response=_LlmResponse(),
+    )
+
+    # The pending entry must be popped after the pair completes.
+    assert plugin._invocation_llm_pending.get(inv_id) is None
+
+    # The steerer observed the turn. The raw payload must carry the
+    # metrics dict so custom sinks can surface the numbers alongside
+    # each LLM turn without re-parsing the log output.
+    assert len(steerer.events) == 1
+    raw = steerer.events[0]["raw"]
+    assert "metrics" in raw, f"expected metrics key in raw dict; got {raw!r}"
+    metrics = raw["metrics"]
+    assert metrics["llm.request.chars"] > 50
+    assert metrics["llm.request.messages_count"] == 3
+    assert metrics["llm.call.duration_ms"] >= 0
+    assert metrics["llm.usage.prompt_tokens"] == 421
+    assert metrics["llm.usage.completion_tokens"] == 97
+    assert metrics["llm.usage.total_tokens"] == 518
+
+    # INFO log records carry the structured fields.
+    request_logs = [
+        r.getMessage() for r in caplog.records if "goldfive.llm.request" in r.getMessage()
+    ]
+    response_logs = [
+        r.getMessage() for r in caplog.records if "goldfive.llm.response" in r.getMessage()
+    ]
+    assert any(inv_id in msg for msg in request_logs), (
+        f"expected goldfive.llm.request log for {inv_id}; saw {request_logs!r}"
+    )
+    assert any("llm.call.duration_ms=" in msg and inv_id in msg for msg in response_logs), (
+        f"expected goldfive.llm.response log with duration for {inv_id}; saw {response_logs!r}"
+    )
+
+
+async def test_llm_call_instrumentation_tolerates_missing_usage(
+    state_ctx_cls,
+) -> None:
+    """LLM responses without ``usage_metadata`` still yield duration + chars.
+
+    Some LiteLLM-fronted providers omit usage (especially on the first
+    streaming chunk). The instrumentation must degrade gracefully —
+    duration + char counts are still reported; usage keys are simply
+    absent.
+    """
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+        make_adk_plugin,
+    )
+
+    plugin = make_adk_plugin(host_agent_name="coord")
+    steerer = _RecordingSteerer()
+    state: dict = {
+        SESSION_CONTEXT_STATE_KEY: SessionContext(
+            session=Session(run_id="run-instr-2"),
+            steerer=steerer,
+            task=Task(id="t-instr-2", title="No usage"),
+            tool_handlers={},
+            host_agent_name="coord",
+        )
+    }
+
+    class _InvContext:
+        def __init__(self, invocation_id: str) -> None:
+            self.invocation_id = invocation_id
+
+    class _CbContext:
+        def __init__(self, state: dict, invocation_id: str) -> None:
+            self._state = state
+            self._invocation_context = _InvContext(invocation_id)
+
+        @property
+        def session(self) -> Any:
+            return state_ctx_cls(self._state).session
+
+    class _Part:
+        def __init__(self, text: str = "") -> None:
+            self.text = text
+            self.thought = False
+            self.function_call = None
+            self.function_response = None
+
+    class _Content:
+        def __init__(self, parts: list[_Part]) -> None:
+            self.role = "user"
+            self.parts = parts
+
+    class _LlmRequest:
+        contents = [_Content([_Part(text="hello")])]
+        config = None
+
+    class _RespContent:
+        parts = [_Part(text="hi")]
+
+    class _LlmResponse:
+        content = _RespContent()
+        finish_reason = None
+        # No usage_metadata attribute at all.
+
+    inv_id = "inv-instr-2"
+    await plugin.before_model_callback(
+        callback_context=_CbContext(state, inv_id),
+        llm_request=_LlmRequest(),
+    )
+    await plugin.after_model_callback(
+        callback_context=_CbContext(state, inv_id),
+        llm_response=_LlmResponse(),
+    )
+
+    assert len(steerer.events) == 1
+    metrics = steerer.events[0]["raw"].get("metrics", {})
+    assert "llm.call.duration_ms" in metrics
+    assert "llm.request.chars" in metrics
+    assert "llm.request.messages_count" in metrics
+    # Usage omitted on this response — keys must be absent, not zero.
+    assert "llm.usage.prompt_tokens" not in metrics
+    assert "llm.usage.completion_tokens" not in metrics
+
+
+def test_measure_request_chars_counts_text_and_tool_payloads() -> None:
+    """_measure_request_chars sums text, function_call, function_response."""
+    from goldfive.adapters._adk_plugin import _measure_request_chars
+
+    class _Part:
+        def __init__(
+            self,
+            text: str = "",
+            function_call: Any = None,
+            function_response: Any = None,
+        ) -> None:
+            self.text = text
+            self.function_call = function_call
+            self.function_response = function_response
+            self.thought = False
+
+    class _FC:
+        def __init__(self, name: str, args: dict) -> None:
+            self.name = name
+            self.args = args
+
+    class _FR:
+        def __init__(self, name: str, response: dict) -> None:
+            self.name = name
+            self.response = response
+
+    class _Content:
+        def __init__(self, parts: list[_Part]) -> None:
+            self.parts = parts
+
+    class _Config:
+        system_instruction = "SYS"
+
+    class _LlmRequest:
+        contents = [
+            _Content([_Part(text="hello world")]),
+            _Content([_Part(function_call=_FC("tool", {"a": 1}))]),
+            _Content([_Part(function_response=_FR("tool", {"ok": True}))]),
+        ]
+        config = _Config()
+
+    chars, messages = _measure_request_chars(_LlmRequest())
+    assert messages == 3
+    # "hello world" is 11 chars; "SYS" is 3; plus tool name + json
+    # blobs each contribute a few more. Bound loosely but require
+    # meaningful content.
+    assert chars >= len("hello world") + len("SYS")
+    # Must also pick up the function_call + function_response
+    # serialisation (so more than just text + sys).
+    assert chars > len("hello world") + len("SYS") + 4
+
+
+def test_measure_request_chars_safe_on_garbage() -> None:
+    """_measure_request_chars returns (0, 0) for non-ADK inputs."""
+    from goldfive.adapters._adk_plugin import _measure_request_chars
+
+    assert _measure_request_chars(None) == (0, 0)
+    assert _measure_request_chars(object()) == (0, 0)
+
+
 async def test_on_event_transfer_calls_steerer_observe(state_ctx_cls) -> None:
     from goldfive.adapters._adk_plugin import (
         SESSION_CONTEXT_STATE_KEY,
