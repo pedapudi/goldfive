@@ -19,9 +19,19 @@ and performs two structural jobs on every LLM call that agent makes:
      ``session.state['goldfive.cancelled_function_call_ids']`` are
      stripped (the LLM tried to retry a call goldfive already
      cancelled — e.g. on USER_STEER).
-   * ``function_call`` parts to agents outside the adapter's
-     registry emit a ``PLAN_DIVERGENCE`` drift via the steerer.
-     **The call is not blocked** — this is a signal, not a gate.
+   * ``function_call`` parts are classified via a three-stage gate
+     (see :meth:`GoldfivePlanner.process_planning_response`):
+
+     1. **Own tool** — name is in the currently-running agent's
+        ``tools`` list. Legitimate; no drift.
+     2. **Cross-layer agent** — name is in the tree's agent registry
+        but wasn't exposed to this agent. LLM attempted delegation
+        past its layer → ``PLAN_DIVERGENCE`` (WARNING).
+     3. **Nowhere** — name is neither a tool nor a known agent. Pure
+        hallucination → ``CONFABULATION_RISK`` (WARNING).
+
+     **The call is not blocked** in any case — this is a signal, not
+     a gate.
 
 Request-side injection requires a plugin workaround
 -----------------------------------------------------
@@ -333,16 +343,30 @@ class GoldfivePlanner(BasePlanner):
     ) -> list[types.Part] | None:
         """Apply structural filters to the LLM's response parts.
 
-        Two independent filters run in order:
+        Two independent concerns run in order:
 
-        1. Strip ``function_call`` parts whose ``function_call.id`` is
-           in ``session.state['goldfive.cancelled_function_call_ids']``.
-           Keeps the rest of the parts intact.
-        2. For every retained ``function_call`` whose ``name`` is not
-           in :attr:`_agent_registry` (when the registry is set),
-           emit a ``PLAN_DIVERGENCE`` drift at INFO severity via
-           ``steerer._handle_drift``. The call is NOT blocked; this
-           is signal-only so the steerer can decide policy.
+        1. **Cancelled-id filter.** Strip ``function_call`` parts
+           whose ``function_call.id`` is in
+           ``session.state['goldfive.cancelled_function_call_ids']``.
+           Keeps the rest of the parts intact. This runs on EVERY part
+           regardless of which drift-stage its name falls in.
+        2. **Three-stage drift classification** (for each retained
+           ``function_call`` part):
+
+           - *Stage 1 — own tool.* Name appears in the currently-
+             running agent's ``tools`` list (read from
+             ``callback_context._invocation_context.agent.tools``).
+             Legitimate; no drift.
+           - *Stage 2 — cross-layer agent.* Name matches an agent in
+             :attr:`_agent_registry` but is not in the running agent's
+             tools. The LLM attempted to delegate past its exposed
+             layer. Emit :data:`DriftKind.PLAN_DIVERGENCE` at WARNING.
+           - *Stage 3 — nowhere.* Name is neither a tool nor a known
+             agent. Emit :data:`DriftKind.CONFABULATION_RISK` at
+             WARNING.
+
+           Calls are NEVER blocked — this is signal-only; the steerer
+           decides whether to escalate.
 
         After goldfive's filters run, if a :attr:`user_planner` is set
         its own ``process_planning_response`` is called on the
@@ -351,7 +375,8 @@ class GoldfivePlanner(BasePlanner):
         state = _extract_state(callback_context)
         cancelled_ids = {s for s in _state_list(state, KEY_CANCELLED_FUNCTION_CALL_IDS)}
 
-        # Filter 1: strip cancelled function_call ids.
+        # Filter 1: strip cancelled function_call ids. Runs on every
+        # part regardless of which drift-stage its name would fall in.
         kept: list[Any] = []
         stripped_count = 0
         for part in response_parts or []:
@@ -369,11 +394,13 @@ class GoldfivePlanner(BasePlanner):
                 stripped_count,
             )
 
-        # Filter 2: signal PLAN_DIVERGENCE on function_calls to agents
-        # outside the registry. We emit best-effort and never block;
-        # the steerer decides whether to escalate.
-        if self._agent_registry is not None and self._steerer is not None:
-            off_registry: list[str] = []
+        # Filter 2: three-stage tool-call drift classification. We
+        # need the currently-running agent's own tool set to
+        # distinguish legitimate tool calls (stage 1) from cross-layer
+        # delegation (stage 2) and hallucination (stage 3).
+        own_tool_names = _extract_own_tool_names(callback_context)
+        divergence_fired = False
+        if self._steerer is not None:
             for part in kept:
                 fc = getattr(part, "function_call", None)
                 if fc is None:
@@ -381,32 +408,50 @@ class GoldfivePlanner(BasePlanner):
                 name = getattr(fc, "name", "") or ""
                 if not name:
                     continue
-                # Only call names that LOOK like agent delegation
-                # targets are checked — goldfive cannot distinguish
-                # an AgentTool name from any other tool name purely
-                # from the Part, so we rely on the registry being
-                # authoritative: if the tool name is in
-                # _agent_registry it's on-plan; if not, it MAY be a
-                # regular tool (fine) OR an off-registry agent call
-                # (divergence). We emit on not-in-registry only when
-                # the name matches the delegation shape we care about
-                # — today that's "not a known agent and not prefixed
-                # with the reporting-tool 'report_' namespace".
-                if name in self._agent_registry:
-                    continue
-                if name.startswith("report_"):
-                    # Reporting tools (report_task_started, etc.) are
-                    # protocol calls, not agent delegation. Skip.
-                    continue
-                # Heuristic: genuine ADK tool names usually include
-                # verbs (web_search, read_file) and rarely coincide
-                # with agent names. We keep the signal permissive —
-                # over-reporting once is fine; the steerer's INFO
-                # severity is absorbable.
-                off_registry.append(name)
 
-            for name in off_registry:
-                self._emit_divergence_signal(name, callback_context)
+                # Stage 1 — agent's own tool. Always legitimate.
+                if name in own_tool_names:
+                    continue
+                # Reporting tools (report_task_started, etc.) are
+                # protocol calls. They may be injected onto the agent
+                # tree post-construction; treat the ``report_`` prefix
+                # as an always-legitimate protocol namespace even if
+                # the tool list didn't reflect it.
+                if name.startswith("report_"):
+                    continue
+
+                # Stage 2 — name matches an agent in the registry but
+                # wasn't exposed to this agent. Cross-layer delegation.
+                if self._agent_registry is not None and name in self._agent_registry:
+                    self._emit_tool_call_drift(
+                        name,
+                        callback_context,
+                        kind_name="PLAN_DIVERGENCE",
+                        detail=(
+                            f"LLM emitted function_call to agent "
+                            f"{name!r} which is in the tree registry "
+                            f"but was not exposed as a tool to the "
+                            f"currently-running agent — cross-layer "
+                            f"delegation attempt, call not blocked"
+                        ),
+                    )
+                    divergence_fired = True
+                    continue
+
+                # Stage 3 — name is neither a tool nor a known agent.
+                # Pure hallucination.
+                self._emit_tool_call_drift(
+                    name,
+                    callback_context,
+                    kind_name="CONFABULATION_RISK",
+                    detail=(
+                        f"LLM emitted function_call to {name!r} which "
+                        f"is neither one of the current agent's tools "
+                        f"nor a known agent in the tree registry — "
+                        f"hallucinated tool, call not blocked"
+                    ),
+                )
+                divergence_fired = True
 
         # Compose with user planner: their filter runs AFTER goldfive's
         # so they see the structurally-clean parts.
@@ -426,12 +471,8 @@ class GoldfivePlanner(BasePlanner):
         # ADK's "leave response untouched" signal — when we kept
         # everything AND did not emit any divergence signals. The
         # latter gate keeps this a no-op in the common case where no
-        # cancelled-ids / off-registry calls exist.
-        if stripped_count or (
-            self._agent_registry is not None
-            and self._steerer is not None
-            and any(getattr(p, "function_call", None) is not None for p in kept)
-        ):
+        # cancelled-ids / divergence classifications fired.
+        if stripped_count or divergence_fired:
             return kept
         return None
 
@@ -440,12 +481,24 @@ class GoldfivePlanner(BasePlanner):
     # the same pipeline PlanReconciler / RUNAWAY_DELEGATION use.
     # ------------------------------------------------------------------
 
-    def _emit_divergence_signal(self, off_registry_name: str, callback_context: Any) -> None:
-        """Emit a ``PLAN_DIVERGENCE`` drift for an off-registry function_call.
+    def _emit_tool_call_drift(
+        self,
+        function_call_name: str,
+        callback_context: Any,
+        *,
+        kind_name: str,
+        detail: str,
+    ) -> None:
+        """Emit a structural tool-call drift via ``steerer._handle_drift``.
+
+        ``kind_name`` selects which :class:`DriftKind` member to fire
+        — one of ``"PLAN_DIVERGENCE"`` (cross-layer delegation) or
+        ``"CONFABULATION_RISK"`` (hallucinated tool) per the three-
+        stage classification in :meth:`process_planning_response`.
 
         Non-blocking: the call still reaches ADK's dispatcher and is
         executed (or fails naturally if the tool name is unknown). We
-        only SIGNAL the divergence so the steerer's policy can decide
+        only SIGNAL the drift so the steerer's policy can decide
         whether to escalate via the intervention ladder (#142) or let
         it ride.
 
@@ -465,8 +518,16 @@ class GoldfivePlanner(BasePlanner):
             )
         except Exception as exc:  # noqa: BLE001
             log.debug(
-                "GoldfivePlanner._emit_divergence_signal: cannot import DriftEvent: %s",
+                "GoldfivePlanner._emit_tool_call_drift: cannot import DriftEvent: %s",
                 exc,
+            )
+            return
+
+        kind = getattr(DriftKind, kind_name, None)
+        if kind is None:
+            log.debug(
+                "GoldfivePlanner._emit_tool_call_drift: unknown DriftKind %r; signal dropped",
+                kind_name,
             )
             return
 
@@ -475,18 +536,18 @@ class GoldfivePlanner(BasePlanner):
         current_task_id = _state_get(state, KEY_CURRENT_TASK_ID, "")
 
         drift = DriftEvent(
-            kind=DriftKind.PLAN_DIVERGENCE,
-            severity=DriftSeverity.INFO,
-            detail=(
-                f"LLM emitted function_call to off-registry agent "
-                f"{off_registry_name!r} — call not blocked, signal only"
-            ),
+            kind=kind,
+            severity=DriftSeverity.WARNING,
+            detail=detail,
             current_task_id=current_task_id,
-            current_agent_id=off_registry_name,
+            current_agent_id=function_call_name,
         )
         handle = getattr(steerer, "_handle_drift", None)
         if not callable(handle):
-            log.debug("GoldfivePlanner: steerer has no _handle_drift; divergence signal dropped")
+            log.debug(
+                "GoldfivePlanner: steerer has no _handle_drift; %s signal dropped",
+                kind_name,
+            )
             return
 
         session = self._session
@@ -494,15 +555,16 @@ class GoldfivePlanner(BasePlanner):
         # ``process_planning_response`` is SYNC by ADK's contract, we
         # schedule on the running event loop. When no loop is running
         # (hypothetical tests calling the method synchronously) fall
-        # through silently — the divergence signal is best-effort.
+        # through silently — the drift signal is best-effort.
         try:
             import asyncio  # noqa: PLC0415 — lazy
 
             loop = asyncio.get_running_loop()
         except RuntimeError:
             log.debug(
-                "GoldfivePlanner: no running loop; divergence signal for %s dropped",
-                off_registry_name,
+                "GoldfivePlanner: no running loop; %s signal for %s dropped",
+                kind_name,
+                function_call_name,
             )
             return
 
@@ -555,6 +617,63 @@ def _extract_state(ctx: Any) -> Any:
         if ok and cur is not None:
             return cur
     return {}
+
+
+def _extract_own_tool_names(callback_context: Any) -> set[str]:
+    """Return the set of tool names exposed to the currently-running agent.
+
+    Reads ``callback_context._invocation_context.agent.tools`` and
+    collects each tool's ``.name`` attribute (falling back to the
+    underlying function's ``__name__`` for ``FunctionTool`` wrappers
+    that don't carry an explicit ``name``). Tools that expose neither
+    are skipped silently.
+
+    Returns an empty set when the attribute chain is missing (e.g.
+    test stubs that don't plumb an invocation_context) — the three-
+    stage classifier treats every function_call as either stage 2 or
+    stage 3 in that case, which is the safe fallback (we err toward
+    reporting rather than suppressing).
+    """
+    # Prefer the standard chain CallbackContext exposes in ADK:
+    # ``_invocation_context.agent`` → the agent whose LLM turn we're
+    # processing.
+    agent = None
+    for attr_chain in (
+        ("_invocation_context", "agent"),
+        ("invocation_context", "agent"),
+        ("agent",),
+    ):
+        cur: Any = callback_context
+        ok = True
+        for part in attr_chain:
+            try:
+                cur = getattr(cur, part, None)
+            except Exception:  # noqa: BLE001 — best-effort
+                cur = None
+            if cur is None:
+                ok = False
+                break
+        if ok and cur is not None:
+            agent = cur
+            break
+    if agent is None:
+        return set()
+
+    tools = getattr(agent, "tools", None)
+    if not tools:
+        return set()
+
+    names: set[str] = set()
+    for tool in tools:
+        name = getattr(tool, "name", None)
+        if not name:
+            # FunctionTool sometimes carries its name on the
+            # wrapped function rather than on the tool object.
+            func = getattr(tool, "func", None)
+            name = getattr(func, "__name__", None) if func is not None else None
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
 
 
 __all__ = [
