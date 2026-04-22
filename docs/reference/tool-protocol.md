@@ -11,9 +11,28 @@ interception path: when the agent calls `report_task_completed(...)`,
 the adapter routes it through the spec's handler, which invokes the
 steerer, which applies the state transition and emits an event.
 
+Canonical list of tool names lives in
+`goldfive.reporting.REPORTING_TOOL_NAMES`:
+
+```python
+REPORTING_TOOL_NAMES: tuple[str, ...] = (
+    "report_task_started",
+    "report_task_progress",
+    "report_task_completed",
+    "report_task_failed",
+    "report_task_blocked",
+    "report_new_work_discovered",
+    "report_plan_divergence",
+    "report_awaiting_approval",
+)
+```
+
+Pre-built specs live in `goldfive.reporting.BUILTIN_REPORTING_TOOLS`.
+
 Related: [STATE-MACHINE.md](../design/STATE-MACHINE.md),
 [PROTOCOLS.md](../design/PROTOCOLS.md#agentadapter),
-[writing-an-agent-adapter.md](../guides/writing-an-agent-adapter.md).
+[writing-an-agent-adapter.md](../guides/writing-an-agent-adapter.md),
+[APPROVAL.md](../design/APPROVAL.md) (report_awaiting_approval).
 
 ## The `ReportingToolSpec` shape
 
@@ -53,10 +72,13 @@ The current `task_id` is made available to the agent by the adapter —
 either in a shared session-state dict (ADK), a system prompt (Claude
 SDK), or as a direct argument (CallableAdapter).
 
-## The seven tools
+## The eight tools
 
 Names are stable contract — do not rename. Mirrors harmonograf's
 canonical reporting tools; goldfive owns the list from v0.1 forward.
+`report_awaiting_approval` is documented at the end of this file —
+it's the task-level half of the human-in-the-loop approval flow
+(see [APPROVAL.md](../design/APPROVAL.md)).
 
 ### 1. `report_task_started`
 
@@ -286,6 +308,45 @@ await report_plan_divergence(
 Use sparingly. Most drift should route through the more specific
 tools above; `report_plan_divergence` is the catch-all.
 
+### 8. `report_awaiting_approval`
+
+```python
+report_awaiting_approval(
+    task_id: str,
+    target_id: str = "",
+    detail: str = "",
+) -> dict
+```
+
+**Call when:** a task needs a human decision before it can proceed.
+Blocks the calling tool-call until an `APPROVE` or `REJECT`
+`ControlMessage` targeting the same id lands on the runner's
+`ControlChannel`.
+
+**Side effects:**
+
+- Registers an `asyncio.Event` on
+  `session.pending_approvals[target_id]` (defaults to `task_id`).
+- Emits `ApprovalRequested(task_id, target_id, detail)`.
+- Blocks until the control dispatcher sets the event, then returns
+  `{"acknowledged": True, "decision": "approve"|"reject",
+  "detail": "..."}`.
+
+**Example:**
+
+```python
+outcome = await report_awaiting_approval(
+    task_id="t5",
+    detail="about to commit destructive changes to production",
+)
+if outcome["decision"] == "reject":
+    await report_task_failed(task_id="t5", reason="operator rejected")
+```
+
+See [APPROVAL.md](../design/APPROVAL.md) for the full Flow A
+semantics (goldfive-native) and Flow B (ADK require_confirmation /
+tool-call id).
+
 ## Summary table
 
 | Tool | Signature | Transition | Drift kind |
@@ -297,6 +358,50 @@ tools above; `report_plan_divergence` is the catch-all.
 | `report_task_blocked` | `(task_id, blocker, needed="")` | RUNNING → BLOCKED | `BLOCKED` |
 | `report_new_work_discovered` | `(parent_task_id, title, description, assignee="")` | none | `NEW_WORK_DISCOVERED` |
 | `report_plan_divergence` | `(note, suggested_action="")` | none | `PLAN_DIVERGENCE` |
+| `report_awaiting_approval` | `(task_id, target_id="", detail="")` | none (blocks caller) | — |
+
+## Interaction with goldfive orchestration
+
+### Tool-loop detector (goldfive#181/#186)
+
+Every tool call the ADK plugin dispatches is observed by
+`ToolLoopTracker` at `after_tool_callback`. **Calls to any
+`report_task_*` tool bypass the detector's counters and instead call
+`ToolLoopTracker.on_task_progress(...)` which clears the per-
+`(invocation_id, agent_name)` ring buffer.** This means:
+
+- A legitimate loop like `read_file → read_file → read_file → report_task_completed`
+  is not flagged.
+- A busted loop that keeps emitting `search → search → search` without
+  ever calling `report_task_progress` / `report_task_completed` will
+  fire `LOOPING_REASONING` (`mode=name`, WARNING) after five same-name
+  calls in seven.
+
+Agents should call `report_task_progress` / `report_task_completed`
+at natural step boundaries so the detector's window clears
+deterministically.
+
+### Session state written by reporting tools
+
+Reporting-tool handlers live in `goldfive.reporting` and write
+through the bound `Steerer`. The ADK plugin bridges a subset onto
+the live ADK `session.state` via `_adk_state_protocol` so the
+agent's next turn sees them:
+
+| Tool | Key(s) stamped on ADK `session.state` |
+|---|---|
+| `report_task_started` | `goldfive.current_task_id`, `goldfive.current_task_title`, `goldfive.current_task_description`, `goldfive.current_task_assignee` |
+| `report_task_progress` | `goldfive.task_progress` |
+| `report_task_completed` | `goldfive.task_outcome`, `goldfive.completed_task_results` |
+| `report_task_failed` | `goldfive.task_outcome` |
+| `report_plan_divergence` | `goldfive.divergence_flag` |
+
+Orchestration-owned keys under `goldfive.*` (see
+`goldfive.orchestration_state`) — `current_plan_id`,
+`goals_summary`, `active_steer.*`, `cancelled_function_call_ids`,
+`processed_steer_ids` — are written by goldfive itself (Runner,
+Steerer, adapter heal path) and read by `GoldfivePlanner` at
+request-side injection time.
 
 ## How the interception works
 

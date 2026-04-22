@@ -3,23 +3,92 @@
 **Stay on target.**
 
 goldfive is a small, framework-agnostic Python library that wraps an agent
-with the orchestration scaffolding most agents quietly need: an explicit
-**goal**, a **plan** broken into tasks, per-turn **drift analysis**, and a
-**steering** loop that nudges the agent back on course when it wanders.
+tree with the orchestration scaffolding most agents quietly need: an
+explicit **goal**, a **plan** broken into tasks, per-turn **drift analysis**,
+and a **steering** loop that nudges the agent back on course when it wanders
+— without driving the tree per-task.
+
+Execution model (since goldfive#141): **overlay, not controller.**
+`goldfive.wrap(tree)` hands the caller's original request verbatim to the
+tree exactly once, observes via ADK callbacks, and intervenes structurally
+through an intervention ladder (Levels 0-5) rather than rewriting every
+turn. The tree runs its natural flow; goldfive watches, steers on drift,
+and reconciles a plan view alongside.
 
 It does not ship an LLM client, a prompt DSL, or a tool registry. It wraps
 whatever agent runtime you already use (Google ADK, the Anthropic SDK, a
 plain callable, ...) behind a narrow `AgentAdapter` protocol and gives you:
 
-- a `Runner` (or one-line `goldfive.wrap` / `goldfive.run`) that drives
-  the agent turn by turn against a `Goal`
-- pluggable `GoalDeriver`, `Planner`, `Executor`, and `Steerer` components
+- a `Runner` (or one-line `goldfive.wrap` / `goldfive.run`) that overlays
+  goldfive's goal / plan / drift machinery on top of a live tree
+- pluggable `GoalDeriver`, `Planner`, `Executor`, `Steerer` components
+  plus an ADK `BasePlanner` subclass (`GoldfivePlanner`) auto-attached per
+  `LlmAgent` for per-turn structural steering
+- an observation-driven `PlanReconciler` that maps before/after-agent
+  callbacks to plan-task transitions
 - an `EventSink` stream of proto-encoded events you can log, persist, or
   ship to an observability console
 
 goldfive is the orchestration half of
 [harmonograf](https://github.com/pedapudi/harmonograf), extracted so you
 can use the control loop without the console.
+
+## Architecture at a glance
+
+```
+           caller's agent tree (any shape)
+           ┌──────────────────────────────┐
+           │  LlmAgent / Coordinator      │
+           │    ├─ AgentTool(Specialist)  │
+           │    └─ sub_agents=[...]       │
+           └──────────────────────────────┘
+                         │
+                         ▼
+            goldfive.wrap(tree, ...)
+                         │
+                         ▼
+     ┌─────────────────────────────────────────────┐
+     │         GoldfiveADKAgent (BaseAgent)        │
+     │  (adk-web sees a root_agent; Runner inside) │
+     └─────────────────────────────────────────────┘
+                         │
+                         ▼
+     ┌─────────────────────────────────────────────┐
+     │   Runner                                    │
+     │     SequentialExecutor(overlay_mode=True)   │
+     │       ──► one adapter.invoke_passthrough    │
+     │                                             │
+     │   auto-attached per LlmAgent:               │
+     │     GoldfivePlanner (BasePlanner subclass)  │
+     │                                             │
+     │   observation:                              │
+     │     PlanReconciler (before/after_agent)     │
+     │     ToolLoopTracker (after_tool)            │
+     │                                             │
+     │   control:                                  │
+     │     DefaultSteerer + intervention ladder    │
+     │     LLMPlanner.{plan,refine}                │
+     └─────────────────────────────────────────────┘
+                         │
+                         ▼
+        EventSink stream (proto goldfive.v1.Event)
+            InMemory / Logging / JSONL / SQLite /
+                   GRPC / HarmonografSink
+                         │
+                         ▼
+              harmonograf server + UI
+```
+
+Key properties:
+
+| Property | Shape |
+|---|---|
+| Tree shape | any — single `LlmAgent`, coordinator + `AgentTool` specialists, deep `sub_agents` nesting |
+| Tree rewriting | none; `goldfive.wrap` walks once to build a `name → BaseAgent` registry |
+| Per-task driving | no (since #141) — one invocation, natural flow |
+| Planning | LLM-driven by default (detects ADK's LLM); falls back to `PassthroughPlanner` when no LLM |
+| Drift signals | tool errors, refusals, tool-loops, reasoning similarity, goal drift (opt-in), cross-layer delegation, hallucinated tools |
+| Intervention | six-level ladder (OBSERVE / ABSORB / NUDGE / CANCEL_REINVOKE / PAUSE_ESCALATE / TERMINATE) in `DefaultSteerer` |
 
 ## Get running in 10 minutes
 
@@ -62,9 +131,9 @@ the agent's LLM when it can detect one, and returns an
 import asyncio
 import goldfive
 
-# `agent` is any of: an ADK BaseAgent, a Claude SDK client factory,
-# an async (task, session, tools) -> InvocationResult callable, or
-# anything implementing goldfive.AgentAdapter.
+# `agent` is any of: an ADK BaseAgent (or pre-built Runner), a Claude
+# SDK client factory, an async (task, session, tools) -> InvocationResult
+# callable, or anything implementing goldfive.AgentAdapter.
 outcome = await goldfive.run(agent, "make a presentation about waffles")
 ```
 
@@ -72,28 +141,76 @@ Prefer to keep the runner around (for `.resume()`, custom sinks, or
 multiple runs)? Use `goldfive.wrap`:
 
 ```python
-runner = goldfive.wrap(agent, sinks=[my_sink])
+runner = goldfive.wrap(
+    agent,
+    sinks=[my_sink],
+    # Common overrides (all optional):
+    # planner=LLMPlanner(call_llm=..., model=...),
+    # goal_deriver=LLMGoalDeriver(call_llm=..., model=...),
+    # steerer=DefaultSteerer(),
+    # plugins=[HarmonografTelemetryPlugin(...)],
+    # control=ControlChannel(),
+)
 outcome = await runner.run("make a presentation about waffles")
 ```
 
-Every default component is overridable — pass `planner=`,
-`executor=`, `sinks=`, `call_llm=`, `model=`, or
-`max_task_invocations=` as keyword arguments to either function.
+Every default component is overridable. Keyword arguments accepted by
+both `wrap` and `run`:
 
-`goldfive.wrap(any_adk_tree)` works regardless of tree shape —
-single agent, coordinator with `AgentTool`-wrapped specialists,
-deep `sub_agents` nesting, `inner_agent` wrappers. goldfive walks
-the tree once at wrap time, builds a `name -> BaseAgent` registry,
-and dispatches each task to the per-agent runner for its
-`task.assignee_agent_id`. The tree is **respected, never rewritten
-or flattened**. See
-[`docs/design/ARCHITECTURE.md §"Registry dispatch"`](docs/design/ARCHITECTURE.md#registry-dispatch-goldfive-drives-adk-executes)
-for the model and
+| Keyword | Default | Notes |
+|---|---|---|
+| `planner=` | `LLMPlanner` when an LLM is detectable, else `PassthroughPlanner` | Any `Planner` |
+| `goal_deriver=` | `LLMGoalDeriver` / `LiteralGoalDeriver` by the same rule | Any `GoalDeriver` |
+| `executor=` | `SequentialExecutor(overlay_mode=True)` | Any `Executor` |
+| `steerer=` | `DefaultSteerer()` | |
+| `sinks=` | `[LoggingSink()]` | Pass `[]` to suppress |
+| `call_llm=` | auto-detected from ADK trees; none otherwise | Async `(system, user, model) -> str` |
+| `model=` | auto-detected from ADK; else empty string | |
+| `max_task_invocations=` | `None` (unbounded) | Cap on adapter invocations per run |
+| `plugins=` | `None` | List of ADK `BasePlugin` instances installed on the runner |
+| `control=` | `None` | `ControlChannel` for live PAUSE / STEER / CANCEL / etc. |
+
+`goldfive.wrap(any_adk_tree)` works regardless of tree shape — single
+agent, coordinator with `AgentTool`-wrapped specialists, deep
+`sub_agents` nesting, `inner_agent` wrappers. Under the **single-Runner,
+overlay-mode** model (since goldfive#141):
+
+- goldfive walks the tree once at wrap time, builds a
+  `name → BaseAgent` registry, and **attaches `GoldfivePlanner`** to
+  every `LlmAgent` so per-turn structural context is injected.
+- `goldfive.wrap` builds **one** `InMemoryRunner` around the root; the
+  tree runs its natural flow (coordinator delegates, specialists report
+  back, etc.).
+- `adapter.invoke_passthrough(user_input)` sends the caller's request
+  verbatim — no `"Task: X"` framing, no goldfive jargon — and the
+  `PlanReconciler` maps observed agent turns back to plan-task
+  transitions via ADK callbacks.
+- The tree is **respected, never rewritten or flattened.**
+
+See
+[`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md)
+for the full model and
 [`docs/guides/adk-web-integration.md`](docs/guides/adk-web-integration.md)
 for a coordinator+AgentTool example under `adk web`.
 
 A runnable demo lives in
 [`examples/hello_callable.py`](examples/hello_callable.py).
+
+## What's new in this version
+
+Arc since the last stable doc refresh, in rough order of impact:
+
+- **Overlay execution model** (#141-#148) — one invocation per run, observation-driven reconciliation, per-task driving is retired.
+- **Intervention ladder** (#142/#147) — Levels 0-5 uniformly map `(drift_kind, severity, occurrence_count)` to the right response.
+- **GoldfivePlanner** (#153/#156) — `BasePlanner` subclass auto-attached per `LlmAgent`, injects tree-agnostic orchestration context + structural drift gate.
+- **Tree-aware planner** (#151/#160) — `LLMPlanner` plans + refines against a structured agent registry.
+- **`goldfive.*` session-state namespace** (#152/#159) — documented keys
+  on ADK session state bridged from `goldfive.orchestration_state`.
+- **STEER idempotency + author propagation** (#171/#175) — `DefaultSteerer.observe` dedupes by source `annotation_id`.
+- **Tool-loop detector** (#181/#186) — three-mode args-aware detector on every tool call, not just reporting tools.
+- **Per-LLM-call instrumentation** (#172/#174) — structured request/response logs with `chars`/`messages_count`/`duration`/`usage`.
+
+Full list: [CHANGELOG.md](CHANGELOG.md).
 
 ## Docs
 
@@ -137,7 +254,8 @@ inspect the event stream. Concrete and runnable.
 ### Reference
 
 - [`docs/reference/api.md`](docs/reference/api.md) — public API surface.
-- [`docs/reference/tool-protocol.md`](docs/reference/tool-protocol.md) — the seven reporting tools.
+- [`docs/reference/tool-protocol.md`](docs/reference/tool-protocol.md) — the eight reporting tools.
+- [`docs/performance.md`](docs/performance.md) — orchestration-overhead baseline.
 
 ## License
 

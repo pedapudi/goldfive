@@ -1,11 +1,12 @@
 # Public API surface
 
-Hand-maintained reference for goldfive's public API as of v0.1. When
+Hand-maintained reference for goldfive's public API. When
 this doc disagrees with the code, trust the code and file a patch to
 fix the doc.
 
 Related: [PROTOCOLS.md](../design/PROTOCOLS.md),
-[ARCHITECTURE.md](../design/ARCHITECTURE.md).
+[ARCHITECTURE.md](../design/ARCHITECTURE.md),
+[DRIFT.md](../design/DRIFT.md).
 
 ## Top-level imports
 
@@ -66,14 +67,16 @@ call.
 def wrap(
     agent: Any,
     *,
-    planner: Optional[Planner] = None,
-    goal_deriver: Optional[GoalDeriver] = None,
-    executor: Optional[Executor] = None,
-    steerer: Optional[Steerer] = None,
-    sinks: Optional[list[EventSink]] = None,
-    call_llm: Optional[Callable[[str, str, str], Awaitable[str]]] = None,
-    model: Optional[str] = None,
-    max_task_invocations: Optional[int] = None,
+    planner: Planner | None = None,
+    goal_deriver: GoalDeriver | None = None,
+    executor: Executor | None = None,
+    steerer: Steerer | None = None,
+    sinks: list[EventSink] | None = None,
+    control: ControlChannel | None = None,
+    call_llm: Callable[[str, str, str], Awaitable[str]] | None = None,
+    model: str | None = None,
+    max_task_invocations: int | None = None,
+    plugins: list[Any] | None = None,
 ) -> Runner: ...
 
 
@@ -81,7 +84,7 @@ async def run(
     agent: Any,
     user_input: str | list[Goal],
     *,
-    context: Optional[Mapping[str, Any]] = None,
+    context: Mapping[str, Any] | None = None,
     **wrap_kwargs: Any,
 ) -> ExecutionOutcome: ...
 ```
@@ -97,10 +100,27 @@ Adapter dispatch favours ADK over the async-callable path so ADK
 agents are not misrouted to `CallableAdapter`. Unknown shapes raise
 `TypeError` with a pointer to the supported options.
 
+Default `executor` is `SequentialExecutor(overlay_mode=True,
+max_task_invocations=max_task_invocations)`; callers who supply their
+own `executor=` retain full control of the execution model.
+
 When no `call_llm` is supplied and the agent does not expose an LLM
 surface `wrap` can detect (currently only ADK), `wrap` falls back to
 `PassthroughPlanner` + `LiteralGoalDeriver` and emits a `DEBUG`
 log line on the `goldfive.wrap` logger.
+
+`plugins=` is forwarded to `ADKAdapter(plugins=...)` and installed on
+the one runner. ADK propagates the plugin manager into any
+`AgentTool`-spawned sub-Runner so delegation inherits the same plugin
+surface. Duplicate plugin instances (same `plugin.name`) are
+silently deduped (#166/#169).
+
+When the wrap target is an ADK `BaseAgent`, the returned object is a
+`GoldfiveADKAgent` — a `BaseAgent` subclass that *also* exposes the
+`Runner` surface, so the same call site works programmatically and as
+the `root_agent` of an `adk web` app. `GoldfiveADKAgent` pins the
+outer adk-web session id onto the inner `ADKAdapter` so all three
+session layers align (#161/#164).
 
 Direct `auto_adapter` access is available for callers who want the
 dispatch logic without the Runner defaults:
@@ -235,7 +255,10 @@ class TaskStatus(StrEnum):
     FAILED
     CANCELLED
     BLOCKED
+    NOT_NEEDED   # terminal; overlay-mode sweep at invocation end (#141/#163)
 ```
+
+`TERMINAL_TASK_STATUSES = {COMPLETED, FAILED, CANCELLED, NOT_NEEDED}`.
 
 ### `DriftSeverity`
 
@@ -248,16 +271,56 @@ class DriftSeverity(StrEnum):
 
 ### `DriftKind`
 
-25 values. See [DRIFT.md](../design/DRIFT.md) for the full
-taxonomy. Examples:
+Full taxonomy. Proto numbers are the authoritative wire values from
+`proto/goldfive/v1/types.proto::DriftKind`. Python `StrEnum` values
+use snake_case for forward compatibility with sinks.
 
-```python
-class DriftKind(StrEnum):
-    TOOL_ERROR, AGENT_REFUSAL, NEW_WORK_DISCOVERED, PLAN_DIVERGENCE,
-    USER_STEER, USER_CANCEL, TASK_FAILED_RECOVERABLE,
-    TASK_FAILED_FATAL, CONTEXT_PRESSURE, BLOCKED, WRONG_AGENT, ...
-    CUSTOM
-```
+| Proto # | Name | Python value | Meaning |
+|---|---|---|---|
+| 1 | TOOL_ERROR | `"tool_error"` | A tool invocation raised or returned a structured error. |
+| 2 | AGENT_REFUSAL | `"agent_refusal"` | Agent declined to perform; graduated severity via `classify_refusal`. |
+| 3 | NEW_WORK_DISCOVERED | `"new_work_discovered"` | `report_new_work_discovered` called; refine expected. |
+| 4 | PLAN_DIVERGENCE | `"plan_divergence"` | `report_plan_divergence`; cross-layer `AgentTool` call from `GoldfivePlanner`. |
+| 5 | USER_STEER | `"user_steer"` | `ControlKind.STEER` arrived; cascade-cancel + refine. |
+| 6 | USER_CANCEL | `"user_cancel"` | `ControlKind.CANCEL` arrived. |
+| 7 | TASK_FAILED_RECOVERABLE | `"task_failed_recoverable"` | `report_task_failed(recoverable=True)`; WARNING. |
+| 8 | TASK_FAILED_FATAL | `"task_failed_fatal"` | `report_task_failed(recoverable=False)`; CRITICAL. |
+| 9 | CONTEXT_PRESSURE | `"context_pressure"` | Stop-reason implied context / token pressure. |
+| 10 | BLOCKED | `"blocked"` | `report_task_blocked`; awaits external input. |
+| 11 | WRONG_AGENT | `"wrong_agent"` | Agent-transfer landed at the wrong target. |
+| 12 | AGENT_TRANSFER | `"agent_transfer"` | Transfer observed; informational. |
+| 13 | MODEL_REFUSAL | `"model_refusal"` | Provider-level refusal. |
+| 14 | STOPPED_EARLY | `"stopped_early"` | Response truncated before the task completed. |
+| 15 | TOO_MANY_STEPS | `"too_many_steps"` | Per-task / per-lineage step cap exceeded. |
+| 16 | GOAL_UNREACHABLE | `"goal_unreachable"` | Planner concluded no plan can satisfy the goal. |
+| 17 | TASK_TIMEOUT | `"task_timeout"` | Task exceeded `predicted_duration_ms` by threshold. |
+| 18 | REPEATED_FAILURE | `"repeated_failure"` | N consecutive refine failures for the same `(kind, task)` pair. |
+| 19 | UNEXPECTED_OUTPUT | `"unexpected_output"` | Output shape violates declared schema. |
+| 20 | SCHEMA_VIOLATION | `"schema_violation"` | Hard JSON / schema parse failure. |
+| 21 | HALLUCINATION_SUSPECTED | `"hallucination_suspected"` | Content inconsistent with the session's facts. |
+| 22 | SAFETY_CONCERN | `"safety_concern"` | Policy / safety signal. |
+| 23 | RESOURCE_EXHAUSTED | `"resource_exhausted"` | Rate limits, quota, etc. |
+| 24 | AMBIGUOUS_INTENT | `"ambiguous_intent"` | Signals the planner needs clarification. |
+| 25 | CUSTOM | `"custom"` | Escape hatch paired with `DriftDetected.detail`. |
+| 26 | LOOPING_TOOL_CALL | `"looping_tool_call"` | Reporting-tool loop guard tripped. |
+| 27 | LOOPING_REASONING | `"looping_reasoning"` | Reasoning-content loop (hash/embedding) **or** tool-loop detector (#181). |
+| 28 | CONFUSION | `"confusion"` | Reasoning expresses uncertainty; INFO. |
+| 29 | OFF_TOPIC | `"off_topic"` | Reasoning topic distant from task description (embedding). |
+| 30 | INTENT_DIVERGENCE | `"intent_divergence"` | Reasoning mentions a non-session goal; graduated severity. |
+| 31 | UNCERTAIN_PROGRESS | `"uncertain_progress"` | Opt-in reflective check: yes-but-low-confidence. |
+| 32 | SELF_REPORTED_STUCK | `"self_reported_stuck"` | Opt-in reflective check: agent says no progress. |
+| 33 | REASONING_CLUSTER_TIGHTENING | `"reasoning_cluster_tightening"` | Embedding-only early-warning below the LOOPING_REASONING cliff. |
+| 34 | CONFABULATION_RISK | `"confabulation_risk"` | Task implies external data but no tool was called; hallucinated `function_call` name (from `GoldfivePlanner`). |
+| 35 | RUNAWAY_DELEGATION | `"runaway_delegation"` | `ADKAdapter(agent_tool_cap=N)` exceeded; CRITICAL. |
+| 36 | REFINE_VALIDATION_FAILED | `"refine_validation_failed"` | `LLMPlanner.refine` exhausted retries; CRITICAL terminal signal. |
+| 37 | HUMAN_INTERVENTION_REQUIRED | `"human_intervention_required"` | Ladder Level 4 escalation; CRITICAL. |
+| 38 | GOAL_DRIFT | `"goal_drift"` | Periodic trajectory-level goal-alignment check; CRITICAL. |
+
+`DriftKind.USER_PAUSE` also exists on the Python side (no proto
+member) for in-process PAUSE bookkeeping.
+
+See [DRIFT.md](../design/DRIFT.md) for severity bands, classifier
+pipelines, and the intervention ladder's level-mapping table.
 
 ### `Task`
 
@@ -329,12 +392,17 @@ class DriftEvent:
 
 ### `Session`
 
+Abbreviated shape (see `goldfive.types.Session` for the full
+dataclass including reflective-check counters and ladder-handoff
+slots):
+
 ```python
 @dataclass
 class Session:
     run_id: str
+    conversation_id: str = ""
     goals: list[Goal] = field(default_factory=list)
-    plan: Optional[Plan] = None
+    plan: Plan | None = None
     current_task_id: str = ""
     completed_results: dict[str, str] = field(default_factory=dict)
     task_progress: dict[str, float] = field(default_factory=dict)
@@ -343,9 +411,45 @@ class Session:
     history: list[Any] = field(default_factory=list)
     started_at_ms: int = 0
 
+    # Reasoning-drift pipeline (goldfive#96)
+    reasoning_history: list[str] = field(default_factory=list)
+    reasoning_history_max: int = 20
+
+    # Intervention-ladder handoffs (goldfive#142)
+    paused_for_human_intervention: bool = False
+    pending_nudges: list[str] = field(default_factory=list)
+    pending_corrective_message: str | None = None
+
+    # Goldfive-orchestration session state (goldfive#152). Owned key
+    # names live in ``goldfive.orchestration_state``; see below.
+    state: dict[str, Any] = field(default_factory=dict)
+
     def next_sequence(self) -> int:
         """Monotonic event sequence counter."""
+
+    @property
+    def id(self) -> str:
+        """Alias for ``run_id``; used as ``Event.session_id`` (goldfive#155)."""
 ```
+
+`goldfive.orchestration_state` owns these keys under `goldfive.*`:
+
+| Key | Written by | Read by |
+|---|---|---|
+| `goldfive.current_plan_id` | plan-submitted / plan-revised paths | planners, sinks |
+| `goldfive.current_task_id` | `PlanReconciler` on RUNNING | `GoldfivePlanner`, sinks |
+| `goldfive.current_task_title` | same | same |
+| `goldfive.goals_summary` | Runner (on goals change / USER_STEER) | `GoldfivePlanner` |
+| `goldfive.active_steer.body` | `DefaultSteerer` on USER_STEER | `GoldfivePlanner` |
+| `goldfive.active_steer.at_turn` | same | refine / drift |
+| `goldfive.active_steer.author` | same | sinks |
+| `goldfive.processed_steer_ids` | `DefaultSteerer.observe` dedupe | self |
+| `goldfive.cancelled_function_call_ids` | adapter `_heal_pending_tool_calls` | `GoldfivePlanner` response filter |
+
+`_GoldfiveADKPlugin.before_run_callback` bridges a subset of these
+from `goldfive.Session.state` onto the live ADK `session.state` so
+`GoldfivePlanner` sees them on its request-side read
+(goldfive#170/#173).
 
 ## Results (`goldfive.results`)
 
@@ -384,11 +488,21 @@ marked otherwise below. Full contracts in
 | Protocol | Methods |
 |---|---|
 | `GoalDeriver` | `derive(user_input, *, context=None) -> list[Goal]` |
-| `Planner` | `generate(*, goals, available_agents, context=None) -> Optional[Plan]` · `refine(*, plan, drift, goals) -> Optional[Plan]` |
-| `Steerer` | `observe(event, session)` · `transition(task_id, to, *, detail="", session)` · `detect_drift(event, session) -> Optional[DriftEvent]` (sync) · `bind(*, sinks, planner)` (sync) |
-| `AgentAdapter` | `register_reporting_tools(tools)` · `invoke(task, session) -> InvocationResult` · property `available_agents: list[str]` (sync) |
-| `Executor` | `run(*, plan, session, adapter, steerer, planner, sinks) -> ExecutionOutcome` |
+| `Planner` | `generate(*, goals, available_agents, context=None) -> Plan \| None` · `refine(*, plan, drift, goals, observed_actions=None, available_agents=None) -> Plan \| None` |
+| `Steerer` | `observe(event, session)` · `transition(task_id, to, *, detail="", session)` · `detect_drift(event, session) -> DriftEvent \| None` (sync) · `bind(*, sinks, planner)` (sync) |
+| `AgentAdapter` | `register_reporting_tools(tools)` · `invoke(task, session) -> InvocationResult` · `emit_reasoning(text, *, task=None, session, provider="", call_id="")` · property `available_agents: list[str]` (sync) |
+| `Executor` | `run(*, plan, session, adapter, steerer, planner, sinks, control=None, user_input="")` — overlay-mode executors honour `user_input`; legacy per-task executors ignore it. |
 | `EventSink` | `emit(event_pb)` · `close()` |
+
+Overlay-specific adapter methods are **duck-typed**, not in the
+`AgentAdapter` protocol: `invoke_passthrough(user_message, *, session,
+reconciler=None, ctx=None)` and `invoke_follow_up(task, session)` are
+defined on `ADKAdapter`. Custom adapters that want to participate in
+the overlay execution path implement them; callers look them up via
+`getattr` and fall back to `invoke` when absent. Similarly,
+`available_agents_tree` (goldfive#151) is a duck-typed property
+shipped on `ADKAdapter` / `CallableAdapter` / `ClaudeAgentSDKAdapter`
+but not part of the Protocol contract.
 
 ## Default implementations
 
@@ -429,22 +543,70 @@ class StaticPlanner(Planner):
     # always returns None.
 
 class LLMPlanner(Planner):
+    DEFAULT_MAX_REFINE_ATTEMPTS: int = 2
+
     def __init__(
         self,
         *,
         call_llm: Callable[[str, str, str], Awaitable[str]],
         model: str = "",
-        system_prompt: Optional[str] = None,
-        refine_system_prompt: Optional[str] = None,
+        system_prompt: str | None = None,
+        refine_system_prompt: str | None = None,
+        user_steer_system_prompt: str | None = None,
+        looping_tool_call_system_prompt: str | None = None,
+        plan_divergence_system_prompt: str | None = None,
+        max_refine_attempts: int | None = None,
     ) -> None: ...
+
+    async def generate(
+        self,
+        *,
+        goals: list[Goal],
+        available_agents: list[str] | list[dict[str, Any]] | None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Plan | None: ...
+
+    async def refine(
+        self,
+        *,
+        plan: Plan,
+        drift: DriftEvent,
+        goals: list[Goal],
+        observed_actions: list[ObservedAction] | None = None,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
+    ) -> Plan | None: ...
 ```
+
+`available_agents` may be a plain `list[str]` (legacy callers) or the
+structured walker produced by
+`ADKAdapter.available_agents_tree` (goldfive#151). When the tree form
+is supplied the prompt renders an `AGENT TREE` section and the
+validator rejects any task whose `assignee_agent_id` is not in the
+registry, feeding the validator message back into a
+retry-with-correction loop. An empty / `None` registry skips the
+assignee check for back-compat.
+
+`refine` behaviour by drift kind:
+
+| `drift.kind` | Prompt used | Uses `observed_actions`? | Uses `available_agents`? |
+|---|---|---|---|
+| `USER_STEER` | user-steer system prompt | no | yes |
+| `LOOPING_TOOL_CALL` / `LOOPING_REASONING` | looping-tool-call prompt | no | yes |
+| `PLAN_DIVERGENCE` with `observed_actions` | divergence / reconciler prompt | yes — ABSORB or `{"reject": true, ...}` | yes |
+| `REFINE_VALIDATION_FAILED` | — | — | — (returns `None`; terminal) |
+| everything else | generic refine prompt | no | yes |
+
+Goal-aware refine (#154): `goals` are included in the divergence
+prompt; USER_STEER-sourced goals render with `[STICKY]`, and the
+validator rejects revisions that silently drop them.
 
 ### Steerer (`goldfive.steerer`)
 
 ```python
 class DefaultSteerer(Steerer):
     # Implements the full state machine + drift classifier from
-    # DRIFT.md and STATE-MACHINE.md. No required constructor args.
+    # DRIFT.md and STATE-MACHINE.md plus the six-level intervention
+    # ladder. No required constructor args.
 ```
 
 In addition to the `Steerer` protocol methods, `DefaultSteerer`
@@ -454,6 +616,147 @@ exposes `mark_task_running`, `mark_task_progress`,
 `report_plan_divergence` for the canonical reporting-tool handlers to
 call into.
 
+STEER idempotency (goldfive#171): `observe(event, session)` dedupes
+`ControlMessage`s of kind `STEER` by source annotation id. The
+dedupe key is taken from the `ControlMessage.payload["annotation_id"]`
+when the bridge supplied one; otherwise the `ControlMessage.id` is
+used as the fallback. Processed ids are stored in
+`session.state[goldfive.processed_steer_ids]` with FIFO eviction at
+`DefaultSteerer.PROCESSED_STEER_IDS_CAP`. Content-based drifts
+(`LOOPING_REASONING`, tool errors, etc.) are **not** deduped — they
+are heuristic signals, not user actions.
+
+Intervention ladder (goldfive#142):
+
+| Level | Name | Action |
+|---|---|---|
+| 0 | OBSERVE | Emit `DriftDetected`; no further action. |
+| 1 | ABSORB | Call `planner.refine`; continue. |
+| 2 | NUDGE | Queue a soft follow-up on `session.pending_nudges`; overlay loop picks it up at the next invocation boundary. |
+| 3 | CANCEL_REINVOKE | Cancel in-flight, refine, stash a corrective message on `session.pending_corrective_message`. |
+| 4 | PAUSE_ESCALATE | Emit `HUMAN_INTERVENTION_REQUIRED`; set `session.paused_for_human_intervention`. |
+| 5 | TERMINATE | Run-level abort (reserved for unhandled Level 4 timeouts). |
+
+Mapping from `(drift_kind, severity, occurrence_count)` to level lives
+in `DefaultSteerer._ladder_level_for`.
+
+### `GoldfivePlanner` (`goldfive.planners.goldfive_planner`)
+
+ADK `BasePlanner` subclass auto-attached by `goldfive.wrap` to every
+`LlmAgent` in the tree (goldfive#153/#156). Two jobs:
+
+1. **Request side** — `build_planning_instruction` returns a
+   tree-agnostic `[GOLDFIVE ORCHESTRATION CONTEXT]` block assembled
+   from `session.state[goldfive.*]` keys. Request-side injection is
+   performed by `_GoldfiveADKPlugin.before_model_callback`
+   (workaround for ADK's `isinstance(planner, PlanReActPlanner)` gate
+   in `_nl_planning.py`).
+2. **Response side** — `process_planning_response` filters response
+   parts:
+   - strips `function_call` parts whose id is in
+     `session.state[goldfive.cancelled_function_call_ids]`
+   - classifies each remaining `function_call` via a three-stage
+     gate (goldfive#178/#184): own-tool → skip; cross-layer agent
+     name in the tree registry → `PLAN_DIVERGENCE` (WARNING);
+     hallucinated name → `CONFABULATION_RISK` (WARNING). Calls are
+     **never blocked**.
+
+```python
+class GoldfivePlanner(BasePlanner):
+    def __init__(
+        self,
+        *,
+        user_planner: BasePlanner | None = None,
+        agent_registry: Iterable[str] | None = None,
+        steerer: Any = None,
+        session: Any = None,
+    ) -> None: ...
+
+    def bind(
+        self,
+        *,
+        agent_registry: Iterable[str] | None = None,
+        steerer: Any = None,
+        session: Any = None,
+    ) -> None: ...
+
+    def build_planning_instruction(
+        self, readonly_context, llm_request
+    ) -> str | None: ...
+
+    def process_planning_response(
+        self, callback_context, response_parts
+    ) -> list[Part] | None: ...
+```
+
+Composes with a user-supplied `BasePlanner` via `user_planner=`: the
+user's `build_planning_instruction` is called first and **prepended**
+ahead of goldfive's block; on the response side goldfive's filters
+run first and the cleaned parts flow through the user planner's
+`process_planning_response`.
+
+### `ToolLoopTracker` (`goldfive.drift.tool_loops`)
+
+Tool-call loop detector (goldfive#181/#186) plumbed on every
+`after_tool_callback` dispatch in `_GoldfiveADKPlugin`. Per-
+`(invocation_id, agent_name)` ring buffer; emits
+`DriftEvent(kind=LOOPING_REASONING, ...)` on three patterns.
+
+```python
+class ToolLoopTracker:
+    def __init__(
+        self,
+        *,
+        window: int = 7,                   # DEFAULT_WINDOW
+        exact_threshold: int = 3,          # DEFAULT_EXACT_THRESHOLD
+        name_threshold: int = 5,           # DEFAULT_NAME_THRESHOLD
+        alternating_threshold: int = 5,    # DEFAULT_ALTERNATING_THRESHOLD
+    ) -> None: ...
+
+    def observe_tool_call(
+        self,
+        *,
+        invocation_id: str,
+        agent_name: str,
+        tool_name: str,
+        args: Any,
+        task_id: str = "",
+    ) -> list[DriftEvent]: ...
+
+    def on_task_progress(
+        self, *, invocation_id: str, agent_name: str
+    ) -> None: ...
+
+    def clear(self) -> None: ...
+
+    def buffer_size(self, *, invocation_id: str, agent_name: str) -> int: ...
+
+
+def args_hash(args: Any) -> str: ...          # 8-char md5 hex of sorted-keys JSON
+def load_thresholds_from_env() -> dict[str, int]: ...
+```
+
+Detection modes:
+
+| Mode | Pattern | Default | Severity |
+|---|---|---|---|
+| Exact | same `(tool_name, args_hash)` ≥ threshold in last `window` | 3 / 7 | WARNING |
+| Name | same `tool_name` ≥ threshold in last `window`, no task progress | 5 / 7 | WARNING |
+| Alternating | A,B,A,B,A pattern in last `alternating_threshold` | 5 | INFO |
+
+Progress-reporting tools (`report_task_*`) call
+`on_task_progress(...)` which clears the per-(invocation, agent)
+window, so legitimate scripted sequences aren't flagged.
+
+Env-var overrides:
+`GOLDFIVE_TOOL_LOOP_WINDOW`,
+`GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD`,
+`GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD`,
+`GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD`.
+
+Follow-ups tracked: #179 (umbrella), #182 (args-quality),
+#183 (silent-success), #185 (wrong-tool).
+
 ### Executors (`goldfive.executors`)
 
 ```python
@@ -461,9 +764,10 @@ class SequentialExecutor(Executor):
     def __init__(
         self,
         *,
-        max_task_invocations: Optional[int] = None,  # None = unbounded
+        max_task_invocations: int | None = None,       # None = unbounded
         max_retries_per_task_lineage: int = 3,
         fail_fast: bool = True,
+        overlay_mode: bool = False,                     # goldfive#141
     ) -> None: ...
 
 class ParallelDAGExecutor(Executor):
@@ -471,9 +775,19 @@ class ParallelDAGExecutor(Executor):
         self,
         max_concurrency: int = 0,  # 0 = unbounded fan-out
         drift_policy: Literal["cancel_stage", "finish_stage"] = "finish_stage",
-        max_task_invocations: Optional[int] = None,  # None = unbounded
+        max_task_invocations: int | None = None,  # None = unbounded
     ) -> None: ...
 ```
+
+`overlay_mode=True` (set by `goldfive.wrap` by default) swaps the
+executor's per-task loop for a single
+`adapter.invoke_passthrough(user_input)` invocation. Observation
+happens via the plugin callback surface and `PlanReconciler` maps
+observed agent turns to plan-task transitions. STEER control
+messages cancel the in-flight invocation and restart `invoke_passthrough`
+with the composed steer-restart message as the new user input. At
+invocation end any task still PENDING lands in
+`TaskStatus.NOT_NEEDED` (no soft follow-up, goldfive#163).
 
 ### Adapters (`goldfive.adapters`)
 
@@ -497,11 +811,40 @@ class ADKAdapter(AgentAdapter):
         agent_or_runner: Any,  # google.adk.BaseAgent OR an existing Runner
         *,
         user_id: str = "goldfive_user",
-        session_id: Optional[str] = None,
-        app_name: Optional[str] = None,
-        plugins: Optional[list[Any]] = None,
-        agent_tool_cap: Optional[int] = None,  # default 16; 0 disables
+        session_id: str | None = None,
+        app_name: str | None = None,
+        plugins: list[Any] | None = None,
+        agent_tool_cap: int | None = None,  # default 16; 0 disables
     ) -> None: ...
+
+    # Overlay-model entry points (goldfive#141). `goldfive.wrap` uses
+    # ``invoke_passthrough`` exclusively; ``invoke`` and
+    # ``invoke_follow_up`` are kept for external callers.
+
+    async def invoke_passthrough(
+        self,
+        user_message: str,
+        *,
+        session: Session,
+        reconciler: Any = None,
+        ctx: Any = None,
+    ) -> InvocationResult:
+        """Drive ONE ADK turn with the user's original request verbatim."""
+
+    async def invoke_follow_up(
+        self, task: Task, session: Session
+    ) -> InvocationResult:
+        """Gentle ``Also, please: {title}.`` for a missed task.
+
+        Not called by the overlay executor since goldfive#163 —
+        PENDING tasks land in ``TaskStatus.NOT_NEEDED`` at invocation
+        end. Retained for external callers.
+        """
+
+    async def invoke(self, task: Task, session: Session) -> InvocationResult:
+        """DEPRECATED — per-task drive. Uses ``invoke_follow_up`` phrasing."""
+
+    def add_plugin(self, plugin: Any) -> None: ...
 
     @property
     def available_agents(self) -> list[str]:
@@ -512,6 +855,15 @@ class ADKAdapter(AgentAdapter):
         populates ``task.assignee_agent_id`` as a delegation hint;
         goldfive does not route on the assignee under the single-
         Runner model (goldfive#130).
+        """
+
+    @property
+    def available_agents_tree(self) -> list[dict[str, Any]]:
+        """Structured walker of the tree: one dict per reachable agent
+        with ``name`` / ``depth`` / ``parent`` / ``role`` / ``kind``.
+        Passed to ``LLMPlanner.generate(available_agents=...)`` so the
+        prompt and validator can enforce on-registry assignees
+        (goldfive#151).
         """
 
 # Requires `goldfive[claude]`
@@ -530,12 +882,21 @@ class ClaudeAgentSDKAdapter(AgentAdapter):
         """Wire a :class:`Steerer` in after construction."""
 ```
 
-`ADKAdapter.invoke(task, session)` drives the one runner regardless
-of `task.assignee_agent_id` — the assignee is a planner hint, not
-a routing key. The plugin enforces a per-invocation cap on
-AgentTool spawns (default 16, `agent_tool_cap=0` disables); on
-exceed the plugin emits a `RUNAWAY_DELEGATION` drift at CRITICAL
-severity and cancels the invocation.
+`ADKAdapter.invoke_passthrough(user_message, session=..., reconciler=...)`
+drives the one runner regardless of `task.assignee_agent_id` — the
+assignee is a planner hint, not a routing key. The plugin enforces a
+per-invocation cap on AgentTool spawns (default 16,
+`agent_tool_cap=0` disables); on exceed the plugin emits a
+`RUNAWAY_DELEGATION` drift at CRITICAL severity and cancels the
+invocation.
+
+When the caller or the executor cancels an in-flight invocation,
+`ADKAdapter` invokes `plugin.on_cancellation(invocation_id)` on every
+plugin that defines the method (goldfive#167/#168). Observability
+plugins like `HarmonografTelemetryPlugin` use this to close open
+spans with `status=CANCELLED` before the `CancelledError` is
+re-raised. Exceptions in the hook are swallowed — cancel semantics
+take precedence.
 
 See [ARCHITECTURE.md §"Single-Runner dispatch"](../design/ARCHITECTURE.md#single-runner-dispatch-goldfive-drives-the-root-adk-delegates-within)
 for the model and [adk-web-integration.md §"Pre-built Runner degrade mode"](../guides/adk-web-integration.md#pre-built-runner-degrade-mode)
@@ -856,11 +1217,42 @@ Event, RunStarted, GoalDerived, PlanSubmitted, PlanRevised,
 TaskStarted, TaskProgress, TaskCompleted, TaskFailed,
 TaskBlocked, TaskCancelled, DriftDetected, RunCompleted, RunAborted,
 AgentInvocationStarted, AgentInvocationCompleted, DelegationObserved
+
+# control_pb2
+ControlEvent, ControlAck, ControlKind, ControlAckResult, ControlTarget,
+SteerPayload, RewindPayload, ApprovePayload, RejectPayload,
+InjectMessagePayload
 ```
 
 The `Event` envelope has a `oneof payload` with one field per
 per-event message. See [EVENT-MODEL.md](../design/EVENT-MODEL.md) for
 the full catalog.
+
+Envelope fields worth knowing about:
+
+| # | Field | Added | Purpose |
+|---|---|---|---|
+| 1 | `event_id` | v0.1 | UUIDv7 recommended for sink dedupe. |
+| 2 | `run_id` | v0.1 | Stable across every event in a run. |
+| 3 | `sequence` | v0.1 | Per-run monotonic, gap-free starting at 0. |
+| 4 | `emitted_at` | v0.1 | Wall clock; advisory only. |
+| 5 | `session_id` | goldfive#155/#157 | Per-event `Session.id` for stream-multiplexed consumers. Empty means "route via stream Hello". |
+
+Drift-side augmentations:
+
+- `DriftDetected.annotation_id` (field 6, goldfive#176/#177) — source
+  annotation id for USER_STEER / USER_CANCEL drifts minted from a
+  `ControlMessage`; empty for goldfive-minted drifts. Sinks dedupe
+  against the annotation card.
+
+Control-side augmentations (`SteerPayload`, goldfive#171/#175):
+
+| # | Field | Purpose |
+|---|---|---|
+| 1 | `note` | Steer body text. |
+| 2 | `suggested_action` | Optional hint to the planner. |
+| 3 | `author` | Operator identity from the originating annotation; empty when the bridge doesn't source annotations. |
+| 4 | `annotation_id` | Source annotation id used for idempotent delivery in `DefaultSteerer.observe`. |
 
 ## Convenience helpers (`goldfive.conv`)
 

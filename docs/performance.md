@@ -41,10 +41,36 @@ proto event messages. The script prints a single block of measurements
 to stdout and unlinks its temp file before exiting. Total runtime is
 well under a second on commodity hardware.
 
-## Recorded baseline (v0.1.0)
+## Recorded baselines
 
-Median of five consecutive runs on **2026-04-18**, commodity Linux
-laptop, single core, no parallelism, CPython 3.12.13:
+### 2026-04-21 (current)
+
+Median of five consecutive runs, commodity Linux laptop, single
+core, no parallelism, CPython 3.12.13, post-overlay + tool-loop
+detector.
+
+| Metric             | Value          |
+| ------------------ | -------------- |
+| Wall time          | **0.104 s**    |
+| Throughput         | **962 tasks/s** |
+| Peak memory        | **0.33 MiB**   |
+| JSONL file size    | **61.59 KiB**  |
+| Python             | 3.12.13        |
+| goldfive           | 0.1.0          |
+
+JSONL file size grew ~20 % vs the 2026-04-18 baseline because the
+proto `Event` envelope gained the `session_id` field (goldfive#155)
+and `DriftDetected` gained `annotation_id` (goldfive#177). These
+are per-event string fields stamped by the Runner / Steerer, not
+per-turn overhead. Peak memory and wall time held flat relative to
+baseline — the overlay execution model (goldfive#141) removes the
+per-task re-invocation overhead, offsetting the new per-call
+instrumentation (`goldfive.llm.request` / `goldfive.llm.response`
+logs, goldfive#172/#174).
+
+### 2026-04-18 (v0.1.0 release snapshot)
+
+Median of five consecutive runs on the same hardware:
 
 | Metric             | Value          |
 | ------------------ | -------------- |
@@ -55,7 +81,7 @@ laptop, single core, no parallelism, CPython 3.12.13:
 | Python             | 3.12.13        |
 | goldfive           | 0.1.0          |
 
-Run-to-run variance over the five samples was roughly ±10 % on
+Run-to-run variance over the five samples is roughly ±10 % on
 wall-time and effectively zero on peak memory and JSONL size.
 
 ## Methodology notes
@@ -76,6 +102,36 @@ wall-time and effectively zero on peak memory and JSONL size.
   only**. Real workloads will be dominated by LLM and tool latency,
   which goldfive does not control.
 
+## Shape of the performance profile
+
+The 2026-04-18 baseline measures a **legacy per-task** executor path
+(`SequentialExecutor(overlay_mode=False)` + `StaticPlanner`, no LLM
+in the loop). Real `goldfive.wrap`-driven runs have a different
+profile:
+
+- **LLM call count** scales with `tree_depth × task_count` in the
+  per-task model; under the overlay model (goldfive#141, default for
+  `goldfive.wrap`) it scales with whatever the wrapped tree does
+  naturally for the single passthrough invocation. Goldfive adds
+  one additional LLM call per refine, bounded by
+  `LLMPlanner.DEFAULT_MAX_REFINE_ATTEMPTS=2`.
+- **Tool-loop detector** (`ToolLoopTracker`) is **O(1) per tool call**
+  modulo the ring-buffer window (default 7). Pure Python dict /
+  deque ops; no embeddings, no LLM.
+- **Reasoning-similarity detectors** are O(1) when embeddings are
+  unavailable (hash-only path). With `goldfive[embedding]`
+  installed, each reasoning block costs one embedding lookup against
+  the last N=5 blocks in `session.reasoning_history`.
+- **Per-LLM-call instrumentation** (goldfive#172/#174) adds a
+  constant-time log line before and after each model call. No
+  measurable overhead at this scale.
+- **GoldfivePlanner** runs request-side and response-side on every
+  LLM turn; both are O(parts_in_response) for the three-stage
+  classifier. No allocations per call in the common case.
+- **Session state bridge** (goldfive#170/#173) writes ~5 goldfive
+  keys onto ADK `session.state` at `before_run_callback`; one dict
+  copy per invocation, not per turn.
+
 ## Known limitations
 
 - **Single-threaded**: `SequentialExecutor` walks one task at a time.
@@ -89,18 +145,23 @@ wall-time and effectively zero on peak memory and JSONL size.
   own serialisation cost.
 - **Linear plan**: a 100-stage chain stresses sequential walking but
   not the topological-sort path that wide DAGs exercise.
+- **Per-task executor**: the benchmark still runs the legacy per-task
+  loop because the overlay path needs an adapter that implements
+  `invoke_passthrough`. An overlay-mode baseline should be added
+  once the benchmark is migrated.
 - **CPython only**: numbers measured under CPython 3.12; PyPy and
   newer CPython releases may differ.
 
 ## Regression policy
 
-If a future change pushes wall-time past **2× baseline** (~0.21 s) or
-peak memory past **2× baseline** (~0.58 MiB) on this exact workload,
-that warrants investigation before merge. We do **not** gate CI on the
-benchmark — it is a tripwire for human reviewers, not infrastructure.
+If a future change pushes wall-time past **2× current baseline**
+(~0.21 s) or peak memory past **2× current baseline** (~0.66 MiB) on
+this exact workload, that warrants investigation before merge. We do
+**not** gate CI on the benchmark — it is a tripwire for human
+reviewers, not infrastructure.
 
 To check after a change, simply re-run the benchmark a handful of times
-and compare the medians against the table above. If the workload
+and compare the medians against the tables above. If the workload
 itself changes (different sink, different plan shape, different
-adapter), record a new baseline rather than comparing apples to
-oranges.
+adapter, overlay-mode path), record a new baseline rather than
+comparing apples to oranges.
