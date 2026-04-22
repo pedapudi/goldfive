@@ -1264,13 +1264,22 @@ class ADKAdapter:
     async def invoke_follow_up(self, task: Task, session: Session) -> InvocationResult:
         """Drive a gentle follow-up for a plan ``task`` missed during passthrough.
 
-        Used by the overlay-model executor (goldfive#141) after
-        :meth:`invoke_passthrough` finishes and the
-        :class:`PlanReconciler` reports PENDING tasks the tree did
-        not exercise. Sends a natural-language "Also, please: ..."
-        user turn on top of the existing conversation so the tree
-        picks up the missed work without re-running its full
-        pipeline.
+        .. note::
+           As of goldfive#163 this method is **no longer called by the
+           overlay-mode** :class:`~goldfive.executors.sequential.SequentialExecutor`.
+           The overlay now marks PENDING tasks ``NOT_NEEDED`` at the
+           end of the passthrough invocation instead of dispatching
+           follow-ups — flow-prompted coordinators were re-running
+           their full pipeline on every follow-up user message,
+           amplifying a ~10 min run into 40+ min. STEER is the
+           supported user-driven path for exercising uncovered work.
+
+        The method is retained for external callers that want to
+        manually nudge a single task on top of an existing
+        conversation (e.g. custom executors, interactive tooling).
+        It sends a natural-language "Also, please: ..." user turn
+        on top of the existing conversation so the tree picks up
+        the missed work without re-running its full pipeline.
         """
         return await self._invoke_internal(
             task=task,

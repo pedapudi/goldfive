@@ -32,8 +32,13 @@ streams from the goldfive ADK plugin:
 
 After the invocation completes the runner / executor calls
 :meth:`get_missed_tasks` to find PENDING tasks the tree never
-exercised. Those become candidates for soft follow-up via
-``ADKAdapter.invoke_follow_up``.
+exercised. As of goldfive#163 the overlay executor transitions
+those to ``TaskStatus.NOT_NEEDED`` and does NOT dispatch soft
+follow-ups — flow-prompted coordinators were re-running their
+full pipeline on every follow-up user message. The method is
+kept available for external callers that want to surface the
+coverage gap in their own way (logging, custom nudge prompts,
+etc.).
 
 Tolerance
 ---------
@@ -406,8 +411,11 @@ class PlanReconciler:
         """Return PENDING tasks the tree never exercised.
 
         Called by the executor's overlay-mode loop after the single
-        invocation ends. Each returned task is a candidate for a
-        soft follow-up via :meth:`ADKAdapter.invoke_follow_up`.
+        invocation ends. As of goldfive#163 the overlay transitions
+        these tasks to ``TaskStatus.NOT_NEEDED`` rather than
+        re-dispatching them; the method is retained for external
+        callers (custom executors, telemetry) that want to surface
+        the coverage gap.
 
         If ``plan`` is ``None`` the reconciler reads the session's
         live plan — which may differ from the plan at the start of

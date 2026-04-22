@@ -4,6 +4,27 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ## Unreleased
 
+### Changed
+
+- #163 Overlay executor no longer dispatches soft follow-ups. When
+  `SequentialExecutor._run_overlay` finishes its single
+  `invoke_passthrough` invocation, any still-PENDING plan tasks are
+  transitioned to `TaskStatus.NOT_NEEDED` instead of being
+  re-dispatched as per-task `invoke_follow_up` calls. Evidence from
+  a flow-prompted coordinator: a tree that plain-ADK completes in
+  ~10 min was taking 40+ min under `goldfive.wrap` because each
+  follow-up user message re-triggered the coordinator's full
+  research → web_dev → reviewer → debugger pipeline. Follow-up was
+  intended as a safety net for genuinely missed tasks but fired for
+  tasks the tree's flow simply did not specifically exercise by
+  agent invocation — which is most of them when the tree is
+  flow-prompted. Users who want uncovered tasks exercised
+  explicitly can STEER. `ADKAdapter.invoke_follow_up` is retained
+  for external callers but is no longer invoked by the overlay
+  executor. The `SequentialExecutor(max_follow_up_rounds=...)`
+  kwarg is accepted for one release with a `DeprecationWarning`
+  and has no effect.
+
 ### Added
 
 - #141 Overlay execution model — `goldfive.wrap(...)` no longer drives
