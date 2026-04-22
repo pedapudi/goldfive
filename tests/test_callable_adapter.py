@@ -44,6 +44,7 @@ class _StubSteerer:
         *,
         detail: str = "",
         session: Session,
+        cancel_reason: str = "",  # noqa: ARG002
     ) -> None:
         self.transitions.append((task_id, to, detail))
         # Mirror real steerer behaviour: update session state.

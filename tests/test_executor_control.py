@@ -82,6 +82,7 @@ class StubSteerer:
         self._planner: Any = None
         self.observed: list[Any] = []
         self.refine_result = refine_result
+        self.last_cancel_reason: str = ""
 
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks
@@ -106,6 +107,7 @@ class StubSteerer:
         *,
         detail: str = "",
         session: Session,
+        cancel_reason: str = "",
     ) -> None:
         if session.plan is None:
             return
@@ -114,6 +116,8 @@ class StubSteerer:
                 t.status = to
                 if to == TaskStatus.COMPLETED and detail:
                     session.completed_results[task_id] = detail
+                if to == TaskStatus.CANCELLED:
+                    self.last_cancel_reason = cancel_reason or detail
                 return
 
     def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:

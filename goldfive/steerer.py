@@ -445,22 +445,48 @@ class DefaultSteerer:
         *,
         detail: str = "",
         session: Session,
+        cancel_reason: str = "",
     ) -> None:
         """Generic transition entry point.
 
         Dispatches to the corresponding ``mark_task_*`` method. Unknown
         target statuses are a no-op (we don't invent new transitions).
+
+        ``cancel_reason`` (goldfive#205): structured reason string stamped
+        on the emitted ``TaskCancelled`` / ``TaskFailed`` envelope when the
+        transition is to CANCELLED or FAILED. Takes precedence over
+        ``detail`` for reason-field population. Conventional formats
+        recognised by harmonograf's Trajectory view:
+
+        * ``upstream_failed:<upstream_task_id>`` — cascade from a failed
+          or cancelled ancestor.
+        * ``superseded_by_revision:<replacement_task_id>`` — refine
+          replaced this task with a new one.
+        * ``run_aborted:<abort_reason>`` — fail_fast / validation / budget.
+        * ``user_cancel:<annotation_id>`` — user-initiated CANCEL control.
+        * ``adk_cancellation:<invocation_id>`` — ADK mid-invocation cancel.
+        * ``steerer_policy:<drift_kind>`` — steerer-imposed cancel via
+          intervention ladder.
+
+        Sinks that don't know the format still surface the raw string,
+        so it's safe to evolve the vocabulary without a proto change.
+
+        Passing ``cancel_reason`` for non-terminal transitions is a
+        no-op; the value is only consulted when ``to`` is CANCELLED or
+        FAILED.
         """
         if to is TaskStatus.RUNNING:
             await self.mark_task_running(task_id, session=session, detail=detail)
         elif to is TaskStatus.COMPLETED:
             await self.mark_task_completed(task_id, summary=detail, session=session)
         elif to is TaskStatus.FAILED:
-            await self.mark_task_failed(task_id, reason=detail, session=session)
+            reason = cancel_reason or detail
+            await self.mark_task_failed(task_id, reason=reason, session=session)
         elif to is TaskStatus.BLOCKED:
             await self.mark_task_blocked(task_id, blocker=detail, session=session)
         elif to is TaskStatus.CANCELLED:
-            await self.mark_task_cancelled(task_id, reason=detail, session=session)
+            reason = cancel_reason or detail
+            await self.mark_task_cancelled(task_id, reason=reason, session=session)
         elif to is TaskStatus.NOT_NEEDED:
             await self.mark_task_not_needed(task_id, reason=detail, session=session)
         # PENDING and UNSPECIFIED are intentionally not reachable from
@@ -740,7 +766,12 @@ class DefaultSteerer:
             downstream.setdefault(e.from_task_id, []).append(e.to_task_id)
         tasks_by_id: dict[str, Task] = {t.id: t for t in plan.tasks if t.id}
 
-        cascade_reason = f"cascade from {cancelled_id}"
+        # goldfive#205: structured reason consumed by harmonograf's
+        # Trajectory view. Old ``cascade from <id>`` form preserved in a
+        # human-readable tail after the colon so sinks that render the
+        # raw reason keep their existing copy; new sinks parse the
+        # ``upstream_failed:`` prefix to categorise the cancel.
+        cascade_reason = f"upstream_failed:{cancelled_id}"
         cascaded: list[str] = []
         queue: list[str] = list(downstream.get(cancelled_id, []))
         visited: set[str] = set()

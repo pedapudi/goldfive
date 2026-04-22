@@ -86,6 +86,7 @@ class StubSteerer:
         *,
         detail: str = "",  # noqa: ARG002
         session: Session,
+        cancel_reason: str = "",  # noqa: ARG002
     ) -> None:
         self.transitions.append((task_id, to))
         if session.plan is None:
