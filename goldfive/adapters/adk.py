@@ -1424,6 +1424,24 @@ class ADKAdapter:
                 reason=reason,
                 session=session,
             )
+            # Notify every caller-supplied plugin that implements the
+            # ``on_cancellation(invocation_id)`` hook so they can flush
+            # per-invocation state that would otherwise leak.
+            #
+            # Why this is needed: ADK's
+            # :meth:`Runner._exec_with_plugin` places
+            # ``after_run_callback`` (and the sub-call after-hooks) AFTER
+            # its ``async with Aclosing(execute_fn(...))`` block — NOT
+            # inside a ``finally``. On ``CancelledError`` the generator
+            # is closed but the after-callbacks never fire. Observability
+            # plugins like :class:`HarmonografTelemetryPlugin` that open
+            # spans on the before-callbacks would then leave those spans
+            # in ``status=RUNNING`` forever (goldfive#167).
+            #
+            # Best-effort, fire-and-forget: any plugin exception is
+            # swallowed so we still re-raise ``CancelledError`` with the
+            # expected cancel semantics (no extra exception chaining).
+            self._notify_plugins_on_cancellation(last_invocation_id)
             raise
         except Exception as exc:  # noqa: BLE001
             err = exc
@@ -1524,6 +1542,42 @@ class ADKAdapter:
                 "ADKAdapter._touch_session: create_session raised: %s",
                 exc,
             )
+
+    def _notify_plugins_on_cancellation(self, invocation_id: str) -> None:
+        """Fire-and-forget ``on_cancellation`` notification to every plugin.
+
+        Walks the caller-supplied plugin list (``self._plugins``) and
+        invokes ``plugin.on_cancellation(invocation_id)`` on every plugin
+        that defines the method. This is the canonical handoff from
+        goldfive's ``except asyncio.CancelledError:`` branch to
+        observability plugins that must flush per-invocation state —
+        most notably :class:`HarmonografTelemetryPlugin`, which closes
+        its open spans with ``status=CANCELLED`` to prevent the stale
+        ``RUNNING`` spans reported in goldfive#167.
+
+        The hook is an opt-in duck-typed contract: plugins that don't
+        need cancellation cleanup simply don't define the method. ADK's
+        ``BasePlugin`` doesn't require it.
+
+        Swallows every exception: we must NOT replace the
+        ``CancelledError`` about to be re-raised with a plugin-side
+        error — that would change the cancel semantics for every caller
+        above us in the stack.
+        """
+        if not invocation_id:
+            return
+        for plugin in self._plugins:
+            hook = getattr(plugin, "on_cancellation", None)
+            if not callable(hook):
+                continue
+            try:
+                hook(invocation_id)
+            except Exception:  # noqa: BLE001 — observability must not break cancel
+                log.debug(
+                    "ADKAdapter: plugin %r on_cancellation raised (swallowed)",
+                    type(plugin).__name__,
+                    exc_info=True,
+                )
 
     async def _heal_pending_tool_calls(
         self,
