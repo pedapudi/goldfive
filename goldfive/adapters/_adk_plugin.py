@@ -38,7 +38,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive.adapters import _adk_state_protocol as _sp
@@ -198,6 +198,105 @@ def _session_context_from_callback(ctx: Any) -> SessionContext | None:
     if isinstance(value, SessionContext):
         return value
     return None
+
+
+# --------------------------------------------------------------------------
+# goldfive#191 — Layer 3: task_id arg injection for reporting tools
+# --------------------------------------------------------------------------
+#
+# When an LLM emits a report_task_* / report_awaiting_approval call with a
+# missing or obviously-placeholder ``task_id``, we fall back to the pinned
+# ``goldfive.current_task_id`` that ``before_agent_callback`` (Layer 1)
+# stamps into session.state at the start of every agent turn. The reporting-
+# tool handler itself (Layer 2) also defaults from state, so this layer is
+# the outermost safety net: the goal is to have the handler see a valid
+# task_id no matter which dispatch path runs it.
+#
+# We ONLY rewrite when the arg is missing or is a well-known placeholder
+# string. A real-looking task_id (even if it's for the wrong task) is left
+# alone so the handler surfaces the mismatch as a proper terminal-task /
+# not-found failure rather than silently re-targeting the call. Wrong
+# task_ids are better surfaced as failures than masked.
+
+# Reporting-tool names that must always target a specific task. The match
+# is an exact-set test for ``report_awaiting_approval`` plus a prefix test
+# for ``report_task_*`` (see goldfive.reporting for the canonical list).
+_REPORT_AWAITING_APPROVAL = "report_awaiting_approval"
+
+# Case-insensitive set of strings we treat as "the LLM didn't supply a real
+# task_id". Whitespace is stripped before comparison. Keep this list
+# conservative — any real-looking slug should NOT be on it.
+_PLACEHOLDER_TASK_IDS: frozenset[str] = frozenset(
+    {"", "placeholder", "unknown", "todo", "none", "null", "n/a"}
+)
+
+
+def _is_placeholder_task_id(value: Any) -> bool:
+    """Return True if ``value`` is missing or an obvious placeholder.
+
+    Used by :meth:`_GoldfiveADKPlugin.before_tool_callback` to decide
+    whether to overwrite ``tool_args["task_id"]`` with the pinned
+    ``goldfive.current_task_id`` from session.state. Case-insensitive and
+    whitespace-tolerant. Non-string values are treated as placeholders
+    (an int task_id isn't real either).
+    """
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return True
+    return value.strip().lower() in _PLACEHOLDER_TASK_IDS
+
+
+def _is_reporting_tool_name(tool_name: str) -> bool:
+    """Return True if ``tool_name`` is a reporting-tool that needs a task_id."""
+    if not tool_name:
+        return False
+    return tool_name.startswith("report_task_") or tool_name == _REPORT_AWAITING_APPROVAL
+
+
+def _inject_task_id_from_state(
+    *,
+    tool_name: str,
+    tool_args: Any,
+    tool_context: Any,
+) -> None:
+    """Best-effort: fill in ``tool_args['task_id']`` from pinned state.
+
+    This is the goldfive#191 Layer-3 safety net. Mutates ``tool_args`` in
+    place when:
+
+      * ``tool_name`` is a reporting tool (report_task_* or
+        report_awaiting_approval),
+      * ``tool_args`` is a mutable mapping,
+      * the current ``task_id`` arg is missing / blank / a known
+        placeholder,
+      * session.state has a non-empty ``goldfive.current_task_id``.
+
+    NEVER raises — injection is advisory. If anything goes wrong we log
+    at DEBUG and return, letting Layer 2 (handler default-from-state)
+    handle the fallback or surface the error.
+    """
+    try:
+        if not _is_reporting_tool_name(tool_name):
+            return
+        if not isinstance(tool_args, MutableMapping):
+            return
+        existing = tool_args.get("task_id", "")
+        if not _is_placeholder_task_id(existing):
+            return
+        state = _session_state_from_callback(tool_context)
+        if not isinstance(state, Mapping):
+            return
+        state_tid = state.get(_sp.KEY_CURRENT_TASK_ID, "")
+        if not isinstance(state_tid, str) or not state_tid.strip():
+            return
+        tool_args["task_id"] = state_tid
+    except Exception:  # noqa: BLE001
+        log.debug(
+            "before_tool_callback: task_id injection failed for tool=%s",
+            tool_name,
+            exc_info=True,
+        )
 
 
 def _measure_request_chars(llm_request: Any) -> tuple[int, int]:
@@ -1693,6 +1792,23 @@ def make_adk_plugin(
             #      can intervene.
             #
             # See ``docs/design/TASK-LIFECYCLE.md`` §5 for the contract.
+            #
+            # goldfive#191 Layer 3 — task_id injection. Before we dispatch
+            # a reporting tool, if the LLM omitted ``task_id`` (or passed
+            # an obvious placeholder like "" / "placeholder" / "unknown"
+            # / "TODO") we fall back to the ``goldfive.current_task_id``
+            # pinned into session.state by ``before_agent_callback`` at
+            # the start of the agent turn. The state write fires first in
+            # ADK's callback order (agent-turn → tool-calls-within-turn)
+            # so by the time we reach here the pin is already visible.
+            # Real-looking task_ids are preserved verbatim — we don't
+            # silently rewrite them even if they look wrong (see #191).
+            _inject_task_id_from_state(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                tool_context=tool_context,
+            )
+
             tool_names_registered = {spec.name for spec in ctx.tools}
             if tool_name in tool_names_registered:
                 args_map: dict[str, Any]
