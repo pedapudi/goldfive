@@ -122,7 +122,7 @@ parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
 
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
-| `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). | `warning` | yes |
+| `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). Also fired by the tool-call-loop detector in `goldfive.drift.tool_loops` when the ADK plugin's `after_tool_callback` observes repeated `(tool_name, args_hash)` patterns (exact / name / alternating) — see goldfive#181. | `warning` (`info` for the alternating-cycle variant) | yes |
 | `REASONING_CLUSTER_TIGHTENING` | Max cosine similarity between current reasoning and the last N=5 blocks falls in `[0.75, 0.9)` (opt-in, `goldfive[embedding]`). Graduated early-warning tier below the `LOOPING_REASONING` cliff. One-shot per task. | `info` | yes |
 | `CONFUSION` | Reasoning text has ≥ 3 uncertainty markers ("I'm not sure", "wait", "hmm", …). | `info` | yes |
 | `OFF_TOPIC` | Reasoning cosine-distance from the current task description ≥ `0.7` (requires `goldfive[embedding]`). | `warning` | yes |

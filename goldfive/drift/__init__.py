@@ -43,6 +43,8 @@ __all__ = [
     "detect_intent_divergence",
     "detect_looping_reasoning",
     "detect_off_topic",
+    "ToolLoopTracker",
+    "load_tool_loop_thresholds_from_env",
 ]
 
 
@@ -66,13 +68,22 @@ _GOALS_EXPORTS = frozenset(
 )
 
 
+_TOOL_LOOP_EXPORTS = frozenset(
+    {
+        "ToolLoopTracker",
+        "load_tool_loop_thresholds_from_env",
+    }
+)
+
+
 def __getattr__(name: str) -> Any:
     """Lazy re-export of the reasoning-drift and goal-drift helpers.
 
     Defers the regex / optional-embedding imports in
     :mod:`goldfive.drift.reasoning` until first access, so
     ``from goldfive.drift import classify_tool_error`` stays cheap.
-    The ``goals`` submodule is also lazy-loaded for parity.
+    The ``goals`` and ``tool_loops`` submodules are also lazy-loaded
+    for parity.
     """
     if name in _REASONING_EXPORTS:
         from goldfive.drift import reasoning as _reasoning
@@ -82,6 +93,12 @@ def __getattr__(name: str) -> Any:
         from goldfive.drift import goals as _goals
 
         return getattr(_goals, name)
+    if name in _TOOL_LOOP_EXPORTS:
+        from goldfive.drift import tool_loops as _tool_loops
+
+        if name == "load_tool_loop_thresholds_from_env":
+            return _tool_loops.load_thresholds_from_env
+        return getattr(_tool_loops, name)
     raise AttributeError(f"module 'goldfive.drift' has no attribute {name!r}")
 
 

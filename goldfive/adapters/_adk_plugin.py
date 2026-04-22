@@ -877,6 +877,34 @@ def make_adk_plugin(
             # sub-Runners get their own invocation_id). Each entry is
             # a small dict to keep the payload auditable in tests.
             self._invocation_llm_pending: dict[str, dict[str, Any]] = {}
+            # Tool-loop drift detector (goldfive#181). Observes every
+            # tool call the plugin sees in ``after_tool_callback`` and
+            # fires a ``LOOPING_REASONING`` drift when any of the
+            # three configured patterns (exact / name / alternating)
+            # trips. Thresholds read from ``GOLDFIVE_TOOL_LOOP_*`` env
+            # vars, falling back to the defaults documented in
+            # :mod:`goldfive.drift.tool_loops`. Lazy import so the
+            # plugin module stays importable without the drift helpers
+            # materialised — matches the pattern used for the
+            # confabulation classifier.
+            from goldfive.drift import tool_loops as _tool_loops
+
+            self._tool_loop_tracker = _tool_loops.ToolLoopTracker(
+                **_tool_loops.load_thresholds_from_env()
+            )
+            # Reporting-tool names that indicate forward task progress
+            # and therefore clear the tool-loop tracker's window for
+            # the current (invocation, agent) key. Matches the set
+            # exposed by the adapter's state-transition protocol.
+            self._progress_reporting_tools: frozenset[str] = frozenset(
+                {
+                    "report_task_started",
+                    "report_task_progress",
+                    "report_task_completed",
+                    "report_task_failed",
+                    "report_task_blocked",
+                }
+            )
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
@@ -910,6 +938,10 @@ def make_adk_plugin(
             # ``after_model_callback``; this catches the case where a
             # model turn errored between before/after and never paired.
             self._invocation_llm_pending.clear()
+            # Drop per-(invocation, agent) tool-loop ring buffers so
+            # state from the just-finished dispatch doesn't leak into
+            # the next one on the same plugin instance (goldfive#181).
+            self._tool_loop_tracker.clear()
 
         def set_reconciler(self, reconciler: Any) -> None:
             """Attach a :class:`~goldfive.reconciler.PlanReconciler`.
@@ -1946,6 +1978,121 @@ def make_adk_plugin(
                 await ctx.steerer.observe(observation, ctx.session)
             except Exception as exc:  # noqa: BLE001
                 log.debug("on_tool_error_callback: steerer.observe raised: %s", exc)
+            return None
+
+        # --- Tool-loop drift detection (goldfive#181) ------------------
+
+        async def after_tool_callback(
+            self,
+            *,
+            tool: Any,
+            tool_args: Any,
+            tool_context: Any,
+            result: Any,
+        ) -> None:
+            """Feed the tool-loop tracker and emit any drifts it raises.
+
+            Runs after every tool ADK dispatched (reporting tools,
+            AgentTool delegations, MCP/custom tools) so the detector
+            sees the real function_call stream the agent is emitting.
+            A reporting-tool progress call (``report_task_started`` /
+            ``_progress`` / ``_completed`` / ``_failed`` / ``_blocked``)
+            additionally clears the per-(invocation, agent) window so
+            mode 2's "no task progress" gate is correct.
+
+            The detector is deterministic and O(1) per call modulo the
+            tracker's ``window`` length; any failure is swallowed so a
+            buggy classifier never breaks tool dispatch. Drifts are
+            routed through ``steerer._handle_drift`` when available so
+            the intervention ladder sees them; falls back to
+            ``steerer.observe`` for stubs that don't expose
+            ``_handle_drift``.
+            """
+            ctx = self._resolve_ctx(tool_context)
+            if ctx is None or ctx.steerer is None:
+                return None
+            tool_name = str(_safe_attr(tool, "name", "") or "")
+            if not tool_name:
+                func = _safe_attr(tool, "func", None)
+                tool_name = str(_safe_attr(func, "__name__", "") or "")
+            # Resolve invocation_id + agent_name so the tracker's
+            # per-(invocation, agent) buckets match the reconciler's
+            # isolation model. Missing fields fall back to "" so the
+            # tracker still keys consistently on an ephemeral "unknown"
+            # bucket (tests exercise this path).
+            inv_ctx = _safe_attr(tool_context, "_invocation_context", None) or _safe_attr(
+                tool_context, "invocation_context", None
+            )
+            inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+            running_agent = _safe_attr(inv_ctx, "agent", None)
+            agent_name = str(_safe_attr(running_agent, "name", "") or "") or self._host_agent_name
+            task_id = str(_safe_attr(ctx.task, "id", "") or "")
+
+            # Progress-reporting tools reset the window BEFORE we
+            # record the call itself. That way a task-completing
+            # sequence (e.g. the fifth `read_file` that finally
+            # answers the question, followed by report_task_completed)
+            # doesn't leave the completing `report_*` call feeding
+            # a window that's about to be cleared. The progress tool
+            # is not appended at all — its job is to reset, not to
+            # feed the detector.
+            if tool_name in self._progress_reporting_tools:
+                self._tool_loop_tracker.on_task_progress(
+                    invocation_id=inv_id,
+                    agent_name=agent_name,
+                )
+                return None
+
+            try:
+                # tool_args may be None / missing on adapter edge cases;
+                # the tracker's hash helper copes with both.
+                args_payload = tool_args if isinstance(tool_args, Mapping) else {}
+                drifts = self._tool_loop_tracker.observe_tool_call(
+                    invocation_id=inv_id,
+                    agent_name=agent_name,
+                    tool_name=tool_name,
+                    args=dict(args_payload),
+                    task_id=task_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "after_tool_callback: tool-loop tracker raised: %s",
+                    exc,
+                )
+                return None
+
+            if not drifts:
+                return None
+
+            # Prefer ``_handle_drift`` so the intervention ladder
+            # sees the signal. Fall back to ``observe`` for stubs.
+            handle = getattr(ctx.steerer, "_handle_drift", None)
+            for drift in drifts:
+                if handle is not None:
+                    try:
+                        await handle(drift, ctx.session)
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "after_tool_callback: _handle_drift raised: %s",
+                            exc,
+                        )
+                # Fallback path for steerer stubs that don't expose
+                # _handle_drift.
+                observation = _as_observation(
+                    kind="tool_loop_detected",
+                    detail=drift.detail,
+                    raw=drift.raw if isinstance(drift.raw, dict) else {"drift": repr(drift.raw)},
+                    task=ctx.task,
+                    agent_id=agent_name or self._host_agent_name,
+                )
+                try:
+                    await ctx.steerer.observe(observation, ctx.session)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "after_tool_callback: steerer.observe raised: %s",
+                        exc,
+                    )
             return None
 
     return _GoldfiveADKPlugin()
