@@ -104,6 +104,23 @@ class InterventionLevel(enum.IntEnum):
     TERMINATE = 5
 
 
+# goldfive#202: drift kinds for which a successful ABSORB (Level 1
+# refine) also queues a Level 2 nudge onto ``session.pending_nudges``.
+# The executor's overlay loop consumes the nudge at invocation end and
+# re-invokes the passthrough with a synthesized user message describing
+# the plan revision — the only way for a coordinator that is still
+# mid-invocation (retrying the superseded task) to learn its plan
+# changed. Scoped to "coordinator-stuck" shapes; other ABSORB kinds
+# recover at the next task boundary or via Level 3 CANCEL_REINVOKE.
+_ABSORB_NUDGE_KINDS: frozenset[DriftKind] = frozenset(
+    {
+        DriftKind.LOOPING_REASONING,
+        DriftKind.LOOPING_TOOL_CALL,
+        DriftKind.SELF_REPORTED_STUCK,
+    }
+)
+
+
 # Default drift messages per kind, used by
 # :func:`compose_corrective_user_message` when the drift carries no
 # kind-specific override. Keep SHORT, action-focused; no goldfive jargon
@@ -472,9 +489,7 @@ class DefaultSteerer:
             session.agent_notes[task_id] = detail
         # goldfive#152: stamp current_task_* on the orchestration-state
         # dict so downstream prompt templates / refine paths see it.
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.RUNNING
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.RUNNING)
         await self._emit_task_started(session, task_id, detail)
 
     async def mark_task_progress(
@@ -521,9 +536,7 @@ class DefaultSteerer:
         if summary:
             session.completed_results[task_id] = summary
         # goldfive#152: clear current_task_* if we were the active task.
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.COMPLETED
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.COMPLETED)
         await self._emit_task_completed(session, task_id, summary, artifacts or {})
 
     async def mark_task_failed(
@@ -560,9 +573,7 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         task.status = TaskStatus.FAILED
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.FAILED
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.FAILED)
         await self._emit_task_failed(session, task_id, reason, recoverable)
         # Fatal failures cascade downstream via the same primitive used
         # by mark_task_cancelled, so both §6.2 and §6.3 produce the
@@ -642,9 +653,7 @@ class DefaultSteerer:
             # TaskCancelled events for downstream tasks on every call.
             return
         task.status = TaskStatus.CANCELLED
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.CANCELLED
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.CANCELLED)
         await self._emit_task_cancelled(session, task_id, reason)
         await self.cascade_cancel_downstream(session, task_id)
 
@@ -677,9 +686,7 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         task.status = TaskStatus.NOT_NEEDED
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.NOT_NEEDED
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.NOT_NEEDED)
         # There is no dedicated ``TaskNotNeeded`` proto message;
         # reuse TaskCancelled with the reason prefix so sinks that
         # inspect reason can differentiate if they wish. The live
@@ -794,9 +801,7 @@ class DefaultSteerer:
         """
         if self._is_duplicate_steer(event, session):
             steer_id = self._steer_dedupe_id(event)
-            log.debug(
-                "DefaultSteerer.observe: dropping duplicate STEER id=%s", steer_id
-            )
+            log.debug("DefaultSteerer.observe: dropping duplicate STEER id=%s", steer_id)
             return
         drift = self._drift_from_control(event, session)
         if drift is None:
@@ -1644,6 +1649,35 @@ class DefaultSteerer:
                 drift=drift,
                 refined_plan=session.plan,
             )
+        # goldfive#202: for drifts where the coordinator has no way to
+        # observe the plan revision on its own (it is still mid-
+        # invocation, retrying the superseded task), ALSO queue a
+        # Level 2 nudge after a successful ABSORB. The overlay loop's
+        # scoped nudge-replay path (see SequentialExecutor._run_overlay)
+        # picks this up at invocation end and re-invokes the
+        # passthrough with the nudge as the next user message — the
+        # only way for the coordinator to learn its plan changed.
+        #
+        # Scoped to drift kinds whose mid-invocation signature is
+        # "coordinator is stuck on a task goldfive just replaced":
+        # LOOPING_REASONING / LOOPING_TOOL_CALL (detector fires while
+        # the coordinator retries the same tool call), SELF_REPORTED_STUCK
+        # (reflective self-check reports no progress). Other ABSORB
+        # kinds (CONFUSION, CONFABULATION_RISK, etc.) do not need
+        # mid-invocation rescue — their corrective path fires at the
+        # next task boundary or via Level 3 CANCEL_REINVOKE.
+        if level is InterventionLevel.ABSORB and drift.kind in _ABSORB_NUDGE_KINDS:
+            nudge_msg = compose_corrective_user_message(
+                drift=drift,
+                refined_plan=session.plan,
+            )
+            session.pending_nudges.append(nudge_msg)
+            log.debug(
+                "DefaultSteerer._handle_drift: queued post-ABSORB nudge for kind=%s task=%s: %s",
+                drift.kind.value,
+                drift.current_task_id or "-",
+                nudge_msg,
+            )
 
     # --- Intervention ladder -----------------------------------------
     #
@@ -1963,9 +1997,7 @@ class DefaultSteerer:
         # event — a cheap, always-available "turn" proxy.
         at_turn = getattr(session, "_next_sequence", 0) or 0
         try:
-            _ostate.set_active_steer(
-                session.state, body=body, at_turn=at_turn, author=author
-            )
+            _ostate.set_active_steer(session.state, body=body, at_turn=at_turn, author=author)
         except Exception as exc:  # noqa: BLE001
             log.debug(
                 "DefaultSteerer._apply_user_steer_state: set_active_steer raised: %s",
@@ -1980,8 +2012,7 @@ class DefaultSteerer:
                 _ostate.record_processed_steer_id(session.state, steer_id)
             except Exception as exc:  # noqa: BLE001
                 log.debug(
-                    "DefaultSteerer._apply_user_steer_state: "
-                    "record_processed_steer_id raised: %s",
+                    "DefaultSteerer._apply_user_steer_state: record_processed_steer_id raised: %s",
                     exc,
                 )
         if not body:
