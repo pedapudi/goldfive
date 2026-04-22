@@ -2865,3 +2865,180 @@ async def test_caller_plugin_fires_on_sub_agent_invocation_via_agent_tool() -> N
         "plugin_manager propagation broke. Saw: "
         f"{plugin.agents_seen!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-plugin dedup (goldfive#166)
+# ---------------------------------------------------------------------------
+
+
+def test_dedupe_plugins_by_name_drops_later_duplicates() -> None:
+    """``_dedupe_plugins_by_name`` keeps the first occurrence and drops
+    later instances sharing a ``name``. Plugins without a ``name`` pass
+    through unchanged — only identically-named duplicates are a problem.
+    """
+    from dataclasses import dataclass
+
+    from goldfive.adapters import adk as adk_mod
+
+    @dataclass
+    class _NamedPlugin:
+        name: str
+
+    class _NamelessPlugin:
+        pass
+
+    a = _NamedPlugin(name="telemetry")
+    b = _NamedPlugin(name="telemetry")  # same name -> duplicate
+    c = _NamedPlugin(name="goldfive_adk_plugin")
+    d = _NamelessPlugin()  # no name attribute
+    e = _NamelessPlugin()
+
+    deduped = adk_mod._dedupe_plugins_by_name([a, b, c, d, e])
+
+    assert deduped == [a, c, d, e]
+
+
+def test_build_runner_dedupes_plugins_before_inmemoryrunner() -> None:
+    """``_build_runner`` must collapse same-``name`` duplicates before
+    forwarding to :class:`InMemoryRunner`.
+
+    Without this, ADK's ``PluginManager.register_plugin`` raises
+    ``ValueError`` for the duplicate and the caller's intent (install
+    one telemetry plugin) is lost. See goldfive #166.
+    """
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+
+    from goldfive.adapters import adk as adk_mod
+
+    class _StubPlugin(BasePlugin):
+        def __init__(self) -> None:
+            super().__init__(name="duplicate-stub")
+
+    captured: dict[str, Any] = {}
+
+    class _FakeRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    first = _StubPlugin()
+    second = _StubPlugin()  # same name — should be dropped
+    import google.adk.runners as adk_runners  # type: ignore
+
+    orig = adk_runners.InMemoryRunner
+    adk_runners.InMemoryRunner = _FakeRunner  # type: ignore[assignment]
+    try:
+        adk_mod._build_runner(_make_agent(), plugins=[first, second])
+    finally:
+        adk_runners.InMemoryRunner = orig  # type: ignore[assignment]
+
+    passed = captured.get("plugins")
+    assert passed == [first], (
+        "duplicate plugin instance must be dropped before reaching InMemoryRunner; "
+        f"got {passed!r}"
+    )
+
+
+def test_register_plugin_on_runner_is_idempotent_by_name() -> None:
+    """When the runner already carries a plugin with the same name, the
+    helper must skip the install rather than appending a second copy.
+
+    This is the belt-and-braces guard for goldfive #166: the harmonograf
+    plugin's own dedup is primary, but goldfive's install path must also
+    refuse to stack two instances of the same name. Regression test for
+    the pre-fix behaviour where a ``register_plugin`` ValueError was
+    caught and the helper fell through to ``plugins.append(plugin)``.
+    """
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+
+    from goldfive.adapters.adk import _register_plugin_on_runner
+
+    class _Stub(BasePlugin):
+        def __init__(self, name: str) -> None:
+            super().__init__(name=name)
+
+    first = _Stub("telemetry")
+    second = _Stub("telemetry")  # same name
+
+    class _FakeRunner:
+        class plugin_manager:  # type: ignore[misc]
+            plugins: list[Any] = []
+
+            @classmethod
+            def register_plugin(cls, plugin: Any) -> None:
+                # Mirror ADK's PluginManager: raise on duplicate name.
+                if any(p.name == plugin.name for p in cls.plugins):
+                    raise ValueError(
+                        f"Plugin with name '{plugin.name}' already registered."
+                    )
+                cls.plugins.append(plugin)
+
+    runner = _FakeRunner()
+    assert _register_plugin_on_runner(runner, first) is True
+    assert _register_plugin_on_runner(runner, second) is True
+    assert runner.plugin_manager.plugins == [first], (
+        "dedup guard must short-circuit; got "
+        f"{runner.plugin_manager.plugins!r}"
+    )
+
+
+async def test_wrap_skips_duplicate_plugin_on_same_tree() -> None:
+    """``ADKAdapter(tree, plugins=[p, p'])`` where both plugins share a
+    name must install only one of them on the runner.
+
+    Exercises the integration path end-to-end: pass two instances of the
+    same-named plugin and assert the runner's plugin list carries just
+    one. Goldfive #166 regression.
+    """
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    class _Stub(BasePlugin):
+        def __init__(self) -> None:
+            super().__init__(name="tele-stub")
+
+    p1 = _Stub()
+    p2 = _Stub()  # same name
+    adapter = ADKAdapter(_make_agent(), plugins=[p1, p2])
+
+    installed = list(getattr(adapter._runner.plugin_manager, "plugins", []))
+    tele = [p for p in installed if getattr(p, "name", "") == "tele-stub"]
+    assert len(tele) == 1, (
+        f"expected a single telemetry-stub plugin after dedup, got {tele!r}"
+    )
+    # First instance wins.
+    assert tele[0] is p1
+
+
+async def test_add_plugin_skips_when_same_name_already_installed() -> None:
+    """``ADKAdapter.add_plugin`` must not stack a second instance when a
+    plugin of the same name already sits on the runner.
+
+    Under ``goldfive.wrap`` + ``adk web``, the outer App carries the
+    telemetry plugin and a downstream call (``observe()``,
+    ``add_plugin``) can end up trying to attach a second instance. The
+    guard prevents the duplicate span-doubling pathology (goldfive #166)
+    even when the harmonograf plugin's own dedup is disabled or absent.
+    """
+    from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+
+    class _Stub(BasePlugin):
+        def __init__(self) -> None:
+            super().__init__(name="observability")
+
+    adapter = ADKAdapter(_make_agent(), plugins=[_Stub()])
+    before = list(getattr(adapter._runner.plugin_manager, "plugins", []))
+    before_count = sum(1 for p in before if getattr(p, "name", "") == "observability")
+    assert before_count == 1
+
+    # User / library tries to install a second same-named instance.
+    adapter.add_plugin(_Stub())
+
+    after = list(getattr(adapter._runner.plugin_manager, "plugins", []))
+    after_count = sum(1 for p in after if getattr(p, "name", "") == "observability")
+    assert after_count == 1, (
+        f"add_plugin installed a duplicate; counts before={before_count} after={after_count}"
+    )
