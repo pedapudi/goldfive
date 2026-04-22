@@ -205,6 +205,13 @@ async def test_errored_report_task_started_counts_as_loop() -> None:
     were previously exempt from loop detection. With the tightening,
     the third identical errored retry fires mode 1 at the default
     exact-threshold of 3.
+
+    Under goldfive#204 the severity is now **graduated by category**:
+    ``report_task_*`` is a *meta* tool, so 3 identical retries fire at
+    **INFO** (OBSERVE tier -- no plan mutation), not WARNING. The
+    original #192 invariant that errored retries are NOT exempt from
+    the detector is still enforced -- they produce a drift; the
+    severity just reflects meta-tool character now.
     """
     pytest.importorskip("google.adk")
     steerer = _RecordingToolLoopSteerer()
@@ -222,15 +229,19 @@ async def test_errored_report_task_started_counts_as_loop() -> None:
     await plugin.after_tool_callback(tool=tool, tool_args=args, tool_context=tool_ctx, result=nack)
     assert steerer.drifts == []
 
-    # Call 3: exact-threshold hit -> WARNING drift fires.
+    # Call 3: INFO-tier exact-threshold hit -> INFO drift fires (meta
+    # category; #204). The key invariant from #192 -- errored retries
+    # ARE counted, not exempt -- is still enforced.
     await plugin.after_tool_callback(tool=tool, tool_args=args, tool_context=tool_ctx, result=nack)
     assert len(steerer.drifts) == 1
     drift = steerer.drifts[0]
     assert drift.kind is DriftKind.LOOPING_REASONING
-    assert drift.severity is DriftSeverity.WARNING
+    assert drift.severity is DriftSeverity.INFO
     assert drift.raw is not None
     assert drift.raw.get("mode") == "exact"
     assert drift.raw.get("tool_name") == "report_task_started"
+    assert drift.raw.get("category") == "meta"
+    assert drift.raw.get("tier") == "info"
     assert drift.current_task_id == "t-err"
 
     # The errored call must NOT have reset the window -- subsequent
