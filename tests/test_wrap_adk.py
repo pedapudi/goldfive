@@ -253,6 +253,172 @@ async def test_sinks_mutation_propagates_to_inner_runner() -> None:
 
 
 # ---------------------------------------------------------------------------
+# on_run_end teardown fan-out (goldfive#196)
+# ---------------------------------------------------------------------------
+
+
+async def test_run_async_impl_fires_on_run_end_on_normal_exit(stub_call_llm: Any) -> None:
+    """On clean ``_run_async_impl`` completion, every adapter plugin
+    that defines ``on_run_end`` must have it called exactly once.
+
+    Observability plugins (e.g. harmonograf's telemetry plugin) use
+    this hook to sweep orphan INVOCATION spans left open because ADK's
+    ``after_run_callback`` is placed after an ``async with
+    Aclosing(...)`` block — not inside a ``finally`` — so cancelled or
+    early-closed sub-Runners leak their spans. See goldfive#196.
+    """
+    from unittest.mock import AsyncMock
+
+    from goldfive import InvocationResult, SequentialExecutor
+
+    inner = _mk_inner()
+    wrapped = goldfive.wrap(
+        inner,
+        planner=_one_task_planner(),
+        sinks=[InMemorySink()],
+    )
+
+    async def _fake_invoke(task: Task, session: Any) -> InvocationResult:
+        return InvocationResult(task_id=task.id, text="ok")
+
+    wrapped.runner.agent.invoke = AsyncMock(side_effect=_fake_invoke)
+    wrapped.runner.executor = SequentialExecutor(max_task_invocations=3)
+
+    class _RecordingPlugin:
+        def __init__(self) -> None:
+            self.on_run_end_calls = 0
+
+        def on_run_end(self) -> None:
+            self.on_run_end_calls += 1
+
+    plugin = _RecordingPlugin()
+    wrapped.runner.agent._plugins.append(plugin)
+
+    ctx = _FakeCtx("do a thing")
+    events = [evt async for evt in wrapped._run_async_impl(ctx)]
+    assert len(events) >= 1
+
+    assert plugin.on_run_end_calls == 1
+
+
+async def test_run_async_impl_fires_on_run_end_on_generator_close(
+    stub_call_llm: Any,
+) -> None:
+    """If the caller ``aclose()``s the generator early (the adk-web
+    disconnect path), ``on_run_end`` still fires via the ``finally``
+    block. This is the specific orphan-span scenario goldfive#196
+    closes: outer adk-web cancel leaves sub-Runner spans open, so the
+    teardown hook MUST run even when the generator doesn't exhaust
+    naturally.
+    """
+    from unittest.mock import AsyncMock
+
+    from goldfive import InvocationResult, SequentialExecutor
+
+    inner = _mk_inner()
+    wrapped = goldfive.wrap(
+        inner,
+        planner=_one_task_planner(),
+        sinks=[InMemorySink()],
+    )
+
+    async def _fake_invoke(task: Task, session: Any) -> InvocationResult:
+        return InvocationResult(task_id=task.id, text="ok")
+
+    wrapped.runner.agent.invoke = AsyncMock(side_effect=_fake_invoke)
+    wrapped.runner.executor = SequentialExecutor(max_task_invocations=3)
+
+    class _RecordingPlugin:
+        def __init__(self) -> None:
+            self.on_run_end_calls = 0
+
+        def on_run_end(self) -> None:
+            self.on_run_end_calls += 1
+
+    plugin = _RecordingPlugin()
+    wrapped.runner.agent._plugins.append(plugin)
+
+    ctx = _FakeCtx("do a thing")
+    agen = wrapped._run_async_impl(ctx)
+    # Pull one event then bail — mimics adk-web disconnecting mid-stream.
+    first = await agen.__anext__()
+    assert first is not None
+    await agen.aclose()
+
+    assert plugin.on_run_end_calls == 1
+
+
+async def test_run_async_impl_swallows_plugin_on_run_end_exceptions(
+    stub_call_llm: Any,
+) -> None:
+    """A faulty ``on_run_end`` hook must not break the main run path.
+    Any plugin exception is swallowed with a debug log so one bad
+    plugin can't crash the outer generator's finalize sequence.
+    """
+    from unittest.mock import AsyncMock
+
+    from goldfive import InvocationResult, SequentialExecutor
+
+    inner = _mk_inner()
+    wrapped = goldfive.wrap(
+        inner,
+        planner=_one_task_planner(),
+        sinks=[InMemorySink()],
+    )
+
+    async def _fake_invoke(task: Task, session: Any) -> InvocationResult:
+        return InvocationResult(task_id=task.id, text="ok")
+
+    wrapped.runner.agent.invoke = AsyncMock(side_effect=_fake_invoke)
+    wrapped.runner.executor = SequentialExecutor(max_task_invocations=3)
+
+    class _BrokenPlugin:
+        def on_run_end(self) -> None:
+            raise RuntimeError("plugin boom")
+
+    wrapped.runner.agent._plugins.append(_BrokenPlugin())
+
+    ctx = _FakeCtx("do a thing")
+    # Must not raise even though the plugin does.
+    events = [evt async for evt in wrapped._run_async_impl(ctx)]
+    assert events
+
+
+async def test_run_async_impl_without_on_run_end_plugins_still_works(
+    stub_call_llm: Any,
+) -> None:
+    """Plugins that do NOT define ``on_run_end`` fall through cleanly —
+    this is the back-compat path for older ADK plugins that don't
+    know about the teardown hook.
+    """
+    from unittest.mock import AsyncMock
+
+    from goldfive import InvocationResult, SequentialExecutor
+
+    inner = _mk_inner()
+    wrapped = goldfive.wrap(
+        inner,
+        planner=_one_task_planner(),
+        sinks=[InMemorySink()],
+    )
+
+    async def _fake_invoke(task: Task, session: Any) -> InvocationResult:
+        return InvocationResult(task_id=task.id, text="ok")
+
+    wrapped.runner.agent.invoke = AsyncMock(side_effect=_fake_invoke)
+    wrapped.runner.executor = SequentialExecutor(max_task_invocations=3)
+
+    class _NoHookPlugin:
+        pass
+
+    wrapped.runner.agent._plugins.append(_NoHookPlugin())
+
+    ctx = _FakeCtx("do a thing")
+    events = [evt async for evt in wrapped._run_async_impl(ctx)]
+    assert events
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
