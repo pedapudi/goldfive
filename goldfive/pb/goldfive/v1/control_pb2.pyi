@@ -56,12 +56,16 @@ class ControlTarget(_message.Message):
     def __init__(self, agent_id: _Optional[str] = ..., task_id: _Optional[str] = ..., tool_call_id: _Optional[str] = ...) -> None: ...
 
 class SteerPayload(_message.Message):
-    __slots__ = ("note", "suggested_action")
+    __slots__ = ("note", "suggested_action", "author", "annotation_id")
     NOTE_FIELD_NUMBER: _ClassVar[int]
     SUGGESTED_ACTION_FIELD_NUMBER: _ClassVar[int]
+    AUTHOR_FIELD_NUMBER: _ClassVar[int]
+    ANNOTATION_ID_FIELD_NUMBER: _ClassVar[int]
     note: str
     suggested_action: str
-    def __init__(self, note: _Optional[str] = ..., suggested_action: _Optional[str] = ...) -> None: ...
+    author: str
+    annotation_id: str
+    def __init__(self, note: _Optional[str] = ..., suggested_action: _Optional[str] = ..., author: _Optional[str] = ..., annotation_id: _Optional[str] = ...) -> None: ...
 
 class RewindPayload(_message.Message):
     __slots__ = ("task_id",)

@@ -108,14 +108,38 @@ def test_steer_round_trip() -> None:
     msg = ControlMessage(
         kind=ControlKind.STEER,
         id="ctl-steer",
-        payload={"note": "focus on slide 3", "suggested_action": "narrow scope"},
+        payload={
+            "note": "focus on slide 3",
+            "suggested_action": "narrow scope",
+            "author": "alice",
+            "annotation_id": "ann_abc123",
+        },
     )
     pb_msg = to_pb_control_event(msg)
     assert pb_msg.WhichOneof("payload") == "steer"
     assert pb_msg.steer.note == "focus on slide 3"
+    assert pb_msg.steer.author == "alice"
+    assert pb_msg.steer.annotation_id == "ann_abc123"
     recovered = from_pb_control_event(pb_msg)
     assert recovered.kind == ControlKind.STEER
     assert recovered.payload == msg.payload
+
+
+def test_steer_round_trip_without_author_or_annotation_id() -> None:
+    """Back-compat: callers that don't set author / annotation_id
+    round-trip through empty strings (not missing keys)."""
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-steer-bare",
+        payload={"note": "pivot", "suggested_action": ""},
+    )
+    pb_msg = to_pb_control_event(msg)
+    assert pb_msg.steer.author == ""
+    assert pb_msg.steer.annotation_id == ""
+    recovered = from_pb_control_event(pb_msg)
+    assert recovered.payload["note"] == "pivot"
+    assert recovered.payload["author"] == ""
+    assert recovered.payload["annotation_id"] == ""
 
 
 def test_rewind_round_trip() -> None:
@@ -207,7 +231,12 @@ def test_every_kind_round_trips(kind: ControlKind) -> None:
     without its payload wiring fails loudly in CI."""
     payload: dict[str, object] = {}
     if kind == ControlKind.STEER:
-        payload = {"note": "n", "suggested_action": "s"}
+        payload = {
+            "note": "n",
+            "suggested_action": "s",
+            "author": "",
+            "annotation_id": "",
+        }
     elif kind == ControlKind.REWIND_TO:
         payload = {"task_id": "t"}
     elif kind in (ControlKind.APPROVE, ControlKind.REJECT):

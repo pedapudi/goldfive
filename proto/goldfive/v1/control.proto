@@ -71,9 +71,18 @@ message ControlTarget {
 
 // STEER: redirect the run. See docs/design/CONTROL.md §5 for the
 // delete-and-replan semantics that follow.
+//
+// ``author`` carries the operator identity from the originating
+// annotation (goldfive#171). Bridges that don't source annotations may
+// leave it empty. ``annotation_id`` carries the source annotation id
+// so goldfive can dedupe retries of the same user action; bridges that
+// don't source annotations may leave it empty and fall back to
+// ``ControlEvent.id``-based dedupe.
 message SteerPayload {
   string note = 1;
   string suggested_action = 2;
+  string author = 3;
+  string annotation_id = 4;
 }
 
 // REWIND_TO: reset ``task_id`` and every downstream task back to

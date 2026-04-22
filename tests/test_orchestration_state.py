@@ -427,3 +427,69 @@ async def test_mark_task_running_stamps_orchestration_state() -> None:
 
     await steerer.mark_task_completed("t1", session=session, summary="done")
     assert _ostate.read(session.state, _ostate.KEY_CURRENT_TASK_ID, "") == ""
+
+
+# ---------------------------------------------------------------------------
+# goldfive#171 — processed_steer_ids helpers + author on set_active_steer
+# ---------------------------------------------------------------------------
+
+
+def test_record_processed_steer_id_appends_and_dedupes() -> None:
+    state: dict[str, Any] = {}
+    _ostate.record_processed_steer_id(state, "ann_1")
+    _ostate.record_processed_steer_id(state, "ann_2")
+    _ostate.record_processed_steer_id(state, "ann_1")  # duplicate — dropped
+    assert state[_ostate.KEY_PROCESSED_STEER_IDS] == ["ann_1", "ann_2"]
+
+
+def test_record_processed_steer_id_empty_is_noop() -> None:
+    state: dict[str, Any] = {}
+    _ostate.record_processed_steer_id(state, "")
+    assert _ostate.KEY_PROCESSED_STEER_IDS not in state
+
+
+def test_has_processed_steer_id_reports_membership() -> None:
+    state: dict[str, Any] = {}
+    assert _ostate.has_processed_steer_id(state, "x") is False
+    _ostate.record_processed_steer_id(state, "x")
+    assert _ostate.has_processed_steer_id(state, "x") is True
+    assert _ostate.has_processed_steer_id(state, "y") is False
+    # Tolerates malformed state.
+    assert (
+        _ostate.has_processed_steer_id({"goldfive.processed_steer_ids": "oops"}, "x")
+        is False
+    )
+    assert _ostate.has_processed_steer_id(state, "") is False
+
+
+def test_record_processed_steer_id_evicts_fifo_at_cap() -> None:
+    state: dict[str, Any] = {}
+    cap = _ostate.PROCESSED_STEER_IDS_CAP
+    for i in range(cap + 2):
+        _ostate.record_processed_steer_id(state, f"id_{i}")
+    ids = state[_ostate.KEY_PROCESSED_STEER_IDS]
+    assert len(ids) == cap
+    assert "id_0" not in ids
+    assert "id_1" not in ids
+    assert ids[0] == "id_2"
+    assert ids[-1] == f"id_{cap + 1}"
+
+
+def test_set_active_steer_writes_author_and_clears_it() -> None:
+    state: dict[str, Any] = {}
+    _ostate.set_active_steer(state, body="pivot", at_turn=7, author="alice")
+    assert state[_ostate.KEY_ACTIVE_STEER_BODY] == "pivot"
+    assert state[_ostate.KEY_ACTIVE_STEER_AT_TURN] == 7
+    assert state[_ostate.KEY_ACTIVE_STEER_AUTHOR] == "alice"
+
+    _ostate.clear_active_steer(state)
+    assert _ostate.KEY_ACTIVE_STEER_BODY not in state
+    assert _ostate.KEY_ACTIVE_STEER_AT_TURN not in state
+    assert _ostate.KEY_ACTIVE_STEER_AUTHOR not in state
+
+
+def test_set_active_steer_author_defaults_to_empty() -> None:
+    """Back-compat: callers that omit author still write an empty key."""
+    state: dict[str, Any] = {}
+    _ostate.set_active_steer(state, body="pivot", at_turn=1)
+    assert state[_ostate.KEY_ACTIVE_STEER_AUTHOR] == ""

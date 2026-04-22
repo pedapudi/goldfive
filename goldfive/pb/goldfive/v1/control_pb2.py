@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import timestamp_pb2 as google_dot_protobuf_dot_timestamp__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x19goldfive/v1/control.proto\x12\x0bgoldfive.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"H\n\rControlTarget\x12\x10\n\x08\x61gent_id\x18\x01 \x01(\t\x12\x0f\n\x07task_id\x18\x02 \x01(\t\x12\x14\n\x0ctool_call_id\x18\x03 \x01(\t\"6\n\x0cSteerPayload\x12\x0c\n\x04note\x18\x01 \x01(\t\x12\x18\n\x10suggested_action\x18\x02 \x01(\t\" \n\rRewindPayload\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"3\n\x0e\x41pprovePayload\x12\x11\n\ttarget_id\x18\x01 \x01(\t\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t\"2\n\rRejectPayload\x12\x11\n\ttarget_id\x18\x01 \x01(\t\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t\"2\n\x14InjectMessagePayload\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\"\x9d\x03\n\x0c\x43ontrolEvent\x12\n\n\x02id\x18\x01 \x01(\t\x12-\n\tissued_at\x18\x02 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12*\n\x06target\x18\x03 \x01(\x0b\x32\x1a.goldfive.v1.ControlTarget\x12&\n\x04kind\x18\x04 \x01(\x0e\x32\x18.goldfive.v1.ControlKind\x12*\n\x05steer\x18\n \x01(\x0b\x32\x19.goldfive.v1.SteerPayloadH\x00\x12,\n\x06rewind\x18\x0b \x01(\x0b\x32\x1a.goldfive.v1.RewindPayloadH\x00\x12.\n\x07\x61pprove\x18\x0c \x01(\x0b\x32\x1b.goldfive.v1.ApprovePayloadH\x00\x12,\n\x06reject\x18\r \x01(\x0b\x32\x1a.goldfive.v1.RejectPayloadH\x00\x12;\n\x0einject_message\x18\x0e \x01(\x0b\x32!.goldfive.v1.InjectMessagePayloadH\x00\x42\t\n\x07payload\"\x8d\x01\n\nControlAck\x12\x12\n\ncontrol_id\x18\x01 \x01(\t\x12-\n\x06result\x18\x02 \x01(\x0e\x32\x1d.goldfive.v1.ControlAckResult\x12\x0e\n\x06\x64\x65tail\x18\x03 \x01(\t\x12,\n\x08\x61\x63ked_at\x18\x04 \x01(\x0b\x32\x1a.google.protobuf.Timestamp*\xc1\x02\n\x0b\x43ontrolKind\x12\x1c\n\x18\x43ONTROL_KIND_UNSPECIFIED\x10\x00\x12\x16\n\x12\x43ONTROL_KIND_PAUSE\x10\x01\x12\x17\n\x13\x43ONTROL_KIND_RESUME\x10\x02\x12\x17\n\x13\x43ONTROL_KIND_CANCEL\x10\x03\x12\x1a\n\x16\x43ONTROL_KIND_REWIND_TO\x10\x04\x12\x16\n\x12\x43ONTROL_KIND_STEER\x10\x05\x12\x18\n\x14\x43ONTROL_KIND_APPROVE\x10\x06\x12\x17\n\x13\x43ONTROL_KIND_REJECT\x10\x07\x12\x1d\n\x19\x43ONTROL_KIND_STATUS_QUERY\x10\x08\x12#\n\x1f\x43ONTROL_KIND_INTERCEPT_TRANSFER\x10\t\x12\x1f\n\x1b\x43ONTROL_KIND_INJECT_MESSAGE\x10\n*\x9a\x01\n\x10\x43ontrolAckResult\x12\"\n\x1e\x43ONTROL_ACK_RESULT_UNSPECIFIED\x10\x00\x12\x1e\n\x1a\x43ONTROL_ACK_RESULT_SUCCESS\x10\x01\x12\x1e\n\x1a\x43ONTROL_ACK_RESULT_FAILURE\x10\x02\x12\"\n\x1e\x43ONTROL_ACK_RESULT_UNSUPPORTED\x10\x03\x42\x39Z7github.com/pedapudi/goldfive/gen/goldfive/v1;goldfivev1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x19goldfive/v1/control.proto\x12\x0bgoldfive.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"H\n\rControlTarget\x12\x10\n\x08\x61gent_id\x18\x01 \x01(\t\x12\x0f\n\x07task_id\x18\x02 \x01(\t\x12\x14\n\x0ctool_call_id\x18\x03 \x01(\t\"]\n\x0cSteerPayload\x12\x0c\n\x04note\x18\x01 \x01(\t\x12\x18\n\x10suggested_action\x18\x02 \x01(\t\x12\x0e\n\x06\x61uthor\x18\x03 \x01(\t\x12\x15\n\rannotation_id\x18\x04 \x01(\t\" \n\rRewindPayload\x12\x0f\n\x07task_id\x18\x01 \x01(\t\"3\n\x0e\x41pprovePayload\x12\x11\n\ttarget_id\x18\x01 \x01(\t\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t\"2\n\rRejectPayload\x12\x11\n\ttarget_id\x18\x01 \x01(\t\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t\"2\n\x14InjectMessagePayload\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\"\x9d\x03\n\x0c\x43ontrolEvent\x12\n\n\x02id\x18\x01 \x01(\t\x12-\n\tissued_at\x18\x02 \x01(\x0b\x32\x1a.google.protobuf.Timestamp\x12*\n\x06target\x18\x03 \x01(\x0b\x32\x1a.goldfive.v1.ControlTarget\x12&\n\x04kind\x18\x04 \x01(\x0e\x32\x18.goldfive.v1.ControlKind\x12*\n\x05steer\x18\n \x01(\x0b\x32\x19.goldfive.v1.SteerPayloadH\x00\x12,\n\x06rewind\x18\x0b \x01(\x0b\x32\x1a.goldfive.v1.RewindPayloadH\x00\x12.\n\x07\x61pprove\x18\x0c \x01(\x0b\x32\x1b.goldfive.v1.ApprovePayloadH\x00\x12,\n\x06reject\x18\r \x01(\x0b\x32\x1a.goldfive.v1.RejectPayloadH\x00\x12;\n\x0einject_message\x18\x0e \x01(\x0b\x32!.goldfive.v1.InjectMessagePayloadH\x00\x42\t\n\x07payload\"\x8d\x01\n\nControlAck\x12\x12\n\ncontrol_id\x18\x01 \x01(\t\x12-\n\x06result\x18\x02 \x01(\x0e\x32\x1d.goldfive.v1.ControlAckResult\x12\x0e\n\x06\x64\x65tail\x18\x03 \x01(\t\x12,\n\x08\x61\x63ked_at\x18\x04 \x01(\x0b\x32\x1a.google.protobuf.Timestamp*\xc1\x02\n\x0b\x43ontrolKind\x12\x1c\n\x18\x43ONTROL_KIND_UNSPECIFIED\x10\x00\x12\x16\n\x12\x43ONTROL_KIND_PAUSE\x10\x01\x12\x17\n\x13\x43ONTROL_KIND_RESUME\x10\x02\x12\x17\n\x13\x43ONTROL_KIND_CANCEL\x10\x03\x12\x1a\n\x16\x43ONTROL_KIND_REWIND_TO\x10\x04\x12\x16\n\x12\x43ONTROL_KIND_STEER\x10\x05\x12\x18\n\x14\x43ONTROL_KIND_APPROVE\x10\x06\x12\x17\n\x13\x43ONTROL_KIND_REJECT\x10\x07\x12\x1d\n\x19\x43ONTROL_KIND_STATUS_QUERY\x10\x08\x12#\n\x1f\x43ONTROL_KIND_INTERCEPT_TRANSFER\x10\t\x12\x1f\n\x1b\x43ONTROL_KIND_INJECT_MESSAGE\x10\n*\x9a\x01\n\x10\x43ontrolAckResult\x12\"\n\x1e\x43ONTROL_ACK_RESULT_UNSPECIFIED\x10\x00\x12\x1e\n\x1a\x43ONTROL_ACK_RESULT_SUCCESS\x10\x01\x12\x1e\n\x1a\x43ONTROL_ACK_RESULT_FAILURE\x10\x02\x12\"\n\x1e\x43ONTROL_ACK_RESULT_UNSUPPORTED\x10\x03\x42\x39Z7github.com/pedapudi/goldfive/gen/goldfive/v1;goldfivev1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,24 +33,24 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'goldfive.v1.control_pb2', _
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Z7github.com/pedapudi/goldfive/gen/goldfive/v1;goldfivev1'
-  _globals['_CONTROLKIND']._serialized_start=957
-  _globals['_CONTROLKIND']._serialized_end=1278
-  _globals['_CONTROLACKRESULT']._serialized_start=1281
-  _globals['_CONTROLACKRESULT']._serialized_end=1435
+  _globals['_CONTROLKIND']._serialized_start=996
+  _globals['_CONTROLKIND']._serialized_end=1317
+  _globals['_CONTROLACKRESULT']._serialized_start=1320
+  _globals['_CONTROLACKRESULT']._serialized_end=1474
   _globals['_CONTROLTARGET']._serialized_start=75
   _globals['_CONTROLTARGET']._serialized_end=147
   _globals['_STEERPAYLOAD']._serialized_start=149
-  _globals['_STEERPAYLOAD']._serialized_end=203
-  _globals['_REWINDPAYLOAD']._serialized_start=205
-  _globals['_REWINDPAYLOAD']._serialized_end=237
-  _globals['_APPROVEPAYLOAD']._serialized_start=239
-  _globals['_APPROVEPAYLOAD']._serialized_end=290
-  _globals['_REJECTPAYLOAD']._serialized_start=292
-  _globals['_REJECTPAYLOAD']._serialized_end=342
-  _globals['_INJECTMESSAGEPAYLOAD']._serialized_start=344
-  _globals['_INJECTMESSAGEPAYLOAD']._serialized_end=394
-  _globals['_CONTROLEVENT']._serialized_start=397
-  _globals['_CONTROLEVENT']._serialized_end=810
-  _globals['_CONTROLACK']._serialized_start=813
-  _globals['_CONTROLACK']._serialized_end=954
+  _globals['_STEERPAYLOAD']._serialized_end=242
+  _globals['_REWINDPAYLOAD']._serialized_start=244
+  _globals['_REWINDPAYLOAD']._serialized_end=276
+  _globals['_APPROVEPAYLOAD']._serialized_start=278
+  _globals['_APPROVEPAYLOAD']._serialized_end=329
+  _globals['_REJECTPAYLOAD']._serialized_start=331
+  _globals['_REJECTPAYLOAD']._serialized_end=381
+  _globals['_INJECTMESSAGEPAYLOAD']._serialized_start=383
+  _globals['_INJECTMESSAGEPAYLOAD']._serialized_end=433
+  _globals['_CONTROLEVENT']._serialized_start=436
+  _globals['_CONTROLEVENT']._serialized_end=849
+  _globals['_CONTROLACK']._serialized_start=852
+  _globals['_CONTROLACK']._serialized_end=993
 # @@protoc_insertion_point(module_scope)

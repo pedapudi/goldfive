@@ -226,6 +226,191 @@ async def test_observe_non_control_event_still_uses_classifier() -> None:
 
 
 # ---------------------------------------------------------------------------
+# goldfive#171 — STEER idempotency, author propagation
+# ---------------------------------------------------------------------------
+
+
+async def test_observe_steer_dedupes_by_annotation_id() -> None:
+    """Second delivery of the same STEER annotation is a no-op.
+
+    Two ``ControlMessage`` values with different ``id`` but the same
+    ``payload['annotation_id']`` must only trigger one refine. Models
+    the delivery-retry scenario.
+    """
+    steerer, session, _sink, planner = _bind_fresh()
+
+    first = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-retry-1",
+        payload={"note": "pivot", "annotation_id": "ann_abc"},
+    )
+    second = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-retry-2",
+        payload={"note": "pivot", "annotation_id": "ann_abc"},
+    )
+    await steerer.observe(first, session)
+    await steerer.observe(second, session)
+
+    assert len(planner.refine_calls) == 1
+    assert session.state.get("goldfive.processed_steer_ids") == ["ann_abc"]
+
+
+async def test_observe_steer_dedupes_by_control_id_when_annotation_id_absent() -> None:
+    """Bridges that don't source annotations fall back to ControlMessage.id."""
+    steerer, session, _sink, planner = _bind_fresh()
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-noid-1",
+        payload={"note": "pivot"},
+    )
+
+    await steerer.observe(msg, session)
+    # Same id, deliberately re-delivered.
+    await steerer.observe(msg, session)
+
+    assert len(planner.refine_calls) == 1
+    assert session.state.get("goldfive.processed_steer_ids") == ["ctl-noid-1"]
+
+
+async def test_observe_steer_distinct_ids_each_trigger_refine() -> None:
+    """Two distinct STEER annotations each fire refine exactly once."""
+    steerer, session, _sink, planner = _bind_fresh()
+    first = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-a",
+        payload={"note": "one", "annotation_id": "ann_1"},
+    )
+    second = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-b",
+        payload={"note": "two", "annotation_id": "ann_2"},
+    )
+
+    await steerer.observe(first, session)
+    await steerer.observe(second, session)
+
+    assert len(planner.refine_calls) == 2
+    assert session.state.get("goldfive.processed_steer_ids") == ["ann_1", "ann_2"]
+
+
+async def test_observe_dedupe_does_not_affect_heuristic_drifts() -> None:
+    """LOOPING_REASONING-class heuristic drifts are never deduped.
+
+    The dedupe set lives only for user-originated STEER annotations;
+    content-based classifiers (tool errors, refusals, loops) must
+    remain free-running so repeated heuristic signals still escalate.
+    """
+    steerer, session, _sink, planner = _bind_fresh()
+
+    # A steer populates processed_steer_ids.
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-s",
+        payload={"note": "go", "annotation_id": "ann_s"},
+    )
+    await steerer.observe(msg, session)
+    # A tool-error event — classified as TOOL_ERROR, must still emit.
+    await steerer.observe({"error": "boom"}, session)
+    await steerer.observe({"error": "boom"}, session)
+
+    # planner.refine: 1 steer + 2 tool_error observations.
+    assert len(planner.refine_calls) == 3
+
+
+async def test_observe_steer_propagates_author_into_state_and_detail() -> None:
+    """``author`` from SteerPayload lands on state + drift detail prefix."""
+    steerer, session, _sink, planner = _bind_fresh()
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-auth",
+        payload={
+            "note": "focus on clarity",
+            "author": "alice",
+            "annotation_id": "ann_author",
+        },
+    )
+
+    await steerer.observe(msg, session)
+
+    assert session.state.get("goldfive.active_steer.author") == "alice"
+    # Raw body — not the "by alice: ..." rewrite — lands on body.
+    assert session.state.get("goldfive.active_steer.body") == "focus on clarity"
+    # The drift.detail seen by the planner is the prefixed form.
+    assert len(planner.refine_calls) == 1
+    drift: DriftEvent = planner.refine_calls[0]["drift"]
+    assert drift.detail == "by alice: focus on clarity"
+
+
+async def test_observe_steer_without_author_leaves_author_empty() -> None:
+    steerer, session, _sink, planner = _bind_fresh()
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-noauth",
+        payload={"note": "quiet nudge", "annotation_id": "ann_na"},
+    )
+
+    await steerer.observe(msg, session)
+
+    assert session.state.get("goldfive.active_steer.author") == ""
+    assert session.state.get("goldfive.active_steer.body") == "quiet nudge"
+    drift: DriftEvent = planner.refine_calls[0]["drift"]
+    # No "by X: " prefix when author is empty.
+    assert drift.detail == "quiet nudge"
+
+
+async def test_processed_steer_ids_list_evicts_oldest_when_capped() -> None:
+    """The FIFO cap bounds the dedupe list so long sessions stay bounded."""
+    from goldfive import orchestration_state as _ostate
+
+    steerer, session, _sink, _planner = _bind_fresh()
+    cap = _ostate.PROCESSED_STEER_IDS_CAP
+
+    # Fire cap + 3 distinct steers.
+    for i in range(cap + 3):
+        msg = ControlMessage(
+            kind=ControlKind.STEER,
+            id=f"ctl-{i}",
+            payload={"note": f"n{i}", "annotation_id": f"ann_{i}"},
+        )
+        await steerer.observe(msg, session)
+
+    ids = session.state.get("goldfive.processed_steer_ids") or []
+    assert len(ids) == cap
+    # Oldest 3 were evicted.
+    assert "ann_0" not in ids
+    assert "ann_1" not in ids
+    assert "ann_2" not in ids
+    # Newest survives.
+    assert ids[-1] == f"ann_{cap + 2}"
+
+
+async def test_direct_user_steer_drift_event_without_raw_still_writes_state() -> None:
+    """Back-compat: tests that build DriftEvent directly still work.
+
+    Pre-#171 tests fabricate a USER_STEER DriftEvent without a raw
+    ControlMessage behind it. The state writer must fall back to
+    parsing ``detail`` so those tests still round-trip body/author
+    into state.
+    """
+    steerer, session, _sink, _planner = _bind_fresh()
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="by bob: direct call",
+        current_task_id="t2",
+    )
+
+    await steerer._apply_user_steer_state(drift, session)
+
+    assert session.state.get("goldfive.active_steer.body") == "direct call"
+    assert session.state.get("goldfive.active_steer.author") == "bob"
+    # No dedupe id recoverable from a bare DriftEvent → processed list
+    # is not populated.
+    assert session.state.get("goldfive.processed_steer_ids") in (None, [])
+
+
+# ---------------------------------------------------------------------------
 # goldfive#139 — steerer tags the bound adapter's next cancel with a
 # symbolic reason on USER_STEER drift, so the synthetic function_response
 # the adapter appends on cancel carries LLM-actionable content.

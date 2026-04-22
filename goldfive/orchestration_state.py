@@ -54,6 +54,13 @@ Active steer (set by DefaultSteerer on USER_STEER drift):
 * ``goldfive.active_steer.at_turn`` — monotonic sequence value
   captured at steer-fire time. Lets downstream refines know "was this
   steer before or after the observation I'm looking at?".
+* ``goldfive.active_steer.author`` — operator identity from the
+  originating annotation (goldfive#171). Empty string when the bridge
+  doesn't source annotations.
+* ``goldfive.processed_steer_ids`` — bounded FIFO list of
+  already-processed STEER ids (annotation id when available, otherwise
+  the ``ControlMessage.id``). Consulted by DefaultSteerer to drop
+  delivery retries and UI double-fires (goldfive#171).
 
 Heal path (set by adapter ``_heal_pending_tool_calls``):
 
@@ -98,6 +105,13 @@ KEY_GOALS_SUMMARY = "goldfive.goals_summary"
 # Active steer (DefaultSteerer)
 KEY_ACTIVE_STEER_BODY = "goldfive.active_steer.body"
 KEY_ACTIVE_STEER_AT_TURN = "goldfive.active_steer.at_turn"
+KEY_ACTIVE_STEER_AUTHOR = "goldfive.active_steer.author"
+
+# USER_STEER idempotency (goldfive#171). A bounded list of already-
+# processed annotation / control ids. Consulted by DefaultSteerer so a
+# delivery retry or UI double-fire of the same STEER annotation doesn't
+# cascade-cancel + refine twice.
+KEY_PROCESSED_STEER_IDS = "goldfive.processed_steer_ids"
 
 # Heal path (ADKAdapter._heal_pending_tool_calls)
 KEY_CANCELLED_FUNCTION_CALL_IDS = "goldfive.cancelled_function_call_ids"
@@ -109,8 +123,15 @@ ALL_KEYS: tuple[str, ...] = (
     KEY_GOALS_SUMMARY,
     KEY_ACTIVE_STEER_BODY,
     KEY_ACTIVE_STEER_AT_TURN,
+    KEY_ACTIVE_STEER_AUTHOR,
+    KEY_PROCESSED_STEER_IDS,
     KEY_CANCELLED_FUNCTION_CALL_IDS,
 )
+
+# Cap on how many processed steer ids we retain on ``session.state`` so
+# long-lived sessions don't balloon the dedupe set. The oldest entries
+# are evicted FIFO when the cap is reached.
+PROCESSED_STEER_IDS_CAP = 256
 
 
 # ---------------------------------------------------------------------------
@@ -229,16 +250,68 @@ def set_active_steer(
     *,
     body: str,
     at_turn: int,
+    author: str = "",
 ) -> None:
-    """Record the active steer body + turn. See module docstring."""
+    """Record the active steer body + turn (+ optional author).
+
+    See module docstring. ``author`` defaults to the empty string so
+    existing callers that don't know who authored the steer keep
+    working unchanged (goldfive#171).
+    """
     write(state, KEY_ACTIVE_STEER_BODY, str(body or ""))
     write(state, KEY_ACTIVE_STEER_AT_TURN, int(at_turn))
+    write(state, KEY_ACTIVE_STEER_AUTHOR, str(author or ""))
 
 
 def clear_active_steer(state: MutableMapping[str, Any]) -> None:
     """Clear the active-steer keys (e.g. at run start). Idempotent."""
     clear(state, KEY_ACTIVE_STEER_BODY)
     clear(state, KEY_ACTIVE_STEER_AT_TURN)
+    clear(state, KEY_ACTIVE_STEER_AUTHOR)
+
+
+# ---------------------------------------------------------------------------
+# Processed steer ids (goldfive#171)
+# ---------------------------------------------------------------------------
+
+
+def has_processed_steer_id(state: Any, steer_id: str) -> bool:
+    """True when ``steer_id`` is already in the processed set.
+
+    Tolerant of malformed state values: a non-list / missing entry is
+    treated as an empty set.
+    """
+    if not steer_id:
+        return False
+    existing = read(state, KEY_PROCESSED_STEER_IDS, [])
+    if not isinstance(existing, list):
+        return False
+    return str(steer_id) in existing
+
+
+def record_processed_steer_id(
+    state: MutableMapping[str, Any],
+    steer_id: str,
+) -> None:
+    """Append ``steer_id`` to the processed list with FIFO eviction.
+
+    Empty ids are a no-op. Duplicates are silently dropped so the
+    function is safe to call unconditionally after a ``has_`` check.
+    """
+    if not steer_id:
+        return
+    existing = read(state, KEY_PROCESSED_STEER_IDS, [])
+    if not isinstance(existing, list):
+        existing = []
+    merged: list[str] = [str(v) for v in existing if v]
+    sid = str(steer_id)
+    if sid in merged:
+        return
+    merged.append(sid)
+    overflow = len(merged) - PROCESSED_STEER_IDS_CAP
+    if overflow > 0:
+        merged = merged[overflow:]
+    write(state, KEY_PROCESSED_STEER_IDS, merged)
 
 
 # ---------------------------------------------------------------------------
@@ -320,19 +393,24 @@ __all__ = [
     "ALL_KEYS",
     "GOLDFIVE_PREFIX",
     "KEY_ACTIVE_STEER_AT_TURN",
+    "KEY_ACTIVE_STEER_AUTHOR",
     "KEY_ACTIVE_STEER_BODY",
     "KEY_CANCELLED_FUNCTION_CALL_IDS",
     "KEY_CURRENT_PLAN_ID",
     "KEY_CURRENT_TASK_ID",
     "KEY_CURRENT_TASK_TITLE",
     "KEY_GOALS_SUMMARY",
+    "KEY_PROCESSED_STEER_IDS",
+    "PROCESSED_STEER_IDS_CAP",
     "append_cancelled_function_call_ids",
     "clear",
     "clear_active_steer",
     "clear_current_task",
     "format_goals_summary",
+    "has_processed_steer_id",
     "read",
     "read_cancelled_function_call_ids",
+    "record_processed_steer_id",
     "refresh_goals_summary",
     "set_active_steer",
     "set_current_plan",
