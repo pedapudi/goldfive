@@ -284,15 +284,78 @@ class GoldfiveADKAgent(BaseAgent):
             )
             return
 
-        outcome = await self._runner.run(
-            user_input,
-            context={"adk_ctx": ctx},
-            session_id=outer_sid or None,
-        )
-        async for adk_event in _outcome_to_adk_events(
-            outcome, ctx, author=self.name
-        ):
-            yield adk_event
+        # try/finally wraps the entire run so ``_notify_plugins_on_run_end``
+        # fires on ALL exit paths — normal completion, adapter raise,
+        # upstream ``CancelledError`` (adk-web disconnect mid-stream), or
+        # ``GeneratorExit`` when the caller ``aclose()``s this generator
+        # early. Observability plugins rely on this hook to close any
+        # INVOCATION spans their own ``before_run_callback`` opened but
+        # whose matching ``after_run_callback`` never fired — see
+        # goldfive#196. ADK's plugin-manager ``after_run_callback`` is
+        # placed AFTER an ``async with Aclosing(execute_fn(...))`` block
+        # in :meth:`Runner._exec_with_plugin`, NOT inside a ``finally``,
+        # so a cancelled or early-closed generator leaks open spans. The
+        # teardown hook here is the goldfive-side guarantee that orphan
+        # INVOCATION spans get flushed regardless of ADK's gap.
+        try:
+            outcome = await self._runner.run(
+                user_input,
+                context={"adk_ctx": ctx},
+                session_id=outer_sid or None,
+            )
+            async for adk_event in _outcome_to_adk_events(
+                outcome, ctx, author=self.name
+            ):
+                yield adk_event
+        finally:
+            self._notify_plugins_on_run_end()
+
+    def _notify_plugins_on_run_end(self) -> None:
+        """Fire ``on_run_end()`` on every adapter plugin that defines it.
+
+        Fire-and-forget: any plugin exception is swallowed so a faulty
+        observability hook cannot mask the real outcome of the run.
+        Duck-typed — plugins without the hook (older builds, plugins
+        that don't track per-invocation spans) fall through cleanly.
+
+        Why this exists (goldfive#196):
+        The harmonograf telemetry plugin opens an INVOCATION span on
+        every ``before_run_callback``, keyed by the sub-Runner's ADK
+        ``invocation_id``. On normal completion the matching
+        ``after_run_callback`` closes it. But when the outer
+        :class:`GoldfiveADKAgent` run is cancelled mid-flight (adk-web
+        client disconnect, STEER during an AgentTool sub-Runner, crash
+        in a sibling sub-Runner), ADK's plugin-manager does NOT fire
+        ``after_run_callback`` — it's placed after
+        ``async with Aclosing(execute_fn(...))`` in
+        :meth:`Runner._exec_with_plugin`, outside any ``finally``. The
+        sub-Runner's span then leaks ``status=RUNNING`` in the
+        harmonograf DB forever, and the frontend's Live Activity panel
+        shows a stuck "N RUNNING" header.
+
+        ADKAdapter.invoke already calls ``on_cancellation`` on the
+        OUTER invocation on ``CancelledError``. This hook is the
+        broader sweep that fires on EVERY exit path and lets plugins
+        close every span they opened during the run — including
+        orphaned sub-Runner spans the outer cancel path cannot reach.
+        """
+        adapter = getattr(self._runner, "agent", None)
+        plugins = getattr(adapter, "_plugins", None)
+        if not plugins:
+            return
+        for plugin in plugins:
+            hook = getattr(plugin, "on_run_end", None)
+            if hook is None:
+                continue
+            try:
+                hook()
+            except Exception as exc:  # noqa: BLE001 — defensive
+                log.debug(
+                    "GoldfiveADKAgent: plugin %r on_run_end raised "
+                    "(swallowed): %s",
+                    plugin,
+                    exc,
+                )
 
     @staticmethod
     def _outer_session_id_from_ctx(ctx: InvocationContext) -> str:
