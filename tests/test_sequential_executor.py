@@ -86,6 +86,7 @@ class StubSteerer:
         *,
         detail: str = "",
         session: Session,
+        cancel_reason: str = "",
     ) -> None:
         if session.plan is None:
             return

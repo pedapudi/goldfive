@@ -74,6 +74,7 @@ class Steerer(Protocol):
         *,
         detail: str = "",
         session: Session,
+        cancel_reason: str = "",
     ) -> None: ...
 
     async def cascade_cancel_downstream(

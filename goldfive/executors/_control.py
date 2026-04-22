@@ -98,6 +98,13 @@ class ControlOutcome:
     rewind_task_id: str = ""
     # Reason string, populated when cancel_run=True.
     cancel_reason: str = ""
+    # goldfive#205: structured cancel reason prefix for harmonograf's
+    # Trajectory view. Empty unless the control message was a CANCEL.
+    # When populated, looks like ``user_cancel:<annotation_id>`` (or just
+    # ``user_cancel:cancelled_by_control`` when the bridge did not carry
+    # an annotation id). Threaded through to ``steerer.transition`` so
+    # the emitted ``TaskCancelled`` carries the reason.
+    cancel_reason_prefix: str = ""
 
 
 def _now_ms() -> int:
@@ -203,10 +210,21 @@ async def dispatch_control(
 
     if kind == "CANCEL":
         reason = str(msg.payload.get("reason", "")) or "cancelled by control"
+        # goldfive#205: compose a structured reason prefix so downstream
+        # per-task cancel emits can carry provenance ("user_cancel:<id>").
+        # Prefers the bridge-supplied annotation_id when present (the
+        # stable id harmonograf uses to dedupe annotation rows against
+        # drift rows, goldfive#176); falls back to the control message's
+        # own id so every user-cancel row still has a non-empty prefix.
+        ann_id = str(msg.payload.get("annotation_id", "") or "")
+        cancel_prefix = (
+            f"user_cancel:{ann_id}" if ann_id else f"user_cancel:{msg.id}"
+        )
         return ControlOutcome(
             ack=_build_ack(msg, result=AckResult.SUCCESS, detail="cancel acknowledged"),
             cancel_run=True,
             cancel_reason=reason,
+            cancel_reason_prefix=cancel_prefix,
         )
 
     if kind == "PAUSE":

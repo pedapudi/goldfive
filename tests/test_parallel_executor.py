@@ -118,6 +118,7 @@ class RecordingSteerer:
         *,
         detail: str = "",
         session: Session,
+        cancel_reason: str = "",
     ) -> None:
         return None
 

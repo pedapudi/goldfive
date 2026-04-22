@@ -68,6 +68,27 @@ log = logging.getLogger(__name__)
 _CANCEL_REASON_USER_STEER: str = "user_steer"
 
 
+def _steer_cancel_reason_prefix(steer_msg: Any) -> str:
+    """Return a structured cancel reason for a STEER-interrupted task.
+
+    Format: ``user_steer:<annotation_id>`` when the bridge forwarded an
+    annotation id on ``payload["annotation_id"]`` (goldfive#171); falls
+    back to ``user_steer:<control_id>`` when no annotation id is
+    present (e.g. a direct SDK caller); final fallback is the generic
+    ``user_steer:steer`` so the reason field is never empty on a
+    steer-driven cancel. See goldfive#205.
+    """
+    payload = getattr(steer_msg, "payload", None)
+    if isinstance(payload, dict):
+        ann = str(payload.get("annotation_id", "") or "")
+        if ann:
+            return f"user_steer:{ann}"
+    msg_id = str(getattr(steer_msg, "id", "") or "")
+    if msg_id:
+        return f"user_steer:{msg_id}"
+    return "user_steer:steer"
+
+
 def _tag_adapter_cancel_user_steer(adapter: Any) -> None:
     """Tag ``adapter._next_cancel_reason`` with the USER_STEER symbolic reason.
 
@@ -428,8 +449,17 @@ class SequentialExecutor(Executor):
             )
 
             if outcome_kind == "cancelled":
+                # goldfive#205: the dispatch stashed a structured cancel
+                # prefix on the session (``user_cancel:<annotation_id>``
+                # for user-initiated CANCEL); thread it through so the
+                # emitted TaskCancelled carries the reason.
+                cancel_prefix = getattr(session, "_last_cancel_reason_prefix", "")
+                session._last_cancel_reason_prefix = ""
                 await self._mark_cancelled_if_live(
-                    task_id=task.id, steerer=steerer, session=session
+                    task_id=task.id,
+                    steerer=steerer,
+                    session=session,
+                    cancel_reason=cancel_prefix,
                 )
                 failure_reason = str(outcome_payload) or "cancelled by control"
                 run_failed = True
@@ -446,8 +476,17 @@ class SequentialExecutor(Executor):
                 break
 
             if outcome_kind == "steer":
+                # goldfive#205: the in-flight task is being cancelled in
+                # favour of a steer-driven plan revision. Stamp a
+                # ``user_steer:<annotation_id>`` reason so sinks can
+                # distinguish "superseded by user steering" from
+                # generic run-aborts / cascade-cancels.
+                steer_prefix = _steer_cancel_reason_prefix(outcome_payload)
                 await self._mark_cancelled_if_live(
-                    task_id=task.id, steerer=steerer, session=session
+                    task_id=task.id,
+                    steerer=steerer,
+                    session=session,
+                    cancel_reason=steer_prefix,
                 )
                 await self._apply_steer(outcome_payload, steerer=steerer, session=session)
                 continue
@@ -631,11 +670,20 @@ class SequentialExecutor(Executor):
                 len(orphaned),
                 ", ".join(orphaned),
             )
+            # goldfive#205: structured cancel reason so harmonograf can
+            # answer "why was this task cancelled?" in the Trajectory view.
+            # Prefix the reason with ``run_aborted:`` and keep the legacy
+            # humane tail so existing sinks that render the raw reason
+            # unchanged still see intent.
+            cancel_reason_value = (
+                "run_aborted:orphaned by plan revision failure"
+            )
             for orphan_id in orphaned:
                 await steerer.transition(
                     orphan_id,
                     TaskStatus.CANCELLED,
                     detail="orphaned by plan revision failure",
+                    cancel_reason=cancel_reason_value,
                     session=session,
                 )
             reason = (
@@ -790,6 +838,11 @@ class SequentialExecutor(Executor):
             )
             if kind == "cancelled":
                 failure_reason = str(payload) or "cancelled by control"
+                # goldfive#205: overlay path doesn't have a single
+                # "current task" to stamp — the orphan sweep below
+                # handles PENDING tasks. Clear the transient prefix so
+                # it doesn't leak to a subsequent run.
+                session._last_cancel_reason_prefix = ""
                 await emit(
                     sinks,
                     run_aborted_event(
@@ -1030,6 +1083,8 @@ class SequentialExecutor(Executor):
 
             if outcome.cancel_run:
                 await self._cancel_invoke_task(invoke_task)
+                if outcome.cancel_reason_prefix:
+                    session._last_cancel_reason_prefix = outcome.cancel_reason_prefix
                 return ("cancelled", outcome.cancel_reason or "cancelled by control")
 
             if outcome.steer_message is not None:
@@ -1086,12 +1141,14 @@ class SequentialExecutor(Executor):
 
         cancel_run = False
         cancel_reason = ""
+        cancel_prefix = ""
         steer_msg: object | None = None
         paused = False
         for o in outcomes:
             if o.cancel_run:
                 cancel_run = True
                 cancel_reason = o.cancel_reason
+                cancel_prefix = o.cancel_reason_prefix
                 break
             if o.steer_message is not None:
                 steer_msg = o.steer_message
@@ -1101,6 +1158,11 @@ class SequentialExecutor(Executor):
                 paused = False
 
         if cancel_run:
+            # goldfive#205: stash the structured cancel prefix on the
+            # session so any per-task cancel cascade triggered by this
+            # abort picks it up.
+            if cancel_prefix:
+                session._last_cancel_reason_prefix = cancel_prefix
             raise _ControlCancelled(cancel_reason or "cancelled by control")
 
         # Intervention-ladder pause (goldfive#142). The steerer sets
@@ -1124,6 +1186,8 @@ class SequentialExecutor(Executor):
             except Exception:  # noqa: BLE001
                 pass
             if outcome.cancel_run:
+                if outcome.cancel_reason_prefix:
+                    session._last_cancel_reason_prefix = outcome.cancel_reason_prefix
                 raise _ControlCancelled(outcome.cancel_reason or "cancelled by control")
             if outcome.request_resume:
                 paused = False
@@ -1213,6 +1277,10 @@ class SequentialExecutor(Executor):
 
             if outcome.cancel_run:
                 await self._cancel_invoke_task(invoke_task)
+                # goldfive#205: stash the structured cancel prefix on the
+                # session so the per-task cancel emit below picks it up.
+                if outcome.cancel_reason_prefix:
+                    session._last_cancel_reason_prefix = outcome.cancel_reason_prefix
                 return ("cancelled", outcome.cancel_reason or "cancelled by control")
 
             if outcome.steer_message is not None:
@@ -1260,8 +1328,15 @@ class SequentialExecutor(Executor):
         task_id: str,
         steerer: Steerer,
         session: Session,
+        cancel_reason: str = "",
     ) -> None:
-        """Transition a not-yet-terminal task to CANCELLED."""
+        """Transition a not-yet-terminal task to CANCELLED.
+
+        ``cancel_reason`` (goldfive#205): structured reason stamped on the
+        emitted ``TaskCancelled``. Defaults to a generic
+        ``user_cancel:cancelled_by_control`` when the caller does not
+        pass something more specific (e.g. an annotation_id).
+        """
         if session.plan is None:
             return
         for t in session.plan.tasks:
@@ -1272,10 +1347,12 @@ class SequentialExecutor(Executor):
                     TaskStatus.CANCELLED,
                 ):
                     return
+                reason_value = cancel_reason or "user_cancel:cancelled_by_control"
                 await steerer.transition(
                     task_id,
                     TaskStatus.CANCELLED,
                     detail="cancelled by control",
+                    cancel_reason=reason_value,
                     session=session,
                 )
                 return

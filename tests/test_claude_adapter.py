@@ -60,6 +60,7 @@ class _RecordingSteerer:
         *,
         detail: str = "",
         session: Session,
+        cancel_reason: str = "",  # noqa: ARG002
     ) -> None:
         self.transitions.append((task_id, str(to)))
 

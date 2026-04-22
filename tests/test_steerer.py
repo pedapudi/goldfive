@@ -249,8 +249,9 @@ async def test_mark_task_failed_fatal_fires_critical_drift() -> None:
     assert sink.events[0].task_failed.recoverable is False
     # Downstream cascade picked up t2 via the shared primitive.
     assert sink.events[1].task_cancelled.task_id == "t2"
-    assert "cascade" in sink.events[1].task_cancelled.reason
-    assert "t1" in sink.events[1].task_cancelled.reason
+    # goldfive#205: cascade reason is structured as ``upstream_failed:<source_id>``
+    # so harmonograf's Trajectory view can render "why was this task cancelled?".
+    assert sink.events[1].task_cancelled.reason == "upstream_failed:t1"
     drift_evt = sink.events[2]
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -1153,12 +1154,12 @@ async def test_mark_task_cancelled_cascades_to_downstream_pending() -> None:
     ids = [e.task_cancelled.task_id for e in sink.events]
     assert ids == ["t1", "t2", "t3"]
     # The initiator keeps the caller's reason; the cascaded tasks
-    # carry a "cascade from <initiator>" reason so operators can
-    # trace the blast radius back to the trigger.
+    # carry a structured ``upstream_failed:<initiator>`` reason
+    # (goldfive#205) so operators — and harmonograf's Trajectory view —
+    # can trace the blast radius back to the trigger.
     assert reasons[0] == "user cancelled"
     for r in reasons[1:]:
-        assert "cascade" in r
-        assert "t1" in r
+        assert r == "upstream_failed:t1"
 
 
 async def test_mark_task_cancelled_does_not_cascade_to_completed() -> None:
@@ -1313,12 +1314,12 @@ async def test_cascade_primitive_shared_between_recoverable_and_unrecoverable_pa
     fat_downstream_reasons = {c.task_id: c.reason for c in fat_cancelled}
 
     # Core parity assertion: the downstream TaskCancelled events emitted
-    # by the two paths carry the same reason strings ("cascade from t1"
-    # shape), proving both paths funnel through cascade_cancel_downstream.
+    # by the two paths carry the same reason strings
+    # (``upstream_failed:t1`` post goldfive#205), proving both paths
+    # funnel through cascade_cancel_downstream.
     assert rec_downstream_reasons == fat_downstream_reasons
     for tid, reason in fat_downstream_reasons.items():
-        assert "cascade" in reason, (tid, reason)
-        assert "t1" in reason, (tid, reason)
+        assert reason == "upstream_failed:t1", (tid, reason)
 
     # Final plan shape parity on the downstream set (initiator differs:
     # CANCELLED on the recoverable path, FAILED on the unrecoverable).

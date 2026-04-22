@@ -4,6 +4,22 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ## Unreleased — 2026-04-21
 
+### Observability
+
+- [#205](https://github.com/pedapudi/goldfive/pull/205) **Structured cancel
+  reasons on every `TaskCancelled`.** Every task-cancellation emit site
+  now stamps a colon-prefixed reason — `upstream_failed:<id>`,
+  `run_aborted:<reason>`, `user_cancel:<annotation_id>`,
+  `user_steer:<annotation_id>` — so downstream sinks can answer "why was
+  this task cancelled?" without cross-referencing sibling events.
+  `Steerer.transition` grows a `cancel_reason=""` kwarg that overrides
+  `detail` for the reason field on CANCELLED / FAILED transitions.
+  `ControlOutcome` carries a new `cancel_reason_prefix` propagated from
+  `CANCEL` control messages (falls back to the control id when no
+  annotation id is present).
+
+
+
 Overview of the arc since the last doc refresh: **goldfive stopped driving
 per-task and became an overlay.** `goldfive.wrap` now hands the user's
 original request to the tree once, observes via ADK callbacks, and steers

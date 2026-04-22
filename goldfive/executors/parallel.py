@@ -245,9 +245,17 @@ class ParallelDAGExecutor:
 
                 if control_outcome is not None and control_outcome.cancel_run:
                     abort_reason = control_outcome.cancel_reason or "cancelled by control"
+                    # goldfive#205: propagate the structured cancel prefix
+                    # onto every task this CANCEL interrupted.
+                    cancel_prefix = control_outcome.cancel_reason_prefix or (
+                        "user_cancel:cancelled_by_control"
+                    )
                     for task, _inv, _drift, _err in stage_results:
                         await self._mark_cancelled_if_live(
-                            task_id=task.id, steerer=steerer, session=session
+                            task_id=task.id,
+                            steerer=steerer,
+                            session=session,
+                            cancel_reason=cancel_prefix,
                         )
                     break
 
@@ -268,7 +276,17 @@ class ParallelDAGExecutor:
                             )
                     elif isinstance(error, asyncio.CancelledError):
                         if not already_terminal:
-                            task.status = TaskStatus.CANCELLED
+                            # goldfive#205: route through the steerer so
+                            # an observable ``TaskCancelled`` envelope with
+                            # a structured reason reaches sinks. Previously
+                            # this mutated task.status silently.
+                            await steerer.transition(
+                                task.id,
+                                TaskStatus.CANCELLED,
+                                detail="cancelled by asyncio (stage)",
+                                cancel_reason="adk_cancellation:stage_task",
+                                session=session,
+                            )
                     elif inv is not None and inv.error is not None:
                         if not already_terminal:
                             await steerer.transition(
@@ -818,10 +836,12 @@ class ParallelDAGExecutor:
         cancel_run = False
         steer_msg: object | None = None
         paused = False
+        cancel_prefix = ""
         for o in outcomes:
             if o.cancel_run:
                 cancel_run = True
                 cancel_reason = o.cancel_reason
+                cancel_prefix = o.cancel_reason_prefix
                 break
             if o.steer_message is not None:
                 steer_msg = o.steer_message
@@ -831,6 +851,10 @@ class ParallelDAGExecutor:
                 paused = False
 
         if cancel_run:
+            # goldfive#205: stash structured cancel prefix for downstream
+            # per-task cancel emits (``user_cancel:<annotation_id>``).
+            if cancel_prefix:
+                session._last_cancel_reason_prefix = cancel_prefix
             raise _ControlCancelled(cancel_reason or "cancelled by control")
 
         # Intervention-ladder pause (goldfive#142). See the Sequential
@@ -849,6 +873,8 @@ class ParallelDAGExecutor:
             except Exception:  # noqa: BLE001
                 pass
             if outcome.cancel_run:
+                if outcome.cancel_reason_prefix:
+                    session._last_cancel_reason_prefix = outcome.cancel_reason_prefix
                 raise _ControlCancelled(outcome.cancel_reason or "cancelled by control")
             if outcome.request_resume:
                 paused = False
@@ -866,19 +892,27 @@ class ParallelDAGExecutor:
         task_id: str,
         steerer: Steerer,
         session: Session,
+        cancel_reason: str = "",
     ) -> None:
-        """Transition a not-yet-terminal task to CANCELLED."""
+        """Transition a not-yet-terminal task to CANCELLED.
+
+        ``cancel_reason`` (goldfive#205): structured reason stamped on
+        the emitted ``TaskCancelled``. Defaults to a generic
+        ``user_cancel:cancelled_by_control`` when unspecified.
+        """
         if session.plan is None:
             return
         for t in session.plan.tasks:
             if t.id == task_id:
                 if t.status in _TERMINAL_TASK_STATUSES:
                     return
+                reason_value = cancel_reason or "user_cancel:cancelled_by_control"
                 try:
                     await steerer.transition(
                         task_id,
                         TaskStatus.CANCELLED,
                         detail="cancelled by control",
+                        cancel_reason=reason_value,
                         session=session,
                     )
                 except Exception as exc:  # noqa: BLE001

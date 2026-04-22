@@ -207,6 +207,7 @@ async def test_plugin_forwards_before_agent_to_reconciler() -> None:
             *,
             detail: str = "",  # noqa: ARG002
             session: Any,
+            cancel_reason: str = "",  # noqa: ARG002
         ) -> None:
             self.transitions.append((task_id, to))
             if session.plan is None:

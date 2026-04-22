@@ -138,6 +138,7 @@ class SteerAwareStubSteerer:
         *,
         detail: str = "",  # noqa: ARG002
         session: Session,
+        cancel_reason: str = "",  # noqa: ARG002
     ) -> None:
         if session.plan is None:
             return
@@ -674,6 +675,7 @@ async def test_reconciler_reset_for_new_plan_clears_plan_scoped_state() -> None:
             *,
             detail: str = "",  # noqa: ARG002
             session: Session,  # noqa: ARG002
+            cancel_reason: str = "",  # noqa: ARG002
         ) -> None:
             return None
 
