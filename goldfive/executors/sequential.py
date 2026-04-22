@@ -130,7 +130,6 @@ class SequentialExecutor(Executor):
         max_retries_per_task_lineage: int = 3,
         fail_fast: bool = True,
         overlay_mode: bool = False,
-        max_follow_up_rounds: int = 3,
         **legacy_kwargs: Any,
     ) -> None:
         # Backwards-compatible alias: accept the old name for one release
@@ -148,6 +147,25 @@ class SequentialExecutor(Executor):
             )
             if max_task_invocations is None:
                 max_task_invocations = legacy_value
+        # ``max_follow_up_rounds`` was the cap on the overlay's soft
+        # follow-up loop. goldfive#163 removed that loop entirely
+        # (flow-prompted coordinators were re-running their full
+        # pipeline on every follow-up, amplifying a ~10min run into
+        # 40+ minutes). The kwarg is accepted here for back-compat
+        # with a DeprecationWarning; it has no effect. Remove in a
+        # future release.
+        if "max_follow_up_rounds" in legacy_kwargs:
+            legacy_kwargs.pop("max_follow_up_rounds")
+            warnings.warn(
+                "SequentialExecutor(max_follow_up_rounds=...) is deprecated "
+                "and has no effect; the overlay's soft follow-up loop was "
+                "removed in goldfive#163. PENDING tasks at the end of the "
+                "passthrough invocation are transitioned to NOT_NEEDED "
+                "instead of being re-dispatched. STEER remains the user-"
+                "driven path for exercising uncovered tasks.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if legacy_kwargs:
             unexpected = ", ".join(sorted(legacy_kwargs))
             raise TypeError(f"SequentialExecutor got unexpected keyword argument(s): {unexpected}")
@@ -156,22 +174,22 @@ class SequentialExecutor(Executor):
         )
         self.max_retries_per_task_lineage = int(max_retries_per_task_lineage)
         self.fail_fast = bool(fail_fast)
-        # Overlay model (goldfive#141). When ``overlay_mode`` is True:
+        # Overlay model (goldfive#141, refined in goldfive#163). When
+        # ``overlay_mode`` is True:
         #   1. Call ``adapter.invoke_passthrough(goal_text)`` ONCE
         #      with the user's original request and a plugin-attached
         #      :class:`~goldfive.reconciler.PlanReconciler` watching
         #      the agent tree run its natural flow.
-        #   2. After the invocation ends, ask the reconciler for
-        #      PENDING tasks the tree missed and fire one
-        #      ``adapter.invoke_follow_up(task)`` per missed task.
-        #   3. Repeat up to ``max_follow_up_rounds`` times or until
-        #      every task reaches a terminal status.
+        #   2. When the invocation ends, mark any PENDING tasks as
+        #      NOT_NEEDED. The tree did what it naturally does; the
+        #      reconciler recorded the coverage; goldfive does not
+        #      drive per-task. Users who want uncovered tasks
+        #      exercised explicitly can STEER.
         # When False (default for direct SequentialExecutor() callers)
         # we keep the legacy per-task loop so tests and callers that
         # already encode that model keep working. The ``goldfive.wrap``
         # convenience flips this to True by default.
         self.overlay_mode = bool(overlay_mode)
-        self.max_follow_up_rounds = int(max_follow_up_rounds)
 
     # ------------------------------------------------------------------
     # Executor protocol
@@ -197,10 +215,14 @@ class SequentialExecutor(Executor):
 
         When :attr:`overlay_mode` is True the executor switches to the
         goldfive#141 overlay path: one
-        :meth:`AgentAdapter.invoke_passthrough` with ``user_input``
-        followed by :meth:`AgentAdapter.invoke_follow_up` for each
-        task the reconciler flags as missed. Falls through to the
-        legacy per-task loop when ``overlay_mode`` is False.
+        :meth:`AgentAdapter.invoke_passthrough` with ``user_input``.
+        When the invocation ends any PENDING tasks are transitioned to
+        ``NOT_NEEDED`` — goldfive#163 removed the soft follow-up loop
+        that used to re-dispatch missed tasks (it amplified slow
+        flow-prompted coordinators into rework loops). STEER remains
+        the user-driven path for exercising uncovered work. Falls
+        through to the legacy per-task loop when ``overlay_mode`` is
+        False.
         """
         # Pin the plan onto the session so the steerer / reporting handlers
         # see the same object the executor is iterating.
@@ -647,7 +669,7 @@ class SequentialExecutor(Executor):
         control: ControlChannel | None,
         user_input: str,
     ) -> ExecutionOutcome:
-        """Overlay-model run loop: single passthrough + reconciled follow-ups.
+        """Overlay-model run loop: single passthrough, no soft follow-ups.
 
         See :meth:`run` for the high-level contract. In order:
 
@@ -657,16 +679,21 @@ class SequentialExecutor(Executor):
            reconciler=...)`` ONCE. While the generator runs, the
            plugin forwards before/after_agent observations to the
            reconciler, which transitions plan tasks.
-        3. When the invocation ends, ask the reconciler for missed
-           PENDING tasks. For each missed task, fire
-           ``adapter.invoke_follow_up(task, session)`` and let the
-           plugin's legacy per-task attribution path close it out.
-        4. Repeat missed-task discovery up to
-           :attr:`max_follow_up_rounds` times.
-        5. If any tasks remain PENDING after the last round, mark
-           them NOT_NEEDED (not CANCELLED — the tree intentionally
-           did not run them and a re-invoke would not help).
-        6. Emit terminal RunCompleted / RunAborted.
+        3. When the invocation ends, mark any PENDING tasks as
+           ``NOT_NEEDED``. The tree did what it naturally does;
+           goldfive does not drive per-task. See goldfive#163:
+           the previous soft follow-up loop re-dispatched each
+           PENDING task as a new user message, and flow-prompted
+           coordinators re-ran their full pipeline on every such
+           message — turning a ~10 min run into 40+ min. Users who
+           want uncovered tasks exercised explicitly can STEER.
+        4. Emit terminal RunCompleted / RunAborted.
+
+        STEER handling inside the passthrough loop is preserved
+        (goldfive#149): a steer cancels the in-flight invocation,
+        feeds the message to the steerer for USER_STEER drift +
+        refine, then restarts ``invoke_passthrough`` with the steer
+        body as the new user input.
         """
         from goldfive.reconciler import PlanReconciler
 
@@ -696,7 +723,7 @@ class SequentialExecutor(Executor):
         # the tree runs the revised plan. This is why the loop is a
         # ``while True`` — a steer restarts the invocation against
         # the new plan; ``cancelled`` / ``adapter_error`` terminates
-        # the run; ``result`` falls through to the follow-up rounds.
+        # the run; ``result`` falls through to the NOT_NEEDED sweep.
         # See goldfive#149 for the regression this guards against.
         current_user_input = user_input
         failure_reason = ""
@@ -740,9 +767,10 @@ class SequentialExecutor(Executor):
                 # Feed the STEER through the steerer so USER_STEER
                 # drift fires → cascade-cancel + planner.refine runs
                 # → session.plan is replaced with the revised plan.
-                # Without this call the overlay would just re-enter
-                # the missed-task follow-up loop on the ORIGINAL plan,
-                # which is the goldfive#149 regression.
+                # Without this call the overlay would just mark the
+                # pre-steer plan's tasks NOT_NEEDED on the ORIGINAL
+                # plan and miss the steer entirely (the goldfive#149
+                # regression, preserved here post-#163).
                 log.info(
                     "SequentialExecutor._run_overlay: STEER received; "
                     "feeding steerer.observe for USER_STEER drift + refine",
@@ -762,101 +790,36 @@ class SequentialExecutor(Executor):
                 # Restart the invocation with the steer body as the
                 # new user input.
                 continue
-            # kind == "result": fall through to the follow-up rounds.
+            # kind == "result": invocation ended normally; fall
+            # through to the NOT_NEEDED sweep.
             break
 
-        # --- Missed-task follow-up rounds. -------------------------
-        rounds = 0
-        while rounds < self.max_follow_up_rounds:
-            missed = reconciler.get_missed_tasks(session.plan)
-            if not missed:
-                break
-            rounds += 1
+        # --- PENDING → NOT_NEEDED on invocation end (goldfive#163). ----
+        # The tree finished its natural flow. Any task still PENDING
+        # was not exercised by the tree. Mark terminal so sinks do not
+        # see stale PENDING entries and downstream runs do not wedge.
+        # We deliberately do NOT dispatch a follow-up: flow-prompted
+        # coordinators re-run their full pipeline on every new user
+        # message, which amplifies a ~10 min run into 40+ min. STEER
+        # is the user-driven path for exercising uncovered work.
+        live_plan = session.plan or plan
+        pending_ids = [
+            t.id
+            for t in list(getattr(live_plan, "tasks", None) or ())
+            if t.status is TaskStatus.PENDING and t.id
+        ]
+        if pending_ids:
             log.info(
-                "SequentialExecutor._run_overlay: round %d follow-up for %d missed task(s): %s",
-                rounds,
-                len(missed),
-                ", ".join(t.id for t in missed),
+                "SequentialExecutor._run_overlay: marking %d PENDING task(s) "
+                "NOT_NEEDED at invocation end (no soft follow-up per #163): %s",
+                len(pending_ids),
+                ", ".join(pending_ids),
             )
-            for task in missed:
-                # Re-check: a previous follow-up in this round may have
-                # pulled the task through a dependency side effect.
-                live = _find_task(session.plan or plan, task.id)
-                if live is None or live.status is not TaskStatus.PENDING:
-                    continue
-                # Announce the task as RUNNING before the follow-up
-                # invocation so TaskStarted lands in the sink stream
-                # exactly like the legacy per-task path. Idempotent
-                # via the steerer's terminal-status guard.
+            for tid in pending_ids:
                 await steerer.transition(
-                    task.id,
-                    TaskStatus.RUNNING,
-                    session=session,
-                )
-                # Attempt a gentle follow-up. We tolerate adapters that
-                # don't expose ``invoke_follow_up`` by falling back to
-                # the legacy ``invoke`` (same gentle phrasing now).
-                invoke_fn = getattr(adapter, "invoke_follow_up", None) or adapter.invoke
-                try:
-                    result = await invoke_fn(task, session)
-                except asyncio.CancelledError:
-                    failure_reason = "cancelled during follow-up"
-                    await emit(
-                        sinks,
-                        run_aborted_event(
-                            run_id=session.run_id,
-                            sequence=session.next_sequence(),
-                            reason=failure_reason,
-                            session_id=session.id,
-                        ),
-                    )
-                    return ExecutionOutcome(success=False, session=session, reason=failure_reason)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning(
-                        "SequentialExecutor._run_overlay: follow-up for %s raised: %s",
-                        task.id,
-                        exc,
-                    )
-                    await steerer.transition(
-                        task.id,
-                        TaskStatus.FAILED,
-                        detail=f"follow-up adapter raised: {exc}",
-                        session=session,
-                    )
-                    continue
-                # If the follow-up didn't complete the task, let the
-                # auto-transition logic decide: invocation error →
-                # FAILED, otherwise COMPLETED. Idempotent on already-
-                # terminal tasks.
-                live_after = _find_task(session.plan or plan, task.id)
-                live_status = live_after.status if live_after is not None else TaskStatus.PENDING
-                if live_status in (TaskStatus.PENDING, TaskStatus.RUNNING):
-                    if result is not None and getattr(result, "error", None) is not None:
-                        await steerer.transition(
-                            task.id,
-                            TaskStatus.FAILED,
-                            detail=str(result.error),
-                            session=session,
-                        )
-                    else:
-                        summary = (result.text if result is not None else "") or ""
-                        await steerer.transition(
-                            task.id,
-                            TaskStatus.COMPLETED,
-                            detail=summary,
-                            session=session,
-                        )
-
-        # --- Any remaining PENDING tasks are "not needed". --------
-        # The tree legitimately did not run them, the follow-up
-        # rounds didn't resurrect them; mark terminal so sinks don't
-        # see stale PENDING entries and downstream runs don't wedge.
-        for t in list(getattr(session.plan, "tasks", None) or ()):
-            if t.status is TaskStatus.PENDING:
-                await steerer.transition(
-                    t.id,
+                    tid,
                     TaskStatus.NOT_NEEDED,
-                    detail="overlay: tree did not exercise; no follow-up needed",
+                    detail="overlay: tree did not exercise; no follow-up dispatched (goldfive#163)",
                     session=session,
                 )
 

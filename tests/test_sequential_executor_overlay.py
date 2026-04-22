@@ -1,18 +1,24 @@
 """Unit tests for :class:`SequentialExecutor`'s overlay-mode branch.
 
-The overlay path (goldfive#141) flips execution from "loop over plan
-tasks calling adapter.invoke(task)" to:
+The overlay path (goldfive#141, refined in goldfive#163) flips
+execution from "loop over plan tasks calling adapter.invoke(task)" to:
 
 1. ONE call to ``adapter.invoke_passthrough(user_input, reconciler=...)``.
-2. After that completes, ask the reconciler for missed tasks.
-3. Fire ``adapter.invoke_follow_up(task)`` for each missed task.
-4. Mark any still-PENDING tasks NOT_NEEDED at end-of-run.
+2. When the invocation ends, mark any PENDING tasks as ``NOT_NEEDED``.
+
+goldfive#163 specifically **removed** the old "fire
+``adapter.invoke_follow_up(task)`` for each missed task" loop — it
+was amplifying slow flow-prompted coordinators into 4-5x rework
+loops. The tests below encode the new contract: no follow-up
+dispatch, PENDING → NOT_NEEDED at invocation end, STEER and CANCEL
+paths preserved.
 
 These tests use stub adapters — no ADK, no LLM, no network.
 """
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -61,6 +67,7 @@ class StubSteerer:
         self._sinks: list[EventSink] = []
         self._planner: Any = None
         self.observed: list[Any] = []
+        self.transitions: list[tuple[str, TaskStatus]] = []
 
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks
@@ -80,6 +87,7 @@ class StubSteerer:
         detail: str = "",  # noqa: ARG002
         session: Session,
     ) -> None:
+        self.transitions.append((task_id, to))
         if session.plan is None:
             return
         for t in session.plan.tasks:
@@ -105,8 +113,12 @@ class OverlayStubAdapter:
     ``passthrough_effect`` is called on ``invoke_passthrough`` with
     the (user_input, session, reconciler) and may transition tasks
     through the reconciler to simulate the agent tree's natural
-    activity. ``follow_up_effect`` is called on ``invoke_follow_up``
-    with (task, session).
+    activity.
+
+    The adapter also exposes ``invoke_follow_up`` so the tests can
+    **assert it is never called** under the goldfive#163 contract.
+    If the overlay ever re-introduces follow-up dispatch, these
+    tests catch it via ``follow_up_calls``.
     """
 
     def __init__(
@@ -181,13 +193,13 @@ def _three_task_plan() -> Plan:
 
 
 # ---------------------------------------------------------------------------
-# Overlay ON: one passthrough call + follow-ups for missed tasks.
+# Overlay ON: single passthrough, no follow-ups under any circumstance.
 # ---------------------------------------------------------------------------
 
 
 async def test_overlay_mode_single_passthrough_no_missed_tasks() -> None:
     """If the passthrough transitions every task COMPLETED via the
-    reconciler, no follow-ups should fire.
+    reconciler, the overlay exits cleanly and no follow-ups fire.
     """
     plan = _three_task_plan()
     session = Session(run_id="r1")
@@ -217,15 +229,18 @@ async def test_overlay_mode_single_passthrough_no_missed_tasks() -> None:
 
     assert outcome.success is True
     assert adapter.passthrough_calls == ["make it"]
-    assert adapter.follow_up_calls == [], "no tasks were missed"
+    assert adapter.follow_up_calls == [], "no follow-ups should ever fire under #163"
     for t in plan.tasks:
         assert t.status is TaskStatus.COMPLETED
     assert sink.payload_kinds()[-1] == "run_completed"
 
 
-async def test_overlay_mode_fires_follow_up_for_missed_tasks() -> None:
-    """If the passthrough only completes t0, follow-ups should fire
-    for t1 and t2.
+async def test_overlay_does_not_dispatch_follow_ups() -> None:
+    """goldfive#163: even when the reconciler reports missed PENDING
+    tasks, the overlay MUST NOT dispatch ``invoke_follow_up``. The
+    missed tasks end up ``NOT_NEEDED`` instead.
+
+    Regression guard: this is the core contract #163 added.
     """
     plan = _three_task_plan()
     session = Session(run_id="r1")
@@ -237,6 +252,7 @@ async def test_overlay_mode_fires_follow_up_for_missed_tasks() -> None:
         session: Session,
         reconciler: Any,  # noqa: ARG001
     ) -> InvocationResult:
+        # Only t0 is exercised by the tree. t1 and t2 stay PENDING.
         await reconciler.on_before_agent(agent_name="agent_a", invocation_id="inv_t0")
         await reconciler.on_after_agent(agent_name="agent_a", invocation_id="inv_t0")
         return InvocationResult(task_id="", text="")
@@ -254,88 +270,32 @@ async def test_overlay_mode_fires_follow_up_for_missed_tasks() -> None:
     )
 
     assert outcome.success is True
+    # Passthrough ran exactly once.
     assert adapter.passthrough_calls == ["do it"]
-    # Both t1 and t2 were missed — follow-up fired for each.
-    assert set(adapter.follow_up_calls) == {"t1", "t2"}
-    for t in plan.tasks:
-        assert t.status is TaskStatus.COMPLETED
-
-
-async def test_overlay_mode_marks_stubborn_pending_as_not_needed() -> None:
-    """If a task stays PENDING after every follow-up round, the
-    executor marks it NOT_NEEDED (the tree chose not to run it).
-    """
-    plan = _three_task_plan()
-    session = Session(run_id="r1")
-    steerer = StubSteerer()
-    sink = RecordingSink()
-
-    async def _passthrough(
-        user_message: str,
-        session: Session,
-        reconciler: Any,  # noqa: ARG001
-    ) -> InvocationResult:
-        # Complete t0 only.
-        await reconciler.on_before_agent(agent_name="agent_a", invocation_id="inv_t0")
-        await reconciler.on_after_agent(agent_name="agent_a", invocation_id="inv_t0")
-        return InvocationResult(task_id="", text="")
-
-    async def _follow_up_noop(task: Task, session: Session) -> InvocationResult:  # noqa: ARG001
-        # Stay PENDING — follow-up did nothing. But the executor's
-        # auto-transition will move to COMPLETED on a clean result.
-        # Simulate a genuinely "not actionable" task by returning an
-        # error-free result and then immediately back to PENDING via
-        # direct mutation.
-        return InvocationResult(task_id=task.id, text="")
-
-    async def _follow_up_stubborn(task: Task, session: Session) -> InvocationResult:
-        # Simulate the tree ignoring the follow-up: don't run, don't
-        # complete, just return an empty result. BUT set status back
-        # to PENDING after the executor's auto-transition so the next
-        # round sees it missed again — mimicking an agent that refuses.
-        # Simplest way: return with error=None but the executor
-        # still auto-completes. To force a NOT_NEEDED outcome, use a
-        # task the adapter's follow-up can't resolve: the assignee is
-        # unreachable and we want the adapter to *raise*.
-        raise RuntimeError("tree cannot run this task")
-
-    # Replace with an effect that raises for t2 to exercise the failed
-    # path; t1 succeeds via follow-up.
-    async def _mixed(task: Task, session: Session) -> InvocationResult:  # noqa: ARG001
-        if task.id == "t2":
-            raise RuntimeError("unreachable")
-        return InvocationResult(task_id=task.id, text=f"done:{task.id}")
-
-    adapter = OverlayStubAdapter(passthrough_effect=_passthrough, follow_up_effect=_mixed)
-    executor = SequentialExecutor(overlay_mode=True, fail_fast=False)
-    outcome = await executor.run(
-        plan=plan,
-        session=session,
-        adapter=adapter,
-        steerer=steerer,
-        planner=StubPlanner(),
-        sinks=[sink],
-        user_input="try",
+    # CRITICAL: no follow-up dispatch under any circumstance.
+    assert adapter.follow_up_calls == [], (
+        f"overlay must not dispatch follow-ups (goldfive#163); got {adapter.follow_up_calls!r}"
     )
-
-    # fail_fast=False: run completes with t2 failed.
+    # t0 completed via the reconciler; t1 and t2 are NOT_NEEDED (not
+    # PENDING, not COMPLETED-via-follow-up, not FAILED).
     by_id = {t.id: t.status for t in plan.tasks}
     assert by_id["t0"] is TaskStatus.COMPLETED
-    assert by_id["t1"] is TaskStatus.COMPLETED
-    assert by_id["t2"] is TaskStatus.FAILED
-    # t2 went through follow-up path, raised → transitioned FAILED.
-    assert outcome.success is True or outcome.success is False
-    assert "t1" in adapter.follow_up_calls
-    assert "t2" in adapter.follow_up_calls
+    assert by_id["t1"] is TaskStatus.NOT_NEEDED, (
+        f"missed task t1 should be NOT_NEEDED, got {by_id['t1']}"
+    )
+    assert by_id["t2"] is TaskStatus.NOT_NEEDED, (
+        f"missed task t2 should be NOT_NEEDED, got {by_id['t2']}"
+    )
 
 
-async def test_overlay_mode_respects_max_follow_up_rounds() -> None:
-    """The follow-up loop should terminate after ``max_follow_up_rounds``
-    even if the tasks keep staying PENDING.
+async def test_overlay_pending_to_not_needed_on_invocation_end() -> None:
+    """Explicit transition test: every PENDING task at the end of
+    ``invoke_passthrough`` is transitioned via
+    ``steerer.transition(..., TaskStatus.NOT_NEEDED, ...)``.
 
-    We simulate that by making every follow-up put the task BACK to
-    PENDING after the executor's auto-transition. This is a torture
-    test for the loop boundary — a real adapter would succeed or fail.
+    Verifies the exact transition API call (not just the terminal
+    status), so future refactors can't silently mutate task.status
+    without going through the steerer.
     """
     plan = _three_task_plan()
     session = Session(run_id="r1")
@@ -343,27 +303,15 @@ async def test_overlay_mode_respects_max_follow_up_rounds() -> None:
     sink = RecordingSink()
 
     async def _passthrough(
-        user_message: str,
-        session: Session,
+        user_message: str,  # noqa: ARG001
+        session: Session,  # noqa: ARG001
         reconciler: Any,  # noqa: ARG001
     ) -> InvocationResult:
+        # Tree does nothing — all three tasks stay PENDING.
         return InvocationResult(task_id="", text="")
 
-    call_counts: dict[str, int] = {}
-
-    async def _stuck(task: Task, session: Session) -> InvocationResult:
-        call_counts[task.id] = call_counts.get(task.id, 0) + 1
-        # Return a benign result; the executor will auto-COMPLETE.
-        # To force a second round we'd need to re-PENDING the task,
-        # but the terminal guard prevents that via the steerer. So
-        # instead: just return and let auto-COMPLETE happen — the
-        # loop then sees no missed tasks and exits. This test
-        # confirms the loop CAP works even when follow-ups do
-        # succeed.
-        return InvocationResult(task_id=task.id, text="ok")
-
-    adapter = OverlayStubAdapter(passthrough_effect=_passthrough, follow_up_effect=_stuck)
-    executor = SequentialExecutor(overlay_mode=True, max_follow_up_rounds=1)
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    executor = SequentialExecutor(overlay_mode=True)
     outcome = await executor.run(
         plan=plan,
         session=session,
@@ -371,12 +319,243 @@ async def test_overlay_mode_respects_max_follow_up_rounds() -> None:
         steerer=steerer,
         planner=StubPlanner(),
         sinks=[sink],
-        user_input="x",
+        user_input="anything",
     )
 
     assert outcome.success is True
-    # All three tasks touched in exactly one round (not more).
-    assert sum(call_counts.values()) == 3
+    # Exactly three NOT_NEEDED transitions (one per PENDING task).
+    not_needed_transitions = [tid for tid, to in steerer.transitions if to is TaskStatus.NOT_NEEDED]
+    assert set(not_needed_transitions) == {"t0", "t1", "t2"}, (
+        f"expected NOT_NEEDED transitions for t0/t1/t2, got {not_needed_transitions!r}"
+    )
+    # All tasks terminal.
+    for t in plan.tasks:
+        assert t.status is TaskStatus.NOT_NEEDED
+    # And of course: no follow-up dispatch.
+    assert adapter.follow_up_calls == []
+
+
+async def test_overlay_no_pending_tasks_no_not_needed_transitions() -> None:
+    """When every task is already terminal when the passthrough
+    ends, the overlay does NOT emit spurious NOT_NEEDED transitions.
+    """
+    plan = _three_task_plan()
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    async def _passthrough(
+        user_message: str,  # noqa: ARG001
+        session: Session,
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        # Simulate the tree completing every task directly.
+        if session.plan is not None:
+            for t in session.plan.tasks:
+                t.status = TaskStatus.COMPLETED
+        return InvocationResult(task_id="", text="")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    executor = SequentialExecutor(overlay_mode=True)
+    await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="go",
+    )
+
+    # No NOT_NEEDED transitions when nothing was pending.
+    assert [tid for tid, to in steerer.transitions if to is TaskStatus.NOT_NEEDED] == []
+
+
+# ---------------------------------------------------------------------------
+# Deprecation: max_follow_up_rounds kwarg is accepted but warns + ignored.
+# ---------------------------------------------------------------------------
+
+
+def test_max_follow_up_rounds_kwarg_is_deprecated_and_ignored() -> None:
+    """Back-compat: ``max_follow_up_rounds=`` on the executor is
+    accepted but emits a ``DeprecationWarning`` and has no effect.
+
+    goldfive#163 removed the follow-up loop; the parameter is
+    retained for one release so external callers don't break on
+    upgrade.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        executor = SequentialExecutor(overlay_mode=True, max_follow_up_rounds=5)
+
+    deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert deprecations, "expected a DeprecationWarning for max_follow_up_rounds"
+    assert "max_follow_up_rounds" in str(deprecations[0].message)
+    # And the attribute is NOT stored on the instance (there's no
+    # follow-up loop to parameterise).
+    assert not hasattr(executor, "max_follow_up_rounds")
+
+
+# ---------------------------------------------------------------------------
+# Regression guards: STEER / CANCEL / adapter-error paths preserved.
+# ---------------------------------------------------------------------------
+
+
+async def test_overlay_steer_restart_still_works() -> None:
+    """Regression: ``kind == "steer"`` from the passthrough control
+    loop still restarts the invocation with the steer body. The
+    goldfive#163 change only touched the post-result NOT_NEEDED
+    sweep; the STEER branch must behave identically.
+
+    Uses a simple stub that delivers a synthetic STEER by raising
+    a sentinel and then completing on the second call. The full
+    control-channel integration is covered in
+    ``tests/test_overlay_steer.py``; this test is a belt-and-
+    suspenders check that the restart loop in ``_run_overlay``
+    still routes STEERs to ``steerer.observe`` and re-invokes
+    passthrough.
+    """
+    # We exercise the STEER branch through the real
+    # ``_invoke_passthrough_with_control`` code path by monkey-
+    # patching a version that returns (kind, payload) directly.
+    plan = _three_task_plan()
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    class SteerOnceAdapter(OverlayStubAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+
+    adapter = SteerOnceAdapter()
+    executor = SequentialExecutor(overlay_mode=True)
+
+    call_idx = {"n": 0}
+
+    async def _fake_invoke_passthrough_with_control(
+        *, adapter, session, steerer, sinks, control, reconciler, user_input
+    ):  # noqa: ARG001
+        call_idx["n"] += 1
+        adapter.passthrough_calls.append(user_input)
+        if call_idx["n"] == 1:
+            # Emulate a STEER arriving mid-invocation.
+            msg = type(
+                "StubSteerMsg",
+                (),
+                {"kind": type("K", (), {"value": "STEER"})(), "payload": {"note": "switch focus"}},
+            )()
+            return ("steer", msg)
+        # Second invocation: mark every task COMPLETED directly.
+        if session.plan is not None:
+            for t in session.plan.tasks:
+                t.status = TaskStatus.COMPLETED
+        return ("result", InvocationResult(task_id="", text="done"))
+
+    executor._invoke_passthrough_with_control = _fake_invoke_passthrough_with_control  # type: ignore[assignment]
+
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="v0",
+    )
+
+    assert outcome.success is True
+    # Two passthrough invocations: v0 (steered), then the steer
+    # body (wrapped in the goldfive#152 "USER STEERING CONTROL"
+    # header). We assert on the body substring rather than exact
+    # equality so the header wording can evolve without flaking
+    # this test.
+    assert len(adapter.passthrough_calls) == 2
+    assert adapter.passthrough_calls[0] == "v0"
+    assert "switch focus" in adapter.passthrough_calls[1]
+    # Steerer observed the STEER message.
+    assert any(
+        str(getattr(getattr(o, "kind", None), "value", "")).upper() == "STEER"
+        for o in steerer.observed
+    ), "steerer.observe was not called with the STEER message"
+    # No follow-up dispatch (even though we had a steer in the middle).
+    assert adapter.follow_up_calls == []
+
+
+async def test_overlay_cancel_still_works() -> None:
+    """Regression: ``kind == "cancelled"`` terminates the run with
+    ``ExecutionOutcome(success=False)`` and a ``RunAborted`` sink
+    event. The goldfive#163 change did not touch this branch.
+    """
+    plan = _three_task_plan()
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    async def _fake_invoke_passthrough_with_control(
+        *, adapter, session, steerer, sinks, control, reconciler, user_input
+    ):  # noqa: ARG001
+        adapter.passthrough_calls.append(user_input)
+        return ("cancelled", "user aborted")
+
+    adapter = OverlayStubAdapter()
+    executor = SequentialExecutor(overlay_mode=True)
+    executor._invoke_passthrough_with_control = _fake_invoke_passthrough_with_control  # type: ignore[assignment]
+
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="go",
+    )
+
+    assert outcome.success is False
+    assert "aborted" in (outcome.reason or "")
+    assert sink.payload_kinds()[-1] == "run_aborted"
+    # No follow-ups, no NOT_NEEDED sweep on cancel — we exit early.
+    assert adapter.follow_up_calls == []
+    # Tasks remain PENDING (we aborted; didn't reach the sweep).
+    for t in plan.tasks:
+        assert t.status is TaskStatus.PENDING
+
+
+async def test_overlay_adapter_error_still_works() -> None:
+    """Regression: ``kind == "adapter_error"`` terminates the run
+    with a ``RunAborted`` event and a descriptive reason.
+    """
+    plan = _three_task_plan()
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    boom = RuntimeError("adapter exploded")
+
+    async def _fake_invoke_passthrough_with_control(
+        *, adapter, session, steerer, sinks, control, reconciler, user_input
+    ):  # noqa: ARG001
+        adapter.passthrough_calls.append(user_input)
+        return ("adapter_error", boom)
+
+    adapter = OverlayStubAdapter()
+    executor = SequentialExecutor(overlay_mode=True)
+    executor._invoke_passthrough_with_control = _fake_invoke_passthrough_with_control  # type: ignore[assignment]
+
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="go",
+    )
+
+    assert outcome.success is False
+    assert "adapter exploded" in (outcome.reason or "")
+    assert sink.payload_kinds()[-1] == "run_aborted"
+    assert adapter.follow_up_calls == []
 
 
 # ---------------------------------------------------------------------------
