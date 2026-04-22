@@ -318,6 +318,108 @@ async def test_observe_dedupe_does_not_affect_heuristic_drifts() -> None:
     assert len(planner.refine_calls) == 3
 
 
+async def test_observe_steer_stamps_annotation_id_on_drift_detected(
+) -> None:
+    """DriftDetected proto carries the source annotation_id (goldfive#176).
+
+    Without this field, harmonograf can't dedup the drift row against the
+    source annotation — a single user STEER surfaces as three cards
+    (annotation row + drift row + plan_revised row) in the Intervention
+    view. See harmonograf#75.
+    """
+    steerer, session, sink, _planner = _bind_fresh()
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-ann",
+        payload={
+            "note": "refocus",
+            "author": "alice",
+            "annotation_id": "ann_abc123",
+        },
+    )
+
+    await steerer.observe(msg, session)
+
+    drift_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert drift_events, "USER_STEER must emit DriftDetected"
+    assert drift_events[0].drift_detected.annotation_id == "ann_abc123"
+
+
+async def test_observe_steer_without_annotation_id_leaves_drift_annotation_id_empty(
+) -> None:
+    """Back-compat: a STEER with no annotation_id in payload → empty field.
+
+    Models the case where the bridge didn't forward one (older clients,
+    programmatic STEERs without an annotation source). The field must
+    serialize as the empty string so harmonograf's dedup falls through
+    to the existing path (drift gets its own card).
+    """
+    steerer, session, sink, _planner = _bind_fresh()
+    msg = ControlMessage(
+        kind=ControlKind.STEER,
+        id="ctl-noann",
+        payload={"note": "focus"},
+    )
+
+    await steerer.observe(msg, session)
+
+    drift_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert drift_events
+    assert drift_events[0].drift_detected.annotation_id == ""
+
+
+async def test_observe_cancel_stamps_annotation_id_on_drift_detected(
+) -> None:
+    """USER_CANCEL also carries annotation_id when supplied by the bridge."""
+    steerer, session, sink, planner = _bind_fresh()
+    # A planner that returns None is fine for CANCEL — the drift still
+    # gets emitted, and annotation_id must round-trip on it.
+    planner.revised = None
+
+    msg = ControlMessage(
+        kind=ControlKind.CANCEL,
+        id="ctl-cancel",
+        payload={"reason": "operator abort", "annotation_id": "ann_cxl"},
+    )
+
+    await steerer.observe(msg, session)
+
+    drift_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+    ]
+    # CANCEL emits the original drift + a refine-failure follow-up (None
+    # planner). Only the first carries the source annotation_id; the
+    # follow-up drift synthesized internally has no backing ControlMessage.
+    assert len(drift_events) == 2
+    assert drift_events[0].drift_detected.annotation_id == "ann_cxl"
+    assert drift_events[1].drift_detected.annotation_id == ""
+
+
+async def test_autonomous_drift_has_empty_annotation_id() -> None:
+    """A drift goldfive minted itself (loop, tool error) has no annotation_id.
+
+    Contract: only user-control drifts carry the annotation id; anything
+    else (LOOPING_REASONING, TOOL_ERROR, GOAL_DRIFT, …) must emit with
+    an empty string so harmonograf's deduper treats it as an autonomous
+    intervention that owns its own card.
+    """
+    steerer, session, sink, _planner = _bind_fresh()
+    # Use a tool-error event — classify_tool_error mints a drift directly
+    # from an untyped event (no ControlMessage.raw).
+    await steerer.observe({"error": "boom"}, session)
+
+    drift_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert drift_events
+    for evt in drift_events:
+        assert evt.drift_detected.annotation_id == ""
+
+
 async def test_observe_steer_propagates_author_into_state_and_detail() -> None:
     """``author`` from SteerPayload lands on state + drift detail prefix."""
     steerer, session, _sink, planner = _bind_fresh()

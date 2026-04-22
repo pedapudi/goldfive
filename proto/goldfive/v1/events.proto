@@ -207,6 +207,14 @@ message DriftDetected {
   string current_task_id = 4;
   // Agent that was active when drift was detected, if any.
   string current_agent_id = 5;
+  // For USER_STEER / USER_CANCEL drifts, the annotation id carried by
+  // the originating ControlMessage (goldfive#171). Empty for drifts that
+  // goldfive minted itself (loop detection, goal drift, etc). Sinks use
+  // this to dedup the drift row against the source annotation — without
+  // it a single user STEER surfaces as three cards (annotation row,
+  // user_steer drift row, plan_revised row) in harmonograf's Intervention
+  // view. See goldfive#176 / harmonograf#75.
+  string annotation_id = 6;
 }
 
 // Terminal event on a successful run.

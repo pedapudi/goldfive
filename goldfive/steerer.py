@@ -1337,6 +1337,7 @@ class DefaultSteerer:
                 severity=DriftSeverity.CRITICAL,
                 detail=reason,
                 current_task_id=session.current_task_id,
+                raw=event,
             )
         if kind_str == ControlKind.PAUSE.value:
             return DriftEvent(
@@ -1344,6 +1345,7 @@ class DefaultSteerer:
                 severity=DriftSeverity.INFO,
                 detail=note,
                 current_task_id=session.current_task_id,
+                raw=event,
             )
         return None
 
@@ -2249,7 +2251,37 @@ class DefaultSteerer:
         evt.drift_detected.detail = drift.detail
         evt.drift_detected.current_task_id = drift.current_task_id
         evt.drift_detected.current_agent_id = drift.current_agent_id
+        # Stamp the source annotation_id for USER_STEER / USER_CANCEL drifts
+        # minted from a ControlMessage with a bridge-supplied annotation_id
+        # (goldfive#171). Sinks use this to dedup the drift row against the
+        # source annotation — without it a single user STEER surfaces as
+        # three cards (annotation row + drift row + plan_revised row) in
+        # harmonograf's Intervention view. See goldfive#176 / harmonograf#75.
+        ann_id = self._drift_annotation_id(drift)
+        if ann_id:
+            evt.drift_detected.annotation_id = ann_id
         await self._emit(evt)
+
+    @staticmethod
+    def _drift_annotation_id(drift: DriftEvent) -> str:
+        """Return the source annotation id for a user-control drift, or "".
+
+        Looks at :attr:`DriftEvent.raw` — populated by
+        :meth:`_drift_from_control` when the drift was minted from a STEER
+        / CANCEL ControlMessage — and extracts
+        ``payload["annotation_id"]`` (set by the bridge per goldfive#171).
+        Returns "" for drifts that goldfive minted itself (loop detection,
+        goal drift, etc), whose ``raw`` is either absent or not a
+        ControlMessage. Non-string payloads are coerced to str so a
+        mis-typed bridge still flows the id through.
+        """
+        from goldfive.control import ControlMessage
+
+        raw = getattr(drift, "raw", None)
+        if not isinstance(raw, ControlMessage):
+            return ""
+        payload = raw.payload if isinstance(raw.payload, dict) else {}
+        return str(payload.get("annotation_id", "") or "")
 
     async def _emit_plan_revised(
         self,

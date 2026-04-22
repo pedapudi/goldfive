@@ -182,18 +182,20 @@ class TaskCancelled(_message.Message):
     def __init__(self, task_id: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
 
 class DriftDetected(_message.Message):
-    __slots__ = ("kind", "severity", "detail", "current_task_id", "current_agent_id")
+    __slots__ = ("kind", "severity", "detail", "current_task_id", "current_agent_id", "annotation_id")
     KIND_FIELD_NUMBER: _ClassVar[int]
     SEVERITY_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
     CURRENT_TASK_ID_FIELD_NUMBER: _ClassVar[int]
     CURRENT_AGENT_ID_FIELD_NUMBER: _ClassVar[int]
+    ANNOTATION_ID_FIELD_NUMBER: _ClassVar[int]
     kind: _types_pb2.DriftKind
     severity: _types_pb2.DriftSeverity
     detail: str
     current_task_id: str
     current_agent_id: str
-    def __init__(self, kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., detail: _Optional[str] = ..., current_task_id: _Optional[str] = ..., current_agent_id: _Optional[str] = ...) -> None: ...
+    annotation_id: str
+    def __init__(self, kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., detail: _Optional[str] = ..., current_task_id: _Optional[str] = ..., current_agent_id: _Optional[str] = ..., annotation_id: _Optional[str] = ...) -> None: ...
 
 class RunCompleted(_message.Message):
     __slots__ = ("outcome_summary",)
