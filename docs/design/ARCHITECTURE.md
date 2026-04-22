@@ -66,11 +66,15 @@ revises it on drift via `refine(plan, drift, goals)`. The planner is
 the only component that ever decides *what* tasks exist. Executors and
 steerers just mechanically walk whatever plan the planner hands them.
 
-**Executor** — walks the plan. Two executors ship in v0.1:
-`SequentialExecutor` runs tasks one at a time in topological order;
-`ParallelDAGExecutor` batches independent tasks per topological stage
-and runs the stage with `asyncio.gather`. The executor is the only
-component that calls `adapter.invoke(task, session)`.
+**Executor** — drives the run. Two executors ship:
+`SequentialExecutor` (the default; supports both the overlay model
+and a legacy per-task loop behind `overlay_mode=False`) and
+`ParallelDAGExecutor` (per-task; batches independent tasks per
+topological stage and runs the stage with `asyncio.gather`). Under
+the overlay model the executor calls `adapter.invoke_passthrough(user_input)`
+ONCE per run / turn; under the legacy per-task loop it calls
+`adapter.invoke(task, session)` per eligible task. See §"Overlay
+execution model" below for the overlay flow.
 
 **Steerer** — owns the task state machine. It reacts to reporting tool
 calls (from the adapter) and to adapter-observed events, transitions
@@ -289,6 +293,165 @@ caller captures the same information.
   flushes buffered writes and releases the file lock. See the
   [persistence guide](../guides/persistence-and-recovery.md).
 
+## Overlay execution model
+
+Since the 2026-04 overlay refactor (goldfive#141, PR #148, refined by
+#163, #149, #152, #160, #170) goldfive **no longer drives per-task**
+for the default code path. The model is observation-driven with soft
+intervention:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ Default path (goldfive.wrap → SequentialExecutor(overlay_mode=1))│
+│                                                                  │
+│ 1. Single invocation:                                            │
+│    adapter.invoke_passthrough(user_input)                        │
+│                                                                  │
+│ 2. While the tree runs, the ADK plugin emits                     │
+│    before_agent / after_agent / before_tool / after_tool         │
+│    events. A PlanReconciler consumes the before/after_agent      │
+│    pair and maps observed agent transitions onto plan tasks:     │
+│      coordinator → (no task claim, host lifecycle marker)         │
+│      researcher  → claim first PENDING task assigned to this name │
+│      writer      → same, contextual match via invocation chain    │
+│      (goldfive#151) if a direct assignee match fails              │
+│                                                                  │
+│ 3. The GoldfivePlanner (BasePlanner) attached to every LlmAgent  │
+│    in the tree injects a per-turn orchestration block into the   │
+│    LLM system prompt and classifies every function_call via the  │
+│    three-stage gate (own-tool / cross-layer / confabulation).    │
+│                                                                  │
+│ 4. Drift signals (PLAN_DIVERGENCE, CONFABULATION_RISK,           │
+│    LOOPING_REASONING from reasoning + tool_loops detectors,      │
+│    INTENT_DIVERGENCE, GOAL_DRIFT, ...) feed the intervention     │
+│    ladder (Levels 0-5) in DefaultSteerer._handle_drift.          │
+│                                                                  │
+│ 5. On USER_STEER:                                                │
+│      a. dedup by annotation_id (goldfive#171)                    │
+│      b. refine under USER_STEER drift (delete-and-replan)        │
+│      c. cancel in-flight adapter.invoke_passthrough              │
+│      d. restart invoke_passthrough with framed steer message     │
+│         (`_compose_steer_restart_message`, goldfive#152)          │
+│                                                                  │
+│ 6. Invocation-end sweep:                                         │
+│    Any PENDING task the tree never exercised → NOT_NEEDED        │
+│    (goldfive#163). No soft follow-up — flow-coordinators         │
+│    re-ran their full pipeline on every follow-up user message.   │
+│    STEER is the user-driven path for exercising uncovered work. │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Per-task driving is gone** from the default code path. The legacy
+per-task loop still lives in `SequentialExecutor.run` behind
+`overlay_mode=False` for backward compatibility with direct
+`SequentialExecutor(...)` callers and tests.
+
+**Key modules.**
+
+- `goldfive/executors/sequential.py::SequentialExecutor._run_overlay`
+  — the overlay loop.
+- `goldfive/reconciler.py::PlanReconciler` — observation → task
+  transition mapping.
+- `goldfive/steerer.py::DefaultSteerer` — the intervention ladder
+  (`InterventionLevel.OBSERVE`, `ABSORB`, `NUDGE`,
+  `CANCEL_REINVOKE`, `PAUSE_ESCALATE`, `TERMINATE`) plus
+  `compose_corrective_user_message` used by Level 3.
+- `goldfive/planners/goldfive_planner.py::GoldfivePlanner` —
+  `BasePlanner` subclass auto-attached to every LlmAgent.
+- `goldfive/adapters/_adk_plugin.py::_GoldfiveADKPlugin` — installs
+  once per `InMemoryRunner`, propagates into AgentTool sub-Runners,
+  plumbs the plan reconciler's observation hooks and instruments
+  `goldfive.llm.request` / `goldfive.llm.response` per-LLM-call
+  logs (goldfive#172).
+
+### GoldfivePlanner: structural steering via plugin injection
+
+`GoldfivePlanner` subclasses ADK's `BasePlanner` directly (NOT
+`PlanReActPlanner` — see [RATIONALE.md](RATIONALE.md#why-goldfiveplanner-subclasses-baseplanner-not-planreactplanner)).
+It has two structural jobs on every LLM call:
+
+1. **Request side** — build a short tree-agnostic orchestration
+   block assembled from `session.state["goldfive.*"]` keys (plan
+   task, goals, active user steer) and inject it into the
+   `llm_request.config.system_instruction`. Because ADK gates native
+   request-side instruction injection on
+   `isinstance(planner, PlanReActPlanner)`, the `_GoldfiveADKPlugin`'s
+   `before_model_callback` takes over the injection whenever it
+   detects a `GoldfivePlanner` on the running agent.
+
+2. **Response side** — run the three-stage `function_call`
+   classifier (own-tool / cross-layer / confabulation) and strip
+   any parts whose id is in
+   `session.state["goldfive.cancelled_function_call_ids"]` (post-
+   STEER retry suppression). ADK's response-side
+   `_NlPlanningResponseProcessor` fires for any `BasePlanner`
+   subclass, so this side runs natively.
+
+`goldfive.wrap` auto-attaches a `GoldfivePlanner` instance to every
+LlmAgent reachable in the tree (#153/#156). Pre-existing user
+planners are preserved via `GoldfivePlanner(user_planner=...)`
+composition — the user planner's request-side output is **prepended**
+ahead of goldfive's block, and goldfive's response-side filters run
+first (cancelled-id strip + divergence signal) before the user
+planner sees the remaining parts.
+
+### Orchestration state namespace (goldfive.*)
+
+`Session.state` is a dict goldfive stamps under the `goldfive.*`
+prefix (see `goldfive/orchestration_state.py`). It is the framework-
+agnostic orchestration surface; the ADK-specific
+`_adk_state_protocol` bridges it onto the ADK runtime session.state
+so the `GoldfivePlanner` reading from `state["goldfive.current_task_id"]`
+sees what the reconciler just wrote.
+
+Key names:
+
+| Key | Owner | Lifecycle |
+|---|---|---|
+| `goldfive.current_plan_id` | Runner / `_apply_revision` | Set on plan install; persists across the run. |
+| `goldfive.current_task_id`, `goldfive.current_task_title` | `PlanReconciler` | Set on RUNNING; cleared on terminal transition + run end. |
+| `goldfive.goals_summary` | Runner post-derivation; `_apply_user_steer_state` | Refreshed whenever `session.goals` changes. |
+| `goldfive.active_steer.body`, `.at_turn`, `.author` | `DefaultSteerer._apply_user_steer_state` | Durable read-back of the most recent USER_STEER — NOT a cooldown. No-cooldown is a user directive (goldfive#152). |
+| `goldfive.processed_steer_ids` | `DefaultSteerer` | Bounded FIFO of processed STEER ids; drives idempotency (goldfive#171). |
+| `goldfive.cancelled_function_call_ids` | `ADKAdapter._heal_pending_tool_calls` | Append-only list of function_call ids healed mid-invocation. Consumed by `GoldfivePlanner.process_planning_response` to strip retry attempts. |
+
+**Writers only go through** `goldfive.orchestration_state.write(...)`
+which enforces the `goldfive.*` prefix.
+
+### Session unification (three-session alignment, goldfive#161)
+
+Three session ids used to float independently; post-#161 / #164 they
+are pinned together:
+
+```
+┌──────────────────────────┐    ┌──────────────────────────┐
+│ adk-web                  │    │ harmonograf              │
+│   InvocationContext      │    │   home session (client)  │
+│   .session.id = S        │    │   Hello: session_id=S    │
+└─────────┬────────────────┘    └─────────┬────────────────┘
+          │                               │
+          ▼                               ▼
+┌──────────────────────────────────────────────────────────┐
+│ goldfive                                                 │
+│   Session.id (= run_id) = S   ← pinned by Runner(        │
+│                                   session_id=ctx.session.id)│
+│                                                           │
+│   Every emitted Event carries Event.session_id = S       │
+│   (goldfive#155 field 5)                                 │
+│                                                           │
+│   ADK-side session (_adk_state_protocol) runs in the     │
+│   same runtime session; state.goldfive.* writes land on  │
+│   the live session the plugin sees.                      │
+└──────────────────────────────────────────────────────────┘
+```
+
+The `HarmonografSink` routes spans by `ctx.session.id` and goldfive
+events by `Event.session_id` (field 5). All three layers reference
+the same id, so "plan view / Gantt / event log" line up.
+
+See [RATIONALE.md §"Session unification"](RATIONALE.md#why-session-unification-over-multi-session-rollup)
+for the design reasoning.
+
 ## Single-Runner dispatch: goldfive drives the root, ADK delegates within
 
 The `AgentAdapter.invoke(task, session)` boundary is deliberately
@@ -449,10 +612,16 @@ Four invariants hold across every `Runner.run(...)` invocation:
   supplied `EventSink`, not through an async generator.
 
 **Live steering is in-box.** Human-in-the-loop mid-run steering
-(PAUSE, RESUME, CANCEL, STEER, REWIND_TO, APPROVE, REJECT) is
-implemented. Pass a `ControlChannel` to `Runner(control=...)` and
-an external process can drive the run through it. See
-[CONTROL.md](CONTROL.md) for the wire format and
+(PAUSE, RESUME, CANCEL, STEER, REWIND_TO, APPROVE, REJECT,
+STATUS_QUERY, INTERCEPT_TRANSFER, INJECT_MESSAGE) is implemented.
+Pass a `ControlChannel` to `Runner(control=...)` and an external
+process can drive the run through it. STEER is idempotent by
+`annotation_id` (goldfive#171). The intervention ladder
+(`DefaultSteerer`) classifies drift into one of six levels (OBSERVE /
+ABSORB / NUDGE / CANCEL_REINVOKE / PAUSE_ESCALATE / TERMINATE) so
+"when does goldfive interrupt the tree" is a single table. See
+[CONTROL.md](CONTROL.md) for the wire format, [DRIFT.md](DRIFT.md)
+for the ladder, and
 [`examples/live_steering.py`](../../examples/live_steering.py) for
 a runnable demo.
 

@@ -191,6 +191,47 @@ Different drifts demand different rewrites of the DAG. The current
 planner implements three modes, each with its own preservation
 contract layered on top of the §3 invariants.
 
+### 4.0 Refine inputs and goal-awareness
+
+`Planner.refine(*, plan, drift, goals, observed_actions=None, available_agents=None) -> Plan | None`
+is the contract. Beyond `drift` + `plan` the refine receives:
+
+- **`goals`** (`list[Goal]`) — the run's active goals. Goal-aware
+  refine (goldfive#154) surfaces them in the LLM prompt AND enforces
+  a "every sticky USER_STEER goal must have at least one advancing
+  task" validator check. A USER_STEER synthesizes a new `Goal` via
+  `planner.synthesize_goal_from_steer(body)` which returns
+  `(Goal, mode)` where mode is `"append"` or `"replace"` (see
+  `goldfive/steerer.py::DefaultSteerer._apply_user_steer_state`).
+  Sticky goals are marked via `Goal.metadata["source"] == "user_steer"`
+  and cannot be silently dropped by subsequent refines.
+- **`observed_actions`** (`list[ObservedAction] | None`, goldfive#144)
+  — only consulted on `drift.kind is DriftKind.PLAN_DIVERGENCE`. The
+  reconciler (`PlanReconciler`) builds the list from observed tool
+  calls / agent transitions so the planner can either ABSORB the
+  observed activity into a revised plan or REJECT by emitting
+  `{"reject": true, "reason": "..."}`. A reject collapses to
+  `None` — the steerer then escalates via the intervention ladder.
+- **`available_agents`** — either a flat `list[str]` (legacy) or a
+  structured tree (`list[dict]` with `{name, depth, parent, role,
+  kind}` per entry, goldfive#151). On the tree form the planner
+  renders an "AGENT TREE" section in its prompt and the validator
+  rejects off-registry assignees.
+
+The drift's `kind` + `severity` plus the `DriftEvent.detail` string
+is how refine derives its "reason". Conventional reasons:
+
+| Reason origin | Typical `drift.kind` |
+|---|---|
+| `USER_STEER` | `ControlKind.STEER` → `DriftKind.USER_STEER` |
+| `PLAN_DIVERGENCE` | Three-stage gate cross-layer delegation, reconciler off-plan agent, or `report_plan_divergence` |
+| `DRIFT_ESCALATION` (umbrella term; no literal enum) | Any other drift that reached Level 1 (ABSORB) or Level 3 (CANCEL_REINVOKE) — `TOOL_ERROR`, `LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `AGENT_REFUSAL`, `INTENT_DIVERGENCE`, `RUNAWAY_DELEGATION`, etc. Generic refine path. |
+
+`REFINE_VALIDATION_FAILED` is **not** a refine input — it's the
+terminal output when the planner's own retry budget is exhausted.
+The steerer deliberately does NOT feed it back into another refine
+(infinite-loop risk); it routes to Level 4 (PAUSE_ESCALATE).
+
 ### 4.1 Inline-edit (default)
 
 **Triggers:** `TOOL_ERROR`, `AGENT_REFUSAL`, `PLAN_DIVERGENCE`,
@@ -314,18 +355,57 @@ Called by `LLMPlanner.generate` (creation) and
   `PENDING`. At revision (`for_revision=True`), terminal tasks are
   allowed (expected, per §3.1).
 - **At revision with a `prior` plan supplied**
-  (`for_revision=True, prior=old_plan`): every terminal task in
-  `prior` appears in the revision with the same id and the same
-  terminal status (no regression, no drop) — §3.1 — and every
-  terminal→terminal edge in `prior` appears in the revision — §3.2.
-  The steerer calls `validate(for_revision=True, prior=session.plan)`
-  in `_apply_revision`, and `LLMPlanner.refine` / `_refine_user_steer`
-  / `_refine_looping_tool_call` likewise thread `prior=plan` so the
-  planner catches its own violations before the steerer does.
+  (`for_revision=True, prior=old_plan`):
+    - Every terminal task in `prior` appears in the revision with
+      the same id and the same terminal status (no regression, no
+      drop) — §3.1.
+    - Every terminal→terminal edge in `prior` appears in the
+      revision — §3.2.
+    - **Re-animation rejected (goldfive#138):** a task that was
+      terminal (`COMPLETED` / `FAILED` / `CANCELLED` / `NOT_NEEDED`)
+      in the prior plan cannot be re-emitted as `PENDING` in the
+      revision. This prevents the planner from "retrying" a
+      terminal task by resetting its status — the planner must
+      emit a NEW task id (optionally with a `retry_` prefix) if it
+      wants a fresh attempt.
+- **Off-registry assignees rejected (goldfive#151):** when
+  `available_agents` is supplied as a tree, every task's
+  `assignee_agent_id` must be a reachable name in the registry.
+  An unknown assignee is rejected and fed back to the LLM as a
+  validator-correction message for the retry loop.
+- **Sticky USER_STEER goal coverage (goldfive#154):** when any
+  goal on the session carries
+  `Goal.metadata["source"] == "user_steer"`, the revision must
+  include at least one PENDING task advancing it. Planner-side
+  escape: emit `{"reject": true, "reason": "..."}` instead of
+  silently dropping the goal.
+
+`LLMPlanner.refine` / `_refine_user_steer` / `_refine_looping_tool_call`
+thread `prior=plan` so the planner catches its own violations before
+the steerer does. The retry loop feeds the validator's error message
+back to the LLM on attempt N+1 (up to `max_refine_attempts`, default
+2). If both attempts fail the planner emits a CRITICAL
+`REFINE_VALIDATION_FAILED` drift and returns `None` — see §4.0.
 
 On failure: `ValueError` with a descriptive message. `generate`
 returns `None`; `_apply_revision` rejects the revision and emits
 `SCHEMA_VIOLATION`.
+
+### 5.1 Revision metadata
+
+Every revision carries, besides the plan structure itself:
+
+| Field | Source | Meaning |
+|---|---|---|
+| `revision_index` | Monotonic from `prior.revision_index + 1` | Ordering key across revisions; stamped by `_apply_revision` if the planner didn't. |
+| `revision_kind` | `drift.kind` | Which drift triggered the refine. |
+| `revision_severity` | `drift.severity` | Drift severity at the time. |
+| `revision_reason` | `drift.detail` | Human-readable reason. |
+
+All four are surfaced on the `PlanRevised` event so sinks can render
+revision timelines without walking back through the drift stream.
+The accompanying `PlanRevisionDiff` sidecar (§2.1) tells the sink
+what specifically changed.
 
 ---
 

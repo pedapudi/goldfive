@@ -23,17 +23,30 @@ and the [writing-an-event-sink guide](../guides/writing-an-event-sink.md).
 
 Every event, regardless of kind, carries a common envelope:
 
-| Field | Type | Meaning |
-|---|---|---|
-| `event_id` | `string` | UUIDv7, unique per event. |
-| `run_id` | `string` | The owning `Session.run_id`. |
-| `emitted_at` | `google.protobuf.Timestamp` | Wall-clock time of emission. |
-| `sequence` | `uint64` | Monotonic per-run counter from `Session.next_sequence()`. |
-| `payload` | `oneof` | The event-specific body; see the taxonomy. |
+| Field | # | Type | Meaning |
+|---|---|---|---|
+| `event_id` | 1 | `string` | UUIDv7, unique per event. |
+| `run_id` | 2 | `string` | The owning `Session.run_id`. |
+| `sequence` | 3 | `uint64` | Monotonic per-run counter from `Session.next_sequence()`. |
+| `emitted_at` | 4 | `google.protobuf.Timestamp` | Wall-clock time of emission. |
+| `session_id` | 5 | `string` | The `Session.id` this event belongs to. Stable across all events one turn produces. Empty string means "route via the stream's Hello session" (pre-#155 behaviour); populated by Runner / Steerer / Executor emitters so a harmonograf stream can multiplex multiple goldfive sessions onto one client connection. Added in goldfive#155 (PR #157). |
+| `payload` | 10+ | `oneof` | The event-specific body; see the taxonomy. |
 
 The envelope is defined in `proto/goldfive/v1/events.proto` (see
 [issue #3](https://github.com/pedapudi/goldfive/issues/3)). Generated
 Python lives under `goldfive/pb/goldfive/v1/events_pb2.py`.
+
+### `session_id` vs `run_id`
+
+These are the same value today under the three-session-unification
+work (goldfive#161 / #164) — `Runner(session_id=...)` pins
+`Session.run_id = session_id`, so every `Event.run_id == Event.session_id`
+for runs that flow through an outer session (adk-web, harmonograf
+client, kikuchi). The distinction matters at the proto layer because
+`run_id` is the logical "run lineage" (surviving conversation turns
+if we ever decouple them) while `session_id` is the routing key
+downstream sinks multiplex on. Both fields are always populated for
+goldfive-emitted events post-#155.
 
 Helpers in `goldfive/events.py` produce envelopes:
 
@@ -91,9 +104,21 @@ string, and an optional `artifacts` map for `TaskCompleted`.
 
 | Event | Fired by | When |
 |---|---|---|
-| `DriftDetected` | `Steerer` | Whenever `detect_drift()` returns a non-None `DriftEvent`. Always fired before the corresponding `PlanRevised` (if refine runs). Carries `kind`, `severity`, `detail`, `current_task_id`, and a summarized `raw` trigger. |
+| `DriftDetected` | `Steerer` | Whenever a drift is produced (via `detect_drift`, `observe`, `_handle_drift` from a reporting-tool handler, or synthesized by a plugin). Always fired before the corresponding `PlanRevised` (if refine runs). |
 
-See [DRIFT.md](DRIFT.md) for the full drift-kind taxonomy.
+**`DriftDetected` fields** (`goldfive.v1.DriftDetected`):
+
+| Field | # | Meaning |
+|---|---|---|
+| `kind` | 1 | `DriftKind` enum. |
+| `severity` | 2 | `DriftSeverity` enum. |
+| `detail` | 3 | Human-readable note. For USER_STEER this is prefixed `"by {author}: {note}"` when the bridge forwarded an author. |
+| `current_task_id` | 4 | Task id current at emission. |
+| `current_agent_id` | 5 | Agent id current at emission. |
+| `annotation_id` | 6 | Source annotation id for user-control drifts (USER_STEER / USER_CANCEL) when the bridge forwarded one. Empty for goldfive-minted drifts. Added in goldfive#177. Sinks use this to dedup the drift row against the source annotation — without it a single user STEER surfaces as three cards (annotation row, `user_steer` drift row, `plan_revised` row) in harmonograf's Intervention view. |
+
+See [DRIFT.md](DRIFT.md) for the full drift-kind taxonomy and the
+intervention ladder mapping.
 
 ### Agent-invocation events
 
@@ -191,6 +216,77 @@ given a task assigned to the coordinator:
 Emission is best-effort: a failure in the plugin's observability
 path is swallowed and logged at DEBUG — the run never blocks on
 observability.
+
+### Per-LLM-call instrumentation logs (goldfive#172)
+
+In addition to proto events, the `_GoldfiveADKPlugin` emits two
+`logging.INFO`-level log lines per LLM invocation (one before, one
+after) so operators running a live run can tail stderr and correlate
+context growth / cost against a specific task + invocation.
+
+**`goldfive.llm.request`** — emitted from `before_model_callback`
+after `GoldfivePlanner.build_planning_instruction` has appended its
+block, so the reported chars reflect what the model actually sees:
+
+```
+goldfive.llm.request invocation_id=<inv_id>
+  llm.request.chars=<int>
+  llm.request.messages_count=<int>
+  task_id=<str or ?>
+  agent=<str or ?>
+```
+
+**`goldfive.llm.response`** — emitted from `after_model_callback`
+paired with the matching request by `invocation_id`:
+
+```
+goldfive.llm.response invocation_id=<inv_id>
+  llm.call.duration_ms=<int>
+  llm.request.chars=<int>
+  llm.request.messages_count=<int>
+  llm.usage.prompt_tokens=<int or ?>
+  llm.usage.completion_tokens=<int or ?>
+  llm.usage.total_tokens=<int or ?>
+  task_id=<str or ?>
+  agent=<str or ?>
+```
+
+Usage extraction is best-effort via `_extract_usage_metadata` off the
+`LlmResponse`; models that don't surface usage leave those fields as
+`?`. Duration is wall-clock (time.monotonic) between the two
+callbacks.
+
+The same metrics (plus any extras) are also stashed onto the
+`observation.raw["metrics"]` passed to `steerer.observe` so custom
+steerer sinks can surface the numbers alongside the LLM response
+event without parsing logs.
+
+### `SteerPayload` fields (proto `goldfive.v1.SteerPayload`)
+
+STEER control messages carry a typed payload:
+
+| Field | # | Meaning |
+|---|---|---|
+| `note` | 1 | Free-text steering instruction. |
+| `suggested_action` | 2 | Optional short verb for the UI to surface as a hint. |
+| `author` | 3 | Operator identity from the originating annotation (goldfive#171). Empty when the bridge doesn't source annotations. |
+| `annotation_id` | 4 | Source annotation id. Used for idempotency — see [CONTROL.md §1.c](CONTROL.md#1c-steer-idempotency-contract-goldfive171). |
+
+### HarmonografSink routing contract
+
+`HarmonografSink` (the canonical external sink, implemented in
+harmonograf) routes per-event using two keys:
+
+1. **Spans** (otel-style traces from adapter / plugin code) are
+   routed by `ctx.session.id` — the live ADK / runtime session they
+   were emitted against.
+2. **Goldfive events** are routed by `Event.session_id` (field 5).
+
+Post-#161 / #164 / #155 the two keys align: `Runner(session_id=ctx.session.id)`
+pins `Session.id` onto the outer session id, and every
+goldfive-emitted Event stamps that id on field 5. The sink therefore
+renders "plan view / Gantt / event log" in one consistent session
+on the UI side. See [ARCHITECTURE.md §"Session unification"](ARCHITECTURE.md#session-unification-three-session-alignment-goldfive161).
 
 ## Sequence semantics
 

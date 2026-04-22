@@ -98,7 +98,9 @@ class Planner(Protocol):
         self,
         *,
         goals: list[Goal],
-        available_agents: list[str],
+        # Either a flat list[str] (legacy) or a structured tree of
+        # {name, depth, parent, role, kind} dicts (goldfive#151).
+        available_agents: list[str] | list[dict[str, Any]] | None,
         context: Optional[Mapping[str, Any]] = None,
     ) -> Optional[Plan]: ...
 
@@ -108,6 +110,11 @@ class Planner(Protocol):
         plan: Plan,
         drift: DriftEvent,
         goals: list[Goal],
+        # PLAN_DIVERGENCE path — reconciler-observed actions to
+        # reconcile into the revised plan (goldfive#144).
+        observed_actions: list[ObservedAction] | None = None,
+        # Tree-aware assignee validation (goldfive#151).
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Optional[Plan]: ...
 ```
 
@@ -631,6 +638,64 @@ class NullSink:
     async def close(self):
         return
 ```
+
+## Proto changes (summary)
+
+Recent additions to the `goldfive.v1` proto set. Fields are
+non-breaking additions (proto3 defaults apply).
+
+### `Event.session_id` (goldfive#155, PR #157)
+
+`Event.session_id` (field 5) — stable id for the goldfive
+`Session` that emitted the event. Populated by every Runner /
+Executor / Steerer emission site. Empty string means "route via
+the stream's Hello session" for back-compat. See
+[EVENT-MODEL.md §"Event envelope"](EVENT-MODEL.md#event-envelope).
+
+### `DriftDetected.annotation_id` (goldfive#177)
+
+`DriftDetected.annotation_id` (field 6) — source annotation id for
+`USER_STEER` / `USER_CANCEL` drifts that rode in on a
+`ControlMessage` with a bridge-populated annotation id. Empty for
+drifts goldfive minted itself. Sinks use it to dedup the drift row
+against the annotation-source row. See
+[DRIFT.md §"How drifts become events"](DRIFT.md#how-drifts-become-events).
+
+### `SteerPayload.author`, `.annotation_id` (goldfive#171)
+
+`SteerPayload.author` (field 3) — operator identity from the
+originating annotation. `SteerPayload.annotation_id` (field 4) —
+source annotation id used for idempotency. Both empty when the
+bridge doesn't source annotations. See
+[CONTROL.md §1.b](CONTROL.md#1b-steerpayload-fields-goldfive171).
+
+### Control messages
+
+The full `ControlKind` set is unchanged:
+`PAUSE`, `RESUME`, `CANCEL`, `REWIND_TO`, `STEER`, `APPROVE`,
+`REJECT`, `STATUS_QUERY`, `INTERCEPT_TRANSFER`, `INJECT_MESSAGE`.
+Per-kind typed payloads live in `control.proto` as `SteerPayload`,
+`RewindPayload`, `ApprovePayload`, `RejectPayload`,
+`InjectMessagePayload`. See [CONTROL.md](CONTROL.md).
+
+### `TaskStatus.NOT_NEEDED` (goldfive#141)
+
+`TaskStatus.TASK_STATUS_NOT_NEEDED` (enum value 7) — terminal
+status the PlanReconciler stamps on PENDING tasks the tree never
+exercised. Distinct from `CANCELLED`. See
+[STATE-MACHINE.md](STATE-MACHINE.md).
+
+### New `DriftKind` values
+
+| Value | # | Added in |
+|---|---|---|
+| `CONFABULATION_RISK` | 34 | goldfive#128 (hallucination classifier) + #178 (three-stage gate) |
+| `RUNAWAY_DELEGATION` | 35 | goldfive#130 (AgentTool cap) |
+| `REFINE_VALIDATION_FAILED` | 36 | goldfive#133 |
+| `HUMAN_INTERVENTION_REQUIRED` | 37 | goldfive#142 (intervention ladder Level 4) |
+| `GOAL_DRIFT` | 38 | goldfive#143 (trajectory-level goal judge) |
+
+See [DRIFT.md](DRIFT.md) for per-kind semantics.
 
 ## Composition example
 

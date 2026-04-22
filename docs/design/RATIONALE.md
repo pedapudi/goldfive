@@ -354,10 +354,6 @@ consolidating back to proto-only.
 **Related.** [EVENT-MODEL.md](EVENT-MODEL.md),
 [.agents/debug-goldfive.md §"Common pitfalls"](../../.agents/debug-goldfive.md#common-pitfalls).
 
-<!-- TODO: once docs/design/CONTROL.md lands, cross-link from the
-ControlChannel, STEER "delete-and-replan", and "Phase 1 mid-task cancel"
-entries below. -->
-
 ## Why `ControlChannel` is a primitive rather than methods on Runner
 
 **Observation.** `Runner.pause()` / `Runner.cancel()` / `Runner.steer()`
@@ -950,6 +946,314 @@ enough.
 
 **Related.** `goldfive/steerer.py::DefaultSteerer._handle_drift`,
 [STATE-MACHINE.md](STATE-MACHINE.md).
+
+## Why the overlay model over per-task driving
+
+**Observation.** The default `SequentialExecutor(overlay_mode=True)`
+— reached through `goldfive.wrap` — calls
+`adapter.invoke_passthrough(user_input)` exactly ONCE per run / turn
+and observes the tree's natural flow via a `PlanReconciler`. Per-
+task driving (`adapter.invoke(task, session)` in a loop) still lives
+behind `overlay_mode=False` for back-compat but is no longer the
+default code path.
+
+**Intent.** ADK coordinators whose prompts describe a pipeline
+(goldfive#130's coordinator-flow-looping regression) fan out one
+AgentTool call per task goldfive drove. Each per-task drive then
+re-entered the coordinator's instruction text, which re-routed the
+pipeline, which re-invoked the specialists. A ~10 min run amplified
+into 40+ min of redundant work. The overlay model breaks the
+feedback loop:
+
+- **ONE invocation.** The tree runs its natural flow once; the
+  reconciler maps observed agent transitions onto plan tasks
+  post-hoc.
+- **Drift catches divergence.** The three-stage gate
+  (`GoldfivePlanner.process_planning_response`), the tool-loop
+  tracker (`ToolLoopTracker`), and the reasoning detectors classify
+  observed behaviour into drift kinds. The intervention ladder
+  escalates via refine (Level 1) or cancel-reinvoke (Level 3) when
+  divergence is non-trivial.
+- **PENDING → NOT_NEEDED.** Tasks the tree didn't exercise at
+  invocation end are marked `NOT_NEEDED` (goldfive#163). No soft
+  follow-up was tried (goldfive#141 pre-#163 did; it re-amplified
+  the regression). STEER is the user-driven path for exercising
+  uncovered work.
+
+**Alternatives considered.**
+
+1. **Keep per-task driving + cap coordinators.** Rejected: the cap
+   catches symptoms, not the root cause. Tree shape is user-owned
+   (goldfive.wrap contract — don't blame the coordinator), so the
+   fix has to respect coordinator prompts as written.
+2. **Registry-dispatch (PR #120).** Walk the tree, build one runner
+   per agent, route directly to the leaf. Broke the "one tree, one
+   Runner" invariant harmonograf / adk-web / span-rollup all relied
+   on. Reverted via PR #130. See §"Why single-Runner, not
+   registry-dispatch".
+3. **Keep a soft follow-up loop (pre-#163 overlay).** Re-dispatch
+   each missed task as a new user message. Flow-prompted
+   coordinators re-ran their full pipeline per follow-up,
+   amplifying the very regression the overlay was supposed to fix.
+
+**Tradeoffs.**
+
+- Refine semantics shift: `PlanReconciler` is now the primary
+  driver of `PENDING → RUNNING` under the default path; the
+  executor no longer picks tasks.
+- Missed-task handling is by terminal `NOT_NEEDED` rather than
+  iterative re-dispatch. A user who wants uncovered tasks
+  exercised must STEER.
+- The three-stage gate has to distinguish "legitimate tool call on
+  this agent" from "cross-layer delegation" from "hallucination,"
+  which is more code than the pre-#184 single-stage PLAN_DIVERGENCE
+  check. The payoff is no false-PLAN_DIVERGENCE firing on every
+  legitimate tool call (the regression that PR #184 closed).
+
+**Signals this might be wrong.** If a large class of users wants
+goldfive to drive per-task for structural reasons (stepwise human
+approval, per-task logging boundaries, etc.), the default could
+flip back — but the overlay mode already supports STEER-per-task
+manually, and the NOT_NEEDED signal is richer than
+per-task-dispatch visibility would be.
+
+**Related.** [ARCHITECTURE.md §"Overlay execution model"](ARCHITECTURE.md#overlay-execution-model),
+`goldfive/executors/sequential.py::SequentialExecutor._run_overlay`,
+`goldfive/reconciler.py::PlanReconciler`.
+
+## Why `GoldfivePlanner` subclasses `BasePlanner`, not `PlanReActPlanner`
+
+**Observation.** `goldfive/planners/goldfive_planner.py` imports
+`google.adk.planners.base_planner.BasePlanner` and subclasses it
+directly. It does NOT subclass the concrete
+`google.adk.planners.plan_re_act_planner.PlanReActPlanner`. The
+`_GoldfiveADKPlugin.before_model_callback` contains a bespoke
+workaround that detects a `GoldfivePlanner` on the running agent
+and manually appends `build_planning_instruction`'s output to the
+LLM request's system instruction.
+
+**Intent.** ADK's `flows/llm_flows/_nl_planning.py` gates
+request-side instruction injection on
+`isinstance(planner, PlanReActPlanner)`. If we subclassed
+`PlanReActPlanner` we would:
+
+- get the request-side injection for free (the gate matches),
+- BUT inherit the ReAct response filter that constrains agent
+  output to the `<think>...</think>` / `<tool>...</tool>` tag
+  shape, which we explicitly don't want to impose on callers'
+  trees. Many ADK agents aren't ReAct-shaped; forcing the ReAct
+  output contract would break them.
+
+Subclassing `BasePlanner` directly gives us:
+
+- The response-side gate (`_NlPlanningResponseProcessor`) fires for
+  any `BasePlanner` subclass other than `BuiltInPlanner`, so
+  `process_planning_response` runs natively without a workaround.
+- The request-side gate is bypassed, so we handle it in the plugin:
+  `_GoldfiveADKPlugin.before_model_callback` detects
+  `isinstance(agent.planner, GoldfivePlanner)` and appends via
+  `append_instructions`.
+
+**Alternatives considered.**
+
+1. **Subclass `PlanReActPlanner`.** Rejected: imposes ReAct
+   output on callers' agents.
+2. **File a patch against ADK to generalize the gate.** Future
+   work; the plugin workaround is the pragmatic fix in the
+   meantime.
+3. **Use a custom `before_model_callback` PER agent instead of
+   auto-attaching a planner.** Rejected: planners are the ADK-
+   native surface for "structural reasoning extensions," and
+   composing with user-attached planners (per the
+   `GoldfivePlanner(user_planner=...)` compose contract) falls out
+   of the planner subclass naturally.
+
+**Tradeoffs.** The plugin workaround is a small amount of extra
+code tied to a specific ADK version. If ADK's gate changes shape,
+the plugin may need a follow-up.
+
+**Signals this might be wrong.** If ADK generalises the
+`_nl_planning` gate to accept any `BasePlanner` subclass, we can
+drop the plugin workaround. If callers want full ReAct shape, they
+should compose their own ReAct planner UNDER the
+`GoldfivePlanner(user_planner=...)` layer rather than swapping the
+base.
+
+**Related.** `goldfive/planners/goldfive_planner.py` module docstring
+("Request-side injection requires a plugin workaround"),
+`goldfive/adapters/_adk_plugin.py::_inject_goldfive_planner_instruction`.
+
+## Why there's no STEER cooldown
+
+**Observation.** `DefaultSteerer._apply_user_steer_state` stamps
+`session.state["goldfive.active_steer.body"]` and `.at_turn` on every
+USER_STEER — but there is no "reject subsequent steers for N seconds"
+cooldown window. Every STEER that arrives (and passes the
+`annotation_id` dedupe, goldfive#171) runs a full drift → refine →
+cancel-reinvoke cycle.
+
+**Intent.** User directive (goldfive#154): steering must always be
+responsive. An operator who clicks Steer twice in a row because the
+first steer wasn't precise enough expects both to land. A cooldown
+would silently drop the second click and erode trust.
+
+Idempotency is handled differently — by `annotation_id` or
+`ControlMessage.id` dedupe in
+`DefaultSteerer._is_duplicate_steer`. That's "same steer delivered
+twice by the transport," not "two distinct steers within N seconds."
+
+**Alternatives considered.**
+
+1. **Time-based cooldown (1s / 5s).** Rejected per the user
+   directive above.
+2. **Queue steers; process one at a time.** The underlying
+   `_handle_drift` is async and sequential per session, so two
+   STEERs arriving back-to-back are serialized naturally. No extra
+   queue is needed.
+
+**Tradeoffs.** A misbehaving external bridge that fires distinct
+message ids for the "same" user action (broken idempotency on the
+bridge side) can cause duplicate refines. The dedupe on
+`annotation_id` was added to prevent this when the bridge sources
+annotations; bridges that don't source annotations should ensure
+they dedupe by `ControlMessage.id` at their layer.
+
+**Signals this might be wrong.** If operators report "double
+refines" after a single click, check the bridge's annotation-
+sourcing; if cooldowns are actually requested, expose them as an
+opt-in rather than changing the default.
+
+**Related.** `goldfive/steerer.py::_is_duplicate_steer`,
+`goldfive/orchestration_state.py::KEY_PROCESSED_STEER_IDS`.
+
+## Why session unification over multi-session rollup
+
+**Observation.** Post-goldfive#161 / #164 all three session layers
+(adk-web outer session, `goldfive.Session.id`, harmonograf home
+session) share the same id. The Runner's
+`run(session_id=ctx.session.id)` pins it explicitly. Every
+`Event.session_id` stamps it on field 5. `HarmonografSink` routes
+spans and events by that one key.
+
+**Intent.** The alternative — goldfive mints its own session id,
+harmonograf mints its own, adk-web mints its own, and downstream
+"rollup" code stitches them together — was the original design
+through the registry-dispatch rabbit hole (#121–#126). Each fix
+closed one seam but introduced another:
+
+- #121 propagated the plugin to sub-agent runners.
+- #122 followed up with additional propagation.
+- #123 shared one outer session id across runners.
+- #124 exposed `outer_session_id=` as a constructor kwarg.
+- #125 propagated outer adk-web session_id into sub-runners.
+- #126 added `_pin_outer_session_from_ctx` for the adk_wrap seam.
+
+Even after all of the above, `TelemetryUp.goldfive_event` had no
+per-event session id. Plan / drift events landed on the client's
+home session regardless of what spans did. The rollup approach
+was drowning in seams.
+
+Unifying the session id (one id = one session, everywhere)
+eliminates the rollup problem entirely. Harmonograf's
+`HarmonografSink` reads `ctx.session.id` for spans and
+`Event.session_id` for events, and the two match — no stitching
+needed.
+
+**Alternatives considered.**
+
+1. **Keep rollup, fix one more seam.** Rejected: tried; each fix
+   exposed the next. The structural fix was to unify upstream.
+2. **Unify only at the sink boundary.** Rejected: the problem
+   wasn't just the sink; goldfive-internal code also needed to
+   know "what session am I in" at drift-emission time, and the
+   per-event session id field is what lets sinks multiplex.
+
+**Tradeoffs.**
+
+- Callers who want goldfive to run *independent* of an outer
+  session must either accept a freshly-minted id (default) or
+  explicitly route events somewhere else. Bridges that want
+  per-goldfive-session routing can no longer distinguish
+  "goldfive run A" from "goldfive run B" when both share an outer
+  session (if they did share one — they shouldn't).
+- The `Session.run_id` field no longer implies a *new* id for
+  every run when an outer session pins it. This is deliberate:
+  `run_id` is the run-lineage identifier for a logical
+  conversation; a turn (one `Runner.run()`) is still one run, but
+  the id may be shared across turns that share an outer session.
+
+**Signals this might be wrong.** If a caller legitimately wants
+separate ids per turn within one outer session, expose a
+`per_turn_session_id` toggle. Today none do.
+
+**Related.** [ARCHITECTURE.md §"Session unification"](ARCHITECTURE.md#session-unification-three-session-alignment-goldfive161),
+`goldfive/runner.py::Runner.run`, harmonograf#61 / #63.
+
+## Why the three-stage drift gate
+
+**Observation.** `GoldfivePlanner.process_planning_response`
+classifies every LLM-emitted `function_call` via a three-stage
+gate: (1) own-tool, (2) cross-layer agent, (3) confabulation. The
+pre-#184 single-stage registry check treated any non-registry
+function_call as `PLAN_DIVERGENCE`, which over-fired on every
+legitimate tool call.
+
+**Intent.** The drift signal needs to distinguish three distinct
+conditions because they demand different responses:
+
+- **Own-tool call.** Agent calls a tool in its own `tools` list.
+  Legitimate; no drift.
+- **Cross-layer delegation attempt.** Agent calls by name an agent
+  that exists elsewhere in the tree but wasn't exposed to this
+  agent. This is a `PLAN_DIVERGENCE` — the LLM tried to
+  transfer_to_agent past its layer.
+- **Pure hallucination.** Agent calls a name that is neither a
+  tool nor a known agent. This is `CONFABULATION_RISK` — the LLM
+  invented the target.
+
+A single-stage check collapsing all three into `PLAN_DIVERGENCE`
+would make the refine prompt meaningless ("divergence from what?")
+and would over-fire on every legitimate tool call whose name isn't
+coincidentally in the agent registry. The three-stage gate gives
+each drift kind a clean meaning and keeps response-side filters
+from blocking legitimate traffic.
+
+**Key detail:** the gate NEVER blocks the call. It only signals.
+The steerer's intervention ladder decides whether to escalate.
+Blocking would break agent authorship — a coordinator that calls
+a legitimate utility tool happens to share a name with a tree
+agent, and blocking would prevent the tool from running.
+
+**Alternatives considered.**
+
+1. **Block cross-layer delegation structurally.** Rejected: breaks
+   trees where the coordinator's prompt legitimately references a
+   specialist by name (the LLM just uses the wrong call shape).
+2. **Single-stage (pre-#184 behaviour).** Rejected: over-fires on
+   legitimate tool calls because the registry-only check can't
+   tell a tool from an unknown name.
+3. **Classify during response emission rather than during
+   `process_planning_response`.** Rejected: the classification
+   needs the agent's `tools` list, which is only available via
+   `callback_context._invocation_context.agent.tools` — precisely
+   the context ADK gives to `process_planning_response`.
+
+**Tradeoffs.** The classifier's source of truth is the ADK
+`callback_context` + `ADKAdapter.available_agents` (tree
+registry). A subtree whose tools were attached *after* the
+registry was snapshotted may see its tools classified as
+confabulation. The adapter always re-augments on wrap, so this
+window is narrow; tests in `test_goldfive_planner.py` cover the
+common edge cases.
+
+**Signals this might be wrong.** If users report frequent
+false-`CONFABULATION_RISK` signals on legitimate tool calls, the
+own-tool detection probably has a gap (tool names on Python
+callables vs on the FunctionTool wrapper; see
+`_extract_own_tool_names`).
+
+**Related.** `goldfive/planners/goldfive_planner.py::process_planning_response`,
+[DRIFT.md §"Tool-call drift classification"](DRIFT.md#tool-call-drift-classification).
 
 ## Why reasoning-based drift detection is its own channel
 

@@ -1,9 +1,18 @@
-# Human-in-the-loop approval
+# Human-in-the-loop approval & escalation
 
-Two scenarios require a human yes/no before the run proceeds. Both terminate in
-the same two control kinds — `ControlKind.APPROVE` and `ControlKind.REJECT` —
-and both surface through the same three proto events, so a single UI affordance
-(approve/reject buttons on a queued "awaiting" card) works for either.
+Three scenarios require a human action before the run proceeds. Two of
+them are **approval flows** (A / B below) — the agent explicitly waits
+for yes/no — and terminate in `ControlKind.APPROVE` /
+`ControlKind.REJECT`. The third is **escalation** — goldfive detects
+unrecoverable drift and pauses until the operator steers or resumes,
+terminating in `HUMAN_INTERVENTION_REQUIRED` drift (Level 4 of the
+intervention ladder).
+
+All three surface through proto events the harmonograf UI (or any
+sink) can render. Approvals use `ApprovalRequested` / `ApprovalGranted`
+/ `ApprovalRejected`; escalation uses `DriftDetected` with kind
+`HUMAN_INTERVENTION_REQUIRED` plus the session's
+`paused_for_human_intervention` flag.
 
 ## Flow A — Task-level approval (framework-agnostic)
 
@@ -202,6 +211,54 @@ ControlMessage(kind=ControlKind.REJECT,  payload={"target_id": "...", "detail": 
 
 The target_id routes to the same `session.pending_approvals` map regardless of
 whether it was a task-level or tool-level request.
+
+## Flow C — `HUMAN_INTERVENTION_REQUIRED` escalation (goldfive#142)
+
+Unlike flows A and B — which are agent-initiated approvals — flow C is
+**goldfive-initiated**. When the intervention ladder
+(`DefaultSteerer._ladder_level_for`) routes a drift to Level 4
+(`PAUSE_ESCALATE`), the steerer:
+
+1. Sets `session.paused_for_human_intervention = True`.
+2. Emits a `DriftDetected` event of kind
+   `HUMAN_INTERVENTION_REQUIRED` (proto enum value 37, CRITICAL
+   severity) carrying `detail="escalated from {orig_kind}: {orig_detail}"`.
+
+Typical Level-4 triggers:
+
+- `GOAL_DRIFT` at CRITICAL (every occurrence — the trajectory LLM
+  judge says the tree is no longer advancing goals).
+- `REFINE_VALIDATION_FAILED` at CRITICAL (planner exhausted its
+  retry budget; steerer deliberately does NOT re-refine to avoid an
+  infinite loop).
+- `INTENT_DIVERGENCE` at CRITICAL (or at WARNING on repeat).
+- `RUNAWAY_DELEGATION` on repeat.
+- Any `CRITICAL` drift whose first-occurrence Level-3 CANCEL_REINVOKE
+  didn't resolve and it repeats.
+
+The Runner's overlay loop blocks before picking up the next step
+when `session.paused_for_human_intervention` is set. To unpause, the
+operator sends one of:
+
+- **`ControlKind.RESUME`** — clear the flag and continue (if the
+  operator believes the drift was spurious).
+- **`ControlKind.STEER`** — provide a new direction. The refine runs,
+  the plan is revised, and the overlay restarts with the steer body.
+- **`ControlKind.CANCEL`** — abort the run cleanly.
+
+If the pause never resolves and the same `HUMAN_INTERVENTION_REQUIRED`
+drift fires a second time (rare — would require the operator to
+send a STEER that re-triggers the same escalation), the ladder
+escalates to Level 5 (`TERMINATE`) — a run-level abort.
+
+Sinks should render the pause as a visible state (badge + paused
+Gantt) and surface the approve/reject-style buttons as Resume /
+Steer / Cancel affordances. The UI path mirrors flow A's
+"awaiting" card shape but with a distinct drift source and a
+different control verb set.
+
+See [DRIFT.md §"Intervention ladder"](DRIFT.md#intervention-ladder-levels-0-5)
+for the full per-drift-kind level mapping.
 
 ## harmonograf follow-up (out of scope for this PR)
 
