@@ -7,9 +7,16 @@ pins the cheaper structural classifiers:
 * :func:`goldfive.drift.classify_confabulation_risk` (issue #128) —
   flags research / verification tasks that finished with zero tool
   calls and non-empty output.
+* :mod:`goldfive.drift.tool_loops` (issue #181) -- deterministic
+  tool-call-loop detector wired into the ADK plugin's
+  ``after_tool_callback``. The unit tests for the classifier live in
+  ``tests/test_tool_loops.py``; here we pin the plugin-level
+  end-to-end wiring.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import pytest
 
@@ -17,7 +24,7 @@ from goldfive.drift import (
     CONFABULATION_TRIGGER_KEYWORDS,
     classify_confabulation_risk,
 )
-from goldfive.types import DriftKind, DriftSeverity, Task
+from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Session, Task
 
 # ---------------------------------------------------------------------------
 # Keyword-set contract
@@ -260,3 +267,163 @@ def test_detail_message_includes_task_id_and_keyword() -> None:
     assert "t-abc-123" in drift.detail
     assert "verify" in drift.detail
     assert "zero tool calls" in drift.detail
+
+
+# ---------------------------------------------------------------------------
+# Tool-loop drift detector: plugin wiring (goldfive#181)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingToolLoopSteerer:
+    """Steerer stub that captures every drift routed via ``_handle_drift``."""
+
+    def __init__(self) -> None:
+        self.drifts: list[DriftEvent] = []
+        self.observations: list[Any] = []
+        self._sinks: list[Any] = []
+
+    async def observe(self, event: Any, session: Any) -> None:
+        self.observations.append(event)
+
+    async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+        self.drifts.append(drift)
+
+
+def _plugin_with_tool_loop_ctx(task: Task, session: Session, steerer: Any):
+    """Build an ADK plugin + state-context for tool-loop wiring tests.
+
+    Importing deferred so the module stays import-clean when ``google.adk``
+    isn't installed (the integration tests guard on ``importorskip``).
+    """
+    pytest.importorskip("google.adk")
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+        make_adk_plugin,
+    )
+
+    plugin = make_adk_plugin(host_agent_name="test_agent")
+    state: dict = {
+        SESSION_CONTEXT_STATE_KEY: SessionContext(
+            session=session,
+            steerer=steerer,
+            task=task,
+            tool_handlers={},
+            host_agent_name="test_agent",
+        )
+    }
+    # Install the context on the plugin directly so _resolve_ctx
+    # returns it without needing the ADK state-dict path.
+    plugin.set_active_context(state[SESSION_CONTEXT_STATE_KEY])
+    return plugin, state
+
+
+class _ToolStub:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _InvCtxStub:
+    def __init__(self, invocation_id: str, agent_name: str) -> None:
+        self.invocation_id = invocation_id
+        self.agent = type("_A", (), {"name": agent_name})()
+
+
+class _ToolCtxStub:
+    """Minimal ADK tool_context shape exposing ``_invocation_context``."""
+
+    def __init__(self, invocation_id: str, agent_name: str) -> None:
+        self._invocation_context = _InvCtxStub(invocation_id, agent_name)
+
+
+async def test_plugin_after_tool_emits_tool_loop_drift() -> None:
+    """Three identical arbitrary tool calls -> LOOPING_REASONING via the plugin."""
+    pytest.importorskip("google.adk")
+    steerer = _RecordingToolLoopSteerer()
+    session = Session(run_id="run-tl-1")
+    task = Task(id="t-loop", title="Something", assignee_agent_id="worker")
+    plugin, _state = _plugin_with_tool_loop_ctx(task, session, steerer)
+
+    tool = _ToolStub("read_file")
+    args = {"path": "doc.md"}
+    tool_ctx = _ToolCtxStub("inv-loop-1", "test_agent")
+
+    # First two calls should not fire.
+    await plugin.after_tool_callback(
+        tool=tool, tool_args=args, tool_context=tool_ctx, result={"ok": True}
+    )
+    await plugin.after_tool_callback(
+        tool=tool, tool_args=args, tool_context=tool_ctx, result={"ok": True}
+    )
+    assert steerer.drifts == []
+
+    # Third identical call trips mode 1.
+    await plugin.after_tool_callback(
+        tool=tool, tool_args=args, tool_context=tool_ctx, result={"ok": True}
+    )
+    assert len(steerer.drifts) == 1
+    drift = steerer.drifts[0]
+    assert drift.kind is DriftKind.LOOPING_REASONING
+    assert drift.severity is DriftSeverity.WARNING
+    assert drift.raw is not None
+    assert drift.raw.get("mode") == "exact"
+    assert drift.raw.get("tool_name") == "read_file"
+    assert drift.current_task_id == "t-loop"
+
+
+async def test_plugin_progress_tool_resets_tool_loop_window() -> None:
+    """A reporting-progress tool call clears the per-(invocation, agent) buffer."""
+    pytest.importorskip("google.adk")
+    steerer = _RecordingToolLoopSteerer()
+    session = Session(run_id="run-tl-2")
+    task = Task(id="t-progress", title="Something", assignee_agent_id="worker")
+    plugin, _state = _plugin_with_tool_loop_ctx(task, session, steerer)
+
+    tool_ctx = _ToolCtxStub("inv-loop-2", "test_agent")
+    tool = _ToolStub("read_file")
+    args = {"path": "doc.md"}
+
+    # Seed two identical calls.
+    await plugin.after_tool_callback(
+        tool=tool, tool_args=args, tool_context=tool_ctx, result={"ok": True}
+    )
+    await plugin.after_tool_callback(
+        tool=tool, tool_args=args, tool_context=tool_ctx, result={"ok": True}
+    )
+    # Progress-reporting tool clears the window.
+    progress_tool = _ToolStub("report_task_progress")
+    await plugin.after_tool_callback(
+        tool=progress_tool,
+        tool_args={"task_id": "t-progress", "fraction": 0.5},
+        tool_context=tool_ctx,
+        result={"acknowledged": True},
+    )
+    # One more identical read_file call should NOT fire because the
+    # buffer was cleared.
+    await plugin.after_tool_callback(
+        tool=tool, tool_args=args, tool_context=tool_ctx, result={"ok": True}
+    )
+    assert steerer.drifts == []
+
+
+async def test_plugin_cross_agent_tool_loop_isolation() -> None:
+    """Same tool, same args, same invocation but different sub-agents -> no drift."""
+    pytest.importorskip("google.adk")
+    steerer = _RecordingToolLoopSteerer()
+    session = Session(run_id="run-tl-3")
+    task = Task(id="t-iso", title="Something", assignee_agent_id="coord")
+    plugin, _state = _plugin_with_tool_loop_ctx(task, session, steerer)
+
+    tool = _ToolStub("read_file")
+    args = {"path": "same.md"}
+
+    # Three identical calls but each attributed to a DIFFERENT sub-agent
+    # (the ADK running_agent.name on ``_invocation_context``).
+    for agent_name in ("researcher", "writer", "reviewer"):
+        await plugin.after_tool_callback(
+            tool=tool,
+            tool_args=args,
+            tool_context=_ToolCtxStub("inv-iso", agent_name),
+            result={"ok": True},
+        )
+    assert steerer.drifts == []
