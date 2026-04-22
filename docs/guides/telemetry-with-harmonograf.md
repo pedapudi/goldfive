@@ -23,19 +23,37 @@ Four pieces:
 
    ```python
    import goldfive
-   from harmonograf_client import HarmonografClient
+   from google.adk.apps.app import App
+   from harmonograf_client import Client, HarmonografSink, HarmonografTelemetryPlugin
 
-   hg = HarmonografClient("localhost:7531")
-   runner = hg.observe(goldfive.wrap(my_agent))
+   client = Client(name="my-agent", server_addr="127.0.0.1:7531")
+
+   wrapped = goldfive.wrap(root_agent, sinks=[HarmonografSink(client)])
+   app = App(
+       name="my-demo",
+       root_agent=wrapped,
+       plugins=[HarmonografTelemetryPlugin(client)],
+   )
    ```
 
-   `observe()` as of harmonograf #44 attaches a `HarmonografSink`
-   and enables the STEERING + HUMAN_IN_LOOP capabilities by
-   default — you can steer, pause, and approve from the UI without
-   extra wiring.
+   Two hooks. `HarmonografSink` carries the goldfive `Event` stream
+   (run / plan / task / drift); `HarmonografTelemetryPlugin` carries
+   per-agent spans. Both route by `session_id` (goldfive#155 stamps
+   each event; goldfive#161 pins adk-web's session id onto the
+   goldfive Session so there's one row per run in harmonograf).
 
-Runnable example:
-[`examples/harmonograf_observed/agent.py`](../../examples/harmonograf_observed/agent.py).
+   `harmonograf_client.observe(wrapped)` is the legacy entry point —
+   still works, appends a `HarmonografSink`, enables STEERING +
+   HUMAN_IN_LOOP capabilities — but the newer path attaches the
+   telemetry plugin explicitly at the `App` level so adk-web's
+   runner sees it.
+
+Runnable examples:
+
+- [`examples/harmonograf_observed/agent.py`](../../examples/harmonograf_observed/agent.py)
+  — minimal CallableAdapter + sink.
+- [`examples/presentation_agent/agent.py`](../../examples/presentation_agent/agent.py)
+  — full ADK tree + both hooks.
 
 ## What you'll see in the UI
 

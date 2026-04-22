@@ -32,9 +32,22 @@ class AgentAdapter(Protocol):
 
     @property
     def available_agents(self) -> list[str]: ...
+
+    # Optional overlay-mode entry point (goldfive#141).
+    async def invoke_passthrough(
+        self,
+        user_message: str,
+        session: Session,
+        *,
+        reconciler: PlanReconciler,
+    ) -> InvocationResult: ...
+
+    # Optional structured tree metadata (goldfive#151).
+    @property
+    def available_agents_tree(self) -> list[dict[str, Any]]: ...
 ```
 
-Three members. That's it.
+Three required members plus two overlay extensions.
 
 - **`register_reporting_tools`** — called once per run, between
   planning and execution. You get the seven canonical reporting tool
@@ -43,9 +56,37 @@ Three members. That's it.
 - **`invoke`** — called per task. Run the agent against `task`, using
   the registered tools to report state changes. Return an
   `InvocationResult` with the final text and/or artifacts.
+- **`invoke_passthrough`** (overlay) — called once per turn with
+  the full user message. The adapter drives the tree naturally; it
+  feeds `before_agent` / `after_agent` / delegation observations
+  into the `PlanReconciler`, which maps them to plan tasks. The
+  `SequentialExecutor(overlay_mode=True)` path uses this when the
+  adapter exposes it. `ADKAdapter` does; `CallableAdapter` and
+  `ClaudeAgentSDKAdapter` do not (they use per-task `invoke`).
 - **`available_agents`** — stable list of agent identifiers this
-  adapter can dispatch to. Planners consult this so they don't generate
-  tasks for non-existent agents.
+  adapter can dispatch to. Planners consult this so they don't
+  generate tasks for non-existent agents. Under the single-Runner
+  model (goldfive#130) this is advisory only; ADK handles actual
+  routing via `AgentTool` / `transfer_to_agent` / `sub_agents`.
+- **`available_agents_tree`** (optional) — list of dicts with
+  `name` / `depth` / `parent` / `role` / `kind`. Consumed by the
+  `GoldfivePlanner`'s orchestration context block and by
+  `LLMPlanner` for structured assignee-hint selection on deep
+  hierarchies. `ADKAdapter._collect_reachable_agent_tree` is the
+  reference implementation.
+
+## Install semantics (goldfive#166)
+
+Callers can pass additional ADK plugins via
+`goldfive.wrap(agent, plugins=[HarmonografTelemetryPlugin(client)])`.
+The adapter dedupes plugins by `name` before handing them to ADK's
+`PluginManager.register_plugin` (which raises on duplicate names). A
+plugin already on `App(plugins=[...])` is not re-installed on wrap.
+
+`ADKAdapter.add_plugin(plugin)` also exists for post-construction
+install — used by `harmonograf_client.observe()` when the caller
+wants to attach telemetry after `goldfive.wrap(...)` has already
+run.
 
 ## Shipped implementations
 

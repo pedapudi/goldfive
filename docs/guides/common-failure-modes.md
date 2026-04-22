@@ -1,358 +1,308 @@
 # Common failure modes
 
-Catalog of the failure shapes goldfive has observed in the wild,
-with the signature on the event stream, the root cause, and the
-recovery path. Pair with
-[troubleshooting.md](troubleshooting.md) (install + setup
-problems) and [insight-from-logs.md](insight-from-logs.md) (how to
-read the stream itself). For the "it wasn't on this page"
+Catalog of the failure shapes goldfive has observed in the wild, with
+the signature on the event stream, the root cause, and the recovery
+path. Pair with [troubleshooting.md](troubleshooting.md) (install +
+setup problems) and [insight-from-logs.md](insight-from-logs.md) (how
+to read the stream itself). For the "it wasn't on this page"
 catch-all, reach for
 [.agents/debug-goldfive.md](../../.agents/debug-goldfive.md).
 
-## 1. Filler loop
+For the taxonomy of every drift kind, severity rules, and the refine
+policy, see [../design/DRIFT.md](../design/DRIFT.md).
 
-The canonical goldfive failure: the agent loops making no forward
-progress, and the guards — which exist — fail to stop it.
-Pre-#98 / #108 / #109 hardening, this class of bug could ride all
-the way to the framework's own ceiling (ADK 500 calls, Claude
-max_turns) before the run aborted.
+## 1. Tool-call loop — agent stuck calling the same tool
 
-**Signature.** One of:
+The canonical filler loop post-#181: the agent keeps calling the same
+tool over and over without reaching a terminal task state. Covered
+automatically by the **`ToolLoopTracker`** (auto-wired, no user
+config). The detector fires at `after_tool_callback` on three
+patterns:
 
-- `outcome.success=False, reason="exhausted max_task_invocations=N with pending task <id>"`
-  with `id` being the same task every time.
-- `outcome.success=False, reason="adapter.invoke raised ... max_turns_exceeded"`
-  or similar framework-level abort.
-- `sink.events` shows `DRIFT_KIND_LOOPING_TOOL_CALL` (post-guard)
-  or a dominating count of `report_task_*` calls on one task
-  (pre-guard).
-- Task status is `COMPLETED` on the session plan, but reporting
-  tool calls keep arriving for the same `task_id` (returned as
-  `task_already_terminal` acks post-#98).
+- **Exact** — same `(tool_name, args_hash)` repeats ≥ 3 in the last 7
+  calls → `LOOPING_REASONING` / WARNING.
+- **Name** — same `tool_name` (any args) repeats ≥ 5 in the last 7
+  with no task-state progress → `LOOPING_REASONING` / WARNING.
+- **Alternating** — A,B,A,B,A pattern in the last 5 → `LOOPING_REASONING`
+  / INFO (observational; does not trigger refine).
 
-**Root causes (by likelihood).**
-
-1. A new adapter bypassed `invoke_tool`. See
-   [.agents/how-to-debug-a-filler-loop.md](../../.agents/how-to-debug-a-filler-loop.md).
-   This was the #108 root cause in the ADK adapter.
-2. A custom planner produced a task the agent can't actually
-   satisfy (the agent reports "done" but the planner doesn't
-   accept the completion, refine spawns a retry, loop).
-3. The agent's instruction prompt is wrong — it thinks it's
-   driving the whole workflow (see §Agent tree misdesign below).
-
-**Recovery path.**
-
-- Set `SequentialExecutor(max_task_invocations=<finite>)` as a
-  belt-and-suspenders ceiling while investigating.
-- Run [.agents/how-to-debug-a-filler-loop.md](../../.agents/how-to-debug-a-filler-loop.md).
-- If the guard was bypassed, fix the adapter. If the agent is
-  mis-prompted, fix the instruction. Do NOT add another cap.
-
-## 2. Refine failure (truncated JSON, LLM unavailable)
-
-The planner LLM returns something `LLMPlanner` can't parse. Three
-common shapes:
-
-- JSON that got truncated at the token limit — missing closing
-  `}` or `]`.
-- An empty string or a whitespace-only response.
-- Valid JSON but in the wrong shape (no `tasks` field, or tasks
-  missing required keys).
+Reporting-tool calls (`report_task_*`, `report_plan_divergence`, etc.)
+are excluded — they're progress signals, not work.
 
 **Signature.**
 
-- `DriftDetected` with detail starting `refine failed` (or
-  `_refine_user_steer: empty/non-string`).
-- Logger `goldfive.planner` DEBUG line with `failed to parse LLM
-  output`.
-- `session.refine_failure_counts` incrementing for
-  `(drift.kind, current_task_id)` across ticks.
-- Once the counter crosses
-  `DefaultSteerer.REFINE_FAILURE_THRESHOLD` (default `2`),
-  `DriftDetected{kind=REPEATED_FAILURE, severity=CRITICAL}` fires
-  and the task is marked FAILED.
+- `DriftDetected{kind=looping_reasoning, severity=warning}` with
+  `detail` starting `tool_loop_exact:`, `tool_loop_name:`, or
+  `tool_loop_alternating:`.
+- `raw.mode` on the drift identifies which mode fired.
+- Downstream: the steerer escalates through the intervention ladder
+  (Level 1 ABSORB → refine; escalates to Level 3 CANCEL_REINVOKE on
+  repeat).
+
+**Configuration.** Defaults tuned for a 7-call window. Override via
+env vars:
+
+- `GOLDFIVE_TOOL_LOOP_WINDOW` (default 7)
+- `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` (default 3)
+- `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` (default 5)
+- `GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD` (default 5)
+
+See `goldfive/drift/tool_loops.py` for the full contract.
+
+**Recovery path.**
+
+1. Read the drift detail: identifies the tool being looped.
+2. If the tool is legitimate (scripted pipeline), raise the threshold
+   or clear the buffer with `ToolLoopTracker.on_task_progress(...)`
+   on your own progress signal.
+3. If it's genuine drift, let the intervention ladder handle it —
+   `planner.refine` typically produces a revised task that escapes
+   the loop.
+
+## 2. Plan divergence — agent ran an unplanned agent
+
+The overlay reconciler observed a `before_agent_callback` for an agent
+whose `name` doesn't match any PENDING plan task's `assignee_agent_id`
+(after walking the parent chain for a contextual match,
+goldfive#151). Emitted as `PLAN_DIVERGENCE` / INFO severity —
+observational.
+
+Separately, the three-stage `function_call` gate in
+`GoldfivePlanner.process_planning_response` (goldfive#184) classifies
+LLM-emitted tool calls:
+
+| Input | Classification |
+|---|---|
+| `function_call` name is in the current agent's `tools` | legitimate; no drift |
+| Name is a known agent in the tree registry but not in this agent's tools | cross-layer delegation attempt → `PLAN_DIVERGENCE` / WARNING |
+| Name is nowhere (not a tool, not a known agent) | hallucination → `CONFABULATION_RISK` / WARNING |
+
+`function_call` names prefixed `report_` (the reporting-tool namespace)
+are always legitimate regardless of tool-list contents. Cancelled
+function-call ids from `session.state['goldfive.cancelled_function_call_ids']`
+are stripped before classification runs.
+
+**Signature.**
+
+- `DriftDetected{kind=plan_divergence, severity=warning, detail="function_call ... cross-layer"}`.
+- `DriftDetected{kind=confabulation_risk, severity=warning, detail="function_call ... hallucinated"}`.
+- Never blocks the call — it's a signal, not a gate. The steerer's
+  ladder decides whether to escalate.
+
+**Recovery path.**
+
+- `PLAN_DIVERGENCE` → the refine path typically narrows the tool /
+  agent scope or adjusts assignee hints.
+- `CONFABULATION_RISK` → usually the prompt is wrong. Either (a)
+  narrow the coordinator's instruction to only describe tools it
+  actually has, or (b) add the missing tool / agent to the tree.
+
+## 3. Refine validation failed
+
+`LLMPlanner.refine` exhausted its retry budget — the LLM's response
+couldn't be parsed or couldn't pass `Plan.validate(for_revision=True,
+prior=plan)` after N attempts. The planner falls back to the prior
+plan (or the deterministic fail-the-looper plan when the drift was
+`LOOPING_REASONING`).
+
+**Signature.**
+
+- Logger `goldfive.planner` line: `LLMPlanner._refine_user_steer: attempt 2/2: <error>`.
+- `DriftDetected{kind=refine_validation_failed, severity=critical}`.
+- The steerer deliberately does **not** refine on this drift (infinite
+  loop risk). The ladder escalates to Level 4 PAUSE_ESCALATE →
+  `HUMAN_INTERVENTION_REQUIRED`.
 
 **Root causes.**
 
-- Planner LLM's `max_tokens` too small for the plan size.
-- Planner LLM provider down / rate-limited / returning 500s.
-- Prompt template is wrong (e.g. `{tasks}` literal in output
-  instead of a JSON array — shows up with custom planners).
+- Planner LLM's `max_tokens` too small; output is truncated JSON.
+- LLM returned a revision that drops a terminal task (§3.1 of
+  PLAN-LIFECYCLE) or grafts PENDING tasks onto CANCELLED predecessors
+  (reachability invariant, §7).
+- Planner prompt template is wrong (custom planners).
 
 **Recovery path.**
 
-- Widen `max_tokens` on your planner LLM.
-- Implement retries / backoff inside your `call_llm` callable
-  (not at the goldfive level — the steerer's refine-failure
-  counter is the coarse backoff).
-- Log the raw `call_llm` response before returning so you can
-  see what was actually truncated. See
-  [insight-from-logs.md §Capturing planner reasoning](insight-from-logs.md).
+- Widen `max_tokens`.
+- Log the raw `call_llm` response to see what the LLM produced. See
+  [insight-from-logs.md](insight-from-logs.md).
+- The operator resumes by steering again, cancelling, or accepting
+  the fallback plan.
 
-## 3. Orphaned PENDINGs at run end
+## 4. Runaway delegation — AgentTool cap exceeded
 
-A run ends with `success=False,
-reason="orphaned pending tasks after run: <ids>"`. Pre-#103 this
-could also produce `success=True` with PENDING tasks still on
-the plan — #103 and the reachability audit (§6.4) made that
-impossible.
+The coordinator's prompt describes a pipeline and its LLM keeps
+delegating via `AgentTool`. The goldfive ADK plugin enforces a
+per-invocation cap (default 16, configurable via
+`ADKAdapter(agent_tool_cap=N)`).
 
 **Signature.**
 
-- `outcome.success=False, reason="orphaned pending tasks after run: t4, t5, t6"`.
-- The last event before `RunAborted` is a CRITICAL
-  `DriftDetected{kind=PLAN_DIVERGENCE}` emitted by the
-  reachability audit.
-- Every orphan task is PENDING on the final plan with a
-  predecessor that is CANCELLED or FAILED.
+- `DriftDetected{kind=runaway_delegation, severity=critical}` once the
+  cap trips.
+- Further AgentTool spawns in the same invocation return a "skipped"
+  dict.
+- The current task is marked FAILED (CRITICAL drift flows through the
+  planner's refine path).
 
-**Root causes.**
+**Root cause.** The coordinator's prompt describes a pipeline and the
+LLM keeps re-routing. Goldfive cannot require prompt cooperation
+(users bring their own trees).
 
-- `planner.refine` returned `None` after a USER_STEER or
-  unrecoverable drift, but the cascade didn't fire — pre-#103 bug,
-  should not recur.
-- A custom steerer cancelled a task without calling
-  `cascade_cancel_downstream` — the primitive is the source of
-  truth; any direct `mark_task_cancelled` that skips the
-  downstream walk regresses §6.3.
+**What catches it first, in order.**
+
+1. **`ToolLoopTracker`** (§1) — catches tight AgentTool loops before
+   the cap trips.
+2. **Reasoning-content drift detectors.** `LOOPING_REASONING` (hash-
+   or embedding-based), `INTENT_DIVERGENCE`, `CONFUSION` fire when
+   the coordinator's chain-of-thought shows the pattern.
+3. **Refine-driven recovery.** A WARNING-or-higher drift flows
+   through the ladder into `planner.refine`, which can narrow the
+   assignee hint or split into sub-tasks before the next turn.
+4. **AgentTool cap.** The last-resort safety net.
 
 **Recovery path.**
 
-- Confirm you're on goldfive ≥ #103. If so, file a bug — this
-  shouldn't happen on current `main`.
-- If you have a custom Steerer subclass, audit it for any
-  `mark_task_cancelled` path that doesn't delegate to
-  `cascade_cancel_downstream`.
+- Inspect `adapter.available_agents` after wrap: should list every
+  agent in the tree. A one-entry list means the wrap target was a
+  pre-built `Runner` rather than a `BaseAgent`.
+- Tighten the coordinator's prompt to be task-focused (see the
+  example in [adk-web-integration.md](adk-web-integration.md)).
+- Raise `agent_tool_cap` only if legitimate delegation exceeds 16
+  per turn.
 
-## 4. Agent tree misdesign (coordinator-drives-whole-workflow)
+## 5. Goal drift (opt-in)
 
-Not a framework bug but easy to mistake for one: the agent's
-prompt tells it to run the whole workflow in one turn, instead of
-handling "just the task the orchestrator routed me". The
-`examples/adk_presentation/` example hit this before #111 — a
-hand-rolled coordinator + subagent tree where the coordinator's
-instructions made it `transfer_to_agent` sub-agents in sequence
-regardless of goldfive's task dispatch. Goldfive then marked the
-task complete while the coordinator was still narrating, and the
-coordinator kept calling `require_confirmation=True` tools that
-silently gated on a UI that wasn't watching.
+Periodic trajectory-level check: every N agent turns, an LLM-judge
+looks at the recent activity window and decides whether the tree is
+advancing `session.goals` (goldfive#143). Emits `GOAL_DRIFT` /
+CRITICAL when the judge concludes progress has stalled.
+
+**Feature gate.** Opt-in via `DefaultSteerer(goal_drift_enabled=True,
+goal_drift_call_llm=...)`. Operators who don't configure it never
+trigger it and pay no LLM cost.
 
 **Signature.**
 
-- Multiple agents show up in `available_agents` but every
-  `InvocationResult` originates from one.
-- Plan generated by the LLM planner has one task per
-  sub-workflow, but the agent's output never acknowledges the
-  individual task ids — it just rolls through.
-- Reasoning content (if extracted) mentions the whole workflow
-  not the current task.
-- `report_task_completed` is called with arguments derived from
-  the *plan summary*, not the *current task id* — the agent
-  doesn't know which task it's on.
+- `DriftDetected{kind=goal_drift, severity=critical}`.
+- Routes to Level 4 PAUSE_ESCALATE → `HUMAN_INTERVENTION_REQUIRED`.
 
-**Root causes.**
+## 6. Human intervention required
 
-- The agent's instruction says "execute the plan" rather than
-  "execute the single task the orchestrator gave you."
-- `require_confirmation=True` on sub-agent tools, combined with
-  no UI watching approvals — the tool silently blocks, the
-  framework reports `max_turns_exceeded`.
-- A coordinator that uses `transfer_to_agent` as its primary
-  control-flow mechanism, treating sub-agents as independent
-  processes rather than goldfive-managed workers.
+The steerer escalated a drift to Level 4. Paused the run on
+`session.paused_for_human_intervention`; the executor blocks waiting
+for a `CONTROL_RESUME` or `CONTROL_STEER`. Emitted for:
+
+- Persistent refine failures.
+- `GOAL_DRIFT` (CRITICAL).
+- `REFINE_VALIDATION_FAILED`.
+- `RUNAWAY_DELEGATION` on repeat.
+
+**Signature.**
+
+- `DriftDetected{kind=human_intervention_required, severity=critical}`.
+- Run pauses; no new tasks start.
+- Harmonograf UI's session header shows the pause; the Steer / Resume
+  buttons are armed.
+
+**Recovery path.** A user-initiated `CONTROL_RESUME` or
+`CONTROL_STEER` clears the flag.
+
+## 7. Qwen coordinator hallucinates tool success (model-specific)
+
+Observed on Qwen3-Coder and similar weaker models under the
+`presentation_agent_orchestrated` tree: the coordinator produces
+fluent output claiming it wrote files via `write_webpage` but never
+actually emits the tool call. The tree reports success; the
+filesystem is empty.
+
+**Not a goldfive regression.** The confabulation-risk classifier
+(§2) catches the shape when the task's title/description implies
+external data access (research, lookup, write, verify, …) and the
+agent produced non-empty output without calling a single tool —
+`CONFABULATION_RISK` / INFO. Record-only; does not trigger refine.
 
 **Recovery path.**
 
-- Simplify to one agent + `goldfive.wrap(agent)` first. If the
-  run now succeeds, the agent tree was the problem, not
-  goldfive. See `examples/adk_presentation/agent.py` for the
-  minimal shape post-#111.
-- If you need multiple agents, have each one handle only its
-  assigned task (`task.assignee_agent_id`) and return. Let
-  goldfive do the routing. The harmonograf
-  `tests/reference_agents/presentation_agent` is a worked
-  example with a real multi-agent tree that works with goldfive.
-- Rewrite the instruction to explicitly scope to the current
-  task: "Each message you receive is a single task; complete
-  just that task and stop."
+- Switch to a stronger model (`USER_MODEL_NAME=openai/gpt-4o-mini`
+  works; Gemini + `GOOGLE_API_KEY` works).
+- Tighten the coordinator prompt to say "you MUST call
+  `write_webpage` — do not claim success without the tool call."
+- The INFO drift itself is informational; operators watching the UI
+  can cancel on sight.
 
-## 5. `require_confirmation` silent gating (pre-#111 behaviour)
+## 8. Refine cascade produced no follow-up plan
 
-Specific sub-case of §4 but distinctive enough to call out. ADK
-sub-agents marked `require_confirmation=True` create a tool-call
-that blocks on an APPROVE / REJECT decision. Pre-#83 goldfive
-didn't have an APPROVE / REJECT control channel, so the tool
-call hung forever; #83 added the bridge; #111 dropped the
-unneeded `require_confirmation=True` from the example tree.
+Not a failure per se — "incomplete but not broken". A USER_STEER
+arrives, the current task is CANCELLED, the cascade cancels
+downstream PENDINGs, and then `planner.refine` returns `None`. No
+new work is installed. The run ends cleanly with `success=False`.
 
 **Signature.**
 
-- Agent "goes silent" — no new events after the first
-  `TaskStarted`.
-- `session.pending_approvals` has an entry keyed by an
-  `adk-<uuid>` (ADK Flow B). Non-empty after the run ends is the
-  red flag.
-- After `max_task_invocations` trips, the `RunAborted.reason`
-  blames the task that was waiting on approval, not the approval
-  itself — the failure mode looks like a stuck task.
-
-**Recovery path.**
-
-- Drop `require_confirmation=True` from any ADK tool that doesn't
-  actually need human-in-the-loop approval. This was the #111 fix.
-- If you do need approval, wire up the control channel
-  (`Runner(control=...)`) and route APPROVE / REJECT messages.
-  See [../design/CONTROL.md §Flow B](../design/CONTROL.md) and
-  [../design/APPROVAL.md](../design/APPROVAL.md).
-- Verify harmonograf `observe()` is attached if you expect the UI
-  to drive approvals — it enables HUMAN_IN_LOOP by default since
-  harmonograf #44.
-
-## 6. Cascade ran but refine didn't produce a follow-up plan
-
-Not a failure per se — just "incomplete but not broken". A
-USER_STEER arrives, the current task is CANCELLED, the cascade
-cancels downstream PENDINGs, and then `planner.refine` returns
-`None`. No new work is installed. The run ends cleanly with
-`success=False`.
-
-**Signature.**
-
-- `DriftDetected{kind=USER_STEER, severity=WARNING}`.
+- `DriftDetected{kind=user_steer, severity=warning}`.
 - `TaskCancelled` for the current task, then a flurry of
   `TaskCancelled` events with `reason="cascade from <task_id>"`.
 - No `PlanRevised` follows.
-- `RunAborted` with a reason like "goal '<...>' unmet" or
-  "planner declined refine".
+- `RunAborted` with reason like "goal '<…>' unmet" or "planner
+  declined refine".
 
 **Root causes.**
 
-- The steer message was ambiguous and the planner genuinely
-  couldn't produce a coherent follow-up.
-- The planner's prompt template doesn't know how to handle
-  USER_STEER (most `LLMPlanner` configurations do; custom
-  planners may not).
+- The steer message was ambiguous and the planner genuinely couldn't
+  produce a coherent follow-up.
+- Custom planners whose refine logic doesn't know how to handle
+  `USER_STEER` (the bundled `LLMPlanner` does).
 
 **Recovery path.**
 
-- This is arguably correct behaviour — the planner decided the
-  steer was unrecoverable. Treat the run as failed and start a
-  new one with the steer text folded into the initial input.
-- If you want the planner to always produce something, customise
-  your planner's refine logic to never return `None` (return a
-  trivial one-task plan as a fallback).
+- Arguably correct behaviour — the planner decided the steer was
+  unrecoverable. Start a new run with the steer text folded into
+  the initial input.
+- Customise your planner to never return `None` (return a trivial
+  one-task plan as a fallback).
 
-## 7. Drift kinds firing at unexpected severity
+## 9. Drift severity not what you expected
 
-`INTENT_DIVERGENCE` fires at graduated severity since #114 —
-INFO / WARNING / CRITICAL based on cosine similarity. If you
-were relying on "INTENT_DIVERGENCE always means refine", expect
-more INFO-severity signals that don't trigger refine.
+`INTENT_DIVERGENCE` fires at graduated severity — INFO / WARNING /
+CRITICAL based on cosine similarity against `session.goals` + the
+current task topic. If you were relying on "INTENT_DIVERGENCE always
+means refine", expect more INFO-severity signals that don't trigger
+it.
 
 **Signature.**
 
-- `DriftDetected{kind=INTENT_DIVERGENCE, severity=INFO}` — no
-  refine follows. This is expected and correct.
-- `DriftDetected{kind=INTENT_DIVERGENCE, severity=CRITICAL}` —
+- `DriftDetected{kind=intent_divergence, severity=info}` — no refine
+  follows. Expected.
+- `DriftDetected{kind=intent_divergence, severity=critical}` —
   treated as unrecoverable; cascade fires and the run aborts.
-- `UNCERTAIN_PROGRESS` (INFO) appearing mid-run — this is the
-  opt-in reflective self-progress check from #112 emitting.
-  Informational, no refine.
-- `SELF_REPORTED_STUCK` (WARNING) — refine triggered. Expect a
-  `PlanRevised` follow-up.
-
-**Root causes.**
-
-- Reading the `kind` without the `severity` — now the wrong
-  abstraction.
-- Relying on pre-#114 semantics where INTENT_DIVERGENCE was a
-  single severity.
+- `LOOPING_REASONING` at INFO (the `tool_loop_alternating` variant) —
+  observational, no refine.
 
 **Recovery path.**
 
 - Filter by `severity >= WARNING` if you only care about the
   refine-triggering band.
-- Update any custom `should_refine(drift)` override to inspect
-  severity, not kind.
+- Update custom `should_refine(drift)` overrides to inspect severity,
+  not kind.
 
-## 8. coordinator+AgentTool loop under real LLM
+## 10. Session rows duplicated in harmonograf
 
-Affects `goldfive.wrap(coordinator)` when the coordinator has
-`AgentTool`-wrapped specialists and its instruction describes a
-pipeline ("first research, then build, then review…"). Under a
-real LLM the coordinator may keep re-routing until ADK's 500-call
-ceiling trips.
+Pre-#161 / #164: goldfive's `Session.id`, the `ADKAdapter`'s internal
+`_session_id`, and adk-web's outer `ctx.session.id` were three
+different UUIDs. Goldfive events carried one id; harmonograf spans
+carried another; the UI showed two rows per run with the plan on one
+and the execution on the other.
 
-**Signature.**
+**Current state.** `GoldfiveADKAgent._run_async_impl` pins the outer
+adk-web session id onto both the goldfive Session and the
+ADKAdapter's internal state (`_outer_session_id`, `_session_id`)
+before any sub-agent dispatch runs. Per-event `session_id` stamping
+(goldfive#155) + `HarmonografSink` routing by it means one session
+row per run.
 
-- Plan submitted, at least one `TaskStarted` fires, but tasks hang
-  without reaching a terminal state.
-- The adk log shows repeated AgentTool calls under a single
-  invocation — the coordinator is decoding its own instruction each
-  turn and picking the next specialist.
-- A `drift_detected` event with kind `runaway_delegation` fires at
-  CRITICAL severity once the AgentTool-per-invoke cap trips.
-- The current task is marked `task_failed` (the CRITICAL drift
-  flows through the planner's refine path) with the drift detail
-  naming the exceeded cap.
-
-**Root cause.** The coordinator's prompt describes a pipeline and
-its LLM keeps delegating. Goldfive cannot require prompt
-cooperation (users bring their own trees).
-
-**What catches it.** Three layers, in order of detection:
-
-1. **Reasoning-content drift detectors.** LOOPING_REASONING (hash-
-   or embedding-based), INTENT_DIVERGENCE, CONFUSION — fire when
-   the coordinator's chain-of-thought shows the pattern. Most
-   cases are caught here before the AgentTool cap kicks in.
-2. **Refine-driven recovery.** A WARNING / CRITICAL drift flows
-   through `DefaultSteerer._handle_drift` into `planner.refine`,
-   which can revise the task (e.g. narrow the assignee hint or
-   split into sub-tasks) before the next invocation.
-3. **AgentTool-per-invoke cap (goldfive#130).** The plugin counts
-   AgentTool spawns scoped to the current invocation. Default 16.
-   On exceed the plugin emits `RUNAWAY_DELEGATION` at CRITICAL
-   severity, cancels the invocation, and short-circuits further
-   AgentTool spawns with a "skipped" dict. Tune via
-   `ADKAdapter(agent_tool_cap=N)` (0 disables).
-
-**Recovery path.**
-
-- Inspect `adapter.available_agents` after wrap: it should list
-  every agent in the tree. A one-entry list means the wrap target
-  was a pre-built `Runner` rather than a `BaseAgent` — see the
-  [degrade-mode section in adk-web-integration.md](adk-web-integration.md#pre-built-runner-degrade-mode).
-- Watch the `AgentInvocationStarted` / `AgentInvocationCompleted`
-  / `DelegationObserved` events on sinks to observe the delegation
-  tree (see [EVENT-MODEL.md §"Agent-invocation events"](../design/EVENT-MODEL.md#agent-invocation-events)).
-- If the cap is firing too often, either (a) tighten the
-  coordinator's prompt to be task-focused rather than pipeline-
-  focused, or (b) raise `agent_tool_cap` if the coordinator
-  legitimately delegates more than 16 times per turn.
-
-See
-[ARCHITECTURE.md §"Single-Runner dispatch"](../design/ARCHITECTURE.md#single-runner-dispatch-goldfive-drives-the-root-adk-delegates-within)
-and
-[RATIONALE.md §"Why single-Runner, not registry-dispatch"](../design/RATIONALE.md#why-single-runner-not-registry-dispatch)
-for the design history — including the goldfive#120 registry-
-dispatch experiment that was reverted in #130.
-
-## 9. Deprecation warning: `max_plan_reinvocations`
-
-`DeprecationWarning: SequentialExecutor(max_plan_reinvocations=...)
-is deprecated; use max_task_invocations=... instead.`
-
-**Root cause.** #115 renamed the parameter. The old kwarg is
-still accepted for one release with a `DeprecationWarning`.
-
-**Recovery.** Rename. The default changed from finite (32) to
-`None` (unbounded) in the same PR — if you were relying on the
-old default as a safety cap, set `max_task_invocations=32`
-explicitly. See
-[../design/RATIONALE.md](../design/RATIONALE.md) for why the
-default changed.
+**If you still see duplicates:** verify you're on goldfive ≥ #164
+and harmonograf ≥ #85 (lazy Hello).
 
 ## Related
 
@@ -361,4 +311,5 @@ default changed.
 - [telemetry-with-harmonograf.md](telemetry-with-harmonograf.md) — same diagnostics via the UI.
 - [../../.agents/debug-goldfive.md](../../.agents/debug-goldfive.md) — the triage tree.
 - [../../.agents/how-to-debug-a-filler-loop.md](../../.agents/how-to-debug-a-filler-loop.md) — deep dive on failure mode 1.
+- [../design/DRIFT.md](../design/DRIFT.md) — the drift taxonomy.
 - [../design/PLAN-LIFECYCLE.md](../design/PLAN-LIFECYCLE.md) — run termination predicate and cascade semantics.

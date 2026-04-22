@@ -5,16 +5,23 @@ the system that knows about a specific framework — ADK, Claude Agent
 SDK, LangGraph, an MCP server, a bare async callable, anything.
 
 This guide walks through writing a new `AgentAdapter` for a framework
-goldfive doesn't ship. Reference v0.1 adapters:
+goldfive doesn't ship. Reference adapters:
 
 - `goldfive.adapters.callable.CallableAdapter` — the simplest form.
   Start here when prototyping a new adapter.
-- `goldfive.adapters.adk.ADKAdapter` — ports harmonograf's ADK plugin.
+- `goldfive.adapters.adk.ADKAdapter` — the overlay-model flagship.
+  Implements `invoke_passthrough` for the single-Runner overlay
+  execution path (goldfive#141) plus the per-task `invoke` fallback.
+  Installs the goldfive ADK plugin once per runner
+  (`_register_plugin_on_runner` is idempotent by plugin name,
+  goldfive#166). Exposes `available_agents_tree` for structural
+  steering (goldfive#151).
 - `goldfive.adapters.claude.ClaudeAgentSDKAdapter` — wraps Anthropic's
-  Claude Agent SDK.
+  Claude Agent SDK. Uses the per-task `invoke` path.
 
 Related: [PROTOCOLS.md](../design/PROTOCOLS.md#agentadapter),
-[tool-protocol.md](../reference/tool-protocol.md).
+[tool-protocol.md](../reference/tool-protocol.md),
+[ARCHITECTURE.md](../design/ARCHITECTURE.md).
 
 ## The protocol
 
@@ -34,24 +41,49 @@ class AgentAdapter(Protocol):
 
     @property
     def available_agents(self) -> list[str]: ...
+
+    # Optional (overlay model, goldfive#141):
+    async def invoke_passthrough(
+        self,
+        user_message: str,
+        session: Session,
+        *,
+        reconciler: PlanReconciler,
+    ) -> InvocationResult: ...
+
+    # Optional (structural steering, goldfive#151):
+    @property
+    def available_agents_tree(self) -> list[dict[str, Any]]: ...
 ```
 
-Three responsibilities:
+Three required members plus two overlay extensions.
+
+Responsibilities:
 
 1. **Register reporting tools.** The steerer hands you a list of
    `ReportingToolSpec`s (see [tool-protocol.md](../reference/tool-protocol.md)).
    Translate each spec into the tool shape your framework expects and
    install a hook that routes calls to the spec's handler.
-2. **Invoke the agent for one task.** Render current-task context,
-   run the agent, stream observed events to the steerer, return an
-   `InvocationResult`. How delegation works inside the framework is
-   the framework's business — goldfive's single-Runner contract
-   says the adapter drives one agent per invoke and the framework
-   resolves anything deeper.
-3. **Expose `available_agents`.** The names the planner may
-   populate `task.assignee_agent_id` with — advisory hints for
-   delegation, not routing keys under the single-Runner model.
-   Must be sorted and unique.
+2. **Invoke the agent.** Two shapes:
+   - **Per-task `invoke(task, session)`** (classic path) — render
+     task context, run the agent, feed observed events to the
+     steerer, return an `InvocationResult`.
+   - **`invoke_passthrough(user_message, session, *, reconciler)`**
+     (overlay model) — the executor passes the full user message
+     once and observes the tree running naturally. The adapter feeds
+     `before_agent` / `after_agent` / delegation observations into
+     the `PlanReconciler`; the reconciler maps them to plan tasks.
+     This is the path `SequentialExecutor(overlay_mode=True)` uses
+     for adapters that expose the method (`ADKAdapter` does,
+     `ClaudeAgentSDKAdapter` does not). `goldfive.wrap(adk_agent)`
+     defaults to overlay mode.
+3. **Expose `available_agents`.** The names the planner may populate
+   `task.assignee_agent_id` with — advisory hints for delegation,
+   not routing keys under the single-Runner model. Must be sorted
+   and unique. Optionally also expose `available_agents_tree` —
+   structured metadata (name / depth / parent / role / kind) per
+   agent — which the planner uses to constrain `assignee_agent_id`
+   selection for deep hierarchies (goldfive#151).
 
 ### The `available_agents` contract
 

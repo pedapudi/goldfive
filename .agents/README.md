@@ -22,16 +22,20 @@ action.
 |---|---|
 | wrap my existing agent with goldfive | [use-goldfive.md](use-goldfive.md) |
 | add a feature, adapter, or sink to goldfive | [develop-goldfive.md](develop-goldfive.md) |
-| diagnose a broken run | [debug-goldfive.md](debug-goldfive.md) |
-| understand or implement an `AgentAdapter` | [adapters.md](adapters.md) |
-| understand or implement an `EventSink` | [sinks.md](sinks.md) |
+| diagnose a broken run (overlay + ladder + session id) | [debug-goldfive.md](debug-goldfive.md) |
+| understand or implement an `AgentAdapter` (incl. overlay `invoke_passthrough`) | [adapters.md](adapters.md) |
+| understand or implement an `EventSink` (incl. per-event session_id routing) | [sinks.md](sinks.md) |
 | know what events exist and how to emit one | [events.md](events.md) |
 | write a goldfive test | [testing.md](testing.md) |
 | cut a release | [release.md](release.md) |
 | add a new `AgentAdapter` wrapping a new framework | [how-to-add-a-new-adapter.md](how-to-add-a-new-adapter.md) |
-| debug the "guards defined but not firing" class of bug | [how-to-debug-a-filler-loop.md](how-to-debug-a-filler-loop.md) |
-| add a new `DriftKind` | [how-to-add-a-drift-kind.md](how-to-add-a-drift-kind.md) |
-| drive a goldfive end-to-end run with harmonograf locally | [how-to-run-the-e2e.md](how-to-run-the-e2e.md) |
+| debug a filler loop (tool-loop detector, intervention ladder) | [how-to-debug-a-filler-loop.md](how-to-debug-a-filler-loop.md) |
+| add a new `DriftKind` (proto reservations included) | [how-to-add-a-drift-kind.md](how-to-add-a-drift-kind.md) |
+| drive a goldfive end-to-end run with harmonograf + adk-web + kikuchi + steer.py | [how-to-run-the-e2e.md](how-to-run-the-e2e.md) |
+
+The set is stable. If you think you need a new skill, first check
+whether one of the existing ones should be extended instead — skills
+that overlap are worse than skills that cross-reference.
 
 ## How these get referenced
 

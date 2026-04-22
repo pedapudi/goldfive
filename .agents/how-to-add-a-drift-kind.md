@@ -55,6 +55,14 @@ The Python-to-proto bridge is by name: the steerer looks up
 `SequentialExecutor._plan_divergence_drift_event`). The Python
 enum name and the proto enum suffix must match exactly.
 
+**Reserved slots 34-38.** The current highest assigned slot in
+`DriftKind` (proto) is typically in the mid-30s. Check the current
+proto file before picking a number; slots 34-38 are reserved for
+in-flight work (goldfive#181 tool-loop detector; goldfive#142
+intervention-ladder kinds; goldfive#143 `GOAL_DRIFT`). Always append
+to the end of the enum rather than filling gaps — that way two
+concurrent PRs don't collide on the same slot.
+
 ## 3. Regenerate the proto stubs
 
 ```bash

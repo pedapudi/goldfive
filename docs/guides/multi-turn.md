@@ -172,6 +172,28 @@ stable conversation identifier is inside the payload.
 - **Multi-user conversation routing.** One Runner, one Conversation.
   Multi-user systems should build a per-user Runner pool.
 
+## Overlay model + multi-turn under adk-web
+
+Under `adk web`, each user turn in the UI is a fresh
+`GoldfiveADKAgent._run_async_impl` call, which translates to one
+`runner.run(user_text, session_id=outer_sid)` pass. The outer
+adk-web session id (`ctx.session.id`) is stable across turns on the
+same URL, so:
+
+- Goldfive Session.id stays constant (pinned to outer id,
+  goldfive#161) — one harmonograf session row carries every turn.
+- Goldfive Conversation state accumulates normally: turn N sees
+  turn N-1's `completed_results` rendered into the planner prompt.
+- Each turn's plan is independent — different `plan.id`,
+  `revision_index` restarts at 0 — but harmonograf's UI shows them
+  all on the same session timeline.
+
+Overlay STEER mid-turn is an **in-turn restart** (the executor
+cancels the in-flight invoke and re-dispatches with the corrective
+message composed by the steerer). It does not create a new turn
+from the user-facing perspective — the harmonograf UI sees one
+continuous span with a PlanRevised marker partway through.
+
 ## Summary
 
 | Question                                     | Answer                                            |

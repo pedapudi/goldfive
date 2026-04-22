@@ -384,6 +384,44 @@ SQLitePersistenceSink("./shared.db", table="harmonograf_events")
 
 `replay_from_sqlite` and `list_runs` take the same `table=` argument.
 
+## Session id stability
+
+Under the adk-web integration, goldfive's `Session.id` is pinned to
+`ctx.session.id` (the adk-web URL session) before sub-agent dispatch
+runs (goldfive#161). adk-web keeps the same session id across
+reloads of the same URL, so JSONL logs keyed on `run_id` can reuse
+the same file across browser refreshes without producing duplicate
+session rows in harmonograf.
+
+In practice:
+
+- **Single file per URL session** — `./runs/{session_id}.jsonl`
+  append-mode tracks every turn on one conversation.
+- **Separate files per "new conversation" click** — after
+  `runner.new_conversation()` the adk-web session id stays the same
+  but the underlying Conversation resets, so downstream consumers
+  see a `ConversationEnded` / `ConversationStarted` boundary in the
+  stream.
+
+## Plan + goldfive state persistence
+
+`reconstruct_session` replays every `TaskStarted` / `TaskCompleted`
+/ `TaskFailed` / `TaskBlocked` / `TaskCancelled` to rebuild the
+plan's per-task status. It also:
+
+- Replays `PlanRevised` in order so the final `session.plan` matches
+  the last revision.
+- Replays `DriftDetected` into `session.history` so post-run analysis
+  can count per-kind occurrences.
+- Rebuilds `session.completed_results` from `TaskCompleted.summary`.
+- Does **not** rebuild `session.reasoning_history`,
+  `session.recent_agent_activity`, `session.refine_failure_counts`,
+  or `session.pending_approvals` — those live only in-process and
+  are reset on resume.
+
+If you need any of those across restarts, log them separately or
+extend `reconstruct_session` with your own replay hook.
+
 ## What's explicitly not in v0.1
 
 - **Live replay** — feeding JSONL back through sinks in real time.

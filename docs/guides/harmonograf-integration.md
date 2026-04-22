@@ -179,18 +179,58 @@ Because the proto values mirror harmonograf's existing ones
 = `"new_work_discovered"`, etc.), the frontend needs no changes other
 than pointing at the new messages.
 
-## Bidirectional control (future)
+## Bidirectional control
 
-In v0.1, goldfive is emit-only: the sink receives events but does not
-take control inputs. harmonograf's "steer", "pause", "cancel" control
-actions flow through a separate control channel from frontend → server
-→ client library.
+goldfive's `ControlChannel` is the inbound control surface. Pass one
+to `Runner(control=...)` (or via `goldfive.wrap(control=...)`) and
+the harmonograf UI's Steer / Pause / Cancel / Approve / Reject
+buttons become `ControlMessage` values in a companion task that
+bridges `client.observe()` → `channel.send(...)`. Acks ride back
+through `channel.acks()` → the harmonograf client's ack stream.
 
-A future goldfive version will expose a control-input surface (a way
-for an external system to synthesize a `DriftEvent(kind=USER_STEER)`
-and hand it to the running steerer). When that lands, harmonograf's
-control actions will flow through it. For now, use the per-agent
-control hooks harmonograf already provides.
+STEER messages carry an `annotation_id` (goldfive#171) that
+propagates through to the drift detail, the plan's `revision_reason`,
+and the resulting `DriftDetected.annotation_id` field — letting the
+UI deduplicate redundant clicks and show author metadata on each
+refine. See [../design/CONTROL.md](../design/CONTROL.md) for the
+complete protocol.
+
+## The two harmonograf hooks: sink + telemetry plugin
+
+Full observability of an ADK run needs **both** sides wired:
+
+```python
+import goldfive
+from google.adk.apps.app import App
+from harmonograf_client import Client, HarmonografSink, HarmonografTelemetryPlugin
+
+client = Client(name="my-agent", server_addr="127.0.0.1:7531")
+
+wrapped = goldfive.wrap(root_agent, sinks=[HarmonografSink(client)])
+app = App(
+    name="my-demo",
+    root_agent=wrapped,
+    plugins=[HarmonografTelemetryPlugin(client)],
+)
+```
+
+| Hook | Where | Captures |
+|---|---|---|
+| `HarmonografSink` | goldfive runner `sinks=[...]` | goldfive `Event` proto (RunStarted, PlanSubmitted, TaskStarted, TaskCompleted, DriftDetected, PlanRevised, …) |
+| `HarmonografTelemetryPlugin` | `App(plugins=[...])` or `goldfive.wrap(plugins=[...])` | ADK-native spans: INVOCATION (per-agent), LLM_CALL (per model request), TOOL_CALL (per tool call) |
+
+Both hooks dedupe by plugin `name` (goldfive#166). If you wire the
+plugin both at the App level and the goldfive.wrap level, only one
+instance lands on the runner.
+
+Per-LLM-call instrumentation logs (goldfive#172) ride alongside the
+spans:
+
+- `goldfive.llm.request invocation_id=… agent=… chars=… messages=…`
+- `goldfive.llm.response invocation_id=… agent=… duration_ms=… chars=… usage=…`
+
+These surface in harmonograf's drawer inspector as the LLM call's
+input/output preview.
 
 ## Running the two together
 

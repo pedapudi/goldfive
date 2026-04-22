@@ -48,6 +48,28 @@ envelopes — a sink only needs to handle that one shape. Dispatch on
 callers who want the simpler shape without proto, but no shipped
 goldfive component feeds dicts to sinks today.
 
+### Per-event `session_id` (field 5, goldfive#155)
+
+Every proto `Event` carries a `session_id` field (tag 5) populated
+from `Session.id` at emission time. `Session.id` aliases `run_id`,
+but under the adk-web integration it's **pinned** to the outer
+adk-web session id before sub-agent dispatch runs (goldfive#161), so
+every event in a run shares one id regardless of how many
+sub-Runners the tree spawned.
+
+Sinks that multiplex across sessions (the `HarmonografSink` reference
+is the canonical example) must route by `event.session_id`, not by
+client-global state:
+
+```python
+async def emit(self, event: Any) -> None:
+    session_id = getattr(event, "session_id", "") or event.run_id
+    await self._route_to_session(session_id, event)
+```
+
+This is what makes "one session row per run in harmonograf" work
+across overlay STEER restarts and nested AgentTool sub-Runners.
+
 ## A minimal stdout sink
 
 ```python

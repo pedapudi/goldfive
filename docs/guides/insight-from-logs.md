@@ -152,6 +152,97 @@ print("refine_failure_counts:", dict(s.refine_failure_counts))
 print(f"reasoning_history: {len(s.reasoning_history)} blocks")
 ```
 
+## Log signatures by subsystem
+
+Current `main` emits structured log lines at key orchestration
+decisions. Filter by logger name to drill into one subsystem:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+for name in (
+    "goldfive.runner",
+    "goldfive.planner",
+    "goldfive.steerer",
+    "goldfive.adapters.adk",
+    "goldfive.drift.tool_loops",
+    "goldfive.reconciler",
+):
+    logging.getLogger(name).setLevel(logging.DEBUG)
+```
+
+### Per-LLM-call instrumentation (goldfive#172)
+
+Every LLM call through the goldfive ADK plugin emits a request +
+response pair:
+
+```
+goldfive.llm.request  invocation_id=<id> agent=<name> chars=<n> messages=<n>
+goldfive.llm.response invocation_id=<id> agent=<name> duration_ms=<ms> chars=<n> usage=<dict>
+```
+
+Useful for:
+
+- Tracing slow turns (grep for `duration_ms=` and sort).
+- Spotting context-window pressure (compare request `chars=` trend).
+- Attributing cost (sum `usage.total_tokens` per agent).
+
+### STEER + refine + orphan heal
+
+When a user steer arrives:
+
+```
+SequentialExecutor._run_overlay: STEER received; cancelling in-flight invoke
+LLMPlanner._refine_user_steer: attempt 1/2: ...
+LLMPlanner._refine_user_steer: attempt 2/2: ...   # only on retry
+goldfive ADKAdapter: healed N orphan tool_call_id(s) after user_steer (pending=...)
+```
+
+The orphan-heal line (ADK-specific, goldfive#139) appends a synthetic
+`function_response` for every `function_call_id` the cancelled
+invocation left hanging, so the LLM sees a well-formed conversation
+on the next turn.
+
+Two consecutive `attempt 2/2` lines that end in an error mean
+`LLMPlanner` exhausted its retry budget; expect a
+`DriftDetected{kind=refine_validation_failed, severity=critical}` to
+follow.
+
+### Tool-loop detector (goldfive#181)
+
+When the `ToolLoopTracker` fires, the drift detail carries the mode:
+
+```jsonc
+{"drift_detected": {
+  "kind": "looping_reasoning",
+  "severity": "warning",
+  "detail": "tool_loop_exact: my_tool x 3 in last 7 calls",
+  "current_task_id": "..."
+}}
+```
+
+`tool_loop_exact:` / `tool_loop_name:` / `tool_loop_alternating:` in
+the detail identify which mode fired; `raw.mode` on the drift
+carries the same tag programmatically.
+
+### Plan reconciler observations
+
+The overlay reconciler emits DEBUG lines at every transition it
+attributes or skips:
+
+```
+PlanReconciler.on_before_agent: agent=writer matched task=t2 (RUNNING)
+PlanReconciler.on_after_agent: agent=writer completed task=t2
+PlanReconciler.get_missed_tasks: marking NOT_NEEDED: [t3, t4]
+```
+
+When an agent runs that has no matching plan task, the reconciler
+emits a `PLAN_DIVERGENCE` at INFO severity and the line reads:
+
+```
+PlanReconciler.on_before_agent: agent=inventor no matching PENDING task; emitted plan_divergence
+```
+
 ## Early warning for the filler-loop class
 
 goldfive has a set of structural guards against filler loops
@@ -167,28 +258,21 @@ sink = InMemorySink()
 
 tool_calls = Counter()
 for e in sink.events:
-    # Reporting-tool dispatch shows up as before_tool_callback in
-    # the underlying framework, not as a dedicated event. Look at
-    # the DriftDetected events of kind LOOPING_TOOL_CALL instead.
     if e.WhichOneof("payload") == "drift_detected":
         d = e.drift_detected
-        if d.kind == "DRIFT_KIND_LOOPING_TOOL_CALL":
+        if d.kind == "DRIFT_KIND_LOOPING_REASONING":
             tool_calls[d.detail] += 1
 
 print(tool_calls.most_common(5))
 ```
 
-If you see the same reporting-tool name dominating the count
-(> 30 calls with identical args, or > 50 calls across varied
-args on the same `task_id`), the guard detected a filler loop
-and cut it off. Cross-reference with
+`LOOPING_REASONING` covers both the reasoning-text loop detector (in
+`goldfive.drift.reasoning`) and the tool-call loop detector (in
+`goldfive.drift.tool_loops`, goldfive#181). The detail prefix
+identifies which — `tool_loop_*` for the tool-call path, `hash=` /
+`cosine=` for the reasoning-text path. Cross-reference with
 [how-to-debug-a-filler-loop.md](../../.agents/how-to-debug-a-filler-loop.md)
 for the postmortem playbook.
-
-For the pre-guard signal — counting raw tool invocations before
-any goldfive guard would fire — instrument the adapter's
-before-tool hook directly or read the harmonograf DB (next
-section).
 
 ## Capturing planner reasoning
 

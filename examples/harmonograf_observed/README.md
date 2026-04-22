@@ -2,8 +2,12 @@
 
 Minimal `CallableAdapter` agent wired to both an `InMemorySink` and a
 `HarmonografSink` so every goldfive event lands in the harmonograf UI.
-No LLM, no ADK, no Claude SDK — just a four-task `StaticPlanner` and a
-canned-reply callable.
+No LLM, no ADK, no Claude SDK — just a four-task `StaticPlanner` and
+a canned-reply callable.
+
+This is the smallest thing that puts real events on the harmonograf
+wire. For the full ADK + `HarmonografTelemetryPlugin` pairing see
+[`../presentation_agent/`](../presentation_agent/).
 
 ## What this shows
 
@@ -12,10 +16,15 @@ canned-reply callable.
   `harmonograf-client` and the paired `runner.close()` +
   `client.shutdown(flush_timeout=5.0)` teardown.
 - Graceful fallback: if `harmonograf_client` is not installed the
-  example still runs end-to-end with `InMemorySink` + `LoggingSink` and
-  prints a pointer to the observability guide.
-- The event counts reported by `InMemorySink` match what the harmonograf
-  console renders — useful as a sanity check when debugging the sink.
+  example still runs end-to-end with `InMemorySink` + `LoggingSink`
+  and prints a pointer to the observability guide.
+- Per-event `session_id` (goldfive#155) — every event carries the
+  same id since `CallableAdapter` runs have a single Session per
+  `runner.run()`. Server-side this gives one session row in
+  harmonograf.
+- The event counts reported by `InMemorySink` match what the
+  harmonograf console renders — useful as a sanity check when
+  debugging the sink.
 
 ## Prerequisites
 

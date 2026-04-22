@@ -104,13 +104,38 @@ When an event goes missing, look at who emits it:
 | Event | Emitted by |
 |---|---|
 | `RunStarted`, `GoalDerived`, `PlanSubmitted`, pre-executor `RunAborted` | `Runner` |
-| `TaskStarted`, `TaskProgress`, `TaskCompleted`, `TaskFailed`, `TaskBlocked`, `TaskCancelled` | `Steerer` (via `mark_task_*`) |
+| `TaskStarted`, `TaskProgress`, `TaskCompleted`, `TaskFailed`, `TaskBlocked`, `TaskCancelled` | `Steerer` (via `mark_task_*`). Under overlay mode, transitions are driven by `PlanReconciler.on_before_agent` / `on_after_agent` which call into the steerer. |
 | `PlanRevised`, terminal `RunCompleted` / `RunAborted` | `Executor` |
 | `DriftDetected` | `Steerer` |
+| `AgentInvocationStarted`, `AgentInvocationCompleted`, `DelegationObserved` | Goldfive ADK plugin via `before_agent` / `after_agent` / `before_tool` callbacks |
+
+Every `Event` carries `session_id` at tag 5 (goldfive#155). Sinks
+that multiplex must route by it, not by client-global state — under
+the adk-web pin (goldfive#161) the id equals `ctx.session.id` for
+the duration of a run, even across sub-Runners spawned by AgentTool.
 
 If your sink never sees `TaskStarted`, the executor never dispatched or
 the steerer is bypassed. If it never sees `RunCompleted`, the executor
 aborted — check `outcome.reason`.
+
+## Intervention ladder — which level fired?
+
+Every drift handled by `DefaultSteerer` routes to exactly one of six
+levels (goldfive#142), dictating what the steerer does next:
+
+| Level | Name | Action |
+|---|---|---|
+| 0 | OBSERVE | Record only; no refine. |
+| 1 | ABSORB | Call `planner.refine`; continue. |
+| 2 | NUDGE | Queue a soft follow-up message on `session.pending_nudges`; overlay loop picks it up at next invocation boundary. |
+| 3 | CANCEL_REINVOKE | Cancel in-flight invoke (`_tag_adapter_cancel_user_steer`), refine, compose corrective message on `session.pending_corrective_message`, overlay loop re-dispatches. |
+| 4 | PAUSE_ESCALATE | Emit `HUMAN_INTERVENTION_REQUIRED`, set `session.paused_for_human_intervention`; executor blocks until CONTROL_RESUME / STEER. |
+| 5 | TERMINATE | Run-level abort (rarely reached directly; actual termination is executor-driven on unhandled Level 4 timeouts). |
+
+The mapping lives in `DefaultSteerer._ladder_level_for` as a
+per-kind table keyed by `(occurrence_count, severity)`. To see which
+level fired, enable DEBUG on `goldfive.steerer` — the
+`_dispatch_ladder_level` routine logs each dispatch.
 
 ## Drift kinds and taxonomy
 
