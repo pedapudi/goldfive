@@ -87,6 +87,9 @@ def _tag_adapter_cancel_user_steer(adapter: Any) -> None:
         )
 
 
+_DEFAULT_MAX_NUDGE_REPLAYS: int = 3
+
+
 class SequentialExecutor(Executor):
     """Single-threaded executor that drives one task at a time.
 
@@ -190,6 +193,13 @@ class SequentialExecutor(Executor):
         # already encode that model keep working. The ``goldfive.wrap``
         # convenience flips this to True by default.
         self.overlay_mode = bool(overlay_mode)
+
+    # goldfive#202: cap on the overlay's nudge-driven re-invoke loop.
+    # Each pass that the steerer queues a Level 2 nudge burns one.
+    # Class attribute (not a constructor kwarg) so subclasses can tune
+    # it without expanding the public constructor surface; also keeps
+    # it out of ``legacy_kwargs`` handling above.
+    _MAX_NUDGE_REPLAYS: int = _DEFAULT_MAX_NUDGE_REPLAYS
 
     # ------------------------------------------------------------------
     # Executor protocol
@@ -515,8 +525,26 @@ class SequentialExecutor(Executor):
             if tracked_status == TaskStatus.FAILED:
                 failure_reason = f"task {task.id} failed"
                 if self.fail_fast:
-                    run_failed = True
-                    break
+                    # goldfive#202: a FAILED task with a live replacement
+                    # in the current plan (refine-spawned successor, e.g.
+                    # ``retry_<id>`` or ``<id>_v2``) is NOT fatal — the
+                    # replacement is the forward-progress path. Only
+                    # abort when no replacement exists.
+                    live_plan = session.plan or current_plan
+                    failed_task = _find_task(live_plan, task.id)
+                    has_replacement = failed_task is not None and _has_live_replacement(
+                        live_plan, failed_task
+                    )
+                    if has_replacement:
+                        log.info(
+                            "SequentialExecutor: fail_fast skipped for task=%s — "
+                            "live replacement present in current plan revision",
+                            task.id,
+                        )
+                        failure_reason = ""  # not actually fatal
+                    else:
+                        run_failed = True
+                        break
                 # else: continue to next eligible task.
 
             # Session.current_task_id gets reset by the next iteration.
@@ -563,12 +591,17 @@ class SequentialExecutor(Executor):
             )
             return ExecutionOutcome(success=False, session=session, reason=reason)
 
-        # If fail_fast=False and some task ended FAILED, the run is only
-        # "successful" in the best-effort sense. Match harmonograf: report
-        # success=False with a reason when any task is terminal-failed.
-        any_failed = _any_failed(session.plan or plan)
-        if any_failed and not self.fail_fast:
-            reason = "one or more tasks failed (fail_fast=False)"
+        # If fail_fast=False and some task ended FAILED with no live
+        # replacement, the run is only "successful" in the best-effort
+        # sense. Match harmonograf: report success=False with a reason
+        # when any task is truly terminal-failed (goldfive#202: a FAILED
+        # task whose refine-spawned successor is live is not fatal).
+        fatally_failed = _fatally_failed_task_ids(session.plan or plan)
+        if fatally_failed and not self.fail_fast:
+            reason = (
+                "one or more tasks failed without a live replacement "
+                f"(fail_fast=False): {', '.join(tid for tid in fatally_failed if tid)}"
+            )
             await emit(
                 sinks,
                 run_aborted_event(
@@ -723,10 +756,28 @@ class SequentialExecutor(Executor):
         # the tree runs the revised plan. This is why the loop is a
         # ``while True`` — a steer restarts the invocation against
         # the new plan; ``cancelled`` / ``adapter_error`` terminates
-        # the run; ``result`` falls through to the NOT_NEEDED sweep.
+        # the run; ``result`` falls through to a (scoped) nudge-replay
+        # check (goldfive#202) and then the NOT_NEEDED sweep.
         # See goldfive#149 for the regression this guards against.
+        #
+        # goldfive#202 re-introduces — in a narrowly scoped form — a
+        # post-invocation re-invoke that #163 removed wholesale. The
+        # #163 removal was correct for the "every PENDING at invocation
+        # end triggers a follow-up" case (flow-prompted coordinators
+        # re-ran their entire pipeline on every such message, turning
+        # a 10-min run into 40+ min). But when the steerer explicitly
+        # queues a nudge via ``session.pending_nudges`` in response to
+        # an autonomous drift + plan revision (e.g. LOOPING_REASONING
+        # → refine spawned ``<task>_v2``), the coordinator has no way
+        # to know its plan changed; without a follow-up it keeps
+        # retrying the superseded task. The nudge-replay path below
+        # fires ONLY when the steerer explicitly asked for it (a nudge
+        # is queued) AND there is still live work to do; capped at
+        # ``_MAX_NUDGE_REPLAYS`` so a pathological nudge-queueing drift
+        # cannot re-introduce the #163 amplification.
         current_user_input = user_input
         failure_reason = ""
+        nudge_replays = 0
         while True:
             kind, payload = await self._invoke_passthrough_with_control(
                 adapter=adapter,
@@ -790,8 +841,39 @@ class SequentialExecutor(Executor):
                 # Restart the invocation with the steer body as the
                 # new user input.
                 continue
-            # kind == "result": invocation ended normally; fall
-            # through to the NOT_NEEDED sweep.
+            # kind == "result": invocation ended normally. Before
+            # falling through to the NOT_NEEDED sweep, check whether
+            # the steerer queued a Level 2 nudge during this invocation
+            # (e.g. LOOPING_REASONING drift → refine spawned a
+            # replacement task → nudge queued describing the pivot).
+            # If so, and there is still live work for the tree to do,
+            # consume the queued nudge(s) as the next user message
+            # and re-invoke. Bounded by ``_MAX_NUDGE_REPLAYS`` to
+            # prevent the #163-style amplification: a coordinator
+            # whose tree keeps producing nudge-eligible drift on every
+            # turn must eventually stop triggering re-invokes.
+            pending = list(session.pending_nudges)
+            if (
+                pending
+                and nudge_replays < self._MAX_NUDGE_REPLAYS
+                and _has_live_pending_or_running(session.plan or plan)
+            ):
+                session.pending_nudges.clear()
+                nudge_replays += 1
+                current_user_input = self._compose_nudge_replay_message(pending)
+                log.info(
+                    "SequentialExecutor._run_overlay: nudge replay %d/%d "
+                    "(nudges=%d) — re-invoking passthrough with queued nudge",
+                    nudge_replays,
+                    self._MAX_NUDGE_REPLAYS,
+                    len(pending),
+                )
+                # Reset reconciler bookkeeping so the revised plan's
+                # tasks map fresh. The refine that queued the nudge
+                # likely added new PENDING tasks that reconciler-side
+                # agent claims should re-match against.
+                reconciler.reset_for_new_plan(session.plan)
+                continue
             break
 
         # --- PENDING → NOT_NEEDED on invocation end (goldfive#163). ----
@@ -824,8 +906,17 @@ class SequentialExecutor(Executor):
                 )
 
         # --- Terminal emission: success if no failures. -----------
-        if _any_failed(session.plan or plan) and self.fail_fast:
-            reason = "one or more tasks failed"
+        # goldfive#202: a FAILED task with a live replacement (refine
+        # spawned a successor like ``retry_<id>`` / ``<id>_v2``) is not
+        # fatal — the replacement is the forward-progress path. Only
+        # abort when at least one FAILED task has no live replacement
+        # in the current plan revision.
+        fatally_failed = _fatally_failed_task_ids(session.plan or plan)
+        if fatally_failed and self.fail_fast:
+            reason = (
+                "one or more tasks failed without a live replacement: "
+                f"{', '.join(tid for tid in fatally_failed if tid)}"
+            )
             await emit(
                 sinks,
                 run_aborted_event(
@@ -1203,6 +1294,46 @@ class SequentialExecutor(Executor):
             log.warning("SequentialExecutor: steerer.observe(STEER) raised: %s", exc)
 
     @staticmethod
+    def _compose_nudge_replay_message(nudges: list[str]) -> str:
+        """Wrap queued nudges in a goldfive-authored framing header.
+
+        Mirrors :meth:`_compose_steer_restart_message` but for the
+        autonomous-nudge path (goldfive#202). The LLM sees:
+
+        * A header distinguishing this from a fresh user turn: the
+          operator did not intervene; goldfive detected drift (e.g.
+          repeated ``report_task_completed`` calls), revised the plan,
+          and is directing the coordinator to the new next task.
+        * Each queued nudge verbatim (short, action-focused strings
+          composed by :func:`compose_corrective_user_message`).
+        * A brief instruction to continue with the revised plan.
+
+        The scoped replay path is the carefully-narrowed successor to
+        the blanket follow-up loop that goldfive#163 removed. #163's
+        removal was correct when every PENDING task triggered a
+        follow-up; this path only fires when the STEERER explicitly
+        queued a nudge in response to a tracked drift + plan
+        revision — not on every PENDING-at-invocation-end.
+        """
+        body = "\n".join(f"- {n}" for n in nudges if n)
+        return (
+            "[GOLDFIVE PLAN REVISION — replace superseded task(s)]\n"
+            "\n"
+            "Goldfive detected drift during the prior turn and revised "
+            "the active plan. The task you were last working on has "
+            "been superseded by a replacement. Proceed with the "
+            "replacement; do NOT retry the prior task.\n"
+            "\n"
+            f"{body}\n"
+            "\n"
+            "Notes:\n"
+            "- Continue the run with the revised plan. Resume with the "
+            "next unfinished task — the replacement mentioned above, "
+            "or any other PENDING task your tree still owns.\n"
+            "- Do not re-invoke reporting tools for the superseded task."
+        )
+
+    @staticmethod
     def _compose_steer_restart_message(msg: object, *, fallback: str) -> str:
         """Wrap a STEER body in a goldfive-authored override header.
 
@@ -1325,6 +1456,112 @@ def _lineage_root(task_id: str) -> str:
 
 def _any_failed(plan: Plan) -> bool:
     return any(t.status == TaskStatus.FAILED for t in plan.tasks)
+
+
+def _has_live_pending_or_running(plan: Plan) -> bool:
+    """Return True if the plan has any PENDING or RUNNING task left.
+
+    Used by the overlay's nudge-replay gate (goldfive#202): a queued
+    nudge should only trigger a re-invoke when there is actually
+    outstanding work for the coordinator to do. Guards against replaying
+    against a terminated plan.
+    """
+    return any(t.status in (TaskStatus.PENDING, TaskStatus.RUNNING) for t in plan.tasks)
+
+
+def _has_live_replacement(plan: Plan, failed: Task) -> bool:
+    """Return True iff ``failed`` has a *live* replacement task in ``plan``.
+
+    A replacement task is one the planner spawned to supersede
+    ``failed`` — a forward-progress successor, not a predecessor. We
+    require it to be PENDING or RUNNING (never COMPLETED) so a
+    COMPLETED sibling lineage peer (``t0`` when ``retry_retry_t0`` is
+    the failure) does NOT mask the failure — that's a predecessor, not
+    a replacement. See goldfive#202.
+
+    Matched via one of two id conventions goldfive's refine path
+    produces (structural inference; no proto ``replaces`` field):
+
+    * Shared retry lineage: ``_lineage_root(R.id) == _lineage_root(failed.id)``.
+      Catches ``retry_<id>``, ``retry2_<id>`` etc. — the pattern the
+      refine system prompt historically emitted (see PLAN-LIFECYCLE.md
+      §7.3).
+    * Versioned replacement: ``R.id`` starts with ``<failed.id>_``
+      (``define_structure`` → ``define_structure_v2``, ``..._retry``,
+      etc.). Empirically the shape LLM planners emit when the refine
+      prompt does NOT encode a ``retry_`` convention.
+
+    Additionally require ``R.assignee_agent_id == failed.assignee_agent_id``
+    when both are populated, so a task owned by a different agent doesn't
+    accidentally mask a genuine failure.
+
+    Lives in the executor (not a proto field on :class:`Task`) to avoid
+    a cross-cutting contract change through planner JSON shapes and
+    prompt templates. Structural inference is adequate: the refine
+    output is always validated against :meth:`Plan.validate`, so the
+    shapes here are the shapes the planner actually emits.
+    """
+    failed_root = _lineage_root(failed.id)
+    for r in plan.tasks:
+        if r.id == failed.id or not r.id:
+            continue
+        # FAILED / CANCELLED are obviously not replacements.
+        if r.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            continue
+        # Convention match. The two patterns have different chronological
+        # semantics w.r.t. the FAILED task:
+        # * Versioned pattern (``<failed_id>_<suffix>`` like
+        #   ``define_structure_v2``) is conventionally a SUCCESSOR — a
+        #   planner would not emit ``..._v2`` before ``v1`` had run —
+        #   so PENDING / RUNNING / COMPLETED all count as a live
+        #   replacement.
+        # * Shared retry lineage (``retry_<id>``, ``retry2_<id>``)
+        #   is CHRONOLOGY-AMBIGUOUS — ``t0`` COMPLETED + ``retry_t0``
+        #   COMPLETED + ``retry_retry_t0`` FAILED describes predecessors
+        #   of the FAILED task, not replacements. So retry-lineage peers
+        #   only count when PENDING / RUNNING (clear "still to run").
+        versioned = r.id.startswith(f"{failed.id}_")
+        same_lineage = (
+            not versioned  # don't double-count versioned-and-lineage
+            and _lineage_root(r.id) == failed_root
+            and r.id != failed.id
+        )
+        if versioned:
+            pass  # any non-FAILED / non-CANCELLED state counts
+        elif same_lineage:
+            if r.status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
+                continue
+        else:
+            continue
+        # Assignee scoping when both are populated — narrow false positives.
+        if (
+            failed.assignee_agent_id
+            and r.assignee_agent_id
+            and r.assignee_agent_id != failed.assignee_agent_id
+        ):
+            continue
+        return True
+    return False
+
+
+def _fatally_failed_task_ids(plan: Plan) -> list[str]:
+    """Return FAILED task ids with NO live replacement in ``plan``.
+
+    Used by :class:`SequentialExecutor`'s ``fail_fast`` gate so a FAILED
+    task whose refine-time replacement is still live (PENDING / RUNNING
+    / COMPLETED) does not abort the run. Without this check,
+    ``fail_fast=True`` would see the refine's FAILED mark and abort
+    before the replacement gets a chance to execute — defeating the
+    point of the refine. See goldfive#202.
+    """
+    fatal: list[str] = []
+    for t in plan.tasks:
+        if t.status != TaskStatus.FAILED:
+            continue
+        if _has_live_replacement(plan, t):
+            continue
+        fatal.append(t.id or "")
+    return fatal
 
 
 def _pending_task_ids(plan: Plan) -> list[str]:
