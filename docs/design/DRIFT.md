@@ -132,7 +132,7 @@ parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
 
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
-| `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). Also fired by the tool-call-loop detector in `goldfive.drift.tool_loops` when the ADK plugin's `after_tool_callback` observes repeated `(tool_name, args_hash)` patterns (exact / name / alternating) — see goldfive#181. | `warning` (`info` for the alternating-cycle variant) | yes |
+| `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). Also fired by the tool-call-loop detector in `goldfive.drift.tool_loops` when the ADK plugin's `after_tool_callback` observes repeated `(tool_name, args_hash)` patterns (exact / name / alternating) — see goldfive#181 and the graduated-severity table in goldfive#204. | `info` · `warning` · `critical` (graduated per tool category + count; `info` for the alternating-cycle variant) | yes |
 | `REASONING_CLUSTER_TIGHTENING` | Max cosine similarity between current reasoning and the last N=5 blocks falls in `[0.75, 0.9)` (opt-in, `goldfive[embedding]`). Graduated early-warning tier below the `LOOPING_REASONING` cliff. One-shot per task. | `info` | yes |
 | `CONFUSION` | Reasoning text has ≥ 3 uncertainty markers ("I'm not sure", "wait", "hmm", …). | `info` | yes |
 | `OFF_TOPIC` | Reasoning cosine-distance from the current task description ≥ `0.7` (requires `goldfive[embedding]`). | `warning` | yes |
@@ -425,31 +425,102 @@ whether to escalate.
 ## Tool-call loop detection (`ToolLoopTracker`)
 
 Per-invocation tool-call loop detector in
-`goldfive/drift/tool_loops.py` (goldfive#181, landed in PR #186). The
-ADK plugin's `after_tool_callback` forwards every tool dispatch —
-reporting tools, AgentTool delegations, MCP tools, custom adapter-
-native tools — into a `ToolLoopTracker` keyed on `(invocation_id,
-agent_name)`. Three patterns fire a `LOOPING_REASONING` drift
-(severity depends on mode):
+`goldfive/drift/tool_loops.py` (goldfive#181, landed in PR #186;
+graduated severity added in goldfive#204). The ADK plugin's
+`after_tool_callback` forwards every tool dispatch — reporting tools,
+AgentTool delegations, MCP tools, custom adapter-native tools — into a
+`ToolLoopTracker` keyed on `(invocation_id, agent_name)`. Matches fire
+a `LOOPING_REASONING` drift; severity depends on mode, count, and
+**tool category**.
 
-| Mode | Trigger | Severity | `raw["mode"]` |
-|---|---|---|---|
-| **Exact loop** | Same `(tool_name, args_hash)` ≥ `exact_threshold=3` times in the last `window=7` calls. | `warning` | `"exact"` |
-| **Name loop** | Same `tool_name` (any args) ≥ `name_threshold=5` times in the window AND no task progress recorded since the window started filling. | `warning` | `"name"` |
-| **Alternating cycle** | A,B,A,B,A pattern over the last `alternating_threshold=5` calls. Suppressed when exact or name mode already fired on the same pair. | `info` | `"alternating"` |
+### Meta-tool vs work-tool classification (goldfive#204)
 
-Thresholds tunable via `GOLDFIVE_TOOL_LOOP_WINDOW` /
-`GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` /
-`GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` /
-`GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD` env vars;
-`load_thresholds_from_env()` reads them.
+Not every tool loop is the same. A `report_task_completed × 3` is the
+agent *reporting* state it already reported — usually cheap and
+idempotent on a healthy handler (goldfive#201 made the handlers
+idempotent). A `web_developer_agent × 3` is a *work* loop burning LLM
+tokens.
 
-**Task-progress gate.** Mode 2 requires "no task progress in window";
-`ToolLoopTracker.on_task_progress(invocation_id, agent_name)` clears
-the per-agent buffer whenever a task transitions to a progress state.
-A legitimate repeating tool that *completes* its task (e.g.
-`read_file read_file read_file → report_task_completed`) is not
-flagged because the next observation starts from an empty window.
+The tracker classifies each tool call via `_classify_tool_category`:
+
+- **`meta`** — progress-reporting / metadata tools. Matches `report_task_*`
+  prefixes and `report_awaiting_approval`.
+- **`work`** — every other tool (agent delegations, MCP tools,
+  adapter-native tools, …).
+
+The same loop pattern fires at **different severity** depending on
+category. The tracker walks tiers from highest severity to lowest and
+emits ONE drift at the first matching tier — no cascade of
+`INFO + WARNING + CRITICAL` on the same window.
+
+### Graduated severity table
+
+| Category | Axis | INFO | WARNING | CRITICAL |
+|---|---|---|---|---|
+| `meta`   | exact | 3 | 6 | 10 |
+| `meta`   | name  | —  | — | —  |
+| `work`   | exact | 3 | 3 | 6  |
+| `work`   | name  | — | 5 | 7  |
+
+"exact" counts identical `(tool_name, args_hash)` signatures in the
+window; "name" counts same-`tool_name`-any-args signatures. Category
+is determined per tool — a window containing 3 meta retries **and** 3
+work retries classifies each tool independently and picks the highest
+severity across tools.
+
+An independent **alternating-cycle** mode still fires INFO when the
+last `alternating_threshold=5` calls match an `A,B,A,B,A` pattern
+(suppressed when an exact/name drift already fired on the same
+window).
+
+Every drift's `raw` dict now carries:
+
+- `category` — `"meta"` or `"work"`.
+- `tier` — `"info"` | `"warning"` | `"critical"`.
+- `mode` — `"exact"` | `"name"` | `"alternating"`.
+- `tool_name`, `count`, `window_len`, `invocation_id` (as before).
+
+Thresholds at the **window size** and alternating length are tunable
+via `GOLDFIVE_TOOL_LOOP_WINDOW` / `GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD`.
+The legacy `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` /
+`GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` env vars still work and override
+the **work-category WARNING tier** only (preserving pre-#204
+single-threshold semantics). The graduated CRITICAL tiers and the
+meta-category thresholds are module-level constants (grouped in
+`_META_THRESHOLDS` / `_WORK_THRESHOLDS`) pending a follow-up that
+exposes them via `ServerConfig`.
+
+### Ladder routing for graduated severity
+
+The intervention ladder (below) routes `LOOPING_REASONING` by
+severity:
+
+- **INFO** → Level 0 (`OBSERVE`): record the drift, no plan mutation.
+  This is the benign tier — meta-tool retries at count 3 land here.
+- **WARNING** → Level 1 (`ABSORB`): call `planner.refine`. Unchanged
+  from pre-#204 — work-tool loops at 3+ calls, meta at 6+, work
+  name-axis at 5.
+- **CRITICAL** first → Level 2 (`NUDGE`): refine **and** queue a soft
+  corrective follow-up on `session.pending_nudges` for the overlay
+  loop to pick up. Coordinates with the forward-progress work that
+  wires nudge consumption.
+- **CRITICAL** repeat → Level 4 (`PAUSE_ESCALATE`): if the loop
+  survives the nudge and re-fires CRITICAL after
+  `REFINE_FAILURE_THRESHOLD` occurrences, escalate to a human pause.
+
+### Task-progress gate
+
+**Task-progress gate.** Mode 2 (name axis) requires "no task progress
+in window"; `ToolLoopTracker.on_task_progress(invocation_id,
+agent_name)` clears the per-agent buffer whenever a task transitions
+to a progress state. A legitimate repeating tool that *completes* its
+task (e.g. `read_file read_file read_file → report_task_completed`)
+is not flagged because the next observation starts from an empty
+window. The plugin gates `on_task_progress` on an acknowledged
+success response from the progress-reporting tool (goldfive#192) so
+errored `report_task_*` retries still accumulate.
+
+### Isolation
 
 **Isolation.** Each `(invocation_id, agent_name)` gets its own ring
 buffer, so parallel AgentTool sub-invocations within one outer
@@ -476,8 +547,8 @@ the authoritative table.
 |---|---|---|---|
 | **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift. |
 | **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `PLAN_DIVERGENCE`, `TOOL_ERROR`, `AGENT_REFUSAL`, `INTENT_DIVERGENCE`, etc.); CRITICAL first-occurrence of most kinds. |
-| **2** | `NUDGE` | Queue a short corrective user message on `session.pending_nudges` for the Runner's overlay loop to pick up at the next invocation boundary. (Not used by default — table entries prefer Level 1 or Level 3. Reserved for future policies.) | Caller overrides. |
-| **3** | `CANCEL_REINVOKE` | Cancel in-flight invocation; refine; compose a corrective user message via `compose_corrective_user_message` for the overlay loop to re-invoke with. | CRITICAL first-occurrence for most refinable kinds (`LOOPING_REASONING`, `PLAN_DIVERGENCE`, `TOOL_ERROR`, `RUNAWAY_DELEGATION`, ...). |
+| **2** | `NUDGE` | Queue a short corrective user message on `session.pending_nudges` for the Runner's overlay loop to pick up at the next invocation boundary. | `LOOPING_REASONING` at CRITICAL (first occurrence) after goldfive#204 — gives the agent a soft corrective prompt before escalating. Also available for caller overrides. |
+| **3** | `CANCEL_REINVOKE` | Cancel in-flight invocation; refine; compose a corrective user message via `compose_corrective_user_message` for the overlay loop to re-invoke with. | CRITICAL first-occurrence for most refinable kinds (`PLAN_DIVERGENCE`, `TOOL_ERROR`, `RUNAWAY_DELEGATION`, ...). (`LOOPING_REASONING` CRITICAL-first now routes to Level 2 via goldfive#204.) |
 | **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; set `session.paused_for_human_intervention = True`; do NOT call `planner.refine`. Runner blocks until a user `RESUME` / `STEER` arrives. | `GOAL_DRIFT` (first & repeat); `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind. |
 | **5** | `TERMINATE` | Run-level abort. Currently only reachable when a Level-4-initiated pause times out and `HUMAN_INTERVENTION_REQUIRED` re-fires as a repeat CRITICAL. | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
 

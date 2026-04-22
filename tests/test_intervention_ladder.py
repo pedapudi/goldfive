@@ -72,13 +72,18 @@ _CASES: list[tuple[DriftKind, DriftSeverity, int, InterventionLevel]] = [
         0,
         InterventionLevel.CANCEL_REINVOKE,
     ),
-    # LOOPING_REASONING (no INFO tier in the classifier).
+    # LOOPING_REASONING: graduated severity landed in goldfive#204.
+    # INFO (meta-tool retries at low counts) -> OBSERVE; WARNING ->
+    # ABSORB (unchanged); CRITICAL first -> NUDGE (refine + queue
+    # corrective message for overlay loop); CRITICAL repeat ->
+    # PAUSE_ESCALATE.
+    (DriftKind.LOOPING_REASONING, DriftSeverity.INFO, 0, InterventionLevel.OBSERVE),
     (DriftKind.LOOPING_REASONING, DriftSeverity.WARNING, 0, InterventionLevel.ABSORB),
     (
         DriftKind.LOOPING_REASONING,
         DriftSeverity.CRITICAL,
         0,
-        InterventionLevel.CANCEL_REINVOKE,
+        InterventionLevel.NUDGE,
     ),
     (
         DriftKind.LOOPING_REASONING,

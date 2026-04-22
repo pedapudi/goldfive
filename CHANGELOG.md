@@ -145,6 +145,27 @@ instrumentation — lands alongside.
   (args-quality classification), [#183](https://github.com/pedapudi/goldfive/issues/183)
   (silent tool success / no-progress), [#185](https://github.com/pedapudi/goldfive/issues/185)
   (wrong-tool-for-job).
+- [#204](https://github.com/pedapudi/goldfive/pull/204) **Graduated severity
+  for the tool-loop detector: meta vs work.** The pre-#204 detector fired
+  a flat `WARNING` at 3 exact repeats regardless of tool kind, cascading
+  benign `report_task_completed` retries (meta tools — usually idempotent
+  state-reporting) into plan revisions. Now classified into two categories
+  with their own ladders:
+
+  | Category | Tier INFO | Tier WARNING | Tier CRITICAL |
+  |---|---|---|---|
+  | `meta` (`report_task_*`, `report_awaiting_approval`) | exact=3 | exact=6 | exact=10 |
+  | `work` (every other tool) | exact=3 | exact=3 / name=5 | exact=6 / name=7 |
+
+  The tracker picks the **highest** tier matched in the window and emits
+  one drift (no cascade). Every drift's `raw` dict now carries `category`
+  and `tier` alongside `mode`. The ladder in `DefaultSteerer._LADDER`
+  maps `LOOPING_REASONING` accordingly: INFO → OBSERVE (no plan mutation
+  on benign meta retries), WARNING → ABSORB (refine), CRITICAL first →
+  NUDGE (refine + queue corrective follow-up), CRITICAL repeat →
+  PAUSE_ESCALATE. Default `window` bumped from 7 to 10 so the
+  meta-CRITICAL tier at 10 can actually fire. Env overrides continue to
+  override the work-WARNING tier for backwards compatibility.
 
 ### Earlier
 

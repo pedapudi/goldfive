@@ -472,9 +472,7 @@ class DefaultSteerer:
             session.agent_notes[task_id] = detail
         # goldfive#152: stamp current_task_* on the orchestration-state
         # dict so downstream prompt templates / refine paths see it.
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.RUNNING
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.RUNNING)
         await self._emit_task_started(session, task_id, detail)
 
     async def mark_task_progress(
@@ -521,9 +519,7 @@ class DefaultSteerer:
         if summary:
             session.completed_results[task_id] = summary
         # goldfive#152: clear current_task_* if we were the active task.
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.COMPLETED
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.COMPLETED)
         await self._emit_task_completed(session, task_id, summary, artifacts or {})
 
     async def mark_task_failed(
@@ -560,9 +556,7 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         task.status = TaskStatus.FAILED
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.FAILED
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.FAILED)
         await self._emit_task_failed(session, task_id, reason, recoverable)
         # Fatal failures cascade downstream via the same primitive used
         # by mark_task_cancelled, so both §6.2 and §6.3 produce the
@@ -642,9 +636,7 @@ class DefaultSteerer:
             # TaskCancelled events for downstream tasks on every call.
             return
         task.status = TaskStatus.CANCELLED
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.CANCELLED
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.CANCELLED)
         await self._emit_task_cancelled(session, task_id, reason)
         await self.cascade_cancel_downstream(session, task_id)
 
@@ -677,9 +669,7 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         task.status = TaskStatus.NOT_NEEDED
-        _ostate.sync_current_task_from_transition(
-            session.state, task, TaskStatus.NOT_NEEDED
-        )
+        _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.NOT_NEEDED)
         # There is no dedicated ``TaskNotNeeded`` proto message;
         # reuse TaskCancelled with the reason prefix so sinks that
         # inspect reason can differentiate if they wish. The live
@@ -794,9 +784,7 @@ class DefaultSteerer:
         """
         if self._is_duplicate_steer(event, session):
             steer_id = self._steer_dedupe_id(event)
-            log.debug(
-                "DefaultSteerer.observe: dropping duplicate STEER id=%s", steer_id
-            )
+            log.debug("DefaultSteerer.observe: dropping duplicate STEER id=%s", steer_id)
             return
         drift = self._drift_from_control(event, session)
         if drift is None:
@@ -1698,10 +1686,23 @@ class DefaultSteerer:
             InterventionLevel.ABSORB,
             (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
         ),
+        # LOOPING_REASONING: severity is now graduated (goldfive#204)
+        # -- the tool-loop detector emits INFO / WARNING / CRITICAL
+        # based on count + category (meta vs work). The ladder mirrors
+        # that graduation:
+        #
+        # * INFO  -> OBSERVE (default fallback; benign meta-tool retries
+        #   at the first threshold should not mutate the plan).
+        # * WARNING -> ABSORB (refine plan; unchanged from pre-#204).
+        # * CRITICAL first -> NUDGE (refine AND queue a soft corrective
+        #   follow-up for the overlay loop -- Agent B wires the nudge
+        #   consumption in goldfive#forward-progress).
+        # * CRITICAL repeat -> PAUSE_ESCALATE (escalate to human if the
+        #   loop persists past nudge).
         DriftKind.LOOPING_REASONING: (
             None,
             InterventionLevel.ABSORB,
-            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+            (InterventionLevel.NUDGE, InterventionLevel.PAUSE_ESCALATE),
         ),
         DriftKind.LOOPING_TOOL_CALL: (
             None,
@@ -1963,9 +1964,7 @@ class DefaultSteerer:
         # event — a cheap, always-available "turn" proxy.
         at_turn = getattr(session, "_next_sequence", 0) or 0
         try:
-            _ostate.set_active_steer(
-                session.state, body=body, at_turn=at_turn, author=author
-            )
+            _ostate.set_active_steer(session.state, body=body, at_turn=at_turn, author=author)
         except Exception as exc:  # noqa: BLE001
             log.debug(
                 "DefaultSteerer._apply_user_steer_state: set_active_steer raised: %s",
@@ -1980,8 +1979,7 @@ class DefaultSteerer:
                 _ostate.record_processed_steer_id(session.state, steer_id)
             except Exception as exc:  # noqa: BLE001
                 log.debug(
-                    "DefaultSteerer._apply_user_steer_state: "
-                    "record_processed_steer_id raised: %s",
+                    "DefaultSteerer._apply_user_steer_state: record_processed_steer_id raised: %s",
                     exc,
                 )
         if not body:
