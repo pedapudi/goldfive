@@ -170,6 +170,18 @@ class Task:
     predicted_start_ms: int = 0
     predicted_duration_ms: int = 0
     bound_span_id: str = ""
+    #: goldfive#205 — structured reason for the most recent CANCELLED /
+    #: FAILED transition. Colon-prefixed tag + provenance id:
+    #: ``upstream_failed:<id>``, ``run_aborted:<reason>``,
+    #: ``user_cancel:<annotation_id>``, ``user_steer:<annotation_id>``,
+    #: ``superseded_by_revision:<replacement_id>``. Empty for PENDING /
+    #: RUNNING / COMPLETED / BLOCKED tasks. Populated by downstream
+    #: sinks (harmonograf's ingest pipeline, persistence sink) from the
+    #: ``TaskCancelled.reason`` / ``TaskFailed.reason`` envelope fields;
+    #: goldfive's own in-memory planner / steerer does not mutate this
+    #: field — it exists so storage-backed consumers have a stable
+    #: schema slot threaded through the Task dataclass they re-export.
+    cancel_reason: str = ""
 
 
 @dataclasses.dataclass
