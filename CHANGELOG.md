@@ -2,9 +2,151 @@
 
 All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
-## Unreleased
+## Unreleased — 2026-04-21
 
-### Changed
+Overview of the arc since the last doc refresh: **goldfive stopped driving
+per-task and became an overlay.** `goldfive.wrap` now hands the user's
+original request to the tree once, observes via ADK callbacks, and steers
+structurally through `GoldfivePlanner` + a drift ladder rather than
+rewriting each turn. The supporting work — session-state namespace,
+per-event session_id, steer idempotency, tool-loop detector, LLM-call
+instrumentation — lands alongside.
+
+### Execution-model refactor (overlay)
+
+- [#135](https://github.com/pedapudi/goldfive/pull/135) **Single-Runner revert.**
+  Rolled back the #120 N-runners registry-dispatch. Goldfive now wraps one
+  `InMemoryRunner` around the caller-supplied root agent and drives it via
+  `ADKAdapter.invoke(_passthrough|_follow_up)`. Delegation happens natively
+  through ADK (`AgentTool`, `transfer_to_agent`, `sub_agents`). `#120`'s
+  state-protocol, reporting-tool augmentation, and sink-event coverage are
+  preserved; per-invocation AgentTool-spawn cap added as a backstop
+  (`ADKAdapter(agent_tool_cap=16)` by default; `RUNAWAY_DELEGATION` drift
+  on exceed).
+- [#140](https://github.com/pedapudi/goldfive/pull/140) **Contextual plan
+  reconciliation.** `PlanReconciler` matches observed agent activity via
+  `parent_invocation_id` so nested `AgentTool` runs no longer trip
+  cross-task attribution.
+- [#148](https://github.com/pedapudi/goldfive/pull/148) **Overlay execution
+  model.** Merged on #141-#144. One `invoke_passthrough` per run; the
+  `PlanReconciler` observes via ADK callbacks. Drop per-task driving
+  entirely for overlay-mode executors. `SequentialExecutor(overlay_mode=True)`
+  is the default for `goldfive.wrap`.
+- [#147](https://github.com/pedapudi/goldfive/pull/147) **Intervention ladder**
+  Levels 0-5: OBSERVE / ABSORB / NUDGE / CANCEL_REINVOKE / PAUSE_ESCALATE /
+  TERMINATE. `DefaultSteerer._ladder_level_for` maps
+  `(kind, severity, occurrence_count)` to a level.
+- [#150](https://github.com/pedapudi/goldfive/pull/150) **Feed STEER through
+  the overlay loop.** STEER cancels in-flight, runs refine, restarts
+  `invoke_passthrough` with a composed steer-restart message. Closes the
+  regression where STEER under overlay landed on the original (pre-refine)
+  plan.
+- [#165](https://github.com/pedapudi/goldfive/pull/165) **Drop overlay soft
+  follow-up** (#163). When the passthrough invocation ends, PENDING plan
+  tasks are transitioned to `TaskStatus.NOT_NEEDED` instead of being
+  re-dispatched as per-task follow-up user messages. Closes the
+  ~10 min → 40+ min amplification on flow-prompted coordinators.
+
+### Structural steering
+
+- [#156](https://github.com/pedapudi/goldfive/pull/156) **GoldfivePlanner.**
+  `BasePlanner` subclass auto-attached by `goldfive.wrap` to every
+  `LlmAgent` in the tree. Injects a tree-agnostic
+  `[GOLDFIVE ORCHESTRATION CONTEXT]` block per turn via plugin-side
+  `before_model_callback` (ADK's `_nl_planning.py` gates request-side
+  injection on `isinstance(..., PlanReActPlanner)`; we bypass via the
+  plugin). Composes with user-supplied `BasePlanner` on both sides. Filters
+  cancelled `function_call` ids; signals off-registry agent calls.
+- [#158](https://github.com/pedapudi/goldfive/pull/158) **Goal-aware refine**
+  (#154). `LLMPlanner.refine` includes `goals` in the divergence prompt;
+  rejects revisions whose observed activity contradicts the goals. **No
+  steer cooldown** per user directive — `goldfive.active_steer.*` is a
+  durable read-back, not a cooldown window.
+- [#159](https://github.com/pedapudi/goldfive/pull/159) **`goldfive.*`
+  session-state namespace** (#152). Owned keys under
+  `goldfive.orchestration_state`: `current_plan_id`, `current_task_id`,
+  `current_task_title`, `goals_summary`, `active_steer.body`,
+  `active_steer.at_turn`, `active_steer.author`,
+  `cancelled_function_call_ids`, `processed_steer_ids`. Also adds
+  USER_STEER Goal synthesis with `Goal.source = GOAL_SOURCE_USER_STEER`
+  and a steer-restart framing header.
+- [#160](https://github.com/pedapudi/goldfive/pull/160) **Tree-aware planner
+  constraints** (#151). `LLMPlanner.plan(available_agents=)` and
+  `refine(available_agents=)` accept either a plain `list[str]` or the
+  structured walker from `ADKAdapter.available_agents_tree`. Validator
+  rejects off-registry assignees with a retry-with-correction loop.
+- [#164](https://github.com/pedapudi/goldfive/pull/164) **Session unification**
+  (#161). `goldfive.adapters.adk_wrap.GoldfiveADKAgent` pins the outer
+  adk-web session id onto `ADKAdapter._session_id` so all three session
+  layers (adk-web, ADKAdapter ADK session, goldfive `Session.id`) align.
+  `Session.id` aliases `run_id`.
+- [#173](https://github.com/pedapudi/goldfive/pull/173) **Bridge
+  orchestration state → ADK session.state** (#170). `_adk_state_protocol`
+  writers for `active_steer.body`, `goals_summary`,
+  `cancelled_function_call_ids`; `_GoldfiveADKPlugin.before_run_callback`
+  bridges per invocation so GoldfivePlanner's request-side read sees the
+  live orchestration-state.
+- [#175](https://github.com/pedapudi/goldfive/pull/175) **STEER idempotency +
+  author propagation** (#171). `DefaultSteerer.observe` dedupes STEER
+  messages by source `annotation_id` (or `ControlMessage.id` when the
+  bridge doesn't source annotations). New proto fields
+  `SteerPayload.author = 3` and `SteerPayload.annotation_id = 4`.
+
+### Observability
+
+- [#157](https://github.com/pedapudi/goldfive/pull/157) **Per-event
+  `session_id`** (#155). `goldfive.v1.Event` gains field 5 `session_id`.
+  Populated by Runner / Steerer / Executors so downstream consumers
+  (harmonograf) can multiplex multiple `Session`s on a single stream
+  without the Hello envelope.
+- [#168](https://github.com/pedapudi/goldfive/pull/168) **On-cancellation
+  plugin notify** (#167). `ADKAdapter` invokes `plugin.on_cancellation(invocation_id)`
+  on every plugin that defines the method before re-raising
+  `CancelledError`, so observability plugins (`HarmonografTelemetryPlugin`)
+  can close open spans with `status=CANCELLED`.
+- [#169](https://github.com/pedapudi/goldfive/pull/169) **Dedupe plugin
+  install** (#166). `_dedupe_plugins_by_name` silent no-ops on duplicate
+  instances of the same plugin name in `ADKAdapter`. Fixes double-install
+  of `HarmonografTelemetryPlugin` when the caller wires it into both
+  `App(plugins=...)` and `goldfive.wrap(plugins=...)`.
+- [#174](https://github.com/pedapudi/goldfive/pull/174) **Per-LLM-call
+  instrumentation** (#172). `_GoldfiveADKPlugin.before_model_callback`
+  emits a structured `goldfive.llm.request` log with `chars` /
+  `messages_count`; `after_model_callback` emits `goldfive.llm.response`
+  with `duration_ms` / `usage`. The `llm_response` observation dict is
+  enriched with a `metrics` key for downstream consumers.
+
+### Drift taxonomy
+
+- [#138](https://github.com/pedapudi/goldfive/pull/138) **Plan validator
+  hardening.** `LLMPlanner.refine` rejects CANCELLED/FAILED → PENDING
+  status regressions and off-registry assignees up-front.
+- [#177](https://github.com/pedapudi/goldfive/pull/177) **`DriftDetected.annotation_id`**
+  (proto field 6). User-control drifts (USER_STEER / USER_CANCEL) carry
+  the source annotation id for server-side dedup against the originating
+  annotation card.
+- [#184](https://github.com/pedapudi/goldfive/pull/184) **Three-stage drift
+  gate** (#178). `GoldfivePlanner.process_planning_response` classifies
+  each `function_call` part: (1) own-tool → skip; (2) cross-layer agent
+  name in the tree registry → `PLAN_DIVERGENCE` (WARNING); (3)
+  hallucinated name → `CONFABULATION_RISK` (WARNING). Calls are never
+  blocked — signal-only. Reporting-tool prefix (`report_*`) always passes
+  as stage 1.
+- [#186](https://github.com/pedapudi/goldfive/pull/186) **Tool-loop detector**
+  (#181). New `goldfive/drift/tool_loops.py::ToolLoopTracker` plumbed via
+  `after_tool_callback`. Three modes:
+  - **Exact** — same `(tool_name, args_hash)` ≥ 3 in last 7 calls (WARNING)
+  - **Name** — same `tool_name` ≥ 5 in last 7 with no task progress (WARNING)
+  - **Alternating** — A,B,A,B,A pattern in last 5 (INFO)
+
+  Progress-reporting calls (`report_task_*`) reset the per-(invocation,
+  agent) window. Tunable via `GOLDFIVE_TOOL_LOOP_{WINDOW,EXACT_THRESHOLD,NAME_THRESHOLD,ALTERNATING_THRESHOLD}`.
+  Follow-up umbrella tracked in #179; specific items in [#182](https://github.com/pedapudi/goldfive/issues/182)
+  (args-quality classification), [#183](https://github.com/pedapudi/goldfive/issues/183)
+  (silent tool success / no-progress), [#185](https://github.com/pedapudi/goldfive/issues/185)
+  (wrong-tool-for-job).
+
+### Earlier
 
 - #163 Overlay executor no longer dispatches soft follow-ups. When
   `SequentialExecutor._run_overlay` finishes its single
