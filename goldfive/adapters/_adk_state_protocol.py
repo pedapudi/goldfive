@@ -49,6 +49,20 @@ KEY_TASK_OUTCOME = "goldfive.task_outcome"
 KEY_AGENT_NOTE = "goldfive.agent_note"
 KEY_DIVERGENCE_FLAG = "goldfive.divergence_flag"
 
+# Orchestration -> Agents (goldfive#170 — bridged from
+# ``goldfive.Session.state`` into the live ADK session.state so
+# :class:`~goldfive.planners.goldfive_planner.GoldfivePlanner` sees them
+# on its request-side injection path. Writers live in
+# :mod:`goldfive.orchestration_state`; this module owns the ADK-side key
+# names so the adapter's plugin can stamp them without importing the
+# orchestration module for key constants. The string values are
+# intentionally identical to the orchestration-state module's keys —
+# same logical field, two readers.
+KEY_ACTIVE_STEER_BODY = "goldfive.active_steer.body"
+KEY_ACTIVE_STEER_AT_TURN = "goldfive.active_steer.at_turn"
+KEY_GOALS_SUMMARY = "goldfive.goals_summary"
+KEY_CANCELLED_FUNCTION_CALL_IDS = "goldfive.cancelled_function_call_ids"
+
 _CURRENT_TASK_KEYS: tuple[str, ...] = (
     KEY_CURRENT_TASK_ID,
     KEY_CURRENT_TASK_TITLE,
@@ -71,6 +85,10 @@ ALL_KEYS: tuple[str, ...] = (
     KEY_TASK_OUTCOME,
     KEY_AGENT_NOTE,
     KEY_DIVERGENCE_FLAG,
+    KEY_ACTIVE_STEER_BODY,
+    KEY_ACTIVE_STEER_AT_TURN,
+    KEY_GOALS_SUMMARY,
+    KEY_CANCELLED_FUNCTION_CALL_IDS,
 )
 
 
@@ -295,6 +313,81 @@ def write_tools_available(
         KEY_TOOLS_AVAILABLE,
         [name for name in tool_names if isinstance(name, str)],
     )
+
+
+# ---------------------------------------------------------------------------
+# Bridge writers (goldfive#170)
+#
+# The four helpers below stamp orchestration-state values onto the ADK
+# session.state dict. They exist so the adapter plugin's
+# ``before_run_callback`` can copy values from ``goldfive.Session.state``
+# (orchestration-level, written by DefaultSteerer / reconciler / heal
+# paths) into the ADK session.state (per-agent view, read by
+# :class:`~goldfive.planners.goldfive_planner.GoldfivePlanner`).
+#
+# A missing / empty value is cleared rather than stamped so a prior
+# bridged write from an earlier invocation doesn't linger past its
+# orchestration-state clear.
+# ---------------------------------------------------------------------------
+
+
+def set_active_steer_on_adk_state(
+    state: MutableMapping[str, Any],
+    *,
+    body: str | None,
+    at_turn: int | None,
+) -> None:
+    """Bridge ``goldfive.active_steer.*`` onto ADK session.state.
+
+    Clears both keys when ``body`` is falsy / ``at_turn`` is None so a
+    later invocation after a steer clear never renders a stale body.
+    """
+    if not body:
+        state.pop(KEY_ACTIVE_STEER_BODY, None)
+        state.pop(KEY_ACTIVE_STEER_AT_TURN, None)
+        return
+    _set(state, KEY_ACTIVE_STEER_BODY, _safe_str(body))
+    try:
+        _set(state, KEY_ACTIVE_STEER_AT_TURN, int(at_turn) if at_turn is not None else 0)
+    except (TypeError, ValueError):
+        _set(state, KEY_ACTIVE_STEER_AT_TURN, 0)
+
+
+def set_goals_summary_on_adk_state(
+    state: MutableMapping[str, Any],
+    summary: str | None,
+) -> None:
+    """Bridge ``goldfive.goals_summary`` onto ADK session.state.
+
+    An empty / None summary clears the key so a planner that re-reads
+    after ``session.goals`` was itself cleared doesn't see the stale
+    rendering.
+    """
+    if not summary:
+        state.pop(KEY_GOALS_SUMMARY, None)
+        return
+    _set(state, KEY_GOALS_SUMMARY, _safe_str(summary))
+
+
+def set_cancelled_function_call_ids_on_adk_state(
+    state: MutableMapping[str, Any],
+    ids: Iterable[str] | None,
+) -> None:
+    """Bridge ``goldfive.cancelled_function_call_ids`` onto ADK session.state.
+
+    Rewrites the whole list on each call (the orchestration-state owner
+    is append-only within a run, but the bridge's job is just to mirror
+    whatever the orchestration dict currently holds). Empty / None
+    input clears the key.
+    """
+    if not ids:
+        state.pop(KEY_CANCELLED_FUNCTION_CALL_IDS, None)
+        return
+    cleaned = [str(v) for v in ids if v]
+    if not cleaned:
+        state.pop(KEY_CANCELLED_FUNCTION_CALL_IDS, None)
+        return
+    _set(state, KEY_CANCELLED_FUNCTION_CALL_IDS, cleaned)
 
 
 # ---------------------------------------------------------------------------
