@@ -387,28 +387,53 @@ increments — so a malformed-call flood cannot poison session-wide
 state or create a false session drift against the next legitimate
 call.
 
-**Terminal-task rejection.** If the task exists and is already
-terminal (`COMPLETED` / `FAILED` / `CANCELLED`):
+**Terminal-task handling (goldfive#201).** Terminal-task retries are
+owned by the handler, not the dispatcher. The handler's per-tool
+idempotency matrix splits the terminal case two ways:
 
-```python
-{
-    "acknowledged": False,
-    "error": "task_already_terminal",
-    "task_id": "<id>",
-    "current_status": "FAILED",
-    "message": "Task '<id>' is already FAILED. Do not call further "
-               "reporting tools for this task; wait for the "
-               "orchestrator to route you to the next task.",
-}
-```
+* **Same-transition retry** (e.g. `report_task_completed` on a
+  `COMPLETED` task) returns an idempotent ACK. No steerer call, no
+  state mutation, no drift:
 
-**Why a structured error and not a silent ACK.** `{"acknowledged":
-True}` cannot be read by the model as "stop." The structured error
-gives the agent clear, model-readable feedback that loops can
-respect. This is the primary line of defence; §3's quiescence check
-prevents the loop at the invocation level, but this layer is the
-fallback for tools that fire *before* the adapter has observed the
-terminal transition.
+  ```python
+  {
+      "acknowledged": True,
+      "idempotent": True,
+      "current_status": "COMPLETED",
+  }
+  ```
+
+* **Cross-transition** (e.g. `report_task_started` on a `COMPLETED`
+  task, or `report_task_progress` on a `FAILED` task) returns a
+  structured invalid-transition error — a real "agent is confused
+  about state" signal:
+
+  ```python
+  {
+      "acknowledged": False,
+      "error": "invalid_transition",
+      "tool": "<name>",
+      "task_id": "<id>",
+      "current_status": "FAILED",
+      "attempted": "RUNNING",
+      "message": "Cannot 'report_task_started' task '<id>' from FAILED "
+                 "to RUNNING. The task is already in a terminal or "
+                 "otherwise-incompatible state; do not retry.",
+  }
+  ```
+
+Pre-goldfive#201 the dispatcher short-circuited both cases with a
+single `task_already_terminal` error. That shape conflated a
+confused-model retry (benign) with a structural invalid transition
+(a confusion signal) — benign retries tripped the tool-loop detector
+and triggered spurious plan revisions. The matrix separates the two.
+
+**Why a structured error and not a silent ACK on the invalid case.**
+`{"acknowledged": True}` cannot be read by the model as "stop." The
+structured error gives the agent clear, model-readable feedback that
+loops can respect. The idempotent ACK is readable as "already done,
+move on"; the invalid-transition error is readable as "you're
+confused, do not retry this specific transition".
 
 ### 5.2 Layer 2 — idempotency (silent dedup)
 

@@ -14,9 +14,17 @@ guard (see :mod:`goldfive.adapters._tool_loop_guard`) so that:
   current plan, is rejected with a structured error **before** any
   other layer runs (so malformed calls can't poison the session
   counter).
-* **Layer 2 — terminal-task rejection.** A call on a task already in
-  ``COMPLETED`` / ``FAILED`` / ``CANCELLED`` is rejected with
-  ``task_already_terminal`` so the agent sees a clear stop signal.
+* **Layer 2 — (handler-owned)**. Terminal-task semantics used to
+  reject here with ``task_already_terminal``. As of goldfive#201 the
+  handler owns that decision with a finer idempotent / invalid-
+  transition split: a retry of the same transition (e.g.
+  ``report_task_completed`` on a COMPLETED task) returns
+  ``{"acknowledged": True, "idempotent": True}``; a
+  cross-transition (e.g. ``report_task_started`` on a COMPLETED
+  task) returns
+  ``{"acknowledged": False, "error": "invalid_transition"}``. Both
+  are still routed through Layer 3 / Layer 4 for loop-detector
+  bookkeeping.
 * **Layer 3 — per-task loop guard.** Duplicate-args calls return a
   cheap ``duplicate`` ACK; a sustained burst (same signature) or
   volume cap (same tool name, varying args) emits a
@@ -46,7 +54,6 @@ from goldfive.adapters._tool_loop_guard import (
     guard_for,
 )
 from goldfive.reporting import ReportingToolSpec
-from goldfive.types import TERMINAL_TASK_STATUSES
 
 if TYPE_CHECKING:  # pragma: no cover - type-only
     from goldfive.protocols import Steerer
@@ -192,29 +199,16 @@ async def invoke_tool(
                     ),
                 }
 
-            # Layer 2 — terminal-task rejection. Models that have
-            # already reported a task as COMPLETED/FAILED/CANCELLED
-            # sometimes keep calling reporting tools for that task —
-            # the first call moved the task to a terminal status (the
-            # Steerer's ``mark_task_*`` guards make subsequent
-            # transitions no-ops), but a bland ``ACK`` back to the
-            # agent doesn't communicate "stop." Without this check, a
-            # model can burn dozens of reporting calls after the task
-            # is already done. Structured error response so the model
-            # has clear, actionable feedback to stop reporting.
-            if task.status in TERMINAL_TASK_STATUSES:
-                return {
-                    "acknowledged": False,
-                    "error": "task_already_terminal",
-                    "task_id": task_id,
-                    "current_status": task.status.value,
-                    "message": (
-                        f"Task {task_id!r} is already {task.status.value}. "
-                        "Do not call further reporting tools for this task; "
-                        "wait for the orchestrator to route you to the next "
-                        "task."
-                    ),
-                }
+            # Layer 2 used to hard-reject terminal-task retries with
+            # ``task_already_terminal``. goldfive#201 moves that
+            # decision into the handler: retries of the same
+            # transition (e.g. ``report_task_completed`` on COMPLETED)
+            # return idempotent=True; cross-transitions (e.g.
+            # ``report_task_started`` on COMPLETED) return
+            # ``invalid_transition``. Both still bookkeep through
+            # Layers 3 + 4 below so a genuine runaway retry still
+            # trips the loop detector, but benign retries no longer
+            # masquerade as confusion signals.
 
     # ------------------------------------------------------------------
     # Layer 3 — per-task loop guard.

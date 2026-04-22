@@ -141,9 +141,7 @@ PROCESSED_STEER_IDS_CAP = 256
 
 def _assert_goldfive_key(key: str) -> None:
     if not key.startswith(GOLDFIVE_PREFIX):
-        raise ValueError(
-            f"goldfive.orchestration_state refuses to write non-goldfive key: {key!r}"
-        )
+        raise ValueError(f"goldfive.orchestration_state refuses to write non-goldfive key: {key!r}")
 
 
 def write(state: MutableMapping[str, Any], key: str, value: Any) -> None:
@@ -357,6 +355,65 @@ def read_cancelled_function_call_ids(state: Any) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def rotate_current_task_id(
+    state: MutableMapping[str, Any],
+    plan: Plan | None,
+    agent_name: str,
+) -> str | None:
+    """Advance ``goldfive.current_task_id`` after a terminal transition.
+
+    Called from :mod:`goldfive.reporting` when a task transitions to a
+    terminal status (COMPLETED / FAILED / CANCELLED / NOT_NEEDED). The
+    point of this helper is to keep the pin pointed at *work still to
+    do* so subsequent reporting-tool calls in the same invocation
+    context can continue to fall back to the pin instead of failing
+    with ``missing_task_id``.
+
+    Rules:
+
+    * **Rotate** — when exactly one PENDING / RUNNING task remains
+      assigned to ``agent_name`` in ``plan``, stamp its id and return it.
+    * **Clear** — when no PENDING / RUNNING task remains assigned to
+      ``agent_name`` (all done, or none ever assigned), drop the key and
+      return ``None``.
+    * **Clear (ambiguous)** — when multiple PENDING / RUNNING tasks are
+      assigned to ``agent_name`` the helper also clears the key and
+      returns ``None``, deferring to the adapter's
+      ``before_agent_callback`` path to pick the next one when the agent
+      runs again. Stamping an arbitrary pending task here would race
+      with whatever the orchestrator ends up dispatching.
+
+    Tolerant of degenerate input: a ``None`` plan or an empty
+    ``agent_name`` clears the key and returns ``None``. Never raises.
+    """
+    # No plan, no rotation — clear defensively so callers don't keep
+    # driving a stale pointer.
+    if plan is None:
+        clear(state, KEY_CURRENT_TASK_ID)
+        clear(state, KEY_CURRENT_TASK_TITLE)
+        return None
+
+    candidates: list[Task] = []
+    for t in getattr(plan, "tasks", ()) or ():
+        assignee = str(getattr(t, "assignee_agent_id", "") or "")
+        if agent_name and assignee and assignee != agent_name:
+            continue
+        status = getattr(t, "status", None)
+        if status in (TaskStatus.PENDING, TaskStatus.RUNNING):
+            candidates.append(t)
+
+    if len(candidates) == 1:
+        next_task = candidates[0]
+        set_current_task(state, next_task)
+        return str(getattr(next_task, "id", "") or "") or None
+
+    # Zero or multiple candidates — clear and let the orchestrator
+    # re-pin on the next before_agent_callback.
+    clear(state, KEY_CURRENT_TASK_ID)
+    clear(state, KEY_CURRENT_TASK_TITLE)
+    return None
+
+
 def sync_current_task_from_transition(
     state: MutableMapping[str, Any],
     task: Task | None,
@@ -412,6 +469,7 @@ __all__ = [
     "read_cancelled_function_call_ids",
     "record_processed_steer_id",
     "refresh_goals_summary",
+    "rotate_current_task_id",
     "set_active_steer",
     "set_current_plan",
     "set_current_task",

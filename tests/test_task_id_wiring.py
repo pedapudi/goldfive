@@ -368,7 +368,22 @@ async def test_all_task_scoped_reporting_tools_default_task_id(
     up), so they follow a different shape — covered separately.
     """
     steerer = _RecordingSteerer()
-    session = _session_with(_plan_with(Task(id="t-1", title="do", assignee_agent_id="a")))
+    # goldfive#201: start the task RUNNING so ``report_task_progress``
+    # is a legal transition under the handler's idempotency matrix
+    # (progress ticks are only valid on RUNNING). Other handlers
+    # (started, completed, failed, blocked) are legal from
+    # RUNNING too, so this starting state works for the whole
+    # parametrisation.
+    session = _session_with(
+        _plan_with(
+            Task(
+                id="t-1",
+                title="do",
+                assignee_agent_id="a",
+                status=TaskStatus.RUNNING,
+            )
+        )
+    )
     session.state["goldfive.current_task_id"] = "t-1"
 
     spec = _get_spec(tool_name)
@@ -380,10 +395,16 @@ async def test_all_task_scoped_reporting_tools_default_task_id(
     assert result.get("error") != "missing_task_id", (
         f"{tool_name} did not default task_id from state: {result!r}"
     )
-    # Handler ran with the resolved id.
-    assert any(t[0] == "t-1" for t in steerer.transitions), (
-        f"{tool_name} did not invoke the handler with t-1: transitions={steerer.transitions!r}"
-    )
+    # Handler ran with the resolved id. (report_task_started is an
+    # idempotent no-op on RUNNING, so it may not register a transition
+    # — accept either a transition or an idempotent ACK for that one.)
+    if tool_name == "report_task_started":
+        assert result.get("acknowledged") is True
+        assert result.get("idempotent") is True
+    else:
+        assert any(t[0] == "t-1" for t in steerer.transitions), (
+            f"{tool_name} did not invoke the handler with t-1: transitions={steerer.transitions!r}"
+        )
 
 
 async def test_report_awaiting_approval_accepts_state_task_id() -> None:
