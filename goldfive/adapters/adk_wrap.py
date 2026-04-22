@@ -237,24 +237,43 @@ class GoldfiveADKAgent(BaseAgent):
         :meth:`BaseAgent.run_async` is ``@final`` — overriding this
         protected hook is ADK's documented extension seam.
         """
-        # Pin the outer adk-web session id onto the ADKAdapter BEFORE
-        # any sub-agent dispatch kicks in (goldfive#125). adk-web creates
-        # its own session ``X`` and invokes us via this hook; without
-        # pinning, ``ADKAdapter._ensure_session_for`` would lazily mint
-        # a fresh uuid ``Y`` that all per-agent runners share — but
-        # ``Y != X``, so :class:`HarmonografTelemetryPlugin` stamps the
-        # coordinator's spans under ``X`` (adk-web's own runner) and
-        # every sub-agent span under ``Y`` (the adapter's internal
-        # shared id). Users see two harmonograf sessions per run.
+        # Pin the outer adk-web session id onto the goldfive Session
+        # AND the ADKAdapter BEFORE any sub-agent dispatch kicks in
+        # (goldfive#161). Three layers of session identity exist under
+        # overlay + AgentTool:
         #
-        # Pinning here anchors the adapter's shared outer id to
-        # adk-web's real session id so coordinator + sub-agent spans
-        # roll up to ONE harmonograf session. Idempotent: we only set
-        # it if nothing has been pinned yet (constructor path, prior
-        # invocation), and we skip entirely when the context lacks a
-        # usable string session id (bare-Runner / test-harness ctx
-        # shapes fall back to the lazy-uuid path from goldfive#123).
-        self._pin_outer_session_from_ctx(ctx)
+        #   1. adk-web's outer ``ctx.session.id`` (the URL session id
+        #      users see in the harmonograf UI)
+        #   2. goldfive ``Session.id`` (== ``run_id``, minted uuid4
+        #      from :class:`Conversation.next_turn_session`)
+        #   3. the ADKAdapter's internal ``_session_id`` (minted uuid4
+        #      in :meth:`ADKAdapter._ensure_session`)
+        #
+        # If we let each layer pick its own id, goldfive Event
+        # envelopes stamp ``Session.id`` (layer 2) via the #155
+        # per-event session routing field, but harmonograf spans carry
+        # ``ctx.session.id`` (layer 1). The plan view then shows an
+        # empty Gantt: the spans are on the adk-web session, but the
+        # plan / task rows are on the goldfive session. See goldfive#161.
+        #
+        # Pinning layer 1's id onto layer 2 (via the ``session_id=``
+        # override on :meth:`Runner.run`) and layer 3 (via the
+        # adapter's ``_session_id`` / ``_outer_session_id``) makes all
+        # three equal. Harmonograf's plugin (per goldfive#162) caches
+        # the same id for every span it stamps. Result: plan +
+        # execution co-locate on one harmonograf session.
+        #
+        # Idempotent / safe fallback:
+        # * Empty ``ctx.session.id`` (bare contexts, test harnesses
+        #   that skip ``ctx.session``) falls through to the legacy
+        #   uuid4 mint from :meth:`Conversation.next_turn_session` +
+        #   :meth:`ADKAdapter._ensure_session`, preserving back-compat.
+        # * Subsequent invocations (overlay STEER restart, follow-up
+        #   turns) receive the SAME ``ctx.session.id`` from adk-web
+        #   because adk-web keeps the session stable across turns on
+        #   the same URL, so the pin stays consistent.
+        outer_sid = self._outer_session_id_from_ctx(ctx)
+        self._pin_outer_session_on_adapter(outer_sid)
 
         user_input = _extract_user_input(ctx)
         if not user_input:
@@ -266,49 +285,61 @@ class GoldfiveADKAgent(BaseAgent):
             return
 
         outcome = await self._runner.run(
-            user_input, context={"adk_ctx": ctx}
+            user_input,
+            context={"adk_ctx": ctx},
+            session_id=outer_sid or None,
         )
         async for adk_event in _outcome_to_adk_events(
             outcome, ctx, author=self.name
         ):
             yield adk_event
 
-    def _pin_outer_session_from_ctx(self, ctx: InvocationContext) -> None:
-        """Adopt ``ctx.session.id`` as the ADKAdapter's outer session id.
+    @staticmethod
+    def _outer_session_id_from_ctx(ctx: InvocationContext) -> str:
+        """Return ``ctx.session.id`` when usable, ``""`` otherwise.
 
-        On the first adk-web invocation, ``ctx`` carries adk-web's own
-        session id (the one users see in the harmonograf UI). Pinning
-        it onto :attr:`ADKAdapter._outer_session_id` makes every
-        per-agent runner's ``_ensure_session_for`` return that same id,
-        so :class:`HarmonografTelemetryPlugin` stamps the SAME
-        ``ctx.session.id`` onto coordinator AND sub-agent spans. See
-        goldfive#125.
-
-        No-op when:
-
-        * The adapter already has a pinned outer id (constructor
-          ``outer_session_id=`` / ``session_id=``, or a previous
-          invocation already pinned one). We never OVERWRITE — the
-          caller's constructor value is authoritative.
-        * The context does not carry a usable string session id (bare
-          ``Runner`` callers, fake contexts in tests that skip
-          ``ctx.session``). The lazy-uuid4 fallback from goldfive#123
-          then still kicks in on the next ``_ensure_session_for``.
+        Defensive: ADK contexts in tests may omit ``session`` or
+        substitute it with a value whose ``id`` is ``None`` / empty.
+        Centralises the guard so the pin path and the Runner handoff
+        stay in sync.
         """
+        session = getattr(ctx, "session", None)
+        if session is None:
+            return ""
+        sid = getattr(session, "id", None)
+        if not isinstance(sid, str):
+            return ""
+        return sid
+
+    def _pin_outer_session_on_adapter(self, outer_sid: str) -> None:
+        """Adopt ``outer_sid`` on the ADKAdapter's session bookkeeping.
+
+        Pins both ``_outer_session_id`` (for structural consumers that
+        want the raw outer id for logging) and ``_session_id`` (used
+        by :meth:`ADKAdapter._ensure_session` and
+        :meth:`ADKAdapter._heal_pending_tool_calls`). The goal is for
+        the adapter's internal ADK session creation to use the SAME id
+        as the outer adk-web session so the harmonograf plugin sees
+        one session id across both layers.
+
+        No-op when ``outer_sid`` is empty — the adapter's lazy-uuid
+        mint still runs and the legacy behaviour is preserved.
+
+        Never overwrites an adapter that already carries a pinned
+        ``_session_id`` (constructor ``session_id=`` is authoritative).
+        """
+        if not outer_sid:
+            return
         adapter = getattr(self._runner, "agent", None)
         if adapter is None:
             return
-        # Guard against non-ADKAdapter adapters (custom AgentAdapter
-        # implementations under the same wrap path) that don't carry
-        # the shared-outer-session attribute.
-        if not hasattr(adapter, "_outer_session_id"):
-            return
-        if adapter._outer_session_id:
-            return
-        sid = getattr(getattr(ctx, "session", None), "id", None)
-        if not isinstance(sid, str) or not sid:
-            return
-        adapter._outer_session_id = sid
+        # Pin the forensic-only outer id when the attribute exists.
+        if hasattr(adapter, "_outer_session_id") and not adapter._outer_session_id:
+            adapter._outer_session_id = outer_sid
+        # Pin the adapter's effective ADK session id. Constructor
+        # ``session_id=`` wins; we only set when it was empty.
+        if hasattr(adapter, "_session_id") and not adapter._session_id:
+            adapter._session_id = outer_sid
 
     # ------------------------------------------------------------------
     # Runner passthrough — keeps the programmatic entry point working.
