@@ -879,6 +879,24 @@ def make_adk_plugin(
                 except Exception as exc:  # noqa: BLE001
                     log.debug("before_run_callback: state write failed: %s", exc)
 
+                # goldfive#170: bridge orchestration-level state
+                # (goldfive.Session.state — written by DefaultSteerer,
+                # PlanReconciler, and the heal path) onto the live ADK
+                # session.state so GoldfivePlanner's request-side
+                # injection renders real values instead of ``(none)``.
+                # Tree-agnostic: fires on every invocation, including
+                # AgentTool-spawned sub-Runners whose own
+                # ``before_run_callback`` will repeat this bridge on
+                # their own live session. No separate propagation path
+                # needed.
+                try:
+                    self._bridge_orchestration_state(ctx.session, state)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_run_callback: orchestration-state bridge failed: %s",
+                        exc,
+                    )
+
             # Emit AgentInvocationStarted. Best-effort: observability
             # only, so a sink / proto issue must not block the run.
             agent_name = str(_safe_attr(ctx, "host_agent_name", "") or "") or self._host_agent_name
@@ -1084,6 +1102,87 @@ def make_adk_plugin(
                     except Exception as exc:  # noqa: BLE001
                         log.debug("after_run_callback: note_agent_turn raised: %s", exc)
             return None
+
+        def _bridge_orchestration_state(
+            self,
+            gf_session: Any,
+            adk_state: Any,
+        ) -> None:
+            """Copy ``goldfive.Session.state`` orchestration keys onto the
+            ADK session.state (goldfive#170).
+
+            The orchestration dict is the framework-agnostic source of
+            truth for active-steer body / turn, formatted goals summary,
+            and the list of cancelled function-call ids (written by the
+            DefaultSteerer USER_STEER path, PlanReconciler goals-refresh
+            path, and the adapter's heal path respectively).
+            :class:`GoldfivePlanner.build_planning_instruction` reads
+            the same logical keys off the ADK session.state — so this
+            bridge is the missing data path between the orchestration
+            writes and the per-turn instruction injection.
+
+            Called from :meth:`before_run_callback` against the live
+            invocation session so the bridge runs on every root invoke
+            AND every AgentTool-spawned sub-Runner invoke (which has
+            its own ``before_run_callback`` firing against its own
+            live session). Sub-Runner propagation is therefore
+            automatic — no separate handoff path required.
+
+            Silent on any individual key that can't be read: the
+            planner's placeholders default to ``(none)`` so a degraded
+            bridge never breaks the run.
+            """
+            # Lazy import: orchestration_state is framework-agnostic
+            # and cheap, but the adapter module shouldn't assume at
+            # import time that the orchestration module is loaded.
+            from goldfive import orchestration_state as _ostate
+
+            gf_state = _safe_attr(gf_session, "state", None)
+            if gf_state is None:
+                return
+            # Active steer body + turn. The ADK-side helper clears
+            # both keys when body is empty, so a steer-then-clear
+            # sequence correctly renders as ``(none)`` on the next
+            # turn instead of retaining the old body.
+            body = _ostate.read(gf_state, _ostate.KEY_ACTIVE_STEER_BODY, "")
+            at_turn = _ostate.read(gf_state, _ostate.KEY_ACTIVE_STEER_AT_TURN, None)
+            try:
+                _sp.set_active_steer_on_adk_state(
+                    adk_state,
+                    body=str(body) if body else "",
+                    at_turn=at_turn,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_bridge_orchestration_state: active_steer bridge failed: %s",
+                    exc,
+                )
+            # Goals summary.
+            summary = _ostate.read(gf_state, _ostate.KEY_GOALS_SUMMARY, "")
+            try:
+                _sp.set_goals_summary_on_adk_state(
+                    adk_state,
+                    str(summary) if summary else "",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_bridge_orchestration_state: goals_summary bridge failed: %s",
+                    exc,
+                )
+            # Cancelled function-call ids. Use the orchestration-state
+            # reader so the list-shape guard (non-list → []) is
+            # centralised in one place.
+            cancelled = _ostate.read_cancelled_function_call_ids(gf_state)
+            try:
+                _sp.set_cancelled_function_call_ids_on_adk_state(
+                    adk_state,
+                    cancelled,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_bridge_orchestration_state: cancelled_ids bridge failed: %s",
+                    exc,
+                )
 
         async def _maybe_emit_confabulation_risk(
             self,
