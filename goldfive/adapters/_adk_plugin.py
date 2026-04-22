@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -197,6 +198,112 @@ def _session_context_from_callback(ctx: Any) -> SessionContext | None:
     if isinstance(value, SessionContext):
         return value
     return None
+
+
+def _measure_request_chars(llm_request: Any) -> tuple[int, int]:
+    """Return ``(total_chars, messages_count)`` for an ADK ``LlmRequest``.
+
+    Used by the goldfive#172 per-LLM-call instrumentation in
+    :meth:`_GoldfiveADKPlugin.before_model_callback`. We walk
+    ``llm_request.contents`` (a list of ``Content`` whose ``parts`` hold
+    ``text`` / ``function_call`` / ``function_response`` leaves) and
+    sum the character count of each serialised part. The three leaf
+    shapes we care about:
+
+    * ``part.text`` -- plain assistant / user / system text.
+    * ``part.function_call`` -- a model-emitted tool call. We serialise
+      as ``name + json(args)`` because both contribute to the prompt
+      tokens the model pays for.
+    * ``part.function_response`` -- a tool's return payload. Serialised
+      as ``name + json(response)`` for the same reason.
+
+    Unknown part shapes fall through silently (count zero) so a novel
+    ADK part type doesn't break instrumentation. The system instruction
+    on ``llm_request.config.system_instruction`` is counted separately
+    when present, since it's a prompt-prefix the model must process on
+    every call — often the dominant contributor right after a
+    GoldfivePlanner injection.
+
+    Returns ``(0, 0)`` on any failure — instrumentation must never
+    raise into the caller path.
+    """
+    try:
+        contents = _safe_attr(llm_request, "contents", None) or []
+        total_chars = 0
+        messages_count = 0
+        for content in contents:
+            messages_count += 1
+            parts = _safe_attr(content, "parts", None) or []
+            for part in parts:
+                text = _safe_attr(part, "text", "") or ""
+                if text:
+                    total_chars += len(str(text))
+                    continue
+                fc = _safe_attr(part, "function_call", None)
+                if fc is not None:
+                    name = str(_safe_attr(fc, "name", "") or "")
+                    args = _safe_attr(fc, "args", None)
+                    total_chars += len(name)
+                    if args is not None:
+                        try:
+                            total_chars += len(json.dumps(args, default=repr))
+                        except Exception:  # noqa: BLE001
+                            total_chars += len(repr(args))
+                    continue
+                fr = _safe_attr(part, "function_response", None)
+                if fr is not None:
+                    name = str(_safe_attr(fr, "name", "") or "")
+                    resp = _safe_attr(fr, "response", None)
+                    total_chars += len(name)
+                    if resp is not None:
+                        try:
+                            total_chars += len(json.dumps(resp, default=repr))
+                        except Exception:  # noqa: BLE001
+                            total_chars += len(repr(resp))
+                    continue
+        # Include the system instruction — a GoldfivePlanner injection
+        # lands here and typically dominates the prompt prefix.
+        config = _safe_attr(llm_request, "config", None)
+        sys_inst = _safe_attr(config, "system_instruction", "") or ""
+        if isinstance(sys_inst, str):
+            total_chars += len(sys_inst)
+        elif sys_inst is not None:
+            try:
+                total_chars += len(str(sys_inst))
+            except Exception:  # noqa: BLE001
+                pass
+        return total_chars, messages_count
+    except Exception:  # noqa: BLE001 — instrumentation must never raise
+        return 0, 0
+
+
+def _extract_usage_metadata(llm_response: Any) -> dict[str, int]:
+    """Pull prompt / completion / total token counts off an ADK ``LlmResponse``.
+
+    ADK normalises per-provider usage onto
+    ``llm_response.usage_metadata`` (a
+    ``google.genai.types.GenerateContentResponseUsageMetadata`` with
+    ``prompt_token_count`` / ``candidates_token_count`` /
+    ``total_token_count``). Returns an empty dict when the backend
+    didn't report usage (some LiteLLM-fronted providers skip it, some
+    streaming responses defer it to a trailing chunk).
+
+    Returns only fields that are present and non-zero — callers treat
+    missing keys as "not reported".
+    """
+    out: dict[str, int] = {}
+    usage = _safe_attr(llm_response, "usage_metadata", None)
+    if usage is None:
+        return out
+    for src_attr, dst_key in (
+        ("prompt_token_count", "prompt_tokens"),
+        ("candidates_token_count", "completion_tokens"),
+        ("total_token_count", "total_tokens"),
+    ):
+        value = _safe_attr(usage, src_attr, None)
+        if isinstance(value, int) and value > 0:
+            out[dst_key] = value
+    return out
 
 
 def _extract_text_parts(llm_response: Any) -> list[str]:
@@ -760,6 +867,16 @@ def make_adk_plugin(
             # this to break out of ``run_async`` cleanly — the drift
             # event has already been emitted.
             self.runaway_delegation_tripped: bool = False
+            # Per-LLM-call instrumentation (goldfive#172). Keyed by
+            # ADK ``invocation_id`` — ``before_model_callback`` stashes
+            # the start time + request chars + message count here and
+            # ``after_model_callback`` pops it to compute
+            # ``llm.call.duration_ms``. Since ADK fires before/after
+            # pairs synchronously for a single invocation, a single
+            # slot per invocation_id is sufficient (nested AgentTool
+            # sub-Runners get their own invocation_id). Each entry is
+            # a small dict to keep the payload auditable in tests.
+            self._invocation_llm_pending: dict[str, dict[str, Any]] = {}
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
@@ -788,6 +905,11 @@ def make_adk_plugin(
             self._agent_tool_spawn_count = 0
             self.runaway_delegation_tripped = False
             self._reconciler = None
+            # Drop any straggling per-LLM-call metrics entries
+            # (goldfive#172). Normal operation pops each entry in
+            # ``after_model_callback``; this catches the case where a
+            # model turn errored between before/after and never paired.
+            self._invocation_llm_pending.clear()
 
         def set_reconciler(self, reconciler: Any) -> None:
             """Attach a :class:`~goldfive.reconciler.PlanReconciler`.
@@ -1399,7 +1521,8 @@ def make_adk_plugin(
 
         async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> None:
             """Best-effort re-seed goldfive.* state for legacy test harnesses
-            + GoldfivePlanner request-side instruction injection.
+            + GoldfivePlanner request-side instruction injection
+            + per-LLM-call instrumentation (goldfive#172).
 
             The authoritative state write happens in
             :meth:`before_run_callback` against the live invocation
@@ -1418,6 +1541,15 @@ def make_adk_plugin(
             here and append the returned string to
             ``llm_request.config.system_instruction`` via the same
             ``append_instructions`` helper ADK uses internally.
+
+            Finally, it stamps per-LLM-call metrics (goldfive#172):
+            counts ``llm_request.contents`` chars and message count,
+            stashes a start-time on the plugin keyed by invocation_id
+            so the paired ``after_model_callback`` can compute call
+            duration, and logs the measurements at INFO with
+            structured fields so operators running the live kikuchi
+            endpoint can correlate post-steer slowdowns to context
+            growth (see issue #172, hypothesis 1).
             """
             ctx = self._resolve_ctx(callback_context)
             if ctx is None:
@@ -1456,6 +1588,43 @@ def make_adk_plugin(
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "before_model_callback: goldfive planner injection raised: %s",
+                    exc,
+                )
+
+            # Per-LLM-call instrumentation (goldfive#172). Measure the
+            # request AFTER GoldfivePlanner has appended its
+            # instruction so the reported chars reflect what the
+            # model actually sees. Stash a start-time so the paired
+            # after_model_callback can compute duration.
+            try:
+                chars, messages_count = _measure_request_chars(llm_request)
+                inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
+                    callback_context, "invocation_context", None
+                )
+                inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+                start_mono = time.monotonic()
+                if inv_id:
+                    self._invocation_llm_pending[inv_id] = {
+                        "start_mono": start_mono,
+                        "chars": chars,
+                        "messages_count": messages_count,
+                    }
+                # INFO log so an operator running a live e2e (kikuchi)
+                # can tail stderr and correlate context growth against
+                # the subsequent duration line.
+                log.info(
+                    "goldfive.llm.request invocation_id=%s "
+                    "llm.request.chars=%d llm.request.messages_count=%d "
+                    "task_id=%s agent=%s",
+                    inv_id or "?",
+                    chars,
+                    messages_count,
+                    str(_safe_attr(ctx.task, "id", "") or "") or "?",
+                    self._host_agent_name or "?",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "before_model_callback: LLM-call instrumentation raised: %s",
                     exc,
                 )
             return None
@@ -1641,15 +1810,60 @@ def make_adk_plugin(
                     joined = " ".join(texts).strip()
                     if joined:
                         self._invocation_last_text[inv_id] = joined
+            # Per-LLM-call instrumentation (goldfive#172). Pair with the
+            # before_model_callback stash to compute duration, extract
+            # token usage, log the result, and enrich the observation
+            # raw dict so custom steerer sinks can surface the metrics
+            # alongside each LLM turn. Any failure in this block is
+            # swallowed — instrumentation must not shadow a real LLM
+            # response from the steerer.
+            metrics: dict[str, Any] = {}
+            try:
+                pending = self._invocation_llm_pending.pop(inv_id, None) if inv_id else None
+                if pending is not None:
+                    duration_ms = int((time.monotonic() - pending["start_mono"]) * 1000)
+                    metrics["llm.call.duration_ms"] = duration_ms
+                    metrics["llm.request.chars"] = int(pending.get("chars", 0))
+                    metrics["llm.request.messages_count"] = int(pending.get("messages_count", 0))
+                usage = _extract_usage_metadata(llm_response)
+                for key, value in usage.items():
+                    metrics[f"llm.usage.{key}"] = value
+                if metrics:
+                    log.info(
+                        "goldfive.llm.response invocation_id=%s "
+                        "llm.call.duration_ms=%s llm.request.chars=%s "
+                        "llm.request.messages_count=%s "
+                        "llm.usage.prompt_tokens=%s "
+                        "llm.usage.completion_tokens=%s "
+                        "llm.usage.total_tokens=%s "
+                        "task_id=%s agent=%s",
+                        inv_id or "?",
+                        metrics.get("llm.call.duration_ms", "?"),
+                        metrics.get("llm.request.chars", "?"),
+                        metrics.get("llm.request.messages_count", "?"),
+                        metrics.get("llm.usage.prompt_tokens", "?"),
+                        metrics.get("llm.usage.completion_tokens", "?"),
+                        metrics.get("llm.usage.total_tokens", "?"),
+                        str(_safe_attr(ctx.task, "id", "") or "") or "?",
+                        self._host_agent_name or "?",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "after_model_callback: LLM-call instrumentation raised: %s",
+                    exc,
+                )
+            raw: dict[str, Any] = {
+                "texts": texts,
+                "function_calls": calls,
+                "reasoning": reasoning,
+                "finish_reason": str(finish) if finish is not None else "",
+            }
+            if metrics:
+                raw["metrics"] = metrics
             observation = _as_observation(
                 kind="llm_response",
                 detail=" ".join(texts)[:500],
-                raw={
-                    "texts": texts,
-                    "function_calls": calls,
-                    "reasoning": reasoning,
-                    "finish_reason": str(finish) if finish is not None else "",
-                },
+                raw=raw,
                 task=ctx.task,
                 agent_id=self._host_agent_name,
             )
