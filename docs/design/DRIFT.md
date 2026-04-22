@@ -102,8 +102,18 @@ kinds group naturally into six categories.
 
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
-| `USER_STEER` | Caller synthesized a `DriftEvent` to redirect the run. | `warning` | yes |
-| `USER_CANCEL` | Caller cancelled the run. | `critical` | no |
+| `USER_STEER` | Caller synthesized a `DriftEvent` to redirect the run. Carries `annotation_id` on the emitted `DriftDetected` event (#177) for sink-side dedupe with the source annotation. Idempotent by `annotation_id` (#171) — duplicate deliveries of the same STEER are dropped by `DefaultSteerer._is_duplicate_steer`. | `warning` | yes |
+| `USER_CANCEL` | Caller cancelled the run. `annotation_id` stamped on the emitted event. | `critical` | no |
+
+### Delegation & planning category — the tree routed work into a shape the plan doesn't endorse
+
+| Kind | Enum value | Trigger | Default severity | Detector location | Steerer response |
+|---|---|---|---|---|---|
+| `RUNAWAY_DELEGATION` | `35` | ADK coordinator delegated via `AgentTool` more than `ADKAdapter(agent_tool_cap=N)` allows (default 16). | `critical` | `_GoldfiveADKPlugin._emit_runaway_delegation_drift` | Level 3 → Level 4 (cancel + refine; escalate on repeat) |
+| `CONFABULATION_RISK` | `34` | Two sources: (a) `GoldfivePlanner.process_planning_response` sees a `function_call` whose name is neither in the running agent's own tools nor in the tree agent registry (pure hallucination, three-stage gate #178); (b) `goldfive.drift.classify_confabulation_risk` spots the cheap structural pattern "task title implies external data access but the agent produced output without calling any tool." | `warning` (three-stage gate) / `info` (structural) | `GoldfivePlanner` or `after_run_callback` | Level 1 → Level 3 on repeat |
+| `REFINE_VALIDATION_FAILED` | `36` | `LLMPlanner` exhausted its refine retry budget (attempts 1 & 2 both rejected by the structural validator). Terminal signal. | `critical` | `LLMPlanner._emit_refine_validation_failed` | Level 4 (PAUSE_ESCALATE — steerer deliberately does NOT re-refine) |
+| `HUMAN_INTERVENTION_REQUIRED` | `37` | Escalation target emitted by the intervention ladder when Level 4 fires (persistent refine failures, goal drift, repeated critical drift). | `critical` | `DefaultSteerer._dispatch_pause_escalate` | Level 4; repeat → Level 5 (TERMINATE) |
+| `GOAL_DRIFT` | `38` | Periodic trajectory-level LLM-judge: every N invocations, classify whether accumulated activity advances `session.goals`. Gated behind `Runner(goal_drift_enabled=...)` + a `goal_drift_call_llm` callable on the steerer. | `critical` | `goldfive.drift.goals.classify_goal_drift` | Level 4 both on first and repeat (refine cannot recover from trajectory-level drift) |
 
 ### Goal category — we will not be able to finish
 
@@ -129,13 +139,12 @@ parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
 | `INTENT_DIVERGENCE` | Reasoning has drifted from `session.goals` + the current task topic. Severity is **graduated** — see table below. | `info` · `warning` · `critical` | depends on severity |
 
 Each observation produces at most one drift (the first match wins) in
-severity order: `INTENT_DIVERGENCE` → `LOOPING_REASONING` → `OFF_TOPIC`
-<<<<<<< HEAD
-→ `CONFUSION`. Detectors short-circuit so the pipeline cost stays
-bounded regardless of reasoning block size. `INTENT_DIVERGENCE` runs
-first even when it resolves to `info` severity, because the kind is
-stable — callers that only care about warning-and-up simply filter on
-the `severity` field.
+severity order: `INTENT_DIVERGENCE` → `LOOPING_REASONING` →
+`REASONING_CLUSTER_TIGHTENING` → `OFF_TOPIC` → `CONFUSION`. Detectors
+short-circuit so the pipeline cost stays bounded regardless of
+reasoning block size. `INTENT_DIVERGENCE` runs first even when it
+resolves to `info` severity, because the kind is stable — callers that
+only care about warning-and-up simply filter on the `severity` field.
 
 #### Graduated `INTENT_DIVERGENCE` severity
 
@@ -170,14 +179,12 @@ bands: callers filtering by kind see one stable signal; the
 `INTENT_DIVERGENCE_HEALTHY_SIMILARITY`,
 `INTENT_DIVERGENCE_MINOR_SIMILARITY`, and
 `INTENT_DIVERGENCE_WARNING_SIMILARITY`.
-=======
-→ `REASONING_CLUSTER_TIGHTENING` → `CONFUSION`. Detectors short-circuit
-so the pipeline cost stays bounded regardless of reasoning block size.
 
-**Graduated reasoning-similarity ladder.** `LOOPING_REASONING` and
-`REASONING_CLUSTER_TIGHTENING` together form a two-rung early-warning
-ladder on the same underlying signal (cosine similarity of the current
-reasoning block against recent history):
+#### Graduated reasoning-similarity ladder
+
+`LOOPING_REASONING` and `REASONING_CLUSTER_TIGHTENING` together form
+a two-rung early-warning ladder on the same underlying signal (cosine
+similarity of the current reasoning block against recent history):
 
 | Max cosine | Tier | Fires what |
 |---|---|---|
@@ -192,7 +199,6 @@ the planner is only woken up once the cliff fires. The INFO tier is
 skipped entirely when the current observation would also trip the
 cliff (i.e., `LOOPING_REASONING` runs first in the pipeline), so the
 two tiers never double-fire on the same observation.
->>>>>>> f6d3daf (Add REASONING_CLUSTER_TIGHTENING graduated drift signal)
 
 The reasoning channel is additive: adapters that cannot surface
 chain-of-thought (e.g. classic GPT-4o) simply never call
@@ -379,14 +385,15 @@ Four invariants govern the refine path:
 
 `GoldfivePlanner.process_planning_response` (see
 `goldfive/planners/goldfive_planner.py`) classifies every
-`function_call` part an LLM emits via a three-stage gate. The gate
-keys on the currently-running agent's own `tools` list (read from
+`function_call` part an LLM emits via a three-stage gate (PR #184 /
+goldfive#178). The gate keys on the currently-running agent's own
+`tools` list (read from
 `callback_context._invocation_context.agent.tools`) combined with the
 tree-wide agent registry plumbed in by `ADKAdapter`. The three stages
 cleanly separate "legitimate tool call", "cross-layer delegation
-attempt", and "hallucinated tool name" — which the single-stage
-registry check in #178 conflated into PLAN_DIVERGENCE and over-fired
-on.
+attempt", and "hallucinated tool name" — which the pre-#184
+single-stage registry check conflated into `PLAN_DIVERGENCE` and
+over-fired on for every legitimate non-registry tool.
 
 | Input shape | Drift kind | Detector location |
 |---|---|---|
@@ -394,43 +401,134 @@ on.
 | `function_call` name in tree agent registry but not in this agent's tools (cross-layer) | `PLAN_DIVERGENCE` | `GoldfivePlanner.process_planning_response` |
 | `function_call` name nowhere (not a tool, not a known agent) | `CONFABULATION_RISK` | `GoldfivePlanner.process_planning_response` |
 | tool returned an error payload or raised | `TOOL_ERROR` | `after_tool_callback` observer |
-| tool called in a tight loop | `LOOPING_TOOL_CALL` / `LOOPING_REASONING` | sequence-based detector in `goldfive/drift/reasoning.py` |
-| tool misaligned with the current task's intent | `INTENT_DIVERGENCE` / `GOAL_DRIFT` | goal classifier (`goldfive/drift/goals.py`, future extension) |
-
-The last row is intentionally not implemented in this classifier — a
-separate work item extends `goldfive/drift/goals.py` to cover it.
+| tool called in a tight loop | `LOOPING_REASONING` (modes exact/name/alternating) | `goldfive/drift/tool_loops.py::ToolLoopTracker` (PR #186) |
+| reasoning-content loop (chain-of-thought identical / similar across blocks) | `LOOPING_REASONING` | `goldfive/drift/reasoning.py` |
+| tool misaligned with the current task's intent | `INTENT_DIVERGENCE` / `GOAL_DRIFT` | goal classifier (`goldfive/drift/goals.py`) |
 
 `function_call` names prefixed with `report_` (the reporting-tool
-protocol namespace — `report_task_started`, `report_task_finished`,
+protocol namespace — `report_task_started`, `report_task_completed`,
 etc.) are always treated as legitimate regardless of tool-list
 contents: they're protocol calls goldfive injects and may not be
 reflected in every agent's `tools` list depending on when the
 augmentation ran.
 
-Cancelled function_call ids (from
+Cancelled `function_call` ids (from
 `session.state['goldfive.cancelled_function_call_ids']`, populated on
 USER_STEER / REPLAN cascade-cancel) are stripped BEFORE the three-
 stage classifier runs, so a cancelled part never produces a drift
 signal regardless of which stage its name would have fallen in.
 
 All three stages emit signals only — the call is never blocked. The
-steerer's intervention ladder (#142) decides whether to escalate.
+steerer's intervention ladder (§"Intervention ladder") decides
+whether to escalate.
+
+## Tool-call loop detection (`ToolLoopTracker`)
+
+Per-invocation tool-call loop detector in
+`goldfive/drift/tool_loops.py` (goldfive#181, landed in PR #186). The
+ADK plugin's `after_tool_callback` forwards every tool dispatch —
+reporting tools, AgentTool delegations, MCP tools, custom adapter-
+native tools — into a `ToolLoopTracker` keyed on `(invocation_id,
+agent_name)`. Three patterns fire a `LOOPING_REASONING` drift
+(severity depends on mode):
+
+| Mode | Trigger | Severity | `raw["mode"]` |
+|---|---|---|---|
+| **Exact loop** | Same `(tool_name, args_hash)` ≥ `exact_threshold=3` times in the last `window=7` calls. | `warning` | `"exact"` |
+| **Name loop** | Same `tool_name` (any args) ≥ `name_threshold=5` times in the window AND no task progress recorded since the window started filling. | `warning` | `"name"` |
+| **Alternating cycle** | A,B,A,B,A pattern over the last `alternating_threshold=5` calls. Suppressed when exact or name mode already fired on the same pair. | `info` | `"alternating"` |
+
+Thresholds tunable via `GOLDFIVE_TOOL_LOOP_WINDOW` /
+`GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` /
+`GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` /
+`GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD` env vars;
+`load_thresholds_from_env()` reads them.
+
+**Task-progress gate.** Mode 2 requires "no task progress in window";
+`ToolLoopTracker.on_task_progress(invocation_id, agent_name)` clears
+the per-agent buffer whenever a task transitions to a progress state.
+A legitimate repeating tool that *completes* its task (e.g.
+`read_file read_file read_file → report_task_completed`) is not
+flagged because the next observation starts from an empty window.
+
+**Isolation.** Each `(invocation_id, agent_name)` gets its own ring
+buffer, so parallel AgentTool sub-invocations within one outer
+invocation do not cross-contaminate. State is ephemeral to a run —
+`clear()` is called from the plugin's `clear_active_context`.
+
+This is complementary to the reporting-tool-scoped
+`ToolLoopGuard` (`goldfive/adapters/_tool_loop_guard.py`, TASK-
+LIFECYCLE §5) which only covers calls routed through
+`invoke_tool`. The `ToolLoopTracker` sees every tool call the ADK
+plugin observes.
+
+## Intervention ladder (Levels 0-5)
+
+Drift handling routes through an explicit six-level ladder
+(goldfive#142) so "when does goldfive interrupt the tree" is a single
+table, not a tangle of conditionals. The live mapping from
+`(drift_kind, severity, occurrence_count)` to level is
+`DefaultSteerer._LADDER` plus the fallback in
+`DefaultSteerer._ladder_level_for`. See `goldfive/steerer.py` for
+the authoritative table.
+
+| Level | Name | Action | Typical triggers |
+|---|---|---|---|
+| **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift. |
+| **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `PLAN_DIVERGENCE`, `TOOL_ERROR`, `AGENT_REFUSAL`, `INTENT_DIVERGENCE`, etc.); CRITICAL first-occurrence of most kinds. |
+| **2** | `NUDGE` | Queue a short corrective user message on `session.pending_nudges` for the Runner's overlay loop to pick up at the next invocation boundary. (Not used by default — table entries prefer Level 1 or Level 3. Reserved for future policies.) | Caller overrides. |
+| **3** | `CANCEL_REINVOKE` | Cancel in-flight invocation; refine; compose a corrective user message via `compose_corrective_user_message` for the overlay loop to re-invoke with. | CRITICAL first-occurrence for most refinable kinds (`LOOPING_REASONING`, `PLAN_DIVERGENCE`, `TOOL_ERROR`, `RUNAWAY_DELEGATION`, ...). |
+| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; set `session.paused_for_human_intervention = True`; do NOT call `planner.refine`. Runner blocks until a user `RESUME` / `STEER` arrives. | `GOAL_DRIFT` (first & repeat); `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind. |
+| **5** | `TERMINATE` | Run-level abort. Currently only reachable when a Level-4-initiated pause times out and `HUMAN_INTERVENTION_REQUIRED` re-fires as a repeat CRITICAL. | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
+
+**Repeat detection.** Occurrence count per `(drift.kind, task_id)` is
+tracked on the session; a drift crosses "repeat" once
+`occurrence_count >= DefaultSteerer.REFINE_FAILURE_THRESHOLD`
+(default `2`). Most CRITICAL entries have a `(first, repeat)` level
+pair so the first critical fire refines, the second escalates.
+
+**Severity-to-level quick map (fallback).** Drifts with no explicit
+table entry fall through to:
+
+- `INFO` → `OBSERVE`
+- `WARNING` → `ABSORB`
+- `CRITICAL` first → `ABSORB`; repeat → `PAUSE_ESCALATE`
+
+Subclasses of `DefaultSteerer` override `_ladder_level_for` to tune
+the table without re-implementing `_handle_drift`.
+
+See goldfive#179 (umbrella) for future detection work — additional
+detectors will register new rows on `_LADDER` rather than editing the
+handler.
 
 ## How drifts become events
 
 Every `DriftEvent` produces exactly one `DriftDetected` event in the
-proto stream. The event envelope carries:
+proto stream. The event envelope (`goldfive.v1.DriftDetected`)
+carries:
 
-- `kind` — the `DriftKind` string value.
-- `severity` — the `DriftSeverity` string value.
-- `detail` — human-readable note.
-- `current_task_id`, `current_agent_id` — from the session at
-  emission time.
-- `recoverable` — derived from severity and kind.
-- `raw_summary` — a short stringification of `raw` (the full
-  untouched trigger is not serialized into the proto to avoid
-  bloating the wire; sinks that need the raw trigger should snapshot
-  it in-process).
+- `kind` (field 1) — the `DriftKind` enum value.
+- `severity` (field 2) — the `DriftSeverity` enum value.
+- `detail` (field 3) — human-readable note.
+- `current_task_id` (field 4), `current_agent_id` (field 5) — from
+  the session at emission time.
+- `annotation_id` (field 6, goldfive#177) — for `USER_STEER` /
+  `USER_CANCEL` drifts that rode in on a `ControlMessage` with a
+  bridge-supplied annotation id. Empty for drifts goldfive minted
+  itself (loop detection, `GOAL_DRIFT`, `CONFABULATION_RISK`, etc.).
+  Sinks use this to dedup the drift row against the source annotation
+  — without it a single user STEER surfaces as three cards
+  (annotation row, `user_steer` drift row, `plan_revised` row) in
+  harmonograf's Intervention view.
+
+Per-event `session_id` (#155) is stamped on the outer `Event`
+envelope, not inside the drift payload — see
+[EVENT-MODEL.md §"Event envelope"](EVENT-MODEL.md#event-envelope).
+
+Note: `recoverable` and `raw_summary` are in-memory fields on the
+Python `DriftEvent` dataclass; they are NOT serialized onto the
+proto event. The full untouched trigger (`raw`) is not emitted; sinks
+that need it should snapshot in-process.
 
 If refine runs and succeeds, the next event in the stream is
 `PlanRevised`, whose `revision_kind` / `revision_severity` / `revision_index`

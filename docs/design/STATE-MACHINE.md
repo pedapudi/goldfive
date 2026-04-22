@@ -26,6 +26,7 @@ class TaskStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     BLOCKED = "BLOCKED"
+    NOT_NEEDED = "NOT_NEEDED"
 ```
 
 | State | Meaning |
@@ -36,6 +37,7 @@ class TaskStatus(StrEnum):
 | `FAILED` | Terminal failure. `report_task_failed(...)` was called, or the adapter returned an exception, or the executor aborted the task. |
 | `CANCELLED` | Terminal. Executor-driven; e.g. after an unrecoverable upstream failure cascaded down to this task. |
 | `BLOCKED` | Non-terminal. An external condition prevents progress; the task may return to `RUNNING` once the blocker resolves. |
+| `NOT_NEEDED` | Terminal (overlay-model only, goldfive#141/#163). PENDING task the tree never exercised during an overlay invocation; stamped when the passthrough invocation ends. Distinct from `CANCELLED` so sinks render "tree chose not to run" vs "user/system cancelled" differently. |
 
 ## The diagram
 
@@ -43,12 +45,13 @@ class TaskStatus(StrEnum):
 stateDiagram-v2
     [*] --> PENDING : task added to plan
 
-    PENDING --> RUNNING : executor invokes adapter\n(emits TaskStarted)
+    PENDING --> RUNNING : executor invokes adapter OR\nreconciler observes RUNNING\n(emits TaskStarted)
     PENDING --> CANCELLED : upstream cancellation cascade\n(emits TaskCancelled)
+    PENDING --> NOT_NEEDED : overlay invocation end\n(tree did not exercise)
 
     RUNNING --> RUNNING : report_task_progress\n(emits TaskProgress; no transition)
-    RUNNING --> COMPLETED : report_task_completed\n(emits TaskCompleted)
-    RUNNING --> FAILED : report_task_failed or adapter error\n(emits TaskFailed)
+    RUNNING --> COMPLETED : report_task_completed OR\nreconciler observes after_agent success\n(emits TaskCompleted)
+    RUNNING --> FAILED : report_task_failed, adapter error, OR\nreconciler observes after_agent error\n(emits TaskFailed)
     RUNNING --> BLOCKED : report_task_blocked (structural)\n(emits TaskBlocked)
     RUNNING --> CANCELLED : executor cancel\n(emits TaskCancelled)
 
@@ -59,6 +62,7 @@ stateDiagram-v2
     COMPLETED --> [*]
     FAILED --> [*]
     CANCELLED --> [*]
+    NOT_NEEDED --> [*]
 ```
 
 ## Transition rules
@@ -67,9 +71,11 @@ Every transition obeys three invariants.
 
 ### Invariant 1 — Terminal states absorb
 
-Once a task is in `COMPLETED`, `FAILED`, or `CANCELLED`, no further
-transition is legal. `Steerer.transition()` rejects attempts to leave a
-terminal state:
+Once a task is in `COMPLETED`, `FAILED`, `CANCELLED`, or `NOT_NEEDED`,
+no further transition is legal. `Steerer.transition()` rejects
+attempts to leave a terminal state. `TERMINAL_TASK_STATUSES` in
+`goldfive/types.py` is the authoritative set, imported by every
+module that gates on terminality.
 
 ```python
 # pseudo-code: illustrative of the absorbing-terminal-state guard.
@@ -90,17 +96,27 @@ This is the single most load-bearing invariant in goldfive. Every
 feature downstream (progress reporting, refine, crash recovery,
 harmonograf integration) assumes it.
 
-### Invariant 2 — Reporting tools drive the machine
+### Invariant 2 — Transitions have two canonical entry points
 
-In v0.1, the canonical path into the state machine is through
-**reporting tools** (see [tool-protocol.md](../reference/tool-protocol.md)).
-When an agent calls `report_task_started("t3")`, the adapter routes
-the call through `goldfive.adapters._tool_invocation.invoke_tool`
-(which runs the schema / terminal / loop / volume guards), the
-spec's handler fires, and the steerer applies `PENDING → RUNNING`
-for task `t3`.
+Under the **overlay model (default)**, the primary driver is the
+`PlanReconciler` (`goldfive/reconciler.py`). The ADK plugin's
+`before_agent_callback` / `after_agent_callback` pairs are forwarded
+to `PlanReconciler.on_before_agent` / `.on_after_agent`, which claim
+the first PENDING task assigned to the observed agent name (direct
+match, or contextual match via the invocation-parent chain,
+goldfive#151/#160) and drive `steerer.transition(..., RUNNING)` then
+`steerer.transition(..., COMPLETED | FAILED)`.
 
-There are four non-reporting-tool paths in:
+Under both overlay and legacy modes, agents may also call
+**reporting tools** (`report_task_started`, `report_task_completed`,
+etc.) to report state directly. The adapter routes those calls
+through `goldfive.adapters._tool_invocation.invoke_tool` (which runs
+the schema / terminal / loop / volume guards), the spec's handler
+fires, and the steerer applies the transition. This is redundant
+with the reconciler's observation but harmless — the steerer's
+terminal-absorption guard drops duplicate transitions.
+
+Non-reconciler, non-reporting-tool paths in:
 
 - **Executor-driven transitions.** When the executor first picks up a
   `PENDING` task, it calls `steerer.transition(task_id, RUNNING, ...)`
@@ -135,6 +151,7 @@ Every successful transition in `Steerer.transition()` emits one event:
 | `RUNNING → BLOCKED` | `TaskBlocked` |
 | `RUNNING → CANCELLED` | `TaskCancelled` |
 | `PENDING → CANCELLED` | `TaskCancelled` |
+| `PENDING → NOT_NEEDED` | `TaskCancelled` (overlay-only; reason `"not needed (tree did not exercise)"`; task status in the plan is `NOT_NEEDED`) |
 | `BLOCKED → RUNNING` | `TaskStarted` (with `detail="resumed"`) |
 | `BLOCKED → *` | same as the `RUNNING → *` case |
 

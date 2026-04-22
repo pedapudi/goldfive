@@ -61,8 +61,6 @@ The symmetry: a `ControlKind` (external verb) is often *bridged* into a
 `DriftKind` (internal observation) before it acts on the plan. The
 next section walks one such bridge end-to-end.
 
-<!-- TODO: once docs/design/CONTROL.md lands, add cross-links in §2 and §3. -->
-
 ## 2. `ControlKind` vs `DriftKind` — a worked example
 
 The subtlest distinction in goldfive is between the five `ControlKind`
@@ -235,11 +233,12 @@ enum reference.
 | State | String | Terminal? | Meaning |
 |---|---|---|---|
 | `PENDING` | `"PENDING"` | no | Task exists in the plan, has not been started. Default on every new task in a fresh plan. |
-| `RUNNING` | `"RUNNING"` | no | Executor has dispatched `adapter.invoke(task, session)`. Agent is working. |
-| `COMPLETED` | `"COMPLETED"` | **yes** | Terminal success. Output is in `session.completed_results[task_id]`. Reached via `report_task_completed` or the executor's default-complete path. |
-| `FAILED` | `"FAILED"` | **yes** | Terminal failure. Reached via `report_task_failed`, adapter exception, or executor-driven failure. |
+| `RUNNING` | `"RUNNING"` | no | Executor has dispatched `adapter.invoke(task, session)` OR the `PlanReconciler` observed an agent running for this task. Agent is working. |
+| `COMPLETED` | `"COMPLETED"` | **yes** | Terminal success. Output is in `session.completed_results[task_id]`. Reached via `report_task_completed` or reconciler-observed `after_agent`. |
+| `FAILED` | `"FAILED"` | **yes** | Terminal failure. Reached via `report_task_failed`, adapter exception, reconciler-observed `after_agent` with error, or executor-driven failure. |
 | `CANCELLED` | `"CANCELLED"` | **yes** | Terminal. Reached via executor cancellation cascade or `report_task_cancelled`. |
 | `BLOCKED` | `"BLOCKED"` | no | External condition prevents progress. Task can return to `RUNNING` if the planner resolves the blocker, or convert to `FAILED`/`CANCELLED`. |
+| `NOT_NEEDED` | `"NOT_NEEDED"` | **yes** | Overlay-only (goldfive#141/#163). PENDING task the tree never exercised during the single passthrough invocation; stamped at invocation end. Distinct from `CANCELLED` so sinks can render "tree chose not to run" vs "user/system cancelled" differently. Proto enum value 7. |
 
 ### State diagram
 
@@ -388,8 +387,8 @@ the full bridge table.
 
 | `DriftKind` | Value | Default severity | Bridges from |
 |---|---|---|---|
-| `USER_STEER` | `"user_steer"` | `WARNING` | `ControlKind.STEER` (via `steerer.observe(ControlMessage)`). |
-| `USER_CANCEL` | `"user_cancel"` | `CRITICAL` | `ControlKind.CANCEL` (synthesized in `control_received_event` for audit; executor short-circuits to `RunAborted`). |
+| `USER_STEER` | `"user_steer"` | `WARNING` | `ControlKind.STEER` (via `steerer.observe(ControlMessage)`). Idempotent by `annotation_id` or `ControlMessage.id` (goldfive#171); emitted `DriftDetected` carries `annotation_id` (field 6) so sinks can dedup against the source annotation row. |
+| `USER_CANCEL` | `"user_cancel"` | `CRITICAL` | `ControlKind.CANCEL` (synthesized in `control_received_event` for audit; executor short-circuits to `RunAborted`). Emitted `DriftDetected` carries `annotation_id` when the bridge sourced one. |
 | `USER_PAUSE` | `"user_pause"` | `INFO` | `ControlKind.PAUSE` (synthesized for audit; executor blocks on next poll). |
 
 ### 5.e Transfer — the wrong agent picked something up
@@ -415,15 +414,17 @@ session-state mutation, not drift synthesis.
 
 ### Count check
 
-The table above covers the core trigger-driven kinds. The live
+The tables above cover the core trigger-driven kinds. The live
 `DriftKind` in `goldfive/types.py` also carries the reasoning-category
 kinds (`LOOPING_REASONING`, `REASONING_CLUSTER_TIGHTENING`, `CONFUSION`,
-`OFF_TOPIC`, `INTENT_DIVERGENCE`) and the reflective/confabulation
+`OFF_TOPIC`, `INTENT_DIVERGENCE`), the reflective / confabulation
 signals (`UNCERTAIN_PROGRESS`, `SELF_REPORTED_STUCK`,
-`CONFABULATION_RISK`) documented in [DRIFT.md](DRIFT.md), plus the
-looping-signal kinds (`LOOPING_TOOL_CALL`) and `USER_PAUSE`. The
-authoritative per-kind reference lives in [DRIFT.md](DRIFT.md); this
-section groups the kinds by what triggers them in production code.
+`CONFABULATION_RISK`), the looping-signal kinds (`LOOPING_TOOL_CALL`),
+`USER_PAUSE`, and the post-overlay additions
+(`RUNAWAY_DELEGATION` #35, `REFINE_VALIDATION_FAILED` #36,
+`HUMAN_INTERVENTION_REQUIRED` #37, `GOAL_DRIFT` #38).
+See `proto/goldfive/v1/types.proto::DriftKind` for the authoritative
+enum values and [DRIFT.md](DRIFT.md) for per-kind semantics.
 
 ## 6. Event payload kinds
 
@@ -554,3 +555,25 @@ compare string values directly — use the helpers.
 - [EVENT-MODEL.md](EVENT-MODEL.md) for the envelope spec.
 - [RATIONALE.md](RATIONALE.md) for why each of these shapes is the way
   it is.
+
+## 8. Overlay-era glossary
+
+New terms introduced by the 2026-04 overlay refactor and structural-
+steering work. Each has a load-bearing meaning distinct from its
+plain-English reading.
+
+| Term | Defined in | Meaning |
+|---|---|---|
+| **Overlay model** | `goldfive/executors/sequential.py::SequentialExecutor._run_overlay` | The default execution model. Single `adapter.invoke_passthrough(user_input)` per run / turn; plan tasks are transitioned by a `PlanReconciler` observing the tree's natural flow rather than by the executor driving one task at a time. Counterpart: "per-task driving," the legacy `overlay_mode=False` path. |
+| **PlanReconciler** | `goldfive/reconciler.py::PlanReconciler` | Overlay-mode component that maps observed agent transitions (`before_agent` / `after_agent` pairs from the ADK plugin) onto plan-task state transitions via `steerer.transition`. One instance per invocation. |
+| **Intervention ladder** | `goldfive/steerer.py::InterventionLevel` | Six-level policy table (0–5: OBSERVE / ABSORB / NUDGE / CANCEL_REINVOKE / PAUSE_ESCALATE / TERMINATE) that maps `(drift_kind, severity, occurrence_count)` to an action. Single source of truth for "when does goldfive interrupt the tree." See [DRIFT.md §"Intervention ladder"](DRIFT.md#intervention-ladder-levels-0-5). |
+| **Drift kind** | `goldfive/types.py::DriftKind` | The categorized observation; see §5. "Adding a drift kind" means proto + Python enum + classifier + (optional) ladder entry. |
+| **Orchestration state** | `goldfive/orchestration_state.py` | Framework-agnostic dict of `goldfive.*`-prefixed keys on `Session.state`. Bridges via `_adk_state_protocol` to the ADK runtime session state. |
+| **Tree-agnostic** | N/A | A component behaves the same regardless of tree shape (flat, nested, deep). `GoldfivePlanner`'s orchestration block is tree-agnostic; plan divergence classification is tree-aware (consults the registry). |
+| **Annotation id** | `proto/goldfive/v1/control.proto::SteerPayload.annotation_id`, `goldfive.v1.DriftDetected.annotation_id` | Source identifier for a user-control message, used for (a) STEER idempotency in `DefaultSteerer._is_duplicate_steer` and (b) sink-side dedup of a drift row against the annotation row. |
+| **Session unification** | goldfive#161 | The convention that `adk-web.ctx.session.id == goldfive.Session.id == harmonograf home session id`. All three layers reference the same id; `Event.session_id` stamps it per-event. |
+| **Three-stage gate** | `GoldfivePlanner.process_planning_response` | The classifier that splits an LLM-emitted `function_call` into "own tool" (no drift), "cross-layer agent" (`PLAN_DIVERGENCE`), or "nowhere" (`CONFABULATION_RISK`). Replaces the pre-#184 single-stage registry check. |
+| **Tool-loop tracker** | `goldfive/drift/tool_loops.py::ToolLoopTracker` | Per-`(invocation_id, agent_name)` ring buffer + loop classifier. Detects exact / name / alternating tool-call patterns (#186). |
+| **Structural steering** | goldfive#151-#155 | Umbrella for tree-aware planner constraints, orchestration state namespace, `GoldfivePlanner(BasePlanner)`, goal-aware refine. |
+| **Reporting tools** | `goldfive/reporting.py::ReportingToolSpec` | The agent-facing protocol tools (`report_task_started`, `report_task_completed`, `report_task_failed`, `report_task_blocked`, `report_task_progress`, `report_task_cancelled`, `report_plan_divergence`, `report_new_work_discovered`, `report_awaiting_approval`). Still present; agents can call them to drive state directly. Under overlay the reconciler is usually faster, but the two paths converge at `steerer.transition` (terminal absorption dedupes). |
+| **`NOT_NEEDED`** | `TaskStatus.NOT_NEEDED` | Terminal status stamped on PENDING tasks at overlay-invocation end. |

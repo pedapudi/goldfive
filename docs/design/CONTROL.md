@@ -69,6 +69,43 @@ that carries data has a dedicated message (`SteerPayload`,
 `payload: dict[str, Any]` for Python-side ergonomics; the converter is
 the boundary that maps `dict` → oneof branch and back.
 
+### 1.b `SteerPayload` fields (goldfive#171)
+
+`SteerPayload` (`proto/goldfive/v1/control.proto`) carries four
+strings:
+
+| Field | # | Meaning |
+|---|---|---|
+| `note` | 1 | The free-text steering instruction the operator authored. |
+| `suggested_action` | 2 | Optional short verb the UI may surface as a hint (e.g. "drop research phase"). |
+| `author` | 3 | Operator identity from the originating annotation. Empty when the bridge doesn't source annotations. Used for audit trails and prompt attribution (appears in the USER_STEER drift detail as `"by {author}: {note}"`). |
+| `annotation_id` | 4 | Source annotation id. Used for idempotency (see §1.c) and for stamping `DriftDetected.annotation_id` on the resulting USER_STEER drift so sinks can dedup against the annotation row. |
+
+Bridges that don't source annotations may leave `author` and
+`annotation_id` empty — the in-process dedupe falls back to
+`ControlEvent.id` / `ControlMessage.id`.
+
+### 1.c STEER idempotency contract (goldfive#171)
+
+Every STEER carries a dedupe id: `annotation_id` when the bridge
+populated one, otherwise the `ControlMessage.id`. `DefaultSteerer`
+records processed ids on
+`session.state["goldfive.processed_steer_ids"]` (a bounded FIFO) and
+drops retries before they reach `steerer._handle_drift`:
+
+- **Retries of the same STEER** (same annotation, repeated
+  `channel.send`) — dropped silently; the steerer does not cascade-
+  cancel or call `planner.refine` a second time.
+- **New STEER with a fresh id** — processed normally; emits
+  USER_STEER drift, cancels the in-flight invocation, runs refine.
+- **Bridge that doesn't source annotation_id** — falls back to the
+  `ControlMessage.id`; retries at the transport layer still dedupe
+  because the bridge re-uses the same message id.
+
+Dispatcher and ack still fire on every delivery (so the bridge sees
+an `AckResult.SUCCESS` back) — only the side-effects (drift + refine)
+are suppressed for duplicates.
+
 ## 2. The `ControlChannel` primitive
 
 One class, two queues, a dozen lines of interface. Lives at
@@ -500,6 +537,38 @@ acks iterator or on events captured by an `InMemorySink`. Patterns:
 `tests/test_live_steering_e2e.py`. A runnable demo covering PAUSE /
 STEER / CANCEL against an offline canned-LLM planner lives at
 `examples/live_steering.py`.
+
+## 7.d Intervention ladder (goldfive#142)
+
+A STEER control message is the user-initiated entry into a broader
+intervention story. Goldfive-internal drift detectors (loop, refusal,
+goal drift, ...) enter the same pipeline via synthesized drifts, and
+both paths route through `DefaultSteerer._handle_drift` which maps
+`(drift_kind, severity, occurrence_count)` to one of six levels:
+
+| Level | Name | What happens |
+|---|---|---|
+| **0** | `OBSERVE` | Emit `DriftDetected`; no further action. |
+| **1** | `ABSORB` | Call `planner.refine`; install revised plan; continue. This is where USER_STEER lands. |
+| **2** | `NUDGE` | Queue a corrective user message on `session.pending_nudges`. Not on the default table today; reserved for future policies. |
+| **3** | `CANCEL_REINVOKE` | Cancel the in-flight invocation; refine; compose a corrective user message for overlay re-invoke. |
+| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; set `session.paused_for_human_intervention = True`; runner blocks for user input. |
+| **5** | `TERMINATE` | Run-level abort. Only reached on repeat Level-4 that didn't resolve. |
+
+The per-`(drift_kind, severity)` mapping lives in
+`DefaultSteerer._LADDER` (see `goldfive/steerer.py`). A subclass can
+override `_ladder_level_for` to tune the table.
+
+USER_STEER specifically maps to **Level 1 (ABSORB)** at WARNING (the
+default severity) — refine runs synchronously, the revised plan
+installs, and the overlay loop restarts with the steer body as the
+new user input (framed via `_compose_steer_restart_message`, see
+goldfive#152). USER_CANCEL is special-cased to short-circuit the
+ladder into an unconditional `RunAborted`.
+
+See [DRIFT.md §"Intervention ladder (Levels 0-5)"](DRIFT.md#intervention-ladder-levels-0-5)
+for the full per-drift-kind mapping and the corresponding code
+path in `goldfive/steerer.py`.
 
 ## 8. What ControlChannel is *not*
 

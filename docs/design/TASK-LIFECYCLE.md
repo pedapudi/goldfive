@@ -79,10 +79,47 @@ See §7.
 
 ## 2. Assignment protocol
 
-Once a Plan exists, tasks move from `PENDING` to `RUNNING` via one of
-two entry points, and execution is driven by the Executor.
+Once a Plan exists, tasks move from `PENDING` to one of two active
+states (`RUNNING` under the overlay model, via a
+`PlanReconciler` observation; or `PENDING → NOT_NEEDED` at invocation
+end if the tree never exercised it). Under the legacy per-task loop
+the executor drives `PENDING → RUNNING` directly.
 
-### 2.1 Who picks the next task
+### Overlay-model assignment
+
+Under the default overlay mode (goldfive#141, refined by #163 /
+#149 / #152) the executor issues ONE
+`adapter.invoke_passthrough(user_input)` per run / turn. While the
+tree runs:
+
+1. ADK plugin's `before_agent_callback` fires → the plugin calls
+   `PlanReconciler.on_before_agent(name, invocation_id, parent_invocation_id)`
+   → the reconciler picks the first PENDING task assigned to that
+   agent (or a contextual match via the invocation-parent chain,
+   goldfive#151) and transitions it `PENDING → RUNNING` via
+   `steerer.transition`.
+2. `after_agent_callback` fires with an optional error → the
+   reconciler transitions `RUNNING → COMPLETED` (no error) or
+   `RUNNING → FAILED` (error).
+3. Drift signals (PLAN_DIVERGENCE from three-stage gate,
+   LOOPING_REASONING from tool-loop and reasoning detectors, ...)
+   ride the ADK plugin → steerer.observe / steerer._handle_drift
+   → intervention ladder.
+
+### Invocation-end `PENDING → NOT_NEEDED` sweep (goldfive#163)
+
+When the passthrough invocation generator ends cleanly (tree
+finished its natural flow), `SequentialExecutor._run_overlay`
+walks the live plan and transitions every still-PENDING task to
+`NOT_NEEDED`. The previous behaviour (goldfive#141 pre-#163)
+dispatched a soft follow-up per missed task; flow-prompted
+coordinators re-ran their full pipeline on every follow-up,
+amplifying a ~10 min run into 40+ min. STEER remains the user-
+driven path for exercising uncovered work.
+
+### Legacy per-task assignment (overlay_mode=False)
+
+### 2.1 Who picks the next task (legacy per-task mode)
 
 `SequentialExecutor._pick_next_task` (`executors/sequential.py:~624`)
 walks topological stages and returns the first task that is `PENDING`
