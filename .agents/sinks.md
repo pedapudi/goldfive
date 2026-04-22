@@ -111,6 +111,13 @@ class MySink:
 - **Be prepared for dict envelopes.** At minimum, skip them cleanly.
 - **Ordering.** Events are emitted in sequence order per run. Don't
   reorder within a sink.
+- **Route by `session_id` when multiplexing** (goldfive#155). Every
+  `Event` carries `session_id` at tag 5 — under the adk-web pin
+  (goldfive#161) it equals the outer adk-web session id, which is
+  stable across overlay STEER restarts and nested AgentTool
+  sub-Runners. Sinks that fan out to per-session buffers (e.g.
+  `HarmonografSink`) must key on `event.session_id`, not on any
+  client-global state.
 
 ## Quick reference
 

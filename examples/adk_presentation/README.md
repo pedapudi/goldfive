@@ -1,26 +1,36 @@
 # Minimal goldfive + ADK example
 
-The smallest possible demo showing how `goldfive.wrap(agent, ...)` plugs a
-plain Google ADK agent into goldfive's planner + executor + steerer stack.
+The smallest possible demo showing how `goldfive.wrap(agent, ...)`
+plugs a plain Google ADK agent into goldfive's planner + reconciler
++ steerer stack.
 
 ```python
 agent  = <your ADK Agent>                 # any BaseAgent
 runner = goldfive.wrap(                   # goldfive handles decomposition,
-    agent,                                # dispatch, drift, and steering
+    agent,                                # overlay dispatch, drift, and steering
     planner=LLMPlanner(call_llm=...),
     goal_deriver=LLMGoalDeriver(call_llm=...),
 )
 await runner.run("make a presentation about waffles")
 ```
 
-One agent, no coordinator, no hand-rolled delegation. If you need a
-multi-specialist reference see the "richer example" section below.
+One agent, no coordinator, no hand-rolled delegation. `goldfive.wrap`
+returns a `GoldfiveADKAgent` — a `BaseAgent` subclass that also
+exposes `Runner.run`, so the same object works under `adk web` and
+programmatically.
 
 ## What this demonstrates
 
-- **One ADK `Agent`, goldfive does the rest.** The planner emits a task
-  DAG; the executor invokes the same agent for each task in turn. No
-  subagent tree, no `AgentTool`s, no coordinator with hardcoded routing.
+- **One ADK `Agent`, goldfive does the rest.** The planner emits a
+  task DAG; the overlay reconciler observes the agent running via
+  `before_agent` / `after_agent` callbacks and maps invocations to
+  plan tasks. No subagent tree, no `AgentTool`s, no coordinator with
+  hardcoded routing.
+- **`GoldfivePlanner` auto-attached** to the agent's `LlmAgent`
+  (goldfive#153). A per-turn orchestration context block is injected
+  into the LLM's system instruction so the agent reads the current
+  task from `session.state['goldfive.*']` without the caller wiring
+  prompts manually.
 - **Planner + goal deriver are pluggable.** Wire any model provider
   behind a `call_llm` callable with signature
   `(system_prompt, user_prompt, model) -> str`.

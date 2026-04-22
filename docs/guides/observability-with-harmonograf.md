@@ -316,6 +316,12 @@ reuses the ADK agent's `.model` to configure `LLMPlanner` and
 `LLMGoalDeriver`. Override any default (`planner=`, `executor=`,
 `call_llm=`, `model=`, ...) by passing it as a keyword argument.
 
+For the full ADK + `adk web` pairing — including the
+`HarmonografTelemetryPlugin` that captures per-agent spans so the
+Gantt shows one row per sub-agent (goldfive#170 + harmonograf#80) —
+see [adk-web-integration.md](adk-web-integration.md) and
+[harmonograf-integration.md §"The two harmonograf hooks"](harmonograf-integration.md#the-two-harmonograf-hooks-sink--telemetry-plugin).
+
 The lower-level `goldfive.quickstart()` factory is still available
 for callers who want a ready-to-run `StaticPlanner` with one task per
 goal — see the source of `goldfive/quickstart.py`.

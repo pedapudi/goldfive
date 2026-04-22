@@ -119,6 +119,38 @@ crosses the wire. If a caller (or a custom component) hands a dict
 envelope to the sink, it is silently dropped with a debug log —
 pair with `JSONLPersistenceSink` locally if you need that path.
 
+### Session id stamping
+
+Every `Event` on the wire carries `session_id` (tag 5, goldfive#155).
+Server-side routing uses it as the multiplex key when a single stream
+carries events from multiple Sessions — which matters for consumers
+like `HarmonografSink` where the client-side buffer is process-wide
+but runs are session-scoped.
+
+Under the adk-web integration the outer adk-web session id is pinned
+onto `Session.id` before dispatch (goldfive#161), so the goldfive
+Session, ADKAdapter's internal session, and adk-web's URL session id
+all match. One session row per run; no reconciliation on the
+server side.
+
+### Lazy Hello (harmonograf-specific, harmonograf#85)
+
+The harmonograf client's `Client(name=..., server_addr=...)`
+constructor used to issue a Hello RPC synchronously, which meant the
+session was minted server-side at *client construction* time — before
+the goldfive Session existed. That led to a race where the
+server-side session id and the goldfive-side session id disagreed.
+
+Current harmonograf (≥ #85) defers the Hello until the first event
+emission. The client observes the first goldfive event's `session_id`
+and uses it as the Hello session id. Result: server-side session =
+goldfive Session = adk-web session. No reconciliation needed; no
+duplicate rows in the UI.
+
+If you're building a server that consumes the goldfive gRPC stream,
+mirror the same lazy pattern — defer session creation until the first
+Event's `session_id` is known.
+
 ### Reconnect semantics
 
 With `reconnect=True` (the default) the drain task retries `StreamEvents`

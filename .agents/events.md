@@ -47,14 +47,27 @@ Current `main` emits every event (Runner, Executor, Steerer) as a proto
 `goldfive.events.make_event` is still exported as a fallback for
 callers that can't use the `proto` extra; sinks should tolerate both.
 
+The proto envelope carries:
+
+| Field | Tag | What |
+|---|---|---|
+| `event_id` | 1 | Stable ULID per emission. |
+| `run_id` | 2 | Alias for `Session.id`; stable across a run. |
+| `emitted_at` | 3 | Wall-clock time (proto `Timestamp`). |
+| `sequence` | 4 | Monotonic per-run counter. |
+| `session_id` | 5 | Multiplex key (goldfive#155) — under adk-web pin (goldfive#161) equals `ctx.session.id`. |
+| `payload` | oneof | `run_started` / `task_completed` / `drift_detected` / … |
+
 Common idiom for dispatch:
 
 ```python
 if hasattr(event, "DESCRIPTOR"):
     kind = event.WhichOneof("payload")
     payload = getattr(event, kind) if kind else None
+    session_id = event.session_id or event.run_id
 else:
     kind, payload = event["kind"], event["payload"]
+    session_id = event.get("session_id") or event["run_id"]
 ```
 
 ## The seven reporting tools

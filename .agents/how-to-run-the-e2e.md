@@ -37,6 +37,31 @@ The `third_party/adk-python` clone is required even for runs that
 don't go through ADK — the harmonograf `make install` target
 treats it as an editable path dep.
 
+### 3. LLM backend
+
+The canonical e2e uses a local LLM served by kikuchi. Point the
+environment at it before running adk-web:
+
+```bash
+# kikuchi-hosted Qwen on LAN (adjust host as needed)
+export USER_MODEL_NAME=openai/qwen3-coder-30b
+export OPENAI_BASE_URL=http://kikuchi:8000/v1
+export OPENAI_API_KEY=sk-anything   # kikuchi doesn't check
+
+# or OpenAI cloud
+export USER_MODEL_NAME=openai/gpt-4o-mini
+export OPENAI_API_KEY=sk-...
+
+# planner model (defaults to USER_MODEL_NAME via litellm)
+export GOLDFIVE_EXAMPLE_PLANNER_MODEL=gpt-4o-mini
+```
+
+`USER_MODEL_NAME` is the env var the reference agents
+(`presentation_agent_orchestrated` etc.) read. **Do not** leave it
+unset — the default `gemini-2.5-flash` silently breaks without
+`GOOGLE_API_KEY` (see
+[docs/guides/troubleshooting.md §"Run terminates immediately"](../docs/guides/troubleshooting.md)).
+
 ## Driving a run
 
 ### The `/tmp/e2e-*.py` pattern
@@ -92,7 +117,7 @@ few hours and carry local config. Committing them creates churn;
 
 ### Booting the harmonograf stack
 
-Two terminals:
+Three terminals for the canonical e2e (server + frontend + adk-web):
 
 ```bash
 # terminal 1 — gRPC server on :7531 + gRPC-Web on :7532
@@ -102,15 +127,54 @@ make server-run
 # terminal 2 — frontend dev server on :5173
 cd ~/git/harmonograf/frontend
 pnpm dev --port 5173 --strictPort
+
+# terminal 3 — adk-web hosting the reference presentation agent
+cd ~/git/harmonograf/.demo-agents
+export USER_MODEL_NAME=openai/qwen3-coder-30b   # or OpenAI / Gemini
+export OPENAI_BASE_URL=http://kikuchi:8000/v1
+export OPENAI_API_KEY=sk-anything
+export HARMONOGRAF_SERVER=127.0.0.1:7531
+uv run adk web presentation_agent_orchestrated
 ```
 
-Then open `http://127.0.0.1:5173`. Runs started against
-`localhost:7531` appear in the Sessions view as they begin.
+Open `http://127.0.0.1:5173` for the harmonograf UI and
+`http://127.0.0.1:8000` for the adk-web UI.
 
-If you want the full ADK demo rollout (server + frontend + an
-`adk web` process hosting `presentation_agent`), `make demo` in
-the harmonograf repo does all three; skip `make server-run` +
-`pnpm dev` in that case.
+If you want the one-shot demo (server + frontend + adk-web all in
+one command), `make demo` in the harmonograf repo does all three;
+skip the separate terminals in that case.
+
+### Steer flow: `/tmp/steer.py` + browser-use
+
+The canonical driver for STEER end-to-end testing is a small
+script at `/tmp/steer.py` (ephemeral, tuned per session):
+
+```python
+# /tmp/steer.py — submit a prompt to adk-web, wait, then STEER
+import asyncio, json, urllib.request
+
+def post(path, payload):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:8000{path}",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    return urllib.request.urlopen(req).read()
+
+async def main():
+    # 1. submit initial prompt
+    post("/run", {"message": "Make a presentation about waffles"})
+    await asyncio.sleep(10)
+    # 2. steer mid-run
+    post("/steer", {"message": "Switch to raccoons", "author": "e2e"})
+
+asyncio.run(main())
+```
+
+Or drive via `mcp__browser-use__` tools from a parent agent to
+open the adk-web / harmonograf UIs, click Steer buttons, and
+verify PlanRevised events in the UI — same thing, just
+higher-fidelity.
 
 ### Running the reproducer
 

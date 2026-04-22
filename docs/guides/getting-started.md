@@ -81,20 +81,68 @@ Every default is overridable via keyword argument — `planner=`,
 
 ## Mental model in five sentences
 
-goldfive wraps an agent and runs it against an explicit plan.
+goldfive wraps an agent and **observes** it running against an explicit plan.
 
 1. Your user input becomes one or more **Goals**.
 2. A **Planner** produces a **Plan** (a DAG of **Tasks**) that, if
    executed, satisfies the goals.
-3. An **Executor** walks the plan. For each task, it calls your
-   **AgentAdapter**, which drives whatever underlying framework
-   (Claude, ADK, a bare callable) actually runs the agent.
-4. A **Steerer** watches the execution and classifies **drift** —
-   structured "we're off-track" signals.
-5. On drift, the planner revises the plan; every state change emits a
-   proto **Event** to every configured **EventSink**.
+3. For ADK trees the **Executor** issues ONE invocation with the user
+   request and lets the tree run naturally; a **PlanReconciler** maps
+   the tree's observed `before_agent` / `after_agent` callbacks onto
+   plan tasks (the "overlay" model, goldfive#141). For non-ADK adapters
+   it falls back to the per-task invoke loop.
+4. A **Steerer** watches execution and classifies **drift** — structured
+   "we're off-track" signals — then routes through a six-level
+   intervention ladder (OBSERVE → ABSORB → NUDGE → CANCEL_REINVOKE →
+   PAUSE_ESCALATE → TERMINATE, goldfive#142).
+5. On drift at Level 1+ the planner refines the plan; every state change
+   emits a proto **Event** to every configured **EventSink**.
 
 Six primitives, one `Runner` object, one `await runner.run(...)` call.
+
+## Using goldfive with an ADK agent (the common path)
+
+If you already have a Google ADK agent tree — single `Agent`, flat
+specialists, coordinator+`AgentTool`, or deep hierarchies — the whole
+integration is:
+
+```python
+import goldfive
+from google.adk.apps.app import App
+
+wrapped = goldfive.wrap(root_agent)            # ADK BaseAgent subclass
+app = App(name="my-demo", root_agent=wrapped)  # works in adk web
+```
+
+`goldfive.wrap` on an ADK agent:
+
+1. Builds one `InMemoryRunner` around the tree root (single-Runner
+   model, goldfive#130). ADK handles delegation within the tree via
+   `AgentTool` / `sub_agents` / `transfer_to_agent`.
+2. Walks the tree and attaches the goldfive reporting-tools to every
+   reachable agent (`sub_agents` / `inner_agent` / `tool.agent` edges).
+3. Attaches a `GoldfivePlanner(BasePlanner)` to every `LlmAgent` in
+   the tree (goldfive#153). This injects a per-turn orchestration
+   context block into the LLM's system instruction (current task id /
+   title, plan summary, active user steer, goal summaries) via the
+   goldfive ADK plugin's `before_model_callback`.
+4. Installs the goldfive ADK plugin on the runner. It observes tool
+   calls, function responses, agent transitions, and LLM request /
+   response pairs; routes drift to the steerer; heals orphan tool-call
+   ids on USER_STEER cancellation.
+
+The pipeline runs naturally inside `adk web` — the wrapped object IS
+a `BaseAgent` (`GoldfiveADKAgent`, see
+[adk-web-integration.md](adk-web-integration.md)) — and the same
+object still works programmatically:
+
+```python
+outcome = await wrapped.run("make a presentation about waffles")
+```
+
+See [adk-web-integration.md](adk-web-integration.md) for end-to-end
+setup including environment variables and the `HarmonografTelemetryPlugin`
+pairing.
 
 ## Hello-callable: your first agent in 10 minutes
 

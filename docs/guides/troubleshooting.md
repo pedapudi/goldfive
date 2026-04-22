@@ -282,6 +282,123 @@ finally:
     await runner.close()
 ```
 
+## adk-web integration
+
+### Symptom: Run terminates immediately with "goldfive run complete."
+
+**What you see.** You open adk-web, submit a prompt, and the stream
+shows a plan summary followed instantly by "goldfive run complete."
+— nothing actually ran. Sometimes a bare `AttributeError:
+'_async_httpx_client'` shows up in the server log at teardown.
+
+**Why it happens.** Almost always the model is misconfigured. Two
+common shapes:
+
+1. **Gemini default with no `GOOGLE_API_KEY`.** `presentation_agent_orchestrated`
+   and similar examples default `USER_MODEL_NAME` to `gemini-2.5-flash`;
+   without credentials the first LLM call raises after goldfive has
+   already emitted RunStarted / PlanSubmitted, so the stream looks
+   short but ended.
+2. **Custom planner returned `None` from `generate`** — e.g.
+   `LLMPlanner` with a `call_llm` that raised on first use. The
+   Runner emits `RunAborted` with `reason="no plan generated"` and
+   the UI renders it as "goldfive run complete." with no tasks.
+
+**Fix.**
+
+```bash
+export USER_MODEL_NAME=openai/gpt-4o-mini
+export OPENAI_API_KEY=sk-...
+# or for local LLMs:
+export USER_MODEL_NAME=openai/qwen3-coder-30b
+export OPENAI_BASE_URL=http://localhost:8000/v1
+export OPENAI_API_KEY=sk-anything
+```
+
+Then inspect the underlying issue:
+
+```python
+import logging
+logging.getLogger("goldfive.runner").setLevel(logging.DEBUG)
+logging.getLogger("goldfive.planner").setLevel(logging.DEBUG)
+```
+
+The full exception trace is logged at `ERROR` on `goldfive.runner`.
+
+### Symptom: Spans don't appear per-agent in the harmonograf Gantt
+
+**What you see.** The Gantt timeline shows one big bar per turn
+instead of a row per sub-agent.
+
+**Why it happens.** You're on a goldfive / harmonograf combination
+that predates per-agent span stamping (goldfive#170 +
+harmonograf#80). Or the `HarmonografTelemetryPlugin` didn't install
+on the App-level runner — goldfive's in-process plugin sees its own
+observations but not the ADK-native spans the telemetry plugin adds.
+
+**Fix.**
+
+```python
+from google.adk.apps.app import App
+from harmonograf_client import Client, HarmonografTelemetryPlugin
+
+client = Client(name="my-agent", server_addr="127.0.0.1:7531")
+app = App(
+    name="my-demo",
+    root_agent=goldfive.wrap(root_agent),
+    plugins=[HarmonografTelemetryPlugin(client)],  # <— this line
+)
+```
+
+The plugin must be on the `App`; putting it on `goldfive.wrap(plugins=...)`
+also works but the App-level path is idempotent and doesn't require
+that goldfive construct the runner.
+
+### Symptom: Steer doesn't take effect
+
+**What you see.** You click Steer in the harmonograf UI, the
+`DriftDetected{kind=user_steer}` event appears, but no `PlanRevised`
+follows and the run keeps running against the old plan.
+
+**Possible causes.**
+
+1. **`planner.refine` silently failed.** Look for
+   `DriftDetected{kind=refine_validation_failed, severity=critical}`
+   — that's the terminal signal from `LLMPlanner` when it exhausts
+   its retry budget. See [common-failure-modes.md §3](common-failure-modes.md).
+2. **Annotation not propagated.** STEER annotations are deduped by
+   `annotation_id` (goldfive#171). If two clicks have the same id
+   the second is a no-op. Check the harmonograf client's bridge is
+   forwarding a fresh id per click.
+3. **Author missing.** The refine's revised plan should carry the
+   steering author in `revision_reason`. If it's empty the bridge
+   didn't forward `ControlMessage.steer.author`.
+
+**Fix.** Enable DEBUG on `goldfive.planner` and re-steer; the
+`LLMPlanner._refine_user_steer: attempt X/2: <error>` log line tells
+you exactly which attempt failed and why.
+
+### Symptom: Multiple session rows in harmonograf per run
+
+**What you see.** Every goldfive run produces two (or three) rows in
+the harmonograf Sessions picker — one has the plan, another has the
+spans, and they refer to the same underlying run.
+
+**Why it happens.** Pre-goldfive#161 / #164 + pre-harmonograf#85
+(lazy Hello). Goldfive's `Session.id` and the ADKAdapter's internal
+session id disagreed with adk-web's outer `ctx.session.id`; per-event
+routing split the stream across multiple sessions.
+
+**Fix.** Upgrade both goldfive (≥ #164) and harmonograf (≥ #85). In
+current `main` `GoldfiveADKAgent._run_async_impl` pins the outer
+session id onto both goldfive and the adapter before sub-agent
+dispatch runs, and harmonograf's client defers the Hello RPC until
+the first event — so every span + event carries the same session id.
+
+If you're still seeing duplicates on current code, check for a
+pre-built `Runner` constructed outside `goldfive.wrap` (degrade mode)
+— the pin only works when the wrap path built the runner.
+
 ## harmonograf integration
 
 ### Symptom: `HarmonografSink` — connection refused

@@ -80,10 +80,18 @@ flowchart LR
 
 - `GoalDeriver` runs once, at the top of `Runner.run()`.
 - `Planner.generate` runs once, after goals.
-- `Planner.refine` runs once per warning-or-higher drift.
+- `Planner.refine` runs once per drift escalated to ABSORB (Level 1+)
+  by the steerer's intervention ladder. Same-kind drifts within
+  `DEFAULT_REFINE_THROTTLE_SECONDS` collapse into one refine call;
+  CRITICAL severities bypass the throttle.
 
-Goals never change mid-run in v0.1. Plans change whenever refine
-returns a non-None plan.
+Goals accumulate across USER_STEER interventions (goldfive#154): each
+user steer appends a goal with `source=GOAL_SOURCE_USER_STEER`. These
+are "sticky" — `LLMPlanner.refine` rejects revisions that silently
+drop them, so later drifts cannot unwind an operator's steer by
+merely refining around it.
+
+Plans change whenever refine returns a non-None plan.
 
 ## GoalDerivers
 
@@ -279,20 +287,32 @@ When to write one:
 
 ### The refine contract (important)
 
-`refine(plan, drift, goals)` must:
+`refine(plan, drift, goals, *, observed_actions=None)` must:
 
 1. **Preserve completed tasks verbatim.** The executor will skip any
    task in a terminal state, but the revised plan should still list
    them so downstream plan-diff consumers (sinks, UIs) can see the
-   full history. In practice, copy completed tasks into the new plan
-   unchanged.
-2. **Leave the plan semantically sensible even if the drift is
+   full history. `Plan.validate(for_revision=True, prior=plan)`
+   enforces this (PLAN-LIFECYCLE §3.1 — terminal task preservation;
+   §3.2 — terminal→terminal edge preservation).
+2. **Honor sticky goals.** Goals whose `source == GOAL_SOURCE_USER_STEER`
+   (goldfive#154) must be represented in the revised plan. A refine
+   that silently drops a user-steer goal is rejected by the
+   `LLMPlanner` and triggers a `REFINE_VALIDATION_FAILED` drift.
+3. **Leave the plan semantically sensible even if the drift is
    garbage.** If you can't do anything useful with the drift, return
    `None`. `None` is a legitimate signal that means "I can't revise".
-3. **Increment `revision_index` and stamp `revision_reason`.** The
+4. **Increment `revision_index` and stamp `revision_reason`.** The
    executor stamps these for you after `refine()` returns, but a
    custom planner can pre-populate them if it's doing its own
    tracking.
+5. **Optionally consume `observed_actions`** — the overlay-model
+   reconciler (goldfive#141) builds a list of `ObservedAction`
+   snapshots per invocation and hands them to refine when the drift
+   kind is `PLAN_DIVERGENCE` (goldfive#144). Each entry carries
+   agent name, invocation id, timestamps, status, and a short
+   summary, letting the planner compare planned dispatch against the
+   observed tree execution.
 
 A skeleton refine:
 

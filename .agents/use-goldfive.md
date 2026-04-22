@@ -27,13 +27,33 @@ Optional extras, install only what you need:
   events on the wire or on disk.
 - `goldfive[examples]` — runtime deps for scripts in `examples/`.
 
-## The one-liner (`quickstart`)
+## The one-liner (`goldfive.run` / `goldfive.wrap`)
 
-For callers who just want a runnable `Runner` with sensible defaults:
+For ADK agents and bare callables alike, two convenience helpers:
+
+```python
+import goldfive
+
+# One line: wrap + run, get an ExecutionOutcome back.
+outcome = await goldfive.run(my_agent, "make a presentation about waffles")
+
+# Or, keep the Runner around:
+runner = goldfive.wrap(my_agent, sinks=[my_sink])
+outcome = await runner.run("make a presentation about waffles")
+```
+
+`wrap` auto-detects the adapter from the agent's shape (ADK
+BaseAgent, Claude SDK client factory, async callable, or an existing
+`AgentAdapter` instance); tries to reuse the agent's LLM for the
+planner + goal-deriver; and defaults the executor to
+`SequentialExecutor(overlay_mode=True)` for ADK wrap targets
+(goldfive#141).
+
+For the tightest possible Runner construction with an explicit
+`StaticPlanner`, `goldfive.quickstart` is still available:
 
 ```python
 import asyncio
-
 from goldfive import InvocationResult, quickstart
 
 
@@ -54,9 +74,6 @@ asyncio.run(main())
 `quickstart` wires a `CallableAdapter`, `StaticPlanner` (one task per
 goal), `SequentialExecutor`, and a single `InMemorySink`. Pass
 `planner=` or `sinks=` to override.
-
-> `goldfive.run(agent, "...")` is tracked by issue #66 and not yet
-> merged. Until then, use `quickstart` or construct a `Runner` directly.
 
 ## The explicit form (`Runner`)
 
@@ -105,13 +122,30 @@ asyncio.run(main())
 
 ## Swapping in a real framework
 
-Change one line — the rest of the `Runner` construction stays identical:
+For ADK, use `goldfive.wrap(adk_agent)` directly — it returns a
+`GoldfiveADKAgent` that both satisfies the `BaseAgent` contract (so
+`adk web` loads it) and exposes `Runner.run`:
 
 ```python
-# ADK (requires goldfive[adk])
-from goldfive.adapters.adk import ADKAdapter
-agent = ADKAdapter(root_agent)
+import goldfive
+from google.adk.apps.app import App
+from harmonograf_client import Client, HarmonografSink, HarmonografTelemetryPlugin
 
+client = Client(name="my-agent", server_addr="127.0.0.1:7531")
+wrapped = goldfive.wrap(root_agent, sinks=[HarmonografSink(client)])
+
+app = App(
+    name="my-demo",
+    root_agent=wrapped,
+    plugins=[HarmonografTelemetryPlugin(client)],
+)
+# `adk web agent.py` now loads wrapped; programmatic use:
+#   outcome = await wrapped.run("make a presentation about waffles")
+```
+
+For the Claude Agent SDK:
+
+```python
 # Claude Agent SDK (requires goldfive[claude])
 from goldfive.adapters.claude import ClaudeAgentSDKAdapter
 agent = ClaudeAgentSDKAdapter(
