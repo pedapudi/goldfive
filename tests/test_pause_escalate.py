@@ -343,13 +343,18 @@ async def test_cancel_reinvoke_queues_corrective_message() -> None:
             )
 
     steerer.bind(sinks=[], planner=GoodPlanner())
+    # Use TOOL_ERROR for the Level 3 first-occurrence check:
+    # LOOPING_REASONING's CRITICAL-first tier routes to NUDGE
+    # (Level 2) after goldfive#204, so we pick a drift kind whose
+    # CRITICAL-first tier still routes to CANCEL_REINVOKE AND whose
+    # corrective-template interpolates the current_task_id.
     drift = DriftEvent(
-        kind=DriftKind.LOOPING_REASONING,
+        kind=DriftKind.TOOL_ERROR,
         severity=DriftSeverity.CRITICAL,
-        detail="looped",
+        detail="tool error",
         current_task_id="t1",
     )
     await steerer._handle_drift(drift, session)
     assert session.pending_corrective_message is not None
     assert "t1" in session.pending_corrective_message
-    assert "different approach" in session.pending_corrective_message
+    assert "Try a different approach" in session.pending_corrective_message

@@ -1732,10 +1732,23 @@ class DefaultSteerer:
             InterventionLevel.ABSORB,
             (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
         ),
+        # LOOPING_REASONING: severity is now graduated (goldfive#204)
+        # -- the tool-loop detector emits INFO / WARNING / CRITICAL
+        # based on count + category (meta vs work). The ladder mirrors
+        # that graduation:
+        #
+        # * INFO  -> OBSERVE (default fallback; benign meta-tool retries
+        #   at the first threshold should not mutate the plan).
+        # * WARNING -> ABSORB (refine plan; unchanged from pre-#204).
+        # * CRITICAL first -> NUDGE (refine AND queue a soft corrective
+        #   follow-up for the overlay loop -- Agent B wires the nudge
+        #   consumption in goldfive#forward-progress).
+        # * CRITICAL repeat -> PAUSE_ESCALATE (escalate to human if the
+        #   loop persists past nudge).
         DriftKind.LOOPING_REASONING: (
             None,
             InterventionLevel.ABSORB,
-            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+            (InterventionLevel.NUDGE, InterventionLevel.PAUSE_ESCALATE),
         ),
         DriftKind.LOOPING_TOOL_CALL: (
             None,

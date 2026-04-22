@@ -1,4 +1,4 @@
-"""Tool-call loop drift detector (goldfive#181).
+"""Tool-call loop drift detector (goldfive#181, #204).
 
 Post-steer replays on weaker models occasionally degenerate into a
 pattern where the coordinator / sub-agent LLM emits the same
@@ -22,24 +22,66 @@ This module is the complementary detector: it observes **every** tool
 call the ADK plugin sees (reporting or otherwise), keyed per
 ``(invocation_id, agent_name)``, and fires a
 ``LOOPING_REASONING``-kind :class:`~goldfive.types.DriftEvent` when
-one of three patterns is detected:
+one of several patterns is detected.
 
-1. **Exact loop** -- same ``(tool_name, args_hash)`` repeats >= the
-   configured ``exact_threshold`` in the last ``window`` calls.
-   WARNING severity.
-2. **Name loop** -- same ``tool_name`` (any args) repeats >= the
-   configured ``name_threshold`` in the last ``window`` calls AND no
-   task-state transition has been recorded in the window. WARNING
-   severity.
-3. **Alternating cycle** -- A,B,A,B,A pattern in the last
-   ``alternating_threshold`` calls. INFO severity.
+Graduated severity (goldfive#204)
+---------------------------------
 
-Mode 2's "no task progress" gate is satisfied by calling
-:meth:`ToolLoopTracker.on_task_progress` whenever a task transitions
-RUNNING -> COMPLETED (or any other meaningful progress signal). That
-clears the per-agent buffer so a legitimate burst of the same tool
-(e.g. a scripted lint + build + test pipeline) is not flagged when
-each call completes its step.
+Not every tool loop is the same. ``report_task_completed`` retrying 3
+times is probably the agent *reporting* state it's already reported
+(cheap, often idempotent on a healthy handler). ``web_developer_agent``
+retrying 3 times is a *work* loop burning LLM tokens.
+
+The tracker now classifies each tool call into one of two categories
+via :func:`_classify_tool_category`:
+
+* **meta** -- progress-reporting / metadata tools (``report_task_*``,
+  ``report_awaiting_approval``). Retries here are usually cheap and
+  benign.
+* **work** -- every other tool. Retries here are expensive.
+
+Each category has its own graduated severity ladder with three tiers.
+At classify time the tracker picks the **highest** tier matched by the
+current window and emits one drift at that severity -- it does NOT
+cascade INFO + WARNING + CRITICAL on the same window:
+
++----------+-------+---------+---------+----------+
+| Category | Tier  | INFO    | WARNING | CRITICAL |
++==========+=======+=========+=========+==========+
+| meta     | exact | 3       | 6       | 10       |
++----------+-------+---------+---------+----------+
+| meta     | name  | (none)  | (none)  | (none)   |
++----------+-------+---------+---------+----------+
+| work     | exact | 3       | 3       | 6        |
++----------+-------+---------+---------+----------+
+| work     | name  | (none)  | 5       | 7        |
++----------+-------+---------+---------+----------+
+
+(The ``exact`` column counts identical ``(name, args_hash)`` signatures
+in the window; the ``name`` column counts same-``name``-any-args
+signatures. Category is determined by the tool being matched, not by
+any other call in the window.)
+
+Work-tier thresholds are chosen to be backwards-compatible with the
+pre-#204 detector: three identical work calls still fire WARNING (what
+the single-threshold detector did), and same-name 5-in-window still
+fires WARNING. CRITICAL is new -- escalates plan revision into cancel-
+reinvoke at higher counts. Meta-tier thresholds push the first WARNING
+out from 3 to 6 so benign ``report_task_*`` retries trigger only an
+INFO drift (OBSERVE -- no plan mutation) until the loop genuinely
+persists.
+
+The alternating-cycle mode (A,B,A,B,A in the tail) remains INFO-only
+and is independent of category -- it's a textural signal that can
+involve either tool kind and the response should be to observe, not
+intervene.
+
+Mode 2's "no task progress" gate (same-name-any-args) is satisfied by
+calling :meth:`ToolLoopTracker.on_task_progress` whenever a task
+transitions RUNNING -> COMPLETED (or any other meaningful progress
+signal). That clears the per-agent buffer so a legitimate burst of the
+same tool (e.g. a scripted lint + build + test pipeline) is not
+flagged when each call completes its step.
 
 .. note::
 
@@ -66,24 +108,19 @@ is intentionally held in a single :class:`ToolLoopTracker` instance
 on the plugin -- we don't need per-session persistence, the whole
 window is ephemeral to one run.
 
-Configuration overrides via environment variables. Defaults chosen
-to balance signal vs noise (see below).
+Configuration
+-------------
 
-* ``GOLDFIVE_TOOL_LOOP_WINDOW`` -- ring-buffer size (default ``7``).
-  Picked so mode 2's 5-in-7 name-repeat check has two "any-other-tool"
-  slots for variance before firing; a stricter ``5`` window made the
-  detector fire on legitimate pipelines in early manual testing.
-* ``GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD`` -- minimum identical
-  signatures to fire mode 1 (default ``3``). Three identical calls in
-  a row is the smallest number that cannot plausibly be a benign
-  retry.
-* ``GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD`` -- minimum same-name calls to
-  fire mode 2 (default ``5``). Five same-name calls in a 7-call window
-  means at most two distinct tools were invoked -- strong signal the
-  agent is stuck grinding on one capability.
-* ``GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD`` -- pattern length for
-  mode 3 (default ``5``). A,B,A,B,A is the smallest alternating pattern
-  that isn't just "ping once, then ping again" noise.
+The window size and the alternating-pattern length remain env-
+overridable (``GOLDFIVE_TOOL_LOOP_WINDOW`` and
+``GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD``). The graduated category
+thresholds are module-level constants (:data:`_META_THRESHOLDS`,
+:data:`_WORK_THRESHOLDS`) grouped so a future PR can surface them via
+``ServerConfig`` / env vars if ops needs to tune. The legacy
+``GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD`` / ``GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD``
+vars are still read by :func:`load_thresholds_from_env` for backwards
+compatibility and override the **work** category's WARNING tier
+(preserving the pre-#204 single-threshold semantics).
 
 The detector is intentionally deterministic (no embeddings, no LLM
 calls). O(1) per tool call modulo the `window` length.
@@ -115,19 +152,110 @@ log = logging.getLogger("goldfive.drift.tool_loops")
 
 
 # ---------------------------------------------------------------------------
-# Tunables
+# Tool-category classifier (goldfive#204)
+# ---------------------------------------------------------------------------
+
+#: Tool-name prefixes that identify "meta" (progress-reporting) tools.
+#: Kept as a tuple so ``str.startswith`` can match any element in one
+#: call. Covers ``report_task_started``, ``_progress``, ``_completed``,
+#: ``_failed``, ``_blocked``.
+_META_TOOL_PREFIXES: tuple[str, ...] = ("report_task_",)
+
+#: Tool-name literals that identify meta tools without a ``report_task_``
+#: prefix. ``report_awaiting_approval`` is metadata for an approval
+#: state transition -- same "not real work" character.
+_META_TOOL_NAMES: frozenset[str] = frozenset({"report_awaiting_approval"})
+
+
+def _classify_tool_category(tool_name: str) -> str:
+    """Return ``"meta"`` for progress-reporting / metadata tools, ``"work"`` otherwise.
+
+    Meta tools don't advance task state; their retries are cheap and
+    often benign (the healthy-path handlers are idempotent -- a repeat
+    ``report_task_completed`` on an already-completed task ACKs without
+    mutating anything). Work tools burn real LLM time / tokens / have
+    side effects, so loops there are expensive and the detector should
+    escalate sooner.
+
+    The classifier is intentionally name-only so it's cheap and
+    deterministic -- no args inspection, no runtime registry lookup.
+    Future meta tools added by adapters should either follow the
+    ``report_task_`` prefix convention or be added to
+    :data:`_META_TOOL_NAMES` explicitly.
+    """
+    if not tool_name:
+        return "work"
+    if tool_name.startswith(_META_TOOL_PREFIXES) or tool_name in _META_TOOL_NAMES:
+        return "meta"
+    return "work"
+
+
+# ---------------------------------------------------------------------------
+# Graduated thresholds per category (goldfive#204)
+# ---------------------------------------------------------------------------
+#
+# Each category exposes three tiers. Each tier has an ``"exact"`` count
+# (minimum identical ``(name, args_hash)`` repeats in the window) and a
+# ``"name"`` count (minimum same-``name``-any-args repeats in the
+# window). ``None`` means that tier/axis does not fire.
+#
+# Reading the table:
+#
+# * At each observation, find the highest tier (CRITICAL > WARNING >
+#   INFO) whose threshold is matched by the window, emit one drift at
+#   that severity, and stop. Do NOT fire all three when thresholds
+#   stack.
+# * "exact" match is checked first; "name" match is checked only if
+#   "exact" did not already classify the tool at the same-or-higher
+#   severity (this preserves the pre-#204 "exact preempts name on the
+#   same tool" suppression rule).
+# * Thresholds chosen so the **work** category's WARNING tier is
+#   backwards-compatible with the pre-#204 single-threshold defaults
+#   (exact=3, name=5). CRITICAL is new at 6/7 respectively. Meta
+#   thresholds push WARNING from 3 to 6 so benign reporting retries
+#   produce only an INFO drift (OBSERVE) until the loop persists.
+
+_META_THRESHOLDS: dict[str, dict[str, int | None]] = {
+    "info": {"exact": 3, "name": None},
+    "warning": {"exact": 6, "name": None},
+    "critical": {"exact": 10, "name": None},
+}
+
+_WORK_THRESHOLDS: dict[str, dict[str, int | None]] = {
+    "info": {"exact": 3, "name": None},
+    "warning": {"exact": 3, "name": 5},
+    "critical": {"exact": 6, "name": 7},
+}
+
+#: Severity tiers in ascending order. Used by :meth:`ToolLoopTracker._classify`
+#: to walk from highest to lowest when picking the single tier to emit.
+_SEVERITY_TIERS: tuple[tuple[str, DriftSeverity], ...] = (
+    ("critical", DriftSeverity.CRITICAL),
+    ("warning", DriftSeverity.WARNING),
+    ("info", DriftSeverity.INFO),
+)
+
+
+# ---------------------------------------------------------------------------
+# Legacy tunables (retained for env-override compatibility + docs)
 # ---------------------------------------------------------------------------
 
 #: Ring-buffer size: how many recent tool calls to retain per
-#: ``(invocation_id, agent_name)`` key. ``7`` is the default so the
-#: 5-in-7 name-repeat check has room for two "other-tool" calls without
-#: firing.
-DEFAULT_WINDOW: int = 7
+#: ``(invocation_id, agent_name)`` key. ``10`` is the default so the
+#: meta-CRITICAL 10-in-window check has room to fire; name-repeat and
+#: alternating checks are unaffected since they only inspect the last
+#: ``name_threshold`` / ``alternating_threshold`` slots.
+DEFAULT_WINDOW: int = 10
 
-#: Mode 1 threshold: exact ``(name, args_hash)`` repeats in the window.
+#: Legacy alias for the work-category WARNING exact threshold. Retained
+#: so callers (and tests) that read the old single-threshold constant
+#: keep working, and so
+#: :envvar:`GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` still has somewhere to
+#: land.
 DEFAULT_EXACT_THRESHOLD: int = 3
 
-#: Mode 2 threshold: same ``tool_name`` repeats in the window.
+#: Legacy alias for the work-category WARNING name threshold. Same
+#: rationale as above.
 DEFAULT_NAME_THRESHOLD: int = 5
 
 #: Mode 3 threshold: alternating pattern length (A,B,A,B,A == 5).
@@ -166,6 +294,14 @@ def load_thresholds_from_env() -> dict[str, int]:
     Suitable for ``**kwargs``-splatting into :class:`ToolLoopTracker`.
     Missing / malformed vars fall back to the module defaults. Returned
     keys match the tracker's constructor kwargs.
+
+    The ``exact_threshold`` / ``name_threshold`` keys remain in the
+    returned dict for backwards compatibility; under #204 they override
+    the **work** category's WARNING tier only (preserving the pre-#204
+    single-threshold semantics). The graduated CRITICAL tiers and the
+    meta-category thresholds are not env-tunable in this PR -- they
+    live as module constants grouped so a follow-up can make them
+    configurable.
     """
     return {
         "window": _read_int_env("GOLDFIVE_TOOL_LOOP_WINDOW", DEFAULT_WINDOW),
@@ -212,11 +348,26 @@ class ToolLoopTracker:
     task on the same invocation transitions to a progress state so mode
     2's no-progress gate clears.
 
+    Under goldfive#204 the classifier emits **graduated severity**: for
+    a tool matching one of the threshold tiers, the tracker picks the
+    highest tier (CRITICAL > WARNING > INFO) and emits one drift. The
+    alternating-cycle mode (independent, A,B,A,B,A-shaped) still fires
+    INFO only.
+
     The classifier never mutates its buffers after firing -- we do not
     dedupe drifts here. Upstream (the steerer's intervention ladder)
     already dedupes by ``(kind, task_id)`` occurrence count, and a
     repeating loop SHOULD keep emitting so the ladder escalates if the
     agent doesn't recover.
+
+    ``exact_threshold`` / ``name_threshold`` kwargs are retained for
+    backwards compatibility with callers that constructed the tracker
+    with a single-threshold config (tests, env overrides). When
+    provided, they **override the work category's WARNING tier** only;
+    the graduated CRITICAL tiers and the meta category still use the
+    module constants. This preserves the pre-#204 single-threshold
+    semantics for work tools. Tests that exercise CRITICAL should
+    leave these kwargs at their defaults.
     """
 
     def __init__(
@@ -235,33 +386,55 @@ class ToolLoopTracker:
             raise ValueError(f"name_threshold must be positive, got {name_threshold}")
         if alternating_threshold <= 0:
             raise ValueError(f"alternating_threshold must be positive, got {alternating_threshold}")
+
+        self.window = window
+        self.exact_threshold = exact_threshold
+        self.name_threshold = name_threshold
+        self.alternating_threshold = alternating_threshold
+
+        # Build the effective threshold tables. The work-WARNING tier
+        # is overridden by the legacy kwargs so callers supplying the
+        # old single-threshold config get pre-#204 behaviour there.
+        # Meta thresholds and work-CRITICAL/INFO come from the module
+        # constants unchanged.
+        self._meta_thresholds = _META_THRESHOLDS
+        work: dict[str, dict[str, int | None]] = {
+            "info": dict(_WORK_THRESHOLDS["info"]),
+            "warning": {"exact": exact_threshold, "name": name_threshold},
+            "critical": dict(_WORK_THRESHOLDS["critical"]),
+        }
+        # Ensure INFO's exact threshold is never HIGHER than WARNING's
+        # -- otherwise a caller passing exact_threshold=2 would make
+        # INFO unreachable. Clamp defensively.
+        info_exact = work["info"]["exact"]
+        war_exact = work["warning"]["exact"]
+        if info_exact is not None and war_exact is not None and info_exact > war_exact:
+            work["info"]["exact"] = war_exact
+        self._work_thresholds = work
+
         # Sanity: if the window is too small to hold the thresholds,
         # the detector can never fire for that mode. We log a debug
         # warning but still accept the config -- tests pin specific
         # (window, threshold) tuples and we don't want to reject them.
         if window < exact_threshold:
             log.debug(
-                "tool-loop: window=%d < exact_threshold=%d -- mode 1 cannot fire",
+                "tool-loop: window=%d < exact_threshold=%d -- work-WARNING exact cannot fire",
                 window,
                 exact_threshold,
             )
         if window < name_threshold:
             log.debug(
-                "tool-loop: window=%d < name_threshold=%d -- mode 2 cannot fire",
+                "tool-loop: window=%d < name_threshold=%d -- work-WARNING name cannot fire",
                 window,
                 name_threshold,
             )
         if window < alternating_threshold:
             log.debug(
-                "tool-loop: window=%d < alternating_threshold=%d -- mode 3 cannot fire",
+                "tool-loop: window=%d < alternating_threshold=%d -- alternating-cycle cannot fire",
                 window,
                 alternating_threshold,
             )
 
-        self.window = window
-        self.exact_threshold = exact_threshold
-        self.name_threshold = name_threshold
-        self.alternating_threshold = alternating_threshold
         # Keyed by (invocation_id, agent_name). Value: deque of
         # (tool_name, args_hash). Uses ``defaultdict`` with a bound
         # ``maxlen`` so slots auto-size.
@@ -343,85 +516,128 @@ class ToolLoopTracker:
 
     # -- Internal -----------------------------------------------------------
 
+    def _thresholds_for_tool(self, tool_name: str) -> dict[str, dict[str, int | None]]:
+        """Return the per-tier threshold table for ``tool_name``'s category."""
+        if _classify_tool_category(tool_name) == "meta":
+            return self._meta_thresholds
+        return self._work_thresholds
+
     def _classify(
         self,
         key: tuple[str, str],
         *,
         current_task_id: str,
     ) -> list[DriftEvent]:
-        """Return zero or more drift observations for the current window."""
+        """Return zero or more drift observations for the current window.
+
+        Emits **at most one** exact/name-based drift (the highest
+        severity tier matched for the tool that hit threshold) plus,
+        independently, **at most one** alternating-cycle INFO drift.
+        Alternating is suppressed when an exact/name drift already
+        fired -- same rationale as pre-#204 (the weaker signal would
+        be noise on top of the stronger).
+        """
         buf = list(self._buffers[key])
         observations: list[DriftEvent] = []
         invocation_id, agent_name = key
 
-        # --- Mode 1: exact-signature repeat --------------------------------
+        # Pre-compute per-signature and per-name counts in the window.
         exact_counts: dict[tuple[str, str], int] = {}
-        for sig in buf:
-            exact_counts[sig] = exact_counts.get(sig, 0) + 1
-        fired_exact = False
-        for sig, count in exact_counts.items():
-            if count >= self.exact_threshold:
-                tool_name, sig_hash = sig
-                observations.append(
-                    DriftEvent(
-                        kind=DriftKind.LOOPING_REASONING,
-                        severity=DriftSeverity.WARNING,
-                        detail=(f"tool_loop_exact: {tool_name} x {count} in last {len(buf)} calls"),
-                        current_task_id=current_task_id,
-                        current_agent_id=agent_name,
-                        raw={
-                            "mode": "exact",
-                            "tool_name": tool_name,
-                            "args_hash": sig_hash,
-                            "count": count,
-                            "window_len": len(buf),
-                            "invocation_id": invocation_id,
-                        },
-                    )
-                )
-                fired_exact = True
-                break  # at most one exact drift per classify call
-
-        # --- Mode 2: same-name repeat (only if no task progress) -----------
-        # ``on_task_progress`` clears the window, so if we're here with
-        # a full-enough buffer, no progress has been recorded since the
-        # window started filling. No separate token needed.
         name_counts: dict[str, int] = {}
         for sig in buf:
+            exact_counts[sig] = exact_counts.get(sig, 0) + 1
             name_counts[sig[0]] = name_counts.get(sig[0], 0) + 1
-        fired_name = False
-        for name, count in name_counts.items():
-            if count < self.name_threshold:
-                continue
-            # Suppress mode 2 when mode 1 already fired on the same
-            # tool -- it's the same signal, more specific. Mode 2
-            # still fires independently when mode 1 didn't (args
-            # varied across the burst).
-            if fired_exact and any(
-                sig[0] == name and c >= self.exact_threshold for sig, c in exact_counts.items()
-            ):
-                continue
-            observations.append(
-                DriftEvent(
-                    kind=DriftKind.LOOPING_REASONING,
-                    severity=DriftSeverity.WARNING,
-                    detail=(
-                        f"tool_loop_name: {name} x {count} in last "
-                        f"{len(buf)} calls (no task progress)"
-                    ),
-                    current_task_id=current_task_id,
-                    current_agent_id=agent_name,
-                    raw={
-                        "mode": "name",
+
+        # --- Graduated exact/name classification ---------------------------
+        #
+        # For each distinct tool name in the window, find the highest
+        # tier matched (CRITICAL > WARNING > INFO) and emit one drift
+        # at that severity. "exact" axis is checked first; "name" axis
+        # is checked only if "exact" didn't already match the same
+        # tool at the same-or-higher tier (preserves the pre-#204
+        # "exact preempts name on same tool" suppression).
+        #
+        # We iterate over unique tool names (not signatures) so a tool
+        # with varied args contributes to "name" counts even when no
+        # single signature hits the "exact" threshold. We pick the
+        # name with the highest matched tier; if several names match,
+        # we pick the highest severity first (ties broken by
+        # dictionary iteration order, which is stable on CPython).
+        best_drift: DriftEvent | None = None
+        best_tier_index: int | None = None  # 0=critical, 1=warning, 2=info (lower = better)
+
+        for name in name_counts:
+            thresholds = self._thresholds_for_tool(name)
+            name_total = name_counts[name]
+            # Max exact-signature count for this tool in the window.
+            exact_for_name = max(
+                (c for sig, c in exact_counts.items() if sig[0] == name),
+                default=0,
+            )
+            # Walk tiers from highest severity to lowest.
+            for tier_index, (tier_key, severity) in enumerate(_SEVERITY_TIERS):
+                tier = thresholds.get(tier_key) or {}
+                exact_thr = tier.get("exact")
+                name_thr = tier.get("name")
+                hit_exact = exact_thr is not None and exact_for_name >= exact_thr
+                hit_name = name_thr is not None and name_total >= name_thr
+                if not (hit_exact or hit_name):
+                    continue
+
+                # Found the highest tier for this tool. Build a drift.
+                # Prefer the "exact" detail when both axes are
+                # satisfied -- the more specific signal.
+                mode = "exact" if hit_exact else "name"
+                if mode == "exact":
+                    sig = next(
+                        sig
+                        for sig, c in exact_counts.items()
+                        if sig[0] == name and c == exact_for_name
+                    )
+                    detail = f"tool_loop_exact: {name} x {exact_for_name} in last {len(buf)} calls"
+                    raw: dict[str, Any] = {
+                        "mode": "exact",
                         "tool_name": name,
-                        "count": count,
+                        "args_hash": sig[1],
+                        "count": exact_for_name,
                         "window_len": len(buf),
                         "invocation_id": invocation_id,
-                    },
+                        "category": _classify_tool_category(name),
+                        "tier": tier_key,
+                    }
+                else:
+                    detail = (
+                        f"tool_loop_name: {name} x {name_total} in last "
+                        f"{len(buf)} calls (no task progress)"
+                    )
+                    raw = {
+                        "mode": "name",
+                        "tool_name": name,
+                        "count": name_total,
+                        "window_len": len(buf),
+                        "invocation_id": invocation_id,
+                        "category": _classify_tool_category(name),
+                        "tier": tier_key,
+                    }
+
+                candidate = DriftEvent(
+                    kind=DriftKind.LOOPING_REASONING,
+                    severity=severity,
+                    detail=detail,
+                    current_task_id=current_task_id,
+                    current_agent_id=agent_name,
+                    raw=raw,
                 )
-            )
-            fired_name = True
-            break
+                # Keep the highest-severity candidate seen across all
+                # tools. tier_index is 0 for CRITICAL, so "lower is
+                # better" for our "best" accumulator.
+                if best_tier_index is None or tier_index < best_tier_index:
+                    best_drift = candidate
+                    best_tier_index = tier_index
+                break  # stop at the highest tier for this tool
+
+        if best_drift is not None:
+            observations.append(best_drift)
 
         # --- Mode 3: alternating A,B,A,B,A pattern -------------------------
         if len(buf) >= self.alternating_threshold:
@@ -432,10 +648,10 @@ class ToolLoopTracker:
                 and names[0] != names[1]
                 and all(names[i] == names[i % 2] for i in range(len(names)))
             ):
-                # Don't double-fire if mode 1 or 2 already flagged
-                # this same pair -- the alternating signal is weaker
-                # (INFO) and would be noise on top of a WARNING.
-                if not (fired_exact or fired_name):
+                # Don't double-fire if an exact/name drift already
+                # flagged this window -- the alternating signal is
+                # weaker (INFO) and would be noise on top.
+                if best_drift is None:
                     a_name, b_name = names[0], names[1]
                     observations.append(
                         DriftEvent(

@@ -30,6 +30,7 @@ from goldfive.drift.tool_loops import (
     DEFAULT_NAME_THRESHOLD,
     DEFAULT_WINDOW,
     ToolLoopTracker,
+    _classify_tool_category,
     args_hash,
     load_thresholds_from_env,
 )
@@ -441,3 +442,236 @@ def test_exact_mode_preempts_name_mode_on_same_tool() -> None:
     third = drifts_per_call[2]
     assert len(third) == 1
     assert third[0].raw.get("mode") == "exact"
+
+
+# ---------------------------------------------------------------------------
+# Graduated severity (goldfive#204) -- meta vs work categories
+# ---------------------------------------------------------------------------
+
+
+def test_classify_tool_category_meta_prefixes() -> None:
+    """All ``report_task_*`` names and ``report_awaiting_approval`` are meta."""
+    for name in (
+        "report_task_started",
+        "report_task_progress",
+        "report_task_completed",
+        "report_task_failed",
+        "report_task_blocked",
+        "report_awaiting_approval",
+    ):
+        assert _classify_tool_category(name) == "meta", name
+
+
+def test_classify_tool_category_work_fallback() -> None:
+    """Arbitrary tool names -- including the empty string -- classify as work."""
+    for name in (
+        "web_developer_agent",
+        "research_agent",
+        "patch_file",
+        "read_file",
+        "",
+        "reporter",  # not a ``report_task_`` prefix -- work, not meta
+    ):
+        assert _classify_tool_category(name) == "work", name
+
+
+def test_meta_tool_retries_fire_info_at_3_not_warning() -> None:
+    """Meta tool (``report_task_completed``) x 3 fires INFO, not WARNING.
+
+    Benign meta-tool retries should not mutate the plan -- INFO goes
+    through the ladder at OBSERVE level.
+    """
+    tracker = ToolLoopTracker()
+    drifts_per_call = _seed(
+        tracker,
+        [("report_task_completed", {"task_id": "t1"})] * 3,
+    )
+    # Below threshold on calls 1-2.
+    assert drifts_per_call[0] == []
+    assert drifts_per_call[1] == []
+    # Call 3: INFO fires, not WARNING / CRITICAL.
+    third = drifts_per_call[2]
+    assert len(third) == 1, f"expected single INFO drift, got {third}"
+    drift = third[0]
+    assert drift.kind is DriftKind.LOOPING_REASONING
+    assert drift.severity is DriftSeverity.INFO, (
+        f"meta retry at 3 should be INFO, got {drift.severity}"
+    )
+    assert drift.raw is not None
+    assert drift.raw.get("category") == "meta"
+    assert drift.raw.get("tier") == "info"
+    assert drift.raw.get("mode") == "exact"
+    assert drift.raw.get("count") == 3
+
+
+def test_meta_tool_retries_escalate_to_warning_at_6() -> None:
+    """Meta tool x 6 identical calls escalates to WARNING."""
+    # Default window (10) is large enough to hold 6 identical calls.
+    tracker = ToolLoopTracker()
+    drifts_per_call = _seed(
+        tracker,
+        [("report_task_completed", {"task_id": "t1"})] * 6,
+    )
+    # Calls 3-5 fire INFO (below WARNING threshold of 6).
+    for i in (2, 3, 4):
+        assert drifts_per_call[i], f"expected INFO at call {i + 1}"
+        assert drifts_per_call[i][0].severity is DriftSeverity.INFO
+    # Call 6: WARNING fires.
+    sixth = drifts_per_call[5]
+    assert len(sixth) == 1
+    drift = sixth[0]
+    assert drift.severity is DriftSeverity.WARNING
+    assert drift.raw.get("category") == "meta"
+    assert drift.raw.get("tier") == "warning"
+    assert drift.raw.get("count") == 6
+
+
+def test_work_tool_retries_fire_warning_at_3_as_before() -> None:
+    """Backwards-compat: work tool x 3 exact calls still fires WARNING."""
+    tracker = ToolLoopTracker()
+    drifts_per_call = _seed(
+        tracker,
+        [("web_developer_agent", {"q": "hello"})] * 3,
+    )
+    assert drifts_per_call[0] == drifts_per_call[1] == []
+    third = drifts_per_call[2]
+    assert len(third) == 1
+    drift = third[0]
+    assert drift.kind is DriftKind.LOOPING_REASONING
+    # Pre-#204 behaviour: 3 identical work calls -> WARNING.
+    assert drift.severity is DriftSeverity.WARNING
+    assert drift.raw.get("category") == "work"
+    assert drift.raw.get("tier") == "warning"
+    assert drift.raw.get("mode") == "exact"
+
+
+def test_critical_tool_loops_at_10_meta_or_6_work() -> None:
+    """CRITICAL fires at the right per-category thresholds.
+
+    * Meta exact: 10 identical ``report_task_*`` calls -> CRITICAL.
+    * Work exact: 6 identical work-tool calls -> CRITICAL.
+    """
+    # --- Meta CRITICAL at 10 -------------------------------------------------
+    meta_tracker = ToolLoopTracker()
+    meta_drifts = _seed(
+        meta_tracker,
+        [("report_task_completed", {"task_id": "t1"})] * 10,
+    )
+    tenth = meta_drifts[9]
+    assert len(tenth) == 1
+    assert tenth[0].severity is DriftSeverity.CRITICAL
+    assert tenth[0].raw.get("category") == "meta"
+    assert tenth[0].raw.get("tier") == "critical"
+
+    # --- Work CRITICAL at 6 --------------------------------------------------
+    work_tracker = ToolLoopTracker()
+    work_drifts = _seed(
+        work_tracker,
+        [("web_developer_agent", {"q": "hello"})] * 6,
+    )
+    sixth = work_drifts[5]
+    assert len(sixth) == 1
+    assert sixth[0].severity is DriftSeverity.CRITICAL
+    assert sixth[0].raw.get("category") == "work"
+    assert sixth[0].raw.get("tier") == "critical"
+
+
+def test_work_name_tier_fires_critical_at_7() -> None:
+    """Work tool, args varying, 7 same-name calls -> CRITICAL."""
+    tracker = ToolLoopTracker()
+    # 7 calls to the same work tool with distinct args -- no exact
+    # signature hits, but the name axis trips CRITICAL at 7.
+    drifts = _seed(
+        tracker,
+        [("web_developer_agent", {"q": f"q{i}"}) for i in range(7)],
+    )
+    # Call 5: name count = 5 -> WARNING tier (work name warning=5).
+    assert drifts[4], "expected WARNING at call 5"
+    assert drifts[4][0].severity is DriftSeverity.WARNING
+    # Call 7: name count = 7 -> CRITICAL.
+    seventh = drifts[6]
+    assert len(seventh) == 1
+    drift = seventh[0]
+    assert drift.severity is DriftSeverity.CRITICAL
+    assert drift.raw.get("category") == "work"
+    assert drift.raw.get("tier") == "critical"
+    assert drift.raw.get("mode") == "name"
+
+
+def test_highest_severity_emitted_once() -> None:
+    """At 10 identical meta calls, only CRITICAL fires -- not INFO/WARNING too."""
+    tracker = ToolLoopTracker()
+    drifts = _seed(
+        tracker,
+        [("report_task_completed", {"task_id": "t1"})] * 10,
+    )
+    tenth = drifts[9]
+    # Exactly ONE drift, at CRITICAL -- not a cascade of INFO + WARNING + CRITICAL.
+    assert len(tenth) == 1, f"expected single drift, got {len(tenth)}: {tenth}"
+    assert tenth[0].severity is DriftSeverity.CRITICAL
+
+
+def test_meta_at_3_does_not_fire_warning_or_critical() -> None:
+    """Regression guard: meta x 3 MUST NOT fire WARNING (the original bug)."""
+    tracker = ToolLoopTracker()
+    drifts = _seed(
+        tracker,
+        [("report_task_completed", {"task_id": "t1"})] * 3,
+    )
+    severities = [d.severity for d in drifts[2]]
+    assert DriftSeverity.WARNING not in severities
+    assert DriftSeverity.CRITICAL not in severities
+    assert severities == [DriftSeverity.INFO]
+
+
+def test_mixed_meta_and_work_in_same_window() -> None:
+    """Interleaved meta + work -- each tool classified independently.
+
+    A window holding 3 identical meta calls AND 3 identical work calls
+    should classify the work loop at WARNING (higher severity wins
+    across tools) rather than stopping at the meta INFO.
+    """
+    tracker = ToolLoopTracker()
+    # Interleave so both end up with 3 exact matches in the window.
+    calls = [
+        ("report_task_completed", {"task_id": "t1"}),
+        ("web_developer_agent", {"q": "x"}),
+        ("report_task_completed", {"task_id": "t1"}),
+        ("web_developer_agent", {"q": "x"}),
+        ("report_task_completed", {"task_id": "t1"}),
+        ("web_developer_agent", {"q": "x"}),
+    ]
+    drifts = _seed(tracker, calls)
+    last = drifts[-1]
+    # The work tool matched WARNING (count=3 >= work warning exact=3);
+    # meta only matched INFO (count=3). Highest severity wins -> WARNING.
+    assert len(last) == 1
+    assert last[0].severity is DriftSeverity.WARNING
+    assert last[0].raw.get("category") == "work"
+    assert last[0].raw.get("tool_name") == "web_developer_agent"
+
+
+def test_legacy_exact_threshold_kwarg_overrides_work_warning() -> None:
+    """The ``exact_threshold`` ctor kwarg continues to override work-WARNING.
+
+    Env-override / programmatic callers that passed ``exact_threshold=4``
+    pre-#204 should still see WARNING fire at 4 identical work calls,
+    not 3.
+    """
+    tracker = ToolLoopTracker(exact_threshold=4, name_threshold=10)
+    drifts = _seed(
+        tracker,
+        [("web_developer_agent", {"q": "x"})] * 3,
+    )
+    # At 3 calls: INFO fires (INFO exact=3 module constant, clamped to
+    # the WARNING exact of 4 but not raised above). Since INFO exact=3
+    # and WARNING exact=4, INFO matches but WARNING does not yet.
+    assert drifts[2], "INFO should fire at 3"
+    assert drifts[2][0].severity is DriftSeverity.INFO
+    # At 4 calls: WARNING fires.
+    drifts = _seed(
+        tracker,
+        [("web_developer_agent", {"q": "x"})],
+    )
+    assert drifts[0], "WARNING should fire at 4"
+    assert drifts[0][0].severity is DriftSeverity.WARNING

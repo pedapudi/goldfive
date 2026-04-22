@@ -707,9 +707,9 @@ class ToolLoopTracker:
     def __init__(
         self,
         *,
-        window: int = 7,                   # DEFAULT_WINDOW
-        exact_threshold: int = 3,          # DEFAULT_EXACT_THRESHOLD
-        name_threshold: int = 5,           # DEFAULT_NAME_THRESHOLD
+        window: int = 10,                  # DEFAULT_WINDOW (bumped in #204 to fit meta-CRITICAL@10)
+        exact_threshold: int = 3,          # DEFAULT_EXACT_THRESHOLD (overrides work-WARNING exact)
+        name_threshold: int = 5,           # DEFAULT_NAME_THRESHOLD (overrides work-WARNING name)
         alternating_threshold: int = 5,    # DEFAULT_ALTERNATING_THRESHOLD
     ) -> None: ...
 
