@@ -301,6 +301,7 @@ class DefaultSteerer:
         goal_drift_call_llm: ReflectiveCallLLM | None = None,
         goal_drift_model: str = "",
         goal_drift_activity_window: int = 10,
+        plan_revision_cooldown_seconds: float = 30.0,
     ) -> None:
         """Build a steerer.
 
@@ -345,6 +346,18 @@ class DefaultSteerer:
             Number of recent-activity entries retained on
             ``session.recent_agent_activity`` and passed to the
             judge. Bounds the prompt size; defaults to ``10``.
+        plan_revision_cooldown_seconds:
+            Minimum interval, in seconds, between two drift-triggered
+            plan revisions for the same ``(task_id, drift_kind)`` key.
+            Defaults to ``30.0``. Set to ``0.0`` to disable the cooldown
+            entirely (pre-fix behaviour). Cooldown is scoped per-kind so
+            genuinely different problems (e.g. ``LOOPING_REASONING`` vs
+            ``CONFUSION``) can still replan independently. USER_STEER
+            drifts bypass this gate (user intent is always honoured
+            immediately) and GOAL_DRIFT has its own rate limiting via
+            ``_last_goal_drift_check_ts``, so it also bypasses this
+            gate. See goldfive feedback-loop fix for the observation
+            that prompted this.
 
         See ``docs/design/DRIFT.md`` §"Reflective self-progress check"
         for the full feature-gate semantics. The GOAL_DRIFT check
@@ -379,6 +392,10 @@ class DefaultSteerer:
         self._goal_drift_check_interval = max(1, int(goal_drift_check_interval))
         self._goal_drift_model = goal_drift_model
         self._goal_drift_activity_window = max(1, int(goal_drift_activity_window))
+        # Drift-triggered plan-revision cooldown (goldfive feedback-loop
+        # fix). Clamped to a non-negative float; ``0.0`` disables the
+        # gate so callers can opt out without subclassing.
+        self._plan_revision_cooldown_seconds = max(0.0, float(plan_revision_cooldown_seconds))
 
     # ------------------------------------------------------------------
     # Protocol-required: wiring
@@ -1625,6 +1642,19 @@ class DefaultSteerer:
             return
         if session.refine_failure_counts.get(counter_key, 0) >= self.REFINE_FAILURE_THRESHOLD:
             return
+        # Plan-revision cooldown (goldfive feedback-loop fix). A cluster
+        # of related drifts (same kind, same task) should not each
+        # trigger a separate ``planner.refine`` -- an observed live run
+        # saw 6 drift events + 4 plan_revised rows in a single short
+        # session, burning LLM budget and thrashing the agent mid-task.
+        # The DriftDetected event already landed on the wire above, so
+        # observability is covered; we just suppress the replan. The
+        # gate is keyed on (task_id, drift_kind) so genuinely different
+        # problems can still replan independently, and USER_STEER /
+        # GOAL_DRIFT bypass it (see the method docstring on
+        # ``_is_plan_revision_cooldown_exempt``).
+        if self._is_plan_revision_gated(drift, session):
+            return
         # Plumb the session into the planner's drift-emitter callback
         # for the duration of this refine call so the planner can emit
         # REFINE_VALIDATION_FAILED drifts through the normal event
@@ -1726,6 +1756,12 @@ class DefaultSteerer:
         prev_plan = session.plan
         self._apply_revision(session, revised, drift)
         await self._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
+        # Stamp the cooldown table so a follow-up drift of the same
+        # kind+task within ``plan_revision_cooldown_seconds`` is gated.
+        # Only recorded on a revision that *actually landed* (past all
+        # the error / validation short-circuits above) so a failed
+        # refine doesn't wedge the cooldown.
+        self._record_plan_revision(drift, session)
         # Level 3 (CANCEL_REINVOKE) handoff: compose a corrective user
         # message from the drift + refined plan and stash it on the
         # session so the Runner's overlay loop (goldfive#141) can cancel
@@ -2438,6 +2474,82 @@ class DefaultSteerer:
             return ""
         payload = raw.payload if isinstance(raw.payload, dict) else {}
         return str(payload.get("annotation_id", "") or "")
+
+    # ------------------------------------------------------------------
+    # Plan-revision cooldown (drift-triggered replan rate limit)
+    # ------------------------------------------------------------------
+
+    # Drift kinds that always bypass the plan-revision cooldown. USER_STEER
+    # is an explicit user intervention -- user intent is always honoured
+    # immediately, even if a recent autonomous revision on the same task
+    # is still within the window. GOAL_DRIFT is trajectory-level and has
+    # its own rate limiting via ``_last_goal_drift_check_ts`` +
+    # ``_GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S`` (goldfive#220).
+    _PLAN_REVISION_COOLDOWN_EXEMPT_KINDS: frozenset[DriftKind] = frozenset(
+        {
+            DriftKind.USER_STEER,
+            DriftKind.USER_CANCEL,
+            DriftKind.GOAL_DRIFT,
+        }
+    )
+
+    def _is_plan_revision_gated(self, drift: DriftEvent, session: Session) -> bool:
+        """Return ``True`` iff a drift-triggered revision should be suppressed.
+
+        Consults ``session._last_plan_revision_at`` keyed on
+        ``(drift.current_task_id, drift.kind.value)``. If the age of
+        the last revision for that key is below
+        ``plan_revision_cooldown_seconds``, logs at DEBUG + INFO and
+        returns ``True``. Otherwise returns ``False``.
+
+        No-op (returns ``False``) when the cooldown is disabled
+        (``plan_revision_cooldown_seconds <= 0``) or the drift kind is
+        in :data:`_PLAN_REVISION_COOLDOWN_EXEMPT_KINDS`.
+        """
+        cooldown = self._plan_revision_cooldown_seconds
+        if cooldown <= 0:
+            return False
+        if drift.kind in self._PLAN_REVISION_COOLDOWN_EXEMPT_KINDS:
+            return False
+        key = (drift.current_task_id, drift.kind.value)
+        last_at = session._last_plan_revision_at.get(key)
+        if last_at is None:
+            return False
+        now = time.monotonic()
+        age = now - last_at
+        if age >= cooldown:
+            return False
+        # Within the cooldown window -- suppress.
+        log.debug(
+            "plan revision suppressed by cooldown (task=%r age=%.1fs cooldown=%.1fs trigger=%r)",
+            drift.current_task_id,
+            age,
+            cooldown,
+            drift.kind.value,
+        )
+        log.info(
+            "goldfive observed a %s drift on task=%r within the plan-revision "
+            "cooldown (%.1fs < %.1fs); skipping replan",
+            drift.kind.value,
+            drift.current_task_id,
+            age,
+            cooldown,
+        )
+        return True
+
+    def _record_plan_revision(self, drift: DriftEvent, session: Session) -> None:
+        """Stamp ``session._last_plan_revision_at`` after a successful revision.
+
+        Called at the very end of the refine path, after the new plan
+        is installed and ``PlanRevised`` has been emitted. Exempt
+        kinds (see :meth:`_is_plan_revision_gated`) are still recorded
+        for completeness -- the gate short-circuits on them
+        independently of whether a stamp exists.
+        """
+        if self._plan_revision_cooldown_seconds <= 0:
+            return
+        key = (drift.current_task_id, drift.kind.value)
+        session._last_plan_revision_at[key] = time.monotonic()
 
     async def _emit_plan_revised(
         self,

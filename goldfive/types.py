@@ -583,6 +583,18 @@ class Session:
     # and mark the task FAILED after N consecutive failures, preventing
     # the same drift from looping until ``max_task_invocations`` trips.
     refine_failure_counts: dict[tuple[str, str], int] = dataclasses.field(default_factory=dict)
+    # Per-(task_id, drift_kind_value) ``time.monotonic()`` timestamp of the
+    # last plan revision that actually landed (``_emit_plan_revised``).
+    # Consumed by :class:`~goldfive.steerer.DefaultSteerer` to gate
+    # drift-triggered revisions through a short cooldown window so a
+    # cluster of closely-spaced drifts of the same kind on the same task
+    # does not thrash ``planner.refine`` (goldfive feedback-loop fix).
+    # Sentinel task_id ``""`` covers trajectory-wide revisions. Does NOT
+    # apply to USER_STEER (always honoured) or GOAL_DRIFT (has its own
+    # task-boundary rate limit via ``_last_goal_drift_check_ts``).
+    _last_plan_revision_at: dict[tuple[str, str], float] = dataclasses.field(
+        default_factory=dict
+    )
     # Counter of LLM turns observed since the last reflective self-progress
     # check. Incremented by ``DefaultSteerer.note_llm_call`` (which adapters
     # call once per LLM invocation when the opt-in reflective check is
