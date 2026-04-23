@@ -273,19 +273,41 @@ async def classify_goal_drift(
     except Exception as exc:  # noqa: BLE001 - never break the run
         log.warning("classify_goal_drift: call_llm raised %s; no drift emitted", exc)
         return None
+    # Debug-log the raw judge response so operators can distinguish
+    # "judge said progressing=true" from "judge returned garbage" without
+    # bisecting (goldfive#219). Truncated to 500 chars to bound log size.
+    raw_str = raw if isinstance(raw, str) else ""
+    log.debug(
+        "classify_goal_drift: raw response (%d chars): %s",
+        len(raw_str),
+        raw_str[:500],
+    )
     parsed = _parse_response(raw)
     if parsed is None:
-        log.debug("classify_goal_drift: response was not JSON; no drift emitted")
+        log.debug(
+            "classify_goal_drift: response was not JSON (raw=%r); no drift emitted",
+            raw_str[:200],
+        )
         return None
     progressing = parsed.get("progressing")
     if not isinstance(progressing, bool):
         log.debug(
-            "classify_goal_drift: response missing boolean 'progressing' key; no drift emitted"
+            "classify_goal_drift: parsed=%r lacks boolean 'progressing' key; "
+            "no drift emitted",
+            parsed,
         )
         return None
     if progressing:
+        log.debug(
+            "classify_goal_drift: judge says on-track (reason=%r)",
+            parsed.get("reason", ""),
+        )
         return None
     reason = str(parsed.get("reason", "") or "").strip()
+    log.info(
+        "classify_goal_drift: drift detected (reason=%r); emitting GOAL_DRIFT event",
+        reason,
+    )
     detail = (
         f"goal drift detected: {reason}"
         if reason

@@ -47,6 +47,7 @@ import enum
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -564,6 +565,8 @@ class DefaultSteerer:
         # goldfive#152: clear current_task_* if we were the active task.
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.COMPLETED)
         await self._emit_task_completed(session, task_id, summary, artifacts or {})
+        # goldfive#219: task boundary is a natural goal-drift checkpoint.
+        await self._maybe_run_goal_drift_on_task_boundary(session)
 
     async def mark_task_failed(
         self,
@@ -601,6 +604,8 @@ class DefaultSteerer:
         task.status = TaskStatus.FAILED
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.FAILED)
         await self._emit_task_failed(session, task_id, reason, recoverable)
+        # goldfive#219: task boundary is a natural goal-drift checkpoint.
+        await self._maybe_run_goal_drift_on_task_boundary(session)
         # Fatal failures cascade downstream via the same primitive used
         # by mark_task_cancelled, so both §6.2 and §6.3 produce the
         # same TaskCancelled event stream and share rejection guards.
@@ -681,6 +686,12 @@ class DefaultSteerer:
         task.status = TaskStatus.CANCELLED
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.CANCELLED)
         await self._emit_task_cancelled(session, task_id, reason)
+        # goldfive#219: task boundary is a natural goal-drift checkpoint.
+        # Fire before cascade so the judge sees the initiator's transition;
+        # cascade-cancel downstream tasks share the same rate-limit bucket
+        # and will no-op as subsequent boundary fires fall within the
+        # 10s guard.
+        await self._maybe_run_goal_drift_on_task_boundary(session)
         await self.cascade_cancel_downstream(session, task_id)
 
     async def mark_task_not_needed(
@@ -720,6 +731,8 @@ class DefaultSteerer:
         await self._emit_task_cancelled(
             session, task_id, f"not_needed: {reason}" if reason else "not_needed"
         )
+        # goldfive#219: task boundary is a natural goal-drift checkpoint.
+        await self._maybe_run_goal_drift_on_task_boundary(session)
 
     async def cascade_cancel_downstream(
         self,
@@ -1109,6 +1122,51 @@ class DefaultSteerer:
             return
         # Reset before running so a check that itself triggers further
         # invocations in the agent loop doesn't double-fire.
+        session._agent_turns_since_goal_check = 0
+        await self.maybe_run_goal_drift_check(session)
+
+    # Minimum spacing between two task-boundary-triggered GOAL_DRIFT
+    # judge calls, in seconds (goldfive#219). Task transitions can
+    # arrive back-to-back (e.g. a cascade-cancel fan-out or a fast
+    # research→write→review pipeline), and we don't want to pay for
+    # N LLM calls per burst; one is enough to catch drift. Turn-based
+    # scheduling has its own interval (``goal_drift_check_interval``)
+    # and is not affected by this guard.
+    _GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S: float = 10.0
+
+    async def _maybe_run_goal_drift_on_task_boundary(self, session: Session) -> None:
+        """Fire :meth:`maybe_run_goal_drift_check` on a task transition.
+
+        Task completions / failures / cancellations are natural
+        "am I still on plan?" checkpoints, so we fire the judge here
+        in addition to the turn-counter-driven path (goldfive#219).
+        Short pipelines that finish before ``goal_drift_check_interval``
+        turns would otherwise never trigger the judge.
+
+        Rate-limited: if two task transitions happen within
+        :data:`_GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S` seconds of
+        each other, only the first fires a judge call. Callers pass
+        a fresh ``time.time()`` implicitly via the session-stored
+        ``_last_goal_drift_check_ts``.
+
+        Also resets ``session._agent_turns_since_goal_check`` so a
+        task boundary that lands on exactly the interval boundary
+        does not pay for two back-to-back judge calls.
+
+        No-ops when ``goal_drift_call_llm`` is unconfigured — that
+        gate is enforced inside :meth:`maybe_run_goal_drift_check`;
+        we short-circuit here only to avoid bumping the timestamp
+        when no judge will run.
+        """
+        if self._goal_drift_call_llm is None:
+            return
+        now = time.time()
+        last = getattr(session, "_last_goal_drift_check_ts", 0.0)
+        if now - last < self._GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S:
+            return
+        session._last_goal_drift_check_ts = now
+        # Reset the turn counter so the next turn-interval check starts
+        # fresh rather than firing one more judge call on the next turn.
         session._agent_turns_since_goal_check = 0
         await self.maybe_run_goal_drift_check(session)
 
