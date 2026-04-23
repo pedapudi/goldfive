@@ -301,7 +301,7 @@ class DefaultSteerer:
         goal_drift_call_llm: ReflectiveCallLLM | None = None,
         goal_drift_model: str = "",
         goal_drift_activity_window: int = 10,
-        plan_revision_cooldown_seconds: float = 30.0,
+        plan_revision_cooldown_seconds: float = 0.0,
     ) -> None:
         """Build a steerer.
 
@@ -349,15 +349,15 @@ class DefaultSteerer:
         plan_revision_cooldown_seconds:
             Minimum interval, in seconds, between two drift-triggered
             plan revisions for the same ``(task_id, drift_kind)`` key.
-            Defaults to ``30.0``. Set to ``0.0`` to disable the cooldown
-            entirely (pre-fix behaviour). Cooldown is scoped per-kind so
-            genuinely different problems (e.g. ``LOOPING_REASONING`` vs
-            ``CONFUSION``) can still replan independently. USER_STEER
-            drifts bypass this gate (user intent is always honoured
-            immediately) and GOAL_DRIFT has its own rate limiting via
-            ``_last_goal_drift_check_ts``, so it also bypasses this
-            gate. See goldfive feedback-loop fix for the observation
-            that prompted this.
+            **Defaults to ``0.0`` — disabled.** Operators who observe
+            replan thrashing from aggressive drift detection can pass a
+            positive value (e.g. ``30.0``) to opt in. Cooldown is scoped
+            per-kind so genuinely different problems (e.g.
+            ``LOOPING_REASONING`` vs ``CONFUSION``) can still replan
+            independently. USER_STEER drifts bypass this gate (user
+            intent is always honoured immediately) and GOAL_DRIFT has
+            its own rate limiting via ``_last_goal_drift_check_ts``, so
+            it also bypasses this gate. See goldfive#227.
 
         See ``docs/design/DRIFT.md`` §"Reflective self-progress check"
         for the full feature-gate semantics. The GOAL_DRIFT check
