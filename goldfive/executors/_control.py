@@ -29,9 +29,10 @@ members and their raw string equivalents — ``ControlKind`` is a
   can produce a fresh plan on the ``USER_STEER`` drift.
 * ``REWIND_TO`` — mark a task and every downstream task ``PENDING``
   so the executor re-walks them.
-* ``STATUS_QUERY`` — synthesize a status-snapshot event on the sinks
-  (forward-compat; not in the Phase-1 ``ControlKind`` enum, but
-  recognized if an external caller sends the string).
+* ``STATUS_QUERY`` — read-only probe. Returns a compact status
+  snapshot string via the ack's ``detail`` field. Does NOT emit any
+  sink events: status polling must not register as drift or pollute
+  observer streams.
 * ``INTERCEPT_TRANSFER`` — toggle ``session._intercept_transfer`` so
   adapters that honour the flag refuse transfers.
 * ``APPROVE`` / ``REJECT`` — resolve a pending human-in-the-loop
@@ -60,9 +61,9 @@ log = logging.getLogger(__name__)
 __all__ = [
     "ControlOutcome",
     "_ControlCancelled",
+    "build_status_snapshot",
     "dispatch_control",
     "drain_controls",
-    "emit_status_report",
 ]
 
 
@@ -136,24 +137,21 @@ def _kind_value(msg: ControlMessage) -> str:
     return str(getattr(raw, "value", raw)).upper()
 
 
-async def emit_status_report(
-    *,
-    session: Session,
-    sinks: list[EventSink],
-    control_id: str,
-) -> None:
-    """Emit a synthetic status report as a ``DriftDetected`` event.
+def build_status_snapshot(*, session: Session, control_id: str) -> str:
+    """Build a compact status-snapshot string for a STATUS_QUERY ack.
 
     STATUS_QUERY messages ask the runner "what are you working on right
-    now?" Reuses the existing ``DriftDetected`` payload (no proto regen
-    for Phase 1 — see issue #71) with kind ``CUSTOM`` and a detail
-    string that encodes a compact status snapshot. External observers
-    pick the message up off the sink stream and surface it to the UI.
-    """
-    from goldfive.events import drift_detected_event
-    from goldfive.events import emit as emit_event
-    from goldfive.types import DriftEvent, DriftKind, DriftSeverity
+    now?" This is a read-only probe — it MUST NOT emit any drift events
+    or pollute the sink stream. The snapshot string is returned via the
+    control-channel ack's ``detail`` field so the frontend can poll
+    cheaply without generating observer-visible drift markers.
 
+    Previous versions (pre goldfive#XXX) synthesised a ``DriftDetected``
+    event here, which meant every status poll produced 2 drift rows in
+    the sink chain. A 5-minute e2e run saw 33,666 bogus
+    ``drift_detected`` events with ``kind=0`` (UNSPECIFIED) — this
+    helper is the fix.
+    """
     plan = session.plan
     total = len(plan.tasks) if plan is not None else 0
     completed_ids: list[str] = []
@@ -169,31 +167,11 @@ async def emit_status_report(
                 TaskStatus.BLOCKED,
             ):
                 pending_ids.append(t.id)
-    detail = (
+    return (
         f"status_query control_id={control_id} current_task={current} "
         f"completed={len(completed_ids)}/{total} "
         f"pending={','.join(pending_ids) or '-'}"
     )
-    drift = DriftEvent(
-        kind=DriftKind.CUSTOM,
-        severity=DriftSeverity.INFO,
-        detail=detail,
-        current_task_id=current,
-    )
-    try:
-        evt = drift_detected_event(
-            run_id=session.run_id,
-            sequence=session.next_sequence(),
-            drift=drift,
-            session_id=session.id,
-        )
-    except Exception as exc:  # noqa: BLE001 — proto stubs may be missing
-        log.debug("emit_status_report: proto event build failed: %s", exc)
-        return
-    try:
-        await emit_event(sinks, evt)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("emit_status_report: sink emit raised: %s", exc)
 
 
 async def dispatch_control(
@@ -286,9 +264,15 @@ async def dispatch_control(
         )
 
     if kind == "STATUS_QUERY":
-        await emit_status_report(session=session, sinks=sinks, control_id=msg.id)
+        # Read-only probe: return the status snapshot via the ack's
+        # `detail` field. Do NOT emit a drift event — status polls must
+        # not pollute the sink stream or register as drift markers in
+        # the frontend. See the module docstring for the background
+        # (goldfive#XXX: 33k bogus drift_detected events from
+        # status_query polling in a single 5-min e2e run).
+        snapshot = build_status_snapshot(session=session, control_id=msg.id)
         return ControlOutcome(
-            ack=_build_ack(msg, result=AckResult.SUCCESS, detail="status emitted"),
+            ack=_build_ack(msg, result=AckResult.SUCCESS, detail=snapshot),
         )
 
     if kind == "INTERCEPT_TRANSFER":

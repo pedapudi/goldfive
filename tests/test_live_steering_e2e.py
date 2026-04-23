@@ -17,8 +17,9 @@ Scenarios covered:
 * PAUSE between tasks blocks the executor until RESUME arrives.
 * REWIND_TO resets a target task plus every downstream task back to
   ``PENDING`` so the executor re-walks them.
-* STATUS_QUERY emits a synthetic :class:`DriftDetected` report on the
-  sinks and acks ``SUCCESS``.
+* STATUS_QUERY is a read-only probe — it does NOT emit any sink
+  events; the status snapshot is returned via the ack's ``detail``
+  field.
 
 Module-level tests in ``tests/test_executor_control.py`` already cover
 executor-level semantics with a stub steerer; the tests here verify the
@@ -437,8 +438,15 @@ async def test_rewind_resets_target_and_downstream_tasks() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_status_query_emits_synthetic_report() -> None:
-    """STATUS_QUERY emits a synthetic ``DriftDetected`` status event."""
+async def test_status_query_is_readonly_no_drift_snapshot_in_ack() -> None:
+    """STATUS_QUERY is a read-only probe: NO sink events, snapshot in ack.
+
+    Regression guard for the "33k bogus drift_detected events per
+    5-minute e2e run" bug: every status_query poll used to produce a
+    synthetic ``DriftDetected`` event with ``kind=0`` (UNSPECIFIED),
+    crushing harmonograf's DB and frontend rendering. Status snapshots
+    now flow back via the ack's ``detail`` field only.
+    """
 
     sink = InMemorySink()
     channel = ControlChannel()
@@ -478,10 +486,16 @@ async def test_status_query_emits_synthetic_report() -> None:
     assert outcome.success is True
     assert status_sent.is_set()
 
+    # NO drift events should mention status_query. Any drift row tagged
+    # with status_query is a regression of the 33k-drift bug.
     details = _drift_details(sink.events)
-    assert any("status_query" in d for d in details), (
-        f"expected a status_query drift emission; got drift details={details}"
+    offending = [d for d in details if "status_query" in d]
+    assert offending == [], (
+        f"STATUS_QUERY must not emit drift_detected events; got {offending!r}"
     )
 
     acks = await _drain_acks(channel, count=1, timeout=1.0)
-    assert len(acks) == 1 and acks[0].result == AckResult.SUCCESS
+    assert len(acks) == 1
+    assert acks[0].result == AckResult.SUCCESS
+    # Snapshot is returned via the ack's detail field.
+    assert "status_query" in acks[0].detail
