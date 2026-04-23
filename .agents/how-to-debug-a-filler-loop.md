@@ -21,7 +21,8 @@ Any of these is a high-confidence filler-loop signal:
   guard.
 - `sink.events` shows the same reporting tool called more than
   ~20 times in a single `invoke()` with the same or near-identical
-  args, yet no `LOOPING_TOOL_CALL` drift fires.
+  args, yet no `LOOPING_REASONING` drift fires from the
+  `ToolLoopTracker`.
 - `outcome.success=True` but a large fraction of tasks are still
   `PENDING` after the run.
 - `outcome.success=False` with `reason="adapter.invoke raised ...
@@ -40,13 +41,19 @@ Check which guard you expected to fire. The goldfive guards are:
 | Guard | Where | Expected drift or ack |
 |---|---|---|
 | Schema rejection (missing / unknown `task_id`) | `_tool_invocation.invoke_tool` | `{acknowledged: False, error: "missing_task_id" \| "unknown_task_id"}` |
-| Terminal-task rejection | `_tool_invocation.invoke_tool` | `{acknowledged: False, error: "task_already_terminal"}` |
-| Per-task loop guard (reporting tools) | `_tool_loop_guard.detect_loop` | `LOOPING_TOOL_CALL` drift; subsequent calls get `loop_detected` |
-| Session-wide volume cap | `_tool_loop_guard.detect_session_loop` | `LOOPING_TOOL_CALL` drift (severity CRITICAL); all further calls hard-rejected |
-| **`ToolLoopTracker`** (all ADK tool calls, goldfive#181) | `goldfive/drift/tool_loops.py`, fires at `after_tool_callback` | `LOOPING_REASONING` drift with `detail="tool_loop_exact:…"`/`tool_loop_name:…`/`tool_loop_alternating:…` |
+| Handler idempotency / invalid-transition (goldfive#201) | `goldfive.reporting._handle_task_*` | `{acknowledged: True, idempotent: True, ...}` on same-transition retry; `{acknowledged: False, error: "invalid_transition", ...}` on cross-transition |
+| **`ToolLoopTracker`** (all ADK tool calls, goldfive#181 + #204) | `goldfive/drift/tool_loops.py`, fires at `after_tool_callback` | `LOOPING_REASONING` drift with `detail="tool_loop_exact:…"`/`tool_loop_name:…`/`tool_loop_alternating:…` and graduated INFO/WARNING/CRITICAL severity |
 | Per-task retry-lineage cap | `SequentialExecutor._lineage_root` | task marked FAILED without invoking the adapter |
 | Refine-failure threshold | `DefaultSteerer.REFINE_FAILURE_THRESHOLD` | `REPEATED_FAILURE` drift + task FAILED |
 | AgentTool-per-invoke cap | `_GoldfiveADKPlugin.before_tool_callback` | `RUNAWAY_DELEGATION` drift (CRITICAL); further spawns return `{"status": "skipped"}` |
+
+> **Retired (goldfive#206).** The per-task + session-wide
+> `ToolLoopGuard` in `goldfive/adapters/_tool_loop_guard.py` used
+> to sit between schema rejection and the handler. It was retired
+> because it was firing CRITICAL `LOOPING_TOOL_CALL` drifts on
+> benign idempotent retries (the exact=6-in-window-of-8
+> behaviour pre-dated both handler-owned idempotency and the
+> tracker's graduated severity).
 
 If none of these ACK/drift shapes appear in your sink log, the
 guard never ran. That is the bug — do not patch a new cap; find
@@ -55,13 +62,19 @@ why the existing guard was skipped.
 ### Step 1.5 — Check the `ToolLoopTracker` coverage (goldfive#181)
 
 The `ToolLoopTracker` is auto-wired into the ADK plugin and observes
-**every** tool call in the ADK tree (not just reporting tools).
-Three modes:
+**every** tool call in the ADK tree (not just reporting tools). Since
+goldfive#204 it uses graduated severity per category (meta vs work
+tools) — see `goldfive/drift/tool_loops.py` for the full threshold
+table. In brief:
 
-- **Exact** — same `(tool_name, args_hash)` ≥ 3 in last 7 calls.
-- **Name** — same `tool_name` (any args) ≥ 5 in last 7 with no task
-  progress.
-- **Alternating** — A,B,A,B,A pattern in last 5.
+- **Meta tools** (`report_task_*`, `report_awaiting_approval`):
+  exact-match INFO at 3, WARNING at 6, CRITICAL at 10 in a window
+  of 10.
+- **Work tools** (everything else): exact-match INFO at 3, WARNING
+  at 3, CRITICAL at 6; same-name (any args) WARNING at 5, CRITICAL
+  at 7.
+- **Alternating** A,B,A,B,A pattern always fires INFO only (window
+  tail of 5).
 
 Inspect its detection output with:
 
@@ -71,16 +84,19 @@ logging.getLogger("goldfive.drift.tool_loops").setLevel(logging.DEBUG)
 ```
 
 The tracker is keyed by `(invocation_id, agent_name)`, so parallel
-sub-agents within one invocation are isolated. Mode 2's "no task
-progress" gate is cleared by calls to
+sub-agents within one invocation are isolated. The "no task
+progress" gate for the name-axis is cleared by
 `ToolLoopTracker.on_task_progress(invocation_id=…, agent_name=…)` —
-the plugin wires this to `mark_task_completed` and friends.
+the plugin wires this to the `after_tool_callback` for
+acknowledged-success reporting responses (goldfive#192).
 
 Env-var overrides:
 
-- `GOLDFIVE_TOOL_LOOP_WINDOW` (default 7)
-- `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` (default 3)
-- `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` (default 5)
+- `GOLDFIVE_TOOL_LOOP_WINDOW` (default 10)
+- `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` (default 3, overrides the
+  work-category WARNING tier only)
+- `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` (default 5, overrides the
+  work-category WARNING tier only)
 - `GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD` (default 5)
 
 If the tracker isn't firing on a run you know is looping, three

@@ -39,12 +39,12 @@ are excluded — they're progress signals, not work.
   (Level 1 ABSORB → refine; escalates to Level 3 CANCEL_REINVOKE on
   repeat).
 
-**Configuration.** Defaults tuned for a 7-call window. Override via
+**Configuration.** Defaults tuned for a 10-call window. Override via
 env vars:
 
-- `GOLDFIVE_TOOL_LOOP_WINDOW` (default 7)
-- `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` (default 3)
-- `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` (default 5)
+- `GOLDFIVE_TOOL_LOOP_WINDOW` (default 10)
+- `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` (default 3, work-WARNING only)
+- `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` (default 5, work-WARNING only)
 - `GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD` (default 5)
 
 See `goldfive/drift/tool_loops.py` for the full contract.

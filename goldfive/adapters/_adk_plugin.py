@@ -1960,17 +1960,20 @@ def make_adk_plugin(
             # calls, not side-effects.
             #
             # Route through ``invoke_tool`` (NOT a direct handler call)
-            # so every reporting-tool dispatch picks up the three
-            # protection layers defined in
-            # ``goldfive.adapters._tool_invocation``:
+            # so every reporting-tool dispatch picks up schema validation
+            # (missing / unknown ``task_id`` → structured error) and
+            # then reaches the reporting handlers, which own the rest of
+            # the protection stack:
             #
-            #   1. terminal-task rejection — structured error response
-            #      once a task has reached COMPLETED/FAILED/CANCELLED,
-            #   2. idempotency — duplicate (task_id, name, args) calls
-            #      return ``{"acknowledged": True, "duplicate": True}``,
-            #   3. loop guard — a sustained burst of identical calls
-            #      fires a ``LOOPING_TOOL_CALL`` drift so the planner
-            #      can intervene.
+            #   * idempotency — same-transition retries return
+            #     ``{"acknowledged": True, "idempotent": True, ...}``
+            #     (goldfive#201, #203),
+            #   * invalid-transition — cross-transitions on terminal
+            #     tasks return ``{"acknowledged": False,
+            #     "error": "invalid_transition", ...}``,
+            #   * tool-loop detection — covered independently by
+            #     :class:`goldfive.drift.tool_loops.ToolLoopTracker`
+            #     at ``after_tool_callback`` (goldfive#181, #204).
             #
             # See ``docs/design/TASK-LIFECYCLE.md`` §5 for the contract.
             #
