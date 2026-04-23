@@ -567,6 +567,15 @@ class Session:
     # session.
     reasoning_cluster_flagged: set[str] = dataclasses.field(default_factory=set)
     reasoning_loop_flagged: set[str] = dataclasses.field(default_factory=set)
+    # Per-task one-shot flag for the standalone unreferenced-keyword
+    # detector (``detect_unreferenced_keyword``). Promoted from the
+    # severity-bump helper because whole-block cosine empirically fails
+    # to separate drifted from on-topic reasoning on real embedding
+    # models (see #223); the lexical signal fires independently so we
+    # gate it per-task the same way as ``reasoning_cluster_flagged`` to
+    # avoid drift-spam when the same off-topic reasoning block repeats
+    # across turns.
+    unreferenced_keyword_flagged: set[str] = dataclasses.field(default_factory=set)
     # Per-(drift_kind_value, task_id) consecutive refine-failure counter.
     # Incremented each time ``planner.refine`` raises or returns ``None``
     # for the given (kind, task) tuple; reset on a successful refine.

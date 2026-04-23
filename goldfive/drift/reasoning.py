@@ -61,12 +61,15 @@ __all__ = [
     "LOOPING_REASONING_SIMILARITY_THRESHOLD",
     "OFF_TOPIC_DISTANCE_THRESHOLD",
     "REASONING_CLUSTER_SIMILARITY_THRESHOLD",
+    "SENTENCE_LEVEL_MIN_BLOCK_LENGTH",
+    "SENTENCE_LEVEL_MAX_SENTENCES",
     "analyze_reasoning",
     "detect_confusion",
     "detect_intent_divergence",
     "detect_looping_reasoning",
     "detect_off_topic",
     "detect_reasoning_cluster_tightening",
+    "detect_unreferenced_keyword",
     "reasoning_hash",
 ]
 
@@ -116,6 +119,26 @@ REASONING_CLUSTER_SIMILARITY_THRESHOLD: float = 0.75
 # Cosine-distance threshold for OFF_TOPIC. ``1 - cosine >= threshold``
 # means the reasoning is far from the task description.
 OFF_TOPIC_DISTANCE_THRESHOLD: float = 0.7
+
+# Minimum character length for ``detect_off_topic`` to additionally run
+# the per-sentence min-cosine check. Below this threshold a block is
+# likely a single sentence already; splitting buys nothing.
+SENTENCE_LEVEL_MIN_BLOCK_LENGTH: int = 200
+
+# Upper bound on how many sentences ``detect_off_topic`` checks per call
+# when the sentence-level path is engaged. Keeps HTTP-backed embedding
+# cost bounded for pathologically long reasoning blocks.
+SENTENCE_LEVEL_MAX_SENTENCES: int = 10
+
+# Sentence boundary: period / exclamation / question mark followed by
+# whitespace. Pragmatic — see ``_split_sentences`` docstring for the
+# tradeoffs vs more elaborate NLTK-style tokenisation.
+_SENTENCE_BOUNDARY: re.Pattern[str] = re.compile(r"[.!?]\s+")
+
+# Minimum length for a sentence-level candidate. Fragments shorter
+# than this (e.g. ``"OK."``, ``"Step 1."``) can't carry enough lexical
+# content for cosine to be meaningful.
+_SENTENCE_MIN_LENGTH: int = 10
 
 # Regex looking for explicit "my goal is / let me change goals / new
 # objective" style phrasing. Used by the pattern-based fallback path
@@ -489,8 +512,27 @@ def detect_reasoning_cluster_tightening(
 
 
 def detect_off_topic(text: str, session: Session) -> DriftEvent | None:
-    """Return :data:`DriftKind.OFF_TOPIC` when the reasoning vector is
-    far from the current task topic vector.
+    """Return :data:`DriftKind.OFF_TOPIC` when the reasoning is far from
+    the current task topic.
+
+    Two checks, in order:
+
+    1. **Whole-text distance.** The original signal — still useful for
+       blocks that are uniformly off-topic ("FAR-OFF" regime).
+    2. **Per-sentence min-distance.** When ``text`` is long enough to
+       likely contain multiple sentences, split on sentence terminators
+       and embed each sentence individually. If ANY non-trivial sentence
+       has ``distance_to_topic >= OFF_TOPIC_DISTANCE_THRESHOLD`` the
+       pipeline fires. Rationale: on real embedding models the shared
+       vocabulary of a long reasoning block swamps a brief drift tangent,
+       so the whole-text cosine stays high even when the block clearly
+       drifted (see #223 for the raccoon stimulus calibration). A single
+       sentence is short enough that the drift tokens are a large
+       fraction of the embedding, so the existing 0.7 threshold applies
+       roughly unchanged; we deliberately don't introduce a new knob.
+
+    Rate-limited to :data:`SENTENCE_LEVEL_MAX_SENTENCES` sentences per
+    call to bound HTTP cost on the OpenAI-compatible backend.
 
     Requires the embedding extra. Returns ``None`` when the model is
     unavailable or when there is no bound current task to compare
@@ -508,17 +550,175 @@ def detect_off_topic(text: str, session: Session) -> DriftEvent | None:
         OFF_TOPIC_DISTANCE_THRESHOLD,
         topic[:60],
     )
-    if dist < 0:
+    if dist >= 0 and dist >= OFF_TOPIC_DISTANCE_THRESHOLD:
+        return DriftEvent(
+            kind=DriftKind.OFF_TOPIC,
+            severity=DriftSeverity.WARNING,
+            detail=(
+                f"reasoning far from task (distance={dist:.2f} >= "
+                f"{OFF_TOPIC_DISTANCE_THRESHOLD:.2f}): task={topic[:60]!r}"
+            ),
+            current_task_id=session.current_task_id,
+            raw=text,
+        )
+
+    # Sentence-level path. Whole-text cosine came in either healthy or
+    # unavailable; only engage per-sentence splitting when the block is
+    # plausibly multi-sentence. A short single-sentence block has already
+    # been tested above.
+    if not _looks_multi_sentence(text):
         return None
-    if dist < OFF_TOPIC_DISTANCE_THRESHOLD:
+    sentences = _split_sentences(text)[:SENTENCE_LEVEL_MAX_SENTENCES]
+    candidates = [s for s in sentences if _is_sentence_candidate(s)]
+    if not candidates:
         return None
+    per_sentence: list[tuple[float, str]] = []
+    worst: tuple[float, str] | None = None
+    for sentence in candidates:
+        sdist = _embed.distance_to_topic(sentence, topic)
+        if sdist < 0:
+            # Embedding unavailable mid-loop — match the whole-text
+            # graceful-degrade contract.
+            return None
+        per_sentence.append((sdist, sentence))
+        if worst is None or sdist > worst[0]:
+            worst = (sdist, sentence)
+    log.debug(
+        "off_topic: sentence-level scan (%d sentences, threshold=%.2f): %s",
+        len(per_sentence),
+        OFF_TOPIC_DISTANCE_THRESHOLD,
+        [(round(d, 3), s[:40]) for d, s in per_sentence],
+    )
+    if worst is None or worst[0] < OFF_TOPIC_DISTANCE_THRESHOLD:
+        return None
+    worst_dist, worst_sentence = worst
     return DriftEvent(
         kind=DriftKind.OFF_TOPIC,
         severity=DriftSeverity.WARNING,
         detail=(
-            f"reasoning far from task (distance={dist:.2f} >= "
-            f"{OFF_TOPIC_DISTANCE_THRESHOLD:.2f}): task={topic[:60]!r}"
+            f"reasoning has off-topic sentence (distance={worst_dist:.2f} "
+            f">= {OFF_TOPIC_DISTANCE_THRESHOLD:.2f}): {worst_sentence[:80]!r}"
         ),
+        current_task_id=session.current_task_id,
+        raw=text,
+    )
+
+
+def _looks_multi_sentence(text: str) -> bool:
+    """Return True when ``text`` is long enough to plausibly contain
+    multiple sentences. Either a char-count heuristic or two+ sentence
+    terminators suffices — short blocks with a stray period (``"OK. "``)
+    still get treated as single-sentence and fall through.
+    """
+    if len(text) > SENTENCE_LEVEL_MIN_BLOCK_LENGTH:
+        return True
+    terminators = sum(1 for ch in text if ch in ".!?")
+    return terminators >= 2
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split ``text`` into rough sentences on terminator + whitespace.
+
+    Trailing terminators are trimmed from each piece for readability in
+    the diagnostic ``detail`` field. No attempt is made to handle
+    abbreviations ("Dr."), ellipses, or quoted dialogue — the calibration
+    corpus (#223) has none of those, and a heavier tokeniser trades
+    accuracy for dependency weight we don't want here.
+    """
+    if not text:
+        return []
+    pieces = _SENTENCE_BOUNDARY.split(text)
+    return [p.strip().rstrip(".!?").strip() for p in pieces if p.strip()]
+
+
+def _is_sentence_candidate(sentence: str) -> bool:
+    """Return True when ``sentence`` has enough lexical content for a
+    cosine check to be meaningful. Filters trivial fragments like
+    ``"OK"`` or ``"Step 1"`` that lack a single 5+ char alpha token —
+    embedding them burns HTTP budget without producing signal.
+    """
+    if len(sentence) < _SENTENCE_MIN_LENGTH:
+        return False
+    return bool(re.search(r"[a-zA-Z]{5,}", sentence))
+
+
+def detect_unreferenced_keyword(
+    text: str, session: Session
+) -> DriftEvent | None:
+    """Return :data:`DriftKind.OFF_TOPIC` when the reasoning mentions
+    significant keywords that are absent from ``session.goals`` and the
+    current task topic.
+
+    Graduated severity by surplus-keyword count:
+
+    ========================  ==========
+    surplus keyword count     severity
+    ========================  ==========
+    1                          INFO
+    2 - 3                      WARNING
+    >= 4                       CRITICAL
+    ========================  ==========
+
+    A "keyword" is any 5+ char alpha token from ``text`` that is not a
+    stopword — same rule as :func:`_has_unreferenced_keyword`, so the
+    standalone detector and the severity-bump path in
+    :func:`detect_intent_divergence` stay behaviourally consistent.
+
+    One-shot per task: the detector fires at most once per
+    ``session.current_task_id`` via ``session.unreferenced_keyword_flagged``.
+    Same pattern as :func:`detect_reasoning_cluster_tightening` — avoids
+    drift-spam when the same off-topic reasoning block repeats across
+    turns.
+
+    Returns ``None`` when there is no reference text (no goals and no
+    bound task), matching :func:`detect_off_topic`'s precondition.
+
+    Rationale: whole-block cosine is empirically a weak separator on
+    real embedding models (see #223), so the lexical signal is often
+    the only one that fires on genuine drift. The severity-bump path
+    in :func:`detect_intent_divergence` is left intact — it still adds
+    signal when both paths agree.
+    """
+    if not text:
+        return None
+    goals_text = _goals_text(session)
+    task_topic = _task_topic(_current_task(session))
+    reference = (goals_text + " " + task_topic).strip().lower()
+    if not reference:
+        return None
+    task_id = session.current_task_id or ""
+    if task_id and task_id in session.unreferenced_keyword_flagged:
+        return None
+    # Preserve first-seen order so the diagnostic message reflects what
+    # the operator would read top-to-bottom.
+    seen: set[str] = set()
+    surplus: list[str] = []
+    for tok in re.findall(r"[a-z]{5,}", text.lower()):
+        if tok in _STOPWORDS:
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        if tok not in reference:
+            surplus.append(tok)
+    if not surplus:
+        return None
+    count = len(surplus)
+    if count >= 4:
+        severity = DriftSeverity.CRITICAL
+    elif count >= 2:
+        severity = DriftSeverity.WARNING
+    else:
+        severity = DriftSeverity.INFO
+    preview = ", ".join(surplus[:3])
+    if count > 3:
+        preview = f"{preview} (+{count - 3} more)"
+    if task_id:
+        session.unreferenced_keyword_flagged.add(task_id)
+    return DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=severity,
+        detail=f"reasoning mentions off-task keywords: {preview}",
         current_task_id=session.current_task_id,
         raw=text,
     )
@@ -553,8 +753,9 @@ def analyze_reasoning(text: str, session: Session) -> DriftEvent | None:
     Emits at most one drift per call. Detectors are tried in the order
     that preserves the worst-signal-wins invariant:
     INTENT_DIVERGENCE (graduated INFO/WARNING/CRITICAL) ->
-    LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING) ->
-    REASONING_CLUSTER_TIGHTENING (INFO) -> CONFUSION (INFO).
+    LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING, whole-text +
+    sentence-level) -> UNREFERENCED_KEYWORD (OFF_TOPIC kind, graduated
+    by count) -> REASONING_CLUSTER_TIGHTENING (INFO) -> CONFUSION (INFO).
 
     INTENT_DIVERGENCE runs first even at INFO severity so its kind is
     stable; callers that only care about warning-and-up simply filter
@@ -566,6 +767,16 @@ def analyze_reasoning(text: str, session: Session) -> DriftEvent | None:
     tier — the two are mutually exclusive by construction, and running
     LOOPING_REASONING first keeps the "no double-fire" invariant
     cheap to reason about.
+
+    ``detect_unreferenced_keyword`` runs AFTER ``detect_off_topic``
+    (both the whole-text and sentence-level paths) and BEFORE
+    ``detect_reasoning_cluster_tightening``. Rationale:
+    ``detect_off_topic`` and the intent-divergence embedding path own
+    the "pure semantic drift" signal; ``detect_unreferenced_keyword``
+    owns the lexical signal. Both may be right; we prefer the
+    embedding-based drift when it fires, and fall back to lexical when
+    the whole-block cosine fails to separate drift from on-topic (the
+    scenario documented in #223).
     """
     if not text:
         return None
@@ -576,6 +787,9 @@ def analyze_reasoning(text: str, session: Session) -> DriftEvent | None:
     if drift is not None:
         return drift
     drift = detect_off_topic(text, session)
+    if drift is not None:
+        return drift
+    drift = detect_unreferenced_keyword(text, session)
     if drift is not None:
         return drift
     drift = detect_reasoning_cluster_tightening(text, session)

@@ -675,8 +675,13 @@ def test_analyze_reasoning_prefers_intent_divergence_over_confusion() -> None:
 
 
 def test_analyze_reasoning_returns_none_on_clean_text() -> None:
+    # Every 5+ char non-stopword token in the reasoning also appears in
+    # the default goals+task reference ("produce a slide review report"
+    # + "Review the slides" + "Read every slide and list any typos
+    # found.") so the standalone ``detect_unreferenced_keyword`` stays
+    # silent alongside the intent-divergence / off-topic paths.
     session = _session_with_task()
-    text = "Focus: examine slide 3 for typos; log each typo with line number."
+    text = "slide review: read each slide, list the typos found."
     assert dreason.analyze_reasoning(text, session) is None
 
 
@@ -701,14 +706,26 @@ async def test_observe_reasoning_appends_to_history_and_caps() -> None:
 
 async def test_observe_reasoning_emits_confusion_drift_but_no_refine() -> None:
     steerer = DefaultSteerer()
-    session = _session_with_task()
+    # Build a session whose goals+task reference contains every 5+ char
+    # non-stopword token the reasoning uses, so the standalone
+    # ``detect_unreferenced_keyword`` path stays silent and CONFUSION
+    # (INFO) owns the signal. The pipeline runs UNREFERENCED_KEYWORD
+    # before CONFUSION, so any surplus token would steal the event.
+    session = _session_with_task(
+        title="review slides produce",
+        description=(
+            "review slides produce report typos found summary prompt "
+            "should check needs"
+        ),
+        goals=[Goal(id="g1", summary="produce a slide review report summary")],
+    )
     sink = ListSink()
     planner = RecordingPlanner()
     steerer.bind(sinks=[sink], planner=planner)
 
     text = (
-        "Hmm, I'm not sure what the user wants. I don't know if they want "
-        "a summary. Wait, should I re-check the prompt?"
+        "Hmm, I'm not sure what the report summary needs. I don't know if "
+        "they want the slides prompt. Wait, should I re-check?"
     )
     await steerer.observe_reasoning(text, session=session)
 
@@ -831,8 +848,17 @@ def test_adk_extract_reasoning_returns_empty_for_plain_text_response() -> None:
 
 
 async def test_issue_acceptance_confusion_from_reasoning_block() -> None:
+    # Session reference intentionally covers "wants" and "should" (not
+    # stopwords but generic enough to slip past the keyword detector);
+    # the reasoning's 5+ char non-stopword tokens are all present in
+    # goals+task so UNREFERENCED_KEYWORD stays silent and CONFUSION
+    # (the acceptance target) wins.
     steerer = DefaultSteerer()
-    session = _session_with_task()
+    session = _session_with_task(
+        title="wants review",
+        description="wants review slides user should list",
+        goals=[Goal(id="g1", summary="wants a slide review report should list")],
+    )
     sink = ListSink()
     planner = NullPlanner()
     steerer.bind(sinks=[sink], planner=planner)
