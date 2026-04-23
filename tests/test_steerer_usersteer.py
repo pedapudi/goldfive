@@ -300,8 +300,20 @@ async def test_observe_dedupe_does_not_affect_heuristic_drifts() -> None:
     The dedupe set lives only for user-originated STEER annotations;
     content-based classifiers (tool errors, refusals, loops) must
     remain free-running so repeated heuristic signals still escalate.
+
+    This test deliberately fires two identical back-to-back tool-error
+    drifts, which would otherwise be suppressed by the plan-revision
+    cooldown (goldfive feedback-loop fix). The cooldown is an
+    orthogonal rate limit covered by
+    ``tests/test_plan_revision_cooldown.py``; here we disable it so
+    the dedup-set assertion can stand on its own.
     """
     steerer, session, _sink, planner = _bind_fresh()
+    # Hot-patch the cooldown off for this test only. ``_bind_fresh``
+    # builds a default-configured steerer; we need the cooldown window
+    # at 0 so the two identical tool-error observations below both
+    # trigger refine.
+    steerer._plan_revision_cooldown_seconds = 0.0
 
     # A steer populates processed_steer_ids.
     msg = ControlMessage(
