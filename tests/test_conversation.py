@@ -311,6 +311,12 @@ async def test_runner_planner_sees_prior_turn_context() -> None:
         executor=SequentialExecutor(),
         goal_deriver=PassthroughGoalDeriver("demo"),
         sinks=[InMemorySink()],
+        # Disable the turn-aware planning gate (planner-gate): this
+        # test exercises the planner-context wiring on turn 2, so we
+        # need Planner.generate to actually run on turn 2 — the gate
+        # would otherwise classify the short "make it funnier" input
+        # as conversational and skip the planner call.
+        planner_gate=None,
     )
     out1 = await runner.run("write a limerick about cats")
     assert out1.success
