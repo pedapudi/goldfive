@@ -47,7 +47,10 @@ from __future__ import annotations
 import logging
 import os
 from collections import OrderedDict
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from goldfive.config import EmbeddingConfig
 
 log = logging.getLogger("goldfive.drift.reasoning.embed")
 
@@ -55,6 +58,12 @@ log = logging.getLogger("goldfive.drift.reasoning.embed")
 _MODEL: Any | None = None
 _MODEL_UNAVAILABLE: bool = False
 _DEFAULT_MODEL_NAME: str = "all-MiniLM-L6-v2"
+
+# Installed per-Runner embedding config (goldfive#225). When non-None,
+# the :func:`_get_model` lazy-load path reads backend parameters from
+# this object instead of environment variables. ``None`` preserves the
+# pre-#225 env-driven behaviour exactly.
+_CONFIG: EmbeddingConfig | None = None
 
 # LRU cache for per-text encoded vectors.
 _CACHE_MAX: int = 512
@@ -71,6 +80,33 @@ def set_model(model: Any | None) -> None:
     """
     global _MODEL, _MODEL_UNAVAILABLE
     _MODEL = model
+    _MODEL_UNAVAILABLE = False
+    _reset_cache()
+
+
+def configure(config: EmbeddingConfig | None) -> None:
+    """Install a :class:`~goldfive.config.EmbeddingConfig` for this process.
+
+    Called by :func:`goldfive.wrap` with the ``runtime.embedding``
+    dataclass. Once installed the env-based auto-config path in
+    :func:`_get_model` is skipped — the config wins over env vars.
+    Passing ``None`` reverts to env-driven behaviour.
+
+    This also drops any cached encoder so the next :func:`_get_model`
+    call re-enters the lazy-load path with the new configuration.
+    :func:`set_model` (the test escape hatch) is NOT cleared — callers
+    who want to replace a test-installed encoder with a config-driven
+    one should call ``set_model(None)`` first.
+    """
+    global _CONFIG, _MODEL, _MODEL_UNAVAILABLE
+    _CONFIG = config
+    # Only flush the cached backend when the caller did not previously
+    # install their own via ``set_model``. Tests that set a fake
+    # encoder + also install a config expect the fake to keep winning.
+    if _MODEL is None or not isinstance(_MODEL, _OpenAIEmbeddingBackend):
+        pass  # keep a test-installed model alive
+    else:
+        _MODEL = None
     _MODEL_UNAVAILABLE = False
     _reset_cache()
 
@@ -100,16 +136,25 @@ def _get_model() -> Any | None:
     if _MODEL_UNAVAILABLE:
         return None
 
-    base_url = os.environ.get("GOLDFIVE_EMBEDDING_BASE_URL", "").strip()
+    # Prefer an installed RuntimeConfig over env vars (goldfive#225).
+    # When ``configure()`` has been called with a non-None base_url,
+    # its values win; otherwise we fall back to env lookup to preserve
+    # the pre-#225 contract for callers that never touched the new API.
+    base_url = ""
+    if _CONFIG is not None and _CONFIG.base_url:
+        base_url = _CONFIG.base_url.strip()
+    else:
+        base_url = os.environ.get("GOLDFIVE_EMBEDDING_BASE_URL", "").strip()
     if base_url:
         backend = _try_load_openai_backend(base_url)
         if backend is not None:
             _MODEL = backend
             return _MODEL
-        # Env var set but backend failed to build: do NOT silently fall
-        # through to sentence-transformers -- the user configured an
-        # HTTP endpoint; honour that by flipping to unavailable so they
-        # see "no-signal" instead of surprise-local-encoding.
+        # Base URL configured but backend failed to build: do NOT
+        # silently fall through to sentence-transformers -- the user
+        # configured an HTTP endpoint; honour that by flipping to
+        # unavailable so they see "no-signal" instead of surprise-
+        # local-encoding.
         _MODEL_UNAVAILABLE = True
         return None
 
@@ -143,13 +188,23 @@ def _try_load_openai_backend(base_url: str) -> Any | None:
 
     Splitting this out lets tests assert backend construction without
     going through the full ``_get_model`` state machine.
+
+    Under goldfive#225, parameters are pulled from the installed
+    :class:`~goldfive.config.EmbeddingConfig` when one is set; missing
+    fields fall back to env vars, then to the built-in defaults — the
+    same precedence as :func:`_get_model` uses for ``base_url``.
     """
-    model_name = os.environ.get("GOLDFIVE_EMBEDDING_MODEL", "")
-    api_key = os.environ.get("GOLDFIVE_EMBEDDING_API_KEY") or None
-    try:
-        timeout_ms = int(os.environ.get("GOLDFIVE_EMBEDDING_TIMEOUT_MS", "10000"))
-    except ValueError:
-        timeout_ms = 10000
+    if _CONFIG is not None:
+        model_name = _CONFIG.model
+        api_key = _CONFIG.api_key
+        timeout_ms = _CONFIG.timeout_ms
+    else:
+        model_name = os.environ.get("GOLDFIVE_EMBEDDING_MODEL", "")
+        api_key = os.environ.get("GOLDFIVE_EMBEDDING_API_KEY") or None
+        try:
+            timeout_ms = int(os.environ.get("GOLDFIVE_EMBEDDING_TIMEOUT_MS", "10000"))
+        except ValueError:
+            timeout_ms = 10000
     try:
         return _OpenAIEmbeddingBackend(
             base_url=base_url,

@@ -1,0 +1,372 @@
+"""Typed, per-Runner configuration for goldfive (goldfive#225).
+
+goldfive has accumulated ad-hoc configuration knobs across four
+subsystems, each with a different mechanism:
+
+1. **Embedding backend** (#221). ``GOLDFIVE_EMBEDDING_BASE_URL`` /
+   ``_MODEL`` / ``_API_KEY`` / ``_TIMEOUT_MS`` read at first call in
+   :mod:`goldfive.drift._embed`.
+2. **Tool-loop detector**. ``GOLDFIVE_TOOL_LOOP_WINDOW`` /
+   ``_EXACT_THRESHOLD`` / ``_NAME_THRESHOLD`` / ``_ALTERNATING_THRESHOLD``
+   read in :mod:`goldfive.drift.tool_loops`.
+3. **Reasoning-drift thresholds**. Module-level constants in
+   :mod:`goldfive.drift.reasoning` with no env wiring at all.
+4. **Goal-drift scheduling**. Kwargs on
+   :class:`~goldfive.steerer.DefaultSteerer` that ``goldfive.wrap()``
+   does not thread through.
+
+This module introduces a typed :class:`RuntimeConfig` dataclass with
+four sub-configs that collapses those four surfaces into a single
+object operators can pass to :func:`goldfive.wrap`. The ``from_env()``
+classmethods preserve the existing env-var surface (names unchanged
+where they already exist; new ``GOLDFIVE_DRIFT_*`` / ``GOLDFIVE_GOAL_DRIFT_*``
+names for the knobs that did not previously have env wiring) so
+``goldfive.wrap(tree)`` with no ``runtime=`` kwarg remains byte-
+identical to pre-#225 behaviour.
+
+Dataclasses are deliberately **mutable** (``frozen=False``). Operators
+commonly tweak a field after constructing from env (e.g. load
+defaults then bump ``goal_drift.check_interval`` for a debugging run).
+Callers who want a snapshot can :func:`dataclasses.replace` to build a
+variant without mutating the source.
+
+See :func:`goldfive.wrap` for the installation path and
+``docs/design/DRIFT.md`` §"Per-Runner runtime config" for the design
+note.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+import os
+
+__all__ = [
+    "EmbeddingConfig",
+    "GoalDriftConfig",
+    "ReasoningDriftConfig",
+    "RuntimeConfig",
+    "ToolLoopConfig",
+]
+
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Env helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_int_env(name: str, default: int) -> int:
+    """Best-effort positive-integer env override; returns default on any failure.
+
+    Matches the semantics of
+    :func:`goldfive.drift.tool_loops._read_int_env` (and, indirectly,
+    :func:`goldfive.drift._embed._try_load_openai_backend`'s timeout
+    read). Non-integer / non-positive / missing values silently fall
+    back to the default.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        log.debug(
+            "runtime-config: ignoring non-integer %s=%r (using default %d)",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if val <= 0:
+        log.debug(
+            "runtime-config: ignoring non-positive %s=%d (using default %d)",
+            name,
+            val,
+            default,
+        )
+        return default
+    return val
+
+
+def _read_float_env(name: str, default: float) -> float:
+    """Best-effort float env override; returns default on any failure.
+
+    Unlike :func:`_read_int_env` we do **not** require the value to be
+    positive — a reasoning-drift threshold of ``0.0`` is a valid (if
+    degenerate) configuration. Parse failures fall back to the default
+    with a debug log.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log.debug(
+            "runtime-config: ignoring non-float %s=%r (using default %s)",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
+def _read_str_env(name: str, default: str) -> str:
+    """Return ``os.environ[name]`` or ``default`` when missing.
+
+    The empty string is a legitimate value for model names (llama.cpp
+    tolerates ``model=""``), so we do NOT treat empty as "missing" here
+    — the caller may explicitly want to clear a default.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw
+
+
+def _read_optional_str_env(name: str, default: str | None) -> str | None:
+    """Return ``os.environ[name]`` or ``default``. Empty string -> ``None``.
+
+    Used for fields whose Python type is ``str | None`` (e.g.
+    ``api_key``, ``base_url``) where the semantic "unset" value is
+    ``None``, not the empty string.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    return stripped
+
+
+# ---------------------------------------------------------------------------
+# Sub-configs
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class EmbeddingConfig:
+    """Configuration for the embedding backend used by reasoning-drift detectors.
+
+    When ``base_url`` is ``None`` the OpenAI-compatible HTTP backend is
+    skipped and the lazy-load path in :mod:`goldfive.drift._embed`
+    falls through to sentence-transformers (if the ``goldfive[embedding]``
+    extra is installed). When ``base_url`` is set, the HTTP backend is
+    used exclusively — no silent fall-through to sentence-transformers
+    on HTTP failure (matches the pre-#225 env-driven contract).
+    """
+
+    base_url: str | None = None
+    model: str = ""
+    api_key: str | None = None
+    timeout_ms: int = 10_000
+
+    @classmethod
+    def from_env(cls) -> EmbeddingConfig:
+        """Read ``GOLDFIVE_EMBEDDING_*`` env vars into an instance.
+
+        Missing vars fall back to the field defaults. Preserves the
+        exact env-var surface documented in
+        :mod:`goldfive.drift._embed`.
+        """
+        defaults = cls()
+        return cls(
+            base_url=_read_optional_str_env(
+                "GOLDFIVE_EMBEDDING_BASE_URL", defaults.base_url
+            ),
+            model=_read_str_env("GOLDFIVE_EMBEDDING_MODEL", defaults.model),
+            api_key=_read_optional_str_env(
+                "GOLDFIVE_EMBEDDING_API_KEY", defaults.api_key
+            ),
+            timeout_ms=_read_int_env(
+                "GOLDFIVE_EMBEDDING_TIMEOUT_MS", defaults.timeout_ms
+            ),
+        )
+
+
+@dataclasses.dataclass
+class ToolLoopConfig:
+    """Configuration for :class:`~goldfive.drift.tool_loops.ToolLoopTracker`.
+
+    ``exact_threshold`` / ``name_threshold`` override the **work**
+    category's WARNING tier only; the graduated CRITICAL tiers and
+    the meta-category thresholds remain module constants. This
+    preserves the pre-#204 single-threshold semantics for work tools.
+    See :mod:`goldfive.drift.tool_loops` §"Graduated thresholds per
+    category" for the full table.
+    """
+
+    window: int = 10
+    exact_threshold: int = 3
+    name_threshold: int = 5
+    alternating_threshold: int = 5
+
+    @classmethod
+    def from_env(cls) -> ToolLoopConfig:
+        """Read ``GOLDFIVE_TOOL_LOOP_*`` env vars into an instance.
+
+        Names preserved from :func:`goldfive.drift.tool_loops.load_thresholds_from_env`.
+        """
+        defaults = cls()
+        return cls(
+            window=_read_int_env("GOLDFIVE_TOOL_LOOP_WINDOW", defaults.window),
+            exact_threshold=_read_int_env(
+                "GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD", defaults.exact_threshold
+            ),
+            name_threshold=_read_int_env(
+                "GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD", defaults.name_threshold
+            ),
+            alternating_threshold=_read_int_env(
+                "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD",
+                defaults.alternating_threshold,
+            ),
+        )
+
+
+@dataclasses.dataclass
+class ReasoningDriftConfig:
+    """Thresholds for the reasoning-drift detectors.
+
+    Field defaults match the module-level constants in
+    :mod:`goldfive.drift.reasoning` one-for-one. Operators who want to
+    tune these previously had to fork the module; now they can either
+    set the corresponding env var (``GOLDFIVE_DRIFT_*``) or pass a
+    :class:`RuntimeConfig` explicitly.
+
+    Installation is process-wide via
+    :func:`goldfive.drift.reasoning.configure` — "last Runner wins"
+    for processes that host multiple Runners concurrently. The
+    tradeoff is documented at the install site. If two-Runners-in-
+    one-process with different drift thresholds becomes a real use
+    case, #225's follow-up plan is to move the config onto
+    :class:`~goldfive.types.Session` and read it per-session in each
+    detector.
+    """
+
+    off_topic_distance_threshold: float = 0.7
+    intent_divergence_healthy_similarity: float = 0.6
+    intent_divergence_minor_similarity: float = 0.4
+    intent_divergence_warning_similarity: float = 0.2
+    looping_reasoning_similarity_threshold: float = 0.9
+    reasoning_cluster_similarity_threshold: float = 0.75
+    looping_reasoning_hash_window: int = 5
+    confusion_min_hits: int = 3
+
+    @classmethod
+    def from_env(cls) -> ReasoningDriftConfig:
+        """Read ``GOLDFIVE_DRIFT_*`` env vars into an instance.
+
+        New env surface introduced by #225 — the reasoning-drift
+        thresholds had no env wiring before. Names are chosen to be
+        self-descriptive and lowercased versions match the dataclass
+        fields verbatim.
+        """
+        defaults = cls()
+        return cls(
+            off_topic_distance_threshold=_read_float_env(
+                "GOLDFIVE_DRIFT_OFF_TOPIC_DISTANCE",
+                defaults.off_topic_distance_threshold,
+            ),
+            intent_divergence_healthy_similarity=_read_float_env(
+                "GOLDFIVE_DRIFT_INTENT_HEALTHY_SIMILARITY",
+                defaults.intent_divergence_healthy_similarity,
+            ),
+            intent_divergence_minor_similarity=_read_float_env(
+                "GOLDFIVE_DRIFT_INTENT_MINOR_SIMILARITY",
+                defaults.intent_divergence_minor_similarity,
+            ),
+            intent_divergence_warning_similarity=_read_float_env(
+                "GOLDFIVE_DRIFT_INTENT_WARNING_SIMILARITY",
+                defaults.intent_divergence_warning_similarity,
+            ),
+            looping_reasoning_similarity_threshold=_read_float_env(
+                "GOLDFIVE_DRIFT_LOOPING_SIMILARITY",
+                defaults.looping_reasoning_similarity_threshold,
+            ),
+            reasoning_cluster_similarity_threshold=_read_float_env(
+                "GOLDFIVE_DRIFT_CLUSTER_SIMILARITY",
+                defaults.reasoning_cluster_similarity_threshold,
+            ),
+            looping_reasoning_hash_window=_read_int_env(
+                "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
+                defaults.looping_reasoning_hash_window,
+            ),
+            confusion_min_hits=_read_int_env(
+                "GOLDFIVE_DRIFT_CONFUSION_MIN_HITS",
+                defaults.confusion_min_hits,
+            ),
+        )
+
+
+@dataclasses.dataclass
+class GoalDriftConfig:
+    """Scheduling for the trajectory-level GOAL_DRIFT judge (#143).
+
+    ``check_interval`` is the number of agent-invocation turns between
+    judge calls; ``activity_window`` bounds
+    ``session.recent_agent_activity`` and hence the prompt size. Both
+    were previously ``DefaultSteerer`` kwargs with no env or
+    ``wrap()``-level override; this config surfaces them.
+    """
+
+    check_interval: int = 5
+    activity_window: int = 10
+
+    @classmethod
+    def from_env(cls) -> GoalDriftConfig:
+        """Read ``GOLDFIVE_GOAL_DRIFT_*`` env vars into an instance."""
+        defaults = cls()
+        return cls(
+            check_interval=_read_int_env(
+                "GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL",
+                defaults.check_interval,
+            ),
+            activity_window=_read_int_env(
+                "GOLDFIVE_GOAL_DRIFT_ACTIVITY_WINDOW",
+                defaults.activity_window,
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Aggregate
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class RuntimeConfig:
+    """Per-Runner typed configuration aggregate.
+
+    Pass to :func:`goldfive.wrap` via the ``runtime=`` kwarg to install
+    all four sub-configs at once. When the kwarg is omitted, ``wrap()``
+    builds an instance from the environment via :meth:`from_env` —
+    byte-identical to pre-#225 behaviour for callers that relied on
+    env vars or accepted the built-in defaults.
+    """
+
+    embedding: EmbeddingConfig = dataclasses.field(default_factory=EmbeddingConfig)
+    tool_loops: ToolLoopConfig = dataclasses.field(default_factory=ToolLoopConfig)
+    reasoning_drift: ReasoningDriftConfig = dataclasses.field(
+        default_factory=ReasoningDriftConfig
+    )
+    goal_drift: GoalDriftConfig = dataclasses.field(default_factory=GoalDriftConfig)
+
+    @classmethod
+    def from_env(cls) -> RuntimeConfig:
+        """Build a :class:`RuntimeConfig` by reading every supported env var.
+
+        Aggregates the four sub-``from_env`` calls. Each sub-config is
+        independent: a missing env var in one subsystem does not affect
+        the others. The result is a fresh instance; callers may mutate
+        it in place or :func:`dataclasses.replace` to derive a variant.
+        """
+        return cls(
+            embedding=EmbeddingConfig.from_env(),
+            tool_loops=ToolLoopConfig.from_env(),
+            reasoning_drift=ReasoningDriftConfig.from_env(),
+            goal_drift=GoalDriftConfig.from_env(),
+        )

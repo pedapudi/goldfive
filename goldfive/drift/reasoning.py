@@ -45,6 +45,7 @@ from goldfive.drift import _embed
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity
 
 if TYPE_CHECKING:
+    from goldfive.config import ReasoningDriftConfig
     from goldfive.types import Session, Task
 
 
@@ -171,6 +172,98 @@ INTENT_DIVERGENCE_WARNING_SIMILARITY: float = 0.2
 
 
 # ---------------------------------------------------------------------------
+# Runtime-config installation (goldfive#225)
+# ---------------------------------------------------------------------------
+#
+# Module-level ``_CONFIG`` + :func:`configure` form the per-Runner
+# threshold override channel. When ``_CONFIG`` is ``None`` (default)
+# the detectors read the module-level constants above — byte-identical
+# to pre-#225 behaviour. When a :class:`~goldfive.config.ReasoningDriftConfig`
+# is installed, the detectors read from it instead.
+#
+# Installation is **process-wide**: two Runners in one process share
+# the last-installed config. :class:`~goldfive.steerer.DefaultSteerer.observe_reasoning`
+# is the sole entry point to the pipeline, and the observed race
+# (Runner A installs config, Runner B installs config, Runner A's
+# observe_reasoning fires against Runner B's thresholds) is minor in
+# practice — the thresholds are for heuristic drift detection, not
+# correctness-critical limits.
+#
+# Alternative: attach the config to :class:`~goldfive.types.Session`
+# and thread it through every free-function detector. ~5x LOC and
+# requires touching every detector signature. Revisit if two-Runners-
+# in-one-process with differing thresholds becomes a real use case.
+
+_CONFIG: ReasoningDriftConfig | None = None
+
+
+def configure(config: ReasoningDriftConfig | None) -> None:
+    """Install a :class:`~goldfive.config.ReasoningDriftConfig` for this process.
+
+    Called by :func:`goldfive.wrap` with ``runtime.reasoning_drift``.
+    Passing ``None`` clears the override so detectors fall back to the
+    module-level constants — used in test teardown to avoid cross-test
+    leakage.
+    """
+    global _CONFIG
+    _CONFIG = config
+
+
+def _looping_hash_window() -> int:
+    """Return the active LOOPING_REASONING hash-window size.
+
+    Either the installed config's field or the module-level constant.
+    Wrapping the lookup in a helper keeps the detector call sites
+    terse and makes the config/no-config branch obvious in tests.
+    """
+    if _CONFIG is not None:
+        return _CONFIG.looping_reasoning_hash_window
+    return LOOPING_REASONING_HASH_WINDOW
+
+
+def _looping_similarity_threshold() -> float:
+    if _CONFIG is not None:
+        return _CONFIG.looping_reasoning_similarity_threshold
+    return LOOPING_REASONING_SIMILARITY_THRESHOLD
+
+
+def _cluster_similarity_threshold() -> float:
+    if _CONFIG is not None:
+        return _CONFIG.reasoning_cluster_similarity_threshold
+    return REASONING_CLUSTER_SIMILARITY_THRESHOLD
+
+
+def _off_topic_distance_threshold() -> float:
+    if _CONFIG is not None:
+        return _CONFIG.off_topic_distance_threshold
+    return OFF_TOPIC_DISTANCE_THRESHOLD
+
+
+def _intent_healthy_similarity() -> float:
+    if _CONFIG is not None:
+        return _CONFIG.intent_divergence_healthy_similarity
+    return INTENT_DIVERGENCE_HEALTHY_SIMILARITY
+
+
+def _intent_minor_similarity() -> float:
+    if _CONFIG is not None:
+        return _CONFIG.intent_divergence_minor_similarity
+    return INTENT_DIVERGENCE_MINOR_SIMILARITY
+
+
+def _intent_warning_similarity() -> float:
+    if _CONFIG is not None:
+        return _CONFIG.intent_divergence_warning_similarity
+    return INTENT_DIVERGENCE_WARNING_SIMILARITY
+
+
+def _confusion_min_hits() -> int:
+    if _CONFIG is not None:
+        return _CONFIG.confusion_min_hits
+    return CONFUSION_MIN_HITS
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -267,9 +360,9 @@ def detect_intent_divergence(
             "(thresholds healthy=%.2f minor=%.2f warning=%.2f); "
             "text_head=%r",
             sim,
-            INTENT_DIVERGENCE_HEALTHY_SIMILARITY,
-            INTENT_DIVERGENCE_MINOR_SIMILARITY,
-            INTENT_DIVERGENCE_WARNING_SIMILARITY,
+            _intent_healthy_similarity(),
+            _intent_minor_similarity(),
+            _intent_warning_similarity(),
             text[:80],
         )
         severity = _severity_from_similarity(sim)
@@ -344,13 +437,15 @@ def _severity_from_similarity(sim: float) -> DriftSeverity | None:
     """Map a cosine-similarity score to an INTENT_DIVERGENCE severity.
 
     Returns ``None`` for "healthy" scores (>= ``HEALTHY``) so the
-    caller can suppress the drift entirely.
+    caller can suppress the drift entirely. Thresholds are read from
+    the installed :class:`~goldfive.config.ReasoningDriftConfig` when
+    one is set (goldfive#225), else from the module-level constants.
     """
-    if sim >= INTENT_DIVERGENCE_HEALTHY_SIMILARITY:
+    if sim >= _intent_healthy_similarity():
         return None
-    if sim >= INTENT_DIVERGENCE_MINOR_SIMILARITY:
+    if sim >= _intent_minor_similarity():
         return DriftSeverity.INFO
-    if sim >= INTENT_DIVERGENCE_WARNING_SIMILARITY:
+    if sim >= _intent_warning_similarity():
         return DriftSeverity.WARNING
     return DriftSeverity.CRITICAL
 
@@ -404,8 +499,9 @@ def detect_looping_reasoning(
     is inspected but not mutated here -- the steerer appends the new
     reasoning block before running the pipeline.
     """
+    hash_window = _looping_hash_window()
     history = [
-        h for h in session.reasoning_history[-LOOPING_REASONING_HASH_WINDOW - 1 : -1]
+        h for h in session.reasoning_history[-hash_window - 1 : -1]
         if h
     ]
     if not history or not text:
@@ -424,13 +520,14 @@ def detect_looping_reasoning(
                 raw=text,
             )
     sim = _embed.max_similarity(text, history)
+    loop_threshold = _looping_similarity_threshold()
     log.debug(
         "looping_reasoning: cosine=%.3f over %d prior turns (threshold=%.2f)",
         sim,
         len(history),
-        LOOPING_REASONING_SIMILARITY_THRESHOLD,
+        loop_threshold,
     )
-    if sim >= LOOPING_REASONING_SIMILARITY_THRESHOLD:
+    if sim >= loop_threshold:
         return DriftEvent(
             kind=DriftKind.LOOPING_REASONING,
             severity=DriftSeverity.WARNING,
@@ -473,28 +570,31 @@ def detect_reasoning_cluster_tightening(
     task_id = session.current_task_id or ""
     if task_id and task_id in session.reasoning_cluster_flagged:
         return None
+    hash_window = _looping_hash_window()
     history = [
-        h for h in session.reasoning_history[-LOOPING_REASONING_HASH_WINDOW - 1 : -1]
+        h for h in session.reasoning_history[-hash_window - 1 : -1]
         if h
     ]
     if not history:
         return None
     sim = _embed.max_similarity(text, history)
+    cluster_threshold = _cluster_similarity_threshold()
+    loop_threshold = _looping_similarity_threshold()
     log.debug(
         "reasoning_cluster_tightening: cosine=%.3f over %d prior turns "
         "(band=[%.2f, %.2f))",
         sim,
         len(history),
-        REASONING_CLUSTER_SIMILARITY_THRESHOLD,
-        LOOPING_REASONING_SIMILARITY_THRESHOLD,
+        cluster_threshold,
+        loop_threshold,
     )
     # max_similarity returns 0.0 both when the model is unavailable and
     # when the genuine cosine is zero; either way the early-warning tier
     # stays silent. This matches ``detect_off_topic``'s graceful-degrade
     # contract.
-    if sim < REASONING_CLUSTER_SIMILARITY_THRESHOLD:
+    if sim < cluster_threshold:
         return None
-    if sim >= LOOPING_REASONING_SIMILARITY_THRESHOLD:
+    if sim >= loop_threshold:
         # Cliff tier owns this regime -- do not double-fire.
         return None
     if task_id:
@@ -544,19 +644,20 @@ def detect_off_topic(text: str, session: Session) -> DriftEvent | None:
     if not topic:
         return None
     dist = _embed.distance_to_topic(text, topic)
+    off_topic_threshold = _off_topic_distance_threshold()
     log.debug(
         "off_topic: distance=%.3f (threshold=%.2f); task=%r",
         dist,
-        OFF_TOPIC_DISTANCE_THRESHOLD,
+        off_topic_threshold,
         topic[:60],
     )
-    if dist >= 0 and dist >= OFF_TOPIC_DISTANCE_THRESHOLD:
+    if dist >= 0 and dist >= off_topic_threshold:
         return DriftEvent(
             kind=DriftKind.OFF_TOPIC,
             severity=DriftSeverity.WARNING,
             detail=(
                 f"reasoning far from task (distance={dist:.2f} >= "
-                f"{OFF_TOPIC_DISTANCE_THRESHOLD:.2f}): task={topic[:60]!r}"
+                f"{off_topic_threshold:.2f}): task={topic[:60]!r}"
             ),
             current_task_id=session.current_task_id,
             raw=text,
@@ -586,10 +687,10 @@ def detect_off_topic(text: str, session: Session) -> DriftEvent | None:
     log.debug(
         "off_topic: sentence-level scan (%d sentences, threshold=%.2f): %s",
         len(per_sentence),
-        OFF_TOPIC_DISTANCE_THRESHOLD,
+        off_topic_threshold,
         [(round(d, 3), s[:40]) for d, s in per_sentence],
     )
-    if worst is None or worst[0] < OFF_TOPIC_DISTANCE_THRESHOLD:
+    if worst is None or worst[0] < off_topic_threshold:
         return None
     worst_dist, worst_sentence = worst
     return DriftEvent(
@@ -597,7 +698,7 @@ def detect_off_topic(text: str, session: Session) -> DriftEvent | None:
         severity=DriftSeverity.WARNING,
         detail=(
             f"reasoning has off-topic sentence (distance={worst_dist:.2f} "
-            f">= {OFF_TOPIC_DISTANCE_THRESHOLD:.2f}): {worst_sentence[:80]!r}"
+            f">= {off_topic_threshold:.2f}): {worst_sentence[:80]!r}"
         ),
         current_task_id=session.current_task_id,
         raw=text,
@@ -727,11 +828,15 @@ def detect_unreferenced_keyword(
 def detect_confusion(text: str, session: Session) -> DriftEvent | None:
     """Return :data:`DriftKind.CONFUSION` when the reasoning text has
     at least :data:`CONFUSION_MIN_HITS` uncertainty markers.
+
+    The threshold is read from the installed
+    :class:`~goldfive.config.ReasoningDriftConfig` when one is set
+    (goldfive#225), else from :data:`CONFUSION_MIN_HITS`.
     """
     if not text:
         return None
     hits = CONFUSION_MARKERS.findall(text)
-    if len(hits) < CONFUSION_MIN_HITS:
+    if len(hits) < _confusion_min_hits():
         return None
     return DriftEvent(
         kind=DriftKind.CONFUSION,

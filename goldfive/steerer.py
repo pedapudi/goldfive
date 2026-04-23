@@ -70,6 +70,11 @@ from goldfive.types import (
 )
 
 if TYPE_CHECKING:
+    from goldfive.config import (
+        GoalDriftConfig,
+        ReasoningDriftConfig,
+        ToolLoopConfig,
+    )
     from goldfive.protocols import EventSink, Planner
 
 # Shape of the opt-in reflective LLM callable. Matches the signature of
@@ -297,10 +302,13 @@ class DefaultSteerer:
         reflective_check_interval: int = 15,
         reflective_call_llm: ReflectiveCallLLM | None = None,
         reflective_model: str = "",
-        goal_drift_check_interval: int = 5,
+        goal_drift_check_interval: int | None = None,
         goal_drift_call_llm: ReflectiveCallLLM | None = None,
         goal_drift_model: str = "",
-        goal_drift_activity_window: int = 10,
+        goal_drift_activity_window: int | None = None,
+        goal_drift_config: GoalDriftConfig | None = None,
+        tool_loop_config: ToolLoopConfig | None = None,
+        reasoning_drift_config: ReasoningDriftConfig | None = None,
         plan_revision_cooldown_seconds: float = 0.0,
     ) -> None:
         """Build a steerer.
@@ -328,7 +336,8 @@ class DefaultSteerer:
         goal_drift_check_interval:
             Number of agent-invocation turns (as reported via
             :meth:`note_agent_turn`) between trajectory-level
-            GOAL_DRIFT checks. Defaults to ``5``. Ignored when
+            GOAL_DRIFT checks. Defaults to ``5`` when
+            ``goal_drift_config`` is also ``None``. Ignored when
             ``goal_drift_call_llm`` is ``None``.
         goal_drift_call_llm:
             Optional async callable ``(system_prompt, user_prompt,
@@ -345,7 +354,38 @@ class DefaultSteerer:
         goal_drift_activity_window:
             Number of recent-activity entries retained on
             ``session.recent_agent_activity`` and passed to the
-            judge. Bounds the prompt size; defaults to ``10``.
+            judge. Bounds the prompt size; defaults to ``10`` when
+            ``goal_drift_config`` is also ``None``.
+        goal_drift_config:
+            Optional :class:`~goldfive.config.GoalDriftConfig` (see
+            goldfive#225). When provided, its fields supply fallback
+            defaults for ``goal_drift_check_interval`` and
+            ``goal_drift_activity_window``. **Precedence**: an
+            explicit individual kwarg (``goal_drift_check_interval=``
+            or ``goal_drift_activity_window=``) wins over the config
+            dataclass; the config wins over the module-level
+            built-in. This matches :func:`goldfive.wrap`'s contract
+            where operators can pass a fully-typed ``RuntimeConfig``
+            at the top level and still selectively override a single
+            knob on a per-steerer basis.
+        tool_loop_config:
+            Optional :class:`~goldfive.config.ToolLoopConfig`. Stored
+            on the steerer so callers (the ADK plugin, custom
+            adapters) can pull thresholds via
+            :meth:`get_tool_loop_config` instead of re-reading env
+            vars. The steerer itself does NOT instantiate a
+            :class:`~goldfive.drift.tool_loops.ToolLoopTracker` — the
+            plugin still owns that — but exposing the config here
+            keeps the four typed knobs co-located on a single
+            component. Precedence: the config field is advisory; the
+            plugin is free to honour or ignore it. Added in #225.
+        reasoning_drift_config:
+            Optional :class:`~goldfive.config.ReasoningDriftConfig`.
+            When provided, :meth:`observe_reasoning` installs it via
+            :func:`goldfive.drift.reasoning.configure` so the
+            detector thresholds pick it up. Process-wide (see the
+            module docstring on :mod:`goldfive.drift.reasoning` for
+            the multi-Runner caveat). Added in #225.
         plan_revision_cooldown_seconds:
             Minimum interval, in seconds, between two drift-triggered
             plan revisions for the same ``(task_id, drift_kind)`` key.
@@ -388,14 +428,51 @@ class DefaultSteerer:
         self._reflective_model = reflective_model
         # GOAL_DRIFT (goldfive#143) wiring. Same opt-in contract as the
         # reflective check: feature is inert unless a callable is passed.
+        #
+        # Precedence resolution (goldfive#225): an explicit individual
+        # kwarg wins over the config dataclass which wins over the
+        # module-level default. ``None`` on the individual kwarg means
+        # "not explicitly set", which is the trigger to fall through to
+        # the config / default.
         self._goal_drift_call_llm: ReflectiveCallLLM | None = goal_drift_call_llm
-        self._goal_drift_check_interval = max(1, int(goal_drift_check_interval))
+        if goal_drift_check_interval is not None:
+            _check_interval = goal_drift_check_interval
+        elif goal_drift_config is not None:
+            _check_interval = goal_drift_config.check_interval
+        else:
+            _check_interval = 5
+        self._goal_drift_check_interval = max(1, int(_check_interval))
         self._goal_drift_model = goal_drift_model
-        self._goal_drift_activity_window = max(1, int(goal_drift_activity_window))
-        # Drift-triggered plan-revision cooldown (goldfive feedback-loop
-        # fix). Clamped to a non-negative float; ``0.0`` disables the
-        # gate so callers can opt out without subclassing.
-        self._plan_revision_cooldown_seconds = max(0.0, float(plan_revision_cooldown_seconds))
+        if goal_drift_activity_window is not None:
+            _activity_window = goal_drift_activity_window
+        elif goal_drift_config is not None:
+            _activity_window = goal_drift_config.activity_window
+        else:
+            _activity_window = 10
+        self._goal_drift_activity_window = max(1, int(_activity_window))
+        # Typed-config stash (goldfive#225). Retained as-is so
+        # downstream consumers (plugins, tests) can introspect the
+        # effective configuration without reconstructing it from the
+        # scalar fields above.
+        self._goal_drift_config: GoalDriftConfig | None = goal_drift_config
+        self._tool_loop_config: ToolLoopConfig | None = tool_loop_config
+        self._reasoning_drift_config: ReasoningDriftConfig | None = (
+            reasoning_drift_config
+        )
+        # Install the reasoning-drift thresholds eagerly so any
+        # ``observe_reasoning`` call on any session sees the
+        # Runner-scoped config. Process-wide — see the installation-
+        # site docstring on :mod:`goldfive.drift.reasoning`.
+        if reasoning_drift_config is not None:
+            from goldfive.drift import reasoning as _reasoning
+
+            _reasoning.configure(reasoning_drift_config)
+        # Drift-triggered plan-revision cooldown (goldfive#227).
+        # Clamped to a non-negative float; ``0.0`` disables the gate
+        # so callers can opt out without subclassing.
+        self._plan_revision_cooldown_seconds = max(
+            0.0, float(plan_revision_cooldown_seconds)
+        )
 
     # ------------------------------------------------------------------
     # Protocol-required: wiring
@@ -427,6 +504,19 @@ class DefaultSteerer:
         variant.
         """
         self._adapter = adapter
+
+    def get_tool_loop_config(self) -> ToolLoopConfig | None:
+        """Return the :class:`~goldfive.config.ToolLoopConfig` stashed at init, if any.
+
+        Plugins (the ADK plugin) call this when constructing a
+        :class:`~goldfive.drift.tool_loops.ToolLoopTracker` so the
+        tracker's thresholds come from the :class:`RuntimeConfig`
+        threaded through :func:`goldfive.wrap` instead of from env
+        vars. Returns ``None`` when the steerer was built without a
+        config, in which case callers should fall back to
+        :func:`~goldfive.drift.tool_loops.load_thresholds_from_env`.
+        """
+        return self._tool_loop_config
 
     async def _emit_planner_refine_validation_failed(self, drift: DriftEvent) -> None:
         """Emit a planner-side drift through the DriftDetected pipeline.

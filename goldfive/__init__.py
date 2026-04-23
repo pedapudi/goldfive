@@ -5,6 +5,13 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 from goldfive.adapters.callable import CallableAdapter
+from goldfive.config import (
+    EmbeddingConfig,
+    GoalDriftConfig,
+    ReasoningDriftConfig,
+    RuntimeConfig,
+    ToolLoopConfig,
+)
 from goldfive.control import (
     AckResult,
     ControlAck,
@@ -77,6 +84,7 @@ __all__ = [
     "DriftEvent",
     "DriftKind",
     "DriftSeverity",
+    "EmbeddingConfig",
     "EventSink",
     "ExecutionOutcome",
     "Executor",
@@ -84,6 +92,7 @@ __all__ = [
     "GRPCSink",
     "Goal",
     "GoalDeriver",
+    "GoalDriftConfig",
     "InMemorySink",
     "InvocationResult",
     "JSONLPersistenceSink",
@@ -97,8 +106,10 @@ __all__ = [
     "PassthroughPlanner",
     "Plan",
     "Planner",
+    "ReasoningDriftConfig",
     "ReportingToolSpec",
     "Runner",
+    "RuntimeConfig",
     "SQLitePersistenceSink",
     "SequentialExecutor",
     "Session",
@@ -107,6 +118,7 @@ __all__ = [
     "Task",
     "TaskEdge",
     "TaskStatus",
+    "ToolLoopConfig",
     "TurnClassification",
     "TurnRecord",
     "classify_refusal",
