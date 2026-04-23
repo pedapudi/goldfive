@@ -165,19 +165,25 @@ def test_detail_caps_preview_at_three_keywords() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline integration
+# Pipeline integration: detector is UNWIRED from ``analyze_reasoning``.
+#
+# Post goldfive#226 the keyword detector is retained as a standalone
+# exported function (tests above) but no longer contributes to the
+# synchronous pipeline in any mode. Rationale: the lexical heuristic
+# fired on generic English vocabulary absent from task descriptions
+# ("wants", "asking", "interactive", "slideshow"), producing noisy
+# CRITICAL drifts on routine reasoning. The two regression tests below
+# pin that the pipeline stays quiet on the same raccoon stimulus the
+# pre-226 code relied on.
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_fires_unreferenced_keyword_when_off_topic_silent(
+async def test_pipeline_does_not_fire_keyword_drift_in_embedding_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the embedding model is unavailable (so ``detect_off_topic``
-    and ``detect_intent_divergence``'s embedding path stay quiet), the
-    lexical keyword detector still fires via ``analyze_reasoning``.
-
-    This is the #223 raccoon regression: whole-block cosine missed the
-    drift on real models; the keyword path owns the signal.
+    """With embeddings unavailable and the keyword detector unwired,
+    ``analyze_reasoning`` in ``"embedding"`` mode stays quiet on the
+    raccoon stimulus the pre-226 code relied on.
     """
     from goldfive.drift import _embed as _embed_mod
     from goldfive.drift._embed import set_model
@@ -190,21 +196,18 @@ def test_pipeline_fires_unreferenced_keyword_when_off_topic_silent(
         "Slide 1: Solar Panels. Slide 2: Raccoons (habitat, diet, "
         "behaviour). Let me compile comprehensive info."
     )
-    drift = dreason.analyze_reasoning(text, session)
-    assert drift is not None
-    assert drift.kind is DriftKind.OFF_TOPIC
-    # At least raccoons, habitat, behaviour are surplus -> WARNING or
-    # CRITICAL depending on whether "diet" (4 chars, skipped) and
-    # "compile" / "comprehensive" / "presentation" land in the
-    # reference. We only assert severity is at least WARNING.
-    assert drift.severity in (DriftSeverity.WARNING, DriftSeverity.CRITICAL)
+    drift = await dreason.analyze_reasoning(text, session, mode="embedding")
+    # Pattern-path intent-divergence does not match this text, embedding
+    # backends are silent without a model, and the keyword detector is
+    # unwired. The pipeline returns None.
+    assert drift is None
 
 
-def test_pipeline_runs_unreferenced_keyword_after_off_topic() -> None:
-    """``detect_unreferenced_keyword`` runs AFTER ``detect_off_topic``
-    and BEFORE ``detect_reasoning_cluster_tightening``. Verify by
-    isolating the detector call against a session where whole-text
-    embedding is unavailable — keyword-only signal must still fire.
+async def test_pipeline_off_mode_is_silent() -> None:
+    """``mode="off"`` skips every mode-selected detector. The always-on
+    loop + confusion detectors live in the steerer (see
+    ``test_drift_reasoning.py::test_observe_reasoning_*``) and are not
+    consulted by :func:`analyze_reasoning` itself.
     """
     from goldfive.drift import _embed as _embed_mod
     from goldfive.drift._embed import set_model
@@ -216,11 +219,7 @@ def test_pipeline_runs_unreferenced_keyword_after_off_topic() -> None:
         "Slide 1: solar panels. Slide 2: raccoons habitat species "
         "behaviour zoology climate."
     )
-    drift = dreason.analyze_reasoning(text, session)
-    assert drift is not None
-    assert drift.kind is DriftKind.OFF_TOPIC
-    # Keyword detector's diagnostic contains "off-task keywords:".
-    assert "off-task keywords" in drift.detail
+    assert await dreason.analyze_reasoning(text, session, mode="off") is None
 
 
 # ---------------------------------------------------------------------------

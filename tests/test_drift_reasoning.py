@@ -154,11 +154,10 @@ def test_confusion_suppressed_below_threshold() -> None:
 
 
 def test_intent_divergence_pattern_path_fires_when_goal_proposes_unrelated_focus() -> None:
-    # No embedding model -> pattern-based fallback. Default severity is
-    # WARNING; a keyword mismatch elsewhere in the text bumps it to
-    # CRITICAL (covered in the dedicated test below). The "cryptocurrency
-    # trading dashboard" text here has several 5+ char tokens absent
-    # from the goal summary, so severity bumps to CRITICAL.
+    # No embedding model -> pattern-based fallback. Severity is flat
+    # WARNING post goldfive#226 -- the historical keyword-mismatch bump
+    # to CRITICAL was removed because the lexical heuristic fired on
+    # generic English vocabulary absent from task descriptions.
     session = _session_with_task(
         goals=[Goal(id="g1", summary="write a slide review report")]
     )
@@ -169,19 +168,15 @@ def test_intent_divergence_pattern_path_fires_when_goal_proposes_unrelated_focus
     drift = dreason.detect_intent_divergence(text, session)
     assert drift is not None
     assert drift.kind is DriftKind.INTENT_DIVERGENCE
-    # Proposal tokens disjoint AND unrelated keywords present -> bumped
-    # from WARNING up to CRITICAL.
-    assert drift.severity is DriftSeverity.CRITICAL
+    assert drift.severity is DriftSeverity.WARNING
 
 
-def test_intent_divergence_pattern_path_warning_without_keyword_mismatch() -> None:
-    # The unreferenced-keyword bump only fires on 5+ char non-stopword
-    # tokens that appear in the reasoning but not in goals+task. Here
-    # every 5+ char token in the reasoning also shows up in the task
-    # description, so the bump is suppressed and severity stays at
-    # WARNING. Meanwhile the proposal tokens ("tactics", "champion",
-    # "shortly") are disjoint from the goal summary, so the pattern
-    # detector still fires.
+def test_intent_divergence_pattern_path_stays_warning() -> None:
+    # Pattern-path severity is flat WARNING in all cases post-#226.
+    # This test pins the invariant explicitly: even when every 5+ char
+    # token in the reasoning also appears in the task description
+    # (i.e. the pre-#226 keyword-mismatch bump would have been
+    # suppressed), the pattern path still emits WARNING.
     session = _session_with_task(
         title="pivot actually focus report",
         description="pivot actually focus report tactics champion shortly goal",
@@ -460,14 +455,15 @@ def test_intent_divergence_critical_below_0_2() -> None:
     assert drift.severity is DriftSeverity.CRITICAL
 
 
-def test_intent_divergence_keyword_mismatch_upgrades_severity() -> None:
+def test_intent_divergence_keyword_mismatch_does_not_bump_severity() -> None:
     import math
 
-    # Cosine sits in the INFO band (0.5). The reasoning text mentions
-    # "blockchain" -- a 5+ char non-stopword absent from both the goal
-    # summary and the task topic -> severity bumps INFO -> WARNING.
-    # All other 5+ char reasoning tokens DO appear in the reference, so
-    # only the off-topic keyword drives the bump.
+    # Post goldfive#226 the historical keyword-mismatch severity bump
+    # was removed -- it fired on generic English vocabulary absent from
+    # task descriptions and noisily promoted real embedding triggers to
+    # spurious CRITICAL severities. Cosine bands alone determine
+    # severity. Here cosine is 0.5 (INFO band), and the stray 5+ char
+    # off-reference token "blockchain" must NOT bump the verdict.
     reasoning_text = "alpha bravo blockchain charlie"
     session = _intent_session(
         reasoning_text=reasoning_text,
@@ -476,8 +472,8 @@ def test_intent_divergence_keyword_mismatch_upgrades_severity() -> None:
     drift = dreason.detect_intent_divergence(reasoning_text, session)
     assert drift is not None
     assert drift.kind is DriftKind.INTENT_DIVERGENCE
-    # INFO (cosine band) + unreferenced keyword "blockchain" -> WARNING.
-    assert drift.severity is DriftSeverity.WARNING
+    # Severity stays at INFO (cosine band only, no keyword bump).
+    assert drift.severity is DriftSeverity.INFO
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +555,10 @@ def test_reasoning_cluster_tightening_does_not_fire_below_0_75() -> None:
 
 async def test_reasoning_cluster_tightening_is_one_shot_per_task() -> None:
     set_model(_StubEncoder())
-    steerer = DefaultSteerer()
+    # Cluster-tightening is an embedding-pipeline signal; engage it
+    # explicitly. The default ``mode="judge"`` with no ``call_llm`` would
+    # silently skip the embedding path.
+    steerer = DefaultSteerer(reasoning_drift_mode="embedding")
     session = _cluster_session()
     sink = ListSink()
     planner = NullPlanner()
@@ -608,7 +607,7 @@ async def test_reasoning_cluster_tightening_is_one_shot_per_task() -> None:
     assert looping == []
 
 
-def test_reasoning_high_similarity_skips_tightening_fires_loop() -> None:
+async def test_reasoning_high_similarity_skips_tightening_fires_loop() -> None:
     set_model(_StubEncoder())
     session = _cluster_session()
     current = _pad_tokens("shared", 10)
@@ -621,7 +620,7 @@ def test_reasoning_high_similarity_skips_tightening_fires_loop() -> None:
         _pad_tokens("shared", 10) + f" filler{block:02d}" for block in range(3)
     ]
     session.reasoning_history = [*priors, current]
-    drift = dreason.analyze_reasoning(current, session)
+    drift = await dreason.analyze_reasoning(current, session, mode="embedding")
     assert drift is not None
     # Cliff owns the signal; tightening must not steal it.
     assert drift.kind is DriftKind.LOOPING_REASONING
@@ -659,7 +658,7 @@ def test_reasoning_cluster_skipped_when_embeddings_unavailable(
 # ---------------------------------------------------------------------------
 
 
-def test_analyze_reasoning_prefers_intent_divergence_over_confusion() -> None:
+async def test_analyze_reasoning_prefers_intent_divergence_over_confusion() -> None:
     session = _session_with_task(
         goals=[Goal(id="g1", summary="write tax report")]
     )
@@ -669,12 +668,12 @@ def test_analyze_reasoning_prefers_intent_divergence_over_confusion() -> None:
         "Hmm, I'm not sure. Wait, let me change goals -- actually, let's "
         "focus on building a video game instead. I don't know about taxes."
     )
-    drift = dreason.analyze_reasoning(text, session)
+    drift = await dreason.analyze_reasoning(text, session, mode="embedding")
     assert drift is not None
     assert drift.kind is DriftKind.INTENT_DIVERGENCE
 
 
-def test_analyze_reasoning_returns_none_on_clean_text() -> None:
+async def test_analyze_reasoning_returns_none_on_clean_text() -> None:
     # Every 5+ char non-stopword token in the reasoning also appears in
     # the default goals+task reference ("produce a slide review report"
     # + "Review the slides" + "Read every slide and list any typos
@@ -682,7 +681,7 @@ def test_analyze_reasoning_returns_none_on_clean_text() -> None:
     # silent alongside the intent-divergence / off-topic paths.
     session = _session_with_task()
     text = "slide review: read each slide, list the typos found."
-    assert dreason.analyze_reasoning(text, session) is None
+    assert await dreason.analyze_reasoning(text, session, mode="embedding") is None
 
 
 # ---------------------------------------------------------------------------

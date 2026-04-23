@@ -317,7 +317,7 @@ def test_sentence_level_silent_without_model() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_calibration_pipeline_fires_via_sentence_level() -> None:
+async def test_calibration_pipeline_fires_via_sentence_level() -> None:
     """Replicate the #223 calibration cosines in a stub encoder and
     verify ``analyze_reasoning`` emits OFF_TOPIC.
 
@@ -354,7 +354,7 @@ def test_calibration_pipeline_fires_via_sentence_level() -> None:
     encoder.set_cosine(text, 0.90)  # whole-block stays high per #223
     set_model(encoder)
 
-    drift = dreason.analyze_reasoning(text, session)
+    drift = await dreason.analyze_reasoning(text, session, mode="embedding")
     assert drift is not None
     assert drift.kind is DriftKind.OFF_TOPIC
     # Sentence-level path owns the signal -- detail calls out the
