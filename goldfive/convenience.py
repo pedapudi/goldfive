@@ -240,12 +240,18 @@ def wrap(
     if steerer is not None:
         resolved_steerer = steerer
     elif resolved_call_llm is not None:
+        # Same call_llm wires into both the trajectory-level goal-drift
+        # judge (goldfive#218) and the per-thinking-message reasoning
+        # judge (goldfive#226). Default ``reasoning_drift_mode`` on the
+        # steerer is ``"judge"`` -- see :class:`DefaultSteerer`.
         resolved_steerer = DefaultSteerer(
             goal_drift_call_llm=resolved_call_llm,
             goal_drift_model=resolved_model,
             goal_drift_config=resolved_runtime.goal_drift,
             tool_loop_config=resolved_runtime.tool_loops,
             reasoning_drift_config=resolved_runtime.reasoning_drift,
+            reasoning_drift_call_llm=resolved_call_llm,
+            reasoning_drift_model=resolved_model,
         )
     else:
         resolved_steerer = DefaultSteerer(

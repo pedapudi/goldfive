@@ -57,6 +57,10 @@ from goldfive.drift import (
     classify_stop_reason,
     classify_tool_error,
 )
+from goldfive.drift.reasoning import (
+    DEFAULT_REASONING_DRIFT_MODE,
+    ReasoningDriftMode,
+)
 from goldfive.types import (
     TERMINAL_TASK_STATUSES,
     DriftEvent,
@@ -309,6 +313,10 @@ class DefaultSteerer:
         goal_drift_config: GoalDriftConfig | None = None,
         tool_loop_config: ToolLoopConfig | None = None,
         reasoning_drift_config: ReasoningDriftConfig | None = None,
+        reasoning_drift_mode: ReasoningDriftMode = DEFAULT_REASONING_DRIFT_MODE,
+        reasoning_drift_call_llm: ReflectiveCallLLM | None = None,
+        reasoning_drift_model: str = "",
+        reasoning_drift_rate_limit: int = 3,
         plan_revision_cooldown_seconds: float = 0.0,
     ) -> None:
         """Build a steerer.
@@ -386,6 +394,28 @@ class DefaultSteerer:
             detector thresholds pick it up. Process-wide (see the
             module docstring on :mod:`goldfive.drift.reasoning` for
             the multi-Runner caveat). Added in #225.
+        reasoning_drift_mode:
+            Pipeline selection for :meth:`observe_reasoning`.
+            ``"judge"`` (default) runs the LLM judge (goldfive#226);
+            ``"embedding"`` runs the legacy embedding pipeline;
+            ``"both"`` runs both with higher-severity-wins reconciliation;
+            ``"off"`` disables off-topic detection (the always-on loop
+            and confusion detectors continue to run).
+        reasoning_drift_call_llm:
+            Optional async ``(system_prompt, user_prompt, model) -> str``
+            callable used by the LLM-as-a-judge reasoning-drift detector.
+            Required for ``reasoning_drift_mode`` in ``"judge"`` / ``"both"``
+            to fire; silently no-ops when ``None`` so tests without a
+            live LLM do not crash. Shape matches ``goal_drift_call_llm``
+            so the same callable can be reused.
+        reasoning_drift_model:
+            Model name forwarded to ``reasoning_drift_call_llm``.
+        reasoning_drift_rate_limit:
+            Run the judge once every N thinking messages per task.
+            ``N=1`` fires on every thinking message; ``N=3`` (the
+            default) fires on the 1st, 4th, 7th ... per task. The
+            first thinking message of every task always gets a judge
+            call; counters reset on task transition.
         plan_revision_cooldown_seconds:
             Minimum interval, in seconds, between two drift-triggered
             plan revisions for the same ``(task_id, drift_kind)`` key.
@@ -467,6 +497,17 @@ class DefaultSteerer:
             from goldfive.drift import reasoning as _reasoning
 
             _reasoning.configure(reasoning_drift_config)
+        # Per-thinking-message reasoning-drift judge wiring (goldfive#226).
+        # Mode selects which detectors run in :meth:`observe_reasoning`;
+        # the judge callable / model are forwarded to the LLM-as-a-judge
+        # path. ``None`` callable silently no-ops the judge (tests without
+        # a live LLM stay green).
+        self._reasoning_drift_mode: ReasoningDriftMode = reasoning_drift_mode
+        self._reasoning_drift_call_llm: ReflectiveCallLLM | None = (
+            reasoning_drift_call_llm
+        )
+        self._reasoning_drift_model = reasoning_drift_model
+        self._reasoning_drift_rate_limit = max(1, int(reasoning_drift_rate_limit))
         # Drift-triggered plan-revision cooldown (goldfive#227).
         # Clamped to a non-negative float; ``0.0`` disables the gate
         # so callers can opt out without subclassing.
@@ -975,6 +1016,19 @@ class DefaultSteerer:
         ``session.reasoning_history_max``), then runs the reasoning
         detectors. Emits at most one drift per call.
 
+        Pipeline dispatch (goldfive#226):
+
+        * Always-on detectors — :func:`~goldfive.drift.reasoning.detect_looping_reasoning`
+          and :func:`~goldfive.drift.reasoning.detect_confusion` — run
+          first on every call. They catch patterns (repetition,
+          uncertainty) that the LLM judge does not, and they are cheap.
+        * Mode-selected pipeline — :func:`~goldfive.drift.reasoning.analyze_reasoning`
+          runs in the configured ``reasoning_drift_mode``. The LLM judge
+          path is rate-limited to at most one call every
+          ``reasoning_drift_rate_limit`` thinking messages per task; the
+          first thinking message of every task always fires a judge
+          call. Counters reset on task transition.
+
         Adapters call this from their model-response callback once they
         have extracted reasoning_content (OpenAI), thinking blocks
         (Anthropic), or thought parts (Google). Safe to call with empty
@@ -988,12 +1042,67 @@ class DefaultSteerer:
         overflow = len(history) - cap
         if overflow > 0:
             del history[:overflow]
-        from goldfive.drift.reasoning import analyze_reasoning
+        from goldfive.drift.reasoning import (
+            analyze_reasoning,
+            detect_confusion,
+            detect_looping_reasoning,
+        )
 
-        drift = analyze_reasoning(text, session)
+        # Always-on pattern detectors. They emit in severity order
+        # (LOOPING_REASONING WARNING before CONFUSION INFO) and any
+        # fire short-circuits before the mode-selected pipeline so
+        # they remain the canonical signal for "repetitive / uncertain"
+        # reasoning regardless of mode.
+        drift = detect_looping_reasoning(text, session)
+        if drift is None:
+            drift = detect_confusion(text, session)
+        if drift is None:
+            # Mode-selected pipeline (judge / embedding / both / off).
+            # The judge path is rate-limited per-task; embedding path
+            # is synchronous.
+            rl_call_llm = self._maybe_take_reasoning_judge_slot(session)
+            drift = await analyze_reasoning(
+                text,
+                session,
+                mode=self._reasoning_drift_mode,
+                call_llm=rl_call_llm,
+                model=self._reasoning_drift_model,
+            )
         if drift is None:
             return
         await self._handle_drift(drift, session)
+
+    def _maybe_take_reasoning_judge_slot(
+        self, session: Session
+    ) -> ReflectiveCallLLM | None:
+        """Return the judge ``call_llm`` when this turn is a judge turn.
+
+        Rate-limit policy (goldfive#226):
+
+        * First thinking message of every task always fires.
+        * Subsequent messages skip ``(N-1)`` and then fire on the Nth.
+        * Counters are scoped per-task via
+          ``session._reasoning_judge_counters`` so a task transition
+          resets the window lazily -- the next task id is simply not
+          in the dict yet, so its first message falls into the
+          "count=0" branch.
+
+        Returns ``None`` when the judge is globally disabled (mode
+        skips it, or ``reasoning_drift_call_llm`` is unconfigured).
+        Also ``None`` on skip turns even when armed.
+        """
+        if self._reasoning_drift_call_llm is None:
+            return None
+        if self._reasoning_drift_mode not in ("judge", "both"):
+            return None
+        task_id = session.current_task_id or ""
+        counters = session._reasoning_judge_counters
+        count = counters.get(task_id, 0)
+        # count=0 -> fire (first message on this task), reset to 1.
+        # Otherwise fire when count % rate_limit == 0.
+        fire = (count % self._reasoning_drift_rate_limit) == 0
+        counters[task_id] = count + 1
+        return self._reasoning_drift_call_llm if fire else None
 
     # ------------------------------------------------------------------
     # Reflective self-progress check (opt-in)

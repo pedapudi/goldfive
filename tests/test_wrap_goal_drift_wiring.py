@@ -125,6 +125,43 @@ def test_wrap_wires_call_llm_into_default_steerer() -> None:
     assert steerer._goal_drift_model == "fake-model"
 
 
+def test_wrap_wires_call_llm_into_reasoning_drift_judge() -> None:
+    """goldfive.wrap threads ``call_llm`` into the reasoning-drift judge too.
+
+    Regression guard on goldfive#226: ``wrap()`` must wire
+    ``reasoning_drift_call_llm`` / ``reasoning_drift_model`` on the
+    default steerer, otherwise the default mode (``"judge"``) would
+    silently no-op despite the user passing a callable.
+    """
+    call_llm = _stub_call_llm([])
+    runner = goldfive.wrap(
+        _noop_agent,
+        call_llm=call_llm,
+        model="fake-model",
+        sinks=[],
+    )
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    assert steerer._reasoning_drift_call_llm is call_llm
+    assert steerer._reasoning_drift_model == "fake-model"
+    # Default mode stays ``"judge"`` -- same callable wires both judges.
+    assert steerer._reasoning_drift_mode == "judge"
+
+
+def test_wrap_does_not_arm_reasoning_judge_when_steerer_explicit() -> None:
+    """An explicit ``steerer=`` wins: wrap() does not patch kwargs in."""
+    call_llm = _stub_call_llm([])
+    explicit = DefaultSteerer(reasoning_drift_call_llm=None)
+    runner = goldfive.wrap(
+        _noop_agent,
+        call_llm=call_llm,
+        steerer=explicit,
+        sinks=[],
+    )
+    assert runner.steerer is explicit
+    assert runner.steerer._reasoning_drift_call_llm is None
+
+
 def test_wrap_preserves_explicit_steerer() -> None:
     """wrap(steerer=...) never overrides the caller's steerer."""
     call_llm = _stub_call_llm([{"progressing": True}])

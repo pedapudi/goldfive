@@ -39,9 +39,15 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from goldfive.drift import _embed
+from goldfive.drift.reasoning_judge import (
+    CallLLM as JudgeCallLLM,
+)
+from goldfive.drift.reasoning_judge import (
+    classify_reasoning_drift,
+)
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity
 
 if TYPE_CHECKING:
@@ -52,9 +58,26 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+# Pipeline-selection mode. See :func:`analyze_reasoning` for semantics.
+#
+# * ``"judge"``    — LLM-as-a-judge only (plus the always-on loop /
+#                    confusion detectors which live upstream in
+#                    :meth:`DefaultSteerer.observe_reasoning`).
+# * ``"embedding"`` — the legacy embedding-based pipeline.
+# * ``"both"``     — run both; the higher-severity drift wins. Ties
+#                    are broken by the embedding path (runs first,
+#                    synchronous).
+# * ``"off"``      — no off-topic / intent / keyword checks. The
+#                    always-on loop + confusion detectors continue to
+#                    run upstream.
+ReasoningDriftMode = Literal["judge", "embedding", "both", "off"]
+DEFAULT_REASONING_DRIFT_MODE: ReasoningDriftMode = "judge"
+
+
 __all__ = [
     "CONFUSION_MARKERS",
     "CONFUSION_MIN_HITS",
+    "DEFAULT_REASONING_DRIFT_MODE",
     "INTENT_DIVERGENCE_HEALTHY_SIMILARITY",
     "INTENT_DIVERGENCE_MINOR_SIMILARITY",
     "INTENT_DIVERGENCE_WARNING_SIMILARITY",
@@ -62,6 +85,7 @@ __all__ = [
     "LOOPING_REASONING_SIMILARITY_THRESHOLD",
     "OFF_TOPIC_DISTANCE_THRESHOLD",
     "REASONING_CLUSTER_SIMILARITY_THRESHOLD",
+    "ReasoningDriftMode",
     "SENTENCE_LEVEL_MIN_BLOCK_LENGTH",
     "SENTENCE_LEVEL_MAX_SENTENCES",
     "analyze_reasoning",
@@ -329,16 +353,19 @@ def detect_intent_divergence(
     an explicit "my goal is / let's focus on" phrase whose proposal
     tokens do not overlap with any goal summary fires at WARNING.
 
-    Either path may be bumped one step (INFO -> WARNING -> CRITICAL)
-    when the reasoning text mentions a significant noun / keyword that
-    does not appear in ``session.goals`` OR in the current task's
-    title / description -- a cheap "talking about something unrelated"
-    signal that catches soft divergence the cosine score alone may
-    smooth over.
-
     The kind is stable. Severity differentiates -- callers that filter
     by kind see one signal, callers that care about urgency read the
     ``severity`` field.
+
+    .. note::
+
+       The historical ``_has_unreferenced_keyword`` severity-bump that
+       promoted one tier on any 5+ char token absent from goals + task
+       was removed. The lexical heuristic fired on generic English
+       vocabulary not present in the task description, contaminating
+       the embedding signal with noise. The helper is preserved for
+       backward compatibility (external callers may still import it)
+       but has no in-tree consumer.
     """
     if not text:
         return None
@@ -368,8 +395,12 @@ def detect_intent_divergence(
         severity = _severity_from_similarity(sim)
         if severity is None:
             return None
-        if _has_unreferenced_keyword(text, goals_text, task_topic):
-            severity = _bump_severity(severity)
+        # NOTE: the historical ``_has_unreferenced_keyword`` severity-bump
+        # was removed. The lexical heuristic fired on generic English
+        # vocabulary ("wants", "asking", "interactive", "slideshow") that
+        # isn't in the task description, which bumped real embedding
+        # triggers to spurious CRITICAL severities. The cosine band alone
+        # now determines severity. See PR description rationale.
         detail = (
             f"reasoning diverged from goals (cosine={sim:.2f}): "
             f"reference={reference[:80]!r}"
@@ -390,14 +421,21 @@ def _pattern_intent_divergence(
     text: str,
     session: Session,
     goals_text: str,
-    task_topic: str,
+    task_topic: str,  # noqa: ARG001 -- kept for signature stability
 ) -> DriftEvent | None:
     """Return an INTENT_DIVERGENCE drift from regex-only signals.
 
-    Fires at WARNING by default when an off-goal "focus on X" phrase
-    sits next to tokens that do not appear in the goal summary. An
-    unreferenced-keyword mismatch elsewhere in the text bumps severity
-    to CRITICAL.
+    Fires at WARNING when an off-goal "focus on X" phrase sits next to
+    tokens that do not appear in the goal summary.
+
+    .. note::
+
+       The historical ``_has_unreferenced_keyword`` bump that pushed
+       severity to CRITICAL was removed. The lexical heuristic fired on
+       generic English vocabulary and degraded the reliability of the
+       real pattern trigger. Pattern-path severity is flat WARNING now.
+       ``task_topic`` is retained in the signature for backward
+       compatibility with callers that pass it positionally.
     """
     match = _INTENT_DIVERGENCE_MARKERS.search(text)
     if match is None:
@@ -421,8 +459,6 @@ def _pattern_intent_divergence(
     if any(tok in goals_lower for tok in tokens):
         return None
     severity = DriftSeverity.WARNING
-    if _has_unreferenced_keyword(text, goals_text, task_topic):
-        severity = _bump_severity(severity)
     snippet = (text[max(0, match.start() - 40) : match.end() + 80]).strip()
     return DriftEvent(
         kind=DriftKind.INTENT_DIVERGENCE,
@@ -471,8 +507,19 @@ def _has_unreferenced_keyword(
 
     We require a 5-char minimum to avoid matching on generic English
     (``with``, ``from``); stopwords strip the common connectives that
-    slip past the length gate. The check is deliberately conservative
-    -- one odd token can bump severity by one step, never more.
+    slip past the length gate.
+
+    .. deprecated:: goldfive#226
+
+       This helper has **no in-tree consumer** after the keyword
+       severity-bump was removed from :func:`detect_intent_divergence`
+       and :func:`_pattern_intent_divergence`. The 5-char stopword
+       rule still fired on generic English vocabulary absent from
+       task descriptions, so a noisy heuristic was bumping real
+       embedding signals to spurious CRITICAL severities. Kept as a
+       module-private helper for symmetry with
+       :func:`detect_unreferenced_keyword` (which is itself retained
+       for backward compatibility with external imports).
     """
     if not text:
         return False
@@ -761,9 +808,7 @@ def detect_unreferenced_keyword(
     ========================  ==========
 
     A "keyword" is any 5+ char alpha token from ``text`` that is not a
-    stopword — same rule as :func:`_has_unreferenced_keyword`, so the
-    standalone detector and the severity-bump path in
-    :func:`detect_intent_divergence` stay behaviourally consistent.
+    stopword — same rule as :func:`_has_unreferenced_keyword`.
 
     One-shot per task: the detector fires at most once per
     ``session.current_task_id`` via ``session.unreferenced_keyword_flagged``.
@@ -774,11 +819,17 @@ def detect_unreferenced_keyword(
     Returns ``None`` when there is no reference text (no goals and no
     bound task), matching :func:`detect_off_topic`'s precondition.
 
-    Rationale: whole-block cosine is empirically a weak separator on
-    real embedding models (see #223), so the lexical signal is often
-    the only one that fires on genuine drift. The severity-bump path
-    in :func:`detect_intent_divergence` is left intact — it still adds
-    signal when both paths agree.
+    .. deprecated:: goldfive#226
+
+       This detector is **no longer wired into** :func:`analyze_reasoning`
+       in any mode. The lexical heuristic fired on generic English
+       vocabulary not present in the task description (``wants``,
+       ``asking``, ``interactive``, ``slideshow``), producing noisy
+       CRITICAL drifts on routine reasoning. The function is retained
+       as an exported helper for external callers that imported it
+       directly, but there is no in-tree consumer. Prefer the LLM-judge
+       mode (:func:`goldfive.drift.reasoning_judge.classify_reasoning_drift`)
+       or the embedding pipeline for genuine off-topic detection.
     """
     if not text:
         return None
@@ -852,39 +903,33 @@ def detect_confusion(text: str, session: Session) -> DriftEvent | None:
 # ---------------------------------------------------------------------------
 
 
-def analyze_reasoning(text: str, session: Session) -> DriftEvent | None:
-    """Run the reasoning-drift pipeline against ``text``.
+_SEVERITY_ORDER: dict[DriftSeverity, int] = {
+    DriftSeverity.INFO: 0,
+    DriftSeverity.WARNING: 1,
+    DriftSeverity.CRITICAL: 2,
+}
 
-    Emits at most one drift per call. Detectors are tried in the order
-    that preserves the worst-signal-wins invariant:
-    INTENT_DIVERGENCE (graduated INFO/WARNING/CRITICAL) ->
-    LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING, whole-text +
-    sentence-level) -> UNREFERENCED_KEYWORD (OFF_TOPIC kind, graduated
-    by count) -> REASONING_CLUSTER_TIGHTENING (INFO) -> CONFUSION (INFO).
 
-    INTENT_DIVERGENCE runs first even at INFO severity so its kind is
-    stable; callers that only care about warning-and-up simply filter
-    by ``severity``.
+def _embedding_pipeline(text: str, session: Session) -> DriftEvent | None:
+    """Run the embedding-based pipeline (``mode="embedding"``).
 
-    LOOPING_REASONING (cosine >= 0.9) must run before
-    REASONING_CLUSTER_TIGHTENING (0.75 <= cosine < 0.9) so that a
-    tight-loop observation emits the cliff drift and never the INFO
-    tier — the two are mutually exclusive by construction, and running
-    LOOPING_REASONING first keeps the "no double-fire" invariant
-    cheap to reason about.
+    Detectors run in worst-signal-wins order:
+    INTENT_DIVERGENCE -> LOOPING_REASONING -> OFF_TOPIC (with the
+    sentence-level min-cosine path from #224) ->
+    REASONING_CLUSTER_TIGHTENING -> CONFUSION. Ordering rationale
+    lives in :func:`analyze_reasoning`.
 
-    ``detect_unreferenced_keyword`` runs AFTER ``detect_off_topic``
-    (both the whole-text and sentence-level paths) and BEFORE
-    ``detect_reasoning_cluster_tightening``. Rationale:
-    ``detect_off_topic`` and the intent-divergence embedding path own
-    the "pure semantic drift" signal; ``detect_unreferenced_keyword``
-    owns the lexical signal. Both may be right; we prefer the
-    embedding-based drift when it fires, and fall back to lexical when
-    the whole-block cosine fails to separate drift from on-topic (the
-    scenario documented in #223).
+    .. note::
+
+       :func:`detect_unreferenced_keyword` is intentionally NOT called
+       here. The lexical keyword heuristic fired on generic English
+       vocabulary not present in the task description (``wants``,
+       ``asking``, ``interactive``, ``slideshow``), producing noisy
+       CRITICAL drifts on routine reasoning. The function is retained
+       as an exported helper for backward compatibility with external
+       callers, but it no longer contributes to the pipeline's output
+       post goldfive#226.
     """
-    if not text:
-        return None
     drift = detect_intent_divergence(text, session)
     if drift is not None:
         return drift
@@ -894,9 +939,6 @@ def analyze_reasoning(text: str, session: Session) -> DriftEvent | None:
     drift = detect_off_topic(text, session)
     if drift is not None:
         return drift
-    drift = detect_unreferenced_keyword(text, session)
-    if drift is not None:
-        return drift
     drift = detect_reasoning_cluster_tightening(text, session)
     if drift is not None:
         return drift
@@ -904,6 +946,112 @@ def analyze_reasoning(text: str, session: Session) -> DriftEvent | None:
     if drift is not None:
         return drift
     return None
+
+
+async def _run_judge(
+    text: str,
+    session: Session,
+    *,
+    call_llm: JudgeCallLLM,
+    model: str,
+) -> DriftEvent | None:
+    """Dispatch ``classify_reasoning_drift`` against the current task."""
+    task = _current_task(session)
+    return await classify_reasoning_drift(
+        reasoning=text,
+        task=task,
+        goals=list(session.goals),
+        model=model,
+        call_llm=call_llm,
+        current_task_id=session.current_task_id,
+    )
+
+
+async def analyze_reasoning(
+    text: str,
+    session: Session,
+    *,
+    mode: ReasoningDriftMode = "embedding",
+    call_llm: JudgeCallLLM | None = None,
+    model: str = "",
+) -> DriftEvent | None:
+    """Run the reasoning-drift pipeline against ``text``.
+
+    Emits at most one drift per call. The behaviour is selected by
+    ``mode``:
+
+    * ``"embedding"`` — embedding-based pipeline. Detectors are tried
+      in worst-signal-wins order: INTENT_DIVERGENCE ->
+      LOOPING_REASONING -> OFF_TOPIC (whole-text + sentence-level
+      min-cosine from #224) -> REASONING_CLUSTER_TIGHTENING ->
+      CONFUSION. INTENT_DIVERGENCE runs first even at INFO severity so
+      its kind is stable; callers that only care about warning-and-up
+      simply filter by ``severity``. LOOPING_REASONING (cosine >= 0.9)
+      runs before REASONING_CLUSTER_TIGHTENING (0.75 <= cosine < 0.9)
+      so tight-loop observations emit the cliff drift and never the
+      INFO tier.
+
+    * ``"judge"`` — LLM-as-a-judge (goldfive#226). Dispatches to
+      :func:`classify_reasoning_drift` with ``call_llm`` / ``model``.
+      When ``call_llm`` is ``None`` the judge path silently no-ops so
+      tests without a live LLM do not crash. The cheap orthogonal
+      always-on detectors (LOOPING_REASONING, CONFUSION) run upstream
+      in :meth:`DefaultSteerer.observe_reasoning` in every mode.
+
+    * ``"both"`` — run the embedding pipeline and the judge; the
+      higher-severity drift wins. Tie-breaker is embedding (runs first,
+      synchronously). When ``call_llm`` is ``None`` this degrades to
+      ``"embedding"``.
+
+    * ``"off"`` — skip the mode-selected pipeline entirely. The
+      always-on loop + confusion detectors continue to run upstream in
+      :meth:`DefaultSteerer.observe_reasoning`.
+
+    .. note::
+
+       The keyword heuristic (:func:`detect_unreferenced_keyword`) is
+       no longer part of the active pipeline in any mode. It fired on
+       generic English vocabulary that isn't in the task description
+       (real examples: ``wants``, ``asking``, ``interactive``,
+       ``slideshow``), producing noisy CRITICAL drifts on routine
+       reasoning. The function is retained as an exported helper for
+       backward compatibility with external callers.
+    """
+    if not text:
+        return None
+    if mode == "off":
+        return None
+    if mode == "embedding":
+        return _embedding_pipeline(text, session)
+    if mode == "judge":
+        if call_llm is None:
+            return None
+        return await _run_judge(text, session, call_llm=call_llm, model=model)
+    if mode == "both":
+        embedding_drift = _embedding_pipeline(text, session)
+        judge_drift: DriftEvent | None = None
+        if call_llm is not None:
+            judge_drift = await _run_judge(
+                text, session, call_llm=call_llm, model=model
+            )
+        if embedding_drift is None:
+            return judge_drift
+        if judge_drift is None:
+            return embedding_drift
+        # Both fired — worst-severity wins. Embedding wins ties
+        # (deterministic, synchronous path).
+        if _SEVERITY_ORDER[judge_drift.severity] > _SEVERITY_ORDER[
+            embedding_drift.severity
+        ]:
+            return judge_drift
+        return embedding_drift
+    # Unknown mode -- log and fall back to the legacy pipeline so the
+    # run is never broken by a typo'd config value.
+    log.warning(
+        "analyze_reasoning: unknown mode=%r; falling back to 'embedding'",
+        mode,
+    )
+    return _embedding_pipeline(text, session)
 
 
 # Small stopword set used by the intent-divergence token-overlap check.
