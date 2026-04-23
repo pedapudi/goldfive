@@ -55,10 +55,23 @@ from goldfive.events import (
     run_started_event,
 )
 from goldfive.goal_deriver import PassthroughGoalDeriver
+from goldfive.planner_gate import (
+    TurnClassification,
+    classify_turn,
+    heuristic_classify_turn,
+)
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS
 from goldfive.results import ExecutionOutcome
 from goldfive.steerer import DefaultSteerer
-from goldfive.types import Goal, Session
+from goldfive.types import (
+    GOAL_SOURCE_USER_STEER,
+    DriftEvent,
+    DriftKind,
+    DriftSeverity,
+    Goal,
+    Plan,
+    Session,
+)
 
 if TYPE_CHECKING:
     from goldfive.control import ControlChannel
@@ -119,6 +132,33 @@ class Runner:
         spurious GOAL_DRIFT firings from the bookkeeping path.
         Has no effect when the steerer was never configured with a
         ``goal_drift_call_llm`` (the feature is already inert).
+    planner_gate:
+        Turn-aware planning gate. On every turn after the first the
+        Runner consults the gate to decide whether to run full
+        ``GoalDeriver.derive`` + ``Planner.generate`` (``"new_work"``),
+        skip planning and let the coordinator answer from context
+        (``"conversational"``), or call ``Planner.refine`` against the
+        prior plan with the new user input as a synthesized steer
+        (``"refine_existing"``). Accepts:
+
+        * A sentinel string ``"auto"`` (default) — use the LLM-backed
+          :func:`goldfive.planner_gate.classify_turn` when a
+          ``call_llm`` is available on the planner, falling through
+          to the deterministic heuristic otherwise. This is the
+          recommended production setting.
+        * ``None`` — disable the gate entirely. Every turn runs full
+          re-planning as in pre-planner-gate behaviour. Useful for
+          deterministic replay and pure-unit tests.
+        * Any async callable with the
+          :func:`~goldfive.planner_gate.classify_turn` signature
+          (``(*, prior_plan, completed_results, user_input,
+          conversation_id) -> str``) — drop-in replacement for the
+          default gate. Must return one of ``"new_work" |
+          "conversational" | "refine_existing"``.
+
+        The gate is always skipped on the first turn of a
+        Conversation (no prior plan to preserve); every first turn
+        runs the full goal-derive + plan-generate path.
     """
 
     def __init__(
@@ -134,6 +174,7 @@ class Runner:
         max_task_invocations: int | None = None,
         conversation: Conversation | None = None,
         goal_drift_enabled: bool = True,
+        planner_gate: Any = "auto",
         **legacy_kwargs: Any,
     ) -> None:
         if "max_plan_reinvocations" in legacy_kwargs:
@@ -179,6 +220,17 @@ class Runner:
         # be monotonic within a run_id, so the terminal marker needs the
         # session that produced the run's other events).
         self._last_session: Session | None = None
+        # Turn-aware planning gate (planner-gate). ``"auto"`` picks the
+        # LLM-backed gate when ``self.planner._call_llm`` exists and
+        # falls back to the pure heuristic otherwise. ``None`` disables
+        # the gate entirely (every turn re-plans). Any other value must
+        # be an async callable implementing the
+        # :func:`goldfive.planner_gate.classify_turn` signature.
+        self._planner_gate: Any = planner_gate
+        # Held across turns so the ``conversational`` path can carry
+        # the prior plan forward onto the freshly minted session
+        # without re-running the planner.
+        self._last_plan: Plan | None = None
 
     # ------------------------------------------------------------------
     # run
@@ -229,6 +281,42 @@ class Runner:
         # 3. Emit RunStarted before anything else for this turn.
         await self._emit_run_started(session, user_input)
 
+        # 3a. Turn-aware planning gate (planner-gate).
+        # Before running goal-derivation + planning for this turn,
+        # ask the classifier whether the new user_input warrants new
+        # work or can be satisfied by the prior plan / conversation
+        # history. First-turn callers (no prior plan) always run full
+        # planning. When ``user_input`` is already a ``list[Goal]``
+        # the caller has opted out of natural-language derivation, so
+        # we also skip the gate.
+        verdict: TurnClassification = "new_work"
+        if self._last_plan is not None and isinstance(user_input, str):
+            try:
+                verdict = await self._classify_turn(
+                    prior_plan=self._last_plan,
+                    completed_results=session.completed_results,
+                    user_input=user_input,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A misbehaving gate must never hang the Runner; degrade
+                # to full re-planning — the pre-#169 behaviour — so we
+                # always make forward progress.
+                log.warning("planner_gate raised; falling back to new_work: %s", exc)
+                verdict = "new_work"
+
+        # Conversational follow-up: skip goal derivation + planning.
+        # Carry the prior plan forward onto the freshly minted Session
+        # so the executor has something to drive; do not emit
+        # GoalDerived or PlanSubmitted for this turn — the executor
+        # will still close the turn with RunCompleted / RunAborted.
+        if verdict == "conversational":
+            outcome = await self._run_conversational_turn(
+                session=session,
+                user_input=user_input,
+                context=context,
+            )
+            return outcome
+
         # 4. Derive (or accept) goals for this turn. Cross-turn state
         #    lives on ``session.goals`` already (seeded by the
         #    Conversation); we append newly-derived goals that weren't
@@ -273,7 +361,7 @@ class Runner:
             planner_context.update(context)
         planner_context["run_id"] = session.run_id
 
-        # 4. Generate the plan.
+        # 4. Generate (or refine) the plan.
         # Prefer the richer tree shape (goldfive#151) when the adapter
         # exposes it so the planner can constrain assignee_agent_id to
         # real tree names and render the tree in its prompt. Adapters
@@ -285,21 +373,36 @@ class Runner:
             available_agents = list(tree)
         else:
             available_agents = list(self.agent.available_agents)
-        try:
-            plan = await self.planner.generate(
-                goals=session.goals,
+        plan: Plan | None = None
+        if verdict == "refine_existing" and self._last_plan is not None:
+            # Refine path: treat the new user_input as a steering
+            # directive against the prior plan. Preserves completed
+            # tasks verbatim and asks the planner for a delta of new
+            # PENDING tasks. On any refine failure we fall through to
+            # full generate() below — the safe path is always to ship
+            # a plan.
+            plan = await self._refine_from_user_input(
+                prior_plan=self._last_plan,
+                user_input=user_input if isinstance(user_input, str) else "",
+                goals=list(session.goals),
                 available_agents=available_agents,
-                context=planner_context,
             )
-        except Exception as exc:  # noqa: BLE001
-            reason = f"planner.generate raised: {exc}"
-            log.exception("planner.generate raised")
-            await self._emit_run_aborted(session, reason)
-            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            self._conversation.absorb_turn(
-                outcome, user_input_summary=_initial_goal_summary(user_input)
-            )
-            return outcome
+        if plan is None:
+            try:
+                plan = await self.planner.generate(
+                    goals=session.goals,
+                    available_agents=available_agents,
+                    context=planner_context,
+                )
+            except Exception as exc:  # noqa: BLE001
+                reason = f"planner.generate raised: {exc}"
+                log.exception("planner.generate raised")
+                await self._emit_run_aborted(session, reason)
+                outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+                self._conversation.absorb_turn(
+                    outcome, user_input_summary=_initial_goal_summary(user_input)
+                )
+                return outcome
 
         if plan is None:
             reason = "no plan generated"
@@ -424,6 +527,13 @@ class Runner:
         # cross-turn on the owning Conversation).
         _ostate.clear_current_task(session.state)
         _ostate.clear_active_steer(session.state)
+
+        # planner-gate: snapshot the turn's final plan so the next
+        # turn's planner_gate can classify against it. Only stash on
+        # success — an aborted run's plan would poison the next
+        # turn's gate with half-run state.
+        if outcome.success and session.plan is not None:
+            self._last_plan = session.plan
 
         self._conversation.absorb_turn(
             outcome, user_input_summary=_initial_goal_summary(user_input)
@@ -626,6 +736,9 @@ class Runner:
         self._conversation = Conversation.new()
         self._conversation_announced = False
         self._last_session = None
+        # planner-gate: reset turn-aware gate state so the first turn
+        # of the new conversation runs full planning.
+        self._last_plan = None
 
     # ------------------------------------------------------------------
     # close
@@ -725,6 +838,243 @@ class Runner:
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
+
+    async def _classify_turn(
+        self,
+        *,
+        prior_plan: Plan,
+        completed_results: Mapping[str, str],
+        user_input: str,
+    ) -> TurnClassification:
+        """Invoke the planner_gate setting to classify this turn.
+
+        ``planner_gate == None`` short-circuits to ``"new_work"`` so
+        the Runner behaves exactly as before. ``planner_gate ==
+        "auto"`` picks the LLM-backed gate when the planner exposes
+        a ``_call_llm`` and falls through to the heuristic otherwise.
+        Any other value is assumed to be a caller-supplied async
+        callable with the :func:`planner_gate.classify_turn`
+        signature.
+        """
+        gate = self._planner_gate
+        if gate is None:
+            return "new_work"
+        if gate == "auto":
+            call_llm = getattr(self.planner, "_call_llm", None)
+            if call_llm is None:
+                return heuristic_classify_turn(
+                    prior_plan=prior_plan,
+                    completed_results=completed_results,
+                    user_input=user_input,
+                    conversation_id=self._conversation.id,
+                )
+            return await classify_turn(
+                call_llm=call_llm,
+                prior_plan=prior_plan,
+                completed_results=completed_results,
+                user_input=user_input,
+                conversation_id=self._conversation.id,
+                model=getattr(self.planner, "_model", "") or "",
+            )
+        # Caller-supplied async callable.
+        result = await gate(
+            prior_plan=prior_plan,
+            completed_results=completed_results,
+            user_input=user_input,
+            conversation_id=self._conversation.id,
+        )
+        if result not in ("new_work", "conversational", "refine_existing"):
+            log.warning(
+                "planner_gate callable returned non-canonical verdict %r; "
+                "falling back to new_work",
+                result,
+            )
+            return "new_work"
+        return result  # type: ignore[return-value]
+
+    async def _run_conversational_turn(
+        self,
+        *,
+        session: Session,
+        user_input: str | list[Goal],
+        context: Mapping[str, Any] | None,
+    ) -> ExecutionOutcome:
+        """Run a turn classified as ``"conversational"`` by the gate.
+
+        Skips :class:`GoalDeriver.derive`, :meth:`Planner.generate`,
+        and the ``GoalDerived`` / ``PlanSubmitted`` emissions — the
+        prior plan is carried forward onto the freshly minted session
+        and the executor drives the coordinator over existing context.
+        Reporting tools still register and the steerer still binds so
+        the executor's per-task events fire normally; this is the
+        minimum scaffolding the executor needs to turn a single
+        conversational exchange.
+        """
+        _ = context  # currently unused; reserved for future hooks
+        # Carry the prior plan forward. Mutate the prior plan's
+        # run_id to the fresh turn's run_id so sink events correlate
+        # with this turn, but otherwise reuse the same task ids /
+        # statuses so completed tasks stay completed.
+        carried = self._last_plan
+        if carried is None:  # defensive — gate shouldn't have returned
+            return await self._degrade_to_new_work(session, user_input)
+        carried.run_id = session.run_id
+        session.plan = carried
+        _ostate.set_current_plan(session.state, carried)
+        # Do NOT emit GoalDerived / PlanSubmitted — by design, a
+        # conversational turn produces no planning events.
+
+        try:
+            await self.agent.register_reporting_tools(list(BUILTIN_REPORTING_TOOLS))
+        except Exception as exc:  # noqa: BLE001
+            reason = f"register_reporting_tools raised: {exc}"
+            log.exception("register_reporting_tools raised")
+            await self._emit_run_aborted(session, reason)
+            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+            self._conversation.absorb_turn(
+                outcome, user_input_summary=_initial_goal_summary(user_input)
+            )
+            return outcome
+
+        try:
+            self.steerer.bind(sinks=list(self.sinks), planner=self.planner)
+        except Exception as exc:  # noqa: BLE001
+            reason = f"steerer.bind raised: {exc}"
+            log.exception("steerer.bind raised")
+            await self._emit_run_aborted(session, reason)
+            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+            self._conversation.absorb_turn(
+                outcome, user_input_summary=_initial_goal_summary(user_input)
+            )
+            return outcome
+
+        bind_adapter_steerer = getattr(self.agent, "bind_steerer", None)
+        if bind_adapter_steerer is not None:
+            try:
+                bind_adapter_steerer(self.steerer)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("adapter.bind_steerer raised on conversational turn: %s", exc)
+        bind_steerer_adapter = getattr(self.steerer, "bind_adapter", None)
+        if callable(bind_steerer_adapter):
+            try:
+                bind_steerer_adapter(self.agent)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("steerer.bind_adapter raised on conversational turn: %s", exc)
+
+        try:
+            executor_kwargs: dict[str, Any] = dict(
+                plan=session.plan,
+                session=session,
+                adapter=self.agent,
+                steerer=self.steerer,
+                planner=self.planner,
+                sinks=list(self.sinks),
+            )
+            if self.control is not None:
+                executor_kwargs["control"] = self.control
+            if isinstance(user_input, str):
+                run_sig = inspect.signature(self.executor.run)
+                if "user_input" in run_sig.parameters:
+                    executor_kwargs["user_input"] = user_input
+            outcome = await self.executor.run(**executor_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            reason = f"executor.run raised (conversational): {exc}"
+            log.exception("executor.run raised (conversational)")
+            await self._emit_run_aborted(session, reason)
+            aborted = ExecutionOutcome(success=False, session=session, reason=reason)
+            self._conversation.absorb_turn(
+                aborted, user_input_summary=_initial_goal_summary(user_input)
+            )
+            return aborted
+
+        _ostate.clear_current_task(session.state)
+        _ostate.clear_active_steer(session.state)
+        # Do NOT overwrite ``self._last_plan`` — the conversational
+        # turn piggy-backed on the prior plan; preserve it verbatim
+        # for the next turn's gate.
+        self._conversation.absorb_turn(
+            outcome, user_input_summary=_initial_goal_summary(user_input)
+        )
+        return outcome
+
+    async def _degrade_to_new_work(
+        self,
+        session: Session,
+        user_input: str | list[Goal],
+    ) -> ExecutionOutcome:
+        """Fallback for a conversational verdict with no prior plan.
+
+        Should never trigger in production — the gate checks for a
+        prior plan before returning ``"conversational"`` — but if it
+        does, we abort cleanly rather than drive the executor over a
+        missing plan.
+        """
+        reason = "planner_gate returned conversational but no prior plan is available"
+        log.warning(reason)
+        await self._emit_run_aborted(session, reason)
+        outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+        self._conversation.absorb_turn(
+            outcome, user_input_summary=_initial_goal_summary(user_input)
+        )
+        return outcome
+
+    async def _refine_from_user_input(
+        self,
+        *,
+        prior_plan: Plan,
+        user_input: str,
+        goals: list[Goal],
+        available_agents: Any,
+    ) -> Plan | None:
+        """Build a synthetic USER_STEER drift and call ``planner.refine``.
+
+        The new user_input is treated as a steering directive against
+        the prior plan. Returns ``None`` if the planner doesn't
+        support refine or any step raises — the caller then falls
+        through to :meth:`Planner.generate`, which is always safe.
+        """
+        if not user_input.strip():
+            return None
+        refine = getattr(self.planner, "refine", None)
+        if refine is None:
+            return None
+        # Synthesize a steer Goal so the refine prompt can reference it.
+        synth = getattr(self.planner, "synthesize_goal_from_steer", None)
+        steer_goal: Goal | None = None
+        if callable(synth):
+            try:
+                pair = await synth(user_input)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("synthesize_goal_from_steer raised: %s", exc)
+                pair = None
+            if pair is not None:
+                steer_goal, _mode = pair
+        if steer_goal is None:
+            steer_goal = Goal(
+                id="steer",
+                summary=user_input.strip(),
+                source=GOAL_SOURCE_USER_STEER,
+            )
+        else:
+            steer_goal.source = GOAL_SOURCE_USER_STEER
+        refine_goals = list(goals)
+        refine_goals.append(steer_goal)
+        drift = DriftEvent(
+            kind=DriftKind.USER_STEER,
+            severity=DriftSeverity.HIGH,
+            detail=user_input.strip(),
+        )
+        try:
+            return await refine(
+                plan=prior_plan,
+                drift=drift,
+                goals=refine_goals,
+                observed_actions=None,
+                available_agents=available_agents,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("planner.refine raised from planner_gate path: %s", exc)
+            return None
 
     async def _resolve_goals(
         self,
