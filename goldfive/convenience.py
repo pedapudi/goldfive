@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from goldfive._llm_detect import CallLLM, detect_llm
 from goldfive.adapters.auto import auto_adapter, is_adk_agent
+from goldfive.config import RuntimeConfig
 from goldfive.executors.sequential import SequentialExecutor
 from goldfive.goal_deriver import LiteralGoalDeriver, LLMGoalDeriver
 from goldfive.planner import LLMPlanner, PassthroughPlanner
@@ -63,6 +64,7 @@ def wrap(
     model: str | None = None,
     max_task_invocations: int | None = None,
     plugins: list[Any] | None = None,
+    runtime: RuntimeConfig | None = None,
     **legacy_kwargs: Any,
 ) -> Runner:
     """Build a :class:`Runner` that drives ``agent`` with goldfive.
@@ -116,6 +118,19 @@ def wrap(
         same plugins as the coordinator — not just the
         ``App(plugins=[...])``-level root runner. Ignored for
         non-ADK agents. See goldfive#121.
+    runtime:
+        Optional :class:`~goldfive.config.RuntimeConfig` (goldfive#225)
+        bundling the four typed-config surfaces: embedding backend,
+        tool-loop detector thresholds, reasoning-drift thresholds, and
+        goal-drift scheduling. When ``None`` (the default) ``wrap()``
+        builds an instance from the environment via
+        :meth:`RuntimeConfig.from_env` so pre-#225 callers get
+        byte-identical behaviour. When provided, the config is
+        installed into the per-process embedding backend and
+        reasoning-drift module, and threaded into the default
+        :class:`DefaultSteerer` via its config kwargs. An explicit
+        ``steerer=`` kwarg wins — the caller keeps full control
+        over the steerer they build themselves.
 
     Returns
     -------
@@ -133,6 +148,25 @@ def wrap(
         ``cast(GoldfiveADKAgent, goldfive.wrap(...))`` themselves.
     """
     adapter = auto_adapter(agent, plugins=plugins)
+
+    # Resolve the runtime config (goldfive#225). When ``runtime`` is
+    # not supplied we build one from the environment so pre-#225
+    # callers — and the env-var tests they already ship — keep working
+    # without modification. The resolved config is then installed
+    # eagerly into the embedding backend's module-level state; the
+    # reasoning-drift module is installed later inside ``DefaultSteerer``
+    # when the steerer-default branch runs (so callers who pass their
+    # own ``steerer=`` can make their own installation decisions).
+    resolved_runtime: RuntimeConfig = (
+        runtime if runtime is not None else RuntimeConfig.from_env()
+    )
+    from goldfive.drift import _embed as _embed_module
+    from goldfive.drift import reasoning as _reasoning_module
+    from goldfive.drift import tool_loops as _tool_loops_module
+
+    _embed_module.configure(resolved_runtime.embedding)
+    _reasoning_module.configure(resolved_runtime.reasoning_drift)
+    _tool_loops_module.configure(resolved_runtime.tool_loops)
 
     resolved_call_llm: CallLLM | None = call_llm
     resolved_model: str = model or ""
@@ -209,9 +243,16 @@ def wrap(
         resolved_steerer = DefaultSteerer(
             goal_drift_call_llm=resolved_call_llm,
             goal_drift_model=resolved_model,
+            goal_drift_config=resolved_runtime.goal_drift,
+            tool_loop_config=resolved_runtime.tool_loops,
+            reasoning_drift_config=resolved_runtime.reasoning_drift,
         )
     else:
-        resolved_steerer = DefaultSteerer()
+        resolved_steerer = DefaultSteerer(
+            goal_drift_config=resolved_runtime.goal_drift,
+            tool_loop_config=resolved_runtime.tool_loops,
+            reasoning_drift_config=resolved_runtime.reasoning_drift,
+        )
     resolved_sinks: list[EventSink] = list(sinks) if sinks is not None else [LoggingSink()]
 
     runner = Runner(

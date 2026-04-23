@@ -135,9 +135,12 @@ import json
 import logging
 import os
 from collections import defaultdict, deque
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity
+
+if TYPE_CHECKING:
+    from goldfive.config import ToolLoopConfig
 
 __all__ = [
     "DEFAULT_WINDOW",
@@ -147,10 +150,47 @@ __all__ = [
     "ToolLoopTracker",
     "args_hash",
     "load_thresholds_from_env",
+    "thresholds_from_config",
 ]
 
 
 log = logging.getLogger("goldfive.drift.tool_loops")
+
+
+# Installed per-process tool-loop config (goldfive#225). When non-None,
+# :func:`resolve_thresholds` returns the config's fields; otherwise it
+# falls back to :func:`load_thresholds_from_env`. Process-wide for the
+# same reason :mod:`goldfive.drift.reasoning` is: the ADK plugin builds
+# its tracker at plugin-init time before any Runner context is bound,
+# and we want ``goldfive.wrap(runtime=...)`` to influence the tracker
+# the plugin builds for that Runner. Operators who need per-Runner
+# isolation in a multi-Runner process can call :func:`configure` just
+# before ``wrap()`` for each Runner.
+_CONFIG: ToolLoopConfig | None = None
+
+
+def configure(config: ToolLoopConfig | None) -> None:
+    """Install a :class:`~goldfive.config.ToolLoopConfig` for this process.
+
+    Called by :func:`goldfive.wrap` with ``runtime.tool_loops``.
+    Passing ``None`` reverts to env-driven / default behaviour.
+    """
+    global _CONFIG
+    _CONFIG = config
+
+
+def resolve_thresholds() -> dict[str, int]:
+    """Return tracker-constructor kwargs sourced from the active config.
+
+    Precedence: the installed :class:`~goldfive.config.ToolLoopConfig`
+    (via :func:`configure`) wins over :func:`load_thresholds_from_env`
+    which in turn wins over the module-level defaults. This is the
+    helper plugins should splat into :class:`ToolLoopTracker` under
+    goldfive#225.
+    """
+    if _CONFIG is not None:
+        return thresholds_from_config(_CONFIG)
+    return load_thresholds_from_env()
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +356,22 @@ def load_thresholds_from_env() -> dict[str, int]:
         "alternating_threshold": _read_int_env(
             "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD", DEFAULT_ALTERNATING_THRESHOLD
         ),
+    }
+
+
+def thresholds_from_config(config: ToolLoopConfig) -> dict[str, int]:
+    """Adapt a :class:`~goldfive.config.ToolLoopConfig` to tracker kwargs.
+
+    Mirrors :func:`load_thresholds_from_env` so callers can splat the
+    result into :class:`ToolLoopTracker` without worrying about which
+    source they read from. Added under goldfive#225 alongside the
+    typed-config refactor.
+    """
+    return {
+        "window": config.window,
+        "exact_threshold": config.exact_threshold,
+        "name_threshold": config.name_threshold,
+        "alternating_threshold": config.alternating_threshold,
     }
 
 

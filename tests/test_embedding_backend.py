@@ -27,15 +27,21 @@ def _reset_embed_state(monkeypatch: pytest.MonkeyPatch) -> Any:
     ``set_model(None)`` both clears any installed encoder and resets
     ``_MODEL_UNAVAILABLE`` so the lazy-load path can run again. We
     also scrub the env vars so one test leaking a ``setenv`` can't
-    influence another.
+    influence another. Under goldfive#225 ``configure(None)`` also
+    clears any :class:`~goldfive.config.EmbeddingConfig` a prior
+    ``goldfive.wrap()`` call may have installed; without this, the
+    env-var behaviour these tests exercise would be short-circuited
+    by a leaked config from another test module.
     """
     _embed.set_model(None)
+    _embed.configure(None)
     monkeypatch.delenv("GOLDFIVE_EMBEDDING_BASE_URL", raising=False)
     monkeypatch.delenv("GOLDFIVE_EMBEDDING_MODEL", raising=False)
     monkeypatch.delenv("GOLDFIVE_EMBEDDING_API_KEY", raising=False)
     monkeypatch.delenv("GOLDFIVE_EMBEDDING_TIMEOUT_MS", raising=False)
     yield
     _embed.set_model(None)
+    _embed.configure(None)
 
 
 def _canonical_response(vectors: list[list[float]]) -> dict[str, Any]:

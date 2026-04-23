@@ -1018,16 +1018,19 @@ def make_adk_plugin(
             # tool call the plugin sees in ``after_tool_callback`` and
             # fires a ``LOOPING_REASONING`` drift when any of the
             # three configured patterns (exact / name / alternating)
-            # trips. Thresholds read from ``GOLDFIVE_TOOL_LOOP_*`` env
-            # vars, falling back to the defaults documented in
-            # :mod:`goldfive.drift.tool_loops`. Lazy import so the
-            # plugin module stays importable without the drift helpers
-            # materialised — matches the pattern used for the
-            # confabulation classifier.
+            # trips. Thresholds are sourced from
+            # :func:`~goldfive.drift.tool_loops.resolve_thresholds`,
+            # which prefers an installed
+            # :class:`~goldfive.config.ToolLoopConfig` (goldfive#225,
+            # wired by :func:`goldfive.wrap`) and falls back to
+            # ``GOLDFIVE_TOOL_LOOP_*`` env vars and then the module
+            # defaults. Lazy import so the plugin module stays
+            # importable without the drift helpers materialised —
+            # matches the pattern used for the confabulation classifier.
             from goldfive.drift import tool_loops as _tool_loops
 
             self._tool_loop_tracker = _tool_loops.ToolLoopTracker(
-                **_tool_loops.load_thresholds_from_env()
+                **_tool_loops.resolve_thresholds()
             )
             # Reporting-tool names that indicate forward task progress
             # and therefore can clear the tool-loop tracker's window
