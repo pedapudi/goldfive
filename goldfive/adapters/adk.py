@@ -1072,6 +1072,19 @@ class ADKAdapter:
         # tests/test_live_steering_e2e.py set this explicitly.
         self._outer_session_id: str | None = None
 
+        # Optional fan-out listeners for raw inner-Runner ADK events.
+        # :meth:`Runner.run_streamed` (goldfive: stream-inner-adk-events)
+        # registers a listener here so it can forward every
+        # ``google.adk.events.Event`` out to an outer ADK consumer
+        # (:class:`GoldfiveADKAgent._run_async_impl`) in real time while
+        # the adapter continues its own bookkeeping (pending-tool heal,
+        # reconciler, plugin callbacks). Empty by default — no overhead
+        # for programmatic callers that don't use ``run_streamed``.
+        # Listeners are plain sync callables; they MUST NOT raise and
+        # MUST NOT block on I/O. The adapter swallows listener
+        # exceptions so a faulty subscriber cannot break the real run.
+        self._adk_event_listeners: list[Any] = []
+
         # Wrap-time integrity check: the one runner must carry the
         # goldfive plugin. In degraded mode we skip because the caller
         # may have constructed a runner shape we don't fully control.
@@ -1248,6 +1261,52 @@ class ADKAdapter:
                     f"reporting tools so terminal status can flow back "
                     f"from an AgentTool sub-invocation. See "
                     f"_augment_subtree_with_reporting."
+                )
+
+    # ------------------------------------------------------------------
+    # Inner ADK event fan-out (goldfive: stream-inner-adk-events)
+    # ------------------------------------------------------------------
+
+    def subscribe_adk_events(self, listener: Any) -> None:
+        """Register a sync callable to receive every inner-Runner ADK Event.
+
+        The listener is invoked once per event the adapter consumes from
+        ``runner.run_async(...)``, IN ORDER, BEFORE the adapter's own
+        bookkeeping (pending-tool tracking, final-event detection,
+        runaway-delegation cap) runs. This guarantees the outer
+        consumer sees the exact same event stream ADK delivers, without
+        the adapter filtering or transforming anything.
+
+        Listeners MUST be sync and MUST NOT block on I/O — a
+        ``queue.put_nowait`` or ``list.append`` is the expected shape.
+        Any exception raised by the listener is swallowed with a DEBUG
+        log so a faulty subscriber cannot break the real run.
+        """
+        if listener is None:
+            return
+        if listener in self._adk_event_listeners:
+            return
+        self._adk_event_listeners.append(listener)
+
+    def unsubscribe_adk_events(self, listener: Any) -> None:
+        """Remove a previously-registered ADK Event listener. Idempotent."""
+        try:
+            self._adk_event_listeners.remove(listener)
+        except ValueError:
+            return
+
+    def _dispatch_adk_event(self, event: Any) -> None:
+        """Fan ``event`` out to every registered listener. Swallows raises."""
+        if not self._adk_event_listeners:
+            return
+        for listener in list(self._adk_event_listeners):
+            try:
+                listener(event)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                log.debug(
+                    "ADKAdapter: adk-event listener %r raised (swallowed): %s",
+                    listener,
+                    exc,
                 )
 
     def bind_steerer(self, steerer: Steerer | None) -> None:
@@ -1460,6 +1519,14 @@ class ADKAdapter:
                 session_id=session_id,
                 new_message=new_message,
             ):
+                # Fan the raw event out to any registered listeners
+                # (e.g. :meth:`Runner.run_streamed` forwarding to
+                # :class:`GoldfiveADKAgent._run_async_impl` so adk-web
+                # sees real per-agent activity in its UI) BEFORE we
+                # run any adapter bookkeeping. Dispatch is best-effort
+                # sync and swallows raises — the adapter's own
+                # observation pipeline must not depend on it.
+                self._dispatch_adk_event(event)
                 last_event = event
                 inv_id = getattr(event, "invocation_id", "") or ""
                 if inv_id:

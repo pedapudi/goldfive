@@ -35,10 +35,11 @@ and are loaded lazily by callers.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import warnings
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive import orchestration_state as _ostate
@@ -428,6 +429,123 @@ class Runner:
             outcome, user_input_summary=_initial_goal_summary(user_input)
         )
         return outcome
+
+    # ------------------------------------------------------------------
+    # run_streamed — yield inner-adapter framework events in real time
+    # ------------------------------------------------------------------
+
+    async def run_streamed(
+        self,
+        user_input: str | list[Goal],
+        *,
+        context: Mapping[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[Any]:
+        """Execute a run and stream inner-adapter framework events out as they arrive.
+
+        Async generator that yields — in order — every framework-native
+        event the adapter observes mid-invocation (e.g. ADK ``Event``
+        objects: ``transfer_to_agent``, model text parts, function
+        calls, function responses) followed by exactly one trailing
+        :class:`~goldfive.results.ExecutionOutcome` as the final
+        yielded element when the run finishes.
+
+        The trailing ``ExecutionOutcome`` is how callers recover the
+        completed run's success flag, reason, and live
+        :class:`~goldfive.types.Session`. Consumers distinguish the
+        two yielded shapes via ``isinstance(item, ExecutionOutcome)``.
+
+        The equivalent of :meth:`run` — same lifecycle, same sinks, same
+        plugin callbacks, same conversation bookkeeping — is driven in
+        the background. :meth:`run_streamed` does NOT call :meth:`run`
+        recursively; it subscribes to the adapter's event fan-out
+        (:meth:`ADKAdapter.subscribe_adk_events`, when available) and
+        forwards those events through an :class:`asyncio.Queue` so
+        backpressure from the consumer cannot stall the inner Runner.
+
+        Non-ADK adapters (callable, Claude SDK) have no streamable
+        framework events; :meth:`run_streamed` still works for them —
+        it simply yields no mid-run events and produces the outcome at
+        the end, exactly as :meth:`run` would. Callers do not need to
+        switch on adapter type.
+
+        This is the primary path used by
+        :class:`~goldfive.adapters.adk_wrap.GoldfiveADKAgent` so
+        ``adk web`` sees per-agent activity (LLM responses, tool calls,
+        agent transitions) in its UI while the goldfive pipeline runs.
+
+        Parameters mirror :meth:`run` — see that docstring for
+        ``session_id`` semantics.
+        """
+        # Import here so non-ADK consumers don't pay the optional-ADK
+        # import cost when they never call run_streamed.
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+
+        # Subscribe a sync listener to the adapter's raw-event fan-out
+        # when the adapter supports it. The listener enqueues every
+        # event into ``queue`` for us to re-yield. Non-ADK adapters
+        # simply don't expose ``subscribe_adk_events`` — the run still
+        # completes and we yield only the final outcome.
+        subscribe = getattr(self.agent, "subscribe_adk_events", None)
+        unsubscribe = getattr(self.agent, "unsubscribe_adk_events", None)
+
+        def _listener(event: Any) -> None:
+            # ``put_nowait`` is correct here: the queue is unbounded
+            # so it never raises, and we must NOT block the adapter's
+            # event loop on a consumer that's slow to pull.
+            try:
+                queue.put_nowait(event)
+            except Exception:  # noqa: BLE001 — defensive; unbounded queue shouldn't raise
+                log.debug("run_streamed: queue.put_nowait unexpectedly raised")
+
+        if callable(subscribe):
+            subscribe(_listener)
+
+        # Sentinel that tells the consumer loop the run is done and
+        # any remaining events have already been enqueued.
+        _DONE = object()
+
+        async def _drive() -> ExecutionOutcome:
+            try:
+                return await self.run(
+                    user_input,
+                    context=context,
+                    session_id=session_id,
+                )
+            finally:
+                # Signal end-of-stream regardless of success / failure.
+                # The consumer drains any remaining buffered events,
+                # then stops when it sees the sentinel.
+                queue.put_nowait(_DONE)
+
+        run_task: asyncio.Task[ExecutionOutcome] = asyncio.create_task(_drive())
+
+        try:
+            while True:
+                item = await queue.get()
+                if item is _DONE:
+                    break
+                yield item
+            outcome = await run_task
+            yield outcome
+        except (asyncio.CancelledError, GeneratorExit):
+            # Upstream cancelled us (adk-web disconnect) OR the caller
+            # aclose()'d the generator early. Propagate the cancel into
+            # the driver so its ``try/finally`` teardown runs, then
+            # await it to collect the final state — suppressing the
+            # CancelledError so the generator exits cleanly.
+            run_task.cancel()
+            try:
+                await run_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            raise
+        finally:
+            if callable(unsubscribe):
+                try:
+                    unsubscribe(_listener)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("run_streamed: unsubscribe raised: %s", exc)
 
     # ------------------------------------------------------------------
     # resume — best-effort replay
