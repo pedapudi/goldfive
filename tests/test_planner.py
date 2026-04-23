@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from goldfive.planner import (
+    _DEFAULT_SYSTEM_PROMPT,
     LLMPlanner,
     PassthroughPlanner,
+    _normalize_assignee,
     _plan_from_json,
     _strip_code_fences,
 )
@@ -1534,3 +1538,110 @@ async def test_synthesize_goal_from_steer_defaults_mode_when_invalid() -> None:
     assert result is not None
     _goal, mode = result
     assert mode == "append"
+
+
+# ---------------------------------------------------------------------------
+# Compound assignee normalization (goldfive#214)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_assignee_strips_compound_form() -> None:
+    assert (
+        _normalize_assignee("presentation-orchestrated-9b2b3a9c7289:research_agent")
+        == "research_agent"
+    )
+
+
+def test_normalize_assignee_passes_bare_form_through() -> None:
+    assert _normalize_assignee("research_agent") == "research_agent"
+    assert _normalize_assignee("") == ""
+
+
+def test_normalize_assignee_uses_last_colon() -> None:
+    # Defensive: multi-segment prefixes still yield the trailing bare name.
+    assert _normalize_assignee("a:b:c:research_agent") == "research_agent"
+
+
+def test_plan_from_json_normalizes_compound_assignees(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = {
+        "summary": "s",
+        "tasks": [
+            {
+                "id": "t1",
+                "title": "research",
+                "assignee_agent_id": "client-xyz:research_agent",
+            },
+            {
+                "id": "t2",
+                "title": "draft",
+                "assignee_agent_id": "client-xyz:writer",
+            },
+        ],
+    }
+    with caplog.at_level("WARNING", logger="goldfive.planner"):
+        plan = _plan_from_json(payload, run_id="r", goal_ids=[])
+    assert plan is not None
+    assert [t.assignee_agent_id for t in plan.tasks] == ["research_agent", "writer"]
+    compound_warnings = [
+        r for r in caplog.records if "compound assignee_agent_id" in r.getMessage()
+    ]
+    assert len(compound_warnings) == 2
+
+
+def test_plan_from_json_leaves_bare_assignees_unchanged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = {
+        "summary": "s",
+        "tasks": [
+            {"id": "t1", "title": "research", "assignee_agent_id": "research_agent"},
+            {"id": "t2", "title": "draft", "assignee_agent_id": "writer"},
+        ],
+    }
+    with caplog.at_level("WARNING", logger="goldfive.planner"):
+        plan = _plan_from_json(payload, run_id="r", goal_ids=[])
+    assert plan is not None
+    assert [t.assignee_agent_id for t in plan.tasks] == ["research_agent", "writer"]
+    compound_warnings = [
+        r for r in caplog.records if "compound assignee_agent_id" in r.getMessage()
+    ]
+    assert compound_warnings == []
+
+
+def test_plan_from_json_normalizes_mixed_assignees(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = {
+        "summary": "s",
+        "tasks": [
+            {"id": "t1", "title": "research", "assignee_agent_id": "research_agent"},
+            {
+                "id": "t2",
+                "title": "draft",
+                "assignee_agent_id": "client-xyz:writer",
+            },
+            {"id": "t3", "title": "review", "assignee_agent_id": "reviewer"},
+        ],
+    }
+    with caplog.at_level("WARNING", logger="goldfive.planner"):
+        plan = _plan_from_json(payload, run_id="r", goal_ids=[])
+    assert plan is not None
+    assert [t.assignee_agent_id for t in plan.tasks] == [
+        "research_agent",
+        "writer",
+        "reviewer",
+    ]
+    compound_warnings = [
+        r for r in caplog.records if "compound assignee_agent_id" in r.getMessage()
+    ]
+    assert len(compound_warnings) == 1
+    assert "'client-xyz:writer'" in compound_warnings[0].getMessage()
+    assert "'writer'" in compound_warnings[0].getMessage()
+
+
+def test_default_system_prompt_forbids_compound_assignee() -> None:
+    # Regression guard against the planner prompt drifting away from the
+    # explicit "bare name only" directive added alongside #214.
+    assert "do NOT add a namespace" in _DEFAULT_SYSTEM_PROMPT

@@ -467,3 +467,53 @@ async def test_missing_task_id_still_rejects_when_state_empty() -> None:
         assert result["error"] == "missing_task_id", bad_args
     # No handler runs → no transitions.
     assert steerer.transitions == []
+
+
+# ---------------------------------------------------------------------------
+# Compound-assignee end-to-end (goldfive#214)
+# ---------------------------------------------------------------------------
+
+
+async def test_before_agent_callback_pins_when_plan_came_from_compound_json() -> None:
+    """Plans built from compound-form planner JSON still pin the right task.
+
+    Regression guard for #214: the planner's JSON→TaskPlan path normalizes
+    ``"<client>:<agent>"`` to the bare ADK name, so the reconciler /
+    plugin match (`assignee == agent_name`) finds exactly one candidate.
+    """
+    from goldfive.planner import _plan_from_json
+
+    payload = {
+        "summary": "s",
+        "tasks": [
+            {
+                "id": "t1",
+                "title": "research",
+                "assignee_agent_id": "presentation-orchestrated-9b2b3a9c7289:research_agent",
+            },
+            {
+                "id": "t2",
+                "title": "code",
+                "assignee_agent_id": "presentation-orchestrated-9b2b3a9c7289:web_developer",
+            },
+        ],
+    }
+    plan = _plan_from_json(payload, run_id="r1", goal_ids=[])
+    assert plan is not None
+    # Sanity: normalization happened at parse time.
+    assert [t.assignee_agent_id for t in plan.tasks] == [
+        "research_agent",
+        "web_developer",
+    ]
+
+    plugin = make_adk_plugin(host_agent_name="coord")
+    session = _session_with(plan)
+    state, ctx = _ctx_for(session, "coord")
+
+    await plugin.before_agent_callback(
+        agent=_Agent("research_agent"),
+        callback_context=ctx,
+    )
+
+    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state["goldfive.current_task_id"] == "t1"

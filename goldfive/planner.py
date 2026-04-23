@@ -85,6 +85,8 @@ Requirements for the plan:
    the provided available_agents list. If multiple agents could do a
    task, pick the most specialised one. If no agent fits, assign it
    to the coordinator/root agent rather than inventing an id.
+   `assignee_agent_id` must be the bare agent name as listed above —
+   do NOT add a namespace, client prefix, or `<something>:` qualifier.
 
 5. STABILITY. Task ids must be short, unique, and stable strings
    (e.g. "research", "draft_intro", "review_final"). Descriptions
@@ -396,6 +398,18 @@ def _strip_code_fences(raw: str) -> str:
     return raw
 
 
+def _normalize_assignee(raw: str) -> str:
+    if ":" not in raw:
+        return raw
+    bare = raw.rsplit(":", 1)[-1]
+    log.warning(
+        "planner emitted compound assignee_agent_id=%r; normalized to %r",
+        raw,
+        bare,
+    )
+    return bare
+
+
 def _coerce_status(raw: Any) -> TaskStatus:
     text = str(raw or "PENDING").upper()
     if text not in _VALID_TASK_STATUSES:
@@ -436,7 +450,9 @@ def _plan_from_json(
                 id=tid,
                 title=title,
                 description=str(t.get("description") or ""),
-                assignee_agent_id=str(t.get("assignee_agent_id") or ""),
+                assignee_agent_id=_normalize_assignee(
+                    str(t.get("assignee_agent_id") or "")
+                ),
                 status=_coerce_status(t.get("status")),
                 predicted_start_ms=int(t.get("predicted_start_ms") or 0),
                 predicted_duration_ms=int(t.get("predicted_duration_ms") or 0),
