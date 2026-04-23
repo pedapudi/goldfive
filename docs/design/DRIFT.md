@@ -527,11 +527,16 @@ buffer, so parallel AgentTool sub-invocations within one outer
 invocation do not cross-contaminate. State is ephemeral to a run —
 `clear()` is called from the plugin's `clear_active_context`.
 
-This is complementary to the reporting-tool-scoped
-`ToolLoopGuard` (`goldfive/adapters/_tool_loop_guard.py`, TASK-
-LIFECYCLE §5) which only covers calls routed through
-`invoke_tool`. The `ToolLoopTracker` sees every tool call the ADK
-plugin observes.
+The `ToolLoopTracker` is the only tool-loop detector goldfive
+ships; it sees every tool call the ADK plugin observes (both
+reporting-namespace and arbitrary agent-visible tools). A legacy
+per-task + session-wide `ToolLoopGuard` in
+`goldfive/adapters/_tool_loop_guard.py` used to cover the
+reporting-tool slice with a hard-reject protocol, but it was
+retired in goldfive#206 — its CRITICAL-at-first-crossing behaviour
+pre-dated both handler-owned idempotency (#201) and this
+graduated-severity classifier (#204), and it was actively firing
+CRITICAL drifts on benign idempotent retries.
 
 ## Intervention ladder (Levels 0-5)
 

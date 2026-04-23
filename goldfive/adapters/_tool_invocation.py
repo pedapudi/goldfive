@@ -6,39 +6,23 @@ handler with ``(args, session, steerer)``. This helper centralises that
 lookup so that every adapter (CallableAdapter, ADK, Claude) routes through
 the same code path — keeping behaviour and error messages consistent.
 
-The dispatcher threads every reporting-tool call through a four-layer
-guard (see :mod:`goldfive.adapters._tool_loop_guard`) so that:
+Schema validation (Layer 1) is the only gate the dispatcher enforces on
+its own. Terminal-task / idempotency / invalid-transition semantics all
+live inside the reporting handlers themselves (goldfive#201); tool-loop
+detection is covered by :class:`goldfive.drift.tool_loops.ToolLoopTracker`
+which observes every tool call the ADK plugin sees (goldfive#181, #204)
+and emits graduated-severity ``LOOPING_REASONING`` drifts.
 
-* **Layer 1 — schema rejections.** A call with no ``task_id`` for a
-  task-scoped tool, or an unknown ``task_id`` not present in the
-  current plan, is rejected with a structured error **before** any
-  other layer runs (so malformed calls can't poison the session
-  counter).
-* **Layer 2 — (handler-owned)**. Terminal-task semantics used to
-  reject here with ``task_already_terminal``. As of goldfive#201 the
-  handler owns that decision with a finer idempotent / invalid-
-  transition split: a retry of the same transition (e.g.
-  ``report_task_completed`` on a COMPLETED task) returns
-  ``{"acknowledged": True, "idempotent": True}``; a
-  cross-transition (e.g. ``report_task_started`` on a COMPLETED
-  task) returns
-  ``{"acknowledged": False, "error": "invalid_transition"}``. Both
-  are still routed through Layer 3 / Layer 4 for loop-detector
-  bookkeeping.
-* **Layer 3 — per-task loop guard.** Duplicate-args calls return a
-  cheap ``duplicate`` ACK; a sustained burst (same signature) or
-  volume cap (same tool name, varying args) emits a
-  ``LOOPING_TOOL_CALL`` drift and flips that ``(task, tool)`` bucket
-  into a hard-reject state so subsequent spam gets
-  ``loop_detected`` instead of pass-through.
-* **Layer 4 — session-wide volume cap.** A final safety net against
-  adversarial callers that invent a fresh ``task_id`` every call,
-  which would distribute one call per per-task bucket and defeat the
-  per-task cap. Once a tool is called > 50 times across ALL tasks in
-  a session, it is flagged session-wide and every subsequent call is
-  hard-rejected.
+Historically this module also hosted a per-task + session-wide
+``ToolLoopGuard`` (goldfive#109). goldfive#206 retired it: the guard's
+unconditional CRITICAL + hard-reject behaviour pre-dated both the
+idempotent-handler layer (#203, benign retries no longer look like
+loops) and the graduated tool-loop detector (#204, INFO/WARNING/CRITICAL
+tiers), so it was actively firing CRITICAL drifts on benign idempotent
+retries and aborting runs that the newer stack would have absorbed.
 
-See ``docs/design/TASK-LIFECYCLE.md`` §5 for the layering rationale.
+See ``docs/design/TASK-LIFECYCLE.md`` §5 for the current dispatch
+contract.
 """
 
 from __future__ import annotations
@@ -46,13 +30,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from goldfive.adapters._tool_loop_guard import (
-    args_signature,
-    detect_loop,
-    detect_session_loop,
-    emit_loop_drift,
-    guard_for,
-)
 from goldfive.reporting import ReportingToolSpec
 
 if TYPE_CHECKING:  # pragma: no cover - type-only
@@ -61,16 +38,9 @@ if TYPE_CHECKING:  # pragma: no cover - type-only
 
 
 # Tools that carry no task_id and represent plan-level signals — they
-# are exempt from the per-task idempotency guard, but still feed the
-# loop detector under a synthetic "(plan)" task key so a runaway
-# divergence-spam loop is still caught.
+# skip the schema-level task-id validation because they don't target a
+# specific task.
 _PLAN_LEVEL_TOOLS: frozenset[str] = frozenset({"report_plan_divergence"})
-
-# Tools that are intentionally allowed to be called multiple times with
-# the same args (the dispatch is the entire point — e.g. blocking on an
-# approval decision). These bypass the idempotency table but still
-# count toward the loop detector window.
-_NON_IDEMPOTENT_TOOLS: frozenset[str] = frozenset({"report_awaiting_approval"})
 
 
 def find_tool(
@@ -124,17 +94,15 @@ async def invoke_tool(
     mirrors the behaviour a real SDK would exhibit when an agent hallucinates
     a tool name, and lets adapters surface a clean error to the agent.
 
-    See the module docstring for the layer ordering. In brief, the layers
-    fire in this order and any rejection short-circuits the rest:
-
-    1. Schema validation (missing / unknown ``task_id``) — malformed
-       calls never reach the counters so an adversarial flood can't
-       poison session-wide state.
-    2. Terminal-task rejection — structured ``task_already_terminal``.
-    3. Per-task loop guard — duplicate ACK, or ``loop_detected`` once
-       the bucket is flagged.
-    4. Session-wide volume cap — ``loop_detected`` once the tool is
-       flagged session-wide.
+    Schema validation short-circuits the handler: a task-scoped tool
+    with no / unknown ``task_id`` returns a structured
+    ``missing_task_id`` / ``unknown_task_id`` error without invoking
+    the handler. Every other decision (terminal-state idempotency,
+    invalid transitions, progress dispatch) lives in the handler
+    itself (goldfive#201). Tool-loop detection is handled separately
+    by :class:`goldfive.drift.tool_loops.ToolLoopTracker` at the ADK
+    plugin's ``after_tool_callback`` — not gated inline on this
+    dispatch path.
     """
     tool = find_tool(tools, name)
     if tool is None:
@@ -153,20 +121,18 @@ async def invoke_tool(
     # delegation time when the starting sub-agent has an unambiguous
     # plan task assignment. Mutating ``args`` here (rather than just
     # using a local) makes the resolved id visible to the handler too,
-    # so all downstream paths (idempotency signature, terminal-task
-    # lookup, handler body) see a single consistent value.
+    # so all downstream paths see a single consistent value.
     if not task_id:
         fallback = _resolve_state_task_id(session)
         if fallback:
             task_id = fallback
             args["task_id"] = fallback
-    guard_key = task_id or "__plan__"
     is_plan_level = name in _PLAN_LEVEL_TOOLS
-    sig = (name, args_signature(args))
 
     # ------------------------------------------------------------------
-    # Layer 1 — schema rejections. These MUST run before any counter
-    # updates so a malformed-call spam can't poison session state.
+    # Schema rejections. Task-scoped tools require a task_id that
+    # exists in the current plan; anything else is a malformed call
+    # the handler cannot serve.
     # ------------------------------------------------------------------
     if not is_plan_level:
         if not task_id:
@@ -179,11 +145,11 @@ async def invoke_tool(
                     "of the task you're reporting on."
                 ),
             }
-        # The unknown-task and terminal-task checks are only meaningful
-        # when the session has an installed plan to look the id up in.
-        # Plan-less sessions do occur (early bootstrap, minimal test
-        # harnesses) and we don't want to spuriously reject a call
-        # that the adapter has legitimately dispatched.
+        # The unknown-task check is only meaningful when the session has
+        # an installed plan to look the id up in. Plan-less sessions do
+        # occur (early bootstrap, minimal test harnesses) and we don't
+        # want to spuriously reject a call that the adapter has
+        # legitimately dispatched.
         if session.plan is not None:
             task = _find_task(session, task_id)
             if task is None:
@@ -199,143 +165,7 @@ async def invoke_tool(
                     ),
                 }
 
-            # Layer 2 used to hard-reject terminal-task retries with
-            # ``task_already_terminal``. goldfive#201 moves that
-            # decision into the handler: retries of the same
-            # transition (e.g. ``report_task_completed`` on COMPLETED)
-            # return idempotent=True; cross-transitions (e.g.
-            # ``report_task_started`` on COMPLETED) return
-            # ``invalid_transition``. Both still bookkeep through
-            # Layers 3 + 4 below so a genuine runaway retry still
-            # trips the loop detector, but benign retries no longer
-            # masquerade as confusion signals.
-
-    # ------------------------------------------------------------------
-    # Layer 3 — per-task loop guard.
-    # ------------------------------------------------------------------
-    guard = guard_for(session)
-    state = guard.state_for(guard_key)
-
-    # If this (task, tool) bucket is already flagged, hard-reject
-    # without updating the sliding window or incrementing counters
-    # further. This is the fix for "one-shot loop flag lets subsequent
-    # calls pass through": after the drift fires once, every future
-    # call to that tool on that task gets a structured
-    # ``loop_detected`` error instead of silently falling through to
-    # the handler (which was the live-run failure).
-    if state.loop_flagged and state.loop_tool == name:
-        return _loop_rejection(
-            task_id=task_id,
-            tool_name=name,
-            reason=state.loop_reason or "per_task_loop",
-            scope="per_task",
-        )
-
-    state.window.append(sig)
-
-    if detect_loop(state, sig):
-        await emit_loop_drift(
-            session=session,
-            steerer=steerer,
-            task_id=task_id,
-            tool_name=name,
-            reason=_human_reason(state.loop_reason),
-        )
-        # The call that trips the guard is itself rejected — there's
-        # no forward progress to preserve (the agent is already
-        # spamming) and letting it through would be our 16th+ handler
-        # invocation on a confirmed-looping task.
-        return _loop_rejection(
-            task_id=task_id,
-            tool_name=name,
-            reason=state.loop_reason,
-            scope="per_task",
-        )
-
-    if not is_plan_level and name not in _NON_IDEMPOTENT_TOOLS and task_id and sig in state.seen:
-        return {"acknowledged": True, "duplicate": True}
-
-    # ------------------------------------------------------------------
-    # Layer 4 — session-wide volume cap. Runs AFTER Layer 1 (so
-    # malformed calls don't count) but before we invoke the handler,
-    # so the flood is cut off at its 51st call, not its 500th.
-    # ------------------------------------------------------------------
-    if detect_session_loop(guard, name):
-        await emit_loop_drift(
-            session=session,
-            steerer=steerer,
-            task_id=task_id or "(session)",
-            tool_name=name,
-            reason=(
-                f"session-wide volume cap ({guard.session_tool_count[name]} "
-                "calls across all tasks, no forward progress)"
-            ),
-        )
-        return _loop_rejection(
-            task_id=task_id,
-            tool_name=name,
-            reason="session_volume_cap",
-            scope="session",
-        )
-    if name in guard.session_tool_flagged:
-        # Tool was already session-flagged on a prior call; keep
-        # rejecting without re-firing drift.
-        return _loop_rejection(
-            task_id=task_id,
-            tool_name=name,
-            reason="session_volume_cap",
-            scope="session",
-        )
-
-    state.seen.add(sig)
     return await tool.handler(args, session, steerer)
-
-
-def _loop_rejection(*, task_id: str, tool_name: str, reason: str, scope: str) -> dict[str, Any]:
-    """Build the structured ``loop_detected`` response.
-
-    All rejection paths funnel through this helper so the response
-    shape stays consistent and the agent sees the same error key
-    (``loop_detected``) regardless of which trigger fired. ``scope``
-    is ``"per_task"`` or ``"session"``; ``reason`` is a machine-
-    readable classifier (``exact_signature_burst``,
-    ``per_task_volume_cap``, ``session_volume_cap``).
-    """
-    message: str
-    if scope == "session":
-        message = (
-            f"Tool {tool_name!r} has been called too many times across all "
-            "tasks in this session without forward progress. Do not retry; "
-            "wait for the orchestrator to route you to the next task."
-        )
-    else:
-        message = (
-            f"Repeated calls to {tool_name!r} without forward progress "
-            f"detected (reason: {reason}). Do not retry; wait for the "
-            "orchestrator to route you to the next task."
-        )
-    payload: dict[str, Any] = {
-        "acknowledged": False,
-        "error": "loop_detected",
-        "tool": tool_name,
-        "reason": reason,
-        "scope": scope,
-        "message": message,
-    }
-    if task_id:
-        payload["task_id"] = task_id
-    return payload
-
-
-def _human_reason(machine_reason: str) -> str:
-    """Map a machine classifier to a human-readable drift detail fragment."""
-    if machine_reason == "exact_signature_burst":
-        return (
-            "exact-signature burst: same (tool, args) seen repeatedly in the recent sliding window"
-        )
-    if machine_reason == "per_task_volume_cap":
-        return "per-task volume cap: too many total calls to this tool on this task"
-    return machine_reason or "repeated calls without forward progress"
 
 
 def _find_task(session: Session, task_id: str) -> Task | None:

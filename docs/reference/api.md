@@ -302,7 +302,7 @@ use snake_case for forward compatibility with sinks.
 | 23 | RESOURCE_EXHAUSTED | `"resource_exhausted"` | Rate limits, quota, etc. |
 | 24 | AMBIGUOUS_INTENT | `"ambiguous_intent"` | Signals the planner needs clarification. |
 | 25 | CUSTOM | `"custom"` | Escape hatch paired with `DriftDetected.detail`. |
-| 26 | LOOPING_TOOL_CALL | `"looping_tool_call"` | Reporting-tool loop guard tripped. |
+| 26 | LOOPING_TOOL_CALL | `"looping_tool_call"` | Legacy reporting-tool loop guard kind; retired in goldfive#206. The enum value is preserved for proto stability; `ToolLoopTracker` emits `LOOPING_REASONING` instead. |
 | 27 | LOOPING_REASONING | `"looping_reasoning"` | Reasoning-content loop (hash/embedding) **or** tool-loop detector (#181). |
 | 28 | CONFUSION | `"confusion"` | Reasoning expresses uncertainty; INFO. |
 | 29 | OFF_TOPIC | `"off_topic"` | Reasoning topic distant from task description (embedding). |

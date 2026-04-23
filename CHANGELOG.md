@@ -4,6 +4,23 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ## Unreleased — 2026-04-21
 
+### Dispatch
+
+- [#206](https://github.com/pedapudi/goldfive/pull/206) **Retire
+  `_tool_loop_guard`.** The legacy per-task + session-wide
+  `ToolLoopGuard` in `goldfive/adapters/_tool_loop_guard.py` is
+  deleted. Its behaviour is subsumed by the handler-owned
+  idempotency matrix (#201 / #203), the graduated-severity
+  `ToolLoopTracker` (#181 / #194 / #204), and the schema layer that
+  still lives in `_tool_invocation.invoke_tool`. The guard's
+  CRITICAL-at-first-crossing + hard-reject behaviour pre-dated
+  those systems and was actively firing CRITICAL
+  `LOOPING_TOOL_CALL` drifts on benign idempotent retries (evidence:
+  harmonograf session `dd188a0c-ba61-4fea-a671-8ade1915a83b`).
+  `DriftKind.LOOPING_TOOL_CALL` stays in `goldfive.types` + proto
+  for stability and the planner's refine branch still handles it
+  defensively; no production code path emits it anymore.
+
 ### Observability
 
 - [#205](https://github.com/pedapudi/goldfive/pull/205) **Structured cancel

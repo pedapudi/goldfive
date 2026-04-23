@@ -324,3 +324,103 @@ async def test_unknown_task_id_still_acks_at_handler_level() -> None:
         {"task_id": "does-not-exist", "detail": "x"}, session, steerer
     )
     assert result == {"acknowledged": True}
+
+
+# ---------------------------------------------------------------------------
+# goldfive#206: benign idempotent retries produce ZERO tool-loop drifts
+# ---------------------------------------------------------------------------
+#
+# Regression guard for the session-``dd188a0c``-style pattern: a smaller
+# model calls ``report_task_progress`` six times in a row with identical
+# args after its task has already transitioned to RUNNING. Before #206
+# retired the per-task ``ToolLoopGuard``, this pattern fired a CRITICAL
+# ``LOOPING_TOOL_CALL`` drift at the 6th call and aborted the run; the
+# newer stack (handler-owned idempotency + ToolLoopTracker's
+# on_task_progress reset) absorbs it silently.
+
+
+async def test_idempotent_progress_retries_produce_zero_drifts() -> None:
+    """Six identical ``report_task_progress`` retries against a RUNNING
+    task each return a plain ``{"acknowledged": True}`` ACK and do NOT
+    emit any drift. Before goldfive#206 the per-task
+    ``_tool_loop_guard`` would have fired CRITICAL ``LOOPING_TOOL_CALL``
+    on the 6th call (exact=6 in window of 8) and aborted the run;
+    after retirement the handler ACKs every call and no drift fires
+    at this layer.
+    """
+    from goldfive.types import DriftEvent
+
+    class _CapturingSteerer(DefaultSteerer):
+        drifts_captured: list[DriftEvent]
+
+        async def _handle_drift(self, drift: DriftEvent, session: Session) -> None:  # type: ignore[override]
+            self.drifts_captured.append(drift)
+            await super()._handle_drift(drift, session)
+
+    steerer = _CapturingSteerer()
+    steerer.drifts_captured = []
+    sink = _ListSink()
+    planner = _StubPlanner()
+    session = Session(
+        run_id="r1",
+        goals=[Goal(id="g1", summary="do it")],
+        plan=Plan(
+            id="p1",
+            run_id="r1",
+            goal_ids=["g1"],
+            tasks=[
+                Task(
+                    id="t1",
+                    title="A",
+                    assignee_agent_id="worker",
+                    status=TaskStatus.RUNNING,
+                ),
+            ],
+            edges=[],
+        ),
+    )
+    steerer.bind(sinks=[sink], planner=planner)
+
+    args = {"task_id": "t1", "fraction": 0.5, "detail": "stuck"}
+    for _ in range(6):
+        result = await _tool("report_task_progress").handler(args, session, steerer)
+        # report_task_progress on RUNNING is a legal liveness tick —
+        # plain ACK every time; the handler does not reject benign
+        # retries.
+        assert result == {"acknowledged": True}
+
+    # No drifts — the retired per-task loop guard would have fired
+    # CRITICAL LOOPING_TOOL_CALL at the 6th call (exact=6 in window
+    # of 8) and aborted the run.
+    assert steerer.drifts_captured == []
+    # Task stays RUNNING; no forced transition.
+    assert session.plan.tasks[0].status is TaskStatus.RUNNING
+
+
+async def test_idempotent_progress_retries_do_not_fire_tool_loop_tracker() -> None:
+    """The complementary regression guard for the tracker path: six
+    identical progress reports where each acknowledged=True response
+    resets the :class:`ToolLoopTracker` buffer via
+    ``on_task_progress``. The tracker therefore emits zero drifts for
+    benign progress-retry patterns, which matches the session
+    ``dd188a0c`` shape that motivated goldfive#206.
+    """
+    from goldfive.drift.tool_loops import ToolLoopTracker
+
+    tracker = ToolLoopTracker()
+    all_drifts: list[Any] = []
+    for _ in range(6):
+        drifts = tracker.observe_tool_call(
+            invocation_id="inv-1",
+            agent_name="debugger_agent",
+            tool_name="report_task_progress",
+            args={"task_id": "t1", "fraction": 0.5, "detail": "stuck"},
+            task_id="t1",
+        )
+        all_drifts.extend(drifts)
+        # The ADK plugin calls on_task_progress after every
+        # acknowledged=True response — simulate that here so the
+        # buffer resets as it would on the real dispatch path.
+        tracker.on_task_progress(invocation_id="inv-1", agent_name="debugger_agent")
+
+    assert all_drifts == []

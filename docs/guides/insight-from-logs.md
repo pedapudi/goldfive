@@ -74,9 +74,9 @@ Twelve event payloads ship in v0.1. The envelope is common —
 
 // DriftDetected — fires whenever detect_drift returns non-None.
 {"drift_detected": {
-  "kind": "DRIFT_KIND_LOOPING_TOOL_CALL",
+  "kind": "DRIFT_KIND_LOOPING_REASONING",
   "severity": "DRIFT_SEVERITY_WARNING",
-  "detail": "report_task_completed called 7 times with identical args",
+  "detail": "tool_loop_exact: report_task_completed x 3 in last 10 calls",
   "current_task_id": "draft"
 }}
 
@@ -359,11 +359,15 @@ SELECT json_extract(payload, '$.plan.tasks') AS tasks
  ORDER BY sequence DESC LIMIT 1;
 
 -- Tool call frequency by name — the filler-loop signal.
+-- Since goldfive#181+#206 the ToolLoopTracker emits these as
+-- DRIFT_KIND_LOOPING_REASONING (detail starts with ``tool_loop_exact:``,
+-- ``tool_loop_name:``, or ``tool_loop_alternating:``).
 SELECT json_extract(payload, '$.detail'), COUNT(*)
   FROM events
  WHERE run_id = '<run_id>'
    AND event_type = 'DriftDetected'
-   AND json_extract(payload, '$.kind') = 'DRIFT_KIND_LOOPING_TOOL_CALL'
+   AND json_extract(payload, '$.kind') = 'DRIFT_KIND_LOOPING_REASONING'
+   AND json_extract(payload, '$.detail') LIKE 'tool_loop_%'
  GROUP BY 1 ORDER BY 2 DESC;
 ```
 

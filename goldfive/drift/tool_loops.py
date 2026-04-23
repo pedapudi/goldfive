@@ -12,11 +12,13 @@ hash / cosine loops -- it does NOT look at the function_call stream,
 so tight tool-loops that never emit the same reasoning text slip
 through.
 
-The existing :class:`goldfive.adapters._tool_loop_guard.ToolLoopGuard`
-IS args-aware but is scoped to **reporting tools** (tools dispatched
-via :func:`~goldfive.adapters._tool_invocation.invoke_tool`). Tool-loops
-on arbitrary agent-visible tools (AgentTool delegations, MCP tools,
-custom adapter-native tools) are not covered there.
+Before goldfive#206 an args-aware :class:`ToolLoopGuard` covered the
+reporting-tool slice (calls dispatched via
+:func:`~goldfive.adapters._tool_invocation.invoke_tool`). That guard
+has been retired; this tracker is now the sole tool-loop detector
+goldfive ships and sees **every** tool call the ADK plugin observes
+(reporting tools plus AgentTool delegations, MCP tools, custom
+adapter-native tools).
 
 This module is the complementary detector: it observes **every** tool
 call the ADK plugin sees (reporting or otherwise), keyed per
