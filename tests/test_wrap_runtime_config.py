@@ -130,6 +130,30 @@ def test_wrap_threads_runtime_config() -> None:
     assert steerer._tool_loop_config is cfg.tool_loops
     assert steerer._reasoning_drift_config is cfg.reasoning_drift
     assert steerer._goal_drift_config is cfg.goal_drift
+    # Mode flows from the config into the steerer.
+    assert steerer._reasoning_drift_mode == "judge"
+
+
+def test_wrap_threads_reasoning_drift_mode_from_config() -> None:
+    """A non-default ``reasoning_drift.mode`` propagates into the steerer."""
+    cfg = RuntimeConfig(
+        reasoning_drift=ReasoningDriftConfig(mode="embedding"),
+    )
+    runner = goldfive.wrap(_noop_agent, runtime=cfg, sinks=[])
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    assert steerer._reasoning_drift_mode == "embedding"
+
+
+def test_wrap_threads_reasoning_drift_mode_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GOLDFIVE_DRIFT_REASONING_MODE=both make demo` end-to-end."""
+    monkeypatch.setenv("GOLDFIVE_DRIFT_REASONING_MODE", "both")
+    runner = goldfive.wrap(_noop_agent, sinks=[])
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    assert steerer._reasoning_drift_mode == "both"
 
 
 def test_wrap_falls_back_to_from_env_when_runtime_none(

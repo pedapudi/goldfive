@@ -41,6 +41,11 @@ import dataclasses
 import logging
 import os
 
+from goldfive.drift.reasoning import (
+    DEFAULT_REASONING_DRIFT_MODE,
+    ReasoningDriftMode,
+)
+
 __all__ = [
     "EmbeddingConfig",
     "GoalDriftConfig",
@@ -112,6 +117,38 @@ def _read_float_env(name: str, default: float) -> float:
             default,
         )
         return default
+
+
+_VALID_REASONING_DRIFT_MODES: frozenset[str] = frozenset(
+    {"judge", "embedding", "both", "off"}
+)
+
+
+def _read_reasoning_drift_mode_env(
+    name: str, default: ReasoningDriftMode
+) -> ReasoningDriftMode:
+    """Return ``os.environ[name]`` as a ``ReasoningDriftMode``, or ``default``.
+
+    Accepts exactly the four literal values of
+    :data:`~goldfive.drift.reasoning.ReasoningDriftMode`
+    (``"judge"`` / ``"embedding"`` / ``"both"`` / ``"off"``).
+    Anything else logs a WARNING and falls back to ``default`` so a
+    typo in the env never silently disables drift detection.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _VALID_REASONING_DRIFT_MODES:
+        return value  # type: ignore[return-value]
+    log.warning(
+        "ignoring unknown %s=%r (expected one of %s); using default %r",
+        name,
+        raw,
+        sorted(_VALID_REASONING_DRIFT_MODES),
+        default,
+    )
+    return default
 
 
 def _read_str_env(name: str, default: str) -> str:
@@ -247,6 +284,7 @@ class ReasoningDriftConfig:
     detector.
     """
 
+    mode: ReasoningDriftMode = DEFAULT_REASONING_DRIFT_MODE
     off_topic_distance_threshold: float = 0.7
     intent_divergence_healthy_similarity: float = 0.6
     intent_divergence_minor_similarity: float = 0.4
@@ -267,6 +305,9 @@ class ReasoningDriftConfig:
         """
         defaults = cls()
         return cls(
+            mode=_read_reasoning_drift_mode_env(
+                "GOLDFIVE_DRIFT_REASONING_MODE", defaults.mode
+            ),
             off_topic_distance_threshold=_read_float_env(
                 "GOLDFIVE_DRIFT_OFF_TOPIC_DISTANCE",
                 defaults.off_topic_distance_threshold,

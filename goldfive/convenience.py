@@ -250,6 +250,7 @@ def wrap(
             goal_drift_config=resolved_runtime.goal_drift,
             tool_loop_config=resolved_runtime.tool_loops,
             reasoning_drift_config=resolved_runtime.reasoning_drift,
+            reasoning_drift_mode=resolved_runtime.reasoning_drift.mode,
             reasoning_drift_call_llm=resolved_call_llm,
             reasoning_drift_model=resolved_model,
         )
@@ -258,6 +259,7 @@ def wrap(
             goal_drift_config=resolved_runtime.goal_drift,
             tool_loop_config=resolved_runtime.tool_loops,
             reasoning_drift_config=resolved_runtime.reasoning_drift,
+            reasoning_drift_mode=resolved_runtime.reasoning_drift.mode,
         )
     resolved_sinks: list[EventSink] = list(sinks) if sinks is not None else [LoggingSink()]
 
