@@ -410,7 +410,7 @@ session-state mutation, not drift synthesis.
 
 | `DriftKind` | Value | Default severity | Trigger |
 |---|---|---|---|
-| `CUSTOM` | `"custom"` | caller's choice | Caller-supplied drift kind. Used by `emit_status_report` for `STATUS_QUERY` audit events (severity `INFO`). Prefer a named kind when one fits. |
+| `CUSTOM` | `"custom"` | caller's choice | Caller-supplied drift kind. Prefer a named kind when one fits. |
 
 ### Count check
 
@@ -445,7 +445,7 @@ and who emits each. Factories for every kind live in `goldfive/events.py`.
 | `task_failed` | `task_failed_event` | **Steerer** | `mark_task_failed` — `RUNNING → FAILED`. |
 | `task_blocked` | `task_blocked_event` | **Steerer** | `mark_task_blocked` — `RUNNING → BLOCKED`. |
 | `task_cancelled` | `task_cancelled_event` | **Steerer** | `mark_task_cancelled` — `* → CANCELLED`. |
-| `drift_detected` | `drift_detected_event` | **Steerer** | Every successful `_handle_drift` call. Also used by `control_received_event` and `emit_status_report`. |
+| `drift_detected` | `drift_detected_event` | **Steerer** | Every successful `_handle_drift` call. Also used by `control_received_event`. (`STATUS_QUERY` is read-only — it does NOT emit drift events; the snapshot is returned via the control-channel ack's `detail` field.) |
 | `run_completed` | `run_completed_event` | **Executor** | Terminal success — all tasks reached a terminal state with the plan fully realized. |
 | `run_aborted` | `run_aborted_event` | **Runner** *or* **Executor** | Runner emits on setup failure (pre-executor). Executor emits on reinvocation cap, cancel, or unrecoverable drift. |
 

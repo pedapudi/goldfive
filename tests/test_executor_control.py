@@ -519,11 +519,20 @@ async def test_rewind_helper_resets_target_and_downstream_only() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sequential executor: STATUS_QUERY emits a synthetic event
+# Sequential executor: STATUS_QUERY is a read-only probe — no drift events
 # ---------------------------------------------------------------------------
 
 
-async def test_sequential_status_query_emits_event_and_acks_success() -> None:
+async def test_sequential_status_query_emits_no_drift_and_returns_snapshot_in_ack() -> None:
+    """STATUS_QUERY must NOT emit any drift_detected (or other) sink
+    events — it is a read-only probe. The status snapshot is returned
+    via the ack's ``detail`` field so the frontend can poll cheaply
+    without polluting the sink stream.
+
+    Regression test for the "33k bogus drift_detected events per 5-min
+    run" bug: each status_query poll previously fired a
+    ``DriftDetected`` with ``kind=0`` (UNSPECIFIED) on every sink.
+    """
     plan = _linear_plan(["t0", "t1"])
     session = _fresh_session()
     steerer = StubSteerer()
@@ -535,15 +544,13 @@ async def test_sequential_status_query_emits_event_and_acks_success() -> None:
 
     async def _handler(task: Task, session: Session) -> InvocationResult:
         if task.id == "t0":
-            # Send a STATUS_QUERY while t0 is running. Using a raw
-            # string kind is the forward-compat path; ControlMessage's
-            # kind field is not runtime-enforced.
-            await channel.send(
-                ControlMessage(kind="STATUS_QUERY", payload={})  # type: ignore[arg-type]
-            )
+            # Fire several STATUS_QUERY probes to mirror a polling
+            # frontend; none should produce drift events.
+            for _ in range(5):
+                await channel.send(
+                    ControlMessage(kind="STATUS_QUERY", payload={})  # type: ignore[arg-type]
+                )
             status_sent.set()
-            # Brief sleep so the executor has time to pick up the
-            # control message before the adapter returns.
             await asyncio.sleep(0.1)
         for t in session.plan.tasks:
             if t.id == task.id:
@@ -568,12 +575,20 @@ async def test_sequential_status_query_emits_event_and_acks_success() -> None:
 
     assert outcome.success is True
     assert status_sent.is_set()
-    # A DriftDetected event was emitted for the status report.
+    # ZERO drift events from status_query polling. Any drift detail
+    # matching "status_query" is a regression.
     drifts = sink.drift_events()
-    assert any("status_query" in (getattr(d, "detail", "")) for d in drifts)
-    # Ack was SUCCESS.
-    acks = await _drain_acks(channel, count=1, timeout=1.0)
-    assert len(acks) == 1 and acks[0].result == AckResult.SUCCESS
+    offending = [d for d in drifts if "status_query" in getattr(d, "detail", "")]
+    assert offending == [], (
+        f"STATUS_QUERY must not emit drift_detected events; got {offending!r}"
+    )
+    # All 5 polls get SUCCESS acks whose detail carries the snapshot.
+    acks = await _drain_acks(channel, count=5, timeout=1.0)
+    assert len(acks) == 5
+    assert all(a.result == AckResult.SUCCESS for a in acks)
+    assert all("status_query" in a.detail for a in acks), (
+        f"expected snapshot in ack.detail; got {[a.detail for a in acks]!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
