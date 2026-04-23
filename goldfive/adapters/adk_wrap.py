@@ -25,10 +25,11 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from goldfive.results import ExecutionOutcome
+
 if TYPE_CHECKING:
     from goldfive.control import ControlChannel
     from goldfive.protocols import EventSink
-    from goldfive.results import ExecutionOutcome
     from goldfive.runner import Runner
     from goldfive.types import Goal
 
@@ -94,6 +95,11 @@ def _plan_summary_event(outcome: ExecutionOutcome, author: str, invocation_id: s
     """Build the opening Event that summarises the plan we're about to run."""
     session = outcome.session
     plan = getattr(session, "plan", None)
+    return _plan_summary_event_from_plan(plan, author=author, invocation_id=invocation_id)
+
+
+def _plan_summary_event_from_plan(plan: Any, author: str, invocation_id: str) -> Event:
+    """Build a plan-summary Event from a bare :class:`Plan` (may be ``None``)."""
     summary = getattr(plan, "summary", "") or "goldfive plan"
     tasks = list(getattr(plan, "tasks", None) or ())
     lines = [f"**{summary}**"]
@@ -148,13 +154,32 @@ async def _outcome_to_adk_events(
 
     The stream is intentionally minimal: a plan summary up top, one
     Event per completed task, a best-effort line per recorded drift,
-    and a terminal turn-complete Event at the end. This is enough for
-    adk web to render a coherent turn; richer views can subscribe to
-    goldfive's own Event stream via a sink.
+    and a terminal turn-complete Event at the end.
+
+    Retained for back-compat (callers that want to render a full
+    outcome synchronously after the fact). The streaming path
+    (:meth:`GoldfiveADKAgent._run_async_impl`) now uses the finer-
+    grained :func:`_post_run_framing_events` to interleave real
+    inner-Runner events with the goldfive-owned framing.
     """
     invocation_id = str(getattr(ctx, "invocation_id", "") or "")
     yield _plan_summary_event(outcome, author=author, invocation_id=invocation_id)
+    async for event in _post_run_framing_events(outcome, ctx, author=author):
+        yield event
 
+
+async def _post_run_framing_events(
+    outcome: ExecutionOutcome, ctx: InvocationContext, author: str
+) -> AsyncIterator[Event]:
+    """Yield goldfive's own framing events for the end of a streamed run.
+
+    Emits one Event per completed task, one per recorded drift, and the
+    terminal turn-complete Event. These wrap / follow the real inner-
+    Runner events streamed through :meth:`Runner.run_streamed` so
+    adk-web sees goldfive-owned structure around the agent tree's
+    native activity.
+    """
+    invocation_id = str(getattr(ctx, "invocation_id", "") or "")
     session = outcome.session
     completed = getattr(session, "completed_results", None) or {}
     plan = getattr(session, "plan", None)
@@ -297,16 +322,61 @@ class GoldfiveADKAgent(BaseAgent):
         # so a cancelled or early-closed generator leaks open spans. The
         # teardown hook here is the goldfive-side guarantee that orphan
         # INVOCATION spans get flushed regardless of ADK's gap.
+        #
+        # Streaming model (goldfive: stream-inner-adk-events):
+        # :meth:`Runner.run_streamed` yields every raw ADK Event the
+        # inner ``InMemoryRunner`` emits (``transfer_to_agent``,
+        # ``function_call``, ``function_response``, model text parts,
+        # etc.) as they arrive, followed by exactly one trailing
+        # :class:`ExecutionOutcome`. We forward the ADK events through
+        # verbatim so adk-web sees the real agent tree's activity, then
+        # emit goldfive-owned framing (plan summary up front, per-task
+        # result blocks at the end, drift lines, terminal
+        # turn-complete) around them.
+        invocation_id = str(getattr(ctx, "invocation_id", "") or "")
+        plan_summary_yielded = False
         try:
-            outcome = await self._runner.run(
+            outcome: ExecutionOutcome | None = None
+            async for item in self._runner.run_streamed(
                 user_input,
                 context={"adk_ctx": ctx},
                 session_id=outer_sid or None,
-            )
-            async for adk_event in _outcome_to_adk_events(
-                outcome, ctx, author=self.name
             ):
-                yield adk_event
+                if isinstance(item, ExecutionOutcome):
+                    outcome = item
+                    continue
+                # Lazy plan-summary emission: the first real inner-Runner
+                # event reaches us AFTER the Runner has installed a plan
+                # on the session, so we can synthesize the plan summary
+                # with real task titles and yield it BEFORE the first
+                # tree event. On runs that produce zero inner events
+                # (degenerate no-op trees, immediate abort) we still
+                # get to emit it from the outcome branch below.
+                if not plan_summary_yielded and outcome is None:
+                    session = getattr(self._runner, "_last_session", None)
+                    plan = getattr(session, "plan", None) if session is not None else None
+                    if plan is not None:
+                        yield _plan_summary_event_from_plan(
+                            plan,
+                            author=self.name,
+                            invocation_id=invocation_id,
+                        )
+                        plan_summary_yielded = True
+                yield item
+            # Final framing. If we never yielded a plan summary (no
+            # inner events landed before the outcome) fall back to
+            # synthesizing it from the outcome's session so adk-web
+            # still gets a plan header.
+            if outcome is not None:
+                if not plan_summary_yielded:
+                    yield _plan_summary_event(
+                        outcome, author=self.name, invocation_id=invocation_id
+                    )
+                    plan_summary_yielded = True
+                async for adk_event in _post_run_framing_events(
+                    outcome, ctx, author=self.name
+                ):
+                    yield adk_event
         finally:
             self._notify_plugins_on_run_end()
 
