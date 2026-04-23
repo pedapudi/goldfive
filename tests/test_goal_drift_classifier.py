@@ -498,3 +498,185 @@ async def test_runner_goal_drift_enabled_true_is_default_and_preserves_wiring() 
     )
     assert runner.goal_drift_enabled is True
     assert steerer._goal_drift_call_llm is call_llm
+
+
+# ---------------------------------------------------------------------------
+# Task-boundary trigger (goldfive#219)
+# ---------------------------------------------------------------------------
+
+
+async def test_task_boundary_fires_goal_drift_check_on_mark_task_completed() -> None:
+    """mark_task_completed fires the judge exactly once after emit.
+
+    Regression on goldfive#219: short pipelines (e.g. coordinator →
+    research → web_dev → reviewer) complete before the turn counter
+    reaches the configured interval, so the turn-based judge never
+    fires. Task transitions are the natural fallback.
+    """
+    call_llm = _stub_call_llm([{"progressing": True}])
+    steerer = DefaultSteerer(
+        goal_drift_check_interval=100,  # Way above any turn count.
+        goal_drift_call_llm=call_llm,
+    )
+    sink = ListSink()
+    steerer.bind(sinks=[sink], planner=StubPlanner())
+    session = _make_session()
+
+    await steerer.mark_task_completed("t1", session=session, summary="done")
+    assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
+    # Turn counter is reset on task-boundary fire so we don't double-pay.
+    assert session._agent_turns_since_goal_check == 0
+
+
+async def test_task_boundary_fires_on_mark_task_failed_and_cancelled() -> None:
+    """Both FAILED and CANCELLED transitions trigger the judge."""
+    # Provide four responses: one per transition we'll drive below. The
+    # 10s rate limit is enforced via _last_goal_drift_check_ts; we reset
+    # it between calls to simulate "enough real time has passed".
+    call_llm = _stub_call_llm(
+        [{"progressing": True}, {"progressing": True}, {"progressing": True}]
+    )
+    steerer = DefaultSteerer(
+        goal_drift_check_interval=100,
+        goal_drift_call_llm=call_llm,
+    )
+    steerer.bind(sinks=[ListSink()], planner=StubPlanner())
+    session = _make_session()
+
+    await steerer.mark_task_failed("t1", session=session, reason="boom")
+    assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
+
+    # Rewind the rate-limit clock so the next boundary fires.
+    session._last_goal_drift_check_ts = 0.0
+    await steerer.mark_task_cancelled("t2", session=session, reason="no longer needed")
+    assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
+
+
+async def test_task_boundary_fires_independent_of_turn_counter() -> None:
+    """Turn counter at 0 (never incremented) → task boundary still fires."""
+    call_llm = _stub_call_llm([{"progressing": True}])
+    steerer = DefaultSteerer(
+        goal_drift_check_interval=5,
+        goal_drift_call_llm=call_llm,
+    )
+    steerer.bind(sinks=[ListSink()], planner=StubPlanner())
+    session = _make_session()
+    assert session._agent_turns_since_goal_check == 0
+
+    await steerer.mark_task_completed("t1", session=session, summary="done")
+    assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
+
+
+async def test_task_boundary_rate_limited_within_ten_seconds() -> None:
+    """Two task transitions 1s apart → judge only fires once."""
+    call_llm = _stub_call_llm([{"progressing": True}, {"progressing": True}])
+    steerer = DefaultSteerer(
+        goal_drift_check_interval=100,
+        goal_drift_call_llm=call_llm,
+    )
+    steerer.bind(sinks=[ListSink()], planner=StubPlanner())
+    session = _make_session()
+
+    # First transition primes the timestamp.
+    await steerer.mark_task_completed("t1", session=session, summary="done")
+    assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
+    first_ts = session._last_goal_drift_check_ts
+    assert first_ts > 0.0
+
+    # Second transition <1s later: should be suppressed by the 10s guard.
+    await steerer.mark_task_completed("t2", session=session, summary="done")
+    assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
+    # Timestamp must NOT advance on a suppressed call.
+    assert session._last_goal_drift_check_ts == first_ts
+
+
+async def test_task_boundary_noop_when_goal_drift_not_wired() -> None:
+    """Without a ``goal_drift_call_llm`` the boundary trigger is silent.
+
+    Also asserts ``_last_goal_drift_check_ts`` stays at its default so
+    the timestamp is only advanced when a real judge call is made.
+    """
+    steerer = DefaultSteerer(goal_drift_call_llm=None)
+    steerer.bind(sinks=[ListSink()], planner=StubPlanner())
+    session = _make_session()
+    await steerer.mark_task_completed("t1", session=session, summary="done")
+    assert session._last_goal_drift_check_ts == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Judge-response logging (goldfive#219)
+# ---------------------------------------------------------------------------
+
+
+async def test_classifier_logs_on_track_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+    """progressing=true → DEBUG log with 'on-track' so operators can diagnose."""
+    call_llm = _stub_call_llm([{"progressing": True, "reason": "writing in progress"}])
+    with caplog.at_level("DEBUG", logger="goldfive.drift.goals"):
+        drift = await classify_goal_drift(
+            goals=[Goal(id="g1", summary="ship memo")],
+            plan=None,
+            observed_actions=[],
+            model="m",
+            call_llm=call_llm,
+        )
+    assert drift is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("on-track" in m for m in messages), messages
+    # Raw response is also logged at DEBUG for every call.
+    assert any("raw response" in m for m in messages), messages
+
+
+async def test_classifier_logs_drift_detected_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    """progressing=false → INFO log with 'drift detected' so operators see it
+    without having to crank logging to DEBUG."""
+    reason = "researching raccoons instead of solar panels"
+    call_llm = _stub_call_llm([{"progressing": False, "reason": reason}])
+    with caplog.at_level("INFO", logger="goldfive.drift.goals"):
+        drift = await classify_goal_drift(
+            goals=[Goal(id="g1", summary="ship memo")],
+            plan=None,
+            observed_actions=[],
+            model="m",
+            call_llm=call_llm,
+        )
+    assert drift is not None
+    info_msgs = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert any("drift detected" in m and "raccoons" in m for m in info_msgs), info_msgs
+
+
+async def test_classifier_logs_malformed_json_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Malformed response → DEBUG log including the raw text snippet."""
+    call_llm = _stub_call_llm(["this is not JSON at all -- raccoons everywhere"])
+    with caplog.at_level("DEBUG", logger="goldfive.drift.goals"):
+        drift = await classify_goal_drift(
+            goals=[Goal(id="g1", summary="ship memo")],
+            plan=None,
+            observed_actions=[],
+            model="m",
+            call_llm=call_llm,
+        )
+    assert drift is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(
+        "not JSON" in m and "raccoons" in m for m in messages
+    ), messages
+
+
+async def test_classifier_logs_missing_progressing_key_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Dict without 'progressing' key → DEBUG log with 'lacks boolean'."""
+    call_llm = _stub_call_llm([{"reason": "no key"}])
+    with caplog.at_level("DEBUG", logger="goldfive.drift.goals"):
+        drift = await classify_goal_drift(
+            goals=[Goal(id="g1", summary="ship memo")],
+            plan=None,
+            observed_actions=[],
+            model="m",
+            call_llm=call_llm,
+        )
+    assert drift is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("lacks boolean" in m for m in messages), messages

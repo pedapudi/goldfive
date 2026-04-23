@@ -602,6 +602,14 @@ class Session:
     # ``task_id``, ``detail``) rather than a full event proto to keep
     # this framework-neutral.
     recent_agent_activity: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # Monotonic-ish timestamp (``time.time()``, seconds since epoch) of the
+    # last GOAL_DRIFT judge call fired via the task-boundary trigger
+    # (goldfive#219). Prevents two task transitions <10s apart from paying
+    # for back-to-back judge calls. Distinct from
+    # ``_agent_turns_since_goal_check`` because turn-based scheduling is
+    # already cost-bounded by the interval; task-boundary scheduling needs
+    # its own rate limit. Default 0 (never fired).
+    _last_goal_drift_check_ts: float = 0.0
     # Set to ``True`` by :class:`DefaultSteerer` when it escalates a
     # drift to Level 4 of the intervention ladder (goldfive#142).
     # Executors honour this flag the same way they honour a PAUSE
