@@ -1,27 +1,52 @@
 """Optional embedding helpers for reasoning-based drift detection.
 
-The helpers here light up when ``sentence-transformers`` is installed
-(``goldfive[embedding]`` extra). When the dependency is absent every
-function in this module returns ``None`` (or the "no-signal" value)
-silently so the caller can fall through to pattern / hash heuristics.
+Two encoder backends are supported; the right one is chosen lazily the
+first time :func:`_get_model` is called.
+
+1. **OpenAI-compatible HTTP backend** -- selected when the
+   ``GOLDFIVE_EMBEDDING_BASE_URL`` environment variable is set. Posts
+   to ``{BASE_URL}/v1/embeddings`` against any llama.cpp / Ollama /
+   OpenAI-compatible endpoint the caller already has running for
+   inference. Zero extra local install; the user's LLM server is the
+   embedding server. Env vars:
+
+   * ``GOLDFIVE_EMBEDDING_BASE_URL`` -- e.g. ``http://kikuchi.lan:8081``
+     (no trailing slash; ``/v1/embeddings`` is appended).
+   * ``GOLDFIVE_EMBEDDING_MODEL`` -- model name for the request body.
+     Defaults to ``""``; most llama.cpp / Ollama servers accept the
+     empty model (they use the single loaded model).
+   * ``GOLDFIVE_EMBEDDING_API_KEY`` -- optional bearer token.
+   * ``GOLDFIVE_EMBEDDING_TIMEOUT_MS`` -- HTTP timeout, default 10000.
+
+2. **sentence-transformers backend** -- fallback when the env var is
+   unset. Requires the ``goldfive[embedding]`` extra to be installed.
+
+When neither backend is reachable every function in this module
+returns the "no-signal" value (``0.0`` / ``-1.0``) silently so the
+caller can fall through to pattern / hash heuristics.
 
 Design notes
 ------------
-* Import of the heavy ML stack is deferred to first call. Importing
-  :mod:`goldfive.drift._embed` is always safe, even from minimal
-  installs.
-* The model is loaded at most once per process and cached in a module
-  global. It stays loaded for the life of the process -- a 23 MB
-  residue is cheap and avoids the 200 ms warm-up on every reasoning
-  observation.
-* No public API is exposed via :mod:`goldfive.drift.__init__`. These
-  helpers are detector-private; swap the model by replacing the
-  singleton via :func:`set_model` in tests or custom runtimes.
+* Import / network I/O is deferred to first call. Importing this
+  module is always safe, even from minimal installs.
+* The model is loaded at most once per process and cached in a
+  module global.
+* ``set_model()`` is the public escape hatch for tests and custom
+  runtimes. It accepts any object exposing
+  ``encode(list[str]) -> list[vector-like]`` and overrides both the
+  env-driven and the sentence-transformers paths.
+* Per-encode results are additionally memoised in a small LRU
+  (:data:`_CACHE_MAX`) keyed on ``(backend_name, text)`` so that
+  repeated comparisons against history entries do not re-pay the
+  HTTP round-trip. The cache is process-local; drop it by calling
+  :func:`set_model` or :func:`_reset_cache`.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+from collections import OrderedDict
 from typing import Any
 
 log = logging.getLogger("goldfive.drift.reasoning.embed")
@@ -31,23 +56,42 @@ _MODEL: Any | None = None
 _MODEL_UNAVAILABLE: bool = False
 _DEFAULT_MODEL_NAME: str = "all-MiniLM-L6-v2"
 
+# LRU cache for per-text encoded vectors.
+_CACHE_MAX: int = 512
+_CACHE: OrderedDict[tuple[str, str], Any] = OrderedDict()
+
 
 def set_model(model: Any | None) -> None:
     """Install a caller-supplied encoder (tests, custom runtimes).
 
     ``None`` clears the cached model so the next call falls back to
-    lazy loading. Callers that pass a custom encoder should ensure it
-    exposes ``encode(list[str]) -> list[ndarray-like]``.
+    the lazy-load path (env-driven OpenAI backend, else
+    sentence-transformers). Callers that pass a custom encoder should
+    ensure it exposes ``encode(list[str]) -> list[ndarray-like]``.
     """
     global _MODEL, _MODEL_UNAVAILABLE
     _MODEL = model
     _MODEL_UNAVAILABLE = False
+    _reset_cache()
+
+
+def _reset_cache() -> None:
+    """Drop the per-encode LRU cache. Called from :func:`set_model`."""
+    _CACHE.clear()
 
 
 def _get_model() -> Any | None:
-    """Return the lazily-loaded sentence-transformers model, or ``None``.
+    """Return the lazily-loaded encoder, or ``None``.
 
-    The first failed import flips ``_MODEL_UNAVAILABLE`` so subsequent
+    Preference order (first match wins):
+
+    1. A test- or caller-installed model via :func:`set_model`.
+    2. An OpenAI-compatible HTTP backend when
+       ``GOLDFIVE_EMBEDDING_BASE_URL`` is set in the environment.
+    3. A ``sentence-transformers`` model loaded from the
+       ``goldfive[embedding]`` extra.
+
+    The first failed path flips ``_MODEL_UNAVAILABLE`` so subsequent
     calls skip the import cost. Callers must check for ``None``.
     """
     global _MODEL, _MODEL_UNAVAILABLE
@@ -55,13 +99,28 @@ def _get_model() -> Any | None:
         return _MODEL
     if _MODEL_UNAVAILABLE:
         return None
+
+    base_url = os.environ.get("GOLDFIVE_EMBEDDING_BASE_URL", "").strip()
+    if base_url:
+        backend = _try_load_openai_backend(base_url)
+        if backend is not None:
+            _MODEL = backend
+            return _MODEL
+        # Env var set but backend failed to build: do NOT silently fall
+        # through to sentence-transformers -- the user configured an
+        # HTTP endpoint; honour that by flipping to unavailable so they
+        # see "no-signal" instead of surprise-local-encoding.
+        _MODEL_UNAVAILABLE = True
+        return None
+
     try:
         from sentence_transformers import SentenceTransformer
     except Exception as exc:  # noqa: BLE001 -- any import issue disables
         log.debug(
             "sentence-transformers not available (%s); install the "
-            "`goldfive[embedding]` extra to enable semantic reasoning "
-            "drift detection",
+            "`goldfive[embedding]` extra or set "
+            "GOLDFIVE_EMBEDDING_BASE_URL to use an OpenAI-compatible "
+            "remote embedding endpoint",
             exc,
         )
         _MODEL_UNAVAILABLE = True
@@ -77,6 +136,191 @@ def _get_model() -> Any | None:
         _MODEL_UNAVAILABLE = True
         return None
     return _MODEL
+
+
+def _try_load_openai_backend(base_url: str) -> Any | None:
+    """Construct an :class:`_OpenAIEmbeddingBackend`, or return ``None``.
+
+    Splitting this out lets tests assert backend construction without
+    going through the full ``_get_model`` state machine.
+    """
+    model_name = os.environ.get("GOLDFIVE_EMBEDDING_MODEL", "")
+    api_key = os.environ.get("GOLDFIVE_EMBEDDING_API_KEY") or None
+    try:
+        timeout_ms = int(os.environ.get("GOLDFIVE_EMBEDDING_TIMEOUT_MS", "10000"))
+    except ValueError:
+        timeout_ms = 10000
+    try:
+        return _OpenAIEmbeddingBackend(
+            base_url=base_url,
+            model=model_name,
+            api_key=api_key,
+            timeout_ms=timeout_ms,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "failed to build OpenAI-compatible embedding backend "
+            "(base_url=%r): %s",
+            base_url,
+            exc,
+        )
+        return None
+
+
+class _OpenAIEmbeddingBackend:
+    """Encoder backed by an OpenAI-compatible ``/v1/embeddings`` endpoint.
+
+    Exposes the same ``encode(list[str]) -> list[list[float]]`` surface
+    as the sentence-transformers adapter, so drop-in usage works.
+
+    Uses the ``openai`` SDK when importable (for auth / retry
+    consistency with the rest of the harmonograf client stack); falls
+    back to raw ``httpx`` when it is not.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str = "",
+        api_key: str | None = None,
+        timeout_ms: int = 10000,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._api_key = api_key
+        self._timeout_s = max(0.1, timeout_ms / 1000.0)
+        self._openai_client: Any | None = None
+        self._httpx_client: Any | None = None
+        self._prefer_sdk = self._try_build_openai_client()
+
+    def _try_build_openai_client(self) -> bool:
+        try:
+            from openai import OpenAI  # type: ignore[import-not-found]
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            # The OpenAI SDK requires ``api_key`` to be a non-empty
+            # string; llama.cpp servers don't check it, so pass a
+            # placeholder when the user hasn't configured one.
+            self._openai_client = OpenAI(
+                base_url=f"{self._base_url}/v1",
+                api_key=self._api_key or "not-needed",
+                timeout=self._timeout_s,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.debug("openai SDK client construction failed: %s", exc)
+            self._openai_client = None
+            return False
+
+    def _get_httpx_client(self) -> Any | None:
+        if self._httpx_client is not None:
+            return self._httpx_client
+        try:
+            import httpx
+        except Exception as exc:  # noqa: BLE001
+            log.debug("httpx not importable for embedding backend: %s", exc)
+            return None
+        self._httpx_client = httpx.Client(timeout=self._timeout_s)
+        return self._httpx_client
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        """Return one vector per input text.
+
+        Network / parse errors yield an empty list; callers upstream
+        treat that as "no signal" and fall through to the 0.0 / -1.0
+        defaults.
+        """
+        if not texts:
+            return []
+        if self._prefer_sdk and self._openai_client is not None:
+            vectors = self._encode_via_sdk(texts)
+            if vectors is not None:
+                return vectors
+            # SDK path failed -- fall through to raw httpx before giving up.
+        return self._encode_via_httpx(texts) or []
+
+    def _encode_via_sdk(self, texts: list[str]) -> list[list[float]] | None:
+        assert self._openai_client is not None
+        try:
+            resp = self._openai_client.embeddings.create(
+                model=self._model or "",
+                input=texts,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("openai SDK embeddings.create failed: %s", exc)
+            return None
+        return _parse_openai_response(resp)
+
+    def _encode_via_httpx(self, texts: list[str]) -> list[list[float]] | None:
+        client = self._get_httpx_client()
+        if client is None:
+            return None
+        url = f"{self._base_url}/v1/embeddings"
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        payload: dict[str, Any] = {"input": texts}
+        if self._model:
+            payload["model"] = self._model
+        else:
+            # llama.cpp / Ollama tolerate ``model=""`` or a missing
+            # field; always send an explicit key so servers that
+            # *require* the field (strict OpenAI) complain loudly
+            # rather than embedding silence.
+            payload["model"] = ""
+        try:
+            r = client.post(url, json=payload, headers=headers)
+            r.raise_for_status()
+            body = r.json()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("httpx embedding POST to %s failed: %s", url, exc)
+            return None
+        return _parse_openai_response(body)
+
+
+def _parse_openai_response(resp: Any) -> list[list[float]] | None:
+    """Extract vectors from an OpenAI ``/v1/embeddings`` response shape.
+
+    Accepts either a dict (raw JSON from ``httpx``) or an SDK
+    ``CreateEmbeddingResponse``-like object. Returns ``None`` if the
+    response doesn't match the expected shape -- callers treat that as
+    "no signal".
+
+    Defensive against three real-world footguns:
+
+    * ``data`` missing entirely (error responses: ``{"error": ...}``).
+    * ``data[i].embedding`` being a nested list (some llama.cpp builds
+      wrap it one level deep for pooled vs per-token embeddings).
+    * ``embedding`` items being non-numeric (strings, ``None``).
+    """
+    try:
+        data = resp["data"] if isinstance(resp, dict) else resp.data  # noqa: B009
+    except Exception:  # noqa: BLE001
+        log.debug("embedding response missing 'data' field: %r", resp)
+        return None
+    if not isinstance(data, list) or not data:
+        log.debug("embedding response 'data' is empty or not a list")
+        return None
+    out: list[list[float]] = []
+    for item in data:
+        try:
+            emb = item["embedding"] if isinstance(item, dict) else item.embedding
+        except Exception:  # noqa: BLE001
+            log.debug("embedding item missing 'embedding' field: %r", item)
+            return None
+        # Unwrap one level of nesting for servers that return
+        # ``[[...]]`` instead of ``[...]``.
+        if isinstance(emb, list) and emb and isinstance(emb[0], list):
+            emb = emb[0]
+        try:
+            vec = [float(x) for x in emb]
+        except Exception:  # noqa: BLE001
+            log.debug("embedding item has non-numeric values: %r", emb)
+            return None
+        out.append(vec)
+    return out
 
 
 def available() -> bool:
@@ -112,6 +356,17 @@ def _cosine(a: Any, b: Any) -> float:
     return dot / (na * nb)
 
 
+def _backend_name(model: Any) -> str:
+    """Return a stable identifier used as the first half of the cache key.
+
+    A different encoder identity => a different cache bucket, so that
+    swapping the model via :func:`set_model` in tests cannot return
+    stale vectors from an earlier run.
+    """
+    cls = type(model).__name__
+    return f"{cls}:{id(model)}"
+
+
 def _encode(model: Any, text: str) -> Any | None:
     if not text:
         return None
@@ -124,6 +379,31 @@ def _encode(model: Any, text: str) -> Any | None:
         return vecs[0]
     except Exception:  # noqa: BLE001
         return None
+
+
+def _cached_encode(model: Any, text: str) -> Any | None:
+    """LRU-cached wrapper around :func:`_encode`.
+
+    The sentence-transformers path is cheap, but the OpenAI HTTP path
+    pays a round-trip per call and :func:`max_similarity` re-encodes
+    each history entry on every new observation. The cache holds at
+    most :data:`_CACHE_MAX` entries and evicts oldest-first.
+    """
+    if not text:
+        return None
+    key = (_backend_name(model), text)
+    hit = _CACHE.get(key)
+    if hit is not None:
+        _CACHE.move_to_end(key)
+        return hit
+    vec = _encode(model, text)
+    if vec is None:
+        return None
+    _CACHE[key] = vec
+    _CACHE.move_to_end(key)
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.popitem(last=False)
+    return vec
 
 
 def max_similarity(current: str, history: list[str]) -> float:
@@ -139,12 +419,12 @@ def max_similarity(current: str, history: list[str]) -> float:
     model = _get_model()
     if model is None:
         return 0.0
-    cur = _encode(model, current)
+    cur = _cached_encode(model, current)
     if cur is None:
         return 0.0
     best = 0.0
     for past in history:
-        past_vec = _encode(model, past)
+        past_vec = _cached_encode(model, past)
         if past_vec is None:
             continue
         sim = _cosine(cur, past_vec)
@@ -165,8 +445,8 @@ def distance_to_topic(text: str, topic: str) -> float:
     model = _get_model()
     if model is None:
         return -1.0
-    tv = _encode(model, text)
-    topic_v = _encode(model, topic)
+    tv = _cached_encode(model, text)
+    topic_v = _cached_encode(model, topic)
     if tv is None or topic_v is None:
         return -1.0
     return 1.0 - _cosine(tv, topic_v)

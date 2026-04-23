@@ -37,6 +37,7 @@ severity differentiates.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from typing import TYPE_CHECKING
 
@@ -45,6 +46,9 @@ from goldfive.types import DriftEvent, DriftKind, DriftSeverity
 
 if TYPE_CHECKING:
     from goldfive.types import Session, Task
+
+
+log = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -235,6 +239,16 @@ def detect_intent_divergence(
     # encoder is loadable; otherwise fall through to the pattern path.
     if _embed.available():
         sim = _embed.max_similarity(text, [reference])
+        log.debug(
+            "intent_divergence: cosine=%.3f "
+            "(thresholds healthy=%.2f minor=%.2f warning=%.2f); "
+            "text_head=%r",
+            sim,
+            INTENT_DIVERGENCE_HEALTHY_SIMILARITY,
+            INTENT_DIVERGENCE_MINOR_SIMILARITY,
+            INTENT_DIVERGENCE_WARNING_SIMILARITY,
+            text[:80],
+        )
         severity = _severity_from_similarity(sim)
         if severity is None:
             return None
@@ -387,6 +401,12 @@ def detect_looping_reasoning(
                 raw=text,
             )
     sim = _embed.max_similarity(text, history)
+    log.debug(
+        "looping_reasoning: cosine=%.3f over %d prior turns (threshold=%.2f)",
+        sim,
+        len(history),
+        LOOPING_REASONING_SIMILARITY_THRESHOLD,
+    )
     if sim >= LOOPING_REASONING_SIMILARITY_THRESHOLD:
         return DriftEvent(
             kind=DriftKind.LOOPING_REASONING,
@@ -437,6 +457,14 @@ def detect_reasoning_cluster_tightening(
     if not history:
         return None
     sim = _embed.max_similarity(text, history)
+    log.debug(
+        "reasoning_cluster_tightening: cosine=%.3f over %d prior turns "
+        "(band=[%.2f, %.2f))",
+        sim,
+        len(history),
+        REASONING_CLUSTER_SIMILARITY_THRESHOLD,
+        LOOPING_REASONING_SIMILARITY_THRESHOLD,
+    )
     # max_similarity returns 0.0 both when the model is unavailable and
     # when the genuine cosine is zero; either way the early-warning tier
     # stays silent. This matches ``detect_off_topic``'s graceful-degrade
@@ -474,6 +502,12 @@ def detect_off_topic(text: str, session: Session) -> DriftEvent | None:
     if not topic:
         return None
     dist = _embed.distance_to_topic(text, topic)
+    log.debug(
+        "off_topic: distance=%.3f (threshold=%.2f); task=%r",
+        dist,
+        OFF_TOPIC_DISTANCE_THRESHOLD,
+        topic[:60],
+    )
     if dist < 0:
         return None
     if dist < OFF_TOPIC_DISTANCE_THRESHOLD:
