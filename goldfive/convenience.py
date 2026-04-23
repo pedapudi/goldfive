@@ -194,7 +194,24 @@ def wrap(
         max_task_invocations=max_task_invocations,
         overlay_mode=True,
     )
-    resolved_steerer: Steerer = steerer or DefaultSteerer()
+    # Wire the resolved call_llm into the default steerer so the
+    # trajectory-level GOAL_DRIFT judge (goldfive#143) actually fires.
+    # Without this, ``DefaultSteerer()`` gets ``goal_drift_call_llm=None``
+    # and ``note_agent_turn`` short-circuits before the counter advances —
+    # the docstring on :class:`DefaultSteerer` promises the Runner wires
+    # the planner LLM here when ``goal_drift_enabled`` is on, but until
+    # now nothing fulfilled that promise. Never override an
+    # explicit user-supplied steerer. See goldfive#217.
+    resolved_steerer: Steerer
+    if steerer is not None:
+        resolved_steerer = steerer
+    elif resolved_call_llm is not None:
+        resolved_steerer = DefaultSteerer(
+            goal_drift_call_llm=resolved_call_llm,
+            goal_drift_model=resolved_model,
+        )
+    else:
+        resolved_steerer = DefaultSteerer()
     resolved_sinks: list[EventSink] = list(sinks) if sinks is not None else [LoggingSink()]
 
     runner = Runner(

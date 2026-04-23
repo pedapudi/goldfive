@@ -206,6 +206,22 @@ class Runner:
         self.goal_drift_enabled: bool = goal_drift_enabled
         if not goal_drift_enabled and hasattr(self.steerer, "_goal_drift_call_llm"):
             self.steerer._goal_drift_call_llm = None
+        elif (
+            goal_drift_enabled
+            and hasattr(self.steerer, "_goal_drift_call_llm")
+            and self.steerer._goal_drift_call_llm is None
+        ):
+            # Soft-fail: the docstring at ``DefaultSteerer.__init__`` says
+            # the Runner wires its planner LLM here when the feature is
+            # on. If no callable is present the judge can never fire;
+            # surface that once rather than failing silently. Don't raise
+            # -- existing Runner(...) callers that build a steerer
+            # without a judge intentionally (mock tests, degraded LLMs)
+            # must still construct cleanly. See goldfive#217.
+            log.warning(
+                "goal_drift_enabled=True but no call_llm wired on steerer; "
+                "goal-drift judge disabled"
+            )
         self.sinks: list[EventSink] = list(sinks) if sinks else []
         self._control: ControlChannel | None = control
         self._close_hooks: list[Callable[[], Awaitable[None]]] = []
