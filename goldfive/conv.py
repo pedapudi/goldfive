@@ -47,6 +47,26 @@ def _pb_module() -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _strict_enum_value(pb: Any, name: str) -> int:
+    """Resolve ``name`` to its proto enum int on ``pb`` or raise.
+
+    The historical helpers used ``getattr(pb, name, 0)`` which silently
+    returned the UNSPECIFIED sentinel when callers passed the wrong proto
+    module (see goldfive#211 — the status_query dispatch path accidentally
+    passed ``events_pb2`` and downgraded 50k+ drift events to ``kind=0``).
+
+    Callers must not pass the wrong module; this helper refuses to paper
+    over missing names so that kind of mistake fails loud in tests instead
+    of silently corrupting the wire. The ``_pb_module()`` /
+    ``_events_pb_module()`` / ``_control_pb_module()`` accessors are the
+    only legitimate sources.
+    """
+    try:
+        return getattr(pb, name)
+    except AttributeError as exc:
+        raise ValueError(f"unknown proto enum value: {name}") from exc
+
+
 _TASK_STATUS_TO_PB: dict[TaskStatus, str] = {
     TaskStatus.PENDING: "TASK_STATUS_PENDING",
     TaskStatus.RUNNING: "TASK_STATUS_RUNNING",
@@ -62,14 +82,16 @@ _TASK_STATUS_TO_PB: dict[TaskStatus, str] = {
 _PB_TO_TASK_STATUS: dict[str, TaskStatus] = {v: k for k, v in _TASK_STATUS_TO_PB.items()}
 
 
-def _task_status_to_pb(status: TaskStatus, pb: Any) -> int:
+def _task_status_to_pb(status: TaskStatus) -> int:
+    pb = _pb_module()
     name = _TASK_STATUS_TO_PB[status]
-    return getattr(pb, name, 0)
+    return _strict_enum_value(pb, name)
 
 
-def _task_status_from_pb(value: int, pb: Any) -> TaskStatus:
+def _task_status_from_pb(value: int) -> TaskStatus:
     # Resolve enum name from value and map back; unknown / unspecified falls
     # back to PENDING so callers never crash on forward-compatible inputs.
+    pb = _pb_module()
     try:
         name = pb.TaskStatus.Name(value)
     except (ValueError, AttributeError):
@@ -85,12 +107,14 @@ _DRIFT_SEVERITY_TO_PB: dict[DriftSeverity, str] = {
 _PB_TO_DRIFT_SEVERITY: dict[str, DriftSeverity] = {v: k for k, v in _DRIFT_SEVERITY_TO_PB.items()}
 
 
-def _drift_severity_to_pb(severity: DriftSeverity, pb: Any) -> int:
+def _drift_severity_to_pb(severity: DriftSeverity) -> int:
+    pb = _pb_module()
     name = _DRIFT_SEVERITY_TO_PB[severity]
-    return getattr(pb, name, 0)
+    return _strict_enum_value(pb, name)
 
 
-def _drift_severity_from_pb(value: int, pb: Any) -> DriftSeverity:
+def _drift_severity_from_pb(value: int) -> DriftSeverity:
+    pb = _pb_module()
     try:
         name = pb.DriftSeverity.Name(value)
     except (ValueError, AttributeError):
@@ -98,14 +122,22 @@ def _drift_severity_from_pb(value: int, pb: Any) -> DriftSeverity:
     return _PB_TO_DRIFT_SEVERITY.get(name, DriftSeverity.INFO)
 
 
-def _drift_kind_to_pb(kind: DriftKind, pb: Any) -> int:
+def _drift_kind_to_pb(kind: DriftKind) -> int:
     # Proto convention: DRIFT_KIND_<UPPER_SNAKE> values mirror the enum
-    # member name (not the wire value). Fall back to CUSTOM when absent.
+    # member name (not the wire value). Python-side ``DriftKind`` has a
+    # few members (e.g. ``USER_PAUSE``) that intentionally aren't on the
+    # wire; those legitimately degrade to ``DRIFT_KIND_CUSTOM`` rather
+    # than raising. Any other unknown name is a bug and raises via
+    # :func:`_strict_enum_value`.
+    pb = _pb_module()
     name = f"DRIFT_KIND_{kind.name}"
-    return getattr(pb, name, getattr(pb, "DRIFT_KIND_CUSTOM", 0))
+    if hasattr(pb, name):
+        return _strict_enum_value(pb, name)
+    return _strict_enum_value(pb, "DRIFT_KIND_CUSTOM")
 
 
-def _drift_kind_from_pb(value: int, pb: Any) -> DriftKind:
+def _drift_kind_from_pb(value: int) -> DriftKind:
+    pb = _pb_module()
     try:
         name = pb.DriftKind.Name(value)
     except (ValueError, AttributeError):
@@ -132,7 +164,7 @@ def to_pb_task(task: Task) -> Any:
         title=task.title,
         description=task.description,
         assignee_agent_id=task.assignee_agent_id,
-        status=_task_status_to_pb(task.status, pb),
+        status=_task_status_to_pb(task.status),
         predicted_start_ms=task.predicted_start_ms,
         predicted_duration_ms=task.predicted_duration_ms,
         bound_span_id=task.bound_span_id,
@@ -141,13 +173,12 @@ def to_pb_task(task: Task) -> Any:
 
 
 def from_pb_task(msg: Any) -> Task:
-    pb = _pb_module()
     return Task(
         id=msg.id,
         title=msg.title,
         description=msg.description,
         assignee_agent_id=msg.assignee_agent_id,
-        status=_task_status_from_pb(msg.status, pb),
+        status=_task_status_from_pb(msg.status),
         predicted_start_ms=msg.predicted_start_ms,
         predicted_duration_ms=msg.predicted_duration_ms,
         bound_span_id=msg.bound_span_id,
@@ -173,48 +204,52 @@ def from_pb_task_edge(msg: Any) -> TaskEdge:
 # ---------------------------------------------------------------------------
 
 
-def _plan_revision_kind_to_pb(value: str, pb: Any) -> int:
+def _plan_revision_kind_to_pb(value: str) -> int:
     """Convert a dataclass ``Plan.revision_kind`` (a ``DriftKind`` string
     value or ``""``) into the matching proto enum int. Empty string →
     ``DRIFT_KIND_UNSPECIFIED``; unknown value → ``DRIFT_KIND_CUSTOM``.
     """
+    pb = _pb_module()
     if not value:
-        return getattr(pb, "DRIFT_KIND_UNSPECIFIED", 0)
+        return _strict_enum_value(pb, "DRIFT_KIND_UNSPECIFIED")
     try:
         kind = DriftKind(value)
     except ValueError:
-        return getattr(pb, "DRIFT_KIND_CUSTOM", 0)
-    return _drift_kind_to_pb(kind, pb)
+        return _strict_enum_value(pb, "DRIFT_KIND_CUSTOM")
+    return _drift_kind_to_pb(kind)
 
 
-def _plan_revision_severity_to_pb(value: str, pb: Any) -> int:
+def _plan_revision_severity_to_pb(value: str) -> int:
+    pb = _pb_module()
     if not value:
-        return getattr(pb, "DRIFT_SEVERITY_UNSPECIFIED", 0)
+        return _strict_enum_value(pb, "DRIFT_SEVERITY_UNSPECIFIED")
     try:
         severity = DriftSeverity(value)
     except ValueError:
-        return getattr(pb, "DRIFT_SEVERITY_UNSPECIFIED", 0)
-    return _drift_severity_to_pb(severity, pb)
+        return _strict_enum_value(pb, "DRIFT_SEVERITY_UNSPECIFIED")
+    return _drift_severity_to_pb(severity)
 
 
-def _plan_revision_kind_from_pb(value: int, pb: Any) -> str:
+def _plan_revision_kind_from_pb(value: int) -> str:
+    pb = _pb_module()
     try:
         name = pb.DriftKind.Name(value)
     except (ValueError, AttributeError):
         return ""
     if name == "DRIFT_KIND_UNSPECIFIED":
         return ""
-    return _drift_kind_from_pb(value, pb).value
+    return _drift_kind_from_pb(value).value
 
 
-def _plan_revision_severity_from_pb(value: int, pb: Any) -> str:
+def _plan_revision_severity_from_pb(value: int) -> str:
+    pb = _pb_module()
     try:
         name = pb.DriftSeverity.Name(value)
     except (ValueError, AttributeError):
         return ""
     if name == "DRIFT_SEVERITY_UNSPECIFIED":
         return ""
-    return _drift_severity_from_pb(value, pb).value
+    return _drift_severity_from_pb(value).value
 
 
 def to_pb_plan(plan: Plan) -> Any:
@@ -224,8 +259,8 @@ def to_pb_plan(plan: Plan) -> Any:
         run_id=plan.run_id,
         summary=plan.summary,
         revision_reason=plan.revision_reason,
-        revision_kind=_plan_revision_kind_to_pb(plan.revision_kind, pb),
-        revision_severity=_plan_revision_severity_to_pb(plan.revision_severity, pb),
+        revision_kind=_plan_revision_kind_to_pb(plan.revision_kind),
+        revision_severity=_plan_revision_severity_to_pb(plan.revision_severity),
         revision_index=plan.revision_index,
         # goldfive#199: carry the trigger_event_id on the Plan so
         # out-of-band PlanRevised emitters can thread it through without
@@ -242,7 +277,6 @@ def to_pb_plan(plan: Plan) -> Any:
 
 
 def from_pb_plan(msg: Any) -> Plan:
-    pb = _pb_module()
     return Plan(
         id=msg.id,
         run_id=msg.run_id,
@@ -251,8 +285,8 @@ def from_pb_plan(msg: Any) -> Plan:
         edges=[from_pb_task_edge(e) for e in msg.edges],
         summary=msg.summary,
         revision_reason=msg.revision_reason,
-        revision_kind=_plan_revision_kind_from_pb(msg.revision_kind, pb),
-        revision_severity=_plan_revision_severity_from_pb(msg.revision_severity, pb),
+        revision_kind=_plan_revision_kind_from_pb(msg.revision_kind),
+        revision_severity=_plan_revision_severity_from_pb(msg.revision_severity),
         revision_index=msg.revision_index,
         # goldfive#199: round-trip the trigger_event_id so persistence
         # sinks that re-emit stored plans don't lose the dedup key.
@@ -310,11 +344,10 @@ def _events_pb_module() -> Any:
 
 def to_pb_drift_event(evt: DriftEvent) -> Any:
     """Convert a :class:`DriftEvent` to the wire ``DriftDetected`` proto."""
-    types_pb = _pb_module()
     events_pb = _events_pb_module()
     return events_pb.DriftDetected(
-        kind=_drift_kind_to_pb(evt.kind, types_pb),
-        severity=_drift_severity_to_pb(evt.severity, types_pb),
+        kind=_drift_kind_to_pb(evt.kind),
+        severity=_drift_severity_to_pb(evt.severity),
         detail=evt.detail,
         current_task_id=evt.current_task_id,
         current_agent_id=evt.current_agent_id,
@@ -322,10 +355,9 @@ def to_pb_drift_event(evt: DriftEvent) -> Any:
 
 
 def from_pb_drift_event(msg: Any) -> DriftEvent:
-    pb = _pb_module()
     return DriftEvent(
-        kind=_drift_kind_from_pb(msg.kind, pb),
-        severity=_drift_severity_from_pb(msg.severity, pb),
+        kind=_drift_kind_from_pb(msg.kind),
+        severity=_drift_severity_from_pb(msg.severity),
         detail=msg.detail,
         current_task_id=msg.current_task_id,
         current_agent_id=msg.current_agent_id,
@@ -371,12 +403,14 @@ _CONTROL_KIND_TO_PB: dict[ControlKind, str] = {
 _PB_TO_CONTROL_KIND: dict[str, ControlKind] = {v: k for k, v in _CONTROL_KIND_TO_PB.items()}
 
 
-def _control_kind_to_pb(kind: ControlKind, pb: Any) -> int:
+def _control_kind_to_pb(kind: ControlKind) -> int:
+    pb = _control_pb_module()
     name = _CONTROL_KIND_TO_PB[kind]
-    return getattr(pb, name, 0)
+    return _strict_enum_value(pb, name)
 
 
-def _control_kind_from_pb(value: int, pb: Any) -> ControlKind:
+def _control_kind_from_pb(value: int) -> ControlKind:
+    pb = _control_pb_module()
     try:
         name = pb.ControlKind.Name(value)
     except (ValueError, AttributeError):
@@ -397,12 +431,14 @@ _ACK_RESULT_TO_PB: dict[AckResult, str] = {
 _PB_TO_ACK_RESULT: dict[str, AckResult] = {v: k for k, v in _ACK_RESULT_TO_PB.items()}
 
 
-def _ack_result_to_pb(result: AckResult, pb: Any) -> int:
+def _ack_result_to_pb(result: AckResult) -> int:
+    pb = _control_pb_module()
     name = _ACK_RESULT_TO_PB[result]
-    return getattr(pb, name, 0)
+    return _strict_enum_value(pb, name)
 
 
-def _ack_result_from_pb(value: int, pb: Any) -> AckResult:
+def _ack_result_from_pb(value: int) -> AckResult:
+    pb = _control_pb_module()
     try:
         name = pb.ControlAckResult.Name(value)
     except (ValueError, AttributeError):
@@ -469,7 +505,7 @@ def to_pb_control_event(msg: ControlMessage) -> Any:
     pb = _control_pb_module()
     kwargs: dict[str, Any] = {
         "id": msg.id,
-        "kind": _control_kind_to_pb(msg.kind, pb),
+        "kind": _control_kind_to_pb(msg.kind),
     }
     builder = _PAYLOAD_BUILDERS.get(msg.kind)
     if builder is not None:
@@ -483,8 +519,7 @@ def to_pb_control_event(msg: ControlMessage) -> Any:
 
 def from_pb_control_event(pb_msg: Any) -> ControlMessage:
     """Convert a ``ControlEvent`` proto back to a :class:`ControlMessage`."""
-    pb = _control_pb_module()
-    kind = _control_kind_from_pb(pb_msg.kind, pb)
+    kind = _control_kind_from_pb(pb_msg.kind)
     payload: dict[str, Any] = {}
     which = pb_msg.WhichOneof("payload")
     if which == "steer":
@@ -530,7 +565,7 @@ def to_pb_control_ack(ack: ControlAck) -> Any:
     result = AckResult(ack.result)
     pb_ack = pb.ControlAck(
         control_id=ack.control_id,
-        result=_ack_result_to_pb(result, pb),
+        result=_ack_result_to_pb(result),
         detail=ack.detail,
     )
     if ack.acked_at_ms:
@@ -540,13 +575,12 @@ def to_pb_control_ack(ack: ControlAck) -> Any:
 
 def from_pb_control_ack(pb_msg: Any) -> ControlAck:
     """Convert a ``ControlAck`` proto back to a :class:`ControlAck`."""
-    pb = _control_pb_module()
     acked_at_ms = 0
     if pb_msg.HasField("acked_at"):
         acked_at_ms = pb_msg.acked_at.ToMilliseconds()
     return ControlAck(
         control_id=pb_msg.control_id,
-        result=_ack_result_from_pb(pb_msg.result, pb),
+        result=_ack_result_from_pb(pb_msg.result),
         detail=pb_msg.detail,
         acked_at_ms=acked_at_ms,
     )
