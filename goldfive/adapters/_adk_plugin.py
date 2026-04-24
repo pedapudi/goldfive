@@ -259,44 +259,190 @@ def _inject_task_id_from_state(
     tool_name: str,
     tool_args: Any,
     tool_context: Any,
-) -> None:
-    """Best-effort: fill in ``tool_args['task_id']`` from pinned state.
+) -> bool:
+    """Populate ``tool_args['task_id']`` from state for reporting tools.
 
-    This is the goldfive#191 Layer-3 safety net. Mutates ``tool_args`` in
-    place when:
+    goldfive#241 — ``task_id`` is hidden from the LLM-facing reporting-
+    tool schema (see :func:`goldfive.adapters.adk._apply_llm_signature`),
+    so the model cannot supply it. Every reporting-tool call lands here
+    with no ``task_id`` arg; this function is the authoritative
+    resolution layer.
 
-      * ``tool_name`` is a reporting tool (report_task_* or
-        report_awaiting_approval),
-      * ``tool_args`` is a mutable mapping,
-      * the current ``task_id`` arg is missing / blank / a known
-        placeholder,
-      * session.state has a non-empty ``goldfive.current_task_id``.
+    Resolution order, keyed by the invocation's ``function_call_id``:
 
-    NEVER raises — injection is advisory. If anything goes wrong we log
-    at DEBUG and return, letting Layer 2 (handler default-from-state)
-    handle the fallback or surface the error.
+    1. ``goldfive.pending_delegations[<function_call_id>]`` — the
+       delegation-site pin stamped by :meth:`before_tool_callback` for
+       the AgentTool dispatch that spawned the current sub-invocation.
+       This path handles coordinators that fire multiple parallel
+       AgentTool calls to the same sub-agent on the same turn — each
+       parallel dispatch gets its own pin rather than racing on the
+       single ``goldfive.current_task_id`` slot.
+    2. ``session.state[goldfive.current_task_id]`` — the agent-turn
+       pin written by ``before_agent_callback`` at the start of every
+       agent invocation (goldfive#191/#195).
+
+    Returns ``True`` when ``tool_args`` now carries a usable ``task_id``
+    (either pre-existing non-placeholder, or freshly populated from
+    state) and ``False`` when no pin is available — in that case the
+    caller short-circuits with a structured error so the handler never
+    runs on an unpinned call. Pre-#241 the call would have fallen
+    through to the handler's ``missing_task_id`` error, but that path
+    goes back to the LLM via a successful tool response shape and
+    confused the model into retry loops.
+
+    NEVER raises — any internal failure degrades to "no pin", letting
+    the caller emit the canonical ``no_task_pinned`` error.
     """
     try:
         if not _is_reporting_tool_name(tool_name):
-            return
+            return True
         if not isinstance(tool_args, MutableMapping):
-            return
+            return True
         existing = tool_args.get("task_id", "")
         if not _is_placeholder_task_id(existing):
-            return
-        state = _session_state_from_callback(tool_context)
-        if not isinstance(state, Mapping):
-            return
-        state_tid = state.get(_sp.KEY_CURRENT_TASK_ID, "")
-        if not isinstance(state_tid, str) or not state_tid.strip():
-            return
-        tool_args["task_id"] = state_tid
+            # A real-looking id was supplied (e.g. legacy caller,
+            # custom tool that didn't opt into the hidden schema).
+            # Leave it alone so the handler surfaces mismatches as
+            # terminal-task / not-found failures rather than silently
+            # re-targeting the call.
+            return True
+        resolved = _resolve_pinned_task_id(
+            tool_context=tool_context,
+        )
+        if not resolved:
+            return False
+        tool_args["task_id"] = resolved
+        return True
     except Exception:  # noqa: BLE001
         log.debug(
             "before_tool_callback: task_id injection failed for tool=%s",
             tool_name,
             exc_info=True,
         )
+        return False
+
+
+# State-key used to stash per-function_call_id task pins at the
+# delegation site (goldfive#241 Item 3-bis). The plugin's
+# ``before_tool_callback`` writes an entry here when it dispatches an
+# AgentTool call and the reporting-tool callback reads it back when
+# the sub-invocation's tool call arrives. Keyed by the ADK
+# ``function_call_id`` of the AgentTool dispatch so parallel calls
+# don't race.
+_PENDING_DELEGATIONS_KEY = "goldfive.pending_delegations"
+
+
+def _resolve_pinned_task_id(*, tool_context: Any) -> str:
+    """Return the task_id pinned for this tool invocation, or ``""``.
+
+    Consults the delegation-site map first (``pending_delegations``
+    keyed by the current invocation's ``function_call_id``), then
+    falls back to the agent-turn pin (``goldfive.current_task_id``).
+    Returns ``""`` when neither path yields a value — the caller
+    should then fail the call with the ``no_task_pinned`` error
+    rather than invoking the handler on an unpinned arg.
+    """
+    state = _session_state_from_callback(tool_context)
+    if not isinstance(state, Mapping):
+        return ""
+    fc_id = _function_call_id_from_tool_context(tool_context)
+    if fc_id:
+        pend = state.get(_PENDING_DELEGATIONS_KEY)
+        if isinstance(pend, Mapping):
+            raw = pend.get(fc_id, "")
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+    state_tid = state.get(_sp.KEY_CURRENT_TASK_ID, "")
+    if isinstance(state_tid, str) and state_tid.strip():
+        return state_tid.strip()
+    return ""
+
+
+def _function_call_id_from_tool_context(tool_context: Any) -> str:
+    """Best-effort extraction of the current ``function_call_id``.
+
+    ADK's ToolContext carries the active ``function_call_id`` directly;
+    legacy / test stubs may not have the attribute, in which case we
+    degrade to ``""`` (falls back to the agent-turn pin).
+    """
+    fc_id = _safe_attr(tool_context, "function_call_id", "")
+    if isinstance(fc_id, str) and fc_id.strip():
+        return fc_id.strip()
+    return ""
+
+
+def _tokenize_for_matching(text: Any) -> set[str]:
+    """Return the set of lowercase alphanumeric tokens of length ≥4.
+
+    Used by :func:`_score_candidates_by_args` to score candidate tasks
+    against AgentTool args. The ≥4 threshold filters out noisy
+    short-word matches ("in", "of", "the") that would otherwise
+    saturate every candidate's score.
+    """
+    if not isinstance(text, str):
+        text = str(text or "")
+    tokens: set[str] = set()
+    buf: list[str] = []
+    for ch in text.lower():
+        if ch.isalnum():
+            buf.append(ch)
+        else:
+            if buf:
+                tok = "".join(buf)
+                if len(tok) >= 4:
+                    tokens.add(tok)
+                buf.clear()
+    if buf:
+        tok = "".join(buf)
+        if len(tok) >= 4:
+            tokens.add(tok)
+    return tokens
+
+
+def _score_candidates_by_args(candidates: list[Any], tool_args: Any) -> Any:
+    """Return the best-scoring candidate, or ``None`` on tie / zero match.
+
+    Scoring: tokenise ``tool_args`` and each candidate's
+    ``title + description``. Candidate with the highest overlap wins.
+    Ties (two or more candidates with the same top non-zero score)
+    return ``None`` so the caller falls through to the no-pin path;
+    guessing would be worse than letting the sub-agent path handle
+    the ambiguity.
+    """
+    if not candidates:
+        return None
+    # Serialise args into a single token bag. Keys contribute too
+    # (``topic=solar`` contributes "topic" and "solar") because the
+    # key names often hint at which task the call is about.
+    args_text = ""
+    if isinstance(tool_args, Mapping):
+        parts: list[str] = []
+        for k, v in tool_args.items():
+            parts.append(str(k))
+            parts.append(str(v))
+        args_text = " ".join(parts)
+    elif isinstance(tool_args, str):
+        args_text = tool_args
+    arg_tokens = _tokenize_for_matching(args_text)
+    if not arg_tokens:
+        return None
+    best_score = 0
+    best: Any = None
+    tied = False
+    for cand in candidates:
+        title = str(_safe_attr(cand, "title", "") or "")
+        desc = str(_safe_attr(cand, "description", "") or "")
+        cand_tokens = _tokenize_for_matching(f"{title} {desc}")
+        score = len(arg_tokens & cand_tokens)
+        if score > best_score:
+            best_score = score
+            best = cand
+            tied = False
+        elif score == best_score and score > 0:
+            tied = True
+    if best_score == 0 or tied:
+        return None
+    return best
 
 
 def _measure_request_chars(llm_request: Any) -> tuple[int, int]:
@@ -1359,6 +1505,41 @@ def make_adk_plugin(
             # top-level import for a rarely-hot-path enum compare.
             from goldfive.types import TaskStatus, task_upstream_ready
 
+            # goldfive#241 Item 3-bis — delegation-site pin takes
+            # precedence over the agent-turn match. If the parent
+            # coordinator's ``before_tool_callback`` stamped a
+            # task_id for THIS AgentTool dispatch (keyed by
+            # function_call_id), trust that pin and stamp it onto
+            # both state surfaces. Sub-agent ``before_agent_callback``
+            # doesn't carry the function_call_id, but the reporting-
+            # tool path reads ``pending_delegations`` directly anyway;
+            # this branch only matters for the single-match fallback.
+            gf_state_early = _safe_attr(ctx.session, "state", None)
+            if isinstance(gf_state_early, Mapping):
+                pend = gf_state_early.get(_PENDING_DELEGATIONS_KEY)
+                if isinstance(pend, Mapping) and pend:
+                    for tid in pend.values():
+                        if not isinstance(tid, str) or not tid:
+                            continue
+                        for task in tasks:
+                            if str(_safe_attr(task, "id", "") or "") != tid:
+                                continue
+                            assignee = str(
+                                _safe_attr(task, "assignee_agent_id", "") or ""
+                            )
+                            if assignee != agent_name:
+                                continue
+                            status = _safe_attr(task, "status", None)
+                            if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
+                                self._stamp_current_task_id(
+                                    ctx=ctx,
+                                    callback_context=callback_context,
+                                    task_id=tid,
+                                    agent_name=agent_name,
+                                    source="delegation_pin",
+                                )
+                                return
+
             # Pre-filter: PENDING/RUNNING tasks whose assignee is this
             # agent. This is the pre-#242 candidate set. The DAG-gate
             # below filters it further; we keep the pre-DAG list so we
@@ -1424,10 +1605,31 @@ def make_adk_plugin(
             task_id = str(_safe_attr(task, "id", "") or "")
             if not task_id:
                 return
+            self._stamp_current_task_id(
+                ctx=ctx,
+                callback_context=callback_context,
+                task_id=task_id,
+                agent_name=agent_name,
+                source="single_match",
+            )
 
-            # Stamp the goldfive orchestration-state key first — the
-            # reporting-tool handler fallback in ``invoke_tool`` +
-            # ``reporting.py`` reads from here.
+        def _stamp_current_task_id(
+            self,
+            *,
+            ctx: SessionContext,
+            callback_context: Any,
+            task_id: str,
+            agent_name: str,
+            source: str,
+        ) -> None:
+            """Write ``task_id`` into both state surfaces for the sub-agent.
+
+            Shared by the delegation-site branch and the single-match
+            fallback in :meth:`_pin_current_task_id_for_agent`. The
+            ``source`` label threads into the log line so the operator
+            log shows whether the pin came from the pending-delegations
+            map (goldfive#241) or the legacy assignee-match path.
+            """
             gf_state = _safe_attr(ctx.session, "state", None)
             if isinstance(gf_state, dict):
                 try:
@@ -1437,11 +1639,6 @@ def make_adk_plugin(
                         "before_agent_callback: goldfive session.state pin failed: %s",
                         exc,
                     )
-
-            # Stamp the ADK session.state key — the sibling's Layer 3
-            # (before_tool_callback arg-injection) reads from here and
-            # any agent that inspects ``tool_ctx.state`` directly picks
-            # up the same value.
             adk_state = _session_state_from_callback(callback_context)
             if isinstance(adk_state, Mapping):
                 try:
@@ -1451,11 +1648,132 @@ def make_adk_plugin(
                         "before_agent_callback: ADK session.state pin failed: %s",
                         exc,
                     )
-
             log.info(
-                "goldfive: pinned current_task_id=%s for sub-agent %s",
+                "goldfive: pinned current_task_id=%s for sub-agent %s "
+                "(source=%s)",
                 task_id,
                 agent_name,
+                source,
+            )
+
+        def _pin_delegation_task_id(
+            self,
+            *,
+            ctx: SessionContext,
+            tool_context: Any,
+            to_agent: str,
+            tool_args: Any,
+        ) -> None:
+            """Stamp a per-``function_call_id`` task pin for an AgentTool
+            dispatch so parallel same-agent invocations don't race on the
+            single ``goldfive.current_task_id`` slot.
+
+            goldfive#241 Item 3-bis. Resolution algorithm:
+
+            1. Collect PENDING/RUNNING tasks whose ``assignee_agent_id``
+               matches ``to_agent``.
+            2. Keep only the tasks whose upstream edges all point at
+               COMPLETED predecessors (DAG-aware; a task whose
+               dependency isn't done yet cannot be the target of THIS
+               dispatch).
+            3. If exactly one candidate, that's the pin.
+            4. If multiple candidates, score each against ``tool_args``
+               by keyword overlap with its ``title + description`` and
+               pick the top. Ties or zero-overlap fall through to "no
+               pin" — the sub-agent's ``before_agent_callback`` takes
+               over via the legacy single-match path.
+            5. If zero candidates, no pin.
+
+            Writes to ``ctx.session.state[goldfive.pending_delegations]``
+            (a dict keyed by function_call_id) when a pin resolves.
+            Silent on every failure mode — the worst case is we fall
+            through to the legacy behaviour.
+            """
+            if not to_agent:
+                return
+            fc_id = _function_call_id_from_tool_context(tool_context)
+            if not fc_id:
+                return
+            plan = _safe_attr(ctx.session, "plan", None)
+            if plan is None:
+                return
+            tasks = _safe_attr(plan, "tasks", None) or ()
+            edges = _safe_attr(plan, "edges", None) or ()
+            from goldfive.types import TaskStatus
+
+            completed_ids: set[str] = set()
+            for t in tasks:
+                if _safe_attr(t, "status", None) is TaskStatus.COMPLETED:
+                    tid = str(_safe_attr(t, "id", "") or "")
+                    if tid:
+                        completed_ids.add(tid)
+
+            def _upstream_ok(task_id: str) -> bool:
+                for e in edges:
+                    to_id = str(_safe_attr(e, "to_task_id", "") or "")
+                    if to_id != task_id:
+                        continue
+                    from_id = str(_safe_attr(e, "from_task_id", "") or "")
+                    if from_id and from_id not in completed_ids:
+                        return False
+                return True
+
+            candidates: list[Any] = []
+            for task in tasks:
+                assignee = str(_safe_attr(task, "assignee_agent_id", "") or "")
+                if assignee != to_agent:
+                    continue
+                status = _safe_attr(task, "status", None)
+                if status is not TaskStatus.PENDING and status is not TaskStatus.RUNNING:
+                    continue
+                tid = str(_safe_attr(task, "id", "") or "")
+                if not tid or not _upstream_ok(tid):
+                    continue
+                candidates.append(task)
+
+            if not candidates:
+                return
+            if len(candidates) == 1:
+                chosen = candidates[0]
+            else:
+                chosen = _score_candidates_by_args(candidates, tool_args)
+                if chosen is None:
+                    log.debug(
+                        "before_tool_callback: %d candidates for %s; "
+                        "args did not disambiguate — no pin",
+                        len(candidates),
+                        to_agent,
+                    )
+                    return
+            task_id = str(_safe_attr(chosen, "id", "") or "")
+            if not task_id:
+                return
+            # Stamp the pin onto BOTH the goldfive orchestration
+            # session.state (so reporting-tool handlers that read it
+            # directly see it) AND the ADK tool_context session.state
+            # (so the plugin's before_tool_callback → _resolve_pinned_task_id
+            # sees it on the sub-invocation's ToolContext). The two
+            # dicts are distinct in live ADK — the goldfive Session
+            # is our orchestration state, the ADK session.state is
+            # the live ADK session the Runner drives.
+            for target in (
+                _safe_attr(ctx.session, "state", None),
+                _session_state_from_callback(tool_context),
+            ):
+                if not isinstance(target, dict):
+                    continue
+                pend = target.get(_PENDING_DELEGATIONS_KEY)
+                if not isinstance(pend, dict):
+                    pend = {}
+                    target[_PENDING_DELEGATIONS_KEY] = pend
+                pend[fc_id] = task_id
+            log.info(
+                "goldfive: pinned delegation task_id=%s for fc_id=%s "
+                "(sub-agent=%s, %d candidates)",
+                task_id,
+                fc_id,
+                to_agent,
+                len(candidates),
             )
 
         async def after_agent_callback(self, *, agent: Any, callback_context: Any) -> None:
@@ -2023,21 +2341,28 @@ def make_adk_plugin(
             #
             # See ``docs/design/TASK-LIFECYCLE.md`` §5 for the contract.
             #
-            # goldfive#191 Layer 3 — task_id injection. Before we dispatch
-            # a reporting tool, if the LLM omitted ``task_id`` (or passed
-            # an obvious placeholder like "" / "placeholder" / "unknown"
-            # / "TODO") we fall back to the ``goldfive.current_task_id``
-            # pinned into session.state by ``before_agent_callback`` at
-            # the start of the agent turn. The state write fires first in
-            # ADK's callback order (agent-turn → tool-calls-within-turn)
-            # so by the time we reach here the pin is already visible.
-            # Real-looking task_ids are preserved verbatim — we don't
-            # silently rewrite them even if they look wrong (see #191).
-            _inject_task_id_from_state(
+            # goldfive#241 — task_id is hidden from the LLM-facing
+            # reporting-tool schema so the model never supplies it.
+            # Resolve from state (delegation-site pin first, then the
+            # agent-turn pin). If neither resolves, short-circuit with
+            # a structured ``no_task_pinned`` error — better than
+            # invoking the handler on an unbound reporting call.
+            pinned = _inject_task_id_from_state(
                 tool_name=tool_name,
                 tool_args=tool_args,
                 tool_context=tool_context,
             )
+            if _is_reporting_tool_name(tool_name) and not pinned:
+                log.info(
+                    "before_tool_callback: no task pinned for %s; "
+                    "short-circuiting with no_task_pinned",
+                    tool_name,
+                )
+                return {
+                    "acknowledged": False,
+                    "error": "no_task_pinned",
+                    "detail": "no task bound to this agent invocation",
+                }
 
             tool_names_registered = {spec.name for spec in ctx.tools}
             if tool_name in tool_names_registered:
@@ -2107,6 +2432,30 @@ def make_adk_plugin(
                             "before_tool_callback: reconciler.on_delegation_observed raised: %s",
                             exc,
                         )
+
+                # goldfive#241 Item 3-bis — delegation-site task_id
+                # pinning. When the coordinator fires multiple parallel
+                # AgentTool calls to the same sub-agent in one turn,
+                # each dispatch spawns its own sub-invocation; the
+                # sub-agent's ``before_agent_callback`` cannot
+                # disambiguate because all N parallel calls share the
+                # same (agent_name, session.state) pair. We resolve
+                # the candidate task for THIS AgentTool dispatch and
+                # stash it on ``pending_delegations[<function_call_id>]``
+                # so the reporting-tool callback (which DOES see the
+                # function_call_id) can read the correct pin back.
+                try:
+                    self._pin_delegation_task_id(
+                        ctx=ctx,
+                        tool_context=tool_context,
+                        to_agent=to_agent,
+                        tool_args=tool_args,
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    log.debug(
+                        "before_tool_callback: delegation pin raised: %s",
+                        exc,
+                    )
 
                 # Runaway-delegation cap. Count BEFORE short-circuiting
                 # so the drift fires exactly once at the threshold

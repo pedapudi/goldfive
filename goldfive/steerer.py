@@ -44,6 +44,7 @@ levels. See goldfive#142 for the full table.
 from __future__ import annotations
 
 import enum
+import inspect
 import json
 import logging
 import re
@@ -2461,6 +2462,45 @@ class DefaultSteerer:
             )
         return reason
 
+    async def _request_adapter_cancel(self, reason: str) -> None:
+        """Invoke the optional ``adapter.request_cancel(reason)`` hook.
+
+        goldfive#241 — a goldfive-promoted steer needs the in-flight
+        LLM call to stop NOW so the contaminated reasoning / tool
+        calls don't keep writing to the session while we queue the
+        restart. The ADK adapter exposes :meth:`ADKAdapter.request_cancel`
+        which fires ``task.cancel()`` on the asyncio task driving
+        ``runner.run_async`` so the stream raises ``CancelledError``
+        and the adapter's standard heal path runs with the already-
+        stamped ``_next_cancel_reason`` tag.
+
+        Optional protocol: adapters that don't implement the method
+        (Claude adapter, callable adapter, test stubs without live
+        invocations) keep the legacy deferred-cancel semantics —
+        ``_next_cancel_reason`` is still tagged, the restart message
+        is still queued, and the next executor checkpoint still
+        terminates the invocation. Tolerates an unbound adapter and
+        swallows every failure so a best-effort cancel cannot break
+        the promotion path.
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return
+        fn = getattr(adapter, "request_cancel", None)
+        if not callable(fn):
+            return
+        try:
+            result = fn(reason)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "DefaultSteerer._request_adapter_cancel(reason=%r): "
+                "adapter raised: %s",
+                reason,
+                exc,
+            )
+
     # ------------------------------------------------------------------
     # goldfive-steer-unification: promotion policy + handler
     # ------------------------------------------------------------------
@@ -2603,6 +2643,15 @@ class DefaultSteerer:
             session._last_cancel_reason_prefix = cancel_reason
         except Exception:  # noqa: BLE001
             pass
+        # 1a. Fire the adapter's request_cancel so the in-flight LLM
+        # call terminates NOW instead of running to completion while
+        # we queue the restart (goldfive#241). Pre-#241 the cancel was
+        # deferred to the next executor checkpoint and the contaminated
+        # invocation finished first — tens of seconds of wasted work
+        # with tainted output landing on the wire. Optional protocol:
+        # adapters that don't implement ``request_cancel`` keep the
+        # legacy deferred-cancel semantics.
+        await self._request_adapter_cancel(cancel_reason)
         # 2. Stamp active-steer state + compose the restart body.
         at_turn = int(getattr(session, "_next_sequence", 0) or 0)
         body = self._compose_goldfive_steer_body(drift)
