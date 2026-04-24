@@ -71,7 +71,9 @@ from goldfive.types import (
     Goal,
     Plan,
     Session,
+    SupersessionKind,
     Task,
+    TaskEdge,
     TaskStatus,
 )
 
@@ -3575,6 +3577,92 @@ class DefaultSteerer:
         key = (drift.current_task_id, drift.kind.value)
         session._last_plan_revision_at[key] = time.monotonic()
 
+    @staticmethod
+    def _integrate_correction_supersedes(revised: Plan) -> None:
+        """Rewire DAG edges for every ``CORRECT``-kind supersedes link.
+
+        goldfive#251 Option B topology. For a new task
+        ``new.supersedes == old_id`` with ``new.supersedes_kind ==
+        SupersessionKind.CORRECT``:
+
+        * The old task is NOT marked superseded / hidden — it stays in
+          the plan as a historical COMPLETED node.
+        * An edge ``old -> new`` is added (unless already present), so
+          the new correction-task has the old as its upstream.
+        * Every existing edge ``old -> X`` for some X != new is
+          rewritten to ``new -> X`` so downstream work that used to
+          depend on the old task now flows through the correction.
+
+        The in-revision edges from the refiner sometimes already
+        reflect this topology (the LLM may emit the rewired shape);
+        this method is idempotent and re-runnable in that case.
+
+        Does nothing when no task carries a CORRECT-kind supersedes.
+        REPLACE-kind links are intentionally left alone — the pre-#251
+        behaviour (old task marked terminal / hidden by the refiner;
+        downstream edges rewritten to the replacement) was already
+        correct and this method does not touch that path.
+
+        Runs BEFORE :meth:`_repin_current_task_on_supersedes` so that
+        helper's downstream rewrites see the already-correct DAG.
+        """
+        if revised is None:
+            return
+        tasks_by_id: dict[str, Task] = {t.id: t for t in revised.tasks if t.id}
+        corrections: list[tuple[str, str]] = []  # (old_id, new_id)
+        for task in revised.tasks:
+            if task.supersedes_kind is not SupersessionKind.CORRECT:
+                continue
+            old_id = (task.supersedes or "").strip()
+            new_id = (task.id or "").strip()
+            if not old_id or not new_id or old_id == new_id:
+                continue
+            if old_id not in tasks_by_id:
+                # Structural validator will reject; skip the rewrite.
+                continue
+            corrections.append((old_id, new_id))
+        if not corrections:
+            return
+        # Index existing edges as a set for idempotence checks.
+        existing_edges: set[tuple[str, str]] = {
+            (e.from_task_id, e.to_task_id) for e in revised.edges
+        }
+        for old_id, new_id in corrections:
+            # 1. Ensure old -> new edge exists.
+            if (old_id, new_id) not in existing_edges:
+                revised.edges.append(TaskEdge(from_task_id=old_id, to_task_id=new_id))
+                existing_edges.add((old_id, new_id))
+            # 2. Rewrite outgoing edges of the old task to originate
+            #    from the new (correction) task. Skip the old -> new
+            #    edge we just ensured.
+            for edge in revised.edges:
+                if edge.from_task_id != old_id:
+                    continue
+                if edge.to_task_id == new_id:
+                    continue
+                # Avoid duplicating an edge that already exists from the
+                # new task to the same downstream.
+                if (new_id, edge.to_task_id) in existing_edges:
+                    # Mark for removal by setting a sentinel; we
+                    # prune the duplicates after the loop.
+                    edge.from_task_id = new_id  # same content as existing; dedup below
+                    continue
+                existing_edges.discard((old_id, edge.to_task_id))
+                edge.from_task_id = new_id
+                existing_edges.add((new_id, edge.to_task_id))
+        # Final dedup: rewriting may have produced structurally-duplicate
+        # edges. Preserve insertion order while dropping repeats.
+        seen: set[tuple[str, str]] = set()
+        deduped: list[TaskEdge] = []
+        for e in revised.edges:
+            key = (e.from_task_id, e.to_task_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(e)
+        if len(deduped) != len(revised.edges):
+            revised.edges = deduped
+
     def _repin_current_task_on_supersedes(
         self,
         session: Session,
@@ -3698,6 +3786,15 @@ class DefaultSteerer:
     ) -> None:
         from goldfive.conv import to_pb_plan
         from goldfive.events import build_plan_revision_diff
+
+        # goldfive#251: integrate CORRECT-kind supersedes links into
+        # the DAG. The old task stays in the plan as a historical
+        # COMPLETED node; the new correction-task is inserted as a
+        # child with an edge old -> new, and any downstream edges of
+        # the old task are rewritten so work flows through the
+        # correction. No-op for REPLACE-kind (existing behaviour is
+        # preserved) and for plans without supersedes.
+        self._integrate_correction_supersedes(revised)
 
         # goldfive#237: re-pin ``current_task_id`` onto any replacement
         # task the revision introduces. Without this, agents keep

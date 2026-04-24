@@ -36,6 +36,7 @@ from goldfive.types import (
     Goal,
     ObservedAction,
     Plan,
+    SupersessionKind,
     Task,
     TaskEdge,
     TaskStatus,
@@ -148,6 +149,14 @@ Requirements:
    ``"supersedes": "<failed_task_id>"`` on the new task so the
    framework can re-pin agent reporting onto the replacement. Omit
    (or empty) ``supersedes`` for tasks that are not replacements.
+   Also set ``"supersedes_kind"`` on every supersedes link:
+     * ``"REPLACE"`` — the superseded task was PENDING / RUNNING /
+       FAILED / CANCELLED (the looper, typically).
+     * ``"CORRECT"`` — the superseded task had already COMPLETED but
+       its output was drift-contaminated and the new task re-does
+       that work. In CORRECT mode the old task stays in the plan as
+       a historical COMPLETED node; the new task is added as a
+       child with an edge old -> new.
 4. PRESERVE OR REWORK other non-finished tasks at your discretion.
 5. GOAL COVERAGE: every unsatisfied goal must still be addressed by at
    least one task in the returned plan.
@@ -163,7 +172,8 @@ Respond with a single JSON object and NOTHING ELSE:
       "description": "...",
       "assignee_agent_id": "...",
       "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED",
-      "supersedes": "<optional: id of a terminal task this one replaces>"
+      "supersedes": "<optional: id of a terminal task this one replaces>",
+      "supersedes_kind": "<REPLACE|CORRECT — required when supersedes is set>"
     }
   ],
   "edges": [{"from_task_id": "...", "to_task_id": "..."}]
@@ -210,6 +220,12 @@ Requirements:
    CANCELLED (same semantic intent, new shape), set
    ``"supersedes": "<old_task_id>"`` on the replacement so the
    framework can re-pin reporting onto it. Leave empty otherwise.
+   Also set ``"supersedes_kind"`` whenever ``supersedes`` is set:
+   ``"REPLACE"`` for a superseded task that was PENDING / RUNNING /
+   FAILED / CANCELLED, and ``"CORRECT"`` for a superseded task that
+   had already COMPLETED but whose output the steer judges drift-
+   contaminated (the correction re-does that work; the old task
+   stays in the plan as a historical node).
 
 Respond with a single JSON object and NOTHING ELSE:
 
@@ -221,7 +237,8 @@ Respond with a single JSON object and NOTHING ELSE:
       "title": "...",
       "description": "...",
       "assignee_agent_id": "...",
-      "supersedes": "<optional: id of a terminal task this one replaces>"
+      "supersedes": "<optional: id of a terminal task this one replaces>",
+      "supersedes_kind": "<REPLACE|CORRECT — required when supersedes is set>"
     }
   ],
   "edges": [{"from_task_id": "...", "to_task_id": "..."}]
@@ -340,7 +357,20 @@ You MUST:
    FAILED or CANCELLED, set ``"supersedes": "<old_task_id>"`` on the
    replacement so the framework can re-pin reporting onto it. Omit
    (or leave empty) ``supersedes`` for genuinely new work that is
-   not replacing anything.
+   not replacing anything. Also set ``"supersedes_kind"`` on every
+   supersedes link:
+     * ``"REPLACE"`` — the superseded task is PENDING / RUNNING /
+       FAILED / CANCELLED (the new task takes its slot in the DAG).
+     * ``"CORRECT"`` — the superseded task is already COMPLETED but
+       its output is drift-contaminated. Use this when the drift
+       shows the agent hallucinated progress, produced off-topic
+       output but still called ``report_task_completed``, or any
+       similar case where the COMPLETED signal was spurious. In
+       CORRECT mode the old task stays in the plan (its COMPLETED
+       status is preserved — it is the historical record of the
+       drift-contaminated work) and the new task is inserted as a
+       child: an edge ``old -> new`` is added and any downstream
+       edges are rewired so work flows through the correction.
 
 4. DROP OBSOLETE PENDING TASKS. If the drift makes a PENDING task
    unnecessary (e.g., a goal has been satisfied early, a dependency
@@ -369,7 +399,8 @@ Respond with a single JSON object and NOTHING ELSE:
       "description": "...",
       "assignee_agent_id": "...",
       "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED",
-      "supersedes": "<optional: id of a terminal task this one replaces>"
+      "supersedes": "<optional: id of a terminal task this one replaces>",
+      "supersedes_kind": "<REPLACE|CORRECT — required when supersedes is set>"
     }
   ],
   "edges": [{"from_task_id": "...", "to_task_id": "..."}]
@@ -420,7 +451,15 @@ _REFINEMENT_GUIDANCE_BLOCK = (
     "the user request genuinely warrants it.\n"
     "- The `supersedes` field is required on every replacement — "
     "it's how runtime routing re-pins reports from the old task "
-    "to the new one."
+    "to the new one.\n"
+    "- The `supersedes_kind` field MUST accompany `supersedes`:\n"
+    "  * REPLACE when the superseded task was PENDING / RUNNING / "
+    "FAILED / CANCELLED (the typical retry).\n"
+    "  * CORRECT when the superseded task is already COMPLETED but "
+    "its output is drift-contaminated (the agent wandered off-topic "
+    "yet still signalled completion). CORRECT keeps the old task "
+    "in the plan as a historical COMPLETED node and adds an edge "
+    "old -> new so downstream work flows through the correction."
 )
 
 
@@ -477,6 +516,131 @@ def _coerce_status(raw: Any) -> TaskStatus:
     return TaskStatus(text)
 
 
+_VALID_SUPERSESSION_KINDS = frozenset(k.value for k in SupersessionKind)
+
+
+def _coerce_supersession_kind(raw: Any) -> SupersessionKind:
+    """Parse an LLM-emitted ``supersedes_kind`` value.
+
+    Accepts the dataclass-enum string (``"REPLACE"`` / ``"CORRECT"`` /
+    ``"UNSPECIFIED"``) as well as the full proto name
+    (``"SUPERSESSION_KIND_REPLACE"``) so prompts can quote either shape.
+    Unknown / missing values fall back to ``UNSPECIFIED``; the post-
+    parse validator will resolve the final kind from the old task's
+    status.
+    """
+    if raw is None:
+        return SupersessionKind.UNSPECIFIED
+    text = str(raw).strip().upper()
+    if not text:
+        return SupersessionKind.UNSPECIFIED
+    if text.startswith("SUPERSESSION_KIND_"):
+        text = text[len("SUPERSESSION_KIND_") :]
+    if text not in _VALID_SUPERSESSION_KINDS:
+        return SupersessionKind.UNSPECIFIED
+    return SupersessionKind(text)
+
+
+#: Old-task statuses that anchor a REPLACE-kind supersession (the old
+#: task is still mid-flight / never ran). COMPLETED triggers the
+#: CORRECT path. FAILED / CANCELLED / NOT_NEEDED are modelled as
+#: REPLACE (the old task never delivered; the new one takes its slot).
+_REPLACE_ELIGIBLE_OLD_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.PENDING,
+        TaskStatus.RUNNING,
+        TaskStatus.BLOCKED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.NOT_NEEDED,
+    }
+)
+
+
+def _normalize_supersession_kinds(revised: Plan, *, prior: Plan | None) -> None:
+    """In-place coerce ``supersedes_kind`` on every task in ``revised``.
+
+    goldfive#251 Option B validator. Rules, in order:
+
+    1. If ``task.supersedes`` is empty, clear ``supersedes_kind`` to
+       ``UNSPECIFIED`` — a kind without a target is dangling.
+    2. If the supersedes target does not resolve against either
+       ``revised`` (in-revision chain like C.supersedes=B with B being
+       added in the same revision) or ``prior`` (referencing a task
+       that was in the outgoing plan), clear the kind. The structural
+       validator will reject the dangling link independently.
+    3. Otherwise resolve the old-task status from ``prior`` first
+       (ground truth — the new task's ``supersedes`` points backward
+       in time) and fall back to ``revised`` when the old task is
+       being added in the same revision (edge case; supersession
+       chains C->B->A introduced at once).
+       * COMPLETED old task ⇒ coerce to ``CORRECT`` (warn if the LLM
+         set REPLACE).
+       * PENDING / RUNNING / BLOCKED / FAILED / CANCELLED / NOT_NEEDED
+         ⇒ coerce to ``REPLACE`` (warn if the LLM set CORRECT).
+
+    The coercion honours Option B's contract: the LLM's semantic signal
+    is preserved when it aligns with status; when it disagrees, old-
+    task status is ground truth. Writes proceed in place so callers can
+    pass the revised plan straight through to ``validate``.
+    """
+    prior_by_id: dict[str, Task] = (
+        {t.id: t for t in getattr(prior, "tasks", ()) or () if t.id} if prior is not None else {}
+    )
+    revised_by_id: dict[str, Task] = {t.id: t for t in revised.tasks if t.id}
+    for task in revised.tasks:
+        sup_id = (task.supersedes or "").strip()
+        if not sup_id:
+            # Rule 1: dangling kind with no target.
+            if task.supersedes_kind is not SupersessionKind.UNSPECIFIED:
+                log.warning(
+                    "planner: task %r has supersedes_kind=%s without a "
+                    "supersedes target; clearing to UNSPECIFIED",
+                    task.id,
+                    task.supersedes_kind.value,
+                )
+                task.supersedes_kind = SupersessionKind.UNSPECIFIED
+            continue
+        old = prior_by_id.get(sup_id) or revised_by_id.get(sup_id)
+        if old is None:
+            # Rule 2: unresolved target — clear the kind; the plan's
+            # structural validator (step 3) will reject the dangling
+            # edge separately.
+            if task.supersedes_kind is not SupersessionKind.UNSPECIFIED:
+                log.warning(
+                    "planner: task %r supersedes %r which is not in the plan; "
+                    "clearing supersedes_kind from %s to UNSPECIFIED",
+                    task.id,
+                    sup_id,
+                    task.supersedes_kind.value,
+                )
+                task.supersedes_kind = SupersessionKind.UNSPECIFIED
+            continue
+        # Rule 3: resolve based on old-task status.
+        if old.status is TaskStatus.COMPLETED:
+            expected = SupersessionKind.CORRECT
+        elif old.status in _REPLACE_ELIGIBLE_OLD_STATUSES:
+            expected = SupersessionKind.REPLACE
+        else:
+            # Defensive: any unknown / future status falls through to
+            # REPLACE (the pre-#251 behaviour), which preserves the old
+            # topology rewrite path.
+            expected = SupersessionKind.REPLACE
+        if task.supersedes_kind is SupersessionKind.UNSPECIFIED:
+            task.supersedes_kind = expected
+        elif task.supersedes_kind is not expected:
+            log.warning(
+                "planner: task %r supersedes %r (status=%s) with kind=%s; "
+                "coercing to %s based on old-task status (Option B)",
+                task.id,
+                sup_id,
+                old.status.value,
+                task.supersedes_kind.value,
+                expected.value,
+            )
+            task.supersedes_kind = expected
+
+
 def _plan_from_json(
     obj: Any,
     *,
@@ -520,6 +684,11 @@ def _plan_from_json(
                 # failed/cancelled task. Empty for net-new and preserved
                 # terminal tasks.
                 supersedes=str(t.get("supersedes") or "").strip(),
+                # goldfive#251: supersession kind. Parsed raw here
+                # (``UNSPECIFIED`` when absent); the post-parse validator
+                # in :func:`_normalize_supersession_kinds` coerces it to
+                # REPLACE / CORRECT based on the old task's status.
+                supersedes_kind=_coerce_supersession_kind(t.get("supersedes_kind")),
             )
         )
     if not tasks:
@@ -1636,6 +1805,13 @@ class LLMPlanner:
                     if attempt < attempts:
                         user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
                     continue
+            # goldfive#251: Option B validator -- coerce supersedes_kind
+            # on every task based on old-task status. Runs before
+            # ``revised.validate`` so the structural validator sees
+            # self-consistent kinds. In-place; warnings only, never
+            # rejects (Option B is about making the LLM's intent
+            # survive rather than blocking a structurally-valid plan).
+            _normalize_supersession_kinds(revised, prior=prior_plan)
             try:
                 revised.validate(for_revision=True, prior=prior_plan)
             except ValueError as exc:

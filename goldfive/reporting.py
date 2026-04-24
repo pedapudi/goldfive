@@ -24,7 +24,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
-from goldfive.types import TaskStatus
+from goldfive.types import SupersessionKind, TaskStatus
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
@@ -242,13 +242,22 @@ def _resolve_effective_task_id(session: Session, task_id: str) -> str:
     tasks = getattr(plan, "tasks", None) or ()
     # Index once — handlers call this up to five times per tool call.
     by_id: dict[str, Task] = {str(getattr(t, "id", "") or ""): t for t in tasks}
-    # Build a reverse map supersedes -> new once.
+    # Build a reverse map supersedes -> new once. goldfive#251: a
+    # ``CORRECT``-kind supersedes link DOES NOT route — the old task's
+    # completion is historical fact (it is a COMPLETED node retained
+    # for DAG history) and a late report on it is an idempotent no-op
+    # on a completed task, not a retroactive write to the correction.
+    # Only ``REPLACE`` / ``UNSPECIFIED`` (legacy) links reroute.
     replacements: dict[str, str] = {}
     for t in tasks:
         sup = str(getattr(t, "supersedes", "") or "").strip()
         tid = str(getattr(t, "id", "") or "").strip()
-        if sup and tid:
-            replacements[sup] = tid
+        if not sup or not tid:
+            continue
+        kind = getattr(t, "supersedes_kind", SupersessionKind.UNSPECIFIED)
+        if kind is SupersessionKind.CORRECT:
+            continue
+        replacements[sup] = tid
     current = task_id
     visited: set[str] = {current}
     for _ in range(8):  # hard cap: plan-revision chains don't grow deep
