@@ -11,9 +11,14 @@ parameters") and abandoning the reporting protocol entirely.
 either:
 
   * injects it into ``tool_args`` before the handler runs, or
-  * short-circuits the dispatch with a structured ``no_task_pinned``
-    error when neither the delegation-site pin nor the agent-turn
-    pin resolves.
+  * short-circuits the dispatch with a bare ``{"acknowledged": True}``
+    when neither the delegation-site pin nor the agent-turn pin
+    resolves. When the current agent has PENDING/RUNNING candidates
+    in the plan (so the pin SHOULD have worked), a ``DriftDetected``
+    sink event also fires for operator observability — the tool
+    response is still the bare ack so the LLM can't pattern-match
+    on an error payload. See the #252 follow-up for the live
+    prompt-injection evidence that motivated the silent-ack shape.
 
 For coordinators that fire parallel AgentTool calls to the same
 sub-agent on a single turn, the agent-turn pin is not unique
@@ -101,8 +106,47 @@ class _AgentToolStub:
         self.name = tool_name or f"{agent_name}_tool"
 
 
-def _make_plugin_with_handler(tool_name: str, plan: Plan | None = None):
-    """Return (plugin, state_dict, captured) wired for a reporting tool."""
+class _SinkCapture:
+    """Minimal sink stub — collects every event so tests can assert shape.
+
+    ``goldfive.events.emit`` calls ``sink.emit(event_pb)``; the method
+    name matches the ``ListSink`` pattern used elsewhere in the test
+    suite (see ``tests/test_reporting.py``).
+    """
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def emit(self, event_pb: Any) -> None:
+        self.events.append(event_pb)
+
+    async def close(self) -> None:
+        pass
+
+
+class _SinkingSteererStub:
+    """Steerer stand-in that exposes ``_sinks`` so the plugin emits drift."""
+
+    def __init__(self, sinks: list[Any]) -> None:
+        self._sinks = list(sinks)
+
+    async def observe(self, *a: Any, **kw: Any) -> None:  # pragma: no cover
+        pass
+
+
+def _make_plugin_with_handler(
+    tool_name: str,
+    plan: Plan | None = None,
+    *,
+    with_sink: bool = False,
+):
+    """Return (plugin, state_dict, captured, session, sink) wired for a reporting tool.
+
+    When ``with_sink=True`` the returned ``SessionContext.steerer`` exposes a
+    ``_sinks`` list so the plugin's ``DriftDetected`` emission path can
+    observe a sink and write to it. Default is ``None`` steerer to keep
+    back-compat with older call sites.
+    """
     captured: list[dict[str, Any]] = []
 
     async def handler(args: Any, session: Any, steerer: Any) -> dict[str, Any]:
@@ -118,17 +162,22 @@ def _make_plugin_with_handler(tool_name: str, plan: Plan | None = None):
     plugin = make_adk_plugin(host_agent_name="coordinator")
     session_obj = Session(run_id="run-1", plan=plan)
     task = Task(id="t-ignored", title="x")
+    sink: _SinkCapture | None = None
+    steerer: Any | None = None
+    if with_sink:
+        sink = _SinkCapture()
+        steerer = _SinkingSteererStub([sink])
     state: dict = {
         SESSION_CONTEXT_STATE_KEY: SessionContext(
             session=session_obj,
-            steerer=None,
+            steerer=steerer,
             task=task,
             tool_handlers={tool_name: handler},
             tools=[spec],
             host_agent_name="coordinator",
         )
     }
-    return plugin, state, captured, session_obj
+    return plugin, state, captured, session_obj, sink
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +247,7 @@ async def test_hidden_task_id_populates_from_state() -> None:
     """LLM calls ``report_task_started()`` with no task_id arg — the
     callback populates from ``goldfive.current_task_id`` state before
     the handler runs."""
-    plugin, state, captured, _ = _make_plugin_with_handler("report_task_started")
+    plugin, state, captured, _, _ = _make_plugin_with_handler("report_task_started")
     state[KEY_CURRENT_TASK_ID] = "t-pinned"
 
     args: dict[str, Any] = {"detail": "starting"}
@@ -235,7 +284,7 @@ async def test_hidden_task_id_is_noop_when_state_empty() -> None:
     """
     # No plan attached — the agent has zero candidates, the
     # orchestration-only-turn branch applies.
-    plugin, state, captured, _ = _make_plugin_with_handler("report_task_started")
+    plugin, state, captured, _, _ = _make_plugin_with_handler("report_task_started")
     # Deliberately not setting KEY_CURRENT_TASK_ID or pending_delegations.
 
     args: dict[str, Any] = {"detail": "starting"}
@@ -280,12 +329,15 @@ def _ambiguous_plan_for(agent_name: str = "coordinator") -> Plan:
 
 async def test_pin_unresolved_when_agent_has_candidates() -> None:
     """Agent has PENDING candidates but the pin couldn't resolve
-    (ambiguous — >1 match) → surface a structured ``pin_unresolved``
-    error instead of silently ack-ing. A silent ack here would mask
-    a real stall (goldfive#250 follow-up)."""
+    (ambiguous — >1 match) → the LLM-visible response is a bare
+    ``{"acknowledged": True}`` (so the model can't pattern-match on an
+    error payload) AND a ``DriftDetected`` sink event fires for operator
+    observability. Pre-#252-followup the tool response carried an
+    ``error: pin_unresolved`` payload; live research_agent read the
+    payload as a reasoning cue and bypassed the reporting contract."""
     plan = _ambiguous_plan_for("coordinator")
-    plugin, state, captured, _ = _make_plugin_with_handler(
-        "report_task_started", plan=plan
+    plugin, state, captured, _session, sink = _make_plugin_with_handler(
+        "report_task_started", plan=plan, with_sink=True
     )
     # No KEY_CURRENT_TASK_ID / pending_delegations wired — resolution
     # fails despite the agent having candidates.
@@ -296,8 +348,30 @@ async def test_pin_unresolved_when_agent_has_candidates() -> None:
         tool_args=args,
         tool_context=_Ctx(state),
     )
-    assert result == {"acknowledged": False, "error": "pin_unresolved"}
+    # LLM-visible response: bare ack. No error / detail / pin_unresolved
+    # strings that the model could paraphrase into its reasoning.
+    assert result == {"acknowledged": True}
     assert captured == []
+    # Operator-visible response: a DriftDetected event with a
+    # pin_unresolved reason prefix and the candidate task ids in detail.
+    assert sink is not None
+    assert len(sink.events) == 1, (
+        f"expected exactly one sink event, got {len(sink.events)}"
+    )
+    evt = sink.events[0]
+    # Protobuf ``Event`` with a ``drift_detected`` oneof branch.
+    drift = evt.drift_detected
+    assert drift.detail.startswith("pin_unresolved:"), (
+        f"expected pin_unresolved prefix on drift detail, got {drift.detail!r}"
+    )
+    assert "report_task_started" in drift.detail
+    assert "coordinator" in drift.detail
+    # Candidate ids from the ambiguous plan must be present so operators
+    # can see which tasks were eligible.
+    assert "t-alpha" in drift.detail
+    assert "t-beta" in drift.detail
+    # Current-agent attribution for the UI.
+    assert drift.current_agent_id == "coordinator"
 
 
 def _dag_gated_plan_for(agent_name: str = "coordinator") -> Plan:
@@ -334,10 +408,12 @@ async def test_pin_unresolved_when_candidate_is_dag_gated() -> None:
     """Agent has a PENDING candidate but it's upstream-gated. Even
     though the DAG gate would reject it for the pin, the agent still
     has work in the plan, so the pin failure is a stall worth
-    surfacing — return ``pin_unresolved`` rather than silent-ack."""
+    surfacing via a ``DriftDetected`` sink event — but the tool response
+    must still be a bare ack so the LLM can't read a ``pin_unresolved``
+    error string."""
     plan = _dag_gated_plan_for("coordinator")
-    plugin, state, captured, _ = _make_plugin_with_handler(
-        "report_task_started", plan=plan
+    plugin, state, captured, _session, sink = _make_plugin_with_handler(
+        "report_task_started", plan=plan, with_sink=True
     )
 
     args: dict[str, Any] = {"detail": "starting"}
@@ -346,8 +422,87 @@ async def test_pin_unresolved_when_candidate_is_dag_gated() -> None:
         tool_args=args,
         tool_context=_Ctx(state),
     )
-    assert result == {"acknowledged": False, "error": "pin_unresolved"}
+    assert result == {"acknowledged": True}
     assert captured == []
+    assert sink is not None
+    assert len(sink.events) == 1
+    drift = sink.events[0].drift_detected
+    assert drift.detail.startswith("pin_unresolved:")
+    assert "t-gated" in drift.detail
+
+
+_FORBIDDEN_LLM_KEYS = ("error", "detail", "no_task_pinned", "pin_unresolved")
+
+
+def _assert_prompt_safe(response: Any) -> None:
+    """The LLM-visible response from a pin-fail branch must be a bare
+    ``{"acknowledged": True}`` with no editorialising keys or error-shaped
+    payloads.
+
+    Tool responses go back to the LLM verbatim. Any ``error``, ``detail``,
+    ``no_task_pinned``, or ``pin_unresolved`` string is treated as
+    actionable context (observed live twice: #250's ``detail`` leak and
+    #252's ``error: pin_unresolved`` payload), and the model will bypass
+    the reporting contract rather than retry. The fix is to keep the
+    LLM-facing shape inert — operator visibility goes through the sink
+    event channel instead.
+    """
+    assert isinstance(response, dict), f"expected dict response, got {type(response)}"
+    for key in _FORBIDDEN_LLM_KEYS:
+        assert key not in response, (
+            f"pin-fail response leaked {key!r} to the LLM; this is a "
+            f"prompt-injection surface. Full payload: {response}"
+        )
+    # Bare ack shape — no other keys.
+    assert response == {"acknowledged": True}
+
+
+async def test_pin_fail_responses_never_leak_error_keys_to_llm() -> None:
+    """Invariant: every pin-fail code path in ``before_tool_callback``
+    must return an LLM-visible payload that carries NONE of
+    ``{error, detail, no_task_pinned, pin_unresolved}``.
+
+    This is the single-sentence version of the #250 + #252-followup
+    bug class: any named-problem string in the tool response becomes a
+    prompt-injection surface. Covers both branches:
+
+      * no-candidates (orchestration-only turn),
+      * has-candidates (sink-driven drift emission path).
+    """
+    # Branch 1 — no candidates (no plan).
+    plugin_a, state_a, _cap_a, _s_a, _sink_a = _make_plugin_with_handler(
+        "report_task_started", plan=None, with_sink=True
+    )
+    result_a = await plugin_a.before_tool_callback(
+        tool=_Tool("report_task_started"),
+        tool_args={"detail": "starting"},
+        tool_context=_Ctx(state_a),
+    )
+    _assert_prompt_safe(result_a)
+
+    # Branch 2 — has candidates, ambiguous pin.
+    plan_b = _ambiguous_plan_for("coordinator")
+    plugin_b, state_b, _cap_b, _s_b, _sink_b = _make_plugin_with_handler(
+        "report_task_started", plan=plan_b, with_sink=True
+    )
+    result_b = await plugin_b.before_tool_callback(
+        tool=_Tool("report_task_started"),
+        tool_args={"detail": "starting"},
+        tool_context=_Ctx(state_b),
+    )
+    _assert_prompt_safe(result_b)
+
+    # Branch 3 — has DAG-gated candidate.
+    plan_c = _dag_gated_plan_for("coordinator")
+    plugin_c, state_c, _cap_c, _s_c, _sink_c = _make_plugin_with_handler(
+        "report_task_started", plan=plan_c, with_sink=True
+    )
+    result_c = await plugin_c.before_tool_callback(
+        tool=_Tool("report_task_started"),
+        tool_args={"detail": "starting"},
+        tool_context=_Ctx(state_c),
+    )
+    _assert_prompt_safe(result_c)
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +587,7 @@ async def test_parallel_agenttool_resolves_by_args() -> None:
     report correctly.
     """
     plan = _parallel_plan()
-    plugin, state, _captured, session_obj = _make_plugin_with_handler(
+    plugin, state, _captured, session_obj, _sink = _make_plugin_with_handler(
         "report_task_completed", plan=plan
     )
 
@@ -464,7 +619,7 @@ async def test_parallel_agenttool_falls_through_on_ambiguous_args() -> None:
     agent-turn pin path (which, for an ambiguous coordinator, ALSO
     leaves state unset — no guess)."""
     plan = _parallel_plan()
-    plugin, state, _captured, session_obj = _make_plugin_with_handler(
+    plugin, state, _captured, session_obj, _sink = _make_plugin_with_handler(
         "report_task_completed", plan=plan
     )
 
@@ -488,7 +643,7 @@ async def test_dag_aware_candidate_filter() -> None:
     """A PENDING task whose upstream is not COMPLETED is NOT eligible
     to be the target of a delegation."""
     plan = _gated_plan()
-    plugin, state, _captured, session_obj = _make_plugin_with_handler(
+    plugin, state, _captured, session_obj, _sink = _make_plugin_with_handler(
         "report_task_completed", plan=plan
     )
 
@@ -519,7 +674,7 @@ async def test_delegation_pin_beats_agent_turn_pin() -> None:
     available, the delegation pin wins — it's the more specific
     resolution."""
     plan = _parallel_plan()
-    plugin, state, captured, session_obj = _make_plugin_with_handler(
+    plugin, state, captured, session_obj, _sink = _make_plugin_with_handler(
         "report_task_completed", plan=plan
     )
 

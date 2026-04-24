@@ -415,3 +415,83 @@ async def test_judge_disabled_when_call_llm_is_none() -> None:
     # Only confusion/looping always-on detectors ran, and neither fires
     # on a single clean-text thinking message with no history.
     assert sink.events == []
+
+
+async def test_judge_rate_limit_buckets_per_agent_not_globally() -> None:
+    """Two agents firing unpinned thinking blocks don't share a counter bucket.
+
+    Pre-fix the rate-limit counter keyed on ``current_task_id or ""``,
+    so every unpinned turn from every agent collapsed onto the ``""``
+    bucket. Agent B's legitimate first thinking block on an unpinned
+    turn could legitimately fail to fire the judge because unrelated
+    agent A's unpinned turn had already incremented the ``""`` counter.
+
+    Post-fix the key is ``(agent_name, task_id)``. Each agent gets
+    its own counter, so agent A's first unpinned block fires, and
+    agent B's first unpinned block ALSO fires independently.
+
+    Test matrix (rate_limit=3, task_id=""):
+
+        agent A turn 1 -> FIRE (count=0)    expected calls=1
+        agent B turn 1 -> FIRE (count=0)    expected calls=2
+        agent A turn 2 -> skip (count=1)    expected calls=2
+        agent B turn 2 -> skip (count=1)    expected calls=2
+        agent A turn 3 -> skip (count=2)    expected calls=2
+        agent B turn 3 -> skip (count=2)    expected calls=2
+
+    With the old global-""-bucket code calls would have been 1 after
+    agent B's first turn (skipped because agent A already consumed
+    the ``count=0`` firing slot).
+    """
+    call_llm = _stub_call_llm([{"on_task": True}] * 10)
+    steerer = DefaultSteerer(
+        reasoning_drift_call_llm=call_llm,
+        reasoning_drift_model="fake",
+        reasoning_drift_rate_limit=3,
+        reasoning_drift_mode="judge",
+    )
+    # Session with no current_task_id — both agents' turns are unpinned.
+    session = Session(
+        run_id="r1",
+        goals=_goals(),
+        plan=Plan(id="p1", run_id="r1", goal_ids=["g1"], tasks=[], edges=[]),
+        current_task_id="",
+    )
+    sink = ListSink()
+    steerer.bind(sinks=[sink], planner=NullPlanner())
+
+    # Round 1: both agents fire on their first unpinned block.
+    await steerer.observe_reasoning("A turn 1", session=session, agent_name="agent_a")
+    assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
+    await steerer.observe_reasoning("B turn 1", session=session, agent_name="agent_b")
+    # The bug reproduces here: pre-fix this would stay at 1 because
+    # agent A's turn had already incremented the shared ``""`` bucket.
+    assert len(call_llm.calls) == 2, (  # type: ignore[attr-defined]
+        f"agent_b's first unpinned block must fire the judge independently "
+        f"of agent_a's. Got {len(call_llm.calls)} calls; expected 2. "  # type: ignore[attr-defined]
+        f"Pre-fix both agents shared the ``(\"\", \"\")`` bucket."
+    )
+
+    # Round 2: both skip (count=1 for each agent's bucket).
+    await steerer.observe_reasoning("A turn 2", session=session, agent_name="agent_a")
+    await steerer.observe_reasoning("B turn 2", session=session, agent_name="agent_b")
+    assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
+
+    # Round 3: both skip again (count=2).
+    await steerer.observe_reasoning("A turn 3", session=session, agent_name="agent_a")
+    await steerer.observe_reasoning("B turn 3", session=session, agent_name="agent_b")
+    assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
+
+    # Round 4: both fire (count=3 % 3 == 0). Confirms the per-agent
+    # counters advance independently and are NOT a shared global bucket.
+    await steerer.observe_reasoning("A turn 4", session=session, agent_name="agent_a")
+    assert len(call_llm.calls) == 3  # type: ignore[attr-defined]
+    await steerer.observe_reasoning("B turn 4", session=session, agent_name="agent_b")
+    assert len(call_llm.calls) == 4  # type: ignore[attr-defined]
+
+    # Sanity: the counters dict is keyed by (agent_name, task_id) tuples.
+    counters = session._reasoning_judge_counters
+    assert ("agent_a", "") in counters
+    assert ("agent_b", "") in counters
+    assert counters[("agent_a", "")] == 4
+    assert counters[("agent_b", "")] == 4

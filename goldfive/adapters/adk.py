@@ -1448,6 +1448,7 @@ class ADKAdapter:
         session: Session,
         provider: str = "",
         call_id: str = "",  # noqa: ARG002 -- part of the protocol
+        agent_name: str = "",
     ) -> None:
         """Forward an extracted reasoning block to the bound steerer."""
         steerer = self._steerer
@@ -1456,7 +1457,16 @@ class ADKAdapter:
         observe = getattr(steerer, "observe_reasoning", None)
         if observe is None:
             return
-        await observe(text, task=task, session=session, provider=provider)
+        try:
+            await observe(
+                text,
+                task=task,
+                session=session,
+                provider=provider,
+                agent_name=agent_name,
+            )
+        except TypeError:
+            await observe(text, task=task, session=session, provider=provider)
 
     async def invoke(self, task: Task, session: Session) -> InvocationResult:
         """DEPRECATED — drive one ADK turn for a single ``task``.

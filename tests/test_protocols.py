@@ -69,6 +69,7 @@ class _SteererStub:
         task: Any = None,
         session: Any,
         provider: str = "",
+        agent_name: str = "",
     ) -> None:
         return None
 

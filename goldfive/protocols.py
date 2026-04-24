@@ -65,6 +65,7 @@ class Steerer(Protocol):
         task: Task | None = None,
         session: Session,
         provider: str = "",
+        agent_name: str = "",
     ) -> None: ...
 
     async def transition(
@@ -141,6 +142,7 @@ class AgentAdapter(Protocol):
         session: Session,
         provider: str = "",
         call_id: str = "",
+        agent_name: str = "",
     ) -> None: ...
 
     @property

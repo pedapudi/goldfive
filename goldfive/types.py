@@ -725,14 +725,22 @@ class Session:
     # already cost-bounded by the interval; task-boundary scheduling needs
     # its own rate limit. Default 0 (never fired).
     _last_goal_drift_check_ts: float = 0.0
-    # Per-task thinking-message counter for the LLM-as-a-judge reasoning
-    # drift detector (goldfive#226). Task id -> count of ``observe_reasoning``
-    # calls since the last judge firing (or since task transition).
-    # ``DefaultSteerer`` fires the judge on the first message of every task
-    # (count=0) and then every ``reasoning_drift_rate_limit`` messages after
-    # that. Scoped per-task (not per-session) so the first thinking message
-    # on a fresh task always gets a judge call even on rate limits >1.
-    _reasoning_judge_counters: dict[str, int] = dataclasses.field(default_factory=dict)
+    # Per-(agent, task) thinking-message counter for the LLM-as-a-judge
+    # reasoning drift detector (goldfive#226). Keyed by
+    # ``(agent_name, task_id)`` -> count of ``observe_reasoning`` calls
+    # since the last judge firing (or since task/agent transition).
+    # ``DefaultSteerer`` fires the judge on the first message of every
+    # (agent, task) bucket (count=0) and then every
+    # ``reasoning_drift_rate_limit`` messages after that. Scoped
+    # per-(agent, task) — not globally, not per-task — so unrelated
+    # unpinned turns from different agents don't share the empty-task-id
+    # bucket and distort judge cadence. Pre-fix the key was a single
+    # string keyed on ``current_task_id or ""``; every unpinned turn
+    # from every agent collapsed onto the ``""`` bucket and legitimate
+    # first-block judge firings were skipped.
+    _reasoning_judge_counters: dict[tuple[str, str], int] = dataclasses.field(
+        default_factory=dict
+    )
     # Set to ``True`` by :class:`DefaultSteerer` when it escalates a
     # drift to Level 4 of the intervention ladder (goldfive#142).
     # Executors honour this flag the same way they honour a PAUSE
