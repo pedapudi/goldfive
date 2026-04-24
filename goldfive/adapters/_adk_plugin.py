@@ -1113,6 +1113,49 @@ async def _inject_goldfive_planner_instruction(
         )
 
 
+def _bridge_pending_corrections(gf_state: Any, adk_state: Any) -> None:
+    """Mirror every ``goldfive.pending_corrections.*`` key from ``gf_state`` onto ``adk_state``.
+
+    goldfive#251 Stream D. Structural (prefix-scoped) bridge rather than
+    a per-key copy because the correction family is ``(agent,
+    task)``-expanded — goldfive doesn't know the set of keys at
+    plugin-init time. Idempotent: re-running on the same pair of states
+    restores whatever ``gf_state`` has NOW and evicts ADK entries
+    ``gf_state`` no longer carries. That eviction is the mechanism by
+    which a :func:`goldfive._correction_injection.clear_correction`
+    call on the orchestration state reaches the dynamic instruction
+    resolver on the ADK side.
+
+    Called from :meth:`make_adk_plugin`'s inner
+    ``_bridge_orchestration_state`` once per ``before_run_callback``;
+    also directly unit-testable as a module-level helper with any pair
+    of dicts.
+
+    Silent on non-mapping inputs so one malformed state never blocks
+    the rest of the bridge.
+    """
+    if not isinstance(adk_state, MutableMapping):
+        return
+    prefix = _sp.KEY_PENDING_CORRECTIONS + "."
+    # Snapshot the gf-side keys first so mutation during the loop is
+    # impossible.
+    gf_keys: dict[str, Any] = {}
+    if isinstance(gf_state, Mapping):
+        for k, v in gf_state.items():
+            if isinstance(k, str) and k.startswith(prefix):
+                gf_keys[k] = v
+    # Evict any ADK-side correction key that no longer exists on the
+    # goldfive side. This is the mechanism by which a clear on
+    # gf_state reaches the resolver (the resolver reads the ADK copy
+    # via ``readonly_context.state``).
+    for k in list(adk_state.keys()):
+        if isinstance(k, str) and k.startswith(prefix) and k not in gf_keys:
+            adk_state.pop(k, None)
+    # Copy fresh values through.
+    for k, v in gf_keys.items():
+        adk_state[k] = v
+
+
 def make_adk_plugin(
     *,
     name: str = "goldfive_adk_plugin",
@@ -2229,6 +2272,21 @@ def make_adk_plugin(
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "_bridge_orchestration_state: cancelled_ids bridge failed: %s",
+                    exc,
+                )
+            # goldfive#251 Stream D: pending-corrections bridge. Keys
+            # under ``goldfive.pending_corrections.<agent>.<task>`` are
+            # written by :mod:`goldfive._correction_injection` on refine
+            # landing. They're prefix-scoped and per-(agent, task), so
+            # the bridge is structural — copy anything present under
+            # the family prefix, evict anything the orchestration side
+            # has cleared. The dynamic instruction resolver reads the
+            # ADK-side copy per turn.
+            try:
+                _bridge_pending_corrections(gf_state, adk_state)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_bridge_orchestration_state: pending_corrections bridge failed: %s",
                     exc,
                 )
 

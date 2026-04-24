@@ -4017,6 +4017,10 @@ class DefaultSteerer:
         *,
         prev_plan: Plan | None = None,
     ) -> None:
+        from goldfive._correction_injection import (
+            clear_obsolete_corrections_on_revision,
+            queue_corrections_for_revision,
+        )
         from goldfive.conv import to_pb_plan
         from goldfive.events import build_plan_revision_diff
 
@@ -4028,6 +4032,29 @@ class DefaultSteerer:
         # correction. No-op for REPLACE-kind (existing behaviour is
         # preserved) and for plans without supersedes.
         self._integrate_correction_supersedes(revised)
+
+        # goldfive#251 Stream D: GC corrections for tasks superseded by
+        # this revision BEFORE queuing new ones. A task whose correction
+        # is about to be obsoleted (because the new revision supersedes
+        # the correction task itself) must have its stale correction
+        # dropped. Runs first so a same-revision CORRECT->CORRECT chain
+        # (T -> T' -> T'') doesn't race: the T correction is cleared
+        # here, then T''s correction is written below.
+        clear_obsolete_corrections_on_revision(session, revised)
+
+        # goldfive#251 Stream D: for every NEW task with supersedes_kind
+        # == CORRECT, stamp a structured correction dict on the
+        # orchestration session state under
+        # ``goldfive.pending_corrections.<agent_name>.<task_id>``. The
+        # dynamic instruction resolver (Stream B) reads this on the next
+        # turn and appends a directive-style correction block to the
+        # agent's system prompt. No-op on refines with no CORRECT links.
+        queue_corrections_for_revision(
+            session=session,
+            revised=revised,
+            prev_plan=prev_plan,
+            drift=drift,
+        )
 
         # goldfive#237: re-pin ``current_task_id`` onto any replacement
         # task the revision introduces. Without this, agents keep

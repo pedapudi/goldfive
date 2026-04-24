@@ -464,7 +464,48 @@ async def _handle_task_started(
                 task_id=task_id,
             )
     await steerer.mark_task_running(task_id, session=session, detail=detail)
+    # goldfive#251 Stream D: the agent has acknowledged the (possibly
+    # corrected) task; clear any queued correction scoped to this
+    # ``(agent, task_id)`` pair. The correction block only needs to be
+    # injected until the agent is on-task — further turns should see
+    # the unadorned instruction. ``report_task_failed`` does NOT clear
+    # (failure is not acknowledgment, and a re-invocation still needs
+    # the correction).
+    _clear_correction_on_started(session, task)
     return dict(_ACK)
+
+
+def _clear_correction_on_started(session: Session, task: Task | None) -> None:
+    """Best-effort GC of the pending correction for this task's assignee.
+
+    The correction is keyed by ``(agent_name, task_id)``; we recover
+    ``agent_name`` from ``task.assignee_agent_id`` on the plan. When
+    the task is unknown (shouldn't happen by the time we reach this
+    handler — ``_handle_task_started`` has already looked it up — but
+    defensive for edge cases) the clear is silently skipped.
+
+    Isolated so the call site in ``_handle_task_started`` stays terse
+    and so the import of the correction-injection module is paid only
+    in handler paths that actually need it.
+    """
+    if task is None:
+        return
+    from goldfive._correction_injection import clear_correction
+
+    assignee = str(getattr(task, "assignee_agent_id", "") or "").strip()
+    task_id = str(getattr(task, "id", "") or "").strip()
+    if not assignee or not task_id:
+        return
+    # Normalise the same way the write-side does so keys round-trip.
+    if "." in assignee:
+        assignee = assignee.rsplit(".", 1)[-1]
+    try:
+        clear_correction(session, agent_name=assignee, task_id=task_id)
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "reporting: clear_correction on report_task_started raised: %s",
+            exc,
+        )
 
 
 async def _handle_task_progress(
