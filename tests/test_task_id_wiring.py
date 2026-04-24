@@ -263,6 +263,213 @@ async def test_before_agent_callback_skips_terminal_tasks() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Layer 1 (goldfive#242) — DAG-aware candidate filter
+# ---------------------------------------------------------------------------
+
+
+async def test_pin_skips_task_with_incomplete_upstream() -> None:
+    """A -> B, A is PENDING, agent is assigned to B -> no pin (upstream gate)."""
+    plugin = make_adk_plugin(host_agent_name="coord")
+    session = _session_with(
+        _plan_with(
+            Task(id="a", title="A", assignee_agent_id="other"),
+            Task(id="b", title="B", assignee_agent_id="research_agent"),
+            edges=[TaskEdge("a", "b")],
+        )
+    )
+    state, ctx = _ctx_for(session, "coord")
+
+    await plugin.before_agent_callback(
+        agent=_Agent("research_agent"),
+        callback_context=ctx,
+    )
+
+    # DAG gate filters B out because A is still PENDING.
+    assert KEY_CURRENT_TASK_ID not in state
+    assert "goldfive.current_task_id" not in session.state
+
+
+async def test_pin_selects_task_after_upstream_completes() -> None:
+    """A COMPLETED, B PENDING, agent assigned to B -> B is pinned."""
+    plugin = make_adk_plugin(host_agent_name="coord")
+    session = _session_with(
+        _plan_with(
+            Task(
+                id="a",
+                title="A",
+                assignee_agent_id="other",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(id="b", title="B", assignee_agent_id="research_agent"),
+            edges=[TaskEdge("a", "b")],
+        )
+    )
+    state, ctx = _ctx_for(session, "coord")
+
+    await plugin.before_agent_callback(
+        agent=_Agent("research_agent"),
+        callback_context=ctx,
+    )
+
+    assert state[KEY_CURRENT_TASK_ID] == "b"
+    assert session.state["goldfive.current_task_id"] == "b"
+
+
+async def test_pin_ambiguous_narrows_by_dag() -> None:
+    """Two agent-matches, one has incomplete upstream -> singleton remains, pins."""
+    plugin = make_adk_plugin(host_agent_name="coord")
+    # ``t1`` is free of upstream deps; ``t2`` depends on ``gate`` which
+    # is still PENDING. Without the DAG gate both would be candidates
+    # and pin would bail on ambiguity; with the gate, only ``t1``
+    # remains.
+    session = _session_with(
+        _plan_with(
+            Task(id="gate", title="gate", assignee_agent_id="other"),
+            Task(id="t1", title="first", assignee_agent_id="research_agent"),
+            Task(id="t2", title="second", assignee_agent_id="research_agent"),
+            edges=[TaskEdge("gate", "t2")],
+        )
+    )
+    state, ctx = _ctx_for(session, "coord")
+
+    await plugin.before_agent_callback(
+        agent=_Agent("research_agent"),
+        callback_context=ctx,
+    )
+
+    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state["goldfive.current_task_id"] == "t1"
+
+
+async def test_pin_reproduces_finalize_bug() -> None:
+    """Live-scenario regression: 5-stage plan, only finalize is the coordinator's.
+
+    Stages 0-3 are PENDING; the final ``finalize_and_deliver_presentation``
+    task (Stage 4) is the only one assigned to the coordinator. Before
+    the DAG gate, ``before_agent_callback`` pinned the finalize task on
+    the coordinator's very first turn (pre-delegation), letting the
+    LLM call ``report_task_started`` on it and transitioning a Stage 4
+    task to RUNNING while upstream was still PENDING. The gate must
+    block that pin.
+    """
+    plugin = make_adk_plugin(host_agent_name="coordinator_agent")
+    session = _session_with(
+        _plan_with(
+            Task(id="s0", title="Gather", assignee_agent_id="researcher"),
+            Task(id="s1", title="Outline", assignee_agent_id="outliner"),
+            Task(id="s2", title="Draft", assignee_agent_id="writer"),
+            Task(id="s3", title="Review", assignee_agent_id="reviewer"),
+            Task(
+                id="finalize_and_deliver_presentation",
+                title="Finalize",
+                assignee_agent_id="coordinator_agent",
+            ),
+            edges=[
+                TaskEdge("s0", "s1"),
+                TaskEdge("s1", "s2"),
+                TaskEdge("s2", "s3"),
+                TaskEdge("s3", "finalize_and_deliver_presentation"),
+            ],
+        )
+    )
+    state, ctx = _ctx_for(session, "coordinator_agent")
+
+    await plugin.before_agent_callback(
+        agent=_Agent("coordinator_agent"),
+        callback_context=ctx,
+    )
+
+    # The entire bug: nothing should be pinned on the coordinator's
+    # first turn because the finalize task's upstream is still PENDING.
+    assert KEY_CURRENT_TASK_ID not in state
+    assert "goldfive.current_task_id" not in session.state
+
+
+async def test_pin_supersedes_redirection_tracks_replacement() -> None:
+    """Edge ``A -> C`` survives supersession; readiness tracks B's status."""
+    plugin = make_adk_plugin(host_agent_name="coord")
+    # A is the original, now FAILED; B replaces A (B.supersedes == "A");
+    # C depends on A in the edges table. The live status driving C's
+    # readiness must be B's (PENDING), not A's (FAILED).
+    plan = _plan_with(
+        Task(id="A", title="A", status=TaskStatus.FAILED, assignee_agent_id="other"),
+        Task(
+            id="B",
+            title="B",
+            status=TaskStatus.PENDING,
+            assignee_agent_id="other",
+            supersedes="A",
+        ),
+        Task(id="C", title="C", assignee_agent_id="research_agent"),
+        edges=[TaskEdge("A", "C")],
+    )
+    session = _session_with(plan)
+    state, ctx = _ctx_for(session, "coord")
+
+    # B is still PENDING -> C is NOT ready -> pin blocked.
+    await plugin.before_agent_callback(
+        agent=_Agent("research_agent"),
+        callback_context=ctx,
+    )
+    assert KEY_CURRENT_TASK_ID not in state
+
+    # Flip B to COMPLETED; now C is ready -> pin proceeds.
+    plan.tasks[1].status = TaskStatus.COMPLETED
+    await plugin.before_agent_callback(
+        agent=_Agent("research_agent"),
+        callback_context=ctx,
+    )
+    assert state[KEY_CURRENT_TASK_ID] == "C"
+
+
+async def test_pin_orchestration_block_shows_none_when_unpinned() -> None:
+    """When the DAG gate blocks pin, the planner instruction block shows '(none)'.
+
+    This is the user-visible effect: the agent's system prompt does
+    NOT contain a stale or wrong task id on turns where no task is
+    eligible. GoldfivePlanner renders the pinned id from
+    ``goldfive.current_task_id``; an unset key surfaces ``(none)``.
+    """
+    from goldfive.planners.goldfive_planner import GoldfivePlanner
+
+    plugin = make_adk_plugin(host_agent_name="coordinator_agent")
+    session = _session_with(
+        _plan_with(
+            Task(id="s0", title="Gather", assignee_agent_id="researcher"),
+            Task(
+                id="finalize",
+                title="Finalize",
+                assignee_agent_id="coordinator_agent",
+            ),
+            edges=[TaskEdge("s0", "finalize")],
+        )
+    )
+    state, ctx = _ctx_for(session, "coordinator_agent")
+
+    await plugin.before_agent_callback(
+        agent=_Agent("coordinator_agent"),
+        callback_context=ctx,
+    )
+
+    # No pin happened (s0 still PENDING).
+    assert KEY_CURRENT_TASK_ID not in state
+
+    # Build the planner instruction the LLM would see. We use a
+    # tolerant readonly-context stub carrying the ADK state dict.
+    planner = GoldfivePlanner(session=session)
+
+    class _Readonly:
+        def __init__(self, s: dict) -> None:
+            self.state = s
+
+    instruction = planner.build_planning_instruction(_Readonly(state), None)
+    assert instruction is not None
+    # The critical assertion: the block does not contain the finalize id.
+    assert "finalize" not in instruction
+    assert "Plan task (if any): (none)" in instruction
+
+
+# ---------------------------------------------------------------------------
 # Layer 2 — reporting-tool handlers default task_id from state
 # ---------------------------------------------------------------------------
 

@@ -14,6 +14,7 @@ from goldfive.types import (
     Task,
     TaskEdge,
     TaskStatus,
+    task_upstream_ready,
 )
 
 # ---------------------------------------------------------------------------
@@ -663,3 +664,149 @@ class TestPlanValidate:
         )
         revision.validate(for_revision=True)
         revision.validate(for_revision=False)
+
+
+# ---------------------------------------------------------------------------
+# DAG readiness helper (goldfive#242)
+# ---------------------------------------------------------------------------
+
+
+def _mk_plan_tasks(tasks: list[Task], edges: list[TaskEdge] | None = None) -> Plan:
+    return Plan(
+        id="p",
+        run_id="r",
+        goal_ids=[],
+        tasks=list(tasks),
+        edges=list(edges or []),
+    )
+
+
+class TestTaskUpstreamReady:
+    def test_zero_upstream_edges_is_ready(self) -> None:
+        plan = _mk_plan_tasks(
+            [Task(id="a", title="A"), Task(id="b", title="B")],
+            edges=[],
+        )
+        assert task_upstream_ready(plan, "a") is True
+        assert task_upstream_ready(plan, "b") is True
+
+    def test_single_upstream_completed_is_ready(self) -> None:
+        plan = _mk_plan_tasks(
+            [
+                Task(id="a", title="A", status=TaskStatus.COMPLETED),
+                Task(id="b", title="B", status=TaskStatus.PENDING),
+            ],
+            edges=[TaskEdge("a", "b")],
+        )
+        assert task_upstream_ready(plan, "b") is True
+
+    def test_single_upstream_pending_is_not_ready(self) -> None:
+        plan = _mk_plan_tasks(
+            [
+                Task(id="a", title="A", status=TaskStatus.PENDING),
+                Task(id="b", title="B", status=TaskStatus.PENDING),
+            ],
+            edges=[TaskEdge("a", "b")],
+        )
+        assert task_upstream_ready(plan, "b") is False
+
+    def test_upstream_running_is_not_ready(self) -> None:
+        plan = _mk_plan_tasks(
+            [
+                Task(id="a", title="A", status=TaskStatus.RUNNING),
+                Task(id="b", title="B", status=TaskStatus.PENDING),
+            ],
+            edges=[TaskEdge("a", "b")],
+        )
+        assert task_upstream_ready(plan, "b") is False
+
+    def test_upstream_failed_is_not_ready(self) -> None:
+        # FAILED is not COMPLETED — downstream cannot be pinned.
+        plan = _mk_plan_tasks(
+            [
+                Task(id="a", title="A", status=TaskStatus.FAILED),
+                Task(id="b", title="B", status=TaskStatus.PENDING),
+            ],
+            edges=[TaskEdge("a", "b")],
+        )
+        assert task_upstream_ready(plan, "b") is False
+
+    def test_mixed_upstream_one_pending_blocks(self) -> None:
+        # Two upstreams; one COMPLETED, one PENDING -> not ready.
+        plan = _mk_plan_tasks(
+            [
+                Task(id="a", title="A", status=TaskStatus.COMPLETED),
+                Task(id="b", title="B", status=TaskStatus.PENDING),
+                Task(id="c", title="C", status=TaskStatus.PENDING),
+            ],
+            edges=[TaskEdge("a", "c"), TaskEdge("b", "c")],
+        )
+        assert task_upstream_ready(plan, "c") is False
+
+    def test_mixed_upstream_all_completed_is_ready(self) -> None:
+        plan = _mk_plan_tasks(
+            [
+                Task(id="a", title="A", status=TaskStatus.COMPLETED),
+                Task(id="b", title="B", status=TaskStatus.COMPLETED),
+                Task(id="c", title="C", status=TaskStatus.PENDING),
+            ],
+            edges=[TaskEdge("a", "c"), TaskEdge("b", "c")],
+        )
+        assert task_upstream_ready(plan, "c") is True
+
+    def test_irrelevant_edges_are_ignored(self) -> None:
+        # Edges that do not terminate at ``task_id`` are ignored.
+        plan = _mk_plan_tasks(
+            [
+                Task(id="a", title="A", status=TaskStatus.PENDING),
+                Task(id="b", title="B", status=TaskStatus.PENDING),
+                Task(id="c", title="C", status=TaskStatus.PENDING),
+            ],
+            edges=[TaskEdge("a", "b")],
+        )
+        # c has no incoming edges at all.
+        assert task_upstream_ready(plan, "c") is True
+
+    def test_empty_task_id_trivially_ready(self) -> None:
+        # Edge case — caller has no task id to evaluate, treat as ready
+        # (the adapter's pin logic checks the return of ``task.id`` too
+        # and skips empty-id tasks upstream of this call).
+        plan = _mk_plan_tasks([])
+        assert task_upstream_ready(plan, "") is True
+
+    def test_dangling_edge_blocks(self) -> None:
+        # Edge references an unknown from-task -> conservative False.
+        plan = _mk_plan_tasks(
+            [Task(id="b", title="B", status=TaskStatus.PENDING)],
+            edges=[TaskEdge("ghost", "b")],
+        )
+        assert task_upstream_ready(plan, "b") is False
+
+    def test_supersedes_redirects_upstream_status(self) -> None:
+        # The live scenario: edge ``A -> C`` exists in the plan. ``A``
+        # failed; the refiner added ``B`` with ``supersedes="A"`` and
+        # marked ``A`` FAILED. The edge is still ``A -> C`` — the
+        # readiness of C must now track ``B``'s status (the live
+        # replacement), not ``A``'s FAILED status.
+        plan = _mk_plan_tasks(
+            [
+                Task(id="A", title="A", status=TaskStatus.FAILED),
+                Task(
+                    id="B",
+                    title="B (replacement)",
+                    status=TaskStatus.PENDING,
+                    supersedes="A",
+                ),
+                Task(id="C", title="C", status=TaskStatus.PENDING),
+            ],
+            edges=[TaskEdge("A", "C")],
+        )
+        # B is PENDING, so C is NOT ready yet. Critically: we should
+        # NOT have short-circuited on A's FAILED status and blocked C
+        # forever (nor should we have ignored the edge and reported C
+        # as ready).
+        assert task_upstream_ready(plan, "C") is False
+
+        # Flip B to COMPLETED — C becomes ready.
+        plan.tasks[1].status = TaskStatus.COMPLETED
+        assert task_upstream_ready(plan, "C") is True
