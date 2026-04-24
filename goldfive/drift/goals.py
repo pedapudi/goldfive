@@ -209,6 +209,10 @@ async def classify_goal_drift(
     current_agent_id: str = "",
     system_prompt: str | None = None,
     user_prompt_template: str | None = None,
+    sinks: list[Any] | None = None,
+    run_id: str = "",
+    session_id: str = "",
+    sequence_fn: Callable[[], int] | None = None,
 ) -> DriftEvent | None:
     """Ask an LLM-judge whether recent activity is progressing the goals.
 
@@ -269,7 +273,18 @@ async def classify_goal_drift(
         activity_count=activity_count,
     )
     try:
-        raw = await call_llm(system, user, model)
+        from goldfive._llm_span import goldfive_llm_span
+
+        async with goldfive_llm_span(
+            sinks=list(sinks or []),
+            name="judge_goal_drift",
+            model=model,
+            session_id=session_id,
+            run_id=run_id,
+            task_id=current_task_id,
+            sequence_fn=sequence_fn,
+        ):
+            raw = await call_llm(system, user, model)
     except Exception as exc:  # noqa: BLE001 - never break the run
         log.warning("classify_goal_drift: call_llm raised %s; no drift emitted", exc)
         return None

@@ -305,8 +305,27 @@ async def classify_reasoning_drift(
     )
     started = time.monotonic()
     call_failed = False
+    # Wrap the judge call in the shared LLM span helper so harmonograf
+    # renders it as a span on the goldfive lane alongside every other
+    # goldfive-internal LLM call. Redundant with the
+    # ``ReasoningJudgeInvoked`` event (same timing) but matches the
+    # pattern every other goldfive-internal LLM call uses — frontends
+    # prefer the event for the verdict detail and the span for Gantt
+    # rendering. See goldfive internal-llm-spans.
+    from goldfive._llm_span import goldfive_llm_span
+
+    span_sinks = [sink] if sink is not None else []
     try:
-        raw = await call_llm(system, user, model)
+        async with goldfive_llm_span(
+            sinks=span_sinks,
+            name="judge_reasoning",
+            model=model,
+            session_id=session_id,
+            run_id=run_id,
+            task_id=current_task_id,
+            sequence_fn=sequence_fn,
+        ):
+            raw = await call_llm(system, user, model)
     except Exception as exc:  # noqa: BLE001 - never break the run
         log.warning(
             "classify_reasoning_drift: call_llm raised %s; no drift emitted",

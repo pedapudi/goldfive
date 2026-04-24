@@ -660,6 +660,15 @@ class LLMPlanner:
         # When left as ``None`` (e.g. the planner is used standalone in
         # tests) the fallback still happens -- it is just not emitted.
         self._drift_emitter: Callable[[DriftEvent], Awaitable[None]] | None = None
+        # Optional context provider for ``GoldfiveLLMCallStart/End``
+        # spans (goldfive internal-llm-spans). The steerer wires this
+        # up in :meth:`bind` so every planner-internal ``call_llm``
+        # site shows up on harmonograf's Gantt. Returns
+        # ``(sinks, run_id, session_id, task_id, sequence_fn)`` snapshotted
+        # against the currently-active session, or ``None`` when the
+        # planner is used standalone (tests) — spans degrade to a
+        # no-op in that case.
+        self._span_ctx_provider: Callable[[], Any] | None = None
 
     @property
     def model(self) -> str:
@@ -679,6 +688,50 @@ class LLMPlanner:
         event pipeline without the planner owning a sink list itself.
         """
         self._drift_emitter = emitter
+
+    def set_span_context_provider(
+        self, provider: Callable[[], Any] | None
+    ) -> None:
+        """Install (or remove) the callable that supplies span-emission context.
+
+        The callable is invoked at every ``call_llm`` site to snapshot
+        the currently-bound ``(sinks, run_id, session_id, task_id,
+        sequence_fn)`` tuple under which the call is running. When it
+        returns ``None`` (no session in scope) span emission degrades
+        to a no-op — the wrapped ``await call_llm(...)`` runs exactly
+        as before.
+
+        Wired from :meth:`DefaultSteerer.bind` so goldfive-internal LLM
+        calls show up as proper spans on harmonograf's Gantt without
+        the planner owning a sink list itself.
+        """
+        self._span_ctx_provider = provider
+
+    def _span_kwargs(self, task_id_override: str = "") -> dict[str, Any]:
+        """Resolve keyword args for :func:`goldfive_llm_span` at a call site.
+
+        Returns an empty dict when no provider is bound (span degrades
+        to a no-op wrapping the call). ``task_id_override`` lets refine
+        paths stamp the drift-bound task id on the span even when the
+        session's ``current_task_id`` has already flipped.
+        """
+        if self._span_ctx_provider is None:
+            return {"sinks": [], "model": self._model}
+        try:
+            ctx = self._span_ctx_provider()
+        except Exception:  # noqa: BLE001 - observability must never break the run
+            return {"sinks": [], "model": self._model}
+        if ctx is None:
+            return {"sinks": [], "model": self._model}
+        sinks, run_id, session_id, task_id, seq_fn = ctx
+        return {
+            "sinks": list(sinks or []),
+            "model": self._model,
+            "run_id": run_id or "",
+            "session_id": session_id or "",
+            "task_id": task_id_override or task_id or "",
+            "sequence_fn": seq_fn,
+        }
 
     # ---- prompt builders -------------------------------------------------
 
@@ -1327,6 +1380,7 @@ class LLMPlanner:
         log_prefix: str,
         allow_reject: bool = False,
         available_agents: list[str] | list[dict[str, Any]] | None = None,
+        span_name: str = "refine",
     ) -> tuple[Plan | None, str, bool]:
         """Run the retry loop for a single refine call.
 
@@ -1353,12 +1407,15 @@ class LLMPlanner:
         intervention" rather than a validation failure. Used by the
         PLAN_DIVERGENCE path (goldfive#144).
         """
+        from goldfive._llm_span import goldfive_llm_span
+
         user_prompt = base_user_prompt
         last_error = ""
         attempts = max(1, self._max_refine_attempts)
         for attempt in range(1, attempts + 1):
             try:
-                raw = await self._call_llm(system_prompt, user_prompt, self._model)
+                async with goldfive_llm_span(**self._span_kwargs(), name=span_name):
+                    raw = await self._call_llm(system_prompt, user_prompt, self._model)
             except Exception as exc:  # noqa: BLE001 -- retry on transient LLM errors
                 last_error = f"call_llm raised: {exc}"
                 log.warning(
@@ -1625,6 +1682,8 @@ class LLMPlanner:
             log.debug("LLMPlanner.generate: no goals provided; skipping plan")
             return None
         base_prompt = self._build_generate_prompt(goals, available_agents, context)
+        from goldfive._llm_span import goldfive_llm_span
+
         run_id = ""
         if context is not None:
             run_id = str(context.get("run_id") or "")
@@ -1633,7 +1692,10 @@ class LLMPlanner:
         attempts = max(1, self._max_refine_attempts)
         for attempt in range(1, attempts + 1):
             try:
-                raw = await self._call_llm(self._system_prompt, user_prompt, self._model)
+                async with goldfive_llm_span(
+                    **self._span_kwargs(), name="plan_generate"
+                ):
+                    raw = await self._call_llm(self._system_prompt, user_prompt, self._model)
             except Exception as exc:  # noqa: BLE001
                 last_error = f"call_llm raised: {exc}"
                 log.warning(
@@ -1816,6 +1878,7 @@ class LLMPlanner:
             log_prefix="LLMPlanner.refine",
             allow_reject=allow_reject,
             available_agents=available_agents,
+            span_name="refine",
         )
         if rejected:
             # LLM judged the divergence off-goal. Return None so the
@@ -1981,6 +2044,7 @@ class LLMPlanner:
             post_parse=_force_looper_failed,
             log_prefix="LLMPlanner._refine_looping_tool_call",
             available_agents=available_agents,
+            span_name="refine_looping_tool_call",
         )
         if revised is None:
             # Retries exhausted. Signal the failure explicitly, then
@@ -2197,8 +2261,20 @@ class LLMPlanner:
         both the first attempt and every retry apply exactly the same
         plumbing.
         """
+        from goldfive._llm_span import goldfive_llm_span
+
+        # ``source`` is "user" for USER_STEER and "goldfive" for a
+        # goldfive-promoted drift — surface that on the span name so
+        # operators can distinguish them on the Gantt.
+        span_name = "refine_user_steer" if source != "goldfive" else "refine_steer"
         try:
-            raw = await self._call_llm(self._user_steer_system_prompt, user_prompt, self._model)
+            async with goldfive_llm_span(
+                **self._span_kwargs(task_id_override=drift.current_task_id),
+                name=span_name,
+            ):
+                raw = await self._call_llm(
+                    self._user_steer_system_prompt, user_prompt, self._model
+                )
         except Exception as exc:  # noqa: BLE001
             return None, f"call_llm raised: {exc}"
         if not raw or not isinstance(raw, str):
@@ -2337,12 +2413,17 @@ class LLMPlanner:
             f"STEERING DIRECTIVE:\n{body}\n\n"
             "Extract the durable Goal and classify the mode. Reply JSON only."
         )
+        from goldfive._llm_span import goldfive_llm_span
+
         try:
-            raw = await self._call_llm(
-                self._SYNTHESIZE_GOAL_SYSTEM_PROMPT,
-                user_prompt,
-                self._model,
-            )
+            async with goldfive_llm_span(
+                **self._span_kwargs(), name="synthesize_goal_from_steer"
+            ):
+                raw = await self._call_llm(
+                    self._SYNTHESIZE_GOAL_SYSTEM_PROMPT,
+                    user_prompt,
+                    self._model,
+                )
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "LLMPlanner.synthesize_goal_from_steer: call_llm raised %s",

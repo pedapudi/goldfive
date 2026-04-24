@@ -559,6 +559,14 @@ class DefaultSteerer:
         setter = getattr(planner, "set_drift_emitter", None)
         if callable(setter):
             setter(self._emit_planner_refine_validation_failed)
+        # Wire the span-context provider so every planner-internal
+        # ``call_llm`` site emits ``GoldfiveLLMCallStart/End`` pairs onto
+        # the sink bus and shows up as a proper span on harmonograf's
+        # Gantt. Duck-typed — pre-spans Planner implementations simply
+        # skip this hook.
+        span_setter = getattr(planner, "set_span_context_provider", None)
+        if callable(span_setter):
+            span_setter(self._span_context_for_planner)
 
     def bind_adapter(self, adapter: Any) -> None:
         """Attach the active adapter for cancel-reason tagging.
@@ -586,6 +594,32 @@ class DefaultSteerer:
         :func:`~goldfive.drift.tool_loops.load_thresholds_from_env`.
         """
         return self._tool_loop_config
+
+    def _span_context_for_planner(self) -> Any | None:
+        """Snapshot the currently-active session into span-emission context.
+
+        Returns the ``(sinks, run_id, session_id, task_id, sequence_fn)``
+        tuple that :func:`goldfive._llm_span.goldfive_llm_span` expects,
+        or ``None`` when no session is in scope (e.g. tests that
+        exercise the planner standalone).
+
+        The steerer plumbs ``self._active_session`` just before calling
+        ``planner.refine`` / ``planner.refine_steer`` /
+        ``planner.synthesize_goal_from_steer`` so every LLM call site
+        inside those methods has a valid session to stamp onto its
+        spans. When called outside that window (``_active_session`` is
+        ``None``), spans are no-ops.
+        """
+        session = self._active_session
+        if session is None:
+            return None
+        return (
+            list(self._sinks),
+            session.run_id,
+            session.id,
+            session.current_task_id,
+            session.next_sequence,
+        )
 
     async def _emit_planner_refine_validation_failed(self, drift: DriftEvent) -> None:
         """Emit a planner-side drift through the DriftDetected pipeline.
@@ -1256,12 +1290,23 @@ class DefaultSteerer:
             tool_call_summary=tool_call_summary,
             reasoning_summary=reasoning_summary,
         )
+        from goldfive._llm_span import goldfive_llm_span
+
         try:
-            raw = await call_llm(
-                self.REFLECTIVE_SYSTEM_PROMPT,
-                user_prompt,
-                self._reflective_model,
-            )
+            async with goldfive_llm_span(
+                sinks=self._sinks,
+                name="reflective_check",
+                model=self._reflective_model,
+                session_id=session.id,
+                run_id=session.run_id,
+                task_id=task.id,
+                sequence_fn=session.next_sequence,
+            ):
+                raw = await call_llm(
+                    self.REFLECTIVE_SYSTEM_PROMPT,
+                    user_prompt,
+                    self._reflective_model,
+                )
         except Exception as exc:  # noqa: BLE001 - never break the run
             log.warning("DefaultSteerer.maybe_run_reflective_check: call_llm raised %s", exc)
             await self._emit_reflective_failure(
@@ -1474,6 +1519,10 @@ class DefaultSteerer:
             model=self._goal_drift_model,
             call_llm=call_llm,
             current_task_id=session.current_task_id,
+            sinks=self._sinks,
+            run_id=session.run_id,
+            session_id=session.id,
+            sequence_fn=session.next_sequence,
         )
         if drift is None:
             return
@@ -1859,7 +1908,15 @@ class DefaultSteerer:
         # ``session.goals`` we just mutated) so the refine sees the
         # new goal shape in the same dispatch.
         if drift.kind is DriftKind.USER_STEER:
-            await self._apply_user_steer_state(drift, session)
+            # Plumb the session into the planner's span-context provider
+            # for the duration of synthesize_goal_from_steer so its LLM
+            # call shows up as a span on the Gantt. Cleared in a
+            # ``finally`` so exceptions don't leave a stale pointer.
+            self._active_session = session
+            try:
+                await self._apply_user_steer_state(drift, session)
+            finally:
+                self._active_session = None
         # goldfive-steer-unification: consult the severity-aware
         # promotion policy BEFORE emitting DriftDetected so that a
         # suppressed goldfive steer carries the ``suppressed_by_user_steer``

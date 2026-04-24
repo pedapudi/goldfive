@@ -312,7 +312,10 @@ async def test_broken_sink_does_not_break_run() -> None:
     )
     assert drift is not None
     assert drift.severity is DriftSeverity.WARNING
-    assert sink.calls == 1  # the emit was attempted
+    # One attempt was made per emitted event, none broke the run:
+    # ``ReasoningJudgeInvoked`` (1) + ``GoldfiveLLMCallStart`` (1) +
+    # ``GoldfiveLLMCallEnd`` (1) = 3 since the span-wrapper PR.
+    assert sink.calls == 3
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +341,7 @@ async def test_elapsed_ms_is_non_negative_int() -> None:
 
 
 async def test_sequence_fn_advances_envelope_sequence() -> None:
-    """``sequence_fn`` is called once per invocation; its value lands on the envelope."""
+    """``sequence_fn`` advances on every emission; its value lands on each envelope."""
     sink = ListSink()
     call_llm = _stub_call_llm([{"on_task": True}])
     counter = {"n": 41}
@@ -357,9 +360,20 @@ async def test_sequence_fn_advances_envelope_sequence() -> None:
         sequence_fn=seq,
         run_id="r",
     )
-    # One emission ⇒ one sequence pop.
-    assert counter["n"] == 42
-    assert sink.events[0].sequence == 42
+    # Three emissions since the span-wrapper PR:
+    # ``GoldfiveLLMCallStart`` (span enter) + ``ReasoningJudgeInvoked``
+    # (verdict) + ``GoldfiveLLMCallEnd`` (span exit). Each pops a fresh
+    # sequence number from ``seq()``.
+    assert counter["n"] == 44
+    judge_events = [
+        e for e in sink.events
+        if e.WhichOneof("payload") == "reasoning_judge_invoked"
+    ]
+    assert len(judge_events) == 1
+    # Emission order is span-start, span-end (after call_llm returns),
+    # then ReasoningJudgeInvoked — so the judge envelope carries the
+    # final sequence value of 44.
+    assert judge_events[0].sequence == 44
 
 
 # ---------------------------------------------------------------------------
