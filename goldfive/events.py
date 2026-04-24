@@ -740,4 +740,11 @@ def drift_detected_event(
     ann_id = _drift_annotation_id_from(drift)
     if ann_id:
         evt.drift_detected.annotation_id = ann_id
+    # Forward the detector-supplied trigger_input onto the wire so sinks
+    # rendering a Gantt / timeline can explain the drift without
+    # re-fetching raw transcripts. Optional; older DriftEvent producers
+    # that predate the field simply emit "".
+    trigger_input = str(getattr(drift, "trigger_input", "") or "")
+    if trigger_input:
+        evt.drift_detected.trigger_input = trigger_input
     return evt

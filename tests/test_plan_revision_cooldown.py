@@ -326,3 +326,107 @@ async def test_suppressed_revision_does_not_emit_extra_events(
     # Second handle: drift_detected only (suppressed).
     assert kinds == ["drift_detected", "plan_revised", "drift_detected"]
     assert len(planner.refine_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# PlanRevised refine-context observability (judge-observability event)
+# ---------------------------------------------------------------------------
+
+
+def _plan_revised_events(sink: ListSink) -> list[Any]:
+    return [e for e in sink.events if e.WhichOneof("payload") == "plan_revised"]
+
+
+async def test_plan_revised_event_populates_refine_summaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PlanRevised carries refine_input_summary + refine_output_summary."""
+    steerer, session, sink, _planner = _build(cooldown=0.0)
+    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: 1000.0)
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="agent drifted to raccoons",
+        current_task_id="t1",
+        current_agent_id="researcher",
+    )
+    await steerer._handle_drift(drift, session)
+
+    events = _plan_revised_events(sink)
+    assert len(events) == 1
+    pr = events[0].plan_revised
+    # Input summary names the drift kind + severity + detail + prior plan shape.
+    # ``DriftKind.value`` is lowercase (e.g. "off_topic"), so that's what
+    # gets rendered into the human-readable summary.
+    assert "off_topic" in pr.refine_input_summary
+    assert "warning" in pr.refine_input_summary
+    assert "raccoons" in pr.refine_input_summary
+    assert "task=t1" in pr.refine_input_summary
+    assert "prior_plan=rev0" in pr.refine_input_summary
+    # Output summary carries the revised index + task count + titles.
+    assert "revision_index=1" in pr.refine_output_summary
+    assert "tasks=2" in pr.refine_output_summary
+
+
+async def test_plan_revised_event_stamps_target_agent_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """target_agent_id mirrors DriftEvent.current_agent_id for agent-scoped refines."""
+    steerer, session, sink, _planner = _build(cooldown=0.0)
+    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: 1000.0)
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="off topic",
+        current_task_id="t1",
+        current_agent_id="researcher",
+    )
+    await steerer._handle_drift(drift, session)
+
+    pr = _plan_revised_events(sink)[0].plan_revised
+    assert pr.target_agent_id == "researcher"
+
+
+async def test_plan_revised_event_target_agent_id_empty_for_trajectory_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drift with no current_agent_id → target_agent_id == ""."""
+    steerer, session, sink, _planner = _build(cooldown=0.0)
+    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: 1000.0)
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="unscoped",
+        current_task_id="t1",
+        current_agent_id="",  # no agent bound — trajectory-level
+    )
+    await steerer._handle_drift(drift, session)
+
+    pr = _plan_revised_events(sink)[0].plan_revised
+    assert pr.target_agent_id == ""
+
+
+async def test_plan_revised_refine_input_summary_truncates_when_long(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pathological drift.detail does not blow the refine_input_summary field."""
+    steerer, session, sink, _planner = _build(cooldown=0.0)
+    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: 1000.0)
+
+    huge_detail = "x" * 5000
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail=huge_detail,
+        current_task_id="t1",
+        current_agent_id="researcher",
+    )
+    await steerer._handle_drift(drift, session)
+
+    pr = _plan_revised_events(sink)[0].plan_revised
+    assert pr.refine_input_summary.endswith(" … [truncated]")
+    # 2048 + suffix length.
+    assert len(pr.refine_input_summary) == 2048 + len(" … [truncated]")

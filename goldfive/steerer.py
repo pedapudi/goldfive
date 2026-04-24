@@ -1061,16 +1061,42 @@ class DefaultSteerer:
             # The judge path is rate-limited per-task; embedding path
             # is synchronous.
             rl_call_llm = self._maybe_take_reasoning_judge_slot(session)
+            # Thread the first bound sink into the judge path so a
+            # ``ReasoningJudgeInvoked`` event fires on every judge call,
+            # regardless of verdict. ``None`` when no sinks are bound —
+            # the classifier then stays sink-less and behaves as before.
+            judge_sink = self._sinks[0] if self._sinks else None
             drift = await analyze_reasoning(
                 text,
                 session,
                 mode=self._reasoning_drift_mode,
                 call_llm=rl_call_llm,
                 model=self._reasoning_drift_model,
+                sink=judge_sink,
             )
         if drift is None:
             return
+        # Populate ``trigger_input`` on drifts produced by the always-on
+        # pattern detectors (they do not set it themselves — they are
+        # framework-agnostic). The judge path already stamps it on
+        # drifts it produces.
+        if not drift.trigger_input:
+            drift.trigger_input = self._truncate_trigger_input(text)
         await self._handle_drift(drift, session)
+
+    @staticmethod
+    def _truncate_trigger_input(text: str, limit: int = 2048) -> str:
+        """Truncate ``text`` for use as a ``DriftDetected.trigger_input``.
+
+        Uses the same suffix convention as the reasoning-judge
+        observability event so consumers see one truncation marker
+        regardless of which detector produced the drift.
+        """
+        if not isinstance(text, str):
+            return ""
+        if len(text) <= limit:
+            return text
+        return text[:limit] + " … [truncated]"
 
     def _maybe_take_reasoning_judge_slot(
         self, session: Session
@@ -2651,6 +2677,16 @@ class DefaultSteerer:
         ann_id = self._drift_annotation_id(drift)
         if ann_id:
             evt.drift_detected.annotation_id = ann_id
+        # Forward the detector-supplied trigger_input onto the wire so
+        # sinks that render a Gantt / timeline can explain "why did
+        # goldfive flag this?" without re-fetching raw agent transcripts.
+        # Always truncated by the detector before it lands on the drift;
+        # we belt-and-braces truncate here in case an out-of-tree
+        # detector forgot. Empty string for user-control drifts (their
+        # explanation lives on the source annotation).
+        trigger_input = getattr(drift, "trigger_input", "") or ""
+        if trigger_input:
+            evt.drift_detected.trigger_input = self._truncate_trigger_input(trigger_input)
         await self._emit(evt)
 
     @staticmethod
@@ -2786,4 +2822,67 @@ class DefaultSteerer:
         # of a run that never received an initial plan — the helper
         # treats that as "everything in revised is newly added".
         evt.plan_revised.diff.CopyFrom(build_plan_revision_diff(prev_plan, revised))
+        # Refine-context observability (judge-observability event). Sinks
+        # rendering a Gantt / timeline want to explain WHY a refine was
+        # requested and WHAT the planner produced without re-fetching
+        # the drift and both plans.
+        evt.plan_revised.refine_input_summary = self._build_refine_input_summary(
+            drift, prev_plan
+        )
+        evt.plan_revised.refine_output_summary = self._build_refine_output_summary(
+            revised
+        )
+        evt.plan_revised.target_agent_id = drift.current_agent_id or ""
         await self._emit(evt)
+
+    @staticmethod
+    def _build_refine_input_summary(
+        drift: DriftEvent,
+        prev_plan: Plan | None,
+    ) -> str:
+        """Render a short summary of what goldfive sent to ``planner.refine``.
+
+        Intentionally terse — we pair the drift's ``kind`` / ``severity``
+        / ``detail`` with a compact plan census (task count + status
+        tallies) so a sink can answer "why was this refine requested,
+        what did the planner see?" at a glance. Truncated via the same
+        convention used by ``trigger_input`` to keep event sinks bounded.
+        """
+        parts: list[str] = []
+        parts.append(f"drift={drift.kind.value}/{drift.severity.value}")
+        if drift.current_task_id:
+            parts.append(f"task={drift.current_task_id}")
+        if drift.detail:
+            parts.append(f"detail={drift.detail}")
+        if prev_plan is not None:
+            tasks = getattr(prev_plan, "tasks", None) or []
+            parts.append(f"prior_plan=rev{prev_plan.revision_index}:{len(tasks)}tasks")
+            if tasks:
+                status_counts: dict[str, int] = {}
+                for t in tasks:
+                    status = getattr(t, "status", None)
+                    key = str(getattr(status, "value", status) or "unspecified")
+                    status_counts[key] = status_counts.get(key, 0) + 1
+                tally = ",".join(f"{k}={v}" for k, v in sorted(status_counts.items()))
+                parts.append(f"prior_statuses={tally}")
+        else:
+            parts.append("prior_plan=none")
+        text = " | ".join(parts)
+        return DefaultSteerer._truncate_trigger_input(text)
+
+    @staticmethod
+    def _build_refine_output_summary(revised: Plan) -> str:
+        """Render a short summary of the plan the planner returned."""
+        tasks = getattr(revised, "tasks", None) or []
+        parts: list[str] = [
+            f"revision_index={revised.revision_index}",
+            f"tasks={len(tasks)}",
+        ]
+        # Include the first few task titles so a Gantt can show the
+        # revised plan's shape without fetching the full plan payload.
+        titles = [str(getattr(t, "title", "") or "") for t in tasks[:6]]
+        titles = [t for t in titles if t]
+        if titles:
+            parts.append("titles=[" + ", ".join(titles) + "]")
+        text = " | ".join(parts)
+        return DefaultSteerer._truncate_trigger_input(text)

@@ -313,10 +313,29 @@ async def classify_goal_drift(
         if reason
         else "goal drift detected (judge returned no reason)"
     )
+    # Stamp the activity summary the judge actually saw onto the drift
+    # as ``trigger_input`` so downstream sinks can render "WHY did
+    # goldfive decide this is off-goal?" on the timeline without
+    # re-fetching the per-invocation activity log.
+    trigger_input = _truncate_trigger_input(activity_block)
     return DriftEvent(
         kind=DriftKind.GOAL_DRIFT,
         severity=DriftSeverity.CRITICAL,
         detail=detail,
         current_task_id=current_task_id,
         current_agent_id=current_agent_id,
+        trigger_input=trigger_input,
     )
+
+
+_GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS: int = 2048
+_GOAL_DRIFT_TRUNCATE_SUFFIX: str = " … [truncated]"
+
+
+def _truncate_trigger_input(text: str) -> str:
+    """Cap the observability ``trigger_input`` at a bounded length."""
+    if not isinstance(text, str):
+        return ""
+    if len(text) <= _GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS:
+        return text
+    return text[:_GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS] + _GOAL_DRIFT_TRUNCATE_SUFFIX

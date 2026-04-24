@@ -878,3 +878,77 @@ async def test_issue_acceptance_confusion_from_reasoning_block() -> None:
     assert evt.drift_detected.severity == types_pb2.DRIFT_SEVERITY_INFO
 
 
+# ---------------------------------------------------------------------------
+# DriftDetected.trigger_input enrichment (judge-observability event)
+# ---------------------------------------------------------------------------
+
+
+async def test_observe_reasoning_populates_drift_trigger_input() -> None:
+    """Always-on detectors populate ``DriftDetected.trigger_input``.
+
+    The always-on pattern detectors (looping / confusion) don't
+    construct ``trigger_input`` themselves — ``observe_reasoning``
+    fills it in from the reasoning text before emitting the drift.
+    Harmonograf uses this to explain "why did goldfive flag this
+    reasoning block?".
+
+    Uses the confusion detector (INFO severity -> no refine path) so
+    the test isn't entangled with the refine-failure emission path.
+    """
+    steerer = DefaultSteerer()
+    session = _session_with_task(
+        title="review slides produce",
+        description=(
+            "review slides produce report typos found summary prompt "
+            "should check needs"
+        ),
+        goals=[Goal(id="g1", summary="produce a slide review report summary")],
+    )
+    sink = ListSink()
+    planner = NullPlanner()
+    steerer.bind(sinks=[sink], planner=planner)
+
+    text = (
+        "Hmm, I'm not sure what the report summary needs. I don't know if "
+        "they want the slides prompt. Wait, should I re-check?"
+    )
+    await steerer.observe_reasoning(text, session=session)
+
+    drift_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert len(drift_events) == 1
+    assert drift_events[0].drift_detected.trigger_input == text
+
+
+async def test_observe_reasoning_truncates_long_trigger_input() -> None:
+    """trigger_input is capped so long reasoning does not blow up sinks."""
+    steerer = DefaultSteerer()
+    session = _session_with_task(
+        title="review slides produce",
+        description=(
+            "review slides produce report typos found summary prompt "
+            "should check needs"
+        ),
+        goals=[Goal(id="g1", summary="produce a slide review report summary")],
+    )
+    sink = ListSink()
+    planner = NullPlanner()
+    steerer.bind(sinks=[sink], planner=planner)
+
+    # Pathological confusion block: 3 KB+, well over the 2048-char cap.
+    huge = (
+        "Hmm, I'm not sure what the report summary needs. I don't know if "
+        "they want the slides prompt. Wait, should I re-check? "
+    ) * 60
+    await steerer.observe_reasoning(huge, session=session)
+
+    drift_events = [
+        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert len(drift_events) == 1
+    trigger_input = drift_events[0].drift_detected.trigger_input
+    assert trigger_input.endswith(" … [truncated]")
+    # At the 2048-char cap + suffix length.
+    assert len(trigger_input) == 2048 + len(" … [truncated]")
+

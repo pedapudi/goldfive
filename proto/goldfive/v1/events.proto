@@ -70,6 +70,7 @@ message Event {
     AgentInvocationStarted agent_invocation_started = 28;
     AgentInvocationCompleted agent_invocation_completed = 29;
     DelegationObserved delegation_observed = 30;
+    ReasoningJudgeInvoked reasoning_judge_invoked = 31;
   }
 }
 
@@ -165,6 +166,23 @@ message PlanRevised {
   // a breaking change; pre-fix DB data is unsupported, see
   // harmonograf#99).
   string trigger_event_id = 7;
+  // Short human-readable rendering of what goldfive sent to
+  // ``planner.refine`` as context: drift detail + a summary of the prior
+  // plan (task count / titles / statuses) so a Gantt / timeline can
+  // explain "why was this refine requested, what did the planner see?".
+  // Up to 2048 chars; longer input is truncated with " … [truncated]".
+  // Empty string on producers that predate this field. Populated at the
+  // ``_emit_plan_revised`` site.
+  string refine_input_summary = 8;
+  // Short rendering of the plan the planner returned (revision_index +
+  // task titles / statuses). Up to 2048 chars with the same truncation
+  // convention. Empty for producers that predate the field.
+  string refine_output_summary = 9;
+  // The agent the refine is steering — usually the agent that triggered
+  // the drift that caused this revision (``DriftDetected.current_agent_id``).
+  // Empty string for trajectory-level refines (goal-drift and any drift
+  // that was not bound to a specific agent).
+  string target_agent_id = 10;
 }
 
 // Task transitioned PENDING -> RUNNING.
@@ -245,6 +263,19 @@ message DriftDetected {
   // — the ``PlanRevised.trigger_event_id`` matches this field's value.
   // See goldfive#199 / harmonograf#95 (rescope).
   string id = 7;
+  // Short rendering of the data goldfive fed into the detector that
+  // produced this drift — e.g. the reasoning block the LLM judge saw, the
+  // activity summary shown to the goal-drift classifier, a summary of the
+  // tool invocations the loop detector matched against. Up to 2048 chars;
+  // longer input is truncated with the suffix " … [truncated]".
+  //
+  // Sinks that render a Gantt or timeline use this to answer "why did
+  // goldfive flag this?" without re-fetching raw agent transcripts.
+  // Optional: older producers emit "" and readers that don't know about
+  // the field see zero change. Populated at the emit site on every
+  // ``DriftDetected`` minted autonomously (user-control drifts preserve
+  // their existing annotation semantics and may leave this empty).
+  string trigger_input = 8;
 }
 
 // Terminal event on a successful run.
@@ -376,4 +407,55 @@ message DelegationObserved {
   string task_id = 3;
   string invocation_id = 4;
   google.protobuf.Timestamp observed_at = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Goldfive-as-judge observability
+// ---------------------------------------------------------------------------
+
+// Emitted by goldfive on every invocation of the LLM-as-a-judge
+// reasoning-drift classifier (see
+// :func:`goldfive.drift.reasoning_judge.classify_reasoning_drift`),
+// regardless of verdict. Fires on both on-task and off-task outcomes
+// so sinks that render a Gantt / timeline can show every judge call
+// — not just the ones that produced a drift — and explain WHY a
+// steering decision was or was not made.
+//
+// Harmonograf renders this as a span on a dedicated "goldfive" lane
+// keyed on the event kind itself: no matter what ``agent_id`` the sink
+// stamps on the outgoing wire, consumers treat this payload as
+// originating from the goldfive library's synthetic agent identity
+// (the string ``"goldfive"`` in the compound ``"<client>:goldfive"``).
+message ReasoningJudgeInvoked {
+  string run_id = 1;
+  string task_id = 2;
+  // The agent whose reasoning was judged (the agent that emitted the
+  // thinking block / chain-of-thought). Empty when no agent was
+  // active at judge time.
+  string subject_agent_id = 3;
+  // The judge model (forwarded verbatim to the configured
+  // ``call_llm``). Empty when the callable substitutes its own default.
+  string model = 4;
+  // Wall-clock duration of the judge call in milliseconds. Advisory.
+  int64 elapsed_ms = 5;
+  // The reasoning / chain-of-thought the judge saw. Truncated to 4096
+  // chars with the suffix " … [truncated]" when longer.
+  string reasoning_input = 6;
+  // The raw judge response (before JSON parsing). Truncated to 2048
+  // chars with the same convention. Populated even on plumbing failures
+  // (e.g. non-JSON responses) so operators can diagnose malformed
+  // judge output from the wire alone.
+  string raw_response = 7;
+
+  // Parsed verdict. ``on_task = true`` means the judge said the
+  // reasoning is on-track; ``on_task = false`` means a drift was
+  // produced (see also the paired ``DriftDetected`` event emitted on
+  // the same run_id). ``severity`` is one of "info" / "warning" /
+  // "critical" when ``on_task = false``, and the empty string when
+  // ``on_task = true`` (no drift severity applies). ``reason`` is the
+  // judge's one-sentence explanation or empty when the judge did not
+  // supply one.
+  bool on_task = 8;
+  string severity = 9;
+  string reason = 10;
 }
