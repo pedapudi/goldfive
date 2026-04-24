@@ -49,6 +49,88 @@ def pending_correction_key(agent_name: str, task_id: str) -> str:
     return f"{_sp.KEY_PENDING_CORRECTIONS}.{agent_name}.{task_id}"
 
 
+def format_correction_block(correction: Mapping[str, Any]) -> str:
+    """Render a pending-correction dict into the prompt block a resolver appends.
+
+    Stream D (goldfive#251 :mod:`goldfive._correction_injection`) writes a
+    structured dict describing the correction; this helper is the Stream
+    B (resolver) side of that contract and owns the exact language the
+    LLM sees.
+
+    Design principle: **directive, not diagnostic.** We tell the LLM
+    what to do on the corrected task ("focus only on", "do not
+    propagate"), NOT what went wrong with the prior task ("was broken",
+    "failed"). Problem-naming language is an attractor for LLM pattern-
+    matching failure modes — meta-commentary, apologies, retries of the
+    wrong thing (see goldfive#250 / #252 / #253 / #259's lessons on
+    response-shape minimality). The diagnostic data (drift kind, drift
+    reason, revision number) is still present in the dict for sinks /
+    observability but is deliberately NOT interpolated into the LLM-
+    visible block.
+
+    The rendered block is designed to slot after the ``Current
+    assigned task`` section via :func:`_compose_instruction`:
+
+        ---
+        Plan was revised (REV {n}). Your prior output for
+        task "{superseded_task_title}" (id {superseded_task_id}) was
+        superseded.
+
+        Focus only on the revised scope as described above in
+        "Current assigned task." Do not propagate the superseded
+        content into downstream dispatches.
+        ---
+
+    Missing fields degrade to sensible placeholders so a partial dict
+    (sink-shaped, persistence-restored) still renders cleanly.
+    """
+    if not isinstance(correction, Mapping):
+        return ""
+    rev = correction.get("revision_number", 0)
+    try:
+        rev_num = int(rev) if rev is not None else 0
+    except (TypeError, ValueError):
+        rev_num = 0
+    superseded_title = str(correction.get("superseded_task_title", "") or "(prior task)")
+    superseded_id = str(correction.get("superseded_task_id", "") or "")
+    id_fragment = f" (id {superseded_id})" if superseded_id else ""
+
+    return (
+        "---\n"
+        f"Plan was revised (REV {rev_num}). Your prior output for "
+        f"task \"{superseded_title}\"{id_fragment} was superseded.\n"
+        "\n"
+        "Focus only on the revised scope as described above in "
+        "\"Current assigned task.\" Do not propagate the superseded "
+        "content into downstream dispatches.\n"
+        "---"
+    )
+
+
+def _resolve_pending_correction(raw: Any) -> str:
+    """Normalise a pending-correction state value to the final prompt string.
+
+    Accepts three shapes so the resolver stays forgiving as Stream D's
+    write contract evolves:
+
+    * Mapping — the structured dict Stream D writes; rendered via
+      :func:`format_correction_block`.
+    * Non-empty string — treated as a pre-rendered block (back-compat
+      path for tests and operators who stamped a literal string into
+      state before Stream D existed, or who want to override the
+      template for a one-off).
+    * Anything else (None, empty string, bool, int) — degrades to an
+      empty string, which :func:`_compose_instruction` then skips.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, Mapping):
+        return format_correction_block(raw)
+    if isinstance(raw, str):
+        return raw
+    return ""
+
+
 def _state_from_readonly_context(readonly_ctx: Any) -> Mapping[str, Any]:
     """Pull ``session.state`` off a ``ReadonlyContext`` defensively.
 
@@ -141,12 +223,10 @@ def make_dynamic_instruction(
                 state.get(_sp.KEY_CURRENT_TASK_DESCRIPTION, "") or ""
             )
 
-            pending_correction = str(
+            pending_correction = _resolve_pending_correction(
                 state.get(
                     pending_correction_key(agent_name, current_task_id),
-                    "",
                 )
-                or ""
             )
 
             return _compose_instruction(
@@ -320,6 +400,7 @@ def log_dynamic_instruction_opt_out(root_agent: Any) -> None:
 
 
 __all__ = [
+    "format_correction_block",
     "install_dynamic_instructions",
     "is_dynamic_instruction",
     "log_dynamic_instruction_opt_out",
