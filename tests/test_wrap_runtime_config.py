@@ -228,6 +228,33 @@ def test_default_steerer_config_wins_over_default() -> None:
     assert steerer._goal_drift_activity_window == 20
 
 
+def test_wrap_threads_steering_config() -> None:
+    """RuntimeConfig.steering propagates into DefaultSteerer."""
+    from goldfive.config import SteeringConfig
+
+    cfg = RuntimeConfig(
+        steering=SteeringConfig(threshold="critical", suppression_window_turns=9)
+    )
+    runner = goldfive.wrap(_noop_agent, runtime=cfg, sinks=[])
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    assert steerer._goldfive_steer_threshold == "critical"
+    assert steerer._goldfive_steer_suppression_window_turns == 9
+
+
+def test_wrap_threads_steering_config_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GOLDFIVE_STEER_THRESHOLD env var threads through wrap()."""
+    monkeypatch.setenv("GOLDFIVE_STEER_THRESHOLD", "off")
+    monkeypatch.setenv("GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS", "11")
+    runner = goldfive.wrap(_noop_agent, sinks=[])
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    assert steerer._goldfive_steer_threshold == "off"
+    assert steerer._goldfive_steer_suppression_window_turns == 11
+
+
 def test_default_steerer_no_config_no_kwarg_uses_module_default() -> None:
     """Back-compat: bare ``DefaultSteerer()`` still yields the pre-#225 defaults."""
     steerer = DefaultSteerer()

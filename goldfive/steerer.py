@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from goldfive.config import (
         GoalDriftConfig,
         ReasoningDriftConfig,
+        SteeringConfig,
         ToolLoopConfig,
     )
     from goldfive.protocols import EventSink, Planner
@@ -318,6 +319,9 @@ class DefaultSteerer:
         reasoning_drift_model: str = "",
         reasoning_drift_rate_limit: int = 3,
         plan_revision_cooldown_seconds: float = 0.0,
+        steering_config: SteeringConfig | None = None,
+        goldfive_steer_threshold: str | None = None,
+        goldfive_steer_suppression_window_turns: int | None = None,
     ) -> None:
         """Build a steerer.
 
@@ -514,6 +518,34 @@ class DefaultSteerer:
         self._plan_revision_cooldown_seconds = max(
             0.0, float(plan_revision_cooldown_seconds)
         )
+        # goldfive-steer-unification: policy knob + freshness window for
+        # promoting goldfive-detected drifts into the USER_STEER-style
+        # cancel+refine+restart machinery. Precedence mirrors the other
+        # goldfive#225 knobs: explicit individual kwarg wins over the
+        # ``SteeringConfig`` dataclass, which wins over the built-in
+        # defaults.
+        if goldfive_steer_threshold is not None:
+            _threshold = str(goldfive_steer_threshold).strip().lower()
+        elif steering_config is not None:
+            _threshold = str(steering_config.threshold).strip().lower()
+        else:
+            _threshold = "warning"
+        if _threshold not in {"off", "warning", "critical"}:
+            log.warning(
+                "DefaultSteerer: unknown goldfive_steer_threshold=%r; "
+                "falling back to 'warning'",
+                _threshold,
+            )
+            _threshold = "warning"
+        self._goldfive_steer_threshold: str = _threshold
+        if goldfive_steer_suppression_window_turns is not None:
+            _window = int(goldfive_steer_suppression_window_turns)
+        elif steering_config is not None:
+            _window = int(steering_config.suppression_window_turns)
+        else:
+            _window = 3
+        self._goldfive_steer_suppression_window_turns = max(0, _window)
+        self._steering_config: SteeringConfig | None = steering_config
 
     # ------------------------------------------------------------------
     # Protocol-required: wiring
@@ -1666,6 +1698,7 @@ class DefaultSteerer:
                 detail=detail,
                 current_task_id=session.current_task_id,
                 raw=event,
+                authored_by="user",
             )
         if kind_str == ControlKind.CANCEL.value:
             return DriftEvent(
@@ -1674,6 +1707,7 @@ class DefaultSteerer:
                 detail=reason,
                 current_task_id=session.current_task_id,
                 raw=event,
+                authored_by="user",
             )
         if kind_str == ControlKind.PAUSE.value:
             return DriftEvent(
@@ -1682,6 +1716,7 @@ class DefaultSteerer:
                 detail=note,
                 current_task_id=session.current_task_id,
                 raw=event,
+                authored_by="user",
             )
         return None
 
@@ -1803,6 +1838,14 @@ class DefaultSteerer:
         every tick until ``SequentialExecutor.max_task_invocations``
         tripped (see TASK-LIFECYCLE.md §7.3).
         """
+        # Normalise source attribution early so every downstream
+        # consumer (sinks, promotion policy, prompt framing) sees a
+        # non-empty ``authored_by``. USER_* kinds → "user"; anything
+        # else → "goldfive". Honours an explicit non-empty value on
+        # the drift (e.g. callers that already attributed) via
+        # :meth:`_resolve_authored_by`.
+        if not drift.authored_by:
+            drift.authored_by = self._resolve_authored_by(drift)
         # Tag the bound adapter's next cancel with a symbolic reason so
         # the synthetic function_response the adapter appends on cancel
         # carries LLM-actionable content. Done BEFORE the drift event
@@ -1823,7 +1866,30 @@ class DefaultSteerer:
         # new goal shape in the same dispatch.
         if drift.kind is DriftKind.USER_STEER:
             await self._apply_user_steer_state(drift, session)
+        # goldfive-steer-unification: consult the severity-aware
+        # promotion policy BEFORE emitting DriftDetected so that a
+        # suppressed goldfive steer carries the ``suppressed_by_user_steer``
+        # flag on the wire (sinks can surface the suppression
+        # decision). ``_should_promote_to_steer`` returns ``True`` iff
+        # the drift is goldfive-authored, clears the configured
+        # severity threshold, and is not blocked by an active fresh
+        # user steer; as a side effect it stamps
+        # ``drift.suppressed_by_user_steer=True`` when the suppression
+        # path wins.
+        promote_to_steer = self._should_promote_to_steer(drift, session)
         await self._emit_drift_detected(session, drift)
+        if drift.suppressed_by_user_steer:
+            # Suppression path: the goldfive drift fired, was observed
+            # via DriftDetected, and — per the fresh user-steer
+            # suppression window — we neither cancel nor refine. The
+            # pre-unification passive ladder dispatch is also skipped:
+            # a user steer is already active, its refine has already
+            # happened, and running another refine for this signal
+            # would race against it.
+            return
+        if promote_to_steer:
+            await self._promote_drift_to_steer(drift, session)
+            return
         # Route through the intervention ladder. The per-(kind, task)
         # occurrence count drives the "first vs repeat" distinction in
         # the ladder table -- we read it BEFORE any mutation so the
@@ -2298,6 +2364,13 @@ class DefaultSteerer:
         content variant. Tolerates adapters that don't carry the
         attribute (no-op) and an unbound adapter (no-op). See
         goldfive#139.
+
+        The goldfive-steer-unification promotion path uses a separate
+        helper (:meth:`_tag_adapter_cancel_reason_for_promotion`) to
+        stamp a ``"goldfive_<drift_kind>"`` reason when promoting a
+        detector drift to a full steer; keeping the two call sites
+        distinct avoids muddling the pre-unification tag semantics for
+        unpromoted paths.
         """
         adapter = self._adapter
         if adapter is None:
@@ -2314,6 +2387,345 @@ class DefaultSteerer:
                 "DefaultSteerer: could not tag adapter cancel reason: %s",
                 exc,
             )
+
+    def _tag_adapter_cancel_reason_for_promotion(self, drift: DriftEvent) -> str:
+        """Stamp a goldfive-specific cancel reason on the bound adapter.
+
+        Returns the reason string stamped (or synthesised) so callers
+        can record it on the session for downstream observability.
+        Mirrors :meth:`_tag_adapter_cancel_reason` semantics: adapters
+        without ``_next_cancel_reason`` are tolerated.
+        """
+        reason = f"goldfive_{drift.kind.name.lower()}"
+        adapter = self._adapter
+        if adapter is None:
+            return reason
+        try:
+            adapter._next_cancel_reason = reason
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "DefaultSteerer: could not tag adapter cancel reason for "
+                "goldfive promotion: %s",
+                exc,
+            )
+        return reason
+
+    # ------------------------------------------------------------------
+    # goldfive-steer-unification: promotion policy + handler
+    # ------------------------------------------------------------------
+
+    # Drift kinds eligible for ladder-promoted steer treatment when
+    # goldfive-authored. Mirrors the "content drifts the coordinator
+    # acknowledges but doesn't correct" list from the unification
+    # design brief: off-topic / intent / unexpected output /
+    # confabulation / loop kinds. Other detector kinds (SCHEMA_VIOLATION,
+    # REFINE_VALIDATION_FAILED, REPEATED_FAILURE, GOAL_DRIFT, …) keep
+    # their pre-unification ladder mapping so escalation / repeated-
+    # failure semantics aren't rerouted into the cancel-in-flight path.
+    _GOLDFIVE_STEER_ELIGIBLE_KINDS: frozenset[DriftKind] = frozenset(
+        {
+            DriftKind.OFF_TOPIC,
+            DriftKind.INTENT_DIVERGENCE,
+            DriftKind.UNEXPECTED_OUTPUT,
+            DriftKind.CONFABULATION_RISK,
+            DriftKind.LOOPING_REASONING,
+            DriftKind.LOOPING_TOOL_CALL,
+            DriftKind.PLAN_DIVERGENCE,
+        }
+    )
+
+    def _severity_meets_promotion_threshold(self, severity: DriftSeverity) -> bool:
+        """True iff ``severity`` satisfies the configured promotion threshold."""
+        threshold = self._goldfive_steer_threshold
+        if threshold == "off":
+            return False
+        if threshold == "critical":
+            return severity is DriftSeverity.CRITICAL
+        # "warning" — promote WARNING and CRITICAL.
+        return severity in (DriftSeverity.WARNING, DriftSeverity.CRITICAL)
+
+    def _should_promote_to_steer(self, drift: DriftEvent, session: Session) -> bool:
+        """Evaluate the drift against the unification promotion policy.
+
+        Returns ``True`` iff the drift should be dispatched through
+        :meth:`_promote_drift_to_steer` instead of the legacy passive
+        ladder. Side-effect: stamps ``drift.suppressed_by_user_steer``
+        when a fresh user steer is blocking promotion so the subsequent
+        ``DriftDetected`` emission reflects the suppression decision.
+
+        The policy:
+
+        1. User-authored drifts (USER_STEER / USER_CANCEL / USER_PAUSE)
+           keep their pre-unification handling — USER_STEER already
+           routes through the refine path with cancel-in-flight wired
+           by the executor. Return ``False``.
+        2. The drift kind must be in
+           :data:`_GOLDFIVE_STEER_ELIGIBLE_KINDS` — other kinds keep
+           their legacy ladder mapping.
+        3. The severity must clear the configured ``threshold``.
+        4. If a user-authored steer is within the freshness window
+           (``suppression_window_turns`` turns), stamp the suppression
+           flag and return ``False``. Otherwise return ``True``.
+        """
+        if drift.kind in self._USER_AUTHORED_DRIFT_KINDS:
+            return False
+        authored_by = self._resolve_authored_by(drift)
+        if authored_by != "goldfive":
+            return False
+        if drift.kind not in self._GOLDFIVE_STEER_ELIGIBLE_KINDS:
+            return False
+        if not self._severity_meets_promotion_threshold(drift.severity):
+            return False
+        # Consult the active user steer freshness window.
+        window = self._goldfive_steer_suppression_window_turns
+        if window > 0:
+            active_source = _ostate.read(
+                session.state, _ostate.KEY_ACTIVE_STEER_SOURCE, ""
+            )
+            active_at_turn = _ostate.read(
+                session.state, _ostate.KEY_ACTIVE_STEER_AT_TURN, None
+            )
+            if str(active_source or "").lower() == "user" and isinstance(
+                active_at_turn, int
+            ):
+                current_turn = int(getattr(session, "_next_sequence", 0) or 0)
+                age = current_turn - int(active_at_turn)
+                if 0 <= age < window:
+                    active_body = str(
+                        _ostate.read(session.state, _ostate.KEY_ACTIVE_STEER_BODY, "")
+                        or ""
+                    )
+                    drift.suppressed_by_user_steer = True
+                    log.info(
+                        "goldfive steer suppressed: user steer %r is active "
+                        "(age=%d turns, window=%d)",
+                        active_body,
+                        age,
+                        window,
+                    )
+                    return False
+        return True
+
+    async def _promote_drift_to_steer(
+        self, drift: DriftEvent, session: Session
+    ) -> None:
+        """Promote a goldfive-detected drift into a full steer.
+
+        Ordered side effects (mirrors the USER_STEER path):
+
+        1. Tag the bound adapter's ``_next_cancel_reason`` with a
+           ``"goldfive_<drift_kind>"`` symbolic reason so the in-flight
+           invocation's synthetic ``function_response`` carries an
+           LLM-actionable explanation.
+        2. Stamp ``goldfive.active_steer.*`` onto ``session.state``
+           (body = derived from :meth:`_compose_goldfive_steer_body`,
+           author = ``"goldfive"``, source = ``"goldfive"``).
+        3. Record ``drift.id`` in ``goldfive.processed_steer_ids`` so
+           the same drift cannot re-promote on a delivery retry.
+        4. Call :meth:`LLMPlanner.refine_steer` (or the generic
+           ``planner.refine`` fallback when the planner doesn't expose
+           the goldfive-specific entry point) with ``source="goldfive"``
+           semantics so the refine prompt frames the pivot as a
+           correction, not as an operator directive.
+        5. Install the revised plan + emit ``PlanRevised``.
+
+        Note on cancel-in-flight: the actual ``task.cancel()`` on the
+        adapter invocation is the executor's responsibility
+        (:meth:`SequentialExecutor._invoke_with_control` performs it
+        when a ``STEER`` ControlMessage arrives). The steerer tags the
+        adapter and queues a restart message so that the **next** time
+        the executor reaches a cancel / steer checkpoint (either
+        because a sink callback requested cancel, or because the
+        overlay loop picks up the pending restart message), the
+        contaminated invocation is preempted. For the common case
+        where the drift is detected from a mid-invocation reasoning
+        block and the overlay loop is already streaming, the queued
+        restart message reaches the LLM on the next turn — cancel
+        semantics identical to USER_STEER.
+        """
+        # 1. Tag adapter cancel reason.
+        cancel_reason = self._tag_adapter_cancel_reason_for_promotion(drift)
+        # Session-visible cancel prefix so ``_mark_cancelled_if_live``
+        # stamps it on any TaskCancelled the executor emits for the
+        # in-flight task as part of the promotion.
+        try:
+            session._last_cancel_reason_prefix = cancel_reason
+        except Exception:  # noqa: BLE001
+            pass
+        # 2. Stamp active-steer state + compose the restart body.
+        at_turn = int(getattr(session, "_next_sequence", 0) or 0)
+        body = self._compose_goldfive_steer_body(drift)
+        try:
+            _ostate.set_active_steer(
+                session.state,
+                body=body,
+                at_turn=at_turn,
+                author="goldfive",
+                source="goldfive",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "DefaultSteerer._promote_drift_to_steer: set_active_steer raised: %s",
+                exc,
+            )
+        # Queue the wrapped restart message on the session so the
+        # overlay loop re-invokes the passthrough with a
+        # ``[GOLDFIVE STEERING CONTROL …]`` framing. Reuses
+        # ``pending_corrective_message`` — the same slot the Level 3
+        # CANCEL_REINVOKE path writes to. The steer framing is richer
+        # than the corrective-message template, so callers see the
+        # goldfive authorship banner.
+        try:
+            from goldfive.executors.sequential import SequentialExecutor
+
+            restart = SequentialExecutor._compose_steer_restart_message(
+                None,
+                fallback=body,
+                source="goldfive",
+                superseded_task_ids=[drift.current_task_id] if drift.current_task_id else [],
+                replacement_task_ids=[],
+            )
+            session.pending_corrective_message = restart
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "DefaultSteerer._promote_drift_to_steer: restart compose raised: %s",
+                exc,
+            )
+        # 3. Record the drift id in processed_steer_ids so a redelivery
+        # (same drift id) doesn't re-cancel / re-refine.
+        drift_id = str(getattr(drift, "id", "") or "")
+        if drift_id:
+            try:
+                _ostate.record_processed_steer_id(session.state, drift_id)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "DefaultSteerer._promote_drift_to_steer: "
+                    "record_processed_steer_id raised: %s",
+                    exc,
+                )
+        # 4. Route to planner.refine_steer (source="goldfive") — falls
+        # back to planner.refine for planners that don't expose the
+        # goldfive-specific entry point.
+        if self._planner is None or session.plan is None:
+            return
+        if self._is_plan_revision_gated(drift, session):
+            return
+        counter_key = (drift.kind.value, drift.current_task_id)
+        self._active_session = session
+        try:
+            revised = await self._dispatch_goldfive_steer_refine(drift, session)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "DefaultSteerer._promote_drift_to_steer: refine raised %s; "
+                "plan unchanged",
+                exc,
+            )
+            await self._emit_refine_failure(session, drift, reason=str(exc))
+            await self._register_refine_failure(session, drift, counter_key)
+            return
+        finally:
+            self._active_session = None
+        if revised is None:
+            log.warning(
+                "DefaultSteerer._promote_drift_to_steer: refine returned None; "
+                "plan unchanged"
+            )
+            await self._emit_refine_failure(
+                session, drift, reason="planner returned no revised plan"
+            )
+            await self._register_refine_failure(session, drift, counter_key)
+            return
+        try:
+            revised.validate(for_revision=True, prior=session.plan)
+        except ValueError as exc:
+            await self._emit_drift_detected(
+                session,
+                DriftEvent(
+                    kind=DriftKind.SCHEMA_VIOLATION,
+                    severity=DriftSeverity.CRITICAL,
+                    detail=f"plan validation failed: {exc}",
+                    current_task_id=session.current_task_id,
+                    authored_by="goldfive",
+                ),
+            )
+            await self._register_refine_failure(session, drift, counter_key)
+            return
+        session.refine_failure_counts.pop(counter_key, None)
+        prev_plan = session.plan
+        self._apply_revision(session, revised, drift)
+        await self._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
+        self._record_plan_revision(drift, session)
+
+    async def _dispatch_goldfive_steer_refine(
+        self, drift: DriftEvent, session: Session
+    ) -> Plan | None:
+        """Call ``planner.refine_steer`` when available; fall back to
+        ``planner.refine``.
+
+        Threads the same ``available_agents`` resolution used by
+        :meth:`_handle_drift` so the goldfive steer refine honours the
+        #151 registry constraint.
+        """
+        planner = self._planner
+        if planner is None or session.plan is None:
+            return None
+        available_agents: Any = None
+        adapter = self._adapter
+        if adapter is not None:
+            tree = getattr(adapter, "available_agents_tree", None)
+            if isinstance(tree, list) and tree:
+                available_agents = list(tree)
+            else:
+                flat = getattr(adapter, "available_agents", None)
+                if flat:
+                    available_agents = list(flat)
+        refine_steer = getattr(planner, "refine_steer", None)
+        if callable(refine_steer):
+            return await refine_steer(
+                plan=session.plan,
+                drift=drift,
+                goals=list(session.goals),
+                available_agents=available_agents,
+            )
+        # Fallback: planner doesn't expose the goldfive-specific entry
+        # point (test stubs, third-party planners). Call plain
+        # ``refine`` with the drift as-is; the generic path is better
+        # than no refine at all.
+        refine_accepts_registry = _planner_refine_accepts_available_agents(planner)
+        if refine_accepts_registry:
+            return await planner.refine(
+                plan=session.plan,
+                drift=drift,
+                goals=list(session.goals),
+                available_agents=available_agents,
+            )
+        return await planner.refine(
+            plan=session.plan,
+            drift=drift,
+            goals=list(session.goals),
+        )
+
+    @staticmethod
+    def _compose_goldfive_steer_body(drift: DriftEvent) -> str:
+        """Derive the steer body for a goldfive-promoted drift.
+
+        Prefers ``drift.detail`` verbatim — the reasoning judge and
+        other LLM-as-a-judge paths already emit human-readable reasons
+        like "agent acknowledged discrepancy but chose to adopt
+        expanded topic" that are directly usable as a corrective. When
+        ``detail`` is empty, synthesise a generic template from the
+        drift's kind / severity / task context.
+        """
+        detail = str(getattr(drift, "detail", "") or "").strip()
+        if detail:
+            return detail
+        task_id = drift.current_task_id or "the current task"
+        return (
+            f"Goldfive detected {drift.kind.name} drift "
+            f"(severity={drift.severity.name}). The preceding agent "
+            f"output did not match the task: {task_id}. Discard prior "
+            "work on this task and proceed with the corrective plan."
+        )
 
     # ------------------------------------------------------------------
     # USER_STEER state handler (goldfive#152)
@@ -2360,7 +2772,13 @@ class DefaultSteerer:
         # event — a cheap, always-available "turn" proxy.
         at_turn = getattr(session, "_next_sequence", 0) or 0
         try:
-            _ostate.set_active_steer(session.state, body=body, at_turn=at_turn, author=author)
+            _ostate.set_active_steer(
+                session.state,
+                body=body,
+                at_turn=at_turn,
+                author=author,
+                source="user",
+            )
         except Exception as exc:  # noqa: BLE001
             log.debug(
                 "DefaultSteerer._apply_user_steer_state: set_active_steer raised: %s",
@@ -2661,6 +3079,14 @@ class DefaultSteerer:
         evt.drift_detected.detail = drift.detail
         evt.drift_detected.current_task_id = drift.current_task_id
         evt.drift_detected.current_agent_id = drift.current_agent_id
+        # goldfive-steer-unification: source attribution. Normalise a
+        # missing ``authored_by`` on the drift here so downstream sinks
+        # never see an unattributed event from goldfive-internal paths
+        # (the ladder dispatcher normalises pre-emit; this is a belt-
+        # and-braces for direct ``_emit_drift_detected`` callers like
+        # ``_dispatch_pause_escalate`` / ``_emit_refine_failure``).
+        evt.drift_detected.authored_by = self._resolve_authored_by(drift)
+        evt.drift_detected.suppressed_by_user_steer = bool(drift.suppressed_by_user_steer)
         # goldfive#199: stamp the drift's own id on the wire so a
         # subsequent ``PlanRevised.trigger_event_id`` can strict-match the
         # drift row in harmonograf. Always non-empty — ``DriftEvent``
@@ -2688,6 +3114,32 @@ class DefaultSteerer:
         if trigger_input:
             evt.drift_detected.trigger_input = self._truncate_trigger_input(trigger_input)
         await self._emit(evt)
+
+    # goldfive-steer-unification: drift kinds that are always "user"-
+    # authored when no explicit source was stamped. Any other kind
+    # defaults to "goldfive" (the detector path).
+    _USER_AUTHORED_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
+        {
+            DriftKind.USER_STEER,
+            DriftKind.USER_CANCEL,
+            DriftKind.USER_PAUSE,
+        }
+    )
+
+    @classmethod
+    def _resolve_authored_by(cls, drift: DriftEvent) -> str:
+        """Return the effective ``authored_by`` value for ``drift``.
+
+        Honours an explicit value on the dataclass first; otherwise
+        derives from the drift kind. User-control kinds → ``"user"``;
+        everything else → ``"goldfive"`` (the detector path).
+        """
+        explicit = str(getattr(drift, "authored_by", "") or "").strip()
+        if explicit:
+            return explicit
+        if drift.kind in cls._USER_AUTHORED_DRIFT_KINDS:
+            return "user"
+        return "goldfive"
 
     @staticmethod
     def _drift_annotation_id(drift: DriftEvent) -> str:

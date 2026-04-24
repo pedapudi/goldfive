@@ -919,14 +919,40 @@ class LLMPlanner:
         drift: DriftEvent,
         goals: list[Goal],
     ) -> str:
-        """Build the delete-and-replan user prompt for a USER_STEER drift.
+        """Compatibility shim for :meth:`_build_steer_prompt` (user source).
+
+        Kept for subclasses and tests that referred to the pre-
+        unification name. New code should call
+        :meth:`_build_steer_prompt` with an explicit ``source``.
+        """
+        return self._build_steer_prompt(completed, drift, goals, source="user")
+
+    def _build_steer_prompt(
+        self,
+        completed: list[Task],
+        drift: DriftEvent,
+        goals: list[Goal],
+        *,
+        source: str = "user",
+    ) -> str:
+        """Build the delete-and-replan user prompt for a steer drift.
 
         Completed tasks are shown as read-only context; the LLM is told
         to produce only the remaining pending work in light of the
-        steering note. The caller prepends the completed tasks back onto
-        the returned plan so lineage is preserved verbatim. The new
-        PENDING task ids must not collide with the history ids; this is
-        stated as an explicit invariant (goldfive#133).
+        steer. The caller prepends the completed tasks back onto the
+        returned plan so lineage is preserved verbatim. The new PENDING
+        task ids must not collide with the history ids; this is stated
+        as an explicit invariant (goldfive#133).
+
+        ``source`` selects the directive framing:
+
+        * ``"user"`` — the drift carries an operator note; prompt
+          labels it "Operator steering note".
+        * ``"goldfive"`` — goldfive's drift ladder promoted a detector
+          signal into a steer; prompt labels it "Goldfive drift
+          correction (agent drift was detected in the preceding
+          activity)" and instructs the LLM to discard work on the
+          contaminated task.
         """
         history = [
             {
@@ -968,6 +994,24 @@ class LLMPlanner:
             "4. Your task ids must be unique within your response.\n"
             "5. Do not introduce edges that create a cycle."
         )
+        if source == "goldfive":
+            directive_header = (
+                "Goldfive drift correction (agent drift was detected in "
+                "the preceding activity — discard any prior work on the "
+                "contaminated task):"
+            )
+            closing = (
+                "Generate only the NEW PENDING tasks (and their edges) that "
+                "should run from here, applying the correction above. "
+                "Respond with JSON only."
+            )
+        else:
+            directive_header = "Operator steering note:"
+            closing = (
+                "Generate only the NEW PENDING tasks (and their edges) that "
+                "should run from here, taking the steering note into account. "
+                "Respond with JSON only."
+            )
         return (
             f"CURRENT GOALS (the new PENDING tasks must still advance "
             f"every goal, and MUST NOT silently drop any [STICKY] "
@@ -976,11 +1020,9 @@ class LLMPlanner:
             f"Completed/Failed/Cancelled tasks (READ-ONLY CONTEXT — "
             "preserve these verbatim at the start of the returned plan; "
             f"do NOT repeat them in your response):\n{history_json}\n\n"
-            f"Operator steering note:\n{note}\n\n"
+            f"{directive_header}\n{note}\n\n"
             f"{invariants}\n\n"
-            "Generate only the NEW PENDING tasks (and their edges) that "
-            "should run from here, taking the steering note into account. "
-            "Respond with JSON only."
+            f"{closing}"
         )
 
     # ---- structural-invariant helpers (issue #133) ----------------------
@@ -1694,7 +1736,9 @@ class LLMPlanner:
         if plan is None:
             return None
         if drift.kind is DriftKind.USER_STEER:
-            return await self._refine_user_steer(plan, drift, goals, available_agents)
+            return await self._refine_steer(
+                plan, drift, goals, available_agents, source="user"
+            )
         if drift.kind in (
             DriftKind.LOOPING_TOOL_CALL,
             DriftKind.LOOPING_REASONING,
@@ -2000,29 +2044,70 @@ class LLMPlanner:
             revision_index=plan.revision_index + 1,
         )
 
-    async def _refine_user_steer(
+    async def refine_steer(
         self,
+        *,
         plan: Plan,
         drift: DriftEvent,
         goals: list[Goal],
         available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None:
-        """Delete-and-replan path for ``USER_STEER`` drift.
+        """Public entry point for a goldfive-promoted steer refine.
 
-        Completed/failed/cancelled tasks are preserved verbatim (same
-        ids, titles, assignees, statuses). Pending/running/blocked
-        tasks are dropped; the LLM produces a fresh set of PENDING
-        tasks that honour the operator's steering note. The returned
+        Called by :meth:`DefaultSteerer._promote_drift_to_steer` when a
+        goldfive-detected drift has cleared the severity threshold and
+        the suppression window. Dispatches to the shared delete-and-
+        replan path with ``source="goldfive"`` so the LLM prompt frames
+        the refine as "goldfive detected agent drift — discard prior
+        work on this task", not as "an operator typed a steer".
+
+        The ``USER_STEER`` path continues to go through :meth:`refine`
+        with ``source="user"``; the two call sites share the underlying
+        implementation to guarantee identical merge / validation
+        semantics.
+        """
+        if plan is None:
+            return None
+        return await self._refine_steer(plan, drift, goals, available_agents, source="goldfive")
+
+    async def _refine_steer(
+        self,
+        plan: Plan,
+        drift: DriftEvent,
+        goals: list[Goal],
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
+        *,
+        source: str = "user",
+    ) -> Plan | None:
+        """Delete-and-replan path for an authoritative steer drift.
+
+        Shared by :meth:`refine` (``USER_STEER``; ``source="user"``) and
+        :meth:`refine_steer` (goldfive-promoted drift;
+        ``source="goldfive"``). Completed/failed/cancelled tasks are
+        preserved verbatim (same ids, titles, assignees, statuses).
+        Pending/running/blocked tasks are dropped; the LLM produces a
+        fresh set of PENDING tasks that honour the steer. The returned
         plan reuses ``plan.id`` and ``plan.run_id`` so lineage stays
         intact.
+
+        The ``source`` parameter selects the prompt shape — a user
+        steer reads the body as an operator directive; a goldfive
+        steer reads it as a corrective drift reason ("agent drift was
+        detected in the preceding activity"). Merge + validation
+        behaviour is identical across both sources.
         """
+        effective_source = (source or "user").strip().lower()
+        if effective_source not in {"user", "goldfive"}:
+            effective_source = "user"
         completed = [t for t in plan.tasks if t.status in _TERMINAL_STATUSES]
         completed_ids = {t.id for t in completed}
         try:
-            base_user_prompt = self._build_user_steer_prompt(completed, drift, goals)
+            base_user_prompt = self._build_steer_prompt(
+                completed, drift, goals, source=effective_source
+            )
         except (TypeError, ValueError) as exc:
             log.warning(
-                "LLMPlanner._refine_user_steer: failed to serialise inputs (%s)",
+                "LLMPlanner._refine_steer: failed to serialise inputs (%s)",
                 exc,
             )
             return None
@@ -2039,12 +2124,14 @@ class LLMPlanner:
                 completed_ids=completed_ids,
                 user_prompt=user_prompt,
                 available_agents=available_agents,
+                source=effective_source,
             )
             if merged_plan is not None:
                 return merged_plan
             last_error = error
             log.warning(
-                "LLMPlanner._refine_user_steer: attempt %d/%d: %s",
+                "LLMPlanner._refine_steer(source=%s): attempt %d/%d: %s",
+                effective_source,
                 attempt,
                 attempts,
                 last_error,
@@ -2056,6 +2143,21 @@ class LLMPlanner:
         await self._emit_refine_validation_failed(plan, drift, last_error)
         return None
 
+    # Backwards-compatible alias for :meth:`_refine_steer`. Existing
+    # callers / subclasses that referred to ``_refine_user_steer``
+    # directly keep working; new code should use ``_refine_steer`` with
+    # an explicit ``source`` or go through :meth:`refine_steer`.
+    async def _refine_user_steer(
+        self,
+        plan: Plan,
+        drift: DriftEvent,
+        goals: list[Goal],
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
+    ) -> Plan | None:
+        return await self._refine_steer(
+            plan, drift, goals, available_agents, source="user"
+        )
+
     async def _user_steer_one_attempt(
         self,
         *,
@@ -2066,6 +2168,7 @@ class LLMPlanner:
         completed_ids: set[str],
         user_prompt: str,
         available_agents: list[str] | list[dict[str, Any]] | None = None,
+        source: str = "user",
     ) -> tuple[Plan | None, str]:
         """Run a single LLM attempt for the USER_STEER refine path.
 
@@ -2121,6 +2224,16 @@ class LLMPlanner:
             seen.add(key)
             merged_edges.append(e)
 
+        if (source or "user").strip().lower() == "goldfive":
+            revision_reason = (
+                f"goldfive steer ({drift.kind.value}): {drift.detail}"
+            )
+            # Preserve the underlying drift kind on the revision so sinks
+            # see the ladder-promoted source, not a synthesised USER_STEER.
+            revision_kind_value = drift.kind.value
+        else:
+            revision_reason = f"user steering: {drift.detail}"
+            revision_kind_value = DriftKind.USER_STEER.value
         merged_plan = Plan(
             id=plan.id,
             run_id=plan.run_id,
@@ -2128,8 +2241,8 @@ class LLMPlanner:
             tasks=merged_tasks,
             edges=merged_edges,
             summary=fresh.summary or plan.summary,
-            revision_reason=f"user steering: {drift.detail}",
-            revision_kind=DriftKind.USER_STEER.value,
+            revision_reason=revision_reason,
+            revision_kind=revision_kind_value,
             revision_severity=DriftSeverity.WARNING.value,
             revision_index=plan.revision_index + 1,
         )

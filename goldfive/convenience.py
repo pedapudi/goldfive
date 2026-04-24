@@ -415,6 +415,7 @@ def wrap(
             reasoning_drift_mode=resolved_runtime.reasoning_drift.mode,
             reasoning_drift_call_llm=judge_call_llm,
             reasoning_drift_model=judge_model,
+            steering_config=resolved_runtime.steering,
         )
     else:
         resolved_steerer = DefaultSteerer(
@@ -422,6 +423,7 @@ def wrap(
             tool_loop_config=resolved_runtime.tool_loops,
             reasoning_drift_config=resolved_runtime.reasoning_drift,
             reasoning_drift_mode=resolved_runtime.reasoning_drift.mode,
+            steering_config=resolved_runtime.steering,
         )
         # Judges inherit ``call_llm`` from :func:`goldfive.wrap`; with
         # no callable wired here, both the trajectory-level GOAL_DRIFT

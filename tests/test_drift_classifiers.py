@@ -270,6 +270,84 @@ def test_detail_message_includes_task_id_and_keyword() -> None:
 
 
 # ---------------------------------------------------------------------------
+# goldfive-steer-unification: authored_by attribution on drifts
+# ---------------------------------------------------------------------------
+
+
+def test_drift_event_default_authored_by_is_empty() -> None:
+    """The dataclass default is empty -- the steerer normalises at emit."""
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="probe",
+    )
+    assert drift.authored_by == ""
+
+
+def test_drift_event_explicit_authored_by_preserved() -> None:
+    """Call sites that already attributed keep their value."""
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="focus",
+        authored_by="user",
+    )
+    assert drift.authored_by == "user"
+
+
+def test_user_control_drifts_are_authored_by_user() -> None:
+    """``_drift_from_control`` stamps user-sourced drifts as 'user'."""
+    from goldfive.control import ControlKind, ControlMessage
+    from goldfive.steerer import DefaultSteerer
+    from goldfive.types import Session
+
+    session = Session(run_id="r", current_task_id="t1")
+
+    steer_drift = DefaultSteerer._drift_from_control(
+        ControlMessage(
+            kind=ControlKind.STEER,
+            id="ctl-1",
+            payload={"note": "focus"},
+        ),
+        session,
+    )
+    assert steer_drift is not None
+    assert steer_drift.authored_by == "user"
+
+    cancel_drift = DefaultSteerer._drift_from_control(
+        ControlMessage(
+            kind=ControlKind.CANCEL,
+            id="ctl-2",
+            payload={"reason": "stop"},
+        ),
+        session,
+    )
+    assert cancel_drift is not None
+    assert cancel_drift.authored_by == "user"
+
+    pause_drift = DefaultSteerer._drift_from_control(
+        ControlMessage(kind=ControlKind.PAUSE, id="ctl-3", payload={}),
+        session,
+    )
+    assert pause_drift is not None
+    assert pause_drift.authored_by == "user"
+
+
+def test_goldfive_detector_drifts_resolve_to_goldfive() -> None:
+    """``_resolve_authored_by`` infers 'goldfive' for detector-sourced drifts."""
+    from goldfive.steerer import DefaultSteerer
+
+    # Built without an explicit authored_by (e.g. a detector that
+    # predates the unification).
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_REASONING,
+        severity=DriftSeverity.WARNING,
+        detail="loop",
+    )
+    assert DefaultSteerer._resolve_authored_by(drift) == "goldfive"
+
+
+# ---------------------------------------------------------------------------
 # Tool-loop drift detector: plugin wiring (goldfive#181)
 # ---------------------------------------------------------------------------
 

@@ -75,7 +75,12 @@ class StubPlanner:
 
 
 def _fresh() -> tuple[DefaultSteerer, Session, ListSink, StubPlanner]:
-    steerer = DefaultSteerer()
+    # goldfive-steer-unification: pause-escalate tests exercise the
+    # LEGACY ladder semantics (INTENT_DIVERGENCE CRITICAL -> pause,
+    # HUMAN_INTERVENTION_REQUIRED -> pause) so we explicitly disable
+    # the new drift-to-steer promotion. The promotion path itself is
+    # covered in tests/test_steer_unification.py.
+    steerer = DefaultSteerer(goldfive_steer_threshold="off")
     session = Session(run_id="pause-test", current_task_id="t1")
     session.plan = Plan(
         id="p1",

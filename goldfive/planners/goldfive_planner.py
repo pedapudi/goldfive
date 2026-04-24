@@ -116,6 +116,15 @@ KEY_GOALS_SUMMARY = "goldfive.goals_summary"
 KEY_ACTIVE_STEER_BODY = "goldfive.active_steer.body"
 """Text of the most recent user steering command, if any."""
 
+KEY_ACTIVE_STEER_SOURCE = "goldfive.active_steer.source"
+"""Source attribution for the active steer (``"user"`` / ``"goldfive"`` / empty).
+
+Written by :class:`~goldfive.steerer.DefaultSteerer`. Consulted by
+:meth:`GoldfivePlanner.build_planning_instruction` to render the
+active-steer line with explicit attribution — operators can tell a
+user-authored steer from a goldfive drift-promoted steer at a glance.
+"""
+
 KEY_CANCELLED_FUNCTION_CALL_IDS = "goldfive.cancelled_function_call_ids"
 """List of ADK ``function_call`` ids the adapter cancelled mid-invoke.
 
@@ -294,7 +303,24 @@ class GoldfivePlanner(BasePlanner):
         task_id = _state_get(state, KEY_CURRENT_TASK_ID) or _NONE_MARKER
         task_title = _state_get(state, KEY_CURRENT_TASK_TITLE) or _NONE_MARKER
         goals_summary = _state_get(state, KEY_GOALS_SUMMARY) or _NONE_MARKER
-        steer_body = _state_get(state, KEY_ACTIVE_STEER_BODY) or _NONE_MARKER
+        steer_body_raw = _state_get(state, KEY_ACTIVE_STEER_BODY)
+        steer_source_raw = _state_get(state, KEY_ACTIVE_STEER_SOURCE).strip().lower()
+
+        # goldfive-steer-unification: source-aware attribution line so
+        # the LLM sees whether the active steer is an operator
+        # directive or a goldfive-detected drift correction. The label
+        # matches the framing used by
+        # :meth:`SequentialExecutor._compose_steer_restart_message`.
+        if not steer_body_raw:
+            steer_line = f"Active steer (if any): {_NONE_MARKER}"
+        elif steer_source_raw == "goldfive":
+            steer_line = f"Active steer (goldfive): {steer_body_raw}"
+        elif steer_source_raw == "user":
+            steer_line = f"Active steer (user): {steer_body_raw}"
+        else:
+            # Empty / unknown source — treat as user-authored for
+            # back-compat (pre-unification stamps had no source key).
+            steer_line = f"Active steer (user): {steer_body_raw}"
 
         goldfive_block = (
             "[GOLDFIVE ORCHESTRATION CONTEXT]\n"
@@ -302,7 +328,7 @@ class GoldfivePlanner(BasePlanner):
             f"Plan task (if any): {task_id}\n"
             f"  title: {task_title}\n"
             f"Current goals: {goals_summary}\n"
-            f"Active user steer (if any): {steer_body}\n"
+            f"{steer_line}\n"
             "\n"
             "Notes:\n"
             "- The steering direction above supersedes prior context "
@@ -678,6 +704,7 @@ def _extract_own_tool_names(callback_context: Any) -> set[str]:
 
 __all__ = [
     "KEY_ACTIVE_STEER_BODY",
+    "KEY_ACTIVE_STEER_SOURCE",
     "KEY_CANCELLED_FUNCTION_CALL_IDS",
     "KEY_GOALS_SUMMARY",
     "GoldfivePlanner",

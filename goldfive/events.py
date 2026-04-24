@@ -747,4 +747,21 @@ def drift_detected_event(
     trigger_input = str(getattr(drift, "trigger_input", "") or "")
     if trigger_input:
         evt.drift_detected.trigger_input = trigger_input
+    # goldfive-steer-unification: source attribution + suppression flag.
+    # Out-of-band emitters that haven't stamped ``authored_by`` fall
+    # through to a kind-based inference so the field is always a
+    # non-empty string on the wire.
+    authored_by = str(getattr(drift, "authored_by", "") or "").strip()
+    if not authored_by:
+        kind_val = str(getattr(drift, "kind", "")).upper()
+        is_user_kind = (
+            kind_val.endswith("USER_STEER")
+            or kind_val.endswith("USER_CANCEL")
+            or kind_val.endswith("USER_PAUSE")
+        )
+        authored_by = "user" if is_user_kind else "goldfive"
+    evt.drift_detected.authored_by = authored_by
+    evt.drift_detected.suppressed_by_user_steer = bool(
+        getattr(drift, "suppressed_by_user_steer", False)
+    )
     return evt

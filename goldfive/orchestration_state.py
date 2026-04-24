@@ -106,6 +106,15 @@ KEY_GOALS_SUMMARY = "goldfive.goals_summary"
 KEY_ACTIVE_STEER_BODY = "goldfive.active_steer.body"
 KEY_ACTIVE_STEER_AT_TURN = "goldfive.active_steer.at_turn"
 KEY_ACTIVE_STEER_AUTHOR = "goldfive.active_steer.author"
+# Source attribution for the active steer
+# (goldfive-steer-unification). ``"user"`` for operator-authored steers
+# (USER_STEER ControlMessage); ``"goldfive"`` for steers promoted by the
+# drift-ladder (WARNING+/CRITICAL goldfive-detected drifts). Empty
+# string when no steer is active or when the writer didn't know the
+# source (treated as ``"user"`` for back-compat by readers that
+# decide on suppression, i.e. "we have an active steer; if we can't
+# prove it's goldfive-authored, treat it as user-authoritative").
+KEY_ACTIVE_STEER_SOURCE = "goldfive.active_steer.source"
 
 # USER_STEER idempotency (goldfive#171). A bounded list of already-
 # processed annotation / control ids. Consulted by DefaultSteerer so a
@@ -124,6 +133,7 @@ ALL_KEYS: tuple[str, ...] = (
     KEY_ACTIVE_STEER_BODY,
     KEY_ACTIVE_STEER_AT_TURN,
     KEY_ACTIVE_STEER_AUTHOR,
+    KEY_ACTIVE_STEER_SOURCE,
     KEY_PROCESSED_STEER_IDS,
     KEY_CANCELLED_FUNCTION_CALL_IDS,
 )
@@ -249,16 +259,23 @@ def set_active_steer(
     body: str,
     at_turn: int,
     author: str = "",
+    source: str = "",
 ) -> None:
-    """Record the active steer body + turn (+ optional author).
+    """Record the active steer body + turn (+ optional author + source).
 
     See module docstring. ``author`` defaults to the empty string so
     existing callers that don't know who authored the steer keep
     working unchanged (goldfive#171).
+
+    ``source`` (goldfive-steer-unification) indicates the origin of the
+    steer: ``"user"`` for an operator-authored ControlMessage, or
+    ``"goldfive"`` for a drift-ladder-promoted goldfive-internal steer.
+    Empty string is tolerated for back-compat.
     """
     write(state, KEY_ACTIVE_STEER_BODY, str(body or ""))
     write(state, KEY_ACTIVE_STEER_AT_TURN, int(at_turn))
     write(state, KEY_ACTIVE_STEER_AUTHOR, str(author or ""))
+    write(state, KEY_ACTIVE_STEER_SOURCE, str(source or ""))
 
 
 def clear_active_steer(state: MutableMapping[str, Any]) -> None:
@@ -266,6 +283,7 @@ def clear_active_steer(state: MutableMapping[str, Any]) -> None:
     clear(state, KEY_ACTIVE_STEER_BODY)
     clear(state, KEY_ACTIVE_STEER_AT_TURN)
     clear(state, KEY_ACTIVE_STEER_AUTHOR)
+    clear(state, KEY_ACTIVE_STEER_SOURCE)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +470,7 @@ __all__ = [
     "KEY_ACTIVE_STEER_AT_TURN",
     "KEY_ACTIVE_STEER_AUTHOR",
     "KEY_ACTIVE_STEER_BODY",
+    "KEY_ACTIVE_STEER_SOURCE",
     "KEY_CANCELLED_FUNCTION_CALL_IDS",
     "KEY_CURRENT_PLAN_ID",
     "KEY_CURRENT_TASK_ID",

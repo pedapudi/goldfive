@@ -52,8 +52,35 @@ __all__ = [
     "JudgeConfig",
     "ReasoningDriftConfig",
     "RuntimeConfig",
+    "SteeringConfig",
     "ToolLoopConfig",
 ]
+
+
+_VALID_STEER_THRESHOLDS: frozenset[str] = frozenset({"off", "warning", "critical"})
+
+
+def _read_steer_threshold_env(name: str, default: str) -> str:
+    """Return ``os.environ[name]`` as a steer threshold literal, or ``default``.
+
+    Accepts ``"off"`` / ``"warning"`` / ``"critical"`` (case-insensitive).
+    Anything else logs a WARNING and falls back so a typo doesn't
+    silently disable the promotion policy.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _VALID_STEER_THRESHOLDS:
+        return value
+    log.warning(
+        "ignoring unknown %s=%r (expected one of %s); using default %r",
+        name,
+        raw,
+        sorted(_VALID_STEER_THRESHOLDS),
+        default,
+    )
+    return default
 
 
 log = logging.getLogger(__name__)
@@ -429,6 +456,55 @@ class GoalDriftConfig:
         )
 
 
+@dataclasses.dataclass
+class SteeringConfig:
+    """Drift → steer promotion policy (goldfive-steer-unification).
+
+    Controls how goldfive-detected drifts (reasoning judge, embedding
+    detectors, goal-drift, loop detectors, tool-loops, confabulation)
+    interact with the cancel-in-flight + refine + restart-message
+    machinery previously reserved for ``USER_STEER``.
+
+    ``threshold``:
+
+    * ``"off"`` — every goldfive-detected drift stays on the legacy
+      passive ``REFINE_PLAN`` path (no cancel-in-flight, no
+      restart-message). For operators who want the softer pre-
+      unification semantics.
+    * ``"warning"`` (default) — ``WARNING``+ goldfive-detected drifts
+      are promoted to a full steer (cancel in-flight + stamp
+      ``goldfive.active_steer.*`` + refine + restart message).
+    * ``"critical"`` — only ``CRITICAL`` goldfive-detected drifts are
+      promoted. Useful for high-noise trees where the WARNING judge
+      fires too aggressively.
+
+    ``suppression_window_turns`` is the number of session-sequence
+    "turns" (monotonic ``_next_sequence`` increments) within which a
+    fresh user-authored steer suppresses any goldfive-authored steer
+    promotion. The goldfive drift still surfaces as a ``DriftDetected``
+    event with ``suppressed_by_user_steer=true``; no cancel or refine
+    fires. Default ``3`` keeps a live operator override dominant
+    across a few detector ticks.
+    """
+
+    threshold: str = "warning"
+    suppression_window_turns: int = 3
+
+    @classmethod
+    def from_env(cls) -> SteeringConfig:
+        """Read ``GOLDFIVE_STEER_*`` env vars into an instance."""
+        defaults = cls()
+        return cls(
+            threshold=_read_steer_threshold_env(
+                "GOLDFIVE_STEER_THRESHOLD", defaults.threshold
+            ),
+            suppression_window_turns=_read_int_env(
+                "GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS",
+                defaults.suppression_window_turns,
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Aggregate
 # ---------------------------------------------------------------------------
@@ -452,6 +528,7 @@ class RuntimeConfig:
     )
     goal_drift: GoalDriftConfig = dataclasses.field(default_factory=GoalDriftConfig)
     judge: JudgeConfig = dataclasses.field(default_factory=JudgeConfig)
+    steering: SteeringConfig = dataclasses.field(default_factory=SteeringConfig)
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -468,4 +545,5 @@ class RuntimeConfig:
             reasoning_drift=ReasoningDriftConfig.from_env(),
             goal_drift=GoalDriftConfig.from_env(),
             judge=JudgeConfig.from_env(),
+            steering=SteeringConfig.from_env(),
         )
