@@ -168,6 +168,7 @@ def to_pb_task(task: Task) -> Any:
         predicted_start_ms=task.predicted_start_ms,
         predicted_duration_ms=task.predicted_duration_ms,
         bound_span_id=task.bound_span_id,
+        supersedes=task.supersedes,
     )
     return msg
 
@@ -182,6 +183,7 @@ def from_pb_task(msg: Any) -> Task:
         predicted_start_ms=msg.predicted_start_ms,
         predicted_duration_ms=msg.predicted_duration_ms,
         bound_span_id=msg.bound_span_id,
+        supersedes=getattr(msg, "supersedes", "") or "",
     )
 
 

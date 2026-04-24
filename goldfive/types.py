@@ -182,6 +182,16 @@ class Task:
     #: field — it exists so storage-backed consumers have a stable
     #: schema slot threaded through the Task dataclass they re-export.
     cancel_reason: str = ""
+    #: Explicit supersession link (goldfive#237). When the planner
+    #: produces a replacement for a task that has failed / been
+    #: cancelled / needs a different shape, the new task sets
+    #: ``supersedes = <old_task.id>``. Consumed by
+    #: :meth:`goldfive.steerer.DefaultSteerer._emit_plan_revised` to
+    #: re-pin ``session.current_task_id`` on the replacement, and by
+    #: :mod:`goldfive.reporting` to reroute reporting-tool calls from
+    #: the old terminal id to the live replacement. Default empty —
+    #: legacy plans and tasks that are NOT replacements leave it unset.
+    supersedes: str = ""
 
 
 @dataclasses.dataclass
@@ -622,9 +632,7 @@ class Session:
     # Sentinel task_id ``""`` covers trajectory-wide revisions. Does NOT
     # apply to USER_STEER (always honoured) or GOAL_DRIFT (has its own
     # task-boundary rate limit via ``_last_goal_drift_check_ts``).
-    _last_plan_revision_at: dict[tuple[str, str], float] = dataclasses.field(
-        default_factory=dict
-    )
+    _last_plan_revision_at: dict[tuple[str, str], float] = dataclasses.field(default_factory=dict)
     # Counter of LLM turns observed since the last reflective self-progress
     # check. Incremented by ``DefaultSteerer.note_llm_call`` (which adapters
     # call once per LLM invocation when the opt-in reflective check is

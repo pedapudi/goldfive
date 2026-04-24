@@ -207,6 +207,83 @@ def _find_task_in_session(session: Session, task_id: str) -> Task | None:
     return None
 
 
+def _resolve_effective_task_id(session: Session, task_id: str) -> str:
+    """Follow the plan's ``supersedes`` chain from a terminal task to its live replacement.
+
+    goldfive#237. The scenario: ``planner.refine`` has replaced
+    ``research_solar`` (now FAILED) with ``research_solar_corrected``
+    (supersedes=``research_solar``, PENDING). The agent keeps its
+    previously-pinned ``current_task_id=research_solar`` and calls
+    ``report_task_progress`` with that id. Without this resolver the
+    handler would reject the call as an invalid transition from a
+    terminal status — a direct contradiction of "agent is actively
+    working, report is rejected".
+
+    Rules:
+
+    * If ``task_id`` refers to a task that is NOT terminal, return it
+      unchanged (the pre-#237 behaviour).
+    * If ``task_id`` refers to a terminal task, walk the plan looking
+      for any task whose ``supersedes`` equals ``task_id``. When
+      found, recurse (so A → B → C chains collapse to C), capping the
+      walk at a small depth for loop safety.
+    * If no replacement exists, return ``task_id`` unchanged — the
+      handler's existing terminal-state rejection path takes over,
+      which is still the right signal when the planner didn't produce
+      a replacement.
+
+    Empty / unknown task_id is returned unchanged.
+    """
+    if not task_id:
+        return task_id
+    plan = getattr(session, "plan", None)
+    if plan is None:
+        return task_id
+    tasks = getattr(plan, "tasks", None) or ()
+    # Index once — handlers call this up to five times per tool call.
+    by_id: dict[str, Task] = {str(getattr(t, "id", "") or ""): t for t in tasks}
+    # Build a reverse map supersedes -> new once.
+    replacements: dict[str, str] = {}
+    for t in tasks:
+        sup = str(getattr(t, "supersedes", "") or "").strip()
+        tid = str(getattr(t, "id", "") or "").strip()
+        if sup and tid:
+            replacements[sup] = tid
+    current = task_id
+    visited: set[str] = {current}
+    for _ in range(8):  # hard cap: plan-revision chains don't grow deep
+        task = by_id.get(current)
+        if task is None:
+            return current
+        if task.status not in _TERMINAL_STATUSES:
+            return current
+        nxt = replacements.get(current, "")
+        if not nxt or nxt in visited:
+            return current
+        visited.add(nxt)
+        current = nxt
+    return current
+
+
+def _reroute_if_superseded(session: Session, task_id: str, tool_name: str) -> str:
+    """Resolve ``task_id`` through the plan's supersession chain with logging.
+
+    Thin wrapper over :func:`_resolve_effective_task_id` that adds an
+    INFO-level log record the first time a call is rerouted so
+    operators can see the re-pin happening live in sessions. Idempotent
+    beyond the log line: handlers can safely call it every dispatch.
+    """
+    resolved = _resolve_effective_task_id(session, task_id)
+    if resolved != task_id:
+        log.info(
+            "reporting: %s called with superseded task_id=%s; routing to replacement=%s",
+            tool_name,
+            task_id,
+            resolved,
+        )
+    return resolved
+
+
 def _idempotent_response(current_status: TaskStatus) -> dict[str, Any]:
     return {
         "acknowledged": True,
@@ -364,6 +441,7 @@ async def _handle_task_started(
     detail = _str(args, "detail")
     if not task_id:
         return _missing_task_id_response("report_task_started")
+    task_id = _reroute_if_superseded(session, task_id, "report_task_started")
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(tool_name="report_task_started", current_status=task.status)
@@ -388,6 +466,7 @@ async def _handle_task_progress(
     detail = _str(args, "detail")
     if not task_id:
         return _missing_task_id_response("report_task_progress")
+    task_id = _reroute_if_superseded(session, task_id, "report_task_progress")
     task = _find_task_in_session(session, task_id)
     if task is not None:
         # report_task_progress is a liveness tick — only valid on RUNNING.
@@ -423,6 +502,7 @@ async def _handle_task_completed(
     )
     if not task_id:
         return _missing_task_id_response("report_task_completed")
+    task_id = _reroute_if_superseded(session, task_id, "report_task_completed")
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(
@@ -454,6 +534,7 @@ async def _handle_task_failed(
     recoverable = _bool(args, "recoverable", default=True)
     if not task_id:
         return _missing_task_id_response("report_task_failed")
+    task_id = _reroute_if_superseded(session, task_id, "report_task_failed")
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(tool_name="report_task_failed", current_status=task.status)
@@ -485,6 +566,7 @@ async def _handle_task_blocked(
     needed = _str(args, "needed")
     if not task_id:
         return _missing_task_id_response("report_task_blocked")
+    task_id = _reroute_if_superseded(session, task_id, "report_task_blocked")
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(tool_name="report_task_blocked", current_status=task.status)
