@@ -69,6 +69,12 @@ class DriftKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     DRIFT_KIND_REFINE_VALIDATION_FAILED: _ClassVar[DriftKind]
     DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED: _ClassVar[DriftKind]
     DRIFT_KIND_GOAL_DRIFT: _ClassVar[DriftKind]
+
+class SupersessionKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SUPERSESSION_KIND_UNSPECIFIED: _ClassVar[SupersessionKind]
+    SUPERSESSION_KIND_REPLACE: _ClassVar[SupersessionKind]
+    SUPERSESSION_KIND_CORRECT: _ClassVar[SupersessionKind]
 TASK_STATUS_UNSPECIFIED: TaskStatus
 TASK_STATUS_PENDING: TaskStatus
 TASK_STATUS_RUNNING: TaskStatus
@@ -120,6 +126,9 @@ DRIFT_KIND_RUNAWAY_DELEGATION: DriftKind
 DRIFT_KIND_REFINE_VALIDATION_FAILED: DriftKind
 DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED: DriftKind
 DRIFT_KIND_GOAL_DRIFT: DriftKind
+SUPERSESSION_KIND_UNSPECIFIED: SupersessionKind
+SUPERSESSION_KIND_REPLACE: SupersessionKind
+SUPERSESSION_KIND_CORRECT: SupersessionKind
 
 class Goal(_message.Message):
     __slots__ = ("id", "summary", "metadata", "has_success_predicate")
@@ -149,7 +158,7 @@ class TaskEdge(_message.Message):
     def __init__(self, from_task_id: _Optional[str] = ..., to_task_id: _Optional[str] = ...) -> None: ...
 
 class Task(_message.Message):
-    __slots__ = ("id", "title", "description", "assignee_agent_id", "status", "predicted_start_ms", "predicted_duration_ms", "bound_span_id", "supersedes")
+    __slots__ = ("id", "title", "description", "assignee_agent_id", "status", "predicted_start_ms", "predicted_duration_ms", "bound_span_id", "supersedes", "supersedes_kind")
     ID_FIELD_NUMBER: _ClassVar[int]
     TITLE_FIELD_NUMBER: _ClassVar[int]
     DESCRIPTION_FIELD_NUMBER: _ClassVar[int]
@@ -159,6 +168,7 @@ class Task(_message.Message):
     PREDICTED_DURATION_MS_FIELD_NUMBER: _ClassVar[int]
     BOUND_SPAN_ID_FIELD_NUMBER: _ClassVar[int]
     SUPERSEDES_FIELD_NUMBER: _ClassVar[int]
+    SUPERSEDES_KIND_FIELD_NUMBER: _ClassVar[int]
     id: str
     title: str
     description: str
@@ -168,7 +178,8 @@ class Task(_message.Message):
     predicted_duration_ms: int
     bound_span_id: str
     supersedes: str
-    def __init__(self, id: _Optional[str] = ..., title: _Optional[str] = ..., description: _Optional[str] = ..., assignee_agent_id: _Optional[str] = ..., status: _Optional[_Union[TaskStatus, str]] = ..., predicted_start_ms: _Optional[int] = ..., predicted_duration_ms: _Optional[int] = ..., bound_span_id: _Optional[str] = ..., supersedes: _Optional[str] = ...) -> None: ...
+    supersedes_kind: SupersessionKind
+    def __init__(self, id: _Optional[str] = ..., title: _Optional[str] = ..., description: _Optional[str] = ..., assignee_agent_id: _Optional[str] = ..., status: _Optional[_Union[TaskStatus, str]] = ..., predicted_start_ms: _Optional[int] = ..., predicted_duration_ms: _Optional[int] = ..., bound_span_id: _Optional[str] = ..., supersedes: _Optional[str] = ..., supersedes_kind: _Optional[_Union[SupersessionKind, str]] = ...) -> None: ...
 
 class Plan(_message.Message):
     __slots__ = ("id", "run_id", "goal_ids", "summary", "tasks", "edges", "revision_reason", "revision_kind", "revision_severity", "revision_index", "created_at", "revision_trigger_event_id")

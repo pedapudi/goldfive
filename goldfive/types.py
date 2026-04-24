@@ -147,6 +147,38 @@ class DriftSeverity(StrEnum):
     CRITICAL = "critical"
 
 
+class SupersessionKind(StrEnum):
+    """Kind of :attr:`Task.supersedes` link (goldfive#251).
+
+    Authoritative on the :class:`Task` dataclass (not inferred from the
+    old task's status at read time) because status is mutable — a
+    CORRECT-kind link must stay CORRECT even after the plan progresses
+    and the replacement itself finishes. Populated by
+    :mod:`goldfive.planner`'s post-parse validator from the LLM's raw
+    refine output: when the LLM sets a kind that disagrees with the old
+    task's actual status, the validator coerces based on status and
+    logs a WARNING.
+
+    Values:
+
+    * ``UNSPECIFIED`` — default / no supersedes link (or legacy plan).
+    * ``REPLACE`` — old task was PENDING/RUNNING; the new task takes its
+      slot in the DAG. Reporting-tool calls on the old id are rerouted
+      to the new one (:func:`goldfive.reporting._resolve_effective_task_id`).
+    * ``CORRECT`` — old task had already COMPLETED but the refiner
+      judged the output drift-contaminated. The new task is modelled
+      as a correction child: the old task stays in the plan as a
+      historical COMPLETED node, an edge ``old -> new`` is added, and
+      reporting-tool calls on the old id are NOT rerouted (the old
+      work's completion is historical fact). See
+      :meth:`goldfive.steerer.DefaultSteerer._emit_plan_revised`.
+    """
+
+    UNSPECIFIED = "UNSPECIFIED"
+    REPLACE = "REPLACE"
+    CORRECT = "CORRECT"
+
+
 _SEVERITY_RANK: dict[str, int] = {
     DriftSeverity.INFO.value: 0,
     DriftSeverity.WARNING.value: 1,
@@ -192,6 +224,19 @@ class Task:
     #: the old terminal id to the live replacement. Default empty —
     #: legacy plans and tasks that are NOT replacements leave it unset.
     supersedes: str = ""
+    #: goldfive#251: kind of :attr:`supersedes` link. ``UNSPECIFIED`` on
+    #: legacy plans and on tasks without a ``supersedes`` target;
+    #: :attr:`SupersessionKind.REPLACE` when the old task was
+    #: PENDING/RUNNING and the new task takes its slot;
+    #: :attr:`SupersessionKind.CORRECT` when the old task had already
+    #: COMPLETED but the refiner judged its output drift-contaminated
+    #: and the new task should be modelled as a correction child. Drives
+    #: :meth:`goldfive.steerer.DefaultSteerer._emit_plan_revised` (CORRECT
+    #: keeps the old task in the plan and inserts the new task as a DAG
+    #: child) and :func:`goldfive.reporting._resolve_effective_task_id`
+    #: (CORRECT suppresses the rerouting of reports from the old id to
+    #: the new id — the old work is legitimately done).
+    supersedes_kind: SupersessionKind = SupersessionKind.UNSPECIFIED
 
 
 @dataclasses.dataclass

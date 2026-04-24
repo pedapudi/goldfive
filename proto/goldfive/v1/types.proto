@@ -199,6 +199,37 @@ message TaskEdge {
   string to_task_id = 2;
 }
 
+// Kind of supersession link carried by ``Task.supersedes`` (goldfive#251).
+// Disambiguates two structurally different refine outcomes that the
+// pre-#251 code collapsed onto the same field:
+//
+//   * REPLACE — classic "retry a task that has not finished": the old
+//     task was PENDING / RUNNING when refine fired. The new task takes
+//     the old task's slot in the DAG; reporting-tool calls on the old
+//     id are rerouted to the new one.
+//   * CORRECT — refine targets a task that has already COMPLETED but
+//     whose output was drift-contaminated (e.g. agent wandered off-
+//     topic but still called ``report_task_completed``). The old task
+//     stays in the plan as a historical COMPLETED node; the new task
+//     is modelled as a correction child with an edge ``old -> new`` so
+//     downstream work flows through the correction. Reports on the old
+//     (already COMPLETED) id are NOT rerouted — the old work's
+//     completion is historical fact and a late report on it should be
+//     an idempotent no-op, not a retroactive write to the correction.
+//
+// Authoritative on the Task message (not inferred from old-task status
+// at read time) because status is mutable — a CORRECT-kind link must
+// remain a CORRECT-kind link even after the replacement itself finishes
+// and marks the old task's chain entirely terminal. UNSPECIFIED is the
+// default for legacy plans and for tasks that do not carry a
+// supersedes link; the post-parse validator resolves UNSPECIFIED ->
+// REPLACE / CORRECT from old-task status when ``supersedes`` is set.
+enum SupersessionKind {
+  SUPERSESSION_KIND_UNSPECIFIED = 0;
+  SUPERSESSION_KIND_REPLACE = 1;
+  SUPERSESSION_KIND_CORRECT = 2;
+}
+
 // A single unit of work within a Plan.
 message Task {
   string id = 1;
@@ -234,6 +265,15 @@ message Task {
   //     revision hook uses the map to re-pin ``current_task_id`` and
   //     to route reporting-tool calls from the old id to the new.
   string supersedes = 9;
+
+  // goldfive#251: kind of supersession link. See ``SupersessionKind``.
+  // UNSPECIFIED on legacy plans and on tasks without a ``supersedes``
+  // target; REPLACE or CORRECT on every revision task that sets
+  // ``supersedes``. REPLACE for old-task-status in {PENDING, RUNNING};
+  // CORRECT for old-task-status == COMPLETED. The post-parse validator
+  // coerces mismatched values to the correct kind based on the old
+  // task's actual status and logs a WARNING.
+  SupersessionKind supersedes_kind = 10;
 }
 
 // A Plan is a DAG of Tasks with a revision history. The initial plan

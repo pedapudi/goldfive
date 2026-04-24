@@ -18,6 +18,7 @@ from goldfive.types import (
     DriftSeverity,
     Goal,
     Plan,
+    SupersessionKind,
     Task,
     TaskEdge,
     TaskStatus,
@@ -157,6 +158,33 @@ def _drift_kind_from_pb(value: int) -> DriftKind:
 # ---------------------------------------------------------------------------
 
 
+def _supersession_kind_to_pb(kind: SupersessionKind) -> int:
+    """Translate a :class:`SupersessionKind` member to its proto int value.
+
+    Missing / unknown values fall back to the UNSPECIFIED sentinel so
+    round-tripping a legacy Task (no kind set) stays well-defined.
+    """
+    pb = _pb_module()
+    name = f"SUPERSESSION_KIND_{kind.name}" if isinstance(kind, SupersessionKind) else ""
+    return getattr(pb, name, getattr(pb, "SUPERSESSION_KIND_UNSPECIFIED", 0))
+
+
+def _supersession_kind_from_pb(value: int) -> SupersessionKind:
+    """Translate a proto :class:`SupersessionKind` int back to the dataclass enum."""
+    pb = _pb_module()
+    try:
+        name = pb.SupersessionKind.Name(value)
+    except (ValueError, AttributeError):
+        return SupersessionKind.UNSPECIFIED
+    if name.startswith("SUPERSESSION_KIND_"):
+        member = name[len("SUPERSESSION_KIND_") :]
+        try:
+            return SupersessionKind[member]
+        except KeyError:
+            return SupersessionKind.UNSPECIFIED
+    return SupersessionKind.UNSPECIFIED
+
+
 def to_pb_task(task: Task) -> Any:
     pb = _pb_module()
     msg = pb.Task(
@@ -169,6 +197,7 @@ def to_pb_task(task: Task) -> Any:
         predicted_duration_ms=task.predicted_duration_ms,
         bound_span_id=task.bound_span_id,
         supersedes=task.supersedes,
+        supersedes_kind=_supersession_kind_to_pb(task.supersedes_kind),
     )
     return msg
 
@@ -184,6 +213,7 @@ def from_pb_task(msg: Any) -> Task:
         predicted_duration_ms=msg.predicted_duration_ms,
         bound_span_id=msg.bound_span_id,
         supersedes=getattr(msg, "supersedes", "") or "",
+        supersedes_kind=_supersession_kind_from_pb(getattr(msg, "supersedes_kind", 0) or 0),
     )
 
 
