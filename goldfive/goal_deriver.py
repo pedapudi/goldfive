@@ -253,6 +253,14 @@ class LLMGoalDeriver:
             if callable(maybe_seq):
                 span_seq_fn = maybe_seq
 
+        # ``goal_derive`` is trajectory-level (no agent / task bound
+        # yet) so ``target_agent_id`` / ``target_task_id`` stay empty.
+        # The user request is stamped onto ``input_preview`` so
+        # harmonograf can render "what did goldfive derive goals for?"
+        # inline on the Gantt. Parse inside the with-block so the span's
+        # End event carries the derived-goals summary.
+        goals: list[Goal] = []
+        parsed_ok = False
         try:
             async with goldfive_llm_span(
                 sinks=span_sinks,
@@ -261,25 +269,48 @@ class LLMGoalDeriver:
                 session_id=span_session_id,
                 run_id=span_run_id,
                 sequence_fn=span_seq_fn,
-            ):
+                input_preview=user_input,
+            ) as span:
                 raw = await self._call_llm(self._system_prompt, prompt, self._model)
+                try:
+                    parsed_goals = _parse_goals_response(raw)
+                except (ValueError, json.JSONDecodeError, TypeError) as parse_exc:
+                    span.output_preview = (
+                        f"parse failed: {parse_exc}; "
+                        f"raw={raw[:200] if isinstance(raw, str) else '(non-str)'}"
+                    )
+                    span.decision_summary = (
+                        "goal-derive failed to parse LLM response; "
+                        "fell back to passthrough goal"
+                    )
+                    raise
+                if parsed_goals:
+                    goals = parsed_goals
+                    parsed_ok = True
+                    titles = [
+                        (g.summary or g.id or "(no-summary)") for g in goals
+                    ]
+                    span.output_preview = "goals=[" + ", ".join(titles) + "]"
+                    span.decision_summary = (
+                        f"derived {len(goals)} goal"
+                        + ("s" if len(goals) != 1 else "")
+                        + " from user request"
+                    )
+                else:
+                    span.output_preview = "goals=[]"
+                    span.decision_summary = (
+                        "goal-derive returned zero goals; "
+                        "fell back to passthrough goal"
+                    )
         except Exception as e:  # pragma: no cover - exercised via tests w/ stub
             logger.warning(
-                "LLMGoalDeriver: call_llm raised %s; falling back to passthrough goal", e
-            )
-            return [Goal(id="g1", summary=user_input)]
-
-        try:
-            goals = _parse_goals_response(raw)
-        except (ValueError, json.JSONDecodeError, TypeError) as e:
-            logger.warning(
-                "LLMGoalDeriver: could not parse LLM response (%s); "
+                "LLMGoalDeriver: call_llm or parse raised %s; "
                 "falling back to passthrough goal",
                 e,
             )
             return [Goal(id="g1", summary=user_input)]
 
-        if not goals:
+        if not parsed_ok or not goals:
             logger.warning(
                 "LLMGoalDeriver: LLM returned zero goals; falling back to passthrough goal"
             )

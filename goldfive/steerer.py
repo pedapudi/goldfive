@@ -1293,6 +1293,16 @@ class DefaultSteerer:
         )
         from goldfive._llm_span import goldfive_llm_span
 
+        # ``reflective_check`` targets a specific task / agent, so stamp
+        # the driver agent + task onto the span and feed a composed
+        # input_preview (tool calls + reasoning window) so operators can
+        # answer "what did the reflective check see?" from the Gantt.
+        reflective_input_preview = (
+            f"task={task.id} ({task.title or ''})\n"
+            f"tool_calls:\n{tool_call_summary}\n\n"
+            f"reasoning:\n{reasoning_summary}"
+        )
+        parsed: dict[str, Any] | None = None
         try:
             async with goldfive_llm_span(
                 sinks=self._sinks,
@@ -1302,12 +1312,41 @@ class DefaultSteerer:
                 run_id=session.run_id,
                 task_id=task.id,
                 sequence_fn=session.next_sequence,
-            ):
+                input_preview=reflective_input_preview,
+                target_agent_id=task.assignee_agent_id or "",
+                target_task_id=task.id,
+            ) as span:
                 raw = await call_llm(
                     self.REFLECTIVE_SYSTEM_PROMPT,
                     user_prompt,
                     self._reflective_model,
                 )
+                parsed = self._parse_reflective_response(raw)
+                if parsed is None:
+                    span.output_preview = (
+                        f"unparseable verdict; raw={raw!r:.200}"
+                    )
+                    span.decision_summary = (
+                        f"reflective check on {task.id}: unparseable verdict"
+                    )
+                else:
+                    making_progress_inline = parsed.get("making_progress")
+                    conf_inline = parsed.get("confidence")
+                    reason_inline = str(parsed.get("reason", "") or "")
+                    span.output_preview = (
+                        f"making_progress={making_progress_inline}, "
+                        f"confidence={conf_inline}, "
+                        f"reason={reason_inline or '(none)'}"
+                    )
+                    if isinstance(making_progress_inline, bool):
+                        verdict_str = (
+                            "progressing" if making_progress_inline else "stuck"
+                        )
+                    else:
+                        verdict_str = "malformed"
+                    span.decision_summary = (
+                        f"reflective check on {task.id}: {verdict_str}"
+                    )
         except Exception as exc:  # noqa: BLE001 - never break the run
             log.warning("DefaultSteerer.maybe_run_reflective_check: call_llm raised %s", exc)
             await self._emit_reflective_failure(
@@ -1316,7 +1355,6 @@ class DefaultSteerer:
                 reason=f"reflective call_llm raised: {exc}",
             )
             return
-        parsed = self._parse_reflective_response(raw)
         if parsed is None:
             await self._emit_reflective_failure(
                 session,

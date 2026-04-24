@@ -272,6 +272,13 @@ async def classify_goal_drift(
         activity_block=activity_block,
         activity_count=activity_count,
     )
+    # The judge is trajectory-level: ``target_agent_id`` /
+    # ``target_task_id`` deliberately stay empty so harmonograf renders
+    # the span on the goldfive lane without attributing to any one
+    # agent. ``input_preview`` carries the activity block the judge saw
+    # so operators can answer "why did goldfive think this was off-
+    # track?" from the Gantt.
+    parsed: dict[str, Any] | None = None
     try:
         from goldfive._llm_span import goldfive_llm_span
 
@@ -283,8 +290,39 @@ async def classify_goal_drift(
             run_id=run_id,
             task_id=current_task_id,
             sequence_fn=sequence_fn,
-        ):
+            input_preview=activity_block,
+        ) as span:
             raw = await call_llm(system, user, model)
+            # Parse inside the with-block so span.decision_summary /
+            # output_preview see the verdict before the End emission.
+            parsed = _parse_response(raw)
+            if parsed is None:
+                span.output_preview = "(unparseable verdict)"
+                span.decision_summary = (
+                    "judged trajectory: unparseable verdict (no drift emitted)"
+                )
+            else:
+                progressing_inline = parsed.get("progressing")
+                reason_inline = str(parsed.get("reason", "") or "").strip()
+                if isinstance(progressing_inline, bool):
+                    span.output_preview = (
+                        f"progressing={progressing_inline}, "
+                        f"reason={reason_inline or '(none)'}"
+                    )
+                    progressing_str = (
+                        "on-track" if progressing_inline else "off-track"
+                    )
+                    span.decision_summary = (
+                        f"judged trajectory: {progressing_str}"
+                        + (f" ({reason_inline})" if reason_inline else "")
+                    )
+                else:
+                    span.output_preview = (
+                        f"missing boolean 'progressing'; raw={parsed!r}"
+                    )
+                    span.decision_summary = (
+                        "judged trajectory: verdict missing 'progressing'"
+                    )
     except Exception as exc:  # noqa: BLE001 - never break the run
         log.warning("classify_goal_drift: call_llm raised %s; no drift emitted", exc)
         return None
@@ -297,7 +335,9 @@ async def classify_goal_drift(
         len(raw_str),
         raw_str[:500],
     )
-    parsed = _parse_response(raw)
+    # ``parsed`` is populated inside the span block above; re-binding
+    # here is intentional so the post-with path doesn't re-parse the
+    # same string.
     if parsed is None:
         log.debug(
             "classify_goal_drift: response was not JSON (raw=%r); no drift emitted",

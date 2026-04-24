@@ -266,6 +266,15 @@ async def classify_turn(
     )
     from goldfive._llm_span import goldfive_llm_span
 
+    # The planner gate is trajectory-level (decides whether the turn
+    # goes through the planner at all), so ``target_agent_id`` /
+    # ``target_task_id`` stay empty. The trigger context (user input +
+    # conversation id) doubles as ``input_preview`` so harmonograf can
+    # render "what did the gate see?" on the Gantt.
+    gate_input_preview = (
+        f"user_input: {user_input}\nconversation_id: {conversation_id}"
+    )
+    verdict: TurnClassification | None = None
     try:
         async with goldfive_llm_span(
             sinks=list(sinks or []),
@@ -274,8 +283,21 @@ async def classify_turn(
             session_id=session_id,
             run_id=run_id,
             sequence_fn=sequence_fn,
-        ):
+            input_preview=gate_input_preview,
+        ) as span:
             raw = await call_llm(_SYSTEM_PROMPT, user_prompt, model)
+            verdict = _parse_verdict(raw)
+            if verdict is None:
+                span.output_preview = (
+                    f"unparseable verdict; raw={raw!r:.200}"
+                )
+                span.decision_summary = (
+                    "planner gate verdict: unparseable (falling back to heuristic)"
+                )
+            else:
+                verdict_name = getattr(verdict, "name", str(verdict))
+                span.output_preview = f"verdict={verdict_name}"
+                span.decision_summary = f"planner gate verdict: {verdict_name}"
     except Exception as exc:  # noqa: BLE001
         log.warning("planner_gate.classify_turn: call_llm raised: %s", exc)
         return heuristic_classify_turn(
@@ -284,7 +306,6 @@ async def classify_turn(
             user_input=user_input,
             conversation_id=conversation_id,
         )
-    verdict = _parse_verdict(raw)
     if verdict is None:
         log.warning(
             "planner_gate.classify_turn: unparseable verdict from LLM; "

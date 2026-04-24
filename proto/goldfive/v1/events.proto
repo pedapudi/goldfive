@@ -526,6 +526,27 @@ message GoldfiveLLMCallStart {
   // ``time.time_ns()``). Advisory only — the Event envelope's
   // ``emitted_at`` carries the authoritative emission timestamp.
   int64 start_time_ns = 5;
+  // Human-readable summary of the input goldfive provided to the LLM
+  // (drift detail + plan summary for refine; activity block for the
+  // goal-drift judge; user_request for goal_derive; reasoning text for
+  // judge_reasoning). Up to 4096 chars, truncated with
+  // " … [truncated]" server-side. Empty on producers that predate the
+  // field or when the call site has no meaningful input summary.
+  string input_preview = 6;
+  // The agent this call concerns — for a judge, the agent whose
+  // reasoning was judged; for a refine, the agent owning the drifted
+  // task; for a goal_derive, empty. Bare ADK name (harmonograf sink
+  // canonicalizes to compound). Empty string when not applicable
+  // (trajectory-level classifiers) or when no agent was active.
+  string target_agent_id = 7;
+  // The task this call concerns — for a judge, the task the reasoning
+  // was part of; for a refine, the drifted task's id. Empty string
+  // when trajectory-level (goal_drift_check) or when no task is bound.
+  // Duplicates ``task_id`` above for spec parity with
+  // ``GoldfiveLLMCallEnd``; consumers MAY read either and SHOULD
+  // prefer ``target_task_id`` (the "spec" field; ``task_id`` predates
+  // this contract and is preserved for back-compat).
+  string target_task_id = 8;
 }
 
 // End marker for a goldfive-internal LLM call span. Emitted on both the
@@ -547,4 +568,33 @@ message GoldfiveLLMCallEnd {
   // to 1024 chars with " … [truncated]" when longer — the goal is a
   // short diagnostic, not a full traceback.
   string error = 5;
+  // Echo of ``GoldfiveLLMCallStart.input_preview`` so sinks that lost
+  // the Start event can still render retrospective context from the
+  // End alone. Up to 4096 chars, truncated with " … [truncated]".
+  // Empty on producers that predate the field.
+  string input_preview = 6;
+  // Human-readable summary of the decision/output goldfive produced
+  // (new plan summary for refine; verdict + reason for judges; goals
+  // list for goal_derive; "progressing" / "off-track" for reflective).
+  // Up to 4096 chars, truncated with " … [truncated]". Only populated
+  // on End (the decision isn't known at Start time). Empty on
+  // producers that predate the field or when an exception raised
+  // before the output could be computed.
+  string output_preview = 7;
+  // Echo of ``GoldfiveLLMCallStart.target_agent_id`` for End-only
+  // consumers. Bare ADK name.
+  string target_agent_id = 8;
+  // Echo of ``GoldfiveLLMCallStart.target_task_id`` for End-only
+  // consumers.
+  string target_task_id = 9;
+  // One-line human summary of what goldfive DID, written in active
+  // voice from goldfive's perspective. Example for a refine:
+  //   "refined plan in response to OFF_TOPIC drift on research_solar;
+  //    produced research_solar_corrected assigned to research_agent".
+  // Example for a judge:
+  //   "judged research_agent's reasoning on research_solar: off-task
+  //    (WARNING)".
+  // Used as the Gantt bar tooltip + popover headline. Up to 512 chars,
+  // truncated with " … [truncated]". Only populated on End.
+  string decision_summary = 10;
 }

@@ -353,29 +353,45 @@ class ReasoningJudgeInvoked(_message.Message):
     def __init__(self, run_id: _Optional[str] = ..., task_id: _Optional[str] = ..., subject_agent_id: _Optional[str] = ..., model: _Optional[str] = ..., elapsed_ms: _Optional[int] = ..., reasoning_input: _Optional[str] = ..., raw_response: _Optional[str] = ..., on_task: bool = ..., severity: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
 
 class GoldfiveLLMCallStart(_message.Message):
-    __slots__ = ("span_id", "name", "model", "task_id", "start_time_ns")
+    __slots__ = ("span_id", "name", "model", "task_id", "start_time_ns", "input_preview", "target_agent_id", "target_task_id")
     SPAN_ID_FIELD_NUMBER: _ClassVar[int]
     NAME_FIELD_NUMBER: _ClassVar[int]
     MODEL_FIELD_NUMBER: _ClassVar[int]
     TASK_ID_FIELD_NUMBER: _ClassVar[int]
     START_TIME_NS_FIELD_NUMBER: _ClassVar[int]
+    INPUT_PREVIEW_FIELD_NUMBER: _ClassVar[int]
+    TARGET_AGENT_ID_FIELD_NUMBER: _ClassVar[int]
+    TARGET_TASK_ID_FIELD_NUMBER: _ClassVar[int]
     span_id: str
     name: str
     model: str
     task_id: str
     start_time_ns: int
-    def __init__(self, span_id: _Optional[str] = ..., name: _Optional[str] = ..., model: _Optional[str] = ..., task_id: _Optional[str] = ..., start_time_ns: _Optional[int] = ...) -> None: ...
+    input_preview: str
+    target_agent_id: str
+    target_task_id: str
+    def __init__(self, span_id: _Optional[str] = ..., name: _Optional[str] = ..., model: _Optional[str] = ..., task_id: _Optional[str] = ..., start_time_ns: _Optional[int] = ..., input_preview: _Optional[str] = ..., target_agent_id: _Optional[str] = ..., target_task_id: _Optional[str] = ...) -> None: ...
 
 class GoldfiveLLMCallEnd(_message.Message):
-    __slots__ = ("span_id", "name", "end_time_ns", "status", "error")
+    __slots__ = ("span_id", "name", "end_time_ns", "status", "error", "input_preview", "output_preview", "target_agent_id", "target_task_id", "decision_summary")
     SPAN_ID_FIELD_NUMBER: _ClassVar[int]
     NAME_FIELD_NUMBER: _ClassVar[int]
     END_TIME_NS_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
+    INPUT_PREVIEW_FIELD_NUMBER: _ClassVar[int]
+    OUTPUT_PREVIEW_FIELD_NUMBER: _ClassVar[int]
+    TARGET_AGENT_ID_FIELD_NUMBER: _ClassVar[int]
+    TARGET_TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    DECISION_SUMMARY_FIELD_NUMBER: _ClassVar[int]
     span_id: str
     name: str
     end_time_ns: int
     status: str
     error: str
-    def __init__(self, span_id: _Optional[str] = ..., name: _Optional[str] = ..., end_time_ns: _Optional[int] = ..., status: _Optional[str] = ..., error: _Optional[str] = ...) -> None: ...
+    input_preview: str
+    output_preview: str
+    target_agent_id: str
+    target_task_id: str
+    decision_summary: str
+    def __init__(self, span_id: _Optional[str] = ..., name: _Optional[str] = ..., end_time_ns: _Optional[int] = ..., status: _Optional[str] = ..., error: _Optional[str] = ..., input_preview: _Optional[str] = ..., output_preview: _Optional[str] = ..., target_agent_id: _Optional[str] = ..., target_task_id: _Optional[str] = ..., decision_summary: _Optional[str] = ...) -> None: ...
