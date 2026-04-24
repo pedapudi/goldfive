@@ -59,6 +59,19 @@ _MODEL: Any | None = None
 _MODEL_UNAVAILABLE: bool = False
 _DEFAULT_MODEL_NAME: str = "all-MiniLM-L6-v2"
 
+# Runtime circuit breaker for the OpenAI-compatible HTTP backend.
+# Previously ``_MODEL_UNAVAILABLE`` flipped only on *import* failures
+# (sentence-transformers missing). An HTTP backend whose endpoint was
+# unreachable at runtime kept retrying forever, paying the timeout on
+# every single call from :func:`max_similarity` and
+# :func:`distance_to_topic`. The counter below trips the same flag
+# after :data:`_RUNTIME_FAILURE_THRESHOLD` consecutive failures so a
+# dead endpoint degrades to "no signal" after a bounded period of
+# wasted I/O. ``reset_circuit_breaker()`` exposes a test escape hatch.
+_RUNTIME_FAILURE_COUNT: int = 0
+_RUNTIME_FAILURE_THRESHOLD: int = 3
+_RUNTIME_FAILURE_TRIPPED: bool = False
+
 # Installed per-Runner embedding config (goldfive#225). When non-None,
 # the :func:`_get_model` lazy-load path reads backend parameters from
 # this object instead of environment variables. ``None`` preserves the
@@ -81,7 +94,28 @@ def set_model(model: Any | None) -> None:
     global _MODEL, _MODEL_UNAVAILABLE
     _MODEL = model
     _MODEL_UNAVAILABLE = False
+    reset_circuit_breaker()
     _reset_cache()
+
+
+def reset_circuit_breaker() -> None:
+    """Clear the runtime-failure counter and un-trip the circuit breaker.
+
+    Test-only escape hatch. Prod code resets the counter on any
+    successful encode via :meth:`_OpenAIEmbeddingBackend.encode`; tests
+    that exercise the trip path need a deterministic way to reset
+    between cases.
+
+    Also clears :data:`_MODEL_UNAVAILABLE` when it was set by the trip
+    (the counter was at the threshold); leaves it alone otherwise, so
+    a sentence-transformers import failure isn't accidentally papered
+    over.
+    """
+    global _RUNTIME_FAILURE_COUNT, _RUNTIME_FAILURE_TRIPPED, _MODEL_UNAVAILABLE
+    if _RUNTIME_FAILURE_TRIPPED:
+        _MODEL_UNAVAILABLE = False
+    _RUNTIME_FAILURE_COUNT = 0
+    _RUNTIME_FAILURE_TRIPPED = False
 
 
 def configure(config: EmbeddingConfig | None) -> None:
@@ -108,6 +142,7 @@ def configure(config: EmbeddingConfig | None) -> None:
     else:
         _MODEL = None
     _MODEL_UNAVAILABLE = False
+    reset_circuit_breaker()
     _reset_cache()
 
 
@@ -131,10 +166,15 @@ def _get_model() -> Any | None:
     calls skip the import cost. Callers must check for ``None``.
     """
     global _MODEL, _MODEL_UNAVAILABLE
-    if _MODEL is not None:
-        return _MODEL
+    # Check ``_MODEL_UNAVAILABLE`` before ``_MODEL`` so the runtime
+    # circuit breaker (see :func:`_note_backend_failure`) actually
+    # short-circuits. The tripped flag is also cleared by
+    # :func:`reset_circuit_breaker` / :func:`set_model` /
+    # :func:`configure` for callers that want a fresh start.
     if _MODEL_UNAVAILABLE:
         return None
+    if _MODEL is not None:
+        return _MODEL
 
     # Prefer an installed RuntimeConfig over env vars (goldfive#225).
     # When ``configure()`` has been called with a non-None base_url,
@@ -286,15 +326,28 @@ class _OpenAIEmbeddingBackend:
         Network / parse errors yield an empty list; callers upstream
         treat that as "no signal" and fall through to the 0.0 / -1.0
         defaults.
+
+        Empty results also feed the module-level circuit breaker. After
+        :data:`_RUNTIME_FAILURE_THRESHOLD` consecutive failures the
+        :data:`_MODEL_UNAVAILABLE` flag trips, so subsequent calls
+        short-circuit through :func:`_get_model` without paying the
+        network timeout. Any successful call (non-empty vectors)
+        resets the counter. See :func:`reset_circuit_breaker`.
         """
         if not texts:
             return []
         if self._prefer_sdk and self._openai_client is not None:
             vectors = self._encode_via_sdk(texts)
             if vectors is not None:
+                _note_backend_success()
                 return vectors
             # SDK path failed -- fall through to raw httpx before giving up.
-        return self._encode_via_httpx(texts) or []
+        vectors = self._encode_via_httpx(texts)
+        if vectors:
+            _note_backend_success()
+            return vectors
+        _note_backend_failure(self._base_url)
+        return []
 
     def _encode_via_sdk(self, texts: list[str]) -> list[list[float]] | None:
         assert self._openai_client is not None
@@ -333,6 +386,66 @@ class _OpenAIEmbeddingBackend:
             log.debug("httpx embedding POST to %s failed: %s", url, exc)
             return None
         return _parse_openai_response(body)
+
+
+def _note_backend_success() -> None:
+    """Reset the runtime-failure counter on any successful encode.
+
+    Called by :meth:`_OpenAIEmbeddingBackend.encode` whenever a
+    non-empty vector list comes back. Keeping the reset in one place
+    means a transient outage (two failures, one success, two more
+    failures) never trips the circuit breaker — only *consecutive*
+    failures count.
+    """
+    global _RUNTIME_FAILURE_COUNT
+    if _RUNTIME_FAILURE_COUNT:
+        log.debug(
+            "embedding backend recovered after %d failures; "
+            "resetting circuit breaker",
+            _RUNTIME_FAILURE_COUNT,
+        )
+    _RUNTIME_FAILURE_COUNT = 0
+
+
+def _note_backend_failure(base_url: str) -> None:
+    """Increment the runtime-failure counter and trip at threshold.
+
+    Called from the OpenAI backend's ``encode`` when both the SDK and
+    httpx paths return no vectors. After
+    :data:`_RUNTIME_FAILURE_THRESHOLD` consecutive failures we flip
+    :data:`_MODEL_UNAVAILABLE` and log a single WARNING; every
+    :func:`max_similarity` / :func:`distance_to_topic` call after
+    that short-circuits via :func:`_get_model` to the "no signal"
+    default without paying the network timeout. The WARNING mentions
+    ``GOLDFIVE_EMBEDDING_BASE_URL`` so operators can identify the
+    unreachable endpoint from logs.
+    """
+    global _RUNTIME_FAILURE_COUNT, _MODEL_UNAVAILABLE
+    global _RUNTIME_FAILURE_TRIPPED, _MODEL
+    _RUNTIME_FAILURE_COUNT += 1
+    log.debug(
+        "embedding backend %r: failure %d/%d",
+        base_url,
+        _RUNTIME_FAILURE_COUNT,
+        _RUNTIME_FAILURE_THRESHOLD,
+    )
+    if (
+        _RUNTIME_FAILURE_COUNT >= _RUNTIME_FAILURE_THRESHOLD
+        and not _RUNTIME_FAILURE_TRIPPED
+    ):
+        _RUNTIME_FAILURE_TRIPPED = True
+        _MODEL_UNAVAILABLE = True
+        # Drop the cached backend too: ``_get_model`` short-circuits on
+        # ``_MODEL_UNAVAILABLE`` only when ``_MODEL is None``, otherwise
+        # the already-cached (dead) backend keeps getting handed back.
+        _MODEL = None
+        log.warning(
+            "embedding backend at %s has failed %d times in a row; "
+            "disabling for this process (set GOLDFIVE_EMBEDDING_BASE_URL=... "
+            "to redirect or unset to disable silently)",
+            base_url,
+            _RUNTIME_FAILURE_COUNT,
+        )
 
 
 def _parse_openai_response(resp: Any) -> list[list[float]] | None:

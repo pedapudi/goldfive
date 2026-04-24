@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from goldfive._llm_detect import CallLLM, detect_llm
 from goldfive.adapters.auto import auto_adapter, is_adk_agent
-from goldfive.config import RuntimeConfig
+from goldfive.config import JudgeConfig, RuntimeConfig
 from goldfive.executors.sequential import SequentialExecutor
 from goldfive.goal_deriver import LiteralGoalDeriver, LLMGoalDeriver
 from goldfive.planner import LLMPlanner, PassthroughPlanner
@@ -49,6 +49,93 @@ if TYPE_CHECKING:
     from goldfive.control import ControlChannel
 
 log = logging.getLogger("goldfive.wrap")
+
+
+def _build_judge_call_llm(config: JudgeConfig) -> tuple[CallLLM, str] | None:
+    """Construct an OpenAI-compatible ``CallLLM`` from a :class:`JudgeConfig`.
+
+    Returns ``(call_llm, model)`` or ``None`` when the ``openai``
+    package is not importable / the client cannot be built. Shape
+    mirrors :func:`goldfive._llm_detect.make_default_adk_call_llm`: the
+    returned callable exposes a ``close`` coroutine so
+    :class:`Runner` can tear down its HTTP session on shutdown.
+
+    Design parallels :class:`goldfive.drift._embed._OpenAIEmbeddingBackend`
+    — we intentionally tolerate missing / placeholder ``api_key`` so
+    llama.cpp / Ollama endpoints "just work" (they don't check the
+    header).
+    """
+    base_url = (config.base_url or "").strip()
+    if not base_url:
+        return None
+    try:
+        from openai import AsyncOpenAI  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "goldfive.wrap: openai SDK not importable for JudgeConfig "
+            "(base_url=%r): %s",
+            base_url,
+            exc,
+        )
+        return None
+    timeout_s = max(0.1, config.timeout_ms / 1000.0)
+    try:
+        client: Any = AsyncOpenAI(
+            base_url=f"{base_url.rstrip('/')}/v1",
+            api_key=config.api_key or "not-needed",
+            timeout=timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "goldfive.wrap: AsyncOpenAI client construction failed for "
+            "JudgeConfig (base_url=%r): %s",
+            base_url,
+            exc,
+        )
+        return None
+
+    model_name = config.model or ""
+
+    async def _call_llm(system: str, user: str, model_str: str) -> str:
+        # Prefer the model argument supplied by the caller (matches the
+        # contract used by :class:`~goldfive.planner.LLMPlanner`); fall
+        # back to the config model when the caller passes the empty
+        # string. An empty-string model is tolerated by llama.cpp /
+        # Ollama even against an OpenAI endpoint that requires one,
+        # because we only hit endpoints the operator configured.
+        effective_model = model_str or model_name
+        resp = await client.chat.completions.create(
+            model=effective_model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        try:
+            content = resp.choices[0].message.content or ""
+        except Exception:  # noqa: BLE001
+            return ""
+        return str(content)
+
+    async def _close() -> None:
+        for attr_name in ("aclose", "close"):
+            target = getattr(client, attr_name, None)
+            if callable(target):
+                try:
+                    result = target()
+                    if hasattr(result, "__await__"):
+                        await result
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "goldfive.wrap: JudgeConfig client.%s raised %s",
+                        attr_name,
+                        exc,
+                    )
+                    return
+
+    _call_llm.close = _close  # type: ignore[attr-defined]
+    return _call_llm, model_name
 
 
 def wrap(
@@ -120,9 +207,12 @@ def wrap(
         non-ADK agents. See goldfive#121.
     runtime:
         Optional :class:`~goldfive.config.RuntimeConfig` (goldfive#225)
-        bundling the four typed-config surfaces: embedding backend,
-        tool-loop detector thresholds, reasoning-drift thresholds, and
-        goal-drift scheduling. When ``None`` (the default) ``wrap()``
+        bundling the typed-config surfaces: embedding backend,
+        tool-loop detector thresholds, reasoning-drift thresholds,
+        goal-drift scheduling, and (added in the silent-disarm
+        follow-up) a dedicated :class:`~goldfive.config.JudgeConfig`
+        for routing the two drift judges to their own LLM endpoint.
+        When ``None`` (the default) ``wrap()``
         builds an instance from the environment via
         :meth:`RuntimeConfig.from_env` so pre-#225 callers get
         byte-identical behaviour. When provided, the config is
@@ -171,12 +261,76 @@ def wrap(
     resolved_call_llm: CallLLM | None = call_llm
     resolved_model: str = model or ""
 
-    if resolved_call_llm is None and (planner is None or goal_deriver is None):
+    # Track whether the judge-bound callable came from detect_llm so we
+    # can emit the named-model WARNING below. Explicit ``call_llm=`` or
+    # an explicit :class:`JudgeConfig` suppresses that warning.
+    _call_llm_from_detect: bool = False
+    _detected_model_name: str = ""
+
+    # Always auto-detect when the caller did not supply an explicit
+    # ``call_llm``. Prior to this fix the auto-detect was guarded by
+    # ``(planner is None or goal_deriver is None)`` on the assumption that
+    # ``call_llm`` existed only to feed those two. That stopped being
+    # true when #218 / #226 wired the goal-drift and reasoning-drift
+    # judges through the same callable — callers who supply their own
+    # planner + goal_deriver still need the judges armed. Leaving the
+    # guard in place produced a silent-disarm: both judges stayed
+    # inert, and drift in the agent's reasoning went undetected despite
+    # the detectors being "on". See ``docs/design/DRIFT.md`` and the
+    # live-session evidence in harmonograf session
+    # ``1aa68419-00f3-41eb-bf6e-22d0bdff21ed``.
+    if resolved_call_llm is None:
         detected = detect_llm(agent)
         if detected is not None:
             resolved_call_llm, detected_model = detected
+            _call_llm_from_detect = True
+            _detected_model_name = detected_model
             if not resolved_model:
                 resolved_model = detected_model
+
+    # Judge routing (goldfive JudgeConfig + named-model WARNING).
+    # Precedence for the two drift judges' call_llm / model:
+    #   1. Explicit ``goldfive.wrap(call_llm=...)`` — wins outright.
+    #   2. ``resolved_runtime.judge.base_url`` — dedicated judge endpoint.
+    #   3. Auto-detected tree LLM (``detect_llm``).
+    # The planner + goal_deriver stay on ``resolved_call_llm`` regardless;
+    # only the two judges get routed to JudgeConfig when it is set.
+    judge_call_llm: CallLLM | None = resolved_call_llm
+    judge_model: str = resolved_model
+    judge_from_config: bool = False
+    if call_llm is None and resolved_runtime.judge.base_url:
+        built = _build_judge_call_llm(resolved_runtime.judge)
+        if built is not None:
+            judge_call_llm, judge_config_model = built
+            if judge_config_model:
+                judge_model = judge_config_model
+            judge_from_config = True
+        else:
+            log.warning(
+                "goldfive.wrap: JudgeConfig.base_url=%r is set but a "
+                "CallLLM could not be constructed (openai SDK missing "
+                "or client rejected the config); judges will fall back "
+                "to the tree LLM.",
+                resolved_runtime.judge.base_url,
+            )
+
+    # Named-model WARNING (goldfive silent-disarm follow-up). When the
+    # judges' callable was inherited from ``detect_llm`` — i.e. the
+    # operator did not pass ``call_llm=`` and did not configure a
+    # :class:`JudgeConfig` — surface which model is now handling judge
+    # traffic so billed / rate-limited cloud endpoints are visible
+    # from logs rather than hidden inside the adapter. An explicit
+    # ``call_llm=`` or an explicit ``JudgeConfig`` suppresses the
+    # warning (the operator has already made a deliberate choice).
+    if _call_llm_from_detect and not judge_from_config:
+        log.warning(
+            "goldfive.wrap: judge LLM not explicitly configured; inheriting "
+            "%r from agent %r (detected via ADK model attribute). Set "
+            "GOLDFIVE_JUDGE_BASE_URL / GOLDFIVE_JUDGE_MODEL to route "
+            "goldfive's judges to a dedicated endpoint.",
+            _detected_model_name,
+            type(agent).__name__,
+        )
 
     resolved_planner: Planner
     if planner is not None:
@@ -239,20 +393,22 @@ def wrap(
     resolved_steerer: Steerer
     if steerer is not None:
         resolved_steerer = steerer
-    elif resolved_call_llm is not None:
-        # Same call_llm wires into both the trajectory-level goal-drift
-        # judge (goldfive#218) and the per-thinking-message reasoning
-        # judge (goldfive#226). Default ``reasoning_drift_mode`` on the
-        # steerer is ``"judge"`` -- see :class:`DefaultSteerer`.
+    elif judge_call_llm is not None:
+        # The two drift judges share a single callable: the
+        # trajectory-level GOAL_DRIFT judge (goldfive#218) and the
+        # per-thinking-message reasoning judge (goldfive#226). Default
+        # ``reasoning_drift_mode`` on the steerer is ``"judge"`` -- see
+        # :class:`DefaultSteerer`. ``judge_call_llm`` comes from the
+        # precedence chain above: explicit > JudgeConfig > detected.
         resolved_steerer = DefaultSteerer(
-            goal_drift_call_llm=resolved_call_llm,
-            goal_drift_model=resolved_model,
+            goal_drift_call_llm=judge_call_llm,
+            goal_drift_model=judge_model,
             goal_drift_config=resolved_runtime.goal_drift,
             tool_loop_config=resolved_runtime.tool_loops,
             reasoning_drift_config=resolved_runtime.reasoning_drift,
             reasoning_drift_mode=resolved_runtime.reasoning_drift.mode,
-            reasoning_drift_call_llm=resolved_call_llm,
-            reasoning_drift_model=resolved_model,
+            reasoning_drift_call_llm=judge_call_llm,
+            reasoning_drift_model=judge_model,
         )
     else:
         resolved_steerer = DefaultSteerer(
@@ -261,6 +417,24 @@ def wrap(
             reasoning_drift_config=resolved_runtime.reasoning_drift,
             reasoning_drift_mode=resolved_runtime.reasoning_drift.mode,
         )
+        # Judges inherit ``call_llm`` from :func:`goldfive.wrap`; with
+        # no callable wired here, both the trajectory-level GOAL_DRIFT
+        # judge and the per-thinking-message reasoning-drift judge are
+        # silently inert. Fail loud so operators can diagnose without
+        # trawling source — the most common cause is forgetting to
+        # pass ``call_llm=`` (or an ADK agent that ``detect_llm``
+        # cannot introspect). The reasoning-drift mode is still
+        # honoured; it just won't produce drift events until a
+        # callable is wired.
+        mode = resolved_runtime.reasoning_drift.mode
+        if mode in ("judge", "both"):
+            log.warning(
+                "goldfive.wrap: reasoning_drift_mode=%r but no call_llm "
+                "wired — LLM-as-a-judge drift detection is disabled for "
+                "this Runner. Pass call_llm=... to goldfive.wrap() or "
+                "use an ADK agent detect_llm() can introspect.",
+                mode,
+            )
     resolved_sinks: list[EventSink] = list(sinks) if sinks is not None else [LoggingSink()]
 
     runner = Runner(
@@ -273,6 +447,17 @@ def wrap(
         control=control,
         max_task_invocations=max_task_invocations,
     )
+
+    # When the judges were routed through a dedicated JudgeConfig
+    # endpoint we constructed our own ``AsyncOpenAI`` client — register
+    # its ``close`` as a Runner close-hook so the HTTP session is torn
+    # down on ``runner.close()`` rather than leaking until process
+    # exit. (Judges inheriting the tree LLM already close via the
+    # planner/goal_deriver close path.)
+    if judge_from_config and judge_call_llm is not None:
+        _close = getattr(judge_call_llm, "close", None)
+        if callable(_close):
+            runner.add_close_hook(_close)
 
     if is_adk_agent(agent):
         # Lazy import so callers without the ADK extra don't pay for it.

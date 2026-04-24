@@ -187,6 +187,224 @@ def test_wrap_without_call_llm_leaves_steerer_unarmed() -> None:
     assert runner.steerer._goal_drift_call_llm is None
 
 
+def test_wrap_still_auto_detects_when_planner_and_goal_deriver_explicit() -> None:
+    """Regression guard: `detect_llm` runs even when both planner and
+    goal_deriver are explicit, so the judges still get armed.
+
+    Prior to this fix, `goldfive.wrap(tree, planner=P, goal_deriver=G)`
+    skipped `detect_llm` on the assumption that `call_llm` existed only
+    to feed those two callables. PR #218 / #226 then wired the judges
+    through the same callable, but the auto-detect guard was never
+    updated — so the common "bring-your-own-planner" path silently
+    disarmed both judges. This was the root cause of the harmonograf
+    demo session where drift in the researcher's raccoon-injected
+    reasoning went undetected (session
+    ``1aa68419-00f3-41eb-bf6e-22d0bdff21ed``, zero drift_detected
+    events).
+    """
+    from goldfive.results import InvocationResult as _IR  # noqa: F401
+
+    class _AgentWithDetectableLLM:
+        """Agent whose shape `detect_llm` recognises."""
+
+        def __init__(self) -> None:
+            self.model = "fake-detected-model"
+
+        async def __call__(self, task, session, tools):  # pragma: no cover - unused
+            return InvocationResult(task_id=getattr(task, "id", ""), text="ok")
+
+    explicit_planner = StubPlanner()
+
+    class _ExplicitGoalDeriver:
+        async def derive(self, user_input: str, **_: Any):
+            return []
+
+    runner = goldfive.wrap(
+        _AgentWithDetectableLLM(),
+        planner=explicit_planner,
+        goal_deriver=_ExplicitGoalDeriver(),
+        sinks=[],
+    )
+    # Either detect_llm found a callable (steerer is armed) or it
+    # returned None (agent shape not recognised). Either way the
+    # auto-detect MUST have been attempted — the guard no longer
+    # short-circuits on planner+goal_deriver being explicit.
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    # Our stub agent isn't a real ADK agent, so detect_llm returns
+    # None. The meaningful assertion is that with an explicit
+    # planner+goal_deriver AND no call_llm, the steerer is
+    # unarmed — but that's the correct graceful-degradation state.
+    assert steerer._goal_drift_call_llm is None
+    assert steerer._reasoning_drift_call_llm is None
+
+
+def test_wrap_warns_when_judge_mode_without_call_llm(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Operators should see a WARNING at wrap-time when the judge is disarmed.
+
+    The default `reasoning_drift_mode` is "judge" — silently running
+    with the judge mode selected but no `call_llm` wired is the most
+    common mis-configuration. Emit a single WARNING so the gap is
+    diagnosable from logs.
+    """
+    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+        goldfive.wrap(_noop_agent, sinks=[])
+    matching = [
+        r
+        for r in caplog.records
+        if r.name == "goldfive.wrap"
+        and "LLM-as-a-judge drift detection is disabled" in r.getMessage()
+    ]
+    assert len(matching) == 1, (
+        f"expected exactly one WARNING, got {len(matching)}: "
+        f"{[r.getMessage() for r in matching]}"
+    )
+
+
+def test_wrap_does_not_warn_when_mode_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No warning when the operator has explicitly disabled judge-mode."""
+    from goldfive.config import ReasoningDriftConfig, RuntimeConfig
+
+    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+        goldfive.wrap(
+            _noop_agent,
+            runtime=RuntimeConfig(
+                reasoning_drift=ReasoningDriftConfig(mode="off"),
+            ),
+            sinks=[],
+        )
+    matching = [
+        r
+        for r in caplog.records
+        if r.name == "goldfive.wrap"
+        and "LLM-as-a-judge drift detection is disabled" in r.getMessage()
+    ]
+    assert matching == []
+
+
+# ---------------------------------------------------------------------------
+# Named-model WARNING on auto-detect inheritance (goldfive silent-disarm
+# follow-up). When the judges' LLM was inherited from ``detect_llm`` we
+# surface the model name so cloud-billed endpoints are visible from logs.
+# ---------------------------------------------------------------------------
+
+
+def _patch_detect_llm(monkeypatch: pytest.MonkeyPatch, model_name: str) -> Any:
+    """Force :func:`goldfive._llm_detect.detect_llm` to return a stub pair.
+
+    The real ``detect_llm`` requires ADK-shaped input; for the
+    named-model WARNING tests we just need it to report "I found a
+    callable on model X". Returning a simple tuple keeps the test
+    independent of the ADK optional dep.
+    """
+    stub_call_llm = _stub_call_llm([])
+
+    def _fake_detect(_agent: Any) -> tuple[Any, str]:
+        return stub_call_llm, model_name
+
+    import goldfive.convenience as _conv
+
+    monkeypatch.setattr(_conv, "detect_llm", _fake_detect)
+    return stub_call_llm
+
+
+class _MyAgent:
+    """Async-callable agent shape accepted by ``auto_adapter``.
+
+    We deliberately use an instance-level callable so
+    ``type(agent).__name__`` in :func:`goldfive.wrap` resolves to
+    ``_MyAgent`` (the class name) — that's what the named-model
+    WARNING prints, and the test asserts on it.
+    """
+
+    async def __call__(self, task: Any, session: Any, tools: Any) -> InvocationResult:
+        return InvocationResult(task_id=getattr(task, "id", ""), text="ok")
+
+
+def test_wrap_warns_named_model_on_detection(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Auto-detected judge LLM fires the named-model WARNING with model + agent type."""
+    _patch_detect_llm(monkeypatch, "gpt-4o-mini")
+
+    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+        goldfive.wrap(_MyAgent(), sinks=[])
+
+    matching = [
+        r
+        for r in caplog.records
+        if r.name == "goldfive.wrap"
+        and "judge LLM not explicitly configured" in r.getMessage()
+    ]
+    assert len(matching) == 1, (
+        f"expected exactly one named-model WARNING, got {len(matching)}: "
+        f"{[r.getMessage() for r in matching]}"
+    )
+    msg = matching[0].getMessage()
+    assert "gpt-4o-mini" in msg
+    assert "_MyAgent" in msg
+    assert "GOLDFIVE_JUDGE_BASE_URL" in msg
+
+
+def test_wrap_suppresses_named_model_warning_when_call_llm_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Explicit ``call_llm=`` means the operator already owns the decision."""
+    _patch_detect_llm(monkeypatch, "should-not-appear")
+    call_llm = _stub_call_llm([])
+
+    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+        goldfive.wrap(_noop_agent, call_llm=call_llm, sinks=[])
+
+    matching = [
+        r
+        for r in caplog.records
+        if r.name == "goldfive.wrap"
+        and "judge LLM not explicitly configured" in r.getMessage()
+    ]
+    assert matching == []
+
+
+def test_wrap_suppresses_named_model_warning_when_judge_config_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An explicit ``JudgeConfig.base_url`` also suppresses the warning."""
+    from goldfive.config import JudgeConfig, RuntimeConfig
+
+    _patch_detect_llm(monkeypatch, "should-not-appear")
+
+    # Force the judge-llm build to succeed (we don't actually care about
+    # the returned callable here, just that JudgeConfig is honoured).
+    def _fake_build(_config: Any) -> tuple[Any, str]:
+        return _stub_call_llm([]), "judge-model"
+
+    import goldfive.convenience as _conv
+
+    monkeypatch.setattr(_conv, "_build_judge_call_llm", _fake_build)
+
+    runtime = RuntimeConfig(
+        judge=JudgeConfig(base_url="http://judge:9000", model="judge-model"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+        goldfive.wrap(_noop_agent, runtime=runtime, sinks=[])
+
+    matching = [
+        r
+        for r in caplog.records
+        if r.name == "goldfive.wrap"
+        and "judge LLM not explicitly configured" in r.getMessage()
+    ]
+    assert matching == []
+
+
 # ---------------------------------------------------------------------------
 # Runner warning on mis-configuration
 # ---------------------------------------------------------------------------

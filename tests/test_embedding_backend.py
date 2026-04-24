@@ -326,3 +326,164 @@ def test_openai_backend_httpx_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     backend._httpx_client = _Raising()
 
     assert backend.encode(["foo"]) == []
+
+
+# ---------------------------------------------------------------------------
+# Runtime circuit breaker (goldfive#225 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def _make_always_failing_backend() -> Any:
+    """Build a backend whose HTTP paths both fail, so ``encode`` returns ``[]``."""
+
+    class _Raising:
+        def post(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("connection refused")
+
+    backend = _embed._OpenAIEmbeddingBackend(
+        base_url="http://dead:9999",
+        model="",
+        api_key=None,
+        timeout_ms=1000,
+    )
+    backend._prefer_sdk = False
+    backend._openai_client = None
+    backend._httpx_client = _Raising()
+    return backend
+
+
+def test_circuit_breaker_trips_after_three_http_5xx() -> None:
+    """Three consecutive failed encodes flip ``_MODEL_UNAVAILABLE``."""
+    _embed.reset_circuit_breaker()
+    backend = _make_always_failing_backend()
+
+    assert _embed._MODEL_UNAVAILABLE is False
+    # First two failures must not trip.
+    assert backend.encode(["a"]) == []
+    assert _embed._MODEL_UNAVAILABLE is False
+    assert backend.encode(["b"]) == []
+    assert _embed._MODEL_UNAVAILABLE is False
+    # Third failure trips the breaker.
+    assert backend.encode(["c"]) == []
+    assert _embed._MODEL_UNAVAILABLE is True
+    assert _embed._RUNTIME_FAILURE_TRIPPED is True
+
+
+def test_circuit_breaker_resets_on_success() -> None:
+    """A successful encode clears the failure counter."""
+    _embed.reset_circuit_breaker()
+
+    class _Flaky:
+        """Fails twice, then succeeds."""
+
+        def __init__(self) -> None:
+            self._calls = 0
+
+        def post(self, *args: Any, **kwargs: Any) -> Any:
+            self._calls += 1
+            raise RuntimeError("transient")
+
+    backend = _embed._OpenAIEmbeddingBackend(
+        base_url="http://flaky:9999",
+        model="",
+        api_key=None,
+        timeout_ms=1000,
+    )
+    backend._prefer_sdk = False
+    backend._openai_client = None
+    backend._httpx_client = _Flaky()
+
+    # Two failures, counter at 2.
+    assert backend.encode(["a"]) == []
+    assert backend.encode(["b"]) == []
+    assert _embed._RUNTIME_FAILURE_COUNT == 2
+
+    # Simulate a recovery by swapping in a working client.
+    class _OK:
+        def post(self, *args: Any, **kwargs: Any) -> Any:
+            class _Resp:
+                def raise_for_status(self) -> None:
+                    pass
+
+                def json(self) -> dict[str, Any]:
+                    return _canonical_response([[1.0, 0.0]])
+
+            return _Resp()
+
+    backend._httpx_client = _OK()
+    out = backend.encode(["c"])
+    assert out == [[1.0, 0.0]]
+    # Counter reset after the successful call.
+    assert _embed._RUNTIME_FAILURE_COUNT == 0
+
+    # Subsequent failures start counting from zero again -- would need
+    # another THREE to trip.
+    class _FailAgain:
+        def post(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("boom")
+
+    backend._httpx_client = _FailAgain()
+    assert backend.encode(["d"]) == []
+    assert _embed._RUNTIME_FAILURE_COUNT == 1
+    assert _embed._MODEL_UNAVAILABLE is False
+
+
+def test_circuit_breaker_warns_once_on_trip(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only one WARNING is emitted, even if more failures follow."""
+    import logging
+
+    _embed.reset_circuit_breaker()
+    backend = _make_always_failing_backend()
+
+    with caplog.at_level(
+        logging.WARNING, logger="goldfive.drift.reasoning.embed"
+    ):
+        for _ in range(5):
+            backend.encode(["x"])
+
+    warnings = [
+        r
+        for r in caplog.records
+        if r.name == "goldfive.drift.reasoning.embed"
+        and "has failed" in r.getMessage()
+        and "in a row" in r.getMessage()
+    ]
+    assert len(warnings) == 1, (
+        f"expected exactly one trip WARNING, got {len(warnings)}: "
+        f"{[r.getMessage() for r in warnings]}"
+    )
+    assert "http://dead:9999" in warnings[0].getMessage()
+
+
+def test_circuit_breaker_short_circuits_get_model() -> None:
+    """Once tripped, :func:`_get_model` returns ``None`` -- no more HTTP."""
+    _embed.reset_circuit_breaker()
+    backend = _make_always_failing_backend()
+    _embed.set_model(backend)
+
+    # Trip the breaker.
+    for _ in range(3):
+        backend.encode(["x"])
+    assert _embed._MODEL_UNAVAILABLE is True
+
+    # ``_get_model`` now returns ``None`` -- the upstream helpers
+    # (``max_similarity`` / ``distance_to_topic``) see "no signal".
+    assert _embed._get_model() is None
+    assert _embed.max_similarity("a", ["b"]) == 0.0
+    assert _embed.distance_to_topic("a", "b") == -1.0
+
+
+def test_reset_circuit_breaker_clears_state() -> None:
+    """The test-only helper restores a pristine module state."""
+    _embed.reset_circuit_breaker()
+    backend = _make_always_failing_backend()
+    for _ in range(3):
+        backend.encode(["x"])
+    assert _embed._MODEL_UNAVAILABLE is True
+    assert _embed._RUNTIME_FAILURE_TRIPPED is True
+
+    _embed.reset_circuit_breaker()
+    assert _embed._RUNTIME_FAILURE_COUNT == 0
+    assert _embed._RUNTIME_FAILURE_TRIPPED is False
