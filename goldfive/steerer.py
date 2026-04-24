@@ -1072,6 +1072,7 @@ class DefaultSteerer:
         task: Task | None = None,  # noqa: ARG002 -- reserved for future detectors
         session: Session,
         provider: str = "",  # noqa: ARG002 -- reserved for per-provider dispatch
+        agent_name: str = "",
     ) -> None:
         """Feed a chain-of-thought / reasoning block into the drift pipeline.
 
@@ -1123,7 +1124,9 @@ class DefaultSteerer:
             # Mode-selected pipeline (judge / embedding / both / off).
             # The judge path is rate-limited per-task; embedding path
             # is synchronous.
-            rl_call_llm = self._maybe_take_reasoning_judge_slot(session)
+            rl_call_llm = self._maybe_take_reasoning_judge_slot(
+                session, agent_name=agent_name
+            )
             # Thread the first bound sink into the judge path so a
             # ``ReasoningJudgeInvoked`` event fires on every judge call,
             # regardless of verdict. ``None`` when no sinks are bound —
@@ -1161,18 +1164,31 @@ class DefaultSteerer:
             return text
         return text[:limit] + " … [truncated]"
 
-    def _maybe_take_reasoning_judge_slot(self, session: Session) -> ReflectiveCallLLM | None:
+    def _maybe_take_reasoning_judge_slot(
+        self,
+        session: Session,
+        *,
+        agent_name: str = "",
+    ) -> ReflectiveCallLLM | None:
         """Return the judge ``call_llm`` when this turn is a judge turn.
 
         Rate-limit policy (goldfive#226):
 
-        * First thinking message of every task always fires.
+        * First thinking message of every (agent, task) bucket always fires.
         * Subsequent messages skip ``(N-1)`` and then fire on the Nth.
-        * Counters are scoped per-task via
+        * Counters are scoped per-(agent, task) via
           ``session._reasoning_judge_counters`` so a task transition
-          resets the window lazily -- the next task id is simply not
-          in the dict yet, so its first message falls into the
-          "count=0" branch.
+          OR an agent switch resets the window lazily -- the next
+          ``(agent, task_id)`` tuple is simply not in the dict yet, so
+          its first message falls into the "count=0" branch.
+
+        Pre-fix the key was a single string keyed on
+        ``current_task_id or ""``. Every unpinned turn from every agent
+        collapsed onto the ``""`` bucket, so agent B's first thinking
+        block could legitimately skip the judge because unrelated
+        agent A's unpinned turn had already incremented the counter.
+        Bucketing by ``(agent_name, task_id)`` isolates each agent's
+        cadence.
 
         Returns ``None`` when the judge is globally disabled (mode
         skips it, or ``reasoning_drift_call_llm`` is unconfigured).
@@ -1183,12 +1199,13 @@ class DefaultSteerer:
         if self._reasoning_drift_mode not in ("judge", "both"):
             return None
         task_id = session.current_task_id or ""
+        key = (agent_name or "", task_id)
         counters = session._reasoning_judge_counters
-        count = counters.get(task_id, 0)
-        # count=0 -> fire (first message on this task), reset to 1.
-        # Otherwise fire when count % rate_limit == 0.
+        count = counters.get(key, 0)
+        # count=0 -> fire (first message on this (agent, task) bucket),
+        # reset to 1. Otherwise fire when count % rate_limit == 0.
         fire = (count % self._reasoning_drift_rate_limit) == 0
-        counters[task_id] = count + 1
+        counters[key] = count + 1
         return self._reasoning_drift_call_llm if fire else None
 
     # ------------------------------------------------------------------

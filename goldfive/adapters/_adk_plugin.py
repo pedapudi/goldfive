@@ -263,9 +263,12 @@ def _agent_has_pending_candidates(ctx: Any, agent_name: str) -> bool:
     * **No candidates** — the agent's work was moved to other agents by
       a plan refine; a silent-ack no-op is correct.
     * **Has candidates** — the pin SHOULD have worked (single match, or
-      delegation-site pin, or fallback). A silent ack would mask a real
-      stall; the caller surfaces ``{"acknowledged": False,
-      "error": "pin_unresolved"}`` instead.
+      delegation-site pin, or fallback). The tool response is still
+      ``{"acknowledged": True}`` so the LLM can't pattern-match on an
+      error shape (observed live: models read ``"error": "pin_unresolved"``
+      as a reasoning cue and bypass the reporting contract). Operator
+      visibility is preserved via a WARNING log + a ``DriftDetected``
+      sink event; see :meth:`_emit_pin_unresolved_drift`.
 
     NOTE: the DAG-readiness gate from
     :meth:`_pin_current_task_id_for_agent` is intentionally NOT applied
@@ -329,14 +332,16 @@ def _inject_task_id_from_state(
     Returns ``True`` when ``tool_args`` now carries a usable ``task_id``
     (either pre-existing non-placeholder, or freshly populated from
     state) and ``False`` when no pin is available — in that case the
-    caller short-circuits with a structured error so the handler never
-    runs on an unpinned call. Pre-#241 the call would have fallen
-    through to the handler's ``missing_task_id`` error, but that path
-    goes back to the LLM via a successful tool response shape and
-    confused the model into retry loops.
+    caller short-circuits with a bare ``{"acknowledged": True}`` and
+    emits operator observability (WARNING log + ``DriftDetected`` sink
+    event) rather than letting the handler run on an unpinned call.
+    Pre-#241 the call would have fallen through to the handler's
+    ``missing_task_id`` error, but that path goes back to the LLM via a
+    successful tool response shape and confused the model into retry
+    loops. Post-#252-followup, even the structured-error shape is gone
+    from the LLM-visible response — see :meth:`_emit_pin_unresolved_drift`.
 
-    NEVER raises — any internal failure degrades to "no pin", letting
-    the caller emit the canonical ``no_task_pinned`` error.
+    NEVER raises — any internal failure degrades to "no pin".
     """
     try:
         if not _is_reporting_tool_name(tool_name):
@@ -384,8 +389,13 @@ def _resolve_pinned_task_id(*, tool_context: Any) -> str:
     keyed by the current invocation's ``function_call_id``), then
     falls back to the agent-turn pin (``goldfive.current_task_id``).
     Returns ``""`` when neither path yields a value — the caller
-    should then fail the call with the ``no_task_pinned`` error
-    rather than invoking the handler on an unpinned arg.
+    should then short-circuit with a bare ``{"acknowledged": True}``
+    (plus a ``DriftDetected`` sink event for operator visibility on
+    the has-candidates branch) rather than invoking the handler on an
+    unpinned arg. Pre-#252-followup the has-candidates branch emitted
+    an ``error: pin_unresolved`` payload, which the LLM read as a
+    reasoning cue and used to bypass the reporting contract — see
+    the pin-leak fix in that PR.
     """
     state = _session_state_from_callback(tool_context)
     if not isinstance(state, Mapping):
@@ -2191,6 +2201,83 @@ def make_adk_plugin(
                     exc,
                 )
 
+        async def _emit_pin_unresolved_drift(
+            self,
+            *,
+            ctx: SessionContext,
+            agent_name: str,
+            tool_name: str,
+            candidate_ids: list[str],
+        ) -> None:
+            """Emit a ``DriftDetected`` for an unresolvable reporting-tool pin.
+
+            Used when ``before_tool_callback`` can't resolve a pin on a
+            reporting tool and the current agent has PENDING / RUNNING
+            candidates in the plan (so the pin SHOULD have worked — not
+            an orchestration-only turn). The tool response to the LLM is
+            a bare ``{"acknowledged": True}``; this drift event is the
+            operator-visible signal that a stall occurred.
+
+            Uses ``DriftKind.OFF_TOPIC`` with a ``reason=pin_unresolved: …``
+            prefix (not a new ``PIN_UNRESOLVED`` proto kind) because the
+            invariant is observer visibility, not wire-level classification.
+            Sink dispatch fails-safe — observability must not block an
+            invocation.
+            """
+            steerer = ctx.steerer
+            if steerer is None:
+                return
+            try:
+                from goldfive.types import (  # noqa: PLC0415 — lazy
+                    DriftEvent,
+                    DriftKind,
+                    DriftSeverity,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_emit_pin_unresolved_drift: cannot import types: %s",
+                    exc,
+                )
+                return
+
+            detail = (
+                f"pin_unresolved: {tool_name} for agent={agent_name or '?'}; "
+                f"candidates=[{', '.join(candidate_ids)}]"
+            )
+            drift = DriftEvent(
+                kind=DriftKind.OFF_TOPIC,
+                severity=DriftSeverity.WARNING,
+                detail=detail,
+                current_task_id=str(_safe_attr(ctx.task, "id", "") or ""),
+                current_agent_id=agent_name or self._host_agent_name,
+            )
+            # Direct sink emission (bypass _handle_drift): this signal is
+            # purely observability — no refine needed. A pin_unresolved
+            # stall gets resolved by the LLM retrying or the orchestrator
+            # intervening, not by a plan revision.
+            sinks = getattr(steerer, "_sinks", None) or []
+            if not sinks:
+                return
+            try:
+                from goldfive.events import (  # noqa: PLC0415 — lazy
+                    drift_detected_event,
+                    emit,
+                )
+
+                run_id = str(_safe_attr(ctx.session, "run_id", "") or "")
+                session_id = str(_safe_attr(ctx.session, "id", "") or "") or run_id
+                try:
+                    seq = ctx.session.next_sequence()
+                except Exception:  # noqa: BLE001
+                    seq = 0
+                evt = drift_detected_event(run_id, seq, drift, session_id=session_id)
+                await emit(sinks, evt)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_emit_pin_unresolved_drift: direct sink emit failed: %s",
+                    exc,
+                )
+
         async def _emit_observability(self, kind: str, **fields: Any) -> None:
             """Fan out an observability event to the session's sinks.
 
@@ -2402,13 +2489,23 @@ def make_adk_plugin(
             #   here makes the LLM bypass the reporting protocol —
             #   observed live.
             # * **Has candidates** — the pin SHOULD have worked; a
-            #   silent ack would mask a real stall. Return a
-            #   structured ``pin_unresolved`` error so the stall is
-            #   visible.
+            #   silent ack could mask a real stall. To keep the stall
+            #   visible WITHOUT leaking a prompt-injection surface to
+            #   the LLM (observed live: research_agent read an
+            #   ``error: pin_unresolved`` payload and reasoned "This
+            #   might be related to the plan/task system. Let me try
+            #   a different approach — I'll just compile the research
+            #   and create the presentation content directly", bypassing
+            #   the reporting contract), the tool response is the same
+            #   bare ``{"acknowledged": True}``. Operator visibility is
+            #   preserved via a WARNING log AND a ``DriftDetected`` sink
+            #   event (``DriftKind.OFF_TOPIC`` with a ``pin_unresolved:``
+            #   reason prefix). See goldfive#252 follow-up + PR notes.
             #
-            # The silent-ack response carries NO ``detail`` / explanatory
-            # keys — tool responses go back to the LLM verbatim and any
-            # editorialising string is treated as actionable context
+            # The silent-ack response carries NO ``detail`` / ``error`` /
+            # ``no_task_pinned`` / ``pin_unresolved`` keys — tool responses
+            # go back to the LLM verbatim and any editorialising string
+            # (or error-shaped payload) is treated as actionable context
             # (observed live: research_agent paraphrased a detail string
             # into its reasoning and proceeded with stale pre-refine
             # instructions, ignoring the refined scope).
@@ -2447,8 +2544,9 @@ def make_adk_plugin(
                     has_candidates = False
 
                 if has_candidates:
-                    # Gather candidate ids for the diagnostic WARNING
-                    # (nice-to-have; swallow any resolution errors).
+                    # Gather candidate ids for the diagnostic WARNING +
+                    # drift event (nice-to-have; swallow any resolution
+                    # errors).
                     candidate_ids: list[str] = []
                     try:
                         from goldfive.types import TaskStatus
@@ -2470,16 +2568,33 @@ def make_adk_plugin(
                         pass
                     log.warning(
                         "before_tool_callback: pin_unresolved for %s "
-                        "(agent=%s, candidates=[%s]); surfacing structured "
-                        "error rather than silent-ack so the stall is visible",
+                        "(agent=%s, candidates=[%s]); emitting "
+                        "DriftDetected(pin_unresolved) and returning silent "
+                        "ack so the LLM cannot pattern-match on the error",
                         tool_name,
                         agent_name or "?",
                         ", ".join(candidate_ids),
                     )
-                    return {
-                        "acknowledged": False,
-                        "error": "pin_unresolved",
-                    }
+                    # Surface the stall to operators via a sink event so
+                    # it's visible in harmonograf without being visible
+                    # to the LLM. Reuse OFF_TOPIC with a reason prefix
+                    # rather than adding a new proto DriftKind (heavier
+                    # change; the invariant here is operator observability,
+                    # not a new wire-level classification).
+                    try:
+                        await self._emit_pin_unresolved_drift(
+                            ctx=ctx,
+                            agent_name=agent_name,
+                            tool_name=tool_name,
+                            candidate_ids=candidate_ids,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "before_tool_callback: pin_unresolved drift emit "
+                            "raised: %s",
+                            exc,
+                        )
+                    return {"acknowledged": True}
 
                 log.info(
                     "before_tool_callback: no task pinned for %s; "
@@ -2725,13 +2840,46 @@ def make_adk_plugin(
             if reasoning:
                 observe_reasoning = getattr(ctx.steerer, "observe_reasoning", None)
                 if observe_reasoning is not None:
+                    # Resolve the live agent name so the steerer's
+                    # per-(agent, task) reasoning-judge rate-limit
+                    # bucket isolates agents (goldfive#252 follow-up).
+                    # Prefer the invocation's running agent, fall back
+                    # to the host agent so single-agent runs keep their
+                    # historical bucketing.
+                    reasoning_agent_name = ""
+                    try:
+                        running_agent = _safe_attr(inv_ctx, "agent", None)
+                        reasoning_agent_name = str(
+                            _safe_attr(running_agent, "name", "") or ""
+                        )
+                    except Exception:  # noqa: BLE001
+                        reasoning_agent_name = ""
+                    if not reasoning_agent_name:
+                        reasoning_agent_name = self._host_agent_name or ""
                     try:
                         await observe_reasoning(
                             reasoning,
                             task=ctx.task,
                             session=ctx.session,
                             provider=_infer_provider(llm_response),
+                            agent_name=reasoning_agent_name,
                         )
+                    except TypeError:
+                        # Back-compat: custom steerer without the
+                        # ``agent_name`` kwarg. Fall back silently.
+                        try:
+                            await observe_reasoning(
+                                reasoning,
+                                task=ctx.task,
+                                session=ctx.session,
+                                provider=_infer_provider(llm_response),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug(
+                                "after_model_callback: observe_reasoning "
+                                "(fallback) raised: %s",
+                                exc,
+                            )
                     except Exception as exc:  # noqa: BLE001
                         log.debug(
                             "after_model_callback: observe_reasoning raised: %s",

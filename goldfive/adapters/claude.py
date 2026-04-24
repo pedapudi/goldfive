@@ -190,6 +190,7 @@ class ClaudeAgentSDKAdapter:
         session: Session,
         provider: str = "anthropic",
         call_id: str = "",  # noqa: ARG002 -- part of the protocol
+        agent_name: str = "",
     ) -> None:
         """Route an Anthropic ``thinking`` block to the bound steerer.
 
@@ -205,7 +206,17 @@ class ClaudeAgentSDKAdapter:
         observe = getattr(steerer, "observe_reasoning", None)
         if observe is None:
             return
-        await observe(text, task=task, session=session, provider=provider)
+        try:
+            await observe(
+                text,
+                task=task,
+                session=session,
+                provider=provider,
+                agent_name=agent_name,
+            )
+        except TypeError:
+            # Back-compat: steerer without the ``agent_name`` kwarg.
+            await observe(text, task=task, session=session, provider=provider)
 
     async def register_reporting_tools(
         self,

@@ -74,6 +74,7 @@ class CallableAdapter:
         session: Session,
         provider: str = "",
         call_id: str = "",  # noqa: ARG002 -- part of the protocol
+        agent_name: str = "",
     ) -> None:
         """Route a reasoning-content block to the bound steerer (if any).
 
@@ -88,7 +89,16 @@ class CallableAdapter:
         observe = getattr(steerer, "observe_reasoning", None)
         if observe is None:
             return
-        await observe(text, task=task, session=session, provider=provider)
+        try:
+            await observe(
+                text,
+                task=task,
+                session=session,
+                provider=provider,
+                agent_name=agent_name,
+            )
+        except TypeError:
+            await observe(text, task=task, session=session, provider=provider)
 
     def bind_steerer(self, steerer: object | None) -> None:
         """Attach the active :class:`~goldfive.protocols.Steerer`.
