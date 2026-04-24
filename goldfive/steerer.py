@@ -2643,15 +2643,21 @@ class DefaultSteerer:
             session._last_cancel_reason_prefix = cancel_reason
         except Exception:  # noqa: BLE001
             pass
-        # 1a. Fire the adapter's request_cancel so the in-flight LLM
-        # call terminates NOW instead of running to completion while
-        # we queue the restart (goldfive#241). Pre-#241 the cancel was
-        # deferred to the next executor checkpoint and the contaminated
-        # invocation finished first — tens of seconds of wasted work
-        # with tainted output landing on the wire. Optional protocol:
-        # adapters that don't implement ``request_cancel`` keep the
-        # legacy deferred-cancel semantics.
-        await self._request_adapter_cancel(cancel_reason)
+        # 1a. NOTE (#241 emergency revert): previously we fired
+        # ``adapter.request_cancel(reason)`` here to terminate the
+        # in-flight LLM call immediately. In practice that
+        # ``task.cancel()`` propagated a ``CancelledError`` past the
+        # executor's invocation-scope catch and killed the entire run
+        # — observed as ``run_aborted`` immediately after a
+        # goldfive-detected drift. Reverted to the pre-#241 deferred-
+        # cancel semantics: we stamp ``_next_cancel_reason`` (above)
+        # and queue a restart message; the executor loop sees the
+        # queue at the next invocation boundary and resumes with the
+        # refined plan. The taint of letting the in-flight call run
+        # to completion is a lesser evil than aborting the run.
+        # Proper fix (future): scope the cancel to the LLM stream
+        # only, or catch ``CancelledError`` at the goldfive-steer
+        # boundary and continue.
         # 2. Stamp active-steer state + compose the restart body.
         at_turn = int(getattr(session, "_next_sequence", 0) or 0)
         body = self._compose_goldfive_steer_body(drift)
