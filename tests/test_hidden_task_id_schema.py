@@ -213,15 +213,19 @@ async def test_hidden_task_id_populates_from_state() -> None:
     assert captured == [{"task_id": "t-pinned", "detail": "starting"}]
 
 
-async def test_hidden_task_id_fails_when_state_empty() -> None:
-    """No pin anywhere → the dispatch short-circuits with a
-    structured ``no_task_pinned`` error.
+async def test_hidden_task_id_is_noop_when_state_empty() -> None:
+    """No pin anywhere → the dispatch returns a no-op acknowledgment.
 
-    This is the key contract change from #241 — pre-#241 we'd fall
-    through to the handler's ``missing_task_id`` path, which confused
-    the model and triggered retry loops. Failing fast with a clear
-    error prevents the loop and gives the LLM something actionable
-    to react to.
+    This replaces an earlier "fail with no_task_pinned error" contract.
+    The error variant crashed the LLM's reporting protocol when
+    goldfive's refine moved an agent's assigned work to another agent
+    (e.g. a coordinator whose own tasks were superseded into
+    sub-agent tasks). Observed live: the LLM saw the error and
+    reasoned "task started report didn't work, let me proceed directly
+    with the research_agent call," bypassing the reporting contract
+    entirely. Returning a silent no-op acknowledgment keeps the
+    agent's protocol intact; observability is preserved via an INFO
+    log from the plugin.
     """
     plugin, state, captured, _ = _make_plugin_with_handler("report_task_started")
     # Deliberately not setting KEY_CURRENT_TASK_ID or pending_delegations.
@@ -233,11 +237,14 @@ async def test_hidden_task_id_fails_when_state_empty() -> None:
         tool_context=_Ctx(state),
     )
     assert result == {
-        "acknowledged": False,
-        "error": "no_task_pinned",
-        "detail": "no task bound to this agent invocation",
+        "acknowledged": True,
+        "no_task_pinned": True,
+        "detail": (
+            "no task currently bound to this agent; "
+            "report recorded as orchestration-only no-op"
+        ),
     }
-    # Handler not invoked — captured stays empty.
+    # Handler not invoked — captured stays empty (nothing to report on).
     assert captured == []
 
 
