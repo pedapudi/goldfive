@@ -641,6 +641,80 @@ def _normalize_supersession_kinds(revised: Plan, *, prior: Plan | None) -> None:
             task.supersedes_kind = expected
 
 
+#: Old-task statuses that don't require a supersedes link when dropped.
+#: A FAILED or CANCELLED task in the prior plan represents work that was
+#: already conclusively closed — the refine output may legitimately drop
+#: it without naming a successor (the run will end up with the failure /
+#: cancel still on the books from the prior plan even if the rebuilt
+#: revision doesn't carry the slot forward). COMPLETED is intentionally
+#: excluded: a dropped COMPLETED task IS an accountability gap because
+#: its result is durable provenance for the run.
+_ABSORBING_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+
+
+def _check_supersedes_coverage(
+    revised: Plan,
+    *,
+    prior: Plan | None,
+) -> list[Task]:
+    """Return the list of prior tasks dropped without a supersedes link.
+
+    A "dropped" task is one whose id appears in ``prior.tasks`` but not
+    in ``revised.tasks``. Coverage is satisfied when:
+
+    * Some new task in ``revised`` has ``supersedes`` pointing at the
+      dropped id (REPLACE or CORRECT — both count; the kind is the
+      semantic flavour of the link, not its existence). OR
+    * The dropped task's status in ``prior`` is in
+      :data:`_ABSORBING_TERMINAL_STATUSES` (FAILED / CANCELLED): the
+      old work is conclusively closed and doesn't need a successor.
+
+    Tasks that fail both predicates are **orphans**: dropped from the
+    plan with no provenance trail. Returns the orphan ``Task`` objects
+    (from ``prior``) so callers can include id + title in operator-
+    visible telemetry. Order matches ``prior.tasks`` for deterministic
+    log output.
+
+    The CORRECT-kind supersedes case (test 5) doesn't appear here at
+    all: in a CORRECT chain the old task is COMPLETED and is preserved
+    verbatim in ``revised`` (Option B contract), so it's never in the
+    ``dropped`` set in the first place. We don't need to special-case
+    CORRECT vs REPLACE — both kinds satisfy "some task supersedes me"
+    identically.
+
+    .. note::
+
+       Future work: when an orphan has a same-assignee, semantically-
+       similar-title new task in ``revised`` (e.g. via embedding-based
+       title similarity), auto-assign ``supersedes`` instead of just
+       reporting. Out of scope for this observability-first validator
+       — rejection / auto-heal is deferred until orphans become a
+       systemic problem rather than a legitimate scope-narrowing
+       outcome (e.g. user steer "ignore pianos" genuinely orphaning
+       the piano-presentation task).
+    """
+    if prior is None:
+        return []
+    new_ids = {t.id for t in revised.tasks if t.id}
+    supersedes_targets = {
+        (t.supersedes or "").strip()
+        for t in revised.tasks
+        if (t.supersedes or "").strip()
+    }
+    orphans: list[Task] = []
+    for old in prior.tasks:
+        if not old.id or old.id in new_ids:
+            continue
+        if old.id in supersedes_targets:
+            continue  # covered by a new task's supersedes link
+        if old.status in _ABSORBING_TERMINAL_STATUSES:
+            continue  # FAILED/CANCELLED don't need a successor
+        orphans.append(old)
+    return orphans
+
+
 def _plan_from_json(
     obj: Any,
     *,
@@ -1647,6 +1721,91 @@ class LLMPlanner:
                 exc,
             )
 
+    async def _emit_refine_orphaned_tasks(
+        self,
+        prior_plan: Plan,
+        revised: Plan,
+        orphans: list[Task],
+    ) -> None:
+        """Emit a ``refine_orphaned_tasks`` sink event for operator visibility.
+
+        Fires when :func:`_check_supersedes_coverage` finds prior tasks
+        that were dropped by the refine output without a supersedes
+        link or an absorbing-terminal status. This is **telemetry only**
+        — the refine still applies. Some orphans are legitimate (a
+        scope-narrowing user steer can validly remove a task with no
+        replacement concept), so blocking would be too strict; surfacing
+        gives operators the visibility to spot careless drops.
+
+        Routes through the planner's span-context provider (the same
+        snapshot used by ``goldfive_llm_span``) so the event lands on
+        every bound sink with the correct ``run_id`` / ``session_id`` /
+        sequence. A no-op when the planner is used standalone (no
+        provider, e.g. unit tests not exercising sinks).
+        """
+        if not orphans:
+            return
+        if self._span_ctx_provider is None:
+            return
+        try:
+            ctx = self._span_ctx_provider()
+        except Exception:  # noqa: BLE001 -- observability must never break refine
+            return
+        if ctx is None:
+            return
+        sinks, run_id, session_id, _task_id, seq_fn = ctx
+        if not sinks or seq_fn is None:
+            return
+        try:
+            from goldfive.events import emit, make_event  # noqa: PLC0415 — lazy
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "LLMPlanner: events module unavailable; dropping "
+                "refine_orphaned_tasks signal (%s)",
+                exc,
+            )
+            return
+        payload: dict[str, Any] = {
+            "prior_plan_id": prior_plan.id,
+            "prior_revision_index": prior_plan.revision_index,
+            "revised_plan_id": revised.id,
+            "revised_revision_index": revised.revision_index,
+            "orphan_count": len(orphans),
+            "orphans": [
+                {
+                    "task_id": t.id,
+                    "title": t.title,
+                    "status": t.status.value,
+                    "assignee_agent_id": t.assignee_agent_id,
+                }
+                for t in orphans
+            ],
+        }
+        try:
+            seq = seq_fn()
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "LLMPlanner: sequence_fn raised; dropping "
+                "refine_orphaned_tasks signal (%s)",
+                exc,
+            )
+            return
+        try:
+            evt = make_event(
+                run_id or "",
+                seq,
+                "refine_orphaned_tasks",
+                payload,
+                session_id=session_id or "",
+            )
+            await emit(list(sinks), evt)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "LLMPlanner: failed to emit refine_orphaned_tasks event "
+                "(%s); dropping signal",
+                exc,
+            )
+
     async def _call_and_validate_refine(
         self,
         *,
@@ -1862,6 +2021,23 @@ class LLMPlanner:
                 if attempt < attempts:
                     user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
                 continue
+            # Supersedes coverage (observability only — never rejects).
+            # For every prior task absent from the revision, check that
+            # some new task supersedes it OR that the prior status is
+            # absorbing-terminal (FAILED/CANCELLED). Surviving orphans
+            # are surfaced as a WARNING + ``refine_orphaned_tasks`` sink
+            # event so operators can spot careless drops without
+            # blocking legitimate scope-narrowing refines.
+            orphans = _check_supersedes_coverage(revised, prior=prior_plan)
+            if orphans:
+                log.warning(
+                    "%s: refine output dropped %d prior task(s) without a "
+                    "supersedes link or terminal status: %s",
+                    log_prefix,
+                    len(orphans),
+                    ", ".join(f"{t.id!r} ({t.title!r})" for t in orphans),
+                )
+                await self._emit_refine_orphaned_tasks(prior_plan, revised, orphans)
             return revised, "", False
         return None, last_error, False
 
