@@ -50,6 +50,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -556,6 +557,15 @@ class DefaultSteerer:
         # at run end. Tasks auto-discard themselves via
         # ``add_done_callback(self._background_judges.discard)``.
         self._background_judges: set[asyncio.Task[Any]] = set()
+        # Per-session plan-state mutation lock. Held only across the
+        # consistency-critical region of ``_emit_plan_revised`` (revision
+        # index bump + supersedes integration + correction GC + repin +
+        # PlanRevised emit). NOT held across ``planner.refine`` itself —
+        # that would serialise concurrent refines and defeat the
+        # fire-and-forget judge path from #254. Reports that must observe
+        # a consistent plan call :meth:`_wait_plan_stable` to acquire +
+        # immediately release the lock. Keyed by ``session.id``.
+        self._plan_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Protocol-required: wiring
@@ -2263,6 +2273,10 @@ class DefaultSteerer:
         # pipeline. Cleared in a ``finally`` so exceptions don't leave
         # a stale session pointer. See goldfive#133.
         self._active_session = session
+        # goldfive a4: mint a refine-attempt id for correlation across
+        # ``refine_attempted`` and the paired success/failure event.
+        attempt_id = self._new_attempt_id()
+        await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         try:
             # Thread the adapter's available_agents_tree (goldfive#151)
             # through refine so the LLM is constrained to pick real
@@ -2310,6 +2324,14 @@ class DefaultSteerer:
                     drift.kind.value,
                     exc,
                 )
+                await self._emit_refine_failed(
+                    session,
+                    drift,
+                    attempt_id=attempt_id,
+                    failure_kind="llm_error",
+                    reason=str(exc),
+                    detail=type(exc).__name__,
+                )
                 await self._emit_refine_failure(session, drift, reason=str(exc))
                 await self._register_refine_failure(session, drift, counter_key)
                 return
@@ -2320,6 +2342,14 @@ class DefaultSteerer:
                 "DefaultSteerer._handle_drift: planner.refine(kind=%s) returned None; "
                 "plan unchanged",
                 drift.kind.value,
+            )
+            await self._emit_refine_failed(
+                session,
+                drift,
+                attempt_id=attempt_id,
+                failure_kind="parse_error",
+                reason="planner returned no revised plan",
+                detail="",
             )
             await self._emit_refine_failure(
                 session, drift, reason="planner returned no revised plan"
@@ -2338,6 +2368,14 @@ class DefaultSteerer:
             # PLAN-LIFECYCLE.md §3.1 (terminal task preservation) and
             # §3.2 (terminal->terminal edge preservation) on top of the
             # usual structural checks.
+            await self._emit_refine_failed(
+                session,
+                drift,
+                attempt_id=attempt_id,
+                failure_kind="validator_rejected",
+                reason=f"plan validation failed: {exc}",
+                detail=type(exc).__name__,
+            )
             await self._emit_drift_detected(
                 session,
                 DriftEvent(
@@ -2357,7 +2395,9 @@ class DefaultSteerer:
         # PlanRevisionDiff sidecar (PLAN-LIFECYCLE.md §2, §8 gap #4).
         prev_plan = session.plan
         self._apply_revision(session, revised, drift)
-        await self._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
+        await self._emit_plan_revised(
+            session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
+        )
         # Stamp the cooldown table so a follow-up drift of the same
         # kind+task within ``plan_revision_cooldown_seconds`` is gated.
         # Only recorded on a revision that *actually landed* (past all
@@ -3184,6 +3224,10 @@ class DefaultSteerer:
             return
         counter_key = (drift.kind.value, drift.current_task_id)
         self._active_session = session
+        # goldfive a4: same attempt-id correlation contract as
+        # ``_handle_drift``.
+        attempt_id = self._new_attempt_id()
+        await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         try:
             revised = await self._dispatch_goldfive_steer_refine(drift, session)
         except Exception as exc:  # noqa: BLE001
@@ -3191,6 +3235,14 @@ class DefaultSteerer:
                 "DefaultSteerer._promote_drift_to_steer: refine raised %s; "
                 "plan unchanged",
                 exc,
+            )
+            await self._emit_refine_failed(
+                session,
+                drift,
+                attempt_id=attempt_id,
+                failure_kind="llm_error",
+                reason=str(exc),
+                detail=type(exc).__name__,
             )
             await self._emit_refine_failure(session, drift, reason=str(exc))
             await self._register_refine_failure(session, drift, counter_key)
@@ -3202,6 +3254,14 @@ class DefaultSteerer:
                 "DefaultSteerer._promote_drift_to_steer: refine returned None; "
                 "plan unchanged"
             )
+            await self._emit_refine_failed(
+                session,
+                drift,
+                attempt_id=attempt_id,
+                failure_kind="parse_error",
+                reason="planner returned no revised plan",
+                detail="",
+            )
             await self._emit_refine_failure(
                 session, drift, reason="planner returned no revised plan"
             )
@@ -3210,6 +3270,14 @@ class DefaultSteerer:
         try:
             revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
+            await self._emit_refine_failed(
+                session,
+                drift,
+                attempt_id=attempt_id,
+                failure_kind="validator_rejected",
+                reason=f"plan validation failed: {exc}",
+                detail=type(exc).__name__,
+            )
             await self._emit_drift_detected(
                 session,
                 DriftEvent(
@@ -3225,7 +3293,9 @@ class DefaultSteerer:
         session.refine_failure_counts.pop(counter_key, None)
         prev_plan = session.plan
         self._apply_revision(session, revised, drift)
-        await self._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
+        await self._emit_plan_revised(
+            session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
+        )
         self._record_plan_revision(drift, session)
 
     async def _dispatch_goldfive_steer_refine(
@@ -3523,6 +3593,224 @@ class DefaultSteerer:
             current_agent_id=source.current_agent_id,
         )
         await self._emit_drift_detected(session, failure)
+
+    # --- Refine atomicity + observability (goldfive a4) --------------
+
+    def _get_plan_lock(self, session: Session) -> asyncio.Lock:
+        """Return the per-session plan-state mutation lock, creating on first use.
+
+        Keyed by ``session.id``. Multiple Sessions on the same Steerer
+        each get an independent lock so concurrent runs never serialise
+        on each other. The dict is unbounded for the steerer's lifetime;
+        live runs share a steerer with a small number of sessions so
+        this is acceptable. (If a future use-case introduces churn —
+        many short-lived sessions — add a cleanup hook on session end.)
+        """
+        sid = session.id or session.run_id or ""
+        lock = self._plan_locks.get(sid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._plan_locks[sid] = lock
+        return lock
+
+    async def _wait_plan_stable(
+        self,
+        session: Session,
+        *,
+        timeout: float | None = 1.0,
+    ) -> bool:
+        """Block until the per-session plan-state mutation region is idle.
+
+        Acquires + immediately releases the per-session plan lock so the
+        caller observes either pre-revision or post-revision plan state
+        — never a partial apply. Used by report_task_* handlers and
+        ``_resolve_effective_task_id`` callers to coordinate with the
+        fire-and-forget judge-triggered refines introduced in #254.
+
+        Returns ``True`` when the wait completed cleanly; ``False`` when
+        ``timeout`` elapsed (in which case the caller MUST proceed
+        anyway — atomicity is best-effort, not a hard barrier — and the
+        worst case degrades to the pre-fix racy read). The default
+        timeout is intentionally short (1s): a refine's mutation region
+        is bounded by a handful of in-memory operations, so a timeout
+        here means something pathological is happening and blocking
+        a report indefinitely is worse than a stale read.
+
+        ``timeout=None`` waits forever. Pass a positive float to bound
+        the wait. Passing ``timeout<=0`` returns immediately with the
+        lock-free reading semantics (does not check the lock at all);
+        callers wanting a strict barrier should use a positive timeout.
+        """
+        if timeout is not None and timeout <= 0:
+            return True
+        lock = self._get_plan_lock(session)
+        if not lock.locked():
+            return True
+        try:
+            if timeout is None:
+                async with lock:
+                    pass
+                return True
+            await asyncio.wait_for(lock.acquire(), timeout=timeout)
+            try:
+                pass
+            finally:
+                lock.release()
+            return True
+        except TimeoutError:
+            log.warning(
+                "DefaultSteerer._wait_plan_stable: timed out after %.2fs "
+                "waiting for plan lock on session %s; proceeding with "
+                "best-effort racy read",
+                timeout,
+                session.id,
+            )
+            return False
+
+    @staticmethod
+    def _new_attempt_id() -> str:
+        """Mint a fresh refine-attempt UUID for correlation between
+        ``refine_attempted`` and the paired ``refine_failed`` /
+        ``plan_revised`` events.
+        """
+        return str(uuid.uuid4())
+
+    async def _emit_refine_attempted(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        *,
+        attempt_id: str,
+    ) -> None:
+        """Emit a ``refine_attempted`` dict envelope onto the sink bus.
+
+        Fired at the start of a refine call (both the autonomous
+        ``_handle_drift`` path and the goldfive-steer
+        ``_promote_drift_to_steer`` path). Pairs with exactly one of
+        ``refine_failed`` / ``plan_revised`` carrying the same
+        ``attempt_id``. Dict envelope (not proto) — promote to proto
+        when the Stream C (#256) follow-up gets prioritised.
+        """
+        from goldfive.events import emit, make_event
+
+        drift_id = str(getattr(drift, "id", "") or "")
+        payload = {
+            "attempt_id": attempt_id,
+            "drift_id": drift_id,
+            "trigger_kind": drift.kind.value,
+            "trigger_severity": drift.severity.value,
+            "current_task_id": drift.current_task_id or "",
+            "current_agent_id": drift.current_agent_id or "",
+        }
+        try:
+            evt = make_event(
+                session.run_id,
+                session.next_sequence(),
+                "refine_attempted",
+                payload,
+                session_id=session.id,
+            )
+            await emit(self._sinks, evt)
+        except Exception as exc:  # noqa: BLE001 — observability must never break the run
+            log.debug(
+                "DefaultSteerer._emit_refine_attempted: failed to emit: %s",
+                exc,
+            )
+
+    async def _emit_refine_failed(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        *,
+        attempt_id: str,
+        failure_kind: str,
+        reason: str,
+        detail: str = "",
+    ) -> None:
+        """Emit a ``refine_failed`` dict envelope onto the sink bus.
+
+        ``failure_kind`` is one of ``parse_error`` / ``validator_rejected``
+        / ``llm_error`` / ``other`` (string, not enum, so the surface is
+        forward-compatible without proto changes). ``reason`` is a short
+        human-readable summary; ``detail`` may carry a longer
+        free-form payload (e.g. the validator's exception text).
+        Crucially, this event is emitted WITHOUT bumping
+        ``revision_index`` — the attempt_id disambiguates failures
+        across otherwise-incrementing revisions.
+        """
+        from goldfive.events import emit, make_event
+
+        drift_id = str(getattr(drift, "id", "") or "")
+        payload = {
+            "attempt_id": attempt_id,
+            "drift_id": drift_id,
+            "trigger_kind": drift.kind.value,
+            "trigger_severity": drift.severity.value,
+            "failure_kind": failure_kind,
+            "reason": reason,
+            "detail": detail,
+            "current_task_id": drift.current_task_id or "",
+            "current_agent_id": drift.current_agent_id or "",
+        }
+        try:
+            evt = make_event(
+                session.run_id,
+                session.next_sequence(),
+                "refine_failed",
+                payload,
+                session_id=session.id,
+            )
+            await emit(self._sinks, evt)
+        except Exception as exc:  # noqa: BLE001 — observability must never break the run
+            log.debug(
+                "DefaultSteerer._emit_refine_failed: failed to emit: %s",
+                exc,
+            )
+
+    async def _emit_plan_revised_correlation(
+        self,
+        session: Session,
+        revised: Plan,
+        drift: DriftEvent,
+        *,
+        attempt_id: str,
+    ) -> None:
+        """Emit a ``plan_revised`` dict envelope stamped with ``attempt_id``.
+
+        Companion to the proto ``PlanRevised`` event so dict-event
+        consumers correlate successful refines with their preceding
+        ``refine_attempted`` event. The proto event carries the full
+        payload for primary consumers; this dict envelope is purely a
+        correlation side-car. When the Stream C (#256) proto follow-up
+        promotes ``attempt_id`` onto ``PlanRevised``, this emitter goes
+        away.
+        """
+        from goldfive.events import emit, make_event
+
+        drift_id = str(getattr(drift, "id", "") or "")
+        payload = {
+            "attempt_id": attempt_id,
+            "drift_id": drift_id,
+            "trigger_kind": drift.kind.value,
+            "trigger_severity": drift.severity.value,
+            "revision_index": int(revised.revision_index),
+            "current_task_id": drift.current_task_id or "",
+            "current_agent_id": drift.current_agent_id or "",
+        }
+        try:
+            evt = make_event(
+                session.run_id,
+                session.next_sequence(),
+                "plan_revised",
+                payload,
+                session_id=session.id,
+            )
+            await emit(self._sinks, evt)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "DefaultSteerer._emit_plan_revised_correlation: failed to emit: %s",
+                exc,
+            )
 
     @staticmethod
     def _apply_revision(session: Session, revised: Plan, drift: DriftEvent) -> None:
@@ -4016,6 +4304,7 @@ class DefaultSteerer:
         drift: DriftEvent,
         *,
         prev_plan: Plan | None = None,
+        attempt_id: str | None = None,
     ) -> None:
         from goldfive._correction_injection import (
             clear_obsolete_corrections_on_revision,
@@ -4024,81 +4313,108 @@ class DefaultSteerer:
         from goldfive.conv import to_pb_plan
         from goldfive.events import build_plan_revision_diff
 
-        # goldfive#251: integrate CORRECT-kind supersedes links into
-        # the DAG. The old task stays in the plan as a historical
-        # COMPLETED node; the new correction-task is inserted as a
-        # child with an edge old -> new, and any downstream edges of
-        # the old task are rewritten so work flows through the
-        # correction. No-op for REPLACE-kind (existing behaviour is
-        # preserved) and for plans without supersedes.
-        self._integrate_correction_supersedes(revised)
+        # goldfive a4: serialise the consistency-critical region of plan
+        # mutation. Held only across the in-memory mutations + the
+        # PlanRevised emit — NOT across ``planner.refine`` itself, which
+        # the caller owns. Reports calling :meth:`_wait_plan_stable`
+        # observe either the pre- or post-revision state, never a
+        # partial apply (e.g. supersedes integrated but pin not yet
+        # repinned, or revision_index bumped but PlanRevised not yet
+        # emitted). Fixes the race between fire-and-forget
+        # judge-triggered refines (#254) and imperative report_task_*
+        # handlers.
+        lock = self._get_plan_lock(session)
+        async with lock:
+            # goldfive#251: integrate CORRECT-kind supersedes links into
+            # the DAG. The old task stays in the plan as a historical
+            # COMPLETED node; the new correction-task is inserted as a
+            # child with an edge old -> new, and any downstream edges of
+            # the old task are rewritten so work flows through the
+            # correction. No-op for REPLACE-kind (existing behaviour is
+            # preserved) and for plans without supersedes.
+            self._integrate_correction_supersedes(revised)
 
-        # goldfive#251 Stream D: GC corrections for tasks superseded by
-        # this revision BEFORE queuing new ones. A task whose correction
-        # is about to be obsoleted (because the new revision supersedes
-        # the correction task itself) must have its stale correction
-        # dropped. Runs first so a same-revision CORRECT->CORRECT chain
-        # (T -> T' -> T'') doesn't race: the T correction is cleared
-        # here, then T''s correction is written below.
-        clear_obsolete_corrections_on_revision(session, revised)
+            # goldfive#251 Stream D: GC corrections for tasks superseded by
+            # this revision BEFORE queuing new ones. A task whose correction
+            # is about to be obsoleted (because the new revision supersedes
+            # the correction task itself) must have its stale correction
+            # dropped. Runs first so a same-revision CORRECT->CORRECT chain
+            # (T -> T' -> T'') doesn't race: the T correction is cleared
+            # here, then T''s correction is written below.
+            clear_obsolete_corrections_on_revision(session, revised)
 
-        # goldfive#251 Stream D: for every NEW task with supersedes_kind
-        # == CORRECT, stamp a structured correction dict on the
-        # orchestration session state under
-        # ``goldfive.pending_corrections.<agent_name>.<task_id>``. The
-        # dynamic instruction resolver (Stream B) reads this on the next
-        # turn and appends a directive-style correction block to the
-        # agent's system prompt. No-op on refines with no CORRECT links.
-        queue_corrections_for_revision(
-            session=session,
-            revised=revised,
-            prev_plan=prev_plan,
-            drift=drift,
-        )
+            # goldfive#251 Stream D: for every NEW task with supersedes_kind
+            # == CORRECT, stamp a structured correction dict on the
+            # orchestration session state under
+            # ``goldfive.pending_corrections.<agent_name>.<task_id>``. The
+            # dynamic instruction resolver (Stream B) reads this on the next
+            # turn and appends a directive-style correction block to the
+            # agent's system prompt. No-op on refines with no CORRECT links.
+            queue_corrections_for_revision(
+                session=session,
+                revised=revised,
+                prev_plan=prev_plan,
+                drift=drift,
+            )
 
-        # goldfive#237: re-pin ``current_task_id`` onto any replacement
-        # task the revision introduces. Without this, agents keep
-        # reporting on the superseded (FAILED/CANCELLED) task and the
-        # replacement stays PENDING despite active work — the contradiction
-        # live sessions surfaced. Done before the event is emitted so
-        # downstream observers see the revised pin consistently with the
-        # revised plan. Additive: when no task has ``supersedes`` set,
-        # nothing changes.
-        self._repin_current_task_on_supersedes(session, revised)
+            # goldfive#237: re-pin ``current_task_id`` onto any replacement
+            # task the revision introduces. Without this, agents keep
+            # reporting on the superseded (FAILED/CANCELLED) task and the
+            # replacement stays PENDING despite active work — the contradiction
+            # live sessions surfaced. Done before the event is emitted so
+            # downstream observers see the revised pin consistently with the
+            # revised plan. Additive: when no task has ``supersedes`` set,
+            # nothing changes.
+            self._repin_current_task_on_supersedes(session, revised)
 
-        evt = self._new_envelope(session)
-        evt.plan_revised.plan.CopyFrom(to_pb_plan(revised))
-        evt.plan_revised.drift_kind = self._drift_kind_pb_value(drift.kind)
-        evt.plan_revised.severity = self._drift_severity_pb_value(drift.severity)
-        evt.plan_revised.reason = drift.detail
-        evt.plan_revised.revision_index = revised.revision_index
-        # goldfive#199: stamp ``trigger_event_id`` on the PlanRevised
-        # envelope for EVERY refine — user-control (via source
-        # annotation_id) and autonomous (via drift.id). Harmonograf's
-        # intervention aggregator merges PlanRevised rows by strict id
-        # only (legacy time-window fallback is behind a disabled env
-        # flag). Priority: pre-stamped ``revision_trigger_event_id`` on
-        # the revised plan (from ``_apply_revision`` or validator-retry
-        # chain) → source annotation_id from the drift → drift.id.
-        trig_id = revised.revision_trigger_event_id or (
-            self._drift_annotation_id(drift) or str(getattr(drift, "id", "") or "")
-        )
-        if trig_id:
-            evt.plan_revised.trigger_event_id = trig_id
-        # Populate the minimal cross-revision diff so sinks that want a
-        # "what changed" view don't have to re-fetch and diff the two
-        # plans client-side. prev_plan may be None on the first revision
-        # of a run that never received an initial plan — the helper
-        # treats that as "everything in revised is newly added".
-        evt.plan_revised.diff.CopyFrom(build_plan_revision_diff(prev_plan, revised))
-        # Refine-context observability (judge-observability event). Sinks
-        # rendering a Gantt / timeline want to explain WHY a refine was
-        # requested and WHAT the planner produced without re-fetching
-        # the drift and both plans.
-        evt.plan_revised.refine_input_summary = self._build_refine_input_summary(drift, prev_plan)
-        evt.plan_revised.refine_output_summary = self._build_refine_output_summary(revised)
-        evt.plan_revised.target_agent_id = drift.current_agent_id or ""
-        await self._emit(evt)
+            evt = self._new_envelope(session)
+            evt.plan_revised.plan.CopyFrom(to_pb_plan(revised))
+            evt.plan_revised.drift_kind = self._drift_kind_pb_value(drift.kind)
+            evt.plan_revised.severity = self._drift_severity_pb_value(drift.severity)
+            evt.plan_revised.reason = drift.detail
+            evt.plan_revised.revision_index = revised.revision_index
+            # goldfive#199: stamp ``trigger_event_id`` on the PlanRevised
+            # envelope for EVERY refine — user-control (via source
+            # annotation_id) and autonomous (via drift.id). Harmonograf's
+            # intervention aggregator merges PlanRevised rows by strict id
+            # only (legacy time-window fallback is behind a disabled env
+            # flag). Priority: pre-stamped ``revision_trigger_event_id`` on
+            # the revised plan (from ``_apply_revision`` or validator-retry
+            # chain) → source annotation_id from the drift → drift.id.
+            trig_id = revised.revision_trigger_event_id or (
+                self._drift_annotation_id(drift) or str(getattr(drift, "id", "") or "")
+            )
+            if trig_id:
+                evt.plan_revised.trigger_event_id = trig_id
+            # Populate the minimal cross-revision diff so sinks that want a
+            # "what changed" view don't have to re-fetch and diff the two
+            # plans client-side. prev_plan may be None on the first revision
+            # of a run that never received an initial plan — the helper
+            # treats that as "everything in revised is newly added".
+            evt.plan_revised.diff.CopyFrom(build_plan_revision_diff(prev_plan, revised))
+            # Refine-context observability (judge-observability event). Sinks
+            # rendering a Gantt / timeline want to explain WHY a refine was
+            # requested and WHAT the planner produced without re-fetching
+            # the drift and both plans.
+            evt.plan_revised.refine_input_summary = self._build_refine_input_summary(
+                drift, prev_plan
+            )
+            evt.plan_revised.refine_output_summary = self._build_refine_output_summary(revised)
+            evt.plan_revised.target_agent_id = drift.current_agent_id or ""
+            await self._emit(evt)
+            # goldfive a4: paired correlation envelope. The proto
+            # ``PlanRevised`` carries no ``attempt_id`` field today; emit
+            # a sidecar dict event so consumers can pair this success
+            # with its preceding ``refine_attempted`` by attempt_id. The
+            # proto event remains the primary surface; this is purely
+            # correlation. ``attempt_id`` is ``None`` on legacy callers
+            # that haven't been threaded through the new pipeline (e.g.
+            # the executor's plan-swap detector) — those callers skip
+            # the sidecar and behave exactly as before.
+            if attempt_id:
+                await self._emit_plan_revised_correlation(
+                    session, revised, drift, attempt_id=attempt_id
+                )
 
     @staticmethod
     def _build_refine_input_summary(
