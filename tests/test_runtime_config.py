@@ -153,6 +153,7 @@ def test_reasoning_drift_config_defaults() -> None:
     :mod:`goldfive.drift.reasoning`.
     """
     cfg = ReasoningDriftConfig()
+    assert cfg.mode == "judge"
     assert cfg.off_topic_distance_threshold == 0.7
     assert cfg.intent_divergence_healthy_similarity == 0.6
     assert cfg.intent_divergence_minor_similarity == 0.4
@@ -161,6 +162,40 @@ def test_reasoning_drift_config_defaults() -> None:
     assert cfg.reasoning_cluster_similarity_threshold == 0.75
     assert cfg.looping_reasoning_hash_window == 5
     assert cfg.confusion_min_hits == 3
+
+
+@pytest.mark.parametrize("mode", ["judge", "embedding", "both", "off"])
+def test_reasoning_drift_config_from_env_mode(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """`GOLDFIVE_DRIFT_REASONING_MODE` selects the pipeline mode."""
+    monkeypatch.setenv("GOLDFIVE_DRIFT_REASONING_MODE", mode)
+    cfg = ReasoningDriftConfig.from_env()
+    assert cfg.mode == mode
+
+
+def test_reasoning_drift_config_from_env_mode_is_case_insensitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mode parsing tolerates case variations + surrounding whitespace."""
+    monkeypatch.setenv("GOLDFIVE_DRIFT_REASONING_MODE", "  Embedding  ")
+    cfg = ReasoningDriftConfig.from_env()
+    assert cfg.mode == "embedding"
+
+
+def test_reasoning_drift_config_from_env_mode_invalid_warns_and_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unknown mode logs a WARNING and falls back to the default."""
+    monkeypatch.setenv("GOLDFIVE_DRIFT_REASONING_MODE", "bogus")
+    with caplog.at_level("WARNING", logger="goldfive.config"):
+        cfg = ReasoningDriftConfig.from_env()
+    assert cfg.mode == "judge"
+    warnings = [
+        r for r in caplog.records if "GOLDFIVE_DRIFT_REASONING_MODE" in r.getMessage()
+    ]
+    assert len(warnings) == 1
 
 
 def test_reasoning_drift_config_from_env_all_vars(
