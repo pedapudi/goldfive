@@ -1325,6 +1325,15 @@ def make_adk_plugin(
             # short-circuits cleanly instead of emitting its turn and
             # poisoning the parent's history.
             self._invocation_parents: dict[str, str] = {}
+            # Per-invocation pinned task_id (goldfive#264 — aggressive
+            # pin resolution). ``dict[str, str]`` mapping
+            # ``invocation_id -> task_id`` populated by
+            # :meth:`_stamp_current_task_id` whenever a pin lands.
+            # Consumed by signal 5 of :meth:`_pin_current_task_id_for_agent`
+            # so a child invocation can read its parent's pinned task
+            # without racing on the single ``goldfive.current_task_id``
+            # slot. Cleared on ``clear_active_context``.
+            self._invocation_pinned_task_id: dict[str, str] = {}
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
@@ -1370,6 +1379,8 @@ def make_adk_plugin(
             # invocation_id collision.
             self._cancel_state.clear()
             self._invocation_parents.clear()
+            # goldfive#264 — drop per-invocation pin map.
+            self._invocation_pinned_task_id.clear()
 
         # --- Cooperative cancellation (goldfive#251 Stream C / 7a) -----
 
@@ -1694,11 +1705,14 @@ def make_adk_plugin(
             # Layer 1: pin the starting sub-agent's task_id so its
             # reporting-tool calls can default the arg from state
             # (goldfive#191). Best-effort: a raise here must never
-            # break the invocation.
+            # break the invocation. goldfive#264 — multi-signal
+            # resolution, async to allow the PinResolved sink emit.
             try:
-                self._pin_current_task_id_for_agent(
+                await self._pin_current_task_id_for_agent(
                     agent_name=agent_name,
                     callback_context=callback_context,
+                    invocation_id=inv_id,
+                    parent_invocation_id=parent_inv_id,
                 )
             except Exception as exc:  # noqa: BLE001 — pinning must never raise
                 log.debug(
@@ -1735,36 +1749,73 @@ def make_adk_plugin(
                 )
             return None
 
-        def _pin_current_task_id_for_agent(
+        async def _pin_current_task_id_for_agent(
             self,
             *,
             agent_name: str,
             callback_context: Any,
+            invocation_id: str = "",
+            parent_invocation_id: str = "",
         ) -> None:
-            """Stamp ``goldfive.current_task_id`` for ``agent_name`` if unambiguous.
+            """Aggressive multi-signal pin resolution (goldfive#264).
 
-            Matching rule: the plan task whose ``assignee_agent_id``
-            equals ``agent_name``, whose status is PENDING or RUNNING,
-            AND whose upstream DAG predecessors are all COMPLETED
-            (goldfive#242 — without the DAG gate a Stage-4 task assigned
-            to the coordinator can be pinned at run-start while Stages
-            0-3 are still PENDING, producing an impossible Gantt).
-            Exactly-one matches stamp the id onto both the live ADK
-            ``session.state`` (agent-side reads via ``tool_ctx.state``)
-            and the goldfive orchestration ``session.state`` (handler
-            fallback in :mod:`goldfive.reporting` +
-            :mod:`goldfive.adapters._tool_invocation`).
+            Reframed from the original "exactly-1 DAG-ready single
+            match" gate after live operator feedback: *if an agent was
+            invoked, something precipitated the call*. The previous
+            implementation gave up silently on zero/multiple matches,
+            so the agent ran without a pin, every reporting-tool call
+            short-circuited as a no-op, and the orchestration loop
+            stagnated.
 
-            Zero / multiple matches leave state unset — the handler
-            path will surface the existing ``missing_task_id`` error
-            rather than guess, which is the correct signal for an
-            off-plan agent or an ambiguous coordinator assignment.
+            Replaced with an 8-signal resolution ladder, picking the
+            first signal that yields a single best candidate:
+
+            1. **Delegation-site pin** — the parent's ``before_tool_callback``
+               already stamped a per-function_call_id pin on
+               ``pending_delegations``. Authoritative.
+            2. **DAG-ready exactly-1** — assignee match, status PENDING /
+               RUNNING, all upstream predecessors COMPLETED. The pre-
+               existing happy path; preserved as the fast short-circuit.
+            3. **Tool-arg scoring over DAG-ready candidates** — when (2)
+               returns 2+ matches, score each against the parent
+               AgentTool's args via :func:`_score_candidates_by_args`
+               and pick the winner. Falls through on tie.
+            4. **DAG gate relaxed** — drop the upstream-completion check
+               and retry the assignee+status filter. The agent was
+               invoked so something precipitated it; surface the pin
+               and emit a WARNING + low-confidence sink event so
+               operators see the anomaly. Tool-arg scoring breaks ties.
+            5. **Parent-pin downstream** — if a parent invocation has a
+               pinned task on this plugin, prefer candidates whose id
+               is a downstream of the parent's pinned task in
+               ``plan.edges``.
+            6. **Recent drift / correction targeting** — if a
+               ``goldfive.pending_corrections.<agent>.<task_id>`` entry
+               exists in session state, pin the named task. The plan-
+               revision pipeline writes these for CORRECT-kind
+               supersedes; pinning to one is a strong signal that the
+               agent was invoked specifically to act on the correction.
+            7. **Assignee normalization fallback** — re-run signals
+               2-4 with bare/compound forms of ``agent_name`` swapped
+               in. PR #215 fixed planner-side normalisation; this is
+               defence-in-depth for transcripts that retain a compound
+               assignee.
+            8. **Low-confidence best-guess** — if every prior signal
+               failed, pick the highest-scoring candidate from the
+               full assignee+status set (or, lacking any, the highest-
+               scoring PENDING/RUNNING task in the plan) and emit a
+               ``pin_resolved_low_confidence`` sink event so the LLM
+               gets to continue and the operator sees the weakening.
+
+            Every successful pin emits a single ``pin_resolved`` (dict-
+            envelope) sink event labelled with ``via_signal`` so
+            harmonograf and operators can chart how often the happy
+            path is short-circuiting vs. how often the relaxed signals
+            are firing — a leading indicator that pin invariants are
+            weakening.
 
             Silent on every failure mode (no agent name, no ctx, no
-            plan, state not a mapping). Instrumentation-class path:
-            a mistake here degrades to the pre-#191 behaviour where
-            the model sees ``missing_task_id`` and retry-loops — bad,
-            but strictly no worse than the baseline.
+            plan, state not a mapping). Never raises.
             """
             if not agent_name:
                 return
@@ -1779,15 +1830,13 @@ def make_adk_plugin(
             # top-level import for a rarely-hot-path enum compare.
             from goldfive.types import TaskStatus, task_upstream_ready
 
+            tasks_list = list(tasks)
+
+            # ---- Signal 1: delegation-site pin -------------------------
             # goldfive#241 Item 3-bis — delegation-site pin takes
-            # precedence over the agent-turn match. If the parent
-            # coordinator's ``before_tool_callback`` stamped a
-            # task_id for THIS AgentTool dispatch (keyed by
-            # function_call_id), trust that pin and stamp it onto
-            # both state surfaces. Sub-agent ``before_agent_callback``
-            # doesn't carry the function_call_id, but the reporting-
-            # tool path reads ``pending_delegations`` directly anyway;
-            # this branch only matters for the single-match fallback.
+            # precedence. If the parent coordinator's
+            # ``before_tool_callback`` stamped a task_id for THIS
+            # AgentTool dispatch (keyed by function_call_id), trust it.
             gf_state_early = _safe_attr(ctx.session, "state", None)
             if isinstance(gf_state_early, Mapping):
                 pend = gf_state_early.get(_PENDING_DELEGATIONS_KEY)
@@ -1795,7 +1844,7 @@ def make_adk_plugin(
                     for tid in pend.values():
                         if not isinstance(tid, str) or not tid:
                             continue
-                        for task in tasks:
+                        for task in tasks_list:
                             if str(_safe_attr(task, "id", "") or "") != tid:
                                 continue
                             assignee = str(
@@ -1812,82 +1861,595 @@ def make_adk_plugin(
                                     agent_name=agent_name,
                                     source="delegation_pin",
                                     task=task,
+                                    invocation_id=invocation_id,
+                                )
+                                await self._emit_pin_resolved(
+                                    ctx=ctx,
+                                    agent_name=agent_name,
+                                    task_id=tid,
+                                    via_signal="delegation_pin",
+                                    score=1.0,
+                                    invocation_id=invocation_id,
+                                    candidate_count=1,
                                 )
                                 return
 
-            # Pre-filter: PENDING/RUNNING tasks whose assignee is this
-            # agent. This is the pre-#242 candidate set. The DAG-gate
-            # below filters it further; we keep the pre-DAG list so we
-            # can log when the gate actually changes the outcome.
-            pre_dag: list[Any] = []
+            # Build the assignee+status candidate set once; signals 2-4
+            # all reuse it. We also keep the parent's tool args (best-
+            # effort) so signals 3 / 4 / 8 can score candidates.
+            assignee_candidates = self._candidates_for_agent(
+                tasks_list, agent_name
+            )
+            scoring_args = self._scoring_args_for(
+                ctx=ctx,
+                callback_context=callback_context,
+                parent_invocation_id=parent_invocation_id,
+            )
+
+            # ---- Signal 2: DAG-ready exactly-1 -------------------------
+            dag_ready = self._filter_dag_ready(
+                plan, assignee_candidates, task_upstream_ready
+            )
+            if len(dag_ready) == 1:
+                task = dag_ready[0]
+                task_id = str(_safe_attr(task, "id", "") or "")
+                if task_id:
+                    self._stamp_current_task_id(
+                        ctx=ctx,
+                        callback_context=callback_context,
+                        task_id=task_id,
+                        agent_name=agent_name,
+                        source="single_match",
+                        task=task,
+                        invocation_id=invocation_id,
+                    )
+                    await self._emit_pin_resolved(
+                        ctx=ctx,
+                        agent_name=agent_name,
+                        task_id=task_id,
+                        via_signal="dag_ready_single",
+                        score=1.0,
+                        invocation_id=invocation_id,
+                        candidate_count=1,
+                    )
+                    return
+
+            # ---- Signal 3: tool-arg scoring over DAG-ready -------------
+            if len(dag_ready) > 1 and scoring_args is not None:
+                chosen = _score_candidates_by_args(dag_ready, scoring_args)
+                if chosen is not None:
+                    task_id = str(_safe_attr(chosen, "id", "") or "")
+                    if task_id:
+                        self._stamp_current_task_id(
+                            ctx=ctx,
+                            callback_context=callback_context,
+                            task_id=task_id,
+                            agent_name=agent_name,
+                            source="arg_scored",
+                            task=chosen,
+                            invocation_id=invocation_id,
+                        )
+                        await self._emit_pin_resolved(
+                            ctx=ctx,
+                            agent_name=agent_name,
+                            task_id=task_id,
+                            via_signal="arg_scored",
+                            score=1.0,
+                            invocation_id=invocation_id,
+                            candidate_count=len(dag_ready),
+                        )
+                        return
+
+            # ---- Signal 4: DAG gate relaxed ----------------------------
+            # The user's reframe: "if an agent was invoked, something
+            # precipitated it." We've lost ground truth already; bind
+            # to the most-plausible task and surface the anomaly to
+            # operators rather than silent-no-op.
+            if assignee_candidates:
+                relaxed = assignee_candidates
+                if len(relaxed) > 1 and scoring_args is not None:
+                    chosen = _score_candidates_by_args(relaxed, scoring_args)
+                    if chosen is None:
+                        # Tie / no overlap — fall through.
+                        chosen = None
+                else:
+                    chosen = relaxed[0] if len(relaxed) == 1 else None
+                if chosen is not None:
+                    task_id = str(_safe_attr(chosen, "id", "") or "")
+                    if task_id:
+                        log.warning(
+                            "pin: DAG-gate relaxed, bound %s for agent %s "
+                            "(upstreams not yet complete; %d assignee candidates)",
+                            task_id,
+                            agent_name,
+                            len(relaxed),
+                        )
+                        self._stamp_current_task_id(
+                            ctx=ctx,
+                            callback_context=callback_context,
+                            task_id=task_id,
+                            agent_name=agent_name,
+                            source="dag_relaxed",
+                            task=chosen,
+                            invocation_id=invocation_id,
+                        )
+                        await self._emit_pin_resolved(
+                            ctx=ctx,
+                            agent_name=agent_name,
+                            task_id=task_id,
+                            via_signal="dag_relaxed",
+                            score=0.7,
+                            invocation_id=invocation_id,
+                            candidate_count=len(relaxed),
+                        )
+                        return
+
+            # ---- Signal 5: parent-pin downstream -----------------------
+            parent_pin_task = self._task_from_parent_pin_downstream(
+                plan=plan,
+                tasks=tasks_list,
+                parent_invocation_id=parent_invocation_id,
+                agent_name=agent_name,
+                scoring_args=scoring_args,
+            )
+            if parent_pin_task is not None:
+                task_id = str(_safe_attr(parent_pin_task, "id", "") or "")
+                if task_id:
+                    self._stamp_current_task_id(
+                        ctx=ctx,
+                        callback_context=callback_context,
+                        task_id=task_id,
+                        agent_name=agent_name,
+                        source="parent_pin_downstream",
+                        task=parent_pin_task,
+                        invocation_id=invocation_id,
+                    )
+                    await self._emit_pin_resolved(
+                        ctx=ctx,
+                        agent_name=agent_name,
+                        task_id=task_id,
+                        via_signal="parent_pin_downstream",
+                        score=0.6,
+                        invocation_id=invocation_id,
+                        candidate_count=0,
+                    )
+                    return
+
+            # ---- Signal 6: recent drift / correction targeting --------
+            correction_task = self._task_from_pending_correction(
+                ctx=ctx,
+                tasks=tasks_list,
+                agent_name=agent_name,
+            )
+            if correction_task is not None:
+                task_id = str(_safe_attr(correction_task, "id", "") or "")
+                if task_id:
+                    self._stamp_current_task_id(
+                        ctx=ctx,
+                        callback_context=callback_context,
+                        task_id=task_id,
+                        agent_name=agent_name,
+                        source="correction_target",
+                        task=correction_task,
+                        invocation_id=invocation_id,
+                    )
+                    await self._emit_pin_resolved(
+                        ctx=ctx,
+                        agent_name=agent_name,
+                        task_id=task_id,
+                        via_signal="correction_target",
+                        score=0.9,
+                        invocation_id=invocation_id,
+                        candidate_count=0,
+                    )
+                    return
+
+            # ---- Signal 7: assignee bare/compound normalisation -------
+            normalised_alt = self._alternate_agent_name_form(agent_name)
+            if normalised_alt and normalised_alt != agent_name:
+                alt_assignee = self._candidates_for_agent(
+                    tasks_list, normalised_alt
+                )
+                if alt_assignee:
+                    alt_dag_ready = self._filter_dag_ready(
+                        plan, alt_assignee, task_upstream_ready
+                    )
+                    chosen = None
+                    if len(alt_dag_ready) == 1:
+                        chosen = alt_dag_ready[0]
+                    elif len(alt_dag_ready) > 1 and scoring_args is not None:
+                        chosen = _score_candidates_by_args(alt_dag_ready, scoring_args)
+                    elif len(alt_dag_ready) == 0 and len(alt_assignee) == 1:
+                        chosen = alt_assignee[0]
+                    elif len(alt_assignee) > 1 and scoring_args is not None:
+                        chosen = _score_candidates_by_args(alt_assignee, scoring_args)
+                    if chosen is not None:
+                        task_id = str(_safe_attr(chosen, "id", "") or "")
+                        if task_id:
+                            log.warning(
+                                "pin: assignee normalisation %r->%r "
+                                "found candidate %s",
+                                agent_name,
+                                normalised_alt,
+                                task_id,
+                            )
+                            self._stamp_current_task_id(
+                                ctx=ctx,
+                                callback_context=callback_context,
+                                task_id=task_id,
+                                agent_name=agent_name,
+                                source="assignee_normalised",
+                                task=chosen,
+                                invocation_id=invocation_id,
+                            )
+                            await self._emit_pin_resolved(
+                                ctx=ctx,
+                                agent_name=agent_name,
+                                task_id=task_id,
+                                via_signal="assignee_normalised",
+                                score=0.5,
+                                invocation_id=invocation_id,
+                                candidate_count=len(alt_assignee),
+                            )
+                            return
+
+            # ---- Signal 8: low-confidence best-guess -------------------
+            best_guess = self._low_confidence_best_guess(
+                tasks=tasks_list,
+                agent_name=agent_name,
+                scoring_args=scoring_args,
+            )
+            if best_guess is not None:
+                task, score = best_guess
+                task_id = str(_safe_attr(task, "id", "") or "")
+                if task_id:
+                    log.warning(
+                        "pin: low-confidence best-guess %s for agent %s "
+                        "(score=%.2f); every prior signal failed",
+                        task_id,
+                        agent_name,
+                        score,
+                    )
+                    self._stamp_current_task_id(
+                        ctx=ctx,
+                        callback_context=callback_context,
+                        task_id=task_id,
+                        agent_name=agent_name,
+                        source="low_confidence",
+                        task=task,
+                        invocation_id=invocation_id,
+                    )
+                    await self._emit_pin_resolved(
+                        ctx=ctx,
+                        agent_name=agent_name,
+                        task_id=task_id,
+                        via_signal="low_confidence",
+                        score=score,
+                        invocation_id=invocation_id,
+                        candidate_count=0,
+                    )
+                    return
+
+            # All signals failed AND no best-guess candidate at all
+            # (empty plan / agent has nothing remotely matching). Leave
+            # state unset — there's nothing better than the existing
+            # ``missing_task_id`` error path here.
+            log.debug(
+                "before_agent_callback: pin resolution exhausted all "
+                "signals for agent %s; leaving state unset",
+                agent_name,
+            )
+
+        # ---- Pin resolution helpers (goldfive#264) --------------------
+
+        @staticmethod
+        def _candidates_for_agent(tasks: list[Any], agent_name: str) -> list[Any]:
+            """Return PENDING/RUNNING tasks whose assignee matches ``agent_name``.
+
+            Pre-DAG candidate set used by signals 2/3/4/8. Pure helper,
+            no side effects.
+            """
+            from goldfive.types import TaskStatus
+
+            out: list[Any] = []
             for task in tasks:
                 assignee = str(_safe_attr(task, "assignee_agent_id", "") or "")
                 if assignee != agent_name:
                     continue
                 status = _safe_attr(task, "status", None)
                 if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
-                    pre_dag.append(task)
+                    out.append(task)
+            return out
 
-            # DAG-readiness gate (goldfive#242): a task is only pinnable
-            # when every upstream task (via ``plan.edges``) is COMPLETED.
-            # Stage-4 tasks cannot be pinned while Stage 0-3 is still
-            # PENDING, even if the stage-4 assignee happens to be the
-            # agent whose turn is starting (the coordinator case the
-            # live session exposed).
-            matches: list[Any] = []
-            for task in pre_dag:
+        @staticmethod
+        def _filter_dag_ready(
+            plan: Any,
+            candidates: list[Any],
+            task_upstream_ready: Any,
+        ) -> list[Any]:
+            """Filter ``candidates`` to those whose upstream is COMPLETED."""
+            ready: list[Any] = []
+            for task in candidates:
                 task_id = str(_safe_attr(task, "id", "") or "")
                 if not task_id:
                     continue
                 try:
-                    ready = task_upstream_ready(plan, task_id)
+                    if task_upstream_ready(plan, task_id):
+                        ready.append(task)
                 except Exception as exc:  # noqa: BLE001 — never raise from pin
                     log.debug(
-                        "before_agent_callback: task_upstream_ready raised "
+                        "_filter_dag_ready: task_upstream_ready raised "
                         "for %s: %s — treating as not-ready",
                         task_id,
                         exc,
                     )
-                    ready = False
-                if ready:
-                    matches.append(task)
+            return ready
 
-            if len(matches) != len(pre_dag):
-                log.debug(
-                    "pin candidate filter: agent=%s, before=[%s], after=[%s] "
-                    "(upstream-gated)",
-                    agent_name,
-                    ", ".join(
-                        str(_safe_attr(t, "id", "") or "") for t in pre_dag
-                    ),
-                    ", ".join(
-                        str(_safe_attr(t, "id", "") or "") for t in matches
-                    ),
-                )
+        def _scoring_args_for(
+            self,
+            *,
+            ctx: SessionContext,
+            callback_context: Any,
+            parent_invocation_id: str,
+        ) -> Any:
+            """Return a token-bag string for tool-arg scoring, or ``None``.
 
-            if len(matches) != 1:
-                # Zero matches (off-plan) or >1 matches (ambiguous).
-                # Leave state unset; the existing ``missing_task_id``
-                # error path remains the explicit signal.
-                log.debug(
-                    "before_agent_callback: not pinning current_task_id for %s "
-                    "(%d PENDING/RUNNING task matches)",
-                    agent_name,
-                    len(matches),
+            Signal 3/4/8 score candidates by token overlap with whatever
+            we have for "what was this agent invoked for". In priority
+            order:
+
+            1. Parent invocation's last AgentTool args, if we have a
+               record (best signal — exact dispatch payload).
+            2. The active steer body — operators usually phrase the
+               steer with task-named tokens.
+            3. The session's goal summary — broad fallback that at
+               least disambiguates by domain vocabulary.
+
+            Returns whatever non-empty string-or-mapping we found, or
+            ``None`` when there's nothing to score against (in which
+            case the score-based signals fall through silently).
+            """
+            # 1) Parent invocation's last AgentTool args. The plugin's
+            # before_tool_callback already tracks pending_delegations
+            # keyed by function_call_id — that's a per-dispatch pin,
+            # not a per-invocation tool-args record. Without a richer
+            # record we synthesise the best we can: the steer body or
+            # the active-steer-targeting drift detail tends to carry
+            # the same vocabulary as the dispatch.
+            session_state = _safe_attr(ctx.session, "state", None)
+            if isinstance(session_state, Mapping):
+                # Active steer body is a strong signal when present.
+                steer_body = session_state.get("goldfive.active_steer.body", "")
+                if isinstance(steer_body, str) and steer_body.strip():
+                    return steer_body
+                goals_summary = session_state.get("goldfive.goals_summary", "")
+                if isinstance(goals_summary, str) and goals_summary.strip():
+                    return goals_summary
+            # 2) Goals on the session itself (some test harnesses don't
+            # populate the orchestration-state mirror).
+            goals = _safe_attr(ctx.session, "goals", None) or []
+            if goals:
+                summaries = [
+                    str(_safe_attr(g, "summary", "") or "") for g in goals
+                ]
+                joined = " ".join(s for s in summaries if s).strip()
+                if joined:
+                    return joined
+            # 3) Nothing to score against.
+            _ = parent_invocation_id  # intentionally unused; kept for future plumbing
+            return None
+
+        def _task_from_parent_pin_downstream(
+            self,
+            *,
+            plan: Any,
+            tasks: list[Any],
+            parent_invocation_id: str,
+            agent_name: str,
+            scoring_args: Any,
+        ) -> Any:
+            """Signal 5 — pick a candidate downstream of the parent's pin.
+
+            Reads ``self._invocation_pinned_task_id[parent_invocation_id]``
+            to find the parent's pin, then scans ``plan.edges`` for
+            tasks whose id is a downstream of the parent pin. Among
+            those, restrict to assignee-matching PENDING/RUNNING tasks
+            (re-using :meth:`_candidates_for_agent`). If multiple,
+            fall back to tool-arg scoring; if zero, return ``None``.
+            """
+            if not parent_invocation_id:
+                return None
+            parent_pin = self._invocation_pinned_task_id.get(parent_invocation_id, "")
+            if not parent_pin:
+                return None
+            edges = _safe_attr(plan, "edges", None) or ()
+            downstream_ids: set[str] = set()
+            for e in edges:
+                from_id = str(_safe_attr(e, "from_task_id", "") or "")
+                if from_id != parent_pin:
+                    continue
+                to_id = str(_safe_attr(e, "to_task_id", "") or "")
+                if to_id:
+                    downstream_ids.add(to_id)
+            if not downstream_ids:
+                return None
+            assignee_candidates = self._candidates_for_agent(tasks, agent_name)
+            preferred: list[Any] = [
+                t for t in assignee_candidates
+                if str(_safe_attr(t, "id", "") or "") in downstream_ids
+            ]
+            if not preferred:
+                return None
+            if len(preferred) == 1:
+                return preferred[0]
+            if scoring_args is not None:
+                return _score_candidates_by_args(preferred, scoring_args)
+            return None
+
+        @staticmethod
+        def _task_from_pending_correction(
+            *,
+            ctx: SessionContext,
+            tasks: list[Any],
+            agent_name: str,
+        ) -> Any:
+            """Signal 6 — pin to a task targeted by a pending correction.
+
+            Reads ``goldfive.pending_corrections.<agent>.<task_id>``
+            keys off the orchestration session state (written by
+            :mod:`goldfive._correction_injection` for CORRECT-kind
+            supersedes). When at least one entry exists for the bare
+            form of ``agent_name``, returns the first matching plan
+            task that is PENDING or RUNNING.
+            """
+            from goldfive.types import TaskStatus
+
+            state = _safe_attr(ctx.session, "state", None)
+            if not isinstance(state, Mapping):
+                return None
+            # Strip a compound prefix on agent_name to match the
+            # bare-form keys the writer uses.
+            bare_agent = agent_name.rsplit(":", 1)[-1]
+            prefix = f"goldfive.pending_corrections.{bare_agent}."
+            target_task_ids: list[str] = []
+            for key in state:
+                if not isinstance(key, str):
+                    continue
+                if not key.startswith(prefix):
+                    continue
+                tid = key[len(prefix):]
+                if tid:
+                    target_task_ids.append(tid)
+            if not target_task_ids:
+                return None
+            # Resolve to the first PENDING/RUNNING plan task with a
+            # matching id. We do not require assignee-equality here —
+            # the writer keyed on the agent already, and we trust that
+            # the correction is for this agent's turn.
+            tasks_by_id = {
+                str(_safe_attr(t, "id", "") or ""): t for t in tasks
+            }
+            for tid in target_task_ids:
+                task = tasks_by_id.get(tid)
+                if task is None:
+                    continue
+                status = _safe_attr(task, "status", None)
+                if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
+                    return task
+            return None
+
+        @staticmethod
+        def _alternate_agent_name_form(agent_name: str) -> str:
+            """Return the bare/compound alternate of ``agent_name``.
+
+            ``"compound:foo"`` -> ``"foo"``; ``"foo"`` -> ``""`` (no
+            compound prefix to add — there's no convention for which
+            prefix to try without context). Signal 7 only exercises
+            the strip direction, since the planner-side normalisation
+            (PR #215) already strips on the way in.
+            """
+            if not agent_name:
+                return ""
+            if ":" in agent_name:
+                return agent_name.rsplit(":", 1)[-1]
+            return ""
+
+        def _low_confidence_best_guess(
+            self,
+            *,
+            tasks: list[Any],
+            agent_name: str,
+            scoring_args: Any,
+        ) -> tuple[Any, float] | None:
+            """Signal 8 — return a best-guess (task, confidence) pair.
+
+            Last-resort: if every prior signal failed but there's
+            something resembling work for this agent in the plan, pick
+            the most-plausible task and tag the resolution as
+            low-confidence so the operator-visible event makes the
+            uncertainty explicit.
+
+            Strategy: assignee-match candidates (any status that's
+            PENDING/RUNNING) scored against tool args. If empty, no
+            pin — there's nothing better than ``missing_task_id``.
+            """
+            assignee_candidates = self._candidates_for_agent(tasks, agent_name)
+            if not assignee_candidates:
+                return None
+            if len(assignee_candidates) == 1:
+                # Single assignee match but DAG-relaxed already would
+                # have caught this — getting here means the relaxed
+                # path didn't run (e.g. signals 5/6 fell through with
+                # parent or correction context but neither matched).
+                # Pin with low confidence.
+                return assignee_candidates[0], 0.4
+            if scoring_args is not None:
+                chosen = _score_candidates_by_args(
+                    assignee_candidates, scoring_args
                 )
+                if chosen is not None:
+                    return chosen, 0.4
+            # Tie / no scoring available — pick the first deterministically
+            # so behaviour is reproducible across runs. The low-
+            # confidence event makes the uncertainty visible.
+            return assignee_candidates[0], 0.2
+
+        async def _emit_pin_resolved(
+            self,
+            *,
+            ctx: SessionContext,
+            agent_name: str,
+            task_id: str,
+            via_signal: str,
+            score: float,
+            invocation_id: str,
+            candidate_count: int,
+        ) -> None:
+            """Emit a ``pin_resolved`` (or ``pin_resolved_low_confidence``)
+            sink event so operators see which signal landed the pin.
+
+            Uses :func:`goldfive.events.make_event` (dict envelope)
+            because the proto schema doesn't yet carry a PinResolved
+            slot — adding one would expand scope. Best-effort: every
+            failure is logged and swallowed.
+            """
+            steerer = ctx.steerer
+            if steerer is None:
                 return
-            task = matches[0]
-            task_id = str(_safe_attr(task, "id", "") or "")
-            if not task_id:
+            sinks = getattr(steerer, "_sinks", None) or []
+            if not sinks:
                 return
-            self._stamp_current_task_id(
-                ctx=ctx,
-                callback_context=callback_context,
-                task_id=task_id,
-                agent_name=agent_name,
-                source="single_match",
-                task=task,
+            kind = (
+                "pin_resolved_low_confidence"
+                if via_signal == "low_confidence"
+                else "pin_resolved"
             )
+            session = ctx.session
+            run_id = str(_safe_attr(session, "run_id", "") or "")
+            session_id = str(_safe_attr(session, "id", "") or "") or run_id
+            try:
+                seq = session.next_sequence()
+            except Exception:  # noqa: BLE001
+                seq = 0
+            payload: dict[str, Any] = {
+                "agent_name": str(agent_name or ""),
+                "task_id": str(task_id or ""),
+                "via_signal": str(via_signal or ""),
+                "score": float(score),
+                "invocation_id": str(invocation_id or ""),
+                "candidate_count": int(candidate_count),
+            }
+            try:
+                from goldfive.events import emit, make_event  # noqa: PLC0415
+
+                evt = make_event(
+                    run_id, seq, kind, payload, session_id=session_id
+                )
+                await emit(sinks, evt)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_emit_pin_resolved: failed to emit %s: %s", kind, exc
+                )
 
         def _stamp_current_task_id(
             self,
@@ -1898,14 +2460,22 @@ def make_adk_plugin(
             agent_name: str,
             source: str,
             task: Any = None,
+            invocation_id: str = "",
         ) -> None:
             """Write ``task_id`` into both state surfaces for the sub-agent.
 
-            Shared by the delegation-site branch and the single-match
-            fallback in :meth:`_pin_current_task_id_for_agent`. The
-            ``source`` label threads into the log line so the operator
-            log shows whether the pin came from the pending-delegations
-            map (goldfive#241) or the legacy assignee-match path.
+            Shared by every signal in :meth:`_pin_current_task_id_for_agent`
+            (goldfive#264). The ``source`` label threads into the log
+            line so operators see which signal landed the pin
+            (delegation_pin / single_match / arg_scored / dag_relaxed /
+            parent_pin_downstream / correction_target /
+            assignee_normalised / low_confidence).
+
+            ``invocation_id`` (when non-empty) is also recorded onto
+            ``self._invocation_pinned_task_id`` so signal 5 of a
+            child invocation's pin can read this invocation's pin
+            without racing on the single ``goldfive.current_task_id``
+            slot.
 
             When ``task`` is provided, the ADK side also stamps
             ``goldfive.current_task_title`` /
@@ -1948,6 +2518,10 @@ def make_adk_plugin(
                 agent_name,
                 source,
             )
+            # goldfive#264 — record per-invocation pin so child
+            # invocations can resolve their parent's pin (signal 5).
+            if invocation_id and task_id:
+                self._invocation_pinned_task_id[invocation_id] = task_id
 
         def _pin_delegation_task_id(
             self,

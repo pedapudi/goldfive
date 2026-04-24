@@ -2708,10 +2708,13 @@ async def test_agent_invocation_started_and_completed_emitted_to_sinks() -> None
 
     await adapter.invoke(task=task, session=session)
 
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    # goldfive#264 — filter to proto-shaped events; pin_resolved is
+    # a dict envelope and would raise AttributeError on WhichOneof.
+    proto_events = [e for e in sink.events if hasattr(e, "WhichOneof")]
+    kinds = [e.WhichOneof("payload") for e in proto_events]
     assert "agent_invocation_started" in kinds
     assert "agent_invocation_completed" in kinds
-    started = next(e for e in sink.events if e.WhichOneof("payload") == "agent_invocation_started")
+    started = next(e for e in proto_events if e.WhichOneof("payload") == "agent_invocation_started")
     assert started.agent_invocation_started.agent_name == "worker"
     assert started.agent_invocation_started.task_id == "t1"
     # parent_invocation_id is empty on the top-level dispatch.
@@ -2808,7 +2811,8 @@ async def test_delegation_observed_emitted_on_agent_tool_call() -> None:
     delegations = [
         e.delegation_observed
         for e in sink.events
-        if e.WhichOneof("payload") == "delegation_observed"
+        if hasattr(e, "WhichOneof")
+        and e.WhichOneof("payload") == "delegation_observed"
     ]
     assert len(delegations) >= 1, "expected at least one DelegationObserved"
     first = delegations[0]
