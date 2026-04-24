@@ -163,6 +163,39 @@ async def test_classifier_off_track_returns_critical_drift() -> None:
     assert reason in drift.detail
     assert drift.current_task_id == "t1"
     assert drift.current_agent_id == "researcher"
+    # judge-observability: the activity summary the judge saw is
+    # stamped on the drift as ``trigger_input`` so sinks can answer
+    # "WHY did goldfive flag this off-goal?" at a glance.
+    assert drift.trigger_input
+    assert "researcher" in drift.trigger_input
+    assert "t1" in drift.trigger_input
+
+
+async def test_classifier_off_track_trigger_input_is_truncated_when_long() -> None:
+    """Big activity lists get truncated with " … [truncated]" suffix."""
+    reason = "looping"
+    call_llm = _stub_call_llm([{"progressing": False, "reason": reason}])
+    # Build a massive activity list to force truncation.
+    observed = [
+        {
+            "kind": "agent_invocation_completed",
+            "agent_name": f"agent_{i}",
+            "task_id": f"t{i}",
+            "summary": "y" * 120,
+        }
+        for i in range(200)
+    ]
+    drift = await classify_goal_drift(
+        goals=[Goal(id="g1", summary="ship")],
+        plan=None,
+        observed_actions=observed,
+        model="m",
+        call_llm=call_llm,
+    )
+    assert drift is not None
+    assert drift.trigger_input.endswith(" … [truncated]")
+    # Bounded to 2048 + suffix (same convention as DriftDetected.trigger_input).
+    assert len(drift.trigger_input) == 2048 + len(" … [truncated]")
 
 
 async def test_classifier_malformed_json_returns_none() -> None:

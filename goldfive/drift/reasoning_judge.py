@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from typing import Any
 
@@ -43,11 +44,42 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "CallLLM",
+    "REASONING_JUDGE_MAX_REASONING_INPUT_CHARS",
+    "REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS",
     "REASONING_DRIFT_MAX_REASONING_CHARS",
     "REASONING_DRIFT_SYSTEM_PROMPT",
     "REASONING_DRIFT_USER_PROMPT_TEMPLATE",
     "classify_reasoning_drift",
+    "truncate_for_observability",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Observability truncation bounds (goldfive judge-observability event)
+# ---------------------------------------------------------------------------
+#
+# Distinct from :data:`REASONING_DRIFT_MAX_REASONING_CHARS` (the prompt-time
+# truncation that bounds what we *send* to the judge). These bounds apply to
+# the ``ReasoningJudgeInvoked`` event we emit on every judge invocation so a
+# very long reasoning block or a chatty judge response cannot blow up event
+# sinks (in-memory lists, SQLite rows, gRPC message size caps).
+REASONING_JUDGE_MAX_REASONING_INPUT_CHARS: int = 4096
+REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS: int = 2048
+_TRUNCATE_SUFFIX: str = " … [truncated]"
+
+
+def truncate_for_observability(text: str, limit: int) -> str:
+    """Cap ``text`` at ``limit`` chars, appending ``"… [truncated]"`` when cut.
+
+    Shared by the observability emission path on every judge call so both
+    the reasoning input and the raw response use the same truncation
+    convention. Callers that need a different limit pass it explicitly.
+    """
+    if not isinstance(text, str):
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + _TRUNCATE_SUFFIX
 
 
 # Shape matches :mod:`goldfive.drift.goals` / ``LLMPlanner`` so operators
@@ -191,6 +223,10 @@ async def classify_reasoning_drift(
     current_agent_id: str = "",
     system_prompt: str | None = None,
     user_prompt_template: str | None = None,
+    sink: Any = None,
+    run_id: str = "",
+    session_id: str = "",
+    sequence_fn: Callable[[], int] | None = None,
 ) -> DriftEvent | None:
     """Ask an LLM-judge whether ``reasoning`` is on-task.
 
@@ -241,6 +277,22 @@ async def classify_reasoning_drift(
         Override the default prompts. Operators wanting a different
         judge style can pass their own; the defaults match the shape
         pinned in :data:`REASONING_DRIFT_USER_PROMPT_TEMPLATE`.
+    sink:
+        Optional :class:`goldfive.protocols.EventSink` to notify on every
+        judge invocation, regardless of verdict. When provided, emits a
+        ``ReasoningJudgeInvoked`` proto event carrying the truncated
+        reasoning input, truncated raw judge response, elapsed-ms
+        duration, and parsed verdict. When ``None`` the judge stays
+        sink-less and existing callers see no behavioural change. Sink
+        emit failures are absorbed and logged so a broken observability
+        sink cannot break the run. See goldfive judge-observability
+        event.
+    run_id / session_id / sequence_fn:
+        Stamped onto the emitted ``ReasoningJudgeInvoked`` envelope when
+        ``sink`` is provided. ``sequence_fn`` is called at most once per
+        invocation to get the next per-run sequence number; defaults to
+        ``0`` when not supplied (sinks that need gap-free sequencing
+        should pass the session's ``next_sequence``).
     """
     if not reasoning or not reasoning.strip():
         return None
@@ -251,6 +303,8 @@ async def classify_reasoning_drift(
         task_block=_format_task(task),
         reasoning_block=_format_reasoning(reasoning),
     )
+    started = time.monotonic()
+    call_failed = False
     try:
         raw = await call_llm(system, user, model)
     except Exception as exc:  # noqa: BLE001 - never break the run
@@ -258,53 +312,148 @@ async def classify_reasoning_drift(
             "classify_reasoning_drift: call_llm raised %s; no drift emitted",
             exc,
         )
-        return None
+        raw = f"<call_llm raised: {exc!r}>"
+        call_failed = True
+    elapsed_ms = int((time.monotonic() - started) * 1000)
     raw_str = raw if isinstance(raw, str) else ""
-    log.debug(
-        "classify_reasoning_drift: raw response (%d chars): %s",
-        len(raw_str),
-        raw_str[:500],
-    )
-    parsed = _parse_response(raw)
+    if not call_failed:
+        log.debug(
+            "classify_reasoning_drift: raw response (%d chars): %s",
+            len(raw_str),
+            raw_str[:500],
+        )
+    parsed = None if call_failed else _parse_response(raw)
+    on_task_parsed: bool | None = None
+    severity_str = ""
+    reason = ""
+    drift: DriftEvent | None = None
     if parsed is None:
-        log.debug(
-            "classify_reasoning_drift: response was not JSON (raw=%r); "
-            "no drift emitted",
-            raw_str[:200],
+        if not call_failed:
+            log.debug(
+                "classify_reasoning_drift: response was not JSON (raw=%r); "
+                "no drift emitted",
+                raw_str[:200],
+            )
+    else:
+        on_task_raw = parsed.get("on_task")
+        if not isinstance(on_task_raw, bool):
+            log.debug(
+                "classify_reasoning_drift: parsed=%r lacks boolean 'on_task' "
+                "key; no drift emitted",
+                parsed,
+            )
+        else:
+            on_task_parsed = on_task_raw
+            reason = str(parsed.get("reason", "") or "").strip()
+            if on_task_raw:
+                log.debug(
+                    "classify_reasoning_drift: judge says on-track (reason=%r)",
+                    reason,
+                )
+            else:
+                severity_enum = _severity_from_verdict(parsed.get("severity"))
+                severity_str = severity_enum.value.lower()
+                log.info(
+                    "classify_reasoning_drift: drift detected (severity=%s, "
+                    "reason=%r); emitting OFF_TOPIC event",
+                    severity_enum.value,
+                    reason,
+                )
+                detail = (
+                    f"reasoning drift: {reason}"
+                    if reason
+                    else "reasoning drift detected (judge returned no reason)"
+                )
+                drift = DriftEvent(
+                    kind=DriftKind.OFF_TOPIC,
+                    severity=severity_enum,
+                    detail=detail,
+                    current_task_id=current_task_id,
+                    current_agent_id=current_agent_id,
+                    raw=reasoning,
+                    trigger_input=truncate_for_observability(
+                        reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
+                    ),
+                )
+    # Emit ReasoningJudgeInvoked on every invocation, regardless of
+    # verdict. Done after the drift decision so the event carries the
+    # parsed outcome but independent of it — on-task, off-task, and
+    # plumbing-failure paths all produce an observability event.
+    if sink is not None:
+        await _emit_judge_invoked(
+            sink=sink,
+            run_id=run_id,
+            session_id=session_id,
+            sequence_fn=sequence_fn,
+            current_task_id=current_task_id,
+            current_agent_id=current_agent_id,
+            model=model,
+            elapsed_ms=elapsed_ms,
+            reasoning_input=reasoning,
+            raw_response=raw_str,
+            on_task=bool(on_task_parsed) if on_task_parsed is not None else True
+            if drift is None
+            else False,
+            severity=severity_str,
+            reason=reason,
         )
-        return None
-    on_task = parsed.get("on_task")
-    if not isinstance(on_task, bool):
-        log.debug(
-            "classify_reasoning_drift: parsed=%r lacks boolean 'on_task' "
-            "key; no drift emitted",
-            parsed,
+    return drift
+
+
+async def _emit_judge_invoked(
+    *,
+    sink: Any,
+    run_id: str,
+    session_id: str,
+    sequence_fn: Callable[[], int] | None,
+    current_task_id: str,
+    current_agent_id: str,
+    model: str,
+    elapsed_ms: int,
+    reasoning_input: str,
+    raw_response: str,
+    on_task: bool,
+    severity: str,
+    reason: str,
+) -> None:
+    """Build and emit a ``ReasoningJudgeInvoked`` envelope onto ``sink``.
+
+    Broken sinks must not break the run: any exception is caught and
+    logged at WARNING. Proto-import failures are handled the same way
+    so a partially-regenerated tree (``make proto`` not re-run) does
+    not crash the judge path.
+    """
+    try:
+        from goldfive.events import new_event
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "classify_reasoning_drift: proto import failed (%s); "
+            "skipping ReasoningJudgeInvoked emission",
+            exc,
         )
-        return None
-    if on_task:
-        log.debug(
-            "classify_reasoning_drift: judge says on-track (reason=%r)",
-            parsed.get("reason", ""),
+        return
+    try:
+        sequence = sequence_fn() if sequence_fn is not None else 0
+        evt = new_event(run_id, sequence, session_id=session_id)
+        payload = evt.reasoning_judge_invoked
+        payload.run_id = run_id
+        payload.task_id = current_task_id
+        payload.subject_agent_id = current_agent_id
+        payload.model = model
+        payload.elapsed_ms = int(elapsed_ms)
+        payload.reasoning_input = truncate_for_observability(
+            reasoning_input, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
         )
-        return None
-    severity = _severity_from_verdict(parsed.get("severity"))
-    reason = str(parsed.get("reason", "") or "").strip()
-    log.info(
-        "classify_reasoning_drift: drift detected (severity=%s, reason=%r); "
-        "emitting OFF_TOPIC event",
-        severity.value,
-        reason,
-    )
-    detail = (
-        f"reasoning drift: {reason}"
-        if reason
-        else "reasoning drift detected (judge returned no reason)"
-    )
-    return DriftEvent(
-        kind=DriftKind.OFF_TOPIC,
-        severity=severity,
-        detail=detail,
-        current_task_id=current_task_id,
-        current_agent_id=current_agent_id,
-        raw=reasoning,
-    )
+        payload.raw_response = truncate_for_observability(
+            raw_response, REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS
+        )
+        payload.on_task = on_task
+        payload.severity = severity
+        payload.reason = reason
+        await sink.emit(evt)
+    except Exception as exc:  # noqa: BLE001 - observability must never break
+        log.warning(
+            "classify_reasoning_drift: sink.emit raised %s; "
+            "ReasoningJudgeInvoked dropped",
+            exc,
+        )

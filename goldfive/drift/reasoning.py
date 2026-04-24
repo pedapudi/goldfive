@@ -39,7 +39,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from goldfive.drift import _embed
 from goldfive.drift.reasoning_judge import (
@@ -954,8 +954,16 @@ async def _run_judge(
     *,
     call_llm: JudgeCallLLM,
     model: str,
+    sink: Any = None,
 ) -> DriftEvent | None:
-    """Dispatch ``classify_reasoning_drift`` against the current task."""
+    """Dispatch ``classify_reasoning_drift`` against the current task.
+
+    When ``sink`` is provided it is forwarded into the classifier so a
+    ``ReasoningJudgeInvoked`` event is emitted on every invocation
+    regardless of verdict. ``run_id`` / ``session_id`` / a gap-free
+    sequence are stamped from the session so downstream consumers can
+    correlate the observability event with the session's other events.
+    """
     task = _current_task(session)
     return await classify_reasoning_drift(
         reasoning=text,
@@ -964,6 +972,10 @@ async def _run_judge(
         model=model,
         call_llm=call_llm,
         current_task_id=session.current_task_id,
+        sink=sink,
+        run_id=session.run_id,
+        session_id=session.id,
+        sequence_fn=session.next_sequence,
     )
 
 
@@ -974,6 +986,7 @@ async def analyze_reasoning(
     mode: ReasoningDriftMode = "embedding",
     call_llm: JudgeCallLLM | None = None,
     model: str = "",
+    sink: Any = None,
 ) -> DriftEvent | None:
     """Run the reasoning-drift pipeline against ``text``.
 
@@ -1026,13 +1039,15 @@ async def analyze_reasoning(
     if mode == "judge":
         if call_llm is None:
             return None
-        return await _run_judge(text, session, call_llm=call_llm, model=model)
+        return await _run_judge(
+            text, session, call_llm=call_llm, model=model, sink=sink
+        )
     if mode == "both":
         embedding_drift = _embedding_pipeline(text, session)
         judge_drift: DriftEvent | None = None
         if call_llm is not None:
             judge_drift = await _run_judge(
-                text, session, call_llm=call_llm, model=model
+                text, session, call_llm=call_llm, model=model, sink=sink
             )
         if embedding_drift is None:
             return judge_drift

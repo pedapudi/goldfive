@@ -473,6 +473,16 @@ class DriftEvent:
     # when the drift was not minted from a user annotation. See
     # goldfive#199 / harmonograf#95 (rescope).
     id: str = dataclasses.field(default_factory=lambda: uuid.uuid4().hex)
+    # Short rendering of the data goldfive fed into the detector that
+    # produced this drift — e.g. the reasoning block the LLM judge saw,
+    # the activity summary shown to the goal-drift classifier, the tool
+    # invocation the loop detector matched. Populated on autonomous
+    # drifts; left empty on user-control drifts (their source is the
+    # paired annotation/ControlMessage and not a derived prompt
+    # input). Forwarded onto the wire as ``DriftDetected.trigger_input``
+    # for sinks that render a Gantt / timeline and want to answer "why
+    # did goldfive flag this?" without re-fetching raw agent transcripts.
+    trigger_input: str = ""
 
 
 @dataclasses.dataclass

@@ -678,6 +678,14 @@ class ToolLoopTracker:
                         "tier": tier_key,
                     }
 
+                # trigger_input: summarise the window the detector
+                # matched so sinks can render "what were the tool calls
+                # goldfive saw?" without re-fetching the session buffer.
+                tool_names_seen = [sig[0] for sig in buf]
+                trigger_input = (
+                    f"tool_loop window ({len(buf)} calls, tool={name!r}): "
+                    + " -> ".join(tool_names_seen[-16:])
+                )
                 candidate = DriftEvent(
                     kind=DriftKind.LOOPING_REASONING,
                     severity=severity,
@@ -685,6 +693,7 @@ class ToolLoopTracker:
                     current_task_id=current_task_id,
                     current_agent_id=agent_name,
                     raw=raw,
+                    trigger_input=trigger_input,
                 )
                 # Keep the highest-severity candidate seen across all
                 # tools. tier_index is 0 for CRITICAL, so "lower is
@@ -728,6 +737,10 @@ class ToolLoopTracker:
                                 "window_len": len(tail),
                                 "invocation_id": invocation_id,
                             },
+                            trigger_input=(
+                                f"tool_loop alternating ({len(tail)} calls): "
+                                + " -> ".join(names)
+                            ),
                         )
                     )
         return observations
