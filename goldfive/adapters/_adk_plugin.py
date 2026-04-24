@@ -381,6 +381,14 @@ def _inject_task_id_from_state(
 # don't race.
 _PENDING_DELEGATIONS_KEY = "goldfive.pending_delegations"
 
+# Mirror of orchestration_state.KEY_CURRENT_TASK_REVISION (goldfive#266).
+# Stable string contract shared between the adapter's ADK side
+# (``_adk_state_protocol``), the goldfive Session.state writers, and the
+# reporting-handler classifier. Re-declared here rather than imported
+# to keep the plugin module ADK-only without pulling
+# orchestration_state into its top-level imports.
+_GF_KEY_CURRENT_TASK_REVISION = "goldfive.current_task_revision"
+
 
 def _resolve_pinned_task_id(*, tool_context: Any) -> str:
     """Return the task_id pinned for this tool invocation, or ``""``.
@@ -405,12 +413,57 @@ def _resolve_pinned_task_id(*, tool_context: Any) -> str:
         pend = state.get(_PENDING_DELEGATIONS_KEY)
         if isinstance(pend, Mapping):
             raw = pend.get(fc_id, "")
-            if isinstance(raw, str) and raw.strip():
-                return raw.strip()
+            # goldfive#266 — entry may be either the legacy ``str``
+            # task_id or the versioned ``{task_id, revision}`` dict.
+            # Tolerate both so custom adapters that pre-date this PR
+            # keep working unchanged.
+            tid = _delegation_pin_task_id(raw)
+            if tid:
+                return tid
     state_tid = state.get(_sp.KEY_CURRENT_TASK_ID, "")
     if isinstance(state_tid, str) and state_tid.strip():
         return state_tid.strip()
     return ""
+
+
+def _delegation_pin_task_id(raw: Any) -> str:
+    """Return the task_id from a pending-delegations entry.
+
+    Tolerates both pre-#266 shapes:
+
+    * ``str`` — legacy direct task_id.
+    * ``Mapping`` with a ``"task_id"`` key — versioned shape that also
+      carries ``"revision"`` for the report-time classifier.
+
+    Returns ``""`` for any malformed / empty input. Strips whitespace
+    so consumers can treat the result as a clean key.
+    """
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, Mapping):
+        tid = raw.get("task_id", "")
+        if isinstance(tid, str):
+            return tid.strip()
+        if tid is not None:
+            return str(tid).strip()
+    return ""
+
+
+def _delegation_pin_revision(raw: Any) -> int:
+    """Return the pin's revision stamp from a pending-delegations entry.
+
+    Pre-#266 (string-shaped) entries return 0 — they predate the
+    revision stamp and the report-time classifier treats 0 as the
+    initial revision (matches the default ``Plan.revision_index=0``,
+    so an unrevised plan looks fresh).
+    """
+    if isinstance(raw, Mapping):
+        rev = raw.get("revision", 0)
+        try:
+            return max(0, int(rev))
+        except (TypeError, ValueError):
+            return 0
+    return 0
 
 
 def _function_call_id_from_tool_context(tool_context: Any) -> str:
@@ -1841,8 +1894,13 @@ def make_adk_plugin(
             if isinstance(gf_state_early, Mapping):
                 pend = gf_state_early.get(_PENDING_DELEGATIONS_KEY)
                 if isinstance(pend, Mapping) and pend:
-                    for tid in pend.values():
-                        if not isinstance(tid, str) or not tid:
+                    for raw_entry in pend.values():
+                        # goldfive#266 — entries may be either the
+                        # legacy bare-string task_id or the new
+                        # ``{task_id, revision}`` dict. Use the
+                        # back-compat extractor.
+                        tid = _delegation_pin_task_id(raw_entry)
+                        if not tid:
                             continue
                         for task in tasks_list:
                             if str(_safe_attr(task, "id", "") or "") != tid:
@@ -2485,10 +2543,25 @@ def make_adk_plugin(
             don't pass the task object keep working — the resolver
             falls back to placeholders.
             """
+            # goldfive#266 — resolve the plan revision in effect at this
+            # write so the report-time classifier in
+            # :mod:`goldfive.reporting` can distinguish a fresh pin from
+            # one set under an older revision. Defensive: missing /
+            # malformed plan reads as 0 so legacy paths keep behaving
+            # like the initial revision.
+            plan_for_rev = _safe_attr(ctx.session, "plan", None)
+            try:
+                pin_revision = int(_safe_attr(plan_for_rev, "revision_index", 0) or 0)
+            except (TypeError, ValueError):
+                pin_revision = 0
             gf_state = _safe_attr(ctx.session, "state", None)
             if isinstance(gf_state, dict):
                 try:
                     gf_state[_sp.KEY_CURRENT_TASK_ID] = task_id
+                    # Stamp revision alongside the id so a later
+                    # report-time read sees the stamp on the same
+                    # session.state surface.
+                    gf_state[_GF_KEY_CURRENT_TASK_REVISION] = pin_revision
                 except Exception as exc:  # noqa: BLE001
                     log.debug(
                         "before_agent_callback: goldfive session.state pin failed: %s",
@@ -2506,6 +2579,12 @@ def make_adk_plugin(
                         _sp.write_current_task(adk_state, task)
                     else:
                         _sp.write_current_task_id(adk_state, task_id)
+                    # Mirror the revision stamp onto ADK session.state
+                    # so reporting handlers reading from the live ADK
+                    # state (custom adapters, sub-Runner contexts) see
+                    # the same value.
+                    if isinstance(adk_state, MutableMapping):
+                        _sp.write_current_task_revision(adk_state, pin_revision)
                 except Exception as exc:  # noqa: BLE001
                     log.debug(
                         "before_agent_callback: ADK session.state pin failed: %s",
@@ -2615,6 +2694,22 @@ def make_adk_plugin(
             task_id = str(_safe_attr(chosen, "id", "") or "")
             if not task_id:
                 return
+            # goldfive#266 — pin entries evolved from
+            # ``{fc_id: task_id_str}`` to
+            # ``{fc_id: {"task_id": str, "revision": int}}`` so the
+            # report-time classifier can tell whether a delegation pin
+            # was set under an older plan revision. Readers
+            # (:func:`_resolve_pinned_task_id`, signal 1 of
+            # :meth:`_pin_current_task_id_for_agent`) tolerate both
+            # shapes for back-compat with custom adapters that pre-date
+            # this PR.
+            try:
+                pin_revision = int(
+                    _safe_attr(plan, "revision_index", 0) or 0
+                )
+            except (TypeError, ValueError):
+                pin_revision = 0
+            entry = {"task_id": task_id, "revision": pin_revision}
             # Stamp the pin onto BOTH the goldfive orchestration
             # session.state (so reporting-tool handlers that read it
             # directly see it) AND the ADK tool_context session.state
@@ -2633,14 +2728,15 @@ def make_adk_plugin(
                 if not isinstance(pend, dict):
                     pend = {}
                     target[_PENDING_DELEGATIONS_KEY] = pend
-                pend[fc_id] = task_id
+                pend[fc_id] = dict(entry)
             log.info(
                 "goldfive: pinned delegation task_id=%s for fc_id=%s "
-                "(sub-agent=%s, %d candidates)",
+                "(sub-agent=%s, %d candidates, revision=%d)",
                 task_id,
                 fc_id,
                 to_agent,
                 len(candidates),
+                pin_revision,
             )
 
         async def after_agent_callback(self, *, agent: Any, callback_context: Any) -> None:

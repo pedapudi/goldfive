@@ -36,6 +36,14 @@ KEY_CURRENT_TASK_ID = "goldfive.current_task_id"
 KEY_CURRENT_TASK_TITLE = "goldfive.current_task_title"
 KEY_CURRENT_TASK_DESCRIPTION = "goldfive.current_task_description"
 KEY_CURRENT_TASK_ASSIGNEE = "goldfive.current_task_assignee"
+# Plan revision in effect at the moment ``current_task_id`` was
+# stamped (goldfive#266 / pin versioning). Mirrors the orchestration-
+# state key in :mod:`goldfive.orchestration_state` so the value
+# round-trips between goldfive's session.state and ADK's session.state
+# regardless of which surface the reporting handler reads. Missing /
+# malformed entries are read as 0; report-time classifier treats that
+# as "matches initial revision".
+KEY_CURRENT_TASK_REVISION = "goldfive.current_task_revision"
 KEY_PLAN_ID = "goldfive.plan_id"
 KEY_PLAN_SUMMARY = "goldfive.plan_summary"
 KEY_RUN_ID = "goldfive.run_id"
@@ -103,6 +111,7 @@ ALL_KEYS: tuple[str, ...] = (
     KEY_CURRENT_TASK_TITLE,
     KEY_CURRENT_TASK_DESCRIPTION,
     KEY_CURRENT_TASK_ASSIGNEE,
+    KEY_CURRENT_TASK_REVISION,
     KEY_PLAN_ID,
     KEY_PLAN_SUMMARY,
     KEY_RUN_ID,
@@ -283,6 +292,26 @@ def clear_current_task(state: MutableMapping[str, Any]) -> None:
     for key in _CURRENT_TASK_KEYS:
         if key in state:
             state.pop(key, None)
+    state.pop(KEY_CURRENT_TASK_REVISION, None)
+
+
+def write_current_task_revision(
+    state: MutableMapping[str, Any],
+    revision: int,
+) -> None:
+    """Stamp ``goldfive.current_task_revision`` onto ``state``.
+
+    Companion to :func:`write_current_task_id` for goldfive#266 pin
+    versioning. The adapter's pin ladder calls this alongside the
+    id-only write so the report-time classifier in
+    :mod:`goldfive.reporting` can distinguish a fresh pin (matches
+    ``plan.revision_index``) from one set under an older revision.
+    """
+    try:
+        rev = max(0, int(revision))
+    except (TypeError, ValueError):
+        rev = 0
+    _set(state, KEY_CURRENT_TASK_REVISION, rev)
 
 
 def write_plan_context(

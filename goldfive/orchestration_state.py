@@ -98,6 +98,19 @@ KEY_CURRENT_PLAN_ID = "goldfive.current_plan_id"
 # Task lifecycle (PlanReconciler)
 KEY_CURRENT_TASK_ID = "goldfive.current_task_id"
 KEY_CURRENT_TASK_TITLE = "goldfive.current_task_title"
+# Revision stamp on the current_task_id pin (goldfive#266 / pin
+# versioning). When the adapter's pin ladder lands a task_id, it also
+# stamps the plan's ``revision_index`` at write time. The reporting
+# handlers consult this stamp at report time to distinguish a "fresh"
+# pin (matches current revision) from a "stale" pin (set under an
+# older revision and the report arrived after a refine landed). Stale
+# pins under a CORRECT-kind supersedes link refuse the transition; the
+# old task's terminal state is historical fact and the correction is a
+# separate work unit. Stale pins under a REPLACE-kind link route to
+# the replacement (existing supersession behaviour). Missing stamp
+# (legacy state, custom adapter that hasn't migrated) reads as 0 so
+# pre-versioning callers preserve their current behaviour.
+KEY_CURRENT_TASK_REVISION = "goldfive.current_task_revision"
 
 # Goals
 KEY_GOALS_SUMMARY = "goldfive.goals_summary"
@@ -129,6 +142,7 @@ ALL_KEYS: tuple[str, ...] = (
     KEY_CURRENT_PLAN_ID,
     KEY_CURRENT_TASK_ID,
     KEY_CURRENT_TASK_TITLE,
+    KEY_CURRENT_TASK_REVISION,
     KEY_GOALS_SUMMARY,
     KEY_ACTIVE_STEER_BODY,
     KEY_ACTIVE_STEER_AT_TURN,
@@ -209,6 +223,43 @@ def clear_current_task(state: MutableMapping[str, Any]) -> None:
     """Remove the current-task keys. Cheap alias used at run end."""
     clear(state, KEY_CURRENT_TASK_ID)
     clear(state, KEY_CURRENT_TASK_TITLE)
+    clear(state, KEY_CURRENT_TASK_REVISION)
+
+
+def stamp_current_task_revision(
+    state: MutableMapping[str, Any],
+    revision: int,
+) -> None:
+    """Stamp ``goldfive.current_task_revision`` alongside the current-task pin.
+
+    Companion writer to :func:`set_current_task` for the goldfive#266
+    pin-versioning path. Callers stamp the plan ``revision_index``
+    in effect at the moment they wrote the pin so report-time handlers
+    can tell a fresh pin from one set under an older plan.
+
+    Negative revisions are clamped to 0; non-int values are coerced
+    via ``int()`` (defensive — readers assume an int-valued field).
+    """
+    try:
+        rev = max(0, int(revision))
+    except (TypeError, ValueError):
+        rev = 0
+    write(state, KEY_CURRENT_TASK_REVISION, rev)
+
+
+def read_current_task_revision(state: Any) -> int:
+    """Return ``goldfive.current_task_revision`` as an int, default 0.
+
+    Tolerant of missing / malformed values (legacy state, custom
+    adapters that pre-date #266) — those read as 0 and the report-time
+    classifier treats them as "match" against the plan's initial
+    ``revision_index=0``.
+    """
+    raw = read(state, KEY_CURRENT_TASK_REVISION, 0)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +460,7 @@ def rotate_current_task_id(
     if plan is None:
         clear(state, KEY_CURRENT_TASK_ID)
         clear(state, KEY_CURRENT_TASK_TITLE)
+        clear(state, KEY_CURRENT_TASK_REVISION)
         return None
 
     candidates: list[Task] = []
@@ -423,12 +475,19 @@ def rotate_current_task_id(
     if len(candidates) == 1:
         next_task = candidates[0]
         set_current_task(state, next_task)
+        # goldfive#266 — stamp the rotation moment's revision so the
+        # next reporting call on this newly-pinned task reads as
+        # "fresh" against the current plan. The adapter's pin ladder
+        # may overwrite this on the next agent invocation; it's fine.
+        rev = int(getattr(plan, "revision_index", 0) or 0)
+        stamp_current_task_revision(state, rev)
         return str(getattr(next_task, "id", "") or "") or None
 
     # Zero or multiple candidates — clear and let the orchestrator
     # re-pin on the next before_agent_callback.
     clear(state, KEY_CURRENT_TASK_ID)
     clear(state, KEY_CURRENT_TASK_TITLE)
+    clear(state, KEY_CURRENT_TASK_REVISION)
     return None
 
 
@@ -474,6 +533,7 @@ __all__ = [
     "KEY_CANCELLED_FUNCTION_CALL_IDS",
     "KEY_CURRENT_PLAN_ID",
     "KEY_CURRENT_TASK_ID",
+    "KEY_CURRENT_TASK_REVISION",
     "KEY_CURRENT_TASK_TITLE",
     "KEY_GOALS_SUMMARY",
     "KEY_PROCESSED_STEER_IDS",
@@ -486,12 +546,14 @@ __all__ = [
     "has_processed_steer_id",
     "read",
     "read_cancelled_function_call_ids",
+    "read_current_task_revision",
     "record_processed_steer_id",
     "refresh_goals_summary",
     "rotate_current_task_id",
     "set_active_steer",
     "set_current_plan",
     "set_current_task",
+    "stamp_current_task_revision",
     "sync_current_task_from_transition",
     "write",
 ]
