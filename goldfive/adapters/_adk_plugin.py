@@ -1251,6 +1251,37 @@ def make_adk_plugin(
                     "report_awaiting_approval",
                 }
             )
+            # Cooperative cancellation state (goldfive#251 Stream C / 7a).
+            # Authoritative source for the cancel-requested flag:
+            # ``dict[str, CancellationRequest]`` keyed by ``invocation_id``.
+            # The steerer writes entries here via
+            # :meth:`request_invocation_cancel` on the adapter; every
+            # adapter callback checks the dict at the top of its body
+            # and, when an entry matches the current invocation_id,
+            # consumes it (read + clear — same-invocation re-entry won't
+            # re-cancel) and short-circuits the dispatch.
+            #
+            # Stored on the plugin instance rather than ADK session.state
+            # because ``InMemorySessionService`` shallow-copies state on
+            # every ``get_session`` (see the same rationale that drove
+            # goldfive#170 for the _active_ctx field), which would make
+            # cross-callback reads unreliable. The state-protocol module
+            # (:data:`_adk_state_protocol.KEY_CANCEL_REQUESTED`) documents
+            # the key semantics so external consumers see a stable
+            # contract; the plugin's dict is the live source of truth.
+            self._cancel_state: dict[str, Any] = {}
+            # Parent/child invocation map for cancel propagation.
+            # ``dict[str, str]`` mapping ``invocation_id ->
+            # parent_invocation_id``. Populated on every
+            # ``before_run_callback`` that observes a fresh invocation_id
+            # with a known parent (the top-level invocation_id pinned on
+            # the first ``before_run``). Consumed by
+            # :meth:`request_invocation_cancel` so that cancelling a
+            # parent also flags its spawned sub-invocations — this is
+            # how a cancelled coordinator's mid-flight AgentTool child
+            # short-circuits cleanly instead of emitting its turn and
+            # poisoning the parent's history.
+            self._invocation_parents: dict[str, str] = {}
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
@@ -1288,6 +1319,109 @@ def make_adk_plugin(
             # state from the just-finished dispatch doesn't leak into
             # the next one on the same plugin instance (goldfive#181).
             self._tool_loop_tracker.clear()
+            # Drop any lingering cancellation state / parent map so the
+            # next dispatch starts clean (goldfive#251). A request that
+            # was never consumed means the callback path never ran —
+            # still safe to drop because the invocation it targeted is
+            # gone, and keeping it would misfire on an unrelated future
+            # invocation_id collision.
+            self._cancel_state.clear()
+            self._invocation_parents.clear()
+
+        # --- Cooperative cancellation (goldfive#251 Stream C / 7a) -----
+
+        def request_invocation_cancel(
+            self,
+            *,
+            invocation_id: str,
+            request: Any,
+            propagate_to_children: bool = True,
+        ) -> list[str]:
+            """Flag ``invocation_id`` (and optionally its descendants)
+            for cooperative cancellation.
+
+            Called by :class:`~goldfive.steerer.DefaultSteerer` when a
+            drift at CRITICAL severity (or a user-initiated cancel)
+            warrants aborting an in-flight adapter dispatch. Writes an
+            entry to the plugin's ``_cancel_state`` dict keyed by the
+            invocation id; every adapter callback consults the dict at
+            the top of its body and short-circuits when its own id
+            matches.
+
+            When ``propagate_to_children`` is True (the default), the
+            recorded parent/child map is walked breadth-first and an
+            entry is added for every transitive descendant of
+            ``invocation_id`` so an in-flight AgentTool sub-invocation
+            is also flagged. The returned list contains every id that
+            was flagged — the target itself plus any descendants — so
+            callers can sink-report the full set if they want.
+
+            Tree-agnostic: the parent/child map is per-invocation, the
+            plugin has no notion of "coordinator" vs "sub-agent", and
+            every level in the tree is flagged the same way.
+            """
+            if not invocation_id:
+                return []
+            flagged: list[str] = [str(invocation_id)]
+            # Walk the parent/child map when propagation is enabled.
+            # Order is unspecified; deduplication happens inside
+            # ``descendants_of_invocation`` via a seen-set.
+            if propagate_to_children:
+                try:
+                    from goldfive.adapters import _adk_state_protocol as _sp_local
+
+                    descendants = _sp_local.descendants_of_invocation(
+                        {_sp_local.KEY_INVOCATION_PARENTS: self._invocation_parents},
+                        invocation_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "_GoldfiveADKPlugin.request_invocation_cancel: "
+                        "descendant walk raised: %s",
+                        exc,
+                    )
+                    descendants = []
+                flagged.extend(descendants)
+            for flagged_id in flagged:
+                # Preserve the first-writer's request for each id so a
+                # parent cancel with reason="user_steer" doesn't get
+                # silently overwritten by a descendant-propagation pass
+                # reusing the parent's request object. When a descendant
+                # already has a distinct request pending (uncommon but
+                # possible), keep the earlier one — the more-recent
+                # overwrite semantics are only for same-id re-writes
+                # from the steerer itself.
+                self._cancel_state.setdefault(flagged_id, request)
+            return flagged
+
+        def consume_cancel_for_invocation(self, invocation_id: str) -> Any | None:
+            """Read the pending cancel for ``invocation_id`` and clear it.
+
+            Callback-facing helper. Returns the
+            :class:`~goldfive.types.CancellationRequest` when one was
+            pending, or ``None`` otherwise. Clearing before returning
+            gives the "cancel fires once" semantic: a re-entry into the
+            same callback (e.g. after the LLM call was already skipped
+            and a follow-up tool call fires) doesn't re-emit the
+            cancelled marker.
+            """
+            if not invocation_id:
+                return None
+            return self._cancel_state.pop(str(invocation_id), None)
+
+        def peek_cancel_for_invocation(self, invocation_id: str) -> Any | None:
+            """Return the pending cancel for ``invocation_id`` without
+            clearing it.
+
+            Diagnostic / test helper. Production callback paths use
+            :meth:`consume_cancel_for_invocation`; this method exists so
+            the adapter's ``invoke`` loop can check whether a cancel was
+            flagged on the current dispatch without side-effecting the
+            consume-once semantic.
+            """
+            if not invocation_id:
+                return None
+            return self._cancel_state.get(str(invocation_id))
 
         def set_reconciler(self, reconciler: Any) -> None:
             """Attach a :class:`~goldfive.reconciler.PlanReconciler`.
@@ -1351,6 +1485,31 @@ def make_adk_plugin(
                 # First before_run for this dispatch — pin it so nested
                 # AgentTool sub-Runners can attribute themselves below.
                 self._top_invocation_id = inv_id
+
+            # Register the parent/child relationship for cooperative
+            # cancellation propagation (goldfive#251). A cancel targeting
+            # the parent id can then flag this child id without the
+            # steerer having to know the tree shape.
+            if inv_id and parent_inv_id:
+                self._invocation_parents[inv_id] = parent_inv_id
+
+            # Cooperative-cancellation check (goldfive#251 Stream C / 7a).
+            # If the adapter / steerer flagged this invocation before
+            # ``run_async`` actually yielded to ADK, short-circuit the
+            # whole dispatch: skip the state-protocol write, skip the
+            # AgentInvocationStarted emit, and emit an
+            # InvocationCancelled sink event so operators see the
+            # cancel in harmonograf. The outer ``ADKAdapter.invoke``
+            # loop honours the short-circuit via
+            # :meth:`peek_cancel_for_invocation` (below).
+            if inv_id and self._cancel_state.get(inv_id) is not None:
+                request = self.consume_cancel_for_invocation(inv_id)
+                await self._emit_invocation_cancelled(
+                    invocation_id=inv_id,
+                    agent_name="",
+                    request=request,
+                )
+                return None
 
             # Reset the per-invocation counters so the CONFABULATION_RISK
             # check in ``after_run_callback`` sees only the tool calls
@@ -1471,6 +1630,23 @@ def make_adk_plugin(
             parent_inv_id = ""
             if inv_id and self._top_invocation_id and inv_id != self._top_invocation_id:
                 parent_inv_id = self._top_invocation_id
+
+            # Cooperative-cancellation checkpoint (goldfive#251 Stream C / 7a).
+            # When a cancel was flagged for this invocation_id (by the
+            # steerer's CRITICAL-severity ladder path, or by a programmatic
+            # caller), consume the request, emit an InvocationCancelled
+            # sink event, and short-circuit the callback — the agent's
+            # turn is skipped entirely. Done BEFORE the pinning /
+            # reconciler forward work so a cancelled turn leaves no
+            # side-effects on orchestration state.
+            if inv_id and self._cancel_state.get(inv_id) is not None:
+                request = self.consume_cancel_for_invocation(inv_id)
+                await self._emit_invocation_cancelled(
+                    invocation_id=inv_id,
+                    agent_name=agent_name,
+                    request=request,
+                )
+                return None
 
             # Layer 1: pin the starting sub-agent's task_id so its
             # reporting-tool calls can default the arg from state
@@ -2325,6 +2501,95 @@ def make_adk_plugin(
             except Exception as exc:  # noqa: BLE001
                 log.debug("_emit_observability: failed to emit %s: %s", kind, exc)
 
+        async def _emit_invocation_cancelled(
+            self,
+            *,
+            invocation_id: str,
+            agent_name: str = "",
+            request: Any = None,
+            tool_name: str = "",
+        ) -> None:
+            """Emit an ``InvocationCancelled`` sink event (goldfive#251).
+
+            Operator-visible only — does NOT propagate to the LLM
+            (that's what the minimal ``{"status": "cancelled"}`` tool
+            response is for). Rich context: the invocation id, agent
+            name, triggering reason / drift kind / severity / drift
+            id, and an optional tool name when the cancel fired at a
+            tool-dispatch checkpoint.
+
+            Uses :func:`goldfive.events.make_event` (dict envelope)
+            rather than a proto envelope because the proto schema
+            doesn't yet carry an ``InvocationCancelled`` message —
+            adding a new proto + regen would expand the scope of this
+            change beyond Stream C. Dict events round-trip through the
+            same sink fan-out (``goldfive.events.emit``) as proto
+            events, so harmonograf's ingest path can handle both. A
+            follow-up proto slot can be minted if / when sink-side
+            strict typing is needed.
+
+            Best-effort: every failure is logged and swallowed —
+            observability must never block a callback.
+            """
+            ctx = self._active_ctx
+            if ctx is None:
+                return
+            steerer = ctx.steerer
+            if steerer is None:
+                return
+            sinks = getattr(steerer, "_sinks", None) or []
+            if not sinks:
+                return
+            session = ctx.session
+            run_id = str(_safe_attr(session, "run_id", "") or "")
+            session_id = str(_safe_attr(session, "id", "") or "") or run_id
+            try:
+                seq = session.next_sequence()
+            except Exception:  # noqa: BLE001
+                seq = 0
+            # Extract fields from the CancellationRequest dataclass if
+            # provided. Duck-typed so a plain dict or an unfamiliar
+            # shape still rounds-trips without raising.
+            reason = ""
+            severity = ""
+            drift_id = ""
+            drift_kind = ""
+            detail = ""
+            if request is not None:
+                reason = str(_safe_attr(request, "reason", "") or "")
+                sev_val = _safe_attr(request, "severity", None)
+                severity = str(getattr(sev_val, "value", sev_val) or "")
+                drift_id = str(_safe_attr(request, "drift_id", "") or "")
+                drift_kind = str(_safe_attr(request, "drift_kind", "") or "")
+                detail = str(_safe_attr(request, "detail", "") or "")
+            payload: dict[str, Any] = {
+                "invocation_id": str(invocation_id or ""),
+                "agent_name": str(agent_name or ""),
+                "reason": reason,
+                "severity": severity,
+                "drift_id": drift_id,
+                "drift_kind": drift_kind,
+                "detail": detail,
+            }
+            if tool_name:
+                payload["tool_name"] = str(tool_name)
+            try:
+                from goldfive.events import emit, make_event  # noqa: PLC0415 — lazy
+
+                evt = make_event(
+                    run_id,
+                    seq,
+                    "invocation_cancelled",
+                    payload,
+                    session_id=session_id,
+                )
+                await emit(sinks, evt)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_emit_invocation_cancelled: failed to emit: %s",
+                    exc,
+                )
+
         # --- Plan + current-task context -------------------------------
 
         async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> None:
@@ -2362,6 +2627,30 @@ def make_adk_plugin(
             ctx = self._resolve_ctx(callback_context)
             if ctx is None:
                 return None
+
+            # Cooperative-cancellation checkpoint (goldfive#251 Stream C / 7a).
+            # Skip the LLM call when this invocation is flagged for
+            # cancel. This is the checkpoint that matters most in
+            # practice: a mid-flight LLM call is the expensive work
+            # whose output would contaminate the parent transcript.
+            # The ``before_agent_callback`` checkpoint above normally
+            # fires first, but ADK may reach ``before_model_callback``
+            # without ``before_agent_callback`` on some dispatch
+            # shapes (e.g. direct model invocations in tests); this
+            # check is the backstop.
+            inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
+                callback_context, "invocation_context", None
+            )
+            inv_id_check = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+            if inv_id_check and self._cancel_state.get(inv_id_check) is not None:
+                request = self.consume_cancel_for_invocation(inv_id_check)
+                await self._emit_invocation_cancelled(
+                    invocation_id=inv_id_check,
+                    agent_name="",
+                    request=request,
+                )
+                return None
+
             state = _session_state_from_callback(callback_context)
             if not isinstance(state, dict):
                 try:
@@ -2449,6 +2738,38 @@ def make_adk_plugin(
             if not tool_name:
                 func = _safe_attr(tool, "func", None)
                 tool_name = str(_safe_attr(func, "__name__", "") or "")
+
+            # Cooperative-cancellation checkpoint (goldfive#251 Stream C / 7a).
+            # When this invocation was flagged for cancel (either the
+            # steerer at CRITICAL severity or a user-initiated cancel),
+            # skip tool dispatch and return a MINIMAL LLM-visible tool
+            # response: ``{"status": "cancelled"}``. The minimal shape
+            # is deliberate — richer shapes (``reason``, ``detail``,
+            # ``drift_kind``) become prompt-injection vectors (see
+            # lessons from goldfive#250 / #252 / #253 where LLMs
+            # pattern-matched on error strings and invented workarounds).
+            # Rich context for operators lives on the
+            # InvocationCancelled sink event emitted by
+            # :meth:`_emit_invocation_cancelled`.
+            inv_ctx = _safe_attr(tool_context, "_invocation_context", None) or _safe_attr(
+                tool_context, "invocation_context", None
+            )
+            inv_id_check = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+            if inv_id_check and self._cancel_state.get(inv_id_check) is not None:
+                request = self.consume_cancel_for_invocation(inv_id_check)
+                await self._emit_invocation_cancelled(
+                    invocation_id=inv_id_check,
+                    agent_name="",
+                    request=request,
+                    tool_name=tool_name,
+                )
+                # MINIMAL LLM-visible response — single-key dict, no
+                # ``reason`` / ``detail`` / ``drift_kind``. The parent
+                # LLM that receives this as an AgentTool response can
+                # pattern-match only on the word "cancelled" and
+                # should defer to the plan-revised context it sees on
+                # its next turn to decide whether to re-dispatch.
+                return {"status": "cancelled"}
 
             # Reporting-tool short-circuit takes precedence: a tool named
             # e.g. report_task_started should never also be gated by

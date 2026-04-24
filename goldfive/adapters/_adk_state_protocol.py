@@ -63,6 +63,25 @@ KEY_ACTIVE_STEER_AT_TURN = "goldfive.active_steer.at_turn"
 KEY_GOALS_SUMMARY = "goldfive.goals_summary"
 KEY_CANCELLED_FUNCTION_CALL_IDS = "goldfive.cancelled_function_call_ids"
 
+# Cooperative cancellation (goldfive#251 Stream C / 7a). Value is a
+# ``dict[str, CancellationRequest]`` keyed by ``invocation_id``. Every
+# adapter callback that can short-circuit a dispatch checks for an
+# entry under the current invocation_id at the top of the callback
+# and, when present, consumes it (reads + clears) and short-circuits
+# the dispatch. See
+# :mod:`goldfive.adapters._cancel_state` for the helper API and
+# :class:`goldfive.types.CancellationRequest` for the payload shape.
+KEY_CANCEL_REQUESTED = "goldfive.cancel_requested"
+# Parent -> invocation_id bookkeeping for cancellation propagation.
+# ``dict[str, str]`` mapping ``invocation_id -> parent_invocation_id``.
+# Written by the plugin's ``before_run_callback`` whenever a fresh
+# invocation_id is observed; consumed by the cancel-propagation helper
+# so cancelling an invocation also flags its spawned children.
+# Tree-agnostic — the map is per-invocation and carries no notion of
+# "coordinator" or "root"; every agent's children are handled the same
+# way.
+KEY_INVOCATION_PARENTS = "goldfive.invocation_parents"
+
 _CURRENT_TASK_KEYS: tuple[str, ...] = (
     KEY_CURRENT_TASK_ID,
     KEY_CURRENT_TASK_TITLE,
@@ -89,6 +108,8 @@ ALL_KEYS: tuple[str, ...] = (
     KEY_ACTIVE_STEER_AT_TURN,
     KEY_GOALS_SUMMARY,
     KEY_CANCELLED_FUNCTION_CALL_IDS,
+    KEY_CANCEL_REQUESTED,
+    KEY_INVOCATION_PARENTS,
 )
 
 
@@ -400,6 +421,171 @@ def set_cancelled_function_call_ids_on_adk_state(
         state.pop(KEY_CANCELLED_FUNCTION_CALL_IDS, None)
         return
     _set(state, KEY_CANCELLED_FUNCTION_CALL_IDS, cleaned)
+
+
+# ---------------------------------------------------------------------------
+# Cooperative cancellation (goldfive#251 Stream C / 7a)
+#
+# The helpers below manage two state keys used by cooperative
+# cancellation:
+#
+# * :data:`KEY_CANCEL_REQUESTED` — ``dict[str, CancellationRequest]``
+#   keyed by ``invocation_id``; every adapter callback that can
+#   short-circuit a dispatch reads (and consumes) the entry for its
+#   own invocation_id at the top of the callback.
+# * :data:`KEY_INVOCATION_PARENTS` — ``dict[str, str]`` mapping
+#   ``invocation_id -> parent_invocation_id`` so cancel propagation
+#   can flag children when a parent is cancelled, without requiring
+#   the plugin to walk ADK's own context graph.
+#
+# ``CancellationRequest`` is imported lazily to avoid a module-level
+# circular dependency (``goldfive.types`` imports are cheap but we
+# keep this file import-lean so it can load in tests that don't have
+# the ADK optional-dependency group).
+# ---------------------------------------------------------------------------
+
+
+def write_cancel_request(
+    state: MutableMapping[str, Any],
+    *,
+    invocation_id: str,
+    request: Any,
+) -> None:
+    """Stamp a :class:`~goldfive.types.CancellationRequest` on ``state``.
+
+    No-op when ``invocation_id`` is empty. ``request`` is stored
+    verbatim so consumers get the original dataclass (not a copy) —
+    this is the cheapest handoff between the steerer (producer) and
+    the adapter callbacks (consumers) on a per-invocation basis.
+
+    Multiple requests for different invocation_ids coexist in the
+    same dict; a second write for the same id overwrites the prior
+    request (the more-recent cancel wins, same as the steerer's
+    Level-3 corrective-message slot).
+    """
+    if not invocation_id:
+        return
+    bucket = state.get(KEY_CANCEL_REQUESTED)
+    if not isinstance(bucket, dict):
+        bucket = {}
+    bucket[str(invocation_id)] = request
+    _set(state, KEY_CANCEL_REQUESTED, bucket)
+
+
+def read_cancel_request(state: Any, invocation_id: str) -> Any | None:
+    """Return the :class:`~goldfive.types.CancellationRequest` for
+    ``invocation_id``, or ``None`` when no cancel is pending.
+
+    Read-only — callers that want "cancel fires once" semantics must
+    use :func:`consume_cancel_request` instead, which clears the
+    entry after reading so re-entry into the same callback doesn't
+    re-cancel.
+    """
+    if not invocation_id:
+        return None
+    bucket = _safe_get(state, KEY_CANCEL_REQUESTED, None)
+    if not isinstance(bucket, Mapping):
+        return None
+    return bucket.get(str(invocation_id))
+
+
+def consume_cancel_request(
+    state: MutableMapping[str, Any],
+    invocation_id: str,
+) -> Any | None:
+    """Read the cancel request for ``invocation_id`` and clear it.
+
+    Returns the :class:`~goldfive.types.CancellationRequest` dataclass
+    (not a copy) when one was pending, or ``None`` otherwise. The
+    flag is removed from ``state`` BEFORE returning so a re-entry
+    into the same callback (e.g. a retry after the LLM call was
+    already cancelled and a new before_tool fires for a lingering
+    tool call) does not re-emit the cancelled response.
+    """
+    if not invocation_id:
+        return None
+    bucket = state.get(KEY_CANCEL_REQUESTED) if isinstance(state, MutableMapping) else None
+    if not isinstance(bucket, dict):
+        return None
+    request = bucket.pop(str(invocation_id), None)
+    # Cleanup: if the bucket is now empty, remove the key entirely so
+    # downstream readers distinguish "no cancels ever" from "a cancel
+    # was processed and cleared".
+    if not bucket:
+        state.pop(KEY_CANCEL_REQUESTED, None)
+    else:
+        _set(state, KEY_CANCEL_REQUESTED, bucket)
+    return request
+
+
+def register_invocation_parent(
+    state: MutableMapping[str, Any],
+    *,
+    invocation_id: str,
+    parent_invocation_id: str,
+) -> None:
+    """Record that ``invocation_id`` was spawned by
+    ``parent_invocation_id``.
+
+    Called from the plugin's ``before_run_callback`` (or equivalent)
+    once per invocation so cancel propagation can walk the chain
+    without needing to know the ADK context graph. No-op when either
+    id is empty.
+    """
+    if not invocation_id or not parent_invocation_id:
+        return
+    parents = state.get(KEY_INVOCATION_PARENTS)
+    if not isinstance(parents, dict):
+        parents = {}
+    parents[str(invocation_id)] = str(parent_invocation_id)
+    _set(state, KEY_INVOCATION_PARENTS, parents)
+
+
+def children_of_invocation(state: Any, invocation_id: str) -> list[str]:
+    """Return the immediate children of ``invocation_id``.
+
+    Reads the ``KEY_INVOCATION_PARENTS`` map and returns the list of
+    invocation_ids whose parent is ``invocation_id``. Empty list when
+    the invocation has no children or the map hasn't been populated.
+    """
+    if not invocation_id:
+        return []
+    parents = _safe_get(state, KEY_INVOCATION_PARENTS, None)
+    if not isinstance(parents, Mapping):
+        return []
+    target = str(invocation_id)
+    return [str(child) for child, parent in parents.items() if parent == target]
+
+
+def descendants_of_invocation(state: Any, invocation_id: str) -> list[str]:
+    """Return every transitive descendant of ``invocation_id``.
+
+    Walks the parent map breadth-first so cancel propagation can flag
+    the entire sub-tree in one pass. The order is unspecified but the
+    ``invocation_id`` itself is NOT included in the result — callers
+    that want the full cancelled set should prepend it themselves.
+    """
+    if not invocation_id:
+        return []
+    parents = _safe_get(state, KEY_INVOCATION_PARENTS, None)
+    if not isinstance(parents, Mapping):
+        return []
+    # Build reverse index: parent -> [children]
+    reverse: dict[str, list[str]] = {}
+    for child, parent in parents.items():
+        reverse.setdefault(str(parent), []).append(str(child))
+    out: list[str] = []
+    frontier = [str(invocation_id)]
+    seen: set[str] = {str(invocation_id)}
+    while frontier:
+        node = frontier.pop(0)
+        for child in reverse.get(node, ()):
+            if child in seen:
+                continue
+            seen.add(child)
+            out.append(child)
+            frontier.append(child)
+    return out
 
 
 # ---------------------------------------------------------------------------

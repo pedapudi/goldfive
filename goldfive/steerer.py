@@ -50,7 +50,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive import orchestration_state as _ostate
@@ -65,6 +65,7 @@ from goldfive.drift.reasoning import (
 )
 from goldfive.types import (
     TERMINAL_TASK_STATUSES,
+    CancellationRequest,
     DriftEvent,
     DriftKind,
     DriftSeverity,
@@ -2170,6 +2171,31 @@ class DefaultSteerer:
             # happened, and running another refine for this signal
             # would race against it.
             return
+        # Cooperative cancellation (goldfive#251 Stream C / 7a). Severity
+        # ladder decision: CRITICAL drifts (and ONLY critical drifts)
+        # flag the currently-active invocation(s) for cooperative
+        # cancel before the refine / promote path runs. INFO + WARNING
+        # severities do NOT cancel — they flow through the usual
+        # observe / absorb / nudge channels. User-authored drifts
+        # (USER_STEER / USER_CANCEL / USER_PAUSE) additionally bypass
+        # the severity gate because an operator directive must be
+        # honoured even when emitted at a lower severity tier.
+        #
+        # The actual short-circuit happens in the ADK plugin's next
+        # ``before_agent_callback`` / ``before_model_callback`` /
+        # ``before_tool_callback``; this call just writes the flag.
+        # Whether to re-dispatch after the cancel is the parent
+        # agent's decision, informed by plan-causal prompting from
+        # Stream B — the framework itself does NOT auto-reinvoke.
+        if self._should_request_cancel_for_drift(drift):
+            try:
+                await self.request_invocation_cancel(drift=drift, session=session)
+            except Exception as exc:  # noqa: BLE001 — cancel is best-effort
+                log.debug(
+                    "DefaultSteerer._handle_drift: "
+                    "request_invocation_cancel raised: %s",
+                    exc,
+                )
         if promote_to_steer:
             await self._promote_drift_to_steer(drift, session)
             return
@@ -2731,6 +2757,213 @@ class DefaultSteerer:
                 reason,
                 exc,
             )
+
+    # ------------------------------------------------------------------
+    # Cooperative cancellation (goldfive#251 Stream C / 7a)
+    # ------------------------------------------------------------------
+
+    def _resolve_active_invocation_ids(
+        self, drift: DriftEvent, session: Session
+    ) -> list[str]:
+        """Resolve which invocation_id(s) a cancel should target.
+
+        Returns an ordered list of invocation ids that are "active"
+        with respect to the triggering drift. The primary source is
+        the reconciler's invocation bookkeeping (goldfive#151
+        introduced the ``_invocation_agent`` / ``_invocation_parent``
+        maps). When the reconciler is unavailable or empty, falls
+        back to the drift's ``current_agent_id``-keyed invocation
+        (best effort via the adapter's active-context invocation id)
+        and finally returns an empty list.
+
+        Tree-agnostic: the method does NOT special-case "the
+        coordinator" or "the root agent" — it targets whichever
+        invocation matches the drift's context and lets the plugin's
+        child-propagation logic flag the rest of the sub-tree.
+        """
+        candidates: list[str] = []
+        reconciler = getattr(session, "_reconciler", None)
+        if reconciler is None:
+            # The steerer doesn't hold a direct reference to the
+            # reconciler; the adapter's plugin does. Walk it via the
+            # adapter when the plugin exposes the attribute.
+            adapter = self._adapter
+            plugin = getattr(adapter, "_plugin", None) if adapter is not None else None
+            reconciler = getattr(plugin, "_reconciler", None) if plugin is not None else None
+        if reconciler is not None:
+            try:
+                inv_agent = getattr(reconciler, "_invocation_agent", None)
+                if isinstance(inv_agent, Mapping) and drift.current_agent_id:
+                    # Match by agent name — most drifts carry
+                    # ``current_agent_id`` set to the running agent's name.
+                    for inv_id, agent_name in inv_agent.items():
+                        if agent_name == drift.current_agent_id and inv_id:
+                            candidates.append(str(inv_id))
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "DefaultSteerer._resolve_active_invocation_ids: "
+                    "reconciler lookup raised: %s",
+                    exc,
+                )
+        # Fallback: the adapter's plugin pins a top-level invocation_id
+        # for the currently-driving dispatch. When the reconciler lookup
+        # produced nothing, the top-level id is the best we can do —
+        # cancel propagation from there will flag any sub-invocations.
+        if not candidates:
+            adapter = self._adapter
+            plugin = getattr(adapter, "_plugin", None) if adapter is not None else None
+            top = str(getattr(plugin, "_top_invocation_id", "") or "")
+            if top:
+                candidates.append(top)
+        return candidates
+
+    async def request_invocation_cancel(
+        self,
+        *,
+        drift: DriftEvent,
+        session: Session,
+    ) -> list[str]:
+        """Flag the invocation(s) associated with ``drift`` for
+        cooperative cancellation (goldfive#251 Stream C / 7a).
+
+        Called from :meth:`_handle_drift` and
+        :meth:`_promote_drift_to_steer` when the drift's severity is
+        CRITICAL — the only tier on the ladder that reaches the hard
+        cancel per the severity decision. INFO / WARNING drifts flow
+        through their usual nudge / absorb paths without touching
+        this method.
+
+        Writes a :class:`~goldfive.types.CancellationRequest` onto the
+        adapter's plugin state for every resolved active invocation
+        id. The plugin propagates to children automatically. Returns
+        the list of flagged invocation ids (including children) for
+        observability; callers can log / sink-emit from the list.
+
+        Guard rails:
+
+        * No-op when no adapter is bound.
+        * No-op when no active invocation can be resolved (e.g. the
+          drift was synthesized before any agent turn started) — this
+          is the "empty invocation-id guard" called out in the brief.
+        * Tolerates missing plugin methods (third-party adapters that
+          don't implement :meth:`request_invocation_cancel`) by
+          falling through silently; the rest of the ladder (refine,
+          restart message) still runs and eventually catches up at
+          the next task boundary.
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return []
+        plugin = getattr(adapter, "_plugin", None)
+        if plugin is None:
+            return []
+        fn = getattr(plugin, "request_invocation_cancel", None)
+        if not callable(fn):
+            return []
+        invocation_ids = self._resolve_active_invocation_ids(drift, session)
+        if not invocation_ids:
+            # Empty invocation-id guard — drift has no identifiable
+            # in-flight invocation. Don't fabricate one; the cancel
+            # would misfire on whatever invocation happens to share a
+            # blank id. The drift still observed, refine still runs;
+            # cancel is a best-effort add-on.
+            log.debug(
+                "DefaultSteerer.request_invocation_cancel: no active invocation "
+                "for drift kind=%s agent=%s task=%s — skipping cancel",
+                drift.kind.value,
+                drift.current_agent_id or "-",
+                drift.current_task_id or "-",
+            )
+            return []
+        # Build the request once and reuse for every targeted id so
+        # sink events from propagation share a common fingerprint.
+        import time as _time_mod
+
+        request = CancellationRequest(
+            invocation_id=invocation_ids[0],
+            reason=self._cancel_reason_for_drift(drift),
+            severity=drift.severity,
+            drift_id=str(getattr(drift, "id", "") or ""),
+            drift_kind=drift.kind.value,
+            requested_at_ms=int(_time_mod.time() * 1000),
+            detail=(drift.detail or "")[:200],
+        )
+        flagged: list[str] = []
+        for inv_id in invocation_ids:
+            try:
+                result = fn(invocation_id=inv_id, request=request)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "DefaultSteerer.request_invocation_cancel: "
+                    "plugin.request_invocation_cancel(%s) raised: %s",
+                    inv_id,
+                    exc,
+                )
+                continue
+            if isinstance(result, list):
+                flagged.extend(str(x) for x in result)
+            else:
+                flagged.append(inv_id)
+        if flagged:
+            log.info(
+                "DefaultSteerer.request_invocation_cancel: flagged "
+                "invocations=%s for drift kind=%s severity=%s",
+                flagged,
+                drift.kind.value,
+                drift.severity.value,
+            )
+        return flagged
+
+    @staticmethod
+    def _should_request_cancel_for_drift(drift: DriftEvent) -> bool:
+        """Decide whether a drift warrants a cooperative cancel.
+
+        Severity ladder (goldfive#251 design decision):
+
+        * ``DriftSeverity.INFO`` — never cancels. Info drifts are
+          either periodic-check signals or soft one-shots; cancel
+          would be disproportionate.
+        * ``DriftSeverity.WARNING`` — never cancels. Warning drifts
+          route to the existing ABSORB / NUDGE ladder paths; the
+          refined plan lands on the next task boundary without
+          preempting the in-flight turn.
+        * ``DriftSeverity.CRITICAL`` — cancels. The in-flight turn's
+          output is likely to contaminate its parent's transcript
+          (stale prompt, wrong scope, broken tool); short-circuit
+          cleanly and let the parent see ``{"status": "cancelled"}``.
+
+        User-authored drifts (``USER_STEER`` / ``USER_CANCEL`` /
+        ``USER_PAUSE``) bypass the severity gate — an operator
+        directive must be honoured even when the ControlMessage-to-
+        DriftEvent coercion landed on a lower severity tier.
+        """
+        if drift.kind in (
+            DriftKind.USER_STEER,
+            DriftKind.USER_CANCEL,
+            DriftKind.USER_PAUSE,
+        ):
+            return True
+        return drift.severity is DriftSeverity.CRITICAL
+
+    @staticmethod
+    def _cancel_reason_for_drift(drift: DriftEvent) -> str:
+        """Map a drift into a short symbolic reason for the
+        :class:`~goldfive.types.CancellationRequest`.
+
+        USER_STEER / USER_CANCEL / USER_PAUSE get the matching
+        ``"user_*"`` shorthand; everything else uses ``"drift"`` as
+        the generic tag. The reason is OPERATOR-visible only (lives
+        on the InvocationCancelled sink event), so this string is
+        free to be descriptive without prompt-injection concerns.
+        """
+        kind = drift.kind
+        if kind is DriftKind.USER_STEER:
+            return "user_steer"
+        if kind is DriftKind.USER_CANCEL:
+            return "user_cancel"
+        if kind is DriftKind.USER_PAUSE:
+            return "user_pause"
+        return "drift"
 
     # ------------------------------------------------------------------
     # goldfive-steer-unification: promotion policy + handler
