@@ -49,6 +49,7 @@ from goldfive.drift.reasoning import (
 __all__ = [
     "EmbeddingConfig",
     "GoalDriftConfig",
+    "JudgeConfig",
     "ReasoningDriftConfig",
     "RuntimeConfig",
     "ToolLoopConfig",
@@ -226,6 +227,61 @@ class EmbeddingConfig:
 
 
 @dataclasses.dataclass
+class JudgeConfig:
+    """Configuration for a dedicated LLM endpoint for goldfive's judges.
+
+    When ``base_url`` is set, :func:`goldfive.wrap` routes the two
+    LLM-as-a-judge drift detectors (the trajectory-level GOAL_DRIFT
+    judge from goldfive#218 and the per-thinking-message
+    reasoning-drift judge from goldfive#226) through this dedicated
+    endpoint instead of inheriting the tree's LLM. Planner and
+    goal_deriver keep using the tree's LLM — only the judges split
+    off.
+
+    This lets operators run the judges on a cheap local model (e.g.
+    a llama.cpp / Ollama endpoint) while the tree's agent keeps
+    billing against a cloud model. Without ``JudgeConfig``, the
+    detect_llm path silently inherits the tree's LLM for the judges
+    as well; see the named-model WARNING in :func:`goldfive.wrap`
+    for the guardrail that surfaces that inheritance.
+
+    When ``base_url`` is ``None`` (the default), the explicit
+    ``goldfive.wrap(call_llm=...)`` argument — or the auto-detected
+    tree LLM — is used for the judges. Precedence order:
+
+    1. Explicit ``goldfive.wrap(call_llm=...)`` kwarg.
+    2. ``JudgeConfig.base_url``.
+    3. Auto-detected LLM from the agent (``detect_llm``).
+    """
+
+    base_url: str | None = None
+    model: str = ""
+    api_key: str | None = None
+    timeout_ms: int = 10_000
+
+    @classmethod
+    def from_env(cls) -> JudgeConfig:
+        """Read ``GOLDFIVE_JUDGE_*`` env vars into an instance.
+
+        Missing vars fall back to the field defaults. Mirrors the
+        shape of :meth:`EmbeddingConfig.from_env`.
+        """
+        defaults = cls()
+        return cls(
+            base_url=_read_optional_str_env(
+                "GOLDFIVE_JUDGE_BASE_URL", defaults.base_url
+            ),
+            model=_read_str_env("GOLDFIVE_JUDGE_MODEL", defaults.model),
+            api_key=_read_optional_str_env(
+                "GOLDFIVE_JUDGE_API_KEY", defaults.api_key
+            ),
+            timeout_ms=_read_int_env(
+                "GOLDFIVE_JUDGE_TIMEOUT_MS", defaults.timeout_ms
+            ),
+        )
+
+
+@dataclasses.dataclass
 class ToolLoopConfig:
     """Configuration for :class:`~goldfive.drift.tool_loops.ToolLoopTracker`.
 
@@ -395,12 +451,13 @@ class RuntimeConfig:
         default_factory=ReasoningDriftConfig
     )
     goal_drift: GoalDriftConfig = dataclasses.field(default_factory=GoalDriftConfig)
+    judge: JudgeConfig = dataclasses.field(default_factory=JudgeConfig)
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
         """Build a :class:`RuntimeConfig` by reading every supported env var.
 
-        Aggregates the four sub-``from_env`` calls. Each sub-config is
+        Aggregates the sub-``from_env`` calls. Each sub-config is
         independent: a missing env var in one subsystem does not affect
         the others. The result is a fresh instance; callers may mutate
         it in place or :func:`dataclasses.replace` to derive a variant.
@@ -410,4 +467,5 @@ class RuntimeConfig:
             tool_loops=ToolLoopConfig.from_env(),
             reasoning_drift=ReasoningDriftConfig.from_env(),
             goal_drift=GoalDriftConfig.from_env(),
+            judge=JudgeConfig.from_env(),
         )

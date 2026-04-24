@@ -31,6 +31,7 @@ import goldfive  # noqa: E402
 from goldfive.config import (  # noqa: E402
     EmbeddingConfig,
     GoalDriftConfig,
+    JudgeConfig,
     ReasoningDriftConfig,
     RuntimeConfig,
     ToolLoopConfig,
@@ -252,3 +253,122 @@ def test_default_steerer_get_tool_loop_config_returns_stashed() -> None:
     assert steerer.get_tool_loop_config() is cfg
     bare = DefaultSteerer()
     assert bare.get_tool_loop_config() is None
+
+
+# ---------------------------------------------------------------------------
+# JudgeConfig routing (goldfive silent-disarm follow-up)
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_uses_judge_config_over_detected_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``JudgeConfig.base_url`` wins over the auto-detected tree LLM.
+
+    When both an auto-detectable agent LLM AND a :class:`JudgeConfig`
+    are present, the two drift judges should be wired from the
+    JudgeConfig endpoint -- not from ``detect_llm``. Planner +
+    goal_deriver still use the detected LLM; only the judges split.
+    """
+    import goldfive.convenience as _conv
+
+    detected_call_llm = _StubCallable("detected")
+    judge_call_llm = _StubCallable("from-judge-config")
+
+    def _fake_detect(_agent: Any) -> tuple[Any, str]:
+        return detected_call_llm, "detected-tree-model"
+
+    def _fake_build(cfg: JudgeConfig) -> tuple[Any, str]:
+        assert cfg.base_url == "http://judge:9000"
+        return judge_call_llm, cfg.model
+
+    monkeypatch.setattr(_conv, "detect_llm", _fake_detect)
+    monkeypatch.setattr(_conv, "_build_judge_call_llm", _fake_build)
+
+    runtime = RuntimeConfig(
+        judge=JudgeConfig(base_url="http://judge:9000", model="judge-model"),
+    )
+    runner = goldfive.wrap(_noop_agent, runtime=runtime, sinks=[])
+
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    # Judges use the JudgeConfig-built callable, NOT the detected one.
+    assert steerer._reasoning_drift_call_llm is judge_call_llm
+    assert steerer._goal_drift_call_llm is judge_call_llm
+    assert steerer._reasoning_drift_model == "judge-model"
+    assert steerer._goal_drift_model == "judge-model"
+
+
+def test_wrap_explicit_call_llm_wins_over_judge_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit ``call_llm=`` trumps both ``JudgeConfig`` and ``detect_llm``."""
+    import goldfive.convenience as _conv
+
+    explicit = _StubCallable("explicit")
+
+    def _must_not_build(_cfg: Any) -> Any:
+        raise AssertionError("JudgeConfig path should be suppressed")
+
+    monkeypatch.setattr(_conv, "_build_judge_call_llm", _must_not_build)
+
+    runtime = RuntimeConfig(
+        judge=JudgeConfig(base_url="http://should-not-build:9000"),
+    )
+    runner = goldfive.wrap(
+        _noop_agent,
+        call_llm=explicit,
+        model="explicit-model",
+        runtime=runtime,
+        sinks=[],
+    )
+
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    assert steerer._goal_drift_call_llm is explicit
+    assert steerer._reasoning_drift_call_llm is explicit
+    assert steerer._goal_drift_model == "explicit-model"
+
+
+def test_wrap_falls_back_when_judge_config_build_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``JudgeConfig`` build failure falls back to the detected LLM."""
+    import goldfive.convenience as _conv
+
+    detected = _StubCallable("detected")
+
+    def _fake_detect(_agent: Any) -> tuple[Any, str]:
+        return detected, "tree-model"
+
+    def _fail_build(_cfg: Any) -> None:
+        return None  # openai SDK missing / client construction failed
+
+    monkeypatch.setattr(_conv, "detect_llm", _fake_detect)
+    monkeypatch.setattr(_conv, "_build_judge_call_llm", _fail_build)
+
+    runtime = RuntimeConfig(
+        judge=JudgeConfig(base_url="http://judge:9000"),
+    )
+    runner = goldfive.wrap(_noop_agent, runtime=runtime, sinks=[])
+
+    steerer = runner.steerer
+    assert isinstance(steerer, DefaultSteerer)
+    # Falls back to the detected callable rather than disarming judges.
+    assert steerer._goal_drift_call_llm is detected
+    assert steerer._reasoning_drift_call_llm is detected
+
+
+class _StubCallable:
+    """Marker-only callable for identity assertions.
+
+    Shape-compatible with :data:`goldfive._llm_detect.CallLLM`: async
+    callable returning a string. We never actually invoke it in these
+    tests -- the assertions are on identity, not behaviour.
+    """
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    async def __call__(self, system: str, user: str, model: str) -> str:
+        return f"{self._label}:{model}"

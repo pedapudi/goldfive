@@ -176,22 +176,37 @@ def detect_llm(agent: Any) -> tuple[CallLLM, str] | None:
     """Detect an LLM surface on ``agent`` and return ``(call_llm, model)``.
 
     Currently only ADK agents are supported. Returns ``None`` for
-    non-ADK shapes, for ADK agents without a resolvable model, or when
-    the ADK optional dep is not installed.
+    non-ADK shapes, for ADK agents without a resolvable model, when
+    the ADK optional dep is not installed, **or for any unexpected
+    exception during traversal**. The outer try/except is a
+    belt-and-suspenders guard: `goldfive.wrap()` now calls this on
+    every wrap regardless of whether ``planner`` / ``goal_deriver``
+    are provided (the judges need the callable too), so a latent
+    exception in a sub-agent's ``.model`` getter or a broken
+    ``tools[*].agent`` reference would fault the whole wrap. Returning
+    ``None`` on any failure keeps the degradation graceful; the
+    caller logs a WARNING and falls back to unarmed judges.
     """
-    if not _looks_like_adk_agent(agent):
+    try:
+        if not _looks_like_adk_agent(agent):
+            return None
+        model = _extract_adk_model(agent)
+        if model is None:
+            return None
+        call_llm = make_default_adk_call_llm(model)
+        if call_llm is None:
+            return None
+        model_name = getattr(model, "model", None) or (
+            model if isinstance(model, str) else ""
+        )
+        return call_llm, str(model_name or "")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "detect_llm: unexpected failure traversing %s (%s); returning None",
+            type(agent).__name__,
+            exc,
+        )
         return None
-
-    model = _extract_adk_model(agent)
-    if model is None:
-        return None
-
-    call_llm = make_default_adk_call_llm(model)
-    if call_llm is None:
-        return None
-
-    model_name = getattr(model, "model", None) or (model if isinstance(model, str) else "")
-    return call_llm, str(model_name or "")
 
 
 __all__ = ["CallLLM", "detect_llm", "make_default_adk_call_llm"]

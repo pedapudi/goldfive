@@ -22,6 +22,7 @@ import pytest
 from goldfive.config import (
     EmbeddingConfig,
     GoalDriftConfig,
+    JudgeConfig,
     ReasoningDriftConfig,
     RuntimeConfig,
     ToolLoopConfig,
@@ -282,6 +283,59 @@ def test_goal_drift_config_from_env_subset(
 
 
 # ---------------------------------------------------------------------------
+# JudgeConfig
+# ---------------------------------------------------------------------------
+
+
+def test_judge_config_defaults() -> None:
+    """Defaults route judges to inherit the tree LLM (``base_url=None``)."""
+    cfg = JudgeConfig()
+    assert cfg.base_url is None
+    assert cfg.model == ""
+    assert cfg.api_key is None
+    assert cfg.timeout_ms == 10_000
+
+
+def test_judge_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """All four ``GOLDFIVE_JUDGE_*`` env vars map to fields."""
+    monkeypatch.setenv("GOLDFIVE_JUDGE_BASE_URL", "http://judge.local:9000")
+    monkeypatch.setenv("GOLDFIVE_JUDGE_MODEL", "qwen3-judge")
+    monkeypatch.setenv("GOLDFIVE_JUDGE_API_KEY", "judge-token")
+    monkeypatch.setenv("GOLDFIVE_JUDGE_TIMEOUT_MS", "3500")
+    cfg = JudgeConfig.from_env()
+    assert cfg.base_url == "http://judge.local:9000"
+    assert cfg.model == "qwen3-judge"
+    assert cfg.api_key == "judge-token"
+    assert cfg.timeout_ms == 3500
+
+
+def test_judge_config_from_env_subset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing env vars fall back to the built-in defaults."""
+    for name in (
+        "GOLDFIVE_JUDGE_BASE_URL",
+        "GOLDFIVE_JUDGE_MODEL",
+        "GOLDFIVE_JUDGE_API_KEY",
+        "GOLDFIVE_JUDGE_TIMEOUT_MS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GOLDFIVE_JUDGE_BASE_URL", "http://partial-judge:1234")
+    cfg = JudgeConfig.from_env()
+    assert cfg.base_url == "http://partial-judge:1234"
+    assert cfg.model == ""
+    assert cfg.api_key is None
+    assert cfg.timeout_ms == 10_000
+
+
+def test_judge_config_empty_base_url_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whitespace-only ``GOLDFIVE_JUDGE_BASE_URL`` is treated as unset."""
+    monkeypatch.setenv("GOLDFIVE_JUDGE_BASE_URL", "   ")
+    cfg = JudgeConfig.from_env()
+    assert cfg.base_url is None
+
+
+# ---------------------------------------------------------------------------
 # RuntimeConfig
 # ---------------------------------------------------------------------------
 
@@ -293,6 +347,18 @@ def test_runtime_config_defaults() -> None:
     assert cfg.tool_loops == ToolLoopConfig()
     assert cfg.reasoning_drift == ReasoningDriftConfig()
     assert cfg.goal_drift == GoalDriftConfig()
+    assert cfg.judge == JudgeConfig()
+
+
+def test_runtime_config_includes_judge() -> None:
+    """``RuntimeConfig.judge`` is present and independently replaceable."""
+    cfg = RuntimeConfig()
+    # Field is accessible and mutable (frozen=False).
+    cfg.judge.base_url = "http://judge:9000"
+    assert cfg.judge.base_url == "http://judge:9000"
+    # Fresh instance keeps original default (no cross-contamination).
+    fresh = RuntimeConfig()
+    assert fresh.judge.base_url is None
 
 
 def test_runtime_config_from_env_aggregates_all_four(
@@ -303,11 +369,13 @@ def test_runtime_config_from_env_aggregates_all_four(
     monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_WINDOW", "14")
     monkeypatch.setenv("GOLDFIVE_DRIFT_CONFUSION_MIN_HITS", "6")
     monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL", "7")
+    monkeypatch.setenv("GOLDFIVE_JUDGE_BASE_URL", "http://judge-agg:9001")
     cfg = RuntimeConfig.from_env()
     assert cfg.embedding.base_url == "http://agg:7000"
     assert cfg.tool_loops.window == 14
     assert cfg.reasoning_drift.confusion_min_hits == 6
     assert cfg.goal_drift.check_interval == 7
+    assert cfg.judge.base_url == "http://judge-agg:9001"
 
 
 def test_runtime_config_equality_and_mutable_semantics() -> None:
