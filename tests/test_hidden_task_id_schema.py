@@ -214,19 +214,27 @@ async def test_hidden_task_id_populates_from_state() -> None:
 
 
 async def test_hidden_task_id_is_noop_when_state_empty() -> None:
-    """No pin anywhere → the dispatch returns a no-op acknowledgment.
+    """No pin anywhere + no candidates in plan → bare silent ack.
 
-    This replaces an earlier "fail with no_task_pinned error" contract.
-    The error variant crashed the LLM's reporting protocol when
-    goldfive's refine moved an agent's assigned work to another agent
-    (e.g. a coordinator whose own tasks were superseded into
-    sub-agent tasks). Observed live: the LLM saw the error and
+    This replaces an earlier "fail with no_task_pinned error" contract
+    (goldfive#250). The error variant crashed the LLM's reporting
+    protocol when goldfive's refine moved an agent's assigned work to
+    another agent (e.g. a coordinator whose own tasks were superseded
+    into sub-agent tasks). Observed live: the LLM saw the error and
     reasoned "task started report didn't work, let me proceed directly
     with the research_agent call," bypassing the reporting contract
-    entirely. Returning a silent no-op acknowledgment keeps the
-    agent's protocol intact; observability is preserved via an INFO
+    entirely.
+
+    The response must be EXACTLY ``{"acknowledged": True}`` — no
+    ``detail`` / ``no_task_pinned`` keys (goldfive#250 follow-up). Tool
+    responses go back to the LLM verbatim and any editorialising string
+    is treated as actionable context: live research_agent paraphrased
+    a ``detail`` string into its reasoning and proceeded with stale
+    pre-refine instructions. Observability is preserved via an INFO
     log from the plugin.
     """
+    # No plan attached — the agent has zero candidates, the
+    # orchestration-only-turn branch applies.
     plugin, state, captured, _ = _make_plugin_with_handler("report_task_started")
     # Deliberately not setting KEY_CURRENT_TASK_ID or pending_delegations.
 
@@ -236,15 +244,109 @@ async def test_hidden_task_id_is_noop_when_state_empty() -> None:
         tool_args=args,
         tool_context=_Ctx(state),
     )
-    assert result == {
-        "acknowledged": True,
-        "no_task_pinned": True,
-        "detail": (
-            "no task currently bound to this agent; "
-            "report recorded as orchestration-only no-op"
-        ),
-    }
+    assert result == {"acknowledged": True}
     # Handler not invoked — captured stays empty (nothing to report on).
+    assert captured == []
+
+
+def _ambiguous_plan_for(agent_name: str = "coordinator") -> Plan:
+    """Two PENDING tasks both assigned to ``agent_name`` → pin is
+    ambiguous (>1 single-match candidates), but the agent DOES have
+    work in the plan."""
+    return Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="t-alpha",
+                title="Alpha",
+                description="First task",
+                assignee_agent_id=agent_name,
+                status=TaskStatus.PENDING,
+            ),
+            Task(
+                id="t-beta",
+                title="Beta",
+                description="Second task",
+                assignee_agent_id=agent_name,
+                status=TaskStatus.PENDING,
+            ),
+        ],
+        edges=[],
+        summary="Ambiguous",
+    )
+
+
+async def test_pin_unresolved_when_agent_has_candidates() -> None:
+    """Agent has PENDING candidates but the pin couldn't resolve
+    (ambiguous — >1 match) → surface a structured ``pin_unresolved``
+    error instead of silently ack-ing. A silent ack here would mask
+    a real stall (goldfive#250 follow-up)."""
+    plan = _ambiguous_plan_for("coordinator")
+    plugin, state, captured, _ = _make_plugin_with_handler(
+        "report_task_started", plan=plan
+    )
+    # No KEY_CURRENT_TASK_ID / pending_delegations wired — resolution
+    # fails despite the agent having candidates.
+
+    args: dict[str, Any] = {"detail": "starting"}
+    result = await plugin.before_tool_callback(
+        tool=_Tool("report_task_started"),
+        tool_args=args,
+        tool_context=_Ctx(state),
+    )
+    assert result == {"acknowledged": False, "error": "pin_unresolved"}
+    assert captured == []
+
+
+def _dag_gated_plan_for(agent_name: str = "coordinator") -> Plan:
+    """PENDING task assigned to ``agent_name`` but upstream is NOT
+    COMPLETED. The agent has a candidate, but it's DAG-gated — the
+    agent's turn shouldn't be happening yet, which is ALSO a stall
+    worth surfacing rather than silencing (goldfive#250 follow-up)."""
+    return Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="t-upstream",
+                title="Upstream",
+                description="Precursor work",
+                assignee_agent_id="other_agent",
+                status=TaskStatus.PENDING,  # NOT COMPLETED
+            ),
+            Task(
+                id="t-gated",
+                title="Gated",
+                description="Downstream work",
+                assignee_agent_id=agent_name,
+                status=TaskStatus.PENDING,
+            ),
+        ],
+        edges=[TaskEdge(from_task_id="t-upstream", to_task_id="t-gated")],
+        summary="DAG-gated",
+    )
+
+
+async def test_pin_unresolved_when_candidate_is_dag_gated() -> None:
+    """Agent has a PENDING candidate but it's upstream-gated. Even
+    though the DAG gate would reject it for the pin, the agent still
+    has work in the plan, so the pin failure is a stall worth
+    surfacing — return ``pin_unresolved`` rather than silent-ack."""
+    plan = _dag_gated_plan_for("coordinator")
+    plugin, state, captured, _ = _make_plugin_with_handler(
+        "report_task_started", plan=plan
+    )
+
+    args: dict[str, Any] = {"detail": "starting"}
+    result = await plugin.before_tool_callback(
+        tool=_Tool("report_task_started"),
+        tool_args=args,
+        tool_context=_Ctx(state),
+    )
+    assert result == {"acknowledged": False, "error": "pin_unresolved"}
     assert captured == []
 
 
