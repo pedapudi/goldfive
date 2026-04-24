@@ -193,6 +193,85 @@ def severity_rank(sev: DriftSeverity | str) -> int:
 
 
 @dataclasses.dataclass
+class CancellationRequest:
+    """Cooperative-cancellation directive for one in-flight invocation (goldfive#251).
+
+    Written by :class:`~goldfive.steerer.DefaultSteerer` into the ADK
+    ``session.state`` under
+    :data:`goldfive.adapters._adk_state_protocol.KEY_CANCEL_REQUESTED`
+    (a ``dict[str, CancellationRequest]`` keyed by ``invocation_id``)
+    when a drift at CRITICAL severity warrants aborting the in-flight
+    adapter dispatch without tearing down the whole run.
+
+    Every adapter callback that can short-circuit a dispatch
+    (``before_agent_callback``, ``before_model_callback``,
+    ``before_tool_callback``) checks the flag keyed by the current
+    ``invocation_id`` at the top of the callback. When set, the
+    callback consumes the request (read-then-clear), emits an
+    ``InvocationCancelled`` sink event carrying the rich context, and
+    short-circuits the dispatch:
+
+    * ``before_agent_callback`` — returns without invoking the agent.
+    * ``before_tool_callback`` — returns ``{"status": "cancelled"}`` as
+      the tool response so the parent LLM sees a minimal, prompt-safe
+      marker (rich context stays in the sink event, NOT in the
+      LLM-visible response — see goldfive#250 / #252 / #253 lessons).
+    * ``before_model_callback`` — skips the LLM call.
+
+    The rich ``CancellationRequest`` is deliberately NOT the object
+    surfaced to the LLM. It exists for PROGRAMMATIC consumers
+    (harmonograf observability, future Stream D correction-injection
+    logic). The LLM-visible surface is the flat ``{"status":
+    "cancelled"}`` dict above.
+
+    Fields
+    ------
+    invocation_id:
+        ADK ``invocation_id`` of the dispatch this request targets.
+        Cancellation is agent-AGNOSTIC — a parent-child chain of
+        invocations is handled by propagating a separate request per
+        invocation_id, not by naming an agent role.
+    reason:
+        Short symbolic reason (``"drift"``, ``"user_steer"``,
+        ``"plan_revised"``, …). Free-form string; consumers pattern-
+        match prefixes when useful, but the wire contract is just "a
+        string for the sink event".
+    severity:
+        Severity of the triggering drift. Only CRITICAL reaches cancel
+        per the severity ladder (goldfive#142); recorded here so sink
+        consumers can differentiate a user-requested cancel (always
+        honoured regardless of severity) from a graduated-drift cancel.
+    drift_id:
+        Cross-reference to the triggering ``DriftEvent.id`` when this
+        request was minted from a drift. Empty string for user-control
+        cancels or programmatic calls with no drift origin.
+    requested_at_ms:
+        Wall-clock milliseconds at request time. Defaults to 0 so
+        the structure is a cheap ``dataclass()`` literal in tests; the
+        steerer's cancel-request path stamps it on mint.
+    """
+
+    invocation_id: str
+    reason: str = "drift"
+    severity: DriftSeverity = DriftSeverity.CRITICAL
+    drift_id: str = ""
+    requested_at_ms: int = 0
+    # Free-form human-readable detail for operator-visible sink events.
+    # NOT exposed to the LLM (the LLM-visible response is
+    # ``{"status": "cancelled"}`` with no reason/detail/drift_kind — see
+    # lessons from goldfive#250 / #252 / #253). Populated by the steerer
+    # with a short one-line description of why cancel fired so
+    # harmonograf's intervention aggregator has something to render.
+    detail: str = ""
+    # Drift kind that triggered the cancel, if any. Sink-event only;
+    # never reaches the LLM. Stored as the string value of
+    # :class:`DriftKind` rather than the enum itself to keep the
+    # dataclass serialisable by plain ``dataclasses.asdict`` without
+    # importing the enum registry.
+    drift_kind: str = ""
+
+
+@dataclasses.dataclass
 class Task:
     id: str
     title: str
