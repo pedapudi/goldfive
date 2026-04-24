@@ -777,6 +777,70 @@ class LLMPlanner:
             "sequence_fn": seq_fn,
         }
 
+    # ---- span decoration helpers ----------------------------------------
+    #
+    # These compose the ``input_preview`` / ``target_*`` / decision-summary
+    # strings used by the ``goldfive_llm_span`` wrap sites inside the
+    # planner (refine / refine_steer / refine_looping_tool_call /
+    # plan_generate / synthesize_goal_from_steer). Extracted so tests can
+    # assert the exact payload without re-deriving it from drift / plan
+    # internals, and so the callers stay short.
+
+    @staticmethod
+    def _build_refine_span_input_preview(
+        drift: DriftEvent,
+        plan: Plan,
+    ) -> str:
+        """Render the ``input_preview`` string for a refine-type span.
+
+        Mirrors :meth:`DefaultSteerer._build_refine_input_summary` on the
+        steerer's ``PlanRevised`` event but lives here because the
+        planner's span emission has to fire before the PlanRevised event
+        does — duplicating the format keeps the two strings consistent
+        so frontends that render both render the same summary.
+        """
+        parts: list[str] = []
+        parts.append(f"drift: {drift.kind.value}/{drift.severity.value}")
+        if drift.current_task_id:
+            parts.append(f"task: {drift.current_task_id}")
+        if drift.current_agent_id:
+            parts.append(f"agent: {drift.current_agent_id}")
+        if drift.detail:
+            parts.append(f"detail: {drift.detail}")
+        tasks = getattr(plan, "tasks", None) or []
+        plan_line = f"current plan: rev{plan.revision_index}, {len(tasks)} task(s)"
+        if tasks:
+            titles = [
+                f"{t.id} ({str(getattr(t, 'status', '') or '').lower()})"
+                for t in tasks[:8]
+            ]
+            plan_line += ": " + ", ".join(titles)
+        parts.append(plan_line)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _build_refine_span_output_preview(revised: Plan) -> str:
+        """Render the ``output_preview`` for a successful refine result."""
+        tasks = getattr(revised, "tasks", None) or []
+        parts: list[str] = [
+            f"revision_index={revised.revision_index}",
+            f"tasks={len(tasks)}",
+        ]
+        assignees = sorted(
+            {
+                str(t.assignee_agent_id or "")
+                for t in tasks
+                if getattr(t, "assignee_agent_id", "")
+            }
+        )
+        if assignees:
+            parts.append("assignees=[" + ", ".join(assignees) + "]")
+        titles = [str(getattr(t, "title", "") or "") for t in tasks[:6]]
+        titles = [t for t in titles if t]
+        if titles:
+            parts.append("titles=[" + ", ".join(titles) + "]")
+        return " | ".join(parts)
+
     # ---- prompt builders -------------------------------------------------
 
     @staticmethod
@@ -1426,6 +1490,10 @@ class LLMPlanner:
         allow_reject: bool = False,
         available_agents: list[str] | list[dict[str, Any]] | None = None,
         span_name: str = "refine",
+        span_input_preview: str = "",
+        span_target_agent_id: str = "",
+        span_target_task_id: str = "",
+        span_decision_prefix: str = "refine",
     ) -> tuple[Plan | None, str, bool]:
         """Run the retry loop for a single refine call.
 
@@ -1458,9 +1526,32 @@ class LLMPlanner:
         last_error = ""
         attempts = max(1, self._max_refine_attempts)
         for attempt in range(1, attempts + 1):
+            # Per-attempt span. decision_summary / output_preview is
+            # stamped inside the with-block; the outer retry loop's
+            # parse/validate branches don't see the handle. The span
+            # therefore carries "what the LLM returned" rather than
+            # "what the validator decided" — the validator's verdict
+            # becomes the aggregated refine outcome on the enclosing
+            # ``PlanRevised`` event (which already carries
+            # ``refine_output_summary``). This split keeps the span
+            # emission lean inside the tight retry loop.
+            span_kwargs = self._span_kwargs(task_id_override=span_target_task_id)
             try:
-                async with goldfive_llm_span(**self._span_kwargs(), name=span_name):
+                async with goldfive_llm_span(
+                    **span_kwargs,
+                    name=span_name,
+                    input_preview=span_input_preview,
+                    target_agent_id=span_target_agent_id,
+                    target_task_id=span_target_task_id,
+                ) as span:
                     raw = await self._call_llm(system_prompt, user_prompt, self._model)
+                    span.output_preview = (
+                        raw[:4096] if isinstance(raw, str) else "(non-str response)"
+                    )
+                    span.decision_summary = (
+                        f"{span_decision_prefix} attempt {attempt}/{attempts}: "
+                        f"LLM returned {len(raw) if isinstance(raw, str) else 0} chars"
+                    )
             except Exception as exc:  # noqa: BLE001 -- retry on transient LLM errors
                 last_error = f"call_llm raised: {exc}"
                 log.warning(
@@ -1733,15 +1824,40 @@ class LLMPlanner:
         run_id = ""
         if context is not None:
             run_id = str(context.get("run_id") or "")
+        # ``plan_generate`` is trajectory-level: the initial plan
+        # precedes any task binding so ``target_agent_id`` /
+        # ``target_task_id`` stay empty. A compact user-request + goals
+        # rendering doubles as ``input_preview`` so harmonograf can
+        # render "what was goldfive planning for?" on the Gantt.
+        user_request = ""
+        if context is not None:
+            user_request = str(context.get("user_request") or "")
+        goal_lines = [
+            f"- [{g.id or '(no-id)'}] {g.summary or '(no summary)'}" for g in goals
+        ]
+        generate_input_preview = (
+            (f"user_request: {user_request}\n\n" if user_request else "")
+            + "goals:\n"
+            + "\n".join(goal_lines)
+        )
         user_prompt = base_prompt
         last_error = ""
         attempts = max(1, self._max_refine_attempts)
         for attempt in range(1, attempts + 1):
             try:
                 async with goldfive_llm_span(
-                    **self._span_kwargs(), name="plan_generate"
-                ):
+                    **self._span_kwargs(),
+                    name="plan_generate",
+                    input_preview=generate_input_preview,
+                ) as span:
                     raw = await self._call_llm(self._system_prompt, user_prompt, self._model)
+                    span.output_preview = (
+                        raw[:4096] if isinstance(raw, str) else "(non-str response)"
+                    )
+                    span.decision_summary = (
+                        f"plan_generate attempt {attempt}/{attempts}: "
+                        f"LLM returned {len(raw) if isinstance(raw, str) else 0} chars"
+                    )
             except Exception as exc:  # noqa: BLE001
                 last_error = f"call_llm raised: {exc}"
                 log.warning(
@@ -1916,6 +2032,7 @@ class LLMPlanner:
         # exhausting retries. Other callers keep the legacy "parse or
         # bust" semantics.
         allow_reject = use_divergence_prompt or bool(self._user_steer_goals(goals))
+        refine_input_preview = self._build_refine_span_input_preview(drift, plan)
         revised, last_error, rejected = await self._call_and_validate_refine(
             system_prompt=system_prompt,
             base_user_prompt=base_user_prompt,
@@ -1925,6 +2042,10 @@ class LLMPlanner:
             allow_reject=allow_reject,
             available_agents=available_agents,
             span_name="refine",
+            span_input_preview=refine_input_preview,
+            span_target_agent_id=drift.current_agent_id or "",
+            span_target_task_id=drift.current_task_id or "",
+            span_decision_prefix=f"refine ({drift.kind.value})",
         )
         if rejected:
             # LLM judged the divergence off-goal. Return None so the
@@ -2083,6 +2204,7 @@ class LLMPlanner:
                 )
             return revised
 
+        refine_input_preview = self._build_refine_span_input_preview(drift, plan)
         revised, last_error, _rejected = await self._call_and_validate_refine(
             system_prompt=self._looping_tool_call_system_prompt,
             base_user_prompt=base_user_prompt,
@@ -2092,6 +2214,10 @@ class LLMPlanner:
             log_prefix="LLMPlanner._refine_looping_tool_call",
             available_agents=available_agents,
             span_name="refine_looping_tool_call",
+            span_input_preview=refine_input_preview,
+            span_target_agent_id=drift.current_agent_id or "",
+            span_target_task_id=drift.current_task_id or "",
+            span_decision_prefix="refine_looping_tool_call",
         )
         if revised is None:
             # Retries exhausted. Signal the failure explicitly, then
@@ -2314,13 +2440,30 @@ class LLMPlanner:
         # goldfive-promoted drift — surface that on the span name so
         # operators can distinguish them on the Gantt.
         span_name = "refine_user_steer" if source != "goldfive" else "refine_steer"
+        refine_input_preview = self._build_refine_span_input_preview(drift, plan)
         try:
             async with goldfive_llm_span(
                 **self._span_kwargs(task_id_override=drift.current_task_id),
                 name=span_name,
-            ):
+                input_preview=refine_input_preview,
+                target_agent_id=drift.current_agent_id or "",
+                target_task_id=drift.current_task_id or "",
+            ) as span:
                 raw = await self._call_llm(
                     self._user_steer_system_prompt, user_prompt, self._model
+                )
+                span.output_preview = (
+                    raw[:4096] if isinstance(raw, str) else "(non-str response)"
+                )
+                decision_prefix = (
+                    "refined plan (goldfive steer) in response to"
+                    if source == "goldfive"
+                    else "refined plan (user steer) in response to"
+                )
+                span.decision_summary = (
+                    f"{decision_prefix} "
+                    f"{drift.kind.value} on "
+                    f"{drift.current_task_id or '(trajectory)'}"
                 )
         except Exception as exc:  # noqa: BLE001
             return None, f"call_llm raised: {exc}"
@@ -2464,12 +2607,21 @@ class LLMPlanner:
 
         try:
             async with goldfive_llm_span(
-                **self._span_kwargs(), name="synthesize_goal_from_steer"
-            ):
+                **self._span_kwargs(),
+                name="synthesize_goal_from_steer",
+                input_preview=body,
+            ) as span:
                 raw = await self._call_llm(
                     self._SYNTHESIZE_GOAL_SYSTEM_PROMPT,
                     user_prompt,
                     self._model,
+                )
+                span.output_preview = (
+                    raw[:4096] if isinstance(raw, str) else "(non-str response)"
+                )
+                span.decision_summary = (
+                    "synthesized goal from user steer "
+                    f"({len(body)}-char body)"
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning(

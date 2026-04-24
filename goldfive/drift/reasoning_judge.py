@@ -315,6 +315,17 @@ async def classify_reasoning_drift(
     from goldfive._llm_span import goldfive_llm_span
 
     span_sinks = [sink] if sink is not None else []
+    # Stamp the reasoning block goldfive is judging onto the span's
+    # ``input_preview`` so harmonograf can render "what did the judge
+    # see?" inline on the Gantt without re-fetching the agent transcript.
+    # Truncated by the helper.
+    span_input_preview = reasoning if isinstance(reasoning, str) else ""
+
+    on_task_parsed: bool | None = None
+    severity_str = ""
+    reason = ""
+    drift: DriftEvent | None = None
+    parsed: dict[str, Any] | None = None
     try:
         async with goldfive_llm_span(
             sinks=span_sinks,
@@ -324,8 +335,58 @@ async def classify_reasoning_drift(
             run_id=run_id,
             task_id=current_task_id,
             sequence_fn=sequence_fn,
-        ):
+            input_preview=span_input_preview,
+            target_agent_id=current_agent_id,
+            target_task_id=current_task_id,
+        ) as span:
             raw = await call_llm(system, user, model)
+            # Parse inside the with-block so we can stamp
+            # decision-context onto the span before the End event fires
+            # on exit. The heavier handling (log.info, DriftEvent
+            # construction) still runs post-with so span emission stays
+            # lean.
+            raw_str_inline = raw if isinstance(raw, str) else ""
+            parsed = _parse_response(raw)
+            if parsed is not None:
+                on_task_raw = parsed.get("on_task")
+                if isinstance(on_task_raw, bool):
+                    on_task_parsed = on_task_raw
+                    reason = str(parsed.get("reason", "") or "").strip()
+                    if not on_task_raw:
+                        severity_str = _severity_from_verdict(
+                            parsed.get("severity")
+                        ).value.lower()
+            # Build the span's output / decision strings from the parsed
+            # verdict so harmonograf can render "judged agent/task:
+            # on-task" inline.
+            if on_task_parsed is None:
+                span.output_preview = (
+                    f"unparseable verdict; raw={raw_str_inline[:200]!r}"
+                )
+                span.decision_summary = (
+                    f"reasoning-judge call on "
+                    f"{current_agent_id or '(no-agent)'}"
+                    f"/{current_task_id or '(no-task)'}: "
+                    "unparseable verdict"
+                )
+            else:
+                span.output_preview = (
+                    f"on_task={on_task_parsed}, "
+                    f"severity={severity_str or '(none)'}, "
+                    f"reason={reason or '(none)'}"
+                )
+                if on_task_parsed:
+                    verdict_str = "on-task"
+                else:
+                    verdict_str = (
+                        f"off-task ({severity_str.upper()})"
+                        if severity_str
+                        else "off-task"
+                    )
+                span.decision_summary = (
+                    f"judged {current_agent_id or '(no-agent)'}'s reasoning "
+                    f"on {current_task_id or '(no-task)'}: {verdict_str}"
+                )
     except Exception as exc:  # noqa: BLE001 - never break the run
         log.warning(
             "classify_reasoning_drift: call_llm raised %s; no drift emitted",
@@ -341,59 +402,48 @@ async def classify_reasoning_drift(
             len(raw_str),
             raw_str[:500],
         )
-    parsed = None if call_failed else _parse_response(raw)
-    on_task_parsed: bool | None = None
-    severity_str = ""
-    reason = ""
-    drift: DriftEvent | None = None
-    if parsed is None:
-        if not call_failed:
-            log.debug(
-                "classify_reasoning_drift: response was not JSON (raw=%r); "
-                "no drift emitted",
-                raw_str[:200],
-            )
-    else:
-        on_task_raw = parsed.get("on_task")
-        if not isinstance(on_task_raw, bool):
+    if parsed is None and not call_failed:
+        log.debug(
+            "classify_reasoning_drift: response was not JSON (raw=%r); "
+            "no drift emitted",
+            raw_str[:200],
+        )
+    elif parsed is not None:
+        if on_task_parsed is None:
             log.debug(
                 "classify_reasoning_drift: parsed=%r lacks boolean 'on_task' "
                 "key; no drift emitted",
                 parsed,
             )
+        elif on_task_parsed:
+            log.debug(
+                "classify_reasoning_drift: judge says on-track (reason=%r)",
+                reason,
+            )
         else:
-            on_task_parsed = on_task_raw
-            reason = str(parsed.get("reason", "") or "").strip()
-            if on_task_raw:
-                log.debug(
-                    "classify_reasoning_drift: judge says on-track (reason=%r)",
-                    reason,
-                )
-            else:
-                severity_enum = _severity_from_verdict(parsed.get("severity"))
-                severity_str = severity_enum.value.lower()
-                log.info(
-                    "classify_reasoning_drift: drift detected (severity=%s, "
-                    "reason=%r); emitting OFF_TOPIC event",
-                    severity_enum.value,
-                    reason,
-                )
-                detail = (
-                    f"reasoning drift: {reason}"
-                    if reason
-                    else "reasoning drift detected (judge returned no reason)"
-                )
-                drift = DriftEvent(
-                    kind=DriftKind.OFF_TOPIC,
-                    severity=severity_enum,
-                    detail=detail,
-                    current_task_id=current_task_id,
-                    current_agent_id=current_agent_id,
-                    raw=reasoning,
-                    trigger_input=truncate_for_observability(
-                        reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
-                    ),
-                )
+            severity_enum = _severity_from_verdict(parsed.get("severity"))
+            log.info(
+                "classify_reasoning_drift: drift detected (severity=%s, "
+                "reason=%r); emitting OFF_TOPIC event",
+                severity_enum.value,
+                reason,
+            )
+            detail = (
+                f"reasoning drift: {reason}"
+                if reason
+                else "reasoning drift detected (judge returned no reason)"
+            )
+            drift = DriftEvent(
+                kind=DriftKind.OFF_TOPIC,
+                severity=severity_enum,
+                detail=detail,
+                current_task_id=current_task_id,
+                current_agent_id=current_agent_id,
+                raw=reasoning,
+                trigger_input=truncate_for_observability(
+                    reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
+                ),
+            )
     # Emit ReasoningJudgeInvoked on every invocation, regardless of
     # verdict. Done after the drift decision so the event carries the
     # parsed outcome but independent of it — on-task, off-task, and
