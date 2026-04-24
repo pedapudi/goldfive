@@ -2595,15 +2595,14 @@ def make_adk_plugin(
             id, and an optional tool name when the cancel fired at a
             tool-dispatch checkpoint.
 
-            Uses :func:`goldfive.events.make_event` (dict envelope)
-            rather than a proto envelope because the proto schema
-            doesn't yet carry an ``InvocationCancelled`` message —
-            adding a new proto + regen would expand the scope of this
-            change beyond Stream C. Dict events round-trip through the
-            same sink fan-out (``goldfive.events.emit``) as proto
-            events, so harmonograf's ingest path can handle both. A
-            follow-up proto slot can be minted if / when sink-side
-            strict typing is needed.
+            Uses the typed
+            :func:`goldfive.events.invocation_cancelled_event` factory
+            (proto path). The dict-envelope path that Stream C (PR
+            #259) shipped to dodge a proto regen has been removed —
+            consumers that haven't picked up the typed message must
+            update. The harmonograf-side switch off its placeholder
+            ``harmonograf.v1.InvocationCancelled`` lands as a separate
+            submodule-bump PR (Wave 2 / A8).
 
             Best-effort: every failure is logged and swallowed —
             observability must never block a callback.
@@ -2639,25 +2638,23 @@ def make_adk_plugin(
                 drift_id = str(_safe_attr(request, "drift_id", "") or "")
                 drift_kind = str(_safe_attr(request, "drift_kind", "") or "")
                 detail = str(_safe_attr(request, "detail", "") or "")
-            payload: dict[str, Any] = {
-                "invocation_id": str(invocation_id or ""),
-                "agent_name": str(agent_name or ""),
-                "reason": reason,
-                "severity": severity,
-                "drift_id": drift_id,
-                "drift_kind": drift_kind,
-                "detail": detail,
-            }
-            if tool_name:
-                payload["tool_name"] = str(tool_name)
             try:
-                from goldfive.events import emit, make_event  # noqa: PLC0415 — lazy
+                from goldfive.events import (  # noqa: PLC0415 — lazy
+                    emit,
+                    invocation_cancelled_event,
+                )
 
-                evt = make_event(
+                evt = invocation_cancelled_event(
                     run_id,
                     seq,
-                    "invocation_cancelled",
-                    payload,
+                    invocation_id=str(invocation_id or ""),
+                    agent_name=str(agent_name or ""),
+                    reason=reason,
+                    severity=severity,
+                    drift_id=drift_id,
+                    drift_kind=drift_kind,
+                    detail=detail,
+                    tool_name=str(tool_name or ""),
                     session_id=session_id,
                 )
                 await emit(sinks, evt)
