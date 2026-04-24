@@ -48,6 +48,7 @@ module is gated so ``import goldfive.adapters.adk`` raises a clear
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import uuid
 from collections.abc import Mapping
@@ -94,6 +95,16 @@ def _build_ack_shim(name: str, description: str):
     with a proper ``__name__`` / docstring for the model to see. The
     real handler routing happens in the plugin's
     ``before_tool_callback`` — this shim is never actually executed.
+
+    The returned function's ``__signature__`` is set explicitly so ADK's
+    :class:`FunctionTool` introspection generates a declaration with
+    only the LLM-author parameters — ``task_id`` is deliberately
+    omitted (goldfive#241). The plugin's ``before_tool_callback`` fills
+    ``task_id`` in from session state before the handler runs; exposing
+    it in the schema led LLMs to either hallucinate bad values or
+    abandon the reporting protocol entirely (live evidence: "the
+    function is still trying to use a task_id parameter even though
+    the schema says it doesn't require any parameters").
     """
 
     def _shim(**kwargs: Any) -> dict[str, Any]:
@@ -105,11 +116,72 @@ def _build_ack_shim(name: str, description: str):
     return _shim
 
 
+# Declared-for-LLM signatures for the built-in reporting tools
+# (goldfive#241 Item 3). Keys are the canonical tool names from
+# :mod:`goldfive.reporting`; values are the list of :class:`inspect.Parameter`
+# entries the ADK FunctionTool will expose to the model. ``task_id`` is
+# deliberately absent from every entry — the plugin's
+# ``before_tool_callback`` resolves it from session state, so the
+# model never sees the field in the tool declaration and cannot
+# abandon the protocol over optional-arg confusion.
+#
+# Callers that register custom reporting tools via
+# :meth:`ADKAdapter.register_reporting_tools` fall back to the legacy
+# ``**kwargs`` signature if their tool name isn't in this map; the
+# injection path in the plugin still hides ``task_id`` from them by
+# stamping it from state before the handler runs.
+def _reporting_tool_signatures() -> dict[str, list[inspect.Parameter]]:
+    P = inspect.Parameter
+    return {
+        "report_task_started": [
+            P("detail", P.KEYWORD_ONLY, default="", annotation=str),
+        ],
+        "report_task_progress": [
+            P("detail", P.KEYWORD_ONLY, default="", annotation=str),
+            P("fraction", P.KEYWORD_ONLY, default=None, annotation=float | None),
+        ],
+        "report_task_completed": [
+            P("summary", P.KEYWORD_ONLY, default="", annotation=str),
+        ],
+        "report_task_failed": [
+            P("reason", P.KEYWORD_ONLY, default="", annotation=str),
+            P("recoverable", P.KEYWORD_ONLY, default=None, annotation=bool | None),
+        ],
+        "report_task_blocked": [
+            P("blocker", P.KEYWORD_ONLY, default="", annotation=str),
+            P("needed", P.KEYWORD_ONLY, default="", annotation=str),
+        ],
+    }
+
+
+def _apply_llm_signature(shim: Any, tool_name: str) -> None:
+    """Attach a restricted ``__signature__`` to ``shim`` so ADK's
+    FunctionTool builds a declaration that hides ``task_id``.
+
+    No-op when ``tool_name`` isn't one of the built-ins — custom
+    reporting tools keep the permissive ``**kwargs`` signature they
+    had pre-#241 (the plugin's task_id injection still runs for them).
+    """
+    params_map = _reporting_tool_signatures()
+    params = params_map.get(tool_name)
+    if params is None:
+        return
+    try:
+        shim.__signature__ = inspect.Signature(parameters=params)
+    except (TypeError, ValueError) as exc:
+        log.debug(
+            "_apply_llm_signature: could not attach signature for %s: %s",
+            tool_name,
+            exc,
+        )
+
+
 def _build_function_tool(spec: ReportingToolSpec) -> Any:
     """Wrap a :class:`ReportingToolSpec` as a ``google.adk.tools.FunctionTool``."""
     from google.adk.tools import FunctionTool  # type: ignore
 
     shim = _build_ack_shim(spec.name, spec.description)
+    _apply_llm_signature(shim, spec.name)
     return FunctionTool(shim)
 
 
@@ -1065,6 +1137,15 @@ class ADKAdapter:
         # goldfive#139 and
         # :func:`_build_cancelled_response_event` for the content map.
         self._next_cancel_reason: str = ""
+        # Handle to the asyncio.Task currently executing
+        # :meth:`_invoke_internal` — captured via ``asyncio.current_task()``
+        # at entry and cleared in the ``finally`` block. Used by
+        # :meth:`request_cancel` (goldfive#241) to fire ``task.cancel()``
+        # on the in-flight invocation from a goldfive-promoted steer so
+        # the contaminated LLM call terminates early instead of running
+        # to completion while the steerer queues a restart for the next
+        # turn. ``None`` when no invocation is in-flight.
+        self._inflight_invoke_task: asyncio.Task[Any] | None = None
         # Outer session id pinned by :class:`GoldfiveADKAgent` when the
         # adapter runs inside adk-web. ``None`` for programmatic callers
         # and test harnesses; the adapter falls back to the lazy-uuid
@@ -1318,6 +1399,47 @@ class ADKAdapter:
         """
         self._steerer = steerer
 
+    async def request_cancel(self, reason: str) -> None:
+        """Cancel the in-flight ADK invocation so a goldfive-promoted
+        steer takes effect immediately rather than on the next turn.
+
+        goldfive#241 — the pre-unification goldfive-steer path (see
+        :meth:`goldfive.steerer.DefaultSteerer._promote_drift_to_steer`)
+        tagged ``_next_cancel_reason`` and queued a restart message but
+        left the in-flight ``runner.run_async`` stream running to
+        completion. Observed consequence: the coordinator kept writing
+        the contaminated reasoning / tool calls into the session for
+        tens of seconds after the drift fired, and the restart landed
+        only on the next turn. This method fires ``task.cancel()`` on
+        the asyncio task currently inside :meth:`_invoke_internal` so
+        the ``generate_content_async`` stream raises ``CancelledError``
+        and the adapter's standard heal path runs with the tag we just
+        stamped on ``_next_cancel_reason``.
+
+        ``reason`` is informational — the ``_next_cancel_reason`` tag
+        is already set by the steerer before this call; we log it here
+        purely for the operator log.
+
+        No-op when no invocation is in-flight (e.g. the drift fires
+        between turns) or when the pinned task is already finished —
+        the steerer's restart message still arrives on the next turn.
+        Never raises: adapters that ignore cancel still get the queued
+        restart via the pre-existing pathway.
+        """
+        task = self._inflight_invoke_task
+        if task is None or task.done():
+            log.debug(
+                "ADKAdapter.request_cancel(reason=%r): no in-flight "
+                "invocation; no-op",
+                reason,
+            )
+            return
+        log.info(
+            "adapter.request_cancel(reason=%r): cancelling in-flight invocation",
+            reason,
+        )
+        task.cancel()
+
     async def emit_reasoning(
         self,
         text: str,
@@ -1513,6 +1635,11 @@ class ADKAdapter:
         self._pending_tool_call_ids.clear()
         self._pending_tool_call_names.clear()
         was_cancelled = False
+        # Pin the task driving this invocation so request_cancel() can
+        # fire ``task.cancel()`` mid-stream (goldfive#241). Cleared in
+        # the ``finally`` block below so a stale handle cannot target
+        # the next invocation.
+        self._inflight_invoke_task = asyncio.current_task()
         try:
             async for event in self._runner.run_async(
                 user_id=self._user_id,
@@ -1633,6 +1760,9 @@ class ADKAdapter:
                     state.pop(SESSION_CONTEXT_STATE_KEY, None)  # type: ignore[attr-defined]
                 except Exception:
                     pass
+            # Release the in-flight task handle so a later
+            # request_cancel() cannot target a completed invocation.
+            self._inflight_invoke_task = None
 
         return InvocationResult(
             task_id=task_id,

@@ -381,6 +381,50 @@ still as a complete JSON plan, not an empty object).
 
 
 # ---------------------------------------------------------------------------
+# Shared refinement-guidance block (issue #241)
+# ---------------------------------------------------------------------------
+#
+# When a drift triggers refine, the LLM planner's free choice over
+# assignees and DAG shape is the source of two empirically-observed
+# failure modes:
+#
+#   1. Single-agent drift (e.g. research_agent wanders off-topic) gets
+#      "corrected" by reassigning the replacement to a different agent
+#      (e.g. web_developer_agent). The corrective work lands on an
+#      agent that has no relevant context.
+#   2. Multi-stage plans collapse to a single task on refine, because
+#      the LLM treats "refine" as "propose a simpler alternative" when
+#      the actual intent is a minimal correction.
+#
+# The guidance block below steers the planner toward the conservative
+# default (preserve the assignee + DAG shape, emit ``supersedes`` on
+# the replacement) and reserves restructuring for the cases where the
+# drift indicates the agent itself is the problem. Shared across the
+# refine prompt builders so the same contract applies to every refine
+# path that can reshape the plan in response to a drift.
+_REFINEMENT_GUIDANCE_BLOCK = (
+    "REFINEMENT GUIDANCE:\n"
+    "- The drift you're correcting is usually \"small\" — a single "
+    "agent produced off-topic or flawed output on a task it's "
+    "otherwise capable of. Default pattern: replace the drifted task "
+    "with a corrected variant, KEEP THE SAME `assignee_agent_id`, "
+    "and populate `supersedes: <old_task_id>` on the replacement. "
+    "Preserve the surrounding DAG structure (edges, sibling tasks, "
+    "stage count).\n"
+    "- Only reshape the plan (reassign tasks to different agents, "
+    "collapse stages, drop tasks) when the drift indicates the "
+    "agent is systemically incapable — repeated failures on the "
+    "same task, tool errors it can't recover from, refusal-by-the-"
+    "agent, or a pattern the original agent has already failed at.\n"
+    "- Do NOT collapse a multi-stage plan to a single task unless "
+    "the user request genuinely warrants it.\n"
+    "- The `supersedes` field is required on every replacement — "
+    "it's how runtime routing re-pins reports from the old task "
+    "to the new one."
+)
+
+
+# ---------------------------------------------------------------------------
 # JSON parsing helpers (ported from harmonograf_client.planner)
 # ---------------------------------------------------------------------------
 
@@ -1093,6 +1137,7 @@ class LLMPlanner:
             "preserve these verbatim at the start of the returned plan; "
             f"do NOT repeat them in your response):\n{history_json}\n\n"
             f"{directive_header}\n{note}\n\n"
+            f"{_REFINEMENT_GUIDANCE_BLOCK}\n\n"
             f"{invariants}\n\n"
             f"{closing}"
         )
@@ -1624,6 +1669,7 @@ class LLMPlanner:
             f"Current plan:\n{plan_json}\n\n"
             f"Drift event:\n{drift_json}\n\n"
             f"{observed_block}"
+            f"{_REFINEMENT_GUIDANCE_BLOCK}\n\n"
             f"{invariants_block}\n\n"
             "If the plan should change in light of this drift event, respond "
             "with an updated JSON plan using the same schema. If no change "
@@ -1973,6 +2019,7 @@ class LLMPlanner:
             f"Other unfinished tasks (you may keep, drop, or rework):\n"
             f"{json.dumps(others, default=str)}\n\n"
             f"Drift detail:\n{drift.detail}\n\n"
+            f"{_REFINEMENT_GUIDANCE_BLOCK}\n\n"
             f"{invariants_block}\n\n"
             "Generate the updated plan. Respond with JSON only."
         )
