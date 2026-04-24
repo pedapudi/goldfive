@@ -56,15 +56,29 @@ class ListSink:
 
     @property
     def proto_events(self) -> list[Any]:
-        """Return only the proto ``Event`` envelopes recorded.
+        """Return only the per-status proto ``Event`` envelopes recorded.
 
         goldfive a4 added dict-envelope events (``refine_attempted`` /
         ``refine_failed`` / correlation ``plan_revised``) on the same
-        sink fan-out. Tests that assert on proto event order can use
-        this filter to ignore the dict sidecars while still exercising
+        sink fan-out. goldfive#251 R4 added ``task_transitioned`` proto
+        envelopes — observability-only, attached after every per-status
+        envelope. Tests that assert on proto event order can use
+        this filter to ignore both the dict sidecars and the R4
+        observability events while still exercising
         the production emit path.
         """
-        return [e for e in self.events if hasattr(e, "WhichOneof")]
+        out: list[Any] = []
+        for e in self.events:
+            which = getattr(e, "WhichOneof", None)
+            if which is None:
+                continue
+            try:
+                if which("payload") == "task_transitioned":
+                    continue
+            except Exception:
+                pass
+            out.append(e)
+        return out
 
     @property
     def dict_events(self) -> list[dict[str, Any]]:
@@ -169,9 +183,11 @@ async def test_mark_task_running_transitions_and_emits() -> None:
     assert _task(session, "t1").status is TaskStatus.RUNNING
     assert session.current_task_id == "t1"
     assert session.agent_notes["t1"] == "kicking off"
-    assert len(sink.events) == 1
-    evt = sink.events[0]
-    assert evt.WhichOneof("payload") == "task_started"
+    # task_started + the goldfive#251 R4 task_transitioned observability
+    # envelope.
+    started = [e for e in sink.events if e.WhichOneof("payload") == "task_started"]
+    assert len(started) == 1
+    evt = started[0]
     assert evt.task_started.task_id == "t1"
     assert evt.task_started.detail == "kicking off"
     assert evt.run_id == "r1"
@@ -199,6 +215,7 @@ async def test_mark_task_progress_records_and_emits() -> None:
     assert session.agent_notes["t1"] == "halfway"
     # Status is untouched by progress updates.
     assert _task(session, "t1").status is TaskStatus.PENDING
+    # progress is a liveness tick; no transition event from R4.
     assert len(sink.events) == 1
     evt = sink.events[0]
     assert evt.WhichOneof("payload") == "task_progress"
@@ -225,9 +242,11 @@ async def test_mark_task_completed_transitions_and_emits() -> None:
     )
     assert _task(session, "t1").status is TaskStatus.COMPLETED
     assert session.completed_results["t1"] == "done-zo"
-    assert len(sink.events) == 1
-    evt = sink.events[0]
-    assert evt.WhichOneof("payload") == "task_completed"
+    completed = [
+        e for e in sink.events if e.WhichOneof("payload") == "task_completed"
+    ]
+    assert len(completed) == 1
+    evt = completed[0]
     assert evt.task_completed.task_id == "t1"
     assert evt.task_completed.summary == "done-zo"
     assert dict(evt.task_completed.artifacts) == {"file": "out.txt"}
@@ -241,8 +260,8 @@ async def test_mark_task_failed_recoverable_fires_drift() -> None:
     # TaskFailed + DriftDetected + refine-failure DriftDetected (planner
     # returns None so no PlanRevised; the follow-up drift surfaces that).
     assert kinds == ["task_failed", "drift_detected", "drift_detected"]
-    assert sink.events[0].task_failed.recoverable is True
-    drift_evt = sink.events[1]
+    assert sink.proto_events[0].task_failed.recoverable is True
+    drift_evt = sink.proto_events[1]
     # Proto enum DriftKind values: first check by semantic comparison via module.
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -262,14 +281,14 @@ async def test_mark_task_failed_fatal_fires_critical_drift() -> None:
     # would see the post-cascade plan shape.
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["task_failed", "task_cancelled", "drift_detected", "drift_detected"]
-    assert sink.events[0].task_failed.task_id == "t1"
-    assert sink.events[0].task_failed.recoverable is False
+    assert sink.proto_events[0].task_failed.task_id == "t1"
+    assert sink.proto_events[0].task_failed.recoverable is False
     # Downstream cascade picked up t2 via the shared primitive.
-    assert sink.events[1].task_cancelled.task_id == "t2"
+    assert sink.proto_events[1].task_cancelled.task_id == "t2"
     # goldfive#205: cascade reason is structured as ``upstream_failed:<source_id>``
     # so harmonograf's Trajectory view can render "why was this task cancelled?".
-    assert sink.events[1].task_cancelled.reason == "upstream_failed:t1"
-    drift_evt = sink.events[2]
+    assert sink.proto_events[1].task_cancelled.reason == "upstream_failed:t1"
+    drift_evt = sink.proto_events[2]
     from goldfive.pb.goldfive.v1 import types_pb2
 
     assert drift_evt.drift_detected.kind == types_pb2.DRIFT_KIND_TASK_FAILED_FATAL
@@ -302,12 +321,13 @@ async def test_mark_task_cancelled_transitions() -> None:
     await steerer.mark_task_cancelled("t1", session=session, reason="user cancelled")
     assert _task(session, "t1").status is TaskStatus.CANCELLED
     assert _task(session, "t2").status is TaskStatus.CANCELLED
-    assert len(sink.events) == 2
-    assert sink.events[0].WhichOneof("payload") == "task_cancelled"
-    assert sink.events[0].task_cancelled.task_id == "t1"
-    assert sink.events[0].task_cancelled.reason == "user cancelled"
-    assert sink.events[1].WhichOneof("payload") == "task_cancelled"
-    assert sink.events[1].task_cancelled.task_id == "t2"
+    cancelled = [
+        e for e in sink.events if e.WhichOneof("payload") == "task_cancelled"
+    ]
+    assert len(cancelled) == 2
+    assert cancelled[0].task_cancelled.task_id == "t1"
+    assert cancelled[0].task_cancelled.reason == "user cancelled"
+    assert cancelled[1].task_cancelled.task_id == "t2"
 
 
 async def test_transition_dispatches_to_mark_methods() -> None:
@@ -819,7 +839,12 @@ async def test_event_sequence_is_monotonic_and_run_id_stamped() -> None:
     await steerer.mark_task_running("t1", session=session)
     await steerer.mark_task_progress("t1", session=session, fraction=0.5)
     await steerer.mark_task_completed("t1", session=session, summary="ok")
-    assert [e.sequence for e in sink.events] == [0, 1, 2]
+    # mark_task_running and mark_task_completed each emit a per-status
+    # envelope plus a goldfive#251 R4 task_transitioned envelope; progress
+    # is a liveness tick (no transition). 5 envelopes total, monotonic.
+    seqs = [e.sequence for e in sink.events]
+    assert seqs == sorted(seqs)
+    assert seqs == list(range(len(seqs)))
     for e in sink.events:
         assert e.run_id == "r1"
         # emitted_at is a Timestamp — just sanity check it's populated.
@@ -1136,7 +1161,8 @@ async def test_bind_replaces_sinks() -> None:
     session = _make_session()
     await steerer.mark_task_running("t1", session=session)
     assert sink_a.events == []
-    assert len(sink_b.events) == 1
+    # task_started + R4 task_transitioned.
+    assert len(sink_b.events) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1171,8 +1197,11 @@ async def test_mark_task_cancelled_cascades_to_downstream_pending() -> None:
     # then BFS downstream).
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["task_cancelled", "task_cancelled", "task_cancelled"]
-    reasons = [e.task_cancelled.reason for e in sink.events]
-    ids = [e.task_cancelled.task_id for e in sink.events]
+    cancelled_evts = [
+        e for e in sink.events if e.WhichOneof("payload") == "task_cancelled"
+    ]
+    reasons = [e.task_cancelled.reason for e in cancelled_evts]
+    ids = [e.task_cancelled.task_id for e in cancelled_evts]
     assert ids == ["t1", "t2", "t3"]
     # The initiator keeps the caller's reason; the cascaded tasks
     # carry a structured ``upstream_failed:<initiator>`` reason
@@ -1238,7 +1267,11 @@ async def test_mark_task_cancelled_multiple_downstream_paths() -> None:
 
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["task_cancelled"] * 4
-    ids = [e.task_cancelled.task_id for e in sink.events]
+    ids = [
+        e.task_cancelled.task_id
+        for e in sink.events
+        if e.WhichOneof("payload") == "task_cancelled"
+    ]
     # t1 first; then its direct children (t2, t3 in edge-order); then t4.
     # De-duplication: t4 appears exactly once despite two paths.
     assert ids[0] == "t1"
@@ -1262,7 +1295,9 @@ async def test_mark_task_cancelled_does_not_re_cancel() -> None:
 
     await steerer.mark_task_cancelled("t1", session=session, reason="first")
     first_event_count = len(sink.events)
-    assert first_event_count == 2  # t1 + cascaded t2
+    # t1 task_cancelled + R4 task_transitioned + cascaded t2 task_cancelled
+    # + R4 task_transitioned = 4 envelopes.
+    assert first_event_count == 4
 
     # Second call on the same already-terminal task: no new events.
     await steerer.mark_task_cancelled("t1", session=session, reason="again")

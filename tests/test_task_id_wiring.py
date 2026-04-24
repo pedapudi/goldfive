@@ -74,16 +74,30 @@ class _RecordingSteerer:
         self.transitions: list[tuple[str, Any, str]] = []
         self.drifts: list[Any] = []
 
-    async def mark_task_running(self, task_id: str, *, session: Any, detail: str = "") -> None:
+    async def mark_task_running(
+        self, task_id: str, *, session: Any, detail: str = "", **_: Any
+    ) -> None:
         self.transitions.append((task_id, "RUNNING", detail))
 
     async def mark_task_progress(
-        self, task_id: str, *, session: Any, fraction: float = 0.0, detail: str = ""
+        self,
+        task_id: str,
+        *,
+        session: Any,
+        fraction: float = 0.0,
+        detail: str = "",
+        **_: Any,
     ) -> None:
         self.transitions.append((task_id, "PROGRESS", detail))
 
     async def mark_task_completed(
-        self, task_id: str, *, session: Any, summary: str = "", artifacts: Any = None
+        self,
+        task_id: str,
+        *,
+        session: Any,
+        summary: str = "",
+        artifacts: Any = None,
+        **_: Any,
     ) -> None:
         self.transitions.append((task_id, "COMPLETED", summary))
 
@@ -94,11 +108,18 @@ class _RecordingSteerer:
         session: Any,
         reason: str = "",
         recoverable: bool = True,
+        **_: Any,
     ) -> None:
         self.transitions.append((task_id, "FAILED", reason))
 
     async def mark_task_blocked(
-        self, task_id: str, *, session: Any, blocker: str = "", needed: str = ""
+        self,
+        task_id: str,
+        *,
+        session: Any,
+        blocker: str = "",
+        needed: str = "",
+        **_: Any,
     ) -> None:
         self.transitions.append((task_id, "BLOCKED", blocker))
 

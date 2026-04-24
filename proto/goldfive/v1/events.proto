@@ -74,6 +74,7 @@ message Event {
     GoldfiveLLMCallStart goldfive_llm_call_start = 32;
     GoldfiveLLMCallEnd goldfive_llm_call_end = 33;
     InvocationCancelled invocation_cancelled = 34;
+    TaskTransitioned task_transitioned = 35;
   }
 }
 
@@ -650,4 +651,83 @@ message InvocationCancelled {
   // ``before_agent_callback`` / ``before_model_callback`` where no
   // specific tool was in flight.
   string tool_name = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Plan-state transition observability (goldfive#251 R4)
+// ---------------------------------------------------------------------------
+
+// Emitted on EVERY successful task status transition with source
+// attribution so operators can answer "who moved this task and why".
+// Sink-only — the LLM's ``report_task_*`` surface still returns
+// ``{"acknowledged": True}``; this event is operator observability
+// (audit trail + Gantt rendering).
+//
+// Pairs with the ``task_transition_refused`` dict event from the
+// pin-versioning audit (#266): refused attempts emit the dict refusal
+// payload and DO NOT emit ``TaskTransitioned`` (no transition
+// happened). Successful transitions emit this typed proto envelope.
+//
+// ``source`` is a short symbolic vocabulary; readers MUST tolerate
+// unknown values (forward-compat) and SHOULD render them as-is when
+// surfacing to operators. Defined values:
+//
+//   * ``"llm_report"``        — driven by an LLM ``report_task_*``
+//                                tool call with an explicit ``task_id``
+//                                arg.
+//   * ``"handler_default"``    — driven by an LLM ``report_task_*``
+//                                tool call where ``task_id`` was
+//                                resolved from the adapter-stamped
+//                                pin (``goldfive.current_task_id``)
+//                                rather than an explicit arg.
+//   * ``"supersedes_reroute"`` — driven by an LLM report on a
+//                                superseded task that the report-time
+//                                pin classifier (#266) routed to the
+//                                REPLACE-kind successor.
+//   * ``"plan_revision"``      — refine changed the task's status (e.g.
+//                                stamped FAILED on a looping task,
+//                                CANCELLED on a supersede).
+//   * ``"cancellation"``       — cooperative cancellation (#251 Stream
+//                                C) transitioned a running task as a
+//                                consequence (cascade-cancel from a
+//                                CRITICAL drift).
+//   * ``"other"``              — any transition that doesn't match a
+//                                more specific source (e.g. framework
+//                                auto-start, control-message rewinds).
+//                                Operators can still surface the row;
+//                                a follow-up may refine the vocabulary.
+message TaskTransitioned {
+  // The task that transitioned. After supersedes-reroute this is the
+  // SUCCESSOR task id (the one whose status actually changed), not the
+  // pin the LLM quoted.
+  string task_id = 1;
+  // ``TaskStatus`` enum value as the bare lowercase string (e.g.
+  // ``"PENDING"``, ``"RUNNING"``, ``"COMPLETED"``). Recorded as a
+  // string (not the enum) so consumers can render without a lookup
+  // and so unknown future statuses round-trip without proto-regen.
+  string from_status = 2;
+  string to_status = 3;
+  // Source attribution — see the message comment for the defined
+  // vocabulary. Always non-empty on emitted events; readers MUST
+  // tolerate unknown strings.
+  string source = 4;
+  // Plan revision in effect at transition time. Mirrors
+  // ``Plan.revision_index`` of ``session.plan`` at emit time so
+  // operators can correlate transitions with the revision that drove
+  // them (especially useful for supersedes-reroute and plan-revision
+  // sources). Recorded as ``int32`` rather than ``uint32`` for parity
+  // with the existing convention in this file (e.g. revision-driven
+  // counters elsewhere); negative values are not produced.
+  int32 revision_stamp = 5;
+  // Agent the transition was attributed to — usually
+  // ``Task.assignee_agent_id`` for the transitioning task. Empty when
+  // unbound (e.g. CANCELLED via cascade-from-upstream where the
+  // assignee field on the cascaded task was empty). Bare ADK name
+  // (harmonograf sink canonicalises to compound).
+  string agent_name = 6;
+  // ADK ``invocation_id`` for the dispatch that drove this transition,
+  // when resolvable. Empty for transitions not tied to a specific
+  // in-flight invocation (e.g. plan-revision-driven CANCELLED) and on
+  // adapters that don't surface an invocation_id. Best-effort.
+  string invocation_id = 7;
 }

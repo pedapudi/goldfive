@@ -681,6 +681,7 @@ class DefaultSteerer:
         detail: str = "",
         session: Session,
         cancel_reason: str = "",
+        source: str = "other",
     ) -> None:
         """Generic transition entry point.
 
@@ -711,19 +712,21 @@ class DefaultSteerer:
         FAILED.
         """
         if to is TaskStatus.RUNNING:
-            await self.mark_task_running(task_id, session=session, detail=detail)
+            await self.mark_task_running(task_id, session=session, detail=detail, source=source)
         elif to is TaskStatus.COMPLETED:
-            await self.mark_task_completed(task_id, summary=detail, session=session)
+            await self.mark_task_completed(
+                task_id, summary=detail, session=session, source=source
+            )
         elif to is TaskStatus.FAILED:
             reason = cancel_reason or detail
-            await self.mark_task_failed(task_id, reason=reason, session=session)
+            await self.mark_task_failed(task_id, reason=reason, session=session, source=source)
         elif to is TaskStatus.BLOCKED:
-            await self.mark_task_blocked(task_id, blocker=detail, session=session)
+            await self.mark_task_blocked(task_id, blocker=detail, session=session, source=source)
         elif to is TaskStatus.CANCELLED:
             reason = cancel_reason or detail
-            await self.mark_task_cancelled(task_id, reason=reason, session=session)
+            await self.mark_task_cancelled(task_id, reason=reason, session=session, source=source)
         elif to is TaskStatus.NOT_NEEDED:
-            await self.mark_task_not_needed(task_id, reason=detail, session=session)
+            await self.mark_task_not_needed(task_id, reason=detail, session=session, source=source)
         # PENDING and UNSPECIFIED are intentionally not reachable from
         # here; transitions are always forward in the lifecycle.
 
@@ -737,13 +740,24 @@ class DefaultSteerer:
         *,
         session: Session,
         detail: str = "",
+        source: str = "other",
     ) -> None:
-        """Transition ``task_id`` to ``RUNNING`` and emit ``TaskStarted``."""
+        """Transition ``task_id`` to ``RUNNING`` and emit ``TaskStarted``.
+
+        ``source`` (goldfive#251 R4) is the attribution string emitted on
+        the paired ``TaskTransitioned`` sink event — see
+        :func:`goldfive.events.task_transitioned_event` for the
+        vocabulary. Defaults to ``"other"`` for callers that haven't been
+        threaded through (back-compat); the live LLM-driven path through
+        :mod:`goldfive.reporting` passes ``"llm_report"`` /
+        ``"handler_default"`` / ``"supersedes_reroute"`` as appropriate.
+        """
         task = self._find_task(session, task_id)
         if task is None:
             return
         if task.status in _TERMINAL_TASK_STATUSES:
             return
+        from_status = task.status
         task.status = TaskStatus.RUNNING
         session.current_task_id = task_id
         if detail:
@@ -752,6 +766,13 @@ class DefaultSteerer:
         # dict so downstream prompt templates / refine paths see it.
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.RUNNING)
         await self._emit_task_started(session, task_id, detail)
+        await self._emit_task_transitioned(
+            session,
+            task,
+            from_status=from_status,
+            to_status=TaskStatus.RUNNING,
+            source=source,
+        )
 
     async def mark_task_progress(
         self,
@@ -786,19 +807,31 @@ class DefaultSteerer:
         session: Session,
         summary: str = "",
         artifacts: dict[str, str] | None = None,
+        source: str = "other",
     ) -> None:
-        """Transition ``task_id`` to ``COMPLETED`` and emit ``TaskCompleted``."""
+        """Transition ``task_id`` to ``COMPLETED`` and emit ``TaskCompleted``.
+
+        See :meth:`mark_task_running` for the ``source`` contract.
+        """
         task = self._find_task(session, task_id)
         if task is None:
             return
         if task.status in _TERMINAL_TASK_STATUSES:
             return
+        from_status = task.status
         task.status = TaskStatus.COMPLETED
         if summary:
             session.completed_results[task_id] = summary
         # goldfive#152: clear current_task_* if we were the active task.
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.COMPLETED)
         await self._emit_task_completed(session, task_id, summary, artifacts or {})
+        await self._emit_task_transitioned(
+            session,
+            task,
+            from_status=from_status,
+            to_status=TaskStatus.COMPLETED,
+            source=source,
+        )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
         await self._maybe_run_goal_drift_on_task_boundary(session)
 
@@ -809,6 +842,7 @@ class DefaultSteerer:
         session: Session,
         reason: str = "",
         recoverable: bool = True,
+        source: str = "other",
     ) -> None:
         """Transition ``task_id`` to ``FAILED`` and emit ``TaskFailed``.
 
@@ -835,16 +869,28 @@ class DefaultSteerer:
             return
         if task.status in _TERMINAL_TASK_STATUSES:
             return
+        from_status = task.status
         task.status = TaskStatus.FAILED
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.FAILED)
         await self._emit_task_failed(session, task_id, reason, recoverable)
+        await self._emit_task_transitioned(
+            session,
+            task,
+            from_status=from_status,
+            to_status=TaskStatus.FAILED,
+            source=source,
+        )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
         await self._maybe_run_goal_drift_on_task_boundary(session)
         # Fatal failures cascade downstream via the same primitive used
         # by mark_task_cancelled, so both §6.2 and §6.3 produce the
         # same TaskCancelled event stream and share rejection guards.
         if not recoverable:
-            await self.cascade_cancel_downstream(session, task_id)
+            # The cascade is a propagation of the same source-attribution
+            # decision (e.g. an LLM-reported fatal failure cascades as
+            # ``"cancellation"`` from the framework's perspective — the
+            # cascaded tasks weren't moved by the LLM directly).
+            await self.cascade_cancel_downstream(session, task_id, source="cancellation")
         kind = DriftKind.TASK_FAILED_RECOVERABLE if recoverable else DriftKind.TASK_FAILED_FATAL
         severity = DriftSeverity.WARNING if recoverable else DriftSeverity.CRITICAL
         drift = DriftEvent(
@@ -862,6 +908,7 @@ class DefaultSteerer:
         session: Session,
         blocker: str = "",
         needed: str = "",
+        source: str = "other",
     ) -> None:
         """Transition ``task_id`` to ``BLOCKED`` and emit ``TaskBlocked``.
 
@@ -875,12 +922,20 @@ class DefaultSteerer:
             return
         # BLOCKED is not a terminal status but we still guard against
         # re-blocking a task that's already blocked (idempotent).
+        from_status = task.status
         task.status = TaskStatus.BLOCKED
         if blocker or needed:
             session.agent_notes[task_id] = f"blocked: {blocker}" + (
                 f" (needed: {needed})" if needed else ""
             )
         await self._emit_task_blocked(session, task_id, blocker, needed)
+        await self._emit_task_transitioned(
+            session,
+            task,
+            from_status=from_status,
+            to_status=TaskStatus.BLOCKED,
+            source=source,
+        )
         detail = f"task {task_id} blocked: {blocker}" + (f" (needed: {needed})" if needed else "")
         drift = DriftEvent(
             kind=DriftKind.BLOCKED,
@@ -896,6 +951,7 @@ class DefaultSteerer:
         *,
         session: Session,
         reason: str = "",
+        source: str = "other",
     ) -> None:
         """Transition ``task_id`` to ``CANCELLED`` and emit ``TaskCancelled``.
 
@@ -917,16 +973,24 @@ class DefaultSteerer:
             # crucially do NOT re-run the cascade: we would double-emit
             # TaskCancelled events for downstream tasks on every call.
             return
+        from_status = task.status
         task.status = TaskStatus.CANCELLED
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.CANCELLED)
         await self._emit_task_cancelled(session, task_id, reason)
+        await self._emit_task_transitioned(
+            session,
+            task,
+            from_status=from_status,
+            to_status=TaskStatus.CANCELLED,
+            source=source,
+        )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
         # Fire before cascade so the judge sees the initiator's transition;
         # cascade-cancel downstream tasks share the same rate-limit bucket
         # and will no-op as subsequent boundary fires fall within the
         # 10s guard.
         await self._maybe_run_goal_drift_on_task_boundary(session)
-        await self.cascade_cancel_downstream(session, task_id)
+        await self.cascade_cancel_downstream(session, task_id, source="cancellation")
 
     async def mark_task_not_needed(
         self,
@@ -934,6 +998,7 @@ class DefaultSteerer:
         *,
         session: Session,
         reason: str = "",
+        source: str = "other",
     ) -> None:
         """Transition ``task_id`` to ``NOT_NEEDED`` terminally.
 
@@ -956,6 +1021,7 @@ class DefaultSteerer:
             return
         if task.status in _TERMINAL_TASK_STATUSES:
             return
+        from_status = task.status
         task.status = TaskStatus.NOT_NEEDED
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.NOT_NEEDED)
         # There is no dedicated ``TaskNotNeeded`` proto message;
@@ -965,6 +1031,13 @@ class DefaultSteerer:
         await self._emit_task_cancelled(
             session, task_id, f"not_needed: {reason}" if reason else "not_needed"
         )
+        await self._emit_task_transitioned(
+            session,
+            task,
+            from_status=from_status,
+            to_status=TaskStatus.NOT_NEEDED,
+            source=source,
+        )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
         await self._maybe_run_goal_drift_on_task_boundary(session)
 
@@ -972,6 +1045,8 @@ class DefaultSteerer:
         self,
         session: Session,
         cancelled_id: str,
+        *,
+        source: str = "cancellation",
     ) -> None:
         """BFS-cancel every downstream non-terminal task of ``cancelled_id``.
 
@@ -1041,8 +1116,16 @@ class DefaultSteerer:
             # recurse through ``mark_task_cancelled`` here; we fan out
             # via our own BFS queue so the surrounding summary log and
             # emission count stay deterministic.
+            dep_from = dep.status
             dep.status = TaskStatus.CANCELLED
             await self._emit_task_cancelled(session, next_id, cascade_reason)
+            await self._emit_task_transitioned(
+                session,
+                dep,
+                from_status=dep_from,
+                to_status=TaskStatus.CANCELLED,
+                source=source,
+            )
             cascaded.append(next_id)
             for grandchild in downstream.get(next_id, []):
                 if grandchild not in visited:
@@ -3932,6 +4015,174 @@ class DefaultSteerer:
         evt.task_cancelled.reason = reason
         await self._emit(evt)
 
+    async def _emit_task_transitioned(
+        self,
+        session: Session,
+        task: Task,
+        *,
+        from_status: TaskStatus,
+        to_status: TaskStatus,
+        source: str,
+    ) -> None:
+        """Emit a ``TaskTransitioned`` envelope (goldfive#251 R4).
+
+        Sink-only observability. Called from every site that mutates a
+        task's status — both the imperative ``mark_task_*`` path and
+        the cascade path inside :meth:`cascade_cancel_downstream`. The
+        LLM never sees this event; the ``report_task_*`` surface still
+        returns ``{"acknowledged": True}``.
+
+        Source attribution is the caller's responsibility (defaults to
+        ``"other"`` on un-threaded callers); see
+        :func:`goldfive.events.task_transitioned_event` for the
+        vocabulary.
+
+        ``agent_name`` resolves to ``task.assignee_agent_id``; that's
+        the most stable surface goldfive owns. ``invocation_id`` is a
+        best-effort lookup against the reconciler's
+        ``_invocation_agent`` map (goldfive#151) when available; empty
+        when no in-flight invocation matches the assignee. Tolerant of
+        missing maps / proto stubs — emission failures are swallowed
+        with a debug log rather than breaking the transition path.
+        """
+        sinks = self._sinks
+        if not sinks:
+            return
+        try:
+            from goldfive.events import emit, task_transitioned_event
+        except Exception as exc:  # noqa: BLE001 — proto stubs may be missing
+            log.debug(
+                "DefaultSteerer._emit_task_transitioned: events module unavailable: %s",
+                exc,
+            )
+            return
+
+        agent_name = str(getattr(task, "assignee_agent_id", "") or "")
+        invocation_id = self._resolve_invocation_id_for_agent(agent_name)
+        revision_stamp = 0
+        plan = getattr(session, "plan", None)
+        if plan is not None:
+            try:
+                revision_stamp = int(getattr(plan, "revision_index", 0) or 0)
+            except (TypeError, ValueError):
+                revision_stamp = 0
+        try:
+            evt = task_transitioned_event(
+                session.run_id,
+                session.next_sequence(),
+                task_id=str(getattr(task, "id", "") or ""),
+                from_status=str(getattr(from_status, "value", from_status) or ""),
+                to_status=str(getattr(to_status, "value", to_status) or ""),
+                source=str(source or "other"),
+                revision_stamp=revision_stamp,
+                agent_name=agent_name,
+                invocation_id=invocation_id,
+                session_id=session.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "DefaultSteerer._emit_task_transitioned: proto event build failed: %s",
+                exc,
+            )
+            return
+        try:
+            await emit(sinks, evt)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "DefaultSteerer._emit_task_transitioned: sink emit raised: %s",
+                exc,
+            )
+
+    async def _emit_plan_revision_transitions(
+        self,
+        session: Session,
+        prev_plan: Plan | None,
+        revised: Plan,
+    ) -> None:
+        """Emit ``TaskTransitioned`` events for status changes carried by a refine.
+
+        Compares ``prev_plan`` vs ``revised`` task-by-task and emits one
+        ``TaskTransitioned`` event per task whose status changed (or
+        whose ``status`` is now non-PENDING and the task didn't exist
+        in ``prev_plan`` — a refine-introduced task that arrived in a
+        non-PENDING state, e.g. a CORRECT-kind successor that the
+        planner pre-stamped).
+
+        Source is always ``"plan_revision"``: the refine is the
+        authoritative driver. Tasks that exist in both plans with the
+        same status are skipped (no transition happened).
+
+        ``prev_plan`` may be ``None`` on the first revision after a run
+        with no initial plan; in that case every task in ``revised``
+        with non-PENDING status emits a "(implicit) PENDING ->
+        actual_status" event so operators see the post-revision state
+        on the wire.
+        """
+        if not self._sinks:
+            return
+        prev_by_id: dict[str, Task] = {}
+        if prev_plan is not None:
+            for t in getattr(prev_plan, "tasks", []) or []:
+                tid = str(getattr(t, "id", "") or "")
+                if tid:
+                    prev_by_id[tid] = t
+        for t in getattr(revised, "tasks", []) or []:
+            tid = str(getattr(t, "id", "") or "")
+            if not tid:
+                continue
+            new_status = getattr(t, "status", None)
+            if not isinstance(new_status, TaskStatus):
+                continue
+            old = prev_by_id.get(tid)
+            if old is None:
+                old_status: TaskStatus = TaskStatus.PENDING
+            else:
+                old_status = getattr(old, "status", TaskStatus.PENDING)
+            if old_status == new_status:
+                continue
+            # No transition to record when the new status is the
+            # default PENDING and the task is brand-new — sinks would
+            # render that as a phantom "started in PENDING" row.
+            if old is None and new_status is TaskStatus.PENDING:
+                continue
+            await self._emit_task_transitioned(
+                session,
+                t,
+                from_status=old_status,
+                to_status=new_status,
+                source="plan_revision",
+            )
+
+    def _resolve_invocation_id_for_agent(self, agent_name: str) -> str:
+        """Best-effort lookup of an active invocation_id for ``agent_name``.
+
+        Mirrors the reconciler-walk pattern in
+        :meth:`_resolve_active_invocation_ids` but scopes the match to a
+        single agent name (the assignee of the transitioning task). The
+        most-recent matching invocation_id wins; empty string when no
+        match (no reconciler, no in-flight invocation under that
+        agent, etc.). Tolerant of every failure mode — never raises.
+        """
+        if not agent_name:
+            return ""
+        adapter = self._adapter
+        plugin = getattr(adapter, "_plugin", None) if adapter is not None else None
+        reconciler = getattr(plugin, "_reconciler", None) if plugin is not None else None
+        if reconciler is None:
+            return ""
+        try:
+            inv_agent = getattr(reconciler, "_invocation_agent", None)
+            if not isinstance(inv_agent, Mapping):
+                return ""
+            # Iterate insertion-order; later writes win.
+            match = ""
+            for inv_id, name in inv_agent.items():
+                if name == agent_name and inv_id:
+                    match = str(inv_id)
+            return match
+        except Exception:  # noqa: BLE001
+            return ""
+
     async def _emit_drift_detected(self, session: Session, drift: DriftEvent) -> None:
         evt = self._new_envelope(session)
         evt.drift_detected.kind = self._drift_kind_pb_value(drift.kind)
@@ -4402,6 +4653,18 @@ class DefaultSteerer:
             evt.plan_revised.refine_output_summary = self._build_refine_output_summary(revised)
             evt.plan_revised.target_agent_id = drift.current_agent_id or ""
             await self._emit(evt)
+            # goldfive#251 R4 — every per-task status change carried by the
+            # refine (e.g. ``_force_looper_failed`` stamping FAILED on the
+            # looper, a CORRECT-supersedes integration cancelling the
+            # superseded task, a REPLACE supersession marking the old task
+            # CANCELLED) gets a paired ``TaskTransitioned`` sink event with
+            # ``source="plan_revision"`` so operators see the refine-driven
+            # transitions on the same observability lane as LLM-driven
+            # ones. The transition events come AFTER ``PlanRevised`` so a
+            # consumer that processes events strictly in order sees the
+            # plan flip first, then the per-task status changes that flow
+            # from it.
+            await self._emit_plan_revision_transitions(session, prev_plan, revised)
             # goldfive a4: paired correlation envelope. The proto
             # ``PlanRevised`` carries no ``attempt_id`` field today; emit
             # a sidecar dict event so consumers can pair this success

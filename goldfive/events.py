@@ -744,6 +744,60 @@ def invocation_cancelled_event(
     return evt
 
 
+def task_transitioned_event(
+    run_id: str,
+    sequence: int,
+    *,
+    task_id: str,
+    from_status: str,
+    to_status: str,
+    source: str,
+    revision_stamp: int = 0,
+    agent_name: str = "",
+    invocation_id: str = "",
+    session_id: str = "",
+) -> Any:
+    """Build a ``TaskTransitioned`` envelope (goldfive#251 R4).
+
+    Operator-visible sink event marking a successful task status
+    transition with source attribution. The LLM-facing ``report_task_*``
+    surface still returns ``{"acknowledged": True}``; this event is
+    pure observability — emitted from every plan-state transition site
+    (steerer ``mark_task_*``, refine, supersedes-reroute,
+    cooperative-cancellation cascade, …) so operators can answer "who
+    moved this task and why" without reconstructing the timeline by
+    hand.
+
+    Pairs with the ``task_transition_refused`` dict event from #266
+    (pin versioning): refused attempts emit the dict refusal payload
+    and DO NOT emit ``TaskTransitioned`` (no transition happened).
+    Successful transitions emit this typed proto envelope.
+
+    ``source`` vocabulary (see proto comment for the full list):
+    ``"llm_report"`` / ``"handler_default"`` / ``"supersedes_reroute"``
+    / ``"plan_revision"`` / ``"cancellation"`` / ``"other"``. Readers
+    MUST tolerate unknown values for forward-compat.
+
+    ``from_status`` / ``to_status`` are the bare lowercase
+    :class:`~goldfive.types.TaskStatus` values (``"PENDING"`` /
+    ``"RUNNING"`` / ``"COMPLETED"`` / …). String-typed (not enum) so
+    consumers don't need a lookup and unknown future statuses
+    round-trip without proto-regen.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id)
+    evt.task_transitioned.task_id = str(task_id or "")
+    evt.task_transitioned.from_status = str(from_status or "")
+    evt.task_transitioned.to_status = str(to_status or "")
+    evt.task_transitioned.source = str(source or "")
+    try:
+        evt.task_transitioned.revision_stamp = int(revision_stamp or 0)
+    except (TypeError, ValueError):
+        evt.task_transitioned.revision_stamp = 0
+    evt.task_transitioned.agent_name = str(agent_name or "")
+    evt.task_transitioned.invocation_id = str(invocation_id or "")
+    return evt
+
+
 def drift_detected_event(
     run_id: str,
     sequence: int,
