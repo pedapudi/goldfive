@@ -2344,9 +2344,19 @@ def make_adk_plugin(
             # goldfive#241 — task_id is hidden from the LLM-facing
             # reporting-tool schema so the model never supplies it.
             # Resolve from state (delegation-site pin first, then the
-            # agent-turn pin). If neither resolves, short-circuit with
-            # a structured ``no_task_pinned`` error — better than
-            # invoking the handler on an unbound reporting call.
+            # agent-turn pin). If neither resolves, return a silent
+            # acknowledgment so the agent's reporting protocol does
+            # NOT crash on plan-revision boundaries that leave the
+            # current agent without a pinned task (e.g. a coordinator
+            # whose own tasks were superseded by refine into tasks
+            # assigned to other agents). A loud error here makes the
+            # LLM bypass the reporting protocol entirely — observed in
+            # live session where the coordinator saw ``no_task_pinned``
+            # post-revision and reasoned "Let me proceed directly with
+            # the research_agent call since the user has already given
+            # me the topic," abandoning the reporting contract.
+            # Observability is preserved via the INFO log below; the
+            # agent sees a no-op success and continues.
             pinned = _inject_task_id_from_state(
                 tool_name=tool_name,
                 tool_args=tool_args,
@@ -2355,13 +2365,16 @@ def make_adk_plugin(
             if _is_reporting_tool_name(tool_name) and not pinned:
                 log.info(
                     "before_tool_callback: no task pinned for %s; "
-                    "short-circuiting with no_task_pinned",
+                    "returning no-op acknowledgment (orchestration-only turn)",
                     tool_name,
                 )
                 return {
-                    "acknowledged": False,
-                    "error": "no_task_pinned",
-                    "detail": "no task bound to this agent invocation",
+                    "acknowledged": True,
+                    "no_task_pinned": True,
+                    "detail": (
+                        "no task currently bound to this agent; "
+                        "report recorded as orchestration-only no-op"
+                    ),
                 }
 
             tool_names_registered = {spec.name for spec in ctx.tools}
