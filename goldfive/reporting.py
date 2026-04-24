@@ -111,19 +111,46 @@ def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
     should short-circuit with the canonical ``missing_task_id``
     error in that case.
     """
+    return _resolve_task_id_with_source(args, session)[0]
+
+
+def _resolve_task_id_with_source(
+    args: dict[str, Any], session: Session
+) -> tuple[str, str]:
+    """Resolve ``task_id`` and report whether it came from args or state.
+
+    Returns ``(task_id, source)`` where ``source`` is one of:
+
+    * ``"llm_report"`` — the LLM supplied an explicit non-empty
+      ``task_id`` arg.
+    * ``"handler_default"`` — the arg was absent / empty / None and the
+      handler defaulted to the adapter-stamped pin
+      (``goldfive.current_task_id``). This is the goldfive#191 path.
+    * ``""`` — neither source resolved a value (caller short-circuits
+      with the canonical ``missing_task_id`` rejection).
+
+    Used by the goldfive#251 R4 ``TaskTransitioned`` emit sites to
+    distinguish a direct LLM-driven transition from one that piggy-
+    backed on the adapter pin. The tuple-returning variant is
+    additive; existing callers stay on :func:`_resolve_task_id`.
+    """
     raw = args.get("task_id")
     if raw is not None:
         task_id = str(raw).strip()
         if task_id:
-            return task_id
+            return task_id, "llm_report"
     state = getattr(session, "state", None)
     if isinstance(state, dict):
         fallback = state.get(_STATE_KEY_CURRENT_TASK_ID, "")
         if isinstance(fallback, str):
-            return fallback.strip()
-        if fallback is not None:
-            return str(fallback).strip()
-    return ""
+            value = fallback.strip()
+        elif fallback is not None:
+            value = str(fallback).strip()
+        else:
+            value = ""
+        if value:
+            return value, "handler_default"
+    return "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -448,17 +475,21 @@ async def _classify_and_route_pin(
     task_id: str,
     tool_name: str,
     attempted_to: TaskStatus,
-) -> tuple[str, dict[str, Any] | None]:
+) -> tuple[str, dict[str, Any] | None, bool]:
     """Apply the goldfive#266 pin freshness classifier to ``task_id``.
 
-    Returns ``(effective_task_id, refusal_response_or_None)``:
+    Returns ``(effective_task_id, refusal_response_or_None, rerouted)``:
 
-    * ``("<task_id>", None)`` — proceed; ``effective_task_id`` is
-      either the original task_id (fresh pin) or a routed REPLACE-kind
-      successor (stale-but-recoverable pin).
-    * ``("", {refusal})`` — refuse; the caller returns the refusal
-      response (an ack-only dict) without driving the steerer. A
-      ``task_transition_refused`` sink event has already been emitted.
+    * ``("<task_id>", None, False)`` — proceed on the original task_id
+      (fresh pin, no successor to follow).
+    * ``("<successor_task_id>", None, True)`` — proceed; the original
+      pin pointed at a superseded task and the helper routed onto its
+      REPLACE-kind successor. Callers that emit ``TaskTransitioned``
+      (goldfive#251 R4) should record ``source="supersedes_reroute"``
+      on the resulting transition.
+    * ``("", {refusal}, False)`` — refuse; the caller returns the
+      refusal response (an ack-only dict) without driving the steerer.
+      A ``task_transition_refused`` sink event has already been emitted.
 
     Uses the supersedes graph to distinguish a stale REPLACE pin
     (route) from a stale CORRECT pin (refuse: the old task's terminal
@@ -482,7 +513,8 @@ async def _classify_and_route_pin(
         # terminal task whose successor is REPLACE-kind routes; no
         # successor or CORRECT-kind successor falls through to the
         # handler's existing terminal-state rejection path.
-        return _reroute_if_superseded(session, task_id, tool_name), None
+        resolved = _reroute_if_superseded(session, task_id, tool_name)
+        return resolved, None, resolved != task_id
     pin_rev = pin_rev_opt
     freshness, successor_id, _kind = _classify_pin_freshness(
         session,
@@ -496,7 +528,8 @@ async def _classify_and_route_pin(
         # This still routes a fresh pin pointing at a terminal task
         # whose successor is REPLACE-kind (an LLM that retries its
         # own pin without realising the plan repointed).
-        return _reroute_if_superseded(session, task_id, tool_name), None
+        resolved = _reroute_if_superseded(session, task_id, tool_name)
+        return resolved, None, resolved != task_id
 
     if freshness == "stale_replace":
         log.info(
@@ -508,7 +541,7 @@ async def _classify_and_route_pin(
             cur_rev,
             successor_id,
         )
-        return successor_id or task_id, None
+        return successor_id or task_id, None, bool(successor_id and successor_id != task_id)
 
     # stale_correct or stale_ambiguous → refuse.
     reason = (
@@ -544,7 +577,7 @@ async def _classify_and_route_pin(
         pin_revision=pin_rev,
         current_revision=cur_rev,
     )
-    return "", _refused_response()
+    return "", _refused_response(), False
 
 
 async def _emit_task_transition_refused(
@@ -782,7 +815,7 @@ def _int(args: dict[str, Any], key: str, default: int = 0) -> int:
 async def _handle_task_started(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _resolve_task_id(args, session)
+    task_id, source = _resolve_task_id_with_source(args, session)
     detail = _str(args, "detail")
     if not task_id:
         return _missing_task_id_response("report_task_started")
@@ -791,7 +824,7 @@ async def _handle_task_started(
     await _await_plan_stable(session, steerer)
     # goldfive#266 — classify pin freshness; refuse stale CORRECT /
     # ambiguous, route stale REPLACE, fall through on match.
-    task_id, refusal = await _classify_and_route_pin(
+    task_id, refusal, rerouted = await _classify_and_route_pin(
         session=session,
         steerer=steerer,
         task_id=task_id,
@@ -800,6 +833,8 @@ async def _handle_task_started(
     )
     if refusal is not None:
         return refusal
+    if rerouted:
+        source = "supersedes_reroute"
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(tool_name="report_task_started", current_status=task.status)
@@ -812,7 +847,7 @@ async def _handle_task_started(
                 attempted=TaskStatus.RUNNING,
                 task_id=task_id,
             )
-    await steerer.mark_task_running(task_id, session=session, detail=detail)
+    await steerer.mark_task_running(task_id, session=session, detail=detail, source=source)
     # goldfive#251 Stream D: the agent has acknowledged the (possibly
     # corrected) task; clear any queued correction scoped to this
     # ``(agent, task_id)`` pair. The correction block only needs to be
@@ -860,13 +895,13 @@ def _clear_correction_on_started(session: Session, task: Task | None) -> None:
 async def _handle_task_progress(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _resolve_task_id(args, session)
+    task_id, _source = _resolve_task_id_with_source(args, session)
     fraction = _float(args, "fraction")
     detail = _str(args, "detail")
     if not task_id:
         return _missing_task_id_response("report_task_progress")
     await _await_plan_stable(session, steerer)
-    task_id, refusal = await _classify_and_route_pin(
+    task_id, refusal, _rerouted = await _classify_and_route_pin(
         session=session,
         steerer=steerer,
         task_id=task_id,
@@ -900,7 +935,7 @@ async def _handle_task_progress(
 async def _handle_task_completed(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _resolve_task_id(args, session)
+    task_id, source = _resolve_task_id_with_source(args, session)
     summary = _str(args, "summary")
     artifacts_raw = args.get("artifacts")
     artifacts = (
@@ -911,7 +946,7 @@ async def _handle_task_completed(
     if not task_id:
         return _missing_task_id_response("report_task_completed")
     await _await_plan_stable(session, steerer)
-    task_id, refusal = await _classify_and_route_pin(
+    task_id, refusal, rerouted = await _classify_and_route_pin(
         session=session,
         steerer=steerer,
         task_id=task_id,
@@ -920,6 +955,8 @@ async def _handle_task_completed(
     )
     if refusal is not None:
         return refusal
+    if rerouted:
+        source = "supersedes_reroute"
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(
@@ -935,7 +972,7 @@ async def _handle_task_completed(
                 task_id=task_id,
             )
     await steerer.mark_task_completed(
-        task_id, session=session, summary=summary, artifacts=artifacts
+        task_id, session=session, summary=summary, artifacts=artifacts, source=source
     )
     # Rotate the current-task pin now that this one has landed terminal.
     if task is not None:
@@ -946,13 +983,13 @@ async def _handle_task_completed(
 async def _handle_task_failed(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _resolve_task_id(args, session)
+    task_id, source = _resolve_task_id_with_source(args, session)
     reason = _str(args, "reason")
     recoverable = _bool(args, "recoverable", default=True)
     if not task_id:
         return _missing_task_id_response("report_task_failed")
     await _await_plan_stable(session, steerer)
-    task_id, refusal = await _classify_and_route_pin(
+    task_id, refusal, rerouted = await _classify_and_route_pin(
         session=session,
         steerer=steerer,
         task_id=task_id,
@@ -961,6 +998,8 @@ async def _handle_task_failed(
     )
     if refusal is not None:
         return refusal
+    if rerouted:
+        source = "supersedes_reroute"
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(tool_name="report_task_failed", current_status=task.status)
@@ -978,6 +1017,7 @@ async def _handle_task_failed(
         session=session,
         reason=reason,
         recoverable=recoverable,
+        source=source,
     )
     if task is not None:
         _rotate_after_terminal(session, task)
@@ -987,13 +1027,13 @@ async def _handle_task_failed(
 async def _handle_task_blocked(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
-    task_id = _resolve_task_id(args, session)
+    task_id, source = _resolve_task_id_with_source(args, session)
     blocker = _str(args, "blocker")
     needed = _str(args, "needed")
     if not task_id:
         return _missing_task_id_response("report_task_blocked")
     await _await_plan_stable(session, steerer)
-    task_id, refusal = await _classify_and_route_pin(
+    task_id, refusal, rerouted = await _classify_and_route_pin(
         session=session,
         steerer=steerer,
         task_id=task_id,
@@ -1002,6 +1042,8 @@ async def _handle_task_blocked(
     )
     if refusal is not None:
         return refusal
+    if rerouted:
+        source = "supersedes_reroute"
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(tool_name="report_task_blocked", current_status=task.status)
@@ -1014,7 +1056,9 @@ async def _handle_task_blocked(
                 attempted=TaskStatus.BLOCKED,
                 task_id=task_id,
             )
-    await steerer.mark_task_blocked(task_id, session=session, blocker=blocker, needed=needed)
+    await steerer.mark_task_blocked(
+        task_id, session=session, blocker=blocker, needed=needed, source=source
+    )
     return dict(_ACK)
 
 
@@ -1064,7 +1108,7 @@ async def _handle_awaiting_approval(
     decision lands returns ``{"decision": "timeout", "detail": ...}``
     and leaves the task blocked (the caller may re-prompt or fail).
     """
-    task_id = _resolve_task_id(args, session)
+    task_id, source = _resolve_task_id_with_source(args, session)
     prompt = _str(args, "prompt")
     timeout_ms = _int(args, "timeout_ms", 0)
     if not task_id:
@@ -1101,6 +1145,7 @@ async def _handle_awaiting_approval(
         session=session,
         blocker="awaiting_approval",
         needed=prompt,
+        source=source,
     )
     await _emit_approval_requested(
         session=session,

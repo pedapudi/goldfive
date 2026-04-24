@@ -144,11 +144,19 @@ async def test_runner_end_to_end_event_sequence() -> None:
     assert run_kinds[1] == "GoalDerived"
     assert run_kinds[2] == "PlanSubmitted"
 
-    # For each of the three tasks: TaskStarted → TaskCompleted.
+    # For each of the three tasks: TaskStarted → TaskTransitioned (R4)
+    # → TaskCompleted → TaskTransitioned (R4). The TaskTransitioned
+    # envelopes are observability-only (goldfive#251 R4); the per-status
+    # proto envelopes remain the LLM-visible authoritative signal.
     task_kinds = run_kinds[3:-1]  # strip initial triple and trailing RunCompleted
-    assert len(task_kinds) == 6, run_kinds
-    assert task_kinds[0::2] == ["TaskStarted"] * 3
-    assert task_kinds[1::2] == ["TaskCompleted"] * 3
+    # Filter to the per-status envelopes (drop TaskTransitioned) before
+    # asserting the strict TaskStarted -> TaskCompleted ordering.
+    status_kinds = [
+        k for k in task_kinds if k in ("TaskStarted", "TaskCompleted")
+    ]
+    assert len(status_kinds) == 6, run_kinds
+    assert status_kinds[0::2] == ["TaskStarted"] * 3
+    assert status_kinds[1::2] == ["TaskCompleted"] * 3
 
     # Run terminates with a RunCompleted from the executor.
     assert run_kinds[-1] == "RunCompleted"

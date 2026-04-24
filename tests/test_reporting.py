@@ -130,7 +130,10 @@ async def test_report_task_started_marks_running() -> None:
     )
     assert out == {"acknowledged": True}
     assert session.plan.tasks[0].status is TaskStatus.RUNNING
-    assert sink.events[-1].WhichOneof("payload") == "task_started"
+    # task_started lands in the stream (followed by goldfive#251 R4
+    # TaskTransitioned envelope; see test_task_transitioned_events.py).
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert "task_started" in kinds
 
 
 async def test_report_task_progress_records_progress() -> None:
@@ -145,7 +148,8 @@ async def test_report_task_progress_records_progress() -> None:
         steerer,
     )
     assert session.task_progress["t1"] == pytest.approx(0.75)
-    assert sink.events[-1].WhichOneof("payload") == "task_progress"
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert "task_progress" in kinds
 
 
 async def test_report_task_completed_transitions_and_stores_summary() -> None:
@@ -161,9 +165,11 @@ async def test_report_task_completed_transitions_and_stores_summary() -> None:
     )
     assert session.plan.tasks[0].status is TaskStatus.COMPLETED
     assert session.completed_results["t1"] == "all done"
-    evt = sink.events[-1]
-    assert evt.WhichOneof("payload") == "task_completed"
-    assert dict(evt.task_completed.artifacts) == {"result": "42"}
+    completed = [
+        e for e in sink.events if e.WhichOneof("payload") == "task_completed"
+    ]
+    assert len(completed) == 1
+    assert dict(completed[0].task_completed.artifacts) == {"result": "42"}
 
 
 async def test_report_task_failed_transitions_and_refines() -> None:
@@ -232,7 +238,8 @@ async def test_handler_tolerates_missing_optional_fields() -> None:
     # Only required fields — should still transition.
     await _tool("report_task_started").handler({"task_id": "t1"}, session, steerer)
     assert session.plan.tasks[0].status is TaskStatus.RUNNING
-    assert sink.events[-1].task_started.detail == ""
+    started = [e for e in sink.events if e.WhichOneof("payload") == "task_started"]
+    assert started and started[-1].task_started.detail == ""
 
 
 async def test_handler_ignores_unknown_task_id_gracefully() -> None:
@@ -277,4 +284,5 @@ async def test_report_task_started_reroutes_to_replacement() -> None:
     assert by_id["t1_retry"].status is TaskStatus.RUNNING
     assert by_id["t1"].status is TaskStatus.FAILED
     # The emitted TaskStarted event carries the replacement id.
-    assert sink.events[-1].task_started.task_id == "t1_retry"
+    started = [e for e in sink.events if e.WhichOneof("payload") == "task_started"]
+    assert started and started[-1].task_started.task_id == "t1_retry"
