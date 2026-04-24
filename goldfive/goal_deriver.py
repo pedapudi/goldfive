@@ -231,8 +231,38 @@ class LLMGoalDeriver:
 
         prompt = self._build_prompt(user_input, context)
 
+        # Snapshot span-emission context from the optional ``context``
+        # mapping if present. The Runner threads ``sinks`` / ``run_id`` /
+        # ``session_id`` / ``next_sequence`` into this mapping so
+        # ``goal_deriver.derive`` shows up as a span on harmonograf's
+        # Gantt alongside every other goldfive-internal LLM call.
+        # Missing context keys degrade to a no-op span.
+        from goldfive._llm_span import goldfive_llm_span
+
+        span_sinks: list[Any] = []
+        span_run_id = ""
+        span_session_id = ""
+        span_seq_fn: Callable[[], int] | None = None
+        if context is not None:
+            maybe_sinks = context.get("sinks")
+            if isinstance(maybe_sinks, list):
+                span_sinks = list(maybe_sinks)
+            span_run_id = str(context.get("run_id") or "")
+            span_session_id = str(context.get("session_id") or "")
+            maybe_seq = context.get("next_sequence")
+            if callable(maybe_seq):
+                span_seq_fn = maybe_seq
+
         try:
-            raw = await self._call_llm(self._system_prompt, prompt, self._model)
+            async with goldfive_llm_span(
+                sinks=span_sinks,
+                name="goal_derive",
+                model=self._model,
+                session_id=span_session_id,
+                run_id=span_run_id,
+                sequence_fn=span_seq_fn,
+            ):
+                raw = await self._call_llm(self._system_prompt, prompt, self._model)
         except Exception as e:  # pragma: no cover - exercised via tests w/ stub
             logger.warning(
                 "LLMGoalDeriver: call_llm raised %s; falling back to passthrough goal", e

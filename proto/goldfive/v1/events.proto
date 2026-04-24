@@ -71,6 +71,8 @@ message Event {
     AgentInvocationCompleted agent_invocation_completed = 29;
     DelegationObserved delegation_observed = 30;
     ReasoningJudgeInvoked reasoning_judge_invoked = 31;
+    GoldfiveLLMCallStart goldfive_llm_call_start = 32;
+    GoldfiveLLMCallEnd goldfive_llm_call_end = 33;
   }
 }
 
@@ -478,4 +480,71 @@ message ReasoningJudgeInvoked {
   bool on_task = 8;
   string severity = 9;
   string reason = 10;
+}
+
+// ---------------------------------------------------------------------------
+// Goldfive-internal LLM call span (goldfive#internal-llm-spans)
+// ---------------------------------------------------------------------------
+//
+// Emitted as a SpanStart/SpanEnd pair wrapping every goldfive-internal
+// ``await call_llm(...)`` site (planner refine / generate, goal-drift
+// classifier, reasoning-drift judge, goal-derive, reflective
+// self-progress check, etc.). Paired by ``span_id``.
+//
+// Rationale: goldfive's internal LLM work — ``planner.refine`` on a drift,
+// ``classify_goal_drift`` on a periodic check, ``LLMGoalDeriver.derive``
+// on turn start — executes invisibly between the agent spans harmonograf
+// already renders. A live session with a 3-4 minute gap between two agent
+// spans (drift fires, planner refines for 45s, goal-drift judge runs for
+// 15s, then the next agent starts) shows no explanation of what happened
+// in that window. These events make that work visible on the goldfive
+// lane as proper spans with wall-clock start/end pairs.
+//
+// Harmonograf renders every ``{Start, End}`` pair as a single span on the
+// goldfive lane (the "<client>:goldfive" compound agent), keyed by
+// ``span_id``. The ``name`` field distinguishes "refine_steer" from
+// "judge_goal_drift" etc., so the frontend can label each span.
+
+// Start marker for a goldfive-internal LLM call span.
+message GoldfiveLLMCallStart {
+  // Unique id for this span. Paired with the matching ``GoldfiveLLMCallEnd``.
+  // UUID4 hex is fine; clients MUST emit exactly one End for each Start.
+  string span_id = 1;
+  // Short symbolic name of the call site (e.g. ``"refine_steer"``,
+  // ``"judge_goal_drift"``, ``"plan_generate"``, ``"goal_derive"``,
+  // ``"reflective_check"``, ``"judge_reasoning"``).
+  string name = 2;
+  // The LLM model the call was dispatched with (forwarded verbatim to
+  // ``call_llm``). Empty when the callable substitutes its own default.
+  string model = 3;
+  // Task the span is attributed to, when available. Used by sinks that
+  // want to group goldfive-internal work under the driving task on a
+  // Gantt. Empty when the call is not task-scoped (e.g. initial plan
+  // generation, goal-derive).
+  string task_id = 4;
+  // Wall-clock start time (nanoseconds since the Unix epoch, from
+  // ``time.time_ns()``). Advisory only — the Event envelope's
+  // ``emitted_at`` carries the authoritative emission timestamp.
+  int64 start_time_ns = 5;
+}
+
+// End marker for a goldfive-internal LLM call span. Emitted on both the
+// success and exception paths so spans always close on the wire.
+message GoldfiveLLMCallEnd {
+  // Unique id matching the corresponding ``GoldfiveLLMCallStart``.
+  string span_id = 1;
+  // Echo of ``GoldfiveLLMCallStart.name`` so consumers that buffer End
+  // events independently of Start events can still label them.
+  string name = 2;
+  // Wall-clock end time (nanoseconds since the Unix epoch, from
+  // ``time.time_ns()``). Paired with ``GoldfiveLLMCallStart.start_time_ns``
+  // to compute duration without re-deriving from ``emitted_at``.
+  int64 end_time_ns = 3;
+  // Terminal status of the wrapped call. ``"completed"`` when the
+  // ``await`` returned normally; ``"failed"`` when it raised.
+  string status = 4;
+  // Error text when ``status == "failed"``. Empty otherwise. Truncated
+  // to 1024 chars with " … [truncated]" when longer — the goal is a
+  // short diagnostic, not a full traceback.
+  string error = 5;
 }

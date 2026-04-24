@@ -233,6 +233,10 @@ async def classify_turn(
     user_input: str,
     conversation_id: str = "",
     model: str = "",
+    sinks: list[Any] | None = None,
+    run_id: str = "",
+    session_id: str = "",
+    sequence_fn: Callable[[], int] | None = None,
 ) -> TurnClassification:
     """Classify a turn as new_work / conversational / refine_existing.
 
@@ -260,8 +264,18 @@ async def classify_turn(
         user_input=user_input,
         conversation_id=conversation_id,
     )
+    from goldfive._llm_span import goldfive_llm_span
+
     try:
-        raw = await call_llm(_SYSTEM_PROMPT, user_prompt, model)
+        async with goldfive_llm_span(
+            sinks=list(sinks or []),
+            name="planner_gate_classify_turn",
+            model=model,
+            session_id=session_id,
+            run_id=run_id,
+            sequence_fn=sequence_fn,
+        ):
+            raw = await call_llm(_SYSTEM_PROMPT, user_prompt, model)
     except Exception as exc:  # noqa: BLE001
         log.warning("planner_gate.classify_turn: call_llm raised: %s", exc)
         return heuristic_classify_turn(

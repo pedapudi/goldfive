@@ -312,6 +312,7 @@ class Runner:
                     prior_plan=self._last_plan,
                     completed_results=session.completed_results,
                     user_input=user_input,
+                    session=session,
                 )
             except Exception as exc:  # noqa: BLE001
                 # A misbehaving gate must never hang the Runner; degrade
@@ -338,7 +339,7 @@ class Runner:
         #    Conversation); we append newly-derived goals that weren't
         #    already present by id so the planner sees the full history.
         try:
-            new_goals = await self._resolve_goals(user_input, context)
+            new_goals = await self._resolve_goals(user_input, context, session=session)
         except Exception as exc:  # noqa: BLE001
             reason = f"goal derivation failed: {exc}"
             log.exception("goal derivation failed")
@@ -861,6 +862,7 @@ class Runner:
         prior_plan: Plan,
         completed_results: Mapping[str, str],
         user_input: str,
+        session: Session | None = None,
     ) -> TurnClassification:
         """Invoke the planner_gate setting to classify this turn.
 
@@ -891,6 +893,10 @@ class Runner:
                 user_input=user_input,
                 conversation_id=self._conversation.id,
                 model=getattr(self.planner, "_model", "") or "",
+                sinks=list(self.sinks) if self.sinks else None,
+                run_id=session.run_id if session is not None else "",
+                session_id=session.id if session is not None else "",
+                sequence_fn=session.next_sequence if session is not None else None,
             )
         # Caller-supplied async callable.
         result = await gate(
@@ -1096,6 +1102,7 @@ class Runner:
         self,
         user_input: str | list[Goal],
         context: Mapping[str, Any] | None,
+        session: Session | None = None,
     ) -> list[Goal]:
         if isinstance(user_input, list):
             if not user_input:
@@ -1107,7 +1114,19 @@ class Runner:
             raise TypeError(
                 f"Runner.run: user_input must be str or list[Goal], got {type(user_input).__name__}"
             )
-        goals = await self.goal_deriver.derive(user_input, context=context)
+        # Merge span-emission context (sinks + session correlation) into
+        # the context dict the deriver sees so an ``LLMGoalDeriver`` can
+        # emit ``GoldfiveLLMCallStart/End`` spans around its internal
+        # call. Overrides caller-supplied values deliberately — the
+        # Runner owns the sink list and session id.
+        span_ctx: dict[str, Any] = dict(context or {})
+        if session is not None:
+            span_ctx.setdefault("run_id", session.run_id)
+            span_ctx.setdefault("session_id", session.id)
+            span_ctx.setdefault("next_sequence", session.next_sequence)
+        if self.sinks:
+            span_ctx.setdefault("sinks", list(self.sinks))
+        goals = await self.goal_deriver.derive(user_input, context=span_ctx)
         if not goals:
             raise ValueError("GoalDeriver returned an empty goals list")
         return list(goals)
