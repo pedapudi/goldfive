@@ -254,6 +254,51 @@ def _is_reporting_tool_name(tool_name: str) -> bool:
     return tool_name.startswith("report_task_") or tool_name == _REPORT_AWAITING_APPROVAL
 
 
+def _agent_has_pending_candidates(ctx: Any, agent_name: str) -> bool:
+    """Return True if the plan has any PENDING/RUNNING task for ``agent_name``.
+
+    Used to distinguish the two failure modes when the reporting-tool
+    ``task_id`` pin cannot be resolved (goldfive#250 follow-up):
+
+    * **No candidates** — the agent's work was moved to other agents by
+      a plan refine; a silent-ack no-op is correct.
+    * **Has candidates** — the pin SHOULD have worked (single match, or
+      delegation-site pin, or fallback). A silent ack would mask a real
+      stall; the caller surfaces ``{"acknowledged": False,
+      "error": "pin_unresolved"}`` instead.
+
+    NOTE: the DAG-readiness gate from
+    :meth:`_pin_current_task_id_for_agent` is intentionally NOT applied
+    here. Even a DAG-gated candidate means the agent's turn shouldn't
+    be happening yet, which is also a stall worth surfacing rather than
+    silencing.
+
+    Silent on every failure (missing ctx / plan / non-iterable tasks);
+    the caller falls back to the conservative silent-ack path when this
+    returns ``False``.
+    """
+    if not agent_name:
+        return False
+    try:
+        plan = _safe_attr(ctx, "session", None)
+        plan = _safe_attr(plan, "plan", None) if plan is not None else None
+        if plan is None:
+            return False
+        tasks = _safe_attr(plan, "tasks", None) or ()
+        from goldfive.types import TaskStatus
+
+        for task in tasks:
+            assignee = str(_safe_attr(task, "assignee_agent_id", "") or "")
+            if assignee != agent_name:
+                continue
+            status = _safe_attr(task, "status", None)
+            if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
+                return True
+    except Exception:  # noqa: BLE001 — diagnostic-only
+        return False
+    return False
+
+
 def _inject_task_id_from_state(
     *,
     tool_name: str,
@@ -2344,38 +2389,104 @@ def make_adk_plugin(
             # goldfive#241 — task_id is hidden from the LLM-facing
             # reporting-tool schema so the model never supplies it.
             # Resolve from state (delegation-site pin first, then the
-            # agent-turn pin). If neither resolves, return a silent
-            # acknowledgment so the agent's reporting protocol does
-            # NOT crash on plan-revision boundaries that leave the
-            # current agent without a pinned task (e.g. a coordinator
-            # whose own tasks were superseded by refine into tasks
-            # assigned to other agents). A loud error here makes the
-            # LLM bypass the reporting protocol entirely — observed in
-            # live session where the coordinator saw ``no_task_pinned``
-            # post-revision and reasoned "Let me proceed directly with
-            # the research_agent call since the user has already given
-            # me the topic," abandoning the reporting contract.
-            # Observability is preserved via the INFO log below; the
-            # agent sees a no-op success and continues.
+            # agent-turn pin). If neither resolves, the response branch
+            # depends on whether the current agent actually has work in
+            # the plan (goldfive#250 follow-up):
+            #
+            # * **No PENDING/RUNNING candidates for this agent** — a
+            #   legit orchestration-only turn (e.g. coordinator whose
+            #   tasks were superseded by a plan refine into tasks
+            #   assigned to other agents). Return a bare silent
+            #   acknowledgment so the agent's reporting protocol does
+            #   NOT crash on plan-revision boundaries. A loud error
+            #   here makes the LLM bypass the reporting protocol —
+            #   observed live.
+            # * **Has candidates** — the pin SHOULD have worked; a
+            #   silent ack would mask a real stall. Return a
+            #   structured ``pin_unresolved`` error so the stall is
+            #   visible.
+            #
+            # The silent-ack response carries NO ``detail`` / explanatory
+            # keys — tool responses go back to the LLM verbatim and any
+            # editorialising string is treated as actionable context
+            # (observed live: research_agent paraphrased a detail string
+            # into its reasoning and proceeded with stale pre-refine
+            # instructions, ignoring the refined scope).
             pinned = _inject_task_id_from_state(
                 tool_name=tool_name,
                 tool_args=tool_args,
                 tool_context=tool_context,
             )
             if _is_reporting_tool_name(tool_name) and not pinned:
+                # Resolve the current agent name — prefer the live
+                # invocation's agent (tool_context._invocation_context.
+                # agent.name), fall back to the host agent from
+                # SessionContext. Any resolution failure degrades to
+                # the silent-ack path (conservative — avoid breaking
+                # runs on edge-cases).
+                agent_name = ""
+                try:
+                    inv_ctx = _safe_attr(
+                        tool_context, "_invocation_context", None
+                    ) or _safe_attr(tool_context, "invocation_context", None)
+                    running_agent = _safe_attr(inv_ctx, "agent", None)
+                    agent_name = str(_safe_attr(running_agent, "name", "") or "")
+                    if not agent_name:
+                        agent_name = str(
+                            _safe_attr(ctx, "host_agent_name", "") or ""
+                        )
+                except Exception:  # noqa: BLE001
+                    agent_name = ""
+
+                has_candidates = False
+                try:
+                    has_candidates = _agent_has_pending_candidates(
+                        ctx, agent_name
+                    )
+                except Exception:  # noqa: BLE001 — conservative fall-through
+                    has_candidates = False
+
+                if has_candidates:
+                    # Gather candidate ids for the diagnostic WARNING
+                    # (nice-to-have; swallow any resolution errors).
+                    candidate_ids: list[str] = []
+                    try:
+                        from goldfive.types import TaskStatus
+
+                        plan = _safe_attr(ctx.session, "plan", None)
+                        tasks = _safe_attr(plan, "tasks", None) or ()
+                        for task in tasks:
+                            assignee = str(
+                                _safe_attr(task, "assignee_agent_id", "") or ""
+                            )
+                            if assignee != agent_name:
+                                continue
+                            status = _safe_attr(task, "status", None)
+                            if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
+                                candidate_ids.append(
+                                    str(_safe_attr(task, "id", "") or "")
+                                )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    log.warning(
+                        "before_tool_callback: pin_unresolved for %s "
+                        "(agent=%s, candidates=[%s]); surfacing structured "
+                        "error rather than silent-ack so the stall is visible",
+                        tool_name,
+                        agent_name or "?",
+                        ", ".join(candidate_ids),
+                    )
+                    return {
+                        "acknowledged": False,
+                        "error": "pin_unresolved",
+                    }
+
                 log.info(
                     "before_tool_callback: no task pinned for %s; "
                     "returning no-op acknowledgment (orchestration-only turn)",
                     tool_name,
                 )
-                return {
-                    "acknowledged": True,
-                    "no_task_pinned": True,
-                    "detail": (
-                        "no task currently bound to this agent; "
-                        "report recorded as orchestration-only no-op"
-                    ),
-                }
+                return {"acknowledged": True}
 
             tool_names_registered = {spec.name for spec in ctx.tools}
             if tool_name in tool_names_registered:
