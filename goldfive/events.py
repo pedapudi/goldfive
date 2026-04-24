@@ -697,6 +697,53 @@ def build_plan_revision_diff(old_plan: Any, new_plan: Any) -> Any:
     return diff
 
 
+def invocation_cancelled_event(
+    run_id: str,
+    sequence: int,
+    *,
+    invocation_id: str,
+    agent_name: str = "",
+    reason: str = "",
+    severity: str = "",
+    drift_id: str = "",
+    drift_kind: str = "",
+    detail: str = "",
+    tool_name: str = "",
+    session_id: str = "",
+) -> Any:
+    """Build an ``InvocationCancelled`` envelope (goldfive#251 Stream C).
+
+    Operator-visible sink event marking that a CRITICAL-severity drift
+    or user-steer triggered cooperative cancellation of an in-flight
+    agent invocation. The LLM-visible response is the bare
+    ``{"status": "cancelled"}`` dict — the rich context (``reason``,
+    ``severity``, ``drift_id``, ``drift_kind``, ``detail``,
+    ``tool_name``) lives ONLY on this envelope so it cannot leak into
+    the parent agent's transcript and bias its next turn (lessons from
+    goldfive#250 / #252 / #253).
+
+    Promoted from the dict envelope shipped by Stream C (PR #259) —
+    that path went through :func:`make_event` to avoid proto-regen
+    scope-creep at ship time. Wave 2 migrates harmonograf's ingest off
+    its placeholder ``harmonograf.v1.InvocationCancelled`` placeholder
+    and onto this typed message via a submodule bump.
+
+    Field semantics mirror :class:`goldfive.types.CancellationRequest`
+    plus the ``tool_name`` populated only when the cancel checkpoint
+    fires inside ``before_tool_callback``.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id)
+    evt.invocation_cancelled.invocation_id = str(invocation_id or "")
+    evt.invocation_cancelled.agent_name = str(agent_name or "")
+    evt.invocation_cancelled.reason = str(reason or "")
+    evt.invocation_cancelled.severity = str(severity or "")
+    evt.invocation_cancelled.drift_id = str(drift_id or "")
+    evt.invocation_cancelled.drift_kind = str(drift_kind or "")
+    evt.invocation_cancelled.detail = str(detail or "")
+    evt.invocation_cancelled.tool_name = str(tool_name or "")
+    return evt
+
+
 def drift_detected_event(
     run_id: str,
     sequence: int,

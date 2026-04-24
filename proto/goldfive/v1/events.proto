@@ -73,6 +73,7 @@ message Event {
     ReasoningJudgeInvoked reasoning_judge_invoked = 31;
     GoldfiveLLMCallStart goldfive_llm_call_start = 32;
     GoldfiveLLMCallEnd goldfive_llm_call_end = 33;
+    InvocationCancelled invocation_cancelled = 34;
   }
 }
 
@@ -597,4 +598,56 @@ message GoldfiveLLMCallEnd {
   // Used as the Gantt bar tooltip + popover headline. Up to 512 chars,
   // truncated with " … [truncated]". Only populated on End.
   string decision_summary = 10;
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative cancellation (goldfive#251 Stream C)
+// ---------------------------------------------------------------------------
+
+// Emitted when a CRITICAL-severity drift or user-steer triggers
+// cooperative cancellation of an agent invocation. Operator-visible
+// marker — the LLM sees only ``{"status": "cancelled"}`` as the
+// sub-invocation's return value (see goldfive#251 Stream C). The
+// rich operator-side context (reason, severity, drift_id, drift_kind,
+// detail, tool_name) lives ONLY on this sink event so it cannot leak
+// into the parent agent's transcript and bias its next turn.
+//
+// Promoted from a dict envelope to a typed proto message (Stream C
+// shipped the dict shape to avoid proto-regen scope-creep; #187 then
+// added a placeholder ``harmonograf.v1.InvocationCancelled`` for
+// ingest). Harmonograf-side migration onto this typed message is a
+// separate Wave 2 PR (submodule bump).
+message InvocationCancelled {
+  // ADK ``invocation_id`` of the dispatch that was cancelled.
+  string invocation_id = 1;
+  // Agent the invocation was running, when known. Empty when the
+  // cancel fired before the agent identity was resolvable (e.g. on
+  // the ``before_run_callback`` checkpoint).
+  string agent_name = 2;
+  // Short symbolic reason — ``"drift"`` / ``"user_steer"`` /
+  // ``"plan_revised"`` / etc. Free-form string; consumers pattern-
+  // match prefixes when useful.
+  string reason = 3;
+  // Severity of the triggering drift, lowercased: ``"info"`` /
+  // ``"warning"`` / ``"critical"``. Empty when no drift origin
+  // (programmatic cancels). Recorded as a string (not the
+  // ``DriftSeverity`` enum) so consumers can render it without an
+  // enum lookup.
+  string severity = 4;
+  // Cross-reference to the triggering ``DriftEvent.id`` when the
+  // cancel was minted from a drift. Empty for user-control cancels
+  // or programmatic calls with no drift origin.
+  string drift_id = 5;
+  // Drift kind as the bare lowercase string (e.g. ``"off_topic"``).
+  // Optional. Empty when no drift origin.
+  string drift_kind = 6;
+  // Human-readable one-line description of why cancel fired.
+  // Operator-visible only; never reaches the LLM.
+  string detail = 7;
+  // Tool name when the cancel checkpoint fired in
+  // ``before_tool_callback`` (a tool-dispatch was about to run and
+  // was short-circuited). Empty for cancels detected at
+  // ``before_agent_callback`` / ``before_model_callback`` where no
+  // specific tool was in flight.
+  string tool_name = 8;
 }

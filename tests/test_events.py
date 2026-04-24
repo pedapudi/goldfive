@@ -20,7 +20,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 from goldfive.control import ControlKind, ControlMessage  # noqa: E402
-from goldfive.events import build_plan_revision_diff, plan_revised_event  # noqa: E402
+from goldfive.events import (  # noqa: E402
+    build_plan_revision_diff,
+    invocation_cancelled_event,
+    plan_revised_event,
+)
 from goldfive.types import (  # noqa: E402
     DriftEvent,
     DriftKind,
@@ -355,3 +359,91 @@ def test_plan_revised_event_proto_round_trips_trigger_event_id() -> None:
     decoded.ParseFromString(encoded)
     assert decoded.plan_revised.trigger_event_id == "ann_roundtrip"
     assert decoded.plan_revised.plan.revision_trigger_event_id == "ann_roundtrip"
+
+
+# ---------------------------------------------------------------------------
+# invocation_cancelled_event factory (goldfive#251 Stream C / A5 promotion)
+# ---------------------------------------------------------------------------
+
+
+def test_invocation_cancelled_event_builds_proto_with_all_fields() -> None:
+    """Factory populates the typed payload with every field provided."""
+    evt = invocation_cancelled_event(
+        run_id="run-1",
+        sequence=3,
+        invocation_id="inv-abc",
+        agent_name="planner_agent",
+        reason="user_steer",
+        severity="critical",
+        drift_id="drift-xyz",
+        drift_kind="off_topic",
+        detail="agent wandered into raccoons",
+        tool_name="search",
+        session_id="sess-1",
+    )
+    assert evt.WhichOneof("payload") == "invocation_cancelled"
+    assert evt.run_id == "run-1"
+    assert evt.sequence == 3
+    assert evt.session_id == "sess-1"
+    payload = evt.invocation_cancelled
+    assert payload.invocation_id == "inv-abc"
+    assert payload.agent_name == "planner_agent"
+    assert payload.reason == "user_steer"
+    assert payload.severity == "critical"
+    assert payload.drift_id == "drift-xyz"
+    assert payload.drift_kind == "off_topic"
+    assert payload.detail == "agent wandered into raccoons"
+    assert payload.tool_name == "search"
+
+
+def test_invocation_cancelled_event_defaults_optional_fields_to_empty() -> None:
+    """Only ``invocation_id`` is required; other fields default to ``""``."""
+    evt = invocation_cancelled_event(
+        run_id="run-2",
+        sequence=0,
+        invocation_id="inv-only",
+    )
+    payload = evt.invocation_cancelled
+    assert payload.invocation_id == "inv-only"
+    assert payload.agent_name == ""
+    assert payload.reason == ""
+    assert payload.severity == ""
+    assert payload.drift_id == ""
+    assert payload.drift_kind == ""
+    assert payload.detail == ""
+    assert payload.tool_name == ""
+
+
+def test_invocation_cancelled_event_round_trips_through_wire() -> None:
+    """Serialize + deserialize the envelope — fields survive the wire."""
+    from goldfive.pb.goldfive.v1 import events_pb2
+
+    evt = invocation_cancelled_event(
+        run_id="run-rt",
+        sequence=7,
+        invocation_id="inv-rt",
+        agent_name="sub_agent",
+        reason="drift",
+        severity="warning",
+        drift_id="d-1",
+        drift_kind="confusion",
+        detail="loopy",
+        tool_name="lookup",
+        session_id="sess-rt",
+    )
+    encoded = evt.SerializeToString()
+    decoded = events_pb2.Event()
+    decoded.ParseFromString(encoded)
+    assert decoded.WhichOneof("payload") == "invocation_cancelled"
+    assert decoded.run_id == "run-rt"
+    assert decoded.sequence == 7
+    assert decoded.session_id == "sess-rt"
+    payload = decoded.invocation_cancelled
+    assert payload.invocation_id == "inv-rt"
+    assert payload.agent_name == "sub_agent"
+    assert payload.reason == "drift"
+    assert payload.severity == "warning"
+    assert payload.drift_id == "d-1"
+    assert payload.drift_kind == "confusion"
+    assert payload.detail == "loopy"
+    assert payload.tool_name == "lookup"

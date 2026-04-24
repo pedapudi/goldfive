@@ -81,14 +81,19 @@ class ListSink:
 
 
 def _cancelled_events(sink: ListSink) -> list[Any]:
-    """Filter dict-envelope events by ``kind == "invocation_cancelled"``."""
+    """Filter proto envelope events by ``WhichOneof('payload') ==
+    'invocation_cancelled'`` (goldfive A5: dict envelope promoted to
+    proto)."""
     out: list[Any] = []
     for evt in sink.events:
-        getter = getattr(evt, "get", None)
-        if getter is None:
+        which = getattr(evt, "WhichOneof", None)
+        if which is None:
             continue
-        if getter("kind") == "invocation_cancelled":
-            out.append(evt)
+        try:
+            if which("payload") == "invocation_cancelled":
+                out.append(evt)
+        except Exception:
+            continue
     return out
 
 
@@ -345,13 +350,13 @@ async def test_invocation_cancelled_sink_event_rich_fields() -> None:
     )
     cancelled = _cancelled_events(sink)
     assert len(cancelled) == 1
-    payload = cancelled[0]["payload"]
-    assert payload["invocation_id"] == "inv-1"
-    assert payload["agent_name"] == "planner_agent"
-    assert payload["reason"] == "user_steer"
-    assert payload["severity"] == "critical"
-    assert payload["drift_id"] == "drift-abc"
-    assert payload["drift_kind"] == "off_topic"
+    payload = cancelled[0].invocation_cancelled
+    assert payload.invocation_id == "inv-1"
+    assert payload.agent_name == "planner_agent"
+    assert payload.reason == "user_steer"
+    assert payload.severity == "critical"
+    assert payload.drift_id == "drift-abc"
+    assert payload.drift_kind == "off_topic"
 
 
 # ---------------------------------------------------------------------------
