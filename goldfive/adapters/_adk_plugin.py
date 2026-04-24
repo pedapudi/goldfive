@@ -1592,6 +1592,7 @@ def make_adk_plugin(
                                     task_id=tid,
                                     agent_name=agent_name,
                                     source="delegation_pin",
+                                    task=task,
                                 )
                                 return
 
@@ -1666,6 +1667,7 @@ def make_adk_plugin(
                 task_id=task_id,
                 agent_name=agent_name,
                 source="single_match",
+                task=task,
             )
 
         def _stamp_current_task_id(
@@ -1676,6 +1678,7 @@ def make_adk_plugin(
             task_id: str,
             agent_name: str,
             source: str,
+            task: Any = None,
         ) -> None:
             """Write ``task_id`` into both state surfaces for the sub-agent.
 
@@ -1684,6 +1687,14 @@ def make_adk_plugin(
             ``source`` label threads into the log line so the operator
             log shows whether the pin came from the pending-delegations
             map (goldfive#241) or the legacy assignee-match path.
+
+            When ``task`` is provided, the ADK side also stamps
+            ``goldfive.current_task_title`` /
+            ``goldfive.current_task_description`` so the dynamic
+            instruction resolver (goldfive#251) can render plan-causal
+            prompts without re-walking the plan. Legacy callers that
+            don't pass the task object keep working — the resolver
+            falls back to placeholders.
             """
             gf_state = _safe_attr(ctx.session, "state", None)
             if isinstance(gf_state, dict):
@@ -1697,7 +1708,15 @@ def make_adk_plugin(
             adk_state = _session_state_from_callback(callback_context)
             if isinstance(adk_state, Mapping):
                 try:
-                    _sp.write_current_task_id(adk_state, task_id)
+                    if task is not None:
+                        # write_current_task stamps all four fields
+                        # (id / title / description / assignee) from the
+                        # Task. Prefer this over the narrow id-only write
+                        # so the dynamic-instruction resolver (#251)
+                        # sees the title + description it needs.
+                        _sp.write_current_task(adk_state, task)
+                    else:
+                        _sp.write_current_task_id(adk_state, task_id)
                 except Exception as exc:  # noqa: BLE001
                     log.debug(
                         "before_agent_callback: ADK session.state pin failed: %s",

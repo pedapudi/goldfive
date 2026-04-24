@@ -152,6 +152,7 @@ def wrap(
     max_task_invocations: int | None = None,
     plugins: list[Any] | None = None,
     runtime: RuntimeConfig | None = None,
+    dynamic_instruction: bool = True,
     **legacy_kwargs: Any,
 ) -> Runner:
     """Build a :class:`Runner` that drives ``agent`` with goldfive.
@@ -205,6 +206,18 @@ def wrap(
         same plugins as the coordinator — not just the
         ``App(plugins=[...])``-level root runner. Ignored for
         non-ADK agents. See goldfive#121.
+    dynamic_instruction:
+        Default-on (goldfive#251). When ``True`` (the default) every
+        reachable ``LlmAgent`` in an ADK wrap target has its static
+        ``instruction`` string replaced with a callable resolver that
+        re-reads the agent's current-task context from ``session.state``
+        at every turn. The effect is plan-causal prompting: when refine
+        lands a revised description mid-run, the NEXT turn of the
+        affected agent automatically sees the new task without
+        transcript rewrite. Pass ``dynamic_instruction=False`` to keep
+        the original static strings (e.g. for deterministic prompts
+        under test, or when the caller is already managing their own
+        dynamic resolution). Ignored for non-ADK agents.
     runtime:
         Optional :class:`~goldfive.config.RuntimeConfig` (goldfive#225)
         bundling the typed-config surfaces: embedding backend,
@@ -237,6 +250,28 @@ def wrap(
         ``BaseAgent`` side can annotate
         ``cast(GoldfiveADKAgent, goldfive.wrap(...))`` themselves.
     """
+    # Dynamic instruction resolver (goldfive#251). Default-on per user
+    # review decision. Mutates each reachable LlmAgent's ``instruction``
+    # field in-place so the LLM sees a plan-causal prompt every turn,
+    # not just the baked-in string from construction time. Only
+    # meaningful for ADK agents (LlmAgent has the ``instruction``
+    # field); the installer is a no-op on other tree shapes.
+    if is_adk_agent(agent):
+        from goldfive.adapters._adk_dynainst import (
+            install_dynamic_instructions,
+            log_dynamic_instruction_opt_out,
+        )
+
+        if dynamic_instruction:
+            touched = install_dynamic_instructions(agent)
+            if touched:
+                log.debug(
+                    "goldfive.wrap: dynamic_instruction installed on %d agent(s)",
+                    touched,
+                )
+        else:
+            log_dynamic_instruction_opt_out(agent)
+
     adapter = auto_adapter(agent, plugins=plugins)
 
     # Resolve the runtime config (goldfive#225). When ``runtime`` is
