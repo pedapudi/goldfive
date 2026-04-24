@@ -216,6 +216,24 @@ message Task {
   // Populated by sinks that correlate goldfive tasks with harmonograf
   // spans. Empty for sinks that do not track spans.
   optional string bound_span_id = 8;
+
+  // Explicit supersession link (goldfive#237). When the planner
+  // produces a replacement for a task that has failed, been
+  // cancelled, or otherwise needs to be retried under a different
+  // shape, the new task sets ``supersedes = <old_task.id>``. Replaces
+  // the brittle id-suffix heuristics (``_corrected``, ``_v2``,
+  // ``retry_``) the executor's ``_has_live_replacement`` still
+  // tolerates for legacy plans. Default empty string — legacy plans
+  // and tasks that are NOT replacements leave it unset.
+  //
+  // Semantics:
+  //   * Exactly one superseded id. A chain A -> B -> C is expressed
+  //     as B.supersedes = A, C.supersedes = B.
+  //   * The superseded task must already exist in the plan (or be
+  //     being added in the same revision) — the steerer's plan-
+  //     revision hook uses the map to re-pin ``current_task_id`` and
+  //     to route reporting-tool calls from the old id to the new.
+  string supersedes = 9;
 }
 
 // A Plan is a DAG of Tasks with a revision history. The initial plan

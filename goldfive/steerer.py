@@ -490,9 +490,7 @@ class DefaultSteerer:
         # scalar fields above.
         self._goal_drift_config: GoalDriftConfig | None = goal_drift_config
         self._tool_loop_config: ToolLoopConfig | None = tool_loop_config
-        self._reasoning_drift_config: ReasoningDriftConfig | None = (
-            reasoning_drift_config
-        )
+        self._reasoning_drift_config: ReasoningDriftConfig | None = reasoning_drift_config
         # Install the reasoning-drift thresholds eagerly so any
         # ``observe_reasoning`` call on any session sees the
         # Runner-scoped config. Process-wide — see the installation-
@@ -507,9 +505,7 @@ class DefaultSteerer:
         # path. ``None`` callable silently no-ops the judge (tests without
         # a live LLM stay green).
         self._reasoning_drift_mode: ReasoningDriftMode = reasoning_drift_mode
-        self._reasoning_drift_call_llm: ReflectiveCallLLM | None = (
-            reasoning_drift_call_llm
-        )
+        self._reasoning_drift_call_llm: ReflectiveCallLLM | None = reasoning_drift_call_llm
         self._reasoning_drift_model = reasoning_drift_model
         self._reasoning_drift_rate_limit = max(1, int(reasoning_drift_rate_limit))
         # Drift-triggered plan-revision cooldown (goldfive#227).
@@ -1130,9 +1126,7 @@ class DefaultSteerer:
             return text
         return text[:limit] + " … [truncated]"
 
-    def _maybe_take_reasoning_judge_slot(
-        self, session: Session
-    ) -> ReflectiveCallLLM | None:
+    def _maybe_take_reasoning_judge_slot(self, session: Session) -> ReflectiveCallLLM | None:
         """Return the judge ``call_llm`` when this turn is a judge turn.
 
         Rate-limit policy (goldfive#226):
@@ -3238,6 +3232,119 @@ class DefaultSteerer:
         key = (drift.current_task_id, drift.kind.value)
         session._last_plan_revision_at[key] = time.monotonic()
 
+    def _repin_current_task_on_supersedes(
+        self,
+        session: Session,
+        revised: Plan,
+    ) -> None:
+        """Re-pin ``current_task_id`` onto replacement tasks after revision.
+
+        When a revision's tasks carry a non-empty ``supersedes`` link
+        (goldfive#237), treat it as the explicit "this task replaces
+        that one" signal that older heuristic id-suffix matching was
+        unable to express. Walk the map and:
+
+        * Update ``session.current_task_id`` if it matches a superseded
+          id — so agent-facing reporting-tool calls land on the live
+          replacement rather than the FAILED/CANCELLED original.
+        * Update the goldfive orchestration ``session.state`` pin
+          (``goldfive.current_task_id`` key) when it matches a
+          superseded id. This is the key the reporting-handler fallback
+          (:func:`goldfive.reporting._resolve_task_id`) reads when the
+          LLM's tool call omits the arg.
+        * Ask the bound adapter (if any) to rewrite any per-agent ADK
+          ``session.state`` copies whose current-task pin matches a
+          superseded id. Best-effort: adapters without the hook no-op.
+
+        The supersession map is built fresh from ``revised`` every call
+        so A→B→C chains across multiple revisions compose naturally
+        (each refine sees B.supersedes=A at revision N and
+        C.supersedes=B at revision N+1; we never need to chase
+        transitive links because the pin can only point at one id at a
+        time and each revision fires this hook independently).
+        """
+        if revised is None:
+            return
+        # Build fresh per-revision. Old -> new. A planner producing
+        # `C.supersedes = B` in the SAME revision that also ages
+        # `B.supersedes = A` is handled transitively: we follow the
+        # chain from the current pin forward to the first task that is
+        # NOT itself superseded within the revision. In practice the
+        # chain is rarely >1 hop per revision but the loop is cheap.
+        supersession: dict[str, str] = {}
+        for task in getattr(revised, "tasks", None) or ():
+            old_id = str(getattr(task, "supersedes", "") or "").strip()
+            new_id = str(getattr(task, "id", "") or "").strip()
+            if not old_id or not new_id or old_id == new_id:
+                continue
+            supersession[old_id] = new_id
+        if not supersession:
+            return
+
+        def _resolve_chain(start: str) -> str:
+            """Walk the supersession map from ``start`` to its latest end."""
+            seen: set[str] = {start}
+            current = start
+            while current in supersession:
+                nxt = supersession[current]
+                if nxt in seen:
+                    # Defensive: a cycle shouldn't exist but guard
+                    # against an adversarial planner before looping.
+                    break
+                seen.add(nxt)
+                current = nxt
+            return current
+
+        # 1. goldfive Session pin.
+        pinned = str(getattr(session, "current_task_id", "") or "")
+        if pinned and pinned in supersession:
+            resolved = _resolve_chain(pinned)
+            if resolved != pinned:
+                log.info(
+                    "goldfive#237: re-pinning session.current_task_id %s -> %s (supersedes)",
+                    pinned,
+                    resolved,
+                )
+                session.current_task_id = resolved
+
+        # 2. goldfive orchestration session.state pin (the reporting-
+        # tool fallback's source of truth). Use the canonical state key
+        # so tests that inspect the state dict directly see the update.
+        state = getattr(session, "state", None)
+        if isinstance(state, dict):
+            state_pinned = state.get(_ostate.KEY_CURRENT_TASK_ID, "")
+            if isinstance(state_pinned, str):
+                state_pinned_s = state_pinned.strip()
+            else:
+                state_pinned_s = str(state_pinned or "").strip()
+            if state_pinned_s and state_pinned_s in supersession:
+                resolved = _resolve_chain(state_pinned_s)
+                if resolved != state_pinned_s:
+                    log.info(
+                        "goldfive#237: re-pinning session.state %s -> %s (supersedes)",
+                        state_pinned_s,
+                        resolved,
+                    )
+                    state[_ostate.KEY_CURRENT_TASK_ID] = resolved
+
+        # 3. Per-agent ADK session.state copies (when the adapter
+        # exposes a hook). Optional wiring: most test-path adapters
+        # don't — we guard with hasattr and swallow exceptions so a
+        # missing hook never breaks revision emission.
+        adapter = self._adapter
+        if adapter is None:
+            return
+        hook = getattr(adapter, "rewrite_pinned_task_ids", None)
+        if not callable(hook):
+            return
+        try:
+            hook(supersession)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "goldfive#237: adapter.rewrite_pinned_task_ids raised: %s",
+                exc,
+            )
+
     async def _emit_plan_revised(
         self,
         session: Session,
@@ -3248,6 +3355,16 @@ class DefaultSteerer:
     ) -> None:
         from goldfive.conv import to_pb_plan
         from goldfive.events import build_plan_revision_diff
+
+        # goldfive#237: re-pin ``current_task_id`` onto any replacement
+        # task the revision introduces. Without this, agents keep
+        # reporting on the superseded (FAILED/CANCELLED) task and the
+        # replacement stays PENDING despite active work — the contradiction
+        # live sessions surfaced. Done before the event is emitted so
+        # downstream observers see the revised pin consistently with the
+        # revised plan. Additive: when no task has ``supersedes`` set,
+        # nothing changes.
+        self._repin_current_task_on_supersedes(session, revised)
 
         evt = self._new_envelope(session)
         evt.plan_revised.plan.CopyFrom(to_pb_plan(revised))
@@ -3278,12 +3395,8 @@ class DefaultSteerer:
         # rendering a Gantt / timeline want to explain WHY a refine was
         # requested and WHAT the planner produced without re-fetching
         # the drift and both plans.
-        evt.plan_revised.refine_input_summary = self._build_refine_input_summary(
-            drift, prev_plan
-        )
-        evt.plan_revised.refine_output_summary = self._build_refine_output_summary(
-            revised
-        )
+        evt.plan_revised.refine_input_summary = self._build_refine_input_summary(drift, prev_plan)
+        evt.plan_revised.refine_output_summary = self._build_refine_output_summary(revised)
         evt.plan_revised.target_agent_id = drift.current_agent_id or ""
         await self._emit(evt)
 

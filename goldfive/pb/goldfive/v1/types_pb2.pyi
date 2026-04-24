@@ -149,7 +149,7 @@ class TaskEdge(_message.Message):
     def __init__(self, from_task_id: _Optional[str] = ..., to_task_id: _Optional[str] = ...) -> None: ...
 
 class Task(_message.Message):
-    __slots__ = ("id", "title", "description", "assignee_agent_id", "status", "predicted_start_ms", "predicted_duration_ms", "bound_span_id")
+    __slots__ = ("id", "title", "description", "assignee_agent_id", "status", "predicted_start_ms", "predicted_duration_ms", "bound_span_id", "supersedes")
     ID_FIELD_NUMBER: _ClassVar[int]
     TITLE_FIELD_NUMBER: _ClassVar[int]
     DESCRIPTION_FIELD_NUMBER: _ClassVar[int]
@@ -158,6 +158,7 @@ class Task(_message.Message):
     PREDICTED_START_MS_FIELD_NUMBER: _ClassVar[int]
     PREDICTED_DURATION_MS_FIELD_NUMBER: _ClassVar[int]
     BOUND_SPAN_ID_FIELD_NUMBER: _ClassVar[int]
+    SUPERSEDES_FIELD_NUMBER: _ClassVar[int]
     id: str
     title: str
     description: str
@@ -166,7 +167,8 @@ class Task(_message.Message):
     predicted_start_ms: int
     predicted_duration_ms: int
     bound_span_id: str
-    def __init__(self, id: _Optional[str] = ..., title: _Optional[str] = ..., description: _Optional[str] = ..., assignee_agent_id: _Optional[str] = ..., status: _Optional[_Union[TaskStatus, str]] = ..., predicted_start_ms: _Optional[int] = ..., predicted_duration_ms: _Optional[int] = ..., bound_span_id: _Optional[str] = ...) -> None: ...
+    supersedes: str
+    def __init__(self, id: _Optional[str] = ..., title: _Optional[str] = ..., description: _Optional[str] = ..., assignee_agent_id: _Optional[str] = ..., status: _Optional[_Union[TaskStatus, str]] = ..., predicted_start_ms: _Optional[int] = ..., predicted_duration_ms: _Optional[int] = ..., bound_span_id: _Optional[str] = ..., supersedes: _Optional[str] = ...) -> None: ...
 
 class Plan(_message.Message):
     __slots__ = ("id", "run_id", "goal_ids", "summary", "tasks", "edges", "revision_reason", "revision_kind", "revision_severity", "revision_index", "created_at", "revision_trigger_event_id")

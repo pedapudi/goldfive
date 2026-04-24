@@ -247,3 +247,27 @@ async def test_handler_recoverable_accepts_string_bool() -> None:
     )
     # "false" string → recoverable=False → TASK_FAILED_FATAL
     assert planner.refine_calls[0]["drift"].kind is DriftKind.TASK_FAILED_FATAL
+
+
+# ---------------------------------------------------------------------------
+# goldfive#237 — reroute-on-supersedes coverage
+# ---------------------------------------------------------------------------
+
+
+async def test_report_task_started_reroutes_to_replacement() -> None:
+    """A report_task_started against a terminal+superseded id lands on the replacement."""
+    steerer, session, sink, _ = _fresh()
+    # Mark t1 FAILED and add a replacement superseding it.
+    session.plan.tasks[0].status = TaskStatus.FAILED
+    session.plan.tasks.append(
+        Task(id="t1_retry", title="A retry", supersedes="t1"),
+    )
+    out = await _tool("report_task_started").handler(
+        {"task_id": "t1", "detail": "starting retry"}, session, steerer
+    )
+    assert out == {"acknowledged": True}
+    by_id = {t.id: t for t in session.plan.tasks}
+    assert by_id["t1_retry"].status is TaskStatus.RUNNING
+    assert by_id["t1"].status is TaskStatus.FAILED
+    # The emitted TaskStarted event carries the replacement id.
+    assert sink.events[-1].task_started.task_id == "t1_retry"

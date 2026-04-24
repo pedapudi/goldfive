@@ -143,7 +143,11 @@ Requirements:
 3. REPLACE OR DROP the looping work as needed. If the work is still
    required, add a fresh PENDING task (with a new id) that approaches
    it differently — split it smaller, hand it to a different agent, or
-   precede it with a clarifying step.
+   precede it with a clarifying step. When the fresh PENDING task is
+   intended to carry the failed task's work forward, set
+   ``"supersedes": "<failed_task_id>"`` on the new task so the
+   framework can re-pin agent reporting onto the replacement. Omit
+   (or empty) ``supersedes`` for tasks that are not replacements.
 4. PRESERVE OR REWORK other non-finished tasks at your discretion.
 5. GOAL COVERAGE: every unsatisfied goal must still be addressed by at
    least one task in the returned plan.
@@ -158,7 +162,8 @@ Respond with a single JSON object and NOTHING ELSE:
       "title": "...",
       "description": "...",
       "assignee_agent_id": "...",
-      "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED"
+      "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED",
+      "supersedes": "<optional: id of a terminal task this one replaces>"
     }
   ],
   "edges": [{"from_task_id": "...", "to_task_id": "..."}]
@@ -201,6 +206,10 @@ Requirements:
 5. Honour the steering note: if it says "skip review", don't add a
    review task; if it says "focus on X", center the remaining work
    on X.
+6. If any new task is REPLACING a task that has gone FAILED /
+   CANCELLED (same semantic intent, new shape), set
+   ``"supersedes": "<old_task_id>"`` on the replacement so the
+   framework can re-pin reporting onto it. Leave empty otherwise.
 
 Respond with a single JSON object and NOTHING ELSE:
 
@@ -211,7 +220,8 @@ Respond with a single JSON object and NOTHING ELSE:
       "id": "...",
       "title": "...",
       "description": "...",
-      "assignee_agent_id": "..."
+      "assignee_agent_id": "...",
+      "supersedes": "<optional: id of a terminal task this one replaces>"
     }
   ],
   "edges": [{"from_task_id": "...", "to_task_id": "..."}]
@@ -326,6 +336,11 @@ You MUST:
    question, an error requires a retry/fallback path, a transfer
    introduces a sub-workflow), ADD new PENDING tasks for that work
    with fresh stable ids and appropriate edges back into the DAG.
+   If a new PENDING task is a REPLACEMENT for a task that has gone
+   FAILED or CANCELLED, set ``"supersedes": "<old_task_id>"`` on the
+   replacement so the framework can re-pin reporting onto it. Omit
+   (or leave empty) ``supersedes`` for genuinely new work that is
+   not replacing anything.
 
 4. DROP OBSOLETE PENDING TASKS. If the drift makes a PENDING task
    unnecessary (e.g., a goal has been satisfied early, a dependency
@@ -353,7 +368,8 @@ Respond with a single JSON object and NOTHING ELSE:
       "title": "...",
       "description": "...",
       "assignee_agent_id": "...",
-      "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED"
+      "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED",
+      "supersedes": "<optional: id of a terminal task this one replaces>"
     }
   ],
   "edges": [{"from_task_id": "...", "to_task_id": "..."}]
@@ -450,13 +466,16 @@ def _plan_from_json(
                 id=tid,
                 title=title,
                 description=str(t.get("description") or ""),
-                assignee_agent_id=_normalize_assignee(
-                    str(t.get("assignee_agent_id") or "")
-                ),
+                assignee_agent_id=_normalize_assignee(str(t.get("assignee_agent_id") or "")),
                 status=_coerce_status(t.get("status")),
                 predicted_start_ms=int(t.get("predicted_start_ms") or 0),
                 predicted_duration_ms=int(t.get("predicted_duration_ms") or 0),
                 bound_span_id=str(t.get("bound_span_id") or ""),
+                # goldfive#237: explicit supersession link. Populated by
+                # refine paths when the LLM produces a replacement for a
+                # failed/cancelled task. Empty for net-new and preserved
+                # terminal tasks.
+                supersedes=str(t.get("supersedes") or "").strip(),
             )
         )
     if not tasks:
@@ -2331,9 +2350,7 @@ class LLMPlanner:
             )
             return None
         if not isinstance(raw, str) or not raw.strip():
-            log.warning(
-                "LLMPlanner.synthesize_goal_from_steer: empty / non-str response"
-            )
+            log.warning("LLMPlanner.synthesize_goal_from_steer: empty / non-str response")
             return None
         cleaned = _strip_code_fences(raw).strip()
         try:
@@ -2346,23 +2363,17 @@ class LLMPlanner:
             return None
         if not isinstance(parsed, dict):
             log.warning(
-                "LLMPlanner.synthesize_goal_from_steer: response was not an "
-                "object; got %r",
+                "LLMPlanner.synthesize_goal_from_steer: response was not an object; got %r",
                 type(parsed),
             )
             return None
         goal_raw = parsed.get("goal")
         if not isinstance(goal_raw, dict):
-            log.warning(
-                "LLMPlanner.synthesize_goal_from_steer: missing 'goal' object"
-            )
+            log.warning("LLMPlanner.synthesize_goal_from_steer: missing 'goal' object")
             return None
         summary = goal_raw.get("summary")
         if not isinstance(summary, str) or not summary.strip():
-            log.warning(
-                "LLMPlanner.synthesize_goal_from_steer: goal missing non-empty "
-                "'summary'"
-            )
+            log.warning("LLMPlanner.synthesize_goal_from_steer: goal missing non-empty 'summary'")
             return None
         gid = goal_raw.get("id")
         if not isinstance(gid, str) or not gid.strip():
