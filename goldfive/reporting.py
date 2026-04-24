@@ -88,6 +88,11 @@ _ACK: dict[str, Any] = {"acknowledged": True}
 # :mod:`._adk_state_protocol`, :mod:`orchestration_state`, and this
 # handler module.
 _STATE_KEY_CURRENT_TASK_ID = "goldfive.current_task_id"
+# Companion key (goldfive#266 / pin versioning) — the plan revision
+# in effect at the moment the adapter wrote the pin. Same back-compat
+# stance: a missing / malformed entry reads as 0, which matches the
+# default ``Plan.revision_index`` so unrevised plans remain "fresh".
+_STATE_KEY_CURRENT_TASK_REVISION = "goldfive.current_task_revision"
 
 
 def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
@@ -293,6 +298,313 @@ def _reroute_if_superseded(session: Session, task_id: str, tool_name: str) -> st
     return resolved
 
 
+# ---------------------------------------------------------------------------
+# Pin freshness classification (goldfive#266 / pin versioning)
+# ---------------------------------------------------------------------------
+
+
+def _read_pin_revision(session: Session) -> int | None:
+    """Return the pin's stamped revision from session state, or ``None``.
+
+    ``None`` indicates "no stamp present" — distinct from a stamp of 0.
+    Custom adapters / legacy sessions / tests that pre-date #266 won't
+    have stamped the key; those callers must keep working unchanged
+    against the legacy ``_reroute_if_superseded`` semantics. Callers
+    that observe ``None`` should treat the pin as fresh (the stamp
+    isn't load-bearing).
+
+    A stamp of ``0`` means "the pin was set under the initial plan
+    revision" and is treated by the classifier as a stale pin against
+    any plan with ``revision_index > 0`` — that's the actual
+    versioning semantics, distinct from "no stamp".
+    """
+    state = getattr(session, "state", None)
+    if not isinstance(state, dict):
+        return None
+    if _STATE_KEY_CURRENT_TASK_REVISION not in state:
+        return None
+    raw = state.get(_STATE_KEY_CURRENT_TASK_REVISION, 0)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_plan_revision(session: Session) -> int:
+    """Return ``session.plan.revision_index`` as an int, default 0.
+
+    Tolerant of missing / mock plans (test stubs, custom executors).
+    """
+    plan = getattr(session, "plan", None)
+    try:
+        return max(0, int(getattr(plan, "revision_index", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _supersession_successor(
+    session: Session, task_id: str
+) -> tuple[str, SupersessionKind]:
+    """Return ``(successor_task_id, kind)`` for ``task_id``.
+
+    Walks the plan looking for a task whose ``supersedes`` equals
+    ``task_id``. Empty successor + ``UNSPECIFIED`` when no successor
+    exists. Used by the report-time pin classifier — ``REPLACE``
+    successors route, ``CORRECT`` successors refuse, no successor also
+    refuses (ambiguity).
+    """
+    plan = getattr(session, "plan", None)
+    if plan is None or not task_id:
+        return "", SupersessionKind.UNSPECIFIED
+    for t in getattr(plan, "tasks", ()) or ():
+        sup = str(getattr(t, "supersedes", "") or "").strip()
+        if sup != task_id:
+            continue
+        successor_id = str(getattr(t, "id", "") or "").strip()
+        kind = getattr(t, "supersedes_kind", SupersessionKind.UNSPECIFIED)
+        return successor_id, kind
+    return "", SupersessionKind.UNSPECIFIED
+
+
+# Outcomes of :func:`_classify_pin_freshness`:
+#
+# * ``"match"`` — pin revision equals (or exceeds — defensive) current
+#   plan revision. Handler proceeds on the pin's task_id.
+# * ``"stale_replace"`` — pin is older than the current plan revision
+#   and the pin's task has a REPLACE-kind supersedes successor. Handler
+#   routes onto the successor (existing pre-#266 behaviour).
+# * ``"stale_correct"`` — pin is older + the pin's task has a
+#   CORRECT-kind supersedes successor. Handler REFUSES + emits a
+#   ``task_transition_refused`` sink event. The old task's terminal
+#   state is historical fact and the correction is a separate work
+#   unit; transitioning the old task out of terminal would either
+#   destroy fact or shadow the correction.
+# * ``"stale_ambiguous"`` — pin is older + the pin's task has no
+#   supersedes successor. Handler REFUSES; an operator must
+#   disambiguate. Same shape as stale_correct.
+_PinFreshness = str
+
+
+def _classify_pin_freshness(
+    session: Session,
+    task_id: str,
+    *,
+    pin_revision: int,
+    current_revision: int,
+) -> tuple[_PinFreshness, str, SupersessionKind]:
+    """Classify the relationship between a pinned task_id and the live plan.
+
+    Returns ``(freshness, successor_task_id, supersedes_kind)``. The
+    successor is empty for ``"match"`` and ``"stale_ambiguous"``.
+    """
+    if pin_revision >= current_revision:
+        # Future revisions (pin_revision > current_revision) shouldn't
+        # happen under a single executor — the writer reads
+        # plan.revision_index that the report-time reader sees later,
+        # and revisions only ever increment. If it does, treat as a
+        # match (trust the pin) rather than refusing.
+        if pin_revision > current_revision:
+            log.debug(
+                "reporting: pin_revision=%d > current=%d for task_id=%s "
+                "(unexpected; trusting pin)",
+                pin_revision,
+                current_revision,
+                task_id,
+            )
+        return "match", "", SupersessionKind.UNSPECIFIED
+
+    # pin_revision < current_revision — the pin was set under an older
+    # plan. Consult the supersedes graph.
+    successor_id, kind = _supersession_successor(session, task_id)
+    if successor_id and kind is SupersessionKind.REPLACE:
+        return "stale_replace", successor_id, kind
+    if successor_id and kind is SupersessionKind.CORRECT:
+        return "stale_correct", successor_id, kind
+    if successor_id and kind is SupersessionKind.UNSPECIFIED:
+        # Legacy plans pre-#258 didn't carry a supersedes_kind enum.
+        # Preserve the historical "treat unspecified as REPLACE" rerouting
+        # path used by ``_resolve_effective_task_id`` so legacy data
+        # keeps reaching the right handler.
+        return "stale_replace", successor_id, kind
+    return "stale_ambiguous", "", SupersessionKind.UNSPECIFIED
+
+
+def _refused_response() -> dict[str, Any]:
+    """Return the ack-only response for a refused stale-pin transition.
+
+    The LLM still sees ``{"acknowledged": True}`` rather than an error
+    payload — surfacing the refusal as a structured error would create a
+    prompt-injection surface (the LLM might reason against the rejection
+    and bypass the contract). Operators see the refusal via the
+    ``task_transition_refused`` sink event.
+    """
+    return dict(_ACK)
+
+
+async def _classify_and_route_pin(
+    *,
+    session: Session,
+    steerer: Steerer,
+    task_id: str,
+    tool_name: str,
+    attempted_to: TaskStatus,
+) -> tuple[str, dict[str, Any] | None]:
+    """Apply the goldfive#266 pin freshness classifier to ``task_id``.
+
+    Returns ``(effective_task_id, refusal_response_or_None)``:
+
+    * ``("<task_id>", None)`` — proceed; ``effective_task_id`` is
+      either the original task_id (fresh pin) or a routed REPLACE-kind
+      successor (stale-but-recoverable pin).
+    * ``("", {refusal})`` — refuse; the caller returns the refusal
+      response (an ack-only dict) without driving the steerer. A
+      ``task_transition_refused`` sink event has already been emitted.
+
+    Uses the supersedes graph to distinguish a stale REPLACE pin
+    (route) from a stale CORRECT pin (refuse: the old task's terminal
+    state is historical fact, the correction is a separate work unit)
+    and from a stale pin with no successor (refuse: ambiguity —
+    operator must decide).
+
+    Always falls back gracefully on the existing
+    :func:`_reroute_if_superseded` helper when classification yields
+    "match" — preserving the post-#258 behaviour where a fresh pin on a
+    terminal task whose successor is REPLACE-kind still routes (the
+    "agent was retrying its own pin id but the planner already
+    replaced it" path).
+    """
+    pin_rev_opt = _read_pin_revision(session)
+    cur_rev = _read_plan_revision(session)
+    if pin_rev_opt is None:
+        # No stamp present — legacy session, custom adapter, or test
+        # stub that pre-dates #266. Preserve the historical
+        # ``_reroute_if_superseded`` semantics: fresh pin on a
+        # terminal task whose successor is REPLACE-kind routes; no
+        # successor or CORRECT-kind successor falls through to the
+        # handler's existing terminal-state rejection path.
+        return _reroute_if_superseded(session, task_id, tool_name), None
+    pin_rev = pin_rev_opt
+    freshness, successor_id, _kind = _classify_pin_freshness(
+        session,
+        task_id,
+        pin_revision=pin_rev,
+        current_revision=cur_rev,
+    )
+
+    if freshness == "match":
+        # Fresh pin — fall through to the legacy rerouting helper.
+        # This still routes a fresh pin pointing at a terminal task
+        # whose successor is REPLACE-kind (an LLM that retries its
+        # own pin without realising the plan repointed).
+        return _reroute_if_superseded(session, task_id, tool_name), None
+
+    if freshness == "stale_replace":
+        log.info(
+            "reporting: %s called with stale pin task_id=%s "
+            "(pin_rev=%d, current_rev=%d); routing to REPLACE successor=%s",
+            tool_name,
+            task_id,
+            pin_rev,
+            cur_rev,
+            successor_id,
+        )
+        return successor_id or task_id, None
+
+    # stale_correct or stale_ambiguous → refuse.
+    reason = (
+        "stale_pin_correct_supersedes"
+        if freshness == "stale_correct"
+        else "stale_pin_no_supersedes"
+    )
+    log.warning(
+        "reporting: %s REFUSED on stale pin task_id=%s "
+        "(pin_rev=%d, current_rev=%d, reason=%s)",
+        tool_name,
+        task_id,
+        pin_rev,
+        cur_rev,
+        reason,
+    )
+    # Look up the pin's current status in the plan for a faithful
+    # ``attempted_from`` value on the sink event. Falls back to PENDING
+    # if the task isn't in the plan (which would be a separate bug —
+    # the classifier has already consulted the supersedes graph and
+    # found a successor or absence-of-one).
+    pin_task = _find_task_in_session(session, task_id)
+    attempted_from = (
+        pin_task.status if pin_task is not None else TaskStatus.PENDING
+    )
+    await _emit_task_transition_refused(
+        session=session,
+        steerer=steerer,
+        task_id=task_id,
+        attempted_from=attempted_from,
+        attempted_to=attempted_to,
+        reason=reason,
+        pin_revision=pin_rev,
+        current_revision=cur_rev,
+    )
+    return "", _refused_response()
+
+
+async def _emit_task_transition_refused(
+    *,
+    session: Session,
+    steerer: Steerer,
+    task_id: str,
+    attempted_from: TaskStatus,
+    attempted_to: TaskStatus,
+    reason: str,
+    pin_revision: int,
+    current_revision: int,
+    agent_name: str = "",
+    invocation_id: str = "",
+) -> None:
+    """Emit a ``task_transition_refused`` dict envelope onto the sink bus.
+
+    Fired when the report-time pin classifier refuses to drive a stale
+    pin's transition because the old task either has a CORRECT-kind
+    supersedes successor (history vs. correction) or no successor at
+    all (ambiguity — operator must decide). The LLM still sees an
+    ``{"acknowledged": True}`` response so it doesn't reason against
+    the refusal; operators consume this event for the audit trail.
+
+    Dict envelope (not proto) — matches the pattern set by
+    ``refine_attempted`` / ``refine_failed`` (#264) and
+    ``InvocationCancelled`` pre-proto. Promote to proto when the
+    follow-up prioritises it.
+    """
+    sinks = getattr(steerer, "_sinks", None) or []
+    if not sinks:
+        return
+    from goldfive.events import emit, make_event
+
+    payload = {
+        "task_id": task_id,
+        "attempted_from": attempted_from.value,
+        "attempted_to": attempted_to.value,
+        "reason": reason,
+        "pin_revision": int(pin_revision),
+        "current_revision": int(current_revision),
+        "agent_name": agent_name,
+        "invocation_id": invocation_id,
+    }
+    try:
+        evt = make_event(
+            session.run_id,
+            session.next_sequence(),
+            "task_transition_refused",
+            payload,
+            session_id=session.id,
+        )
+        await emit(sinks, evt)
+    except Exception as exc:  # noqa: BLE001 — observability must never break a report
+        log.debug(
+            "reporting._emit_task_transition_refused: failed to emit: %s",
+            exc,
+        )
+
+
 async def _await_plan_stable(session: Session, steerer: Steerer) -> None:
     """Block briefly until the steerer's plan mutation region is idle.
 
@@ -477,7 +789,17 @@ async def _handle_task_started(
     # goldfive a4: barrier against a concurrent fire-and-forget refine
     # mutating the plan mid-read. See ``_await_plan_stable``.
     await _await_plan_stable(session, steerer)
-    task_id = _reroute_if_superseded(session, task_id, "report_task_started")
+    # goldfive#266 — classify pin freshness; refuse stale CORRECT /
+    # ambiguous, route stale REPLACE, fall through on match.
+    task_id, refusal = await _classify_and_route_pin(
+        session=session,
+        steerer=steerer,
+        task_id=task_id,
+        tool_name="report_task_started",
+        attempted_to=TaskStatus.RUNNING,
+    )
+    if refusal is not None:
+        return refusal
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(tool_name="report_task_started", current_status=task.status)
@@ -544,7 +866,15 @@ async def _handle_task_progress(
     if not task_id:
         return _missing_task_id_response("report_task_progress")
     await _await_plan_stable(session, steerer)
-    task_id = _reroute_if_superseded(session, task_id, "report_task_progress")
+    task_id, refusal = await _classify_and_route_pin(
+        session=session,
+        steerer=steerer,
+        task_id=task_id,
+        tool_name="report_task_progress",
+        attempted_to=TaskStatus.RUNNING,
+    )
+    if refusal is not None:
+        return refusal
     task = _find_task_in_session(session, task_id)
     if task is not None:
         # report_task_progress is a liveness tick — only valid on RUNNING.
@@ -581,7 +911,15 @@ async def _handle_task_completed(
     if not task_id:
         return _missing_task_id_response("report_task_completed")
     await _await_plan_stable(session, steerer)
-    task_id = _reroute_if_superseded(session, task_id, "report_task_completed")
+    task_id, refusal = await _classify_and_route_pin(
+        session=session,
+        steerer=steerer,
+        task_id=task_id,
+        tool_name="report_task_completed",
+        attempted_to=TaskStatus.COMPLETED,
+    )
+    if refusal is not None:
+        return refusal
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(
@@ -614,7 +952,15 @@ async def _handle_task_failed(
     if not task_id:
         return _missing_task_id_response("report_task_failed")
     await _await_plan_stable(session, steerer)
-    task_id = _reroute_if_superseded(session, task_id, "report_task_failed")
+    task_id, refusal = await _classify_and_route_pin(
+        session=session,
+        steerer=steerer,
+        task_id=task_id,
+        tool_name="report_task_failed",
+        attempted_to=TaskStatus.FAILED,
+    )
+    if refusal is not None:
+        return refusal
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(tool_name="report_task_failed", current_status=task.status)
@@ -647,7 +993,15 @@ async def _handle_task_blocked(
     if not task_id:
         return _missing_task_id_response("report_task_blocked")
     await _await_plan_stable(session, steerer)
-    task_id = _reroute_if_superseded(session, task_id, "report_task_blocked")
+    task_id, refusal = await _classify_and_route_pin(
+        session=session,
+        steerer=steerer,
+        task_id=task_id,
+        tool_name="report_task_blocked",
+        attempted_to=TaskStatus.BLOCKED,
+    )
+    if refusal is not None:
+        return refusal
     task = _find_task_in_session(session, task_id)
     if task is not None:
         decision = _classify_transition(tool_name="report_task_blocked", current_status=task.status)

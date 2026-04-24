@@ -609,8 +609,14 @@ async def test_parallel_agenttool_resolves_by_args() -> None:
     )
 
     pending = session_obj.state.get(_PENDING_DELEGATIONS_KEY) or {}
-    assert pending.get("fc_solar") == "research_solar", pending
-    assert pending.get("fc_wind") == "research_wind", pending
+    # goldfive#266: entries evolved from ``{fc_id: task_id_str}`` to
+    # ``{fc_id: {"task_id": str, "revision": int}}``. Normalise via the
+    # back-compat extractor so the test asserts the contract, not the
+    # storage shape.
+    from goldfive.adapters._adk_plugin import _delegation_pin_task_id
+
+    assert _delegation_pin_task_id(pending.get("fc_solar")) == "research_solar", pending
+    assert _delegation_pin_task_id(pending.get("fc_wind")) == "research_wind", pending
 
 
 async def test_parallel_agenttool_falls_through_on_ambiguous_args() -> None:
@@ -657,7 +663,9 @@ async def test_dag_aware_candidate_filter() -> None:
     )
 
     pending = session_obj.state.get(_PENDING_DELEGATIONS_KEY) or {}
-    pinned = pending.get("fc_gated")
+    from goldfive.adapters._adk_plugin import _delegation_pin_task_id
+
+    pinned = _delegation_pin_task_id(pending.get("fc_gated"))
     # Only "research" is upstream-clear (no predecessors); the
     # "synthesise" task is gated on "research". The pin must be on
     # "research" — NOT on "synthesise" even though its description
