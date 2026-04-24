@@ -177,8 +177,15 @@ async def test_before_agent_callback_pins_unambiguous_task() -> None:
     assert session.state["goldfive.current_task_id"] == "t1"
 
 
-async def test_before_agent_callback_ambiguous_match_leaves_unset() -> None:
-    """Two PENDING tasks for the same agent → no stamp."""
+async def test_before_agent_callback_ambiguous_match_pins_low_confidence() -> None:
+    """Two PENDING tasks for the same agent → signal 8 picks deterministically.
+
+    goldfive#264 reframed the resolver: an invoked agent must end up
+    with a pin (something precipitated the call). The ambiguous-match
+    case now falls through to signal 8 which picks the first
+    assignee-matching candidate with low-confidence telemetry. The
+    pre-#264 silent-unset behaviour is gone.
+    """
     plugin = make_adk_plugin(host_agent_name="coord")
     session = _session_with(
         _plan_with(
@@ -193,8 +200,9 @@ async def test_before_agent_callback_ambiguous_match_leaves_unset() -> None:
         callback_context=ctx,
     )
 
-    assert KEY_CURRENT_TASK_ID not in state
-    assert "goldfive.current_task_id" not in session.state
+    # The ambiguous case lands on the first deterministic candidate.
+    assert state[KEY_CURRENT_TASK_ID] in {"t1", "t2"}
+    assert session.state["goldfive.current_task_id"] == state[KEY_CURRENT_TASK_ID]
 
 
 async def test_before_agent_callback_no_match_leaves_unset() -> None:
@@ -267,8 +275,14 @@ async def test_before_agent_callback_skips_terminal_tasks() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_pin_skips_task_with_incomplete_upstream() -> None:
-    """A -> B, A is PENDING, agent is assigned to B -> no pin (upstream gate)."""
+async def test_pin_relaxes_dag_gate_when_upstream_incomplete() -> None:
+    """A -> B, A is PENDING, agent is assigned to B -> signal 4 binds B.
+
+    goldfive#264 reframe: the DAG-ready filter is now signal 2; if it
+    rejects every candidate, signal 4 retries without the gate and
+    pins the assignee match. The operator-visible safety net moves
+    from "silently no-op" to "WARNING log + dag_relaxed sink event".
+    """
     plugin = make_adk_plugin(host_agent_name="coord")
     session = _session_with(
         _plan_with(
@@ -284,9 +298,9 @@ async def test_pin_skips_task_with_incomplete_upstream() -> None:
         callback_context=ctx,
     )
 
-    # DAG gate filters B out because A is still PENDING.
-    assert KEY_CURRENT_TASK_ID not in state
-    assert "goldfive.current_task_id" not in session.state
+    # Signal 4 — DAG gate relaxed — pins B.
+    assert state[KEY_CURRENT_TASK_ID] == "b"
+    assert session.state["goldfive.current_task_id"] == "b"
 
 
 async def test_pin_selects_task_after_upstream_completes() -> None:
@@ -341,16 +355,18 @@ async def test_pin_ambiguous_narrows_by_dag() -> None:
     assert session.state["goldfive.current_task_id"] == "t1"
 
 
-async def test_pin_reproduces_finalize_bug() -> None:
-    """Live-scenario regression: 5-stage plan, only finalize is the coordinator's.
+async def test_pin_finalize_with_incomplete_upstream_relaxes_loudly() -> None:
+    """Live-scenario regression (goldfive#242 + #264 reframe).
 
-    Stages 0-3 are PENDING; the final ``finalize_and_deliver_presentation``
-    task (Stage 4) is the only one assigned to the coordinator. Before
-    the DAG gate, ``before_agent_callback`` pinned the finalize task on
-    the coordinator's very first turn (pre-delegation), letting the
-    LLM call ``report_task_started`` on it and transitioning a Stage 4
-    task to RUNNING while upstream was still PENDING. The gate must
-    block that pin.
+    5-stage plan; only the Stage-4 finalize is the coordinator's task.
+    Stages 0-3 are PENDING. Pre-#242 the pin would race ahead and the
+    LLM would call ``report_task_started`` on finalize while upstream
+    was incomplete; #242 added a strict DAG gate that left the pin
+    unset and produced silent no-ops in the reporting path. #264
+    reframes again: the agent WAS invoked so something precipitated
+    it. Signal 4 relaxes the DAG gate and binds finalize, but loudly —
+    a ``dag_relaxed`` sink event + WARNING log gives operators the
+    same anomaly visibility the silent unset used to deny them.
     """
     plugin = make_adk_plugin(host_agent_name="coordinator_agent")
     session = _session_with(
@@ -379,14 +395,20 @@ async def test_pin_reproduces_finalize_bug() -> None:
         callback_context=ctx,
     )
 
-    # The entire bug: nothing should be pinned on the coordinator's
-    # first turn because the finalize task's upstream is still PENDING.
-    assert KEY_CURRENT_TASK_ID not in state
-    assert "goldfive.current_task_id" not in session.state
+    # Signal 4 binds finalize (the agent WAS invoked).
+    assert state[KEY_CURRENT_TASK_ID] == "finalize_and_deliver_presentation"
+    assert session.state["goldfive.current_task_id"] == "finalize_and_deliver_presentation"
 
 
 async def test_pin_supersedes_redirection_tracks_replacement() -> None:
-    """Edge ``A -> C`` survives supersession; readiness tracks B's status."""
+    """Edge ``A -> C`` survives supersession; readiness tracks B's status.
+
+    goldfive#264: signal 2 (DAG-ready) consults supersession-aware
+    readiness via :func:`task_upstream_ready`. With B still PENDING
+    signal 2 fails, but signal 4 (DAG-relaxed) still binds C — the
+    agent was invoked. Once B completes, signal 2 picks up C as the
+    happy-path single-DAG-ready match.
+    """
     plugin = make_adk_plugin(host_agent_name="coord")
     # A is the original, now FAILED; B replaces A (B.supersedes == "A");
     # C depends on A in the edges table. The live status driving C's
@@ -406,14 +428,14 @@ async def test_pin_supersedes_redirection_tracks_replacement() -> None:
     session = _session_with(plan)
     state, ctx = _ctx_for(session, "coord")
 
-    # B is still PENDING -> C is NOT ready -> pin blocked.
+    # B is still PENDING -> signal 2 rejects, but signal 4 binds C.
     await plugin.before_agent_callback(
         agent=_Agent("research_agent"),
         callback_context=ctx,
     )
-    assert KEY_CURRENT_TASK_ID not in state
+    assert state[KEY_CURRENT_TASK_ID] == "C"
 
-    # Flip B to COMPLETED; now C is ready -> pin proceeds.
+    # Flip B to COMPLETED; now C is DAG-ready -> signal 2 binds.
     plan.tasks[1].status = TaskStatus.COMPLETED
     await plugin.before_agent_callback(
         agent=_Agent("research_agent"),
@@ -422,13 +444,15 @@ async def test_pin_supersedes_redirection_tracks_replacement() -> None:
     assert state[KEY_CURRENT_TASK_ID] == "C"
 
 
-async def test_pin_orchestration_block_shows_none_when_unpinned() -> None:
-    """When the DAG gate blocks pin, the planner instruction block shows '(none)'.
+async def test_pin_orchestration_block_renders_pinned_task_after_relaxation() -> None:
+    """When signal 4 relaxes the DAG gate, GoldfivePlanner renders the bound task.
 
-    This is the user-visible effect: the agent's system prompt does
-    NOT contain a stale or wrong task id on turns where no task is
-    eligible. GoldfivePlanner renders the pinned id from
-    ``goldfive.current_task_id``; an unset key surfaces ``(none)``.
+    Pre-#264 the user-visible effect was an unset pin → ``(none)`` in
+    the planner instruction block. Post-#264 the relaxed pin reaches
+    the prompt — the operator-visible safety net moved to the sink
+    event + log. The LLM seeing the task id is the intended behaviour:
+    something precipitated the call, and the pin is goldfive's best
+    structural answer to "what was I invoked for".
     """
     from goldfive.planners.goldfive_planner import GoldfivePlanner
 
@@ -451,8 +475,8 @@ async def test_pin_orchestration_block_shows_none_when_unpinned() -> None:
         callback_context=ctx,
     )
 
-    # No pin happened (s0 still PENDING).
-    assert KEY_CURRENT_TASK_ID not in state
+    # Signal 4 relaxes the DAG gate and binds finalize.
+    assert state[KEY_CURRENT_TASK_ID] == "finalize"
 
     # Build the planner instruction the LLM would see. We use a
     # tolerant readonly-context stub carrying the ADK state dict.
@@ -464,9 +488,12 @@ async def test_pin_orchestration_block_shows_none_when_unpinned() -> None:
 
     instruction = planner.build_planning_instruction(_Readonly(state), None)
     assert instruction is not None
-    # The critical assertion: the block does not contain the finalize id.
-    assert "finalize" not in instruction
-    assert "Plan task (if any): (none)" in instruction
+    # The pinned task id reaches the prompt now that the resolver
+    # binds aggressively. The "(none)" string was the pre-#264 marker
+    # of a silent unset; the new contract surfaces the bound task and
+    # records the relaxation for operators via the sink event.
+    assert "finalize" in instruction
+    assert "Plan task (if any): (none)" not in instruction
 
 
 # ---------------------------------------------------------------------------

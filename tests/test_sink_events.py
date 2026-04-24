@@ -124,8 +124,19 @@ def _make_terminal_llm() -> Any:
     return _T
 
 
+def _proto_events(events: list[Any]) -> list[Any]:
+    """Filter ``events`` to only the proto-envelope ones.
+
+    goldfive#264 introduced dict-shaped ``pin_resolved`` events that
+    fan out through the same sink list as proto-envelope events.
+    Tests that filter by ``WhichOneof("payload")`` have to skip the
+    dict shape to avoid AttributeError.
+    """
+    return [e for e in events if hasattr(e, "WhichOneof")]
+
+
 def _kinds(events: list[Any]) -> list[str]:
-    return [e.WhichOneof("payload") for e in events]
+    return [e.WhichOneof("payload") for e in _proto_events(events)]
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +168,16 @@ async def test_single_agent_dispatch_emits_started_and_completed_pair() -> None:
     session = Session(run_id="r1", plan=plan)
     await adapter.invoke(task=task, session=session)
 
-    starts = [e for e in sink.events if e.WhichOneof("payload") == "agent_invocation_started"]
-    completes = [e for e in sink.events if e.WhichOneof("payload") == "agent_invocation_completed"]
+    starts = [
+        e
+        for e in _proto_events(sink.events)
+        if e.WhichOneof("payload") == "agent_invocation_started"
+    ]
+    completes = [
+        e
+        for e in _proto_events(sink.events)
+        if e.WhichOneof("payload") == "agent_invocation_completed"
+    ]
 
     assert len(starts) == 1, f"expected 1 start; got {len(starts)}: {_kinds(sink.events)}"
     assert len(completes) == 1
@@ -210,7 +229,7 @@ async def test_agent_tool_delegation_produces_nested_started_completed_shape() -
     # check the ordering reads "A.started → delegation(A→B) → B.started
     # → B.completed → A.completed".
     ordered: list[tuple[str, str]] = []
-    for e in sink.events:
+    for e in _proto_events(sink.events):
         kind = e.WhichOneof("payload")
         if kind == "agent_invocation_started":
             ordered.append((kind, e.agent_invocation_started.agent_name))
@@ -279,7 +298,7 @@ async def test_sub_runner_events_inherit_outer_task_id() -> None:
 
     b_events = [
         e
-        for e in sink.events
+        for e in _proto_events(sink.events)
         if (
             e.WhichOneof("payload") == "agent_invocation_started"
             and e.agent_invocation_started.agent_name == "agent_b"
@@ -331,13 +350,13 @@ async def test_sub_runner_started_event_parent_invocation_id_equals_outer() -> N
 
     a_starts = [
         e
-        for e in sink.events
+        for e in _proto_events(sink.events)
         if e.WhichOneof("payload") == "agent_invocation_started"
         and e.agent_invocation_started.agent_name == "agent_a"
     ]
     b_starts = [
         e
-        for e in sink.events
+        for e in _proto_events(sink.events)
         if e.WhichOneof("payload") == "agent_invocation_started"
         and e.agent_invocation_started.agent_name == "agent_b"
     ]
@@ -395,7 +414,11 @@ async def test_delegation_observed_carries_outer_task_id() -> None:
     session = Session(run_id="r1", plan=plan)
     await adapter.invoke(task=task, session=session)
 
-    delegations = [e for e in sink.events if e.WhichOneof("payload") == "delegation_observed"]
+    delegations = [
+        e
+        for e in _proto_events(sink.events)
+        if e.WhichOneof("payload") == "delegation_observed"
+    ]
     assert delegations, "expected at least one delegation_observed event"
     d = delegations[0].delegation_observed
     assert d.from_agent == "agent_a"
