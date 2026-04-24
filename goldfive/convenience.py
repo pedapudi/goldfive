@@ -323,13 +323,19 @@ def wrap(
     # ``call_llm=`` or an explicit ``JudgeConfig`` suppresses the
     # warning (the operator has already made a deliberate choice).
     if _call_llm_from_detect and not judge_from_config:
+        # Prefer the agent's own ``.name`` ("coordinator_agent", "research_agent",
+        # ...) over the Python class name ("LlmAgent", "BaseAgent", ...) — the
+        # latter is nearly useless for identifying *which* agent in a tree the
+        # LLM was detected from. Fall through to the class name only when the
+        # object has no usable ``.name`` attribute (non-ADK shapes).
+        _agent_label = getattr(agent, "name", "") or type(agent).__name__
         log.warning(
             "goldfive.wrap: judge LLM not explicitly configured; inheriting "
             "%r from agent %r (detected via ADK model attribute). Set "
             "GOLDFIVE_JUDGE_BASE_URL / GOLDFIVE_JUDGE_MODEL to route "
             "goldfive's judges to a dedicated endpoint.",
             _detected_model_name,
-            type(agent).__name__,
+            _agent_label,
         )
 
     resolved_planner: Planner
