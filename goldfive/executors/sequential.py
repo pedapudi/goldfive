@@ -1411,7 +1411,14 @@ class SequentialExecutor(Executor):
         )
 
     @staticmethod
-    def _compose_steer_restart_message(msg: object, *, fallback: str) -> str:
+    def _compose_steer_restart_message(
+        msg: object,
+        *,
+        fallback: str,
+        source: str = "user",
+        superseded_task_ids: list[str] | None = None,
+        replacement_task_ids: list[str] | None = None,
+    ) -> str:
         """Wrap a STEER body in a goldfive-authored override header.
 
         The STEER payload shape on the goldfive side is
@@ -1424,16 +1431,18 @@ class SequentialExecutor(Executor):
         ``payload["body"]`` as a courtesy for callers building STEER
         messages directly from annotation shapes, so either key works.
 
-        Replaces goldfive#149's ``_extract_steer_body`` which handed
-        the raw body to the adapter. Post-#152 we wrap the body in an
-        ``[USER STEERING CONTROL — supersedes prior task context]``
-        header plus a notes block so the LLM has an explicit signal
-        that: (a) this is an operator override, not a fresh user turn,
-        and (b) prior research / partial work / pending tasks are
-        superseded unless the steer references them. Clean framing
-        without wiping conversation history — the LLM can still see
-        earlier turns, but the framing makes it unambiguous that the
-        steer is the new north star.
+        ``source`` (goldfive-steer-unification) selects the framing:
+
+        * ``"user"`` (default) — ``[USER STEERING CONTROL — supersedes
+          prior task context]`` header: this is an operator override,
+          not a fresh user turn.
+        * ``"goldfive"`` — ``[GOLDFIVE STEERING CONTROL — supersedes
+          prior task context]`` header: goldfive's drift ladder
+          promoted a detector signal into a steer and is directing the
+          coordinator away from contaminated work. When the optional
+          ``superseded_task_ids`` / ``replacement_task_ids`` lists are
+          provided, a task-id block is appended so the LLM knows
+          precisely which ids are void and what replaced them.
 
         Falls back to ``fallback`` when the extracted text is empty,
         then wraps that fallback in the same header so the re-invocation
@@ -1446,7 +1455,39 @@ class SequentialExecutor(Executor):
         effective = body or fallback
         # Build the override-framing message. Keep the header line
         # short and machine-readable so prompt templates / tests can
-        # match on the prefix ("[USER STEERING CONTROL").
+        # match on the prefix ("[USER STEERING CONTROL" or
+        # "[GOLDFIVE STEERING CONTROL").
+        source_norm = (source or "user").strip().lower()
+        if source_norm == "goldfive":
+            header = "[GOLDFIVE STEERING CONTROL — supersedes prior task context]"
+            extra_notes: list[str] = []
+            sup = [str(t) for t in (superseded_task_ids or []) if t]
+            rep = [str(t) for t in (replacement_task_ids or []) if t]
+            if sup:
+                extra_notes.append(
+                    "- Superseded task ids (do NOT resume these): "
+                    + ", ".join(sup)
+                )
+            if rep:
+                extra_notes.append(
+                    "- Replacement task ids (pick these up instead): "
+                    + ", ".join(rep)
+                )
+            extra_block = ("\n" + "\n".join(extra_notes)) if extra_notes else ""
+            return (
+                f"{header}\n"
+                "\n"
+                f"{effective}\n"
+                "\n"
+                "Notes:\n"
+                "- Goldfive detected drift in the prior turn's activity. "
+                "Prior research, partial work, or planned tasks from the "
+                "contaminated step are superseded unless this message "
+                "explicitly references them.\n"
+                "- Proceed with the corrective direction above. Do not "
+                "retry the superseded task."
+                f"{extra_block}"
+            )
         return (
             "[USER STEERING CONTROL — supersedes prior task context]\n"
             "\n"

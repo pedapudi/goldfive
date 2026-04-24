@@ -483,6 +483,26 @@ class DriftEvent:
     # for sinks that render a Gantt / timeline and want to answer "why
     # did goldfive flag this?" without re-fetching raw agent transcripts.
     trigger_input: str = ""
+    # Source attribution for this drift (goldfive-steer-unification).
+    # ``"user"`` — minted from a ``ControlMessage`` (USER_STEER / USER_CANCEL
+    # / USER_PAUSE). ``"goldfive"`` — minted by a goldfive-internal
+    # detector (reasoning judge, embedding detectors, goal-drift, loop
+    # detectors, tool-loops, confabulation). Empty string for legacy /
+    # unknown origins (pre-steer-unification producers).
+    #
+    # The default is empty; the steerer normalises it at the entry of
+    # :meth:`DefaultSteerer._handle_drift` so every on-the-wire
+    # ``DriftDetected`` carries either ``"user"`` (for ``DriftKind.USER_*``
+    # kinds) or ``"goldfive"`` (everything else). Explicit call sites
+    # that already know the source may set this at construction.
+    authored_by: str = ""
+    # True when a ``_handle_drift`` invocation decided to suppress a
+    # goldfive-originated steer promotion because a recent user-authored
+    # steer is still active within the configured freshness window. The
+    # ``DriftDetected`` event still fires so operators see the detector
+    # ran; the cancel-in-flight + refine + restart-message machinery is
+    # elided. Always ``False`` on user-authored drifts.
+    suppressed_by_user_steer: bool = False
 
 
 @dataclasses.dataclass

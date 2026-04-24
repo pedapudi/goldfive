@@ -276,6 +276,26 @@ message DriftDetected {
   // ``DriftDetected`` minted autonomously (user-control drifts preserve
   // their existing annotation semantics and may leave this empty).
   string trigger_input = 8;
+  // Source attribution for the drift. One of:
+  //   * ``"user"``    — minted from a ``ControlMessage`` (USER_STEER /
+  //                     USER_CANCEL / USER_PAUSE).
+  //   * ``"goldfive"`` — minted by a goldfive detector (reasoning judge,
+  //                      embedding detectors, goal-drift, loop detectors,
+  //                      tool-loops, confabulation).
+  //   * ``""``        — legacy / unknown (pre-goldfive-steer-unification
+  //                     producers). Readers MUST tolerate the empty
+  //                     string and treat it as "not attributed".
+  // Downstream UI (harmonograf) uses this to colour-code intervention
+  // rows and to decide whether to surface the drift under the operator's
+  // steering lane or under the judge/detector lane.
+  string authored_by = 9;
+  // True when a goldfive-detected drift was suppressed from promoting
+  // to a steer-level intervention because a recent user-authored steer
+  // is still active (see ``DefaultSteerer.goldfive_steer_suppression_window_turns``).
+  // The DriftDetected row is still emitted so operators can see the
+  // detector fired — but no cancel-in-flight or refine was triggered on
+  // goldfive's behalf. Always ``false`` on user-authored drifts.
+  bool suppressed_by_user_steer = 10;
 }
 
 // Terminal event on a successful run.

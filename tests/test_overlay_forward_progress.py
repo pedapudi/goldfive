@@ -646,7 +646,13 @@ async def test_absorb_on_looping_reasoning_queues_nudge() -> None:
     session.goals = [Goal(id="g0", summary="make it")]
 
     sink = RecordingSink()
-    steerer = DefaultSteerer()
+    # goldfive-steer-unification: LOOPING_REASONING@WARNING is in the
+    # promotion-eligible set under the default threshold, which routes
+    # through the steer path (no ABSORB nudge). This test locks in the
+    # LEGACY ABSORB-with-nudge behaviour for operators who disable
+    # promotion; cover the promotion path in
+    # tests/test_steer_unification.py.
+    steerer = DefaultSteerer(goldfive_steer_threshold="off")
     steerer.bind(sinks=[sink], planner=_StubPlanner())
 
     drift = DriftEvent(

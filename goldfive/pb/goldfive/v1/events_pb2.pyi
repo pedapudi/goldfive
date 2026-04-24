@@ -192,7 +192,7 @@ class TaskCancelled(_message.Message):
     def __init__(self, task_id: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
 
 class DriftDetected(_message.Message):
-    __slots__ = ("kind", "severity", "detail", "current_task_id", "current_agent_id", "annotation_id", "id", "trigger_input")
+    __slots__ = ("kind", "severity", "detail", "current_task_id", "current_agent_id", "annotation_id", "id", "trigger_input", "authored_by", "suppressed_by_user_steer")
     KIND_FIELD_NUMBER: _ClassVar[int]
     SEVERITY_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
@@ -201,6 +201,8 @@ class DriftDetected(_message.Message):
     ANNOTATION_ID_FIELD_NUMBER: _ClassVar[int]
     ID_FIELD_NUMBER: _ClassVar[int]
     TRIGGER_INPUT_FIELD_NUMBER: _ClassVar[int]
+    AUTHORED_BY_FIELD_NUMBER: _ClassVar[int]
+    SUPPRESSED_BY_USER_STEER_FIELD_NUMBER: _ClassVar[int]
     kind: _types_pb2.DriftKind
     severity: _types_pb2.DriftSeverity
     detail: str
@@ -209,7 +211,9 @@ class DriftDetected(_message.Message):
     annotation_id: str
     id: str
     trigger_input: str
-    def __init__(self, kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., detail: _Optional[str] = ..., current_task_id: _Optional[str] = ..., current_agent_id: _Optional[str] = ..., annotation_id: _Optional[str] = ..., id: _Optional[str] = ..., trigger_input: _Optional[str] = ...) -> None: ...
+    authored_by: str
+    suppressed_by_user_steer: bool
+    def __init__(self, kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., detail: _Optional[str] = ..., current_task_id: _Optional[str] = ..., current_agent_id: _Optional[str] = ..., annotation_id: _Optional[str] = ..., id: _Optional[str] = ..., trigger_input: _Optional[str] = ..., authored_by: _Optional[str] = ..., suppressed_by_user_steer: bool = ...) -> None: ...
 
 class RunCompleted(_message.Message):
     __slots__ = ("outcome_summary",)
