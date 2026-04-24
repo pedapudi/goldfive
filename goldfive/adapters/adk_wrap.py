@@ -378,7 +378,35 @@ class GoldfiveADKAgent(BaseAgent):
                 ):
                     yield adk_event
         finally:
+            # Drain any background reasoning-judge tasks the steerer
+            # scheduled during this run (goldfive#251). The judge is
+            # fire-and-forget so ADK tool dispatch isn't blocked behind
+            # a slow LLM; this is the paired run-end drain so judges
+            # don't leak into subsequent runs and so ``CancelledError``
+            # from an adk-web disconnect doesn't orphan the tasks.
+            # Bounded timeout keeps a hung judge from stalling exit.
+            await self._drain_steerer_background_judges()
             self._notify_plugins_on_run_end()
+
+    async def _drain_steerer_background_judges(self) -> None:
+        """Call ``steerer.shutdown()`` on the bound runner's steerer, if any.
+
+        Duck-typed so custom ``Steerer`` implementations (or stubs used
+        in tests) without the method fall through cleanly. Exceptions
+        are swallowed: teardown must never mask the run's real outcome.
+        """
+        steerer = getattr(self._runner, "steerer", None)
+        shutdown = getattr(steerer, "shutdown", None)
+        if shutdown is None:
+            return
+        try:
+            await shutdown()
+        except Exception as exc:  # noqa: BLE001 — defensive
+            log.debug(
+                "GoldfiveADKAgent: steerer.shutdown raised "
+                "(swallowed): %s",
+                exc,
+            )
 
     def _notify_plugins_on_run_end(self) -> None:
         """Fire ``on_run_end()`` on every adapter plugin that defines it.

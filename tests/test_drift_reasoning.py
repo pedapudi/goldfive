@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -50,6 +51,19 @@ class ListSink:
 
     async def close(self) -> None:
         pass
+
+
+async def _wait_for_judges(steerer: DefaultSteerer) -> None:
+    """Drain background reasoning-judge tasks scheduled by the steerer.
+
+    Since goldfive#251 :meth:`DefaultSteerer.observe_reasoning` routes
+    the mode-selected pipeline (judge / embedding / both) through
+    ``asyncio.create_task``; tests that assert sink state need to
+    await the pending tasks before inspecting the sink.
+    """
+    pending = list(steerer._background_judges)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 class NullPlanner:
@@ -584,6 +598,9 @@ async def test_reasoning_cluster_tightening_is_one_shot_per_task() -> None:
             _pad_tokens("shared", 8) + f" uniqueturn{turn:02d}00 uniqueturn{turn:02d}01"
         )
         await steerer.observe_reasoning(current, session=session)
+    # The embedding pipeline is now fire-and-forget (goldfive#251);
+    # drain before inspecting the sink.
+    await _wait_for_judges(steerer)
 
     drift_events = [
         e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
