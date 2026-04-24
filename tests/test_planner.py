@@ -16,6 +16,7 @@ from goldfive.planner import (
     _DEFAULT_SYSTEM_PROMPT,
     LLMPlanner,
     PassthroughPlanner,
+    _check_supersedes_coverage,
     _normalize_assignee,
     _plan_from_json,
     _strip_code_fences,
@@ -26,6 +27,7 @@ from goldfive.types import (
     DriftSeverity,
     Goal,
     Plan,
+    SupersessionKind,
     Task,
     TaskEdge,
     TaskStatus,
@@ -1645,3 +1647,435 @@ def test_default_system_prompt_forbids_compound_assignee() -> None:
     # Regression guard against the planner prompt drifting away from the
     # explicit "bare name only" directive added alongside #214.
     assert "do NOT add a namespace" in _DEFAULT_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Supersedes coverage validator (observability — never rejects)
+# ---------------------------------------------------------------------------
+
+
+def _coverage_prior_plan(*, statuses: dict[str, TaskStatus] | None = None) -> Plan:
+    """A 3-task prior plan whose statuses can be tweaked per test.
+
+    ``a`` / ``b`` / ``c`` default to PENDING / RUNNING / PENDING. Tests
+    that need terminal-status priors override via ``statuses``.
+    """
+    statuses = statuses or {}
+    return Plan(
+        id="p-prior",
+        run_id="r-cov",
+        goal_ids=["g1"],
+        summary="prior",
+        tasks=[
+            Task(
+                id="a",
+                title="alpha",
+                assignee_agent_id="agent_x",
+                status=statuses.get("a", TaskStatus.PENDING),
+            ),
+            Task(
+                id="b",
+                title="bravo",
+                assignee_agent_id="agent_y",
+                status=statuses.get("b", TaskStatus.RUNNING),
+            ),
+            Task(
+                id="c",
+                title="charlie",
+                assignee_agent_id="agent_z",
+                status=statuses.get("c", TaskStatus.PENDING),
+            ),
+        ],
+        edges=[],
+        revision_index=0,
+    )
+
+
+def test_supersedes_coverage_no_orphans_when_every_drop_is_superseded() -> None:
+    """Test 1 — full coverage. All dropped tasks have a supersedes link
+    from some new task in the revised plan. Validator returns no
+    orphans."""
+    prior = _coverage_prior_plan()
+    revised = Plan(
+        id="p-revised",
+        run_id="r-cov",
+        goal_ids=["g1"],
+        summary="revised",
+        tasks=[
+            Task(
+                id="a2",
+                title="alpha v2",
+                assignee_agent_id="agent_x",
+                status=TaskStatus.PENDING,
+                supersedes="a",
+                supersedes_kind=SupersessionKind.REPLACE,
+            ),
+            Task(
+                id="b2",
+                title="bravo v2",
+                assignee_agent_id="agent_y",
+                status=TaskStatus.PENDING,
+                supersedes="b",
+                supersedes_kind=SupersessionKind.REPLACE,
+            ),
+            Task(
+                id="c2",
+                title="charlie v2",
+                assignee_agent_id="agent_z",
+                status=TaskStatus.PENDING,
+                supersedes="c",
+                supersedes_kind=SupersessionKind.REPLACE,
+            ),
+        ],
+        edges=[],
+        revision_index=1,
+    )
+    orphans = _check_supersedes_coverage(revised, prior=prior)
+    assert orphans == []
+
+
+def test_supersedes_coverage_terminal_drops_are_covered_by_default() -> None:
+    """Test 2 — all dropped priors are FAILED / CANCELLED. Absorbing-
+    terminal old tasks don't need a supersedes link."""
+    prior = _coverage_prior_plan(
+        statuses={
+            "a": TaskStatus.FAILED,
+            "b": TaskStatus.CANCELLED,
+            "c": TaskStatus.FAILED,
+        }
+    )
+    revised = Plan(
+        id="p-revised",
+        run_id="r-cov",
+        goal_ids=["g1"],
+        summary="revised — all priors absorbed by terminal status",
+        tasks=[
+            Task(
+                id="brand_new",
+                title="fresh work, not a replacement",
+                assignee_agent_id="agent_x",
+                status=TaskStatus.PENDING,
+            ),
+        ],
+        edges=[],
+        revision_index=1,
+    )
+    orphans = _check_supersedes_coverage(revised, prior=prior)
+    assert orphans == []
+
+
+def test_supersedes_coverage_pending_drop_with_no_link_is_orphan() -> None:
+    """Test 3 — legitimate orphan: a PENDING prior task is dropped with
+    no supersedes from any new task. Validator surfaces it."""
+    prior = _coverage_prior_plan()
+    # Drop ``b`` entirely (no successor, not terminal). ``a`` and ``c``
+    # are kept verbatim so they do not contribute to the dropped set.
+    revised = Plan(
+        id="p-revised",
+        run_id="r-cov",
+        goal_ids=["g1"],
+        summary="revised",
+        tasks=[
+            prior.tasks[0],  # a — preserved
+            prior.tasks[2],  # c — preserved
+        ],
+        edges=[],
+        revision_index=1,
+    )
+    orphans = _check_supersedes_coverage(revised, prior=prior)
+    assert [t.id for t in orphans] == ["b"]
+    assert orphans[0].title == "bravo"
+
+
+def test_supersedes_coverage_mixed_only_orphan_uncovered() -> None:
+    """Test 4 — mixed: one drop is superseded, one is FAILED-terminal,
+    one is a legitimate orphan. Only the orphan is reported."""
+    prior = _coverage_prior_plan(
+        statuses={
+            "a": TaskStatus.PENDING,
+            "b": TaskStatus.FAILED,  # terminal — absorbed
+            "c": TaskStatus.PENDING,  # orphan
+        }
+    )
+    revised = Plan(
+        id="p-revised",
+        run_id="r-cov",
+        goal_ids=["g1"],
+        summary="revised",
+        tasks=[
+            Task(
+                id="a2",
+                title="alpha v2",
+                assignee_agent_id="agent_x",
+                status=TaskStatus.PENDING,
+                supersedes="a",
+                supersedes_kind=SupersessionKind.REPLACE,
+            ),
+            # ``b`` is dropped but FAILED in prior — covered by status.
+            # ``c`` is dropped with no supersedes → orphan.
+        ],
+        edges=[],
+        revision_index=1,
+    )
+    orphans = _check_supersedes_coverage(revised, prior=prior)
+    assert [t.id for t in orphans] == ["c"]
+
+
+def test_supersedes_coverage_correct_kind_chain_is_not_a_drop() -> None:
+    """Test 5 — CORRECT-kind supersession: the prior COMPLETED task is
+    preserved verbatim in the revision (Option B contract — terminal
+    tasks are immutable across refines), and a new task supersedes it
+    with kind=CORRECT. The COMPLETED task is therefore NOT in the
+    dropped set, and there are no orphans."""
+    prior = Plan(
+        id="p-prior",
+        run_id="r-cov",
+        goal_ids=["g1"],
+        summary="prior",
+        tasks=[
+            Task(
+                id="research_solar",
+                title="Research solar options",
+                assignee_agent_id="research_agent",
+                status=TaskStatus.COMPLETED,
+            ),
+        ],
+        edges=[],
+        revision_index=0,
+    )
+    revised = Plan(
+        id="p-revised",
+        run_id="r-cov",
+        goal_ids=["g1"],
+        summary="revised — correction supersedes",
+        tasks=[
+            # Prior COMPLETED task preserved verbatim.
+            prior.tasks[0],
+            # New task corrects it.
+            Task(
+                id="research_solar_corrected",
+                title="Research solar options (corrected facts)",
+                assignee_agent_id="research_agent",
+                status=TaskStatus.PENDING,
+                supersedes="research_solar",
+                supersedes_kind=SupersessionKind.CORRECT,
+            ),
+        ],
+        edges=[],
+        revision_index=1,
+    )
+    orphans = _check_supersedes_coverage(revised, prior=prior)
+    # Even if the COMPLETED task were somehow dropped, CORRECT-kind
+    # links count toward "covered" identically to REPLACE — the
+    # validator only cares whether *some* new task names the old id.
+    assert orphans == []
+    # And confirm the dropped set is genuinely empty: no prior id is
+    # missing from revised.
+    new_ids = {t.id for t in revised.tasks}
+    dropped = {t.id for t in prior.tasks} - new_ids
+    assert dropped == set()
+
+
+async def test_refine_emits_orphan_event_on_legitimate_drop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """End-to-end: a refine response that drops a PENDING prior task
+    without a supersedes link triggers a WARNING log + a
+    ``refine_orphaned_tasks`` sink event. The refine still applies."""
+    from goldfive.sinks.memory import InMemorySink
+
+    # Prior plan: one COMPLETED task (preserved) + two PENDING tasks
+    # (one of which the LLM will silently drop).
+    prior = Plan(
+        id="p-prior",
+        run_id="r-orphan",
+        goal_ids=["g1"],
+        summary="prior",
+        tasks=[
+            Task(
+                id="research",
+                title="Research goldfish",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="draft_intro",
+                title="Draft intro",
+                assignee_agent_id="writer",
+                status=TaskStatus.PENDING,
+            ),
+            Task(
+                id="draft_body",
+                title="Draft body",
+                assignee_agent_id="writer",
+                status=TaskStatus.PENDING,
+            ),
+        ],
+        edges=[
+            TaskEdge(from_task_id="research", to_task_id="draft_intro"),
+            TaskEdge(from_task_id="draft_intro", to_task_id="draft_body"),
+        ],
+        revision_index=0,
+    )
+    # LLM drops ``draft_body`` entirely — no supersedes, not terminal.
+    refine_response = json.dumps(
+        {
+            "summary": "narrowed scope",
+            "tasks": [
+                {
+                    "id": "research",
+                    "title": "Research goldfish",
+                    "assignee_agent_id": "researcher",
+                    "status": "COMPLETED",
+                },
+                {
+                    "id": "draft_intro",
+                    "title": "Draft intro",
+                    "assignee_agent_id": "writer",
+                    "status": "PENDING",
+                },
+            ],
+            "edges": [
+                {"from_task_id": "research", "to_task_id": "draft_intro"},
+            ],
+        }
+    )
+    scripted = _ScriptedLLM([refine_response])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=1)
+
+    # Wire a span context provider so the planner knows which sinks to
+    # emit on. (Mirrors ``DefaultSteerer.bind`` minus the steerer.)
+    sink = InMemorySink()
+    seq = iter(range(1000))
+
+    def provider() -> object:
+        return ([sink], "r-orphan", "s-orphan", "draft_body", lambda: next(seq))
+
+    planner.set_span_context_provider(provider)
+
+    drift = DriftEvent(
+        kind=DriftKind.NEW_WORK_DISCOVERED,
+        severity=DriftSeverity.WARNING,
+        detail="scope narrowed",
+        current_task_id="draft_body",
+    )
+
+    with caplog.at_level("WARNING", logger="goldfive.planner"):
+        revised = await planner.refine(plan=prior, drift=drift, goals=_goals())
+
+    # Refine applied (validator does not reject — observability only).
+    assert revised is not None
+    assert {t.id for t in revised.tasks} == {"research", "draft_intro"}
+    # WARNING log surfaced the orphan.
+    orphan_warnings = [
+        r
+        for r in caplog.records
+        if "supersedes link or terminal status" in r.getMessage()
+    ]
+    assert len(orphan_warnings) == 1
+    assert "'draft_body'" in orphan_warnings[0].getMessage()
+    # Sink event emitted with kind=refine_orphaned_tasks and orphan
+    # detail in the payload.
+    orphan_events = [
+        e
+        for e in sink.events
+        if isinstance(e, dict) and e.get("kind") == "refine_orphaned_tasks"
+    ]
+    assert len(orphan_events) == 1
+    payload = orphan_events[0]["payload"]
+    assert payload["orphan_count"] == 1
+    assert payload["prior_plan_id"] == "p-prior"
+    assert payload["prior_revision_index"] == 0
+    # ``revision_index`` on the freshly-parsed revised plan reflects the
+    # LLM JSON (default 0); the caller bumps it AFTER
+    # ``_call_and_validate_refine`` returns, which is downstream of this
+    # validator. Asserting on the at-validation-time value documents
+    # that contract.
+    assert payload["revised_revision_index"] == 0
+    assert len(payload["orphans"]) == 1
+    orphan = payload["orphans"][0]
+    assert orphan["task_id"] == "draft_body"
+    assert orphan["title"] == "Draft body"
+    assert orphan["status"] == TaskStatus.PENDING.value
+    assert orphan["assignee_agent_id"] == "writer"
+
+
+async def test_refine_emits_no_orphan_event_when_coverage_complete() -> None:
+    """Inverse of the orphan integration test: a refine response with
+    full supersedes coverage emits NO ``refine_orphaned_tasks`` event."""
+    from goldfive.sinks.memory import InMemorySink
+
+    prior = Plan(
+        id="p-prior",
+        run_id="r-clean",
+        goal_ids=["g1"],
+        summary="prior",
+        tasks=[
+            Task(
+                id="research",
+                title="Research goldfish",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="draft",
+                title="Draft post",
+                assignee_agent_id="writer",
+                status=TaskStatus.PENDING,
+            ),
+        ],
+        edges=[
+            TaskEdge(from_task_id="research", to_task_id="draft"),
+        ],
+        revision_index=0,
+    )
+    # LLM replaces ``draft`` with ``draft_v2`` carrying a supersedes link.
+    refine_response = json.dumps(
+        {
+            "summary": "redirected draft",
+            "tasks": [
+                {
+                    "id": "research",
+                    "title": "Research goldfish",
+                    "assignee_agent_id": "researcher",
+                    "status": "COMPLETED",
+                },
+                {
+                    "id": "draft_v2",
+                    "title": "Draft post (new angle)",
+                    "assignee_agent_id": "writer",
+                    "status": "PENDING",
+                    "supersedes": "draft",
+                    "supersedes_kind": "REPLACE",
+                },
+            ],
+            "edges": [
+                {"from_task_id": "research", "to_task_id": "draft_v2"},
+            ],
+        }
+    )
+    scripted = _ScriptedLLM([refine_response])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=1)
+    sink = InMemorySink()
+    seq = iter(range(1000))
+
+    def provider() -> object:
+        return ([sink], "r-clean", "s-clean", "draft", lambda: next(seq))
+
+    planner.set_span_context_provider(provider)
+    drift = DriftEvent(
+        kind=DriftKind.NEW_WORK_DISCOVERED,
+        severity=DriftSeverity.WARNING,
+        detail="redirect",
+        current_task_id="draft",
+    )
+
+    revised = await planner.refine(plan=prior, drift=drift, goals=_goals())
+
+    assert revised is not None
+    orphan_events = [
+        e
+        for e in sink.events
+        if isinstance(e, dict) and e.get("kind") == "refine_orphaned_tasks"
+    ]
+    assert orphan_events == []
