@@ -784,6 +784,16 @@ class Runner:
             except Exception as exc:  # noqa: BLE001
                 log.warning("conversation_ended emission raised: %s", exc)
             self._conversation_announced = False
+        # Drain background reasoning-judge tasks the steerer scheduled
+        # via its fire-and-forget judge path (goldfive#251). Bounded
+        # shutdown so a hung LLM judge doesn't stall close. Duck-typed
+        # — custom steerers without ``shutdown`` fall through cleanly.
+        steerer_shutdown = getattr(self.steerer, "shutdown", None)
+        if callable(steerer_shutdown):
+            try:
+                await steerer_shutdown()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("steerer.shutdown() raised: %s", exc)
         for sink in self.sinks:
             try:
                 await sink.close()

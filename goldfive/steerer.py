@@ -43,6 +43,7 @@ levels. See goldfive#142 for the full table.
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import inspect
 import json
@@ -543,6 +544,15 @@ class DefaultSteerer:
             _window = 3
         self._goldfive_steer_suppression_window_turns = max(0, _window)
         self._steering_config: SteeringConfig | None = steering_config
+        # Background reasoning-judge tasks (goldfive#251). The LLM-judge
+        # path in :meth:`observe_reasoning` is fire-and-forget so the
+        # adapter's model-response callback can return immediately and
+        # ADK can dispatch tool calls without waiting on a minute-long
+        # local-llama judge round-trip. This set holds the live
+        # ``asyncio.Task`` handles so :meth:`shutdown` can drain them
+        # at run end. Tasks auto-discard themselves via
+        # ``add_done_callback(self._background_judges.discard)``.
+        self._background_judges: set[asyncio.Task[Any]] = set()
 
     # ------------------------------------------------------------------
     # Protocol-required: wiring
@@ -1080,18 +1090,35 @@ class DefaultSteerer:
         ``session.reasoning_history_max``), then runs the reasoning
         detectors. Emits at most one drift per call.
 
-        Pipeline dispatch (goldfive#226):
+        Pipeline dispatch (goldfive#226, refined in #251):
 
         * Always-on detectors — :func:`~goldfive.drift.reasoning.detect_looping_reasoning`
           and :func:`~goldfive.drift.reasoning.detect_confusion` — run
           first on every call. They catch patterns (repetition,
           uncertainty) that the LLM judge does not, and they are cheap.
+          Their drift verdicts are handled SYNCHRONOUSLY: callers
+          awaiting this method see the resulting ``DriftDetected`` sink
+          emission and any refine dispatch before control returns.
         * Mode-selected pipeline — :func:`~goldfive.drift.reasoning.analyze_reasoning`
           runs in the configured ``reasoning_drift_mode``. The LLM judge
           path is rate-limited to at most one call every
           ``reasoning_drift_rate_limit`` thinking messages per task; the
           first thinking message of every task always fires a judge
-          call. Counters reset on task transition.
+          call. Counters reset on task transition. This path is
+          **fire-and-forget**: the judge is scheduled via
+          :func:`asyncio.create_task` and tracked on
+          ``self._background_judges`` so :meth:`shutdown` can drain it
+          at run end. Its drift verdict may therefore arrive AFTER tool
+          calls from the same turn have already dispatched — the refine
+          machinery handles "drift arrives mid-run" via supersedes, so
+          there is no correctness regression; late refines simply apply
+          to a plan state that has already advanced.
+
+        Why the judge path is async: this method is called from the
+        adapter's model-response callback, which is on the critical
+        path for ADK tool dispatch. Awaiting a minute-long local-llama
+        judge round-trip inline serialized every subsequent tool call
+        behind it.
 
         Adapters call this from their model-response callback once they
         have extracted reasoning_content (OpenAI), thinking blocks
@@ -1107,7 +1134,6 @@ class DefaultSteerer:
         if overflow > 0:
             del history[:overflow]
         from goldfive.drift.reasoning import (
-            analyze_reasoning,
             detect_confusion,
             detect_looping_reasoning,
         )
@@ -1116,39 +1142,189 @@ class DefaultSteerer:
         # (LOOPING_REASONING WARNING before CONFUSION INFO) and any
         # fire short-circuits before the mode-selected pipeline so
         # they remain the canonical signal for "repetitive / uncertain"
-        # reasoning regardless of mode.
+        # reasoning regardless of mode. These are cheap and their
+        # verdicts can affect the current turn, so they remain inline.
         drift = detect_looping_reasoning(text, session)
         if drift is None:
             drift = detect_confusion(text, session)
-        if drift is None:
-            # Mode-selected pipeline (judge / embedding / both / off).
-            # The judge path is rate-limited per-task; embedding path
-            # is synchronous.
-            rl_call_llm = self._maybe_take_reasoning_judge_slot(
-                session, agent_name=agent_name
-            )
-            # Thread the first bound sink into the judge path so a
-            # ``ReasoningJudgeInvoked`` event fires on every judge call,
-            # regardless of verdict. ``None`` when no sinks are bound —
-            # the classifier then stays sink-less and behaves as before.
-            judge_sink = self._sinks[0] if self._sinks else None
-            drift = await analyze_reasoning(
-                text,
-                session,
-                mode=self._reasoning_drift_mode,
-                call_llm=rl_call_llm,
-                model=self._reasoning_drift_model,
-                sink=judge_sink,
-            )
-        if drift is None:
+        if drift is not None:
+            # Populate ``trigger_input`` on drifts produced by the
+            # always-on pattern detectors (they do not set it
+            # themselves — they are framework-agnostic).
+            if not drift.trigger_input:
+                drift.trigger_input = self._truncate_trigger_input(text)
+            await self._handle_drift(drift, session)
             return
-        # Populate ``trigger_input`` on drifts produced by the always-on
-        # pattern detectors (they do not set it themselves — they are
-        # framework-agnostic). The judge path already stamps it on
-        # drifts it produces.
-        if not drift.trigger_input:
-            drift.trigger_input = self._truncate_trigger_input(text)
-        await self._handle_drift(drift, session)
+
+        # Mode-selected pipeline (judge / embedding / both / off).
+        # The judge path is rate-limited per-(agent, task) bucket.
+        # Historically this awaited ``analyze_reasoning`` inline; as of
+        # goldfive#251 the judge is fire-and-forget so the
+        # model-response callback can return immediately.
+        rl_call_llm = self._maybe_take_reasoning_judge_slot(
+            session, agent_name=agent_name
+        )
+        # Fast-exit when there's nothing for ``analyze_reasoning`` to
+        # do: ``mode="off"``, or ``mode="judge"`` with no judge slot
+        # (rate-limited or globally disabled). Embedding and "both"
+        # modes always schedule — their embedding pipeline runs even
+        # when the judge slot is empty.
+        if self._reasoning_drift_mode == "off":
+            return
+        if self._reasoning_drift_mode == "judge" and rl_call_llm is None:
+            return
+        # Thread the first bound sink into the judge path so a
+        # ``ReasoningJudgeInvoked`` event fires on every judge call,
+        # regardless of verdict. ``None`` when no sinks are bound —
+        # the classifier then stays sink-less and behaves as before.
+        judge_sink = self._sinks[0] if self._sinks else None
+        # Snapshot the reasoning-history position at schedule time so
+        # the bg pipeline sees the same view the inline pattern
+        # detectors just saw, even if subsequent turns append more
+        # entries before the bg task runs. Without this, a detector
+        # that slices ``history[-N:-1]`` (expecting ``text`` to be the
+        # last entry) would see ``text`` itself in the comparison
+        # window and trivially self-match (goldfive#251 ordering
+        # regression surfaced by the cluster-tightening one-shot
+        # test). ``history_length`` is the length AFTER ``text`` was
+        # appended — the bg path trims ``session.reasoning_history``
+        # to this length for its invocation.
+        history_length = len(session.reasoning_history)
+        bg_task = asyncio.create_task(
+            self._run_judge_background(
+                text=text,
+                session=session,
+                call_llm=rl_call_llm,
+                judge_sink=judge_sink,
+                history_length=history_length,
+            )
+        )
+        self._background_judges.add(bg_task)
+        bg_task.add_done_callback(self._background_judges.discard)
+
+    async def _run_judge_background(
+        self,
+        *,
+        text: str,
+        session: Session,
+        call_llm: ReflectiveCallLLM | None,
+        judge_sink: Any,
+        history_length: int,
+    ) -> None:
+        """Run the mode-selected reasoning drift pipeline off the critical path.
+
+        Scheduled by :meth:`observe_reasoning` as an
+        :func:`asyncio.create_task` so the adapter's model-response
+        callback can return before ADK dispatches the response's tool
+        calls. Awaits :func:`~goldfive.drift.reasoning.analyze_reasoning`
+        and, if it yields a :class:`DriftEvent`, routes it through
+        :meth:`_handle_drift` — same effect as the historical inline
+        path, just resolving later.
+
+        ``history_length`` pins the ``session.reasoning_history`` view
+        the pipeline sees to the same tail index that was in effect
+        when the bg task was scheduled. Later turns that append to
+        the shared history (this same session receiving more
+        reasoning blocks before the bg task runs) would otherwise
+        shift the detectors' "exclude self" slice and generate false
+        self-match LOOPING signals. We temporarily truncate the
+        session view for the duration of this bg invocation and
+        restore it after; concurrent bg tasks serialize on the same
+        session's reasoning_history via the asyncio event loop (no
+        threading) so the save/restore pattern is safe in practice.
+
+        Never raises: any exception (from the judge LLM, the embedding
+        pipeline, or ``_handle_drift``) is logged at ``WARNING`` and
+        swallowed. The background task must not crash the run; the
+        adapter callback that scheduled us has long since returned.
+        """
+        try:
+            from goldfive.drift.reasoning import analyze_reasoning
+
+            # Save the shared live history and swap in a list snapshot
+            # truncated to the length captured at schedule time. Using
+            # list slicing (not mutation) keeps any already-escaped
+            # reference (e.g. a concurrent detector) pointing at the
+            # original list. We restore the live reference in a
+            # ``finally`` so intervening appends are not lost.
+            original_history = session.reasoning_history
+            pinned_history = list(original_history[:history_length])
+            session.reasoning_history = pinned_history
+            try:
+                drift = await analyze_reasoning(
+                    text,
+                    session,
+                    mode=self._reasoning_drift_mode,
+                    call_llm=call_llm,
+                    model=self._reasoning_drift_model,
+                    sink=judge_sink,
+                )
+            finally:
+                # Restore the live history. Any entries appended by
+                # subsequent turns are preserved because we pointed
+                # ``session.reasoning_history`` at a separate list for
+                # our window.
+                session.reasoning_history = original_history
+            if drift is None:
+                return
+            if not drift.trigger_input:
+                drift.trigger_input = self._truncate_trigger_input(text)
+            await self._handle_drift(drift, session)
+        except asyncio.CancelledError:
+            # Propagate cancellation so :meth:`shutdown` / event-loop
+            # teardown can cleanly abort a still-running judge without
+            # the WARNING log below muddying the signal.
+            raise
+        except Exception as exc:  # noqa: BLE001 — background task
+            log.warning(
+                "DefaultSteerer: background reasoning-judge raised "
+                "(swallowed): %s",
+                exc,
+            )
+
+    async def shutdown(self, *, timeout: float = 5.0) -> None:
+        """Drain background reasoning-judge tasks with a bounded wait.
+
+        Called at run / runner teardown so ``asyncio.create_task``
+        handles scheduled by :meth:`observe_reasoning` do not leak
+        beyond the event loop's lifetime. Waits at most ``timeout``
+        seconds (default 5.0) for all tracked judges to finish; any
+        still-running tasks past the timeout are cancelled and awaited
+        briefly so their ``CancelledError`` propagation settles before
+        we return.
+
+        Idempotent: a second call on an empty ``_background_judges``
+        set is a no-op.
+        """
+        if not self._background_judges:
+            return
+        # Snapshot: tasks may be removed from the set by their
+        # done-callbacks while we're iterating.
+        pending = list(self._background_judges)
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=max(0.0, float(timeout)),
+            )
+        except TimeoutError:
+            # Cancel the stragglers and give them a beat to unwind so
+            # we don't leave "pending task" warnings on loop close.
+            still_pending = [t for t in pending if not t.done()]
+            for task in still_pending:
+                task.cancel()
+            if still_pending:
+                try:
+                    await asyncio.wait(still_pending, timeout=0.5)
+                except Exception:  # noqa: BLE001 — defensive
+                    pass
+            log.warning(
+                "DefaultSteerer.shutdown: %d background judge task(s) "
+                "exceeded %.2fs timeout; cancelled",
+                len(still_pending),
+                float(timeout),
+            )
 
     @staticmethod
     def _truncate_trigger_input(text: str, limit: int = 2048) -> str:
