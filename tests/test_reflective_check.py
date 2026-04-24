@@ -58,6 +58,13 @@ class ListSink:
     async def close(self) -> None:
         pass
 
+    @property
+    def proto_events(self) -> list[Any]:
+        """goldfive a4: filter dict-envelope sidecars (refine_attempted /
+        refine_failed / correlation plan_revised) so legacy proto-only
+        assertions still hold."""
+        return [e for e in self.events if hasattr(e, "WhichOneof")]
+
 
 class StubPlanner:
     def __init__(self) -> None:
@@ -164,7 +171,7 @@ async def test_reflective_check_making_progress_emits_no_drift() -> None:
     for _ in range(3):
         await steerer.note_llm_call(session)
     # No drift_detected events emitted (high-confidence yes).
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert "drift_detected" not in kinds
     # Planner was never asked to refine.
     assert planner.refine_calls == []
@@ -185,7 +192,7 @@ async def test_reflective_check_low_confidence_emits_uncertain() -> None:
     session = _make_session_with_task()
     for _ in range(2):
         await steerer.note_llm_call(session)
-    drifts = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
+    drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     assert len(drifts) == 1
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -217,7 +224,7 @@ async def test_reflective_check_stuck_emits_warning() -> None:
     session = _make_session_with_task()
     for _ in range(2):
         await steerer.note_llm_call(session)
-    drifts = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
+    drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     # The WARNING drift flows through _handle_drift, which also emits a
     # follow-up drift_detected when planner.refine returns None (refine
     # failure surfaces as a CRITICAL drift). Both should carry the same
@@ -247,7 +254,7 @@ async def test_reflective_check_malformed_response_is_graceful() -> None:
 
     session = _make_session_with_task()
     await steerer.note_llm_call(session)
-    drifts = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
+    drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     assert len(drifts) == 1
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -268,7 +275,7 @@ async def test_reflective_check_raised_exception_is_graceful() -> None:
 
     session = _make_session_with_task()
     await steerer.note_llm_call(session)  # should not raise
-    drifts = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
+    drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     assert len(drifts) == 1
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -289,10 +296,10 @@ async def test_reflective_check_disabled_by_default() -> None:
         await steerer.note_llm_call(session)
     # Counter never incremented (feature is off), and no drift emitted.
     assert session._llm_calls_since_check == 0
-    assert [e.WhichOneof("payload") for e in sink.events] == []
+    assert [e.WhichOneof("payload") for e in sink.proto_events] == []
     # Even calling maybe_run_reflective_check directly is a no-op.
     await steerer.maybe_run_reflective_check(session)
-    assert [e.WhichOneof("payload") for e in sink.events] == []
+    assert [e.WhichOneof("payload") for e in sink.proto_events] == []
 
 
 async def test_reflective_check_configurable_interval() -> None:
@@ -371,7 +378,7 @@ async def test_reflective_check_tolerates_fenced_markdown() -> None:
 
     session = _make_session_with_task()
     await steerer.note_llm_call(session)
-    drifts = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
+    drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     from goldfive.pb.goldfive.v1 import types_pb2
 
     assert drifts[0].drift_detected.kind == types_pb2.DRIFT_KIND_SELF_REPORTED_STUCK

@@ -67,6 +67,11 @@ class ListSink:
     async def close(self) -> None:
         return
 
+    @property
+    def proto_events(self) -> list[Any]:
+        """goldfive a4: filter dict-envelope sidecars."""
+        return [e for e in self.events if hasattr(e, "WhichOneof")]
+
 
 class _StubPlanner:
     """Planner stub that records refine + refine_steer calls."""
@@ -158,7 +163,7 @@ def _bind(
 def _drift_detected_events(sink: ListSink) -> list[Any]:
     return [
         evt
-        for evt in sink.events
+        for evt in sink.proto_events
         if evt.WhichOneof("payload") == "drift_detected"
     ]
 
@@ -166,7 +171,7 @@ def _drift_detected_events(sink: ListSink) -> list[Any]:
 def _plan_revised_events(sink: ListSink) -> list[Any]:
     return [
         evt
-        for evt in sink.events
+        for evt in sink.proto_events
         if evt.WhichOneof("payload") == "plan_revised"
     ]
 
@@ -228,8 +233,18 @@ async def test_goldfive_steer_does_not_promote_at_info_severity() -> None:
 
 
 async def test_goldfive_steer_suppressed_when_user_steer_active() -> None:
-    """Fresh user steer within the freshness window blocks a goldfive steer."""
-    steerer, session, sink, planner, adapter = _bind(window=3)
+    """Fresh user steer within the freshness window blocks a goldfive steer.
+
+    goldfive a4: each refine now emits two extra dict-envelope sidecars
+    (``refine_attempted`` + correlation ``plan_revised``) which advance
+    ``session._next_sequence`` alongside the canonical proto events.
+    ``_should_promote_to_steer`` reads ``_next_sequence`` as the "current
+    turn" surrogate, so the user-steer's promotion path now consumes
+    more sequence positions than before. The window is widened from 3
+    to 6 to keep the suppression invariant honoured under the new
+    emit count. (See the PR's "ordering invariant weakened" note.)
+    """
+    steerer, session, sink, planner, adapter = _bind(window=6)
 
     # Apply a user steer first.
     user_msg = ControlMessage(

@@ -54,6 +54,23 @@ class ListSink:
     async def close(self) -> None:
         self.closed = True
 
+    @property
+    def proto_events(self) -> list[Any]:
+        """Return only the proto ``Event`` envelopes recorded.
+
+        goldfive a4 added dict-envelope events (``refine_attempted`` /
+        ``refine_failed`` / correlation ``plan_revised``) on the same
+        sink fan-out. Tests that assert on proto event order can use
+        this filter to ignore the dict sidecars while still exercising
+        the production emit path.
+        """
+        return [e for e in self.events if hasattr(e, "WhichOneof")]
+
+    @property
+    def dict_events(self) -> list[dict[str, Any]]:
+        """Return only the dict-envelope events recorded (a4 observability)."""
+        return [e for e in self.events if isinstance(e, dict)]
+
 
 class StubPlanner:
     """``Planner`` stub that returns a pre-canned revised plan (or None)."""
@@ -220,7 +237,7 @@ async def test_mark_task_failed_recoverable_fires_drift() -> None:
     steerer, session, sink, planner = _fresh()
     await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
     assert _task(session, "t1").status is TaskStatus.FAILED
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # TaskFailed + DriftDetected + refine-failure DriftDetected (planner
     # returns None so no PlanRevised; the follow-up drift surfaces that).
     assert kinds == ["task_failed", "drift_detected", "drift_detected"]
@@ -243,7 +260,7 @@ async def test_mark_task_failed_fatal_fires_critical_drift() -> None:
     # refine-failure DriftDetected (stub planner returns None). The
     # cascade fires before the fatal drift so planner.refine (if it ran)
     # would see the post-cascade plan shape.
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["task_failed", "task_cancelled", "drift_detected", "drift_detected"]
     assert sink.events[0].task_failed.task_id == "t1"
     assert sink.events[0].task_failed.recoverable is False
@@ -265,13 +282,13 @@ async def test_mark_task_blocked_transitions_and_emits_drift() -> None:
         "t1", session=session, blocker="need API key", needed="credentials.json"
     )
     assert _task(session, "t1").status is TaskStatus.BLOCKED
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # TaskBlocked + DriftDetected + refine-failure DriftDetected (stub
     # planner returns None; the follow-up drift surfaces that).
     assert kinds == ["task_blocked", "drift_detected", "drift_detected"]
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    assert sink.events[1].drift_detected.kind == types_pb2.DRIFT_KIND_BLOCKED
+    assert sink.proto_events[1].drift_detected.kind == types_pb2.DRIFT_KIND_BLOCKED
     assert len(planner.refine_calls) == 1
     assert planner.refine_calls[0]["drift"].kind is DriftKind.BLOCKED
 
@@ -478,7 +495,7 @@ async def test_observe_emits_drift_and_refines() -> None:
 
     await steerer.observe({"error": "oh no"}, session)
 
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "plan_revised"]
     assert sink.events[0].drift_detected.kind == types_pb2.DRIFT_KIND_TOOL_ERROR
     assert len(planner.refine_calls) == 1
@@ -531,11 +548,11 @@ async def test_observe_swallows_planner_exceptions() -> None:
     # First failure: emit original drift + refine-failure visibility
     # drift. Counter bumps to 1 (below the threshold), so we stay in
     # visibility-only mode — no REPEATED_FAILURE, no mark_task_failed.
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "drift_detected"]
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    follow_up = sink.events[1].drift_detected
+    follow_up = sink.proto_events[1].drift_detected
     assert follow_up.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
     assert "refine failed" in follow_up.detail
     assert "planner down" in follow_up.detail
@@ -555,11 +572,11 @@ async def test_observe_surfaces_refine_none_return() -> None:
     session = _make_session()
 
     await steerer.observe({"error": "x"}, session)
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "drift_detected"]
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    follow_up = sink.events[1].drift_detected
+    follow_up = sink.proto_events[1].drift_detected
     assert follow_up.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
     assert "refine failed" in follow_up.detail
     assert "no revised plan" in follow_up.detail
@@ -653,7 +670,7 @@ async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
 
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # Expected stream across both ticks (inclusive of the unrecoverable
     # downstream cascade — PLAN-LIFECYCLE.md §6.2 step 3 — that
     # mark_task_failed(recoverable=False) now drives through the shared
@@ -666,13 +683,15 @@ async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
     #           drift_detected (REPEATED_FAILURE).
     assert "task_failed" in kinds
     drift_kinds = [
-        e.drift_detected.kind for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+        e.drift_detected.kind
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
     ]
     assert types_pb2.DRIFT_KIND_REPEATED_FAILURE in drift_kinds
     # The REPEATED_FAILURE drift should be CRITICAL severity.
     repeated_events = [
         e
-        for e in sink.events
+        for e in sink.proto_events
         if e.WhichOneof("payload") == "drift_detected"
         and e.drift_detected.kind == types_pb2.DRIFT_KIND_REPEATED_FAILURE
     ]
@@ -766,11 +785,13 @@ async def test_report_new_work_discovered_fires_drift() -> None:
         assignee="analyst",
     )
     # Original drift + refine-failure drift (stub planner returns None).
-    assert len(sink.events) == 2
-    assert sink.events[0].WhichOneof("payload") == "drift_detected"
+    # goldfive a4: also a refine_attempted + refine_failed dict envelope
+    # — filter to proto events for the count assertion.
+    assert len(sink.proto_events) == 2
+    assert sink.proto_events[0].WhichOneof("payload") == "drift_detected"
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    assert sink.events[0].drift_detected.kind == types_pb2.DRIFT_KIND_NEW_WORK_DISCOVERED
+    assert sink.proto_events[0].drift_detected.kind == types_pb2.DRIFT_KIND_NEW_WORK_DISCOVERED
     assert planner.refine_calls[0]["drift"].kind is DriftKind.NEW_WORK_DISCOVERED
 
 
@@ -835,7 +856,7 @@ async def test_observe_rejects_invalid_revised_plan() -> None:
 
     await steerer.observe({"error": "trigger refine"}, session)
 
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # The initial TOOL_ERROR drift, then a CRITICAL validation-failure
     # drift when the bad revised plan is rejected. No PlanRevised is
     # emitted because the revision was not installed.
@@ -843,7 +864,7 @@ async def test_observe_rejects_invalid_revised_plan() -> None:
     # Original plan is still in place.
     assert session.plan is original_plan
     # The second drift is the validation-failure signal.
-    second = sink.events[1].drift_detected
+    second = sink.proto_events[1].drift_detected
     assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
     assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
     assert "plan validation failed" in second.detail
@@ -874,9 +895,9 @@ async def test_observe_rejects_revised_plan_with_cycle() -> None:
     await steerer.observe({"error": "trigger refine"}, session)
 
     assert session.plan is original_plan
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "drift_detected"]
-    second = sink.events[1].drift_detected
+    second = sink.proto_events[1].drift_detected
     assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
     assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
     assert "cycle" in second.detail
@@ -903,7 +924,7 @@ async def test_observe_rejects_revised_plan_with_unknown_edge() -> None:
     await steerer.observe({"error": "trigger refine"}, session)
 
     assert session.plan is original_plan
-    second = sink.events[1].drift_detected
+    second = sink.proto_events[1].drift_detected
     assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
     assert "unknown task id" in second.detail
 
@@ -953,9 +974,9 @@ async def test_apply_revision_emits_schema_violation_on_terminal_regression() ->
     # Plan unchanged; two drift events (the original trigger + the
     # schema-violation report); no PlanRevised emitted.
     assert session.plan is prior
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "drift_detected"]
-    second = sink.events[1].drift_detected
+    second = sink.proto_events[1].drift_detected
     assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
     assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
     assert "plan validation failed" in second.detail
@@ -1006,9 +1027,9 @@ async def test_apply_revision_emits_schema_violation_on_missing_terminal_edge() 
     await steerer.observe({"error": "trigger refine"}, session)
 
     assert session.plan is prior
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "drift_detected"]
-    second = sink.events[1].drift_detected
+    second = sink.proto_events[1].drift_detected
     assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
     assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
     assert "plan validation failed" in second.detail
@@ -1057,9 +1078,9 @@ async def test_plan_revised_carries_diff() -> None:
 
     await steerer.observe({"error": "trigger refine"}, session)
 
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "plan_revised"]
-    pr = sink.events[1].plan_revised
+    pr = sink.proto_events[1].plan_revised
     assert list(pr.diff.added_task_ids) == ["t3"]
     assert list(pr.diff.removed_task_ids) == []
     assert list(pr.diff.modified_task_ids) == ["t2"]
@@ -1095,9 +1116,9 @@ async def test_plan_revised_diff_empty_on_identity_revision() -> None:
 
     await steerer.observe({"error": "trigger refine"}, session)
 
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "plan_revised"]
-    pr = sink.events[1].plan_revised
+    pr = sink.proto_events[1].plan_revised
     assert list(pr.diff.added_task_ids) == []
     assert list(pr.diff.removed_task_ids) == []
     assert list(pr.diff.modified_task_ids) == []
@@ -1148,7 +1169,7 @@ async def test_mark_task_cancelled_cascades_to_downstream_pending() -> None:
 
     # One TaskCancelled event per task, in cascade order (t1 first,
     # then BFS downstream).
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["task_cancelled", "task_cancelled", "task_cancelled"]
     reasons = [e.task_cancelled.reason for e in sink.events]
     ids = [e.task_cancelled.task_id for e in sink.events]
@@ -1182,7 +1203,7 @@ async def test_mark_task_cancelled_does_not_cascade_to_completed() -> None:
     assert _task(session, "t1").status is TaskStatus.CANCELLED
     assert _task(session, "t2").status is TaskStatus.COMPLETED
     # Exactly one TaskCancelled event (for t1). t2 was preserved.
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["task_cancelled"]
     assert sink.events[0].task_cancelled.task_id == "t1"
 
@@ -1215,7 +1236,7 @@ async def test_mark_task_cancelled_multiple_downstream_paths() -> None:
     for tid in ("t1", "t2", "t3", "t4"):
         assert _task(session, tid).status is TaskStatus.CANCELLED, tid
 
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["task_cancelled"] * 4
     ids = [e.task_cancelled.task_id for e in sink.events]
     # t1 first; then its direct children (t2, t3 in edge-order); then t4.
@@ -1292,7 +1313,9 @@ async def test_cascade_primitive_shared_between_recoverable_and_unrecoverable_pa
     rec_steerer, rec_session, rec_sink = _build()
     await rec_steerer.mark_task_cancelled("t1", session=rec_session, reason="steer")
     rec_cancelled = [
-        e.task_cancelled for e in rec_sink.events if e.WhichOneof("payload") == "task_cancelled"
+        e.task_cancelled
+        for e in rec_sink.proto_events
+        if e.WhichOneof("payload") == "task_cancelled"
     ]
     # Initiator t1 + downstream {t2, t3, t4} = 4 TaskCancelled events.
     assert [c.task_id for c in rec_cancelled][0] == "t1"
@@ -1304,7 +1327,9 @@ async def test_cascade_primitive_shared_between_recoverable_and_unrecoverable_pa
     fat_steerer, fat_session, fat_sink = _build()
     await fat_steerer.mark_task_failed("t1", session=fat_session, reason="fatal", recoverable=False)
     fat_cancelled = [
-        e.task_cancelled for e in fat_sink.events if e.WhichOneof("payload") == "task_cancelled"
+        e.task_cancelled
+        for e in fat_sink.proto_events
+        if e.WhichOneof("payload") == "task_cancelled"
     ]
     # Initiator t1 is FAILED (not CANCELLED), so only the *downstream*
     # set shows up as TaskCancelled events — same three tasks as the

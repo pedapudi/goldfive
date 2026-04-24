@@ -47,6 +47,13 @@ class ListSink:
     async def close(self) -> None:
         pass
 
+    @property
+    def proto_events(self) -> list[Any]:
+        """Filter out goldfive a4 dict-envelope events (refine_attempted /
+        refine_failed / correlation plan_revised) so legacy assertions
+        on proto-event order still hold."""
+        return [e for e in self.events if hasattr(e, "WhichOneof")]
+
 
 class StubPlanner:
     def __init__(self, revised: Plan | None = None) -> None:
@@ -168,7 +175,7 @@ async def test_report_task_failed_transitions_and_refines() -> None:
     )
     assert session.plan.tasks[0].status is TaskStatus.FAILED
     # Sequence: TaskFailed, DriftDetected. Planner.refine invoked once.
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert "task_failed" in kinds and "drift_detected" in kinds
     assert len(planner.refine_calls) == 1
     assert planner.refine_calls[0]["drift"].kind is DriftKind.TASK_FAILED_RECOVERABLE

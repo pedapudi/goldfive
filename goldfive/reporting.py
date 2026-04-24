@@ -293,6 +293,30 @@ def _reroute_if_superseded(session: Session, task_id: str, tool_name: str) -> st
     return resolved
 
 
+async def _await_plan_stable(session: Session, steerer: Steerer) -> None:
+    """Block briefly until the steerer's plan mutation region is idle.
+
+    Duck-types ``steerer._wait_plan_stable``: any Steerer implementation
+    that exposes an async ``_wait_plan_stable(session)`` method gets a
+    consistent plan-state read; implementations that don't (custom
+    Steerers, test stubs) silently fall through and observe whatever
+    plan state happens to be installed at call time — the pre-a4
+    behaviour. Atomicity is best-effort (the helper times out after a
+    short interval and proceeds anyway), so this is a soft barrier,
+    not a hard mutex.
+    """
+    waiter = getattr(steerer, "_wait_plan_stable", None)
+    if not callable(waiter):
+        return
+    try:
+        await waiter(session)
+    except Exception as exc:  # noqa: BLE001 — barrier must never break a report
+        log.debug(
+            "reporting._await_plan_stable: %s (proceeding with current plan state)",
+            exc,
+        )
+
+
 def _idempotent_response(current_status: TaskStatus) -> dict[str, Any]:
     return {
         "acknowledged": True,
@@ -450,6 +474,9 @@ async def _handle_task_started(
     detail = _str(args, "detail")
     if not task_id:
         return _missing_task_id_response("report_task_started")
+    # goldfive a4: barrier against a concurrent fire-and-forget refine
+    # mutating the plan mid-read. See ``_await_plan_stable``.
+    await _await_plan_stable(session, steerer)
     task_id = _reroute_if_superseded(session, task_id, "report_task_started")
     task = _find_task_in_session(session, task_id)
     if task is not None:
@@ -516,6 +543,7 @@ async def _handle_task_progress(
     detail = _str(args, "detail")
     if not task_id:
         return _missing_task_id_response("report_task_progress")
+    await _await_plan_stable(session, steerer)
     task_id = _reroute_if_superseded(session, task_id, "report_task_progress")
     task = _find_task_in_session(session, task_id)
     if task is not None:
@@ -552,6 +580,7 @@ async def _handle_task_completed(
     )
     if not task_id:
         return _missing_task_id_response("report_task_completed")
+    await _await_plan_stable(session, steerer)
     task_id = _reroute_if_superseded(session, task_id, "report_task_completed")
     task = _find_task_in_session(session, task_id)
     if task is not None:
@@ -584,6 +613,7 @@ async def _handle_task_failed(
     recoverable = _bool(args, "recoverable", default=True)
     if not task_id:
         return _missing_task_id_response("report_task_failed")
+    await _await_plan_stable(session, steerer)
     task_id = _reroute_if_superseded(session, task_id, "report_task_failed")
     task = _find_task_in_session(session, task_id)
     if task is not None:
@@ -616,6 +646,7 @@ async def _handle_task_blocked(
     needed = _str(args, "needed")
     if not task_id:
         return _missing_task_id_response("report_task_blocked")
+    await _await_plan_stable(session, steerer)
     task_id = _reroute_if_superseded(session, task_id, "report_task_blocked")
     task = _find_task_in_session(session, task_id)
     if task is not None:

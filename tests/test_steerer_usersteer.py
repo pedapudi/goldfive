@@ -57,6 +57,11 @@ class ListSink:
     async def close(self) -> None:
         self.closed = True
 
+    @property
+    def proto_events(self) -> list[Any]:
+        """goldfive a4: filter dict-envelope sidecars."""
+        return [e for e in self.events if hasattr(e, "WhichOneof")]
+
 
 class RecordingPlanner:
     """Planner stub that records ``refine`` calls and returns a fixed plan."""
@@ -165,7 +170,7 @@ async def test_observe_steer_triggers_user_steer_drift_and_refine() -> None:
     assert [t.id for t in session.plan.tasks] == ["t1", "t2b"]
 
     # DriftDetected + PlanRevised events were emitted.
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert "drift_detected" in kinds
     assert "plan_revised" in kinds
 
@@ -191,7 +196,7 @@ async def test_observe_cancel_triggers_critical_user_cancel_drift() -> None:
 
     # Original DriftDetected + refine-failure follow-up DriftDetected
     # (planner returned None); no PlanRevised.
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds.count("drift_detected") == 2
     assert "plan_revised" not in kinds
 
@@ -206,7 +211,7 @@ async def test_observe_pause_emits_drift_but_does_not_refine() -> None:
     assert planner.refine_calls == []
 
     # DriftDetected was still emitted.
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected"]
     drift_pb = sink.events[0].drift_detected
     # Detail carries the note.
@@ -221,7 +226,7 @@ async def test_observe_non_control_event_still_uses_classifier() -> None:
     await steerer.observe({"error": "boom"}, session)
 
     # Should have produced a tool_error drift (classify_tool_error path).
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert "drift_detected" in kinds
 
 
@@ -353,7 +358,7 @@ async def test_observe_steer_stamps_annotation_id_on_drift_detected(
     await steerer.observe(msg, session)
 
     drift_events = [
-        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+        e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"
     ]
     assert drift_events, "USER_STEER must emit DriftDetected"
     assert drift_events[0].drift_detected.annotation_id == "ann_abc123"
@@ -378,7 +383,7 @@ async def test_observe_steer_without_annotation_id_leaves_drift_annotation_id_em
     await steerer.observe(msg, session)
 
     drift_events = [
-        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+        e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"
     ]
     assert drift_events
     assert drift_events[0].drift_detected.annotation_id == ""
@@ -401,7 +406,7 @@ async def test_observe_cancel_stamps_annotation_id_on_drift_detected(
     await steerer.observe(msg, session)
 
     drift_events = [
-        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+        e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"
     ]
     # CANCEL emits the original drift + a refine-failure follow-up (None
     # planner). Only the first carries the source annotation_id; the
@@ -425,7 +430,7 @@ async def test_autonomous_drift_has_empty_annotation_id() -> None:
     await steerer.observe({"error": "boom"}, session)
 
     drift_events = [
-        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
+        e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"
     ]
     assert drift_events
     for evt in drift_events:
@@ -805,7 +810,7 @@ async def test_plan_revised_stamps_annotation_id_from_user_steer(
     await steerer.observe(msg, session)
 
     revised_events = [
-        e for e in sink.events if e.WhichOneof("payload") == "plan_revised"
+        e for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised"
     ]
     assert revised_events, "USER_STEER with successful refine must emit PlanRevised"
     assert revised_events[0].plan_revised.trigger_event_id == "ann_pr_123"
@@ -833,7 +838,7 @@ async def test_plan_revised_without_annotation_id_falls_back_to_drift_id(
     await steerer.observe(msg, session)
 
     revised_events = [
-        e for e in sink.events if e.WhichOneof("payload") == "plan_revised"
+        e for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised"
     ]
     assert revised_events
     # Non-empty — either annotation_id (absent here) or drift.id.
@@ -952,7 +957,7 @@ async def test_autonomous_refine_stamps_drift_id_on_plan_revised(
     # Feed an untyped event — classify_tool_error path, no ControlMessage.
     await steerer.observe({"error": "boom"}, session)
     revised_events = [
-        e for e in sink.events if e.WhichOneof("payload") == "plan_revised"
+        e for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised"
     ]
     # Autonomous refines MUST carry a non-empty trigger_event_id — it
     # comes from the synthesized DriftEvent.id.

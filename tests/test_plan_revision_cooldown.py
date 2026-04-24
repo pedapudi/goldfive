@@ -46,6 +46,10 @@ class ListSink:
     async def close(self) -> None:
         return None
 
+    @property
+    def proto_events(self) -> list[Any]:
+        return [e for e in self.events if hasattr(e, "WhichOneof")]
+
 
 class StubPlanner:
     """Planner stub whose ``refine`` returns a fresh plan every call."""
@@ -121,7 +125,10 @@ def _drift(
 
 
 def _plan_revised_count(sink: ListSink) -> int:
-    return sum(1 for e in sink.events if e.WhichOneof("payload") == "plan_revised")
+    # goldfive a4: only count the proto PlanRevised events. The dict
+    # correlation envelope shares the ``plan_revised`` kind name and is
+    # an additional sidecar we don't want to double-count here.
+    return sum(1 for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised")
 
 
 def _build(
@@ -321,7 +328,7 @@ async def test_suppressed_revision_does_not_emit_extra_events(
     clock[0] += 1.0
     await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC), session)
 
-    kinds = [e.WhichOneof("payload") for e in sink.events]
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # First handle: drift_detected + plan_revised.
     # Second handle: drift_detected only (suppressed).
     assert kinds == ["drift_detected", "plan_revised", "drift_detected"]
@@ -334,7 +341,7 @@ async def test_suppressed_revision_does_not_emit_extra_events(
 
 
 def _plan_revised_events(sink: ListSink) -> list[Any]:
-    return [e for e in sink.events if e.WhichOneof("payload") == "plan_revised"]
+    return [e for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised"]
 
 
 async def test_plan_revised_event_populates_refine_summaries(
