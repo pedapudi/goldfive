@@ -445,6 +445,62 @@ class Plan:
         return stages
 
 
+def task_upstream_ready(plan: Plan, task_id: str) -> bool:
+    """Return ``True`` if every upstream task of ``task_id`` is COMPLETED.
+
+    Walks ``plan.edges`` to find all edges with ``to_task_id == task_id``
+    and checks that each ``from_task_id``'s status is
+    :attr:`TaskStatus.COMPLETED`. Tasks with no upstream edges are
+    trivially ready.
+
+    Supersession-aware: when an upstream predecessor ``A`` has been
+    superseded by a replacement ``B`` (``B.supersedes == A.id``) and
+    the edges table still references the original ``A``, the helper
+    resolves to ``B``'s status instead. This fallback is vestigial
+    when the refiner copies edges to point at the replacement id
+    directly -- but some refine paths leave the edges pointing at the
+    pre-supersession id, so we redirect here to keep the readiness
+    evaluation anchored to the live task.
+
+    Missing-endpoint edges (unknown ``from_task_id``) are treated as
+    *not ready* -- callers should validate the plan upstream, but a
+    dangling edge here conservatively blocks pinning rather than
+    silently allowing an underspecified downstream to run.
+
+    This helper is the DAG-readiness primitive the ADK adapter uses
+    to gate ``goldfive.current_task_id`` pinning so a downstream task
+    cannot be stamped onto an agent while its predecessors are still
+    in flight (goldfive#242).
+    """
+    if not task_id:
+        return True
+
+    tasks_by_id: dict[str, Task] = {t.id: t for t in plan.tasks if t.id}
+    # Supersession map: old_id -> replacement Task. The replacement's
+    # status is what we want to evaluate when the edges table still
+    # references the old (likely terminal) id.
+    replacement_of: dict[str, Task] = {}
+    for t in plan.tasks:
+        if t.supersedes and t.supersedes in tasks_by_id:
+            replacement_of[t.supersedes] = t
+
+    for e in plan.edges:
+        if e.to_task_id != task_id:
+            continue
+        upstream = tasks_by_id.get(e.from_task_id)
+        if upstream is None:
+            # Dangling edge — conservatively not ready.
+            return False
+        # Redirect through supersession when the edge still names the
+        # superseded task. The replacement's status is the live signal.
+        replacement = replacement_of.get(upstream.id)
+        if replacement is not None:
+            upstream = replacement
+        if upstream.status is not TaskStatus.COMPLETED:
+            return False
+    return True
+
+
 #: Conventional value for :attr:`Goal.source` indicating a goal was added
 #: by a ``USER_STEER`` directive (goldfive#152 / #154). Goals carrying
 #: this source are treated as "sticky": ``LLMPlanner.refine`` will

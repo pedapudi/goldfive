@@ -1324,12 +1324,16 @@ def make_adk_plugin(
             """Stamp ``goldfive.current_task_id`` for ``agent_name`` if unambiguous.
 
             Matching rule: the plan task whose ``assignee_agent_id``
-            equals ``agent_name`` and whose status is PENDING or
-            RUNNING. Exactly-one matches stamp the id onto both the
-            live ADK ``session.state`` (agent-side reads via
-            ``tool_ctx.state``) and the goldfive orchestration
-            ``session.state`` (handler fallback in
-            :mod:`goldfive.reporting` + :mod:`goldfive.adapters._tool_invocation`).
+            equals ``agent_name``, whose status is PENDING or RUNNING,
+            AND whose upstream DAG predecessors are all COMPLETED
+            (goldfive#242 — without the DAG gate a Stage-4 task assigned
+            to the coordinator can be pinned at run-start while Stages
+            0-3 are still PENDING, producing an impossible Gantt).
+            Exactly-one matches stamp the id onto both the live ADK
+            ``session.state`` (agent-side reads via ``tool_ctx.state``)
+            and the goldfive orchestration ``session.state`` (handler
+            fallback in :mod:`goldfive.reporting` +
+            :mod:`goldfive.adapters._tool_invocation`).
 
             Zero / multiple matches leave state unset — the handler
             path will surface the existing ``missing_task_id`` error
@@ -1353,18 +1357,57 @@ def make_adk_plugin(
             tasks = _safe_attr(plan, "tasks", None) or ()
             # Import here so the type is available without forcing a
             # top-level import for a rarely-hot-path enum compare.
-            from goldfive.types import TaskStatus
+            from goldfive.types import TaskStatus, task_upstream_ready
 
-            matches: list[Any] = []
+            # Pre-filter: PENDING/RUNNING tasks whose assignee is this
+            # agent. This is the pre-#242 candidate set. The DAG-gate
+            # below filters it further; we keep the pre-DAG list so we
+            # can log when the gate actually changes the outcome.
+            pre_dag: list[Any] = []
             for task in tasks:
                 assignee = str(_safe_attr(task, "assignee_agent_id", "") or "")
                 if assignee != agent_name:
                     continue
                 status = _safe_attr(task, "status", None)
                 if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
+                    pre_dag.append(task)
+
+            # DAG-readiness gate (goldfive#242): a task is only pinnable
+            # when every upstream task (via ``plan.edges``) is COMPLETED.
+            # Stage-4 tasks cannot be pinned while Stage 0-3 is still
+            # PENDING, even if the stage-4 assignee happens to be the
+            # agent whose turn is starting (the coordinator case the
+            # live session exposed).
+            matches: list[Any] = []
+            for task in pre_dag:
+                task_id = str(_safe_attr(task, "id", "") or "")
+                if not task_id:
+                    continue
+                try:
+                    ready = task_upstream_ready(plan, task_id)
+                except Exception as exc:  # noqa: BLE001 — never raise from pin
+                    log.debug(
+                        "before_agent_callback: task_upstream_ready raised "
+                        "for %s: %s — treating as not-ready",
+                        task_id,
+                        exc,
+                    )
+                    ready = False
+                if ready:
                     matches.append(task)
-                    if len(matches) > 1:
-                        break  # ambiguous — no need to count further
+
+            if len(matches) != len(pre_dag):
+                log.debug(
+                    "pin candidate filter: agent=%s, before=[%s], after=[%s] "
+                    "(upstream-gated)",
+                    agent_name,
+                    ", ".join(
+                        str(_safe_attr(t, "id", "") or "") for t in pre_dag
+                    ),
+                    ", ".join(
+                        str(_safe_attr(t, "id", "") or "") for t in matches
+                    ),
+                )
 
             if len(matches) != 1:
                 # Zero matches (off-plan) or >1 matches (ambiguous).
