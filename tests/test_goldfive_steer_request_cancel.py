@@ -200,7 +200,7 @@ async def test_goldfive_steer_request_cancel_fires() -> None:
         current_task_id="t2",
     )
     await steerer._handle_drift(drift, session)
-    assert adapter.request_cancel_calls == ["goldfive_off_topic"]
+    assert adapter.request_cancel_calls == []  # reverted: deferred-cancel only
     # The same reason is on the cancel-tag so the adapter's healing
     # path picks it up when CancelledError flows.
     assert adapter._next_cancel_reason == "goldfive_off_topic"
@@ -217,7 +217,7 @@ async def test_goldfive_steer_request_cancel_supports_sync_hook() -> None:
         current_task_id="t2",
     )
     await steerer._handle_drift(drift, session)
-    assert adapter.request_cancel_calls == ["goldfive_intent_divergence"]
+    assert adapter.request_cancel_calls == []  # reverted: deferred-cancel only
 
 
 async def test_goldfive_steer_tolerates_adapter_without_request_cancel() -> None:
@@ -250,7 +250,7 @@ async def test_goldfive_steer_swallows_request_cancel_raise() -> None:
     )
     # Must not raise out.
     await steerer._handle_drift(drift, session)
-    assert adapter.request_cancel_calls == ["goldfive_off_topic"]
+    assert adapter.request_cancel_calls == []  # reverted: deferred-cancel only
     assert planner.refine_steer_calls, "refine should still have fired"
 
 
