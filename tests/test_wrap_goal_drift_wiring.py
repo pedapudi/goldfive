@@ -315,11 +315,24 @@ def _patch_detect_llm(monkeypatch: pytest.MonkeyPatch, model_name: str) -> Any:
 class _MyAgent:
     """Async-callable agent shape accepted by ``auto_adapter``.
 
-    We deliberately use an instance-level callable so
-    ``type(agent).__name__`` in :func:`goldfive.wrap` resolves to
-    ``_MyAgent`` (the class name) — that's what the named-model
-    WARNING prints, and the test asserts on it.
+    No ``.name`` attribute — the named-model WARNING falls through to
+    ``type(agent).__name__`` (``_MyAgent``) and the assertion below
+    exercises that fallback.
     """
+
+    async def __call__(self, task: Any, session: Any, tools: Any) -> InvocationResult:
+        return InvocationResult(task_id=getattr(task, "id", ""), text="ok")
+
+
+class _NamedAgent:
+    """Async-callable agent shape with an ADK-style ``.name`` attribute.
+
+    Exercises the preferred branch of the named-model WARNING: prefer
+    the agent's own ``.name`` (``coordinator_agent`` in the real ADK
+    demo) over the Python class name (``LlmAgent`` / ``_NamedAgent``).
+    """
+
+    name = "coordinator_agent"
 
     async def __call__(self, task: Any, session: Any, tools: Any) -> InvocationResult:
         return InvocationResult(task_id=getattr(task, "id", ""), text="ok")
@@ -349,6 +362,35 @@ def test_wrap_warns_named_model_on_detection(
     assert "gpt-4o-mini" in msg
     assert "_MyAgent" in msg
     assert "GOLDFIVE_JUDGE_BASE_URL" in msg
+
+
+def test_wrap_warns_named_model_prefers_agent_name_over_class_name(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the agent has a ``.name`` attribute the WARNING uses that.
+
+    Regression guard: the first version of this WARNING printed
+    ``type(agent).__name__`` unconditionally, so live demo logs
+    showed "agent 'LlmAgent'" — the ADK base class name — instead
+    of "agent 'coordinator_agent'", which is what operators actually
+    care about.
+    """
+    _patch_detect_llm(monkeypatch, "gpt-4o-mini")
+
+    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+        goldfive.wrap(_NamedAgent(), sinks=[])
+
+    matching = [
+        r
+        for r in caplog.records
+        if r.name == "goldfive.wrap"
+        and "judge LLM not explicitly configured" in r.getMessage()
+    ]
+    assert len(matching) == 1
+    msg = matching[0].getMessage()
+    assert "coordinator_agent" in msg
+    assert "_NamedAgent" not in msg  # class name should NOT appear
 
 
 def test_wrap_suppresses_named_model_warning_when_call_llm_explicit(
