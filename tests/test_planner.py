@@ -2079,3 +2079,170 @@ async def test_refine_emits_no_orphan_event_when_coverage_complete() -> None:
         if isinstance(e, dict) and e.get("kind") == "refine_orphaned_tasks"
     ]
     assert orphan_events == []
+
+
+# ---------------------------------------------------------------------------
+# Fallback / deterministic-revision preservation of supersedes (#251 hardening)
+#
+# The looping-tool-call refine path has two non-LLM clones that historically
+# rebuilt ``Task`` records without ``supersedes`` / ``supersedes_kind``:
+#
+#   * ``_fallback_fail_loop_plan`` — deterministic LLM-can't-help branch.
+#   * ``_force_looper_failed`` post-parse hook (inside ``_refine_looping_tool_call``).
+#   * ``StaticPlanner.generate`` template clone.
+#
+# Dropping those fields silently breaks goldfive#251 supersedes coverage:
+# a CORRECT-kind chain that hits any of these clones loses its provenance
+# link, the supersedes-coverage validator orphans the prior task, and the
+# steerer's ``_repin_current_task_on_supersedes`` can't follow the chain.
+# Pin the invariant for each clone path. Strings are compared verbatim so
+# any future regression that char-splits the field (e.g. via
+# ``list.extend(str)``) would also fail loudly here.
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_fail_loop_plan_preserves_supersedes_on_existing_task() -> None:
+    """``_fallback_fail_loop_plan`` does NOT erase a CORRECT-kind link.
+
+    The looping task in ``plan`` carries ``supersedes='research_solar'`` /
+    ``supersedes_kind=CORRECT``. The fallback marks it FAILED — and must
+    keep both fields intact on the rebuilt Task.
+    """
+    looping_task = Task(
+        id="correct_research_solar",
+        title="Research solar (corrected)",
+        assignee_agent_id="researcher",
+        status=TaskStatus.RUNNING,
+        supersedes="research_solar",
+        supersedes_kind=SupersessionKind.CORRECT,
+    )
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="research_solar",
+                title="Research solar",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+            looping_task,
+        ],
+        edges=[],
+    )
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="loop",
+        current_task_id="correct_research_solar",
+    )
+    fallback = LLMPlanner._fallback_fail_loop_plan(plan, drift, looping_task)
+    looper = next(t for t in fallback.tasks if t.id == "correct_research_solar")
+    assert looper.status is TaskStatus.FAILED
+    # The string MUST round-trip verbatim — never a list of chars, never empty.
+    assert isinstance(looper.supersedes, str)
+    assert looper.supersedes == "research_solar"
+    assert looper.supersedes_kind is SupersessionKind.CORRECT
+    # And the prior COMPLETED task's empty supersedes also round-trips.
+    research = next(t for t in fallback.tasks if t.id == "research_solar")
+    assert isinstance(research.supersedes, str)
+    assert research.supersedes == ""
+    assert research.supersedes_kind is SupersessionKind.UNSPECIFIED
+
+
+def test_fallback_fail_loop_plan_preserves_supersedes_on_inserted_task() -> None:
+    """When the loop task is missing from ``plan``, the fallback re-inserts it.
+
+    The re-insertion path was the original ``supersedes``-stripping site:
+    the synthesised Task carried only the title / assignee / FAILED status.
+    Pin that the supersession metadata is kept in the synthetic insertion
+    too, so a CORRECT chain survives even when the LLM dropped the looper
+    from its proposed revision.
+    """
+    looping_task = Task(
+        id="correct_research_solar",
+        title="Research solar (corrected)",
+        assignee_agent_id="researcher",
+        status=TaskStatus.RUNNING,
+        supersedes="research_solar",
+        supersedes_kind=SupersessionKind.CORRECT,
+    )
+    # Plan does NOT contain the looping task — exercises the synthetic
+    # insertion branch.
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="research_solar",
+                title="Research solar",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+        ],
+        edges=[],
+    )
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="loop",
+        current_task_id="correct_research_solar",
+    )
+    fallback = LLMPlanner._fallback_fail_loop_plan(plan, drift, looping_task)
+    looper = next(
+        (t for t in fallback.tasks if t.id == "correct_research_solar"), None
+    )
+    assert looper is not None
+    assert looper.status is TaskStatus.FAILED
+    assert isinstance(looper.supersedes, str)
+    assert looper.supersedes == "research_solar"
+    assert looper.supersedes_kind is SupersessionKind.CORRECT
+
+
+def test_static_planner_template_clone_preserves_supersedes() -> None:
+    """``StaticPlanner.generate`` clones the template per-call.
+
+    Verify the clone preserves ``supersedes`` / ``supersedes_kind`` on
+    every task, including correction successors. Without preservation a
+    test or CLI that bakes a CORRECT-chain into the template would lose
+    the provenance on the first call, then never recover.
+    """
+    from goldfive.planner import StaticPlanner
+
+    template = Plan(
+        id="static-plan",
+        run_id="static-run",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="research_solar",
+                title="Research solar",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="correct_research_solar",
+                title="Research solar (corrected)",
+                supersedes="research_solar",
+                supersedes_kind=SupersessionKind.CORRECT,
+            ),
+        ],
+        edges=[],
+    )
+    sp = StaticPlanner(template)
+
+    import asyncio
+
+    cloned = asyncio.run(
+        sp.generate(
+            goals=[Goal(id="g1", summary="ship it")],
+            available_agents=None,
+            context={"run_id": "fresh-run"},
+        )
+    )
+    assert cloned is not None
+    correction = next(t for t in cloned.tasks if t.id == "correct_research_solar")
+    assert isinstance(correction.supersedes, str)
+    assert correction.supersedes == "research_solar"
+    assert correction.supersedes_kind is SupersessionKind.CORRECT
