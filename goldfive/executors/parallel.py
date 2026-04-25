@@ -485,7 +485,34 @@ class ParallelDAGExecutor:
             if sem is not None:
                 await sem.acquire()
             try:
+                # F10 / goldfive#251 R4: framework auto-start of a task
+                # is a real status transition (PENDING -> RUNNING) and
+                # deserves a dedicated source label so operators can
+                # tell it apart from ``handler_default`` (LLM tool call
+                # where ``task_id`` defaulted) and ``other`` (catch-all).
+                # Emit BEFORE the adapter invoke so the transition row
+                # lands in the wire order operators expect (transition
+                # then activity).
+                prev_status = task.status
                 task.status = TaskStatus.RUNNING
+                if prev_status is not TaskStatus.RUNNING:
+                    emit_transition = getattr(steerer, "_emit_task_transitioned", None)
+                    if callable(emit_transition):
+                        try:
+                            await emit_transition(
+                                session,
+                                task,
+                                from_status=prev_status,
+                                to_status=TaskStatus.RUNNING,
+                                source="executor_dispatch",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug(
+                                "ParallelDAGExecutor: TaskTransitioned emit raised "
+                                "for task=%s: %s",
+                                task.id,
+                                exc,
+                            )
                 try:
                     inv: InvocationResult | None = await adapter.invoke(task, session)
                 except asyncio.CancelledError:

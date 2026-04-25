@@ -667,3 +667,147 @@ def test_task_transition_refused_factory_defaults() -> None:
     assert p.current_revision == 0
     assert p.agent_name == ""
     assert p.invocation_id == ""
+
+
+# ---------------------------------------------------------------------------
+# 11. F10 / executor_dispatch — ParallelDAGExecutor's framework auto-start
+#     emits TaskTransitioned(source="executor_dispatch") at the
+#     ``task.status = TaskStatus.RUNNING`` mutation point in
+#     :class:`~goldfive.executors.ParallelDAGExecutor`.
+# ---------------------------------------------------------------------------
+
+
+async def test_parallel_executor_dispatch_emits_executor_dispatch_transition() -> None:
+    """When the parallel DAG executor flips a task from PENDING to
+    RUNNING just before invoking the adapter, a TaskTransitioned must
+    land with ``source="executor_dispatch"`` — distinct from
+    ``handler_default`` (LLM tool call where ``task_id`` defaulted)
+    and from generic ``other``.
+    """
+    from goldfive.executors import ParallelDAGExecutor
+    from goldfive.results import InvocationResult
+
+    plan = _plan(
+        Task(id="t1", title="T1", assignee_agent_id="writer"),
+        revision_index=0,
+    )
+    session = _session(plan)
+    session.run_id = "r-pdag"
+    sink = ListSink()
+    steerer = _bound_steerer(sink)
+
+    class _Adapter:
+        async def register_reporting_tools(self, tools: list[Any]) -> None:
+            return None
+
+        @property
+        def available_agents(self) -> list[str]:
+            return ["writer"]
+
+        async def invoke(self, task: Task, session: Session) -> InvocationResult:
+            return InvocationResult(task_id=task.id, text=f"ok {task.id}")
+
+    executor = ParallelDAGExecutor(max_concurrency=0)
+    out = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=_Adapter(),
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+    )
+    assert out.success
+
+    transitions = _transition_events(sink)
+    # The framework auto-start row is the first PENDING -> RUNNING for t1.
+    matching = [
+        e
+        for e in transitions
+        if e.task_transitioned.source == "executor_dispatch"
+        and e.task_transitioned.task_id == "t1"
+        and e.task_transitioned.from_status == TaskStatus.PENDING.value
+        and e.task_transitioned.to_status == TaskStatus.RUNNING.value
+    ]
+    assert len(matching) == 1, (
+        "ParallelDAGExecutor.run_one must emit exactly one "
+        f"TaskTransitioned(source=executor_dispatch) for t1; "
+        f"saw {len(matching)} (all transitions: "
+        f"{[e.task_transitioned.source for e in transitions]!r})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 12. F10 / control_rewind — REWIND_TO control message emits one
+#     TaskTransitioned per affected task with source="control_rewind".
+# ---------------------------------------------------------------------------
+
+
+async def test_control_rewind_emits_control_rewind_transition() -> None:
+    """A ``REWIND_TO`` control message marks the target task and every
+    downstream task PENDING. F10: each affected task whose status
+    actually changed emits one ``TaskTransitioned`` with
+    ``source="control_rewind"`` so operator triage can distinguish a
+    control-driven rewind from a cancellation cascade or a
+    plan_revision flip.
+    """
+    from goldfive.control import ControlKind, ControlMessage
+    from goldfive.executors._control import dispatch_control
+
+    plan = _plan(
+        Task(
+            id="t0",
+            title="T0",
+            assignee_agent_id="writer",
+            status=TaskStatus.COMPLETED,
+        ),
+        Task(
+            id="t1",
+            title="T1",
+            assignee_agent_id="writer",
+            status=TaskStatus.COMPLETED,
+        ),
+        Task(
+            id="t2",
+            title="T2",
+            assignee_agent_id="writer",
+            status=TaskStatus.COMPLETED,
+        ),
+        edges=[
+            TaskEdge(from_task_id="t0", to_task_id="t1"),
+            TaskEdge(from_task_id="t1", to_task_id="t2"),
+        ],
+        revision_index=0,
+    )
+    session = _session(plan)
+    session.run_id = "r-rewind"
+    session.completed_results = {"t0": "a", "t1": "b", "t2": "c"}
+
+    sink = ListSink()
+    steerer = _bound_steerer(sink)
+
+    msg = ControlMessage(kind=ControlKind.REWIND_TO, payload={"task_id": "t1"})
+    outcome = await dispatch_control(
+        msg, session=session, steerer=steerer, sinks=[sink]
+    )
+
+    # Sanity: rewind succeeded.
+    assert outcome.rewind_task_id == "t1"
+    assert plan.tasks[0].status == TaskStatus.COMPLETED  # t0 unchanged
+    assert plan.tasks[1].status == TaskStatus.PENDING
+    assert plan.tasks[2].status == TaskStatus.PENDING
+
+    transitions = _transition_events(sink)
+    rewind_transitions = [
+        e for e in transitions if e.task_transitioned.source == "control_rewind"
+    ]
+    # Two affected tasks (t1 + t2 — both went COMPLETED -> PENDING).
+    assert len(rewind_transitions) == 2, (
+        f"expected one TaskTransitioned(source=control_rewind) per "
+        f"affected task; saw {len(rewind_transitions)}"
+    )
+    rewind_ids = sorted(e.task_transitioned.task_id for e in rewind_transitions)
+    assert rewind_ids == ["t1", "t2"]
+    for evt in rewind_transitions:
+        payload = evt.task_transitioned
+        assert payload.from_status == TaskStatus.COMPLETED.value
+        assert payload.to_status == TaskStatus.PENDING.value
