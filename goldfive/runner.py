@@ -323,9 +323,11 @@ class Runner:
         )
         if pre_verdict in ("new_work", "conversational", "refine_existing"):
             verdict = pre_verdict  # type: ignore[assignment]
-            log.debug(
-                "Runner.run: using adapter-level pre-classified verdict %r",
+            log.info(
+                "Runner.run: gate verdict=%s (source=adapter-prepass) "
+                "prior_plan_id=%s",
                 verdict,
+                (getattr(self._last_plan, "id", "") or "")[:16] or "<none>",
             )
         elif self._last_plan is not None and isinstance(user_input, str):
             try:
@@ -341,6 +343,19 @@ class Runner:
                 # always make forward progress.
                 log.warning("planner_gate raised; falling back to new_work: %s", exc)
                 verdict = "new_work"
+            else:
+                log.info(
+                    "Runner.run: gate verdict=%s (source=runner-inline) "
+                    "prior_plan_id=%s user_input_first=%r",
+                    verdict,
+                    (getattr(self._last_plan, "id", "") or "")[:16] or "<none>",
+                    user_input[:80] if isinstance(user_input, str) else "",
+                )
+        else:
+            log.info(
+                "Runner.run: gate skipped (no prior plan or non-str input); "
+                "treating as new_work"
+            )
 
         # Conversational follow-up: skip goal derivation + planning.
         # Carry the prior plan forward onto the freshly minted Session
@@ -489,6 +504,11 @@ class Runner:
                         kind=DriftKind.USER_STEER,
                         severity=DriftSeverity.WARNING,
                         detail=user_text,
+                    )
+                    log.info(
+                        "Runner.run: routing refine_existing through steerer "
+                        "USER_STEER pipeline (prior_plan_id=%s)",
+                        (prior_plan.id or "")[:16] or "<none>",
                     )
                     try:
                         await self.steerer._handle_drift(drift, session)
@@ -663,11 +683,35 @@ class Runner:
         _ostate.clear_active_steer(session.state)
 
         # planner-gate: snapshot the turn's final plan so the next
-        # turn's planner_gate can classify against it. Only stash on
-        # success — an aborted run's plan would poison the next
-        # turn's gate with half-run state.
-        if outcome.success and session.plan is not None:
+        # turn's planner_gate can classify against it.
+        #
+        # Rationale (Phase 2.X / goldfive#271 Gap 1): the previous
+        # ``outcome.success and ...`` guard discarded the prior plan on
+        # ANY abort — including goldfive-driven CRITICAL drift cancels.
+        # That left ``_last_plan = None`` for the next turn even when
+        # the turn produced a real plan and partially executed it.
+        # The ADK-web user-steer flow hit this on the validation E2E:
+        # turn 1 was cancelled by a CRITICAL goal-drift, turn 2's user
+        # steer arrived next, and the gate found ``_last_plan = None``
+        # so it short-circuited to ``new_work`` — silently skipping the
+        # steerer's USER_STEER pipeline (no DriftDetected(USER_STEER),
+        # no PlanRevised, no sticky-goal preservation).
+        #
+        # Stash any non-None ``session.plan`` (whether the turn
+        # succeeded, was cancelled, or aborted on a planner-bind error)
+        # so the next turn's gate can refine against it. The plan id
+        # remains a stable refine target; the steerer's
+        # ``_apply_revision`` resolves the new revision off
+        # ``prev_plan.revision_index + 1`` and the planner's refine
+        # call carries the prior plan's tasks forward verbatim.
+        if session.plan is not None:
             self._last_plan = session.plan
+            log.info(
+                "Runner.run: stashed prior plan for next turn's gate "
+                "(plan_id=%s success=%s)",
+                (session.plan.id or "")[:16] or "<none>",
+                outcome.success,
+            )
 
         self._conversation.absorb_turn(
             outcome, user_input_summary=_initial_goal_summary(user_input)

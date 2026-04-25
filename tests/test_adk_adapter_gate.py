@@ -689,3 +689,102 @@ async def test_adapter_gate_heuristic_catches_steer_language() -> None:
         "USER_STEER; the regression goldfive#270 documented is back"
     )
     assert plan_revised, "no PlanRevised on the wire after USER_STEER"
+
+
+# ---------------------------------------------------------------------------
+# 8. Phase 2.X / Gap 1: adapter gate logs verdict at INFO for visibility
+# ---------------------------------------------------------------------------
+
+
+async def test_adapter_gate_logs_verdict_at_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The adapter-level gate emits an INFO log line capturing the
+    verdict, prior_plan_id, and user_input prefix on each turn after
+    the first. This is the operator-visible signal that the gate fired
+    and what it decided — without it (the demo log on the validation
+    E2E was silent on the gate), debugging gate misclassifications
+    requires re-running with DEBUG enabled.
+    """
+    import logging as _logging
+
+    sink = InMemorySink()
+    wrapped = _build_wrapped(planner_gate="auto", sinks=[sink])
+    _seed_prior_plan(wrapped)
+
+    async def _force_refine(*, prior_plan, completed_results, user_input, session):
+        return "refine_existing"
+
+    wrapped.runner._classify_turn = _force_refine
+
+    revised = Plan(
+        id="prior-1",
+        run_id="",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="t1",
+                title="Gather facts",
+                description="x",
+                assignee_agent_id="inner_agent",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="t2-new",
+                title="Pivot",
+                description="y",
+                assignee_agent_id="inner_agent",
+            ),
+        ],
+        edges=[],
+        summary="Pivoted plan",
+    )
+
+    async def _fake_refine(*, plan, drift, goals, **kwargs):
+        return revised
+
+    wrapped.runner.planner.refine = _fake_refine  # type: ignore[method-assign]
+
+    ctx = _FakeCtx("forget panels. flares instead.")
+    with caplog.at_level(_logging.INFO, logger="goldfive.adapters.adk_wrap"):
+        [e async for e in wrapped._run_async_impl(ctx)]
+
+    messages = [rec.getMessage() for rec in caplog.records]
+    verdict_lines = [m for m in messages if "gate verdict=" in m]
+    assert verdict_lines, (
+        f"adapter gate did not emit an INFO verdict log; got: {messages!r}"
+    )
+    assert any("verdict=refine_existing" in m for m in verdict_lines), (
+        f"adapter gate verdict missed; got: {verdict_lines!r}"
+    )
+    # The log carries the user_input prefix so an operator can correlate
+    # the verdict with the actual message.
+    assert any("forget panels" in m for m in verdict_lines), (
+        f"verdict log missing user_input snippet; got: {verdict_lines!r}"
+    )
+
+
+async def test_adapter_gate_logs_skip_reason_when_no_prior_plan(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When no prior plan exists the adapter gate skips classification
+    and logs the reason at INFO. This makes the "gate didn't fire"
+    case observable in the demo log.
+    """
+    import logging as _logging
+
+    wrapped = _build_wrapped(planner_gate="auto")
+    # No _last_plan stamped — first turn.
+
+    ctx = _FakeCtx("first message of the conversation")
+    with caplog.at_level(_logging.INFO, logger="goldfive.adapters.adk_wrap"):
+        [e async for e in wrapped._run_async_impl(ctx)]
+
+    messages = [rec.getMessage() for rec in caplog.records]
+    skip_lines = [m for m in messages if "gate skipped" in m]
+    assert skip_lines, (
+        f"expected gate-skipped INFO log when no prior plan; got: {messages!r}"
+    )
+    assert any("no prior plan" in m for m in skip_lines), (
+        f"skip log should mention 'no prior plan'; got: {skip_lines!r}"
+    )

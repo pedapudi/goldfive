@@ -1,6 +1,12 @@
 """F1 / regression: turn-aware planning gate ``refine_existing`` branch
 must route through the steerer.
 
+Phase 2.X (goldfive#271 Gap 1):
+``_last_plan`` is now stashed for the next turn even when the prior
+turn aborted, and the gate's verdict is logged at INFO so operators
+can grep ``/tmp/demo-validation.log`` for the actual classification.
+
+
 PR #210 introduced the planning gate with three verdicts (``new_work``
 / ``conversational`` / ``refine_existing``). The ``refine_existing``
 branch called ``planner.refine`` directly and treated the output as a
@@ -31,6 +37,7 @@ fix.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -319,3 +326,209 @@ async def test_refine_existing_falls_back_to_generate_on_refine_failure() -> Non
         "fall-back path must emit PlanSubmitted for the regenerated "
         "plan (the safe path always ships a plan)."
     )
+
+
+# ---------------------------------------------------------------------------
+# 3. Phase 2.X / Gap 1: prior plan stashed across an aborted turn so the
+#    next turn's planner-gate can route through USER_STEER.
+# ---------------------------------------------------------------------------
+
+
+async def test_prior_plan_stashed_when_turn_aborts_so_next_steer_routes() -> None:
+    """Regression for goldfive#271 Gap 1.
+
+    Scenario from the validation E2E:
+
+    1. Turn 1 builds a plan and starts executing it.
+    2. Turn 1 aborts mid-flight (in this test: a task fails so the
+       executor returns ``ExecutionOutcome(success=False)``).
+    3. Turn 2 is a user steer ("forget X. tell me about Y.").
+
+    Pre-Phase-2.X the runner only stashed ``_last_plan`` on
+    ``outcome.success=True``, so the gate on turn 2 found
+    ``_last_plan = None`` and short-circuited to ``new_work`` —
+    silently dropping the steerer's USER_STEER pipeline. The fix
+    stashes the plan whenever ``session.plan`` is non-None so the
+    gate can refine against it on the next turn even if the prior
+    turn was cancelled or failed.
+    """
+    turn1_plan = json.dumps(
+        {
+            "id": "plan-aborted",
+            "summary": "first plan that aborts",
+            "tasks": [
+                {"id": "t1", "title": "T1", "assignee_agent_id": "writer"},
+            ],
+        }
+    )
+    refined_plan = json.dumps(
+        {
+            "id": "plan-aborted",
+            "summary": "revised after steer",
+            "tasks": [
+                {
+                    "id": "t1",
+                    "title": "T1",
+                    "assignee_agent_id": "writer",
+                    "status": "FAILED",
+                },
+                {"id": "t2", "title": "T2 (steer)", "assignee_agent_id": "writer"},
+            ],
+        }
+    )
+
+    planner = LLMPlanner(
+        call_llm=_planner_call_llm_factory(
+            turn1_plan=turn1_plan,
+            turn2_verdict="refine_existing",
+            refined_plan=refined_plan,
+        ),
+        model="stub",
+    )
+
+    async def _failing_agent(
+        task: Task,
+        session: Session,
+        tools: list[ReportingToolSpec],
+    ) -> InvocationResult:
+        _ = tools, session
+        return InvocationResult(task_id=task.id, text="boom", success=False)
+
+    sink = InMemorySink()
+    runner = Runner(
+        agent=CallableAdapter(_failing_agent, available_agents=["writer"]),
+        planner=planner,
+        executor=SequentialExecutor(),
+        goal_deriver=PassthroughGoalDeriver("demo"),
+        sinks=[sink],
+    )
+
+    out1 = await runner.run("make a 2-slide presentation about solar")
+    # Turn 1 aborts (the agent returns success=False) — but a plan IS
+    # installed on the session before the executor runs.
+    assert not out1.success
+    assert out1.session.plan is not None
+    turn1_plan_id = out1.session.plan.id
+    turn1_revision_index = out1.session.plan.revision_index
+    turn1_end = len(sink.events)
+
+    # The fix: ``_last_plan`` is stashed despite the abort.
+    assert runner._last_plan is not None, (
+        "Gap 1 regression: the runner must stash session.plan for the "
+        "next turn's gate even when the turn aborted; otherwise the "
+        "next user steer skips the USER_STEER pipeline."
+    )
+    assert runner._last_plan.id == turn1_plan_id
+
+    # Turn 2: user steer should classify as refine_existing and route
+    # through the steerer's USER_STEER pipeline.
+    out2 = await runner.run("forget solar. tell me about wind power instead.")
+    await runner.close()
+
+    turn2_kinds = _kinds(sink.events[turn1_end:])
+    assert "DriftDetected" in turn2_kinds, (
+        "USER_STEER drift must appear on the wire even when the prior "
+        "turn aborted — the prior plan is enough context for the gate."
+    )
+    assert "PlanRevised" in turn2_kinds, (
+        "refine_existing routes through the steerer's USER_STEER "
+        "pipeline; PlanRevised must fire with bumped revision_index."
+    )
+
+    # plan_id stable + revision_index bumped (same invariants as the
+    # success-path test but exercised through the abort recovery).
+    assert out2.session.plan is not None
+    assert out2.session.plan.id == turn1_plan_id
+    assert out2.session.plan.revision_index == turn1_revision_index + 1
+
+
+# ---------------------------------------------------------------------------
+# 4. Phase 2.X / Gap 1: gate verdict + USER_STEER routing log lines
+# ---------------------------------------------------------------------------
+
+
+async def test_gate_verdict_logs_at_info_for_operator_visibility(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The runner's planner-gate emits one INFO-level log line per turn
+    capturing the verdict. A future operator debugging an E2E should
+    be able to grep for ``Runner.run: gate verdict=`` and reconstruct
+    the classification path that drove the turn.
+    """
+    turn1_plan = json.dumps(
+        {
+            "id": "plan-log",
+            "summary": "first plan",
+            "tasks": [
+                {"id": "t1", "title": "T1", "assignee_agent_id": "writer"},
+            ],
+        }
+    )
+    refined_plan = json.dumps(
+        {
+            "id": "plan-log",
+            "summary": "revised plan",
+            "tasks": [
+                {
+                    "id": "t1",
+                    "title": "T1",
+                    "assignee_agent_id": "writer",
+                    "status": "COMPLETED",
+                },
+                {"id": "t2", "title": "T2 (steer)", "assignee_agent_id": "writer"},
+            ],
+        }
+    )
+    planner = LLMPlanner(
+        call_llm=_planner_call_llm_factory(
+            turn1_plan=turn1_plan,
+            turn2_verdict="refine_existing",
+            refined_plan=refined_plan,
+        ),
+        model="stub",
+    )
+    sink = InMemorySink()
+    runner = Runner(
+        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
+        planner=planner,
+        executor=SequentialExecutor(),
+        goal_deriver=PassthroughGoalDeriver("demo"),
+        sinks=[sink],
+    )
+
+    with caplog.at_level(logging.INFO, logger="goldfive.runner"):
+        await runner.run("first turn")
+        await runner.run("forget first. tell me about second instead.")
+        await runner.close()
+
+    messages = [rec.getMessage() for rec in caplog.records]
+
+    # First turn: no prior plan → gate skipped log.
+    assert any(
+        "gate skipped (no prior plan or non-str input)" in m for m in messages
+    ), f"expected gate-skipped log on first turn; got: {messages!r}"
+
+    # Second turn: gate verdict logged with verdict + prior_plan_id +
+    # user_input snippet.
+    verdict_lines = [m for m in messages if "gate verdict=" in m]
+    assert verdict_lines, (
+        f"expected at least one gate verdict log; got: {messages!r}"
+    )
+    assert any("verdict=refine_existing" in m for m in verdict_lines), (
+        f"expected refine_existing verdict in logs; got: {verdict_lines!r}"
+    )
+
+    # USER_STEER routing log fires when refine_existing routes through
+    # the steerer.
+    assert any(
+        "routing refine_existing through steerer USER_STEER pipeline" in m
+        for m in messages
+    ), (
+        "expected USER_STEER routing log; got: "
+        f"{[m for m in messages if 'USER_STEER' in m]!r}"
+    )
+
+    # _last_plan stash log on a successful turn.
+    assert any(
+        "stashed prior plan for next turn's gate" in m for m in messages
+    ), f"expected _last_plan stash log; got: {messages!r}"
