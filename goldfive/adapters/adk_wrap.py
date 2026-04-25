@@ -322,8 +322,8 @@ class GoldfiveADKAgent(BaseAgent):
         # closest to ADK's user-message arrival point — so the verdict
         # is computed before the inner :meth:`Runner.run` rebuilds the
         # session. The verdict rides through ``context`` into Runner.run
-        # which honours it via ``_RUN_CONTEXT_PRECLASSIFIED_VERDICT_KEY``
-        # and skips its own :meth:`_classify_turn` call.
+        # under the ``_adk_pre_classified_verdict`` key; Runner.run
+        # honours it and skips its own :meth:`_classify_turn` call.
         #
         # Why both layers? :meth:`Runner.run` retains its own gate for
         # non-ADK callers (programmatic, Claude SDK, callable) that
@@ -392,8 +392,7 @@ class GoldfiveADKAgent(BaseAgent):
             if pre_verdict is not None:
                 # Threaded into Runner.run via context — Runner.run reads
                 # this key, skips its own _classify_turn, and uses the
-                # adapter-side verdict directly. See
-                # :data:`goldfive.runner._RUN_CONTEXT_PRECLASSIFIED_VERDICT_KEY`.
+                # adapter-side verdict directly.
                 run_context["_adk_pre_classified_verdict"] = pre_verdict
             async for item in self._runner.run_streamed(
                 user_input,
