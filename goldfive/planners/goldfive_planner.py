@@ -153,24 +153,62 @@ def _state_get(state: Any, key: str, default: str = "") -> str:
     return str(value)
 
 
-def _goldfive_session_from_state(state: Any) -> Any:
-    """Return the goldfive ``Session`` reachable via ADK state, or ``None``.
+def _goldfive_session_from_context(ctx: Any) -> Any:
+    """Return the goldfive ``Session`` reachable from a callback / readonly context.
 
-    Mirrors :func:`goldfive.adapters._adk_dynainst._goldfive_session_from_state`.
-    The ADK adapter stashes a
-    :class:`~goldfive.adapters._adk_plugin.SessionContext` onto ADK
-    ``session.state`` under ``"goldfive._session_context"``; when
-    present, the ``.session`` attribute is the goldfive
-    :class:`~goldfive.types.Session` whose state dict is goldfive's
-    own orchestration store. Returns ``None`` when the key is missing
-    so the planner can fall back to reading ADK state directly.
+    Phase 2.0 of goldfive#271. Resolution order:
+
+    1. Walk ``ctx._invocation_context.plugin_manager.plugins`` for the
+       goldfive plugin and read its ``_active_ctx.session``. This is
+       the live-run path — set by
+       :meth:`~goldfive.adapters._adk_plugin._GoldfiveADKPlugin.set_active_context`
+       (called from :meth:`ADKAdapter._invoke_internal` before
+       ``runner.run_async``).
+    2. The legacy ``"goldfive._session_context"`` stash on the
+       context's ``state`` — used only by unit tests that drive the
+       planner against a hand-built state dict.
+
+    Returns ``None`` when neither resolves.
     """
+    from goldfive.adapters._adk_plugin import session_context_from_invocation
+
+    inv_ctx = getattr(ctx, "_invocation_context", None) or getattr(
+        ctx, "invocation_context", None
+    )
+    if inv_ctx is not None:
+        sc = session_context_from_invocation(inv_ctx)
+        if sc is not None:
+            session = getattr(sc, "session", None)
+            if session is not None:
+                return session
+    state = getattr(ctx, "state", None)
     if not isinstance(state, Mapping):
         return None
-    ctx = state.get("goldfive._session_context")
-    if ctx is None:
+    legacy_ctx = state.get("goldfive._session_context")
+    if legacy_ctx is None:
         return None
-    return getattr(ctx, "session", None)
+    return getattr(legacy_ctx, "session", None)
+
+
+def _task_title_from_plan(session: Any, task_id: str) -> str:
+    """Look up ``task_id``'s title in ``session.plan.tasks``.
+
+    The typed :class:`~goldfive.types.Task` on ``Session.plan`` is the
+    source of truth — the planner reaches into it for the prompt block
+    instead of reading the de-normalised
+    ``goldfive.current_task_title`` key. Returns ``""`` when the plan
+    or the task is missing.
+    """
+    if session is None or not task_id:
+        return ""
+    plan = getattr(session, "plan", None)
+    if plan is None:
+        return ""
+    tasks = getattr(plan, "tasks", None) or ()
+    for task in tasks:
+        if str(getattr(task, "id", "") or "") == task_id:
+            return str(getattr(task, "title", "") or "")
+    return ""
 
 
 def _state_list(state: Any, key: str) -> list[str]:
@@ -304,81 +342,66 @@ class GoldfivePlanner(BasePlanner):
     ) -> str | None:
         """Return the orchestration context block for this LLM turn.
 
-        Reads ``session.state['goldfive.*']`` off ``readonly_context``
-        and emits a short, tree-agnostic block. When a
-        :attr:`user_planner` is set its own ``build_planning_instruction``
-        is called first and **prepended** so the user planner's framing
-        lands above goldfive's per-turn state block.
+        Reads from goldfive's
+        :class:`~goldfive.orchestration_store.OrchestrationStore` when
+        the planner can reach the goldfive
+        :class:`~goldfive.types.Session` via the
+        ``goldfive._session_context`` stash on ADK state. Falls back
+        to reading ADK state directly only for custom adapters that
+        don't stash a SessionContext / legacy unit tests.
 
-        Phase 1 of goldfive#271 — when the planner can reach the
-        goldfive :class:`~goldfive.types.Session` via the
-        ``goldfive._session_context`` stash on ADK state, the
-        active-steer / pin reads go through
-        :class:`~goldfive.orchestration_store.OrchestrationStore` so
-        the typed accessor is the read of record. Falls back to
-        reading ADK state directly when the goldfive Session isn't
-        reachable (custom adapters that don't stash a SessionContext,
-        legacy unit tests).
+        When a :attr:`user_planner` is set its own
+        ``build_planning_instruction`` is called first and **prepended**
+        so the user planner's framing lands above goldfive's per-turn
+        state block.
+
+        Phase 2.0 of goldfive#271 — the bridge from goldfive
+        ``Session.state`` onto ADK ``session.state`` is gone. The
+        planner reads goldfive Session directly, eliminating the
+        callback-time write to ADK state that raced with ADK's
+        optimistic-concurrency contract (see goldfive#275).
 
         Returns ``None`` only when an internal error prevents building
         any instruction — never returns an empty string (empty would
         cause ADK to skip the append, hiding the bug).
         """
         state = _extract_state(readonly_context)
+        gf_session = _goldfive_session_from_context(readonly_context)
 
-        # Collect the placeholders. Phase 1 of goldfive#271 — prefer
-        # the goldfive OrchestrationStore when reachable AND when its
-        # Session.state has populated values. ADK state remains the
-        # fallback so the existing bridge path (V1/V5/V2 writes to ADK
-        # state by ``before_model_callback`` / ``before_run_callback``)
-        # keeps working unchanged. All keys default to the
-        # ``(none)`` marker so the block still renders when state is
-        # sparse — e.g. before #152 populates the new keys — making
-        # this module a soft dependency.
-        adk_task_id = _state_get(state, KEY_CURRENT_TASK_ID)
-        adk_task_title = _state_get(state, KEY_CURRENT_TASK_TITLE)
-        adk_steer_body = _state_get(state, KEY_ACTIVE_STEER_BODY)
-        adk_steer_source = _state_get(state, KEY_ACTIVE_STEER_SOURCE).strip().lower()
-
-        gf_session = _goldfive_session_from_state(state)
-        gf_task_id = ""
-        gf_task_title = ""
-        gf_steer_body = ""
-        gf_steer_source = ""
         if gf_session is not None:
-            try:
-                from goldfive.orchestration_store import OrchestrationStore
+            from goldfive.orchestration_store import OrchestrationStore
 
-                store = OrchestrationStore.for_session(gf_session)
-                gf_task_id = store.pin_current_task()
-                gf_task_title = store.pin_current_task_title()
-                active = store.get_active_steer()
-                if active is not None:
-                    gf_steer_body = active.body
-                    gf_steer_source = active.source.strip().lower()
-            except Exception as exc:  # noqa: BLE001 — defensive
-                log.debug(
-                    "GoldfivePlanner: OrchestrationStore read raised: %s "
-                    "— falling back to ADK state",
-                    exc,
-                )
-
-        # Prefer goldfive store value when it's populated; ADK state
-        # is the fallback. This preserves the V1/V5 bridge write path
-        # (test scaffolding writes to ADK state via the plugin and
-        # expects the planner to render those values) while making
-        # the OrchestrationStore the read of record once Phase 2's
-        # writers migrate to write goldfive-side first.
-        task_id = gf_task_id or adk_task_id or _NONE_MARKER
-        task_title = gf_task_title or adk_task_title or _NONE_MARKER
-        steer_body_raw = gf_steer_body or adk_steer_body
-        steer_source_raw = gf_steer_source or adk_steer_source
-        # Goals-summary stays read from ADK state — it is bridged from
-        # goldfive Session.state so the value is identical, and the
-        # planner only needs the formatted string. Keeping a single
-        # access pattern here avoids a cross-module dependency on the
-        # goldfive Goals helper for the formatting-only read.
-        goals_summary = _state_get(state, KEY_GOALS_SUMMARY) or _NONE_MARKER
+            store = OrchestrationStore.for_session(gf_session)
+            pin_id = store.pin_current_task()
+            task_id = pin_id or _NONE_MARKER
+            # Title comes from the typed ``Session.plan.tasks`` lookup
+            # — V3's pin write only stamps id+revision on goldfive
+            # ``Session.state``, and the typed Task is the authoritative
+            # source. Falls back to the de-normalised
+            # ``goldfive.current_task_title`` key if a custom path
+            # populated it.
+            task_title = (
+                _task_title_from_plan(gf_session, pin_id)
+                or store.pin_current_task_title()
+                or _NONE_MARKER
+            )
+            active = store.get_active_steer()
+            if active is not None:
+                steer_body_raw = active.body
+                steer_source_raw = active.source.strip().lower()
+            else:
+                steer_body_raw = ""
+                steer_source_raw = ""
+            goals_summary = store.goals_summary() or _NONE_MARKER
+        else:
+            # Legacy ADK-state fallback: tests that drive the planner
+            # against a plain state dict without the SessionContext
+            # stash. Production paths always carry the stash.
+            task_id = _state_get(state, KEY_CURRENT_TASK_ID) or _NONE_MARKER
+            task_title = _state_get(state, KEY_CURRENT_TASK_TITLE) or _NONE_MARKER
+            steer_body_raw = _state_get(state, KEY_ACTIVE_STEER_BODY)
+            steer_source_raw = _state_get(state, KEY_ACTIVE_STEER_SOURCE).strip().lower()
+            goals_summary = _state_get(state, KEY_GOALS_SUMMARY) or _NONE_MARKER
 
         # goldfive-steer-unification: source-aware attribution line so
         # the LLM sees whether the active steer is an operator
@@ -473,7 +496,18 @@ class GoldfivePlanner(BasePlanner):
         remaining parts so it can layer its own transformations.
         """
         state = _extract_state(callback_context)
-        cancelled_ids = {s for s in _state_list(state, KEY_CANCELLED_FUNCTION_CALL_IDS)}
+        gf_session = _goldfive_session_from_context(callback_context)
+        if gf_session is not None:
+            from goldfive.orchestration_store import OrchestrationStore
+
+            cancelled_ids = set(
+                OrchestrationStore.for_session(gf_session).cancelled_function_call_ids()
+            )
+        else:
+            # Legacy ADK-state fallback: tests that drive the planner
+            # against a plain state dict without the SessionContext
+            # stash.
+            cancelled_ids = {s for s in _state_list(state, KEY_CANCELLED_FUNCTION_CALL_IDS)}
 
         # Filter 1: strip cancelled function_call ids. Runs on every
         # part regardless of which drift-stage its name would fall in.

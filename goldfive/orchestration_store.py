@@ -406,6 +406,31 @@ class OrchestrationStore:
             source=str(source_raw or ""),
         )
 
+    # -- Read: goals summary --------------------------------------------
+
+    def goals_summary(self) -> str:
+        """Return ``goldfive.goals_summary``, or ``""`` when unset.
+
+        Pre-formatted comma-joined string maintained by
+        :func:`goldfive.orchestration_state.refresh_goals_summary`. The
+        planner consumes this value verbatim for its per-turn
+        instruction block.
+        """
+        value = self._get(_ostate.KEY_GOALS_SUMMARY, "")
+        if isinstance(value, str):
+            return value
+        return ""
+
+    # -- Read: cancelled function-call ids -------------------------------
+
+    def cancelled_function_call_ids(self) -> list[str]:
+        """Return the list of cancelled ``function_call`` ids.
+
+        Reuses :func:`goldfive.orchestration_state.read_cancelled_function_call_ids`
+        so the list-shape guard (non-list -> ``[]``) is centralised.
+        """
+        return _ostate.read_cancelled_function_call_ids(self._state)
+
     # -- Read: correction ------------------------------------------------
 
     def get_correction(self, agent_name: str, task_id: str) -> Any:

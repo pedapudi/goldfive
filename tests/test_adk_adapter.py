@@ -204,59 +204,6 @@ async def test_non_reporting_tool_passes_through(state_ctx_cls) -> None:
 
 
 # ---------------------------------------------------------------------------
-# State protocol writes
-# ---------------------------------------------------------------------------
-
-
-async def test_before_model_writes_goldfive_state_keys(state_ctx_cls) -> None:
-    """before_model_callback seeds goldfive.* keys for the agent to read."""
-    from goldfive.adapters._adk_plugin import (
-        SESSION_CONTEXT_STATE_KEY,
-        SessionContext,
-        make_adk_plugin,
-    )
-    from goldfive.adapters._adk_state_protocol import (
-        KEY_CURRENT_TASK_ID,
-        KEY_CURRENT_TASK_TITLE,
-        KEY_PLAN_ID,
-        KEY_RUN_ID,
-        KEY_TOOLS_AVAILABLE,
-    )
-
-    plugin = make_adk_plugin(host_agent_name="test_agent")
-    session = Session(
-        run_id="run-abc",
-        plan=Plan(
-            id="plan-1",
-            run_id="run-abc",
-            goal_ids=[],
-            tasks=[Task(id="t1", title="Alpha", assignee_agent_id="worker")],
-            edges=[],
-            summary="test plan",
-        ),
-        completed_results={},
-    )
-    task = Task(id="t1", title="Alpha")
-    state: dict = {
-        SESSION_CONTEXT_STATE_KEY: SessionContext(
-            session=session,
-            steerer=None,
-            task=task,
-            tool_handlers={"report_task_started": lambda *a, **kw: None},
-            host_agent_name="test_agent",
-        )
-    }
-
-    await plugin.before_model_callback(callback_context=state_ctx_cls(state), llm_request=None)
-
-    assert state.get(KEY_RUN_ID) == "run-abc"
-    assert state.get(KEY_PLAN_ID) == "plan-1"
-    assert state.get(KEY_CURRENT_TASK_ID) == "t1"
-    assert state.get(KEY_CURRENT_TASK_TITLE) == "Alpha"
-    assert "report_task_started" in (state.get(KEY_TOOLS_AVAILABLE) or [])
-
-
-# ---------------------------------------------------------------------------
 # Drift observation
 # ---------------------------------------------------------------------------
 

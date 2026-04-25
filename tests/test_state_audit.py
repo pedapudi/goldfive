@@ -154,22 +154,19 @@ def test_no_callback_frame_allows_any_write() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_catalogued_violation_v1_passes_when_driven_through_plugin() -> None:
-    """Drive V1 (``before_run_callback`` plan-context seed) and assert no raise.
+def test_catalogued_violation_v3_passes_when_driven_through_plugin() -> None:
+    """Drive V3 (``before_agent_callback`` pin write) and assert no raise.
 
     This is the integration test the brief asks for. With the
     tripwire enabled and a goldfive callback frame active, a
-    catalogued write (the V1 plan-context seed at
-    ``_adk_plugin.py:1656-1664``) must pass without raising — the
-    catalog entry covers it.
+    catalogued write (V3 — the per-agent pin at
+    ``_stamp_current_task_id`` / ``before_agent_callback``) must
+    pass without raising — the catalog entry covers it.
 
-    Implementation: drive ``write_run_id`` directly from a stack
-    frame that resembles ``before_run_callback``. We accomplish this
-    by calling through a helper named ``before_run_callback`` so the
-    stack walk in ``_check_caller`` sees a matching qualname. The
-    real plugin's callback is also catalogued (separately), but
-    constructing a full plugin invocation for one assertion is
-    heavier than this thin shim.
+    Implementation: drive ``write_current_task_id`` directly. The
+    test runs from a ``tests/`` file so the broad ``tests/`` allow
+    in the catalog is what suppresses the audit; the production V3
+    path's own catalog entry covers the real plugin call.
     """
     pytest.importorskip("google.adk")
     from goldfive.adapters import _adk_state_protocol as sp
@@ -178,24 +175,24 @@ def test_catalogued_violation_v1_passes_when_driven_through_plugin() -> None:
     state: dict[str, object] = {}
 
     class _FakePlugin:
-        async def before_run_callback(self) -> None:
+        async def before_agent_callback(self) -> None:
             # Catalog entry: ("goldfive/adapters/_adk_plugin.py",
-            # "before_run_callback"). The stack walk matches by
+            # "before_agent_callback"). The stack walk matches by
             # filename-suffix on the calling module — but our test
             # file is ``test_state_audit.py``, so we must rely on
-            # the broad ``tests/`` allow rather than the V1 entry.
+            # the broad ``tests/`` allow rather than the V3 entry.
             # That broad allow IS in the catalog (so this is exactly
             # the smoke test "catalogued site -> no raise").
-            sp.write_run_id(state, "run-42")
+            sp.write_current_task_id(state, "task-42")
 
     import asyncio
 
     plugin = _FakePlugin()
-    with _state_audit.goldfive_callback("before_run_callback"):
+    with _state_audit.goldfive_callback("before_agent_callback"):
         asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
-            plugin.before_run_callback()
+            plugin.before_agent_callback()
         )
-    assert state["goldfive.run_id"] == "run-42"
+    assert state["goldfive.current_task_id"] == "task-42"
 
 
 def test_real_plugin_callbacks_are_wrapped() -> None:
@@ -217,39 +214,56 @@ def test_real_plugin_callbacks_are_wrapped() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_includes_all_eight_callback_methods() -> None:
-    """The catalog must enumerate every plugin callback method that
-    today writes to ADK ``session.state``.
+def test_catalog_includes_callback_methods_that_still_write() -> None:
+    """The catalog enumerates every plugin callback method that still
+    writes to ADK ``session.state``.
 
     A new callback method added to the plugin must be added to the
     catalog (or, better, structured so the tripwire's contextvar set
     by :func:`wrap_plugin_callbacks` is the only thing recording it).
+
+    Phase 2.0 of goldfive#271 — V1 / V2 / V5 are migrated, so
+    ``before_run_callback`` and ``before_model_callback`` no longer
+    write ADK state and have been removed from the catalog. The
+    remaining callback writers are V3 (``before_agent_callback``) and
+    V4 (``before_tool_callback``).
     """
     catalogued_qualnames = {q for (_, q) in _state_audit._KNOWN_CALLERS}
     for method_name in (
-        "before_run_callback",
         "before_agent_callback",
-        "before_model_callback",
         "before_tool_callback",
     ):
         assert method_name in catalogued_qualnames, (
             f"plugin callback {method_name!r} missing from _KNOWN_CALLERS"
         )
+    # V1 / V5 callbacks: migrated. They MUST NOT carry catalog
+    # entries — a regression that re-introduces an ADK-state write
+    # from before_run_callback / before_model_callback should fail
+    # the audit loudly.
+    for migrated in ("before_run_callback", "before_model_callback"):
+        assert migrated not in catalogued_qualnames, (
+            f"{migrated!r} still in catalog after Phase 2.0 migration"
+        )
 
 
-def test_known_callers_count_is_stable_at_phase_0() -> None:
-    """Pin the catalog size so a casual PR can't quietly drop or add entries.
+def test_known_callers_count_after_phase_2_migration() -> None:
+    """Catalog shrinks monotonically as Phase 2 migrations land.
 
-    Phase 2 migrations should reduce this number; this assertion will
-    need updating as those land. At Phase 0 it's the count of the
-    pre-existing-violations enumeration in the design doc.
+    Phase 0 (#278) shipped the catalog with the full set of pre-
+    existing violations. Phase 2.0 (this PR) migrated V1, V2, V5 +
+    the bridge writers, so the count must be strictly smaller than
+    Phase 0's baseline. Phase 2.x will continue to drop the count
+    as V3 / V4 / V7 / V8 migrate.
     """
-    # Adjust this number when Phase 2 migrations land. See
-    # ``docs/design/STATE-OWNERSHIP-CONTRACT.md`` §5 for the catalog.
     expected = _state_audit.known_callers_count()
-    assert expected >= 20, (
-        f"catalog suspiciously small ({expected} entries); did Phase 2 "
-        "land out of order?"
+    # Phase 0 baseline was 25; after Phase 2.0 we expect strictly
+    # fewer. The lower bound is loose — the test is asserting the
+    # direction (down) and that we didn't accidentally collapse to
+    # zero before V3 / V4 migrate.
+    assert 5 <= expected < 25, (
+        f"catalog count={expected} unexpected; Phase 0 baseline was 25 "
+        "and Phase 2.0 should have shrunk it without zeroing out the "
+        "still-present V3 / V4 / V7-V8 entries."
     )
 
 
