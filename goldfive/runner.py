@@ -1263,6 +1263,35 @@ class Runner:
         await emit(self.sinks, evt)
 
     async def _emit_plan_submitted(self, session: Session, plan: Any) -> None:
+        # Phase 2.X / goldfive#271 Gap 2: log every plan emission at
+        # INFO so a silent plan-creation regression (validation E2E
+        # found 2 of 4 task_plans rows without corresponding events)
+        # is observable in the demo log. Pair this with the
+        # invariant assertion below — empty run_id / plan_id at
+        # emission time is the precondition harmonograf#197 gated on
+        # the ingest side, so flag it loudly here too.
+        plan_id = (getattr(plan, "id", "") or "")[:16] or "<empty>"
+        if not session.run_id:
+            log.warning(
+                "Runner._emit_plan_submitted: empty run_id for plan_id=%s — "
+                "harmonograf will drop both the audit row AND the task_plans "
+                "dispatch (harmonograf#197 gate); this would silently lose "
+                "the plan",
+                plan_id,
+            )
+        if not getattr(plan, "id", ""):
+            log.warning(
+                "Runner._emit_plan_submitted: empty plan_id on plan with "
+                "%d task(s) — harmonograf will drop the task_plans row "
+                "(no upsert key); this would silently lose the plan",
+                len(getattr(plan, "tasks", None) or ()),
+            )
+        log.info(
+            "Runner._emit_plan_submitted: plan_id=%s tasks=%d run_id=%s",
+            plan_id,
+            len(getattr(plan, "tasks", None) or ()),
+            (session.run_id or "")[:16] or "<empty>",
+        )
         evt = plan_submitted_event(
             run_id=session.run_id,
             sequence=session.next_sequence(),

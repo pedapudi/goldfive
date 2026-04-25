@@ -338,6 +338,22 @@ class SequentialExecutor(Executor):
                 current_plan.id != last_plan_id
                 or current_plan.revision_index != last_revision_index
             ):
+                # Phase 2.X / goldfive#271 Gap 2: log the executor-side
+                # detection at INFO so it's clear who emitted this
+                # PlanRevised. Two emitters exist for the same plan
+                # swap (steerer's _emit_plan_revised + this swap
+                # detector); the source is implicit in the call site,
+                # but explicit logs help cross-reference with the
+                # steerer's INFO line.
+                log.info(
+                    "SequentialExecutor: plan-swap detected, emitting "
+                    "PlanRevised plan_id=%s revision_index=%d "
+                    "(prior=%s) drift_kind=%s",
+                    (current_plan.id or "")[:16] or "<empty>",
+                    int(current_plan.revision_index),
+                    last_plan_id[:16] if last_plan_id else "<none>",
+                    current_plan.revision_kind or "<none>",
+                )
                 await emit(
                     sinks,
                     plan_revised_event(
