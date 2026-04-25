@@ -2937,6 +2937,16 @@ class LLMPlanner:
     #: classify whether the steer is additive (APPEND) or a
     #: scrap-and-pivot (REPLACE). Keep the shape tight so a minimal
     #: response is enough.
+    #:
+    #: Phase 2.X (goldfive#271 Gap 5): when prior goals are supplied
+    #: in the user prompt, the LLM is instructed to MERGE persistent
+    #: qualifications (numeric caps, format requirements, output
+    #: structure) into the new goal so a topic pivot doesn't drop
+    #: sticky context. The validation E2E observed "Create a
+    #: presentation about solar panels with no more than 2 slides."
+    #: → after steer → "Provide informative content about solar
+    #: flares." (both the "presentation" frame AND the "2 slides"
+    #: cap dropped). This guidance closes that gap.
     _SYNTHESIZE_GOAL_SYSTEM_PROMPT: str = (
         "You are a goal extractor for a multi-agent orchestration system. "
         "A human operator has just issued a STEERING directive mid-run. "
@@ -2954,14 +2964,41 @@ class LLMPlanner:
         "- Use 'append' when the steer adds a new concern alongside "
         "existing goals (e.g. 'also include X', 'while you're at it, Y').\n"
         "- The id should be short (<=16 chars) and unique-looking; "
-        "'steer' is an acceptable default when no better label fits."
+        "'steer' is an acceptable default when no better label fits.\n"
+        "- When PRIOR GOALS are listed in the user prompt, MERGE their "
+        "persistent qualifications into the new goal summary unless the "
+        "steer explicitly removes them. Persistent qualifications are: "
+        "numeric caps ('no more than 2 slides', 'at most 500 words', "
+        "'under 5 minutes'), format requirements ('in markdown', 'as "
+        "bullet points', 'as a 2-slide presentation'), output type "
+        "('a presentation', 'a report', 'a summary'), and scope "
+        "qualifiers ('for a non-technical audience', 'only public "
+        "data'). The topic / subject changes; the structural frame "
+        "carries forward. Example: prior goal 'Create a presentation "
+        "about solar panels with no more than 2 slides.' + steer "
+        "'forget solar panels — tell me about wind power instead' → "
+        "new goal 'Create a presentation about wind power with no "
+        "more than 2 slides.' (NOT 'Provide content about wind "
+        "power.').\n"
+        "- Drop a qualification only when the steer explicitly removes "
+        "it (e.g. 'forget the slide-count cap', 'no longer needs to be "
+        "a presentation')."
     )
 
     async def synthesize_goal_from_steer(
         self,
         steer_body: str,
+        prior_goals: list[Goal] | None = None,
     ) -> tuple[Goal, str] | None:
         """Synthesize a ``Goal`` from a USER_STEER body via one LLM call.
+
+        ``prior_goals`` (Phase 2.X / goldfive#271 Gap 5) is the live
+        ``session.goals`` list. When non-empty, the LLM is instructed
+        to merge persistent qualifications (numeric caps, format
+        requirements, output type, scope qualifiers) into the new
+        goal summary so a topic pivot preserves sticky context. The
+        steerer's ``_apply_user_steer_state`` passes the pre-steer
+        goals here.
 
         Returns ``(goal, mode)`` where ``mode`` is ``"append"`` or
         ``"replace"``. Returns ``None`` on LLM error / parse failure so
@@ -2978,7 +3015,22 @@ class LLMPlanner:
         body = (steer_body or "").strip()
         if not body:
             return None
+        prior_block = ""
+        if prior_goals:
+            prior_summaries = [
+                g.summary.strip() for g in prior_goals
+                if g.summary and g.summary.strip()
+            ]
+            if prior_summaries:
+                prior_block = (
+                    "PRIOR GOALS (preserve their persistent "
+                    "qualifications unless the steer explicitly removes "
+                    "them):\n"
+                    + "\n".join(f"- {s}" for s in prior_summaries)
+                    + "\n\n"
+                )
         user_prompt = (
+            f"{prior_block}"
             f"STEERING DIRECTIVE:\n{body}\n\n"
             "Extract the durable Goal and classify the mode. Reply JSON only."
         )
