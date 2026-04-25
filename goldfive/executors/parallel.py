@@ -336,12 +336,13 @@ class ParallelDAGExecutor:
                         )
                         break
 
-                    refined = await self._refine(
+                    refined, refine_attempt_id = await self._refine(
                         plan=session.plan or plan,
                         drift=drift,
                         planner=planner,
                         session=session,
                         sinks=sinks,
+                        steerer=steerer,
                     )
                     if refined is not None and refined is not (session.plan or plan):
                         refinements_used += 1
@@ -362,6 +363,30 @@ class ParallelDAGExecutor:
                                 session_id=session.id,
                             ),
                         )
+                        # Pair the success with its preceding
+                        # refine_attempted event so dict-event consumers
+                        # can correlate by attempt_id (mirrors the steerer's
+                        # _emit_plan_revised_correlation contract). Skipped
+                        # when the legacy path (no steerer) was taken —
+                        # there's no attempt_id to pair against.
+                        if refine_attempt_id:
+                            emit_corr = getattr(
+                                steerer, "_emit_plan_revised_correlation", None
+                            )
+                            if callable(emit_corr):
+                                try:
+                                    await emit_corr(
+                                        session,
+                                        refined,
+                                        drift,
+                                        attempt_id=refine_attempt_id,
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    log.debug(
+                                        "ParallelDAGExecutor: "
+                                        "steerer._emit_plan_revised_correlation raised: %s",
+                                        exc,
+                                    )
                         # Falls through to loop top: stages recomputed.
                         continue
 
@@ -716,7 +741,8 @@ class ParallelDAGExecutor:
         planner: Planner,
         session: Session,
         sinks: list[EventSink],
-    ) -> Plan | None:
+        steerer: Steerer | None = None,
+    ) -> tuple[Plan | None, str]:
         """Ask ``planner.refine`` for a revision; validate and signal failures.
 
         Unlike the previous quiet-null version, every failure mode
@@ -731,45 +757,143 @@ class ParallelDAGExecutor:
         returned (downstream tasks that depended on a replacement still
         block via ``_pick_next_task`` and the reachability audit).
 
+        ``steerer`` (optional): when bound and the steerer exposes the
+        :meth:`~goldfive.steerer.DefaultSteerer.observe_refine` async
+        context manager, refine attempt is wrapped so every refine
+        produces a paired ``refine_attempted`` + (``refine_failed`` |
+        ``plan_revised``) event regardless of which dispatch path
+        triggered it. This unifies emission across the steerer-driven
+        and executor-driven refine paths — without it, refines via this
+        executor emit no observability and the planner's
+        ``refine_orphaned_tasks`` validator no-ops (it depends on the
+        steerer's span-context provider which is wired through
+        ``_active_session``). See goldfive#263 / #264.
+
+        Returns ``(plan, attempt_id)``. ``plan`` is the validated
+        revised plan or ``None`` on any failure. ``attempt_id`` is the
+        empty string when no steerer was used or no observation was
+        established; otherwise the UUID minted inside ``observe_refine``
+        so callers can stamp it onto the success-path ``plan_revised``
+        correlation event.
+
         See goldfive#134.
         """
-        try:
-            refined = await planner.refine(plan=plan, drift=drift, goals=list(session.goals))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
-            await self._emit_refine_failure(
-                session=session,
-                sinks=sinks,
-                source=drift,
-                reason=f"refine raised: {exc}",
-            )
-            return None
-        if refined is None:
-            log.warning(
-                "ParallelDAGExecutor: planner.refine(kind=%s) returned None; plan unchanged",
-                drift.kind.value,
-            )
-            await self._emit_refine_failure(
-                session=session,
-                sinks=sinks,
-                source=drift,
-                reason="planner returned no revised plan",
-            )
-            return None
-        try:
-            refined.validate(for_revision=True, prior=plan)
-        except ValueError as exc:
-            log.warning(
-                "ParallelDAGExecutor: revised plan failed validation (%s); keeping prior plan",
-                exc,
-            )
-            await self._emit_refine_failure(
-                session=session,
-                sinks=sinks,
-                source=drift,
-                reason=f"plan validation failed: {exc}",
-            )
-            return None
+        # If a steerer with observe_refine is bound, route refine
+        # attempt+failure emission through it. Otherwise fall back to
+        # the legacy direct call (test stubs / custom steerers).
+        observe_refine = getattr(steerer, "observe_refine", None) if steerer is not None else None
+        attempt_id: str = ""
+        if observe_refine is not None and callable(observe_refine):
+            cm = observe_refine(session, drift)
+            try:
+                async with cm as ctx_attempt_id:
+                    attempt_id = ctx_attempt_id
+                    refined = await planner.refine(
+                        plan=plan, drift=drift, goals=list(session.goals)
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # observe_refine has already emitted refine_failed; we
+                # ALSO emit the CRITICAL DriftDetected mirror so the
+                # legacy operator-visible signal still lands.
+                log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
+                await self._emit_refine_failure(
+                    session=session,
+                    sinks=sinks,
+                    source=drift,
+                    reason=f"refine raised: {exc}",
+                )
+                return None, attempt_id
+            if refined is None:
+                log.warning(
+                    "ParallelDAGExecutor: planner.refine(kind=%s) returned None; plan unchanged",
+                    drift.kind.value,
+                )
+                # Emit refine_failed via the steerer for parity with the
+                # exception path above. observe_refine has already cleared
+                # _active_session by now, so we go through the steerer's
+                # direct emitter.
+                await self._steerer_emit_refine_failed(
+                    steerer=steerer,
+                    session=session,
+                    drift=drift,
+                    attempt_id=attempt_id,
+                    failure_kind="parse_error",
+                    reason="planner returned no revised plan",
+                    detail="",
+                )
+                await self._emit_refine_failure(
+                    session=session,
+                    sinks=sinks,
+                    source=drift,
+                    reason="planner returned no revised plan",
+                )
+                return None, attempt_id
+            try:
+                refined.validate(for_revision=True, prior=plan)
+            except ValueError as exc:
+                log.warning(
+                    "ParallelDAGExecutor: revised plan failed validation (%s); keeping prior plan",
+                    exc,
+                )
+                await self._steerer_emit_refine_failed(
+                    steerer=steerer,
+                    session=session,
+                    drift=drift,
+                    attempt_id=attempt_id,
+                    failure_kind="validator_rejected",
+                    reason=f"plan validation failed: {exc}",
+                    detail=type(exc).__name__,
+                )
+                await self._emit_refine_failure(
+                    session=session,
+                    sinks=sinks,
+                    source=drift,
+                    reason=f"plan validation failed: {exc}",
+                )
+                return None, attempt_id
+        else:
+            # Legacy path — no steerer or no observe_refine. No
+            # refine_attempted/refine_failed emission, but the
+            # CRITICAL DriftDetected mirror is preserved.
+            try:
+                refined = await planner.refine(
+                    plan=plan, drift=drift, goals=list(session.goals)
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
+                await self._emit_refine_failure(
+                    session=session,
+                    sinks=sinks,
+                    source=drift,
+                    reason=f"refine raised: {exc}",
+                )
+                return None, attempt_id
+            if refined is None:
+                log.warning(
+                    "ParallelDAGExecutor: planner.refine(kind=%s) returned None; plan unchanged",
+                    drift.kind.value,
+                )
+                await self._emit_refine_failure(
+                    session=session,
+                    sinks=sinks,
+                    source=drift,
+                    reason="planner returned no revised plan",
+                )
+                return None, attempt_id
+            try:
+                refined.validate(for_revision=True, prior=plan)
+            except ValueError as exc:
+                log.warning(
+                    "ParallelDAGExecutor: revised plan failed validation (%s); keeping prior plan",
+                    exc,
+                )
+                await self._emit_refine_failure(
+                    session=session,
+                    sinks=sinks,
+                    source=drift,
+                    reason=f"plan validation failed: {exc}",
+                )
+                return None, attempt_id
         # goldfive#199: stamp the trigger_event_id on the plan for every
         # refine so harmonograf can strict-id-merge plan-revision rows
         # regardless of whether the executor refined via the steerer or
@@ -782,7 +906,50 @@ class ParallelDAGExecutor:
             trig_id = _trigger_id_from_drift(drift)
             if trig_id:
                 refined.revision_trigger_event_id = trig_id
-        return refined
+        return refined, attempt_id
+
+    @staticmethod
+    async def _steerer_emit_refine_failed(
+        *,
+        steerer: Steerer | None,
+        session: Session,
+        drift: DriftEvent,
+        attempt_id: str,
+        failure_kind: str,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Best-effort delegate to ``DefaultSteerer._emit_refine_failed``.
+
+        The parallel executor's refine path emits ``refine_failed``
+        events via the bound steerer when one is available so observers
+        can pair attempted/failed/plan-revised by ``attempt_id``. Custom
+        steerers without the ``_emit_refine_failed`` method are tolerated
+        — the call is duck-typed and silently no-ops, which preserves
+        backwards compatibility for tests that pass a stub Steerer.
+
+        Failures inside the steerer's emit are logged and swallowed:
+        observability must never break the run.
+        """
+        if steerer is None:
+            return
+        emit_failed = getattr(steerer, "_emit_refine_failed", None)
+        if not callable(emit_failed):
+            return
+        try:
+            await emit_failed(
+                session,
+                drift,
+                attempt_id=attempt_id,
+                failure_kind=failure_kind,
+                reason=reason,
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001 — observability must never break the run
+            log.debug(
+                "ParallelDAGExecutor: steerer._emit_refine_failed raised: %s",
+                exc,
+            )
 
     async def _emit_refine_failure(
         self,

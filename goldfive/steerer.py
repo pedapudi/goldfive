@@ -44,6 +44,7 @@ levels. See goldfive#142 for the full table.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import inspect
 import json
@@ -51,7 +52,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive import orchestration_state as _ostate
@@ -3849,6 +3850,76 @@ class DefaultSteerer:
                 "DefaultSteerer._emit_refine_failed: failed to emit: %s",
                 exc,
             )
+
+    @contextlib.asynccontextmanager
+    async def observe_refine(
+        self,
+        session: Session,
+        drift: DriftEvent,
+    ) -> AsyncIterator[str]:
+        """Async context manager that wraps a ``planner.refine`` call with
+        observability emission.
+
+        On enter:
+
+        * Mints a fresh ``attempt_id``.
+        * Stamps ``self._active_session = session`` so the planner's
+          ``_span_ctx_provider`` resolves correctly (this is what powers
+          the planner-side ``refine_orphaned_tasks`` emission and the
+          ``GoldfiveLLMCallStart/End`` spans).
+        * Emits ``refine_attempted`` to the bound sinks.
+
+        On exception:
+
+        * Emits ``refine_failed`` with ``failure_kind="llm_error"``,
+          stamped with the same ``attempt_id``, then re-raises.
+
+        On clean exit (no exception):
+
+        * Clears ``_active_session``.
+        * Caller is responsible for emitting either ``plan_revised``
+          (success) or ``refine_failed`` (returned ``None`` / validator
+          rejected) — the helper has no way to introspect the caller's
+          decision tree from here. Pair with :meth:`_emit_refine_failed`
+          / ``_emit_plan_revised`` using the yielded ``attempt_id``.
+
+        Used by:
+
+        * :meth:`_handle_drift` / :meth:`_promote_drift_to_steer` —
+          the steerer's own refine call sites.
+        * :class:`~goldfive.executors.parallel.ParallelDAGExecutor._refine` —
+          the executor-side refine fallback. Without this helper, the
+          parallel path's refines emit no ``refine_attempted`` /
+          ``refine_failed`` / ``refine_orphaned_tasks`` events, since
+          they bypass the steerer's hand-rolled emission blocks.
+        """
+        attempt_id = self._new_attempt_id()
+        # Setting ``_active_session`` before refine lets the planner's
+        # internal ``_emit_refine_orphaned_tasks`` resolve a sink target
+        # via the bound span-context provider. Without this, the planner's
+        # validator computes orphans, logs the WARNING, but no sink event
+        # lands — exactly the symptom Bug A describes.
+        self._active_session = session
+        try:
+            await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
+            try:
+                yield attempt_id
+            except Exception as exc:  # noqa: BLE001 — refine errors must not break observability
+                # Emit failure event with the same attempt_id so consumers
+                # can pair attempted ↔ failed. We do NOT swallow the
+                # exception — re-raise so the caller's existing error path
+                # (e.g. _emit_refine_failure / fallback plans) runs.
+                await self._emit_refine_failed(
+                    session,
+                    drift,
+                    attempt_id=attempt_id,
+                    failure_kind="llm_error",
+                    reason=str(exc),
+                    detail=type(exc).__name__,
+                )
+                raise
+        finally:
+            self._active_session = None
 
     async def _emit_plan_revised_correlation(
         self,
