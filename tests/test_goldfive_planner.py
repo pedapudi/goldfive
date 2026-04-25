@@ -36,7 +36,7 @@ from goldfive.planners.goldfive_planner import (  # noqa: E402
     KEY_GOALS_SUMMARY,
     GoldfivePlanner,
 )
-from goldfive.types import DriftEvent, DriftKind, Session, Task  # noqa: E402
+from goldfive.types import DriftEvent, DriftKind, Plan, Session, Task  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -892,17 +892,41 @@ async def test_plugin_skips_injection_for_custom_base_planner_subclass() -> None
 
 
 async def test_plugin_injection_via_full_before_model_callback() -> None:
-    """End-to-end: running the plugin's real ``before_model_callback`` injects."""
+    """End-to-end: running the plugin's real ``before_model_callback`` injects.
+
+    Phase 2.0 of goldfive#271 — the planner reads goldfive
+    ``Session.state`` directly via the ``SessionContext`` stash. The
+    test pins the current task on goldfive ``Session.state`` (the same
+    surface V3's ``before_agent_callback`` writes in production); the
+    planner's injection picks it up via ``OrchestrationStore``.
+    """
+    from goldfive import orchestration_state as _ostate
+
     plugin = make_adk_plugin(host_agent_name="h")
     agent = _make_llm_agent()
     _attach_goldfive_planner_to_tree(agent)
 
-    session = Session(run_id="r")
+    task = Task(id="t-99", title="Build the thing")
+    session = Session(
+        run_id="r",
+        plan=Plan(
+            id="p1",
+            run_id="r",
+            goal_ids=[],
+            tasks=[task],
+            edges=[],
+        ),
+    )
+    # Pin on goldfive Session.state — the surface V3's
+    # ``before_agent_callback`` writes in production. The planner
+    # reads pin / title via ``OrchestrationStore.for_session``.
+    _ostate.set_current_task(session.state, task)
+
     state = {
         SESSION_CONTEXT_STATE_KEY: SessionContext(
             session=session,
             steerer=None,
-            task=Task(id="t-99", title="Build the thing"),
+            task=task,
             tool_handlers={},
             host_agent_name="h",
         )
@@ -917,8 +941,6 @@ async def test_plugin_injection_via_full_before_model_callback() -> None:
         llm_request=llm_request,
     )
 
-    # before_model_callback also re-seeds current_task via the state protocol;
-    # assert the instruction injection picked the new state up.
     assert llm_request.config.system_instruction is not None
     assert "t-99" in llm_request.config.system_instruction
     assert "Build the thing" in llm_request.config.system_instruction

@@ -63,11 +63,11 @@ The two dicts are easy to confuse at the call site because both end in `.state`.
 
 | Phase | Scope | Status |
 |---|---|---|
-| 0 | This document, audit catalog (§5), runtime tripwire (`goldfive/_state_audit.py`) | **In flight (this PR)** |
-| 1 | Introduce `OrchestrationStore` — single typed handle that owns goldfive's orchestration state. Extract reasoning / pin / cancel state off `Session.state` onto the store. No ADK-side change yet. | Planned |
-| 2 | Migrate every catalog entry. Each ADK-side write becomes `append_event(Event(actions=EventActions(state_delta={...})))`. The bridge becomes a single helper rather than nine inline call sites. | Planned |
-| 3 | Remove the bridge entirely. The orchestration store *is* the source of truth; ADK `session.state` carries only fields ADK itself populates. The dynamic-instruction resolver and `GoldfivePlanner` read off the orchestration store directly via a `ReadonlyContext` adapter. | Planned |
-| 4 | Tripwire flips on by default in production. Catalog is empty. | Planned |
+| 0 | This document, audit catalog (§5), runtime tripwire (`goldfive/_state_audit.py`) | **Done (#278)** |
+| 1 | Introduce `OrchestrationStore` — single typed handle that owns goldfive's orchestration state. Extract reasoning / pin / cancel state off `Session.state` onto the store. No ADK-side change yet. | **Done (#279)** |
+| 2.0 | Eliminate the bridge (V2) and the now-unused initial seeds (V1, V5). The dynamic-instruction resolver and `GoldfivePlanner` read goldfive `Session.state` directly via the `SessionContext` stash + `OrchestrationStore`. Closes goldfive#275. | **Done (Phase 2.0)** |
+| 2.x | Migrate the remaining catalog entries (V3 — per-agent pin write, V4 — delegation pin write, V7 / V8 — `SessionContext` stash). | Planned |
+| 3 | Tripwire flips on by default in production. Catalog is empty. | Planned |
 
 A future contributor can verify a Phase-2 PR by:
 
@@ -87,21 +87,15 @@ Every place goldfive writes to ADK `session.state` (or a structure ADK considers
 
 ### 5.1 Plugin-callback writes (blockers)
 
-#### V1 — `before_run_callback`: initial seed
+#### V1 — `before_run_callback`: initial seed — **MIGRATED (Phase 2.0)**
 
-- **File:line.** `goldfive/adapters/_adk_plugin.py:1656-1664`
-- **State written.** `goldfive.run_id`, `goldfive.plan_id`, `goldfive.plan_summary`, `goldfive.available_tasks`, `goldfive.completed_task_results`, `goldfive.current_task_id`, `goldfive.current_task_title`, `goldfive.current_task_description`, `goldfive.current_task_assignee`, `goldfive.tools_available`.
-- **Why.** Seeds ADK `session.state` with goldfive's plan context so `GoldfivePlanner.build_planning_instruction` and the dynamic-instruction resolver can render a "(none)"-free prompt on the first turn.
-- **Severity.** **blocker.** This fires *before* ADK has appended a single event — so today the race is rare in practice — but the fact pattern is exactly what #275 caught when a *concurrent* steerer cancel reaches the same dict.
-- **Migration target.** Phase 2. Replace with one synthetic event per surface: `append_event(Event(author='goldfive', actions=EventActions(state_delta=plan_context_dict)))`.
+- **Status.** Eliminated by Phase 2.0 of goldfive#271. Nothing on the ADK side reads the seeded keys: the dynamic-instruction resolver and `GoldfivePlanner.build_planning_instruction` now read goldfive `Session.state` directly via the `SessionContext` stash (V7) and the `OrchestrationStore` typed accessor.
+- **Original target.** `goldfive/adapters/_adk_plugin.py:1656-1664` — wrote `goldfive.run_id`, `goldfive.plan_id`, `goldfive.plan_summary`, `goldfive.available_tasks`, `goldfive.completed_task_results`, `goldfive.current_task_id`, `goldfive.current_task_title`, `goldfive.current_task_description`, `goldfive.current_task_assignee`, `goldfive.tools_available`.
 
-#### V2 — `before_run_callback`: orchestration-state bridge
+#### V2 — `before_run_callback`: orchestration-state bridge — **MIGRATED (Phase 2.0)**
 
-- **File:line.** `goldfive/adapters/_adk_plugin.py:1679` calls `_bridge_orchestration_state` defined at `:2920-3014`.
-- **State written.** `goldfive.active_steer.body`, `goldfive.active_steer.at_turn`, `goldfive.goals_summary`, `goldfive.cancelled_function_call_ids`, every `goldfive.pending_corrections.<agent>.<task>` key.
-- **Why.** Mirrors the goldfive orchestration dict (`Session.state`) onto the ADK live session so request-side instruction injection (`GoldfivePlanner` + dynamic-instruction resolver) can read them via `ReadonlyContext.state`.
-- **Severity.** **blocker.** This is the literal bridge from #170 that Wave 3 caught racing with ADK's `state_delta` machinery. It writes a variable number of keys (correction family is `(agent, task)`-expanded) on every invocation, including AgentTool-spawned sub-Runners.
-- **Migration target.** Phase 2 / 3. Phase 2 wraps the bridge in `append_event`; Phase 3 deletes the bridge entirely once the resolver reads off the orchestration store directly.
+- **Status.** Eliminated by Phase 2.0 of goldfive#271. The literal site of goldfive#275. The bridge function `_bridge_orchestration_state` and its inline subroutine `_bridge_pending_corrections` are deleted; the resolver / planner read goldfive `Session.state` directly via `OrchestrationStore`.
+- **Original target.** `goldfive/adapters/_adk_plugin.py:1679` called `_bridge_orchestration_state` to mirror `goldfive.active_steer.body`, `goldfive.active_steer.at_turn`, `goldfive.goals_summary`, `goldfive.cancelled_function_call_ids`, and every `goldfive.pending_corrections.<agent>.<task>` key onto ADK `session.state`.
 
 #### V3 — `_stamp_current_task_id` (called from `before_agent_callback`)
 
@@ -119,13 +113,9 @@ Every place goldfive writes to ADK `session.state` (or a structure ADK considers
 - **Severity.** **blocker.** Same pattern as V3 — dual-write inside a tool callback is exactly the path #275 traces. Fires multiple times per turn for fan-out coordinators.
 - **Migration target.** Phase 2. The orchestration-side write stays; the ADK-side write becomes `append_event` or, better, the resolver reads the orchestration store directly (Phase 3).
 
-#### V5 — `before_model_callback`: defensive duplicate seed
+#### V5 — `before_model_callback`: defensive duplicate seed — **MIGRATED (Phase 2.0)**
 
-- **File:line.** `goldfive/adapters/_adk_plugin.py:3454-3468`
-- **State written.** Same set as V1 (`goldfive.run_id`, `goldfive.plan_*`, `goldfive.current_task_*`, `goldfive.tools_available`).
-- **Why.** Defensive duplicate of V1 to cover dispatch shapes where `before_run_callback` doesn't fire (e.g. direct model invocations in tests, some adk-web pre-warm paths).
-- **Severity.** **blocker.** Same race surface as V1; only differentiator is timing.
-- **Migration target.** Phase 2 — collapse with V1 onto a single `append_event` writer that the steerer / reconciler invoke once per state change.
+- **Status.** Eliminated by Phase 2.0 of goldfive#271. Falls out together with V1: the same keys, the same race surface, the same readers (resolver / planner) all migrated to read goldfive `Session.state` directly. Only the planner's request-side `_inject_goldfive_planner_instruction` path remains in `before_model_callback` (it does not write state — it appends to `llm_request.config.system_instruction`).
 
 ### 5.2 Plugin-callback writes (cosmetic)
 

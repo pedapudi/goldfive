@@ -109,44 +109,33 @@ def format_correction_block(correction: Mapping[str, Any]) -> str:
 
 def _read_pending_correction(
     *,
+    session: Any,
     state: Mapping[str, Any],
     agent_name: str,
     current_task_id: str,
 ) -> str:
     """Resolve the pending-correction block for ``(agent, task)``.
 
-    Phase 1 of goldfive#271 — read-of-record migration. Tries the
-    goldfive :class:`~goldfive.orchestration_store.OrchestrationStore`
-    first when the resolver can reach the goldfive Session via the
-    SessionContext stash on ADK state; falls back to reading the
-    bridged ADK state value when the goldfive Session isn't reachable
-    (legacy tests, pre-#152 adapters).
+    Phase 2.0 of goldfive#271 — bridge eliminated. The goldfive
+    :class:`~goldfive.orchestration_store.OrchestrationStore` is now
+    the read of record. Falls back to reading ADK ``state`` directly
+    only when the SessionContext stash is unreachable (legacy unit
+    tests / custom adapters that drive the resolver against a plain
+    state dict without the stash).
 
     Always returns a string (empty when no correction exists / the
     payload is malformed). Caller appends the result to the
     instruction block when non-empty.
     """
-    # Goldfive-side read (Phase 1 target).
-    session = _goldfive_session_from_state(state)
     if session is not None:
-        try:
-            from goldfive.orchestration_store import OrchestrationStore
+        from goldfive.orchestration_store import OrchestrationStore
 
-            store = OrchestrationStore.for_session(session)
-            value = store.get_correction(agent_name, current_task_id)
-            if value is not None:
-                return _resolve_pending_correction(value)
-        except Exception as exc:  # noqa: BLE001 — defensive
-            log.debug(
-                "_read_pending_correction: store lookup raised for "
-                "agent=%r task=%r: %s — falling back to ADK state",
-                agent_name,
-                current_task_id,
-                exc,
-            )
-    # ADK-side fallback. Reads the bridged copy V2 maintains so
-    # legacy unit tests / custom adapters that don't stash a
-    # SessionContext keep working.
+        store = OrchestrationStore.for_session(session)
+        value = store.get_correction(agent_name, current_task_id)
+        return _resolve_pending_correction(value)
+    # Legacy fallback: no SessionContext reachable. Read directly off
+    # ADK state. Used by unit tests that drive the resolver with a
+    # plain state dict; production paths always carry the stash.
     return _resolve_pending_correction(
         state.get(pending_correction_key(agent_name, current_task_id))
     )
@@ -231,25 +220,74 @@ def _compose_instruction(
     return block
 
 
-def _goldfive_session_from_state(state: Mapping[str, Any]) -> Any:
-    """Return the goldfive ``Session`` reachable from ADK ``state``, or ``None``.
+def _goldfive_session_from_readonly_context(readonly_ctx: Any) -> Any:
+    """Return the goldfive ``Session`` reachable from a ReadonlyContext.
 
-    The ADK adapter stashes a
-    :class:`~goldfive.adapters._adk_plugin.SessionContext` onto ADK
-    ``session.state`` under ``"goldfive._session_context"`` (V7 in the
-    Phase 0 audit). When present, the ``.session`` attribute is the
-    goldfive :class:`~goldfive.types.Session` whose
-    :attr:`~goldfive.types.Session.state` dict is the goldfive-owned
-    orchestration store. Returns ``None`` when the key is missing
-    (pre-#152 path, or a custom adapter that doesn't stash) so the
-    resolver can fall back to reading from ADK state directly.
+    Phase 2.0 of goldfive#271. Resolution order:
+
+    1. Walk ``readonly_ctx._invocation_context.plugin_manager.plugins``
+       for the goldfive plugin and read its ``_active_ctx.session``.
+       This is the live-run path — set by the plugin's
+       :meth:`set_active_context` (called from
+       :meth:`ADKAdapter._invoke_internal` before
+       ``runner.run_async``).
+    2. The legacy ``"goldfive._session_context"`` stash on the
+       readonly context's ``state`` (V7 in the Phase 0 audit). Used
+       only by unit tests that drive the resolver against a
+       hand-built state dict without going through the plugin's
+       lifecycle.
+
+    Returns ``None`` when neither resolves so the resolver can fall
+    back to reading from ADK state directly.
     """
+    from goldfive.adapters._adk_plugin import session_context_from_invocation
+
+    # Live-run path: walk the plugin manager.
+    inv_ctx = getattr(readonly_ctx, "_invocation_context", None) or getattr(
+        readonly_ctx, "invocation_context", None
+    )
+    if inv_ctx is not None:
+        ctx = session_context_from_invocation(inv_ctx)
+        if ctx is not None:
+            session = getattr(ctx, "session", None)
+            if session is not None:
+                return session
+    # Legacy fallback — the V7 stash on the state dict.
+    state = getattr(readonly_ctx, "state", None)
     if not isinstance(state, Mapping):
         return None
-    ctx = state.get("goldfive._session_context")
-    if ctx is None:
+    legacy_ctx = state.get("goldfive._session_context")
+    if legacy_ctx is None:
         return None
-    return getattr(ctx, "session", None)
+    return getattr(legacy_ctx, "session", None)
+
+
+def _task_title_description_from_session(session: Any, task_id: str) -> tuple[str, str]:
+    """Look up ``(title, description)`` for ``task_id`` in ``session.plan``.
+
+    The typed :class:`~goldfive.types.Task` on ``Session.plan.tasks`` is
+    the source of truth — the resolver reaches into it for the prompt
+    block instead of reading the de-normalised
+    ``goldfive.current_task_title`` /
+    ``goldfive.current_task_description`` keys that V1 / V3 / V5 used to
+    stamp onto ADK state.
+
+    Returns ``("", "")`` when the plan / task is missing or doesn't
+    expose ``.title`` / ``.description`` so the caller's placeholder
+    rendering still kicks in cleanly.
+    """
+    if session is None or not task_id:
+        return "", ""
+    plan = getattr(session, "plan", None)
+    if plan is None:
+        return "", ""
+    tasks = getattr(plan, "tasks", None) or ()
+    for task in tasks:
+        if str(getattr(task, "id", "") or "") == task_id:
+            title = str(getattr(task, "title", "") or "")
+            description = str(getattr(task, "description", "") or "")
+            return title, description
+    return "", ""
 
 
 def make_dynamic_instruction(
@@ -260,47 +298,70 @@ def make_dynamic_instruction(
 
     The returned callable:
 
-    * Reads ``session.state`` off the ``ReadonlyContext``.
-    * If no current-task id is pinned for this agent, returns the
-      ``original_instruction`` verbatim (pre-plan turns stay unchanged).
-    * Otherwise composes the original + a current-task block.
+    * Reads ``session.state`` off the ``ReadonlyContext`` to reach the
+      :class:`~goldfive.adapters._adk_plugin.SessionContext` stash and
+      from there the goldfive :class:`~goldfive.types.Session`.
+    * Reads the current-task pin via
+      :class:`~goldfive.orchestration_store.OrchestrationStore`. If
+      no pin is set, returns the ``original_instruction`` verbatim
+      (pre-plan turns stay unchanged).
+    * Looks up the task in ``Session.plan.tasks`` for ``title`` /
+      ``description`` (the typed :class:`~goldfive.types.Task` is the
+      source of truth — the resolver does not consult de-normalised
+      ADK-state keys).
     * If a pending correction exists for ``(agent_name, current_task_id)``
-      the block is appended (Stream D will write; we just read).
+      the block is appended (Stream D writes; the store reads).
 
-    The resolver is pure: given the same state it returns the same
-    string. No side effects, no persistence.
+    The resolver is pure: given the same Session.state it returns the
+    same string. No side effects, no persistence.
 
-    Phase 1 of goldfive#271 — when the resolver can reach the goldfive
-    :class:`~goldfive.types.Session` via the
-    :data:`SESSION_CONTEXT_STATE_KEY` stash, the pending-correction
-    lookup goes through
-    :class:`~goldfive.orchestration_store.OrchestrationStore` so the
-    typed accessor is the read of record. When the goldfive Session
-    isn't reachable (legacy unit tests that drive the resolver against
-    a plain ADK state dict, or pre-#152 adapters), the resolver falls
-    back to reading the bridged ADK state directly — same behaviour
-    as before Phase 1.
+    Phase 2.0 of goldfive#271 — the bridge from goldfive Session.state
+    onto ADK session.state is gone. The resolver reads goldfive
+    Session directly via the SessionContext stash, eliminating the
+    callback-time write to ADK state that raced with ADK's
+    optimistic-concurrency contract (see goldfive#275).
+
+    Legacy fallback: when the SessionContext stash is unreachable (a
+    unit test drives the resolver against a plain state dict without
+    the stash), the resolver reads the pin / title / description /
+    correction directly off ADK state. Production paths always carry
+    the stash.
     """
 
     def resolver(readonly_ctx: Any) -> str:
         try:
             state = _state_from_readonly_context(readonly_ctx)
+            session = _goldfive_session_from_readonly_context(readonly_ctx)
 
-            current_task_id = str(state.get(_sp.KEY_CURRENT_TASK_ID, "") or "")
+            if session is not None:
+                from goldfive.orchestration_store import OrchestrationStore
+
+                store = OrchestrationStore.for_session(session)
+                current_task_id = store.pin_current_task()
+            else:
+                current_task_id = str(state.get(_sp.KEY_CURRENT_TASK_ID, "") or "")
+
             if not current_task_id:
                 # No pin — pre-plan turn, or an agent that doesn't need
                 # plan-causal augmentation this turn. Return the caller's
                 # instruction verbatim.
                 return original_instruction
 
-            current_task_title = str(
-                state.get(_sp.KEY_CURRENT_TASK_TITLE, "") or ""
-            )
-            current_task_description = str(
-                state.get(_sp.KEY_CURRENT_TASK_DESCRIPTION, "") or ""
-            )
+            if session is not None:
+                current_task_title, current_task_description = (
+                    _task_title_description_from_session(session, current_task_id)
+                )
+            else:
+                # Legacy ADK-state fallback path.
+                current_task_title = str(
+                    state.get(_sp.KEY_CURRENT_TASK_TITLE, "") or ""
+                )
+                current_task_description = str(
+                    state.get(_sp.KEY_CURRENT_TASK_DESCRIPTION, "") or ""
+                )
 
             pending_correction = _read_pending_correction(
+                session=session,
                 state=state,
                 agent_name=agent_name,
                 current_task_id=current_task_id,

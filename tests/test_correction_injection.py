@@ -619,44 +619,49 @@ def test_dynamic_resolver_picks_up_correction_dict() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. State bridge propagation gf -> adk.
+# 10. OrchestrationStore reads pending corrections directly.
 # ---------------------------------------------------------------------------
 
 
-def test_bridge_propagates_pending_corrections_gf_to_adk() -> None:
-    """Module-level ``_bridge_pending_corrections`` copies goldfive.pending_corrections.* keys.
+def test_orchestration_store_reads_pending_correction_off_goldfive_session() -> None:
+    """Phase 2.0 of goldfive#271 — bridge eliminated.
 
-    Exercises the prefix-scoped bridge directly with a pair of dicts:
-    writes on goldfive orchestration state land on ADK state, and
-    subsequent clears on goldfive state evict the ADK-side copies so
-    the dynamic instruction resolver stops rendering a dead correction.
+    Pending corrections live on goldfive ``Session.state`` (written by
+    :func:`write_correction`). The dynamic-instruction resolver reads
+    them directly via
+    :meth:`goldfive.orchestration_store.OrchestrationStore.get_correction`;
+    no copy onto ADK ``session.state`` is needed.
     """
-    from goldfive.adapters._adk_plugin import _bridge_pending_corrections
+    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.types import Session
 
-    gf_state: dict[str, Any] = {}
-    adk_state: dict[str, Any] = {}
-
-    # Write two corrections gf-side.
+    session = Session(run_id="r1")
     corr_a = pending_correction_key("agent_a", "task_1")
     corr_b = pending_correction_key("agent_b", "task_2")
-    gf_state[corr_a] = {"agent_name": "agent_a", "task_id": "task_1", "revision_number": 1}
-    gf_state[corr_b] = {"agent_name": "agent_b", "task_id": "task_2", "revision_number": 1}
-    # Non-correction goldfive keys must NOT bleed through this bridge.
-    gf_state["goldfive.current_task_id"] = "unrelated"
+    session.state[corr_a] = {
+        "agent_name": "agent_a",
+        "task_id": "task_1",
+        "revision_number": 1,
+    }
+    session.state[corr_b] = {
+        "agent_name": "agent_b",
+        "task_id": "task_2",
+        "revision_number": 1,
+    }
 
-    _bridge_pending_corrections(gf_state, adk_state)
+    store = OrchestrationStore.for_session(session)
 
-    assert corr_a in adk_state
-    assert corr_b in adk_state
-    assert adk_state[corr_a] == gf_state[corr_a]
-    # The non-correction key must not be copied by this particular bridge.
-    assert "goldfive.current_task_id" not in adk_state
+    # Each (agent, task) returns its own correction; no cross-leakage.
+    assert store.get_correction("agent_a", "task_1") == session.state[corr_a]
+    assert store.get_correction("agent_b", "task_2") == session.state[corr_b]
+    assert store.get_correction("agent_a", "task_2") is None
+    assert store.get_correction("agent_b", "task_1") is None
 
-    # Now clear one gf-side and re-bridge: ADK-side eviction must follow.
-    del gf_state[corr_a]
-    _bridge_pending_corrections(gf_state, adk_state)
-    assert corr_a not in adk_state
-    assert corr_b in adk_state
+    # Clearing the gf-side entry makes the read return None — the
+    # mechanism by which a correction-clear reaches the resolver.
+    del session.state[corr_a]
+    assert store.get_correction("agent_a", "task_1") is None
+    assert store.get_correction("agent_b", "task_2") is not None
 
 
 # ---------------------------------------------------------------------------

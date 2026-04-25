@@ -54,11 +54,58 @@ log = logging.getLogger("goldfive.adapters.adk")
 
 
 # ``SessionContext`` is stashed on ADK ``session.state`` under this key
-# so the plugin callbacks can reach back to the goldfive session (and
-# its steerer + current task) without threading them through every
-# callback signature. The adapter writes this before ``runner.run_async``
-# and deletes it after.
+# so test scaffolding that drives the plugin with a hand-built state
+# dict can reach back to the goldfive session. NOT used on the live-
+# run path: ADK's ``InMemorySessionService.get_session`` returns a
+# (deep-)copy of the session, so a write to ``session.state`` from
+# :class:`ADKAdapter._invoke_internal` does not propagate to the
+# session the runner actually streams against.
+#
+# The live-run path uses :func:`session_context_from_invocation` —
+# a tree-walk that finds the goldfive plugin on the
+# :class:`InvocationContext.plugin_manager` and reads its
+# ``_active_ctx`` (set by :meth:`_GoldfiveADKPlugin.set_active_context`).
 SESSION_CONTEXT_STATE_KEY = "goldfive._session_context"
+
+
+def session_context_from_invocation(invocation_context: Any) -> SessionContext | None:
+    """Return the live :class:`SessionContext` reachable from an ADK invocation.
+
+    Walks ``invocation_context.plugin_manager.plugins`` looking for the
+    goldfive plugin (identified by the ``__goldfive_adk_plugin__``
+    marker attribute set in :func:`make_adk_plugin`) and returns its
+    ``_active_ctx``. The plugin's ``_active_ctx`` is set by
+    :meth:`set_active_context` (called from
+    :meth:`ADKAdapter._invoke_internal` before ``runner.run_async``)
+    so by the time any callback fires the plugin's local field is
+    populated.
+
+    Returns ``None`` when:
+
+    * ``invocation_context`` is ``None``.
+    * No goldfive plugin is registered on the invocation.
+    * The plugin's ``_active_ctx`` hasn't been set yet (out-of-band
+      invocations / unit tests that drive callbacks directly).
+
+    Phase 2.0 of goldfive#271 — replaces the V7 state-stash that did
+    not propagate through ADK's session_service deep-copy. Closes
+    goldfive#275 by giving the resolver / planner a reliable read
+    path that doesn't depend on writing ADK ``session.state`` from
+    inside a callback frame.
+    """
+    if invocation_context is None:
+        return None
+    plugin_manager = getattr(invocation_context, "plugin_manager", None)
+    if plugin_manager is None:
+        return None
+    plugins = getattr(plugin_manager, "plugins", None) or ()
+    for plugin in plugins:
+        if not getattr(plugin, "__goldfive_adk_plugin__", False):
+            continue
+        ctx = getattr(plugin, "_active_ctx", None)
+        if ctx is not None:
+            return ctx
+    return None
 
 
 class SessionContext:
@@ -1186,49 +1233,6 @@ async def _inject_goldfive_planner_instruction(
         )
 
 
-def _bridge_pending_corrections(gf_state: Any, adk_state: Any) -> None:
-    """Mirror every ``goldfive.pending_corrections.*`` key from ``gf_state`` onto ``adk_state``.
-
-    goldfive#251 Stream D. Structural (prefix-scoped) bridge rather than
-    a per-key copy because the correction family is ``(agent,
-    task)``-expanded — goldfive doesn't know the set of keys at
-    plugin-init time. Idempotent: re-running on the same pair of states
-    restores whatever ``gf_state`` has NOW and evicts ADK entries
-    ``gf_state`` no longer carries. That eviction is the mechanism by
-    which a :func:`goldfive._correction_injection.clear_correction`
-    call on the orchestration state reaches the dynamic instruction
-    resolver on the ADK side.
-
-    Called from :meth:`make_adk_plugin`'s inner
-    ``_bridge_orchestration_state`` once per ``before_run_callback``;
-    also directly unit-testable as a module-level helper with any pair
-    of dicts.
-
-    Silent on non-mapping inputs so one malformed state never blocks
-    the rest of the bridge.
-    """
-    if not isinstance(adk_state, MutableMapping):
-        return
-    prefix = _sp.KEY_PENDING_CORRECTIONS + "."
-    # Snapshot the gf-side keys first so mutation during the loop is
-    # impossible.
-    gf_keys: dict[str, Any] = {}
-    if isinstance(gf_state, Mapping):
-        for k, v in gf_state.items():
-            if isinstance(k, str) and k.startswith(prefix):
-                gf_keys[k] = v
-    # Evict any ADK-side correction key that no longer exists on the
-    # goldfive side. This is the mechanism by which a clear on
-    # gf_state reaches the resolver (the resolver reads the ADK copy
-    # via ``readonly_context.state``).
-    for k in list(adk_state.keys()):
-        if isinstance(k, str) and k.startswith(prefix) and k not in gf_keys:
-            adk_state.pop(k, None)
-    # Copy fresh values through.
-    for k, v in gf_keys.items():
-        adk_state[k] = v
-
-
 def make_adk_plugin(
     *,
     name: str = "goldfive_adk_plugin",
@@ -1261,6 +1265,13 @@ def make_adk_plugin(
 
     class _GoldfiveADKPlugin(BasePlugin):  # type: ignore[misc, valid-type]
         """Routes ADK callbacks into the goldfive steerer + state protocol."""
+
+        # Class-level discriminator: lets
+        # :func:`session_context_from_invocation` (and any future
+        # walkers of ``InvocationContext.plugin_manager.plugins``)
+        # identify a goldfive plugin instance without importing the
+        # closure-local class.
+        __goldfive_adk_plugin__: bool = True
 
         def __init__(self) -> None:
             super().__init__(name=name)
@@ -1417,6 +1428,14 @@ def make_adk_plugin(
             (which is an unreliable channel because InMemorySessionService
             copies state on every get). Overwriting a non-``None`` value
             is accepted — sequential invocations reuse the adapter.
+
+            The dynamic-instruction resolver and planner's per-turn
+            injection reach this same field via
+            :func:`session_context_from_invocation` so the goldfive
+            :class:`~goldfive.types.Session` is reachable from inside
+            an ADK callback frame without depending on a write to ADK
+            ``session.state``. Phase 2.0 of goldfive#271 — closes
+            goldfive#275.
             """
             self._active_ctx = ctx
             # Reset the runaway-delegation bookkeeping for the new
@@ -1647,41 +1666,11 @@ def make_adk_plugin(
                 self._invocation_tool_calls[inv_id] = 0
                 self._invocation_last_text[inv_id] = ""
 
-            # Write state-protocol keys onto the LIVE session the
-            # invocation is actually running against — not a copy.
-            session_obj = _safe_attr(invocation_context, "session", None)
-            state = _safe_attr(session_obj, "state", None)
-            if state is not None:
-                try:
-                    _sp.write_run_id(state, _safe_attr(ctx.session, "run_id", "") or "")
-                    _sp.write_plan_context(
-                        state,
-                        _safe_attr(ctx.session, "plan", None),
-                        _safe_attr(ctx.session, "completed_results", {}) or {},
-                        self._host_agent_name,
-                    )
-                    _sp.write_current_task(state, ctx.task)
-                    _sp.write_tools_available(state, list(ctx.tool_handlers.keys()))
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("before_run_callback: state write failed: %s", exc)
-
-                # goldfive#170: bridge orchestration-level state
-                # (goldfive.Session.state — written by DefaultSteerer,
-                # PlanReconciler, and the heal path) onto the live ADK
-                # session.state so GoldfivePlanner's request-side
-                # injection renders real values instead of ``(none)``.
-                # Tree-agnostic: fires on every invocation, including
-                # AgentTool-spawned sub-Runners whose own
-                # ``before_run_callback`` will repeat this bridge on
-                # their own live session. No separate propagation path
-                # needed.
-                try:
-                    self._bridge_orchestration_state(ctx.session, state)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "before_run_callback: orchestration-state bridge failed: %s",
-                        exc,
-                    )
+            # Phase 2.0 of goldfive#271 — V1 (initial seed) and V2
+            # (orchestration-state bridge) both deleted. The dynamic
+            # instruction resolver and GoldfivePlanner now read
+            # goldfive Session directly via the SessionContext stash;
+            # no callback-time write to ADK state is required.
 
             # Emit AgentInvocationStarted. Best-effort: observability
             # only, so a sink / proto issue must not block the run.
@@ -3011,102 +3000,6 @@ def make_adk_plugin(
                         log.debug("after_run_callback: note_agent_turn raised: %s", exc)
             return None
 
-        def _bridge_orchestration_state(
-            self,
-            gf_session: Any,
-            adk_state: Any,
-        ) -> None:
-            """Copy ``goldfive.Session.state`` orchestration keys onto the
-            ADK session.state (goldfive#170).
-
-            The orchestration dict is the framework-agnostic source of
-            truth for active-steer body / turn, formatted goals summary,
-            and the list of cancelled function-call ids (written by the
-            DefaultSteerer USER_STEER path, PlanReconciler goals-refresh
-            path, and the adapter's heal path respectively).
-            :class:`GoldfivePlanner.build_planning_instruction` reads
-            the same logical keys off the ADK session.state — so this
-            bridge is the missing data path between the orchestration
-            writes and the per-turn instruction injection.
-
-            Called from :meth:`before_run_callback` against the live
-            invocation session so the bridge runs on every root invoke
-            AND every AgentTool-spawned sub-Runner invoke (which has
-            its own ``before_run_callback`` firing against its own
-            live session). Sub-Runner propagation is therefore
-            automatic — no separate handoff path required.
-
-            Silent on any individual key that can't be read: the
-            planner's placeholders default to ``(none)`` so a degraded
-            bridge never breaks the run.
-            """
-            # Lazy import: orchestration_state is framework-agnostic
-            # and cheap, but the adapter module shouldn't assume at
-            # import time that the orchestration module is loaded.
-            from goldfive import orchestration_state as _ostate
-
-            gf_state = _safe_attr(gf_session, "state", None)
-            if gf_state is None:
-                return
-            # Active steer body + turn. The ADK-side helper clears
-            # both keys when body is empty, so a steer-then-clear
-            # sequence correctly renders as ``(none)`` on the next
-            # turn instead of retaining the old body.
-            body = _ostate.read(gf_state, _ostate.KEY_ACTIVE_STEER_BODY, "")
-            at_turn = _ostate.read(gf_state, _ostate.KEY_ACTIVE_STEER_AT_TURN, None)
-            try:
-                _sp.set_active_steer_on_adk_state(
-                    adk_state,
-                    body=str(body) if body else "",
-                    at_turn=at_turn,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "_bridge_orchestration_state: active_steer bridge failed: %s",
-                    exc,
-                )
-            # Goals summary.
-            summary = _ostate.read(gf_state, _ostate.KEY_GOALS_SUMMARY, "")
-            try:
-                _sp.set_goals_summary_on_adk_state(
-                    adk_state,
-                    str(summary) if summary else "",
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "_bridge_orchestration_state: goals_summary bridge failed: %s",
-                    exc,
-                )
-            # Cancelled function-call ids. Use the orchestration-state
-            # reader so the list-shape guard (non-list → []) is
-            # centralised in one place.
-            cancelled = _ostate.read_cancelled_function_call_ids(gf_state)
-            try:
-                _sp.set_cancelled_function_call_ids_on_adk_state(
-                    adk_state,
-                    cancelled,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "_bridge_orchestration_state: cancelled_ids bridge failed: %s",
-                    exc,
-                )
-            # goldfive#251 Stream D: pending-corrections bridge. Keys
-            # under ``goldfive.pending_corrections.<agent>.<task>`` are
-            # written by :mod:`goldfive._correction_injection` on refine
-            # landing. They're prefix-scoped and per-(agent, task), so
-            # the bridge is structural — copy anything present under
-            # the family prefix, evict anything the orchestration side
-            # has cleared. The dynamic instruction resolver reads the
-            # ADK-side copy per turn.
-            try:
-                _bridge_pending_corrections(gf_state, adk_state)
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "_bridge_orchestration_state: pending_corrections bridge failed: %s",
-                    exc,
-                )
-
         async def _maybe_emit_confabulation_risk(
             self,
             *,
@@ -3484,27 +3377,25 @@ def make_adk_plugin(
         # --- Plan + current-task context -------------------------------
 
         async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> None:
-            """Best-effort re-seed goldfive.* state for legacy test harnesses
-            + GoldfivePlanner request-side instruction injection
+            """GoldfivePlanner request-side instruction injection
             + per-LLM-call instrumentation (goldfive#172).
 
-            The authoritative state write happens in
-            :meth:`before_run_callback` against the live invocation
-            session. This callback retained its historic write-through
-            for unit tests that drive the plugin with a minimal
-            callback-context stub without a matching ``before_run``
-            lifecycle (see ``tests/test_adk_adapter.py``).
-
-            It ALSO performs GoldfivePlanner request-side instruction
-            injection (goldfive#153): ADK's ``_nl_planning.py``
-            request-side gate fires only for ``PlanReActPlanner``
-            subclasses, not every ``BasePlanner``. Since goldfive
-            deliberately subclasses ``BasePlanner`` directly (we don't
-            want PlanReAct's response filtering), we invoke
+            Performs GoldfivePlanner request-side instruction injection
+            (goldfive#153): ADK's ``_nl_planning.py`` request-side gate
+            fires only for ``PlanReActPlanner`` subclasses, not every
+            ``BasePlanner``. Since goldfive deliberately subclasses
+            ``BasePlanner`` directly (we don't want PlanReAct's response
+            filtering), we invoke
             :meth:`GoldfivePlanner.build_planning_instruction` ourselves
             here and append the returned string to
             ``llm_request.config.system_instruction`` via the same
             ``append_instructions`` helper ADK uses internally.
+
+            Phase 2.0 of goldfive#271 — V5 (the defensive duplicate
+            seed of ``goldfive.*`` keys onto ADK ``session.state``)
+            deleted. The planner now reads goldfive Session directly
+            via the SessionContext stash; nothing on the ADK side
+            needs the seed.
 
             Finally, it stamps per-LLM-call metrics (goldfive#172):
             counts ``llm_request.contents`` chars and message count,
@@ -3542,32 +3433,12 @@ def make_adk_plugin(
                 )
                 return None
 
-            state = _session_state_from_callback(callback_context)
-            if not isinstance(state, dict):
-                try:
-                    state[_sp.KEY_RUN_ID] = state.get(_sp.KEY_RUN_ID, "")  # type: ignore[index]
-                except Exception:
-                    return None
-
-            session = ctx.session
-            try:
-                _sp.write_run_id(state, _safe_attr(session, "run_id", "") or "")
-                _sp.write_plan_context(
-                    state,
-                    _safe_attr(session, "plan", None),
-                    _safe_attr(session, "completed_results", {}) or {},
-                    self._host_agent_name,
-                )
-                _sp.write_current_task(state, ctx.task)
-                _sp.write_tools_available(state, ctx.tool_handlers.keys())
-            except Exception as exc:  # noqa: BLE001
-                log.debug("before_model_callback: state write failed: %s", exc)
-
             # GoldfivePlanner request-side injection (goldfive#153).
             # Best-effort: never raise from this path; injection failure
             # degrades to "LLM runs without goldfive's orchestration
-            # context block" which is safe — ADK state still carries
-            # the same keys via the write above.
+            # context block" which is safe — the planner reads off
+            # goldfive Session directly so no callback-time write
+            # is required.
             try:
                 await _inject_goldfive_planner_instruction(
                     callback_context=callback_context,

@@ -262,16 +262,11 @@ def assert_can_write(
 # (Python 3.11+) or the function name on older runtimes.
 _KNOWN_CALLERS: frozenset[tuple[str, str]] = frozenset(
     {
-        # V1 / V5 — before_run_callback + before_model_callback initial
-        # seed writes. Both methods stamp the same set of plan-context
-        # keys, so both are catalogued.
-        ("goldfive/adapters/_adk_plugin.py", "before_run_callback"),
-        ("goldfive/adapters/_adk_plugin.py", "before_model_callback"),
-        # V2 — _bridge_orchestration_state copies orchestration keys
-        # onto ADK session.state. Includes the inline subroutine
-        # _bridge_pending_corrections that runs in the same call frame.
-        ("goldfive/adapters/_adk_plugin.py", "_bridge_orchestration_state"),
-        ("goldfive/adapters/_adk_plugin.py", "_bridge_pending_corrections"),
+        # V1 / V2 / V5 — MIGRATED in Phase 2.0 (goldfive#271). The
+        # before_run_callback initial seed, the orchestration-state
+        # bridge, and the before_model_callback duplicate seed all
+        # deleted. The dynamic-instruction resolver and GoldfivePlanner
+        # read goldfive Session directly via the SessionContext stash.
         # V3 — _stamp_current_task_id (called from before_agent_callback)
         # writes the per-agent pin onto both surfaces.
         ("goldfive/adapters/_adk_plugin.py", "_stamp_current_task_id"),
@@ -296,16 +291,7 @@ _KNOWN_CALLERS: frozenset[tuple[str, str]] = frozenset(
         ("goldfive/adapters/_adk_state_protocol.py", "write_current_task"),
         ("goldfive/adapters/_adk_state_protocol.py", "write_current_task_id"),
         ("goldfive/adapters/_adk_state_protocol.py", "write_current_task_revision"),
-        ("goldfive/adapters/_adk_state_protocol.py", "write_plan_context"),
-        ("goldfive/adapters/_adk_state_protocol.py", "write_run_id"),
-        ("goldfive/adapters/_adk_state_protocol.py", "write_tools_available"),
         ("goldfive/adapters/_adk_state_protocol.py", "clear_current_task"),
-        ("goldfive/adapters/_adk_state_protocol.py", "set_active_steer_on_adk_state"),
-        ("goldfive/adapters/_adk_state_protocol.py", "set_goals_summary_on_adk_state"),
-        (
-            "goldfive/adapters/_adk_state_protocol.py",
-            "set_cancelled_function_call_ids_on_adk_state",
-        ),
         ("goldfive/adapters/_adk_state_protocol.py", "write_cancel_request"),
         ("goldfive/adapters/_adk_state_protocol.py", "register_invocation_parent"),
         ("goldfive/adapters/_adk_state_protocol.py", "consume_cancel_request"),

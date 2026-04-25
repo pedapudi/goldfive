@@ -29,16 +29,16 @@ Data flow
 2. :func:`queue_corrections_for_revision` writes the correction dict
    into goldfive orchestration state, keyed
    ``goldfive.pending_corrections.<agent_name>.<task_id>``.
-3. On the next root invocation, the adapter's ``before_run_callback``
-   bridges every ``goldfive.pending_corrections.*`` key from the
-   goldfive session state onto the ADK live session.state (goldfive#170
-   state bridge, extended for this key family in
-   :meth:`goldfive.adapters._adk_plugin._bridge_orchestration_state`).
-4. The dynamic instruction resolver (Stream B) reads its
-   ``(agent_name, current_task_id)``-keyed entry and — for dict values
-   — formats it via :func:`format_correction_block` before appending
-   to the composed system prompt.
-5. Agent sees the correction block on its next turn and proceeds on
+3. The dynamic instruction resolver (Stream B) reads its
+   ``(agent_name, current_task_id)``-keyed entry directly off goldfive
+   ``Session.state`` via the
+   :class:`~goldfive.orchestration_store.OrchestrationStore`'s
+   ``get_correction`` accessor (Phase 2.0 of goldfive#271 — the bridge
+   from goldfive ``Session.state`` onto ADK ``session.state`` is gone)
+   and — for dict values — formats it via
+   :func:`format_correction_block` before appending to the composed
+   system prompt.
+4. Agent sees the correction block on its next turn and proceeds on
    the corrected task. Once the agent calls ``report_task_started``
    on the correction task id, :func:`clear_correction` GC's the entry
    (agent has acknowledged the new context).
