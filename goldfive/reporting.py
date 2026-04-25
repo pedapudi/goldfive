@@ -593,7 +593,7 @@ async def _emit_task_transition_refused(
     agent_name: str = "",
     invocation_id: str = "",
 ) -> None:
-    """Emit a ``task_transition_refused`` dict envelope onto the sink bus.
+    """Emit a ``TaskTransitionRefused`` proto envelope onto the sink bus.
 
     Fired when the report-time pin classifier refuses to drive a stale
     pin's transition because the old task either has a CORRECT-kind
@@ -602,32 +602,28 @@ async def _emit_task_transition_refused(
     ``{"acknowledged": True}`` response so it doesn't reason against
     the refusal; operators consume this event for the audit trail.
 
-    Dict envelope (not proto) — matches the pattern set by
-    ``refine_attempted`` / ``refine_failed`` (#264) and
-    ``InvocationCancelled`` pre-proto. Promote to proto when the
-    follow-up prioritises it.
+    Typed proto envelope — promoted from the dict shape that #266
+    shipped, matching the ``InvocationCancelled`` promotion pattern
+    from #262. The dict-envelope path has been removed (full
+    migration; harmonograf-side ingest migration lands separately).
     """
     sinks = getattr(steerer, "_sinks", None) or []
     if not sinks:
         return
-    from goldfive.events import emit, make_event
+    from goldfive.events import emit, task_transition_refused_event
 
-    payload = {
-        "task_id": task_id,
-        "attempted_from": attempted_from.value,
-        "attempted_to": attempted_to.value,
-        "reason": reason,
-        "pin_revision": int(pin_revision),
-        "current_revision": int(current_revision),
-        "agent_name": agent_name,
-        "invocation_id": invocation_id,
-    }
     try:
-        evt = make_event(
+        evt = task_transition_refused_event(
             session.run_id,
             session.next_sequence(),
-            "task_transition_refused",
-            payload,
+            task_id=task_id,
+            attempted_from=attempted_from.value,
+            attempted_to=attempted_to.value,
+            reason=reason,
+            pin_revision=int(pin_revision),
+            current_revision=int(current_revision),
+            agent_name=agent_name,
+            invocation_id=invocation_id,
             session_id=session.id,
         )
         await emit(sinks, evt)

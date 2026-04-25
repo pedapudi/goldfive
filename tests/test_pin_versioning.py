@@ -16,8 +16,9 @@ to distinguish:
   CORRECT-kind) — REFUSE. The old task's terminal state is historical
   fact; the correction is a separate work unit. ``acknowledged: True``
   is still returned to the LLM (no prompt-injection surface), but a
-  ``task_transition_refused`` sink event flags the refusal for
-  operators.
+  ``TaskTransitionRefused`` proto sink event flags the refusal for
+  operators (promoted from the original dict shape per the #262
+  InvocationCancelled pattern).
 * **Stale ambiguous pin** (pin_revision < current_revision, no
   supersedes successor) — REFUSE. Operator must disambiguate.
 
@@ -208,12 +209,24 @@ def _tool(name: str):
     raise AssertionError(f"builtin tool {name!r} missing")
 
 
-def _refused_events(events: list[Any]) -> list[dict]:
-    return [
-        e
-        for e in events
-        if isinstance(e, dict) and e.get("kind") == "task_transition_refused"
-    ]
+def _refused_events(events: list[Any]) -> list[Any]:
+    """Return ``TaskTransitionRefused`` proto envelopes from the sink stream.
+
+    Promoted from the dict shape #266 originally shipped — the typed
+    proto message is now the canonical wire shape (matches the
+    ``InvocationCancelled`` promotion pattern from #262).
+    """
+    out: list[Any] = []
+    for evt in events:
+        which = getattr(evt, "WhichOneof", None)
+        if which is None:
+            continue
+        try:
+            if which("payload") == "task_transition_refused":
+                out.append(evt)
+        except Exception:
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -425,15 +438,15 @@ async def test_handler_stale_correct_refuses_and_emits_event() -> None:
         "stale CORRECT pin must not transition the old task; "
         "its terminal state is historical fact"
     )
-    # Operator sees the refusal as a sink event.
+    # Operator sees the refusal as a typed proto sink event.
     refused = _refused_events(sinks[0].events)
     assert len(refused) == 1
-    payload = refused[0]["payload"]
-    assert payload["task_id"] == "research_solar"
-    assert payload["reason"] == "stale_pin_correct_supersedes"
-    assert payload["pin_revision"] == 1
-    assert payload["current_revision"] == 2
-    assert payload["attempted_to"] == TaskStatus.COMPLETED.value
+    payload = refused[0].task_transition_refused
+    assert payload.task_id == "research_solar"
+    assert payload.reason == "stale_pin_correct_supersedes"
+    assert payload.pin_revision == 1
+    assert payload.current_revision == 2
+    assert payload.attempted_to == TaskStatus.COMPLETED.value
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +490,7 @@ async def test_handler_stale_no_supersedes_refuses() -> None:
     )
     refused = _refused_events(sinks[0].events)
     assert len(refused) == 1
-    assert refused[0]["payload"]["reason"] == "stale_pin_no_supersedes"
+    assert refused[0].task_transition_refused.reason == "stale_pin_no_supersedes"
 
 
 # ---------------------------------------------------------------------------
@@ -564,8 +577,8 @@ async def test_handler_waits_for_plan_stable_during_concurrent_refine() -> None:
     refused = _refused_events(sinks[0].events)
     assert len(refused) == 1
     # The refusal observed the post-refine revision.
-    assert refused[0]["payload"]["current_revision"] == 1
-    assert refused[0]["payload"]["pin_revision"] == 0
+    assert refused[0].task_transition_refused.current_revision == 1
+    assert refused[0].task_transition_refused.pin_revision == 0
 
 
 # ---------------------------------------------------------------------------

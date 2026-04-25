@@ -29,9 +29,12 @@ Source-attribution vocabulary:
                            specific source label (default for un-
                            threaded callers).
 
-Pairs with the ``task_transition_refused`` dict event from #266 (pin
-versioning) — refused attempts emit the dict refusal payload and DO
-NOT emit ``TaskTransitioned`` (no transition happened).
+Pairs with the ``TaskTransitionRefused`` proto event from #266 (pin
+versioning) — refused attempts emit that envelope and DO NOT emit
+``TaskTransitioned`` (no transition happened). The refused variant
+was originally shipped as a dict envelope and later promoted to a
+typed proto message (matches the InvocationCancelled promotion
+pattern from #262).
 """
 
 from __future__ import annotations
@@ -105,13 +108,24 @@ def _transition_events(sink: ListSink) -> list[Any]:
     return out
 
 
-def _refused_dict_events(sink: ListSink) -> list[dict[str, Any]]:
-    """Return ``task_transition_refused`` dict envelopes (#266)."""
-    return [
-        e
-        for e in sink.events
-        if isinstance(e, dict) and e.get("kind") == "task_transition_refused"
-    ]
+def _refused_events(sink: ListSink) -> list[Any]:
+    """Return ``TaskTransitionRefused`` proto envelopes (#266 followup).
+
+    Promoted from the dict shape #266 originally shipped to a typed
+    proto message (matches the ``InvocationCancelled`` promotion from
+    #262).
+    """
+    out: list[Any] = []
+    for evt in sink.events:
+        which = getattr(evt, "WhichOneof", None)
+        if which is None:
+            continue
+        try:
+            if which("payload") == "task_transition_refused":
+                out.append(evt)
+        except Exception:
+            continue
+    return out
 
 
 def _tool(name: str):
@@ -256,7 +270,7 @@ async def test_replace_supersedes_reroute_emits_supersedes_reroute_source() -> N
     assert payload.to_status == TaskStatus.RUNNING.value
     assert payload.source == "supersedes_reroute"
     # No refusal — REPLACE-kind always routes.
-    assert _refused_dict_events(sink) == []
+    assert _refused_events(sink) == []
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +519,7 @@ async def test_agent_name_and_invocation_id_stamped_from_context() -> None:
 
 async def test_refused_stale_correct_pin_does_not_emit_task_transitioned() -> None:
     """A refused transition (stale pin under a CORRECT-kind successor)
-    emits the ``task_transition_refused`` dict event from #266 and
+    emits the ``TaskTransitionRefused`` proto event from #266 and
     DOES NOT emit a typed ``TaskTransitioned``: no transition
     happened, so there is nothing to attribute.
     """
@@ -539,10 +553,10 @@ async def test_refused_stale_correct_pin_does_not_emit_task_transitioned() -> No
 
     # LLM still sees an ack — no prompt-injection surface (#266).
     assert result == {"acknowledged": True}
-    # Refused dict event from #266 is on the wire …
-    refused = _refused_dict_events(sink)
+    # Refused proto event from #266 (typed) is on the wire …
+    refused = _refused_events(sink)
     assert len(refused) == 1
-    assert refused[0]["payload"]["reason"] == "stale_pin_correct_supersedes"
+    assert refused[0].task_transition_refused.reason == "stale_pin_correct_supersedes"
     # … but NO TaskTransitioned was emitted: no transition happened.
     assert _transition_events(sink) == [], (
         "refused attempts must not emit TaskTransitioned"
@@ -571,7 +585,85 @@ async def test_refused_stale_ambiguous_pin_does_not_emit_task_transitioned() -> 
         {"task_id": "orphan", "summary": "x"}, session, steerer
     )
 
-    refused = _refused_dict_events(sink)
+    refused = _refused_events(sink)
     assert len(refused) == 1
-    assert refused[0]["payload"]["reason"] == "stale_pin_no_supersedes"
+    assert refused[0].task_transition_refused.reason == "stale_pin_no_supersedes"
     assert _transition_events(sink) == []
+
+
+# ---------------------------------------------------------------------------
+# 10. TaskTransitionRefused proto round-trip (post-promotion).
+# ---------------------------------------------------------------------------
+
+
+def test_task_transition_refused_proto_round_trip() -> None:
+    """The factory + proto descriptors round-trip every populated field.
+
+    Locks the wire shape after the dict→proto promotion: every field
+    survives ``SerializeToString`` / ``ParseFromString`` and the
+    envelope's payload oneof routes to the new variant.
+    """
+    from goldfive.events import task_transition_refused_event
+    from goldfive.pb.goldfive.v1 import events_pb2
+
+    evt = task_transition_refused_event(
+        run_id="r-rt",
+        sequence=7,
+        task_id="research_solar",
+        attempted_from=TaskStatus.COMPLETED.value,
+        attempted_to=TaskStatus.RUNNING.value,
+        reason="stale_pin_correct_supersedes",
+        pin_revision=1,
+        current_revision=2,
+        agent_name="researcher",
+        invocation_id="inv-9",
+        session_id="sess-1",
+    )
+
+    raw = evt.SerializeToString()
+    parsed = events_pb2.Event()
+    parsed.ParseFromString(raw)
+
+    # Envelope fields preserved.
+    assert parsed.run_id == "r-rt"
+    assert parsed.sequence == 7
+    assert parsed.session_id == "sess-1"
+    assert parsed.WhichOneof("payload") == "task_transition_refused"
+
+    # Payload fields preserved verbatim.
+    p = parsed.task_transition_refused
+    assert p.task_id == "research_solar"
+    assert p.attempted_from == TaskStatus.COMPLETED.value
+    assert p.attempted_to == TaskStatus.RUNNING.value
+    assert p.reason == "stale_pin_correct_supersedes"
+    assert p.pin_revision == 1
+    assert p.current_revision == 2
+    assert p.agent_name == "researcher"
+    assert p.invocation_id == "inv-9"
+
+
+def test_task_transition_refused_factory_defaults() -> None:
+    """Optional kwargs default to empty / zero without raising.
+
+    Defends the partial-population path used by emit sites that don't
+    have invocation_id / agent_name attribution available.
+    """
+    from goldfive.events import task_transition_refused_event
+
+    evt = task_transition_refused_event(
+        run_id="r-defaults",
+        sequence=0,
+        task_id="t1",
+        attempted_from=TaskStatus.PENDING.value,
+        attempted_to=TaskStatus.RUNNING.value,
+        reason="stale_pin_no_supersedes",
+    )
+
+    assert evt.WhichOneof("payload") == "task_transition_refused"
+    p = evt.task_transition_refused
+    assert p.task_id == "t1"
+    assert p.reason == "stale_pin_no_supersedes"
+    assert p.pin_revision == 0
+    assert p.current_revision == 0
+    assert p.agent_name == ""
+    assert p.invocation_id == ""
