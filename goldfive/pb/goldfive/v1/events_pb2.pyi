@@ -11,7 +11,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class Event(_message.Message):
-    __slots__ = ("event_id", "run_id", "sequence", "emitted_at", "session_id", "run_started", "goal_derived", "plan_submitted", "plan_revised", "task_started", "task_progress", "task_completed", "task_failed", "task_blocked", "task_cancelled", "drift_detected", "run_completed", "run_aborted", "conversation_started", "conversation_ended", "approval_requested", "approval_granted", "approval_rejected", "agent_invocation_started", "agent_invocation_completed", "delegation_observed", "reasoning_judge_invoked", "goldfive_llm_call_start", "goldfive_llm_call_end", "invocation_cancelled", "task_transitioned")
+    __slots__ = ("event_id", "run_id", "sequence", "emitted_at", "session_id", "run_started", "goal_derived", "plan_submitted", "plan_revised", "task_started", "task_progress", "task_completed", "task_failed", "task_blocked", "task_cancelled", "drift_detected", "run_completed", "run_aborted", "conversation_started", "conversation_ended", "approval_requested", "approval_granted", "approval_rejected", "agent_invocation_started", "agent_invocation_completed", "delegation_observed", "reasoning_judge_invoked", "goldfive_llm_call_start", "goldfive_llm_call_end", "invocation_cancelled", "task_transitioned", "task_transition_refused")
     EVENT_ID_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
@@ -43,6 +43,7 @@ class Event(_message.Message):
     GOLDFIVE_LLM_CALL_END_FIELD_NUMBER: _ClassVar[int]
     INVOCATION_CANCELLED_FIELD_NUMBER: _ClassVar[int]
     TASK_TRANSITIONED_FIELD_NUMBER: _ClassVar[int]
+    TASK_TRANSITION_REFUSED_FIELD_NUMBER: _ClassVar[int]
     event_id: str
     run_id: str
     sequence: int
@@ -74,7 +75,8 @@ class Event(_message.Message):
     goldfive_llm_call_end: GoldfiveLLMCallEnd
     invocation_cancelled: InvocationCancelled
     task_transitioned: TaskTransitioned
-    def __init__(self, event_id: _Optional[str] = ..., run_id: _Optional[str] = ..., sequence: _Optional[int] = ..., emitted_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., session_id: _Optional[str] = ..., run_started: _Optional[_Union[RunStarted, _Mapping]] = ..., goal_derived: _Optional[_Union[GoalDerived, _Mapping]] = ..., plan_submitted: _Optional[_Union[PlanSubmitted, _Mapping]] = ..., plan_revised: _Optional[_Union[PlanRevised, _Mapping]] = ..., task_started: _Optional[_Union[TaskStarted, _Mapping]] = ..., task_progress: _Optional[_Union[TaskProgress, _Mapping]] = ..., task_completed: _Optional[_Union[TaskCompleted, _Mapping]] = ..., task_failed: _Optional[_Union[TaskFailed, _Mapping]] = ..., task_blocked: _Optional[_Union[TaskBlocked, _Mapping]] = ..., task_cancelled: _Optional[_Union[TaskCancelled, _Mapping]] = ..., drift_detected: _Optional[_Union[DriftDetected, _Mapping]] = ..., run_completed: _Optional[_Union[RunCompleted, _Mapping]] = ..., run_aborted: _Optional[_Union[RunAborted, _Mapping]] = ..., conversation_started: _Optional[_Union[ConversationStarted, _Mapping]] = ..., conversation_ended: _Optional[_Union[ConversationEnded, _Mapping]] = ..., approval_requested: _Optional[_Union[ApprovalRequested, _Mapping]] = ..., approval_granted: _Optional[_Union[ApprovalGranted, _Mapping]] = ..., approval_rejected: _Optional[_Union[ApprovalRejected, _Mapping]] = ..., agent_invocation_started: _Optional[_Union[AgentInvocationStarted, _Mapping]] = ..., agent_invocation_completed: _Optional[_Union[AgentInvocationCompleted, _Mapping]] = ..., delegation_observed: _Optional[_Union[DelegationObserved, _Mapping]] = ..., reasoning_judge_invoked: _Optional[_Union[ReasoningJudgeInvoked, _Mapping]] = ..., goldfive_llm_call_start: _Optional[_Union[GoldfiveLLMCallStart, _Mapping]] = ..., goldfive_llm_call_end: _Optional[_Union[GoldfiveLLMCallEnd, _Mapping]] = ..., invocation_cancelled: _Optional[_Union[InvocationCancelled, _Mapping]] = ..., task_transitioned: _Optional[_Union[TaskTransitioned, _Mapping]] = ...) -> None: ...
+    task_transition_refused: TaskTransitionRefused
+    def __init__(self, event_id: _Optional[str] = ..., run_id: _Optional[str] = ..., sequence: _Optional[int] = ..., emitted_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., session_id: _Optional[str] = ..., run_started: _Optional[_Union[RunStarted, _Mapping]] = ..., goal_derived: _Optional[_Union[GoalDerived, _Mapping]] = ..., plan_submitted: _Optional[_Union[PlanSubmitted, _Mapping]] = ..., plan_revised: _Optional[_Union[PlanRevised, _Mapping]] = ..., task_started: _Optional[_Union[TaskStarted, _Mapping]] = ..., task_progress: _Optional[_Union[TaskProgress, _Mapping]] = ..., task_completed: _Optional[_Union[TaskCompleted, _Mapping]] = ..., task_failed: _Optional[_Union[TaskFailed, _Mapping]] = ..., task_blocked: _Optional[_Union[TaskBlocked, _Mapping]] = ..., task_cancelled: _Optional[_Union[TaskCancelled, _Mapping]] = ..., drift_detected: _Optional[_Union[DriftDetected, _Mapping]] = ..., run_completed: _Optional[_Union[RunCompleted, _Mapping]] = ..., run_aborted: _Optional[_Union[RunAborted, _Mapping]] = ..., conversation_started: _Optional[_Union[ConversationStarted, _Mapping]] = ..., conversation_ended: _Optional[_Union[ConversationEnded, _Mapping]] = ..., approval_requested: _Optional[_Union[ApprovalRequested, _Mapping]] = ..., approval_granted: _Optional[_Union[ApprovalGranted, _Mapping]] = ..., approval_rejected: _Optional[_Union[ApprovalRejected, _Mapping]] = ..., agent_invocation_started: _Optional[_Union[AgentInvocationStarted, _Mapping]] = ..., agent_invocation_completed: _Optional[_Union[AgentInvocationCompleted, _Mapping]] = ..., delegation_observed: _Optional[_Union[DelegationObserved, _Mapping]] = ..., reasoning_judge_invoked: _Optional[_Union[ReasoningJudgeInvoked, _Mapping]] = ..., goldfive_llm_call_start: _Optional[_Union[GoldfiveLLMCallStart, _Mapping]] = ..., goldfive_llm_call_end: _Optional[_Union[GoldfiveLLMCallEnd, _Mapping]] = ..., invocation_cancelled: _Optional[_Union[InvocationCancelled, _Mapping]] = ..., task_transitioned: _Optional[_Union[TaskTransitioned, _Mapping]] = ..., task_transition_refused: _Optional[_Union[TaskTransitionRefused, _Mapping]] = ...) -> None: ...
 
 class RunStarted(_message.Message):
     __slots__ = ("run_id", "goal_summary", "started_at")
@@ -437,3 +439,23 @@ class TaskTransitioned(_message.Message):
     agent_name: str
     invocation_id: str
     def __init__(self, task_id: _Optional[str] = ..., from_status: _Optional[str] = ..., to_status: _Optional[str] = ..., source: _Optional[str] = ..., revision_stamp: _Optional[int] = ..., agent_name: _Optional[str] = ..., invocation_id: _Optional[str] = ...) -> None: ...
+
+class TaskTransitionRefused(_message.Message):
+    __slots__ = ("task_id", "attempted_from", "attempted_to", "reason", "pin_revision", "current_revision", "agent_name", "invocation_id")
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPTED_FROM_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPTED_TO_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    PIN_REVISION_FIELD_NUMBER: _ClassVar[int]
+    CURRENT_REVISION_FIELD_NUMBER: _ClassVar[int]
+    AGENT_NAME_FIELD_NUMBER: _ClassVar[int]
+    INVOCATION_ID_FIELD_NUMBER: _ClassVar[int]
+    task_id: str
+    attempted_from: str
+    attempted_to: str
+    reason: str
+    pin_revision: int
+    current_revision: int
+    agent_name: str
+    invocation_id: str
+    def __init__(self, task_id: _Optional[str] = ..., attempted_from: _Optional[str] = ..., attempted_to: _Optional[str] = ..., reason: _Optional[str] = ..., pin_revision: _Optional[int] = ..., current_revision: _Optional[int] = ..., agent_name: _Optional[str] = ..., invocation_id: _Optional[str] = ...) -> None: ...

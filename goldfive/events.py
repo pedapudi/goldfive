@@ -768,10 +768,10 @@ def task_transitioned_event(
     moved this task and why" without reconstructing the timeline by
     hand.
 
-    Pairs with the ``task_transition_refused`` dict event from #266
-    (pin versioning): refused attempts emit the dict refusal payload
-    and DO NOT emit ``TaskTransitioned`` (no transition happened).
-    Successful transitions emit this typed proto envelope.
+    Pairs with :func:`task_transition_refused_event` from #266
+    (pin versioning): refused attempts emit a ``TaskTransitionRefused``
+    envelope and DO NOT emit ``TaskTransitioned`` (no transition
+    happened). Successful transitions emit this typed proto envelope.
 
     ``source`` vocabulary (see proto comment for the full list):
     ``"llm_report"`` / ``"handler_default"`` / ``"supersedes_reroute"``
@@ -795,6 +795,68 @@ def task_transitioned_event(
         evt.task_transitioned.revision_stamp = 0
     evt.task_transitioned.agent_name = str(agent_name or "")
     evt.task_transitioned.invocation_id = str(invocation_id or "")
+    return evt
+
+
+def task_transition_refused_event(
+    run_id: str,
+    sequence: int,
+    *,
+    task_id: str,
+    attempted_from: str,
+    attempted_to: str,
+    reason: str,
+    pin_revision: int = 0,
+    current_revision: int = 0,
+    agent_name: str = "",
+    invocation_id: str = "",
+    session_id: str = "",
+) -> Any:
+    """Build a ``TaskTransitionRefused`` envelope (goldfive#266 followup).
+
+    Operator-visible sink event marking that the report-time pin
+    classifier refused to drive a transition because the pin is stale
+    and either has a CORRECT-kind supersedes successor (history vs.
+    correction) or no successor at all (ambiguity). The LLM-facing
+    ``report_task_*`` surface still returns ``{"acknowledged": True}``
+    — this event is operator-only audit-trail observability.
+
+    Promoted from the dict envelope shipped by #266 (the dict path went
+    through :func:`make_event` to keep #266's scope tight). Once #266
+    and #267 (typed :func:`task_transitioned_event`) shipped and were
+    validated, the refused variant graduated to a proper proto message
+    — same migration pattern as :func:`invocation_cancelled_event`
+    (PR #262).
+
+    Pairs with :func:`task_transitioned_event`: successful transitions
+    emit that envelope, refused attempts emit this one and the steerer
+    is never driven.
+
+    ``attempted_from`` / ``attempted_to`` are the bare lowercase
+    :class:`~goldfive.types.TaskStatus` values (``"PENDING"`` /
+    ``"RUNNING"`` / ``"COMPLETED"`` / …). String-typed (not enum) for
+    parity with :func:`task_transitioned_event`.
+
+    ``reason`` is one of ``"stale_pin_correct_supersedes"`` /
+    ``"stale_pin_no_supersedes"`` (see :class:`TaskTransitionRefused`
+    proto comment for the full vocabulary). Readers MUST tolerate
+    unknown values for forward-compat.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id)
+    evt.task_transition_refused.task_id = str(task_id or "")
+    evt.task_transition_refused.attempted_from = str(attempted_from or "")
+    evt.task_transition_refused.attempted_to = str(attempted_to or "")
+    evt.task_transition_refused.reason = str(reason or "")
+    try:
+        evt.task_transition_refused.pin_revision = int(pin_revision or 0)
+    except (TypeError, ValueError):
+        evt.task_transition_refused.pin_revision = 0
+    try:
+        evt.task_transition_refused.current_revision = int(current_revision or 0)
+    except (TypeError, ValueError):
+        evt.task_transition_refused.current_revision = 0
+    evt.task_transition_refused.agent_name = str(agent_name or "")
+    evt.task_transition_refused.invocation_id = str(invocation_id or "")
     return evt
 
 
