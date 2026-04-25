@@ -4205,4 +4205,14 @@ def make_adk_plugin(
                     )
             return None
 
-    return _GoldfiveADKPlugin()
+    # goldfive#271 Phase 0 — wrap each callback in a state-audit
+    # bookkeeping context so the runtime tripwire can recognise
+    # "writes from inside a goldfive callback" and gate them against
+    # the catalog. The wrapping is structural (one ContextVar set per
+    # callback entry / exit) and runs unconditionally; the actual
+    # check fires only when ``GOLDFIVE_STRICT_STATE_OWNERSHIP`` /
+    # the test fixture flips it on. See
+    # ``docs/design/STATE-OWNERSHIP-CONTRACT.md`` §7.
+    from goldfive import _state_audit  # noqa: PLC0415
+
+    return _state_audit.wrap_plugin_callbacks(_GoldfiveADKPlugin())

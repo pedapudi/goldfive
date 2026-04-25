@@ -8,11 +8,62 @@ them when a feature PR has not yet landed.
 from __future__ import annotations
 
 import json
+import os
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# State-ownership audit (goldfive#271 Phase 0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _state_audit_enabled() -> Iterator[None]:
+    """Auto-applied fixture — enable the state-ownership tripwire in tests.
+
+    See ``docs/design/STATE-OWNERSHIP-CONTRACT.md`` §7 for the
+    contract. The tripwire is off in production by default; in tests
+    we flip it on so any new ADK-state mutation from inside a goldfive
+    callback raises :class:`StateOwnershipViolation`.
+
+    Tests that need to drive a deliberate violation use
+    ``goldfive._state_audit.expect_violation(reason)`` to suppress
+    the guard for a specific block.
+
+    Tests that want to disable the audit entirely can override this
+    fixture or use the ``no_state_audit`` fixture below.
+    """
+    prior = os.environ.get("GOLDFIVE_STRICT_STATE_OWNERSHIP")
+    os.environ["GOLDFIVE_STRICT_STATE_OWNERSHIP"] = "1"
+    try:
+        yield
+    finally:
+        if prior is None:
+            os.environ.pop("GOLDFIVE_STRICT_STATE_OWNERSHIP", None)
+        else:
+            os.environ["GOLDFIVE_STRICT_STATE_OWNERSHIP"] = prior
+
+
+@pytest.fixture
+def no_state_audit() -> Iterator[None]:
+    """Disable the state-ownership tripwire for the wrapped test.
+
+    Used by the audit module's own tests to demonstrate the off-state
+    sanity check (catalogued + un-catalogued writes both pass through
+    when the tripwire is disabled).
+    """
+    prior = os.environ.get("GOLDFIVE_STRICT_STATE_OWNERSHIP")
+    os.environ["GOLDFIVE_STRICT_STATE_OWNERSHIP"] = "0"
+    try:
+        yield
+    finally:
+        if prior is None:
+            os.environ.pop("GOLDFIVE_STRICT_STATE_OWNERSHIP", None)
+        else:
+            os.environ["GOLDFIVE_STRICT_STATE_OWNERSHIP"] = prior
 
 # ---------------------------------------------------------------------------
 # stub_call_llm factory
