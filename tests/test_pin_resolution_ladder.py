@@ -557,6 +557,89 @@ async def test_signal5_parent_pin_downstream() -> None:
 # ---------------------------------------------------------------------------
 
 
+async def test_signal6_reasoning_binding_pins_target_task() -> None:
+    """A reasoning-extracted binding routes the agent to the named task.
+
+    Phase 1 of goldfive#271: when the steerer's reasoning judge has
+    recorded a binding (via OrchestrationStore) and confidence is at
+    the threshold, the pin ladder's signal 6 fires before the
+    correction-targeting sub-signal.
+
+    Setup forces every prior signal to fail:
+
+      * No delegation pin (signal 1).
+      * Two PENDING tasks for the agent so signal 2 ties.
+      * No DAG edges and no scoring args, so signals 3 / 4 / 5 also
+        skip / tie.
+      * No pending corrections, so signal 6's correction sub-signal
+        also skips.
+
+    The reasoning binding is the only signal that can disambiguate.
+    """
+    from goldfive.orchestration_store import OrchestrationStore
+
+    plugin = make_adk_plugin(host_agent_name="coord")
+    sinks = [_CapturingSink()]
+    session = _session_with(
+        _plan_with(
+            Task(id="t_alpha", title="Alpha", assignee_agent_id="agent_x"),
+            Task(id="t_beta", title="Beta", assignee_agent_id="agent_x"),
+        )
+    )
+    OrchestrationStore.for_session(session).record_reasoning_extracted_binding(
+        agent_name="agent_x",
+        task_id="t_beta",
+        confidence=0.9,
+    )
+    state, ctx = _ctx_for(session, "coord", sinks=sinks)
+
+    await plugin.before_agent_callback(
+        agent=_Agent("agent_x"),
+        callback_context=ctx,
+    )
+
+    assert state[KEY_CURRENT_TASK_ID] == "t_beta"
+    events = _pin_resolved_events(sinks[0].events)
+    assert events[-1]["payload"]["via_signal"] == "reasoning_binding"
+
+
+async def test_signal6_reasoning_binding_falls_through_when_task_terminal() -> None:
+    """A binding pointing at a COMPLETED task falls through to other signals."""
+    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.types import TaskStatus
+
+    plugin = make_adk_plugin(host_agent_name="coord")
+    sinks = [_CapturingSink()]
+    plan = _plan_with(
+        Task(
+            id="t_alpha",
+            title="Alpha",
+            assignee_agent_id="agent_x",
+            status=TaskStatus.COMPLETED,
+        ),
+        Task(id="t_beta", title="Beta", assignee_agent_id="agent_x"),
+    )
+    session = _session_with(plan)
+    # Binding still names the completed task.
+    OrchestrationStore.for_session(session).record_reasoning_extracted_binding(
+        agent_name="agent_x",
+        task_id="t_alpha",
+        confidence=0.95,
+    )
+    state, ctx = _ctx_for(session, "coord", sinks=sinks)
+
+    await plugin.before_agent_callback(
+        agent=_Agent("agent_x"),
+        callback_context=ctx,
+    )
+
+    # Binding rejected (target terminal) → signal 2 binds the only
+    # remaining DAG-ready PENDING candidate.
+    assert state[KEY_CURRENT_TASK_ID] == "t_beta"
+    events = _pin_resolved_events(sinks[0].events)
+    assert events[-1]["payload"]["via_signal"] != "reasoning_binding"
+
+
 async def test_signal6_pending_correction_pins_target_task() -> None:
     """A pending-correction key targets task ``corr1`` → signal 6 binds it."""
     plugin = make_adk_plugin(host_agent_name="coord")

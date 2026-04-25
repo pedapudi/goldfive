@@ -2093,7 +2093,57 @@ def make_adk_plugin(
                     )
                     return
 
-            # ---- Signal 6: recent drift / correction targeting --------
+            # ---- Signal 6: recent drift / correction / reasoning ------
+            #
+            # Phase 1 of goldfive#271 — Signal 6 has two sub-signals,
+            # consulted in confidence order:
+            #
+            #   6a. Reasoning-extracted binding. The LLM judge in
+            #       :mod:`goldfive.drift.reasoning_judge` returns a
+            #       ``focused_task_id`` + ``focus_confidence`` per
+            #       chain-of-thought block. When the steerer recorded
+            #       a binding for this agent and confidence is at the
+            #       configured threshold, the ladder consumes it as
+            #       a real signal — the agent's *stated intent* names
+            #       which plan task it's working on, which is a
+            #       stronger signal than guessing from token overlap.
+            #
+            #   6b. Pending-correction targeting (the pre-existing
+            #       Signal 6). When a CORRECT-kind supersedes wrote a
+            #       ``goldfive.pending_corrections.<agent>.<task>``
+            #       key, the ladder pins to the correction target.
+            #
+            # When 6a doesn't fire (no binding, low-confidence binding,
+            # binding's task is no longer PENDING/RUNNING) the ladder
+            # falls through to 6b unchanged.
+            reasoning_task = self._task_from_reasoning_binding(
+                ctx=ctx,
+                tasks=tasks_list,
+                agent_name=agent_name,
+            )
+            if reasoning_task is not None:
+                task_id = str(_safe_attr(reasoning_task, "id", "") or "")
+                if task_id:
+                    self._stamp_current_task_id(
+                        ctx=ctx,
+                        callback_context=callback_context,
+                        task_id=task_id,
+                        agent_name=agent_name,
+                        source="reasoning_binding",
+                        task=reasoning_task,
+                        invocation_id=invocation_id,
+                    )
+                    await self._emit_pin_resolved(
+                        ctx=ctx,
+                        agent_name=agent_name,
+                        task_id=task_id,
+                        via_signal="reasoning_binding",
+                        score=0.85,
+                        invocation_id=invocation_id,
+                        candidate_count=0,
+                    )
+                    return
+
             correction_task = self._task_from_pending_correction(
                 ctx=ctx,
                 tasks=tasks_list,
@@ -2383,6 +2433,50 @@ def make_adk_plugin(
                 return preferred[0]
             if scoring_args is not None:
                 return _score_candidates_by_args(preferred, scoring_args)
+            return None
+
+        @staticmethod
+        def _task_from_reasoning_binding(
+            *,
+            ctx: SessionContext,
+            tasks: list[Any],
+            agent_name: str,
+        ) -> Any:
+            """Signal 6a — pin to the task named by a reasoning-extracted binding.
+
+            Phase 1 of goldfive#271. Consults
+            :class:`~goldfive.orchestration_store.OrchestrationStore`
+            for a binding stamped by the steerer's reasoning-judge
+            background path; the binding's
+            ``focused_task_id`` is matched against the plan and the
+            matching PENDING/RUNNING task is returned (or ``None`` if
+            the binding doesn't exist, was below the steerer's
+            configured confidence threshold and was thus never recorded,
+            or names a task that's no longer in the active set).
+
+            The store handles agent-name normalisation (compound /
+            bare-form fallback) so a coordinator that fires the judge
+            against ``"agent_x"`` and a sub-runner pinning under
+            ``"client42:agent_x"`` both find the same binding.
+            """
+            from goldfive.orchestration_store import OrchestrationStore
+            from goldfive.types import TaskStatus
+
+            store = OrchestrationStore.for_session(
+                _safe_attr(ctx, "session", None)
+            )
+            binding = store.get_reasoning_extracted_binding(agent_name)
+            if binding is None or not binding.task_id:
+                return None
+            tasks_by_id = {
+                str(_safe_attr(t, "id", "") or ""): t for t in tasks
+            }
+            task = tasks_by_id.get(binding.task_id)
+            if task is None:
+                return None
+            status = _safe_attr(task, "status", None)
+            if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
+                return task
             return None
 
         @staticmethod

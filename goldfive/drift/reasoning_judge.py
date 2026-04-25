@@ -26,10 +26,21 @@ The prompt is pinned via module-level constants
 wording without re-implementing the parse logic. Rationale for the
 empirical failure of the pre-existing embedding-based pipeline lives in
 goldfive#223 / #224 / #226.
+
+Phase 1 of goldfive#271 adds an *attribution* signal alongside the
+on-task verdict: :func:`classify_reasoning_drift_with_focus` returns
+``focused_task_id`` + ``focus_confidence`` extracted from the same
+LLM call. Same prompt, same cost; the prompt is extended to ask the
+judge to name the plan task the reasoning is actually working on. The
+caller (typically :class:`~goldfive.steerer.DefaultSteerer`) writes
+the binding onto :class:`~goldfive.orchestration_store.OrchestrationStore`
+when confidence is above a threshold; the pin-resolution ladder reads
+it back as a real signal.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
@@ -37,19 +48,23 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from typing import Any
 
-from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Goal, Task
+from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Goal, Plan, Task
 
 log = logging.getLogger(__name__)
 
 
 __all__ = [
     "CallLLM",
+    "PLAN_TASKS_SUMMARY_MAX_CHARS",
     "REASONING_JUDGE_MAX_REASONING_INPUT_CHARS",
     "REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS",
     "REASONING_DRIFT_MAX_REASONING_CHARS",
     "REASONING_DRIFT_SYSTEM_PROMPT",
     "REASONING_DRIFT_USER_PROMPT_TEMPLATE",
+    "ReasoningJudgeVerdict",
     "classify_reasoning_drift",
+    "classify_reasoning_drift_with_focus",
+    "format_plan_tasks_summary",
     "truncate_for_observability",
 ]
 
@@ -107,25 +122,43 @@ REASONING_DRIFT_SYSTEM_PROMPT: str = (
 REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     "You are assessing whether an autonomous agent's chain-of-thought "
     "is on task.\n\n"
+    "PLAN TASKS (id -> title):\n{plan_tasks_summary}\n\n"
+    "CURRENTLY BOUND TASK:\n{task_block}\n\n"
     "GOALS:\n{goals_block}\n\n"
-    "CURRENT TASK:\n{task_block}\n\n"
     "REASONING (the agent's most recent chain-of-thought block):\n"
     "{reasoning_block}\n\n"
-    "Decide: does the reasoning stay focused on the explicit task and "
-    "goals above? Answer STRICTLY in one of these two JSON shapes:\n"
-    '{{"on_task": true}}\n'
-    "OR\n"
-    '{{"on_task": false, "severity": "info"|"warning"|"critical", '
-    '"reason": "one-sentence explanation"}}\n\n'
-    "on_task=true = reasoning is working toward the task / goals "
+    "Decide TWO things:\n"
+    "1. Does the reasoning stay focused on the explicit task and "
+    "goals above? (the on-task verdict)\n"
+    "2. Which task in the PLAN TASKS list above is the reasoning "
+    "actually working on right now? (the attribution verdict — answer "
+    "with a task id from the list, or '' when the reasoning is not "
+    "working on any plan task / is off-plan)\n\n"
+    "Reply with a single JSON object and nothing else, in this shape:\n"
+    "{{\n"
+    '  "on_task": true|false,\n'
+    '  "severity": "info"|"warning"|"critical",\n'
+    '  "reason": "one-sentence explanation",\n'
+    '  "focused_task_id": "<id from PLAN TASKS, or \'\' if off-plan>",\n'
+    '  "focus_confidence": 0.0-1.0,\n'
+    '  "stated_intent": "one-sentence summary of what the agent says it '
+    'is doing"\n'
+    "}}\n\n"
+    "on_task=true = reasoning is working toward the bound task / goals "
     "(clarifying sub-steps, exploring tradeoffs, working through a "
-    "calculation all count as on_task).\n"
+    "calculation all count as on_task). When on_task=true, severity / "
+    "reason may be omitted or empty.\n"
     "on_task=false = reasoning has drifted to an unrelated topic, is "
     "proposing to abandon the task, or is otherwise off-course.\n"
     "Severity guidance when on_task=false:\n"
     "- info = mild tangent that may self-correct next turn.\n"
     "- warning = clear off-topic content that deserves a nudge.\n"
-    "- critical = proposing to abandon or replace the task/goal."
+    "- critical = proposing to abandon or replace the task/goal.\n\n"
+    "focused_task_id MUST be the literal id of one of the listed plan "
+    "tasks, or an empty string when the reasoning is not working on "
+    "any plan task. focus_confidence is your subjective certainty in "
+    "the attribution: 1.0 when the reasoning explicitly names the "
+    "task, 0.0 when you are guessing."
 )
 
 
@@ -196,6 +229,94 @@ def _format_reasoning(reasoning: str) -> str:
     return reasoning[:REASONING_DRIFT_MAX_REASONING_CHARS] + " ... [truncated]"
 
 
+# Hard cap on the plan-tasks-summary section of the prompt. Phase-1
+# brief calls for truncation when the plan grows large enough that the
+# rendered list would dominate the judge's context budget. 2000 chars
+# is the agreed cap (~500 tokens) — comfortably below the prompt's
+# overall budget while leaving room for ~50 tasks at typical title
+# length.
+PLAN_TASKS_SUMMARY_MAX_CHARS: int = 2000
+
+
+def format_plan_tasks_summary(
+    plan: Plan | None,
+    *,
+    max_chars: int = PLAN_TASKS_SUMMARY_MAX_CHARS,
+) -> str:
+    """Render ``plan.tasks`` as a one-per-line ``id -> title`` summary.
+
+    Empty / None plan renders as ``"(no plan tasks)"`` so the prompt
+    template renders cleanly when the plan hasn't been built yet.
+
+    Truncation: when the rendered text exceeds ``max_chars`` we drop
+    suffix lines and append a ``"... [N more tasks]"`` marker so the
+    judge knows the list is incomplete. Truncation prefers to keep the
+    head of the list (most recently planned tasks tend to be most
+    relevant for a "what is the agent working on right now?" judgement
+    — they are at the front of typical refines).
+    """
+    if plan is None or not getattr(plan, "tasks", None):
+        return "(no plan tasks)"
+    lines: list[str] = []
+    rendered_chars = 0
+    truncated = 0
+    tasks = list(plan.tasks)
+    for i, task in enumerate(tasks):
+        tid = str(getattr(task, "id", "") or "")
+        title = str(getattr(task, "title", "") or "(untitled)")
+        line = f"- {tid} -> {title}" if tid else f"- (no id) -> {title}"
+        if rendered_chars + len(line) + 1 > max_chars and lines:
+            truncated = len(tasks) - i
+            break
+        lines.append(line)
+        rendered_chars += len(line) + 1
+    if truncated > 0:
+        lines.append(f"... [{truncated} more task(s) elided]")
+    if not lines:
+        return "(no plan tasks)"
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Extended verdict (Phase 1 of goldfive#271)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class ReasoningJudgeVerdict:
+    """Extended verdict returned by :func:`classify_reasoning_drift_with_focus`.
+
+    Carries both the existing on-task ``DriftEvent`` (or ``None`` when
+    the judge was on-task / failed quietly) and the new attribution
+    fields the Phase-1 prompt extension extracts.
+
+    ``drift`` is the same value the legacy
+    :func:`classify_reasoning_drift` returns, so callers that only
+    care about the drift signal can do
+    ``verdict.drift if verdict else None``.
+
+    ``focused_task_id`` is the plan-task id the judge identified as
+    "what the agent is actually working on right now". Empty string
+    when the judge declined to attribute (off-plan reasoning, or
+    response missing the field). The pin-resolution ladder consumes
+    this; the ``focus_confidence`` lets the consumer gate
+    low-certainty bindings.
+
+    ``focus_confidence`` is the judge's subjective certainty. Clamped
+    to ``[0.0, 1.0]``. Defaults to ``0.0`` when the field is missing
+    or malformed — the caller's threshold then naturally rejects it.
+
+    ``stated_intent`` is the judge's one-sentence summary of what the
+    agent claims to be doing. Optional — surfaced for sinks /
+    observability; not consumed by any current pin-resolution logic.
+    """
+
+    drift: DriftEvent | None
+    focused_task_id: str = ""
+    focus_confidence: float = 0.0
+    stated_intent: str = ""
+
+
 # Map the judge's ``severity`` string to a :class:`DriftSeverity`. Missing
 # or unknown values fall through to WARNING so a drift verdict is never
 # silently swallowed by a bad severity string.
@@ -227,26 +348,89 @@ async def classify_reasoning_drift(
     run_id: str = "",
     session_id: str = "",
     sequence_fn: Callable[[], int] | None = None,
+    plan: Plan | None = None,
 ) -> DriftEvent | None:
     """Ask an LLM-judge whether ``reasoning`` is on-task.
 
-    Returns a :class:`DriftEvent` of kind
-    :data:`~goldfive.types.DriftKind.OFF_TOPIC` when the judge returns
-    ``{"on_task": false, ...}``. Severity comes from the judge's
-    ``severity`` field (``info`` / ``warning`` / ``critical``);
-    missing / unknown values default to
-    :data:`~goldfive.types.DriftSeverity.WARNING`.
+    Back-compat wrapper around
+    :func:`classify_reasoning_drift_with_focus`: returns just the
+    drift component of the extended verdict so existing callers
+    (test suite, third-party importers) keep their ``DriftEvent | None``
+    return shape.
 
-    Returns ``None`` in every other case:
+    See :func:`classify_reasoning_drift_with_focus` for the full
+    parameter docs and the new attribution fields. Phase 1 of
+    goldfive#271 added an optional ``plan`` keyword that the extended
+    function uses to render the plan-tasks attribution prompt; legacy
+    callers can omit it and the prompt renders ``"(no plan tasks)"``
+    for that section.
+    """
+    verdict = await classify_reasoning_drift_with_focus(
+        reasoning=reasoning,
+        task=task,
+        goals=goals,
+        model=model,
+        call_llm=call_llm,
+        current_task_id=current_task_id,
+        current_agent_id=current_agent_id,
+        system_prompt=system_prompt,
+        user_prompt_template=user_prompt_template,
+        sink=sink,
+        run_id=run_id,
+        session_id=session_id,
+        sequence_fn=sequence_fn,
+        plan=plan,
+    )
+    return verdict.drift
 
-    * judge returns ``{"on_task": true}`` (the on-track signal),
-    * judge returns malformed / non-JSON text,
-    * judge returns a dict missing / with a non-boolean ``on_task``,
-    * ``call_llm`` raises.
+
+async def classify_reasoning_drift_with_focus(
+    *,
+    reasoning: str,
+    task: Task | None,
+    goals: Sequence[Goal] | Iterable[Any] | None,
+    model: str,
+    call_llm: CallLLM,
+    current_task_id: str = "",
+    current_agent_id: str = "",
+    system_prompt: str | None = None,
+    user_prompt_template: str | None = None,
+    sink: Any = None,
+    run_id: str = "",
+    session_id: str = "",
+    sequence_fn: Callable[[], int] | None = None,
+    plan: Plan | None = None,
+) -> ReasoningJudgeVerdict:
+    """Ask an LLM-judge whether ``reasoning`` is on-task AND which task it works on.
+
+    Phase 1 of goldfive#271 — the extended judge call. Same LLM
+    request, same cost as the legacy
+    :func:`classify_reasoning_drift`; the prompt template is extended
+    to ask the judge to attribute the reasoning to a specific plan
+    task, returning ``focused_task_id`` + ``focus_confidence``
+    alongside the existing ``on_task`` / ``severity`` / ``reason``
+    fields.
+
+    Returns a :class:`ReasoningJudgeVerdict`:
+
+    * ``verdict.drift`` — same as the legacy function. A
+      :class:`DriftEvent` of kind
+      :data:`~goldfive.types.DriftKind.OFF_TOPIC` when the judge
+      returns ``{"on_task": false, ...}``; ``None`` for on-task
+      verdicts and every quiet-failure path (malformed JSON, missing
+      ``on_task``, ``call_llm`` raised, empty reasoning).
+    * ``verdict.focused_task_id`` — the judge's plan-task attribution.
+      Empty string when the judge declined to attribute, when the
+      response was malformed, or when the call failed.
+    * ``verdict.focus_confidence`` — the judge's subjective certainty,
+      clamped to ``[0.0, 1.0]``. ``0.0`` for every quiet-failure path.
+    * ``verdict.stated_intent`` — optional one-sentence summary the
+      judge produced. Empty when missing or after a failure.
 
     The "quiet on failure" contract matches :func:`classify_goal_drift`
     (goldfive#143). A flaky judge must not spam operator UIs with
-    false-positive OFF_TOPIC alarms.
+    false-positive OFF_TOPIC alarms — the extended fields default to
+    "no signal" rather than raising.
 
     Parameters
     ----------
@@ -255,14 +439,21 @@ async def classify_reasoning_drift(
         to :data:`REASONING_DRIFT_MAX_REASONING_CHARS` before prompting
         so pathologically long blocks cannot blow the context budget.
         Empty or whitespace-only ``reasoning`` is treated as nothing to
-        classify -- returns ``None`` without calling the LLM.
+        classify -- returns an empty verdict without calling the LLM.
     task:
         The currently-bound :class:`Task` (typically from
         ``session.current_task_id``). May be ``None`` when no task is
-        active; the judge then has only ``goals`` to compare against.
+        active; the judge then has only ``goals`` and ``plan`` to
+        compare against.
     goals:
         The session's goals. Each entry should have ``id`` / ``summary``
         attributes or be a plain str. May be ``None`` / empty.
+    plan:
+        The session's plan. The judge needs the list of plan tasks to
+        attribute the reasoning ("which task is the agent actually
+        working on?") — when ``None``, the prompt renders an empty
+        plan-tasks block and the judge will return an empty
+        ``focused_task_id``.
     model:
         Model name forwarded verbatim to ``call_llm``. Empty string is
         permitted; model-bound callables can substitute their own
@@ -295,10 +486,11 @@ async def classify_reasoning_drift(
         should pass the session's ``next_sequence``).
     """
     if not reasoning or not reasoning.strip():
-        return None
+        return ReasoningJudgeVerdict(drift=None)
     system = system_prompt or REASONING_DRIFT_SYSTEM_PROMPT
     template = user_prompt_template or REASONING_DRIFT_USER_PROMPT_TEMPLATE
     user = template.format(
+        plan_tasks_summary=format_plan_tasks_summary(plan),
         goals_block=_format_goals(goals),
         task_block=_format_task(task),
         reasoning_block=_format_reasoning(reasoning),
@@ -326,6 +518,13 @@ async def classify_reasoning_drift(
     reason = ""
     drift: DriftEvent | None = None
     parsed: dict[str, Any] | None = None
+    # Phase 1 — extended attribution fields. Default to "no signal" so
+    # every quiet-failure path (call raises, malformed JSON, missing
+    # field, malformed numeric confidence) yields an empty verdict the
+    # caller's threshold naturally rejects.
+    focused_task_id_parsed: str = ""
+    focus_confidence_parsed: float = 0.0
+    stated_intent_parsed: str = ""
     try:
         async with goldfive_llm_span(
             sinks=span_sinks,
@@ -356,6 +555,28 @@ async def classify_reasoning_drift(
                         severity_str = _severity_from_verdict(
                             parsed.get("severity")
                         ).value.lower()
+                # Extended attribution fields — extracted regardless of
+                # the on_task verdict. The judge can name a focused
+                # task whether or not it considers the reasoning on the
+                # currently-bound one (off-task reasoning still has a
+                # focus — that's how the steerer learns the agent has
+                # silently switched to a different plan task).
+                focused_raw = parsed.get("focused_task_id", "")
+                if isinstance(focused_raw, str):
+                    focused_task_id_parsed = focused_raw.strip()
+                conf_raw = parsed.get("focus_confidence", 0.0)
+                try:
+                    focus_confidence_parsed = float(conf_raw)
+                except (TypeError, ValueError):
+                    focus_confidence_parsed = 0.0
+                # Clamp to [0.0, 1.0]; the prompt asks for 0.0-1.0 but
+                # we don't trust the LLM not to drift outside.
+                focus_confidence_parsed = max(
+                    0.0, min(1.0, focus_confidence_parsed)
+                )
+                intent_raw = parsed.get("stated_intent", "")
+                if isinstance(intent_raw, str):
+                    stated_intent_parsed = intent_raw.strip()
             # Build the span's output / decision strings from the parsed
             # verdict so harmonograf can render "judged agent/task:
             # on-task" inline.
@@ -466,7 +687,12 @@ async def classify_reasoning_drift(
             severity=severity_str,
             reason=reason,
         )
-    return drift
+    return ReasoningJudgeVerdict(
+        drift=drift,
+        focused_task_id=focused_task_id_parsed,
+        focus_confidence=focus_confidence_parsed,
+        stated_intent=stated_intent_parsed,
+    )
 
 
 async def _emit_judge_invoked(
