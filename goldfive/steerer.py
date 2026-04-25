@@ -4088,8 +4088,16 @@ class DefaultSteerer:
 
         Preserves the existing ``revision_index`` monotonicity: the new
         plan's index is at least ``old.revision_index + 1``.
+
+        Phase 2.X / goldfive#271 Gap 2: log the install at INFO so the
+        prior_plan_id → revised_plan_id transition is grep-able in the
+        demo log. The validation E2E found 2 of 4 task_plans rows
+        without corresponding plan events; without this log line a
+        silent install (e.g. an exception in ``_emit_plan_revised``
+        right after) leaves no goldfive-side trace of the swap.
         """
         prev = session.plan
+        prior_id = (getattr(prev, "id", "") or "") if prev is not None else ""
         next_index = (prev.revision_index + 1) if prev is not None else 1
         if revised.revision_index < next_index:
             revised.revision_index = next_index
@@ -4099,6 +4107,14 @@ class DefaultSteerer:
             revised.revision_severity = drift.severity.value
         if not revised.revision_reason:
             revised.revision_reason = drift.detail
+        log.info(
+            "DefaultSteerer._apply_revision: prior_plan_id=%s "
+            "revised_plan_id=%s revision_index=%d drift_kind=%s",
+            prior_id[:16] or "<none>",
+            (revised.id or "")[:16] or "<empty>",
+            int(revised.revision_index),
+            drift.kind.value,
+        )
         # goldfive#199: stamp the trigger_event_id from the drift onto the
         # plan so out-of-band PlanRevised emitters (the SequentialExecutor's
         # plan-swap detector) can thread it through without needing the
@@ -4841,6 +4857,38 @@ class DefaultSteerer:
             )
             evt.plan_revised.refine_output_summary = self._build_refine_output_summary(revised)
             evt.plan_revised.target_agent_id = drift.current_agent_id or ""
+            # Phase 2.X / goldfive#271 Gap 2: log the emission so a
+            # raise-mid-fire scenario (proto build OK, sink emit raises)
+            # leaves a goldfive-side trace before the harmonograf side
+            # observes the gap. Pair with the warning on empty
+            # plan_id / run_id below — those are the harmonograf#197
+            # gate preconditions.
+            plan_id_short = (revised.id or "")[:16] or "<empty>"
+            run_id_short = (session.run_id or "")[:16] or "<empty>"
+            if not session.run_id:
+                log.warning(
+                    "DefaultSteerer._emit_plan_revised: empty run_id for "
+                    "plan_id=%s — harmonograf will drop both the audit "
+                    "row AND the task_plans dispatch (harmonograf#197 "
+                    "gate); this would silently lose the revision",
+                    plan_id_short,
+                )
+            if not revised.id:
+                log.warning(
+                    "DefaultSteerer._emit_plan_revised: empty plan_id on "
+                    "revised plan — harmonograf will drop the task_plans "
+                    "row (no upsert key); this would silently lose the "
+                    "revision",
+                )
+            log.info(
+                "DefaultSteerer._emit_plan_revised: plan_id=%s "
+                "revision_index=%d drift_kind=%s severity=%s run_id=%s",
+                plan_id_short,
+                int(revised.revision_index),
+                drift.kind.value,
+                drift.severity.value,
+                run_id_short,
+            )
             await self._emit(evt)
             # goldfive#251 R4 — every per-task status change carried by the
             # refine (e.g. ``_force_looper_failed`` stamping FAILED on the

@@ -532,3 +532,159 @@ async def test_gate_verdict_logs_at_info_for_operator_visibility(
     assert any(
         "stashed prior plan for next turn's gate" in m for m in messages
     ), f"expected _last_plan stash log; got: {messages!r}"
+
+
+# ---------------------------------------------------------------------------
+# 5. Phase 2.X / Gap 2: plan emission INFO logs (silent-plan observability)
+# ---------------------------------------------------------------------------
+
+
+async def test_plan_submitted_emit_logs_at_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``Runner._emit_plan_submitted`` logs the plan_id, task count, and
+    run_id at INFO. Without it, a silent-plan regression (validation
+    E2E found 2 of 4 task_plans rows without corresponding events) is
+    only visible by querying the harmonograf DB after the fact.
+    """
+    # NOTE: LLMPlanner ignores the JSON's ``id`` field and mints a
+    # fresh uuid; we assert on the task count + non-empty plan_id
+    # rather than the literal id string.
+    turn1_plan = json.dumps(
+        {
+            "id": "plan-log-emit",
+            "summary": "first plan",
+            "tasks": [
+                {"id": "t1", "title": "T1", "assignee_agent_id": "writer"},
+            ],
+        }
+    )
+    planner = LLMPlanner(
+        call_llm=_planner_call_llm_factory(
+            turn1_plan=turn1_plan,
+            turn2_verdict="new_work",
+            refined_plan=None,
+        ),
+        model="stub",
+    )
+    sink = InMemorySink()
+    runner = Runner(
+        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
+        planner=planner,
+        executor=SequentialExecutor(),
+        goal_deriver=PassthroughGoalDeriver("demo"),
+        sinks=[sink],
+    )
+
+    with caplog.at_level(logging.INFO, logger="goldfive.runner"):
+        await runner.run("first turn")
+        await runner.close()
+
+    messages = [rec.getMessage() for rec in caplog.records]
+    submitted_lines = [
+        m for m in messages
+        if "Runner._emit_plan_submitted" in m
+    ]
+    assert submitted_lines, (
+        f"expected Runner._emit_plan_submitted INFO log; got: {messages!r}"
+    )
+    # The LLMPlanner mints its own uuid; assert that task count + run_id
+    # are present and a non-empty plan_id was logged.
+    assert any("tasks=1" in m for m in submitted_lines), (
+        f"tasks=1 missing from emit log; got: {submitted_lines!r}"
+    )
+    assert any("run_id=" in m and "<empty>" not in m for m in submitted_lines), (
+        f"run_id missing/empty in emit log; got: {submitted_lines!r}"
+    )
+    # plan_id is a hex-snippet, but it must be non-empty.
+    assert all("plan_id=<empty>" not in m for m in submitted_lines), (
+        f"plan_id flagged empty; got: {submitted_lines!r}"
+    )
+
+
+async def test_plan_revised_emit_logs_at_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``DefaultSteerer._emit_plan_revised`` logs the plan_id,
+    revision_index, drift_kind, and severity at INFO. Same rationale
+    as the PlanSubmitted log — silent revisions on the validation E2E
+    were only visible via DB inspection.
+    """
+    turn1_plan = json.dumps(
+        {
+            "id": "plan-rev-log",
+            "summary": "first plan",
+            "tasks": [
+                {"id": "t1", "title": "T1", "assignee_agent_id": "writer"},
+            ],
+        }
+    )
+    refined_plan = json.dumps(
+        {
+            "id": "plan-rev-log",
+            "summary": "revised plan",
+            "tasks": [
+                {
+                    "id": "t1",
+                    "title": "T1",
+                    "assignee_agent_id": "writer",
+                    "status": "COMPLETED",
+                },
+                {"id": "t2", "title": "T2 (steer)", "assignee_agent_id": "writer"},
+            ],
+        }
+    )
+    planner = LLMPlanner(
+        call_llm=_planner_call_llm_factory(
+            turn1_plan=turn1_plan,
+            turn2_verdict="refine_existing",
+            refined_plan=refined_plan,
+        ),
+        model="stub",
+    )
+    sink = InMemorySink()
+    runner = Runner(
+        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
+        planner=planner,
+        executor=SequentialExecutor(),
+        goal_deriver=PassthroughGoalDeriver("demo"),
+        sinks=[sink],
+    )
+
+    with caplog.at_level(logging.INFO):
+        await runner.run("first turn")
+        await runner.run("forget first. tell me about second.")
+        await runner.close()
+
+    messages = [rec.getMessage() for rec in caplog.records]
+
+    apply_lines = [
+        m for m in messages
+        if "DefaultSteerer._apply_revision" in m
+    ]
+    assert apply_lines, (
+        f"expected _apply_revision INFO log; got: {messages!r}"
+    )
+    assert any("revised_plan_id=" in m for m in apply_lines), (
+        f"revised_plan_id missing from apply log; got: {apply_lines!r}"
+    )
+    assert any("drift_kind=user_steer" in m for m in apply_lines), (
+        f"drift_kind missing from apply log; got: {apply_lines!r}"
+    )
+    assert any("revision_index=1" in m for m in apply_lines), (
+        f"revision_index missing from apply log; got: {apply_lines!r}"
+    )
+
+    emit_lines = [
+        m for m in messages
+        if "DefaultSteerer._emit_plan_revised" in m
+    ]
+    assert emit_lines, (
+        f"expected _emit_plan_revised INFO log; got: {messages!r}"
+    )
+    assert any("revision_index=1" in m for m in emit_lines), (
+        f"revision_index missing from emit log; got: {emit_lines!r}"
+    )
+    assert any("drift_kind=user_steer" in m for m in emit_lines), (
+        f"drift_kind missing from emit log; got: {emit_lines!r}"
+    )
