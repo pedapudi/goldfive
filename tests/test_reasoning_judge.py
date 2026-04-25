@@ -33,6 +33,7 @@ pytestmark = pytest.mark.skipif(
 from goldfive.drift import reasoning_judge as rjudge  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
+    DriftEvent,
     DriftKind,
     DriftSeverity,
     Goal,
@@ -632,7 +633,12 @@ async def test_observe_reasoning_judge_exception_does_not_crash(
     async def _boom(*args: Any, **kwargs: Any) -> Any:  # noqa: ARG001
         raise RuntimeError("judge exploded")
 
+    # The steerer's background judge uses ``analyze_reasoning_with_focus``
+    # since Phase 1 of goldfive#271 (extended verdict path). Patch both
+    # entry points so the test stays robust whichever one the steerer
+    # ends up calling.
     monkeypatch.setattr(reasoning_mod, "analyze_reasoning", _boom)
+    monkeypatch.setattr(reasoning_mod, "analyze_reasoning_with_focus", _boom)
 
     # Any valid judge wiring -- analyze_reasoning is monkeypatched
     # before the background task dispatches.
@@ -709,3 +715,263 @@ async def test_shutdown_is_noop_when_no_background_judges() -> None:
     # No observe_reasoning call -> empty set.
     assert steerer._background_judges == set()
     await steerer.shutdown(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 of goldfive#271 — extended verdict (focused_task_id)
+# ---------------------------------------------------------------------------
+
+
+async def test_classify_with_focus_returns_verdict_with_attribution() -> None:
+    """The judge's focused_task_id + confidence surface on the verdict."""
+    call_llm = _stub_call_llm(
+        [
+            {
+                "on_task": True,
+                "focused_task_id": "t1",
+                "focus_confidence": 0.9,
+                "stated_intent": "researching solar panels",
+            }
+        ]
+    )
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[Task(id="t1", title="Research solar panels")],
+        edges=[],
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="I'll start by reviewing the solar-panel datasheets.",
+        task=_task(),
+        goals=_goals(),
+        plan=plan,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is None  # on-task
+    assert verdict.focused_task_id == "t1"
+    assert verdict.focus_confidence == 0.9
+    assert verdict.stated_intent == "researching solar panels"
+
+
+async def test_classify_with_focus_off_task_carries_drift_and_attribution() -> None:
+    """An off-task verdict still records the focus the agent has switched to."""
+    call_llm = _stub_call_llm(
+        [
+            {
+                "on_task": False,
+                "severity": "warning",
+                "reason": "switched to write_report",
+                "focused_task_id": "t2",
+                "focus_confidence": 0.95,
+                "stated_intent": "writing the final report",
+            }
+        ]
+    )
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="t1", title="Research"),
+            Task(id="t2", title="Write report"),
+        ],
+        edges=[],
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="Let me just start drafting the report instead.",
+        task=Task(id="t1", title="Research"),
+        goals=[],
+        plan=plan,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind == DriftKind.OFF_TOPIC
+    assert verdict.drift.severity == DriftSeverity.WARNING
+    # Off-task reasoning still reveals attribution: t2.
+    assert verdict.focused_task_id == "t2"
+    assert verdict.focus_confidence == 0.95
+
+
+async def test_classify_with_focus_clamps_confidence_to_unit_interval() -> None:
+    """Confidence outside [0, 1] is clamped at parse time."""
+    call_llm = _stub_call_llm(
+        [{"on_task": True, "focused_task_id": "t1", "focus_confidence": 5.0}]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thinking",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.focus_confidence == 1.0
+
+
+async def test_classify_with_focus_off_plan_yields_empty_focus() -> None:
+    """A judge that returns no attribution gives focused_task_id=''."""
+    call_llm = _stub_call_llm(
+        [
+            {
+                "on_task": False,
+                "severity": "info",
+                "focused_task_id": "",
+                "focus_confidence": 0.0,
+            }
+        ]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="random tangent",
+        task=_task(),
+        goals=[],
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.focused_task_id == ""
+    assert verdict.focus_confidence == 0.0
+
+
+async def test_classify_with_focus_malformed_response_returns_empty_verdict() -> None:
+    """A non-JSON response yields a verdict with everything empty."""
+    call_llm = _stub_call_llm(["this is not JSON at all"])
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thinking",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is None
+    assert verdict.focused_task_id == ""
+    assert verdict.focus_confidence == 0.0
+
+
+async def test_classify_with_focus_call_llm_raises_returns_empty_verdict() -> None:
+    """An LLM exception leaves attribution fields at default ('no signal')."""
+    call_llm = _raising_call_llm(RuntimeError("503"))
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thinking",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is None
+    assert verdict.focused_task_id == ""
+    assert verdict.focus_confidence == 0.0
+
+
+async def test_classify_with_focus_empty_reasoning_skips_llm_call() -> None:
+    """An empty reasoning block returns an empty verdict without calling the LLM."""
+    call_llm = _stub_call_llm([])  # would fail if called
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is None
+    assert verdict.focused_task_id == ""
+
+
+async def test_legacy_classify_reasoning_drift_returns_drift_only() -> None:
+    """The back-compat wrapper returns just the drift component.
+
+    Existing call sites depend on ``DriftEvent | None`` — the
+    extended fields live on
+    :func:`classify_reasoning_drift_with_focus`. This test pins the
+    delegating wrapper.
+    """
+    call_llm = _stub_call_llm(
+        [
+            {
+                "on_task": False,
+                "severity": "critical",
+                "focused_task_id": "t1",
+                "focus_confidence": 0.9,
+            }
+        ]
+    )
+    drift = await rjudge.classify_reasoning_drift(
+        reasoning="abandon ship",
+        task=_task(),
+        goals=_goals(),
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert isinstance(drift, DriftEvent)
+    assert drift.severity == DriftSeverity.CRITICAL
+
+
+# ---------------------------------------------------------------------------
+# Plan-tasks summary truncation
+# ---------------------------------------------------------------------------
+
+
+def test_format_plan_tasks_summary_renders_id_arrow_title() -> None:
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[
+            Task(id="t1", title="Alpha"),
+            Task(id="t2", title="Beta"),
+        ],
+        edges=[],
+    )
+    rendered = rjudge.format_plan_tasks_summary(plan)
+    assert "- t1 -> Alpha" in rendered
+    assert "- t2 -> Beta" in rendered
+
+
+def test_format_plan_tasks_summary_truncates_when_over_budget() -> None:
+    """A pathologically long task list is truncated with a marker."""
+    tasks = [
+        Task(id=f"t{i}", title="x" * 80)
+        for i in range(100)
+    ]
+    plan = Plan(id="p1", run_id="r1", goal_ids=[], tasks=tasks, edges=[])
+    rendered = rjudge.format_plan_tasks_summary(plan, max_chars=200)
+    # Truncation marker is present.
+    assert "more task" in rendered
+    # The rendered text obeys the cap (modulo the truncation line).
+    body_lines = [
+        line for line in rendered.splitlines()
+        if not line.startswith("...")
+    ]
+    assert sum(len(line) for line in body_lines) <= 220  # cap + small slack
+
+
+def test_format_plan_tasks_summary_empty_plan_renders_placeholder() -> None:
+    assert rjudge.format_plan_tasks_summary(None) == "(no plan tasks)"
+    empty_plan = Plan(id="p1", run_id="r1", goal_ids=[], tasks=[], edges=[])
+    assert rjudge.format_plan_tasks_summary(empty_plan) == "(no plan tasks)"
+
+
+def test_classify_with_focus_renders_plan_tasks_into_prompt() -> None:
+    """The judge's user prompt includes the plan-tasks summary section."""
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[Task(id="t1", title="Alpha"), Task(id="t2", title="Beta")],
+        edges=[],
+    )
+    rendered = rjudge.REASONING_DRIFT_USER_PROMPT_TEMPLATE.format(
+        plan_tasks_summary=rjudge.format_plan_tasks_summary(plan),
+        goals_block="(no goals)",
+        task_block="(no task bound)",
+        reasoning_block="thinking",
+    )
+    assert "PLAN TASKS" in rendered
+    assert "t1 -> Alpha" in rendered
+    assert "focused_task_id" in rendered
+    assert "focus_confidence" in rendered

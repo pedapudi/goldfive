@@ -325,6 +325,7 @@ class DefaultSteerer:
         reasoning_drift_call_llm: ReflectiveCallLLM | None = None,
         reasoning_drift_model: str = "",
         reasoning_drift_rate_limit: int = 3,
+        reasoning_binding_confidence_threshold: float = 0.7,
         plan_revision_cooldown_seconds: float = 0.0,
         steering_config: SteeringConfig | None = None,
         goldfive_steer_threshold: str | None = None,
@@ -515,6 +516,21 @@ class DefaultSteerer:
         self._reasoning_drift_call_llm: ReflectiveCallLLM | None = reasoning_drift_call_llm
         self._reasoning_drift_model = reasoning_drift_model
         self._reasoning_drift_rate_limit = max(1, int(reasoning_drift_rate_limit))
+        # Phase 1 of goldfive#271 — confidence threshold for recording a
+        # reasoning-extracted binding onto OrchestrationStore. The
+        # judge returns a focus_confidence in [0.0, 1.0]; bindings with
+        # confidence >= this threshold are stamped, lower-confidence
+        # ones are discarded so the pin-resolution ladder doesn't
+        # consume noisy attributions. Clamped to [0.0, 1.0]. Defaults
+        # to 0.7 — empirically the band where the judge's
+        # plan-task attribution stops being a guess.
+        try:
+            _conf_threshold = float(reasoning_binding_confidence_threshold)
+        except (TypeError, ValueError):
+            _conf_threshold = 0.7
+        self._reasoning_binding_confidence_threshold: float = max(
+            0.0, min(1.0, _conf_threshold)
+        )
         # Drift-triggered plan-revision cooldown (goldfive#227).
         # Clamped to a non-negative float; ``0.0`` disables the gate
         # so callers can opt out without subclassing.
@@ -1294,6 +1310,7 @@ class DefaultSteerer:
                 call_llm=rl_call_llm,
                 judge_sink=judge_sink,
                 history_length=history_length,
+                agent_name=agent_name,
             )
         )
         self._background_judges.add(bg_task)
@@ -1307,6 +1324,7 @@ class DefaultSteerer:
         call_llm: ReflectiveCallLLM | None,
         judge_sink: Any,
         history_length: int,
+        agent_name: str = "",
     ) -> None:
         """Run the mode-selected reasoning drift pipeline off the critical path.
 
@@ -1336,7 +1354,7 @@ class DefaultSteerer:
         adapter callback that scheduled us has long since returned.
         """
         try:
-            from goldfive.drift.reasoning import analyze_reasoning
+            from goldfive.drift.reasoning import analyze_reasoning_with_focus
 
             # Save the shared live history and swap in a list snapshot
             # truncated to the length captured at schedule time. Using
@@ -1348,7 +1366,14 @@ class DefaultSteerer:
             pinned_history = list(original_history[:history_length])
             session.reasoning_history = pinned_history
             try:
-                drift = await analyze_reasoning(
+                # Phase 1 of goldfive#271 — call the focused-verdict
+                # path so we get the judge's plan-task attribution
+                # alongside the drift signal. ``analyze_reasoning_with_focus``
+                # is a sibling of ``analyze_reasoning`` that threads a
+                # :class:`ReasoningJudgeVerdict` instead of just the
+                # drift; legacy callers of ``analyze_reasoning`` keep
+                # their existing return shape.
+                verdict = await analyze_reasoning_with_focus(
                     text,
                     session,
                     mode=self._reasoning_drift_mode,
@@ -1362,6 +1387,19 @@ class DefaultSteerer:
                 # ``session.reasoning_history`` at a separate list for
                 # our window.
                 session.reasoning_history = original_history
+
+            # Record the reasoning-extracted binding onto the
+            # orchestration store regardless of the drift verdict —
+            # an on-task verdict that names a different plan task is
+            # itself a useful pin-resolution signal (the agent has
+            # silently moved to a different task without reporting).
+            self._maybe_record_reasoning_binding(
+                session=session,
+                verdict=verdict,
+                agent_name=agent_name,
+            )
+
+            drift = verdict.drift
             if drift is None:
                 return
             if not drift.trigger_input:
@@ -1375,6 +1413,72 @@ class DefaultSteerer:
         except Exception as exc:  # noqa: BLE001 — background task
             log.warning(
                 "DefaultSteerer: background reasoning-judge raised "
+                "(swallowed): %s",
+                exc,
+            )
+
+    def _maybe_record_reasoning_binding(
+        self,
+        *,
+        session: Session,
+        verdict: Any,
+        agent_name: str,
+    ) -> None:
+        """Stamp a reasoning-extracted binding onto the OrchestrationStore.
+
+        Phase 1 of goldfive#271. Called from
+        :meth:`_run_judge_background` after the LLM judge returns its
+        :class:`~goldfive.drift.reasoning_judge.ReasoningJudgeVerdict`.
+        Records a binding when:
+
+        * the verdict carries a non-empty ``focused_task_id``,
+        * the agent name is non-empty (we key bindings by agent),
+        * ``focus_confidence`` is at least the configured threshold.
+
+        Lower-confidence verdicts are silently dropped so the pin
+        ladder doesn't consume noisy bindings. Failures inside the
+        store helper degrade silently — the judge's primary job is
+        the drift signal, not the binding.
+        """
+        if not agent_name:
+            return
+        focused = getattr(verdict, "focused_task_id", "")
+        if not focused:
+            return
+        confidence = float(getattr(verdict, "focus_confidence", 0.0) or 0.0)
+        if confidence < self._reasoning_binding_confidence_threshold:
+            log.debug(
+                "DefaultSteerer: reasoning binding for agent=%r "
+                "task=%r dropped (confidence=%.2f < threshold=%.2f)",
+                agent_name,
+                focused,
+                confidence,
+                self._reasoning_binding_confidence_threshold,
+            )
+            return
+        try:
+            from goldfive.orchestration_store import OrchestrationStore
+
+            store = OrchestrationStore.for_session(session)
+            recorded = store.record_reasoning_extracted_binding(
+                agent_name=agent_name,
+                task_id=focused,
+                confidence=confidence,
+                recorded_at_turn=session.next_sequence(),
+                run_id=session.run_id,
+                session_id=session.id,
+            )
+            if recorded is not None:
+                log.info(
+                    "DefaultSteerer: recorded reasoning-extracted binding "
+                    "agent=%r task=%r confidence=%.2f",
+                    agent_name,
+                    focused,
+                    confidence,
+                )
+        except Exception as exc:  # noqa: BLE001 — never break the run
+            log.warning(
+                "DefaultSteerer: record_reasoning_extracted_binding raised "
                 "(swallowed): %s",
                 exc,
             )
@@ -3158,29 +3262,24 @@ class DefaultSteerer:
         if not self._severity_meets_promotion_threshold(drift.severity):
             return False
         # Consult the active user steer freshness window.
+        # Phase 1 of goldfive#271 — read through OrchestrationStore so
+        # the active-steer slot reads from a single named accessor; the
+        # underlying ``_ostate.read`` calls still funnel through the
+        # goldfive Session.state dict, just behind a typed surface.
         window = self._goldfive_steer_suppression_window_turns
         if window > 0:
-            active_source = _ostate.read(
-                session.state, _ostate.KEY_ACTIVE_STEER_SOURCE, ""
-            )
-            active_at_turn = _ostate.read(
-                session.state, _ostate.KEY_ACTIVE_STEER_AT_TURN, None
-            )
-            if str(active_source or "").lower() == "user" and isinstance(
-                active_at_turn, int
-            ):
+            from goldfive.orchestration_store import OrchestrationStore
+
+            active = OrchestrationStore.for_session(session).get_active_steer()
+            if active is not None and active.source.lower() == "user":
                 current_turn = int(getattr(session, "_next_sequence", 0) or 0)
-                age = current_turn - int(active_at_turn)
+                age = current_turn - active.at_turn
                 if 0 <= age < window:
-                    active_body = str(
-                        _ostate.read(session.state, _ostate.KEY_ACTIVE_STEER_BODY, "")
-                        or ""
-                    )
                     drift.suppressed_by_user_steer = True
                     log.info(
                         "goldfive steer suppressed: user steer %r is active "
                         "(age=%d turns, window=%d)",
-                        active_body,
+                        active.body,
                         age,
                         window,
                     )
@@ -4584,13 +4683,15 @@ class DefaultSteerer:
         # 2. goldfive orchestration session.state pin (the reporting-
         # tool fallback's source of truth). Use the canonical state key
         # so tests that inspect the state dict directly see the update.
+        # Phase 1 of goldfive#271 — read through OrchestrationStore;
+        # the write stays at this call site (Phase 2 migration target
+        # per the catalog).
         state = getattr(session, "state", None)
         if isinstance(state, dict):
-            state_pinned = state.get(_ostate.KEY_CURRENT_TASK_ID, "")
-            if isinstance(state_pinned, str):
-                state_pinned_s = state_pinned.strip()
-            else:
-                state_pinned_s = str(state_pinned or "").strip()
+            from goldfive.orchestration_store import OrchestrationStore
+
+            store = OrchestrationStore.for_state(state)
+            state_pinned_s = store.pin_current_task().strip()
             if state_pinned_s and state_pinned_s in supersession:
                 resolved = _resolve_chain(state_pinned_s)
                 if resolved != state_pinned_s:

@@ -107,6 +107,51 @@ def format_correction_block(correction: Mapping[str, Any]) -> str:
     )
 
 
+def _read_pending_correction(
+    *,
+    state: Mapping[str, Any],
+    agent_name: str,
+    current_task_id: str,
+) -> str:
+    """Resolve the pending-correction block for ``(agent, task)``.
+
+    Phase 1 of goldfive#271 — read-of-record migration. Tries the
+    goldfive :class:`~goldfive.orchestration_store.OrchestrationStore`
+    first when the resolver can reach the goldfive Session via the
+    SessionContext stash on ADK state; falls back to reading the
+    bridged ADK state value when the goldfive Session isn't reachable
+    (legacy tests, pre-#152 adapters).
+
+    Always returns a string (empty when no correction exists / the
+    payload is malformed). Caller appends the result to the
+    instruction block when non-empty.
+    """
+    # Goldfive-side read (Phase 1 target).
+    session = _goldfive_session_from_state(state)
+    if session is not None:
+        try:
+            from goldfive.orchestration_store import OrchestrationStore
+
+            store = OrchestrationStore.for_session(session)
+            value = store.get_correction(agent_name, current_task_id)
+            if value is not None:
+                return _resolve_pending_correction(value)
+        except Exception as exc:  # noqa: BLE001 — defensive
+            log.debug(
+                "_read_pending_correction: store lookup raised for "
+                "agent=%r task=%r: %s — falling back to ADK state",
+                agent_name,
+                current_task_id,
+                exc,
+            )
+    # ADK-side fallback. Reads the bridged copy V2 maintains so
+    # legacy unit tests / custom adapters that don't stash a
+    # SessionContext keep working.
+    return _resolve_pending_correction(
+        state.get(pending_correction_key(agent_name, current_task_id))
+    )
+
+
 def _resolve_pending_correction(raw: Any) -> str:
     """Normalise a pending-correction state value to the final prompt string.
 
@@ -186,6 +231,27 @@ def _compose_instruction(
     return block
 
 
+def _goldfive_session_from_state(state: Mapping[str, Any]) -> Any:
+    """Return the goldfive ``Session`` reachable from ADK ``state``, or ``None``.
+
+    The ADK adapter stashes a
+    :class:`~goldfive.adapters._adk_plugin.SessionContext` onto ADK
+    ``session.state`` under ``"goldfive._session_context"`` (V7 in the
+    Phase 0 audit). When present, the ``.session`` attribute is the
+    goldfive :class:`~goldfive.types.Session` whose
+    :attr:`~goldfive.types.Session.state` dict is the goldfive-owned
+    orchestration store. Returns ``None`` when the key is missing
+    (pre-#152 path, or a custom adapter that doesn't stash) so the
+    resolver can fall back to reading from ADK state directly.
+    """
+    if not isinstance(state, Mapping):
+        return None
+    ctx = state.get("goldfive._session_context")
+    if ctx is None:
+        return None
+    return getattr(ctx, "session", None)
+
+
 def make_dynamic_instruction(
     original_instruction: str,
     agent_name: str,
@@ -203,6 +269,17 @@ def make_dynamic_instruction(
 
     The resolver is pure: given the same state it returns the same
     string. No side effects, no persistence.
+
+    Phase 1 of goldfive#271 — when the resolver can reach the goldfive
+    :class:`~goldfive.types.Session` via the
+    :data:`SESSION_CONTEXT_STATE_KEY` stash, the pending-correction
+    lookup goes through
+    :class:`~goldfive.orchestration_store.OrchestrationStore` so the
+    typed accessor is the read of record. When the goldfive Session
+    isn't reachable (legacy unit tests that drive the resolver against
+    a plain ADK state dict, or pre-#152 adapters), the resolver falls
+    back to reading the bridged ADK state directly — same behaviour
+    as before Phase 1.
     """
 
     def resolver(readonly_ctx: Any) -> str:
@@ -223,10 +300,10 @@ def make_dynamic_instruction(
                 state.get(_sp.KEY_CURRENT_TASK_DESCRIPTION, "") or ""
             )
 
-            pending_correction = _resolve_pending_correction(
-                state.get(
-                    pending_correction_key(agent_name, current_task_id),
-                )
+            pending_correction = _read_pending_correction(
+                state=state,
+                agent_name=agent_name,
+                current_task_id=current_task_id,
             )
 
             return _compose_instruction(

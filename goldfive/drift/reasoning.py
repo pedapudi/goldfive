@@ -46,7 +46,9 @@ from goldfive.drift.reasoning_judge import (
     CallLLM as JudgeCallLLM,
 )
 from goldfive.drift.reasoning_judge import (
-    classify_reasoning_drift,
+    ReasoningJudgeVerdict,
+    classify_reasoning_drift,  # noqa: F401 — re-export consumed by tests
+    classify_reasoning_drift_with_focus,
 )
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity
 
@@ -89,6 +91,7 @@ __all__ = [
     "SENTENCE_LEVEL_MIN_BLOCK_LENGTH",
     "SENTENCE_LEVEL_MAX_SENTENCES",
     "analyze_reasoning",
+    "analyze_reasoning_with_focus",
     "detect_confusion",
     "detect_intent_divergence",
     "detect_looping_reasoning",
@@ -956,7 +959,11 @@ async def _run_judge(
     model: str,
     sink: Any = None,
 ) -> DriftEvent | None:
-    """Dispatch ``classify_reasoning_drift`` against the current task.
+    """Dispatch :func:`classify_reasoning_drift` against the current task.
+
+    Returns just the drift component of the extended verdict. Steerer
+    callers that need the attribution fields call
+    :func:`_run_judge_with_focus` directly.
 
     When ``sink`` is provided it is forwarded into the classifier so a
     ``ReasoningJudgeInvoked`` event is emitted on every invocation
@@ -964,11 +971,37 @@ async def _run_judge(
     sequence are stamped from the session so downstream consumers can
     correlate the observability event with the session's other events.
     """
+    verdict = await _run_judge_with_focus(
+        text, session, call_llm=call_llm, model=model, sink=sink
+    )
+    return verdict.drift
+
+
+async def _run_judge_with_focus(
+    text: str,
+    session: Session,
+    *,
+    call_llm: JudgeCallLLM,
+    model: str,
+    sink: Any = None,
+) -> ReasoningJudgeVerdict:
+    """Dispatch :func:`classify_reasoning_drift_with_focus` against the current task.
+
+    Phase 1 of goldfive#271 — returns the full verdict (drift +
+    attribution fields) so the steerer can record a reasoning-extracted
+    binding onto :class:`~goldfive.orchestration_store.OrchestrationStore`
+    when ``focus_confidence`` clears the configured threshold.
+
+    Same shape as :func:`_run_judge` for the LLM call itself; the only
+    delta is the return type. Stamps ``plan`` so the prompt's
+    plan-tasks-attribution section is populated.
+    """
     task = _current_task(session)
-    return await classify_reasoning_drift(
+    return await classify_reasoning_drift_with_focus(
         reasoning=text,
         task=task,
         goals=list(session.goals),
+        plan=getattr(session, "plan", None),
         model=model,
         call_llm=call_llm,
         current_task_id=session.current_task_id,
@@ -977,6 +1010,91 @@ async def _run_judge(
         session_id=session.id,
         sequence_fn=session.next_sequence,
     )
+
+
+async def analyze_reasoning_with_focus(
+    text: str,
+    session: Session,
+    *,
+    mode: ReasoningDriftMode = "embedding",
+    call_llm: JudgeCallLLM | None = None,
+    model: str = "",
+    sink: Any = None,
+) -> ReasoningJudgeVerdict:
+    """Phase-1 sibling of :func:`analyze_reasoning` returning a focused verdict.
+
+    Same selection logic as :func:`analyze_reasoning`; the only
+    difference is the return type. When the judge path runs, callers
+    get the full
+    :class:`~goldfive.drift.reasoning_judge.ReasoningJudgeVerdict` —
+    drift + ``focused_task_id`` + ``focus_confidence`` +
+    ``stated_intent``. The legacy embedding pipeline, which has no
+    judge, returns a verdict with the embedding-derived drift and
+    empty attribution fields (the embedding pipeline can't attribute
+    against the plan-tasks list).
+
+    Modes:
+
+    * ``"judge"`` — runs only the judge; verdict carries judge fields.
+    * ``"embedding"`` — runs the embedding pipeline; verdict has
+      ``drift`` set when off-topic and empty attribution fields.
+    * ``"both"`` — both pipelines fire; the worst-severity drift
+      wins (same tie-break as :func:`analyze_reasoning`); attribution
+      fields come from the judge regardless of which drift won.
+    * ``"off"`` — empty verdict.
+
+    The legacy :func:`analyze_reasoning` is unchanged — it now
+    delegates to this function and returns ``verdict.drift`` for
+    back-compat with every existing caller.
+    """
+    if not text or mode == "off":
+        return ReasoningJudgeVerdict(drift=None)
+    if mode == "embedding":
+        return ReasoningJudgeVerdict(drift=_embedding_pipeline(text, session))
+    if mode == "judge":
+        if call_llm is None:
+            return ReasoningJudgeVerdict(drift=None)
+        return await _run_judge_with_focus(
+            text, session, call_llm=call_llm, model=model, sink=sink
+        )
+    if mode == "both":
+        embedding_drift = _embedding_pipeline(text, session)
+        judge_verdict: ReasoningJudgeVerdict | None = None
+        if call_llm is not None:
+            judge_verdict = await _run_judge_with_focus(
+                text, session, call_llm=call_llm, model=model, sink=sink
+            )
+        if judge_verdict is None:
+            return ReasoningJudgeVerdict(drift=embedding_drift)
+        if embedding_drift is None:
+            return judge_verdict
+        # Both fired — worst-severity wins. Embedding wins ties
+        # (deterministic, synchronous path). Either way, the
+        # attribution fields come from the judge — the embedding
+        # pipeline doesn't produce them.
+        if judge_verdict.drift is None:
+            return ReasoningJudgeVerdict(
+                drift=embedding_drift,
+                focused_task_id=judge_verdict.focused_task_id,
+                focus_confidence=judge_verdict.focus_confidence,
+                stated_intent=judge_verdict.stated_intent,
+            )
+        if _SEVERITY_ORDER[judge_verdict.drift.severity] > _SEVERITY_ORDER[
+            embedding_drift.severity
+        ]:
+            return judge_verdict
+        return ReasoningJudgeVerdict(
+            drift=embedding_drift,
+            focused_task_id=judge_verdict.focused_task_id,
+            focus_confidence=judge_verdict.focus_confidence,
+            stated_intent=judge_verdict.stated_intent,
+        )
+    log.warning(
+        "analyze_reasoning_with_focus: unknown mode=%r; falling back "
+        "to 'embedding'",
+        mode,
+    )
+    return ReasoningJudgeVerdict(drift=_embedding_pipeline(text, session))
 
 
 async def analyze_reasoning(
