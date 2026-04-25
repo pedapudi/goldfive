@@ -99,13 +99,6 @@ KEY_CANCEL_REQUESTED = "goldfive.cancel_requested"
 # way.
 KEY_INVOCATION_PARENTS = "goldfive.invocation_parents"
 
-_CURRENT_TASK_KEYS: tuple[str, ...] = (
-    KEY_CURRENT_TASK_ID,
-    KEY_CURRENT_TASK_TITLE,
-    KEY_CURRENT_TASK_DESCRIPTION,
-    KEY_CURRENT_TASK_ASSIGNEE,
-)
-
 ALL_KEYS: tuple[str, ...] = (
     KEY_CURRENT_TASK_ID,
     KEY_CURRENT_TASK_TITLE,
@@ -242,76 +235,14 @@ def read_divergence_flag(state: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def write_current_task_id(state: MutableMapping[str, Any], task_id: str) -> None:
-    """Stamp just ``goldfive.current_task_id`` onto ``state``.
-
-    Narrower than :func:`write_current_task` which rewrites all four
-    ``current_task_*`` keys from a :class:`Task`. Used by the adapter's
-    ``before_agent_callback`` pin path (goldfive#191 Layer 1) where the
-    plugin only knows the id at delegation time and doesn't want to
-    overwrite the title/description/assignee written earlier by the
-    reconciler.
-
-    Empty / None ``task_id`` is a no-op — callers that want to clear
-    the key should use :func:`clear_current_task`.
-    """
-    if not task_id:
-        return
-    _set(state, KEY_CURRENT_TASK_ID, _safe_str(task_id))
-
-
-def write_current_task(state: MutableMapping[str, Any], task: Any) -> None:
-    """Mutate state with current_task_* fields from a :class:`goldfive.types.Task`.
-
-    Accepts anything that duck-types to goldfive's ``Task`` (``.id``,
-    ``.title``, ``.description``, ``.assignee_agent_id``) or a mapping
-    with equivalent keys. ``None`` clears the current task.
-    """
-    if task is None:
-        clear_current_task(state)
-        return
-
-    if isinstance(task, Mapping):
-        tid = task.get("id", "")
-        title = task.get("title", "")
-        description = task.get("description", "")
-        assignee = task.get("assignee") or task.get("assignee_agent_id", "")
-    else:
-        tid = getattr(task, "id", "")
-        title = getattr(task, "title", "")
-        description = getattr(task, "description", "")
-        assignee = getattr(task, "assignee_agent_id", "") or getattr(task, "assignee", "")
-
-    _set(state, KEY_CURRENT_TASK_ID, _safe_str(tid))
-    _set(state, KEY_CURRENT_TASK_TITLE, _safe_str(title))
-    _set(state, KEY_CURRENT_TASK_DESCRIPTION, _safe_str(description))
-    _set(state, KEY_CURRENT_TASK_ASSIGNEE, _safe_str(assignee))
-
-
-def clear_current_task(state: MutableMapping[str, Any]) -> None:
-    for key in _CURRENT_TASK_KEYS:
-        if key in state:
-            state.pop(key, None)
-    state.pop(KEY_CURRENT_TASK_REVISION, None)
-
-
-def write_current_task_revision(
-    state: MutableMapping[str, Any],
-    revision: int,
-) -> None:
-    """Stamp ``goldfive.current_task_revision`` onto ``state``.
-
-    Companion to :func:`write_current_task_id` for goldfive#266 pin
-    versioning. The adapter's pin ladder calls this alongside the
-    id-only write so the report-time classifier in
-    :mod:`goldfive.reporting` can distinguish a fresh pin (matches
-    ``plan.revision_index``) from one set under an older revision.
-    """
-    try:
-        rev = max(0, int(revision))
-    except (TypeError, ValueError):
-        rev = 0
-    _set(state, KEY_CURRENT_TASK_REVISION, rev)
+# Note: the adapter-side ``write_current_task`` / ``write_current_task_id``
+# / ``write_current_task_revision`` / ``clear_current_task`` writers were
+# removed in Phase 2.1 of goldfive#271. The pin lives on goldfive
+# ``Session.state`` exclusively now (see
+# :mod:`goldfive.orchestration_store`); no callback-time write to ADK
+# ``session.state`` for the pin keys remains. The key constants stay
+# (read-side contract for custom adapters that consult the live ADK
+# session) but the writers are gone.
 
 
 # ---------------------------------------------------------------------------

@@ -245,10 +245,12 @@ def test_apply_llm_signature_noop_for_unknown_tool() -> None:
 
 async def test_hidden_task_id_populates_from_state() -> None:
     """LLM calls ``report_task_started()`` with no task_id arg — the
-    callback populates from ``goldfive.current_task_id`` state before
-    the handler runs."""
-    plugin, state, captured, _, _ = _make_plugin_with_handler("report_task_started")
-    state[KEY_CURRENT_TASK_ID] = "t-pinned"
+    callback populates from ``goldfive.current_task_id`` on goldfive
+    ``Session.state`` before the handler runs."""
+    plugin, state, captured, session_obj, _ = _make_plugin_with_handler(
+        "report_task_started"
+    )
+    session_obj.state[KEY_CURRENT_TASK_ID] = "t-pinned"
 
     args: dict[str, Any] = {"detail": "starting"}
     result = await plugin.before_tool_callback(
@@ -686,12 +688,12 @@ async def test_delegation_pin_beats_agent_turn_pin() -> None:
         "report_task_completed", plan=plan
     )
 
-    # Simulate: coordinator already stamped delegation pin for fc_A
-    # on the ADK tool_context state (this is what the reporting-tool
-    # callback reads from).
-    state[_PENDING_DELEGATIONS_KEY] = {"fc_A": "research_solar"}
+    # Simulate: coordinator already stamped delegation pin for fc_A on
+    # goldfive Session.state. Phase 2.1 (goldfive#271) — V4 readers
+    # consult goldfive Session via the SessionContext stash.
+    session_obj.state[_PENDING_DELEGATIONS_KEY] = {"fc_A": "research_solar"}
     # Agent-turn pin sits on a different task (stale from an earlier turn).
-    state[KEY_CURRENT_TASK_ID] = "research_wind"
+    session_obj.state[KEY_CURRENT_TASK_ID] = "research_wind"
 
     args: dict[str, Any] = {"summary": "done"}
     await plugin.before_tool_callback(

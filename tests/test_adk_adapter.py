@@ -2443,16 +2443,18 @@ async def test_invoke_always_drives_the_one_runner() -> None:
 
 async def test_state_protocol_writes_propagate_through_agent_tool_subtree() -> None:
     """RELIABILITY CONTRACT: task T dispatched to agent A with
-    ``AgentTool(B)`` must let B's ``before_model_callback`` see
-    ``state[goldfive.current_task_id] == T.id``.
+    ``AgentTool(B)`` must let B's ``before_model_callback`` reach
+    the goldfive ``Session.state`` via the plugin reference and find
+    ``goldfive.current_task_id == T.id``.
 
-    Previously these state writes were done against a shallow copy of
-    the session returned by ``InMemorySessionService.get_session`` and
-    were flagged "best-effort". They now happen inside the plugin's
-    ``before_run_callback`` against the LIVE invocation session, so
-    they propagate through AgentTool sub-Runners automatically (each
-    sub-Runner inherits the plugin and fires its own
-    ``before_run_callback`` that seeds the sub-session's live state).
+    Phase 2.1 of goldfive#271 — the pin no longer lands on ADK
+    ``session.state``; readers reach the goldfive Session through the
+    plugin's ``_active_ctx`` (set by ``set_active_context`` before
+    ``runner.run_async``). This test verifies the live-run path keeps
+    working across an AgentTool sub-Runner: the plugin instance is
+    shared with the sub-Runner so ``session_context_from_invocation``
+    finds the goldfive Session no matter which invocation fires the
+    callback.
     """
     from google.adk.agents import Agent
     from google.adk.models.base_llm import BaseLlm
@@ -2460,8 +2462,9 @@ async def test_state_protocol_writes_propagate_through_agent_tool_subtree() -> N
     from google.adk.tools.agent_tool import AgentTool
     from google.genai import types as genai_types
 
-    from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
+    from goldfive.adapters._adk_plugin import session_context_from_invocation
     from goldfive.adapters.adk import ADKAdapter
+    from goldfive.orchestration_store import OrchestrationStore
 
     observed_task_ids_in_B: list[str] = []
 
@@ -2527,21 +2530,18 @@ async def test_state_protocol_writes_propagate_through_agent_tool_subtree() -> N
                     turn_complete=True,
                 )
 
-    # Agent B — registers a pre-model callback that records the
-    # goldfive.current_task_id on the sub-session's live state.
+    # Agent B — registers a pre-model callback that resolves the
+    # goldfive Session via the plugin reference and reads the pin
+    # via the OrchestrationStore. Phase 2.1 of goldfive#271 — the pin
+    # lives on goldfive ``Session.state`` exclusively.
     def _b_before_model(callback_context: Any, llm_request: Any) -> None:  # noqa: ARG001
-        state = getattr(getattr(callback_context, "_invocation_context", None), "session", None)
-        if state is not None:
-            state = getattr(state, "state", None)
-        if state is None:
-            state = getattr(getattr(callback_context, "session", None), "state", None)
-        tid = None
-        if state is not None:
-            try:
-                tid = state.get(KEY_CURRENT_TASK_ID)
-            except Exception:
-                tid = None
-        observed_task_ids_in_B.append(str(tid or ""))
+        inv_ctx = getattr(callback_context, "_invocation_context", None) or getattr(
+            callback_context, "invocation_context", None
+        )
+        ctx = session_context_from_invocation(inv_ctx)
+        session = getattr(ctx, "session", None) if ctx is not None else None
+        store = OrchestrationStore.for_session(session)
+        observed_task_ids_in_B.append(store.pin_current_task())
 
     agent_b = Agent(
         name="agent_b",

@@ -154,19 +154,19 @@ def test_no_callback_frame_allows_any_write() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_catalogued_violation_v3_passes_when_driven_through_plugin() -> None:
-    """Drive V3 (``before_agent_callback`` pin write) and assert no raise.
+def test_catalogued_callback_path_allows_writer() -> None:
+    """A catalogued callback (e.g. ``write_cancel_request``) lands cleanly.
 
-    This is the integration test the brief asks for. With the
-    tripwire enabled and a goldfive callback frame active, a
-    catalogued write (V3 — the per-agent pin at
-    ``_stamp_current_task_id`` / ``before_agent_callback``) must
-    pass without raising — the catalog entry covers it.
+    With the tripwire enabled and a goldfive callback frame active, a
+    write through one of the still-catalogued protocol writers (here
+    :func:`write_cancel_request` for cooperative cancellation) passes
+    the audit because ``write_cancel_request`` itself appears in
+    ``_KNOWN_CALLERS``.
 
-    Implementation: drive ``write_current_task_id`` directly. The
-    test runs from a ``tests/`` file so the broad ``tests/`` allow
-    in the catalog is what suppresses the audit; the production V3
-    path's own catalog entry covers the real plugin call.
+    Phase 2.1 of goldfive#271 — V3 / V4's own catalog entries are
+    gone (the plugin no longer writes ADK state for the pin), but
+    the cooperative-cancellation writers stay catalogued because
+    they're still load-bearing for cancel propagation.
     """
     pytest.importorskip("google.adk")
     from goldfive.adapters import _adk_state_protocol as sp
@@ -176,14 +176,7 @@ def test_catalogued_violation_v3_passes_when_driven_through_plugin() -> None:
 
     class _FakePlugin:
         async def before_agent_callback(self) -> None:
-            # Catalog entry: ("goldfive/adapters/_adk_plugin.py",
-            # "before_agent_callback"). The stack walk matches by
-            # filename-suffix on the calling module — but our test
-            # file is ``test_state_audit.py``, so we must rely on
-            # the broad ``tests/`` allow rather than the V3 entry.
-            # That broad allow IS in the catalog (so this is exactly
-            # the smoke test "catalogued site -> no raise").
-            sp.write_current_task_id(state, "task-42")
+            sp.write_cancel_request(state, invocation_id="inv-1", request="cancel")
 
     import asyncio
 
@@ -192,7 +185,7 @@ def test_catalogued_violation_v3_passes_when_driven_through_plugin() -> None:
         asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
             plugin.before_agent_callback()
         )
-    assert state["goldfive.current_task_id"] == "task-42"
+    assert state["goldfive.cancel_requested"] == {"inv-1": "cancel"}
 
 
 def test_real_plugin_callbacks_are_wrapped() -> None:
@@ -214,35 +207,29 @@ def test_real_plugin_callbacks_are_wrapped() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_includes_callback_methods_that_still_write() -> None:
-    """The catalog enumerates every plugin callback method that still
-    writes to ADK ``session.state``.
+def test_catalog_excludes_callbacks_with_no_remaining_writes() -> None:
+    """No plugin callback that's been migrated should appear in the catalog.
 
-    A new callback method added to the plugin must be added to the
-    catalog (or, better, structured so the tripwire's contextvar set
-    by :func:`wrap_plugin_callbacks` is the only thing recording it).
-
-    Phase 2.0 of goldfive#271 — V1 / V2 / V5 are migrated, so
-    ``before_run_callback`` and ``before_model_callback`` no longer
-    write ADK state and have been removed from the catalog. The
-    remaining callback writers are V3 (``before_agent_callback``) and
-    V4 (``before_tool_callback``).
+    Phase 2.0 of goldfive#271 migrated V1 / V2 / V5
+    (``before_run_callback`` / ``before_model_callback`` writers).
+    Phase 2.1 (this PR) migrated V3 / V4 (``before_agent_callback`` /
+    ``before_tool_callback`` writers — the per-agent pin and the
+    delegation-site pin both moved to goldfive ``Session.state``).
+    None of those callback names should remain in the catalog — a
+    regression that re-introduces an ADK-state write from any of them
+    must fail the audit loudly.
     """
     catalogued_qualnames = {q for (_, q) in _state_audit._KNOWN_CALLERS}
-    for method_name in (
+    for migrated in (
+        "before_run_callback",
+        "before_model_callback",
         "before_agent_callback",
         "before_tool_callback",
+        "_stamp_current_task_id",
+        "_pin_delegation_task_id",
     ):
-        assert method_name in catalogued_qualnames, (
-            f"plugin callback {method_name!r} missing from _KNOWN_CALLERS"
-        )
-    # V1 / V5 callbacks: migrated. They MUST NOT carry catalog
-    # entries — a regression that re-introduces an ADK-state write
-    # from before_run_callback / before_model_callback should fail
-    # the audit loudly.
-    for migrated in ("before_run_callback", "before_model_callback"):
         assert migrated not in catalogued_qualnames, (
-            f"{migrated!r} still in catalog after Phase 2.0 migration"
+            f"{migrated!r} still in catalog after migration"
         )
 
 
@@ -250,20 +237,19 @@ def test_known_callers_count_after_phase_2_migration() -> None:
     """Catalog shrinks monotonically as Phase 2 migrations land.
 
     Phase 0 (#278) shipped the catalog with the full set of pre-
-    existing violations. Phase 2.0 (this PR) migrated V1, V2, V5 +
-    the bridge writers, so the count must be strictly smaller than
-    Phase 0's baseline. Phase 2.x will continue to drop the count
-    as V3 / V4 / V7 / V8 migrate.
+    existing violations. Phase 2.0 migrated V1, V2, V5 + the bridge
+    writers. Phase 2.1 (this PR) migrated V3 + V4 — both pin write
+    paths now land on goldfive ``Session.state`` exclusively, so
+    their catalog entries are gone. The count must be strictly
+    smaller than the Phase 2.0 baseline (which had 18 entries).
     """
     expected = _state_audit.known_callers_count()
-    # Phase 0 baseline was 25; after Phase 2.0 we expect strictly
-    # fewer. The lower bound is loose — the test is asserting the
-    # direction (down) and that we didn't accidentally collapse to
-    # zero before V3 / V4 migrate.
-    assert 5 <= expected < 25, (
-        f"catalog count={expected} unexpected; Phase 0 baseline was 25 "
-        "and Phase 2.0 should have shrunk it without zeroing out the "
-        "still-present V3 / V4 / V7-V8 entries."
+    # Phase 2.0 baseline was 18; after Phase 2.1 we expect strictly
+    # fewer (V3 + V4 entries removed). Lower bound stays loose so
+    # the test is asserting direction (down), not an exact count.
+    assert 5 <= expected < 18, (
+        f"catalog count={expected} unexpected; Phase 2.0 baseline was 18 "
+        "and Phase 2.1 should have shrunk it (V3 / V4 entries removed)."
     )
 
 
@@ -289,22 +275,27 @@ def test_state_audit_is_off_in_production_default() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Real-violation reproducer: drive an ACTUAL catalogued write
-# (V3 — _stamp_current_task_id) and assert the audit allows it; then
-# strip its catalog entry and assert the audit raises. This is the
-# strongest demonstration that the tripwire would catch a regression
-# at this exact violation site.
+# Phase 2.1 — V3 / V4 migrated. The plugin's ``_stamp_current_task_id``
+# (V3) and ``_pin_delegation_task_id`` (V4) no longer write ADK
+# session.state. Reproducer tests that previously drove those code
+# paths through the tripwire are gone with the migration.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_v3_stamp_current_task_id_is_catalogued() -> None:
-    """V3 catalog entry covers ``_stamp_current_task_id`` writes.
+async def test_v3_v4_pin_writes_no_longer_touch_adk_state() -> None:
+    """The pin no longer mutates ADK ``session.state`` from a callback.
 
-    Drives the real plugin's `_stamp_current_task_id` and asserts no
-    raise. Then strips the V3 catalog entry and asserts the audit
-    fires — pinning that the catalog entry is what's keeping the
-    existing call site green.
+    Drives the real plugin's ``_stamp_current_task_id`` (V3 site) and
+    ``_pin_delegation_task_id`` (V4 site) inside a goldfive callback
+    frame and asserts:
+
+    * the goldfive ``Session.state`` carries the pin keys, and
+    * the ADK-side state dict is untouched (no leakage).
+
+    This is the structural assertion behind Phase 2.1's catalog
+    removal: with no callback-time write to ADK state, the audit
+    has nothing to flag at these sites.
     """
     pytest.importorskip("google.adk")
     from goldfive.adapters._adk_plugin import (
@@ -312,6 +303,7 @@ async def test_v3_stamp_current_task_id_is_catalogued() -> None:
         SessionContext,
         make_adk_plugin,
     )
+    from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
     from goldfive.types import Plan, Session, Task, TaskStatus
 
     plugin = make_adk_plugin(name="audit-test", host_agent_name="root")
@@ -340,75 +332,26 @@ async def test_v3_stamp_current_task_id_is_catalogued() -> None:
         host_agent_name="root",
     )
 
-    # Build a fake callback_context whose ``state`` is a real dict
-    # — the stamp helper reads this via _session_state_from_callback.
     class _FakeCtx:
         def __init__(self) -> None:
             self.state: dict[str, object] = {SESSION_CONTEXT_STATE_KEY: ctx}
 
     fake_cb_ctx = _FakeCtx()
 
-    # The stamp helper is a method on the plugin instance. Call it
-    # inside a goldfive callback frame so the tripwire's active-frame
-    # ContextVar is set — mirroring how real callbacks invoke it.
     _force_on_state()
+    # V3 — the pin landing path. After Phase 2.1 it lands only on
+    # goldfive Session.state.
     with _state_audit.goldfive_callback("before_agent_callback"):
         plugin._stamp_current_task_id(  # type: ignore[attr-defined]
             ctx=ctx,
-            callback_context=fake_cb_ctx,
             task_id="t1",
             agent_name="root",
-            source="test",
+            source="single_match",
             task=task,
             invocation_id="inv-1",
         )
 
-    # The catalogued V3 site should have stamped both surfaces.
-    from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
-
-    assert fake_cb_ctx.state[KEY_CURRENT_TASK_ID] == "t1"
     assert gf_session.state[KEY_CURRENT_TASK_ID] == "t1"
-
-    # Now strip every catalog entry that could short-circuit the
-    # stack walk on this particular violation — V3 itself
-    # (``_stamp_current_task_id`` / ``before_agent_callback``), the
-    # protocol-module helpers it funnels through, and the broad
-    # ``tests/`` allow. This simulates "what would happen if a
-    # future PR removed the opt-out without first migrating the
-    # call site" — i.e. the exact regression the tripwire is
-    # supposed to catch.
-    original = _state_audit._KNOWN_CALLERS
-    pruned = frozenset(
-        {
-            (f, q)
-            for (f, q) in original
-            if "_stamp_current_task_id" not in q
-            and "before_agent_callback" not in q
-            and "write_current_task" not in q
-            and "_set" not in q
-            and not f.startswith("tests/")
-        }
+    assert KEY_CURRENT_TASK_ID not in fake_cb_ctx.state, (
+        "V3 must not write ADK state after Phase 2.1"
     )
-    _state_audit._KNOWN_CALLERS = pruned  # type: ignore[misc]
-    try:
-        # Reset the state dict so the second invocation has a clean slate.
-        fake_cb_ctx.state = {SESSION_CONTEXT_STATE_KEY: ctx}
-        with _state_audit.goldfive_callback("before_agent_callback"):
-            with pytest.raises(StateOwnershipViolation) as excinfo:
-                plugin._stamp_current_task_id(  # type: ignore[attr-defined]
-                    ctx=ctx,
-                    callback_context=fake_cb_ctx,
-                    task_id="t1",
-                    agent_name="root",
-                    source="test",
-                    task=task,
-                    invocation_id="inv-1",
-                )
-    finally:
-        _state_audit._KNOWN_CALLERS = original  # type: ignore[misc]
-
-    # The error message should call out the offending key + the
-    # callback name + the migration target.
-    msg = str(excinfo.value)
-    assert "before_agent_callback" in msg
-    assert "goldfive." in msg  # one of the goldfive.* keys

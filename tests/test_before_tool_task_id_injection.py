@@ -60,13 +60,18 @@ class _Tool:
 
 
 def _make_plugin_with_reporting_spec(tool_name: str):
-    """Return (plugin, state_dict) wired for a single reporting tool.
+    """Return (plugin, state_dict, captured, session) wired for a single reporting tool.
 
     The plugin is built via :func:`make_adk_plugin` (the public factory)
     and wired to a :class:`SessionContext` so the reporting-tool match in
     ``before_tool_callback`` fires. The handler is a no-op that echoes
     the args the plugin dispatched with — callers inspect that echo to
     verify injection.
+
+    Phase 2.1 of goldfive#271 — the pin keys live on goldfive
+    ``Session.state``, not on the ADK state dict. Tests set the pin via
+    ``session.state[...] = ...``; the plugin reads it back through the
+    ``SessionContext`` stash.
     """
     from goldfive.adapters._adk_plugin import (
         SESSION_CONTEXT_STATE_KEY,
@@ -100,7 +105,7 @@ def _make_plugin_with_reporting_spec(tool_name: str):
             host_agent_name="test_agent",
         )
     }
-    return plugin, state, captured
+    return plugin, state, captured, session_obj
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +117,10 @@ async def test_empty_arg_replaced_from_state() -> None:
     """An empty task_id on a report_task_* call is filled from pinned state."""
     from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
 
-    plugin, state, captured = _make_plugin_with_reporting_spec("report_task_completed")
-    state[KEY_CURRENT_TASK_ID] = "t-1"
+    plugin, state, captured, session = _make_plugin_with_reporting_spec(
+        "report_task_completed"
+    )
+    session.state[KEY_CURRENT_TASK_ID] = "t-1"
 
     args: dict[str, Any] = {"task_id": "", "summary": "done"}
     await plugin.before_tool_callback(
@@ -124,7 +131,7 @@ async def test_empty_arg_replaced_from_state() -> None:
 
     assert args["task_id"] == "t-1", (
         "Layer 3 must overwrite an empty task_id with the pinned "
-        "goldfive.current_task_id from state."
+        "goldfive.current_task_id from session.state."
     )
     # And the handler must have seen the corrected arg.
     assert captured == [{"task_id": "t-1", "summary": "done"}]
@@ -135,10 +142,10 @@ async def test_placeholder_arg_replaced() -> None:
     from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
 
     for placeholder in ("placeholder", "unknown", "TODO", "  ", "none", "N/A"):
-        plugin, state, captured = _make_plugin_with_reporting_spec(
+        plugin, state, captured, session = _make_plugin_with_reporting_spec(
             "report_task_progress"
         )
-        state[KEY_CURRENT_TASK_ID] = "t-1"
+        session.state[KEY_CURRENT_TASK_ID] = "t-1"
 
         args: dict[str, Any] = {"task_id": placeholder, "detail": "x"}
         await plugin.before_tool_callback(
@@ -149,7 +156,7 @@ async def test_placeholder_arg_replaced() -> None:
 
         assert args["task_id"] == "t-1", (
             f"placeholder {placeholder!r} must be replaced with the pinned "
-            "task_id from state."
+            "task_id from session.state."
         )
 
 
@@ -163,8 +170,8 @@ async def test_real_looking_arg_preserved() -> None:
     """
     from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
 
-    plugin, state, _ = _make_plugin_with_reporting_spec("report_task_failed")
-    state[KEY_CURRENT_TASK_ID] = "t-1"
+    plugin, state, _, session = _make_plugin_with_reporting_spec("report_task_failed")
+    session.state[KEY_CURRENT_TASK_ID] = "t-1"
 
     args: dict[str, Any] = {"task_id": "t-42", "error": "boom"}
     await plugin.before_tool_callback(
@@ -183,8 +190,10 @@ async def test_awaiting_approval_also_injected() -> None:
     """report_awaiting_approval is part of the reporting-tool family."""
     from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
 
-    plugin, state, _ = _make_plugin_with_reporting_spec("report_awaiting_approval")
-    state[KEY_CURRENT_TASK_ID] = "t-1"
+    plugin, state, _, session = _make_plugin_with_reporting_spec(
+        "report_awaiting_approval"
+    )
+    session.state[KEY_CURRENT_TASK_ID] = "t-1"
 
     args: dict[str, Any] = {"task_id": ""}
     await plugin.before_tool_callback(
@@ -240,7 +249,9 @@ async def test_non_report_tool_untouched() -> None:
 
 async def test_missing_state_leaves_args_unchanged() -> None:
     """No pinned task_id in state → args untouched; Layer 2 will handle it."""
-    plugin, state, _ = _make_plugin_with_reporting_spec("report_task_started")
+    plugin, state, _, _session = _make_plugin_with_reporting_spec(
+        "report_task_started"
+    )
     # Note: NOT setting KEY_CURRENT_TASK_ID.
 
     args: dict[str, Any] = {"task_id": ""}
@@ -309,17 +320,20 @@ async def test_injection_sees_layer1_state_stamp() -> None:
     """Sanity: a state write done BEFORE the tool callback is visible to it.
 
     This is the ordering contract Layer 3 depends on — Layer 1's
-    ``before_agent_callback`` writes to session.state at agent-turn start,
-    and every ``before_tool_callback`` within that turn sees the write.
-    We simulate that by writing the state key, then dispatching, then
-    asserting the injection happened.
+    ``before_agent_callback`` writes to goldfive ``session.state`` at
+    agent-turn start, and every ``before_tool_callback`` within that
+    turn sees the write through the SessionContext stash. We simulate
+    that by writing the state key on goldfive ``session.state``, then
+    dispatching, then asserting the injection happened.
     """
     from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
 
-    plugin, state, _ = _make_plugin_with_reporting_spec("report_task_blocked")
+    plugin, state, _, session = _make_plugin_with_reporting_spec(
+        "report_task_blocked"
+    )
 
     # Layer-1-style write (simulating what before_agent_callback does).
-    state[KEY_CURRENT_TASK_ID] = "t-layer1"
+    session.state[KEY_CURRENT_TASK_ID] = "t-layer1"
 
     # Layer-3 tool-call entry.
     args: dict[str, Any] = {"task_id": "", "blocked_on": "dep-x"}

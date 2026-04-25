@@ -107,6 +107,7 @@ __all__ = [
     "BindingSource",
     "DelegationPin",
     "OrchestrationStore",
+    "PENDING_DELEGATIONS_KEY",
     "REASONING_BINDINGS_KEY",
     "ReasoningBinding",
 ]
@@ -117,6 +118,16 @@ __all__ = [
 # accepts it. Value shape: ``dict[agent_name, ReasoningBinding-as-dict]``
 # for cheap JSON serialisation by sinks that round-trip the state dict.
 REASONING_BINDINGS_KEY = "goldfive.reasoning_extracted_bindings"
+
+# State key for the per-``function_call_id`` delegation-pin map
+# (goldfive#241 Item 3-bis, V4 in the Phase 0 audit catalog). Phase 2.1
+# of goldfive#271 — consolidated here so writers and readers agree on
+# one source of truth on goldfive's own ``Session.state``.
+#
+# Value shape: ``dict[function_call_id, {task_id, revision, tool_args?}]``.
+# Legacy entries stamped by pre-#266 adapters were bare strings; the
+# :class:`DelegationPin` accessor normalises both shapes.
+PENDING_DELEGATIONS_KEY = "goldfive.pending_delegations"
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +500,7 @@ class OrchestrationStore:
         """
         if not fc_id:
             return None
-        pend = self._get("goldfive.pending_delegations", None)
+        pend = self._get(PENDING_DELEGATIONS_KEY, None)
         if not isinstance(pend, Mapping):
             return None
         raw = pend.get(fc_id)
@@ -513,6 +524,67 @@ class OrchestrationStore:
                 args = None
             return DelegationPin(task_id=tid, revision=rev, tool_args=args)
         return None
+
+    def iter_pending_delegations(self) -> Mapping[str, Any]:
+        """Return the raw ``pending_delegations`` map (or empty mapping).
+
+        The plugin's pin-resolution ladder needs to walk every entry
+        (signal 1 iterates to find a task-id match across all parallel
+        dispatches; signal 3 merges every entry's ``tool_args`` into a
+        single token bag for scoring). Returns the live dict so callers
+        can iterate with ``.values()`` / ``.items()`` without a copy.
+        """
+        pend = self._get(PENDING_DELEGATIONS_KEY, None)
+        if isinstance(pend, Mapping):
+            return pend
+        return {}
+
+    # -- Write: pending delegations -------------------------------------
+
+    def set_pending_delegation(
+        self,
+        fc_id: str,
+        *,
+        task_id: str,
+        revision: int = 0,
+        tool_args: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Stamp a per-``function_call_id`` delegation pin.
+
+        V4 of the Phase 0 audit (goldfive#271) — every delegation-site
+        write now lands here on goldfive ``Session.state`` rather than
+        on ADK ``session.state``. The pin-resolution ladder + reporting
+        handlers consult this same store, so a single write is enough.
+
+        ``tool_args`` (when provided as a non-empty Mapping) is stamped
+        alongside the pin so signal 3 of the ladder can score
+        candidates against the parent's literal dispatch args (F7 /
+        #265 followup). Empty / non-mapping args are dropped — the
+        scorer treats those as zero-token signals.
+
+        No-op when ``fc_id`` or ``task_id`` is empty, or when the
+        backing state is not a mutable dict (defensive — production
+        state is always a dict; tests sometimes pass MappingProxyType
+        snapshots).
+        """
+        if not fc_id or not task_id:
+            return
+        if not isinstance(self._state, dict):
+            return
+        existing = self._state.get(PENDING_DELEGATIONS_KEY)
+        bucket: dict[str, Any]
+        if isinstance(existing, dict):
+            bucket = existing
+        else:
+            bucket = {}
+        entry: dict[str, Any] = {
+            "task_id": str(task_id),
+            "revision": int(revision),
+        }
+        if isinstance(tool_args, Mapping) and tool_args:
+            entry["tool_args"] = dict(tool_args)
+        bucket[str(fc_id)] = entry
+        _ostate.write(self._state, PENDING_DELEGATIONS_KEY, bucket)
 
     # -- Read: reasoning-extracted bindings (NEW Phase 1) ---------------
 

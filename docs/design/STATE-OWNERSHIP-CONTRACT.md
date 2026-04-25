@@ -66,7 +66,8 @@ The two dicts are easy to confuse at the call site because both end in `.state`.
 | 0 | This document, audit catalog (§5), runtime tripwire (`goldfive/_state_audit.py`) | **Done (#278)** |
 | 1 | Introduce `OrchestrationStore` — single typed handle that owns goldfive's orchestration state. Extract reasoning / pin / cancel state off `Session.state` onto the store. No ADK-side change yet. | **Done (#279)** |
 | 2.0 | Eliminate the bridge (V2) and the now-unused initial seeds (V1, V5). The dynamic-instruction resolver and `GoldfivePlanner` read goldfive `Session.state` directly via the `SessionContext` stash + `OrchestrationStore`. Closes goldfive#275. | **Done (Phase 2.0)** |
-| 2.x | Migrate the remaining catalog entries (V3 — per-agent pin write, V4 — delegation pin write, V7 / V8 — `SessionContext` stash). | Planned |
+| 2.1 | Migrate the per-agent pin (V3) and the delegation-site pin (V4). Both move to goldfive `Session.state` exclusively via `OrchestrationStore`; readers consult goldfive Session via the plugin reference. After this phase, no callback-time write to ADK `session.state` from inside the wrap remains. | **Done (Phase 2.1)** |
+| 2.x | Clean up V7 / V8 — the `SessionContext` stash is dead in production paths but legacy tests still drive through it. | Planned |
 | 3 | Tripwire flips on by default in production. Catalog is empty. | Planned |
 
 A future contributor can verify a Phase-2 PR by:
@@ -97,21 +98,15 @@ Every place goldfive writes to ADK `session.state` (or a structure ADK considers
 - **Status.** Eliminated by Phase 2.0 of goldfive#271. The literal site of goldfive#275. The bridge function `_bridge_orchestration_state` and its inline subroutine `_bridge_pending_corrections` are deleted; the resolver / planner read goldfive `Session.state` directly via `OrchestrationStore`.
 - **Original target.** `goldfive/adapters/_adk_plugin.py:1679` called `_bridge_orchestration_state` to mirror `goldfive.active_steer.body`, `goldfive.active_steer.at_turn`, `goldfive.goals_summary`, `goldfive.cancelled_function_call_ids`, and every `goldfive.pending_corrections.<agent>.<task>` key onto ADK `session.state`.
 
-#### V3 — `_stamp_current_task_id` (called from `before_agent_callback`)
+#### V3 — `_stamp_current_task_id` (called from `before_agent_callback`) — **MIGRATED (Phase 2.1)**
 
-- **File:line.** `goldfive/adapters/_adk_plugin.py:2620-2628`
-- **State written.** `goldfive.current_task_id`, `goldfive.current_task_title`, `goldfive.current_task_description`, `goldfive.current_task_assignee`, `goldfive.current_task_revision`.
-- **Why.** Pins the active task per-agent invocation (#191/#195/#266) so the dynamic-instruction resolver renders the right title/description block and `report_task_*` tools can resolve their target without an LLM-supplied id.
-- **Severity.** **blocker.** Fires once per `before_agent_callback`, every agent turn, every sub-invocation. The same write also stamps `goldfive.Session.state` (line 2601-2605) — the dual-write is the structural shape Phase 1's `OrchestrationStore` collapses.
-- **Migration target.** Phase 2. The pin is structural goldfive state; the orchestration store will be the only writer, the ADK side will be a derived view via `append_event`.
+- **Status.** Eliminated by Phase 2.1 of goldfive#271. The per-agent pin lands on goldfive `Session.state` exclusively via `OrchestrationStore.set_pin_current_task`. Readers (the dynamic-instruction resolver, the reporting handlers, `_resolve_pinned_task_id`) consult goldfive Session via the plugin reference (`session_context_from_invocation`) — no callback-time write to ADK `session.state` remains.
+- **Original target.** `goldfive/adapters/_adk_plugin.py:2620-2628` wrote `goldfive.current_task_id`, `goldfive.current_task_title`, `goldfive.current_task_description`, `goldfive.current_task_assignee`, `goldfive.current_task_revision` onto both surfaces. The protocol-module writers (`_sp.write_current_task` / `_sp.write_current_task_id` / `_sp.write_current_task_revision` / `_sp.clear_current_task`) are deleted; only the read-side key constants remain.
 
-#### V4 — `_pin_delegation_task_id` (called from `before_tool_callback`)
+#### V4 — `_pin_delegation_task_id` (called from `before_tool_callback`) — **MIGRATED (Phase 2.1)**
 
-- **File:line.** `goldfive/adapters/_adk_plugin.py:2778-2783`
-- **State written.** `goldfive.pending_delegations` (a dict keyed by `function_call_id`).
-- **Why.** Per-`function_call_id` pin (#241 Item 3-bis) so parallel AgentTool dispatches to the same sub-agent on the same turn don't race on the single `goldfive.current_task_id` slot. Stamped on **both** `ctx.session.state` (orchestration) and the ADK `tool_context` session.state.
-- **Severity.** **blocker.** Same pattern as V3 — dual-write inside a tool callback is exactly the path #275 traces. Fires multiple times per turn for fan-out coordinators.
-- **Migration target.** Phase 2. The orchestration-side write stays; the ADK-side write becomes `append_event` or, better, the resolver reads the orchestration store directly (Phase 3).
+- **Status.** Eliminated by Phase 2.1 of goldfive#271. The per-`function_call_id` pin lands on goldfive `Session.state` exclusively via `OrchestrationStore.set_pending_delegation`. The reporting-tool callback's `_resolve_pinned_task_id` reads the same store via the plugin reference.
+- **Original target.** `goldfive/adapters/_adk_plugin.py:2778-2783` wrote `goldfive.pending_delegations` (a dict keyed by `function_call_id`) onto both `ctx.session.state` (orchestration) AND the ADK `tool_context` session.state.
 
 #### V5 — `before_model_callback`: defensive duplicate seed — **MIGRATED (Phase 2.0)**
 

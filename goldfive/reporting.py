@@ -80,20 +80,6 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
 
 _ACK: dict[str, Any] = {"acknowledged": True}
 
-# Orchestration-state key the adapter stamps at delegation time
-# (goldfive#191). Handlers fall back to this value when the model's
-# tool call omits ``task_id``. Re-declared here rather than imported
-# from :mod:`goldfive.orchestration_state` to avoid a circular import
-# — the string is a stable contract shared between the adapter's
-# :mod:`._adk_state_protocol`, :mod:`orchestration_state`, and this
-# handler module.
-_STATE_KEY_CURRENT_TASK_ID = "goldfive.current_task_id"
-# Companion key (goldfive#266 / pin versioning) — the plan revision
-# in effect at the moment the adapter wrote the pin. Same back-compat
-# stance: a missing / malformed entry reads as 0, which matches the
-# default ``Plan.revision_index`` so unrevised plans remain "fresh".
-_STATE_KEY_CURRENT_TASK_REVISION = "goldfive.current_task_revision"
-
 
 def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
     """Return the task_id to act on, falling back to session state.
@@ -101,7 +87,7 @@ def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
     Order of precedence (goldfive#191):
 
     1. ``args["task_id"]`` — explicit model-provided id always wins.
-    2. ``session.state["goldfive.current_task_id"]`` — the id pinned
+    2. ``OrchestrationStore.pin_current_task()`` — the id pinned
        by the adapter's ``before_agent_callback`` when the current
        sub-agent has exactly one PENDING/RUNNING task assigned to
        it. Closes the loop where the LLM's tool call omits the
@@ -125,7 +111,8 @@ def _resolve_task_id_with_source(
       ``task_id`` arg.
     * ``"handler_default"`` — the arg was absent / empty / None and the
       handler defaulted to the adapter-stamped pin
-      (``goldfive.current_task_id``). This is the goldfive#191 path.
+      (:meth:`OrchestrationStore.pin_current_task`). This is the
+      goldfive#191 path.
     * ``""`` — neither source resolved a value (caller short-circuits
       with the canonical ``missing_task_id`` rejection).
 
@@ -133,23 +120,27 @@ def _resolve_task_id_with_source(
     distinguish a direct LLM-driven transition from one that piggy-
     backed on the adapter pin. The tuple-returning variant is
     additive; existing callers stay on :func:`_resolve_task_id`.
+
+    Phase 2.1 of goldfive#271 — the read funnels through
+    :class:`~goldfive.orchestration_store.OrchestrationStore` so the
+    handler is decoupled from goldfive ``Session.state``'s on-disk
+    key strings.
     """
     raw = args.get("task_id")
     if raw is not None:
         task_id = str(raw).strip()
         if task_id:
             return task_id, "llm_report"
-    state = getattr(session, "state", None)
-    if isinstance(state, dict):
-        fallback = state.get(_STATE_KEY_CURRENT_TASK_ID, "")
-        if isinstance(fallback, str):
-            value = fallback.strip()
-        elif fallback is not None:
-            value = str(fallback).strip()
-        else:
-            value = ""
-        if value:
-            return value, "handler_default"
+    from goldfive.orchestration_store import OrchestrationStore
+
+    store = OrchestrationStore.for_session(session)
+    fallback = store.pin_current_task().strip()
+    if fallback:
+        log.debug(
+            "reporting: defaulted task_id=%s from OrchestrationStore",
+            fallback,
+        )
+        return fallback, "handler_default"
     return "", ""
 
 
@@ -345,16 +336,14 @@ def _read_pin_revision(session: Session) -> int | None:
     any plan with ``revision_index > 0`` — that's the actual
     versioning semantics, distinct from "no stamp".
     """
+    from goldfive import orchestration_state as _ostate
+
     state = getattr(session, "state", None)
     if not isinstance(state, dict):
         return None
-    if _STATE_KEY_CURRENT_TASK_REVISION not in state:
+    if _ostate.KEY_CURRENT_TASK_REVISION not in state:
         return None
-    raw = state.get(_STATE_KEY_CURRENT_TASK_REVISION, 0)
-    try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        return 0
+    return _ostate.read_current_task_revision(state)
 
 
 def _read_plan_revision(session: Session) -> int:
@@ -725,7 +714,7 @@ def _rotate_after_terminal(
     session: Session,
     completed_task: Task,
 ) -> None:
-    """Advance ``goldfive.current_task_id`` after a terminal transition.
+    """Advance the current-task pin after a terminal transition.
 
     Delegates to :func:`goldfive.orchestration_state.rotate_current_task_id`.
     Imported lazily so this module stays ADK-free and dodges the
@@ -733,6 +722,9 @@ def _rotate_after_terminal(
     :mod:`goldfive.orchestration_state` (both are imported from
     :mod:`goldfive.steerer`).
     """
+    from goldfive import orchestration_state as _ostate
+    from goldfive.orchestration_store import OrchestrationStore
+
     state = getattr(session, "state", None)
     if not isinstance(state, dict):
         return
@@ -742,16 +734,10 @@ def _rotate_after_terminal(
     # Only rotate if the terminal task was the one we'd been pointing
     # at — otherwise some other caller owns the pin and we'd clobber
     # theirs.
-    pinned = state.get(_STATE_KEY_CURRENT_TASK_ID, "")
-    if isinstance(pinned, str):
-        pinned = pinned.strip()
-    else:
-        pinned = str(pinned or "").strip()
+    pinned = OrchestrationStore.for_session(session).pin_current_task().strip()
     this_id = str(getattr(completed_task, "id", "") or "")
     if pinned and pinned != this_id:
         return
-
-    from goldfive import orchestration_state as _ostate
 
     _ostate.rotate_current_task_id(state, plan, agent_name)
 
