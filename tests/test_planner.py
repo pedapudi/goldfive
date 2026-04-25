@@ -1543,6 +1543,84 @@ async def test_synthesize_goal_from_steer_defaults_mode_when_invalid() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2.X / goldfive#271 Gap 5: prior_goals threaded into the prompt
+# ---------------------------------------------------------------------------
+
+
+async def test_synthesize_goal_from_steer_includes_prior_goals_in_prompt() -> None:
+    """Phase 2.X: when ``prior_goals`` is non-empty, the user prompt
+    includes a ``PRIOR GOALS`` block listing each prior summary so the
+    LLM can merge persistent qualifications into the synthesised goal.
+
+    The validation E2E observed prior goal "Create a presentation
+    about solar panels with no more than 2 slides." → after a topic
+    pivot, the synthesised goal lost both the "presentation" frame
+    and the "2 slides" cap.
+    """
+    from goldfive.types import Goal
+
+    scripted = _SynthLLM(
+        json.dumps(
+            {
+                "goal": {
+                    "id": "steer1",
+                    "summary": (
+                        "Create a presentation about wind power with no "
+                        "more than 2 slides."
+                    ),
+                },
+                "mode": "replace",
+            }
+        )
+    )
+    planner = LLMPlanner(call_llm=scripted)
+    prior = [
+        Goal(
+            id="g1",
+            summary=(
+                "Create a presentation about solar panels with no more "
+                "than 2 slides."
+            ),
+        )
+    ]
+    result = await planner.synthesize_goal_from_steer(
+        "forget solar panels — tell me about wind power instead",
+        prior_goals=prior,
+    )
+    assert result is not None
+
+    _sys, user_prompt, _model = scripted.calls[0]
+    assert "PRIOR GOALS" in user_prompt, (
+        f"PRIOR GOALS block missing from user prompt; got: {user_prompt!r}"
+    )
+    assert "no more than 2 slides" in user_prompt, (
+        f"prior qualification missing; got: {user_prompt!r}"
+    )
+
+
+async def test_synthesize_goal_from_steer_no_prior_goals_block_when_empty() -> None:
+    """Empty / None ``prior_goals`` keeps the original prompt shape —
+    no PRIOR GOALS block. Back-compat for callers that don't pass it.
+    """
+    scripted = _SynthLLM(
+        json.dumps(
+            {
+                "goal": {"id": "steer1", "summary": "x"},
+                "mode": "append",
+            }
+        )
+    )
+    planner = LLMPlanner(call_llm=scripted)
+    await planner.synthesize_goal_from_steer("a steer", prior_goals=None)
+    _sys, user_prompt, _model = scripted.calls[0]
+    assert "PRIOR GOALS" not in user_prompt
+    # And the system prompt's qualification-merge guideline is always
+    # present (it's the LLM's instruction, regardless of whether the
+    # user prompt has prior goals to merge from).
+    assert "MERGE their persistent qualifications" in _sys
+
+
+# ---------------------------------------------------------------------------
 # Compound assignee normalization (goldfive#214)
 # ---------------------------------------------------------------------------
 
