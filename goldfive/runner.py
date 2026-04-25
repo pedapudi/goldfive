@@ -304,8 +304,30 @@ class Runner:
         # planning. When ``user_input`` is already a ``list[Goal]``
         # the caller has opted out of natural-language derivation, so
         # we also skip the gate.
+        #
+        # Pre-classified verdict short-circuit (goldfive#270 follow-up):
+        # :class:`~goldfive.adapters.adk_wrap.GoldfiveADKAgent` runs the
+        # gate at the adapter boundary (the goldfive code closest to
+        # ADK-web's user-message arrival point) and threads its verdict
+        # into ``context["_adk_pre_classified_verdict"]``. When that key
+        # is present we honour it directly, skipping
+        # :meth:`_classify_turn` entirely so the LLM gate fires once
+        # per turn at most. Non-ADK callers (programmatic, callable
+        # adapter, Claude SDK) supply no such key and run the gate
+        # in-line as before.
         verdict: TurnClassification = "new_work"
-        if self._last_plan is not None and isinstance(user_input, str):
+        pre_verdict = (
+            (context or {}).get("_adk_pre_classified_verdict")
+            if isinstance(context, Mapping)
+            else None
+        )
+        if pre_verdict in ("new_work", "conversational", "refine_existing"):
+            verdict = pre_verdict  # type: ignore[assignment]
+            log.debug(
+                "Runner.run: using adapter-level pre-classified verdict %r",
+                verdict,
+            )
+        elif self._last_plan is not None and isinstance(user_input, str):
             try:
                 verdict = await self._classify_turn(
                     prior_plan=self._last_plan,

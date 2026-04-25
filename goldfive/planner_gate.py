@@ -83,6 +83,50 @@ _ALLOWED: frozenset[str] = frozenset(
     {"new_work", "conversational", "refine_existing"}
 )
 
+#: Steer-language regex. A non-empty match in the user's input forces the
+#: heuristic to return ``"refine_existing"`` regardless of token count —
+#: catches the "forget X, do Y instead" / "no, don't X, do Y" pivot pattern
+#: that previously fell through to ``"conversational"`` (token < 20) or
+#: ``"new_work"`` (token >= 20). Both fall-through verdicts dropped the
+#: prior plan's constraints and bypassed the steerer's pipeline (no
+#: PlanRevised, no DriftDetected(USER_STEER), no sticky-goal preservation),
+#: which is what the goldfive#270 E2E hit.
+#:
+#: Anchored to start-of-string OR a sentence break so "I'd like to forget
+#: about ..." doesn't false-positive — only leading directives match.
+_STEER_PATTERN_RE = re.compile(
+    r"(?:^|[.?!]\s+)(?:"
+    r"forget|"
+    r"never mind|"
+    r"nevermind|"
+    r"scratch that|"
+    r"strike that|"
+    r"actually,?\s+|"
+    r"wait,?\s+|"
+    r"no,?\s+(?:wait|don't|do not|not)|"
+    r"stop\b|"
+    r"instead\b|"
+    r"change(?:\s+(?:that|the\s+plan|topic|to))|"
+    r"switch\s+to|"
+    r"do not\b|"
+    r"don't\b|"
+    r"no longer\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_steer(text: str) -> bool:
+    """Return True if ``text`` opens with a directive that revises prior work.
+
+    See :data:`_STEER_PATTERN_RE`. Used by :func:`heuristic_classify_turn`
+    to escape the token-count-only branch and route steer-shaped messages
+    through ``refine_existing`` so the runner's USER_STEER pipeline fires.
+    """
+    if not text:
+        return False
+    return bool(_STEER_PATTERN_RE.search(text))
+
 _SYSTEM_PROMPT = """\
 You are a turn-classifier for a multi-agent orchestration system.
 
@@ -111,13 +155,30 @@ Verdicts:
   plan's completed tasks should be preserved; a small delta of new
   tasks is appended.
 
+  This bucket also covers PIVOT directives that revise the topic
+  while keeping the same artefact / output format — e.g. "forget
+  X, tell me about Y instead", "no, don't do X, do Y", "switch the
+  topic to Z", "instead of X let's do Y", "scratch that — Y", "I
+  changed my mind — Y". These are NOT new_work: they keep the prior
+  plan's structural constraints (slide count, output type, audience)
+  and only swap the subject. Routing them to refine_existing
+  preserves those constraints; routing them to new_work silently
+  drops them.
+
 Guidelines:
 - When in doubt between "conversational" and "refine_existing",
   prefer "conversational" — the coordinator can always answer and
   the user can restate if they actually wanted new work.
 - When in doubt between "refine_existing" and "new_work", prefer
   "refine_existing" — the prior plan's completed tasks give the
-  refined plan a running start.
+  refined plan a running start, and the prior plan's structural
+  constraints survive the pivot.
+- Steer-language openers ("forget", "instead", "no, don't ...",
+  "scratch that", "actually", "wait, ...", "stop", "change the
+  topic", "switch to") are strong refine_existing signals — only
+  classify them as new_work when the user explicitly says they want
+  to abandon the artefact entirely (e.g. "forget the slides, just
+  give me the bullet points").
 
 Reply with a single JSON object and NOTHING ELSE:
 {"verdict": "new_work" | "conversational" | "refine_existing",
@@ -196,25 +257,36 @@ def heuristic_classify_turn(
 ) -> TurnClassification:
     """Deterministic rule-based gate. LLM-free.
 
-    Rules:
+    Rules (in order):
 
     - No prior plan → always ``"new_work"`` (first turn or fresh
       conversation).
+    - Prior plan exists AND :func:`_looks_like_steer` matches →
+      ``"refine_existing"``. Steer-language openers ("forget X",
+      "instead", "no, don't ..., do ...") overwhelmingly indicate the
+      user is pivoting prior work, not asking a clarifying question
+      and not requesting a wholly new workflow. Routing these through
+      the refine pipeline preserves the prior plan's sticky context
+      (slide count, output format) while letting the steerer emit
+      ``DriftDetected(USER_STEER)`` and ``PlanRevised``. Without this
+      branch the heuristic dropped steer messages into
+      ``"conversational"`` (short input) or ``"new_work"`` (long
+      input), both of which silently lost the constraints — see
+      goldfive#270 E2E.
     - Prior plan exists AND user_input is short (``< 20`` tokens) →
-      ``"conversational"``. Short follow-ups are overwhelmingly
-      questions about prior work, not new workflows.
-    - Otherwise → ``"new_work"``. Conservative default: the heuristic
-      never picks ``"refine_existing"`` on its own because getting the
-      refine path wrong silently mangles the plan, whereas getting
-      ``"new_work"`` wrong just means the user pays for an extra plan
-      that still completes.
+      ``"conversational"``. Short follow-ups that AREN'T steer-shaped
+      are overwhelmingly questions about prior work.
+    - Otherwise → ``"new_work"``.
 
     The LLM-backed :func:`classify_turn` is strictly more precise and
-    should be preferred when a ``call_llm`` is available.
+    should be preferred when a ``call_llm`` is available; this gate is
+    a deterministic fallback for offline / mock-mode runs.
     """
     _ = conversation_id  # reserved for future heuristics
     if prior_plan is None or not prior_plan.tasks:
         return "new_work"
+    if _looks_like_steer(user_input):
+        return "refine_existing"
     if _token_count(user_input) < _HEURISTIC_SHORT_TOKEN_BUDGET:
         return "conversational"
     return "new_work"
