@@ -105,15 +105,75 @@ def test_heuristic_long_follow_up_after_prior_plan_is_new_work() -> None:
     assert verdict == "new_work"
 
 
-def test_heuristic_never_returns_refine_existing() -> None:
-    # Heuristic is conservative: never guesses refine; LLM is required
-    # for that verdict.
-    for ui in ["make it funnier", "also add a slide about X", "actually, change the title"]:
+def test_heuristic_non_steer_inputs_avoid_refine_existing() -> None:
+    # Non-steer inputs (asks that don't open with a steer-pattern
+    # directive) still resolve to conversational / new_work — the
+    # heuristic only escalates to refine_existing when it sees a
+    # steer-language opener (see test_heuristic_steer_language_*).
+    for ui in [
+        "make it funnier",
+        "also add a slide about X",
+        "what was the title again",
+    ]:
         assert heuristic_classify_turn(
             prior_plan=_prior_plan(),
             completed_results={},
             user_input=ui,
         ) in ("conversational", "new_work")
+
+
+def test_heuristic_steer_language_returns_refine_existing() -> None:
+    # goldfive#270 follow-up: messages that open with steer-language
+    # ("forget X", "instead", "no, don't ..., do ...", "switch to",
+    # "scratch that", "actually, ...") route through refine_existing
+    # so the runner emits PlanRevised + DriftDetected(USER_STEER) and
+    # preserves the prior plan's structural constraints. Pre-fix the
+    # heuristic returned "conversational" (short input) or "new_work"
+    # (long input), both of which silently dropped sticky context.
+    steer_messages = [
+        "forget solar panels. tell me about solar flares instead.",
+        "no, don't do solar panels — switch to solar flares.",
+        "actually, change the topic to solar flares.",
+        "scratch that. solar flares please.",
+        "instead, do a presentation about solar flares.",
+        "wait, change the plan — solar flares.",
+        "stop. solar flares only.",
+    ]
+    for ui in steer_messages:
+        verdict = heuristic_classify_turn(
+            prior_plan=_prior_plan(),
+            completed_results={},
+            user_input=ui,
+        )
+        assert verdict == "refine_existing", (
+            f"steer-language opener {ui!r} should route refine_existing, "
+            f"got {verdict!r}"
+        )
+
+
+def test_heuristic_steer_language_requires_prior_plan() -> None:
+    # First turn (no prior plan) still returns new_work even on a
+    # steer-shaped opener — there's nothing to refine yet.
+    verdict = heuristic_classify_turn(
+        prior_plan=None,
+        completed_results={},
+        user_input="forget that. tell me about solar flares.",
+    )
+    assert verdict == "new_work"
+
+
+def test_heuristic_inline_steer_word_does_not_match() -> None:
+    # The steer regex is anchored to the start of the message OR a
+    # sentence break, so "forget" appearing mid-clause as part of a
+    # question doesn't mis-route. "I'll never forget the time you ..."
+    # is a conversational reminisce, not a steer.
+    verdict = heuristic_classify_turn(
+        prior_plan=_prior_plan(),
+        completed_results={},
+        user_input="I'll never forget the time you nailed it",
+    )
+    # Short input → conversational (NOT refine_existing).
+    assert verdict == "conversational"
 
 
 # ---------------------------------------------------------------------------
