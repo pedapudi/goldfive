@@ -466,6 +466,26 @@ def _delegation_pin_revision(raw: Any) -> int:
     return 0
 
 
+def _delegation_pin_tool_args(raw: Any) -> Mapping[str, Any] | None:
+    """Return the parent AgentTool's tool-call args from an entry, or ``None``.
+
+    Pre-F7 (string-shaped or ``{task_id, revision}``) entries return
+    ``None`` — they predate the tool-args stamp added in #265-followup.
+    Signal 3 of :meth:`_pin_current_task_id_for_agent` consults this
+    to score DAG-ready candidates against the dispatch args (the
+    strongest available signal: the parent literally said "go do
+    *this*"). Falls back to steer body / goals when ``None`` or empty.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    args = raw.get("tool_args", None)
+    if not isinstance(args, Mapping):
+        return None
+    if not args:
+        return None
+    return args
+
+
 def _function_call_id_from_tool_context(tool_context: Any) -> str:
     """Best-effort extraction of the current ``function_call_id``.
 
@@ -2250,41 +2270,62 @@ def make_adk_plugin(
             callback_context: Any,
             parent_invocation_id: str,
         ) -> Any:
-            """Return a token-bag string for tool-arg scoring, or ``None``.
+            """Return a token-bag string-or-mapping for tool-arg scoring, or ``None``.
 
             Signal 3/4/8 score candidates by token overlap with whatever
             we have for "what was this agent invoked for". In priority
             order:
 
-            1. Parent invocation's last AgentTool args, if we have a
-               record (best signal — exact dispatch payload).
+            1. Parent invocation's AgentTool tool-call args, recorded
+               on ``pending_delegations[<fc_id>].tool_args`` by
+               :meth:`_pin_delegation_task_id` (F7 — #265 followup).
+               This is the strongest signal: the parent literally
+               said "go do *this*". Skipped silently when the entry
+               is pre-F7-shaped (string-only or
+               ``{task_id, revision}`` without ``tool_args``) or when
+               the recorded args produce zero meaningful tokens (e.g.
+               an opaque blob / empty dispatch).
             2. The active steer body — operators usually phrase the
                steer with task-named tokens.
             3. The session's goal summary — broad fallback that at
                least disambiguates by domain vocabulary.
+            4. Goals on the session itself (some test harnesses don't
+               populate the orchestration-state mirror).
 
             Returns whatever non-empty string-or-mapping we found, or
             ``None`` when there's nothing to score against (in which
             case the score-based signals fall through silently).
             """
-            # 1) Parent invocation's last AgentTool args. The plugin's
-            # before_tool_callback already tracks pending_delegations
-            # keyed by function_call_id — that's a per-dispatch pin,
-            # not a per-invocation tool-args record. Without a richer
-            # record we synthesise the best we can: the steer body or
-            # the active-steer-targeting drift detail tends to carry
-            # the same vocabulary as the dispatch.
             session_state = _safe_attr(ctx.session, "state", None)
+            # 1) Parent's AgentTool tool-call args. Iterate
+            # pending_delegations and merge any tool_args payloads we
+            # find — pending entries are usually short-lived (stamped
+            # right before the sub-agent fires, cleared after report)
+            # so the union is a reasonable heuristic when multiple
+            # parallel dispatches landed. Skip when the merged dict
+            # tokenises to nothing.
             if isinstance(session_state, Mapping):
-                # Active steer body is a strong signal when present.
+                pend = session_state.get(_PENDING_DELEGATIONS_KEY)
+                if isinstance(pend, Mapping) and pend:
+                    merged: dict[str, Any] = {}
+                    for raw_entry in pend.values():
+                        ta = _delegation_pin_tool_args(raw_entry)
+                        if ta is None:
+                            continue
+                        merged.update(ta)
+                    if merged and _tokenize_for_matching(
+                        " ".join(f"{k} {v}" for k, v in merged.items())
+                    ):
+                        return merged
+            # 2) Active steer body / goals summary mirrored on session.state.
+            if isinstance(session_state, Mapping):
                 steer_body = session_state.get("goldfive.active_steer.body", "")
                 if isinstance(steer_body, str) and steer_body.strip():
                     return steer_body
                 goals_summary = session_state.get("goldfive.goals_summary", "")
                 if isinstance(goals_summary, str) and goals_summary.strip():
                     return goals_summary
-            # 2) Goals on the session itself (some test harnesses don't
-            # populate the orchestration-state mirror).
+            # 3) Goals on the session itself.
             goals = _safe_attr(ctx.session, "goals", None) or []
             if goals:
                 summaries = [
@@ -2293,7 +2334,7 @@ def make_adk_plugin(
                 joined = " ".join(s for s in summaries if s).strip()
                 if joined:
                     return joined
-            # 3) Nothing to score against.
+            # 4) Nothing to score against.
             _ = parent_invocation_id  # intentionally unused; kept for future plumbing
             return None
 
@@ -2709,7 +2750,19 @@ def make_adk_plugin(
                 )
             except (TypeError, ValueError):
                 pin_revision = 0
-            entry = {"task_id": task_id, "revision": pin_revision}
+            entry: dict[str, Any] = {
+                "task_id": task_id,
+                "revision": pin_revision,
+            }
+            # F7 (#265 followup) — also record the parent's AgentTool
+            # tool-call args. Signal 3 of
+            # :meth:`_pin_current_task_id_for_agent` reads this back as
+            # the highest-priority scoring source (above the active
+            # steer body / goals summary). Only stamp a Mapping; opaque
+            # blobs / non-dict args are treated as "no useful tokens"
+            # and skipped so reads don't have to disambiguate shape.
+            if isinstance(tool_args, Mapping) and tool_args:
+                entry["tool_args"] = dict(tool_args)
             # Stamp the pin onto BOTH the goldfive orchestration
             # session.state (so reporting-tool handlers that read it
             # directly see it) AND the ADK tool_context session.state

@@ -254,6 +254,155 @@ async def test_signal3_arg_scoring_breaks_dag_ready_tie() -> None:
     assert events[-1]["payload"]["via_signal"] == "arg_scored"
 
 
+async def test_signal3_parent_tool_args_outrank_steer_body() -> None:
+    """Parent's stamped AgentTool tool_args is the highest-priority signal 3 source.
+
+    F7 (#265 followup): :meth:`_pin_delegation_task_id` records
+    ``{tool_args: dict}`` on every pending-delegations entry. When
+    signal 1 fails to bind (e.g. signal-1 iterates pend.values()
+    looking for a task-id match but the entry's task is no longer
+    PENDING/RUNNING — or the test stamps an entry whose tid doesn't
+    exist) and signal 2 ties, signal 3's :meth:`_scoring_args_for`
+    consults the recorded parent args BEFORE the steer body / goals
+    summary fallback.
+
+    This test stages a deliberate conflict: the steer body biases
+    toward ``t2`` ("invoices"), but the parent's recorded tool_args
+    bias toward ``t1`` ("solar"). Signal 3 must pick t1, proving
+    parent-args win.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    sinks = [_CapturingSink()]
+    session = _session_with(
+        _plan_with(
+            Task(
+                id="t1",
+                title="solar telemetry research",
+                description="gather solar telemetry",
+                assignee_agent_id="researcher",
+            ),
+            Task(
+                id="t2",
+                title="quarterly invoice review",
+                description="reconcile quarterly invoices",
+                assignee_agent_id="researcher",
+            ),
+        )
+    )
+    # Parent's tool_args bias toward t1 (solar). Use an entry whose
+    # task_id doesn't exist in the plan so signal 1 skips and we drop
+    # into signal 3.
+    session.state["goldfive.pending_delegations"] = {
+        "fc-parent": {
+            "task_id": "missing_id",
+            "revision": 0,
+            "tool_args": {"prompt": "research solar telemetry now"},
+        },
+    }
+    # Steer body biases toward t2 (invoices) — must NOT win.
+    session.state["goldfive.active_steer.body"] = (
+        "look at the quarterly invoices"
+    )
+    state, ctx = _ctx_for(session, "coord", sinks=sinks)
+
+    await plugin.before_agent_callback(
+        agent=_Agent("researcher"),
+        callback_context=ctx,
+    )
+
+    assert state[KEY_CURRENT_TASK_ID] == "t1", (
+        "parent tool_args (solar) should outrank steer body (invoices)"
+    )
+    events = _pin_resolved_events(sinks[0].events)
+    assert events[-1]["payload"]["via_signal"] == "arg_scored"
+
+
+async def test_signal3_empty_parent_tool_args_falls_to_steer_body() -> None:
+    """Empty / non-mapping parent tool_args → fall through to steer body.
+
+    F7 hazard: dispatches with no args (or opaque blobs) tokenise to
+    nothing and would otherwise bias signal 3 against the existing
+    steer-body fallback. The signal-3 source priority must skip a
+    parent-args bag that produces zero meaningful tokens.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    sinks = [_CapturingSink()]
+    session = _session_with(
+        _plan_with(
+            Task(
+                id="t1",
+                title="solar telemetry research",
+                description="gather solar telemetry",
+                assignee_agent_id="researcher",
+            ),
+            Task(
+                id="t2",
+                title="quarterly invoice review",
+                description="reconcile quarterly invoices",
+                assignee_agent_id="researcher",
+            ),
+        )
+    )
+    # Parent stamped an entry but with empty / noise-only tool_args.
+    # The token bag should be empty, so signal 3 falls through to the
+    # steer-body branch which biases t2.
+    session.state["goldfive.pending_delegations"] = {
+        "fc-parent": {
+            "task_id": "missing_id",
+            "revision": 0,
+            "tool_args": {},  # empty → skipped
+        },
+    }
+    session.state["goldfive.active_steer.body"] = (
+        "focus on quarterly invoices, not solar"
+    )
+    state, ctx = _ctx_for(session, "coord", sinks=sinks)
+
+    await plugin.before_agent_callback(
+        agent=_Agent("researcher"),
+        callback_context=ctx,
+    )
+
+    assert state[KEY_CURRENT_TASK_ID] == "t2", (
+        "empty parent tool_args should fall through to steer body"
+    )
+    events = _pin_resolved_events(sinks[0].events)
+    assert events[-1]["payload"]["via_signal"] == "arg_scored"
+
+
+async def test_signal3_pre_f7_string_pending_delegation_back_compat() -> None:
+    """Pre-F7 (string-only) pending_delegation entries still resolve via signal 1.
+
+    Custom adapters or test fixtures that stamp ``{fc_id: "task_id"}``
+    (the legacy shape, before #266 versioning and before F7 tool_args)
+    must keep working unchanged. This regression pins the back-compat
+    contract: signal 1 reads the bare-string entry, finds the task,
+    and pins it. Signal 3's parent-args branch is silently skipped
+    because :func:`_delegation_pin_tool_args` returns ``None`` for the
+    legacy shape.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    sinks = [_CapturingSink()]
+    session = _session_with(
+        _plan_with(
+            Task(id="t1", title="first", assignee_agent_id="researcher"),
+            Task(id="t2", title="second", assignee_agent_id="researcher"),
+        )
+    )
+    # Legacy shape: bare-string task_id, no revision, no tool_args.
+    session.state["goldfive.pending_delegations"] = {"fc-old": "t2"}
+    state, ctx = _ctx_for(session, "coord", sinks=sinks)
+
+    await plugin.before_agent_callback(
+        agent=_Agent("researcher"),
+        callback_context=ctx,
+    )
+
+    assert state[KEY_CURRENT_TASK_ID] == "t2"
+    events = _pin_resolved_events(sinks[0].events)
+    assert events[-1]["payload"]["via_signal"] == "delegation_pin"
+
+
 async def test_signal3_tie_falls_through_to_signal4() -> None:
     """When tool-arg scoring ties, fall through to signal 4.
 
