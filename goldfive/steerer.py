@@ -1520,12 +1520,29 @@ class DefaultSteerer:
                     await asyncio.wait(still_pending, timeout=0.5)
                 except Exception:  # noqa: BLE001 — defensive
                     pass
-            log.warning(
-                "DefaultSteerer.shutdown: %d background judge task(s) "
-                "exceeded %.2fs timeout; cancelled",
-                len(still_pending),
-                float(timeout),
-            )
+            # Phase 2.X (goldfive#271 Gap 3): only WARN when stragglers
+            # were actually cancelled. The TimeoutError can fire even
+            # when every task completed in the same instant the timeout
+            # expired (gather scheduling vs. wait_for race) — those
+            # cases logged ``cancelled 0 tasks`` which was both
+            # confusing and noisy in the demo log. The DEBUG line
+            # preserves visibility for diagnostics while keeping INFO
+            # / WARNING reserved for the real "we cancelled work"
+            # signal.
+            if still_pending:
+                log.warning(
+                    "DefaultSteerer.shutdown: %d background judge task(s) "
+                    "exceeded %.2fs timeout; cancelled",
+                    len(still_pending),
+                    float(timeout),
+                )
+            else:
+                log.debug(
+                    "DefaultSteerer.shutdown: %.2fs timeout expired but "
+                    "all judges completed in the same instant; nothing "
+                    "to cancel",
+                    float(timeout),
+                )
 
     @staticmethod
     def _truncate_trigger_input(text: str, limit: int = 2048) -> str:

@@ -717,6 +717,55 @@ async def test_shutdown_is_noop_when_no_background_judges() -> None:
     await steerer.shutdown(timeout=5.0)
 
 
+async def test_shutdown_quiet_when_zero_tasks_actually_cancelled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Phase 2.X (goldfive#271 Gap 3): the ``shutdown`` WARNING fires
+    only when there were actually stragglers to cancel.
+
+    A judge that completes in the same instant the timeout fires can
+    leave ``still_pending`` empty even though ``wait_for`` raised
+    ``TimeoutError``. The previous unconditional WARNING logged
+    ``cancelled 0 tasks`` which was both confusing and noisy in the
+    demo log. The DEBUG line preserves diagnostic visibility.
+    """
+
+    async def fast_call_llm(system: str, user: str, model: str) -> str:  # noqa: ARG001
+        # Returns immediately so the judge completes before / during
+        # the shutdown's wait_for. With timeout=0.0 we deterministically
+        # hit the "TimeoutError but 0 still pending" branch.
+        return json.dumps({"on_task": True})
+
+    steerer = DefaultSteerer(
+        reasoning_drift_call_llm=fast_call_llm,
+        reasoning_drift_model="fake",
+        reasoning_drift_mode="judge",
+    )
+    session = _session_with_task()
+    sink = ListSink()
+    steerer.bind(sinks=[sink], planner=NullPlanner())
+
+    await steerer.observe_reasoning("a thought", session=session)
+
+    with caplog.at_level(logging.WARNING, logger="goldfive.steerer"):
+        # timeout=0.0 → wait_for raises TimeoutError immediately even
+        # if the gather wins the race in the same instant.
+        await steerer.shutdown(timeout=0.0)
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "exceeded" in r.getMessage()
+    ]
+    if warnings:
+        # If a WARNING fired, it must NOT be the misleading "0 tasks"
+        # variant — that's the regression we're guarding against.
+        for rec in warnings:
+            assert "0 background judge task(s)" not in rec.getMessage(), (
+                "shutdown WARNING regressed to 'cancelled 0 tasks' shape; "
+                f"got {rec.getMessage()!r}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 of goldfive#271 — extended verdict (focused_task_id)
 # ---------------------------------------------------------------------------

@@ -531,19 +531,51 @@ class GoldfiveADKAgent(BaseAgent):
         )
         return verdict
 
+    #: Per-turn drain timeout. Bounds how long ``_run_async_impl``'s
+    #: ``finally`` block can block ADK's iterator exit. Phase 2.X
+    #: (goldfive#271 Gap 3): the previous default of 5.0s was inherited
+    #: from :meth:`Steerer.shutdown` and was the root of the residual
+    #: #275-style stale-session race — while the per-turn drain held
+    #: ADK's outer loop for 5s, a concurrent ``/run_sse`` invocation on
+    #: the same outer session could advance the SQLite session's
+    #: ``last_update_time``, leaving the blocked turn's deferred event
+    #: appends behind. 0.5s is plenty for judges that are about to
+    #: complete; stragglers get cancelled and resume drift emit on
+    #: :meth:`Runner.close` (which keeps the longer 5s timeout for
+    #: programmatic teardown).
+    _PER_TURN_DRAIN_TIMEOUT_S: float = 0.5
+
     async def _drain_steerer_background_judges(self) -> None:
         """Call ``steerer.shutdown()`` on the bound runner's steerer, if any.
 
         Duck-typed so custom ``Steerer`` implementations (or stubs used
         in tests) without the method fall through cleanly. Exceptions
         are swallowed: teardown must never mask the run's real outcome.
+
+        Uses a tight :data:`_PER_TURN_DRAIN_TIMEOUT_S` bound so the
+        ``finally`` block doesn't stall ADK's iterator exit when a
+        slow LLM judge is still in flight at run end. The default
+        :meth:`Steerer.shutdown` timeout (5s) survives on
+        :meth:`Runner.close`, where blocking is acceptable.
         """
         steerer = getattr(self._runner, "steerer", None)
         shutdown = getattr(steerer, "shutdown", None)
         if shutdown is None:
             return
         try:
-            await shutdown()
+            await shutdown(timeout=self._PER_TURN_DRAIN_TIMEOUT_S)
+        except TypeError:
+            # Custom Steerers without the timeout kwarg get the legacy
+            # default. Best-effort fallthrough so we don't break third-
+            # party steerers that haven't been updated.
+            try:
+                await shutdown()
+            except Exception as exc:  # noqa: BLE001 — defensive
+                log.debug(
+                    "GoldfiveADKAgent: steerer.shutdown raised "
+                    "(swallowed): %s",
+                    exc,
+                )
         except Exception as exc:  # noqa: BLE001 — defensive
             log.debug(
                 "GoldfiveADKAgent: steerer.shutdown raised "
