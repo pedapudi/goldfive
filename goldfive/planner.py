@@ -860,6 +860,12 @@ class StaticPlanner:
                     predicted_start_ms=t.predicted_start_ms,
                     predicted_duration_ms=t.predicted_duration_ms,
                     bound_span_id=t.bound_span_id,
+                    # goldfive#251: preserve supersession metadata when
+                    # cloning the StaticPlanner template so callers that
+                    # bake supersedes into a hard-coded plan (tests,
+                    # CLIs) see it survive the per-call clone.
+                    supersedes=t.supersedes,
+                    supersedes_kind=t.supersedes_kind,
                 )
                 for t in self._template.tasks
             ],
@@ -2552,6 +2558,16 @@ class LLMPlanner:
                         description=looping_task.description,
                         assignee_agent_id=looping_task.assignee_agent_id,
                         status=TaskStatus.FAILED,
+                        # goldfive#251: preserve the supersession provenance
+                        # when re-inserting the looping task into the
+                        # revised plan. Dropping these fields here turned a
+                        # CORRECT-kind chain into an orphan, which the
+                        # downstream supersedes-coverage validator would
+                        # then flag as a regression (or, worse, the steerer
+                        # would re-pin to the wrong successor). See the
+                        # paired regression in test_planner.py.
+                        supersedes=looping_task.supersedes,
+                        supersedes_kind=looping_task.supersedes_kind,
                     ),
                 )
             return revised
@@ -2611,6 +2627,13 @@ class LLMPlanner:
                         predicted_start_ms=t.predicted_start_ms,
                         predicted_duration_ms=t.predicted_duration_ms,
                         bound_span_id=t.bound_span_id,
+                        # goldfive#251: preserve supersession provenance
+                        # through the deterministic-fallback path. Without
+                        # this, a CORRECT-kind chain that hits the fallback
+                        # would erase the link to the prior task and the
+                        # supersedes-coverage validator would orphan it.
+                        supersedes=t.supersedes,
+                        supersedes_kind=t.supersedes_kind,
                     )
                 )
                 found = True
@@ -2625,6 +2648,8 @@ class LLMPlanner:
                         predicted_start_ms=t.predicted_start_ms,
                         predicted_duration_ms=t.predicted_duration_ms,
                         bound_span_id=t.bound_span_id,
+                        supersedes=t.supersedes,
+                        supersedes_kind=t.supersedes_kind,
                     )
                 )
         if not found and looping_task is not None and loop_id:
@@ -2635,6 +2660,8 @@ class LLMPlanner:
                     description=looping_task.description,
                     assignee_agent_id=looping_task.assignee_agent_id,
                     status=TaskStatus.FAILED,
+                    supersedes=looping_task.supersedes,
+                    supersedes_kind=looping_task.supersedes_kind,
                 )
             )
         return Plan(
