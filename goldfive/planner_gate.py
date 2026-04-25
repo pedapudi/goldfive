@@ -127,6 +127,59 @@ def _looks_like_steer(text: str) -> bool:
         return False
     return bool(_STEER_PATTERN_RE.search(text))
 
+
+#: Factual-question regex (Phase 2.X / goldfive#271 Gap 4). Matches the
+#: open-ended interrogative shape of "where/when/how/what/why/which/who"
+#: + "is/will/did/does/are/was/were/have/can" when the question is about
+#: the existing work. Stronger than the bare token-count heuristic — a
+#: 6-token question like "where will the slides be saved?" was being
+#: mis-routed to ``refine_existing`` by the LLM gate. The heuristic
+#: returns ``"conversational"`` for these unconditionally.
+#:
+#: Anchored to start-of-string OR a sentence break so "Tell me more
+#: about where the data is" doesn't false-positive.
+_FACTUAL_QUESTION_RE = re.compile(
+    r"(?:^|[.?!]\s+)(?:"
+    r"where(?:\s+(?:is|are|was|were|will|did|does|do|can|could|should|would|the|am)\b)|"
+    r"when(?:\s+(?:is|are|was|were|will|did|does|do|can|could|should|would|the|am)\b)|"
+    r"how(?:\s+(?:is|are|was|were|will|did|does|do|can|could|should|would|much|many|long|the)\b)|"
+    r"what(?:'s|\s+(?:is|are|was|were|will|did|does|do|can|could|should|would|happened|the))|"
+    r"why(?:\s+(?:is|are|was|were|did|does|do|can|could|should|would|the))|"
+    r"which(?:\s+(?:is|are|was|were|did|does|do|the|one|of))|"
+    r"who(?:'s|\s+(?:is|are|was|were|did|does|do|the))|"
+    r"can\s+you\s+(?:tell|show|explain|describe|list)|"
+    r"could\s+you\s+(?:tell|show|explain|describe|list)|"
+    r"did\s+you|"
+    r"is\s+(?:the|it|that|there)|"
+    r"are\s+(?:the|those|there)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_factual_question(text: str) -> bool:
+    """Return True if ``text`` opens with a factual interrogative.
+
+    Phase 2.X / goldfive#271 Gap 4: the LLM gate misclassified
+    "where will the slides be saved?" as ``refine_existing`` despite
+    the prompt's explicit example of "where did you save the output?"
+    as conversational. The future-tense / "will be" framing tripped
+    the LLM. This heuristic catches the canonical factual-question
+    openers (where/when/how/what/why/which/who + auxiliary verb) and
+    routes them through ``conversational`` deterministically before
+    the LLM gate runs.
+
+    Note: false positives are cheap (a steer phrased as a question
+    just gets answered conversationally — the user can restate),
+    while false negatives (mis-routing a factual question to
+    refine_existing) trigger an unwanted re-plan with sticky-goal
+    side effects. The asymmetry justifies a slightly aggressive
+    pattern.
+    """
+    if not text:
+        return False
+    return bool(_FACTUAL_QUESTION_RE.search(text))
+
 _SYSTEM_PROMPT = """\
 You are a turn-classifier for a multi-agent orchestration system.
 
@@ -143,11 +196,30 @@ Verdicts:
   plan did not produce.
 
 - "conversational": the new input is a question or clarification
-  about work that has ALREADY been done — e.g. "where did you save
-  the output?", "what was the second slide?", "did you use source
-  X?", "summarise what you did". These can be answered from the
+  about work that has ALREADY been done OR a question about the
+  artefact's properties (where it lives, how it works, what it
+  looks like, who made which part). These can be answered from the
   existing plan / completed_results / conversation history without
   running any new tasks.
+
+  Examples (ALL conversational):
+  * "where did you save the output?"
+  * "where will the slides be saved?" (future-tense factual question)
+  * "where is the file located?"
+  * "what was the second slide?" / "what was the title?"
+  * "what is this about?" / "what does it do?"
+  * "did you use source X?" / "did you include Y?"
+  * "is the presentation done?" / "is it ready?"
+  * "how does the slideshow work?" / "how do I open it?"
+  * "summarise what you did"
+  * "tell me more about X" (X already covered by the plan)
+  * "can you explain how Y works"
+
+  Future tense ("will be"), present continuous, AND past tense are
+  all conversational when the question targets the prior plan or
+  its outputs. The grammatical tense does NOT change the bucket —
+  what matters is whether the question can be ANSWERED without
+  running new tasks.
 
 - "refine_existing": the new input tweaks, extends, or revises the
   PRIOR PLAN — e.g. "make it funnier", "add a slide about Z",
@@ -166,6 +238,13 @@ Verdicts:
   drops them.
 
 Guidelines:
+- Factual interrogatives that open with where/when/how/what/why/
+  which/who + a state verb (is/are/will/did/does/was/were/can/could)
+  are conversational by default — they ask about prior state, not
+  request new work. Only classify them as refine_existing when the
+  question contains an EXPLICIT directive ("can you ALSO add a
+  slide about X?", "what if we changed the title?") — a bare
+  question is just a question.
 - When in doubt between "conversational" and "refine_existing",
   prefer "conversational" — the coordinator can always answer and
   the user can restate if they actually wanted new work.
@@ -273,6 +352,14 @@ def heuristic_classify_turn(
       ``"conversational"`` (short input) or ``"new_work"`` (long
       input), both of which silently lost the constraints — see
       goldfive#270 E2E.
+    - Prior plan exists AND :func:`_looks_like_factual_question`
+      matches → ``"conversational"``. Factual interrogatives ("where
+      will", "how does", "did you", "what is") are nearly always
+      asking about prior work. Phase 2.X (goldfive#271 Gap 4)
+      regression: "where will the slides be saved?" was mis-routed
+      to ``refine_existing`` by the LLM gate despite the prompt's
+      explicit example. Catching it heuristically routes around the
+      LLM uncertainty.
     - Prior plan exists AND user_input is short (``< 20`` tokens) →
       ``"conversational"``. Short follow-ups that AREN'T steer-shaped
       are overwhelmingly questions about prior work.
@@ -287,6 +374,8 @@ def heuristic_classify_turn(
         return "new_work"
     if _looks_like_steer(user_input):
         return "refine_existing"
+    if _looks_like_factual_question(user_input):
+        return "conversational"
     if _token_count(user_input) < _HEURISTIC_SHORT_TOKEN_BUDGET:
         return "conversational"
     return "new_work"
@@ -329,6 +418,31 @@ async def classify_turn(
             user_input=user_input,
             conversation_id=conversation_id,
         )
+
+    # Phase 2.X / goldfive#271 Gap 4: heuristic short-circuit for the
+    # two patterns where the LLM has historically misclassified —
+    # explicit steer language and explicit factual interrogatives.
+    # Both patterns are unambiguous; running the LLM for them just
+    # adds latency and risks a wrong answer ("where will the slides
+    # be saved?" got refine_existing in the validation E2E).
+    #
+    # Falls through to the LLM only when the heuristic returns
+    # ``"new_work"`` — that's the broad "no signal" bucket where the
+    # LLM's nuance pays off.
+    if _looks_like_steer(user_input):
+        log.info(
+            "planner_gate.classify_turn: heuristic short-circuit "
+            "(steer pattern) -> refine_existing; user_input_first=%r",
+            user_input[:80],
+        )
+        return "refine_existing"
+    if _looks_like_factual_question(user_input):
+        log.info(
+            "planner_gate.classify_turn: heuristic short-circuit "
+            "(factual question) -> conversational; user_input_first=%r",
+            user_input[:80],
+        )
+        return "conversational"
 
     user_prompt = _build_user_prompt(
         prior_plan=prior_plan,

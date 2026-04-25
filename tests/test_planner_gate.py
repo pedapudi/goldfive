@@ -292,3 +292,166 @@ async def test_classify_turn_llm_raising_falls_back_to_heuristic() -> None:
         conversation_id="c1",
     )
     assert verdict == "new_work"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.X / goldfive#271 Gap 4: factual-question short-circuit
+# ---------------------------------------------------------------------------
+
+
+def test_heuristic_factual_question_routes_conversational() -> None:
+    """Phase 2.X (goldfive#271 Gap 4): factual interrogatives that
+    open with where/when/how/what/why/which/who + auxiliary verb route
+    through ``conversational`` deterministically, not via the
+    token-count fallback alone.
+
+    The validation E2E saw "where will the slides be saved?" mis-routed
+    to ``refine_existing`` by the LLM gate. The heuristic catches it
+    before the LLM runs.
+    """
+    factual_questions = [
+        "where will the slides be saved?",  # the validation regression
+        "where is the file located?",
+        "where are the outputs?",
+        "when did you finish the deck?",
+        "when will it be done?",
+        "how does the slideshow work?",
+        "how do I open the file?",
+        "how many slides does it have?",
+        "what is the title of the deck?",
+        "what's the second slide about?",
+        "what was the source you used?",
+        "why did you pick that title?",
+        "which template did you use?",
+        "who wrote the second slide?",
+        "did you include the cost slide?",
+        "is the presentation done?",
+        "are the slides ready?",
+        "can you tell me where it lives?",
+        "could you explain the structure?",
+    ]
+    for ui in factual_questions:
+        verdict = heuristic_classify_turn(
+            prior_plan=_prior_plan(),
+            completed_results={},
+            user_input=ui,
+        )
+        assert verdict == "conversational", (
+            f"factual question {ui!r} should route conversational; "
+            f"got {verdict!r}"
+        )
+
+
+def test_heuristic_factual_question_does_not_match_steer_phrasing() -> None:
+    """Phrases with ``where``/``when``/``how`` that ARE steers must NOT
+    match the factual-question heuristic — the steer regex runs first
+    and wins.
+    """
+    # "switch to" is a steer pattern; "where would..." is conditional.
+    # The first sentence is a steer; the heuristic returns refine_existing.
+    verdict = heuristic_classify_turn(
+        prior_plan=_prior_plan(),
+        completed_results={},
+        user_input="switch to a different topic. where do we start?",
+    )
+    assert verdict == "refine_existing", (
+        f"steer-then-question should still route refine_existing; got {verdict!r}"
+    )
+
+
+def test_heuristic_factual_question_requires_prior_plan() -> None:
+    """First turn (no prior plan) still returns ``new_work`` even on a
+    factual-question opener — there's nothing to ask about yet.
+    """
+    verdict = heuristic_classify_turn(
+        prior_plan=None,
+        completed_results={},
+        user_input="where is it?",
+    )
+    assert verdict == "new_work"
+
+
+async def test_classify_turn_factual_question_short_circuits_llm() -> None:
+    """The LLM gate is bypassed when the user message matches the
+    factual-question heuristic. Pre-Phase-2.X the LLM was always
+    consulted; the validation E2E showed it returning ``refine_existing``
+    for "where will the slides be saved?". Short-circuiting the LLM
+    eliminates the regression path.
+    """
+    llm_calls: list[tuple[str, str, str]] = []
+
+    async def _llm(system: str, user: str, model: str) -> str:
+        llm_calls.append((system, user, model))
+        # If the LLM IS called, it would return refine_existing — the
+        # validation regression. The heuristic must intercept BEFORE
+        # the LLM gets the chance.
+        return json.dumps({"verdict": "refine_existing", "reason": "wrong"})
+
+    verdict = await classify_turn(
+        call_llm=_llm,
+        prior_plan=_prior_plan(),
+        completed_results={"t1": "facts"},
+        user_input="where will the slides be saved?",
+        conversation_id="c1",
+    )
+    assert verdict == "conversational", (
+        f"factual question should route conversational without LLM; "
+        f"got {verdict!r}"
+    )
+    assert llm_calls == [], (
+        "LLM was called despite factual-question heuristic short-circuit; "
+        "the regression path is open"
+    )
+
+
+async def test_classify_turn_steer_language_short_circuits_llm() -> None:
+    """The LLM gate is also bypassed for steer-language openers — same
+    rationale as the factual-question short-circuit. The LLM was prone
+    to misclassifying topic pivots as ``new_work`` (silently dropping
+    sticky constraints), so explicit steer language routes to
+    ``refine_existing`` deterministically.
+    """
+    llm_calls: list[tuple[str, str, str]] = []
+
+    async def _llm(system: str, user: str, model: str) -> str:
+        llm_calls.append((system, user, model))
+        return json.dumps({"verdict": "new_work", "reason": "wrong"})
+
+    verdict = await classify_turn(
+        call_llm=_llm,
+        prior_plan=_prior_plan(),
+        completed_results={},
+        user_input="forget solar panels. tell me about wind power instead.",
+        conversation_id="c1",
+    )
+    assert verdict == "refine_existing"
+    assert llm_calls == []
+
+
+async def test_classify_turn_falls_through_to_llm_for_ambiguous_input() -> None:
+    """Inputs that match neither the steer nor factual-question
+    heuristic still consult the LLM. This is the "no signal" bucket
+    where the LLM's nuance pays off — refining a request, asking for
+    extension, or making genuinely new work.
+    """
+    llm_calls: list[tuple[str, str, str]] = []
+
+    async def _llm(system: str, user: str, model: str) -> str:
+        llm_calls.append((system, user, model))
+        return json.dumps({"verdict": "refine_existing", "reason": "extends prior"})
+
+    ambiguous = (
+        "please make the deck more colourful and add an extra section "
+        "about cost benefits over a five year horizon"
+    )
+    verdict = await classify_turn(
+        call_llm=_llm,
+        prior_plan=_prior_plan(),
+        completed_results={},
+        user_input=ambiguous,
+        conversation_id="c1",
+    )
+    assert verdict == "refine_existing"
+    assert len(llm_calls) == 1, (
+        f"expected exactly one LLM call for ambiguous input; got {len(llm_calls)}"
+    )
