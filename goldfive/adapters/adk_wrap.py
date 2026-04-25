@@ -472,11 +472,20 @@ class GoldfiveADKAgent(BaseAgent):
         # Caller has explicitly disabled the gate — don't reintroduce it
         # at the adapter layer.
         if gate is None:
+            log.info(
+                "GoldfiveADKAgent: gate disabled (planner_gate=None); "
+                "Runner.run will treat this turn as new_work"
+            )
             return None
         last_plan = getattr(runner, "_last_plan", None)
         # No prior plan → first turn, gate would always pick new_work.
         # Skip the call to keep the LLM out of the hot path on turn 1.
         if last_plan is None or not getattr(last_plan, "tasks", None):
+            log.info(
+                "GoldfiveADKAgent: gate skipped — no prior plan; "
+                "treating as new_work (user_input_first=%r)",
+                user_input[:80],
+            )
             return None
 
         # Reuse Runner._classify_turn so the planner-gate configuration
@@ -513,6 +522,13 @@ class GoldfiveADKAgent(BaseAgent):
                 verdict,
             )
             return None
+        log.info(
+            "GoldfiveADKAgent: gate verdict=%s prior_plan_id=%s "
+            "user_input_first=%r",
+            verdict,
+            getattr(last_plan, "id", "")[:16] or "<none>",
+            user_input[:80],
+        )
         return verdict
 
     async def _drain_steerer_background_judges(self) -> None:
