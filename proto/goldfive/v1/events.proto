@@ -692,11 +692,26 @@ message InvocationCancelled {
 //                                C) transitioned a running task as a
 //                                consequence (cascade-cancel from a
 //                                CRITICAL drift).
+//   * ``"executor_dispatch"``  — driven by an executor's framework
+//                                auto-start of a task (the
+//                                ``ParallelDAGExecutor.run_one`` path
+//                                that flips ``task.status = RUNNING``
+//                                before the adapter invoke). Distinct
+//                                from ``handler_default`` (LLM tool
+//                                call where ``task_id`` defaulted) and
+//                                from generic ``other``.
+//   * ``"control_rewind"``     — driven by a ``REWIND_TO`` control
+//                                message in
+//                                :mod:`goldfive.executors._control`;
+//                                marks the target task and every
+//                                downstream task PENDING so the
+//                                executor re-walks them. One
+//                                transition is emitted per affected
+//                                task.
 //   * ``"other"``              — any transition that doesn't match a
-//                                more specific source (e.g. framework
-//                                auto-start, control-message rewinds).
-//                                Operators can still surface the row;
-//                                a follow-up may refine the vocabulary.
+//                                more specific source. Operators can
+//                                still surface the row; a follow-up
+//                                may refine the vocabulary.
 message TaskTransitioned {
   // The task that transitioned. After supersedes-reroute this is the
   // SUCCESSOR task id (the one whose status actually changed), not the

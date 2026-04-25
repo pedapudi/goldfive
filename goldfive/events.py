@@ -775,8 +775,22 @@ def task_transitioned_event(
 
     ``source`` vocabulary (see proto comment for the full list):
     ``"llm_report"`` / ``"handler_default"`` / ``"supersedes_reroute"``
-    / ``"plan_revision"`` / ``"cancellation"`` / ``"other"``. Readers
-    MUST tolerate unknown values for forward-compat.
+    / ``"plan_revision"`` / ``"cancellation"`` / ``"executor_dispatch"``
+    / ``"control_rewind"`` / ``"other"``. Readers MUST tolerate unknown
+    values for forward-compat.
+
+    ``"executor_dispatch"`` (F10) — driven by an executor's framework
+    auto-start of a task (the ``ParallelDAGExecutor.run_one`` path
+    that flips ``task.status = RUNNING`` before the adapter invoke);
+    distinguishes a framework-initiated PENDING -> RUNNING from
+    ``"handler_default"`` (LLM ``report_task_*`` with a defaulted pin)
+    and from generic ``"other"``.
+
+    ``"control_rewind"`` (F10) — driven by a ``REWIND_TO`` control
+    message in :mod:`goldfive.executors._control`; the helper marks
+    the target task and every downstream task PENDING so the
+    executor re-walks them. One transition is emitted per affected
+    task.
 
     ``from_status`` / ``to_status`` are the bare lowercase
     :class:`~goldfive.types.TaskStatus` values (``"PENDING"`` /

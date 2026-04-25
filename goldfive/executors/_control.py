@@ -245,8 +245,8 @@ async def dispatch_control(
                     detail="rewind_to requires payload.task_id",
                 ),
             )
-        ok = _rewind_plan(session, target)
-        if not ok:
+        transitions = _rewind_plan(session, target)
+        if transitions is None:
             return ControlOutcome(
                 ack=_build_ack(
                     msg,
@@ -254,6 +254,32 @@ async def dispatch_control(
                     detail=f"rewind_to: unknown task_id={target!r}",
                 ),
             )
+        # F10 / goldfive#251 R4: emit one ``TaskTransitioned`` with
+        # ``source="control_rewind"`` per affected task so operator
+        # triage can distinguish a control-driven rewind from a
+        # cancellation cascade or a plan_revision flip. The steerer's
+        # _emit_task_transitioned helper is duck-typed on purpose
+        # (custom Steerers may not implement it); failures are
+        # swallowed at debug — observability MUST NOT break the
+        # control path.
+        emit_transition = getattr(steerer, "_emit_task_transitioned", None)
+        if callable(emit_transition):
+            for task, prev_status in transitions:
+                try:
+                    await emit_transition(
+                        session,
+                        task,
+                        from_status=prev_status,
+                        to_status=TaskStatus.PENDING,
+                        source="control_rewind",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "dispatch_control: TaskTransitioned emit raised for "
+                        "REWIND_TO task=%s: %s",
+                        getattr(task, "id", "?"),
+                        exc,
+                    )
         return ControlOutcome(
             ack=_build_ack(
                 msg,
@@ -421,19 +447,31 @@ async def _resolve_approval(
     return True
 
 
-def _rewind_plan(session: Session, target_task_id: str) -> bool:
+def _rewind_plan(
+    session: Session, target_task_id: str
+) -> list[tuple[Any, TaskStatus]] | None:
     """Reset ``target`` and every downstream task back to ``PENDING``.
 
     Any task transitively reachable from ``target`` via ``plan.edges``
-    is considered downstream. Returns ``True`` if ``target`` exists
-    in the session's plan, else ``False``.
+    is considered downstream. Returns ``None`` if ``target`` does not
+    exist in the session's plan; otherwise returns a list of
+    ``(task, previous_status)`` pairs for every task whose status
+    actually changed (i.e. was non-PENDING before the rewind). The
+    caller uses this list to emit one ``TaskTransitioned`` event per
+    affected task with ``source="control_rewind"``.
+
+    F10 / goldfive#251 R4: emitting from the dispatcher (rather than
+    here) keeps this helper sync + dependency-free, while still giving
+    the typed-observability layer a precise per-task transition row
+    that operators can distinguish from ``cancellation`` cascades and
+    ``plan_revision`` flips.
     """
     plan = session.plan
     if plan is None:
-        return False
+        return None
     tasks_by_id = {t.id: t for t in plan.tasks if t.id}
     if target_task_id not in tasks_by_id:
-        return False
+        return None
 
     children: dict[str, list[str]] = {tid: [] for tid in tasks_by_id}
     for e in plan.edges:
@@ -451,9 +489,13 @@ def _rewind_plan(session: Session, target_task_id: str) -> bool:
             if child not in affected:
                 stack.append(child)
 
+    transitions: list[tuple[Any, TaskStatus]] = []
     for tid in affected:
         task = tasks_by_id[tid]
+        prev = task.status
+        if prev is not TaskStatus.PENDING:
+            transitions.append((task, prev))
         task.status = TaskStatus.PENDING
         session.completed_results.pop(tid, None)
         session.task_progress.pop(tid, None)
-    return True
+    return transitions

@@ -64,7 +64,6 @@ from goldfive.reporting import BUILTIN_REPORTING_TOOLS
 from goldfive.results import ExecutionOutcome
 from goldfive.steerer import DefaultSteerer
 from goldfive.types import (
-    GOAL_SOURCE_USER_STEER,
     DriftEvent,
     DriftKind,
     DriftSeverity,
@@ -391,19 +390,109 @@ class Runner:
         else:
             available_agents = list(self.agent.available_agents)
         plan: Plan | None = None
+        # Set when the refine_existing branch routed through the steerer
+        # and successfully installed a revised plan via _apply_revision.
+        # PlanRevised was already emitted there, so the post-planning
+        # code skips _emit_plan_submitted for this turn.
+        revised_via_steerer = False
         if verdict == "refine_existing" and self._last_plan is not None:
-            # Refine path: treat the new user_input as a steering
-            # directive against the prior plan. Preserves completed
-            # tasks verbatim and asks the planner for a delta of new
-            # PENDING tasks. On any refine failure we fall through to
-            # full generate() below — the safe path is always to ship
-            # a plan.
-            plan = await self._refine_from_user_input(
-                prior_plan=self._last_plan,
-                user_input=user_input if isinstance(user_input, str) else "",
-                goals=list(session.goals),
-                available_agents=available_agents,
-            )
+            # Refine path: route the new user_input through the
+            # steerer's drift-handling pipeline as a synthetic
+            # USER_STEER drift. The steerer's pipeline is the only
+            # site that emits DriftDetected(USER_STEER), preserves
+            # sticky goals via _apply_user_steer_state, drives the
+            # severity ladder, and emits PlanRevised (with the #264
+            # atomicity barrier, RefineAttempted/Failed, the #263
+            # supersedes-coverage validator, and a stable plan_id +
+            # bumped revision_index from _apply_revision). The
+            # pre-#210 fix-bypass path (calling planner.refine
+            # directly + emitting PlanSubmitted on the result) is
+            # gone: it dropped DriftDetected, fresh-minted the
+            # plan_id, reset revision_index, and silently bypassed
+            # every typed observability hook from #258-#267.
+            #
+            # On any refine failure inside the steerer (planner.refine
+            # raised, returned None, or validation rejected the
+            # output), session.plan stays equal to the carried-prior;
+            # we detect that below and fall through to planner.generate.
+            user_text = user_input.strip() if isinstance(user_input, str) else ""
+            if user_text:
+                # Carry the prior plan onto the live session so the
+                # steerer's _apply_revision can compute revision_index
+                # from prev_plan.revision_index + 1 and so a refine
+                # failure leaves the session in a recoverable state.
+                # Mutate run_id so any sink emissions correlate with
+                # this turn (mirrors the conversational path).
+                prior_plan = self._last_plan
+                prior_plan.run_id = session.run_id
+                session.plan = prior_plan
+                _ostate.set_current_plan(session.state, prior_plan)
+                # Bind the steerer early so _handle_drift has sinks +
+                # planner. bind() is idempotent — step 6 below re-binds
+                # with the same args, harmless. bind_adapter() is also
+                # safe to call early; the adapter wiring (step 6b)
+                # re-runs after this. We deliberately do NOT run the
+                # adapter-side bind_steerer here — that hook is also
+                # idempotent at step 6b but we want the steerer-only
+                # plumbing to surface refine emissions, not adapter
+                # plugin callbacks.
+                try:
+                    self.steerer.bind(sinks=list(self.sinks), planner=self.planner)
+                    bind_steerer_adapter = getattr(self.steerer, "bind_adapter", None)
+                    if callable(bind_steerer_adapter):
+                        try:
+                            bind_steerer_adapter(self.agent)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug(
+                                "steerer.bind_adapter raised on refine_existing path: %s",
+                                exc,
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    # If the bind itself fails, fall through to full
+                    # generate() — the safe path always ships a plan.
+                    log.warning(
+                        "steerer.bind raised on refine_existing path; "
+                        "falling back to generate: %s",
+                        exc,
+                    )
+                else:
+                    # WARNING matches the severity the steerer
+                    # synthesizes for a USER_STEER drift coerced from a
+                    # ControlMessage (see _drift_from_steer_event).
+                    # USER_STEER bypasses the severity gate in
+                    # _should_request_cancel_for_drift anyway — an
+                    # operator directive always honours the cancel +
+                    # refine path.
+                    drift = DriftEvent(
+                        kind=DriftKind.USER_STEER,
+                        severity=DriftSeverity.WARNING,
+                        detail=user_text,
+                    )
+                    try:
+                        await self.steerer._handle_drift(drift, session)
+                    except Exception as exc:  # noqa: BLE001
+                        # Steerer failures must not break the run.
+                        # Reset session.plan so the fall-through to
+                        # generate() below treats this as no-plan.
+                        log.warning(
+                            "steerer._handle_drift raised on refine_existing path; "
+                            "falling back to generate: %s",
+                            exc,
+                        )
+                        session.plan = None
+                    else:
+                        # _apply_revision installs the revised plan
+                        # in-place when refine succeeded — picked up
+                        # via session.plan. If the steerer left
+                        # session.plan unchanged (refine returned
+                        # None / raised / validation rejected the
+                        # revision) it is still the prior plan; reset
+                        # it so the fall-through to generate() runs.
+                        if session.plan is prior_plan:
+                            session.plan = None
+                        else:
+                            plan = session.plan
+                            revised_via_steerer = True
         if plan is None:
             try:
                 plan = await self.planner.generate(
@@ -442,7 +531,13 @@ class Runner:
         # plan id.
         _ostate.set_current_plan(session.state, plan)
 
-        await self._emit_plan_submitted(session, plan)
+        # PlanSubmitted is for fresh plans only. When the
+        # refine_existing branch routed through the steerer and
+        # _apply_revision installed a revised plan, the steerer
+        # already emitted PlanRevised — skip the new-plan event so we
+        # don't double-announce the plan.
+        if not revised_via_steerer:
+            await self._emit_plan_submitted(session, plan)
 
         # 5. Register the seven canonical reporting tools on the adapter.
         try:
@@ -1049,64 +1144,6 @@ class Runner:
             outcome, user_input_summary=_initial_goal_summary(user_input)
         )
         return outcome
-
-    async def _refine_from_user_input(
-        self,
-        *,
-        prior_plan: Plan,
-        user_input: str,
-        goals: list[Goal],
-        available_agents: Any,
-    ) -> Plan | None:
-        """Build a synthetic USER_STEER drift and call ``planner.refine``.
-
-        The new user_input is treated as a steering directive against
-        the prior plan. Returns ``None`` if the planner doesn't
-        support refine or any step raises — the caller then falls
-        through to :meth:`Planner.generate`, which is always safe.
-        """
-        if not user_input.strip():
-            return None
-        refine = getattr(self.planner, "refine", None)
-        if refine is None:
-            return None
-        # Synthesize a steer Goal so the refine prompt can reference it.
-        synth = getattr(self.planner, "synthesize_goal_from_steer", None)
-        steer_goal: Goal | None = None
-        if callable(synth):
-            try:
-                pair = await synth(user_input)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("synthesize_goal_from_steer raised: %s", exc)
-                pair = None
-            if pair is not None:
-                steer_goal, _mode = pair
-        if steer_goal is None:
-            steer_goal = Goal(
-                id="steer",
-                summary=user_input.strip(),
-                source=GOAL_SOURCE_USER_STEER,
-            )
-        else:
-            steer_goal.source = GOAL_SOURCE_USER_STEER
-        refine_goals = list(goals)
-        refine_goals.append(steer_goal)
-        drift = DriftEvent(
-            kind=DriftKind.USER_STEER,
-            severity=DriftSeverity.HIGH,
-            detail=user_input.strip(),
-        )
-        try:
-            return await refine(
-                plan=prior_plan,
-                drift=drift,
-                goals=refine_goals,
-                observed_actions=None,
-                available_agents=available_agents,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("planner.refine raised from planner_gate path: %s", exc)
-            return None
 
     async def _resolve_goals(
         self,
