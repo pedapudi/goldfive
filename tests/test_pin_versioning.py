@@ -251,12 +251,13 @@ async def test_pin_stamp_writes_revision_alongside_task_id() -> None:
     )
 
     # Pin landed via signal 2 (DAG-ready exactly-1 happy path).
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
-    # And the revision stamp followed it on the same surface.
-    assert state[KEY_CURRENT_TASK_REVISION] == 3
-    # Mirrored on goldfive's session.state too (the shared contract).
+    # Phase 2.1 of goldfive#271 — the pin lives on goldfive Session.state
+    # exclusively; ADK state is no longer mutated by the pin ladder.
     assert session.state.get("goldfive.current_task_id") == "t1"
     assert session.state.get("goldfive.current_task_revision") == 3
+    # And nothing leaked onto the ADK-side state dict.
+    assert KEY_CURRENT_TASK_ID not in state
+    assert KEY_CURRENT_TASK_REVISION not in state
 
 
 # ---------------------------------------------------------------------------
@@ -516,14 +517,32 @@ def test_pending_delegations_back_compat_string_shape() -> None:
     assert _delegation_pin_task_id(None) == ""
     assert _delegation_pin_revision({"task_id": "x"}) == 0  # missing rev
 
-    # _resolve_pinned_task_id resolves both shapes.
+    # _resolve_pinned_task_id resolves both shapes via the SessionContext
+    # stash that points at goldfive Session.state. Phase 2.1 of
+    # goldfive#271 — readers consult the goldfive Session, not ADK state.
+    session_legacy = Session(run_id="r1")
+    session_legacy.state["goldfive.pending_delegations"] = {"fc_X": "task_legacy"}
     state_legacy: dict[str, Any] = {
-        "goldfive.pending_delegations": {"fc_X": "task_legacy"},
+        SESSION_CONTEXT_STATE_KEY: SessionContext(
+            session=session_legacy,
+            steerer=None,
+            task=None,
+            tool_handlers={},
+            host_agent_name="coord",
+        ),
+    }
+    session_new = Session(run_id="r1")
+    session_new.state["goldfive.pending_delegations"] = {
+        "fc_X": {"task_id": "task_new", "revision": 7}
     }
     state_new: dict[str, Any] = {
-        "goldfive.pending_delegations": {
-            "fc_X": {"task_id": "task_new", "revision": 7}
-        },
+        SESSION_CONTEXT_STATE_KEY: SessionContext(
+            session=session_new,
+            steerer=None,
+            task=None,
+            tool_handlers={},
+            host_agent_name="coord",
+        ),
     }
     tool_ctx_legacy = _StateCtx._ToolCtx(state_legacy, fc_id="fc_X")
     tool_ctx_new = _StateCtx._ToolCtx(state_new, fc_id="fc_X")

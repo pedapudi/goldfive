@@ -41,8 +41,12 @@ import time
 from collections.abc import Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any
 
-from goldfive.adapters import _adk_state_protocol as _sp
 from goldfive.adapters._tool_invocation import invoke_tool
+from goldfive.orchestration_store import (
+    PENDING_DELEGATIONS_KEY,
+    BindingSource,
+    OrchestrationStore,
+)
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
@@ -419,30 +423,38 @@ def _inject_task_id_from_state(
         return False
 
 
-# State-key used to stash per-function_call_id task pins at the
-# delegation site (goldfive#241 Item 3-bis). The plugin's
-# ``before_tool_callback`` writes an entry here when it dispatches an
-# AgentTool call and the reporting-tool callback reads it back when
-# the sub-invocation's tool call arrives. Keyed by the ADK
-# ``function_call_id`` of the AgentTool dispatch so parallel calls
-# don't race.
-_PENDING_DELEGATIONS_KEY = "goldfive.pending_delegations"
+# Re-export under the legacy module-private name so downstream tests
+# and custom adapters that import :data:`_PENDING_DELEGATIONS_KEY` keep
+# working unchanged. Phase 2.1 (goldfive#271) moved the canonical
+# definition into :mod:`goldfive.orchestration_store`; the value is
+# unchanged.
+_PENDING_DELEGATIONS_KEY = PENDING_DELEGATIONS_KEY
 
-# Mirror of orchestration_state.KEY_CURRENT_TASK_REVISION (goldfive#266).
-# Stable string contract shared between the adapter's ADK side
-# (``_adk_state_protocol``), the goldfive Session.state writers, and the
-# reporting-handler classifier. Re-declared here rather than imported
-# to keep the plugin module ADK-only without pulling
-# orchestration_state into its top-level imports.
-_GF_KEY_CURRENT_TASK_REVISION = "goldfive.current_task_revision"
+# Map the pin-ladder ``source`` strings used in :meth:`_stamp_current_task_id`'s
+# log line onto :class:`BindingSource` enum values so the orchestration
+# store records typed attribution alongside the pin write. Phase 2.1 of
+# goldfive#271 — the source label is now a structural part of the pin,
+# not just a free-form log token.
+_BINDING_SOURCE_BY_LADDER: dict[str, BindingSource] = {
+    "delegation_pin": BindingSource.DELEGATION_PIN,
+    "single_match": BindingSource.AGENT_CALLBACK,
+    "arg_scored": BindingSource.AGENT_CALLBACK,
+    "dag_relaxed": BindingSource.AGENT_CALLBACK,
+    "parent_pin_downstream": BindingSource.AGENT_CALLBACK,
+    "reasoning_binding": BindingSource.REASONING,
+    "correction_target": BindingSource.CORRECTION_TARGET,
+    "assignee_normalised": BindingSource.AGENT_CALLBACK,
+    "low_confidence": BindingSource.LOW_CONFIDENCE,
+}
 
 
 def _resolve_pinned_task_id(*, tool_context: Any) -> str:
     """Return the task_id pinned for this tool invocation, or ``""``.
 
-    Consults the delegation-site map first (``pending_delegations``
-    keyed by the current invocation's ``function_call_id``), then
-    falls back to the agent-turn pin (``goldfive.current_task_id``).
+    Consults the delegation-site map first
+    (:meth:`OrchestrationStore.get_pending_delegation` keyed by the
+    current invocation's ``function_call_id``), then falls back to
+    the agent-turn pin (:meth:`OrchestrationStore.pin_current_task`).
     Returns ``""`` when neither path yields a value — the caller
     should then short-circuit with a bare ``{"acknowledged": True}``
     (plus a ``DriftDetected`` sink event for operator visibility on
@@ -451,26 +463,69 @@ def _resolve_pinned_task_id(*, tool_context: Any) -> str:
     an ``error: pin_unresolved`` payload, which the LLM read as a
     reasoning cue and used to bypass the reporting contract — see
     the pin-leak fix in that PR.
+
+    Phase 2.1 of goldfive#271 — V4 reader. The store walks goldfive
+    ``Session.state`` reached either via the live plugin reference
+    (production path) or the legacy V7 SessionContext stash on ADK
+    state (unit-test path). No callback-time read of ADK state for
+    pin keys remains.
     """
-    state = _session_state_from_callback(tool_context)
-    if not isinstance(state, Mapping):
-        return ""
+    session = _goldfive_session_from_tool_context(tool_context)
+    store = OrchestrationStore.for_session(session) if session is not None else None
     fc_id = _function_call_id_from_tool_context(tool_context)
-    if fc_id:
-        pend = state.get(_PENDING_DELEGATIONS_KEY)
-        if isinstance(pend, Mapping):
-            raw = pend.get(fc_id, "")
-            # goldfive#266 — entry may be either the legacy ``str``
-            # task_id or the versioned ``{task_id, revision}`` dict.
-            # Tolerate both so custom adapters that pre-date this PR
-            # keep working unchanged.
-            tid = _delegation_pin_task_id(raw)
-            if tid:
-                return tid
-    state_tid = state.get(_sp.KEY_CURRENT_TASK_ID, "")
-    if isinstance(state_tid, str) and state_tid.strip():
-        return state_tid.strip()
+    via = ""
+    pinned = ""
+    if store is not None and fc_id:
+        delegation = store.get_pending_delegation(fc_id)
+        if delegation is not None and delegation.is_set():
+            pinned = delegation.task_id
+            via = "delegation_pin"
+    if not pinned and store is not None:
+        agent_pin = store.pin_current_task()
+        if agent_pin:
+            pinned = agent_pin
+            via = "agent_pin"
+    if pinned:
+        log.debug(
+            "goldfive.pin.read: task_id=%s via=%s fc_id=%s",
+            pinned,
+            via,
+            fc_id or "-",
+        )
+        return pinned
     return ""
+
+
+def _goldfive_session_from_tool_context(tool_context: Any) -> Any:
+    """Return the goldfive ``Session`` reachable from a ``tool_context``.
+
+    Phase 2.1 of goldfive#271. Resolution order matches the
+    dynamic-instruction resolver's :func:`_goldfive_session_from_readonly_context`:
+
+    1. Walk the invocation's ``plugin_manager.plugins`` for the
+       goldfive plugin and read its ``_active_ctx.session``. Live-run
+       path — set by :meth:`set_active_context`.
+    2. Legacy V7 ``SESSION_CONTEXT_STATE_KEY`` stash on the callback's
+       ``session.state``. Used by unit tests that drive the plugin
+       with a hand-built state dict without going through the
+       plugin's lifecycle.
+
+    Returns ``None`` when neither resolves so the caller can degrade
+    cleanly.
+    """
+    inv_ctx = _safe_attr(tool_context, "_invocation_context", None) or _safe_attr(
+        tool_context, "invocation_context", None
+    )
+    if inv_ctx is not None:
+        ctx = session_context_from_invocation(inv_ctx)
+        if ctx is not None:
+            session = getattr(ctx, "session", None)
+            if session is not None:
+                return session
+    legacy_ctx = _session_context_from_callback(tool_context)
+    if legacy_ctx is not None:
+        return getattr(legacy_ctx, "session", None)
+    return None
 
 
 def _delegation_pin_task_id(raw: Any) -> str:
@@ -1923,7 +1978,6 @@ def make_adk_plugin(
                             if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
                                 self._stamp_current_task_id(
                                     ctx=ctx,
-                                    callback_context=callback_context,
                                     task_id=tid,
                                     agent_name=agent_name,
                                     source="delegation_pin",
@@ -1949,7 +2003,6 @@ def make_adk_plugin(
             )
             scoring_args = self._scoring_args_for(
                 ctx=ctx,
-                callback_context=callback_context,
                 parent_invocation_id=parent_invocation_id,
             )
 
@@ -1963,7 +2016,6 @@ def make_adk_plugin(
                 if task_id:
                     self._stamp_current_task_id(
                         ctx=ctx,
-                        callback_context=callback_context,
                         task_id=task_id,
                         agent_name=agent_name,
                         source="single_match",
@@ -1989,7 +2041,6 @@ def make_adk_plugin(
                     if task_id:
                         self._stamp_current_task_id(
                             ctx=ctx,
-                            callback_context=callback_context,
                             task_id=task_id,
                             agent_name=agent_name,
                             source="arg_scored",
@@ -2033,7 +2084,6 @@ def make_adk_plugin(
                         )
                         self._stamp_current_task_id(
                             ctx=ctx,
-                            callback_context=callback_context,
                             task_id=task_id,
                             agent_name=agent_name,
                             source="dag_relaxed",
@@ -2064,7 +2114,6 @@ def make_adk_plugin(
                 if task_id:
                     self._stamp_current_task_id(
                         ctx=ctx,
-                        callback_context=callback_context,
                         task_id=task_id,
                         agent_name=agent_name,
                         source="parent_pin_downstream",
@@ -2115,7 +2164,6 @@ def make_adk_plugin(
                 if task_id:
                     self._stamp_current_task_id(
                         ctx=ctx,
-                        callback_context=callback_context,
                         task_id=task_id,
                         agent_name=agent_name,
                         source="reasoning_binding",
@@ -2143,7 +2191,6 @@ def make_adk_plugin(
                 if task_id:
                     self._stamp_current_task_id(
                         ctx=ctx,
-                        callback_context=callback_context,
                         task_id=task_id,
                         agent_name=agent_name,
                         source="correction_target",
@@ -2192,7 +2239,6 @@ def make_adk_plugin(
                             )
                             self._stamp_current_task_id(
                                 ctx=ctx,
-                                callback_context=callback_context,
                                 task_id=task_id,
                                 agent_name=agent_name,
                                 source="assignee_normalised",
@@ -2229,7 +2275,6 @@ def make_adk_plugin(
                     )
                     self._stamp_current_task_id(
                         ctx=ctx,
-                        callback_context=callback_context,
                         task_id=task_id,
                         agent_name=agent_name,
                         source="low_confidence",
@@ -2306,7 +2351,6 @@ def make_adk_plugin(
             self,
             *,
             ctx: SessionContext,
-            callback_context: Any,
             parent_invocation_id: str,
         ) -> Any:
             """Return a token-bag string-or-mapping for tool-arg scoring, or ``None``.
@@ -2448,7 +2492,6 @@ def make_adk_plugin(
             against ``"agent_x"`` and a sub-runner pinning under
             ``"client42:agent_x"`` both find the same binding.
             """
-            from goldfive.orchestration_store import OrchestrationStore
             from goldfive.types import TaskStatus
 
             store = OrchestrationStore.for_session(
@@ -2637,14 +2680,13 @@ def make_adk_plugin(
             self,
             *,
             ctx: SessionContext,
-            callback_context: Any,
             task_id: str,
             agent_name: str,
             source: str,
             task: Any = None,
             invocation_id: str = "",
         ) -> None:
-            """Write ``task_id`` into both state surfaces for the sub-agent.
+            """Write ``task_id`` onto goldfive ``Session.state`` for the sub-agent.
 
             Shared by every signal in :meth:`_pin_current_task_id_for_agent`
             (goldfive#264). The ``source`` label threads into the log
@@ -2659,13 +2701,13 @@ def make_adk_plugin(
             without racing on the single ``goldfive.current_task_id``
             slot.
 
-            When ``task`` is provided, the ADK side also stamps
-            ``goldfive.current_task_title`` /
-            ``goldfive.current_task_description`` so the dynamic
-            instruction resolver (goldfive#251) can render plan-causal
-            prompts without re-walking the plan. Legacy callers that
-            don't pass the task object keep working — the resolver
-            falls back to placeholders.
+            Phase 2.1 of goldfive#271 — V3 of the audit catalog. The
+            pin lands on goldfive's own ``Session.state`` exclusively,
+            via :class:`~goldfive.orchestration_store.OrchestrationStore`.
+            The dynamic-instruction resolver and reporting handlers
+            both read goldfive Session via the plugin reference
+            (:func:`session_context_from_invocation`) — no callback-time
+            mutation of ADK ``session.state`` happens here anymore.
             """
             # goldfive#266 — resolve the plan revision in effect at this
             # write so the report-time classifier in
@@ -2678,48 +2720,26 @@ def make_adk_plugin(
                 pin_revision = int(_safe_attr(plan_for_rev, "revision_index", 0) or 0)
             except (TypeError, ValueError):
                 pin_revision = 0
-            gf_state = _safe_attr(ctx.session, "state", None)
-            if isinstance(gf_state, dict):
-                try:
-                    gf_state[_sp.KEY_CURRENT_TASK_ID] = task_id
-                    # Stamp revision alongside the id so a later
-                    # report-time read sees the stamp on the same
-                    # session.state surface.
-                    gf_state[_GF_KEY_CURRENT_TASK_REVISION] = pin_revision
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "before_agent_callback: goldfive session.state pin failed: %s",
-                        exc,
-                    )
-            adk_state = _session_state_from_callback(callback_context)
-            if isinstance(adk_state, Mapping):
-                try:
-                    if task is not None:
-                        # write_current_task stamps all four fields
-                        # (id / title / description / assignee) from the
-                        # Task. Prefer this over the narrow id-only write
-                        # so the dynamic-instruction resolver (#251)
-                        # sees the title + description it needs.
-                        _sp.write_current_task(adk_state, task)
-                    else:
-                        _sp.write_current_task_id(adk_state, task_id)
-                    # Mirror the revision stamp onto ADK session.state
-                    # so reporting handlers reading from the live ADK
-                    # state (custom adapters, sub-Runner contexts) see
-                    # the same value.
-                    if isinstance(adk_state, MutableMapping):
-                        _sp.write_current_task_revision(adk_state, pin_revision)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "before_agent_callback: ADK session.state pin failed: %s",
-                        exc,
-                    )
+            store = OrchestrationStore.for_session(ctx.session)
+            title = ""
+            if task is not None:
+                title = str(_safe_attr(task, "title", "") or "")
+            store.set_pin_current_task(
+                task_id,
+                source=_BINDING_SOURCE_BY_LADDER.get(
+                    source, BindingSource.UNKNOWN
+                ),
+                revision=pin_revision,
+                title=title,
+            )
             log.info(
-                "goldfive: pinned current_task_id=%s for sub-agent %s "
-                "(source=%s)",
+                "goldfive.pin.set: task_id=%s agent=%s source=%s revision=%d "
+                "invocation_id=%s",
                 task_id,
                 agent_name,
                 source,
+                pin_revision,
+                invocation_id or "-",
             )
             # goldfive#264 — record per-invocation pin so child
             # invocations can resolve their parent's pin (signal 5).
@@ -2754,10 +2774,14 @@ def make_adk_plugin(
                over via the legacy single-match path.
             5. If zero candidates, no pin.
 
-            Writes to ``ctx.session.state[goldfive.pending_delegations]``
-            (a dict keyed by function_call_id) when a pin resolves.
-            Silent on every failure mode — the worst case is we fall
-            through to the legacy behaviour.
+            Phase 2.1 of goldfive#271 — V4 of the audit catalog. The
+            pin lands on goldfive's ``Session.state`` exclusively,
+            via :meth:`OrchestrationStore.set_pending_delegation`. The
+            sub-invocation's ``before_tool_callback`` reads it back via
+            :func:`_resolve_pinned_task_id` (which now consults goldfive
+            Session via the plugin reference). Silent on every failure
+            mode — the worst case is we fall through to the legacy
+            behaviour.
             """
             if not to_agent:
                 return
@@ -2818,56 +2842,22 @@ def make_adk_plugin(
             task_id = str(_safe_attr(chosen, "id", "") or "")
             if not task_id:
                 return
-            # goldfive#266 — pin entries evolved from
-            # ``{fc_id: task_id_str}`` to
-            # ``{fc_id: {"task_id": str, "revision": int}}`` so the
-            # report-time classifier can tell whether a delegation pin
-            # was set under an older plan revision. Readers
-            # (:func:`_resolve_pinned_task_id`, signal 1 of
-            # :meth:`_pin_current_task_id_for_agent`) tolerate both
-            # shapes for back-compat with custom adapters that pre-date
-            # this PR.
             try:
                 pin_revision = int(
                     _safe_attr(plan, "revision_index", 0) or 0
                 )
             except (TypeError, ValueError):
                 pin_revision = 0
-            entry: dict[str, Any] = {
-                "task_id": task_id,
-                "revision": pin_revision,
-            }
-            # F7 (#265 followup) — also record the parent's AgentTool
-            # tool-call args. Signal 3 of
-            # :meth:`_pin_current_task_id_for_agent` reads this back as
-            # the highest-priority scoring source (above the active
-            # steer body / goals summary). Only stamp a Mapping; opaque
-            # blobs / non-dict args are treated as "no useful tokens"
-            # and skipped so reads don't have to disambiguate shape.
-            if isinstance(tool_args, Mapping) and tool_args:
-                entry["tool_args"] = dict(tool_args)
-            # Stamp the pin onto BOTH the goldfive orchestration
-            # session.state (so reporting-tool handlers that read it
-            # directly see it) AND the ADK tool_context session.state
-            # (so the plugin's before_tool_callback → _resolve_pinned_task_id
-            # sees it on the sub-invocation's ToolContext). The two
-            # dicts are distinct in live ADK — the goldfive Session
-            # is our orchestration state, the ADK session.state is
-            # the live ADK session the Runner drives.
-            for target in (
-                _safe_attr(ctx.session, "state", None),
-                _session_state_from_callback(tool_context),
-            ):
-                if not isinstance(target, dict):
-                    continue
-                pend = target.get(_PENDING_DELEGATIONS_KEY)
-                if not isinstance(pend, dict):
-                    pend = {}
-                    target[_PENDING_DELEGATIONS_KEY] = pend
-                pend[fc_id] = dict(entry)
+            store = OrchestrationStore.for_session(ctx.session)
+            store.set_pending_delegation(
+                fc_id,
+                task_id=task_id,
+                revision=pin_revision,
+                tool_args=tool_args if isinstance(tool_args, Mapping) else None,
+            )
             log.info(
-                "goldfive: pinned delegation task_id=%s for fc_id=%s "
-                "(sub-agent=%s, %d candidates, revision=%d)",
+                "goldfive.delegation_pin.set: task_id=%s fc_id=%s "
+                "sub_agent=%s candidates=%d revision=%d",
                 task_id,
                 fc_id,
                 to_agent,

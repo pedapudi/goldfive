@@ -193,7 +193,7 @@ async def test_before_agent_callback_pins_unambiguous_task() -> None:
     )
 
     # ADK session.state side (sub-agent-visible).
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1"
     # Goldfive orchestration-state side (handler fallback).
     assert session.state["goldfive.current_task_id"] == "t1"
 
@@ -222,8 +222,9 @@ async def test_before_agent_callback_ambiguous_match_pins_low_confidence() -> No
     )
 
     # The ambiguous case lands on the first deterministic candidate.
-    assert state[KEY_CURRENT_TASK_ID] in {"t1", "t2"}
-    assert session.state["goldfive.current_task_id"] == state[KEY_CURRENT_TASK_ID]
+    # Phase 2.1 — pin lives on goldfive Session.state exclusively.
+    assert session.state[KEY_CURRENT_TASK_ID] in {"t1", "t2"}
+    assert KEY_CURRENT_TASK_ID not in state
 
 
 async def test_before_agent_callback_no_match_leaves_unset() -> None:
@@ -263,7 +264,7 @@ async def test_before_agent_callback_includes_running_tasks() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1"
     assert session.state["goldfive.current_task_id"] == "t1"
 
 
@@ -320,7 +321,7 @@ async def test_pin_relaxes_dag_gate_when_upstream_incomplete() -> None:
     )
 
     # Signal 4 — DAG gate relaxed — pins B.
-    assert state[KEY_CURRENT_TASK_ID] == "b"
+    assert session.state[KEY_CURRENT_TASK_ID] == "b"
     assert session.state["goldfive.current_task_id"] == "b"
 
 
@@ -346,7 +347,7 @@ async def test_pin_selects_task_after_upstream_completes() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "b"
+    assert session.state[KEY_CURRENT_TASK_ID] == "b"
     assert session.state["goldfive.current_task_id"] == "b"
 
 
@@ -372,7 +373,7 @@ async def test_pin_ambiguous_narrows_by_dag() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1"
     assert session.state["goldfive.current_task_id"] == "t1"
 
 
@@ -417,7 +418,7 @@ async def test_pin_finalize_with_incomplete_upstream_relaxes_loudly() -> None:
     )
 
     # Signal 4 binds finalize (the agent WAS invoked).
-    assert state[KEY_CURRENT_TASK_ID] == "finalize_and_deliver_presentation"
+    assert session.state[KEY_CURRENT_TASK_ID] == "finalize_and_deliver_presentation"
     assert session.state["goldfive.current_task_id"] == "finalize_and_deliver_presentation"
 
 
@@ -454,7 +455,7 @@ async def test_pin_supersedes_redirection_tracks_replacement() -> None:
         agent=_Agent("research_agent"),
         callback_context=ctx,
     )
-    assert state[KEY_CURRENT_TASK_ID] == "C"
+    assert session.state[KEY_CURRENT_TASK_ID] == "C"
 
     # Flip B to COMPLETED; now C is DAG-ready -> signal 2 binds.
     plan.tasks[1].status = TaskStatus.COMPLETED
@@ -462,7 +463,7 @@ async def test_pin_supersedes_redirection_tracks_replacement() -> None:
         agent=_Agent("research_agent"),
         callback_context=ctx,
     )
-    assert state[KEY_CURRENT_TASK_ID] == "C"
+    assert session.state[KEY_CURRENT_TASK_ID] == "C"
 
 
 async def test_pin_orchestration_block_renders_pinned_task_after_relaxation() -> None:
@@ -497,7 +498,7 @@ async def test_pin_orchestration_block_renders_pinned_task_after_relaxation() ->
     )
 
     # Signal 4 relaxes the DAG gate and binds finalize.
-    assert state[KEY_CURRENT_TASK_ID] == "finalize"
+    assert session.state[KEY_CURRENT_TASK_ID] == "finalize"
 
     # Build the planner instruction the LLM would see. We use a
     # tolerant readonly-context stub carrying the ADK state dict.
@@ -770,5 +771,5 @@ async def test_before_agent_callback_pins_when_plan_came_from_compound_json() ->
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1"
     assert session.state["goldfive.current_task_id"] == "t1"

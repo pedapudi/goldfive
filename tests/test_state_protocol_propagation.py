@@ -106,53 +106,28 @@ class _StubSteerer:
         pass
 
 
-def _read_state_via_before_model(observed: dict[str, Any]):
-    """Return a ``before_model_callback`` that snapshots every
-    ``goldfive.*`` state key into ``observed`` on entry.
+def _read_pin_via_before_model(observed: dict[str, Any]):
+    """Return a ``before_model_callback`` that snapshots the pin into ``observed``.
 
-    ADK invokes this as a sync function receiving ``callback_context``
-    and ``llm_request``. Navigates the several shapes callback_context
-    may expose (``_invocation_context.session.state`` / ``session.state``)
-    so the snapshot works across ADK versions.
+    Phase 2.1 of goldfive#271 — readers consult goldfive
+    ``Session.state`` via the plugin reference, not ADK
+    ``session.state``. Walks ``invocation_context.plugin_manager`` for
+    the goldfive plugin and reads its ``_active_ctx.session`` — same
+    shape as :func:`session_context_from_invocation`.
     """
-    from goldfive.adapters._adk_state_protocol import (
-        KEY_CURRENT_TASK_ASSIGNEE,
-        KEY_CURRENT_TASK_ID,
-        KEY_CURRENT_TASK_TITLE,
-        KEY_PLAN_ID,
-        KEY_PLAN_SUMMARY,
-        KEY_RUN_ID,
-        KEY_TOOLS_AVAILABLE,
-    )
+    from goldfive.adapters._adk_plugin import session_context_from_invocation
+    from goldfive.orchestration_store import OrchestrationStore
 
     def _before_model(callback_context: Any, llm_request: Any) -> None:  # noqa: ARG001
-        inv_ctx = getattr(callback_context, "_invocation_context", None)
-        state = None
-        if inv_ctx is not None:
-            sess = getattr(inv_ctx, "session", None)
-            state = getattr(sess, "state", None)
-        if state is None:
-            sess = getattr(callback_context, "session", None)
-            state = getattr(sess, "state", None)
-        if state is None:
-            return None
-        # Snapshot only the first time — some B callbacks may fire more
-        # than once if the scripted LLM hands more turns to B.
+        inv_ctx = getattr(callback_context, "_invocation_context", None) or getattr(
+            callback_context, "invocation_context", None
+        )
+        ctx = session_context_from_invocation(inv_ctx)
+        session = getattr(ctx, "session", None) if ctx is not None else None
         if observed:
             return None
-        for key in (
-            KEY_RUN_ID,
-            KEY_PLAN_ID,
-            KEY_PLAN_SUMMARY,
-            KEY_CURRENT_TASK_ID,
-            KEY_CURRENT_TASK_TITLE,
-            KEY_CURRENT_TASK_ASSIGNEE,
-            KEY_TOOLS_AVAILABLE,
-        ):
-            try:
-                observed[key] = state.get(key)
-            except Exception:
-                observed[key] = None
+        store = OrchestrationStore.for_session(session)
+        observed["pin_current_task"] = store.pin_current_task()
         return None
 
     return _before_model
@@ -164,14 +139,19 @@ def _read_state_via_before_model(observed: dict[str, Any]):
 
 
 async def test_state_protocol_current_task_id_visible_in_sub_runner() -> None:
-    """B's ``before_model_callback`` sees ``goldfive.current_task_id`` on
-    the sub-Runner's live session — the authoritative state-protocol
-    write must cross the AgentTool boundary.
+    """B's ``before_model_callback`` resolves the pin via the plugin
+    reference and sees ``my-task-id`` on the goldfive Session — the
+    pin must be reachable across an AgentTool boundary.
+
+    Phase 2.1 of goldfive#271 — the pin no longer lives on ADK
+    ``session.state``. The plugin instance is shared with the
+    sub-Runner so :func:`session_context_from_invocation` resolves
+    the same goldfive Session no matter which invocation fires the
+    callback.
     """
     from google.adk.agents import Agent
     from google.adk.tools.agent_tool import AgentTool
 
-    from goldfive.adapters._adk_state_protocol import KEY_CURRENT_TASK_ID
     from goldfive.adapters.adk import ADKAdapter
 
     observed: dict[str, Any] = {}
@@ -179,7 +159,7 @@ async def test_state_protocol_current_task_id_visible_in_sub_runner() -> None:
         name="agent_b",
         model=_make_agent_b_llm()(),
         instruction="",
-        before_model_callback=_read_state_via_before_model(observed),
+        before_model_callback=_read_pin_via_before_model(observed),
     )
     agent_a = Agent(
         name="agent_a",
@@ -197,10 +177,10 @@ async def test_state_protocol_current_task_id_visible_in_sub_runner() -> None:
     await adapter.invoke(task=task, session=session)
 
     assert observed, "B's before_model_callback never ran — AgentTool dispatch broke"
-    assert observed.get(KEY_CURRENT_TASK_ID) == "my-task-id", (
-        f"B's sub-Runner saw current_task_id={observed.get(KEY_CURRENT_TASK_ID)!r}; "
-        "expected 'my-task-id'. The authoritative state write in "
-        "plugin.before_run_callback did not propagate through AgentTool."
+    assert observed.get("pin_current_task") == "my-task-id", (
+        f"B's sub-Runner saw pin={observed.get('pin_current_task')!r}; "
+        "expected 'my-task-id'. The pin write in _stamp_current_task_id "
+        "did not propagate through AgentTool."
     )
 
 

@@ -174,7 +174,7 @@ async def test_signal1_delegation_site_pin() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t2"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t2"
     events = _pin_resolved_events(sinks[0].events)
     assert len(events) == 1
     assert events[0]["payload"]["via_signal"] == "delegation_pin"
@@ -202,7 +202,7 @@ async def test_signal2_dag_ready_single_match() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1"
     events = _pin_resolved_events(sinks[0].events)
     assert len(events) == 1
     assert events[0]["payload"]["via_signal"] == "dag_ready_single"
@@ -249,7 +249,7 @@ async def test_signal3_arg_scoring_breaks_dag_ready_tie() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] == "arg_scored"
 
@@ -310,7 +310,7 @@ async def test_signal3_parent_tool_args_outrank_steer_body() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t1", (
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1", (
         "parent tool_args (solar) should outrank steer body (invoices)"
     )
     events = _pin_resolved_events(sinks[0].events)
@@ -363,7 +363,7 @@ async def test_signal3_empty_parent_tool_args_falls_to_steer_body() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t2", (
+    assert session.state[KEY_CURRENT_TASK_ID] == "t2", (
         "empty parent tool_args should fall through to steer body"
     )
     events = _pin_resolved_events(sinks[0].events)
@@ -398,7 +398,7 @@ async def test_signal3_pre_f7_string_pending_delegation_back_compat() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t2"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t2"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] == "delegation_pin"
 
@@ -435,7 +435,7 @@ async def test_signal3_tie_falls_through_to_signal4() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] in {"t1", "t2"}
+    assert session.state[KEY_CURRENT_TASK_ID] in {"t1", "t2"}
     events = _pin_resolved_events(sinks[0].events)
     # Signal 4 fires with relaxed assignee-candidates because BOTH are
     # DAG-ready — signal 2 sees 2 candidates so it bypasses; signal 3
@@ -474,7 +474,7 @@ async def test_signal4_dag_relaxed_pins_with_warning(
             callback_context=ctx,
         )
 
-    assert state[KEY_CURRENT_TASK_ID] == "b"
+    assert session.state[KEY_CURRENT_TASK_ID] == "b"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] == "dag_relaxed"
     # WARNING log surfaced for operator visibility.
@@ -533,7 +533,7 @@ async def test_signal5_parent_pin_downstream() -> None:
         invocation_id="inv-parent",
         parent_invocation_id="",
     )
-    assert state[KEY_CURRENT_TASK_ID] == "A"
+    assert session.state[KEY_CURRENT_TASK_ID] == "A"
     assert plugin._invocation_pinned_task_id["inv-parent"] == "A"
 
     # Now resolve child with parent_invocation_id → signal 5 picks B
@@ -546,7 +546,7 @@ async def test_signal5_parent_pin_downstream() -> None:
         invocation_id="inv-child",
         parent_invocation_id="inv-parent",
     )
-    assert state[KEY_CURRENT_TASK_ID] == "B"
+    assert session.state[KEY_CURRENT_TASK_ID] == "B"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] == "parent_pin_downstream"
     assert events[-1]["payload"]["task_id"] == "B"
@@ -598,7 +598,7 @@ async def test_signal6_reasoning_binding_pins_target_task() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t_beta"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t_beta"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] == "reasoning_binding"
 
@@ -635,7 +635,7 @@ async def test_signal6_reasoning_binding_falls_through_when_task_terminal() -> N
 
     # Binding rejected (target terminal) → signal 2 binds the only
     # remaining DAG-ready PENDING candidate.
-    assert state[KEY_CURRENT_TASK_ID] == "t_beta"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t_beta"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] != "reasoning_binding"
 
@@ -700,7 +700,7 @@ async def test_signal6_pending_correction_pins_target_task() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "corr1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "corr1"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] == "correction_target"
 
@@ -729,7 +729,7 @@ async def test_signal7_compound_to_bare_normalisation() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] == "assignee_normalised"
 
@@ -767,7 +767,7 @@ async def test_signal8_low_confidence_best_guess_emits_low_confidence_event() ->
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] in {"alpha", "beta"}
+    assert session.state[KEY_CURRENT_TASK_ID] in {"alpha", "beta"}
     events = _pin_resolved_events(sinks[0].events)
     assert any(
         e["kind"] == "pin_resolved_low_confidence" for e in events
@@ -838,7 +838,7 @@ async def test_regression_242_dag_gate_happy_path() -> None:
     )
 
     # Signal 2 short-circuits — t1 is the only DAG-ready candidate.
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] == "dag_ready_single"
 
@@ -861,7 +861,7 @@ async def test_regression_195_delegation_pin_happy_path() -> None:
         callback_context=ctx,
     )
 
-    assert state[KEY_CURRENT_TASK_ID] == "t1"
+    assert session.state[KEY_CURRENT_TASK_ID] == "t1"
     events = _pin_resolved_events(sinks[0].events)
     assert events[-1]["payload"]["via_signal"] == "delegation_pin"
 
