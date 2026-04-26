@@ -69,9 +69,7 @@ class ListSink:
         pass
 
     def payload_kinds(self) -> list[str]:
-        return [
-            e.WhichOneof("payload") for e in self.events if hasattr(e, "WhichOneof")
-        ]
+        return [e.WhichOneof("payload") for e in self.events if hasattr(e, "WhichOneof")]
 
 
 class _StubSteerer:
@@ -121,8 +119,13 @@ def _find_handler(name: str) -> Any:
 
 
 def test_eighth_reporting_tool_is_report_awaiting_approval() -> None:
-    assert REPORTING_TOOL_NAMES[-1] == "report_awaiting_approval"
-    assert len(REPORTING_TOOL_NAMES) == 8
+    # report_awaiting_approval is the 8th canonical reporting tool. The
+    # ninth and tenth are ``declare_task_skipped`` and
+    # ``declare_task_not_needed`` (goldfive#271 Phase 3 — observability-
+    # only structural declarations) — the awaiting_approval position
+    # in the tuple is preserved.
+    assert REPORTING_TOOL_NAMES[7] == "report_awaiting_approval"
+    assert len(REPORTING_TOOL_NAMES) == 10
     names = {spec.name for spec in BUILTIN_REPORTING_TOOLS}
     assert "report_awaiting_approval" in names
 
@@ -173,9 +176,7 @@ async def test_task_level_approve_resumes_handler() -> None:
         kind=ControlKind.APPROVE,
         payload={"target_id": "t1", "detail": "looks fine"},
     )
-    outcome = await dispatch_control(
-        msg, session=session, steerer=steerer, sinks=[sink]
-    )
+    outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=[sink])
     assert outcome.ack.result.value == "SUCCESS"
 
     result = await asyncio.wait_for(task, timeout=1.0)
@@ -215,9 +216,7 @@ async def test_task_level_reject_resumes_handler() -> None:
         kind=ControlKind.REJECT,
         payload={"target_id": "t1", "detail": "absolutely not"},
     )
-    outcome = await dispatch_control(
-        msg, session=session, steerer=steerer, sinks=[sink]
-    )
+    outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=[sink])
     assert outcome.ack.result.value == "SUCCESS"
 
     result = await asyncio.wait_for(task, timeout=1.0)
@@ -255,9 +254,7 @@ async def test_dispatch_approve_unknown_target_fails_ack() -> None:
         kind=ControlKind.APPROVE,
         payload={"target_id": "nope", "detail": ""},
     )
-    outcome = await dispatch_control(
-        msg, session=session, steerer=steerer, sinks=[sink]
-    )
+    outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=[sink])
     assert outcome.ack.result.value == "FAILURE"
     assert "no pending approval" in outcome.ack.detail
 
@@ -269,9 +266,7 @@ async def test_dispatch_approve_missing_target_fails_ack() -> None:
     steerer.bind(sinks=[sink], planner=None)
 
     msg = ControlMessage(kind=ControlKind.APPROVE, payload={})
-    outcome = await dispatch_control(
-        msg, session=session, steerer=steerer, sinks=[sink]
-    )
+    outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=[sink])
     assert outcome.ack.result.value == "FAILURE"
     assert "requires payload.target_id" in outcome.ack.detail
 
@@ -318,9 +313,7 @@ class _FakeToolContext:
 
 def test_tool_requires_confirmation_bool() -> None:
     assert _tool_requires_confirmation(_FakeTool(require_confirmation=True), {})
-    assert not _tool_requires_confirmation(
-        _FakeTool(require_confirmation=False), {}
-    )
+    assert not _tool_requires_confirmation(_FakeTool(require_confirmation=False), {})
 
 
 def test_tool_requires_confirmation_callable() -> None:
@@ -364,9 +357,7 @@ async def test_tool_level_approve_falls_through() -> None:
         kind=ControlKind.APPROVE,
         payload={"target_id": "adk-abc123", "detail": "proceed"},
     )
-    outcome = await dispatch_control(
-        msg, session=session, steerer=steerer, sinks=[sink]
-    )
+    outcome = await dispatch_control(msg, session=session, steerer=steerer, sinks=[sink])
     assert outcome.ack.result.value == "SUCCESS"
 
     result = await asyncio.wait_for(task, timeout=1.0)
@@ -481,9 +472,7 @@ async def test_task_and_tool_waiters_resolve_independently() -> None:
     # Register a task-level waiter via the reporting handler.
     task_handler = _find_handler("report_awaiting_approval")
     task_fut = asyncio.create_task(
-        task_handler(
-            {"task_id": "t1", "prompt": "task-level?"}, session, steerer
-        )
+        task_handler({"task_id": "t1", "prompt": "task-level?"}, session, steerer)
     )
     for _ in range(20):
         if "t1" in session.pending_approvals:
@@ -514,17 +503,13 @@ async def test_task_and_tool_waiters_resolve_independently() -> None:
 
     # Reject the tool, approve the task.
     await dispatch_control(
-        ControlMessage(
-            kind=ControlKind.REJECT, payload={"target_id": "adk-tool"}
-        ),
+        ControlMessage(kind=ControlKind.REJECT, payload={"target_id": "adk-tool"}),
         session=session,
         steerer=steerer,
         sinks=[sink],
     )
     await dispatch_control(
-        ControlMessage(
-            kind=ControlKind.APPROVE, payload={"target_id": "t1"}
-        ),
+        ControlMessage(kind=ControlKind.APPROVE, payload={"target_id": "t1"}),
         session=session,
         steerer=steerer,
         sinks=[sink],

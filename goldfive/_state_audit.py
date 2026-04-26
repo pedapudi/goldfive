@@ -103,6 +103,34 @@ class StateOwnershipViolation(BaseException):
     """
 
 
+class CancellationStashViolation(BaseException):
+    """Raised when ``CancelledError`` propagates through a stash-owning await
+    without entering a ``finally`` block.
+
+    goldfive#271 Phase 3 Addition A. Validation v2 found that
+    ``runner.py:411``'s ``try / except Exception`` block silently
+    bypassed all post-execution housekeeping when ADK closed the
+    runner mid-stream — the executor's broad ``except Exception``
+    let ``CancelledError`` skate past every state-stash, every event
+    flush, every drift-detector teardown, because ``CancelledError``
+    has been a ``BaseException`` subclass since Python 3.8 and is NOT
+    caught by ``except Exception``.
+
+    **Inherits from :class:`BaseException`** for the same reason as
+    :class:`StateOwnershipViolation`: the defensive ``try / except
+    Exception`` blocks the audit catalogues would otherwise swallow
+    the violation marker.
+
+    Phase 3 ships only the EXCEPTION CLASS + the audit document under
+    ``docs/design/CANCELLATION-CONTRACT.md`` (sibling to
+    ``STATE-OWNERSHIP-CONTRACT.md``). The runtime tripwire mechanism
+    (paired with the goldfive task boundary that is the one place
+    we'll catch ``CancelledError``) lands with Phase 3.5's hard-cancel
+    work — there's no point installing the runtime check before the
+    boundary exists to be the legitimate catch site.
+    """
+
+
 @dataclass(frozen=True)
 class _CallbackFrame:
     """Bookkeeping for an active goldfive callback.
