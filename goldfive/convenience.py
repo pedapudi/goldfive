@@ -104,12 +104,20 @@ def _build_judge_call_llm(config: JudgeConfig) -> tuple[CallLLM, str] | None:
         # Ollama even against an OpenAI endpoint that requires one,
         # because we only hit endpoints the operator configured.
         effective_model = model_str or model_name
+        # Pull the per-callsite cap (set by goldfive consumers via
+        # :func:`goldfive._llm.call_llm_budget`). Default ``4096`` is
+        # large enough for plan refines while bounding the worst case
+        # under typical Q4 throughput. Pre-fix: unbounded → 9961-token
+        # responses (goldfive#271 demo-v8.log).
+        from goldfive._llm import get_max_output_tokens
+
         resp = await client.chat.completions.create(
             model=effective_model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            max_tokens=get_max_output_tokens(),
         )
         try:
             content = resp.choices[0].message.content or ""

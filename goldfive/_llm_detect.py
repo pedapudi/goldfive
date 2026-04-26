@@ -106,6 +106,16 @@ def make_default_adk_call_llm(model: Any) -> CallLLM | None:
 
     async def _call_llm(system: str, user: str, model_str: str) -> str:
         _ = model_str  # ADK's BaseLlm is already model-bound
+        # Pull the per-callsite cap (set by goldfive consumers via
+        # :func:`goldfive._llm.call_llm_budget`). ``None`` from the var
+        # falls back to ``DEFAULT_MAX_OUTPUT_TOKENS`` (4096) so an
+        # unsupervised dispatch still has a finite ceiling. See
+        # goldfive#271 follow-up — pre-fix evidence in demo-v8.log
+        # showed unbounded calls reaching 9961 completion tokens (9.6
+        # minutes wall) on a Qwen Q4 endpoint.
+        from goldfive._llm import get_max_output_tokens
+
+        max_output_tokens = get_max_output_tokens()
         req = LlmRequest(
             contents=[
                 genai_types.Content(
@@ -115,6 +125,7 @@ def make_default_adk_call_llm(model: Any) -> CallLLM | None:
             ],
             config=genai_types.GenerateContentConfig(
                 system_instruction=system,
+                max_output_tokens=max_output_tokens,
             ),
         )
         chunks: list[str] = []

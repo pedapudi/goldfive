@@ -1023,6 +1023,7 @@ class ADKAdapter:
         app_name: str | None = None,
         plugins: list[Any] | None = None,
         agent_tool_cap: int | None = None,
+        llm_call_timeout_ms: int | None = None,
     ) -> None:
         self._user_id = user_id
         self._session_id = session_id
@@ -1057,11 +1058,20 @@ class ADKAdapter:
 
         host_agent_name = str(getattr(self._agent, "name", "") or "")
         cap = DEFAULT_AGENT_TOOL_CAP if agent_tool_cap is None else int(agent_tool_cap)
-        self._plugin = make_adk_plugin(
-            host_agent_name=host_agent_name,
-            agent_tool_cap=cap,
-        )
+        # Per-LLM-call wall-clock budget (goldfive#271 follow-up). When
+        # the caller leaves ``llm_call_timeout_ms`` unset, the plugin
+        # uses its module-level default
+        # (:data:`goldfive.adapters._adk_plugin.DEFAULT_LLM_CALL_TIMEOUT_MS`).
+        # Pass ``0`` or a negative int to disable the watcher.
+        plugin_kwargs: dict[str, Any] = {
+            "host_agent_name": host_agent_name,
+            "agent_tool_cap": cap,
+        }
+        if llm_call_timeout_ms is not None:
+            plugin_kwargs["llm_call_timeout_ms"] = int(llm_call_timeout_ms)
+        self._plugin = make_adk_plugin(**plugin_kwargs)
         self._agent_tool_cap = cap
+        self._llm_call_timeout_ms = llm_call_timeout_ms
 
         # Install the goldfive plugin on the one runner. ADK propagates
         # the plugin manager into any AgentTool-spawned sub-Runner so the

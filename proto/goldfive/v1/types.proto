@@ -188,6 +188,16 @@ enum DriftKind {
   // goldfive#143 and
   // ``goldfive.drift.goals.classify_goal_drift``.
   DRIFT_KIND_GOAL_DRIFT = 38;
+  // A single ADK LLM dispatch exceeded the configured wall-clock
+  // budget (default 120s; configurable via
+  // ``make_adk_plugin(llm_call_timeout_ms=...)``). Emitted by the
+  // goldfive ADK plugin's per-call watcher task and paired with a
+  // cooperative cancel on the invocation so subsequent callbacks
+  // short-circuit. CRITICAL severity. Safety net against runaway
+  // thinking-token generations (e.g. Qwen Q4 emitting 9961 tokens
+  // in 9.6 minutes, demo-v8.log) — without it, a single bad turn
+  // wedges the run for minutes. See goldfive#271 follow-up.
+  DRIFT_KIND_LLM_CALL_TIMEOUT = 39;
 }
 
 // Directed edge in a plan's task dependency DAG. `from_task_id` must

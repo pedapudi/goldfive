@@ -139,6 +139,16 @@ class DriftKind(StrEnum):
     # (``session.paused_for_human_intervention``) until a user-initiated
     # ``CONTROL_RESUME`` or ``CONTROL_STEER`` arrives.
     HUMAN_INTERVENTION_REQUIRED = "human_intervention_required"
+    # A single ADK LLM dispatch exceeded the configured wall-clock
+    # budget (default 120s; configurable via ``make_adk_plugin
+    # (llm_call_timeout_ms=...)``). Emitted by the goldfive ADK plugin's
+    # per-call watcher task and paired with a cooperative cancel on the
+    # invocation so subsequent callbacks short-circuit. CRITICAL
+    # severity. This is the safety net for runaway thinking-token
+    # generations (e.g. Qwen Q4 emitting 9961 tokens in 9.6 minutes,
+    # demo-v8.log) — without it, a single bad turn wedges the run for
+    # minutes. See goldfive#271 follow-up.
+    LLM_CALL_TIMEOUT = "llm_call_timeout"
 
 
 class DriftSeverity(StrEnum):
@@ -834,6 +844,19 @@ class Session:
     # apply to USER_STEER (always honoured) or GOAL_DRIFT (has its own
     # task-boundary rate limit via ``_last_goal_drift_check_ts``).
     _last_plan_revision_at: dict[tuple[str, str], float] = dataclasses.field(default_factory=dict)
+    # Per-(task_id, drift_kind_value) count of plan revisions that
+    # actually landed (``_emit_plan_revised``). Goldfive#271 follow-up:
+    # the cooldown above gates by *time*, but the user-directive in
+    # ``project_structural_steering_plan.md`` is "NO cooldown" — this
+    # parallel counter gives up after N successful revisions of the
+    # same (kind, task) regardless of inter-arrival time. Without it,
+    # a drift judge that keeps re-firing on a corrected task (Qwen
+    # off-topic loop, demo-v8.log: rev 2→3→4 in 30 minutes) thrashes
+    # forever. Routed to ``HUMAN_INTERVENTION_REQUIRED`` once the
+    # threshold is crossed. Same exempt set as the cooldown
+    # (USER_STEER, USER_CANCEL, GOAL_DRIFT) so user actions are
+    # always honoured.
+    plan_revision_counts: dict[tuple[str, str], int] = dataclasses.field(default_factory=dict)
     # Counter of LLM turns observed since the last reflective self-progress
     # check. Incremented by ``DefaultSteerer.note_llm_call`` (which adapters
     # call once per LLM invocation when the opt-in reflective check is

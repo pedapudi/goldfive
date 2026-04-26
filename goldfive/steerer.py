@@ -1627,6 +1627,12 @@ class DefaultSteerer:
         '"reason": "one-sentence explanation"}}'
     )
 
+    # Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up).
+    # The reflective check returns a small JSON verdict; 2048 covers
+    # thinking-token preludes on Q4 endpoints without permitting
+    # unbounded essays.
+    REFLECTIVE_MAX_OUTPUT_TOKENS: int = 2048
+
     async def note_llm_call(self, session: Session) -> None:
         """Record one LLM invocation against ``session``.
 
@@ -1726,11 +1732,15 @@ class DefaultSteerer:
                 target_agent_id=task.assignee_agent_id or "",
                 target_task_id=task.id,
             ) as span:
-                raw = await call_llm(
-                    self.REFLECTIVE_SYSTEM_PROMPT,
-                    user_prompt,
-                    self._reflective_model,
-                )
+                # Bound the dispatch — see ``REFLECTIVE_MAX_OUTPUT_TOKENS``.
+                from goldfive._llm import call_llm_budget
+
+                with call_llm_budget(self.REFLECTIVE_MAX_OUTPUT_TOKENS):
+                    raw = await call_llm(
+                        self.REFLECTIVE_SYSTEM_PROMPT,
+                        user_prompt,
+                        self._reflective_model,
+                    )
                 parsed = self._parse_reflective_response(raw)
                 if parsed is None:
                     span.output_preview = (
@@ -2470,6 +2480,17 @@ class DefaultSteerer:
         # GOAL_DRIFT bypass it (see the method docstring on
         # ``_is_plan_revision_cooldown_exempt``).
         if self._is_plan_revision_gated(drift, session):
+            return
+        # Plan-revision *count* gate (goldfive#271 follow-up). Even when
+        # every refine succeeds, the same (drift_kind, task_id) re-firing
+        # can keep producing new revisions (Qwen off-topic judge loop in
+        # demo-v8.log: 4 successful PlanRevised events on the same
+        # off_topic+research_solar pair in 30 minutes). Once we cross the
+        # cap, escalate to HUMAN_INTERVENTION_REQUIRED so a human can
+        # decide whether to cancel or steer the run. Same exempt set as
+        # the cooldown so user actions never burn the budget.
+        if self._is_plan_revision_count_gated(drift, session):
+            await self._emit_revision_cap_escalation(drift, session)
             return
         # Plumb the session into the planner's drift-emitter callback
         # for the duration of this refine call so the planner can emit
@@ -3421,6 +3442,12 @@ class DefaultSteerer:
             return
         if self._is_plan_revision_gated(drift, session):
             return
+        # Plan-revision count gate (goldfive#271 follow-up). See
+        # ``PLAN_REVISION_COUNT_LIMIT`` and the parallel check in
+        # ``_handle_drift``.
+        if self._is_plan_revision_count_gated(drift, session):
+            await self._emit_revision_cap_escalation(drift, session)
+            return
         counter_key = (drift.kind.value, drift.current_task_id)
         self._active_session = session
         # goldfive a4: same attempt-id correlation contract as
@@ -3752,6 +3779,23 @@ class DefaultSteerer:
     # before we give up and mark the task FAILED. Class attribute so
     # subclasses / tests can tune it without poking at instance state.
     REFINE_FAILURE_THRESHOLD: int = 2
+
+    # Maximum number of *successful* plan revisions tolerated for a
+    # given (drift_kind, task_id) before the steerer gives up and
+    # routes the drift to ``HUMAN_INTERVENTION_REQUIRED``
+    # (goldfive#271 follow-up). The existing ``REFINE_FAILURE_THRESHOLD``
+    # only fires when a refine fails (raises / returns None / fails
+    # validation) — but the v8 demo loop produced 4 *successful* plan
+    # revisions on the same off_topic+research_solar pair in 30 minutes,
+    # because each successful refine reset the failure counter to 0.
+    # This second cap is the loop-prevention backstop. USER_STEER /
+    # USER_CANCEL / GOAL_DRIFT bypass this cap (see
+    # ``_PLAN_REVISION_COOLDOWN_EXEMPT_KINDS``); user actions are always
+    # honoured. Default 3 is generous enough that legitimate "agent had
+    # two off-track turns and was corrected" trajectories complete, but
+    # tight enough that a Qwen judge that keeps re-firing on a corrected
+    # task can't burn the whole turn.
+    PLAN_REVISION_COUNT_LIMIT: int = 3
 
     async def _register_refine_failure(
         self,
@@ -4562,6 +4606,69 @@ class DefaultSteerer:
         )
         return True
 
+    def _is_plan_revision_count_gated(
+        self, drift: DriftEvent, session: Session
+    ) -> bool:
+        """Return ``True`` iff the (kind, task) revision cap has been hit.
+
+        Independent of the time-based cooldown -- consults
+        :attr:`Session.plan_revision_counts` and compares against
+        :attr:`PLAN_REVISION_COUNT_LIMIT`. Same exempt set as the
+        cooldown so user-driven revisions never burn the budget.
+
+        Used by ``_handle_drift`` and ``_promote_drift_to_steer`` to
+        suppress further drift-triggered refines once the cap is hit.
+        Returns ``False`` when the limit is non-positive (disabled) or
+        the drift kind is exempt.
+        """
+        limit = self.PLAN_REVISION_COUNT_LIMIT
+        if limit <= 0:
+            return False
+        if drift.kind in self._PLAN_REVISION_COOLDOWN_EXEMPT_KINDS:
+            return False
+        key = (drift.current_task_id, drift.kind.value)
+        count = session.plan_revision_counts.get(key, 0)
+        if count < limit:
+            return False
+        log.warning(
+            "plan revision suppressed by count cap (task=%r kind=%s "
+            "count=%d limit=%d); escalating to HUMAN_INTERVENTION_REQUIRED",
+            drift.current_task_id,
+            drift.kind.value,
+            count,
+            limit,
+        )
+        return True
+
+    async def _emit_revision_cap_escalation(
+        self, drift: DriftEvent, session: Session
+    ) -> None:
+        """Emit a HUMAN_INTERVENTION_REQUIRED drift + pause the runner.
+
+        Called from ``_handle_drift`` / ``_promote_drift_to_steer`` when
+        :meth:`_is_plan_revision_count_gated` returns True. Pauses the
+        Runner via ``session.paused_for_human_intervention`` and emits a
+        CRITICAL drift carrying the underlying (kind, task) so sinks /
+        the UI can surface the cause.
+        """
+        session.paused_for_human_intervention = True
+        key = (drift.current_task_id, drift.kind.value)
+        count = session.plan_revision_counts.get(key, 0)
+        escalation = DriftEvent(
+            kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
+            severity=DriftSeverity.CRITICAL,
+            detail=(
+                f"plan-revision cap reached for {drift.kind.value} on task "
+                f"{drift.current_task_id or '(trajectory)'}: "
+                f"{count} successful revisions, limit "
+                f"{self.PLAN_REVISION_COUNT_LIMIT}"
+            ),
+            current_task_id=drift.current_task_id,
+            current_agent_id=drift.current_agent_id,
+        )
+        # Emit directly; do NOT recurse through ``_handle_drift``.
+        await self._emit_drift_detected(session, escalation)
+
     def _record_plan_revision(self, drift: DriftEvent, session: Session) -> None:
         """Stamp ``session._last_plan_revision_at`` after a successful revision.
 
@@ -4570,11 +4677,25 @@ class DefaultSteerer:
         kinds (see :meth:`_is_plan_revision_gated`) are still recorded
         for completeness -- the gate short-circuits on them
         independently of whether a stamp exists.
+
+        Always bumps :attr:`Session.plan_revision_counts` regardless of
+        cooldown configuration -- the count gate is independent of the
+        time-based cooldown and is the loop-prevention backstop for the
+        "NO cooldown per user directive" stance (see
+        ``project_structural_steering_plan.md``).
         """
-        if self._plan_revision_cooldown_seconds <= 0:
-            return
         key = (drift.current_task_id, drift.kind.value)
-        session._last_plan_revision_at[key] = time.monotonic()
+        if self._plan_revision_cooldown_seconds > 0:
+            session._last_plan_revision_at[key] = time.monotonic()
+        # Bump the unconditional revision counter (goldfive#271
+        # follow-up). Exempt kinds (USER_STEER, USER_CANCEL, GOAL_DRIFT)
+        # do not contribute to the cap so user actions never burn the
+        # budget. GOAL_DRIFT has its own rate-limit via
+        # ``_last_goal_drift_check_ts``.
+        if drift.kind not in self._PLAN_REVISION_COOLDOWN_EXEMPT_KINDS:
+            session.plan_revision_counts[key] = (
+                session.plan_revision_counts.get(key, 0) + 1
+            )
 
     @staticmethod
     def _integrate_correction_supersedes(revised: Plan) -> None:
