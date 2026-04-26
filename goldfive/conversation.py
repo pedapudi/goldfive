@@ -24,9 +24,15 @@ Phase 3 scope (see issue #78):
 * :class:`TurnRecord` captures a one-sentence summary of each turn so
   the planner can reference them in its prompt.
 
-A Runner always owns a Conversation — single-turn callers never notice
-because the Conversation is fresh on construction and discarded with
-the Runner.
+A Runner owns a *map* of Conversations keyed by outer-session id
+(``Runner._conversations``) so cross-turn state never leaks across
+distinct outer ADK sessions sharing one Runner — see goldfive#271
+follow-up to PR #293 / validation v4 Class 1. Programmatic
+(unpinned) callers all share one Conversation under the empty-string
+key, preserving pre-#161 single-Conversation continuity. Each
+pinned outer-session id (e.g. ADK-web's ``ctx.session.id``) gets
+its own dedicated Conversation with isolated ``goals``,
+``completed_results``, ``turns``, and ``_next_sequence`` cursor.
 """
 
 from __future__ import annotations

@@ -211,14 +211,48 @@ class Runner:
         self._close_hooks: list[Callable[[], Awaitable[None]]] = []
         self._closed: bool = False
         self.max_task_invocations: int | None = max_task_invocations
-        self._conversation: Conversation = conversation or Conversation.new()
-        # Tracks whether we've emitted the ConversationStarted event for
-        # the current Conversation. Flips back to False on new_conversation().
-        self._conversation_announced: bool = False
-        # Last turn's Session, held past the turn so that ConversationEnded
-        # can piggy-back on its ``next_sequence()`` counter (sequence must
-        # be monotonic within a run_id, so the terminal marker needs the
-        # session that produced the run's other events).
+        # Per-outer-session :class:`Conversation` map (goldfive#271
+        # follow-up to PR #293 / validation v4 Class 1).
+        #
+        # Pre-fix the Runner held one ``self._conversation``: a
+        # singleton on the Runner instance. PR #293 keyed the
+        # *prior-plan stash* on session id, but every other
+        # Conversation field (``goals``, ``completed_results``,
+        # ``turns``, ``_next_sequence``) still leaked across distinct
+        # outer ADK sessions sharing one Runner. The visible regression:
+        # v4class1-1 saw "Provide the correct answer to 2+2" leaked
+        # from a prior v4-class5 session that had run on the same
+        # Runner — every subsequent session inherited every prior
+        # session's accumulated goals.
+        #
+        # Keying the entire :class:`Conversation` by the outer-session
+        # id used at :meth:`run`'s entry isolates per-session state in
+        # full. The empty-string key (``""``) holds the conversation
+        # for unpinned (programmatic) callers — preserving the legacy
+        # single-Conversation continuity for pre-#161 callers and
+        # one-shot scripts. Pinned callers (typically ADK-web via
+        # :class:`GoldfiveADKAgent`) get their own Conversation per
+        # ``ctx.session.id``.
+        #
+        # Lifetime: Conversations live forever for the Runner's
+        # lifetime. The dict is small (one entry per distinct outer
+        # session ever observed) and Conversations are bounded
+        # (``recent_turns`` cap on prior-turn context). If a future
+        # use case introduces churn (many short-lived outer sessions),
+        # add a cleanup hook on session end.
+        seed_conv = conversation or Conversation.new()
+        self._conversations: dict[str, Conversation] = {"": seed_conv}
+        # Per-key bookkeeping. ``_conversation_announced`` flips to
+        # True after the per-key Conversation's ConversationStarted
+        # event fires; ``_last_session_by_key`` holds the most recent
+        # turn's Session so ConversationEnded can piggy-back on its
+        # ``next_sequence()`` cursor (the terminal marker must share
+        # its run_id's sequence keyspace).
+        self._conversation_announced: dict[str, bool] = {"": False}
+        self._last_session_by_key: dict[str, Session] = {}
+        # Last turn's Session (any key) — kept for back-compat with
+        # tests / inspectors that read ``runner._last_session``
+        # directly. Updated on every :meth:`run` regardless of pin.
         self._last_session: Session | None = None
         # Turn-aware planning gate. Goldfive#271 Phase 4: the gate is
         # now ``planner.handle_turn`` (a single LLM call that classifies
@@ -234,6 +268,37 @@ class Runner:
         # another's first turn. See :meth:`Conversation.prior_plan_for`
         # and the goldfive#271 follow-up validation v4 Class 1
         # post-mortem.
+
+    # ------------------------------------------------------------------
+    # per-session Conversation lookup
+    # ------------------------------------------------------------------
+
+    def _conversation_key(self, session_id: str | None) -> str:
+        """Map an optional outer-session-id pin to the lookup key.
+
+        ``None`` / ``""`` (the unpinned / programmatic caller) use the
+        empty-string key — a single shared Conversation for that path,
+        preserving pre-#161 single-Conversation continuity. Any
+        non-empty pin gets its own keyed Conversation (typically the
+        ``ctx.session.id`` from :class:`GoldfiveADKAgent`).
+        """
+        return session_id or ""
+
+    def _conversation_for(self, key: str) -> Conversation:
+        """Return the :class:`Conversation` for ``key``, creating on miss.
+
+        ``key=""`` is the unpinned-caller slot; non-empty keys belong
+        to outer ADK sessions. Created Conversations get fresh ids,
+        empty goals / completed_results / turns, and a zero
+        ``_next_sequence`` cursor — exactly the state a brand-new
+        outer session deserves to see.
+        """
+        convo = self._conversations.get(key)
+        if convo is None:
+            convo = Conversation.new()
+            self._conversations[key] = convo
+            self._conversation_announced[key] = False
+        return convo
 
     # ------------------------------------------------------------------
     # run
@@ -258,11 +323,21 @@ class Runner:
         Runner callers see no behaviour change.
         """
 
-        # 1. Build Session seeded by the Conversation. The Session's
+        # 1. Resolve the per-outer-session :class:`Conversation`
+        # (goldfive#271 follow-up to PR #293). Every outer ADK session
+        # gets its own Conversation so cross-turn state (goals,
+        # completed_results, turns, wire-sequence cursor, prior-plan
+        # stash) is isolated. The unpinned (programmatic) path uses
+        # the shared ``""`` key for back-compat with pre-#161 callers.
+        # See :meth:`_conversation_for` and validation v4 Class 1.
+        convo_key = self._conversation_key(session_id)
+        convo = self._conversation_for(convo_key)
+
+        # 2. Build Session seeded by the Conversation. The Session's
         #    run_id is fresh for this turn; conversation_id is stable
         #    across turns; goals / completed_results are pre-populated
-        #    with prior-turn state.
-        session = self._conversation.next_turn_session()
+        #    with prior-turn state — all scoped to the convo above.
+        session = convo.next_turn_session()
         # Outer-session pin (goldfive#161): when the caller supplies a
         # non-empty ``session_id`` (typically ``ctx.session.id`` from
         # adk-web), override the freshly-minted ``run_id`` so every
@@ -281,11 +356,12 @@ class Runner:
         if pinned:
             session.run_id = session_id  # type: ignore[assignment]
         self._last_session = session
+        self._last_session_by_key[convo_key] = session
 
-        # 2. Announce the Conversation on the first turn.
-        if not self._conversation_announced:
-            await self._emit_conversation_started(session)
-            self._conversation_announced = True
+        # 2b. Announce the Conversation on its first turn (per key).
+        if not self._conversation_announced.get(convo_key, False):
+            await self._emit_conversation_started(session, conversation=convo)
+            self._conversation_announced[convo_key] = True
 
         # 3. Emit RunStarted before anything else for this turn.
         await self._emit_run_started(session, user_input)
@@ -306,7 +382,7 @@ class Runner:
         # callers (both prior and new turn unpinned) keep the
         # Conversation-level continuity the original ``_last_plan``
         # field provided.
-        prior_plan = self._conversation.prior_plan_for(session.id, pinned=pinned)
+        prior_plan = convo.prior_plan_for(session.id, pinned=pinned)
         if prior_plan is not None:
             prior_plan.run_id = session.run_id
             session.plan = prior_plan
@@ -325,7 +401,7 @@ class Runner:
             log.exception("goal derivation failed")
             await self._emit_run_aborted(session, reason)
             outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            self._conversation.absorb_turn(
+            convo.absorb_turn(
                 outcome,
                 user_input_summary=_initial_goal_summary(user_input),
                 pinned=pinned,
@@ -384,6 +460,7 @@ class Runner:
                     user_input=user_input,
                     session=session,
                     context=context,
+                    conversation=convo,
                 )
                 decided = True
                 log.info(
@@ -426,7 +503,7 @@ class Runner:
                 "run_id": session.run_id,
                 "max_task_invocations": self.max_task_invocations,
             }
-            planner_context.update(self._conversation.prior_turn_context())
+            planner_context.update(convo.prior_turn_context())
             if context:
                 planner_context.update(context)
             planner_context["run_id"] = session.run_id
@@ -441,7 +518,7 @@ class Runner:
                 log.exception("planner.generate raised")
                 await self._emit_run_aborted(session, reason)
                 outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-                self._conversation.absorb_turn(
+                convo.absorb_turn(
                     outcome,
                     user_input_summary=_initial_goal_summary(user_input),
                     pinned=pinned,
@@ -462,7 +539,7 @@ class Runner:
                 reason = "plan revision rejected by validator"
                 await self._emit_run_aborted(session, reason)
                 outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-                self._conversation.absorb_turn(
+                convo.absorb_turn(
                     outcome,
                     user_input_summary=_initial_goal_summary(user_input),
                     pinned=pinned,
@@ -475,7 +552,7 @@ class Runner:
             reason = "no plan generated"
             await self._emit_run_aborted(session, reason)
             outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            self._conversation.absorb_turn(
+            convo.absorb_turn(
                 outcome,
                 user_input_summary=_initial_goal_summary(user_input),
                 pinned=pinned,
@@ -499,7 +576,7 @@ class Runner:
             log.exception("register_reporting_tools raised")
             await self._emit_run_aborted(session, reason)
             outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            self._conversation.absorb_turn(
+            convo.absorb_turn(
                 outcome,
                 user_input_summary=_initial_goal_summary(user_input),
                 pinned=pinned,
@@ -514,7 +591,7 @@ class Runner:
             log.exception("steerer.bind raised")
             await self._emit_run_aborted(session, reason)
             outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            self._conversation.absorb_turn(
+            convo.absorb_turn(
                 outcome,
                 user_input_summary=_initial_goal_summary(user_input),
                 pinned=pinned,
@@ -538,7 +615,7 @@ class Runner:
                 log.exception("adapter.bind_steerer raised")
                 await self._emit_run_aborted(session, reason)
                 outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-                self._conversation.absorb_turn(
+                convo.absorb_turn(
                     outcome,
                     user_input_summary=_initial_goal_summary(user_input),
                     pinned=pinned,
@@ -587,7 +664,7 @@ class Runner:
             log.exception("executor.run raised")
             await self._emit_run_aborted(session, reason)
             aborted = ExecutionOutcome(success=False, session=session, reason=reason)
-            self._conversation.absorb_turn(
+            convo.absorb_turn(
                 aborted,
                 user_input_summary=_initial_goal_summary(user_input),
                 pinned=pinned,
@@ -632,7 +709,7 @@ class Runner:
             # begin with. ``stash_plan`` is idempotent: a subsequent
             # ``absorb_turn`` re-stashes the same plan + session id.
             if session.plan is not None and session.plan.tasks:
-                self._conversation.stash_plan(session, pinned=pinned)
+                convo.stash_plan(session, pinned=pinned)
                 log.info(
                     "Runner.run: stashed prior plan for next turn's "
                     "handle_turn (plan_id=%s revision_index=%d "
@@ -648,7 +725,7 @@ class Runner:
         _ostate.clear_current_task(session.state)
         _ostate.clear_active_steer(session.state)
 
-        self._conversation.absorb_turn(
+        convo.absorb_turn(
             outcome,
             user_input_summary=_initial_goal_summary(user_input),
             pinned=pinned,
@@ -825,31 +902,58 @@ class Runner:
 
     @property
     def conversation_id(self) -> str:
-        """The current Conversation's stable id. Changes only via :meth:`new_conversation`."""
-        return self._conversation.id
+        """The default (unpinned-key) Conversation's stable id.
+
+        Returns the id of the empty-string-keyed :class:`Conversation`
+        — the slot used by programmatic / unpinned :meth:`run` callers.
+        Each pinned outer ADK session owns its own Conversation
+        (look it up via ``runner._conversations[session_id]``); the
+        public property keeps single-Conversation semantics for
+        backward-compatibility with pre-#161 callers and inspection
+        tools.
+        """
+        return self._conversations[""].id
 
     @property
     def conversation(self) -> Conversation:
-        """The live :class:`Conversation` object. Read-only handle for inspection."""
-        return self._conversation
+        """The default (unpinned-key) :class:`Conversation`.
+
+        Read-only handle for inspection. Per-pinned-session
+        Conversations live under ``runner._conversations``; this
+        property returns the empty-string-keyed slot used by
+        programmatic callers, preserving the pre-#293 single-
+        Conversation public surface.
+        """
+        return self._conversations[""]
 
     async def new_conversation(self, *, reason: str = "") -> None:
-        """Reset cross-turn state. The next :meth:`run` starts a fresh Conversation.
+        """Reset cross-turn state across every per-session Conversation.
 
-        Emits a ``ConversationEnded`` event for the outgoing Conversation
-        (if it had any turns), then installs a fresh one. The new
-        Conversation is announced lazily — ``ConversationStarted`` fires
-        on the next :meth:`run` call.
+        Emits a ``ConversationEnded`` event for every outgoing
+        Conversation that had announced its start (one per outer
+        session id observed so far), then installs fresh
+        Conversations. The next :meth:`run` for any session id —
+        pinned or unpinned — starts a brand-new Conversation; its
+        ``ConversationStarted`` is emitted lazily on that call.
         """
-        outgoing = self._conversation
-        if self._conversation_announced and self._last_session is not None:
-            await self._emit_conversation_ended(
-                conversation=outgoing,
-                session_anchor=self._last_session,
-                reason=reason or "new_conversation",
-            )
-        self._conversation = Conversation.new()
-        self._conversation_announced = False
+        for key, outgoing in list(self._conversations.items()):
+            announced = self._conversation_announced.get(key, False)
+            anchor = self._last_session_by_key.get(key)
+            if announced and anchor is not None:
+                await self._emit_conversation_ended(
+                    conversation=outgoing,
+                    session_anchor=anchor,
+                    reason=reason or "new_conversation",
+                )
+        # Reset the per-session bookkeeping. The default ("") slot is
+        # restored eagerly so the public ``conversation`` /
+        # ``conversation_id`` properties keep returning a real handle
+        # right after the reset (callers may inspect them before the
+        # next :meth:`run`). Pinned slots are recreated lazily by
+        # :meth:`_conversation_for` on the next run for that session.
+        self._conversations = {"": Conversation.new()}
+        self._conversation_announced = {"": False}
+        self._last_session_by_key = {}
         self._last_session = None
         # planner-gate: reset turn-aware gate state so the first turn
         # of the new conversation runs full planning. Cross-turn
@@ -875,16 +979,24 @@ class Runner:
         if self._closed:
             return
         self._closed = True
-        if self._conversation_announced and self._last_session is not None:
+        # Emit ConversationEnded for every per-session Conversation
+        # that announced its start. Pinned (ADK-session) and unpinned
+        # slots both flow through here so persisted logs always carry
+        # a clean terminal marker for each conversation_id observed.
+        for key, conv in list(self._conversations.items()):
+            announced = self._conversation_announced.get(key, False)
+            anchor = self._last_session_by_key.get(key)
+            if not (announced and anchor is not None):
+                continue
             try:
                 await self._emit_conversation_ended(
-                    conversation=self._conversation,
-                    session_anchor=self._last_session,
+                    conversation=conv,
+                    session_anchor=anchor,
                     reason="runner_close",
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("conversation_ended emission raised: %s", exc)
-            self._conversation_announced = False
+            self._conversation_announced[key] = False
         # Drain background reasoning-judge tasks the steerer scheduled
         # via its fire-and-forget judge path (goldfive#251). Bounded
         # shutdown so a hung LLM judge doesn't stall close. Duck-typed
@@ -973,6 +1085,7 @@ class Runner:
         user_input: str,
         session: Session,
         context: Mapping[str, Any] | None,
+        conversation: Conversation,
     ) -> Plan | None:
         """Invoke ``planner.handle_turn`` with the runner's per-turn context.
 
@@ -981,6 +1094,11 @@ class Runner:
         Runner threads the available agents and the per-turn context
         (run_id, max_task_invocations, prior_turns) so the planner has
         everything it needs in one call.
+
+        ``conversation`` is the per-outer-session :class:`Conversation`
+        the caller resolved at :meth:`run` entry — passed in rather
+        than read off ``self`` because the Runner now holds a dict of
+        per-session Conversations (see :meth:`_conversation_for`).
         """
         # Prefer the richer tree shape (goldfive#151) when the adapter
         # exposes it. Adapters that don't implement the property fall
@@ -995,14 +1113,14 @@ class Runner:
             "run_id": session.run_id,
             "max_task_invocations": self.max_task_invocations,
         }
-        planner_context.update(self._conversation.prior_turn_context())
+        planner_context.update(conversation.prior_turn_context())
         if context:
             planner_context.update(context)
         planner_context["run_id"] = session.run_id
         return await self.planner.handle_turn(
             user_input=user_input,
             session=session,
-            conversation_history=list(self._conversation.turns),
+            conversation_history=list(conversation.turns),
             available_agents=available_agents,
             context=planner_context,
         )
@@ -1136,11 +1254,13 @@ class Runner:
         )
         await emit(self.sinks, evt)
 
-    async def _emit_conversation_started(self, session: Session) -> None:
+    async def _emit_conversation_started(
+        self, session: Session, *, conversation: Conversation
+    ) -> None:
         evt = conversation_started_event(
             run_id=session.run_id,
             sequence=session.next_sequence(),
-            conversation_id=self._conversation.id,
+            conversation_id=conversation.id,
             session_id=session.id,
         )
         await emit(self.sinks, evt)
