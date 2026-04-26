@@ -284,12 +284,17 @@ def test_presentation_agent_e2e_under_adk_web(
 
     kinds = [_event_kind(e) for e in events]
 
-    # 1. Exactly one plan_submitted, with all four expected tasks.
-    plan_events = [e for e, k in zip(events, kinds, strict=True) if k == "plan_submitted"]
-    assert len(plan_events) == 1, (
-        f"expected exactly one plan_submitted; got {len(plan_events)} (kinds: {kinds})"
+    # 1. At least one plan_revised, with all four expected tasks.
+    # Phase 4 (goldfive#271): every plan install is a revision of the
+    # Plan.empty() seed, so PlanRevised fires uniformly (PlanSubmitted
+    # is gone). The first install lands as revision 1; topic-shift /
+    # additive-constraint turns add subsequent revisions.
+    plan_events = [e for e, k in zip(events, kinds, strict=True) if k == "plan_revised"]
+    assert plan_events, (
+        f"expected at least one plan_revised; got 0 (kinds: {kinds})"
     )
-    plan_pb = plan_events[0].plan_submitted.plan
+    # The first plan_revised holds the initial four-task plan.
+    plan_pb = plan_events[0].plan_revised.plan
     planned_tasks = {t.id: t.assignee_agent_id for t in plan_pb.tasks}
     assert planned_tasks == {
         "research": "research_agent",

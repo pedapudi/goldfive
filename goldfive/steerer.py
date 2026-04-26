@@ -71,7 +71,6 @@ from goldfive.types import (
     DriftEvent,
     DriftKind,
     DriftSeverity,
-    Goal,
     Plan,
     Session,
     SupersessionKind,
@@ -103,233 +102,6 @@ __all__ = [
     "InterventionLevel",
     "compose_corrective_user_message",
 ]
-
-
-# Phase 2.X / goldfive#271 Gap 5 — persistent qualification patterns.
-#
-# When a USER_STEER pivots the topic, the LLM's synthesised goal often
-# drops sticky qualifications from the prior goal (numeric caps, format
-# requirements, output type). The validation E2E observed:
-#
-#   prior:  "Create a presentation about solar panels with no more
-#            than 2 slides."
-#   after:  "Provide informative content about solar flares."  (BAD)
-#   wanted: "Create a presentation about solar flares with no more
-#            than 2 slides."
-#
-# These regexes pick out canonical qualifications from the prior goal's
-# summary so :func:`_merge_prior_qualifications_into_goal` can append
-# them to a synth goal that didn't already include them.
-_NUMERIC_CAP_RE = re.compile(
-    r"\b("
-    r"(?:no\s+more\s+than|at\s+most|up\s+to|under|fewer\s+than|less\s+than|"
-    r"exactly|only|just)\s+\d+\s+\w+"
-    r"|\d+\s+(?:or\s+fewer|or\s+less)"
-    r")\b",
-    re.IGNORECASE,
-)
-_FORMAT_HINT_RE = re.compile(
-    r"\b("
-    r"in\s+(?:markdown|html|json|yaml|plain\s+text|bullet\s+points|prose)"
-    r"|as\s+(?:bullet\s+points|a\s+(?:list|table|presentation|report|"
-    r"summary|essay|outline))"
-    r")\b",
-    re.IGNORECASE,
-)
-_OUTPUT_TYPE_RE = re.compile(
-    r"\b(?:create|build|make|write|generate|draft|prepare|provide)\s+"
-    r"(?:a|an|the)\s+(presentation|report|summary|outline|essay|"
-    r"deck|slide(?:show)?|slides|demo|website|webpage|article|guide|"
-    r"plan)\b",
-    re.IGNORECASE,
-)
-
-
-def _extract_qualifications(text: str) -> list[str]:
-    """Return the canonical qualification phrases present in ``text``.
-
-    Heuristic — looks for the patterns most often dropped on a topic
-    pivot (numeric caps, format hints, output-type framings). Used by
-    :func:`_merge_prior_qualifications_into_goal` to detect what was
-    in the prior goal and is missing from the synthesised one.
-    """
-    if not text:
-        return []
-    out: list[str] = []
-    for m in _NUMERIC_CAP_RE.finditer(text):
-        out.append(m.group(1))
-    for m in _FORMAT_HINT_RE.finditer(text):
-        out.append(m.group(1))
-    return out
-
-
-def _extract_output_type(text: str) -> str:
-    """Return the canonical output type phrase from ``text`` if any.
-
-    e.g. "Create a presentation about solar panels..." → "presentation".
-    Returns the matched output-type noun (lowercased) or ``""`` when no
-    output-type framing is present.
-    """
-    if not text:
-        return ""
-    m = _OUTPUT_TYPE_RE.search(text)
-    return m.group(1).lower() if m else ""
-
-
-def _looks_like_explicit_removal(steer_body: str, qualification: str) -> bool:
-    """Return True when ``steer_body`` explicitly removes ``qualification``.
-
-    Pattern: the steer says "no longer", "drop", "remove", "forget the",
-    or "without" near the qualification's keywords. Conservative —
-    a false negative just preserves a qualification the user wanted
-    dropped (the user can restate); a false positive (preserving when
-    they wanted dropped) is the actual regression we're guarding against.
-    """
-    if not steer_body or not qualification:
-        return False
-    body_lower = steer_body.lower()
-    qual_lower = qualification.lower()
-    # Pull out a "core" keyword from the qualification — first noun-ish
-    # word (skip the cap leader like "no more than"). For "no more than
-    # 2 slides" the core is "slides"; for "in markdown" it's "markdown".
-    parts = qual_lower.split()
-    core = parts[-1] if parts else qual_lower
-    # Look for explicit removal verbs near the core keyword.
-    removal_re = re.compile(
-        r"\b(?:no\s+longer|drop|remove|forget|without|skip)\b[^.]*\b"
-        + re.escape(core)
-        + r"\b",
-        re.IGNORECASE,
-    )
-    return bool(removal_re.search(body_lower))
-
-
-def _merge_prior_qualifications_into_goal(
-    synth_goal: Goal,
-    prior_goals: list[Goal],
-    *,
-    steer_body: str = "",
-) -> Goal:
-    """Augment ``synth_goal`` with prior-goal qualifications it dropped.
-
-    Phase 2.X / goldfive#271 Gap 5 safety net. The LLM synthesizer is
-    instructed to merge qualifications via the system prompt, but
-    will sometimes drop them anyway. This deterministic post-process
-    re-attaches:
-
-    * **Numeric caps** ("no more than 2 slides", "at most 500 words",
-      "under 5 minutes").
-    * **Format hints** ("in markdown", "as bullet points", "as a
-      report").
-    * **Output type** ("a presentation", "a report") — preserved by
-      rewriting the verb-phrase prefix when the synth goal opens with
-      a generic "provide content" / "give information" framing.
-
-    A qualification is dropped from the merge when the steer body
-    explicitly removes it (see :func:`_looks_like_explicit_removal`).
-    Otherwise it's appended to the synth goal's summary if missing.
-
-    Returns a NEW :class:`Goal` (mutating the input would surprise
-    callers that hold the synth result for logging).
-    """
-    if not prior_goals or synth_goal is None:
-        return synth_goal
-    summary = synth_goal.summary or ""
-    summary_lower = summary.lower()
-    # Collect qualifications across all prior goals, dedup by lowercased
-    # text (preserving first-encountered casing).
-    seen: set[str] = set()
-    new_qualifications: list[str] = []
-    new_output_type = ""
-    for g in prior_goals:
-        if not g.summary:
-            continue
-        for q in _extract_qualifications(g.summary):
-            q_lower = q.lower()
-            if q_lower in seen:
-                continue
-            if q_lower in summary_lower:
-                seen.add(q_lower)
-                continue
-            if _looks_like_explicit_removal(steer_body, q):
-                seen.add(q_lower)
-                continue
-            seen.add(q_lower)
-            new_qualifications.append(q)
-        # Output-type framing — only adopt the FIRST prior goal's type
-        # (multiple priors with different types would rather wait for
-        # the user to restate; this is a conservative default).
-        if not new_output_type:
-            ot = _extract_output_type(g.summary)
-            if (
-                ot
-                and ot not in summary_lower
-                and not _looks_like_explicit_removal(steer_body, ot)
-            ):
-                new_output_type = ot
-    if not new_qualifications and not new_output_type:
-        return synth_goal
-    # Build the merged summary. The output-type rewrite tries to keep
-    # the steer's topic intact while restoring the prior framing —
-    # "Provide content about solar flares" → "Create a presentation
-    # about solar flares". Heuristic: replace a leading generic verb
-    # phrase ("provide", "give", "tell me about", "share") with
-    # "Create a/an <output_type> about" when the synth's summary
-    # opens that way.
-    merged_summary = summary
-    if new_output_type:
-        merged_summary = _rewrite_output_type_prefix(merged_summary, new_output_type)
-    if new_qualifications:
-        # Strip any trailing punctuation, append the qualifications
-        # joined with " ", and reapply a terminal period.
-        trimmed = merged_summary.rstrip(" .!?")
-        joined = " ".join(new_qualifications)
-        # Use "with" as the connective; matches the prior goal's phrasing
-        # in the canonical example. If "with" already appears in the
-        # synth, fall back to ", ".
-        connective = ", " if " with " in trimmed.lower() else " with "
-        merged_summary = f"{trimmed}{connective}{joined}."
-    log.info(
-        "DefaultSteerer: merged %d qualification(s) and output_type=%r "
-        "from prior goals into synth goal (was=%r, now=%r)",
-        len(new_qualifications),
-        new_output_type,
-        summary,
-        merged_summary,
-    )
-    return Goal(id=synth_goal.id, summary=merged_summary)
-
-
-_GENERIC_VERB_PREFIX_RE = re.compile(
-    r"^\s*(?P<verb>provide|give|share|tell\s+me|tell\s+us|describe|"
-    r"summarise|summarize|explain|present)\s+(?:me\s+|us\s+)?"
-    r"(?P<filler>(?:with\s+|the\s+)?(?:informative\s+|relevant\s+|some\s+|"
-    r"useful\s+|detailed\s+)?content\s+|some\s+information\s+|"
-    r"information\s+|details\s+|an?\s+overview\s+|details\s+)?"
-    r"(?:about\s+|on\s+|of\s+|regarding\s+)?",
-    re.IGNORECASE,
-)
-
-
-def _rewrite_output_type_prefix(summary: str, output_type: str) -> str:
-    """Rewrite a generic "provide content" prefix to "Create a <output_type> about".
-
-    Phase 2.X / goldfive#271 Gap 5 helper. Used by
-    :func:`_merge_prior_qualifications_into_goal` to preserve the
-    prior goal's output-type framing when the synth goal dropped it.
-    Returns the original summary unchanged when no generic prefix is
-    detected — the prior framing only re-applies when the synth used
-    one of the dropping forms.
-    """
-    if not summary or not output_type:
-        return summary
-    article = "an" if output_type[:1] in "aeiouAEIOU" else "a"
-    new_prefix = f"Create {article} {output_type} about "
-    m = _GENERIC_VERB_PREFIX_RE.match(summary)
-    if not m:
-        return summary
-    rest = summary[m.end():]
-    return new_prefix + rest
 
 
 class InterventionLevel(enum.IntEnum):
@@ -3806,26 +3578,26 @@ class DefaultSteerer:
         session: Session,
     ) -> None:
         """Side-effects for USER_STEER drift that aren't refine: state
-        bookkeeping + goal synthesis.
+        bookkeeping.
 
-        Called from :meth:`_handle_drift` just before ``_emit_drift_detected``
-        and well before ``planner.refine`` runs, so:
+        Called from :meth:`_handle_drift` and
+        :meth:`apply_user_steer_with_plan` just before
+        ``_emit_drift_detected`` and well before any plan install so:
 
         1. The ``goldfive.active_steer.*`` keys are set so downstream
            observers see the steer before the drift event.
-        2. The synthesized Goal is appended / replaced onto
-           ``session.goals`` BEFORE ``planner.refine`` reads
-           ``list(session.goals)``, so the refined plan sees the
-           pivot as a goal, not only as a drift detail string.
-        3. The source annotation / control id is appended to
+        2. The source annotation / control id is appended to
            ``goldfive.processed_steer_ids`` so a retry or UI double-fire
            of the same STEER is a no-op (goldfive#171 dedupe).
 
-        Never raises: a planner that doesn't implement
-        ``synthesize_goal_from_steer`` or a synthesis call that fails
-        falls through to a minimal passthrough (wrap the steer body as
-        a Goal, mode APPEND). The steerer must never break the run on
-        a missing optional hook.
+        Never raises.
+
+        Phase 4 (goldfive#271): goal synthesis was previously done
+        here via ``planner.synthesize_goal_from_steer`` plus a
+        regex-based qualification-merge post-process. That is now the
+        :meth:`Planner.handle_turn` LLM's job — it produces the
+        revised plan with qualifications already merged in one shot.
+        This method retains only the bookkeeping-side effects.
         """
         # Recover the raw body + operator author from the originating
         # ControlMessage when it's available on drift.raw (goldfive#171).
@@ -3834,11 +3606,11 @@ class DefaultSteerer:
         # ControlMessage behind it.
         raw_body, author, steer_id = self._unpack_steer_context(drift)
         body = raw_body.strip()
-        # Stamp the active_steer keys regardless of synthesis outcome
-        # so readers see "a steer is active as of turn N" even when
-        # the planner can't synthesize. ``at_turn`` uses the session's
-        # monotonic sequence counter which increments on every emitted
-        # event — a cheap, always-available "turn" proxy.
+        # Stamp the active_steer keys regardless so readers see "a
+        # steer is active as of turn N". ``at_turn`` uses the
+        # session's monotonic sequence counter which increments on
+        # every emitted event — a cheap, always-available "turn"
+        # proxy.
         at_turn = getattr(session, "_next_sequence", 0) or 0
         try:
             _ostate.set_active_steer(
@@ -3865,125 +3637,91 @@ class DefaultSteerer:
                     "DefaultSteerer._apply_user_steer_state: record_processed_steer_id raised: %s",
                     exc,
                 )
-        if not body:
-            # Empty steer body: nothing to synthesize into a goal. The
-            # active_steer.* keys still landed (readers may want to know
-            # "a steer was fired even if empty"). Keep goals as-is.
-            return
-        # Phase 2.X / goldfive#271 Gap 5: snapshot the prior goals so
-        # the synthesizer can merge persistent qualifications into the
-        # new goal. Done BEFORE we mutate session.goals below.
-        prior_goals_snapshot = list(session.goals)
-        synth_goal, mode = await self._synthesize_goal_from_steer(
-            body, prior_goals=prior_goals_snapshot
-        )
-        if synth_goal is None:
-            return
-        # Heuristic safety net: if the LLM didn't preserve the prior
-        # goals' persistent qualifications, merge them in by pattern
-        # match. Cheap insurance against an LLM that ignored the
-        # MERGE-qualifications guideline in the prompt.
-        synth_goal = _merge_prior_qualifications_into_goal(
-            synth_goal, prior_goals_snapshot, steer_body=body
-        )
-        mode_norm = (mode or "append").strip().lower()
-        if mode_norm == "replace":
-            session.goals.clear()
-            session.goals.append(synth_goal)
-        else:
-            # Default / "append" mode: add unless an id collision
-            # exists (belt-and-braces if the synthesizer reuses an id).
-            existing = {g.id for g in session.goals if g.id}
-            if synth_goal.id and synth_goal.id in existing:
-                # Replace the colliding goal in-place so the synthesizer
-                # can refine a previously-appended steer goal.
-                for i, g in enumerate(session.goals):
-                    if g.id == synth_goal.id:
-                        session.goals[i] = synth_goal
-                        break
-            else:
-                session.goals.append(synth_goal)
-        # Refresh the goals_summary so downstream consumers (refine
-        # prompt templates, GoldfivePlanner in goldfive#153) see the
-        # new shape immediately.
-        try:
-            _ostate.refresh_goals_summary(session.state, session.goals)
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "DefaultSteerer._apply_user_steer_state: refresh_goals_summary raised: %s",
-                exc,
-            )
 
-    async def _synthesize_goal_from_steer(
+    async def apply_user_steer_with_plan(
         self,
-        steer_body: str,
-        prior_goals: list[Goal] | None = None,
-    ) -> tuple[Goal | None, str]:
-        """Call ``planner.synthesize_goal_from_steer`` if available.
+        *,
+        drift: DriftEvent,
+        session: Session,
+        revised_plan: Plan,
+    ) -> bool:
+        """Install ``revised_plan`` as a revision of ``session.plan``.
 
-        ``prior_goals`` (Phase 2.X / goldfive#271 Gap 5) is forwarded
-        to the planner so it can merge persistent qualifications
-        (numeric caps, format requirements) into the synthesised goal.
-        Older planners that don't accept the parameter fall through
-        via a TypeError catch.
+        Goldfive#271 Phase 4 entrypoint used by :meth:`Runner.run`
+        when :meth:`Planner.handle_turn` produced the next revision
+        directly. Replaces the prior pipeline of:
 
-        Returns ``(goal, mode)`` where ``mode`` is ``"append"`` or
-        ``"replace"``. Falls back to a passthrough goal (APPEND) when
-        the planner doesn't implement the hook or the call fails.
-        The fallback keeps the steer body durable on
-        ``session.goals`` even when the planner is a minimal stub
-        (PassthroughPlanner / StaticPlanner / tests).
+        1. ``planner.synthesize_goal_from_steer`` (one LLM call)
+        2. regex-based qualification merge
+        3. ``_handle_drift`` → ladder dispatch → ``planner.refine``
+           (second LLM call)
+
+        with:
+
+        1. ``planner.handle_turn`` (one LLM call producing the
+           revised plan directly)
+        2. this method (purely structural install, no LLM)
+
+        The full revision pipeline fires:
+
+        * :meth:`_apply_user_steer_state` — active_steer bookkeeping +
+          dedup (no-ops on a goldfive-authored drift)
+        * :meth:`_emit_drift_detected` — ``DriftDetected``
+        * :meth:`_apply_revision` — install revised + bump
+          ``revision_index`` + stamp metadata
+        * :meth:`_emit_plan_revised` — ``PlanRevised`` + paired
+          ``RefineAttempted``/``RefineSuccess`` envelopes for parity
+          with the legacy refine path
+
+        Returns ``True`` on success (revised plan installed,
+        ``PlanRevised`` emitted), ``False`` on validation failure
+        (revised plan rejected; session.plan reverts to the prior).
+        Never raises.
         """
-        planner = self._planner
-        synth = getattr(planner, "synthesize_goal_from_steer", None)
-        if not callable(synth):
-            return Goal(id="steer", summary=steer_body), "append"
+        # Normalise source attribution so DriftDetected carries
+        # the right ``authored_by``.
+        if not drift.authored_by:
+            drift.authored_by = self._resolve_authored_by(drift)
+        # USER_STEER bookkeeping (no-op for non-USER drifts).
+        if drift.kind is DriftKind.USER_STEER:
+            await self._apply_user_steer_state(drift, session)
+        await self._emit_drift_detected(session, drift)
+        # Validate the revised plan against the prior. Use the same
+        # ``for_revision=True`` shape as the steerer's drift-handling
+        # pipeline so a malformed revision is rejected with the same
+        # SCHEMA_VIOLATION CRITICAL drift the legacy path emits.
         try:
-            result = await synth(steer_body, prior_goals=prior_goals)
-        except TypeError:
-            # Older planners that don't accept ``prior_goals`` — fall
-            # through to the legacy single-arg call. The heuristic
-            # qualification-merge in ``_apply_user_steer_state`` is the
-            # safety net for those callers.
-            try:
-                result = await synth(steer_body)
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "DefaultSteerer: planner.synthesize_goal_from_steer raised "
-                    "%s; falling back to passthrough append",
-                    exc,
-                )
-                return Goal(id="steer", summary=steer_body), "append"
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "DefaultSteerer: planner.synthesize_goal_from_steer raised "
-                "%s; falling back to passthrough append",
-                exc,
+            revised_plan.validate(for_revision=True, prior=session.plan)
+        except ValueError as exc:
+            await self._emit_drift_detected(
+                session,
+                DriftEvent(
+                    kind=DriftKind.SCHEMA_VIOLATION,
+                    severity=DriftSeverity.CRITICAL,
+                    detail=f"plan validation failed: {exc}",
+                    current_task_id=session.current_task_id,
+                ),
             )
-            return Goal(id="steer", summary=steer_body), "append"
-        if result is None:
-            return Goal(id="steer", summary=steer_body), "append"
-        # Accept two shapes: a bare Goal (mode defaults to "append") or
-        # a ``(Goal, mode)`` tuple. The tuple shape is what the
-        # synthesizer should emit in the common case; the bare form is
-        # a courtesy for callers / tests that only care about the goal.
-        if isinstance(result, tuple) and len(result) == 2:
-            goal, mode = result
-            if not isinstance(goal, Goal):
-                log.warning(
-                    "DefaultSteerer: synthesize_goal_from_steer returned "
-                    "tuple without Goal; falling back"
-                )
-                return Goal(id="steer", summary=steer_body), "append"
-            return goal, str(mode or "append")
-        if isinstance(result, Goal):
-            return result, "append"
-        log.warning(
-            "DefaultSteerer: synthesize_goal_from_steer returned "
-            "unrecognised shape %r; falling back",
-            type(result),
+            return False
+        # Capture prev_plan BEFORE _apply_revision swaps it; the
+        # PlanRevisionDiff sidecar in _emit_plan_revised diffs the
+        # two.
+        prev_plan = session.plan
+        attempt_id = self._new_attempt_id()
+        await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
+        self._apply_revision(session, revised_plan, drift)
+        await self._emit_plan_revised(
+            session,
+            revised_plan,
+            drift,
+            prev_plan=prev_plan,
+            attempt_id=attempt_id,
         )
-        return Goal(id="steer", summary=steer_body), "append"
+        # Stamp the cooldown table so a follow-up drift of the same
+        # kind+task within the cooldown is gated. Mirrors the legacy
+        # _handle_drift path so behavior is identical.
+        self._record_plan_revision(drift, session)
+        return True
 
     # Consecutive refine failures tolerated per (drift_kind, task_id)
     # before we give up and mark the task FAILED. Class attribute so

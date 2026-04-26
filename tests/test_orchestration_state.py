@@ -189,93 +189,13 @@ async def test_user_steer_writes_active_steer_state() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_user_steer_synthesizes_and_appends_goal() -> None:
-    """Planner returns (Goal, 'append') → session.goals grows by one."""
-    session = _make_session_with_plan()
-    synth_goal = Goal(id="steer", summary="focus on the writing instead")
-    planner = _StubPlanner(synth_result=(synth_goal, "append"))
-    steerer = DefaultSteerer()
-    steerer.bind(sinks=[_ListSink()], planner=planner)
-
-    assert [g.id for g in session.goals] == ["g1"]
-
-    msg = ControlMessage(
-        kind=ControlKind.STEER,
-        payload={"note": "focus on the writing instead"},
-    )
-    await steerer.observe(msg, session)
-
-    # Planner was asked to synthesize.
-    assert planner.synth_calls == ["focus on the writing instead"]
-    # Goal was appended.
-    assert [g.id for g in session.goals] == ["g1", "steer"]
-    assert session.goals[-1].summary == "focus on the writing instead"
-    # goals_summary on the state dict refreshed.
-    summary = _ostate.read(session.state, _ostate.KEY_GOALS_SUMMARY, "")
-    assert "[g1]" in summary
-    assert "[steer]" in summary
-    assert "focus on the writing" in summary
-
-
-# ---------------------------------------------------------------------------
-# 4. USER_STEER synthesize decides REPLACE → goals cleared + replaced.
-# ---------------------------------------------------------------------------
-
-
-async def test_user_steer_synthesizes_replace_when_scrap_steer() -> None:
-    """Planner returns mode='replace' → session.goals collapses to one."""
-    session = _make_session_with_plan()
-    # Seed two prior goals so we can prove replace clears BOTH.
-    session.goals.append(Goal(id="g2", summary="secondary"))
-    assert len(session.goals) == 2
-
-    replacement = Goal(id="new", summary="actually, do this instead")
-    planner = _StubPlanner(synth_result=(replacement, "replace"))
-    steerer = DefaultSteerer()
-    steerer.bind(sinks=[_ListSink()], planner=planner)
-
-    msg = ControlMessage(
-        kind=ControlKind.STEER,
-        payload={"note": "actually, do this instead"},
-    )
-    await steerer.observe(msg, session)
-
-    assert [g.id for g in session.goals] == ["new"]
-    assert session.goals[0].summary == "actually, do this instead"
-    summary = _ostate.read(session.state, _ostate.KEY_GOALS_SUMMARY, "")
-    # Prior goal ids are gone from the summary.
-    assert "g1" not in summary
-    assert "g2" not in summary
-    assert "[new]" in summary
-
-
-async def test_user_steer_falls_back_when_planner_lacks_synthesize() -> None:
-    """Planner without ``synthesize_goal_from_steer`` → passthrough append."""
-
-    class _MinimalPlanner:
-        refine_calls: list[dict[str, Any]] = []  # noqa: RUF012
-
-        async def generate(self, **kwargs: Any) -> Plan | None:
-            return None
-
-        async def refine(self, **kwargs: Any) -> Plan | None:
-            self.refine_calls.append(kwargs)
-            return None
-
-    session = _make_session_with_plan()
-    steerer = DefaultSteerer()
-    steerer.bind(sinks=[_ListSink()], planner=_MinimalPlanner())
-
-    msg = ControlMessage(
-        kind=ControlKind.STEER,
-        payload={"note": "tangential aside"},
-    )
-    await steerer.observe(msg, session)
-
-    # Passthrough goal appended with id 'steer'.
-    assert len(session.goals) == 2
-    assert session.goals[-1].id == "steer"
-    assert session.goals[-1].summary == "tangential aside"
+# Phase 4 (goldfive#271) note: synthesize_goal_from_steer was deleted.
+# The USER_STEER goal-synthesis is now done by the planner LLM's
+# handle_turn prompt (per-turn boundary) which produces a revised plan
+# directly. The mid-run control-channel STEER path no longer mutates
+# session.goals — the next turn's handle_turn will read the prior
+# plan and produce the next revision. See test_planner_handle_turn.py
+# for the replacement coverage of goal carryover via plan revision.
 
 
 # ---------------------------------------------------------------------------

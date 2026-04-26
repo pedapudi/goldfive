@@ -36,6 +36,7 @@ from goldfive.types import (
     Goal,
     ObservedAction,
     Plan,
+    Session,
     SupersessionKind,
     Task,
     TaskEdge,
@@ -793,7 +794,8 @@ def _plan_from_json(
 
 
 class PassthroughPlanner:
-    """No-op planner — ``generate`` and ``refine`` always return ``None``.
+    """No-op planner — ``generate`` / ``refine`` / ``handle_turn``
+    always return ``None``.
 
     Makes it safe to wire a ``planner=`` kwarg everywhere without
     forcing callers to opt in to planning on day one.
@@ -817,6 +819,20 @@ class PassthroughPlanner:
         observed_actions: list[ObservedAction] | None = None,
         available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None:
+        return None
+
+    async def handle_turn(
+        self,
+        *,
+        user_input: str,
+        session: Session,
+        conversation_history: list[Any] | None = None,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Plan | None:
+        # Phase 4 (goldfive#271): always returns None so the Runner
+        # falls through to ``generate`` (which also returns None for a
+        # PassthroughPlanner — i.e., the run aborts cleanly).
         return None
 
 
@@ -885,6 +901,22 @@ class StaticPlanner:
         observed_actions: list[ObservedAction] | None = None,
         available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None:
+        return None
+
+    async def handle_turn(
+        self,
+        *,
+        user_input: str,
+        session: Session,
+        conversation_history: list[Any] | None = None,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Plan | None:
+        # Phase 4 (goldfive#271): StaticPlanner has a baked plan, so
+        # there's no per-turn decision to make. Returning None lets
+        # the Runner fall through to ``generate`` which produces the
+        # baked plan unchanged — preserves pre-Phase-4 semantics for
+        # callers using StaticPlanner with multi-turn Runners.
         return None
 
 
@@ -1031,7 +1063,7 @@ class LLMPlanner:
     # These compose the ``input_preview`` / ``target_*`` / decision-summary
     # strings used by the ``goldfive_llm_span`` wrap sites inside the
     # planner (refine / refine_steer / refine_looping_tool_call /
-    # plan_generate / synthesize_goal_from_steer). Extracted so tests can
+    # plan_generate / planner_handle_turn). Extracted so tests can
     # assert the exact payload without re-deriving it from drift / plan
     # internals, and so the callers stay short.
 
@@ -2929,174 +2961,394 @@ class LLMPlanner:
         return merged_plan, ""
 
     # ------------------------------------------------------------------
-    # Goal synthesis from USER_STEER body (goldfive#152)
+    # Per-turn decision (goldfive#271 Phase 4)
     # ------------------------------------------------------------------
 
-    #: System prompt for :meth:`synthesize_goal_from_steer`. Asks the
-    #: LLM to turn a free-form steer body into a durable Goal and
-    #: classify whether the steer is additive (APPEND) or a
-    #: scrap-and-pivot (REPLACE). Keep the shape tight so a minimal
-    #: response is enough.
+    #: System prompt for :meth:`handle_turn`. Asks the planner LLM to
+    #: produce the next plan if the user's input warrants a plan
+    #: change (new task, refined constraints, topic shift, scope
+    #: change), or to return null if the input is purely conversational
+    #: (a question about prior work, a clarification, an
+    #: acknowledgment).
     #:
-    #: Phase 2.X (goldfive#271 Gap 5): when prior goals are supplied
-    #: in the user prompt, the LLM is instructed to MERGE persistent
-    #: qualifications (numeric caps, format requirements, output
-    #: structure) into the new goal so a topic pivot doesn't drop
-    #: sticky context. The validation E2E observed "Create a
-    #: presentation about solar panels with no more than 2 slides."
-    #: → after steer → "Provide informative content about solar
-    #: flares." (both the "presentation" frame AND the "2 slides"
-    #: cap dropped). This guidance closes that gap.
-    _SYNTHESIZE_GOAL_SYSTEM_PROMPT: str = (
-        "You are a goal extractor for a multi-agent orchestration system. "
-        "A human operator has just issued a STEERING directive mid-run. "
-        "Convert the directive into a single durable Goal and decide "
-        "whether it REPLACES the existing goals (scrap-and-pivot) or is "
-        "ADDITIVE (append alongside existing goals).\n\n"
-        "Reply with a single JSON object and NOTHING ELSE:\n"
-        '{"goal": {"id": "<short-id>", "summary": "<one-sentence>"}, '
-        '"mode": "append" | "replace", '
-        '"reason": "<one-sentence why>"}\n\n'
-        "Guidelines:\n"
-        "- Use 'replace' when the steer contradicts or supersedes prior "
-        "goals (e.g. 'actually, just do X instead', 'skip the rest', "
-        "'change direction to Y').\n"
-        "- Use 'append' when the steer adds a new concern alongside "
-        "existing goals (e.g. 'also include X', 'while you're at it, Y').\n"
-        "- The id should be short (<=16 chars) and unique-looking; "
-        "'steer' is an acceptable default when no better label fits.\n"
-        "- When PRIOR GOALS are listed in the user prompt, MERGE their "
-        "persistent qualifications into the new goal summary unless the "
-        "steer explicitly removes them. Persistent qualifications are: "
-        "numeric caps ('no more than 2 slides', 'at most 500 words', "
-        "'under 5 minutes'), format requirements ('in markdown', 'as "
-        "bullet points', 'as a 2-slide presentation'), output type "
-        "('a presentation', 'a report', 'a summary'), and scope "
-        "qualifiers ('for a non-technical audience', 'only public "
-        "data'). The topic / subject changes; the structural frame "
-        "carries forward. Example: prior goal 'Create a presentation "
-        "about solar panels with no more than 2 slides.' + steer "
-        "'forget solar panels — tell me about wind power instead' → "
-        "new goal 'Create a presentation about wind power with no "
-        "more than 2 slides.' (NOT 'Provide content about wind "
-        "power.').\n"
-        "- Drop a qualification only when the steer explicitly removes "
-        "it (e.g. 'forget the slide-count cap', 'no longer needs to be "
-        "a presentation')."
-    )
+    #: This single prompt replaced the prior triage stack:
+    #:
+    #: * the regex-based factual-question short-circuit
+    #:   (``planner_gate._FACTUAL_QUESTION_RE``)
+    #: * the regex-based steer-language short-circuit
+    #:   (``planner_gate._STEER_PATTERN_RE``)
+    #: * the gate's own LLM classifier
+    #:   (``planner_gate.classify_turn``)
+    #: * the qualification-merge regex post-process
+    #:   (``steerer._GENERIC_VERB_PREFIX_RE`` /
+    #:   ``_rewrite_output_type_prefix`` /
+    #:   ``_merge_prior_qualifications_into_goal``)
+    #: * the separate ``synthesize_goal_from_steer`` LLM call
+    #:
+    #: All of the above were collapsed into this single prompt so the
+    #: LLM does the routing AND the qualification merge in one shot
+    #: rather than fighting with brittle regexes for each NL shape.
+    #:
+    #: The "classification" is now an emergent property of "did the
+    #: LLM produce a plan or not" rather than a synthetic categorical
+    #: label the LLM has to be taught.
+    _HANDLE_TURN_SYSTEM_PROMPT: str = """\
+You are the planner for a multi-agent orchestration system. The user
+sent a NEW MESSAGE on a conversation that already has a PRIOR PLAN
+(possibly partially executed). Decide whether the new message warrants
+a plan change. If so, produce the next plan in the same response. If
+not, return null for the plan.
 
-    async def synthesize_goal_from_steer(
+Reply with a single JSON object and NOTHING ELSE:
+{
+  "reasoning": "<one-sentence why>",
+  "plan": null OR {
+    "id": "<short-id>",
+    "summary": "<one-sentence overall plan summary>",
+    "tasks": [
+      {
+        "id": "<short-id>",
+        "title": "<one-sentence what 'done' looks like>",
+        "description": "<optional longer description>",
+        "assignee_agent_id": "<bare agent name from registry>",
+        "status": "PENDING"
+      }
+    ],
+    "edges": [{"from_task_id": "...", "to_task_id": "..."}]
+  }
+}
+
+WHEN TO RETURN A PLAN (plan is non-null):
+
+Produce the next plan if the user's input warrants a plan change —
+new task, refined constraints, topic shift, scope change, additive
+constraint, tone / style tweak, partial correction, or any directive
+that the existing plan does not already cover. Examples:
+
+  * "forget X, tell me about Y instead" — topic shift
+  * "make a 5-page report on dark matter" (when prior plan was about
+    solar panels) — scope / topic change
+  * "make sure the answer fits in 2 slides" — additive constraint
+  * "make it funnier" — tone tweak
+  * "also translate to Spanish" — additive scope
+  * "redo task 3 with the new data" — partial correction
+
+When you produce a plan:
+
+  * REUSE the prior plan's id (use the same id string verbatim) when
+    the new plan is a revision of the prior — almost always the case
+    when the user is iterating on the same artefact even with a topic
+    change. Mint a fresh id ONLY when the user explicitly abandons
+    the artefact entirely (e.g. "forget the slides, just give me
+    bullet points" — different artefact).
+  * KEEP terminal tasks (COMPLETED / FAILED / CANCELLED / NOT_NEEDED)
+    verbatim — same id, same status — so they survive the revision.
+    Add new tasks for the delta work; reuse ids for tasks that
+    represent the same work.
+  * MERGE persistent qualifications from prior_goals into the new
+    plan (numeric caps like "no more than 2 slides", format
+    requirements like "in markdown", output type like "presentation"
+    / "report", scope qualifiers like "for a non-technical audience").
+    The topic / subject changes; the structural frame carries forward.
+    Drop a qualification ONLY when the user explicitly removes it
+    ("forget the slide-count cap", "no longer needs to be a
+    presentation").
+
+WHEN TO RETURN NULL (plan is null):
+
+Return null when the user's input is purely conversational and the
+prior plan should be reused unchanged. Examples:
+
+  * "where will the slides be saved?" — factual question about prior
+  * "what was on slide 2?" — clarification
+  * "did you include source X?" — verification
+  * "is it ready?" / "is the presentation done?" — status question
+  * "summarise what you did" — recap request
+  * "thanks" / "ok" — acknowledgment
+
+Factual interrogatives (where/when/how/what/why/which/who +
+is/are/will/did/does/was/were) about prior work are conversational by
+default. Tense doesn't matter — "where will the file go?" is just as
+much a question as "where did the file go?"
+
+GUIDELINES:
+
+  * When in doubt between null and a plan, prefer null — the
+    coordinator can always answer; the user can restate if they
+    actually wanted new work.
+  * Steer-language openers ("forget", "instead", "no, don't ...",
+    "scratch that", "actually", "wait, ...", "stop", "change the
+    topic", "switch to") are strong plan-change signals — return a
+    plan that revises the prior.
+
+PLAN SHAPE (when plan is non-null):
+
+  * 5-20 tasks typically. Smaller is OK for trivial follow-ups
+    (revisions often add 1-3 delta tasks).
+  * Every task's assignee_agent_id MUST be drawn from the available
+    agents registry passed in the user prompt. Use the bare name only
+    — no namespace, no prefix.
+  * Task ids: short, unique, stable strings ("research", "draft_intro",
+    "review_final"). Reuse prior task ids when the task is the same
+    work; mint new ids for delta tasks.
+  * summary: a one-sentence PR-title-shaped overall summary.
+"""
+
+    async def handle_turn(
         self,
-        steer_body: str,
-        prior_goals: list[Goal] | None = None,
-    ) -> tuple[Goal, str] | None:
-        """Synthesize a ``Goal`` from a USER_STEER body via one LLM call.
+        *,
+        user_input: str,
+        session: Session,
+        conversation_history: list[Any] | None = None,
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Plan | None:
+        """Single per-turn decision point (goldfive#271 Phase 4).
 
-        ``prior_goals`` (Phase 2.X / goldfive#271 Gap 5) is the live
-        ``session.goals`` list. When non-empty, the LLM is instructed
-        to merge persistent qualifications (numeric caps, format
-        requirements, output type, scope qualifiers) into the new
-        goal summary so a topic pivot preserves sticky context. The
-        steerer's ``_apply_user_steer_state`` passes the pre-steer
-        goals here.
+        Returns ``None`` when the user_input is purely conversational
+        and the current revision still describes the right work.
+        Returns the next :class:`Plan` revision when a plan change is
+        warranted (new task, refined constraints, topic shift, scope
+        change, or dropping tasks no longer relevant). The Runner
+        installs the returned plan as the next revision of
+        ``session.plan`` (revision_index += 1) via
+        ``DefaultSteerer.apply_user_steer_with_plan``.
 
-        Returns ``(goal, mode)`` where ``mode`` is ``"append"`` or
-        ``"replace"``. Returns ``None`` on LLM error / parse failure so
-        the caller can fall back to a passthrough Goal. The steerer
-        handles the fallback (see
-        :meth:`goldfive.steerer.DefaultSteerer._synthesize_goal_from_steer`);
-        this method is deliberately strict so a misbehaving LLM doesn't
-        silently append nonsense goals.
+        The prior plan + goals are read off ``session.plan`` /
+        ``session.goals`` — the planner doesn't need them as separate
+        kwargs. The Runner guarantees ``session.plan`` is non-None on
+        every turn, including the very first (it seeds
+        :meth:`Plan.empty` so the planner produces revision 1 against
+        an empty prior).
 
-        One-shot: no retry loop (unlike refine), because the failure
-        mode of a bad synthesis is recoverable by the caller's
-        fallback, whereas a bad refine leaves the plan mis-shaped.
+        Replaces the prior multi-stage pipeline:
+
+        1. ``planner_gate`` regex short-circuits (factual-question +
+           steer-language detection)
+        2. ``planner_gate.classify_turn`` LLM gate
+        3. ``synthesize_goal_from_steer`` LLM call
+        4. regex-based qualification merge post-process
+        5. ``planner.refine`` (or ``planner.generate`` on first turn)
+           LLM call
+
+        — all collapsed into one LLM call that produces both the
+        decision AND the next plan. The "classification" is now an
+        emergent property of "did the LLM produce a plan or not"
+        rather than a synthetic categorical label the LLM has to be
+        taught.
+
+        Any LLM / parse failure logs at WARNING and returns ``None``
+        — the gate must never break the run on a misbehaving LLM.
+        On a None return, the Runner reuses ``session.plan`` for this
+        turn (which is the empty seed on first turn → no work done
+        until a subsequent turn produces a real plan, or the
+        coordinator answers from history).
         """
-        body = (steer_body or "").strip()
-        if not body:
+        text = (user_input or "").strip()
+        if not text:
             return None
-        prior_block = ""
-        if prior_goals:
-            prior_summaries = [
-                g.summary.strip() for g in prior_goals
-                if g.summary and g.summary.strip()
-            ]
-            if prior_summaries:
-                prior_block = (
-                    "PRIOR GOALS (preserve their persistent "
-                    "qualifications unless the steer explicitly removes "
-                    "them):\n"
-                    + "\n".join(f"- {s}" for s in prior_summaries)
-                    + "\n\n"
-                )
-        user_prompt = (
-            f"{prior_block}"
-            f"STEERING DIRECTIVE:\n{body}\n\n"
-            "Extract the durable Goal and classify the mode. Reply JSON only."
+        prior_plan = session.plan
+        prior_goals = list(session.goals)
+        user_prompt = self._build_handle_turn_prompt(
+            user_input=text,
+            prior_plan=prior_plan,
+            prior_goals=prior_goals,
+            conversation_history=conversation_history or [],
+            available_agents=available_agents,
         )
         from goldfive._llm_span import goldfive_llm_span
 
+        # ``handle_turn`` is trajectory-level (decides whether the turn
+        # goes through planning at all), so ``target_agent_id`` /
+        # ``target_task_id`` stay empty. A compact rendering of the
+        # user input + prior plan summary doubles as ``input_preview``.
+        prior_id = (
+            (prior_plan.id or "") if prior_plan is not None else ""
+        )[:16] or "<none>"
+        gate_input_preview = (
+            f"user_input: {text}\nprior_plan_id: {prior_id}"
+        )
         try:
             async with goldfive_llm_span(
                 **self._span_kwargs(),
-                name="synthesize_goal_from_steer",
-                input_preview=body,
+                name="planner_handle_turn",
+                input_preview=gate_input_preview,
             ) as span:
                 raw = await self._call_llm(
-                    self._SYNTHESIZE_GOAL_SYSTEM_PROMPT,
-                    user_prompt,
-                    self._model,
+                    self._HANDLE_TURN_SYSTEM_PROMPT, user_prompt, self._model
                 )
                 span.output_preview = (
                     raw[:4096] if isinstance(raw, str) else "(non-str response)"
                 )
-                span.decision_summary = (
-                    "synthesized goal from user steer "
-                    f"({len(body)}-char body)"
-                )
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "LLMPlanner.synthesize_goal_from_steer: call_llm raised %s",
+                "LLMPlanner.handle_turn: call_llm raised %s; "
+                "treating as conversational (no plan change)",
                 exc,
             )
             return None
+        plan = self._parse_handle_turn_response(
+            raw=raw,
+            prior_plan=prior_plan,
+            context=context,
+        )
+        log.info(
+            "LLMPlanner.handle_turn: produced_plan=%s prior_plan_id=%s",
+            "yes" if plan is not None else "no",
+            prior_id,
+        )
+        return plan
+
+    def _build_handle_turn_prompt(
+        self,
+        *,
+        user_input: str,
+        prior_plan: Plan | None,
+        prior_goals: list[Goal],
+        conversation_history: list[Any],
+        available_agents: list[str] | list[dict[str, Any]] | None,
+    ) -> str:
+        """Render the user prompt for :meth:`handle_turn`.
+
+        Includes:
+        * NEW MESSAGE — the user's free-form input.
+        * PRIOR PLAN — id, summary, and per-task ``[id / status] title``.
+          Empty seeds (``Plan.empty()``) render as "PRIOR PLAN: empty"
+          so the LLM sees the first-turn case explicitly.
+        * PRIOR GOALS — verbatim summaries for the qualification-merge.
+        * AVAILABLE AGENTS — the registry the LLM must pick from.
+        * CONVERSATION HISTORY — capped to recent turns to bound prompt
+          length. Each entry: ``[turn N] <user_input_summary>``.
+        """
+        chunks: list[str] = []
+        chunks.append(f"NEW MESSAGE FROM USER:\n{user_input}")
+        chunks.append(self._render_prior_plan_block(prior_plan))
+        if prior_goals:
+            goal_lines = [
+                f"- [{g.id or '(no-id)'}] {g.summary or '(no summary)'}"
+                for g in prior_goals
+            ]
+            chunks.append(
+                "PRIOR GOALS (preserve their persistent qualifications "
+                "unless the user explicitly removes them):\n"
+                + "\n".join(goal_lines)
+            )
+        if conversation_history:
+            # Cap to the most recent few entries — older context lives
+            # on the prior plan / goals already.
+            recent = conversation_history[-3:]
+            hist_lines = []
+            for i, t in enumerate(recent, start=max(1, len(conversation_history) - 2)):
+                summary = getattr(t, "user_input_summary", "") or ""
+                hist_lines.append(f"  [turn {i}] {summary}")
+            if hist_lines:
+                chunks.append("RECENT CONVERSATION HISTORY:\n" + "\n".join(hist_lines))
+        agents_block = self._render_agents_block(available_agents)
+        if agents_block:
+            chunks.append(agents_block)
+        chunks.append(
+            'Decide and respond. Reply JSON only: '
+            '{"reasoning": "...", "plan": ... | null}'
+        )
+        return "\n\n".join(chunks)
+
+    @staticmethod
+    def _render_prior_plan_block(plan: Plan | None) -> str:
+        """One-shot rendering of the prior plan for the handle_turn prompt.
+
+        Empty plans (``Plan.empty()`` seed used on first turn) render
+        as "PRIOR PLAN: empty (this is the first turn)" so the LLM
+        knows to produce the initial plan rather than treating the
+        empty plan as something to revise minimally.
+        """
+        if plan is None or not plan.tasks:
+            return (
+                "PRIOR PLAN: empty (this is the first turn — produce "
+                "revision 1 from the user's request)."
+            )
+        lines: list[str] = []
+        lines.append(f"PRIOR PLAN (id={plan.id or '(no-id)'}):")
+        if plan.summary:
+            lines.append(f"  Summary: {plan.summary}")
+        lines.append("  Tasks:")
+        for t in plan.tasks:
+            tid = t.id or "(no-id)"
+            status = getattr(t.status, "value", str(t.status))
+            title = t.title or t.description or ""
+            lines.append(f"    - [{tid} / {status}] {title}")
+        return "\n".join(lines)
+
+    def _parse_handle_turn_response(
+        self,
+        *,
+        raw: Any,
+        prior_plan: Plan | None,
+        context: Mapping[str, Any] | None,
+    ) -> Plan | None:
+        """Parse the LLM's JSON response into a :class:`Plan` or ``None``.
+
+        On any parse failure, returns ``None`` (treated as
+        conversational by the Runner). The contract: this method MUST
+        NOT raise.
+
+        When the LLM produces a plan, ALWAYS install the prior plan's
+        id verbatim — the steerer's ``_apply_revision`` then bumps
+        ``revision_index`` cleanly. Validation v3 confirmed
+        refine/replace collapse: even a topic-shift steer like
+        "forget solar panels, tell me about solar flares" lands as a
+        same-id revision_index bump rather than a fresh plan id.
+        """
         if not isinstance(raw, str) or not raw.strip():
-            log.warning("LLMPlanner.synthesize_goal_from_steer: empty / non-str response")
+            log.warning("LLMPlanner.handle_turn: empty / non-str response")
             return None
         cleaned = _strip_code_fences(raw).strip()
         try:
             parsed = json.loads(cleaned)
         except (ValueError, TypeError) as exc:
-            log.warning(
-                "LLMPlanner.synthesize_goal_from_steer: JSON parse failed: %s",
-                exc,
-            )
+            log.warning("LLMPlanner.handle_turn: JSON parse failed: %s", exc)
             return None
         if not isinstance(parsed, dict):
             log.warning(
-                "LLMPlanner.synthesize_goal_from_steer: response was not an object; got %r",
+                "LLMPlanner.handle_turn: response was not an object; got %r",
                 type(parsed),
             )
             return None
-        goal_raw = parsed.get("goal")
-        if not isinstance(goal_raw, dict):
-            log.warning("LLMPlanner.synthesize_goal_from_steer: missing 'goal' object")
+        plan_raw = parsed.get("plan")
+        if plan_raw is None:
+            # Conversational verdict — the LLM emitted no plan.
             return None
-        summary = goal_raw.get("summary")
-        if not isinstance(summary, str) or not summary.strip():
-            log.warning("LLMPlanner.synthesize_goal_from_steer: goal missing non-empty 'summary'")
+        if not isinstance(plan_raw, dict):
+            log.warning(
+                "LLMPlanner.handle_turn: 'plan' present but not an object; "
+                "got %r — treating as conversational",
+                type(plan_raw),
+            )
             return None
-        gid = goal_raw.get("id")
-        if not isinstance(gid, str) or not gid.strip():
-            gid = "steer"
-        mode = parsed.get("mode")
-        if not isinstance(mode, str) or mode.strip().lower() not in (
-            "append",
-            "replace",
-        ):
-            mode = "append"
-        goal = Goal(id=gid.strip(), summary=summary.strip())
-        return goal, mode.strip().lower()
+        run_id = ""
+        if context is not None:
+            run_id = str(context.get("run_id") or "")
+        # Reuse the prior plan's id so the steerer's _apply_revision
+        # bumps revision_index cleanly. This holds for the empty seed
+        # (revision 0 → revision 1) AND for every subsequent revision.
+        plan_id_override = (
+            prior_plan.id if prior_plan is not None and prior_plan.id else None
+        )
+        prior_goal_ids = (
+            list(prior_plan.goal_ids) if prior_plan is not None else []
+        )
+        plan = _plan_from_json(
+            plan_raw,
+            run_id=run_id,
+            goal_ids=prior_goal_ids,
+            plan_id=plan_id_override,
+        )
+        if plan is None:
+            log.warning(
+                "LLMPlanner.handle_turn: 'plan' failed structural parse; "
+                "treating as conversational"
+            )
+            return None
+        return plan
 
 
 __all__ = [

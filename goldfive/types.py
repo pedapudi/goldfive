@@ -531,6 +531,27 @@ class Plan:
                     f"so downstream PENDING tasks can never become eligible)."
                 )
 
+    @classmethod
+    def empty(cls, *, run_id: str = "") -> Plan:
+        """Construct a fresh empty plan (revision_index=0, no tasks).
+
+        Goldfive#271 Phase 4 seed used by :meth:`Runner.run` on the
+        first turn so :meth:`Planner.handle_turn` always sees a
+        non-None ``session.plan``. The runner installs the plan
+        returned by ``handle_turn`` as revision 1 of this seed via
+        ``DefaultSteerer.apply_user_steer_with_plan``, so PlanRevised
+        (not PlanSubmitted) fires uniformly for every turn — there is
+        only one install path post-Phase-4.
+        """
+        return cls(
+            id=uuid.uuid4().hex,
+            run_id=run_id,
+            goal_ids=[],
+            tasks=[],
+            edges=[],
+            summary="",
+        )
+
     def topological_stages(self) -> list[list[Task]]:
         """Return tasks grouped into topological stages (Kahn's algorithm).
 

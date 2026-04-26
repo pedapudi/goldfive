@@ -30,11 +30,6 @@ from goldfive.goal_deriver import (
     PassthroughGoalDeriver,
 )
 from goldfive.planner import LLMPlanner, PassthroughPlanner, StaticPlanner
-from goldfive.planner_gate import (
-    TurnClassification,
-    classify_turn,
-    heuristic_classify_turn,
-)
 from goldfive.protocols import (
     AgentAdapter,
     EventSink,
@@ -119,13 +114,10 @@ __all__ = [
     "TaskEdge",
     "TaskStatus",
     "ToolLoopConfig",
-    "TurnClassification",
     "TurnRecord",
     "classify_refusal",
-    "classify_turn",
     "classify_stop_reason",
     "classify_tool_error",
-    "heuristic_classify_turn",
     "quickstart",
     "run",
     "wrap",

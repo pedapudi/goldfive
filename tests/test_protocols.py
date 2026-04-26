@@ -57,6 +57,20 @@ class _PlannerStub:
     ) -> Any | None:
         return None
 
+    async def handle_turn(
+        self,
+        *,
+        user_input: str,
+        session: Any,
+        conversation_history: list[Any],
+        available_agents: Any = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> Any | None:
+        # Phase 4 (goldfive#271): the per-turn decision LLM. Stub
+        # returns None (conversational verdict) so the Runner reuses
+        # the prior plan unchanged.
+        return None
+
 
 class _SteererStub:
     async def observe(self, event: Any, session: Any) -> None:
