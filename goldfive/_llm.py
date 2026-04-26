@@ -23,14 +23,88 @@ This module standardises a duck-typed close protocol:
 There is no breaking change for existing callers: existing call_llm
 callables continue to work because they just don't have a ``close``
 attribute and the helper short-circuits.
+
+Per-call ``max_output_tokens`` budget (goldfive#271 follow-up)
+--------------------------------------------------------------
+
+The ``call_llm`` signature is opaque ``(system, user, model) -> str`` —
+adding a ``max_tokens`` parameter would be a breaking change for
+user-supplied callables. Instead, goldfive's own consumers (planner,
+goal_deriver, judges, reflective check) set a per-callsite cap via
+:data:`MAX_OUTPUT_TOKENS_VAR` (a :class:`contextvars.ContextVar`)
+immediately before ``await call_llm(...)``. The default ADK / OpenAI
+builders in :mod:`goldfive._llm_detect` and :mod:`goldfive.convenience`
+read the var and forward it as ``max_output_tokens`` /
+``max_completion_tokens`` on the underlying client call.
+
+User-supplied ``call_llm`` callables can opt in by reading
+:func:`get_max_output_tokens` themselves. They are not required to —
+the only effect of ignoring the var is that the LLM continues to emit
+to its natural stop, the very behaviour that caused 9.6-minute /
+5.3-minute calls in goldfive#271 evidence. Setting the cap on the
+default builders restores sane wall-clock budgets without touching
+caller code.
 """
 
 from __future__ import annotations
 
+import contextvars
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Protocol, runtime_checkable
 
 log = logging.getLogger("goldfive.llm")
+
+
+# ---------------------------------------------------------------------------
+# Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up)
+# ---------------------------------------------------------------------------
+
+# Default cap when no consumer-specific override is in effect. 4096 is
+# generous enough for the largest goldfive-internal call (refine /
+# generate plan), while still bounding wall-clock at typical Q4 tps
+# (~17 tok/sec → ~4 minutes worst case). Worst-case before this var:
+# 9.6 minutes (9961 tokens, demo-v8.log).
+DEFAULT_MAX_OUTPUT_TOKENS: int = 4096
+
+#: ContextVar carrying the per-callsite cap. ``None`` means "no
+#: explicit cap" — the default ADK / OpenAI builder falls back to
+#: :data:`DEFAULT_MAX_OUTPUT_TOKENS`. User-supplied ``call_llm``
+#: callables may inspect this via :func:`get_max_output_tokens`.
+MAX_OUTPUT_TOKENS_VAR: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "goldfive_call_llm_max_output_tokens", default=None
+)
+
+
+def get_max_output_tokens() -> int:
+    """Return the per-callsite cap, or :data:`DEFAULT_MAX_OUTPUT_TOKENS`.
+
+    Always returns a positive int. Used by the default ADK / OpenAI
+    builders inside the ``call_llm`` body so the underlying SDK call
+    receives a finite cap on every dispatch.
+    """
+    cap = MAX_OUTPUT_TOKENS_VAR.get()
+    if cap is None or cap <= 0:
+        return DEFAULT_MAX_OUTPUT_TOKENS
+    return int(cap)
+
+
+@contextmanager
+def call_llm_budget(max_output_tokens: int | None) -> Iterator[None]:
+    """Set :data:`MAX_OUTPUT_TOKENS_VAR` for the duration of the with-block.
+
+    Used by goldfive consumers (planner / goal_deriver / judges /
+    reflective check) to bind a per-callsite cap around
+    ``await call_llm(...)``. ``None`` resets to no-cap (default applied
+    by the builders). Restores the prior value on exit even if the body
+    raises.
+    """
+    token = MAX_OUTPUT_TOKENS_VAR.set(max_output_tokens)
+    try:
+        yield
+    finally:
+        MAX_OUTPUT_TOKENS_VAR.reset(token)
 
 
 @runtime_checkable
@@ -76,4 +150,12 @@ async def maybe_close_call_llm(call_llm: Any, *, label: str = "call_llm") -> Non
         log.warning("%s.close() raised %s; ignored", label, exc)
 
 
-__all__ = ["CallLLM", "ClosableCallLLM", "maybe_close_call_llm"]
+__all__ = [
+    "CallLLM",
+    "ClosableCallLLM",
+    "DEFAULT_MAX_OUTPUT_TOKENS",
+    "MAX_OUTPUT_TOKENS_VAR",
+    "call_llm_budget",
+    "get_max_output_tokens",
+    "maybe_close_call_llm",
+]

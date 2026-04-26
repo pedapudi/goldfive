@@ -209,6 +209,12 @@ class LLMGoalDeriver:
             default is :data:`DEFAULT_SYSTEM_PROMPT`.
     """
 
+    # Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up).
+    # Goal extraction returns a small JSON object with one or two goals
+    # — 1024 tokens is generous and bounds wall-clock at ~60s on a
+    # Q4 endpoint.
+    MAX_OUTPUT_TOKENS: int = 1024
+
     def __init__(
         self,
         call_llm: Callable[[str, str, str], Awaitable[str]],
@@ -271,7 +277,11 @@ class LLMGoalDeriver:
                 sequence_fn=span_seq_fn,
                 input_preview=user_input,
             ) as span:
-                raw = await self._call_llm(self._system_prompt, prompt, self._model)
+                # Bound the dispatch — see ``LLMGoalDeriver.MAX_OUTPUT_TOKENS``.
+                from goldfive._llm import call_llm_budget
+
+                with call_llm_budget(self.MAX_OUTPUT_TOKENS):
+                    raw = await self._call_llm(self._system_prompt, prompt, self._model)
                 try:
                     parsed_goals = _parse_goals_response(raw)
                 except (ValueError, json.JSONDecodeError, TypeError) as parse_exc:

@@ -48,6 +48,7 @@ __all__ = [
     "GOAL_DRIFT_USER_PROMPT_TEMPLATE",
     "GOAL_DRIFT_CHECK_INTERVAL",
     "GOAL_DRIFT_IDLE_SECONDS",
+    "GOAL_DRIFT_MAX_OUTPUT_TOKENS",
 ]
 
 
@@ -57,6 +58,12 @@ __all__ = [
 # low-frequency; operators who want tighter monitoring can shorten it.
 GOAL_DRIFT_CHECK_INTERVAL: int = 5
 GOAL_DRIFT_IDLE_SECONDS: int = 300
+
+# Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up).
+# The judge returns a small JSON verdict ({"progressing": bool, "reason":
+# "..."}); 2048 leaves room for thinking-token preludes on Q4 endpoints
+# without permitting unbounded essays.
+GOAL_DRIFT_MAX_OUTPUT_TOKENS: int = 2048
 
 
 # Type alias for the async callable this classifier takes. Matches the
@@ -292,7 +299,11 @@ async def classify_goal_drift(
             sequence_fn=sequence_fn,
             input_preview=activity_block,
         ) as span:
-            raw = await call_llm(system, user, model)
+            # Bound the dispatch — see ``GOAL_DRIFT_MAX_OUTPUT_TOKENS``.
+            from goldfive._llm import call_llm_budget
+
+            with call_llm_budget(GOAL_DRIFT_MAX_OUTPUT_TOKENS):
+                raw = await call_llm(system, user, model)
             # Parse inside the with-block so span.decision_summary /
             # output_preview see the verdict before the End emission.
             parsed = _parse_response(raw)

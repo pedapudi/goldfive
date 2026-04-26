@@ -69,6 +69,7 @@ class DriftKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     DRIFT_KIND_REFINE_VALIDATION_FAILED: _ClassVar[DriftKind]
     DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED: _ClassVar[DriftKind]
     DRIFT_KIND_GOAL_DRIFT: _ClassVar[DriftKind]
+    DRIFT_KIND_LLM_CALL_TIMEOUT: _ClassVar[DriftKind]
 
 class SupersessionKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -126,6 +127,7 @@ DRIFT_KIND_RUNAWAY_DELEGATION: DriftKind
 DRIFT_KIND_REFINE_VALIDATION_FAILED: DriftKind
 DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED: DriftKind
 DRIFT_KIND_GOAL_DRIFT: DriftKind
+DRIFT_KIND_LLM_CALL_TIMEOUT: DriftKind
 SUPERSESSION_KIND_UNSPECIFIED: SupersessionKind
 SUPERSESSION_KIND_REPLACE: SupersessionKind
 SUPERSESSION_KIND_CORRECT: SupersessionKind

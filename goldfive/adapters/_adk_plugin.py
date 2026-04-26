@@ -1288,11 +1288,25 @@ async def _inject_goldfive_planner_instruction(
         )
 
 
+#: Default per-LLM-call wall-clock budget (milliseconds) enforced by
+#: :class:`_GoldfiveADKPlugin` (goldfive#271 follow-up). When a single
+#: ADK LLM dispatch exceeds this budget, the plugin emits a CRITICAL
+#: ``LLM_CALL_TIMEOUT`` drift and flags the invocation for cancel so
+#: subsequent callbacks short-circuit. Set to ``0`` (or any negative
+#: int) to disable the watcher entirely. Default 120000ms (2 minutes)
+#: matches the user-visible spec on goldfive#271 — a Q4 model emitting
+#: at ~17 tok/sec for 2 min produces ~2000 tokens, which is more than
+#: enough headroom for legitimate large responses while bounding the
+#: 9.6-minute pathology observed in demo-v8.log.
+DEFAULT_LLM_CALL_TIMEOUT_MS: int = 120_000
+
+
 def make_adk_plugin(
     *,
     name: str = "goldfive_adk_plugin",
     host_agent_name: str = "",
     agent_tool_cap: int = 16,
+    llm_call_timeout_ms: int = DEFAULT_LLM_CALL_TIMEOUT_MS,
 ) -> Any:
     """Build the ADK plugin class bound to goldfive's protocol.
 
@@ -1312,6 +1326,20 @@ def make_adk_plugin(
     Set to ``0`` or a negative value to disable. See goldfive#130 —
     the cap is the backstop against a coordinator whose prompt
     describes a pipeline and keeps delegating forever.
+
+    ``llm_call_timeout_ms`` (goldfive#271 follow-up) is the per-LLM-call
+    wall-clock budget. When a single ADK LLM dispatch exceeds this
+    duration, the plugin emits a CRITICAL ``LLM_CALL_TIMEOUT`` drift
+    and flags the invocation for cooperative cancel. The current
+    in-flight LLM call is NOT terminated mid-stream (ADK doesn't
+    expose a hook for that, and forcing task cancellation across the
+    HTTP transport is fragile); instead, the next callback the
+    invocation reaches short-circuits via the existing cancel-state
+    plumbing. This is a safety net against runaway thinking-token
+    explosions (Qwen Q4 emitting 9961 completion tokens in 9.6 minutes,
+    demo-v8.log) — without it a single bad turn can wedge the run for
+    minutes. Set to ``0`` or any negative int to disable the watcher.
+    Default ``DEFAULT_LLM_CALL_TIMEOUT_MS`` (120000 / 2 minutes).
     """
     try:
         from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
@@ -1332,6 +1360,10 @@ def make_adk_plugin(
             super().__init__(name=name)
             self._host_agent_name = host_agent_name
             self._agent_tool_cap = agent_tool_cap
+            # Per-LLM-call wall-clock budget (goldfive#271 follow-up).
+            # ``0`` or negative disables the watcher entirely. See
+            # ``make_adk_plugin`` docstring.
+            self._llm_call_timeout_ms = int(llm_call_timeout_ms)
             # Active :class:`SessionContext` for the invocation that is
             # currently driving this plugin's runner. Set by
             # :meth:`ADKAdapter.invoke` before ``run_async`` and cleared
@@ -1513,6 +1545,12 @@ def make_adk_plugin(
             # (goldfive#172). Normal operation pops each entry in
             # ``after_model_callback``; this catches the case where a
             # model turn errored between before/after and never paired.
+            # Also cancel any pending wall-clock watcher so it doesn't
+            # leak into the next dispatch (goldfive#271 follow-up).
+            for pending in self._invocation_llm_pending.values():
+                watcher = pending.get("watcher") if isinstance(pending, dict) else None
+                if watcher is not None and not watcher.done():
+                    watcher.cancel()
             self._invocation_llm_pending.clear()
             # Drop per-(invocation, agent) tool-loop ring buffers so
             # state from the just-finished dispatch doesn't leak into
@@ -3364,6 +3402,132 @@ def make_adk_plugin(
                     exc,
                 )
 
+        # --- Per-LLM-call wall-clock watcher (goldfive#271 follow-up) ---
+
+        async def _run_llm_call_timeout_watcher(
+            self,
+            *,
+            invocation_id: str,
+            timeout_s: float,
+            ctx: SessionContext,
+        ) -> None:
+            """Sleep for ``timeout_s`` then emit a ``LLM_CALL_TIMEOUT`` drift.
+
+            Spawned by :meth:`before_model_callback` and cancelled from
+            the paired :meth:`after_model_callback` when the LLM call
+            completes within budget. If the watcher wakes up first the
+            in-flight LLM call has exceeded the wall-clock budget — we
+            do NOT terminate the call mid-stream (ADK doesn't expose a
+            hook for that), but we:
+
+            * Emit a CRITICAL ``LLM_CALL_TIMEOUT`` drift to the steerer
+              so the configured policy / sinks see the event.
+            * Flag the invocation for cooperative cancel via
+              :meth:`request_invocation_cancel` so subsequent callbacks
+              short-circuit. The current LLM call still completes, but
+              the invocation as a whole stops at the next checkpoint.
+
+            CancelledError propagates back to the caller (the
+            after_model_callback path that cancels us) so the watcher
+            exits cleanly when the LLM call ends in time.
+            """
+            try:
+                await asyncio.sleep(timeout_s)
+            except asyncio.CancelledError:
+                return
+            # Wall-clock budget exceeded.
+            steerer = ctx.steerer if ctx is not None else None
+            session = ctx.session if ctx is not None else None
+            log.warning(
+                "goldfive.llm.timeout invocation_id=%s timeout_s=%.1f "
+                "agent=%s task_id=%s",
+                invocation_id,
+                timeout_s,
+                self._host_agent_name or "?",
+                str(_safe_attr(getattr(ctx, "task", None), "id", "") or "") or "?",
+            )
+            try:
+                from goldfive.types import (  # noqa: PLC0415 — lazy
+                    CancellationRequest,
+                    DriftEvent,
+                    DriftKind,
+                    DriftSeverity,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_run_llm_call_timeout_watcher: cannot import types: %s",
+                    exc,
+                )
+                return
+            # Emit a CRITICAL drift so the steerer's policy fires. Best-
+            # effort: any failure must not block the cancel-flag write.
+            if steerer is not None and session is not None:
+                try:
+                    drift = DriftEvent(
+                        kind=DriftKind.LLM_CALL_TIMEOUT,
+                        severity=DriftSeverity.CRITICAL,
+                        detail=(
+                            f"LLM call exceeded wall-clock budget "
+                            f"({timeout_s:.1f}s) on invocation "
+                            f"{invocation_id}"
+                        ),
+                        current_task_id=str(
+                            _safe_attr(getattr(ctx, "task", None), "id", "") or ""
+                        ),
+                        current_agent_id=self._host_agent_name or "",
+                    )
+                    observation = _as_observation(
+                        kind="llm_call_timeout",
+                        detail=drift.detail,
+                        raw={"invocation_id": invocation_id, "timeout_s": timeout_s},
+                        task=getattr(ctx, "task", None),
+                        agent_id=self._host_agent_name,
+                    )
+                    await steerer.observe(observation, session)
+                    # Also surface as a structured DriftDetected so
+                    # sinks see the drift even if the steerer's
+                    # observe() routes elsewhere.
+                    emit_drift = getattr(steerer, "_emit_drift_detected", None)
+                    if emit_drift is not None:
+                        try:
+                            await emit_drift(session, drift)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug(
+                                "_run_llm_call_timeout_watcher: "
+                                "_emit_drift_detected raised: %s",
+                                exc,
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "_run_llm_call_timeout_watcher: drift emission raised: %s",
+                        exc,
+                    )
+            # Flag the invocation for cooperative cancel so the next
+            # callback (whether after_model fires first, or the next
+            # before_tool / before_model on a follow-up) short-circuits.
+            try:
+                request = CancellationRequest(
+                    invocation_id=invocation_id,
+                    reason="llm_call_timeout",
+                    severity=DriftSeverity.CRITICAL,
+                    drift_kind=DriftKind.LLM_CALL_TIMEOUT.value,
+                    detail=(
+                        f"LLM call exceeded wall-clock budget "
+                        f"({timeout_s:.1f}s)"
+                    ),
+                    requested_at_ms=int(time.time() * 1000),
+                )
+                self.request_invocation_cancel(
+                    invocation_id=invocation_id,
+                    request=request,
+                    propagate_to_children=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_run_llm_call_timeout_watcher: cancel-flag write raised: %s",
+                    exc,
+                )
+
         # --- Plan + current-task context -------------------------------
 
         async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> None:
@@ -3453,11 +3617,43 @@ def make_adk_plugin(
                 inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
                 start_mono = time.monotonic()
                 if inv_id:
-                    self._invocation_llm_pending[inv_id] = {
+                    pending: dict[str, Any] = {
                         "start_mono": start_mono,
                         "chars": chars,
                         "messages_count": messages_count,
                     }
+                    # Per-LLM-call wall-clock watcher (goldfive#271
+                    # follow-up). Spawned as an asyncio task so it
+                    # runs concurrently with the in-flight
+                    # ``generate_content_async`` stream. The paired
+                    # ``after_model_callback`` cancels the watcher
+                    # when the LLM call returns within budget. Skip
+                    # entirely when the budget is non-positive
+                    # (operator opted out) or when no SessionContext
+                    # is available (the watcher can't emit drifts
+                    # without one).
+                    if self._llm_call_timeout_ms > 0 and ctx is not None:
+                        timeout_s = self._llm_call_timeout_ms / 1000.0
+                        try:
+                            watcher = asyncio.create_task(
+                                self._run_llm_call_timeout_watcher(
+                                    invocation_id=inv_id,
+                                    timeout_s=timeout_s,
+                                    ctx=ctx,
+                                ),
+                                name=f"goldfive_llm_watcher_{inv_id}",
+                            )
+                            pending["watcher"] = watcher
+                        except RuntimeError as exc:
+                            # No running loop (extremely unusual in an
+                            # async callback, but the harness kicks
+                            # off with no loop in some unit tests).
+                            log.debug(
+                                "before_model_callback: cannot schedule "
+                                "LLM-timeout watcher: %s",
+                                exc,
+                            )
+                    self._invocation_llm_pending[inv_id] = pending
                 # INFO log so an operator running a live e2e (kikuchi)
                 # can tail stderr and correlate context growth against
                 # the subsequent duration line.
@@ -3864,6 +4060,16 @@ def make_adk_plugin(
                     metrics["llm.call.duration_ms"] = duration_ms
                     metrics["llm.request.chars"] = int(pending.get("chars", 0))
                     metrics["llm.request.messages_count"] = int(pending.get("messages_count", 0))
+                    # Cancel the per-LLM-call wall-clock watcher
+                    # (goldfive#271 follow-up). The LLM call returned
+                    # within budget, so the watcher's pending sleep is
+                    # no longer needed. Tolerate the watcher having
+                    # already fired (race: it can complete just before
+                    # we reach this line if the LLM call landed
+                    # exactly at the budget boundary).
+                    watcher = pending.get("watcher")
+                    if watcher is not None and not watcher.done():
+                        watcher.cancel()
                 usage = _extract_usage_metadata(llm_response)
                 for key, value in usage.items():
                     metrics[f"llm.usage.{key}"] = value

@@ -56,6 +56,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "CallLLM",
     "PLAN_TASKS_SUMMARY_MAX_CHARS",
+    "REASONING_JUDGE_MAX_OUTPUT_TOKENS",
     "REASONING_JUDGE_MAX_REASONING_INPUT_CHARS",
     "REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS",
     "REASONING_DRIFT_MAX_REASONING_CHARS",
@@ -81,6 +82,12 @@ __all__ = [
 REASONING_JUDGE_MAX_REASONING_INPUT_CHARS: int = 4096
 REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS: int = 2048
 _TRUNCATE_SUFFIX: str = " … [truncated]"
+
+# Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up).
+# The judge returns a small JSON verdict ({"on_task": bool, "reason":
+# "...", "severity": "...", ...}); 2048 leaves room for thinking-token
+# preludes on Q4 endpoints without permitting unbounded essays.
+REASONING_JUDGE_MAX_OUTPUT_TOKENS: int = 2048
 
 
 def truncate_for_observability(text: str, limit: int) -> str:
@@ -538,7 +545,11 @@ async def classify_reasoning_drift_with_focus(
             target_agent_id=current_agent_id,
             target_task_id=current_task_id,
         ) as span:
-            raw = await call_llm(system, user, model)
+            # Bound the dispatch — see ``REASONING_JUDGE_MAX_OUTPUT_TOKENS``.
+            from goldfive._llm import call_llm_budget
+
+            with call_llm_budget(REASONING_JUDGE_MAX_OUTPUT_TOKENS):
+                raw = await call_llm(system, user, model)
             # Parse inside the with-block so we can stamp
             # decision-context onto the span before the End event fires
             # on exit. The heavier handling (log.info, DriftEvent

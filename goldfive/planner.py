@@ -950,6 +950,17 @@ class LLMPlanner:
     # globally by subclassing.
     DEFAULT_MAX_REFINE_ATTEMPTS: int = 2
 
+    # Per-callsite ``max_output_tokens`` budget for the underlying
+    # ``call_llm`` (goldfive#271 follow-up). All planner LLM calls return
+    # a JSON plan structure; 4096 covers typical refines and large
+    # multi-task generates while bounding wall-clock at ~4 minutes
+    # against a Q4 Qwen endpoint at ~17 tok/sec. Pre-fix evidence
+    # (demo-v8.log): unbounded → 9961-token / 9.6-minute calls.
+    # Subclasses may override; the value is read once per call into
+    # :func:`goldfive._llm.call_llm_budget` so per-instance overrides
+    # propagate without restart.
+    MAX_OUTPUT_TOKENS: int = 4096
+
     def __init__(
         self,
         *,
@@ -1910,7 +1921,16 @@ class LLMPlanner:
                     target_agent_id=span_target_agent_id,
                     target_task_id=span_target_task_id,
                 ) as span:
-                    raw = await self._call_llm(system_prompt, user_prompt, self._model)
+                    # Cap the underlying LLM dispatch so a runaway
+                    # generation (Qwen Q4 thinking-token explosion)
+                    # cannot wedge the run for minutes. See
+                    # ``LLMPlanner.MAX_OUTPUT_TOKENS``.
+                    from goldfive._llm import call_llm_budget
+
+                    with call_llm_budget(self.MAX_OUTPUT_TOKENS):
+                        raw = await self._call_llm(
+                            system_prompt, user_prompt, self._model
+                        )
                     span.output_preview = (
                         raw[:4096] if isinstance(raw, str) else "(non-str response)"
                     )
@@ -2240,7 +2260,13 @@ class LLMPlanner:
                     name="plan_generate",
                     input_preview=generate_input_preview,
                 ) as span:
-                    raw = await self._call_llm(self._system_prompt, user_prompt, self._model)
+                    # Bound the dispatch — see ``LLMPlanner.MAX_OUTPUT_TOKENS``.
+                    from goldfive._llm import call_llm_budget
+
+                    with call_llm_budget(self.MAX_OUTPUT_TOKENS):
+                        raw = await self._call_llm(
+                            self._system_prompt, user_prompt, self._model
+                        )
                     span.output_preview = (
                         raw[:4096] if isinstance(raw, str) else "(non-str response)"
                     )
@@ -2860,9 +2886,13 @@ class LLMPlanner:
                 target_agent_id=drift.current_agent_id or "",
                 target_task_id=drift.current_task_id or "",
             ) as span:
-                raw = await self._call_llm(
-                    self._user_steer_system_prompt, user_prompt, self._model
-                )
+                # Bound the dispatch — see ``LLMPlanner.MAX_OUTPUT_TOKENS``.
+                from goldfive._llm import call_llm_budget
+
+                with call_llm_budget(self.MAX_OUTPUT_TOKENS):
+                    raw = await self._call_llm(
+                        self._user_steer_system_prompt, user_prompt, self._model
+                    )
                 span.output_preview = (
                     raw[:4096] if isinstance(raw, str) else "(non-str response)"
                 )
@@ -3262,9 +3292,13 @@ PLAN SHAPE (when plan is non-null):
                 name="planner_handle_turn",
                 input_preview=gate_input_preview,
             ) as span:
-                raw = await self._call_llm(
-                    self._HANDLE_TURN_SYSTEM_PROMPT, user_prompt, self._model
-                )
+                # Bound the dispatch — see ``LLMPlanner.MAX_OUTPUT_TOKENS``.
+                from goldfive._llm import call_llm_budget
+
+                with call_llm_budget(self.MAX_OUTPUT_TOKENS):
+                    raw = await self._call_llm(
+                        self._HANDLE_TURN_SYSTEM_PROMPT, user_prompt, self._model
+                    )
                 span.output_preview = (
                     raw[:4096] if isinstance(raw, str) else "(non-str response)"
                 )
