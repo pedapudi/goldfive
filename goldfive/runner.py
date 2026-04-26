@@ -228,10 +228,12 @@ class Runner:
         # via ``Planner.generate`` (pre-#271 behaviour, useful for
         # deterministic replay).
         self._planner_gate: Any = planner_gate
-        # Held across turns so the ``conversational`` path can carry
-        # the prior plan forward onto the freshly minted session
-        # without re-running the planner.
-        self._last_plan: Plan | None = None
+        # Cross-turn prior-plan stash lives on :class:`Conversation`
+        # (keyed by session id) so a Runner shared across multiple
+        # outer ADK sessions does not leak one session's plan into
+        # another's first turn. See :meth:`Conversation.prior_plan_for`
+        # and the goldfive#271 follow-up validation v4 Class 1
+        # post-mortem.
 
     # ------------------------------------------------------------------
     # run
@@ -270,8 +272,14 @@ class Runner:
         # harmonograf spans already target — resolving the
         # "plan view has empty Gantt" regression from the overlay
         # architecture.
-        if session_id:
-            session.run_id = session_id
+        # Track whether the caller explicitly pinned the session id so
+        # the Conversation's prior-plan carry-forward (and the
+        # symmetric stash on absorb_turn) can apply the documented
+        # carry-forward matrix — see :meth:`Conversation.prior_plan_for`
+        # and goldfive#271 follow-up validation v4 Class 1.
+        pinned = bool(session_id)
+        if pinned:
+            session.run_id = session_id  # type: ignore[assignment]
         self._last_session = session
 
         # 2. Announce the Conversation on the first turn.
@@ -287,9 +295,21 @@ class Runner:
         # sees a non-None ``session.plan``. The Runner has a single
         # install path post-Phase-4: every plan landed by the planner
         # becomes the next revision of this seed (revision_index += 1).
-        if self._last_plan is not None:
-            self._last_plan.run_id = session.run_id
-            session.plan = self._last_plan
+        #
+        # The prior-plan lookup combines ``session.id`` (== ``run_id``
+        # after any outer-session pin above) with the caller's pin
+        # state. A turn on a different outer ADK session sharing this
+        # Runner (pinned-vs-pinned with mismatched ids, or a
+        # pinned-prior followed by an unpinned new turn) sees
+        # ``Plan.empty()`` rather than the stash from another session
+        # (validation v4 Class 1 / goldfive#271 follow-up). Programmatic
+        # callers (both prior and new turn unpinned) keep the
+        # Conversation-level continuity the original ``_last_plan``
+        # field provided.
+        prior_plan = self._conversation.prior_plan_for(session.id, pinned=pinned)
+        if prior_plan is not None:
+            prior_plan.run_id = session.run_id
+            session.plan = prior_plan
         else:
             session.plan = Plan.empty(run_id=session.run_id)
         _ostate.set_current_plan(session.state, session.plan)
@@ -306,7 +326,9 @@ class Runner:
             await self._emit_run_aborted(session, reason)
             outcome = ExecutionOutcome(success=False, session=session, reason=reason)
             self._conversation.absorb_turn(
-                outcome, user_input_summary=_initial_goal_summary(user_input)
+                outcome,
+                user_input_summary=_initial_goal_summary(user_input),
+                pinned=pinned,
             )
             return outcome
 
@@ -376,8 +398,7 @@ class Runner:
                 # A misbehaving handle_turn must never break the run;
                 # fall through to generate (legacy first-turn path).
                 log.warning(
-                    "planner.handle_turn raised; falling through to "
-                    "generate: %s",
+                    "planner.handle_turn raised; falling through to generate: %s",
                     exc,
                 )
                 decided = False
@@ -421,7 +442,9 @@ class Runner:
                 await self._emit_run_aborted(session, reason)
                 outcome = ExecutionOutcome(success=False, session=session, reason=reason)
                 self._conversation.absorb_turn(
-                    outcome, user_input_summary=_initial_goal_summary(user_input)
+                    outcome,
+                    user_input_summary=_initial_goal_summary(user_input),
+                    pinned=pinned,
                 )
                 return outcome
 
@@ -440,7 +463,9 @@ class Runner:
                 await self._emit_run_aborted(session, reason)
                 outcome = ExecutionOutcome(success=False, session=session, reason=reason)
                 self._conversation.absorb_turn(
-                    outcome, user_input_summary=_initial_goal_summary(user_input)
+                    outcome,
+                    user_input_summary=_initial_goal_summary(user_input),
+                    pinned=pinned,
                 )
                 return outcome
         elif not session.plan.tasks:
@@ -451,7 +476,9 @@ class Runner:
             await self._emit_run_aborted(session, reason)
             outcome = ExecutionOutcome(success=False, session=session, reason=reason)
             self._conversation.absorb_turn(
-                outcome, user_input_summary=_initial_goal_summary(user_input)
+                outcome,
+                user_input_summary=_initial_goal_summary(user_input),
+                pinned=pinned,
             )
             return outcome
         else:
@@ -459,8 +486,7 @@ class Runner:
             # session.plan unchanged. No PlanRevised — the prior
             # revision is still the right one for this turn.
             log.info(
-                "Runner.run: conversational turn — reusing prior "
-                "plan_id=%s revision_index=%d",
+                "Runner.run: conversational turn — reusing prior plan_id=%s revision_index=%d",
                 (session.plan.id or "")[:16] or "<none>",
                 int(session.plan.revision_index),
             )
@@ -474,7 +500,9 @@ class Runner:
             await self._emit_run_aborted(session, reason)
             outcome = ExecutionOutcome(success=False, session=session, reason=reason)
             self._conversation.absorb_turn(
-                outcome, user_input_summary=_initial_goal_summary(user_input)
+                outcome,
+                user_input_summary=_initial_goal_summary(user_input),
+                pinned=pinned,
             )
             return outcome
 
@@ -487,7 +515,9 @@ class Runner:
             await self._emit_run_aborted(session, reason)
             outcome = ExecutionOutcome(success=False, session=session, reason=reason)
             self._conversation.absorb_turn(
-                outcome, user_input_summary=_initial_goal_summary(user_input)
+                outcome,
+                user_input_summary=_initial_goal_summary(user_input),
+                pinned=pinned,
             )
             return outcome
 
@@ -509,7 +539,9 @@ class Runner:
                 await self._emit_run_aborted(session, reason)
                 outcome = ExecutionOutcome(success=False, session=session, reason=reason)
                 self._conversation.absorb_turn(
-                    outcome, user_input_summary=_initial_goal_summary(user_input)
+                    outcome,
+                    user_input_summary=_initial_goal_summary(user_input),
+                    pinned=pinned,
                 )
                 return outcome
 
@@ -556,7 +588,9 @@ class Runner:
             await self._emit_run_aborted(session, reason)
             aborted = ExecutionOutcome(success=False, session=session, reason=reason)
             self._conversation.absorb_turn(
-                aborted, user_input_summary=_initial_goal_summary(user_input)
+                aborted,
+                user_input_summary=_initial_goal_summary(user_input),
+                pinned=pinned,
             )
             return aborted
         finally:
@@ -571,11 +605,10 @@ class Runner:
             # ``CancelledError`` is a ``BaseException`` (not an
             # ``Exception``) the ``except Exception`` handler above did
             # NOT catch it. Control flowed out of ``run`` entirely and
-            # the stash was skipped, leaving ``_last_plan = None`` for
+            # the stash was skipped, leaving the prior plan empty for
             # the next turn even though the turn produced a real plan.
             # The ADK-web user-steer flow hit this on validation v2:
-            # zero "stashed prior plan" log lines across 4 turns and
-            # "GoldfiveADKAgent: gate skipped — no prior plan" 4 times.
+            # zero stash log lines across 4 turns.
             #
             # Putting the stash in ``finally`` runs it regardless of how
             # the executor exited — normal success, ``Exception`` (e.g.
@@ -583,13 +616,30 @@ class Runner:
             # ``CancelledError`` from ADK closing the runner mid-stream).
             # The exception still propagates after the stash; this block
             # does not swallow it.
+            #
+            # The stash itself lives on :class:`Conversation`
+            # (validation v4 Class 1 / goldfive#271 follow-up): scoping
+            # by session id means a turn on a fresh outer ADK session
+            # sharing this Runner does not inherit a prior plan from
+            # another session. :meth:`Conversation.absorb_turn` (called
+            # on every normal-completion / handled-exception return
+            # path below) folds the stash in alongside the goals /
+            # completed_results merge. The explicit ``stash_plan`` call
+            # here covers the ``BaseException`` (e.g. ``CancelledError``
+            # from ADK closing the runner mid-stream) path that bypasses
+            # ``absorb_turn`` entirely — the same rationale as the
+            # original Gap 1 fix that put the stash in ``finally`` to
+            # begin with. ``stash_plan`` is idempotent: a subsequent
+            # ``absorb_turn`` re-stashes the same plan + session id.
             if session.plan is not None and session.plan.tasks:
-                self._last_plan = session.plan
+                self._conversation.stash_plan(session, pinned=pinned)
                 log.info(
                     "Runner.run: stashed prior plan for next turn's "
-                    "handle_turn (plan_id=%s revision_index=%d)",
+                    "handle_turn (plan_id=%s revision_index=%d "
+                    "session_id=%s)",
                     (session.plan.id or "")[:16] or "<none>",
                     int(session.plan.revision_index),
+                    (session.id or "")[:16] or "<none>",
                 )
 
         # goldfive#152: clear the current_task_* stamp at run end.
@@ -599,7 +649,9 @@ class Runner:
         _ostate.clear_active_steer(session.state)
 
         self._conversation.absorb_turn(
-            outcome, user_input_summary=_initial_goal_summary(user_input)
+            outcome,
+            user_input_summary=_initial_goal_summary(user_input),
+            pinned=pinned,
         )
         return outcome
 
@@ -800,8 +852,11 @@ class Runner:
         self._conversation_announced = False
         self._last_session = None
         # planner-gate: reset turn-aware gate state so the first turn
-        # of the new conversation runs full planning.
-        self._last_plan = None
+        # of the new conversation runs full planning. Cross-turn
+        # plan stash now lives on :class:`Conversation` (keyed by
+        # session id; see goldfive#271 follow-up); the fresh
+        # ``Conversation.new()`` above already starts with
+        # ``_last_plan = None``, so no Runner-side reset is needed.
 
     # ------------------------------------------------------------------
     # close
@@ -989,9 +1044,7 @@ class Runner:
             if callable(bind_steerer_adapter):
                 bind_steerer_adapter(self.agent)
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Runner._install_revision: steerer/adapter bind raised: %s", exc
-            )
+            log.warning("Runner._install_revision: steerer/adapter bind raised: %s", exc)
             return False
         # Stamp run_id on the revised plan so sink emissions correlate
         # with this turn.
@@ -1002,9 +1055,7 @@ class Runner:
         # steerer's apply_user_steer_with_plan does the bookkeeping +
         # validation + revision install + PlanRevised emit.
         user_text = (
-            user_input.strip()
-            if isinstance(user_input, str)
-            else _initial_goal_summary(user_input)
+            user_input.strip() if isinstance(user_input, str) else _initial_goal_summary(user_input)
         )
         drift = DriftEvent(
             kind=DriftKind.USER_STEER,
@@ -1019,8 +1070,7 @@ class Runner:
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "Runner._install_revision: apply_user_steer_with_plan "
-                "raised: %s",
+                "Runner._install_revision: apply_user_steer_with_plan raised: %s",
                 exc,
             )
             return False
