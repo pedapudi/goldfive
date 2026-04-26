@@ -14,7 +14,13 @@ Phase 3 scope (see issue #78):
 
 * ``session.goals`` accumulates across turns (deduplicated by id).
 * ``session.completed_results`` carries over from prior turns.
-* ``session.plan`` resets per turn. Cross-turn plan lineage is v2.
+* ``session.plan`` is seeded each turn from the prior turn's stash
+  (via :meth:`Conversation.prior_plan_for`) so :meth:`Planner.handle_turn`
+  always sees a non-None prior. The carry-forward is gated on
+  ``session_id`` pin state so a Runner shared across multiple outer
+  ADK sessions does not leak one session's plan into another's first
+  turn (goldfive#271 follow-up; pre-fix this lived on
+  ``Runner._last_plan`` and was process-scoped).
 * :class:`TurnRecord` captures a one-sentence summary of each turn so
   the planner can reference them in its prompt.
 
@@ -30,7 +36,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING
 
-from goldfive.types import Goal, Session
+from goldfive.types import Goal, Plan, Session
 
 if TYPE_CHECKING:
     from goldfive.results import ExecutionOutcome
@@ -106,6 +112,31 @@ class Conversation:
     # outer-session pin. Single-turn callers see no change: the cursor
     # starts at 0 on a fresh Conversation.
     _next_sequence: int = 0
+    # Most recently absorbed turn's plan. Used by the Runner to seed
+    # the next turn's ``session.plan`` so :meth:`Planner.handle_turn`
+    # always sees a non-None prior. Pre-fix this lived on
+    # :class:`Runner` as ``_last_plan`` — a process-scoped attribute
+    # that leaked across outer ADK sessions sharing one Runner
+    # (validation v4 Class 1, goldfive#271 follow-up). The seed lookup
+    # (:meth:`prior_plan_for`) gates carry-forward on the session-id
+    # bookkeeping below so an ADK-pinned session boundary defeats the
+    # carry-forward, while a programmatic Runner caller (no pin) still
+    # gets Conversation-level continuity.
+    _last_plan: Plan | None = None
+    # Session id (== ``Session.run_id`` after any
+    # :meth:`Runner.run(session_id=...)` outer-session pin) of the
+    # turn whose plan is held in ``_last_plan``. Default ``""`` means
+    # no plan has been stashed yet — a brand-new Conversation, the
+    # state immediately after :meth:`Runner.new_conversation`.
+    _last_plan_session_id: str = ""
+    # Whether the turn that produced ``_last_plan`` had its session
+    # id explicitly pinned via :meth:`Runner.run(session_id=...)`.
+    # The seed lookup uses this together with the new turn's pin
+    # state to decide whether the session-id check applies:
+    # programmatic (unpinned) callers get unconditional Conversation-
+    # level carry-forward; ADK (pinned) callers must match the prior
+    # turn's pinned id exactly.
+    _last_plan_pinned: bool = False
 
     @classmethod
     def new(cls) -> Conversation:
@@ -139,17 +170,105 @@ class Conversation:
             _next_sequence=self._next_sequence,
         )
 
+    def stash_plan(self, session: Session, *, pinned: bool = False) -> None:
+        """Stash ``session.plan`` keyed by ``session.id`` for the next turn.
+
+        ``pinned`` records whether the turn that produced this plan
+        had its session id explicitly pinned via
+        :meth:`Runner.run(session_id=...)`. The next turn's
+        :meth:`prior_plan_for` lookup combines that flag with the
+        next turn's own pin state to decide whether carry-forward
+        applies; see the lookup docstring for the matrix.
+
+        The Runner calls this from its ``finally`` block so the stash
+        runs even on ``BaseException`` (e.g. ``CancelledError`` from
+        ADK closing the runner mid-stream) — the rationale is the
+        same as goldfive#271 Gap 1's original Runner-side stash. The
+        idempotency contract: a subsequent :meth:`absorb_turn` on the
+        same session re-stashes the same (plan, session id, pinned)
+        tuple, so callers that hit both paths produce identical state.
+
+        Skipped (no-op) when ``session.plan`` is ``None`` or empty —
+        an empty plan is not a meaningful prior to carry forward.
+        """
+        if session.plan is not None and session.plan.tasks:
+            self._last_plan = session.plan
+            self._last_plan_session_id = session.id
+            self._last_plan_pinned = pinned
+
+    def prior_plan_for(self, session_id: str, *, pinned: bool = False) -> Plan | None:
+        """Return the stashed prior plan iff carry-forward applies.
+
+        Called by :meth:`Runner.run` to seed ``session.plan`` at the
+        start of a turn AFTER any
+        :meth:`Runner.run(session_id=...)` outer-session pin has
+        finalised the new turn's session id. ``pinned`` records
+        whether the new turn's caller passed an explicit
+        ``session_id`` pin.
+
+        Carry-forward matrix:
+
+        ===========  ===========  =============================
+        prior turn   new turn     carry forward?
+        ===========  ===========  =============================
+        unpinned     unpinned     YES — Conversation-level
+                                  continuity for programmatic
+                                  Runner callers.
+        unpinned     pinned       NO — the pin signals a switch
+                                  to an externally-owned session
+                                  identity; treat as a boundary.
+        pinned       unpinned     NO — symmetric: leaving an
+                                  externally-owned identity is
+                                  also a boundary.
+        pinned       pinned, ids  YES — same outer ADK session
+                       match      across turns; intra-session
+                                  continuity (the pre-fix
+                                  intent of ``_last_plan``).
+        pinned       pinned, ids  NO — the regression case:
+                       differ     two distinct outer ADK
+                                  sessions sharing one Runner,
+                                  validation v4 Class 1.
+        ===========  ===========  =============================
+
+        Returning ``None`` causes the Runner to seed
+        ``session.plan = Plan.empty(...)`` — the correct first-turn
+        behaviour for an outer session that has never been seen
+        before.
+
+        Pre-fix the carry-forward was unconditional: a process-wide
+        ``Runner._last_plan`` field. Validation v4 Class 1 (goldfive#271
+        follow-up) showed that two distinct outer ADK sessions
+        sharing one Runner caused the second session's first turn
+        to inherit the first session's plan, then fail every
+        revision attempt because the leaked plan made no sense for
+        the new request.
+        """
+        if self._last_plan is None:
+            return None
+        # Either side touched the pin → require an exact session-id
+        # match. Both sides unpinned → Conversation-level continuity.
+        if self._last_plan_pinned or pinned:
+            if self._last_plan_session_id != session_id:
+                return None
+        return self._last_plan
+
     def absorb_turn(
         self,
         outcome: ExecutionOutcome,
         *,
         user_input_summary: str = "",
+        pinned: bool = False,
     ) -> TurnRecord:
         """Fold a turn's outcome back into the Conversation.
 
         Called by the Runner after ``executor.run`` returns (successful
         or not — we record the failure so the next turn's planner can
         see it). Returns the newly-appended :class:`TurnRecord`.
+
+        ``pinned`` records whether this turn's caller passed an
+        explicit ``Runner.run(session_id=...)`` outer-session pin so
+        the next turn's :meth:`prior_plan_for` can apply the
+        carry-forward matrix correctly.
         """
         session = outcome.session
         # Merge goals by id so a restated goal doesn't duplicate.
@@ -176,14 +295,20 @@ class Conversation:
         # turn that aborted before any sink emission).
         self._next_sequence = max(self._next_sequence, int(session._next_sequence))
 
+        # Stash the turn's final plan keyed by the session id (and
+        # pin state) that produced it so the next turn's
+        # :meth:`prior_plan_for` lookup applies the documented
+        # carry-forward matrix. Empty plans are skipped (no-op); see
+        # :meth:`stash_plan` for the idempotency contract this shares
+        # with the Runner's ``finally``-block invocation.
+        self.stash_plan(session, pinned=pinned)
+
         plan_summary = ""
         completed_ids: list[str] = []
         if session.plan is not None:
             plan_summary = session.plan.summary or ""
             completed_ids = [
-                t.id
-                for t in session.plan.tasks
-                if t.status.value == "COMPLETED" and t.id
+                t.id for t in session.plan.tasks if t.status.value == "COMPLETED" and t.id
             ]
 
         record = TurnRecord(
