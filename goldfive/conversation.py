@@ -90,6 +90,22 @@ class Conversation:
     goals: list[Goal] = dataclasses.field(default_factory=list)
     completed_results: dict[str, str] = dataclasses.field(default_factory=dict)
     turns: list[TurnRecord] = dataclasses.field(default_factory=list)
+    # Conversation-level wire sequence cursor (goldfive#271 Gap 2).
+    # Each turn's :class:`Session` seeds its private ``_next_sequence``
+    # from this value, then on :meth:`absorb_turn` writes the post-turn
+    # high-water mark back. Reason: when goldfive#161's outer-session
+    # pin causes ``Session.run_id`` to repeat across turns,
+    # harmonograf's ``goldfive_events`` PK ``(session_id, run_id,
+    # sequence)`` collides on the second turn's early events (sequence
+    # 0, 1, 2, ...) which match turn 1's already-persisted rows. The
+    # storage layer's ``INSERT OR IGNORE`` then silently drops the
+    # second turn's plan_submitted, agent_invocation_started, etc.
+    # Carrying a Conversation-level cursor across turns makes
+    # ``sequence`` unique per (conversation, run_id-or-session_id) so
+    # the persisted-event keyspace stays collision-free even under the
+    # outer-session pin. Single-turn callers see no change: the cursor
+    # starts at 0 on a fresh Conversation.
+    _next_sequence: int = 0
 
     @classmethod
     def new(cls) -> Conversation:
@@ -108,6 +124,11 @@ class Conversation:
         (not aliases) the accumulated ``goals`` and ``completed_results``
         so the executor's in-turn mutations do not retroactively
         rewrite the Conversation's record.
+
+        The Session's wire-sequence counter (``Session._next_sequence``)
+        is seeded from the Conversation's running cursor so per-turn
+        events are globally unique within the conversation; see the
+        ``_next_sequence`` docstring on :class:`Conversation`.
         """
         return Session(
             run_id=uuid.uuid4().hex,
@@ -115,6 +136,7 @@ class Conversation:
             started_at_ms=_now_ms(),
             goals=list(self.goals),
             completed_results=dict(self.completed_results),
+            _next_sequence=self._next_sequence,
         )
 
     def absorb_turn(
@@ -143,6 +165,16 @@ class Conversation:
         # that a revised result on a follow-up turn is visible to the
         # turn after it.
         self.completed_results.update(session.completed_results)
+
+        # goldfive#271 Gap 2: lift the turn's high-water sequence back to
+        # the Conversation cursor so the next ``next_turn_session()``
+        # picks up where this turn left off. This keeps wire sequences
+        # globally unique within the Conversation, which matters when
+        # goldfive#161's outer-session pin makes ``Session.run_id``
+        # constant across turns. Use ``max`` to be defensive against an
+        # outcome whose Session never advanced past the seed (e.g. a
+        # turn that aborted before any sink emission).
+        self._next_sequence = max(self._next_sequence, int(session._next_sequence))
 
         plan_summary = ""
         completed_ids: list[str] = []

@@ -166,6 +166,116 @@ def test_conversation_prior_turn_context_caps_window() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Wire-sequence cursor across turns (goldfive#271 Gap 2)
+# ---------------------------------------------------------------------------
+#
+# Validation v2 of issue #271 surfaced that ``Session._next_sequence``
+# resets to 0 on every ``next_turn_session()`` call, which collides
+# with harmonograf's persisted-event PK ``(session_id, run_id,
+# sequence)`` whenever goldfive#161's outer-session pin makes
+# ``Session.run_id`` repeat across turns. The Conversation-level cursor
+# guarantees that wire sequences are globally unique within the
+# conversation so persisted events never silently drop on a multi-turn
+# session.
+
+
+def test_conversation_seeds_session_sequence_from_running_cursor() -> None:
+    conv = Conversation.new()
+
+    s1 = conv.next_turn_session()
+    assert s1.next_sequence() == 0
+    assert s1.next_sequence() == 1
+    # Manually advance to mimic a turn that emitted three events.
+    assert s1.next_sequence() == 2
+
+    # absorb_turn lifts the high-water mark back to the Conversation.
+    from goldfive.results import ExecutionOutcome
+
+    conv.absorb_turn(ExecutionOutcome(success=True, session=s1))
+    assert conv._next_sequence == 3
+
+    # Turn 2 picks up where turn 1 left off — no collision with turn 1's
+    # already-emitted (session_id, run_id, 0/1/2) wire keys.
+    s2 = conv.next_turn_session()
+    assert s2.next_sequence() == 3
+    assert s2.next_sequence() == 4
+
+    conv.absorb_turn(ExecutionOutcome(success=True, session=s2))
+    assert conv._next_sequence == 5
+
+
+def test_conversation_sequence_unique_under_outer_session_pin() -> None:
+    """Reproduces goldfive#271 Gap 2: with the outer-session pin
+    forcing both turns to share ``run_id`` (and therefore ``session_id``,
+    since ``Session.id`` aliases ``run_id``), every emitted ``(run_id,
+    sequence)`` pair must remain globally unique across the whole
+    conversation. Otherwise harmonograf's INSERT OR IGNORE silently
+    drops the second turn's plan_submitted, agent_invocation_started,
+    and similar early-turn events.
+    """
+    from goldfive.results import ExecutionOutcome
+
+    conv = Conversation.new()
+    pinned_run_id = "outer-adk-session-abc123"
+
+    # Turn 1 — pinned to the outer session id, emits five events.
+    s1 = conv.next_turn_session()
+    s1.run_id = pinned_run_id
+    turn1_keys = {(s1.run_id, s1.next_sequence()) for _ in range(5)}
+    conv.absorb_turn(ExecutionOutcome(success=True, session=s1))
+
+    # Turn 2 — same pin, emits five more events.
+    s2 = conv.next_turn_session()
+    s2.run_id = pinned_run_id
+    turn2_keys = {(s2.run_id, s2.next_sequence()) for _ in range(5)}
+    conv.absorb_turn(ExecutionOutcome(success=True, session=s2))
+
+    # The collision regression: every (run_id, sequence) pair in turn 2
+    # would equal one in turn 1 prior to the fix, and harmonograf's
+    # storage layer would silently drop turn 2's events.
+    assert turn1_keys.isdisjoint(turn2_keys), (
+        "wire-key collision across turns under outer-session pin: "
+        f"turn1={sorted(turn1_keys)} turn2={sorted(turn2_keys)}"
+    )
+    assert len(turn1_keys) == 5 and len(turn2_keys) == 5
+
+
+def test_conversation_sequence_reset_on_new_conversation() -> None:
+    """new_conversation() restarts the cursor at 0 — fresh
+    Conversations carry a fresh wire-sequence keyspace."""
+    from goldfive.results import ExecutionOutcome
+
+    conv = Conversation.new()
+    s1 = conv.next_turn_session()
+    for _ in range(7):
+        s1.next_sequence()
+    conv.absorb_turn(ExecutionOutcome(success=True, session=s1))
+    assert conv._next_sequence == 7
+
+    fresh = Conversation.new()
+    assert fresh._next_sequence == 0
+    s_fresh = fresh.next_turn_session()
+    assert s_fresh.next_sequence() == 0
+
+
+def test_conversation_absorb_turn_is_robust_to_unstamped_session() -> None:
+    """absorb_turn uses ``max(...)`` so an outcome whose Session never
+    emitted (e.g. an early-abort path) doesn't accidentally roll the
+    cursor backwards."""
+    from goldfive.results import ExecutionOutcome
+
+    conv = Conversation.new()
+    # Pretend a prior turn already consumed sequences 0-9.
+    conv._next_sequence = 10
+
+    s = conv.next_turn_session()
+    assert s._next_sequence == 10
+    # An aborted turn never advances its own counter.
+    conv.absorb_turn(ExecutionOutcome(success=False, session=s, reason="abort"))
+    assert conv._next_sequence == 10  # Did not roll backwards.
+
+
+# ---------------------------------------------------------------------------
 # Runner integration
 # ---------------------------------------------------------------------------
 
@@ -216,6 +326,46 @@ async def test_runner_second_turn_session_sees_prior_completed_results() -> None
     for k, v in turn1_results.items():
         assert k in out2.session.completed_results
         assert out2.session.completed_results[k] == v
+
+
+async def test_runner_wire_sequences_unique_under_outer_session_pin() -> None:
+    """End-to-end reproduction of goldfive#271 Gap 2.
+
+    Drives two ``runner.run(...)`` calls with the same ``session_id``
+    pin (mimicking goldfive#161's outer-session pin from
+    :class:`GoldfiveADKAgent`). Asserts every emitted event has a
+    globally-unique ``(session_id, run_id, sequence)`` triple — the
+    exact tuple harmonograf's storage layer uses as its
+    ``goldfive_events`` PK. Prior to the fix turn 2's early events
+    (sequence 0, 1, 2, ...) collided with turn 1 and silently dropped
+    on INSERT OR IGNORE.
+    """
+    sink = InMemorySink()
+    runner = Runner(
+        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
+        planner=StaticPlanner(_linear_plan()),
+        executor=SequentialExecutor(),
+        goal_deriver=PassthroughGoalDeriver("demo"),
+        sinks=[sink],
+    )
+    pinned = "outer-adk-session-deadbeef"
+
+    await runner.run("turn one", session_id=pinned)
+    await runner.run("turn two", session_id=pinned)
+    await runner.close()
+
+    keys = [
+        (evt.session_id, evt.run_id, int(evt.sequence)) for evt in sink.events
+    ]
+    # Every event must have a unique (session_id, run_id, sequence) so
+    # harmonograf's PK never collides.
+    assert len(keys) == len(set(keys)), (
+        f"wire-key collision in sink stream: "
+        f"duplicates={[k for k in keys if keys.count(k) > 1]}"
+    )
+    # And the pin actually held — both turns share the same session_id /
+    # run_id, which is the precondition that creates the collision risk.
+    assert {evt.run_id for evt in sink.events} == {pinned}
 
 
 async def test_runner_session_carries_conversation_id() -> None:
