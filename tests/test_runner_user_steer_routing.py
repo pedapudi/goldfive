@@ -36,6 +36,7 @@ fix.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -687,4 +688,166 @@ async def test_plan_revised_emit_logs_at_info(
     )
     assert any("drift_kind=user_steer" in m for m in emit_lines), (
         f"drift_kind missing from emit log; got: {emit_lines!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. Phase 2.X v2 / Gap 1: stash runs in ``finally`` so CancelledError
+#    (BaseException, not Exception) does not bypass it.
+# ---------------------------------------------------------------------------
+
+
+class _CancellingExecutor:
+    """Test executor: sleeps briefly then raises ``asyncio.CancelledError``.
+
+    Models ADK closing the runner mid-flight — the executor coroutine is
+    cancelled and ``CancelledError`` (a ``BaseException`` since Py 3.8,
+    NOT an ``Exception``) propagates out of ``await self.executor.run(...)``.
+    Pre-fix the ``except Exception`` handler in ``Runner.run`` did NOT catch
+    it and the ``_last_plan`` stash in the post-success path was skipped.
+    """
+
+    async def run(self, **kwargs: Any) -> Any:
+        # Brief sleep so the cancel happens after the runner installed
+        # ``session.plan`` (which is true here because the stamp lives
+        # in ``Runner.run`` itself before the executor handoff — see
+        # ``session.plan = plan`` ~line 568).
+        await asyncio.sleep(0)
+        raise asyncio.CancelledError("simulated ADK closing the runner")
+
+
+class _RaisingExecutor:
+    """Test executor: raises ``ValueError`` immediately.
+
+    Pre-fix this case was already handled by the existing
+    ``except Exception`` block — the stash was nonetheless skipped because
+    that block ``return``-ed before reaching the post-success-path stash.
+    Post-fix the stash lives in ``finally`` and runs in both cases.
+    """
+
+    async def run(self, **kwargs: Any) -> Any:
+        raise ValueError("simulated executor failure")
+
+
+async def test_stash_runs_when_executor_raises_cancellederror() -> None:
+    """Regression for goldfive#271 Gap 1 v2.
+
+    When ADK closes the runner mid-flight the executor coroutine is
+    cancelled and ``CancelledError`` (``BaseException``, not
+    ``Exception``) propagates. The stash MUST run in ``finally`` so the
+    next turn's planner-gate sees the prior plan.
+
+    Validation v2 evidence: zero ``stashed prior plan`` log lines across
+    4 turns; ``GoldfiveADKAgent: gate skipped — no prior plan`` 4 times.
+    """
+    turn1_plan = json.dumps(
+        {
+            "id": "plan-cancel",
+            "summary": "plan that gets cancelled mid-flight",
+            "tasks": [
+                {"id": "t1", "title": "T1", "assignee_agent_id": "writer"},
+            ],
+        }
+    )
+    planner = LLMPlanner(
+        call_llm=_planner_call_llm_factory(
+            turn1_plan=turn1_plan,
+            turn2_verdict="new_work",
+            refined_plan=None,
+        ),
+        model="stub",
+    )
+    runner = Runner(
+        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
+        planner=planner,
+        executor=_CancellingExecutor(),
+        goal_deriver=PassthroughGoalDeriver("demo"),
+        sinks=[InMemorySink()],
+    )
+
+    cancelled_propagated = False
+    try:
+        await runner.run("first turn")
+    except BaseException:  # noqa: BLE001 — verifying CancelledError (BaseException) propagates
+        cancelled_propagated = True
+    finally:
+        # close() must run before assertions so the planner's call_llm
+        # and sinks are cleaned up regardless of the propagated error.
+        await runner.close()
+
+    assert cancelled_propagated, (
+        "CancelledError must propagate out of runner.run — the finally "
+        "block stashes the plan but does NOT swallow the exception."
+    )
+
+    # The fix: the plan is stashed via the finally block even though
+    # CancelledError bypassed the ``except Exception`` handler.
+    assert runner._last_plan is not None, (
+        "Gap 1 v2: the runner MUST stash session.plan in finally so "
+        "CancelledError (BaseException) does not skip the stash. Pre-fix "
+        "_last_plan was None here because control flowed out of run() "
+        "via CancelledError without reaching the post-success-path stash."
+    )
+    # Plan id is stable; the LLMPlanner mints its own uuid so we just
+    # assert it is non-empty.
+    assert runner._last_plan.id, (
+        "stashed plan must carry a non-empty id"
+    )
+
+
+async def test_stash_runs_when_executor_raises_exception() -> None:
+    """Companion regression for the existing ``Exception`` path.
+
+    Pre-fix the ``except Exception`` block ``return``-ed before reaching
+    the post-success-path stash, so ``_last_plan`` was also None after
+    a planner-bind error or any executor-raised ``Exception``. Post-fix
+    the stash in ``finally`` runs in both the ``Exception`` and
+    ``BaseException`` paths.
+    """
+    turn1_plan = json.dumps(
+        {
+            "id": "plan-raise",
+            "summary": "plan that raises during execution",
+            "tasks": [
+                {"id": "t1", "title": "T1", "assignee_agent_id": "writer"},
+            ],
+        }
+    )
+    planner = LLMPlanner(
+        call_llm=_planner_call_llm_factory(
+            turn1_plan=turn1_plan,
+            turn2_verdict="new_work",
+            refined_plan=None,
+        ),
+        model="stub",
+    )
+    runner = Runner(
+        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
+        planner=planner,
+        executor=_RaisingExecutor(),
+        goal_deriver=PassthroughGoalDeriver("demo"),
+        sinks=[InMemorySink()],
+    )
+
+    # The ``except Exception`` handler catches ValueError and returns an
+    # aborted ExecutionOutcome — so this does NOT raise.
+    outcome = await runner.run("first turn")
+    await runner.close()
+
+    assert not outcome.success
+    assert "executor.run raised" in outcome.reason
+    assert "simulated executor failure" in outcome.reason
+
+    # The fix: the plan is stashed via the finally block on the
+    # Exception path too. Pre-fix the ``except Exception`` block
+    # ``return``-ed before the post-success-path stash, so _last_plan
+    # was None even on this path.
+    assert runner._last_plan is not None, (
+        "Gap 1 v2: the runner MUST stash session.plan in finally on the "
+        "Exception path too. The original ``except Exception`` block "
+        "``return``-ed before reaching the post-success-path stash, so "
+        "the prior plan was lost on every executor failure."
+    )
+    assert runner._last_plan.id, (
+        "stashed plan must carry a non-empty id"
     )
