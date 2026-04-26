@@ -50,13 +50,11 @@ from goldfive import (
     SequentialExecutor,
     Session,
     Task,
-    TaskEdge,
 )
 from goldfive import orchestration_state as _ostate
 from goldfive.control import ControlKind, ControlMessage
 from goldfive.steerer import DefaultSteerer
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
