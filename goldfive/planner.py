@@ -3042,17 +3042,105 @@ When you produce a plan:
     the artefact entirely (e.g. "forget the slides, just give me
     bullet points" — different artefact).
   * KEEP terminal tasks (COMPLETED / FAILED / CANCELLED / NOT_NEEDED)
-    verbatim — same id, same status — so they survive the revision.
-    Add new tasks for the delta work; reuse ids for tasks that
-    represent the same work.
+    verbatim — same id, same status — in the ``tasks`` array of the
+    revision. The validator REJECTS any revision that drops a terminal
+    task or regresses its status (e.g. COMPLETED → PENDING). Add new
+    tasks for the delta work; reuse ids for tasks that represent the
+    same work. New PENDING tasks may chain off a COMPLETED predecessor
+    (the natural "done stage feeds into next stage" shape) but must
+    NEVER chain off a CANCELLED, FAILED, or NOT_NEEDED predecessor —
+    such edges are rejected because the downstream task can never
+    become eligible.
   * MERGE persistent qualifications from prior_goals into the new
-    plan (numeric caps like "no more than 2 slides", format
-    requirements like "in markdown", output type like "presentation"
-    / "report", scope qualifiers like "for a non-technical audience").
-    The topic / subject changes; the structural frame carries forward.
-    Drop a qualification ONLY when the user explicitly removes it
-    ("forget the slide-count cap", "no longer needs to be a
-    presentation").
+    plan AND into the ``summary`` string (numeric caps like "no more
+    than 2 slides", format requirements like "in markdown", output
+    type like "presentation" / "report", scope qualifiers like "for a
+    non-technical audience"). The topic / subject changes; the
+    structural frame carries forward. Drop a qualification ONLY when
+    the user explicitly removes it ("forget the slide-count cap", "no
+    longer needs to be a presentation").
+
+    QUALIFICATION-PRESERVATION EXAMPLE (failing case to avoid):
+      prior_goals: "Create a presentation about solar panels with no
+                    more than 2 slides."
+      new message: "Forget solar panels, tell me about solar flares
+                    instead."
+      WRONG plan.summary: "Research solar flares and create
+                           presentation on solar flares."
+        ↑ drops the "2 slides" qualification — REJECT this shape.
+      RIGHT plan.summary: "Create a 2-slide presentation about solar
+                           flares."
+        ↑ subject pivots (panels → flares); the "2-slide" cap and the
+        "presentation" output type carry forward verbatim.
+
+WORKED EXAMPLES OF VALID REVISIONS:
+
+Example A — additive constraint on a partially-executed plan.
+The validator REJECTS revisions that drop terminal tasks. Echo
+COMPLETED tasks back in ``tasks`` with the SAME id and SAME status:
+
+  PRIOR PLAN (id=p1, revision_index=2):
+    - [research_solar / COMPLETED]   Research solar panels
+    - [draft_slides  / RUNNING]      Draft the slides
+    - [review        / PENDING]      Review presentation
+  NEW MESSAGE: "Make sure the answer fits in just 2 slides."
+  VALID revision (same id, terminal task preserved verbatim,
+  delta is the new constraint encoded into existing PENDING titles
+  and a fresh enforcement task):
+    {
+      "id": "p1",
+      "summary": "Draft and review a 2-slide presentation about solar panels.",
+      "tasks": [
+        {"id": "research_solar", "title": "Research solar panels",
+         "assignee_agent_id": "research_agent", "status": "COMPLETED"},
+        {"id": "draft_slides",   "title": "Draft EXACTLY 2 slides",
+         "assignee_agent_id": "presentation_agent", "status": "PENDING"},
+        {"id": "review",         "title": "Review the 2-slide presentation",
+         "assignee_agent_id": "reviewer_agent", "status": "PENDING"}
+      ],
+      "edges": [
+        {"from_task_id": "research_solar", "to_task_id": "draft_slides"},
+        {"from_task_id": "draft_slides",   "to_task_id": "review"}
+      ]
+    }
+
+Example B — topic shift on a partially-executed plan.
+The same id is reused (still iterating on the same artefact). The
+COMPLETED task is preserved verbatim — it stays in ``tasks`` even
+though its subject is now stale, because the validator forbids
+dropping it. The new PENDING work for the new subject forms its own
+sub-DAG (no edge from the now-stale COMPLETED task into the new
+PENDING root, since that would imply the new work depends on stale
+output):
+
+  PRIOR PLAN (id=p1, revision_index=1):
+    - [research_solar / COMPLETED]   Research solar panels
+    - [draft_slides  / PENDING]      Draft 2 slides on solar panels
+    - [review        / PENDING]      Review presentation
+  PRIOR GOAL: "Create a 2-slide presentation about solar panels."
+  NEW MESSAGE: "Forget solar panels, tell me about solar flares
+                instead."
+  VALID revision (qualifications "2-slide" + "presentation" carry
+  forward; COMPLETED task preserved; new PENDING tasks form an
+  independent sub-DAG):
+    {
+      "id": "p1",
+      "summary": "Create a 2-slide presentation about solar flares.",
+      "tasks": [
+        {"id": "research_solar",   "title": "Research solar panels",
+         "assignee_agent_id": "research_agent", "status": "COMPLETED"},
+        {"id": "research_flares",  "title": "Research solar flares",
+         "assignee_agent_id": "research_agent", "status": "PENDING"},
+        {"id": "draft_flares",     "title": "Draft 2-slide presentation about solar flares",
+         "assignee_agent_id": "presentation_agent", "status": "PENDING"},
+        {"id": "review_flares",    "title": "Review the 2-slide solar flares presentation",
+         "assignee_agent_id": "reviewer_agent", "status": "PENDING"}
+      ],
+      "edges": [
+        {"from_task_id": "research_flares", "to_task_id": "draft_flares"},
+        {"from_task_id": "draft_flares",    "to_task_id": "review_flares"}
+      ]
+    }
 
 WHEN TO RETURN NULL (plan is null):
 
