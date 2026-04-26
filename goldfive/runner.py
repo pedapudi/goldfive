@@ -675,43 +675,43 @@ class Runner:
                 aborted, user_input_summary=_initial_goal_summary(user_input)
             )
             return aborted
+        finally:
+            # planner-gate: snapshot the turn's final plan so the next
+            # turn's planner_gate can classify against it.
+            #
+            # Rationale (Phase 2.X v2 / goldfive#271 Gap 1): the prior
+            # post-success-path stash (PR #282) was bypassed when ADK
+            # closed the runner mid-flight — the executor coroutine was
+            # cancelled, ``CancelledError`` propagated out of
+            # ``await self.executor.run(...)``, and since Py 3.8
+            # ``CancelledError`` is a ``BaseException`` (not an
+            # ``Exception``) the ``except Exception`` handler above did
+            # NOT catch it. Control flowed out of ``run`` entirely and
+            # the stash was skipped, leaving ``_last_plan = None`` for
+            # the next turn even though the turn produced a real plan.
+            # The ADK-web user-steer flow hit this on validation v2:
+            # zero "stashed prior plan" log lines across 4 turns and
+            # "GoldfiveADKAgent: gate skipped — no prior plan" 4 times.
+            #
+            # Putting the stash in ``finally`` runs it regardless of how
+            # the executor exited — normal success, ``Exception`` (e.g.
+            # planner bind error), or ``BaseException`` (e.g.
+            # ``CancelledError`` from ADK closing the runner mid-stream).
+            # The exception still propagates after the stash; this block
+            # does not swallow it.
+            if session.plan is not None:
+                self._last_plan = session.plan
+                log.info(
+                    "Runner.run: stashed prior plan for next turn's gate "
+                    "(plan_id=%s)",
+                    (session.plan.id or "")[:16] or "<none>",
+                )
 
         # goldfive#152: clear the current_task_* stamp at run end.
         # The plan id + goals summary stay (they remain meaningful
         # cross-turn on the owning Conversation).
         _ostate.clear_current_task(session.state)
         _ostate.clear_active_steer(session.state)
-
-        # planner-gate: snapshot the turn's final plan so the next
-        # turn's planner_gate can classify against it.
-        #
-        # Rationale (Phase 2.X / goldfive#271 Gap 1): the previous
-        # ``outcome.success and ...`` guard discarded the prior plan on
-        # ANY abort — including goldfive-driven CRITICAL drift cancels.
-        # That left ``_last_plan = None`` for the next turn even when
-        # the turn produced a real plan and partially executed it.
-        # The ADK-web user-steer flow hit this on the validation E2E:
-        # turn 1 was cancelled by a CRITICAL goal-drift, turn 2's user
-        # steer arrived next, and the gate found ``_last_plan = None``
-        # so it short-circuited to ``new_work`` — silently skipping the
-        # steerer's USER_STEER pipeline (no DriftDetected(USER_STEER),
-        # no PlanRevised, no sticky-goal preservation).
-        #
-        # Stash any non-None ``session.plan`` (whether the turn
-        # succeeded, was cancelled, or aborted on a planner-bind error)
-        # so the next turn's gate can refine against it. The plan id
-        # remains a stable refine target; the steerer's
-        # ``_apply_revision`` resolves the new revision off
-        # ``prev_plan.revision_index + 1`` and the planner's refine
-        # call carries the prior plan's tasks forward verbatim.
-        if session.plan is not None:
-            self._last_plan = session.plan
-            log.info(
-                "Runner.run: stashed prior plan for next turn's gate "
-                "(plan_id=%s success=%s)",
-                (session.plan.id or "")[:16] or "<none>",
-                outcome.success,
-            )
 
         self._conversation.absorb_turn(
             outcome, user_input_summary=_initial_goal_summary(user_input)
