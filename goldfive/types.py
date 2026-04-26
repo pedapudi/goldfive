@@ -862,9 +862,7 @@ class Session:
     # string keyed on ``current_task_id or ""``; every unpinned turn
     # from every agent collapsed onto the ``""`` bucket and legitimate
     # first-block judge firings were skipped.
-    _reasoning_judge_counters: dict[tuple[str, str], int] = dataclasses.field(
-        default_factory=dict
-    )
+    _reasoning_judge_counters: dict[tuple[str, str], int] = dataclasses.field(default_factory=dict)
     # Set to ``True`` by :class:`DefaultSteerer` when it escalates a
     # drift to Level 4 of the intervention ladder (goldfive#142).
     # Executors honour this flag the same way they honour a PAUSE
@@ -916,6 +914,50 @@ class Session:
         s = self._next_sequence
         self._next_sequence = s + 1
         return s
+
+    def next_sequence_and_event_id(self) -> tuple[int, str]:
+        """Atomic pair: increment sequence, mint matching event_id.
+
+        Convenience wrapper around :meth:`next_sequence` +
+        :meth:`next_event_id`. Producer migration in goldfive#271 Phase 3
+        Addition B threads ``(sequence, event_id)`` together at every
+        emit site so the proto envelope's ``Event.sequence`` and
+        ``Event.event_id`` fields agree without the caller stashing a
+        local ``seq`` variable. Use this from new emit sites; older sites
+        that already call ``next_sequence()`` separately may pass the
+        captured int into :meth:`next_event_id` without re-incrementing.
+        """
+        seq = self.next_sequence()
+        return seq, self.next_event_id(seq)
+
+    def next_event_id(self, sequence: int | None = None) -> str:
+        """Return a globally-unique event id for the next emitted event.
+
+        Format: ``{run_id}:{sequence}:{uuid4_short}`` where ``uuid4_short``
+        is the first 8 hex characters of a fresh UUID4. The
+        ``(run_id, sequence)`` prefix preserves chronological sortability
+        and per-run debuggability; the uuid4 suffix guarantees PK
+        uniqueness even when an outer system collapses multiple Sessions
+        onto the same outer-session id (harmonograf#61's outer-session
+        pin: two turns share the outer ``session_id`` and each turn
+        restarts ``_next_sequence`` at 0, so the per-turn
+        ``(session_id, run_id, sequence)`` triple is no longer unique).
+
+        ``sequence`` (optional) lets a caller mint an event id around a
+        sequence value it has already pulled — the typical producer
+        pattern is ``seq = session.next_sequence(); evt_id =
+        session.next_event_id(seq)`` so both the ``Event.sequence`` and
+        ``Event.event_id`` proto fields can be set without
+        double-incrementing the counter. When ``sequence`` is ``None``
+        the call advances the counter itself for the convenience of
+        callers that don't otherwise need the int.
+
+        See goldfive#271 Phase 3 Addition B for the full rationale.
+        """
+        if sequence is None:
+            sequence = self.next_sequence()
+        suffix = uuid.uuid4().hex[:8]
+        return f"{self.run_id}:{sequence}:{suffix}"
 
     @property
     def id(self) -> str:
