@@ -903,7 +903,13 @@ class Session:
     # call ids so prompt templates / refine paths / downstream planners
     # can read a single, framework-agnostic source of truth.
     state: dict[str, Any] = dataclasses.field(default_factory=dict)
-    # monotonic event sequence counter for sinks
+    # Monotonic event sequence counter for sinks. When this Session was
+    # built by :meth:`Conversation.next_turn_session`, the seed value is
+    # the Conversation's running cursor (lifted from the previous turn's
+    # high-water mark on :meth:`Conversation.absorb_turn`) — see
+    # goldfive#271 Gap 2. Bare ``Session(run_id=...)`` constructions
+    # remain at 0 so single-Session callers (tests, programmatic use)
+    # see no behaviour change.
     _next_sequence: int = 0
 
     def next_sequence(self) -> int:
