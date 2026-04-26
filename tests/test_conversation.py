@@ -75,8 +75,18 @@ async def _happy_agent(
 def _kinds(events: list[Any]) -> list[str]:
     out: list[str] = []
     for e in events:
-        name = e.WhichOneof("payload") or ""
-        out.append("".join(part.capitalize() for part in name.split("_")) if name else "")
+        if isinstance(e, dict):
+            out.append(e.get("kind") or "")
+            continue
+        if hasattr(e, "WhichOneof"):
+            name = e.WhichOneof("payload") or ""
+            out.append(
+                "".join(part.capitalize() for part in name.split("_"))
+                if name
+                else ""
+            )
+        else:
+            out.append(getattr(e, "kind", ""))
     return out
 
 
@@ -354,8 +364,11 @@ async def test_runner_wire_sequences_unique_under_outer_session_pin() -> None:
     await runner.run("turn two", session_id=pinned)
     await runner.close()
 
+    # Filter out non-proto sidecar events (e.g. plan_revised correlation
+    # dicts emitted by the steerer's _emit_plan_revised_correlation).
+    proto_events = [evt for evt in sink.events if hasattr(evt, "session_id")]
     keys = [
-        (evt.session_id, evt.run_id, int(evt.sequence)) for evt in sink.events
+        (evt.session_id, evt.run_id, int(evt.sequence)) for evt in proto_events
     ]
     # Every event must have a unique (session_id, run_id, sequence) so
     # harmonograf's PK never collides.
@@ -365,7 +378,7 @@ async def test_runner_wire_sequences_unique_under_outer_session_pin() -> None:
     )
     # And the pin actually held — both turns share the same session_id /
     # run_id, which is the precondition that creates the collision risk.
-    assert {evt.run_id for evt in sink.events} == {pinned}
+    assert {evt.run_id for evt in proto_events} == {pinned}
 
 
 async def test_runner_session_carries_conversation_id() -> None:

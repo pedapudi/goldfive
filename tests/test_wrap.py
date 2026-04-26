@@ -107,18 +107,22 @@ async def test_wrap_callable_runs_to_completion(stub_call_llm: Any) -> None:
         [
             # LLMGoalDeriver response.
             {"goals": [{"id": "g1", "summary": "say hello"}]},
-            # LLMPlanner response — one task routed to the default agent.
+            # Phase 4 (goldfive#271): LLMPlanner.handle_turn response —
+            # the per-turn decision LLM produces the plan in one shot.
             {
-                "summary": "one-task plan",
-                "tasks": [
-                    {
-                        "id": "t1",
-                        "title": "say hello",
-                        "description": "Say hello to the user",
-                        "assignee_agent_id": "default",
-                    }
-                ],
-                "edges": [],
+                "reasoning": "first turn — initial plan",
+                "plan": {
+                    "summary": "one-task plan",
+                    "tasks": [
+                        {
+                            "id": "t1",
+                            "title": "say hello",
+                            "description": "Say hello to the user",
+                            "assignee_agent_id": "default",
+                        }
+                    ],
+                    "edges": [],
+                },
             },
         ]
     )

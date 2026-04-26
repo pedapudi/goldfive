@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from goldfive.conversation import TurnRecord
     from goldfive.reporting import ReportingToolSpec
     from goldfive.results import ExecutionOutcome, InvocationResult
     from goldfive.types import (
@@ -31,7 +32,16 @@ class GoalDeriver(Protocol):
 
 @runtime_checkable
 class Planner(Protocol):
-    """Generates and refines ``Plan`` instances from goals and drift events."""
+    """Generates and refines ``Plan`` instances from goals and drift events.
+
+    The optional :meth:`handle_turn` is the goldfive#271 Phase 4
+    consolidated entrypoint: a single planner LLM call decides whether
+    the new user_input requires a plan change at all, and — when one
+    is warranted — produces the next plan in the same response. The
+    Runner prefers it over the legacy ``generate`` / ``refine`` pair on
+    every turn after the first; legacy planners that don't implement
+    it fall back to the unconditional ``generate`` path.
+    """
 
     async def generate(
         self,
@@ -49,6 +59,28 @@ class Planner(Protocol):
         goals: list[Goal],
         observed_actions: list[ObservedAction] | None = None,
         available_agents: list[str] | list[dict[str, Any]] | None = None,
+    ) -> Plan | None: ...
+
+    # Optional — checked via ``hasattr(planner, "handle_turn")``. Legacy
+    # planners (PassthroughPlanner, third-party stubs that predate #271)
+    # may omit it; the Runner falls through to ``generate`` for them.
+    #
+    # Returns ``None`` when the user_input is purely conversational and
+    # the current revision still describes the right work. Returns the
+    # next :class:`Plan` revision when a plan change is warranted; the
+    # Runner installs it as a revision of ``session.plan``
+    # (revision_index += 1) via the unified install path. The Runner
+    # guarantees ``session.plan`` is non-None on every turn (it seeds
+    # :meth:`Plan.empty` on the first turn so the planner produces
+    # revision 1 against an empty prior).
+    async def handle_turn(
+        self,
+        *,
+        user_input: str,
+        session: Session,
+        conversation_history: list[TurnRecord],
+        available_agents: list[str] | list[dict[str, Any]] | None = None,
+        context: Mapping[str, Any] | None = None,
     ) -> Plan | None: ...
 
 

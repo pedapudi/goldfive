@@ -50,16 +50,10 @@ from goldfive.events import (
     conversation_started_event,
     emit,
     goal_derived_event,
-    plan_submitted_event,
     run_aborted_event,
     run_started_event,
 )
 from goldfive.goal_deriver import PassthroughGoalDeriver
-from goldfive.planner_gate import (
-    TurnClassification,
-    classify_turn,
-    heuristic_classify_turn,
-)
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS
 from goldfive.results import ExecutionOutcome
 from goldfive.steerer import DefaultSteerer
@@ -132,32 +126,23 @@ class Runner:
         Has no effect when the steerer was never configured with a
         ``goal_drift_call_llm`` (the feature is already inert).
     planner_gate:
-        Turn-aware planning gate. On every turn after the first the
-        Runner consults the gate to decide whether to run full
-        ``GoalDeriver.derive`` + ``Planner.generate`` (``"new_work"``),
-        skip planning and let the coordinator answer from context
-        (``"conversational"``), or call ``Planner.refine`` against the
-        prior plan with the new user input as a synthesized steer
-        (``"refine_existing"``). Accepts:
+        Per-turn planning behaviour. Goldfive#271 Phase 4 collapsed
+        the prior gate-then-refine pipeline into the planner's own
+        :meth:`Planner.handle_turn` method, so the gate is no longer
+        a separate layer. This kwarg is retained as a feature switch:
 
-        * A sentinel string ``"auto"`` (default) — use the LLM-backed
-          :func:`goldfive.planner_gate.classify_turn` when a
-          ``call_llm`` is available on the planner, falling through
-          to the deterministic heuristic otherwise. This is the
-          recommended production setting.
-        * ``None`` — disable the gate entirely. Every turn runs full
-          re-planning as in pre-planner-gate behaviour. Useful for
-          deterministic replay and pure-unit tests.
-        * Any async callable with the
-          :func:`~goldfive.planner_gate.classify_turn` signature
-          (``(*, prior_plan, completed_results, user_input,
-          conversation_id) -> str``) — drop-in replacement for the
-          default gate. Must return one of ``"new_work" |
-          "conversational" | "refine_existing"``.
+        * ``"auto"`` (default) — call ``planner.handle_turn`` on
+          every turn. The planner LLM either produces the next plan
+          (warrants change) or returns ``None`` (purely conversational
+          — the Runner reuses ``session.plan`` unchanged). The
+          "classification" is emergent: did the LLM produce a plan
+          or not. Recommended production setting.
+        * ``None`` — disable handle_turn entirely; every turn falls
+          through to ``Planner.generate`` (pre-#271 behaviour, useful
+          for deterministic replay).
 
-        The gate is always skipped on the first turn of a
-        Conversation (no prior plan to preserve); every first turn
-        runs the full goal-derive + plan-generate path.
+        Skipped when ``user_input`` is already a ``list[Goal]`` (the
+        caller has opted out of natural-language derivation).
     """
 
     def __init__(
@@ -235,12 +220,13 @@ class Runner:
         # be monotonic within a run_id, so the terminal marker needs the
         # session that produced the run's other events).
         self._last_session: Session | None = None
-        # Turn-aware planning gate (planner-gate). ``"auto"`` picks the
-        # LLM-backed gate when ``self.planner._call_llm`` exists and
-        # falls back to the pure heuristic otherwise. ``None`` disables
-        # the gate entirely (every turn re-plans). Any other value must
-        # be an async callable implementing the
-        # :func:`goldfive.planner_gate.classify_turn` signature.
+        # Turn-aware planning gate. Goldfive#271 Phase 4: the gate is
+        # now ``planner.handle_turn`` (a single LLM call that classifies
+        # AND produces the merged plan). ``"auto"`` (default) calls it
+        # on every turn after the first when the planner exposes the
+        # method; ``None`` disables it entirely so every turn re-plans
+        # via ``Planner.generate`` (pre-#271 behaviour, useful for
+        # deterministic replay).
         self._planner_gate: Any = planner_gate
         # Held across turns so the ``conversational`` path can carry
         # the prior plan forward onto the freshly minted session
@@ -296,79 +282,17 @@ class Runner:
         # 3. Emit RunStarted before anything else for this turn.
         await self._emit_run_started(session, user_input)
 
-        # 3a. Turn-aware planning gate (planner-gate).
-        # Before running goal-derivation + planning for this turn,
-        # ask the classifier whether the new user_input warrants new
-        # work or can be satisfied by the prior plan / conversation
-        # history. First-turn callers (no prior plan) always run full
-        # planning. When ``user_input`` is already a ``list[Goal]``
-        # the caller has opted out of natural-language derivation, so
-        # we also skip the gate.
-        #
-        # Pre-classified verdict short-circuit (goldfive#270 follow-up):
-        # :class:`~goldfive.adapters.adk_wrap.GoldfiveADKAgent` runs the
-        # gate at the adapter boundary (the goldfive code closest to
-        # ADK-web's user-message arrival point) and threads its verdict
-        # into ``context["_adk_pre_classified_verdict"]``. When that key
-        # is present we honour it directly, skipping
-        # :meth:`_classify_turn` entirely so the LLM gate fires once
-        # per turn at most. Non-ADK callers (programmatic, callable
-        # adapter, Claude SDK) supply no such key and run the gate
-        # in-line as before.
-        verdict: TurnClassification = "new_work"
-        pre_verdict = (
-            (context or {}).get("_adk_pre_classified_verdict")
-            if isinstance(context, Mapping)
-            else None
-        )
-        if pre_verdict in ("new_work", "conversational", "refine_existing"):
-            verdict = pre_verdict  # type: ignore[assignment]
-            log.info(
-                "Runner.run: gate verdict=%s (source=adapter-prepass) "
-                "prior_plan_id=%s",
-                verdict,
-                (getattr(self._last_plan, "id", "") or "")[:16] or "<none>",
-            )
-        elif self._last_plan is not None and isinstance(user_input, str):
-            try:
-                verdict = await self._classify_turn(
-                    prior_plan=self._last_plan,
-                    completed_results=session.completed_results,
-                    user_input=user_input,
-                    session=session,
-                )
-            except Exception as exc:  # noqa: BLE001
-                # A misbehaving gate must never hang the Runner; degrade
-                # to full re-planning — the pre-#169 behaviour — so we
-                # always make forward progress.
-                log.warning("planner_gate raised; falling back to new_work: %s", exc)
-                verdict = "new_work"
-            else:
-                log.info(
-                    "Runner.run: gate verdict=%s (source=runner-inline) "
-                    "prior_plan_id=%s user_input_first=%r",
-                    verdict,
-                    (getattr(self._last_plan, "id", "") or "")[:16] or "<none>",
-                    user_input[:80] if isinstance(user_input, str) else "",
-                )
+        # 3a. Seed session.plan with the prior plan (or Plan.empty()
+        # on the very first turn) so :meth:`Planner.handle_turn` always
+        # sees a non-None ``session.plan``. The Runner has a single
+        # install path post-Phase-4: every plan landed by the planner
+        # becomes the next revision of this seed (revision_index += 1).
+        if self._last_plan is not None:
+            self._last_plan.run_id = session.run_id
+            session.plan = self._last_plan
         else:
-            log.info(
-                "Runner.run: gate skipped (no prior plan or non-str input); "
-                "treating as new_work"
-            )
-
-        # Conversational follow-up: skip goal derivation + planning.
-        # Carry the prior plan forward onto the freshly minted Session
-        # so the executor has something to drive; do not emit
-        # GoalDerived or PlanSubmitted for this turn — the executor
-        # will still close the turn with RunCompleted / RunAborted.
-        if verdict == "conversational":
-            outcome = await self._run_conversational_turn(
-                session=session,
-                user_input=user_input,
-                context=context,
-            )
-            return outcome
+            session.plan = Plan.empty(run_id=session.run_id)
+        _ostate.set_current_plan(session.state, session.plan)
 
         # 4. Derive (or accept) goals for this turn. Cross-turn state
         #    lives on ``session.goals`` already (seeded by the
@@ -395,149 +319,98 @@ class Runner:
                 existing_ids.add(g.id)
 
         # goldfive#152: refresh the orchestration-state goals summary
-        # so prompt templates / refine paths / downstream planners
-        # see an up-to-date ``goldfive.goals_summary``.
+        # so prompt templates / handle_turn / downstream planners see
+        # an up-to-date ``goldfive.goals_summary``.
         _ostate.refresh_goals_summary(session.state, session.goals)
 
         await self._emit_goal_derived(session)
 
-        # Build the context passed to the planner. Stamp run_id (so LLM
-        # planners can include it in the plan envelope), max
-        # reinvocations, and cross-turn context from the Conversation.
-        # Caller-supplied context wins on key collisions.
-        planner_context: dict[str, Any] = {
-            "run_id": session.run_id,
-            "max_task_invocations": self.max_task_invocations,
-        }
-        planner_context.update(self._conversation.prior_turn_context())
-        if context:
-            planner_context.update(context)
-        planner_context["run_id"] = session.run_id
-
-        # 4. Generate (or refine) the plan.
-        # Prefer the richer tree shape (goldfive#151) when the adapter
-        # exposes it so the planner can constrain assignee_agent_id to
-        # real tree names and render the tree in its prompt. Adapters
-        # that don't implement the property fall through to the legacy
-        # flat list — keeps back-compat with custom adapters.
-        available_agents: Any
-        tree = getattr(self.agent, "available_agents_tree", None)
-        if isinstance(tree, list) and tree:
-            available_agents = list(tree)
-        else:
-            available_agents = list(self.agent.available_agents)
-        plan: Plan | None = None
-        # Set when the refine_existing branch routed through the steerer
-        # and successfully installed a revised plan via _apply_revision.
-        # PlanRevised was already emitted there, so the post-planning
-        # code skips _emit_plan_submitted for this turn.
-        revised_via_steerer = False
-        if verdict == "refine_existing" and self._last_plan is not None:
-            # Refine path: route the new user_input through the
-            # steerer's drift-handling pipeline as a synthetic
-            # USER_STEER drift. The steerer's pipeline is the only
-            # site that emits DriftDetected(USER_STEER), preserves
-            # sticky goals via _apply_user_steer_state, drives the
-            # severity ladder, and emits PlanRevised (with the #264
-            # atomicity barrier, RefineAttempted/Failed, the #263
-            # supersedes-coverage validator, and a stable plan_id +
-            # bumped revision_index from _apply_revision). The
-            # pre-#210 fix-bypass path (calling planner.refine
-            # directly + emitting PlanSubmitted on the result) is
-            # gone: it dropped DriftDetected, fresh-minted the
-            # plan_id, reset revision_index, and silently bypassed
-            # every typed observability hook from #258-#267.
-            #
-            # On any refine failure inside the steerer (planner.refine
-            # raised, returned None, or validation rejected the
-            # output), session.plan stays equal to the carried-prior;
-            # we detect that below and fall through to planner.generate.
-            user_text = user_input.strip() if isinstance(user_input, str) else ""
-            if user_text:
-                # Carry the prior plan onto the live session so the
-                # steerer's _apply_revision can compute revision_index
-                # from prev_plan.revision_index + 1 and so a refine
-                # failure leaves the session in a recoverable state.
-                # Mutate run_id so any sink emissions correlate with
-                # this turn (mirrors the conversational path).
-                prior_plan = self._last_plan
-                prior_plan.run_id = session.run_id
-                session.plan = prior_plan
-                _ostate.set_current_plan(session.state, prior_plan)
-                # Bind the steerer early so _handle_drift has sinks +
-                # planner. bind() is idempotent — step 6 below re-binds
-                # with the same args, harmless. bind_adapter() is also
-                # safe to call early; the adapter wiring (step 6b)
-                # re-runs after this. We deliberately do NOT run the
-                # adapter-side bind_steerer here — that hook is also
-                # idempotent at step 6b but we want the steerer-only
-                # plumbing to surface refine emissions, not adapter
-                # plugin callbacks.
-                try:
-                    self.steerer.bind(sinks=list(self.sinks), planner=self.planner)
-                    bind_steerer_adapter = getattr(self.steerer, "bind_adapter", None)
-                    if callable(bind_steerer_adapter):
-                        try:
-                            bind_steerer_adapter(self.agent)
-                        except Exception as exc:  # noqa: BLE001
-                            log.debug(
-                                "steerer.bind_adapter raised on refine_existing path: %s",
-                                exc,
-                            )
-                except Exception as exc:  # noqa: BLE001
-                    # If the bind itself fails, fall through to full
-                    # generate() — the safe path always ships a plan.
-                    log.warning(
-                        "steerer.bind raised on refine_existing path; "
-                        "falling back to generate: %s",
-                        exc,
-                    )
-                else:
-                    # WARNING matches the severity the steerer
-                    # synthesizes for a USER_STEER drift coerced from a
-                    # ControlMessage (see _drift_from_steer_event).
-                    # USER_STEER bypasses the severity gate in
-                    # _should_request_cancel_for_drift anyway — an
-                    # operator directive always honours the cancel +
-                    # refine path.
-                    drift = DriftEvent(
-                        kind=DriftKind.USER_STEER,
-                        severity=DriftSeverity.WARNING,
-                        detail=user_text,
-                    )
-                    log.info(
-                        "Runner.run: routing refine_existing through steerer "
-                        "USER_STEER pipeline (prior_plan_id=%s)",
-                        (prior_plan.id or "")[:16] or "<none>",
-                    )
-                    try:
-                        await self.steerer._handle_drift(drift, session)
-                    except Exception as exc:  # noqa: BLE001
-                        # Steerer failures must not break the run.
-                        # Reset session.plan so the fall-through to
-                        # generate() below treats this as no-plan.
-                        log.warning(
-                            "steerer._handle_drift raised on refine_existing path; "
-                            "falling back to generate: %s",
-                            exc,
-                        )
-                        session.plan = None
-                    else:
-                        # _apply_revision installs the revised plan
-                        # in-place when refine succeeded — picked up
-                        # via session.plan. If the steerer left
-                        # session.plan unchanged (refine returned
-                        # None / raised / validation rejected the
-                        # revision) it is still the prior plan; reset
-                        # it so the fall-through to generate() runs.
-                        if session.plan is prior_plan:
-                            session.plan = None
-                        else:
-                            plan = session.plan
-                            revised_via_steerer = True
-        if plan is None:
+        # 4a. Per-turn planner decision (goldfive#271 Phase 4).
+        # ``handle_turn`` is a single LLM call that decides whether
+        # the new user_input warrants a plan change and, when it
+        # does, produces the next revision of session.plan in one
+        # shot. Replaces the prior multi-stage pipeline (regex
+        # short-circuits + LLM gate + synthesize_goal_from_steer +
+        # qualification-merge regex + planner.refine). All plan
+        # changes are revisions: the conversation's plan_id is
+        # stable, revision_index increments monotonically.
+        #
+        # Returns ``None`` when the user_input is purely
+        # conversational and the current revision still describes
+        # the right work — the Runner reuses ``session.plan`` for
+        # this turn (driving the executor over the existing plan).
+        #
+        # Returns the next ``Plan`` revision when a change is
+        # warranted — the Runner installs it via the unified
+        # ``_install_revision`` path so PlanRevised fires uniformly.
+        #
+        # Skipped when ``user_input`` is already a ``list[Goal]``
+        # (caller has opted out of NL derivation), when
+        # ``planner_gate=None`` (deterministic replay mode), and
+        # when the planner doesn't implement ``handle_turn`` (legacy
+        # PassthroughPlanner / third-party stubs — Runner falls
+        # through to ``planner.generate`` once for back-compat).
+        next_plan: Plan | None = None
+        decided = False
+        if (
+            self._planner_gate is not None
+            and isinstance(user_input, str)
+            and hasattr(self.planner, "handle_turn")
+        ):
             try:
-                plan = await self.planner.generate(
+                next_plan = await self._invoke_handle_turn(
+                    user_input=user_input,
+                    session=session,
+                    context=context,
+                )
+                decided = True
+                log.info(
+                    "Runner.run: handle_turn produced_plan=%s "
+                    "(source=runner-inline) prior_plan_id=%s "
+                    "user_input_first=%r",
+                    "yes" if next_plan is not None else "no",
+                    (session.plan.id or "")[:16] or "<none>",
+                    user_input[:80],
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A misbehaving handle_turn must never break the run;
+                # fall through to generate (legacy first-turn path).
+                log.warning(
+                    "planner.handle_turn raised; falling through to "
+                    "generate: %s",
+                    exc,
+                )
+                decided = False
+
+        # If handle_turn was skipped, raised, OR the planner doesn't
+        # implement handle_turn meaningfully (returns None on the
+        # very first turn against an empty seed — true for
+        # PassthroughPlanner / StaticPlanner / non-LLM planners),
+        # fall through to ``planner.generate`` so a brand-new plan
+        # still lands. ``planner.generate`` is the legacy path the
+        # Runner used pre-Phase-4; preserved for back-compat with
+        # planners that don't implement Phase 4's per-turn LLM call.
+        first_turn_seed = not session.plan.tasks
+        needs_generate_fallback = (not decided) or (
+            decided and next_plan is None and first_turn_seed
+        )
+        if needs_generate_fallback:
+            available_agents: Any
+            tree = getattr(self.agent, "available_agents_tree", None)
+            if isinstance(tree, list) and tree:
+                available_agents = list(tree)
+            else:
+                available_agents = list(self.agent.available_agents)
+            planner_context: dict[str, Any] = {
+                "run_id": session.run_id,
+                "max_task_invocations": self.max_task_invocations,
+            }
+            planner_context.update(self._conversation.prior_turn_context())
+            if context:
+                planner_context.update(context)
+            planner_context["run_id"] = session.run_id
+            try:
+                next_plan = await self.planner.generate(
                     goals=session.goals,
                     available_agents=available_agents,
                     context=planner_context,
@@ -552,7 +425,28 @@ class Runner:
                 )
                 return outcome
 
-        if plan is None:
+        # Install the produced plan as the next revision of
+        # session.plan, OR (when next_plan is None and a real prior
+        # exists) reuse session.plan unchanged so the executor drives
+        # the coordinator over existing context.
+        if next_plan is not None:
+            installed = await self._install_revision(
+                session=session,
+                user_input=user_input,
+                revised_plan=next_plan,
+            )
+            if not installed:
+                reason = "plan revision rejected by validator"
+                await self._emit_run_aborted(session, reason)
+                outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+                self._conversation.absorb_turn(
+                    outcome, user_input_summary=_initial_goal_summary(user_input)
+                )
+                return outcome
+        elif not session.plan.tasks:
+            # First turn AND handle_turn returned None (purely
+            # conversational on an empty seed). No plan to drive the
+            # executor over — abort cleanly.
             reason = "no plan generated"
             await self._emit_run_aborted(session, reason)
             outcome = ExecutionOutcome(success=False, session=session, reason=reason)
@@ -560,26 +454,16 @@ class Runner:
                 outcome, user_input_summary=_initial_goal_summary(user_input)
             )
             return outcome
-
-        # Planners may leave run_id blank; stamp ours so downstream sinks
-        # correlate cleanly.
-        if not plan.run_id:
-            plan.run_id = session.run_id
-        session.plan = plan
-
-        # goldfive#152: record the installed plan id on the
-        # orchestration-state dict so downstream components don't
-        # need to reach into ``session.plan`` to read the current
-        # plan id.
-        _ostate.set_current_plan(session.state, plan)
-
-        # PlanSubmitted is for fresh plans only. When the
-        # refine_existing branch routed through the steerer and
-        # _apply_revision installed a revised plan, the steerer
-        # already emitted PlanRevised — skip the new-plan event so we
-        # don't double-announce the plan.
-        if not revised_via_steerer:
-            await self._emit_plan_submitted(session, plan)
+        else:
+            # Conversational follow-up on a real prior plan. Reuse
+            # session.plan unchanged. No PlanRevised — the prior
+            # revision is still the right one for this turn.
+            log.info(
+                "Runner.run: conversational turn — reusing prior "
+                "plan_id=%s revision_index=%d",
+                (session.plan.id or "")[:16] or "<none>",
+                int(session.plan.revision_index),
+            )
 
         # 5. Register the seven canonical reporting tools on the adapter.
         try:
@@ -699,12 +583,13 @@ class Runner:
             # ``CancelledError`` from ADK closing the runner mid-stream).
             # The exception still propagates after the stash; this block
             # does not swallow it.
-            if session.plan is not None:
+            if session.plan is not None and session.plan.tasks:
                 self._last_plan = session.plan
                 log.info(
-                    "Runner.run: stashed prior plan for next turn's gate "
-                    "(plan_id=%s)",
+                    "Runner.run: stashed prior plan for next turn's "
+                    "handle_turn (plan_id=%s revision_index=%d)",
                     (session.plan.id or "")[:16] or "<none>",
+                    int(session.plan.revision_index),
                 )
 
         # goldfive#152: clear the current_task_* stamp at run end.
@@ -1027,189 +912,119 @@ class Runner:
     # internals
     # ------------------------------------------------------------------
 
-    async def _classify_turn(
+    async def _invoke_handle_turn(
         self,
         *,
-        prior_plan: Plan,
-        completed_results: Mapping[str, str],
         user_input: str,
-        session: Session | None = None,
-    ) -> TurnClassification:
-        """Invoke the planner_gate setting to classify this turn.
+        session: Session,
+        context: Mapping[str, Any] | None,
+    ) -> Plan | None:
+        """Invoke ``planner.handle_turn`` with the runner's per-turn context.
 
-        ``planner_gate == None`` short-circuits to ``"new_work"`` so
-        the Runner behaves exactly as before. ``planner_gate ==
-        "auto"`` picks the LLM-backed gate when the planner exposes
-        a ``_call_llm`` and falls through to the heuristic otherwise.
-        Any other value is assumed to be a caller-supplied async
-        callable with the :func:`planner_gate.classify_turn`
-        signature.
+        Goldfive#271 Phase 4 entry point. The planner reads the prior
+        plan + goals off ``session.plan`` / ``session.goals``; the
+        Runner threads the available agents and the per-turn context
+        (run_id, max_task_invocations, prior_turns) so the planner has
+        everything it needs in one call.
         """
-        gate = self._planner_gate
-        if gate is None:
-            return "new_work"
-        if gate == "auto":
-            call_llm = getattr(self.planner, "_call_llm", None)
-            if call_llm is None:
-                return heuristic_classify_turn(
-                    prior_plan=prior_plan,
-                    completed_results=completed_results,
-                    user_input=user_input,
-                    conversation_id=self._conversation.id,
-                )
-            return await classify_turn(
-                call_llm=call_llm,
-                prior_plan=prior_plan,
-                completed_results=completed_results,
-                user_input=user_input,
-                conversation_id=self._conversation.id,
-                model=getattr(self.planner, "_model", "") or "",
-                sinks=list(self.sinks) if self.sinks else None,
-                run_id=session.run_id if session is not None else "",
-                session_id=session.id if session is not None else "",
-                sequence_fn=session.next_sequence if session is not None else None,
-            )
-        # Caller-supplied async callable.
-        result = await gate(
-            prior_plan=prior_plan,
-            completed_results=completed_results,
+        # Prefer the richer tree shape (goldfive#151) when the adapter
+        # exposes it. Adapters that don't implement the property fall
+        # through to the legacy flat list — keeps back-compat.
+        available_agents: Any
+        tree = getattr(self.agent, "available_agents_tree", None)
+        if isinstance(tree, list) and tree:
+            available_agents = list(tree)
+        else:
+            available_agents = list(self.agent.available_agents)
+        planner_context: dict[str, Any] = {
+            "run_id": session.run_id,
+            "max_task_invocations": self.max_task_invocations,
+        }
+        planner_context.update(self._conversation.prior_turn_context())
+        if context:
+            planner_context.update(context)
+        planner_context["run_id"] = session.run_id
+        return await self.planner.handle_turn(
             user_input=user_input,
-            conversation_id=self._conversation.id,
+            session=session,
+            conversation_history=list(self._conversation.turns),
+            available_agents=available_agents,
+            context=planner_context,
         )
-        if result not in ("new_work", "conversational", "refine_existing"):
-            log.warning(
-                "planner_gate callable returned non-canonical verdict %r; "
-                "falling back to new_work",
-                result,
-            )
-            return "new_work"
-        return result  # type: ignore[return-value]
 
-    async def _run_conversational_turn(
+    async def _install_revision(
         self,
         *,
         session: Session,
         user_input: str | list[Goal],
-        context: Mapping[str, Any] | None,
-    ) -> ExecutionOutcome:
-        """Run a turn classified as ``"conversational"`` by the gate.
+        revised_plan: Plan,
+    ) -> bool:
+        """Install ``revised_plan`` as the next revision of ``session.plan``.
 
-        Skips :class:`GoalDeriver.derive`, :meth:`Planner.generate`,
-        and the ``GoalDerived`` / ``PlanSubmitted`` emissions — the
-        prior plan is carried forward onto the freshly minted session
-        and the executor drives the coordinator over existing context.
-        Reporting tools still register and the steerer still binds so
-        the executor's per-task events fire normally; this is the
-        minimum scaffolding the executor needs to turn a single
-        conversational exchange.
+        Goldfive#271 Phase 4 unified install path: every plan change
+        becomes a revision (revision_index += 1, plan_id preserved).
+        On the very first turn ``session.plan`` was seeded with
+        :meth:`Plan.empty` so this still produces revision 1 with a
+        fresh PlanRevised event.
+
+        Routes through :meth:`DefaultSteerer.apply_user_steer_with_plan`
+        so the steerer's USER_STEER bookkeeping (active_steer state,
+        dedup), drift event emission, validation, ``_apply_revision``
+        (revision_index bump, metadata stamp, current_plan refresh),
+        and ``_emit_plan_revised`` (with paired RefineAttempted
+        envelopes) all fire uniformly.
+
+        Returns ``True`` on success, ``False`` on validation failure
+        (the caller should surface RunAborted in that case).
         """
-        _ = context  # currently unused; reserved for future hooks
-        # Carry the prior plan forward. Mutate the prior plan's
-        # run_id to the fresh turn's run_id so sink events correlate
-        # with this turn, but otherwise reuse the same task ids /
-        # statuses so completed tasks stay completed.
-        carried = self._last_plan
-        if carried is None:  # defensive — gate shouldn't have returned
-            return await self._degrade_to_new_work(session, user_input)
-        carried.run_id = session.run_id
-        session.plan = carried
-        _ostate.set_current_plan(session.state, carried)
-        # Do NOT emit GoalDerived / PlanSubmitted — by design, a
-        # conversational turn produces no planning events.
-
-        try:
-            await self.agent.register_reporting_tools(list(BUILTIN_REPORTING_TOOLS))
-        except Exception as exc:  # noqa: BLE001
-            reason = f"register_reporting_tools raised: {exc}"
-            log.exception("register_reporting_tools raised")
-            await self._emit_run_aborted(session, reason)
-            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            self._conversation.absorb_turn(
-                outcome, user_input_summary=_initial_goal_summary(user_input)
-            )
-            return outcome
-
+        # Bind the steerer + adapter so the install pipeline has
+        # sinks + planner + adapter wiring. bind() is idempotent —
+        # the executor handoff below re-binds with the same args.
         try:
             self.steerer.bind(sinks=list(self.sinks), planner=self.planner)
-        except Exception as exc:  # noqa: BLE001
-            reason = f"steerer.bind raised: {exc}"
-            log.exception("steerer.bind raised")
-            await self._emit_run_aborted(session, reason)
-            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            self._conversation.absorb_turn(
-                outcome, user_input_summary=_initial_goal_summary(user_input)
-            )
-            return outcome
-
-        bind_adapter_steerer = getattr(self.agent, "bind_steerer", None)
-        if bind_adapter_steerer is not None:
-            try:
+            bind_adapter_steerer = getattr(self.agent, "bind_steerer", None)
+            if bind_adapter_steerer is not None:
                 bind_adapter_steerer(self.steerer)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("adapter.bind_steerer raised on conversational turn: %s", exc)
-        bind_steerer_adapter = getattr(self.steerer, "bind_adapter", None)
-        if callable(bind_steerer_adapter):
-            try:
+            bind_steerer_adapter = getattr(self.steerer, "bind_adapter", None)
+            if callable(bind_steerer_adapter):
                 bind_steerer_adapter(self.agent)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("steerer.bind_adapter raised on conversational turn: %s", exc)
-
-        try:
-            executor_kwargs: dict[str, Any] = dict(
-                plan=session.plan,
-                session=session,
-                adapter=self.agent,
-                steerer=self.steerer,
-                planner=self.planner,
-                sinks=list(self.sinks),
-            )
-            if self.control is not None:
-                executor_kwargs["control"] = self.control
-            if isinstance(user_input, str):
-                run_sig = inspect.signature(self.executor.run)
-                if "user_input" in run_sig.parameters:
-                    executor_kwargs["user_input"] = user_input
-            outcome = await self.executor.run(**executor_kwargs)
         except Exception as exc:  # noqa: BLE001
-            reason = f"executor.run raised (conversational): {exc}"
-            log.exception("executor.run raised (conversational)")
-            await self._emit_run_aborted(session, reason)
-            aborted = ExecutionOutcome(success=False, session=session, reason=reason)
-            self._conversation.absorb_turn(
-                aborted, user_input_summary=_initial_goal_summary(user_input)
+            log.warning(
+                "Runner._install_revision: steerer/adapter bind raised: %s", exc
             )
-            return aborted
-
-        _ostate.clear_current_task(session.state)
-        _ostate.clear_active_steer(session.state)
-        # Do NOT overwrite ``self._last_plan`` — the conversational
-        # turn piggy-backed on the prior plan; preserve it verbatim
-        # for the next turn's gate.
-        self._conversation.absorb_turn(
-            outcome, user_input_summary=_initial_goal_summary(user_input)
+            return False
+        # Stamp run_id on the revised plan so sink emissions correlate
+        # with this turn.
+        if not revised_plan.run_id:
+            revised_plan.run_id = session.run_id
+        # Goldfive#271 Phase 4: USER_STEER drift coerces the natural-
+        # language input into the unified install pipeline. The
+        # steerer's apply_user_steer_with_plan does the bookkeeping +
+        # validation + revision install + PlanRevised emit.
+        user_text = (
+            user_input.strip()
+            if isinstance(user_input, str)
+            else _initial_goal_summary(user_input)
         )
-        return outcome
-
-    async def _degrade_to_new_work(
-        self,
-        session: Session,
-        user_input: str | list[Goal],
-    ) -> ExecutionOutcome:
-        """Fallback for a conversational verdict with no prior plan.
-
-        Should never trigger in production — the gate checks for a
-        prior plan before returning ``"conversational"`` — but if it
-        does, we abort cleanly rather than drive the executor over a
-        missing plan.
-        """
-        reason = "planner_gate returned conversational but no prior plan is available"
-        log.warning(reason)
-        await self._emit_run_aborted(session, reason)
-        outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-        self._conversation.absorb_turn(
-            outcome, user_input_summary=_initial_goal_summary(user_input)
+        drift = DriftEvent(
+            kind=DriftKind.USER_STEER,
+            severity=DriftSeverity.WARNING,
+            detail=user_text,
         )
-        return outcome
+        try:
+            installed = await self.steerer.apply_user_steer_with_plan(
+                drift=drift,
+                session=session,
+                revised_plan=revised_plan,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Runner._install_revision: apply_user_steer_with_plan "
+                "raised: %s",
+                exc,
+            )
+            return False
+        return bool(installed)
 
     async def _resolve_goals(
         self,
@@ -1258,44 +1073,6 @@ class Runner:
             run_id=session.run_id,
             sequence=session.next_sequence(),
             goals=list(session.goals),
-            session_id=session.id,
-        )
-        await emit(self.sinks, evt)
-
-    async def _emit_plan_submitted(self, session: Session, plan: Any) -> None:
-        # Phase 2.X / goldfive#271 Gap 2: log every plan emission at
-        # INFO so a silent plan-creation regression (validation E2E
-        # found 2 of 4 task_plans rows without corresponding events)
-        # is observable in the demo log. Pair this with the
-        # invariant assertion below — empty run_id / plan_id at
-        # emission time is the precondition harmonograf#197 gated on
-        # the ingest side, so flag it loudly here too.
-        plan_id = (getattr(plan, "id", "") or "")[:16] or "<empty>"
-        if not session.run_id:
-            log.warning(
-                "Runner._emit_plan_submitted: empty run_id for plan_id=%s — "
-                "harmonograf will drop both the audit row AND the task_plans "
-                "dispatch (harmonograf#197 gate); this would silently lose "
-                "the plan",
-                plan_id,
-            )
-        if not getattr(plan, "id", ""):
-            log.warning(
-                "Runner._emit_plan_submitted: empty plan_id on plan with "
-                "%d task(s) — harmonograf will drop the task_plans row "
-                "(no upsert key); this would silently lose the plan",
-                len(getattr(plan, "tasks", None) or ()),
-            )
-        log.info(
-            "Runner._emit_plan_submitted: plan_id=%s tasks=%d run_id=%s",
-            plan_id,
-            len(getattr(plan, "tasks", None) or ()),
-            (session.run_id or "")[:16] or "<empty>",
-        )
-        evt = plan_submitted_event(
-            run_id=session.run_id,
-            sequence=session.next_sequence(),
-            plan=plan,
             session_id=session.id,
         )
         await emit(self.sinks, evt)

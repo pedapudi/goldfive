@@ -3,9 +3,13 @@
 Drives a :class:`CallableAdapter`-backed agent through goal derivation,
 planning, and execution. Asserts the public event order:
 
-    RunStarted, GoalDerived, PlanSubmitted,
+    RunStarted, GoalDerived, PlanRevised,
     (TaskStarted, TaskCompleted) xN,
     RunCompleted
+
+Phase 4 (goldfive#271) note: every plan install is now a revision of
+the empty Plan.empty() seed, so PlanRevised fires uniformly
+(PlanSubmitted is gone — there is no fresh install path).
 
 These tests are the single largest exercise of the public API surface
 pinned by ``INTERFACE_SPEC.md`` — they touch every protocol.
@@ -137,18 +141,20 @@ async def test_runner_end_to_end_event_sequence() -> None:
     run_kinds = [k for k in kinds if not k.startswith("Conversation")]
 
     # Lifecycle envelope up-front. The Runner owns the Run* lifecycle
-    # events: RunStarted then GoalDerived then PlanSubmitted. The
-    # executor no longer emits its own RunStarted (that would duplicate
-    # the Runner's emission and produce a second event for sinks).
+    # events: RunStarted then GoalDerived. Phase 4 (goldfive#271): the
+    # initial plan install is a revision of the Plan.empty() seed, so
+    # the install pipeline emits DriftDetected(USER_STEER) +
+    # RefineAttempted + PlanRevised — no separate PlanSubmitted.
     assert run_kinds[0] == "RunStarted"
     assert run_kinds[1] == "GoalDerived"
-    assert run_kinds[2] == "PlanSubmitted"
+    assert "PlanRevised" in run_kinds, run_kinds
 
     # For each of the three tasks: TaskStarted → TaskTransitioned (R4)
     # → TaskCompleted → TaskTransitioned (R4). The TaskTransitioned
     # envelopes are observability-only (goldfive#251 R4); the per-status
     # proto envelopes remain the LLM-visible authoritative signal.
-    task_kinds = run_kinds[3:-1]  # strip initial triple and trailing RunCompleted
+    plan_revised_idx = run_kinds.index("PlanRevised")
+    task_kinds = run_kinds[plan_revised_idx + 1 : -1]
     # Filter to the per-status envelopes (drop TaskTransitioned) before
     # asserting the strict TaskStarted -> TaskCompleted ordering.
     status_kinds = [

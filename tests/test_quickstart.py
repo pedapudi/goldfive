@@ -80,7 +80,10 @@ async def test_quickstart_string_goal_runs_to_completion() -> None:
     run_kinds = [k for k in kinds if not k.startswith("Conversation")]
     assert run_kinds[0] == "RunStarted"
     assert "GoalDerived" in run_kinds
-    assert "PlanSubmitted" in run_kinds
+    # Phase 4 (goldfive#271): every plan install is a revision of the
+    # session.plan = Plan.empty() seed, so PlanRevised fires uniformly
+    # (PlanSubmitted is gone — there is no fresh install path).
+    assert "PlanRevised" in run_kinds
     assert run_kinds[-1] == "RunCompleted"
 
     # Exactly one task was generated for the single goal.

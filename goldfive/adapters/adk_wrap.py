@@ -240,13 +240,6 @@ class GoldfiveADKAgent(BaseAgent):
 
     _inner: Any = PrivateAttr(default=None)
     _runner: Runner = PrivateAttr(default=None)  # type: ignore[assignment]
-    # Adapter-level planner-gate dedup. Holds the (invocation_id,
-    # user_input) tuple of the most recent message we already classified
-    # for this wrapper, so a redrive of the same invocation does not
-    # double-classify and double-route through the steerer. See
-    # :meth:`_run_async_impl`'s adapter-level gate path. ``None`` means
-    # no message has been classified yet.
-    _last_classified: Any = PrivateAttr(default=None)
 
     def __init__(self, *, inner: Any, runner: Runner) -> None:
         super().__init__(
@@ -256,7 +249,6 @@ class GoldfiveADKAgent(BaseAgent):
         )
         self._inner = inner
         self._runner = runner
-        self._last_classified = None
 
     # ------------------------------------------------------------------
     # BaseAgent extension point
@@ -317,48 +309,12 @@ class GoldfiveADKAgent(BaseAgent):
             )
             return
 
-        # Adapter-level planner-gate (goldfive#270 follow-up). Classify
-        # the freshly-arrived user message HERE — at the goldfive code
-        # closest to ADK's user-message arrival point — so the verdict
-        # is computed before the inner :meth:`Runner.run` rebuilds the
-        # session. The verdict rides through ``context`` into Runner.run
-        # under the ``_adk_pre_classified_verdict`` key; Runner.run
-        # honours it and skips its own :meth:`_classify_turn` call.
-        #
-        # Why both layers? :meth:`Runner.run` retains its own gate for
-        # non-ADK callers (programmatic, Claude SDK, callable) that
-        # bypass the wrapper entirely. The adapter-level pre-pass
-        # documents intent: "the gate IS evaluated for ADK-web turns,
-        # at the adapter boundary, before the inner pipeline starts."
-        #
-        # Dedup: a redrive of the same invocation_id with the same
-        # user_input must not double-classify (and double-route through
-        # the steerer's USER_STEER pipeline). The
-        # :attr:`_last_classified` cache keys on
-        # ``(invocation_id, user_input)`` and short-circuits on hit.
-        invocation_id_for_gate = str(getattr(ctx, "invocation_id", "") or "")
-        gate_cache_key = (invocation_id_for_gate, user_input)
-        pre_verdict: Any = None
-        if self._last_classified == gate_cache_key:
-            log.debug(
-                "GoldfiveADKAgent: gate dedup — same (invocation_id, "
-                "user_input) already classified; reusing prior verdict"
-            )
-            pre_verdict = getattr(self, "_last_classified_verdict", None)
-        else:
-            try:
-                pre_verdict = await self._classify_user_message_for_adk(user_input)
-            except Exception as exc:  # noqa: BLE001
-                # Adapter-side gate must never break a run; fall back to
-                # letting Runner.run classify itself.
-                log.warning(
-                    "GoldfiveADKAgent: adapter-level gate raised; "
-                    "falling back to runner-side gate: %s",
-                    exc,
-                )
-                pre_verdict = None
-            self._last_classified = gate_cache_key
-            self._last_classified_verdict = pre_verdict
+        # Goldfive#271 Phase 4: the prior adapter-level
+        # planner_gate.classify_turn pre-pass is gone. The decision
+        # (whether the new user_input warrants a plan change) is now a
+        # single ``planner.handle_turn`` call inside :meth:`Runner.run`,
+        # so there is no two-LLM-call dedup window to manage at the
+        # adapter boundary. Runner.run is the single decision point.
 
         # try/finally wraps the entire run so ``_notify_plugins_on_run_end``
         # fires on ALL exit paths — normal completion, adapter raise,
@@ -389,11 +345,6 @@ class GoldfiveADKAgent(BaseAgent):
         try:
             outcome: ExecutionOutcome | None = None
             run_context: dict[str, Any] = {"adk_ctx": ctx}
-            if pre_verdict is not None:
-                # Threaded into Runner.run via context — Runner.run reads
-                # this key, skips its own _classify_turn, and uses the
-                # adapter-side verdict directly.
-                run_context["_adk_pre_classified_verdict"] = pre_verdict
             async for item in self._runner.run_streamed(
                 user_input,
                 context=run_context,
@@ -444,92 +395,6 @@ class GoldfiveADKAgent(BaseAgent):
             # Bounded timeout keeps a hung judge from stalling exit.
             await self._drain_steerer_background_judges()
             self._notify_plugins_on_run_end()
-
-    async def _classify_user_message_for_adk(
-        self, user_input: str
-    ) -> Any:
-        """Classify the freshly-arrived ADK user message via the planner-gate.
-
-        Mirrors :meth:`Runner._classify_turn` but reads the planner-gate
-        configuration off the wrapped Runner so settings and overrides
-        already in place (``planner_gate=None``, custom callable, ``"auto"``
-        with the planner's ``_call_llm``) are honoured identically.
-
-        Returns one of:
-
-        * ``"new_work"``, ``"conversational"``, ``"refine_existing"`` —
-          the normal three-verdict set; passed through ``context`` into
-          :meth:`Runner.run` which uses it instead of running its own
-          gate.
-        * ``None`` — gate disabled (planner_gate=None on the Runner) OR
-          first turn (no prior plan to refine against). The Runner-side
-          gate's existing logic handles the no-prior-plan case identically
-          (returns ``"new_work"``); returning ``None`` from this method
-          keeps the contract explicit.
-        """
-        runner = self._runner
-        gate = getattr(runner, "_planner_gate", "auto")
-        # Caller has explicitly disabled the gate — don't reintroduce it
-        # at the adapter layer.
-        if gate is None:
-            log.info(
-                "GoldfiveADKAgent: gate disabled (planner_gate=None); "
-                "Runner.run will treat this turn as new_work"
-            )
-            return None
-        last_plan = getattr(runner, "_last_plan", None)
-        # No prior plan → first turn, gate would always pick new_work.
-        # Skip the call to keep the LLM out of the hot path on turn 1.
-        if last_plan is None or not getattr(last_plan, "tasks", None):
-            log.info(
-                "GoldfiveADKAgent: gate skipped — no prior plan; "
-                "treating as new_work (user_input_first=%r)",
-                user_input[:80],
-            )
-            return None
-
-        # Reuse Runner._classify_turn so the planner-gate configuration
-        # (callable / "auto" / heuristic) is honoured exactly once.
-        #
-        # ``session=None`` is intentional — the wrapper does not yet
-        # have a goldfive Session for THIS turn (Runner.run mints it
-        # inside). The classify_turn span will simply omit session_id /
-        # run_id; harmonograf still gets the planner-gate decision span,
-        # just unattached to the turn's run_id. The verdict carried
-        # forward via context ties back to the run when Runner.run uses
-        # it.
-        try:
-            verdict = await runner._classify_turn(
-                prior_plan=last_plan,
-                completed_results={},
-                user_input=user_input,
-                session=None,
-            )
-        except Exception as exc:  # noqa: BLE001 — never break the run on gate
-            log.warning(
-                "GoldfiveADKAgent._classify_user_message_for_adk: gate raised; "
-                "falling back to runner-side gate: %s",
-                exc,
-            )
-            return None
-        # Defensive: surface any non-canonical verdict as None so Runner.run
-        # falls through to its own classification (which has identical
-        # safety nets).
-        if verdict not in ("new_work", "conversational", "refine_existing"):
-            log.warning(
-                "GoldfiveADKAgent._classify_user_message_for_adk: gate returned "
-                "non-canonical %r; ignoring",
-                verdict,
-            )
-            return None
-        log.info(
-            "GoldfiveADKAgent: gate verdict=%s prior_plan_id=%s "
-            "user_input_first=%r",
-            verdict,
-            getattr(last_plan, "id", "")[:16] or "<none>",
-            user_input[:80],
-        )
-        return verdict
 
     #: Per-turn drain timeout. Bounds how long ``_run_async_impl``'s
     #: ``finally`` block can block ADK's iterator exit. Phase 2.X

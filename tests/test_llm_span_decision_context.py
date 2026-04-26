@@ -525,59 +525,19 @@ async def test_refine_steer_goldfive_source_decision_wording() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Integration: planner_gate.classify_turn
+# Integration: LLMPlanner.handle_turn (Phase 4 — replaced classify_turn
+# and synthesize_goal_from_steer)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_planner_gate_stamps_decision_context() -> None:
-    from goldfive.planner_gate import classify_turn
-    from goldfive.types import Plan, Task
-
-    async def fake_call_llm(system: str, user: str, model: str) -> str:
-        return json.dumps({"classification": "new_work", "reason": "fresh request"})
-
-    sink = InMemorySink()
-    prior = Plan(
-        id="p1",
-        run_id="r1",
-        goal_ids=["g1"],
-        summary="prior",
-        tasks=[Task(id="t1", title="x", description="", assignee_agent_id="")],
-        edges=[],
-    )
-    await classify_turn(
-        prior_plan=prior,
-        completed_results={},
-        user_input="please research solar",
-        conversation_id="c1",
-        call_llm=fake_call_llm,
-        model="gpt-gate",
-        sinks=[sink],
-        run_id="r1",
-        session_id="s1",
-    )
-    events = _span_events(sink)
-    assert events
-    start, end = _start(events[0]), _end(events[1])
-    assert "please research solar" in start.input_preview
-    assert "c1" in start.input_preview
-    assert "verdict=" in end.output_preview
-    assert "planner gate verdict:" in end.decision_summary
-
-
-# ---------------------------------------------------------------------------
-# Integration: LLMPlanner.synthesize_goal_from_steer
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_synthesize_goal_from_steer_stamps_decision_context() -> None:
+async def test_handle_turn_stamps_decision_context() -> None:
     from goldfive.planner import LLMPlanner
+    from goldfive.types import Plan, Session, Task
 
     async def fake_call_llm(system: str, user: str, model: str) -> str:
         return json.dumps(
-            {"goal": {"id": "g-steer", "summary": "focus on X"}, "mode": "append"}
+            {"reasoning": "conversational follow-up", "plan": None}
         )
 
     planner = LLMPlanner(call_llm=fake_call_llm, model="gpt-x")
@@ -588,13 +548,23 @@ async def test_synthesize_goal_from_steer_stamps_decision_context() -> None:
         return ([sink], "r1", "s1", "", lambda: next(seq))
 
     planner.set_span_context_provider(provider)
-    await planner.synthesize_goal_from_steer("please focus on X")
+    session = Session(run_id="r1")
+    session.plan = Plan(
+        id="p-prior",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[Task(id="t1", title="x", description="", assignee_agent_id="")],
+        edges=[],
+    )
+    await planner.handle_turn(
+        user_input="please research solar",
+        session=session,
+    )
     events = _span_events(sink)
     assert events
     start = _start(events[0])
-    end = _end(events[1])
-    assert start.input_preview == "please focus on X"
-    assert "synthesized goal from user steer" in end.decision_summary
+    assert "please research solar" in start.input_preview
+    assert "p-prior" in start.input_preview
 
 
 # ---------------------------------------------------------------------------

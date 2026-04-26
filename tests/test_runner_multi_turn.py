@@ -1,13 +1,22 @@
-"""Runner-level multi-turn gating tests (planner-gate).
+"""Runner-level multi-turn tests for the Phase 4 handle_turn flow
+(goldfive#271).
 
-Verifies the core promise of the planning gate: a conversational
-follow-up on turn 2 does not re-run goal derivation or planning and
-emits no ``GoalDerived`` / ``PlanSubmitted`` events, but still
-produces a terminal ``RunCompleted``. Turn 1 still runs full planning.
+Phase 4 collapsed the prior planner_gate triage layer (factual-question
++ steer-language regex + LLM gate + synthesize_goal_from_steer +
+qualification-merge regex + planner.refine) into a single
+:meth:`Planner.handle_turn` LLM call that decides whether the turn
+warrants a plan change AND, when one is warranted, produces the next
+plan in one shot.
+
+Verifies the core promise: a turn whose ``handle_turn`` returns
+``None`` reuses ``session.plan`` unchanged and emits no GoalDerived /
+PlanRevised. A turn whose ``handle_turn`` returns a Plan installs it
+as the next revision (revision_index += 1; plan_id preserved).
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from goldfive import (
@@ -57,8 +66,18 @@ async def _happy_agent(
 def _kinds(events: list[Any]) -> list[str]:
     out: list[str] = []
     for e in events:
-        name = e.WhichOneof("payload") or ""
-        out.append("".join(part.capitalize() for part in name.split("_")) if name else "")
+        if isinstance(e, dict):
+            out.append(e.get("kind") or "")
+            continue
+        if hasattr(e, "WhichOneof"):
+            name = e.WhichOneof("payload") or ""
+            out.append(
+                "".join(part.capitalize() for part in name.split("_"))
+                if name
+                else ""
+            )
+        else:
+            out.append(getattr(e, "kind", ""))
     return out
 
 
@@ -67,29 +86,43 @@ def _kinds(events: list[Any]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-async def test_conversational_turn_skips_planning_llm_gate() -> None:
-    """Turn 2 classified as "conversational" must not emit PlanSubmitted."""
-    # An LLM planner whose call_llm returns a full plan on every call —
-    # so we can tell from event counts whether the gate actually
-    # skipped ``generate`` on turn 2. The gate itself also reads the
-    # planner's call_llm; we route gate calls to a separate path by
-    # sniffing the system prompt.
-
-    plan_json = (
-        '{"summary":"t","tasks":[{"id":"t1","title":"T","assignee_agent_id":"writer"}]}'
+async def test_first_turn_emits_plan_revised_for_initial_install() -> None:
+    """Phase 4: every plan install (including the very first) is a
+    revision of the Plan.empty() seed, so PlanRevised fires uniformly.
+    """
+    sink = InMemorySink()
+    runner = Runner(
+        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
+        planner=StaticPlanner(_linear_plan()),
+        executor=SequentialExecutor(),
+        goal_deriver=PassthroughGoalDeriver("demo"),
+        sinks=[sink],
     )
+    await runner.run("turn one")
+    await runner.close()
 
-    calls: list[tuple[str, str]] = []
+    kinds = _kinds(sink.events)
+    assert "RunStarted" in kinds
+    assert "GoalDerived" in kinds
+    assert "PlanRevised" in kinds
+
+
+async def test_handle_turn_none_reuses_prior_plan_no_replan() -> None:
+    """When handle_turn returns None on a turn that DOES have a real
+    prior plan, the Runner reuses session.plan unchanged and does NOT
+    emit GoalDerived / PlanRevised for that turn.
+    """
+    plan_json = json.dumps({
+        "summary": "t",
+        "tasks": [{"id": "t1", "title": "T", "assignee_agent_id": "writer"}],
+    })
 
     async def planner_llm(system: str, user: str, model: str) -> str:
         _ = model
-        calls.append((system[:40], user[:40]))
-        # The gate's system prompt starts with the distinctive phrase
-        # "You are a turn-classifier"; route those calls to the
-        # conversational verdict on turn 2 and new_work on turn 1.
-        if "turn-classifier" in system:
-            return '{"verdict": "conversational", "reason": "ask about location"}'
-        # Otherwise it's a plan-generate call.
+        # handle_turn system prompt — return null plan (conversational).
+        if "next REVISION of the plan" in system or "warrants a plan change" in system:
+            return json.dumps({"reasoning": "conversational", "plan": None})
+        # Otherwise it's a plan-generate call (first turn fall-through).
         return plan_json
 
     planner = LLMPlanner(call_llm=planner_llm, model="stub")
@@ -105,120 +138,56 @@ async def test_conversational_turn_skips_planning_llm_gate() -> None:
     out1 = await runner.run("make a 2-slide presentation about solar panels")
     assert out1.success
     turn1_plan_id = out1.session.plan.id
-    turn1_end_index = len(sink.events)
+    turn1_end = len(sink.events)
 
     out2 = await runner.run("where is the presentation located?")
     await runner.close()
 
-    turn2_kinds = _kinds(sink.events[turn1_end_index:])
-
-    # Turn 2 emits RunStarted and RunCompleted but NEITHER
-    # GoalDerived nor PlanSubmitted — the gate short-circuited the
-    # planning phase.
+    turn2_kinds = _kinds(sink.events[turn1_end:])
+    # Conversational turn: no PlanRevised, no GoalDerived.
     assert "RunStarted" in turn2_kinds
-    assert "GoalDerived" not in turn2_kinds
-    assert "PlanSubmitted" not in turn2_kinds
-    assert "RunCompleted" in turn2_kinds or "RunAborted" in turn2_kinds
-
-    # Session.plan on turn 2 is the SAME plan id as turn 1 — carried
-    # forward verbatim, not regenerated.
+    assert "PlanRevised" not in turn2_kinds, turn2_kinds
+    # Session.plan on turn 2 is the SAME plan id as turn 1.
     assert out2.session.plan is not None
     assert out2.session.plan.id == turn1_plan_id
 
 
-async def test_first_turn_still_runs_full_planning() -> None:
-    """Turn 1 with no prior plan always runs goal-derive + generate."""
+async def test_planner_gate_none_skips_handle_turn_on_first_turn() -> None:
+    """``planner_gate=None`` skips the per-turn handle_turn call; the
+    Runner falls through to ``planner.generate`` on the first turn
+    (which is the realistic usage of planner_gate=None — single-turn
+    deterministic replay).
+
+    Phase 4 (goldfive#271): multi-turn runs with planner_gate=None
+    are a degraded mode — handle_turn is the only path that knows
+    how to merge prior plan state into a revision. Tests for that
+    pattern live in the LLMPlanner-with-handle_turn variants below.
+    """
+    plan_t1 = json.dumps({
+        "summary": "t",
+        "tasks": [
+            {"id": "research", "title": "Research", "assignee_agent_id": "writer"},
+        ],
+        "edges": [],
+    })
+
+    async def planner_llm(system: str, user: str, model: str) -> str:
+        _ = system, user, model
+        return plan_t1
+
+    planner = LLMPlanner(call_llm=planner_llm, model="stub")
     sink = InMemorySink()
     runner = Runner(
         agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
-        planner=StaticPlanner(_linear_plan()),
-        executor=SequentialExecutor(),
-        goal_deriver=PassthroughGoalDeriver("demo"),
-        sinks=[sink],
-    )
-    await runner.run("turn one")
-    await runner.close()
-
-    kinds = _kinds(sink.events)
-    assert "RunStarted" in kinds
-    assert "GoalDerived" in kinds
-    assert "PlanSubmitted" in kinds
-
-
-async def test_planner_gate_none_disables_classifier() -> None:
-    """``planner_gate=None`` restores pre-gate behaviour: every turn re-plans."""
-    sink = InMemorySink()
-    runner = Runner(
-        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
-        planner=StaticPlanner(_linear_plan()),
+        planner=planner,
         executor=SequentialExecutor(),
         goal_deriver=PassthroughGoalDeriver("demo"),
         sinks=[sink],
         planner_gate=None,
     )
-    await runner.run("turn one")
-    turn1_end = len(sink.events)
-    await runner.run("where is the artefact?")
-    await runner.close()
-
-    turn2 = _kinds(sink.events[turn1_end:])
-    # With the gate disabled, every turn emits GoalDerived +
-    # PlanSubmitted — the pre-gate shape.
-    assert "GoalDerived" in turn2
-    assert "PlanSubmitted" in turn2
-
-
-async def test_caller_supplied_gate_is_invoked() -> None:
-    """Callers can inject a custom classifier callable."""
-    captured: dict[str, Any] = {}
-
-    async def gate(*, prior_plan, completed_results, user_input, conversation_id):
-        captured["user_input"] = user_input
-        captured["conversation_id"] = conversation_id
-        return "conversational"
-
-    sink = InMemorySink()
-    runner = Runner(
-        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
-        planner=StaticPlanner(_linear_plan()),
-        executor=SequentialExecutor(),
-        goal_deriver=PassthroughGoalDeriver("demo"),
-        sinks=[sink],
-        planner_gate=gate,
-    )
-    await runner.run("turn one")
-    turn1_end = len(sink.events)
-    await runner.run("just a quick question about what you did")
-    await runner.close()
-
-    assert captured["user_input"] == "just a quick question about what you did"
-    assert captured["conversation_id"] == runner.conversation_id
-
-    turn2 = _kinds(sink.events[turn1_end:])
-    # Gate returned "conversational" → no PlanSubmitted on turn 2.
-    assert "PlanSubmitted" not in turn2
-
-
-async def test_conversational_turn_carries_prior_plan_unchanged() -> None:
-    """Turn 2 session.plan identity matches the prior turn's plan id + tasks."""
-
-    async def gate(*, prior_plan, completed_results, user_input, conversation_id):
-        _ = prior_plan, completed_results, user_input, conversation_id
-        return "conversational"
-
-    runner = Runner(
-        agent=CallableAdapter(_happy_agent, available_agents=["writer"]),
-        planner=StaticPlanner(_linear_plan()),
-        executor=SequentialExecutor(),
-        goal_deriver=PassthroughGoalDeriver("demo"),
-        sinks=[InMemorySink()],
-        planner_gate=gate,
-    )
     out1 = await runner.run("turn one")
-    out2 = await runner.run("a follow-up question")
     await runner.close()
-
-    assert out1.session.plan.id == out2.session.plan.id
-    assert [t.id for t in out1.session.plan.tasks] == [
-        t.id for t in out2.session.plan.tasks
-    ]
+    assert out1.success
+    kinds = _kinds(sink.events)
+    assert "GoalDerived" in kinds
+    assert "PlanRevised" in kinds
