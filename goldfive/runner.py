@@ -250,6 +250,26 @@ class Runner:
         # its run_id's sequence keyspace).
         self._conversation_announced: dict[str, bool] = {"": False}
         self._last_session_by_key: dict[str, Session] = {}
+        # Per-key serialisation lock for :meth:`run` so two concurrent
+        # ``runner.run(session_id=X)`` calls on the SAME outer session
+        # id do not race on the per-Conversation prior-plan stash. The
+        # bug this guards against (goldfive#271 follow-up to PR #294 /
+        # demo log v6 / v7class1-1): adk-web fires a second ``/run_sse``
+        # while the first is still in-flight; turn 2 enters
+        # :meth:`run` BEFORE turn 1's ``finally``-block
+        # ``Conversation.stash_plan`` lands, so turn 2's
+        # ``Conversation.prior_plan_for`` returns ``None`` and seeds
+        # ``session.plan = Plan.empty(...)``. Turn 2's
+        # ``Planner.handle_turn`` then sees an empty seed and the
+        # produced plan inherits the empty seed's id — the
+        # ``plan_id`` stable across turns invariant breaks. With this
+        # lock, turn 2 waits for turn 1's full lifecycle (including
+        # ``finally`` stash and ``absorb_turn``) before its own
+        # bookkeeping runs. Concurrent runs on DIFFERENT keys still
+        # proceed in parallel — distinct outer ADK sessions are
+        # independent and have always been intended to run in
+        # parallel on a shared Runner.
+        self._convo_locks: dict[str, asyncio.Lock] = {}
         # Last turn's Session (any key) — kept for back-compat with
         # tests / inspectors that read ``runner._last_session``
         # directly. Updated on every :meth:`run` regardless of pin.
@@ -300,6 +320,22 @@ class Runner:
             self._conversation_announced[key] = False
         return convo
 
+    def _lock_for(self, key: str) -> asyncio.Lock:
+        """Return the per-key :class:`asyncio.Lock` for serialising
+        :meth:`run`, creating on miss. See ``self._convo_locks``
+        commentary in :meth:`__init__` for the rationale.
+
+        Lazy lookup pattern matches :meth:`_conversation_for`. The
+        ``setdefault`` is atomic under asyncio's single-thread model
+        so two concurrent first-time lookups land on the same Lock
+        instance (the second discards its just-built Lock as the
+        ``setdefault`` returns the existing one).
+        """
+        lock = self._convo_locks.get(key)
+        if lock is None:
+            lock = self._convo_locks.setdefault(key, asyncio.Lock())
+        return lock
+
     # ------------------------------------------------------------------
     # run
     # ------------------------------------------------------------------
@@ -321,6 +357,17 @@ class Runner:
         session id that harmonograf spans carry (goldfive#161). Empty
         / ``None`` preserves the legacy uuid4 mint so bare programmatic
         Runner callers see no behaviour change.
+
+        Two concurrent calls with the SAME ``session_id`` (or both
+        unpinned, sharing the ``""`` key) serialise on a per-key
+        :class:`asyncio.Lock` so the second turn's prior-plan
+        carry-forward (Phase 4 ``handle_turn`` seeding) sees the
+        first turn's post-install plan rather than racing the first's
+        ``finally``-block ``Conversation.stash_plan``. See
+        ``self._convo_locks`` commentary in :meth:`__init__` and the
+        v7class1-1 forensic timeline in
+        ``tests/test_intra_session_plan_carry_forward.py``. Concurrent
+        calls on DIFFERENT keys still proceed in parallel.
         """
 
         # 1. Resolve the per-outer-session :class:`Conversation`
@@ -331,6 +378,41 @@ class Runner:
         # the shared ``""`` key for back-compat with pre-#161 callers.
         # See :meth:`_conversation_for` and validation v4 Class 1.
         convo_key = self._conversation_key(session_id)
+        # Per-key serialisation: the lock is acquired BEFORE
+        # :meth:`_conversation_for` so two concurrent first-time
+        # lookups on the same key cannot both Conversation.new() and
+        # write into the dict slot. The ``async with`` releases on
+        # both normal return AND ``BaseException`` propagation so a
+        # cancelled turn's stash always lands before the next turn's
+        # seeding runs.
+        async with self._lock_for(convo_key):
+            return await self._run_locked(
+                user_input,
+                context=context,
+                session_id=session_id,
+                convo_key=convo_key,
+            )
+
+    async def _run_locked(
+        self,
+        user_input: str | list[Goal],
+        *,
+        context: Mapping[str, Any] | None,
+        session_id: str | None,
+        convo_key: str,
+    ) -> ExecutionOutcome:
+        """Body of :meth:`run`, executed under the per-key lock.
+
+        Split out so :meth:`run` can wrap the entire lifecycle
+        (:meth:`Conversation.next_turn_session` →
+        :meth:`Planner.handle_turn` → :meth:`Executor.run` →
+        ``finally``-block stash → :meth:`Conversation.absorb_turn`)
+        in a single ``async with self._lock_for(convo_key):``. The
+        lock prevents two concurrent ``runner.run(session_id=X)``
+        calls from racing on the per-Conversation prior-plan stash;
+        see the v7class1-1 demo log timeline in
+        ``tests/test_intra_session_plan_carry_forward.py``.
+        """
         convo = self._conversation_for(convo_key)
 
         # 2. Build Session seeded by the Conversation. The Session's
