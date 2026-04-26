@@ -58,9 +58,15 @@ class ReportingToolSpec:
     handler: ReportingHandler
 
 
-# The eight canonical reporting tool names. These are a stable contract: the
+# The ten canonical reporting tool names. These are a stable contract: the
 # adapter must surface tools with exactly these names so that the Steerer can
 # interpret them uniformly across frameworks. Do not rename.
+#
+# goldfive#271 Phase 3: ``declare_task_skipped`` and ``declare_task_not_needed``
+# are observability-only (no plan mutation, no steerer drive); they emit a
+# ``TaskDeclarationReceived`` event so the operator can see "agent
+# volunteered skip" before the imperative ``report_task_*`` surface
+# either confirms or contradicts it.
 REPORTING_TOOL_NAMES: tuple[str, ...] = (
     "report_task_started",
     "report_task_progress",
@@ -70,6 +76,28 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
     "report_new_work_discovered",
     "report_plan_divergence",
     "report_awaiting_approval",
+    "declare_task_skipped",
+    "declare_task_not_needed",
+)
+
+
+# State key for the per-Session declarations log. Lives under the
+# ``goldfive.*`` namespace so :func:`goldfive.orchestration_state.write`
+# accepts it. Value shape: ``dict[(kind, task_id), {kind, task_id,
+# reason, recorded_at_seq}]`` keyed by ``(declaration_kind, task_id)``
+# so the second declaration of the same kind on the same task is a
+# no-op.
+DECLARATIONS_KEY = "goldfive.task_declarations"
+
+
+# Vocabulary of declaration kinds. Mirrors the proto envelope's `kind`
+# field once it gets promoted (Phase 3.5/4 cleanup); for now lives as
+# a string vocabulary on the dict envelope.
+DECLARATION_KIND_SKIPPED: str = "skipped"
+DECLARATION_KIND_NOT_NEEDED: str = "not_needed"
+DECLARATION_KINDS: tuple[str, ...] = (
+    DECLARATION_KIND_SKIPPED,
+    DECLARATION_KIND_NOT_NEEDED,
 )
 
 
@@ -100,9 +128,7 @@ def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
     return _resolve_task_id_with_source(args, session)[0]
 
 
-def _resolve_task_id_with_source(
-    args: dict[str, Any], session: Session
-) -> tuple[str, str]:
+def _resolve_task_id_with_source(args: dict[str, Any], session: Session) -> tuple[str, str]:
     """Resolve ``task_id`` and report whether it came from args or state.
 
     Returns ``(task_id, source)`` where ``source`` is one of:
@@ -358,9 +384,7 @@ def _read_plan_revision(session: Session) -> int:
         return 0
 
 
-def _supersession_successor(
-    session: Session, task_id: str
-) -> tuple[str, SupersessionKind]:
+def _supersession_successor(session: Session, task_id: str) -> tuple[str, SupersessionKind]:
     """Return ``(successor_task_id, kind)`` for ``task_id``.
 
     Walks the plan looking for a task whose ``supersedes`` equals
@@ -421,8 +445,7 @@ def _classify_pin_freshness(
         # match (trust the pin) rather than refusing.
         if pin_revision > current_revision:
             log.debug(
-                "reporting: pin_revision=%d > current=%d for task_id=%s "
-                "(unexpected; trusting pin)",
+                "reporting: pin_revision=%d > current=%d for task_id=%s (unexpected; trusting pin)",
                 pin_revision,
                 current_revision,
                 task_id,
@@ -539,8 +562,7 @@ async def _classify_and_route_pin(
         else "stale_pin_no_supersedes"
     )
     log.warning(
-        "reporting: %s REFUSED on stale pin task_id=%s "
-        "(pin_rev=%d, current_rev=%d, reason=%s)",
+        "reporting: %s REFUSED on stale pin task_id=%s (pin_rev=%d, current_rev=%d, reason=%s)",
         tool_name,
         task_id,
         pin_rev,
@@ -553,9 +575,7 @@ async def _classify_and_route_pin(
     # the classifier has already consulted the supersedes graph and
     # found a successor or absence-of-one).
     pin_task = _find_task_in_session(session, task_id)
-    attempted_from = (
-        pin_task.status if pin_task is not None else TaskStatus.PENDING
-    )
+    attempted_from = pin_task.status if pin_task is not None else TaskStatus.PENDING
     await _emit_task_transition_refused(
         session=session,
         steerer=steerer,
@@ -1074,6 +1094,159 @@ async def _handle_plan_divergence(
     return dict(_ACK)
 
 
+async def _emit_task_declaration_received(
+    *,
+    session: Session,
+    steerer: Steerer,
+    kind: str,
+    task_id: str,
+    reason: str,
+) -> None:
+    """Emit a ``TaskDeclarationReceived`` dict envelope onto the sink bus.
+
+    goldfive#271 Phase 3: structural declarations from the agent
+    (``declare_task_skipped``, ``declare_task_not_needed``) are
+    observability-only — they do NOT mutate plan state. Operators see
+    the declaration on the sink so they can compare it against the
+    imperative ``report_task_*`` surface that follows. The dict
+    envelope is the same low-cost path used for ``RefineAttempted``
+    / ``RefineFailed`` (PR #264) before those are promoted to typed
+    proto. A future cleanup may promote ``TaskDeclarationReceived``
+    to a proper proto message; until then the dict shape with a
+    well-known ``kind`` field is the contract.
+
+    ``source_signal`` is fixed to ``"DECLARATION"`` so downstream
+    consumers can distinguish a self-volunteered declaration from a
+    framework-driven inference (steerer rotation, reconciler
+    NOT_NEEDED stamp).
+    """
+    sinks = getattr(steerer, "_sinks", None) or []
+    if not sinks:
+        return
+    from goldfive.events import emit, make_event
+
+    payload = {
+        "kind": str(kind),
+        "task_id": str(task_id),
+        "reason": str(reason),
+        "source_signal": "DECLARATION",
+    }
+    try:
+        evt = make_event(
+            session.run_id,
+            session.next_sequence(),
+            "task_declaration_received",
+            payload,
+            session_id=session.id,
+        )
+        await emit(sinks, evt)
+    except Exception as exc:  # noqa: BLE001 — observability must never break a tool call
+        log.debug(
+            "reporting._emit_task_declaration_received: failed to emit: %s",
+            exc,
+        )
+
+
+def _record_declaration(session: Session, kind: str, task_id: str, reason: str) -> bool:
+    """Record a declaration on session.state; return True if newly recorded.
+
+    Idempotent: a second declaration of the same ``(kind, task_id)``
+    pair is a no-op (returns False, no event re-emitted). The recorded
+    body intentionally keeps the FIRST reason — late declarations don't
+    rewrite history.
+    """
+    state = getattr(session, "state", None)
+    if not isinstance(state, dict):
+        # Defensive: callers without a real Session.state still drive
+        # the emit path (no-op idempotency).
+        return True
+    declarations = state.get(DECLARATIONS_KEY)
+    if not isinstance(declarations, dict):
+        declarations = {}
+        state[DECLARATIONS_KEY] = declarations
+    key = f"{kind}:{task_id}"
+    if key in declarations:
+        return False
+    declarations[key] = {
+        "kind": kind,
+        "task_id": task_id,
+        "reason": reason,
+        # Best-effort sequence stamp for ordering when read back later.
+        "recorded_at_seq": int(getattr(session, "_next_sequence", 0)),
+    }
+    return True
+
+
+async def _handle_declaration(
+    args: dict[str, Any],
+    session: Session,
+    steerer: Steerer,
+    *,
+    kind: str,
+    tool_name: str,
+) -> dict[str, Any]:
+    """Shared body for ``declare_task_skipped`` / ``declare_task_not_needed``.
+
+    Both handlers are observability-only:
+
+    * Resolve ``task_id`` (explicit > pin default — same precedence as
+      the ``report_task_*`` family).
+    * Idempotency: skip the emit when the declaration is a duplicate
+      of the same ``(kind, task_id)`` pair.
+    * Emit ``TaskDeclarationReceived`` on the sink bus.
+    * Return ``{"acknowledged": True}`` — never fail the agent's tool
+      call on a declaration.
+
+    DOES NOT mutate plan state. The steerer's ``_apply_revision``
+    machinery remains the only path that can transition a task; this
+    declaration just queues an advisory signal that the next refine
+    consumes (Phase 4 work).
+    """
+    task_id, _source = _resolve_task_id_with_source(args, session)
+    reason = _str(args, "reason")
+    if not task_id:
+        return _missing_task_id_response(tool_name)
+    is_new = _record_declaration(session, kind, task_id, reason)
+    if is_new:
+        await _emit_task_declaration_received(
+            session=session,
+            steerer=steerer,
+            kind=kind,
+            task_id=task_id,
+            reason=reason,
+        )
+    # Return shape mirrors the ``report_task_*`` family: ``acknowledged``
+    # tells the LLM "we got it", and ``idempotent`` flags the duplicate
+    # case so observability can distinguish first-time vs. repeat.
+    if is_new:
+        return dict(_ACK)
+    return {"acknowledged": True, "idempotent": True}
+
+
+async def _handle_declare_task_skipped(
+    args: dict[str, Any], session: Session, steerer: Steerer
+) -> dict[str, Any]:
+    return await _handle_declaration(
+        args,
+        session,
+        steerer,
+        kind=DECLARATION_KIND_SKIPPED,
+        tool_name="declare_task_skipped",
+    )
+
+
+async def _handle_declare_task_not_needed(
+    args: dict[str, Any], session: Session, steerer: Steerer
+) -> dict[str, Any]:
+    return await _handle_declaration(
+        args,
+        session,
+        steerer,
+        kind=DECLARATION_KIND_NOT_NEEDED,
+        tool_name="declare_task_not_needed",
+    )
+
+
 async def _handle_awaiting_approval(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
@@ -1294,6 +1467,24 @@ _SCHEMA_AWAITING_APPROVAL = _object_schema(
 )
 
 
+_SCHEMA_DECLARE_TASK_SKIPPED = _object_schema(
+    required=["reason"],
+    properties={
+        "task_id": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+)
+
+
+_SCHEMA_DECLARE_TASK_NOT_NEEDED = _object_schema(
+    required=["reason"],
+    properties={
+        "task_id": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+)
+
+
 # ---------------------------------------------------------------------------
 # Built-in tool specs
 # ---------------------------------------------------------------------------
@@ -1385,10 +1576,51 @@ BUILTIN_REPORTING_TOOLS: list[ReportingToolSpec] = [
         parameters=_SCHEMA_AWAITING_APPROVAL,
         handler=_handle_awaiting_approval,
     ),
+    # goldfive#271 Phase 3: structural declarations. Observability-only
+    # — they emit a TaskDeclarationReceived sink event so operators can
+    # see the agent's stated intent without the framework auto-mutating
+    # the plan in response. The imperative report_task_* surface
+    # remains the only path to actually transition a task; declarations
+    # are advisory signals the next refine consumes.
+    ReportingToolSpec(
+        name="declare_task_skipped",
+        description=(
+            "Declare that you are intentionally skipping a task — you read "
+            "the plan, you saw the task, and you decided not to do it (e.g. "
+            "duplicate work already done by another agent, or work the "
+            "user clarified is no longer needed). 'reason' is a one-line "
+            "explanation. This is an OBSERVABILITY signal — the framework "
+            "records it but does NOT remove the task from the plan. If you "
+            "want to actually fail or cancel the task, use report_task_failed. "
+            "Idempotent: a second declaration of the same kind on the same "
+            "task is a no-op."
+        ),
+        parameters=_SCHEMA_DECLARE_TASK_SKIPPED,
+        handler=_handle_declare_task_skipped,
+    ),
+    ReportingToolSpec(
+        name="declare_task_not_needed",
+        description=(
+            "Declare that a planned task is no longer needed — your work "
+            "made the task redundant (e.g. an upstream change satisfies it, "
+            "or the goal evolved past it). 'reason' is a one-line "
+            "explanation. This is an OBSERVABILITY signal — the framework "
+            "records it but does NOT remove the task from the plan. The "
+            "next refine considers your declaration when deciding whether "
+            "to mark the task NOT_NEEDED. Idempotent: a second declaration "
+            "of the same kind on the same task is a no-op."
+        ),
+        parameters=_SCHEMA_DECLARE_TASK_NOT_NEEDED,
+        handler=_handle_declare_task_not_needed,
+    ),
 ]
 
 
 __all__ = [
+    "DECLARATION_KIND_NOT_NEEDED",
+    "DECLARATION_KIND_SKIPPED",
+    "DECLARATION_KINDS",
+    "DECLARATIONS_KEY",
     "ReportingHandler",
     "ReportingToolSpec",
     "REPORTING_TOOL_NAMES",
