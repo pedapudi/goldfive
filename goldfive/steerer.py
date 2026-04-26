@@ -3665,7 +3665,12 @@ class DefaultSteerer:
         The full revision pipeline fires:
 
         * :meth:`_apply_user_steer_state` — active_steer bookkeeping +
-          dedup (no-ops on a goldfive-authored drift)
+          dedup. Only fires when the drift originated from a real
+          user-control STEER :class:`ControlMessage` (``drift.raw`` set);
+          Runner-synthesized USER_STEER drifts (no ``raw``) skip this so
+          ``goldfive.active_steer.*`` reflects only genuine operator
+          interventions, not every fresh user turn driven through
+          :meth:`Planner.handle_turn`.
         * :meth:`_emit_drift_detected` — ``DriftDetected``
         * :meth:`_apply_revision` — install revised + bump
           ``revision_index`` + stamp metadata
@@ -3682,8 +3687,28 @@ class DefaultSteerer:
         # the right ``authored_by``.
         if not drift.authored_by:
             drift.authored_by = self._resolve_authored_by(drift)
-        # USER_STEER bookkeeping (no-op for non-USER drifts).
-        if drift.kind is DriftKind.USER_STEER:
+        # USER_STEER bookkeeping. Two callers reach this method:
+        #   (a) :meth:`Runner._install_revision` — synthesizes a
+        #       USER_STEER drift on EVERY turn whose handle_turn
+        #       produced a plan, with ``drift.raw is None``. This is
+        #       not a genuine operator STEER intervention — it's just
+        #       the structural install pipeline. Stamping
+        #       ``goldfive.active_steer.*`` here would smear every
+        #       fresh user turn into the active-steer slot the planner
+        #       prompt reads to remember the most recent operator
+        #       directive, and prepend the user's raw input onto
+        #       ``processed_steer_ids`` for no benefit (the dedupe id
+        #       is empty without a ControlMessage behind the drift).
+        #   (b) (no other callers today) — reserved for a future
+        #       direct-from-control STEER path that bypasses the
+        #       executor's steer-drain loop. Such callers will populate
+        #       ``drift.raw`` from the originating ControlMessage and
+        #       genuinely want the bookkeeping.
+        # Gate on ``drift.raw`` so (a) skips and (b) (when added) gets
+        # the bookkeeping naturally. Drift kind alone isn't enough:
+        # both callers use ``DriftKind.USER_STEER``; ``raw`` is the
+        # carrier of "this came from a real ControlMessage".
+        if drift.kind is DriftKind.USER_STEER and getattr(drift, "raw", None) is not None:
             await self._apply_user_steer_state(drift, session)
         await self._emit_drift_detected(session, drift)
         # Validate the revised plan against the prior. Use the same
