@@ -265,37 +265,56 @@ async def test_before_agent_skips_turn_when_cancelled() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Flag is CONSUMED (read + clear) -- re-entry doesn't re-cancel
+# 2. Flag is CONSUMED (read + clear) -- re-entry doesn't re-emit, but
+#    the cancellation is sticky for the rest of the invocation
+#    (goldfive#271 follow-up; see /tmp/demo-v12.log regression).
 # ---------------------------------------------------------------------------
 
 
 async def test_cancel_flag_consumed_on_first_callback() -> None:
     plugin, sink, _session = _make_plugin()
-    plugin.request_invocation_cancel(
-        invocation_id="inv-1", request=_make_request()
-    )
+    plugin.request_invocation_cancel(invocation_id="inv-1", request=_make_request())
 
     inv_ctx = _FakeInvocationContext(
         invocation_id="inv-1",
         session_state={},
     )
-    # First callback consumes the flag.
+
+    # Spy reconciler so we can assert no forward work runs on either
+    # the first or second callback (both must short-circuit).
+    class _Spy:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def on_before_agent(self, **_kwargs: Any) -> None:
+            self.calls += 1
+
+    spy = _Spy()
+    plugin.set_reconciler(spy)
+
+    # First callback consumes the cancel-state entry, emits
+    # InvocationCancelled, marks the invocation sticky-cancelled, and
+    # short-circuits.
     await plugin.before_agent_callback(
         agent=_FakeAgent(name="sub_agent"),
         callback_context=_FakeCallbackContext(invocation_context=inv_ctx),
     )
-    # Flag is gone.
+    # The popped flag is gone from cancel_state...
     assert plugin.peek_cancel_for_invocation("inv-1") is None
-    # A second callback on the same invocation sees no cancel and
-    # proceeds normally (we rely on the reconciler being None so the
-    # path completes without raising).
-    plugin.set_reconciler(None)
+    # ...but the sticky bit is set so subsequent callbacks see the
+    # invocation as still cancelled.
+    assert plugin.is_invocation_cancelled("inv-1") is True
+    # A second callback on the same invocation must ALSO short-circuit
+    # (without re-emitting the sink event). Pre-fix: the reconciler's
+    # ``on_before_agent`` ran and the agent turn proceeded.
     await plugin.before_agent_callback(
         agent=_FakeAgent(name="sub_agent"),
         callback_context=_FakeCallbackContext(invocation_context=inv_ctx),
     )
+    assert spy.calls == 0  # neither callback ran the reconciler
     # Only ONE InvocationCancelled event in total — the second
-    # callback did not re-emit.
+    # callback short-circuited silently (it knows the cancel was
+    # already announced).
     assert len(_cancelled_events(sink)) == 1
 
 
@@ -531,9 +550,7 @@ async def test_no_auto_redispatch_after_cancel() -> None:
     spy = _ReconcilerSpy()
     plugin.set_reconciler(spy)
 
-    plugin.request_invocation_cancel(
-        invocation_id="inv-1", request=_make_request()
-    )
+    plugin.request_invocation_cancel(invocation_id="inv-1", request=_make_request())
     inv_ctx = _FakeInvocationContext(
         invocation_id="inv-1",
         session_state={},
