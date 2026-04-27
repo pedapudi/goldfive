@@ -1301,6 +1301,44 @@ async def _inject_goldfive_planner_instruction(
 DEFAULT_LLM_CALL_TIMEOUT_MS: int = 120_000
 
 
+def _make_cancelled_llm_response() -> Any:
+    """Return a synthetic ``LlmResponse`` representing a cancelled call.
+
+    Returned from :meth:`_GoldfiveADKPlugin.before_model_callback` when
+    the active invocation has been flagged for cooperative cancel.
+    Per ADK's ``BasePlugin.before_model_callback`` contract a non-``None``
+    return value short-circuits the LLM dispatch and is propagated as
+    the response — returning ``None`` lets the request proceed normally,
+    which is the source of the demo-v12.log regression where a single
+    ``LLM_CALL_TIMEOUT`` drift fired multiple times on the same
+    invocation. Lazy import keeps this module loadable without
+    ``google.adk`` installed; on import error we fall back to a plain
+    sentinel object — ADK still treats any non-``None`` return as a
+    short-circuit, so the LLM call is skipped either way.
+    """
+    try:
+        from google.adk.models.llm_response import LlmResponse  # type: ignore
+        from google.genai import types as genai_types  # type: ignore
+    except Exception:  # noqa: BLE001
+        return {"goldfive_cancelled": True}
+    try:
+        return LlmResponse(
+            content=genai_types.Content(
+                parts=[genai_types.Part(text="[goldfive: cancelled]")],
+                role="model",
+            ),
+            turn_complete=True,
+        )
+    except Exception:  # noqa: BLE001
+        # Fallback to a bare LlmResponse if Content construction
+        # fails on a future ADK schema change. Any non-None still
+        # short-circuits per ADK's contract.
+        try:
+            return LlmResponse()
+        except Exception:  # noqa: BLE001
+            return {"goldfive_cancelled": True}
+
+
 def make_adk_plugin(
     *,
     name: str = "goldfive_adk_plugin",
@@ -1484,6 +1522,23 @@ def make_adk_plugin(
             # the key semantics so external consumers see a stable
             # contract; the plugin's dict is the live source of truth.
             self._cancel_state: dict[str, Any] = {}
+            # Sticky-cancelled set (goldfive#271 follow-up). Once a
+            # callback has consumed a ``_cancel_state`` entry for an
+            # invocation, the id is added here and EVERY subsequent
+            # callback for the same invocation short-circuits — even
+            # though ``_cancel_state`` itself was popped (consume-once
+            # semantic) so that the InvocationCancelled sink event
+            # only fires once. Without this, after the first
+            # cancellation, follow-up ``before_model_callback`` /
+            # ``before_tool_callback`` invocations on the SAME
+            # invocation_id would see an empty ``_cancel_state`` and
+            # let the LLM call / tool dispatch proceed — exactly the
+            # bug reproduced in /tmp/demo-v12.log where a single
+            # ``LLM_CALL_TIMEOUT`` drift on ``e-1e9e1f05`` was
+            # followed by 3 more watcher firings on the SAME
+            # invocation. Cleared in :meth:`clear_active_context` and
+            # in :meth:`after_run_callback` for the top-level id.
+            self._cancelled_invocations: set[str] = set()
             # Parent/child invocation map for cancel propagation.
             # ``dict[str, str]`` mapping ``invocation_id ->
             # parent_invocation_id``. Populated on every
@@ -1563,6 +1618,7 @@ def make_adk_plugin(
             # gone, and keeping it would misfire on an unrelated future
             # invocation_id collision.
             self._cancel_state.clear()
+            self._cancelled_invocations.clear()
             self._invocation_parents.clear()
             # goldfive#264 — drop per-invocation pin map.
             self._invocation_pinned_task_id.clear()
@@ -1615,8 +1671,7 @@ def make_adk_plugin(
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.debug(
-                        "_GoldfiveADKPlugin.request_invocation_cancel: "
-                        "descendant walk raised: %s",
+                        "_GoldfiveADKPlugin.request_invocation_cancel: descendant walk raised: %s",
                         exc,
                     )
                     descendants = []
@@ -1661,6 +1716,26 @@ def make_adk_plugin(
             if not invocation_id:
                 return None
             return self._cancel_state.get(str(invocation_id))
+
+        def is_invocation_cancelled(self, invocation_id: str) -> bool:
+            """Return True if ``invocation_id`` is flagged for cancel.
+
+            Sticky: returns True both when an unconsumed
+            :class:`~goldfive.types.CancellationRequest` is pending in
+            ``_cancel_state`` AND when an earlier callback already
+            consumed it (recorded in ``_cancelled_invocations``). The
+            sticky bit is what gives us "every subsequent callback for
+            the same invocation short-circuits", fixing the demo-v12.log
+            regression where the watcher fired multiple times on a
+            single invocation. See class-init comment on
+            ``_cancelled_invocations`` for the full rationale.
+            """
+            if not invocation_id:
+                return False
+            inv_id = str(invocation_id)
+            if inv_id in self._cancelled_invocations:
+                return True
+            return self._cancel_state.get(inv_id) is not None
 
         def set_reconciler(self, reconciler: Any) -> None:
             """Attach a :class:`~goldfive.reconciler.PlanReconciler`.
@@ -1741,13 +1816,16 @@ def make_adk_plugin(
             # cancel in harmonograf. The outer ``ADKAdapter.invoke``
             # loop honours the short-circuit via
             # :meth:`peek_cancel_for_invocation` (below).
-            if inv_id and self._cancel_state.get(inv_id) is not None:
-                request = self.consume_cancel_for_invocation(inv_id)
-                await self._emit_invocation_cancelled(
-                    invocation_id=inv_id,
-                    agent_name="",
-                    request=request,
-                )
+            if inv_id and self.is_invocation_cancelled(inv_id):
+                pending = self._cancel_state.get(inv_id)
+                if pending is not None:
+                    request = self.consume_cancel_for_invocation(inv_id)
+                    self._cancelled_invocations.add(inv_id)
+                    await self._emit_invocation_cancelled(
+                        invocation_id=inv_id,
+                        agent_name="",
+                        request=request,
+                    )
                 return None
 
             # Reset the per-invocation counters so the CONFABULATION_RISK
@@ -1848,13 +1926,16 @@ def make_adk_plugin(
             # turn is skipped entirely. Done BEFORE the pinning /
             # reconciler forward work so a cancelled turn leaves no
             # side-effects on orchestration state.
-            if inv_id and self._cancel_state.get(inv_id) is not None:
-                request = self.consume_cancel_for_invocation(inv_id)
-                await self._emit_invocation_cancelled(
-                    invocation_id=inv_id,
-                    agent_name=agent_name,
-                    request=request,
-                )
+            if inv_id and self.is_invocation_cancelled(inv_id):
+                pending = self._cancel_state.get(inv_id)
+                if pending is not None:
+                    request = self.consume_cancel_for_invocation(inv_id)
+                    self._cancelled_invocations.add(inv_id)
+                    await self._emit_invocation_cancelled(
+                        invocation_id=inv_id,
+                        agent_name=agent_name,
+                        request=request,
+                    )
                 return None
 
             # Layer 1: pin the starting sub-agent's task_id so its
@@ -2007,9 +2088,7 @@ def make_adk_plugin(
                         for task in tasks_list:
                             if str(_safe_attr(task, "id", "") or "") != tid:
                                 continue
-                            assignee = str(
-                                _safe_attr(task, "assignee_agent_id", "") or ""
-                            )
+                            assignee = str(_safe_attr(task, "assignee_agent_id", "") or "")
                             if assignee != agent_name:
                                 continue
                             status = _safe_attr(task, "status", None)
@@ -2036,18 +2115,14 @@ def make_adk_plugin(
             # Build the assignee+status candidate set once; signals 2-4
             # all reuse it. We also keep the parent's tool args (best-
             # effort) so signals 3 / 4 / 8 can score candidates.
-            assignee_candidates = self._candidates_for_agent(
-                tasks_list, agent_name
-            )
+            assignee_candidates = self._candidates_for_agent(tasks_list, agent_name)
             scoring_args = self._scoring_args_for(
                 ctx=ctx,
                 parent_invocation_id=parent_invocation_id,
             )
 
             # ---- Signal 2: DAG-ready exactly-1 -------------------------
-            dag_ready = self._filter_dag_ready(
-                plan, assignee_candidates, task_upstream_ready
-            )
+            dag_ready = self._filter_dag_ready(plan, assignee_candidates, task_upstream_ready)
             if len(dag_ready) == 1:
                 task = dag_ready[0]
                 task_id = str(_safe_attr(task, "id", "") or "")
@@ -2249,13 +2324,9 @@ def make_adk_plugin(
             # ---- Signal 7: assignee bare/compound normalisation -------
             normalised_alt = self._alternate_agent_name_form(agent_name)
             if normalised_alt and normalised_alt != agent_name:
-                alt_assignee = self._candidates_for_agent(
-                    tasks_list, normalised_alt
-                )
+                alt_assignee = self._candidates_for_agent(tasks_list, normalised_alt)
                 if alt_assignee:
-                    alt_dag_ready = self._filter_dag_ready(
-                        plan, alt_assignee, task_upstream_ready
-                    )
+                    alt_dag_ready = self._filter_dag_ready(plan, alt_assignee, task_upstream_ready)
                     chosen = None
                     if len(alt_dag_ready) == 1:
                         chosen = alt_dag_ready[0]
@@ -2269,8 +2340,7 @@ def make_adk_plugin(
                         task_id = str(_safe_attr(chosen, "id", "") or "")
                         if task_id:
                             log.warning(
-                                "pin: assignee normalisation %r->%r "
-                                "found candidate %s",
+                                "pin: assignee normalisation %r->%r found candidate %s",
                                 agent_name,
                                 normalised_alt,
                                 task_id,
@@ -2449,9 +2519,7 @@ def make_adk_plugin(
             # 3) Goals on the session itself.
             goals = _safe_attr(ctx.session, "goals", None) or []
             if goals:
-                summaries = [
-                    str(_safe_attr(g, "summary", "") or "") for g in goals
-                ]
+                summaries = [str(_safe_attr(g, "summary", "") or "") for g in goals]
                 joined = " ".join(s for s in summaries if s).strip()
                 if joined:
                     return joined
@@ -2495,7 +2563,8 @@ def make_adk_plugin(
                 return None
             assignee_candidates = self._candidates_for_agent(tasks, agent_name)
             preferred: list[Any] = [
-                t for t in assignee_candidates
+                t
+                for t in assignee_candidates
                 if str(_safe_attr(t, "id", "") or "") in downstream_ids
             ]
             if not preferred:
@@ -2532,15 +2601,11 @@ def make_adk_plugin(
             """
             from goldfive.types import TaskStatus
 
-            store = OrchestrationStore.for_session(
-                _safe_attr(ctx, "session", None)
-            )
+            store = OrchestrationStore.for_session(_safe_attr(ctx, "session", None))
             binding = store.get_reasoning_extracted_binding(agent_name)
             if binding is None or not binding.task_id:
                 return None
-            tasks_by_id = {
-                str(_safe_attr(t, "id", "") or ""): t for t in tasks
-            }
+            tasks_by_id = {str(_safe_attr(t, "id", "") or ""): t for t in tasks}
             task = tasks_by_id.get(binding.task_id)
             if task is None:
                 return None
@@ -2580,7 +2645,7 @@ def make_adk_plugin(
                     continue
                 if not key.startswith(prefix):
                     continue
-                tid = key[len(prefix):]
+                tid = key[len(prefix) :]
                 if tid:
                     target_task_ids.append(tid)
             if not target_task_ids:
@@ -2589,9 +2654,7 @@ def make_adk_plugin(
             # matching id. We do not require assignee-equality here —
             # the writer keyed on the agent already, and we trust that
             # the correction is for this agent's turn.
-            tasks_by_id = {
-                str(_safe_attr(t, "id", "") or ""): t for t in tasks
-            }
+            tasks_by_id = {str(_safe_attr(t, "id", "") or ""): t for t in tasks}
             for tid in target_task_ids:
                 task = tasks_by_id.get(tid)
                 if task is None:
@@ -2647,9 +2710,7 @@ def make_adk_plugin(
                 # Pin with low confidence.
                 return assignee_candidates[0], 0.4
             if scoring_args is not None:
-                chosen = _score_candidates_by_args(
-                    assignee_candidates, scoring_args
-                )
+                chosen = _score_candidates_by_args(assignee_candidates, scoring_args)
                 if chosen is not None:
                     return chosen, 0.4
             # Tie / no scoring available — pick the first deterministically
@@ -2683,9 +2744,7 @@ def make_adk_plugin(
             if not sinks:
                 return
             kind = (
-                "pin_resolved_low_confidence"
-                if via_signal == "low_confidence"
-                else "pin_resolved"
+                "pin_resolved_low_confidence" if via_signal == "low_confidence" else "pin_resolved"
             )
             session = ctx.session
             run_id = str(_safe_attr(session, "run_id", "") or "")
@@ -2705,14 +2764,10 @@ def make_adk_plugin(
             try:
                 from goldfive.events import emit, make_event  # noqa: PLC0415
 
-                evt = make_event(
-                    run_id, seq, kind, payload, session_id=session_id
-                )
+                evt = make_event(run_id, seq, kind, payload, session_id=session_id)
                 await emit(sinks, evt)
             except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "_emit_pin_resolved: failed to emit %s: %s", kind, exc
-                )
+                log.debug("_emit_pin_resolved: failed to emit %s: %s", kind, exc)
 
         def _stamp_current_task_id(
             self,
@@ -2764,15 +2819,12 @@ def make_adk_plugin(
                 title = str(_safe_attr(task, "title", "") or "")
             store.set_pin_current_task(
                 task_id,
-                source=_BINDING_SOURCE_BY_LADDER.get(
-                    source, BindingSource.UNKNOWN
-                ),
+                source=_BINDING_SOURCE_BY_LADDER.get(source, BindingSource.UNKNOWN),
                 revision=pin_revision,
                 title=title,
             )
             log.info(
-                "goldfive.pin.set: task_id=%s agent=%s source=%s revision=%d "
-                "invocation_id=%s",
+                "goldfive.pin.set: task_id=%s agent=%s source=%s revision=%d invocation_id=%s",
                 task_id,
                 agent_name,
                 source,
@@ -2881,9 +2933,7 @@ def make_adk_plugin(
             if not task_id:
                 return
             try:
-                pin_revision = int(
-                    _safe_attr(plan, "revision_index", 0) or 0
-                )
+                pin_revision = int(_safe_attr(plan, "revision_index", 0) or 0)
             except (TypeError, ValueError):
                 pin_revision = 0
             store = OrchestrationStore.for_session(ctx.session)
@@ -2994,6 +3044,10 @@ def make_adk_plugin(
             if inv_id:
                 self._invocation_tool_calls.pop(inv_id, None)
                 self._invocation_last_text.pop(inv_id, None)
+                # Drop the sticky-cancelled marker for this invocation
+                # so a future invocation_id collision (e.g. test
+                # harness reuse) doesn't inherit the cancel bit.
+                self._cancelled_invocations.discard(inv_id)
             await self._emit_observability(
                 "agent_invocation_completed",
                 agent_name=agent_name,
@@ -3439,8 +3493,7 @@ def make_adk_plugin(
             steerer = ctx.steerer if ctx is not None else None
             session = ctx.session if ctx is not None else None
             log.warning(
-                "goldfive.llm.timeout invocation_id=%s timeout_s=%.1f "
-                "agent=%s task_id=%s",
+                "goldfive.llm.timeout invocation_id=%s timeout_s=%.1f agent=%s task_id=%s",
                 invocation_id,
                 timeout_s,
                 self._host_agent_name or "?",
@@ -3471,9 +3524,7 @@ def make_adk_plugin(
                             f"({timeout_s:.1f}s) on invocation "
                             f"{invocation_id}"
                         ),
-                        current_task_id=str(
-                            _safe_attr(getattr(ctx, "task", None), "id", "") or ""
-                        ),
+                        current_task_id=str(_safe_attr(getattr(ctx, "task", None), "id", "") or ""),
                         current_agent_id=self._host_agent_name or "",
                     )
                     observation = _as_observation(
@@ -3493,8 +3544,7 @@ def make_adk_plugin(
                             await emit_drift(session, drift)
                         except Exception as exc:  # noqa: BLE001
                             log.debug(
-                                "_run_llm_call_timeout_watcher: "
-                                "_emit_drift_detected raised: %s",
+                                "_run_llm_call_timeout_watcher: _emit_drift_detected raised: %s",
                                 exc,
                             )
                 except Exception as exc:  # noqa: BLE001
@@ -3511,10 +3561,7 @@ def make_adk_plugin(
                     reason="llm_call_timeout",
                     severity=DriftSeverity.CRITICAL,
                     drift_kind=DriftKind.LLM_CALL_TIMEOUT.value,
-                    detail=(
-                        f"LLM call exceeded wall-clock budget "
-                        f"({timeout_s:.1f}s)"
-                    ),
+                    detail=(f"LLM call exceeded wall-clock budget ({timeout_s:.1f}s)"),
                     requested_at_ms=int(time.time() * 1000),
                 )
                 self.request_invocation_cancel(
@@ -3530,7 +3577,7 @@ def make_adk_plugin(
 
         # --- Plan + current-task context -------------------------------
 
-        async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> None:
+        async def before_model_callback(self, *, callback_context: Any, llm_request: Any) -> Any:
             """GoldfivePlanner request-side instruction injection
             + per-LLM-call instrumentation (goldfive#172).
 
@@ -3564,28 +3611,43 @@ def make_adk_plugin(
             if ctx is None:
                 return None
 
-            # Cooperative-cancellation checkpoint (goldfive#251 Stream C / 7a).
-            # Skip the LLM call when this invocation is flagged for
-            # cancel. This is the checkpoint that matters most in
-            # practice: a mid-flight LLM call is the expensive work
-            # whose output would contaminate the parent transcript.
-            # The ``before_agent_callback`` checkpoint above normally
-            # fires first, but ADK may reach ``before_model_callback``
-            # without ``before_agent_callback`` on some dispatch
-            # shapes (e.g. direct model invocations in tests); this
-            # check is the backstop.
+            # Cooperative-cancellation checkpoint (goldfive#251 Stream C / 7a;
+            # sticky-flag fix from goldfive#271 follow-up). Skip the
+            # LLM call when this invocation is flagged for cancel. This
+            # is the checkpoint that matters most in practice: a
+            # mid-flight LLM call is the expensive work whose output
+            # would contaminate the parent transcript.
+            #
+            # Returns a synthetic ``LlmResponse`` (NOT ``None``) so ADK
+            # actually short-circuits the dispatch — per ADK's
+            # ``BasePlugin.before_model_callback`` contract, returning
+            # ``None`` lets the LLM request proceed normally.
+            #
+            # Uses the sticky :meth:`is_invocation_cancelled` so every
+            # subsequent callback on the same invocation also
+            # short-circuits, even though the cancel-state entry is
+            # popped on first consume (consume-once semantic for the
+            # InvocationCancelled sink event).
             inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
                 callback_context, "invocation_context", None
             )
             inv_id_check = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
-            if inv_id_check and self._cancel_state.get(inv_id_check) is not None:
-                request = self.consume_cancel_for_invocation(inv_id_check)
-                await self._emit_invocation_cancelled(
-                    invocation_id=inv_id_check,
-                    agent_name="",
-                    request=request,
-                )
-                return None
+            if inv_id_check and self.is_invocation_cancelled(inv_id_check):
+                pending = self._cancel_state.get(inv_id_check)
+                if pending is not None:
+                    request = self.consume_cancel_for_invocation(inv_id_check)
+                    self._cancelled_invocations.add(inv_id_check)
+                    await self._emit_invocation_cancelled(
+                        invocation_id=inv_id_check,
+                        agent_name="",
+                        request=request,
+                    )
+                else:
+                    log.info(
+                        "goldfive.llm.skip invocation_id=%s reason=cancel-flag-set",
+                        inv_id_check,
+                    )
+                return _make_cancelled_llm_response()
 
             # GoldfivePlanner request-side injection (goldfive#153).
             # Best-effort: never raise from this path; injection failure
@@ -3632,7 +3694,11 @@ def make_adk_plugin(
                     # (operator opted out) or when no SessionContext
                     # is available (the watcher can't emit drifts
                     # without one).
-                    if self._llm_call_timeout_ms > 0 and ctx is not None:
+                    if (
+                        self._llm_call_timeout_ms > 0
+                        and ctx is not None
+                        and not self.is_invocation_cancelled(inv_id)
+                    ):
                         timeout_s = self._llm_call_timeout_ms / 1000.0
                         try:
                             watcher = asyncio.create_task(
@@ -3649,8 +3715,7 @@ def make_adk_plugin(
                             # async callback, but the harness kicks
                             # off with no loop in some unit tests).
                             log.debug(
-                                "before_model_callback: cannot schedule "
-                                "LLM-timeout watcher: %s",
+                                "before_model_callback: cannot schedule LLM-timeout watcher: %s",
                                 exc,
                             )
                     self._invocation_llm_pending[inv_id] = pending
@@ -3703,14 +3768,17 @@ def make_adk_plugin(
                 tool_context, "invocation_context", None
             )
             inv_id_check = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
-            if inv_id_check and self._cancel_state.get(inv_id_check) is not None:
-                request = self.consume_cancel_for_invocation(inv_id_check)
-                await self._emit_invocation_cancelled(
-                    invocation_id=inv_id_check,
-                    agent_name="",
-                    request=request,
-                    tool_name=tool_name,
-                )
+            if inv_id_check and self.is_invocation_cancelled(inv_id_check):
+                pending = self._cancel_state.get(inv_id_check)
+                if pending is not None:
+                    request = self.consume_cancel_for_invocation(inv_id_check)
+                    self._cancelled_invocations.add(inv_id_check)
+                    await self._emit_invocation_cancelled(
+                        invocation_id=inv_id_check,
+                        agent_name="",
+                        request=request,
+                        tool_name=tool_name,
+                    )
                 # MINIMAL LLM-visible response — single-key dict, no
                 # ``reason`` / ``detail`` / ``drift_kind``. The parent
                 # LLM that receives this as an AgentTool response can
@@ -3792,23 +3860,19 @@ def make_adk_plugin(
                 # runs on edge-cases).
                 agent_name = ""
                 try:
-                    inv_ctx = _safe_attr(
-                        tool_context, "_invocation_context", None
-                    ) or _safe_attr(tool_context, "invocation_context", None)
+                    inv_ctx = _safe_attr(tool_context, "_invocation_context", None) or _safe_attr(
+                        tool_context, "invocation_context", None
+                    )
                     running_agent = _safe_attr(inv_ctx, "agent", None)
                     agent_name = str(_safe_attr(running_agent, "name", "") or "")
                     if not agent_name:
-                        agent_name = str(
-                            _safe_attr(ctx, "host_agent_name", "") or ""
-                        )
+                        agent_name = str(_safe_attr(ctx, "host_agent_name", "") or "")
                 except Exception:  # noqa: BLE001
                     agent_name = ""
 
                 has_candidates = False
                 try:
-                    has_candidates = _agent_has_pending_candidates(
-                        ctx, agent_name
-                    )
+                    has_candidates = _agent_has_pending_candidates(ctx, agent_name)
                 except Exception:  # noqa: BLE001 — conservative fall-through
                     has_candidates = False
 
@@ -3823,16 +3887,12 @@ def make_adk_plugin(
                         plan = _safe_attr(ctx.session, "plan", None)
                         tasks = _safe_attr(plan, "tasks", None) or ()
                         for task in tasks:
-                            assignee = str(
-                                _safe_attr(task, "assignee_agent_id", "") or ""
-                            )
+                            assignee = str(_safe_attr(task, "assignee_agent_id", "") or "")
                             if assignee != agent_name:
                                 continue
                             status = _safe_attr(task, "status", None)
                             if status is TaskStatus.PENDING or status is TaskStatus.RUNNING:
-                                candidate_ids.append(
-                                    str(_safe_attr(task, "id", "") or "")
-                                )
+                                candidate_ids.append(str(_safe_attr(task, "id", "") or ""))
                     except Exception:  # noqa: BLE001
                         pass
                     log.warning(
@@ -3859,8 +3919,7 @@ def make_adk_plugin(
                         )
                     except Exception as exc:  # noqa: BLE001
                         log.debug(
-                            "before_tool_callback: pin_unresolved drift emit "
-                            "raised: %s",
+                            "before_tool_callback: pin_unresolved drift emit raised: %s",
                             exc,
                         )
                     return {"acknowledged": True}
@@ -4128,9 +4187,7 @@ def make_adk_plugin(
                     reasoning_agent_name = ""
                     try:
                         running_agent = _safe_attr(inv_ctx, "agent", None)
-                        reasoning_agent_name = str(
-                            _safe_attr(running_agent, "name", "") or ""
-                        )
+                        reasoning_agent_name = str(_safe_attr(running_agent, "name", "") or "")
                     except Exception:  # noqa: BLE001
                         reasoning_agent_name = ""
                     if not reasoning_agent_name:
@@ -4155,8 +4212,7 @@ def make_adk_plugin(
                             )
                         except Exception as exc:  # noqa: BLE001
                             log.debug(
-                                "after_model_callback: observe_reasoning "
-                                "(fallback) raised: %s",
+                                "after_model_callback: observe_reasoning (fallback) raised: %s",
                                 exc,
                             )
                     except Exception as exc:  # noqa: BLE001
