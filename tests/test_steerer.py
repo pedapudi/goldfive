@@ -1115,13 +1115,18 @@ async def test_plan_revised_carries_diff() -> None:
     assert removed == [("t1", "t2")]
 
 
-async def test_plan_revised_diff_empty_on_identity_revision() -> None:
-    """Revised plan structurally identical to the old → all diff lists empty.
+async def test_no_op_revision_is_rejected_and_escalates() -> None:
+    """Revised plan structurally identical to the old → no-op rejection.
 
-    The steerer still emits the ``PlanRevised`` event (because
-    ``planner.refine`` returned a non-None plan that passed validation),
-    but its ``diff`` fields must all be empty so sinks render a
-    no-op revision without a spurious "what changed" row.
+    goldfive#271: the steerer's structural guarantee at the install
+    boundary catches refines that don't actually change anything (the
+    Qwen judge re-firing on a corrected task pattern). Instead of
+    bumping ``revision_index`` for an unchanged plan, the steerer
+    treats the handler as exhausted and escalates to
+    HUMAN_INTERVENTION_REQUIRED.
+
+    Pre-#271 behaviour: emitted a ``plan_revised`` with empty diff
+    lists. Post-#271 behaviour: skips the install entirely.
     """
     # Build the "revised" plan so it is structurally equal to the
     # outgoing plan but is a distinct object (so the helper doesn't
@@ -1142,13 +1147,18 @@ async def test_plan_revised_diff_empty_on_identity_revision() -> None:
     await steerer.observe({"error": "trigger refine"}, session)
 
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
-    assert kinds == ["drift_detected", "plan_revised"]
-    pr = sink.proto_events[1].plan_revised
-    assert list(pr.diff.added_task_ids) == []
-    assert list(pr.diff.removed_task_ids) == []
-    assert list(pr.diff.modified_task_ids) == []
-    assert list(pr.diff.added_edges) == []
-    assert list(pr.diff.removed_edges) == []
+    # No plan_revised emitted — handler exhausted instead.
+    assert "plan_revised" not in kinds
+    # Two drift_detected events: the original drift + the
+    # HUMAN_INTERVENTION_REQUIRED escalation.
+    drift_kinds = [
+        e.drift_detected.kind
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert len(drift_kinds) >= 2
+    # Session paused for human intervention.
+    assert session.paused_for_human_intervention is True
 
 
 async def test_bind_replaces_sinks() -> None:
