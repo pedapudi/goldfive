@@ -319,3 +319,167 @@ async def test_normal_exception_does_not_trigger_tripwire(strict_on: None) -> No
     # RuntimeError propagates directly — no tripwire involvement.
     with pytest.raises(RuntimeError, match="boom"):
         await _run_with_boundary(raising_call)
+
+
+# ---------------------------------------------------------------------------
+# goldfive#326 regression — per-site assertion in __exit__ runs after finally
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_outer_finally_runs_before_exit_assertion(strict_on: None) -> None:
+    """v19 regression case (goldfive#326).
+
+    Mirrors the production v19 sequence: an outer audited site puts
+    ``mark_stash_completed`` in a ``finally`` block; an inner frame
+    deeper in the call stack catches ``CancelledError`` (mirroring
+    :meth:`ADKAdapter._invoke_internal`'s catch arm) and then
+    re-raises so the cancel propagates back through the outer site.
+
+    The original Phase 3.5 design called ``assert_stash_invariant``
+    centrally from the inner catch, walking ``_open_stash_markers``
+    BEFORE the outer ``finally`` had a chance to run — producing a
+    spurious :class:`CancellationStashViolation` for the outer site.
+    Per-site assertion fixes the frame ordering: the outer
+    ``__exit__`` runs AFTER its ``finally``, sees ``completed ==
+    True``, and does not raise.
+
+    This test reproduces the v19 turn-1 abort and verifies it now
+    propagates a clean ``CancelledError`` instead of a violation.
+    """
+
+    async def inner_catch_and_reraise() -> None:
+        # Mirrors ``_invoke_internal``'s catch arm: catches
+        # CancelledError, does some bookkeeping, then re-raises.
+        # No audited site at this frame — the audit is on the
+        # OUTER site, deeper in the await chain.
+        try:
+            raise asyncio.CancelledError("inner-await-cancelled")
+        except asyncio.CancelledError:
+            # Bookkeeping (close boundaries, heal, etc. — none here)
+            raise
+
+    async def outer_drive() -> None:
+        # Mirrors ``Runner.run.executor_drive``: wraps the inner
+        # call in an audited site whose compliance branch lives in
+        # a ``finally``.
+        with cancellation_stash_audited("Runner.run.executor_drive"):
+            try:
+                await inner_catch_and_reraise()
+            finally:
+                # Compliance: the stash fires regardless of how the
+                # inner call exited. With per-site assertion, this
+                # runs BEFORE the outer ``__exit__`` checks the
+                # marker.
+                mark_stash_completed()
+
+    # The outer's finally runs, marker.completed=True, outer
+    # __exit__ sees it and does not raise. Original CancelledError
+    # propagates cleanly.
+    with pytest.raises(asyncio.CancelledError):
+        await outer_drive()
+
+
+@pytest.mark.asyncio
+async def test_inner_clean_exit_does_not_flag_outer_still_active(
+    strict_on: None,
+) -> None:
+    """An inner site exiting cleanly must not flag the outer site's marker.
+
+    Stack semantics: an audited site that's still on the stack but
+    whose ``with`` body hasn't exited does NOT fire any assertion.
+    Only the site's own ``__exit__`` consults its marker. This test
+    drives a normal-completion inner exit while the outer site is
+    still active and verifies no violation surfaces.
+    """
+
+    inner_completed = False
+
+    async def inner_compliant() -> None:
+        nonlocal inner_completed
+        with cancellation_stash_audited("inner.normal_exit"):
+            try:
+                # Normal completion — no exception.
+                await asyncio.sleep(0)
+            finally:
+                mark_stash_completed()
+        inner_completed = True
+
+    async def outer_drive() -> None:
+        with cancellation_stash_audited("outer.still_active"):
+            try:
+                await inner_compliant()
+                # Now the inner site has exited cleanly. The outer
+                # site is still active. If a centralised walk
+                # were to run here, it would see the outer marker
+                # uncompleted — but no centralised walk runs (and
+                # neither does the outer's own ``__exit__`` until
+                # the outer ``with`` block exits).
+                assert inner_completed
+            finally:
+                mark_stash_completed()
+
+    await outer_drive()  # No exception, no violation.
+
+
+@pytest.mark.asyncio
+async def test_outer_bypass_with_inner_compliant_flags_outer_only(
+    strict_on: None,
+) -> None:
+    """Inverse of test 6: outer bypasses, inner is compliant.
+
+    Verifies the per-site assertion fires for whichever site's own
+    marker shows the bypass — not based on stack position. The
+    inner site's clean exit does not mask the outer's bypass.
+    """
+
+    async def call() -> None:
+        with cancellation_stash_audited("outer.bypass"):
+            try:
+                with cancellation_stash_audited("inner.compliant"):
+                    try:
+                        raise asyncio.CancelledError("inner")
+                    finally:
+                        # Inner compliance: marks INNER marker
+                        # (innermost top of stack).
+                        mark_stash_completed()
+            except BaseException:
+                # Outer does NOT mark its stash before re-raising —
+                # this is the bypass we want to surface.
+                raise
+
+    with pytest.raises(CancellationStashViolation) as exc_info:
+        await call()
+    msg = str(exc_info.value)
+    # Outer is the bypassing site; its name appears.
+    assert "outer.bypass" in msg
+    # Inner was compliant — it must not be in the bypass bullet.
+    assert "- inner.compliant" not in msg
+
+
+@pytest.mark.asyncio
+async def test_assert_stash_invariant_is_noop(strict_on: None) -> None:
+    """Backward compat: ``assert_stash_invariant`` is now a no-op stub.
+
+    The function is preserved so older external call sites (and
+    any third-party code that imported the symbol) keep working,
+    but it never raises. Per-site ``__exit__`` is now the canonical
+    mechanism. This test asserts the stub semantics directly.
+    """
+
+    # No audited sites open — must not raise.
+    assert_stash_invariant()
+    assert_stash_invariant(cause=asyncio.CancelledError("synthetic"))
+
+    # Even with an open uncompleted marker, the central call does
+    # not raise — the assertion only fires from per-site
+    # ``__exit__``.
+    with cancellation_stash_audited("synthetic.bypass.center"):
+        # Marker is open and uncompleted; old design would walk the
+        # stack and raise. New design: no-op.
+        assert_stash_invariant()
+        assert_stash_invariant(cause=asyncio.CancelledError("synthetic"))
+        # Mark before exit so the with-block's own __exit__ doesn't
+        # raise on normal completion (no exception → no per-site
+        # check anyway, but defensive).
+        mark_stash_completed()
