@@ -940,7 +940,14 @@ async def _handle_task_started(
                 attempted=TaskStatus.RUNNING,
                 task_id=task_id,
             )
-    await steerer.mark_task_running(task_id, session=session, detail=detail, source=source)
+    # Phase 3.5 (CANCELLATION-CONTRACT.md §C5): wrap the
+    # ``mark_task_running`` await in ``try/finally`` so the correction
+    # GC fires even when ``CancelledError`` (a ``BaseException`` since
+    # Py 3.8) propagates out mid-await. Without the ``finally`` a
+    # cancelled report-task-started leaves the pending correction
+    # entry on session state, and the next turn re-injects the
+    # correction block on a task the agent has already acknowledged.
+    #
     # goldfive#251 Stream D: the agent has acknowledged the (possibly
     # corrected) task; clear any queued correction scoped to this
     # ``(agent, task_id)`` pair. The correction block only needs to be
@@ -948,7 +955,12 @@ async def _handle_task_started(
     # the unadorned instruction. ``report_task_failed`` does NOT clear
     # (failure is not acknowledgment, and a re-invocation still needs
     # the correction).
-    _clear_correction_on_started(session, task)
+    try:
+        await steerer.mark_task_running(
+            task_id, session=session, detail=detail, source=source
+        )
+    finally:
+        _clear_correction_on_started(session, task)
     return dict(_ACK)
 
 

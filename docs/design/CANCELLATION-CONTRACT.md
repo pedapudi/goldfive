@@ -3,9 +3,10 @@
 **Status.** Phase 3 Addition A of goldfive#271. Sibling to
 [`STATE-OWNERSHIP-CONTRACT.md`](STATE-OWNERSHIP-CONTRACT.md). The
 exception class :class:`goldfive._state_audit.CancellationStashViolation`
-ships in Phase 3; the runtime tripwire mechanism lands with Phase 3.5
-(hard-cancel) when the goldfive task boundary becomes the legitimate
-catch site.
+ships in Phase 3; the C2-C6 audit conversions ship in Phase 3.5
+(this PR). The runtime tripwire mechanism still lands with the
+hard-cancel boundary work, when the goldfive task boundary becomes
+the legitimate catch site.
 
 ## tl;dr
 
@@ -79,11 +80,11 @@ Phase 3 ships an audit pass; Phase 3.5 wires the runtime tripwire.
 | ID | File | Function | Owns | Status | Notes |
 |---|---|---|---|---|---|
 | C1 | `goldfive/runner.py:411` | `_drive_internal` | prior-plan stash | **FIXED** in #287 (`try / finally`) | Validation v2 root-cause |
-| C2 | `goldfive/executors/parallel.py` (multiple) | various | event sequence + sink emit | survey ongoing | Several `try / except Exception` blocks wrap awaits but most stash via `_lock` re-entry — re-audit when boundary lands |
-| C3 | `goldfive/executors/sequential.py` (multiple) | various | event sequence + sink emit | survey ongoing | Same shape as C2 |
-| C4 | `goldfive/steerer.py` (multiple) | refine paths | `_background_judges` set | survey ongoing | Background tasks deliberately swallow on cancel via shutdown drain |
-| C5 | `goldfive/_correction_injection.py` | `clear_correction` | per-task correction body | LOW priority | Best-effort GC; `try / except Exception` swallow is acceptable |
-| C6 | `goldfive/reporting.py` (sink emits) | various | event id stamping | LOW priority | Sink emits are best-effort; broken sink shouldn't break tool calls |
+| C2 | `goldfive/executors/parallel.py` (refine) | `_refine` (steerer-bound + legacy) | CRITICAL drift mirror (`_emit_refine_failure`) | **FIXED** in Phase 3.5 (`except BaseException: emit; raise`) | Both `await planner.refine` call sites; CancelledError now lands the operator-visible "refine cancelled" mirror before propagating |
+| C3 | `goldfive/executors/sequential.py` | refine paths | event sequence + sink emit | **FIXED** transitively via C4 | Sequential refines route through `DefaultSteerer._handle_drift` / `_promote_drift_to_steer`; no direct `await planner.refine` call site here. The mid-stage `await steerer.observe` blocks own no post-await stash (the sequence cursor self-heals on the next emit), so the strict criterion (await + state-stash bypass) does not match any sequential.py site. |
+| C4 | `goldfive/steerer.py` | `_handle_drift`, `_promote_drift_to_steer`, `observe_refine` | paired `refine_failed` (attempt-id correlation) | **FIXED** in Phase 3.5 (`except BaseException: emit; raise`) | All three refine entry points now emit the paired `refine_failed` envelope on `CancelledError` before re-raising, so sinks never see an unmatched `refine_attempted`. The fire-and-forget `_run_judge_background` was already correct (CancelledError handled before `except Exception`; the `_background_judges` set is drained via `shutdown` + `add_done_callback`) |
+| C5 | `goldfive/reporting.py` (`_handle_task_started`) | post-`mark_task_running` correction GC | per-task pending-correction entry | **FIXED** in Phase 3.5 (`try / finally`) | The post-await `_clear_correction_on_started` is now in `finally`, so a `CancelledError` raised inside `await steerer.mark_task_running` no longer leaves a pending correction wedged on session state for an already-acknowledged task. The standalone `clear_correction` helper is sync and was never the bypass site — the bypass was the call-site sequencing in `_handle_task_started` |
+| C6 | `goldfive/reporting.py` (sink emits) | various | event id stamping | **FIXED** by construction | Every reporting sink-emit helper calls `session.next_sequence()` BEFORE the `await emit(...)`, so the cursor is already advanced by the time `CancelledError` lands. The `try / except Exception` around the emit is best-effort observability, not a state-stash. The pinning regression test in `tests/test_cancellation_stash_audit.py::test_c6_sequence_cursor_advances_before_emit_await` makes a future refactor that moves `next_sequence()` after the await regress loudly. |
 
 ### §2.1 Severity classification
 
@@ -104,17 +105,24 @@ Phase 3 ships an audit pass; Phase 3.5 wires the runtime tripwire.
 
 When the goldfive task boundary lands (Phase 3.5):
 
-1. Survey C2-C6 with the full audit pattern; convert HIGH/MEDIUM
-   sites to `try / finally` or `except BaseException: stash; raise`.
+1. **Done.** Survey C2-C6 with the full audit pattern; convert
+   HIGH/MEDIUM sites to `try / finally` or
+   `except BaseException: stash; raise`. Shipped in the
+   Phase 3.5 cancellation-stash PR — see §2 catalog status column.
 2. Wire the runtime tripwire — install
    :class:`CancellationStashViolation` raise machinery (paired with
    the boundary's stack-walk; the boundary becomes the one
    legitimate catch site, and any other site that absorbs
    `CancelledError` without entering its `finally` raises the
    tripwire).
-3. Test surface: `tests/test_cancellation_stash_audit.py` —
-   parametrized over the catalog, fires `CancelledError` at the
-   await, asserts the stash invariant.
+3. **Done.** Test surface:
+   `tests/test_cancellation_stash_audit.py` — fires
+   `CancelledError` at each audited `await`, asserts the stash
+   invariant. Each test fails on `origin/main` (without the
+   conversion) and passes with the fix. C6 is pinned by a
+   complementary regression test that asserts
+   `session.next_sequence()` runs strictly before the sink
+   `await`.
 
 ## §3 Why the boundary is prerequisite
 
