@@ -161,10 +161,21 @@ def _bind_plugin() -> tuple[Any, Session]:
 
 
 async def test_before_run_registers_current_task_under_invocation_id() -> None:
-    """The plugin's per-invocation task registry must be populated by
+    """The per-invocation task registry must be populated by
     ``before_run_callback`` so :meth:`request_invocation_cancel` has a
-    handle to cancel."""
-    plugin, _session = _bind_plugin()
+    handle to cancel.
+
+    Phase 3.5 (goldfive#271 component 1): the registry now lives on
+    :class:`~goldfive.orchestration_store.OrchestrationStore`, not on
+    the plugin instance. The plugin's ``_invocation_tasks`` attribute
+    is a backwards-compat view that delegates to the store. Both the
+    legacy attribute access AND a direct ``OrchestrationStore`` lookup
+    must return the registered task — pinning that the storage truly
+    relocated rather than being duplicated.
+    """
+    from goldfive.orchestration_store import OrchestrationStore
+
+    plugin, session = _bind_plugin()
     inv_ctx = _FakeInvocationContext(
         invocation_id="inv-A",
         session_state={},
@@ -172,7 +183,12 @@ async def test_before_run_registers_current_task_under_invocation_id() -> None:
     )
     await plugin.before_run_callback(invocation_context=inv_ctx)
     expected = asyncio.current_task()
+    # Legacy attribute path — preserved for the steerer + tests.
     assert plugin._invocation_tasks.get("inv-A") is expected
+    # Phase 3.5: registry actually lives on OrchestrationStore.
+    store = OrchestrationStore.for_session(session)
+    assert store.get_invocation_task("inv-A") is expected
+    assert "inv-A" in store.active_invocation_ids()
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +198,15 @@ async def test_before_run_registers_current_task_under_invocation_id() -> None:
 
 async def test_after_run_drops_registered_task() -> None:
     """``after_run_callback`` releases the per-invocation registry slot
-    so an unrelated late cancel doesn't target a finished invocation."""
-    plugin, _session = _bind_plugin()
+    so an unrelated late cancel doesn't target a finished invocation.
+
+    Phase 3.5 (goldfive#271 component 1): the deregister path must
+    reach the OrchestrationStore-backed registry, not just the plugin
+    attribute.
+    """
+    from goldfive.orchestration_store import OrchestrationStore
+
+    plugin, session = _bind_plugin()
     inv_ctx = _FakeInvocationContext(
         invocation_id="inv-B",
         session_state={},
@@ -191,8 +214,12 @@ async def test_after_run_drops_registered_task() -> None:
     )
     await plugin.before_run_callback(invocation_context=inv_ctx)
     assert "inv-B" in plugin._invocation_tasks
+    store = OrchestrationStore.for_session(session)
+    assert store.get_invocation_task("inv-B") is not None
     await plugin.after_run_callback(invocation_context=inv_ctx)
     assert "inv-B" not in plugin._invocation_tasks
+    # And the OrchestrationStore-side bucket no longer has the entry.
+    assert store.get_invocation_task("inv-B") is None
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +258,7 @@ async def test_request_cancel_flag_only_does_not_touch_task() -> None:
     assert plugin.peek_cancel_for_invocation("inv-1") is not None
     # Give the loop a tick to drain any (incorrectly) queued callbacks.
     await asyncio.sleep(0)
-    assert not cancelled.is_set(), (
-        "task.cancel() must NOT fire when cancel_inflight_task is False"
-    )
+    assert not cancelled.is_set(), "task.cancel() must NOT fire when cancel_inflight_task is False"
 
     body_task.cancel()
     try:

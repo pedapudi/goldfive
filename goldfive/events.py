@@ -639,6 +639,61 @@ def agent_invocation_completed_event(
     return evt
 
 
+def invocation_boundary_entered_event(
+    run_id: str,
+    sequence: int,
+    *,
+    invocation_id: str,
+    agent_name: str = "",
+    task_id: str = "",
+    entered_at: Any | None = None,
+    session_id: str = "",
+    event_id: str = "",
+) -> Any:
+    """Build an ``InvocationBoundaryEntered`` envelope (goldfive#271 Phase 3.5).
+
+    Emitted at the entry of the goldfive-owned wrapper around an ADK agent
+    invocation. Pairs with :func:`invocation_boundary_exited_event` — every
+    Entered MUST be followed by an Exited (the wrapper's ``try/finally``
+    arc guarantees this even on cancel/error paths). Operators can use the
+    pair to confirm a goldfive boundary actually wrapped the invocation.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
+    evt.invocation_boundary_entered.invocation_id = str(invocation_id or "")
+    evt.invocation_boundary_entered.agent_name = str(agent_name or "")
+    evt.invocation_boundary_entered.task_id = str(task_id or "")
+    evt.invocation_boundary_entered.entered_at.CopyFrom(entered_at or now_ts())
+    return evt
+
+
+def invocation_boundary_exited_event(
+    run_id: str,
+    sequence: int,
+    *,
+    invocation_id: str,
+    agent_name: str = "",
+    task_id: str = "",
+    reason: str = "completed",
+    exited_at: Any | None = None,
+    session_id: str = "",
+    event_id: str = "",
+) -> Any:
+    """Build an ``InvocationBoundaryExited`` envelope (goldfive#271 Phase 3.5).
+
+    ``reason`` is one of ``"completed"`` (normal return), ``"cancelled"``
+    (CancelledError caught at the boundary and converted to a structured
+    marker), or ``"error:<ExcName>"`` (an exception propagated after the
+    boundary's finally cleanup ran).
+    """
+    evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
+    evt.invocation_boundary_exited.invocation_id = str(invocation_id or "")
+    evt.invocation_boundary_exited.agent_name = str(agent_name or "")
+    evt.invocation_boundary_exited.task_id = str(task_id or "")
+    evt.invocation_boundary_exited.reason = str(reason or "completed")
+    evt.invocation_boundary_exited.exited_at.CopyFrom(exited_at or now_ts())
+    return evt
+
+
 def delegation_observed_event(
     run_id: str,
     sequence: int,

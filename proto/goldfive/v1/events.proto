@@ -76,6 +76,8 @@ message Event {
     InvocationCancelled invocation_cancelled = 34;
     TaskTransitioned task_transitioned = 35;
     TaskTransitionRefused task_transition_refused = 36;
+    InvocationBoundaryEntered invocation_boundary_entered = 37;
+    InvocationBoundaryExited invocation_boundary_exited = 38;
   }
 }
 
@@ -436,6 +438,48 @@ message AgentInvocationCompleted {
   string invocation_id = 3;
   string summary = 4;
   google.protobuf.Timestamp completed_at = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Goldfive boundary wrapper (goldfive#271 Phase 3.5 component 1)
+// ---------------------------------------------------------------------------
+//
+// The goldfive-owned wrapper around each ADK agent invocation emits this
+// pair on entry / exit. The boundary is the canonical try/finally site:
+// CancelledError is caught ONLY here (Phase 3.5 hard-cancel) and
+// converted to a structured exit marker so the rest of the runtime sees
+// a normal return. Operators can use the pair to confirm that an
+// invocation entered AND exited a goldfive boundary — a prerequisite for
+// the cancellation tripwire (CancellationStashViolation) and for proper
+// span lifecycle (Bug #192).
+//
+// Distinct from AgentInvocationStarted / AgentInvocationCompleted:
+//
+//   * AgentInvocation* fires when ADK reports the runner started /
+//     finished (``before_run_callback`` / ``after_run_callback``).
+//   * InvocationBoundary* fires at the goldfive-owned wrapper edges
+//     (``before_agent_callback`` / ``after_agent_callback``'s
+//     try/finally arc) — strictly AT-OR-WITHIN the AgentInvocation*
+//     lifecycle but always paired even on cancel/error paths where
+//     ADK's after-hooks may be skipped.
+message InvocationBoundaryEntered {
+  string invocation_id = 1;
+  string agent_name = 2;
+  string task_id = 3;
+  google.protobuf.Timestamp entered_at = 4;
+}
+
+// Paired with InvocationBoundaryEntered. ``reason`` is one of
+// ``"completed"`` (normal return), ``"cancelled"`` (CancelledError
+// caught at the boundary and converted to a marker), or
+// ``"error:<ExcName>"`` (an exception was observed and propagated
+// after the finally cleanup ran).
+message InvocationBoundaryExited {
+  string invocation_id = 1;
+  string agent_name = 2;
+  string task_id = 3;
+  string reason = 4;
+  google.protobuf.Timestamp exited_at = 5;
 }
 
 // A tool invocation about to run is an AgentTool — the host agent is
