@@ -1453,12 +1453,14 @@ async def _inject_goldfive_planner_instruction(
 #: ADK LLM dispatch exceeds this budget, the plugin emits a CRITICAL
 #: ``LLM_CALL_TIMEOUT`` drift and flags the invocation for cancel so
 #: subsequent callbacks short-circuit. Set to ``0`` (or any negative
-#: int) to disable the watcher entirely. Default 120000ms (2 minutes)
-#: matches the user-visible spec on goldfive#271 — a Q4 model emitting
-#: at ~17 tok/sec for 2 min produces ~2000 tokens, which is more than
-#: enough headroom for legitimate large responses while bounding the
-#: 9.6-minute pathology observed in demo-v8.log.
-DEFAULT_LLM_CALL_TIMEOUT_MS: int = 120_000
+#: int) to disable the watcher entirely. Default 1800000ms (30 minutes)
+#: is the pathological-hang ceiling for slow local models on
+#: compute-bound generation (e.g. Qwen 35B on slide generation or
+#: multi-step research synthesis). The watcher's job is catching wedged
+#: invocations, not enforcing latency SLOs — operators who want a
+#: tighter SLO pass an explicit ``llm_call_timeout_ms`` to
+#: :func:`make_adk_plugin`.
+DEFAULT_LLM_CALL_TIMEOUT_MS: int = 1_800_000
 
 
 def _make_cancelled_llm_response() -> Any:
@@ -1537,7 +1539,9 @@ def make_adk_plugin(
     explosions (Qwen Q4 emitting 9961 completion tokens in 9.6 minutes,
     demo-v8.log) — without it a single bad turn can wedge the run for
     minutes. Set to ``0`` or any negative int to disable the watcher.
-    Default ``DEFAULT_LLM_CALL_TIMEOUT_MS`` (120000 / 2 minutes).
+    Default ``DEFAULT_LLM_CALL_TIMEOUT_MS`` (1800000 / 30 minutes) —
+    sized as the pathological-hang ceiling for slow local models on
+    compute-bound generation, not an SLO.
     """
     try:
         from google.adk.plugins.base_plugin import BasePlugin  # type: ignore

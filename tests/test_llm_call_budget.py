@@ -91,34 +91,34 @@ def test_call_llm_budget_zero_or_negative_falls_back():
 # ---------------------------------------------------------------------------
 
 
-def test_llm_planner_cap_is_4096():
+def test_llm_planner_cap_is_16384():
     from goldfive.planner import LLMPlanner
 
-    assert LLMPlanner.MAX_OUTPUT_TOKENS == 4096
+    assert LLMPlanner.MAX_OUTPUT_TOKENS == 16384
 
 
-def test_llm_goal_deriver_cap_is_1024():
+def test_llm_goal_deriver_cap_is_8192():
     from goldfive.goal_deriver import LLMGoalDeriver
 
-    assert LLMGoalDeriver.MAX_OUTPUT_TOKENS == 1024
+    assert LLMGoalDeriver.MAX_OUTPUT_TOKENS == 8192
 
 
-def test_goal_drift_cap_is_2048():
+def test_goal_drift_cap_is_16384():
     from goldfive.drift.goals import GOAL_DRIFT_MAX_OUTPUT_TOKENS
 
-    assert GOAL_DRIFT_MAX_OUTPUT_TOKENS == 2048
+    assert GOAL_DRIFT_MAX_OUTPUT_TOKENS == 16384
 
 
-def test_reasoning_judge_cap_is_2048():
+def test_reasoning_judge_cap_is_16384():
     from goldfive.drift.reasoning_judge import REASONING_JUDGE_MAX_OUTPUT_TOKENS
 
-    assert REASONING_JUDGE_MAX_OUTPUT_TOKENS == 2048
+    assert REASONING_JUDGE_MAX_OUTPUT_TOKENS == 16384
 
 
-def test_reflective_check_cap_is_2048():
+def test_reflective_check_cap_is_16384():
     from goldfive.steerer import DefaultSteerer
 
-    assert DefaultSteerer.REFLECTIVE_MAX_OUTPUT_TOKENS == 2048
+    assert DefaultSteerer.REFLECTIVE_MAX_OUTPUT_TOKENS == 16384
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +169,7 @@ async def test_goal_deriver_threads_budget():
     goals = await deriver.derive("hello world")
     assert len(goals) == 1
     assert seen_budgets == [LLMGoalDeriver.MAX_OUTPUT_TOKENS]
-    assert seen_budgets == [1024]
+    assert seen_budgets == [8192]
 
 
 @pytest.mark.asyncio

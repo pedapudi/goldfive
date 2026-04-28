@@ -1650,10 +1650,12 @@ class DefaultSteerer:
     )
 
     # Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up).
-    # The reflective check returns a small JSON verdict; 2048 covers
-    # thinking-token preludes on Q4 endpoints without permitting
-    # unbounded essays.
-    REFLECTIVE_MAX_OUTPUT_TOKENS: int = 2048
+    # The reflective check returns a small JSON verdict, but Qwen 3.5
+    # thinking models share think+answer under one ceiling — 16384
+    # covers the think prelude on the 35B variant without permitting
+    # unbounded essays. See
+    # :func:`goldfive._llm.call_llm_budget` docstring for sizing rationale.
+    REFLECTIVE_MAX_OUTPUT_TOKENS: int = 16384
 
     async def note_llm_call(self, session: Session) -> None:
         """Record one LLM invocation against ``session``.

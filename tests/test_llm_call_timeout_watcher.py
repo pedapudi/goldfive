@@ -60,11 +60,12 @@ def _make_session_context(steerer: Any) -> Any:
     )
 
 
-def test_default_llm_call_timeout_is_120_seconds():
-    """120000 ms (2 min) is the user-spec default — generous enough for
-    legitimate long generations, tight enough to catch the 9.6-min Qwen
-    pathology."""
-    assert adk_plugin.DEFAULT_LLM_CALL_TIMEOUT_MS == 120_000
+def test_default_llm_call_timeout_is_30_minutes():
+    """1800000 ms (30 min) is the pathological-hang ceiling for slow
+    local models on compute-bound generation (Qwen 35B on slide
+    generation, multi-step research synthesis). Tight latency SLOs are
+    the operator's responsibility via ``llm_call_timeout_ms``."""
+    assert adk_plugin.DEFAULT_LLM_CALL_TIMEOUT_MS == 1_800_000
 
 
 def test_make_adk_plugin_accepts_llm_call_timeout_ms():
