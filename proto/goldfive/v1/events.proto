@@ -312,6 +312,29 @@ message DriftDetected {
   // do NOT reuse the tag.
   reserved 11;
   reserved "synthetic";
+  // Stable identifier for the drift CONDITION (goldfive#271 PR1).
+  // Same condition_id == same logical drift across multiple emits
+  // (e.g. opened -> escalating -> resolved). Computed as
+  // ``sha1(f"{kind.value}|{task_id}|{agent_id}|{turn_id}")[:16]`` so
+  // a new turn always opens a fresh condition while same-turn re-
+  // emits for the same kind+task+agent collapse onto one condition.
+  // Distinct from ``id`` (per-event identifier carried since #199):
+  // ``id`` identifies one DriftDetected emit; ``condition_id``
+  // identifies the lifecycle group those emits belong to. Empty
+  // string on legacy / not-yet-routed emit paths; sinks that don't
+  // know the field still see one row per emit (back-compat preserved
+  // — this PR is additive and does not collapse rows in harmonograf).
+  string condition_id = 12;
+  // Lifecycle phase at the time of this emit (goldfive#271 PR1). See
+  // :enum:`DriftLifecycle`. ``DRIFT_LIFECYCLE_UNSPECIFIED`` for
+  // legacy / not-yet-routed emit paths — treat as single-shot.
+  DriftLifecycle lifecycle = 13;
+  // Severity prior to this transition. Only meaningful when
+  // ``lifecycle == DRIFT_LIFECYCLE_ESCALATING``; otherwise
+  // ``DRIFT_SEVERITY_UNSPECIFIED``. Sinks rendering an "X bumped from
+  // INFO -> WARNING" view read this without having to remember the
+  // previous emit's severity themselves.
+  DriftSeverity prev_severity = 14;
 }
 
 // Terminal event on a successful run.
