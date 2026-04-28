@@ -2642,6 +2642,14 @@ class DefaultSteerer:
         # PlanRevisionDiff sidecar (PLAN-LIFECYCLE.md §2, §8 gap #4).
         prev_plan = session.plan
         self._apply_revision(session, revised, drift)
+        # Cancel the in-flight coordinator invocation now that the plan
+        # it was reasoning against has been superseded (goldfive#271
+        # follow-up — v15 concurrent-invocation bug). Order: cancel
+        # BEFORE PlanRevised emit so the synthetic InvocationCancelled
+        # sink event lands adjacent to the revision in the wire log
+        # and operators can correlate the two. Best-effort, never
+        # raises — a no-op cancel still leaves the new plan installed.
+        await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
         )
@@ -3111,6 +3119,7 @@ class DefaultSteerer:
         *,
         drift: DriftEvent,
         session: Session,
+        cancel_inflight_task: bool = False,
     ) -> list[str]:
         """Flag the invocation(s) associated with ``drift`` for
         cooperative cancellation (goldfive#251 Stream C / 7a).
@@ -3128,6 +3137,17 @@ class DefaultSteerer:
         the list of flagged invocation ids (including children) for
         observability; callers can log / sink-emit from the list.
 
+        When ``cancel_inflight_task=True`` (goldfive#271 follow-up —
+        v15 concurrent-invocation bug), the plugin ALSO fires
+        ``task.cancel()`` on the registered asyncio.Task driving each
+        flagged invocation, deferred via ``loop.call_soon`` so an
+        inline same-task caller still completes its current emission
+        work before the cancel lands. Default False so the existing
+        pre-refine cancel paths keep their flag-only semantics; the
+        post-refine helper :meth:`_cancel_inflight_for_revision`
+        opts in explicitly so the cancel only fires AFTER a
+        superseding plan has been installed.
+
         Guard rails:
 
         * No-op when no adapter is bound.
@@ -3139,6 +3159,10 @@ class DefaultSteerer:
           falling through silently; the rest of the ladder (refine,
           restart message) still runs and eventually catches up at
           the next task boundary.
+        * Plugins whose ``request_invocation_cancel`` predates
+          ``cancel_inflight_task`` (TypeError on the kwarg) fall back
+          to the kwarg-less call so older third-party plugins don't
+          break — the task-cancel step is silently skipped.
         """
         adapter = self._adapter
         if adapter is None:
@@ -3180,7 +3204,27 @@ class DefaultSteerer:
         flagged: list[str] = []
         for inv_id in invocation_ids:
             try:
-                result = fn(invocation_id=inv_id, request=request)
+                result = fn(
+                    invocation_id=inv_id,
+                    request=request,
+                    cancel_inflight_task=cancel_inflight_task,
+                )
+            except TypeError:
+                # Older plugin without the ``cancel_inflight_task``
+                # kwarg (third-party / pre-#271-follow-up). Fall back
+                # to the legacy signature; the task-cancel step is
+                # silently skipped, but the flag-only contract is
+                # preserved.
+                try:
+                    result = fn(invocation_id=inv_id, request=request)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "DefaultSteerer.request_invocation_cancel: "
+                        "plugin.request_invocation_cancel(%s) raised: %s",
+                        inv_id,
+                        exc,
+                    )
+                    continue
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "DefaultSteerer.request_invocation_cancel: "
@@ -3253,6 +3297,80 @@ class DefaultSteerer:
         if kind is DriftKind.USER_PAUSE:
             return "user_pause"
         return "drift"
+
+    @staticmethod
+    def _is_synthetic_install_user_steer(drift: DriftEvent) -> bool:
+        """Return True for the synthetic USER_STEER drift that
+        :meth:`Runner._install_revision` synthesizes on every turn whose
+        ``handle_turn`` produced a plan.
+
+        That call site stamps a USER_STEER ``DriftEvent`` with
+        ``drift.raw is None`` purely to drive the structural install
+        pipeline through :meth:`apply_user_steer_with_plan`. It is
+        not a refine triggered by a problem with an in-flight
+        invocation, so cancel-on-revision MUST exempt it (cancelling
+        the just-starting coordinator turn against a freshly-installed
+        plan would defeat the whole point of installing it).
+
+        Genuine operator STEERs from a real ControlMessage land here
+        with ``drift.raw`` populated and SHOULD trigger a cancel of
+        the in-flight turn (matching pre-unification USER_STEER cancel
+        semantics). The two callers of
+        :meth:`apply_user_steer_with_plan` are documented in that
+        method's docstring.
+        """
+        return drift.kind is DriftKind.USER_STEER and getattr(drift, "raw", None) is None
+
+    async def _cancel_inflight_for_revision(
+        self, drift: DriftEvent, session: Session
+    ) -> list[str]:
+        """Cancel the in-flight invocation(s) that produced ``drift``.
+
+        Called from every PlanRevised emission path right after the
+        revised plan has been applied to the session and BEFORE the
+        ``PlanRevised`` event is emitted. Closes the gap behind the v15
+        concurrent-invocation bug: a ``refine_steer`` call (10+ minutes
+        on a slow planner) used to overlap the coordinator's invocation
+        for its full duration because the existing cancel-state flag
+        only gates SUBSEQUENT callbacks — the already-running LLM
+        streaming call kept generating output that triggered more
+        drift, looping the refine.
+
+        Skips the synthetic USER_STEER drift
+        :meth:`Runner._install_revision` synthesizes on every turn
+        (see :meth:`_is_synthetic_install_user_steer`). Every other
+        drift kind that produces a successful PlanRevised (refine
+        from drift, refine_steer from goldfive-steer promotion,
+        operator USER_STEER from a real ControlMessage) flows through
+        this method. The plugin's
+        :meth:`request_invocation_cancel` then writes the cancel-state
+        flag (sticky-gate from PR #299) AND fires ``task.cancel()`` on
+        the registered asyncio.Task (goldfive#271 follow-up) so the
+        coordinator's in-flight LLM call observes ``CancelledError``
+        within ~one event-loop tick instead of ~the LLM-call's
+        full duration.
+
+        Best-effort: an unbound adapter, a non-ADK adapter without
+        :meth:`request_invocation_cancel`, or an empty resolved
+        invocation-id list each result in a no-op (the refined plan
+        still lands; the in-flight invocation simply runs to
+        completion under the older, less aggressive contract).
+        """
+        if self._is_synthetic_install_user_steer(drift):
+            return []
+        try:
+            return await self.request_invocation_cancel(
+                drift=drift,
+                session=session,
+                cancel_inflight_task=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — cancel is best-effort
+            log.debug(
+                "DefaultSteerer._cancel_inflight_for_revision: "
+                "request_invocation_cancel raised: %s",
+                exc,
+            )
+            return []
 
     # ------------------------------------------------------------------
     # goldfive-steer-unification: promotion policy + handler
@@ -3544,6 +3662,22 @@ class DefaultSteerer:
         session.refine_failure_counts.pop(counter_key, None)
         prev_plan = session.plan
         self._apply_revision(session, revised, drift)
+        # Cancel the in-flight coordinator invocation now that
+        # ``refine_steer`` produced a superseding plan (goldfive#271
+        # follow-up — v15 concurrent-invocation bug). This is the
+        # path that empirically motivated the fix: a goldfive-steer-
+        # eligible drift (PLAN_DIVERGENCE / OFF_TOPIC / …) at WARNING
+        # severity got refined while the coordinator's LLM call kept
+        # running for the full ``refine_steer`` duration, generating
+        # contaminated output that triggered more drift. Cancelling
+        # here preempts the in-flight LLM call so its remaining
+        # output can't loop the refine.
+        #
+        # Order: cancel BEFORE PlanRevised emit so the synthetic
+        # InvocationCancelled sink event lands adjacent to the
+        # revision and operators can correlate the two on the
+        # gantt timeline.
+        await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
         )
@@ -3787,6 +3921,17 @@ class DefaultSteerer:
         attempt_id = self._new_attempt_id()
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         self._apply_revision(session, revised_plan, drift)
+        # Cancel the in-flight invocation when this is a genuine
+        # operator STEER (drift.raw populated) rather than the
+        # synthetic install USER_STEER from
+        # :meth:`Runner._install_revision`. The exemption lives
+        # inside :meth:`_cancel_inflight_for_revision` itself —
+        # see :meth:`_is_synthetic_install_user_steer` for the
+        # rationale (cancelling on every fresh-turn install would
+        # immediately preempt the just-starting coordinator
+        # against the freshly-installed plan, defeating the
+        # whole point of installing it).
+        await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session,
             revised_plan,
