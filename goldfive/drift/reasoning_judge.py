@@ -85,9 +85,13 @@ _TRUNCATE_SUFFIX: str = " … [truncated]"
 
 # Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up).
 # The judge returns a small JSON verdict ({"on_task": bool, "reason":
-# "...", "severity": "...", ...}); 2048 leaves room for thinking-token
-# preludes on Q4 endpoints without permitting unbounded essays.
-REASONING_JUDGE_MAX_OUTPUT_TOKENS: int = 2048
+# "...", "severity": "...", ...}); 16384 covers Qwen 3.5 thinking-model
+# preludes (think + answer share the same ceiling) without permitting
+# unbounded essays. Empirical: v16 on Qwen 35B exhausted a 2048 budget
+# inside ``<think>`` and returned ``raw=''``, so no drift fired and the
+# cascade never started — see ``call_llm_budget`` docstring for sizing
+# rationale.
+REASONING_JUDGE_MAX_OUTPUT_TOKENS: int = 16384
 
 
 def truncate_for_observability(text: str, limit: int) -> str:

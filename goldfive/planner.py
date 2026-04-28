@@ -963,14 +963,16 @@ class LLMPlanner:
 
     # Per-callsite ``max_output_tokens`` budget for the underlying
     # ``call_llm`` (goldfive#271 follow-up). All planner LLM calls return
-    # a JSON plan structure; 4096 covers typical refines and large
-    # multi-task generates while bounding wall-clock at ~4 minutes
-    # against a Q4 Qwen endpoint at ~17 tok/sec. Pre-fix evidence
-    # (demo-v8.log): unbounded → 9961-token / 9.6-minute calls.
+    # a JSON plan structure; 16384 covers typical refines and large
+    # multi-task generates while leaving ample headroom for Qwen 3.5
+    # thinking-model preludes (think + answer share the same ceiling).
+    # Pre-fix evidence (demo-v8.log): unbounded → 9961-token / 9.6-minute
+    # calls; the wall-clock backstop now lives in
+    # :data:`goldfive.adapters._adk_plugin.DEFAULT_LLM_CALL_TIMEOUT_MS`.
     # Subclasses may override; the value is read once per call into
     # :func:`goldfive._llm.call_llm_budget` so per-instance overrides
     # propagate without restart.
-    MAX_OUTPUT_TOKENS: int = 4096
+    MAX_OUTPUT_TOKENS: int = 16384
 
     def __init__(
         self,

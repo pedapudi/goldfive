@@ -210,10 +210,12 @@ class LLMGoalDeriver:
     """
 
     # Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up).
-    # Goal extraction returns a small JSON object with one or two goals
-    # — 1024 tokens is generous and bounds wall-clock at ~60s on a
-    # Q4 endpoint.
-    MAX_OUTPUT_TOKENS: int = 1024
+    # Goal extraction returns a small JSON object with one or two goals,
+    # but Qwen 3.5 thinking models share think+answer under one ceiling
+    # — 8192 leaves headroom for the think prelude on the 35B variant
+    # without permitting unbounded essays. See ``call_llm_budget``
+    # docstring for sizing rationale.
+    MAX_OUTPUT_TOKENS: int = 8192
 
     def __init__(
         self,

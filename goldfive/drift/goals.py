@@ -61,9 +61,12 @@ GOAL_DRIFT_IDLE_SECONDS: int = 300
 
 # Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up).
 # The judge returns a small JSON verdict ({"progressing": bool, "reason":
-# "..."}); 2048 leaves room for thinking-token preludes on Q4 endpoints
-# without permitting unbounded essays.
-GOAL_DRIFT_MAX_OUTPUT_TOKENS: int = 2048
+# "..."}); 16384 covers Qwen 3.5 thinking-model preludes (think +
+# answer share the same ceiling) without permitting unbounded essays.
+# Empirical: v16 on Qwen 35B exhausted a 2048 budget inside ``<think>``
+# and returned ``raw=''``, so no drift fired — see ``call_llm_budget``
+# docstring for sizing rationale.
+GOAL_DRIFT_MAX_OUTPUT_TOKENS: int = 16384
 
 
 # Type alias for the async callable this classifier takes. Matches the

@@ -99,6 +99,20 @@ def call_llm_budget(max_output_tokens: int | None) -> Iterator[None]:
     ``await call_llm(...)``. ``None`` resets to no-cap (default applied
     by the builders). Restores the prior value on exit even if the body
     raises.
+
+    Sizing note (Qwen 3.5 thinking models)
+    --------------------------------------
+    Qwen 3.5 thinking models combine ``<think>`` reasoning and the final
+    answer under a single ``max_output_tokens`` ceiling. A judge prompt
+    that returns a ~100-300 token JSON verdict still requires several
+    thousand tokens of reasoning headroom on the 35B variant; capping
+    at 2048 produced empty (``raw=''``) responses on v16 because the
+    model exhausted its budget inside the think block before emitting
+    a single JSON byte. Goldfive's consumer caps therefore budget 16k
+    (judges / reflective check / planner) or 8k (goal deriver) to
+    leave ample room for both the think prelude and the structured
+    answer. The wall-clock backstop lives in
+    :data:`goldfive.adapters._adk_plugin.DEFAULT_LLM_CALL_TIMEOUT_MS`.
     """
     token = MAX_OUTPUT_TOKENS_VAR.set(max_output_tokens)
     try:
