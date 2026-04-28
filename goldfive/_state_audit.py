@@ -121,13 +121,25 @@ class CancellationStashViolation(BaseException):
     Exception`` blocks the audit catalogues would otherwise swallow
     the violation marker.
 
-    Phase 3 ships only the EXCEPTION CLASS + the audit document under
+    Phase 3 shipped only the EXCEPTION CLASS + the audit document under
     ``docs/design/CANCELLATION-CONTRACT.md`` (sibling to
-    ``STATE-OWNERSHIP-CONTRACT.md``). The runtime tripwire mechanism
-    (paired with the goldfive task boundary that is the one place
-    we'll catch ``CancelledError``) lands with Phase 3.5's hard-cancel
-    work — there's no point installing the runtime check before the
-    boundary exists to be the legitimate catch site.
+    ``STATE-OWNERSHIP-CONTRACT.md``). Phase 3.5 (this module) wires the
+    runtime tripwire: the goldfive boundary at
+    :meth:`ADKAdapter._invoke_internal` is the canonical
+    ``CancelledError`` catch site, and every audited stash-owning site
+    (§C1-C6) is wrapped in :func:`cancellation_stash_audited` so the
+    catch site can verify the stash invariant fired before the cancel
+    propagated up. A site that started but never ran its compliance
+    branch (neither the ``finally`` block nor the
+    ``except BaseException: stash; raise`` arm) raises this class,
+    chained onto the original ``CancelledError`` as ``__cause__``.
+
+    **Default-off contract.** The tripwire is opt-in via
+    ``GOLDFIVE_STRICT_STATE_OWNERSHIP`` (the same env gate as
+    :class:`StateOwnershipViolation`). Production deploys with the
+    variable unset never pay more than a per-site contextvar
+    push/pop; the boundary check itself short-circuits on
+    :func:`is_enabled` returning False before walking any state.
     """
 
 
@@ -539,3 +551,275 @@ def wrap_plugin_callbacks(plugin: Any) -> Any:
 # always safe — production deploys with the env var unset never pay
 # more than one ContextVar read per protocol write.
 _install_protocol_patch()
+
+
+# ---------------------------------------------------------------------------
+# Cancellation-stash tripwire (Phase 3.5)
+# ---------------------------------------------------------------------------
+#
+# The mechanism: every audited site (C1-C6 in
+# ``docs/design/CANCELLATION-CONTRACT.md``) wraps its stash-owning
+# block in :func:`cancellation_stash_audited`. The context manager
+# pushes a marker on entry and pops it on exit. Compliant sites
+# (``try / finally`` per §1.1, or
+# ``except BaseException: stash; raise`` per §1.2) call
+# :func:`mark_stash_completed` from inside their stash branch BEFORE
+# the block exits — the marker records that the compliance branch
+# fired.
+#
+# At the boundary catch site (``_invoke_internal``'s
+# ``except asyncio.CancelledError`` arm), :func:`assert_stash_invariant`
+# walks the still-open markers (those whose ``__exit__`` hasn't run
+# yet — the cancel propagated through them) and raises
+# :class:`CancellationStashViolation` if any of them never had
+# :func:`mark_stash_completed` called.
+#
+# Default-off: every entry point short-circuits on
+# :func:`is_enabled` so production deploys (env var unset, no pytest
+# loaded) pay one ContextVar read per site enter/exit and nothing
+# more.
+
+
+@dataclass
+class _StashMarker:
+    """Per-audited-site bookkeeping for the cancellation tripwire.
+
+    The ``exited`` flag distinguishes "still inside the ``with``"
+    from "exited via cancellation, retained for boundary inspection".
+    :func:`mark_stash_completed` only flags the innermost
+    not-yet-exited marker — without that filter, a nested cancel
+    would mis-attribute the outer's compliance branch to the inner's
+    retained marker.
+    """
+
+    name: str
+    completed: bool = False
+    exited: bool = False
+
+
+# Stack of currently-open audited sites. A list-valued ContextVar so
+# nested audited sites layer correctly across asyncio task boundaries
+# (a sub-task inherits the parent's stack snapshot at spawn time, so
+# its own ``cancellation_stash_audited`` enters push onto its own
+# private list).
+_open_stash_markers: contextvars.ContextVar[tuple[_StashMarker, ...]] = (
+    contextvars.ContextVar("goldfive_open_stash_markers", default=())
+)
+
+
+class _AuditedSite:
+    """Context manager for a Phase-3.5 audited stash-owning site.
+
+    On entry: pushes a fresh :class:`_StashMarker` onto the
+    open-markers stack.
+
+    On exit:
+
+    * If the block exits normally OR raises a non-cancellation
+      exception, the marker is popped — the audit invariant is
+      moot (the cancel never propagated through this site, so
+      whether the compliance branch ran is irrelevant).
+    * If the block exits via :class:`asyncio.CancelledError` (or any
+      ``BaseException`` that isn't an :class:`Exception`), the
+      marker is RETAINED on the stack so the boundary catch site at
+      :meth:`ADKAdapter._invoke_internal` can inspect its
+      ``completed`` flag. The boundary's
+      :func:`assert_stash_invariant` walks the stack and raises
+      :class:`CancellationStashViolation` for any retained marker
+      whose flag is False — i.e. the site started but never called
+      :func:`mark_stash_completed`.
+
+    Implementation note. We don't use ``ContextVar.reset(token)``
+    because reset would always pop the marker, defeating the
+    "retain on cancel" behaviour. Instead we rebuild the stack
+    tuple ourselves, locating our marker by identity (the
+    :class:`_StashMarker` instance is unique per ``__enter__``).
+    Nested audited sites layer correctly because each
+    ``_AuditedSite`` owns its own marker instance and only removes
+    that instance from the stack.
+    """
+
+    __slots__ = ("_marker", "_active")
+
+    def __init__(self, name: str) -> None:
+        self._marker = _StashMarker(name=name, completed=False)
+        self._active = False
+
+    def __enter__(self) -> None:
+        if not is_enabled():
+            return
+        self._active = True
+        _open_stash_markers.set((*_open_stash_markers.get(), self._marker))
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> bool:
+        if not self._active:
+            return False
+        # Retain the marker on the stack only when the block exits
+        # via an asyncio cancellation (or any ``BaseException`` that
+        # isn't an ``Exception`` — the contract is about the
+        # ``except Exception`` blind spot). The boundary catch site
+        # consumes retained markers via :func:`assert_stash_invariant`.
+        retain = exc is not None and isinstance(exc, BaseException) and not isinstance(
+            exc, Exception
+        )
+        if retain:
+            # Leave the marker in place but flag it as exited so a
+            # parent site's :func:`mark_stash_completed` call
+            # (e.g. from its ``except BaseException`` arm) does not
+            # mis-attribute to our retained marker.
+            self._marker.exited = True
+            return False
+        # Normal / Exception path: pop ourselves off the stack so
+        # subsequent (unrelated) sites don't see a stale marker.
+        # We rebuild by identity — robust against any nesting that
+        # snuck in between enter and exit (shouldn't happen, but
+        # cheap to do correctly).
+        current = _open_stash_markers.get()
+        rebuilt = tuple(m for m in current if m is not self._marker)
+        if rebuilt != current:
+            _open_stash_markers.set(rebuilt)
+        return False
+
+
+def cancellation_stash_audited(name: str) -> _AuditedSite:
+    """Mark the wrapped block as a Phase-3.5 audited stash-owning site.
+
+    Returns a context manager (:class:`_AuditedSite`) wrapping the
+    ``try / except / finally`` (or
+    ``try / except Exception ... except BaseException: stash; raise``)
+    that owns a state-stash duty across an ``await``. The wrapped
+    block MUST call :func:`mark_stash_completed` from inside its
+    stash branch (the ``finally`` block, or the
+    ``except BaseException`` arm before ``raise``) so the boundary
+    catch site can verify the invariant.
+
+    Default-off: when :func:`is_enabled` returns False the
+    context manager is a pass-through (one ContextVar read on
+    ``__enter__`` and nothing else).
+
+    Example::
+
+        async def _refine(...):
+            with cancellation_stash_audited("ParallelDAGExecutor._refine"):
+                try:
+                    refined = await planner.refine(...)
+                except BaseException:
+                    await self._emit_refine_failure(...)
+                    mark_stash_completed()
+                    raise
+    """
+    return _AuditedSite(name)
+
+
+def mark_stash_completed() -> None:
+    """Mark the innermost open audited site as having run its stash branch.
+
+    Called from inside an audited site's compliance branch
+    (the ``finally`` block per §1.1, or the
+    ``except BaseException: stash; raise`` arm per §1.2) BEFORE the
+    block exits / re-raises. The boundary catch site reads the
+    ``completed`` flag to verify the invariant.
+
+    No-op when :func:`is_enabled` returns False or no audited site is
+    currently open. Safe to call from non-cancellation paths (e.g.
+    from a normal ``finally`` block — the marker just records that
+    the stash fired regardless of exit shape).
+    """
+    if not is_enabled():
+        return
+    stack = _open_stash_markers.get()
+    if not stack:
+        return
+    # Walk from innermost to outermost looking for the first marker
+    # whose audited block is still active (``exited == False``).
+    # Skipping retained-but-exited markers prevents nested cancels
+    # from mis-attributing a parent's compliance branch to a child's
+    # retained marker.
+    for marker in reversed(stack):
+        if not marker.exited:
+            marker.completed = True
+            return
+
+
+def assert_stash_invariant(*, cause: BaseException | None = None) -> None:
+    """Raise :class:`CancellationStashViolation` if any open site bypassed its stash.
+
+    Called from the boundary catch site at
+    :meth:`ADKAdapter._invoke_internal`'s
+    ``except asyncio.CancelledError`` arm — by the time control
+    reaches the catch, every audited site whose ``await`` was
+    interrupted by the cancel should have either:
+
+    * exited normally before the cancel hit (popped off the stack
+      by the ``__exit__`` machinery — not visible here), or
+    * had :func:`mark_stash_completed` called from its compliance
+      branch BEFORE the cancel propagated past it (visible here as
+      ``marker.completed == True``).
+
+    If any open marker has ``completed == False``, the cancel
+    propagated past the site without entering the compliance branch
+    — the bug Phase 3.5 was created to surface.
+
+    No-op when :func:`is_enabled` returns False — production deploys
+    with the env var unset never raise from this function.
+
+    The optional ``cause`` is chained onto the violation as
+    ``__cause__`` so the original ``CancelledError`` traceback is
+    preserved alongside the violation.
+    """
+    if not is_enabled():
+        return
+    stack = _open_stash_markers.get()
+    if not stack:
+        return
+    bad = [m.name for m in stack if not m.completed]
+    # Drain the retained markers regardless of outcome. The catch
+    # site has now inspected them; leaving them around would let a
+    # subsequent unrelated cancel inherit stale state from this
+    # one. (Production deploys never re-enter ``_invoke_internal``
+    # on the same async task without a fresh ``ContextVar`` snapshot
+    # — but tests + harness scenarios that drive multiple cancels
+    # back-to-back on one task rely on this drain.)
+    if stack:
+        _open_stash_markers.set(())
+    if not bad:
+        return
+    # Stack-walk diagnostic: include the catch-site frame chain so the
+    # operator can see WHICH boundary observed the violation. Cheap —
+    # we only walk when we're already raising, and only up to 16
+    # frames.
+    frames: list[str] = []
+    walker = inspect.currentframe()
+    if walker is not None:
+        walker = walker.f_back  # skip ourselves
+    seen = 0
+    while walker is not None and seen < 16:
+        code = getattr(walker, "f_code", None)
+        if code is not None:
+            qual = getattr(code, "co_qualname", None) or getattr(code, "co_name", "")
+            fname = str(getattr(code, "co_filename", ""))
+            frames.append(f"  {fname}:{walker.f_lineno} {qual}")
+        walker = walker.f_back
+        seen += 1
+    msg = (
+        "CancelledError propagated past Phase-3.5 audited stash "
+        "site(s) without entering the compliance branch:\n"
+        + "\n".join(f"  - {n}" for n in bad)
+        + "\n\nCatch-site frame chain:\n"
+        + "\n".join(frames)
+        + "\n\nEach audited site MUST call "
+        "goldfive._state_audit.mark_stash_completed() from its "
+        "``finally`` block (CANCELLATION-CONTRACT.md §1.1) or its "
+        "``except BaseException: stash; raise`` arm "
+        "(CANCELLATION-CONTRACT.md §1.2) BEFORE the cancel "
+        "propagates. See docs/design/CANCELLATION-CONTRACT.md."
+    )
+    violation = CancellationStashViolation(msg)
+    if cause is not None:
+        raise violation from cause
+    raise violation

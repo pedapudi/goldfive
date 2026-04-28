@@ -24,6 +24,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+from goldfive import _state_audit
 from goldfive.types import SupersessionKind, TaskStatus
 
 if TYPE_CHECKING:
@@ -955,12 +956,20 @@ async def _handle_task_started(
     # the unadorned instruction. ``report_task_failed`` does NOT clear
     # (failure is not acknowledgment, and a re-invocation still needs
     # the correction).
-    try:
-        await steerer.mark_task_running(
-            task_id, session=session, detail=detail, source=source
-        )
-    finally:
-        _clear_correction_on_started(session, task)
+    with _state_audit.cancellation_stash_audited(
+        "reporting._handle_task_started.mark_task_running"
+    ):
+        try:
+            await steerer.mark_task_running(
+                task_id, session=session, detail=detail, source=source
+            )
+        finally:
+            _clear_correction_on_started(session, task)
+            # Phase 3.5 tripwire compliance marker (§1.1 form): the
+            # GC ran inside ``finally`` regardless of how the await
+            # exited. The boundary catch site can now confirm we
+            # didn't bypass the stash.
+            _state_audit.mark_stash_completed()
     return dict(_ACK)
 
 

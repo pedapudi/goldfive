@@ -44,6 +44,7 @@ import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from goldfive import _state_audit
 from goldfive import orchestration_state as _ostate
 from goldfive._llm import maybe_close_call_llm
 from goldfive.conversation import Conversation
@@ -782,87 +783,101 @@ class Runner:
                 log.debug("steerer.bind_adapter raised: %s", exc)
 
         # 7. Hand off to the executor.
-        try:
-            executor_kwargs: dict[str, Any] = dict(
-                plan=session.plan,
-                session=session,
-                adapter=self.agent,
-                steerer=self.steerer,
-                planner=self.planner,
-                sinks=list(self.sinks),
-            )
-            if self.control is not None:
-                executor_kwargs["control"] = self.control
-            # Overlay model (goldfive#141): pass the original user
-            # request through to the executor so an overlay-capable
-            # :class:`SequentialExecutor` can hand it verbatim to
-            # ``adapter.invoke_passthrough``. Best-effort via
-            # inspection — executors that don't accept
-            # ``user_input=`` keep working with the legacy kwargs.
-            if isinstance(user_input, str):
-                run_sig = inspect.signature(self.executor.run)
-                if "user_input" in run_sig.parameters:
-                    executor_kwargs["user_input"] = user_input
-            outcome = await self.executor.run(**executor_kwargs)
-        except Exception as exc:  # noqa: BLE001
-            reason = f"executor.run raised: {exc}"
-            log.exception("executor.run raised")
-            await self._emit_run_aborted(session, reason)
-            aborted = ExecutionOutcome(success=False, session=session, reason=reason)
-            convo.absorb_turn(
-                aborted,
-                user_input_summary=_initial_goal_summary(user_input),
-                pinned=pinned,
-            )
-            return aborted
-        finally:
-            # planner-gate: snapshot the turn's final plan so the next
-            # turn's planner_gate can classify against it.
-            #
-            # Rationale (Phase 2.X v2 / goldfive#271 Gap 1): the prior
-            # post-success-path stash (PR #282) was bypassed when ADK
-            # closed the runner mid-flight — the executor coroutine was
-            # cancelled, ``CancelledError`` propagated out of
-            # ``await self.executor.run(...)``, and since Py 3.8
-            # ``CancelledError`` is a ``BaseException`` (not an
-            # ``Exception``) the ``except Exception`` handler above did
-            # NOT catch it. Control flowed out of ``run`` entirely and
-            # the stash was skipped, leaving the prior plan empty for
-            # the next turn even though the turn produced a real plan.
-            # The ADK-web user-steer flow hit this on validation v2:
-            # zero stash log lines across 4 turns.
-            #
-            # Putting the stash in ``finally`` runs it regardless of how
-            # the executor exited — normal success, ``Exception`` (e.g.
-            # planner bind error), or ``BaseException`` (e.g.
-            # ``CancelledError`` from ADK closing the runner mid-stream).
-            # The exception still propagates after the stash; this block
-            # does not swallow it.
-            #
-            # The stash itself lives on :class:`Conversation`
-            # (validation v4 Class 1 / goldfive#271 follow-up): scoping
-            # by session id means a turn on a fresh outer ADK session
-            # sharing this Runner does not inherit a prior plan from
-            # another session. :meth:`Conversation.absorb_turn` (called
-            # on every normal-completion / handled-exception return
-            # path below) folds the stash in alongside the goals /
-            # completed_results merge. The explicit ``stash_plan`` call
-            # here covers the ``BaseException`` (e.g. ``CancelledError``
-            # from ADK closing the runner mid-stream) path that bypasses
-            # ``absorb_turn`` entirely — the same rationale as the
-            # original Gap 1 fix that put the stash in ``finally`` to
-            # begin with. ``stash_plan`` is idempotent: a subsequent
-            # ``absorb_turn`` re-stashes the same plan + session id.
-            if session.plan is not None and session.plan.tasks:
-                convo.stash_plan(session, pinned=pinned)
-                log.info(
-                    "Runner.run: stashed prior plan for next turn's "
-                    "handle_turn (plan_id=%s revision_index=%d "
-                    "session_id=%s)",
-                    (session.plan.id or "")[:16] or "<none>",
-                    int(session.plan.revision_index),
-                    (session.id or "")[:16] or "<none>",
+        # Phase 3.5 (goldfive#271): wrap the executor.run call site
+        # in the cancellation-stash audit context so the boundary's
+        # tripwire can verify the prior-plan stash fired before the
+        # cancel propagated past us. The compliance branch lives in
+        # the ``finally`` block below — it calls
+        # ``mark_stash_completed`` after performing the stash.
+        with _state_audit.cancellation_stash_audited("Runner.run.executor_drive"):
+            try:
+                executor_kwargs: dict[str, Any] = dict(
+                    plan=session.plan,
+                    session=session,
+                    adapter=self.agent,
+                    steerer=self.steerer,
+                    planner=self.planner,
+                    sinks=list(self.sinks),
                 )
+                if self.control is not None:
+                    executor_kwargs["control"] = self.control
+                # Overlay model (goldfive#141): pass the original user
+                # request through to the executor so an overlay-capable
+                # :class:`SequentialExecutor` can hand it verbatim to
+                # ``adapter.invoke_passthrough``. Best-effort via
+                # inspection — executors that don't accept
+                # ``user_input=`` keep working with the legacy kwargs.
+                if isinstance(user_input, str):
+                    run_sig = inspect.signature(self.executor.run)
+                    if "user_input" in run_sig.parameters:
+                        executor_kwargs["user_input"] = user_input
+                outcome = await self.executor.run(**executor_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                reason = f"executor.run raised: {exc}"
+                log.exception("executor.run raised")
+                await self._emit_run_aborted(session, reason)
+                aborted = ExecutionOutcome(success=False, session=session, reason=reason)
+                convo.absorb_turn(
+                    aborted,
+                    user_input_summary=_initial_goal_summary(user_input),
+                    pinned=pinned,
+                )
+                return aborted
+            finally:
+                # planner-gate: snapshot the turn's final plan so the next
+                # turn's planner_gate can classify against it.
+                #
+                # Rationale (Phase 2.X v2 / goldfive#271 Gap 1): the prior
+                # post-success-path stash (PR #282) was bypassed when ADK
+                # closed the runner mid-flight — the executor coroutine was
+                # cancelled, ``CancelledError`` propagated out of
+                # ``await self.executor.run(...)``, and since Py 3.8
+                # ``CancelledError`` is a ``BaseException`` (not an
+                # ``Exception``) the ``except Exception`` handler above did
+                # NOT catch it. Control flowed out of ``run`` entirely and
+                # the stash was skipped, leaving the prior plan empty for
+                # the next turn even though the turn produced a real plan.
+                # The ADK-web user-steer flow hit this on validation v2:
+                # zero stash log lines across 4 turns.
+                #
+                # Putting the stash in ``finally`` runs it regardless of how
+                # the executor exited — normal success, ``Exception`` (e.g.
+                # planner bind error), or ``BaseException`` (e.g.
+                # ``CancelledError`` from ADK closing the runner mid-stream).
+                # The exception still propagates after the stash; this block
+                # does not swallow it.
+                #
+                # The stash itself lives on :class:`Conversation`
+                # (validation v4 Class 1 / goldfive#271 follow-up): scoping
+                # by session id means a turn on a fresh outer ADK session
+                # sharing this Runner does not inherit a prior plan from
+                # another session. :meth:`Conversation.absorb_turn` (called
+                # on every normal-completion / handled-exception return
+                # path below) folds the stash in alongside the goals /
+                # completed_results merge. The explicit ``stash_plan`` call
+                # here covers the ``BaseException`` (e.g. ``CancelledError``
+                # from ADK closing the runner mid-stream) path that bypasses
+                # ``absorb_turn`` entirely — the same rationale as the
+                # original Gap 1 fix that put the stash in ``finally`` to
+                # begin with. ``stash_plan`` is idempotent: a subsequent
+                # ``absorb_turn`` re-stashes the same plan + session id.
+                if session.plan is not None and session.plan.tasks:
+                    convo.stash_plan(session, pinned=pinned)
+                    log.info(
+                        "Runner.run: stashed prior plan for next turn's "
+                        "handle_turn (plan_id=%s revision_index=%d "
+                        "session_id=%s)",
+                        (session.plan.id or "")[:16] or "<none>",
+                        int(session.plan.revision_index),
+                        (session.id or "")[:16] or "<none>",
+                    )
+                # Phase 3.5 (goldfive#271) tripwire compliance marker:
+                # the stash above ran (idempotent and unconditional
+                # within this block). The boundary catch site at
+                # ``ADKAdapter._invoke_internal`` will assert this
+                # marker fired before ``CancelledError`` propagated
+                # past us.
+                _state_audit.mark_stash_completed()
 
         # goldfive#152: clear the current_task_* stamp at run end.
         # The plan id + goals summary stay (they remain meaningful

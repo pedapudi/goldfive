@@ -1,12 +1,26 @@
 # Cancellation propagation contract
 
 **Status.** Phase 3 Addition A of goldfive#271. Sibling to
-[`STATE-OWNERSHIP-CONTRACT.md`](STATE-OWNERSHIP-CONTRACT.md). The
-exception class :class:`goldfive._state_audit.CancellationStashViolation`
-ships in Phase 3; the C2-C6 audit conversions ship in Phase 3.5
-(this PR). The runtime tripwire mechanism still lands with the
-hard-cancel boundary work, when the goldfive task boundary becomes
-the legitimate catch site.
+[`STATE-OWNERSHIP-CONTRACT.md`](STATE-OWNERSHIP-CONTRACT.md).
+
+* :class:`goldfive._state_audit.CancellationStashViolation` shipped
+  in Phase 3 (PR #290).
+* The C2-C6 audit conversions shipped in Phase 3.5 component 1
+  (PRs #306, #307 + the boundary catch site at
+  :meth:`ADKAdapter._invoke_internal`).
+* The runtime tripwire — every audited site wrapped in
+  :func:`goldfive._state_audit.cancellation_stash_audited` and the
+  boundary catch site invoking
+  :func:`goldfive._state_audit.assert_stash_invariant` — shipped
+  in Phase 3.5 component 2 (this PR). **The tripwire is now active.**
+
+**Default-off.** The tripwire is gated on
+``GOLDFIVE_STRICT_STATE_OWNERSHIP`` (the same env switch as
+:class:`StateOwnershipViolation`). Production deploys with the
+variable unset never raise from the boundary check; the audited
+sites pay one ContextVar push/pop per enter/exit and nothing more.
+Tests run with strict mode on by default via the auto-applied
+``_state_audit_enabled`` fixture in ``tests/conftest.py``.
 
 ## tl;dr
 
@@ -101,28 +115,36 @@ Phase 3 ships an audit pass; Phase 3.5 wires the runtime tripwire.
 * **LOW** — stash is best-effort GC of transient state. C5 / C6
   are LOW; the GC will run on the next applicable event.
 
-### §2.2 Phase 3.5 plan
-
-When the goldfive task boundary lands (Phase 3.5):
+### §2.2 Phase 3.5 plan — completed
 
 1. **Done.** Survey C2-C6 with the full audit pattern; convert
    HIGH/MEDIUM sites to `try / finally` or
    `except BaseException: stash; raise`. Shipped in the
    Phase 3.5 cancellation-stash PR — see §2 catalog status column.
-2. Wire the runtime tripwire — install
-   :class:`CancellationStashViolation` raise machinery (paired with
-   the boundary's stack-walk; the boundary becomes the one
-   legitimate catch site, and any other site that absorbs
-   `CancelledError` without entering its `finally` raises the
-   tripwire).
+2. **Done.** Wire the runtime tripwire. Every audited site
+   (C1-C5) is wrapped in
+   `goldfive._state_audit.cancellation_stash_audited(name)`; the
+   compliance branch (`finally:` or `except BaseException:`) calls
+   `goldfive._state_audit.mark_stash_completed()` before re-raising;
+   the boundary at `ADKAdapter._invoke_internal`'s
+   `except asyncio.CancelledError:` arm calls
+   `goldfive._state_audit.assert_stash_invariant(cause=...)` which
+   walks the open-marker stack and raises
+   `CancellationStashViolation` (a `BaseException` so
+   `except Exception` cannot swallow it) for any retained marker
+   whose compliance flag is False. C6 needs no instrumentation
+   because the sequence cursor advances before the `await` by
+   construction.
 3. **Done.** Test surface:
-   `tests/test_cancellation_stash_audit.py` — fires
-   `CancelledError` at each audited `await`, asserts the stash
-   invariant. Each test fails on `origin/main` (without the
-   conversion) and passes with the fix. C6 is pinned by a
-   complementary regression test that asserts
-   `session.next_sequence()` runs strictly before the sink
-   `await`.
+   * `tests/test_cancellation_stash_audit.py` — fires
+     `CancelledError` at each audited `await`, asserts the stash
+     invariant. Each test fails on `origin/main` (without the
+     conversion) and passes with the fix.
+   * `tests/test_cancellation_stash_tripwire.py` — synthetic
+     audited sites that verify the tripwire raises
+     `CancellationStashViolation` for a bypass site under strict
+     mode, never raises for a compliant site, and never raises
+     under strict-mode-off regardless of compliance.
 
 ## §3 Why the boundary is prerequisite
 
@@ -138,14 +160,18 @@ exception.
 
 The audit-pass + class-only ship in Phase 3 lets us land the
 boundary in 3.5 without simultaneously fighting a regression
-cascade across every catalogued site. The ordering is deliberate:
+cascade across every catalogued site. The ordering was:
 
-1. **Phase 3 (this PR).** Audit catalog. Class definition. Doc.
+1. **Phase 3.** Audit catalog. Class definition. Doc.
 2. **Phase 3 follow-up.** Convert HIGH-severity sites to
-   `try / finally`. Most are already done (C1 in #287; the
+   `try / finally`. Most were already done (C1 in #287; the
    sequential executor's cooperative-cancel paths are
    self-cleaning by design).
-3. **Phase 3.5.** Goldfive task boundary becomes the catch site.
-   Runtime tripwire installs. Remaining audit sites convert in
-   the same PR.
-4. **Phase 4+.** Hard cancel wires `task.cancel()` from the steerer.
+3. **Phase 3.5 component 1.** Goldfive task boundary becomes the
+   catch site. C2-C5 audit conversions to
+   `except BaseException: stash; raise` or `try / finally` shipped.
+4. **Phase 3.5 component 2 (this PR).** Runtime tripwire wired:
+   audited sites instrumented via
+   `cancellation_stash_audited` + `mark_stash_completed`; boundary
+   catch site invokes `assert_stash_invariant`.
+5. **Phase 4+.** Hard cancel wires `task.cancel()` from the steerer.

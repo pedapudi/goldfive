@@ -56,6 +56,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
+from goldfive import _state_audit
 from goldfive import orchestration_state as _ostate
 from goldfive.drift import (
     classify_refusal,
@@ -2544,63 +2545,74 @@ class DefaultSteerer:
                     if flat:
                         available_agents = list(flat)
             refine_accepts_registry = _planner_refine_accepts_available_agents(self._planner)
-            try:
-                if refine_accepts_registry:
-                    revised = await self._planner.refine(
-                        plan=session.plan,
-                        drift=drift,
-                        goals=list(session.goals),
-                        available_agents=available_agents,
+            # Phase 3.5 (goldfive#271) tripwire wrapper — the
+            # ``except BaseException: stash; raise`` arm below is the
+            # compliance branch (CANCELLATION-CONTRACT.md §1.2). The
+            # boundary catch site at ``ADKAdapter._invoke_internal``
+            # asserts ``mark_stash_completed()`` fired before the
+            # cancel propagated past us.
+            with _state_audit.cancellation_stash_audited(
+                "DefaultSteerer._handle_drift.refine"
+            ):
+                try:
+                    if refine_accepts_registry:
+                        revised = await self._planner.refine(
+                            plan=session.plan,
+                            drift=drift,
+                            goals=list(session.goals),
+                            available_agents=available_agents,
+                        )
+                    else:
+                        revised = await self._planner.refine(
+                            plan=session.plan,
+                            drift=drift,
+                            goals=list(session.goals),
+                        )
+                except Exception as exc:  # noqa: BLE001 — refine errors must not break the run
+                    # Surface the failure via logging + a synthetic follow-up
+                    # drift so operators don't silently see the same plan loop
+                    # forever. Without this, a refine that raises (e.g. malformed
+                    # LLM JSON after a mid-invocation cancel poisons the session)
+                    # leaves session.plan unchanged and the executor re-enters
+                    # the same state on the next tick.
+                    log.warning(
+                        "DefaultSteerer._handle_drift: planner.refine(kind=%s) raised "
+                        "%s; plan unchanged",
+                        drift.kind.value,
+                        exc,
                     )
-                else:
-                    revised = await self._planner.refine(
-                        plan=session.plan,
-                        drift=drift,
-                        goals=list(session.goals),
+                    await self._emit_refine_failed(
+                        session,
+                        drift,
+                        attempt_id=attempt_id,
+                        failure_kind="llm_error",
+                        reason=str(exc),
+                        detail=type(exc).__name__,
                     )
-            except Exception as exc:  # noqa: BLE001 — refine errors must not break the run
-                # Surface the failure via logging + a synthetic follow-up
-                # drift so operators don't silently see the same plan loop
-                # forever. Without this, a refine that raises (e.g. malformed
-                # LLM JSON after a mid-invocation cancel poisons the session)
-                # leaves session.plan unchanged and the executor re-enters
-                # the same state on the next tick.
-                log.warning(
-                    "DefaultSteerer._handle_drift: planner.refine(kind=%s) raised "
-                    "%s; plan unchanged",
-                    drift.kind.value,
-                    exc,
-                )
-                await self._emit_refine_failed(
-                    session,
-                    drift,
-                    attempt_id=attempt_id,
-                    failure_kind="llm_error",
-                    reason=str(exc),
-                    detail=type(exc).__name__,
-                )
-                await self._emit_refine_failure(session, drift, reason=str(exc))
-                await self._register_refine_failure(session, drift, counter_key)
-                return
-            except BaseException as exc:  # noqa: BLE001
-                # Phase 3.5 (CANCELLATION-CONTRACT.md §C4): ``CancelledError``
-                # bypasses the ``except Exception`` branch (it is a
-                # ``BaseException`` since Py 3.8). Emit the paired
-                # ``refine_failed`` observability event so a refine cancelled
-                # mid-flight does not leave sinks with an unmatched
-                # ``refine_attempted``. The ``finally`` below still resets
-                # ``_active_session_var``; we only own the paired-event
-                # stash here. Re-raise so cancellation continues to
-                # propagate per the asyncio contract.
-                await self._emit_refine_failed(
-                    session,
-                    drift,
-                    attempt_id=attempt_id,
-                    failure_kind="cancelled",
-                    reason=f"refine cancelled: {type(exc).__name__}",
-                    detail=type(exc).__name__,
-                )
-                raise
+                    await self._emit_refine_failure(session, drift, reason=str(exc))
+                    await self._register_refine_failure(session, drift, counter_key)
+                    return
+                except BaseException as exc:  # noqa: BLE001
+                    # Phase 3.5 (CANCELLATION-CONTRACT.md §C4): ``CancelledError``
+                    # bypasses the ``except Exception`` branch (it is a
+                    # ``BaseException`` since Py 3.8). Emit the paired
+                    # ``refine_failed`` observability event so a refine cancelled
+                    # mid-flight does not leave sinks with an unmatched
+                    # ``refine_attempted``. The ``finally`` below still resets
+                    # ``_active_session_var``; we only own the paired-event
+                    # stash here. Re-raise so cancellation continues to
+                    # propagate per the asyncio contract.
+                    await self._emit_refine_failed(
+                        session,
+                        drift,
+                        attempt_id=attempt_id,
+                        failure_kind="cancelled",
+                        reason=f"refine cancelled: {type(exc).__name__}",
+                        detail=type(exc).__name__,
+                    )
+                    # Phase 3.5 tripwire compliance marker (§1.2 form).
+                    _state_audit.mark_stash_completed()
+                    raise
         finally:
             self._active_session_var.reset(_active_session_token)
         if revised is None:
@@ -3643,42 +3655,48 @@ class DefaultSteerer:
         # ``_handle_drift``.
         attempt_id = self._new_attempt_id()
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
-        try:
-            revised = await self._dispatch_goldfive_steer_refine(drift, session)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "DefaultSteerer._promote_drift_to_steer: refine raised %s; "
-                "plan unchanged",
-                exc,
-            )
-            await self._emit_refine_failed(
-                session,
-                drift,
-                attempt_id=attempt_id,
-                failure_kind="llm_error",
-                reason=str(exc),
-                detail=type(exc).__name__,
-            )
-            await self._emit_refine_failure(session, drift, reason=str(exc))
-            await self._register_refine_failure(session, drift, counter_key)
-            return
-        except BaseException as exc:  # noqa: BLE001
-            # Phase 3.5 (CANCELLATION-CONTRACT.md §C4): ``CancelledError``
-            # bypasses the ``except Exception`` branch above. Emit the
-            # paired ``refine_failed`` so cancelled goldfive-steer refines
-            # do not leave sinks with an unmatched ``refine_attempted``.
-            # Re-raise to preserve asyncio cancellation propagation.
-            await self._emit_refine_failed(
-                session,
-                drift,
-                attempt_id=attempt_id,
-                failure_kind="cancelled",
-                reason=f"refine cancelled: {type(exc).__name__}",
-                detail=type(exc).__name__,
-            )
-            raise
-        finally:
-            self._active_session_var.reset(_active_session_token)
+        # Phase 3.5 (goldfive#271) tripwire wrapper — see §C4.
+        with _state_audit.cancellation_stash_audited(
+            "DefaultSteerer._promote_drift_to_steer.refine"
+        ):
+            try:
+                revised = await self._dispatch_goldfive_steer_refine(drift, session)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "DefaultSteerer._promote_drift_to_steer: refine raised %s; "
+                    "plan unchanged",
+                    exc,
+                )
+                await self._emit_refine_failed(
+                    session,
+                    drift,
+                    attempt_id=attempt_id,
+                    failure_kind="llm_error",
+                    reason=str(exc),
+                    detail=type(exc).__name__,
+                )
+                await self._emit_refine_failure(session, drift, reason=str(exc))
+                await self._register_refine_failure(session, drift, counter_key)
+                return
+            except BaseException as exc:  # noqa: BLE001
+                # Phase 3.5 (CANCELLATION-CONTRACT.md §C4): ``CancelledError``
+                # bypasses the ``except Exception`` branch above. Emit the
+                # paired ``refine_failed`` so cancelled goldfive-steer refines
+                # do not leave sinks with an unmatched ``refine_attempted``.
+                # Re-raise to preserve asyncio cancellation propagation.
+                await self._emit_refine_failed(
+                    session,
+                    drift,
+                    attempt_id=attempt_id,
+                    failure_kind="cancelled",
+                    reason=f"refine cancelled: {type(exc).__name__}",
+                    detail=type(exc).__name__,
+                )
+                # Phase 3.5 tripwire compliance marker (§1.2 form).
+                _state_audit.mark_stash_completed()
+                raise
+            finally:
+                self._active_session_var.reset(_active_session_token)
         if revised is None:
             log.warning(
                 "DefaultSteerer._promote_drift_to_steer: refine returned None; "
@@ -4329,45 +4347,53 @@ class DefaultSteerer:
         # validator computes orphans, logs the WARNING, but no sink event
         # lands — exactly the symptom Bug A describes.
         _active_session_token = self._active_session_var.set(session)
-        try:
-            await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
+        # Phase 3.5 (goldfive#271) tripwire wrapper — see §C4. The
+        # ``except BaseException: stash; raise`` arm below is the
+        # compliance branch (CANCELLATION-CONTRACT.md §1.2).
+        with _state_audit.cancellation_stash_audited(
+            "DefaultSteerer.observe_refine"
+        ):
             try:
-                yield attempt_id
-            except Exception as exc:  # noqa: BLE001 — refine errors must not break observability
-                # Emit failure event with the same attempt_id so consumers
-                # can pair attempted ↔ failed. We do NOT swallow the
-                # exception — re-raise so the caller's existing error path
-                # (e.g. _emit_refine_failure / fallback plans) runs.
-                await self._emit_refine_failed(
-                    session,
-                    drift,
-                    attempt_id=attempt_id,
-                    failure_kind="llm_error",
-                    reason=str(exc),
-                    detail=type(exc).__name__,
-                )
-                raise
-            except BaseException as exc:  # noqa: BLE001
-                # Phase 3.5 (CANCELLATION-CONTRACT.md §C4): ``CancelledError``
-                # is a ``BaseException`` (not ``Exception``) since Py 3.8, so
-                # the ``except Exception`` branch above does NOT catch it. If
-                # a refine is cancelled mid-flight (e.g. ADK closes the
-                # runner, harness interrupts the loop) the paired
-                # ``refine_failed`` observability event would be skipped,
-                # leaving sinks with an unmatched ``refine_attempted``.
-                # Emit the pair-completing failure event AND re-raise so
-                # cancellation still propagates per the asyncio contract.
-                await self._emit_refine_failed(
-                    session,
-                    drift,
-                    attempt_id=attempt_id,
-                    failure_kind="cancelled",
-                    reason=f"refine cancelled: {type(exc).__name__}",
-                    detail=type(exc).__name__,
-                )
-                raise
-        finally:
-            self._active_session_var.reset(_active_session_token)
+                await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
+                try:
+                    yield attempt_id
+                except Exception as exc:  # noqa: BLE001 — refine errors must not break observability
+                    # Emit failure event with the same attempt_id so consumers
+                    # can pair attempted ↔ failed. We do NOT swallow the
+                    # exception — re-raise so the caller's existing error path
+                    # (e.g. _emit_refine_failure / fallback plans) runs.
+                    await self._emit_refine_failed(
+                        session,
+                        drift,
+                        attempt_id=attempt_id,
+                        failure_kind="llm_error",
+                        reason=str(exc),
+                        detail=type(exc).__name__,
+                    )
+                    raise
+                except BaseException as exc:  # noqa: BLE001
+                    # Phase 3.5 (CANCELLATION-CONTRACT.md §C4): ``CancelledError``
+                    # is a ``BaseException`` (not ``Exception``) since Py 3.8, so
+                    # the ``except Exception`` branch above does NOT catch it. If
+                    # a refine is cancelled mid-flight (e.g. ADK closes the
+                    # runner, harness interrupts the loop) the paired
+                    # ``refine_failed`` observability event would be skipped,
+                    # leaving sinks with an unmatched ``refine_attempted``.
+                    # Emit the pair-completing failure event AND re-raise so
+                    # cancellation still propagates per the asyncio contract.
+                    await self._emit_refine_failed(
+                        session,
+                        drift,
+                        attempt_id=attempt_id,
+                        failure_kind="cancelled",
+                        reason=f"refine cancelled: {type(exc).__name__}",
+                        detail=type(exc).__name__,
+                    )
+                    # Phase 3.5 tripwire compliance marker (§1.2 form).
+                    _state_audit.mark_stash_completed()
+                    raise
+            finally:
+                self._active_session_var.reset(_active_session_token)
 
     async def _emit_plan_revised_correlation(
         self,

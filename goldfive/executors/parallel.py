@@ -29,6 +29,7 @@ import logging
 import warnings
 from typing import TYPE_CHECKING, Any, Literal
 
+from goldfive import _state_audit
 from goldfive.events import (
     emit as emit_event,
 )
@@ -800,44 +801,51 @@ class ParallelDAGExecutor:
         attempt_id: str = ""
         if observe_refine is not None and callable(observe_refine):
             cm = observe_refine(session, drift)
-            try:
-                async with cm as ctx_attempt_id:
-                    attempt_id = ctx_attempt_id
-                    refined = await planner.refine(
-                        plan=plan, drift=drift, goals=list(session.goals)
+            with _state_audit.cancellation_stash_audited(
+                "ParallelDAGExecutor._refine.observed"
+            ):
+                try:
+                    async with cm as ctx_attempt_id:
+                        attempt_id = ctx_attempt_id
+                        refined = await planner.refine(
+                            plan=plan, drift=drift, goals=list(session.goals)
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    # observe_refine has already emitted refine_failed; we
+                    # ALSO emit the CRITICAL DriftDetected mirror so the
+                    # legacy operator-visible signal still lands.
+                    log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
+                    await self._emit_refine_failure(
+                        session=session,
+                        sinks=sinks,
+                        source=drift,
+                        reason=f"refine raised: {exc}",
                     )
-            except Exception as exc:  # noqa: BLE001
-                # observe_refine has already emitted refine_failed; we
-                # ALSO emit the CRITICAL DriftDetected mirror so the
-                # legacy operator-visible signal still lands.
-                log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
-                await self._emit_refine_failure(
-                    session=session,
-                    sinks=sinks,
-                    source=drift,
-                    reason=f"refine raised: {exc}",
-                )
-                return None, attempt_id
-            except BaseException as exc:  # noqa: BLE001
-                # Phase 3.5 (CANCELLATION-CONTRACT.md §C2): ``CancelledError``
-                # bypasses ``except Exception`` (since Py 3.8 it is a
-                # ``BaseException``). The CRITICAL drift mirror is the
-                # operator-visible "refine failed" signal; without this
-                # branch a refine cancelled mid-flight would leave
-                # sinks observing only the original drift, with no
-                # follow-up explaining why the plan didn't change.
-                # Re-raise so cancellation continues to propagate.
-                log.warning(
-                    "ParallelDAGExecutor: planner.refine cancelled: %s",
-                    type(exc).__name__,
-                )
-                await self._emit_refine_failure(
-                    session=session,
-                    sinks=sinks,
-                    source=drift,
-                    reason=f"refine cancelled: {type(exc).__name__}",
-                )
-                raise
+                    return None, attempt_id
+                except BaseException as exc:  # noqa: BLE001
+                    # Phase 3.5 (CANCELLATION-CONTRACT.md §C2): ``CancelledError``
+                    # bypasses ``except Exception`` (since Py 3.8 it is a
+                    # ``BaseException``). The CRITICAL drift mirror is the
+                    # operator-visible "refine failed" signal; without this
+                    # branch a refine cancelled mid-flight would leave
+                    # sinks observing only the original drift, with no
+                    # follow-up explaining why the plan didn't change.
+                    # Re-raise so cancellation continues to propagate.
+                    log.warning(
+                        "ParallelDAGExecutor: planner.refine cancelled: %s",
+                        type(exc).__name__,
+                    )
+                    await self._emit_refine_failure(
+                        session=session,
+                        sinks=sinks,
+                        source=drift,
+                        reason=f"refine cancelled: {type(exc).__name__}",
+                    )
+                    # Phase 3.5 tripwire compliance marker: the
+                    # ``except BaseException: stash; raise`` form (§1.2)
+                    # has run its stash (the refine_failure mirror).
+                    _state_audit.mark_stash_completed()
+                    raise
             if refined is None:
                 log.warning(
                     "ParallelDAGExecutor: planner.refine(kind=%s) returned None; plan unchanged",
@@ -890,36 +898,41 @@ class ParallelDAGExecutor:
             # Legacy path — no steerer or no observe_refine. No
             # refine_attempted/refine_failed emission, but the
             # CRITICAL DriftDetected mirror is preserved.
-            try:
-                refined = await planner.refine(
-                    plan=plan, drift=drift, goals=list(session.goals)
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
-                await self._emit_refine_failure(
-                    session=session,
-                    sinks=sinks,
-                    source=drift,
-                    reason=f"refine raised: {exc}",
-                )
-                return None, attempt_id
-            except BaseException as exc:  # noqa: BLE001
-                # Phase 3.5 (CANCELLATION-CONTRACT.md §C2): ``CancelledError``
-                # bypasses ``except Exception``; emit the CRITICAL drift
-                # mirror so the operator-visible "refine cancelled" signal
-                # still lands, then re-raise to preserve cancellation
-                # propagation per the asyncio contract.
-                log.warning(
-                    "ParallelDAGExecutor: planner.refine cancelled (legacy path): %s",
-                    type(exc).__name__,
-                )
-                await self._emit_refine_failure(
-                    session=session,
-                    sinks=sinks,
-                    source=drift,
-                    reason=f"refine cancelled: {type(exc).__name__}",
-                )
-                raise
+            with _state_audit.cancellation_stash_audited(
+                "ParallelDAGExecutor._refine.legacy"
+            ):
+                try:
+                    refined = await planner.refine(
+                        plan=plan, drift=drift, goals=list(session.goals)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
+                    await self._emit_refine_failure(
+                        session=session,
+                        sinks=sinks,
+                        source=drift,
+                        reason=f"refine raised: {exc}",
+                    )
+                    return None, attempt_id
+                except BaseException as exc:  # noqa: BLE001
+                    # Phase 3.5 (CANCELLATION-CONTRACT.md §C2): ``CancelledError``
+                    # bypasses ``except Exception``; emit the CRITICAL drift
+                    # mirror so the operator-visible "refine cancelled" signal
+                    # still lands, then re-raise to preserve cancellation
+                    # propagation per the asyncio contract.
+                    log.warning(
+                        "ParallelDAGExecutor: planner.refine cancelled (legacy path): %s",
+                        type(exc).__name__,
+                    )
+                    await self._emit_refine_failure(
+                        session=session,
+                        sinks=sinks,
+                        source=drift,
+                        reason=f"refine cancelled: {type(exc).__name__}",
+                    )
+                    # Phase 3.5 tripwire compliance marker.
+                    _state_audit.mark_stash_completed()
+                    raise
             if refined is None:
                 log.warning(
                     "ParallelDAGExecutor: planner.refine(kind=%s) returned None; plan unchanged",
