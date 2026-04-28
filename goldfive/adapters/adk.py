@@ -1026,7 +1026,24 @@ class ADKAdapter:
         llm_call_timeout_ms: int | None = None,
     ) -> None:
         self._user_id = user_id
-        self._session_id = session_id
+        # Per-(goldfive session.conversation_id) cached ADK session id
+        # for routing under concurrent goldfive sessions on one adapter
+        # (PR #294 audit / goldfive#271 follow-up). The legacy single
+        # ``_session_id`` field stayed shared across every goldfive
+        # session that ever ran on this adapter, so a second concurrent
+        # invocation could pick up the first's cached id and target the
+        # wrong ADK session history. The dict is keyed by
+        # ``Session.conversation_id`` (stable across turns of one
+        # Conversation, unique across concurrent Conversations) so each
+        # logical conversation gets its own ADK session id while
+        # multi-turn continuity within one conversation still works.
+        # The legacy ``_session_id`` attribute survives as a property
+        # backed by ``__legacy_session_id`` so callers that pin a
+        # constructor-supplied id (and the back-compat
+        # ``_pin_outer_session_on_adapter`` write) still observe the
+        # historical single-session shape.
+        self._adk_session_ids_by_conv: dict[str, str] = {}
+        self.__legacy_session_id: str | None = session_id
         self._degraded_prebuilt_runner = False
         # Caller-supplied ADK plugins (e.g. HarmonografTelemetryPlugin).
         # ADK's InMemoryRunner forwards its plugin manager into
@@ -1146,7 +1163,23 @@ class ADKAdapter:
         # so a stale tag can't bleed into the next cancel. See
         # goldfive#139 and
         # :func:`_build_cancelled_response_event` for the content map.
-        self._next_cancel_reason: str = ""
+        #
+        # Per-session keyed dict (PR #294 audit / goldfive#271 follow-up):
+        # the legacy single attribute let session A's USER_STEER tag bleed
+        # into session B's cancel emission when one adapter drove two
+        # concurrent goldfive sessions. Production writers
+        # (:class:`SequentialExecutor`, :class:`ParallelExecutor`,
+        # :class:`DefaultSteerer`) now route through
+        # :meth:`set_next_cancel_reason` which keys by the goldfive
+        # ``Session.id``. The bare ``_next_cancel_reason`` attribute
+        # survives as a property backed by ``__legacy_next_cancel_reason``
+        # for tests and external callers that drive ``invoke`` on a
+        # single session at a time — its read is a fallback consulted
+        # only when the per-session dict has no entry for the current
+        # session id, so cross-session leak through the legacy slot is
+        # impossible in production paths.
+        self._next_cancel_reasons: dict[str, str] = {}
+        self.__legacy_next_cancel_reason: str = ""
         # Handle to the asyncio.Task currently executing
         # :meth:`_invoke_internal` — captured via ``asyncio.current_task()``
         # at entry and cleared in the ``finally`` block. Used by
@@ -1161,7 +1194,17 @@ class ADKAdapter:
         # and test harnesses; the adapter falls back to the lazy-uuid
         # mint in :meth:`_ensure_session`. Live tests in
         # tests/test_live_steering_e2e.py set this explicitly.
-        self._outer_session_id: str | None = None
+        #
+        # PR #294 audit / goldfive#271 follow-up: a single shared field
+        # only carried the FIRST pin's id, hiding subsequent pins from
+        # forensic / log paths when one adapter served multiple outer
+        # adk-web sessions. We keep the legacy ``_outer_session_id``
+        # property for back-compat (tests assert the single-session
+        # shape directly) and additionally maintain
+        # ``_pinned_outer_session_ids`` so structural consumers that
+        # iterate over every pinned outer session see them all.
+        self.__legacy_outer_session_id: str | None = None
+        self._pinned_outer_session_ids: set[str] = set()
 
         # Optional fan-out listeners for raw inner-Runner ADK events.
         # :meth:`Runner.run_streamed` (goldfive: stream-inner-adk-events)
@@ -1189,6 +1232,86 @@ class ADKAdapter:
                     f"state-protocol writes, and drift observation would all "
                     f"be broken"
                 )
+
+    # ------------------------------------------------------------------
+    # Per-session state accessors (PR #294 audit / goldfive#271 follow-up)
+    # ------------------------------------------------------------------
+    #
+    # The ADKAdapter is shared across every goldfive session driven by
+    # one :class:`Runner`. Three pieces of per-invocation state used to
+    # live as bare instance attributes — they leaked across concurrent
+    # sessions because there was no key. The accessors below preserve
+    # the historical single-attribute API (so single-session callers
+    # and tests keep working) while routing production writers through
+    # session-keyed helpers.
+
+    @property
+    def _next_cancel_reason(self) -> str:
+        """Legacy view of the most-recent bare cancel-reason write.
+        See :meth:`set_next_cancel_reason` for the session-aware setter
+        that production code uses.
+        """
+        return self.__legacy_next_cancel_reason
+
+    @_next_cancel_reason.setter
+    def _next_cancel_reason(self, value: str) -> None:
+        self.__legacy_next_cancel_reason = value
+
+    @property
+    def _session_id(self) -> str | None:
+        """Legacy view of the constructor-pinned / outer-pinned ADK session id."""
+        return self.__legacy_session_id
+
+    @_session_id.setter
+    def _session_id(self, value: str | None) -> None:
+        self.__legacy_session_id = value
+
+    @property
+    def _outer_session_id(self) -> str | None:
+        """Legacy view of the most-recent outer adk-web session pin."""
+        return self.__legacy_outer_session_id
+
+    @_outer_session_id.setter
+    def _outer_session_id(self, value: str | None) -> None:
+        self.__legacy_outer_session_id = value
+        if value:
+            self._pinned_outer_session_ids.add(value)
+
+    def set_next_cancel_reason(self, session: Session, reason: str) -> None:
+        """Stamp the next cancel reason for ``session``.
+
+        Replaces the bare ``adapter._next_cancel_reason = X`` write so
+        two concurrent goldfive sessions on one adapter cannot bleed
+        a USER_STEER tag into each other's cancel emission. The reader
+        in :meth:`_invoke_internal` consumes the entry keyed by the
+        active session id; absent that, falls back to the legacy slot
+        so single-session callers (tests, simple scripts) keep their
+        bare-attribute write semantics.
+        """
+        sid = getattr(session, "id", "") or ""
+        if sid:
+            self._next_cancel_reasons[sid] = reason
+        else:
+            self.__legacy_next_cancel_reason = reason
+
+    def _consume_next_cancel_reason(self, session: Session) -> str:
+        """Pop ``session``'s pending cancel reason, falling back to legacy.
+
+        Production writers route through :meth:`set_next_cancel_reason`
+        so the per-session entry wins. Legacy bare-attribute writers
+        (tests, external callers) are still observed via the legacy
+        slot; the legacy slot is only consulted when the per-session
+        dict has no entry for ``session.id`` so cross-session leak
+        through the shared slot is impossible in production paths.
+        """
+        sid = getattr(session, "id", "") or ""
+        if sid and sid in self._next_cancel_reasons:
+            reason = self._next_cancel_reasons.pop(sid)
+            if reason:
+                return reason
+        legacy = self.__legacy_next_cancel_reason
+        self.__legacy_next_cancel_reason = ""
+        return legacy
 
     # ------------------------------------------------------------------
     # Post-construction plugin install
@@ -1596,7 +1719,7 @@ class ADKAdapter:
         """
         task_id = getattr(task, "id", "") if task is not None else ""
 
-        session_id = await self._ensure_session()
+        session_id = await self._ensure_session(session)
         state = await self._get_session_state(session_id)
 
         ctx = SessionContext(
@@ -1713,9 +1836,12 @@ class ADKAdapter:
             # Consume the tag the steerer / executor stashed on us before
             # triggering the cancel (see goldfive#139). An unset tag
             # falls through to the legacy generic reason so existing
-            # heal paths keep the neutral content variant.
-            reason = self._next_cancel_reason or "cancelled_mid_invocation"
-            self._next_cancel_reason = ""
+            # heal paths keep the neutral content variant. Routed
+            # through :meth:`_consume_next_cancel_reason` so the
+            # per-session-keyed entry wins over the legacy shared slot
+            # — eliminates the cross-session leak flagged by PR #294's
+            # audit when one adapter drives multiple goldfive sessions.
+            reason = self._consume_next_cancel_reason(session) or "cancelled_mid_invocation"
             await self._heal_pending_tool_calls(
                 runner=self._runner,
                 session_id=session_id,
@@ -1770,7 +1896,13 @@ class ADKAdapter:
                     )
                 # No cancel fired — drop any stale tag so the NEXT
                 # invoke's cancel (if any) doesn't pick up leftover state.
-                self._next_cancel_reason = ""
+                # Clear BOTH the per-session entry (the production
+                # writers' lane) and the legacy single-slot fallback
+                # so neither path can bleed into the next invocation.
+                sid_for_clear = getattr(session, "id", "") or ""
+                if sid_for_clear:
+                    self._next_cancel_reasons.pop(sid_for_clear, None)
+                self.__legacy_next_cancel_reason = ""
             if self._plugin is not None:
                 # ``clear_active_context`` also clears any attached
                 # reconciler — overlay-mode is strictly per-invocation.
@@ -1796,26 +1928,81 @@ class ADKAdapter:
     # Session plumbing
     # ------------------------------------------------------------------
 
-    async def _ensure_session(self) -> str:
-        """Return the ADK session id for the runner.
+    async def _ensure_session(self, session: Session | None = None) -> str:
+        """Return the ADK session id for ``session``.
 
-        Mints one lazily on first call when the caller didn't pin one
-        via ``session_id=``. Cached on ``self._session_id`` after the
-        first call so every subsequent :meth:`invoke` reuses it — the
-        whole run rolls up under one logical session.
+        Per-conversation cache (PR #294 audit / goldfive#271 follow-up):
+        the ADK session id is keyed by ``session.conversation_id`` so
+        two concurrent goldfive Conversations driven by the same
+        adapter target distinct ADK session histories. Within one
+        Conversation every turn shares the same id — preserving the
+        multi-turn ADK history continuity the legacy single-attribute
+        cache provided.
+
+        Lookup order:
+
+        1. ``self._adk_session_ids_by_conv[conversation_id]`` if
+           cached — reuse so multi-turn callers stay on one ADK
+           session.
+        2. Constructor / outer-pin ``self._session_id`` legacy slot —
+           seeds the cache so legacy single-session callers (no
+           Conversation context, ``Session.conversation_id == ""``)
+           keep working unchanged.
+        3. ``session.id`` (the goldfive ``run_id``, possibly already
+           pinned to the outer adk-web session id by
+           :meth:`Runner.run`) — adopting it here lets the harmonograf
+           plugin co-locate plan + spans on one session id without
+           the older :meth:`_pin_outer_session_on_adapter` shared-slot
+           write.
+        4. Fresh uuid4 mint — programmatic callers with no pin.
         """
-        if self._session_id:
-            # Ensure the session exists on the runner's service. Safe to
-            # call repeatedly; create_session is typically idempotent
-            # for a given (app_name, user_id, session_id) triple and we
-            # swallow any conflict so tests that pre-create the session
-            # keep working.
-            await self._touch_session(self._session_id)
-            return self._session_id
+        conv_key = ""
+        if session is not None:
+            conv_key = getattr(session, "conversation_id", "") or ""
 
-        self._session_id = str(uuid.uuid4())
-        await self._touch_session(self._session_id)
-        return self._session_id
+        # 1. Per-conversation cache hit — multi-turn callers reuse the
+        #    same ADK session id within one logical Conversation.
+        cached = self._adk_session_ids_by_conv.get(conv_key)
+        if cached:
+            await self._touch_session(cached)
+            return cached
+
+        # 2. Legacy single-attribute pin (constructor ``session_id=``
+        #    or :meth:`_pin_outer_session_on_adapter` write). Applies
+        #    ONLY to the empty-conv-id legacy bucket so concurrent
+        #    goldfive Conversations cannot collide on the shared slot.
+        if conv_key == "" and self.__legacy_session_id:
+            sid = self.__legacy_session_id
+            self._adk_session_ids_by_conv[""] = sid
+            await self._touch_session(sid)
+            return sid
+
+        # 3. Inherit ``session.id`` when present — typically the outer
+        #    adk-web session id pinned by :meth:`Runner.run(session_id=)`.
+        #    Adopting it here lets the harmonograf plugin co-locate plan
+        #    + spans on one session id without the older shared-slot
+        #    pin-on-adapter dance.
+        if session is not None:
+            sid_from_session = getattr(session, "id", "") or ""
+            if sid_from_session:
+                self._adk_session_ids_by_conv[conv_key] = sid_from_session
+                # Mirror to the legacy slot ONLY when the slot is the
+                # legacy empty-conv-id bucket and currently empty.
+                # Mirroring per-conversation derivations would
+                # reintroduce the cross-session leak we just fixed.
+                if conv_key == "" and not self.__legacy_session_id:
+                    self.__legacy_session_id = sid_from_session
+                await self._touch_session(sid_from_session)
+                return sid_from_session
+
+        # 4. Lazy uuid4 mint — programmatic callers with no pin and no
+        #    Runner-overridden session.run_id.
+        minted = str(uuid.uuid4())
+        self._adk_session_ids_by_conv[conv_key] = minted
+        if conv_key == "" and not self.__legacy_session_id:
+            self.__legacy_session_id = minted
+        await self._touch_session(minted)
+        return minted
 
     async def _touch_session(self, session_id: str) -> None:
         """Best-effort ``create_session`` on the runner's session service.

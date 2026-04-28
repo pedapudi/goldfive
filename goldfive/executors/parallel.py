@@ -86,16 +86,31 @@ _StageResult = tuple[Task, InvocationResult | None, DriftEvent | None, BaseExcep
 _CANCEL_REASON_USER_STEER: str = "user_steer"
 
 
-def _tag_adapter_cancel_user_steer(adapter: Any) -> None:
-    """Tag ``adapter._next_cancel_reason`` with the USER_STEER symbolic reason.
+def _tag_adapter_cancel_user_steer(adapter: Any, session: Any = None) -> None:
+    """Tag the adapter's next mid-invocation cancel with the USER_STEER reason.
 
     Called just before the executor triggers ``task.cancel()`` on any
     in-flight stage invoke task so the adapter's mid-invocation cancel
     handler picks up the tag and appends an LLM-actionable synthetic
-    ``function_response`` (instead of the legacy generic jargon).
-    Adapters that don't expose ``_next_cancel_reason`` are tolerated
-    via a duck-typed write. See goldfive#139.
+    ``function_response`` (instead of the legacy generic jargon). See
+    goldfive#139.
+
+    Routes through :meth:`ADKAdapter.set_next_cancel_reason` when the
+    adapter exposes it (PR #294 audit / goldfive#271 follow-up) so
+    the tag is keyed by ``session.id`` and cannot bleed across
+    concurrent goldfive sessions sharing one adapter. Falls back to
+    the bare attribute write for adapters / stubs that predate the
+    helper.
     """
+    setter = getattr(adapter, "set_next_cancel_reason", None)
+    if callable(setter) and session is not None:
+        try:
+            setter(session, _CANCEL_REASON_USER_STEER)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "ParallelDAGExecutor: set_next_cancel_reason raised: %s", exc
+            )
     try:
         adapter._next_cancel_reason = _CANCEL_REASON_USER_STEER
     except Exception as exc:  # noqa: BLE001
@@ -671,7 +686,7 @@ class ParallelDAGExecutor:
                             # content instead of the legacy generic
                             # jargon. See goldfive#139.
                             if outcome.steer_message is not None:
-                                _tag_adapter_cancel_user_steer(adapter)
+                                _tag_adapter_cancel_user_steer(adapter, session=session)
                             await _cancel_stage_tasks()
                             break
                         # Non-interrupting control (PAUSE/RESUME/
