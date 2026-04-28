@@ -3102,6 +3102,7 @@ not, return null for the plan.
 Reply with a single JSON object and NOTHING ELSE:
 {
   "reasoning": "<one-sentence why>",
+  "replaces_prior": <bool — see PIVOT vs REVISION below>,
   "plan": null OR {
     "id": "<short-id>",
     "summary": "<noun phrase describing the GOAL — see SUMMARY POLICY in PLAN SHAPE>",
@@ -3117,6 +3118,35 @@ Reply with a single JSON object and NOTHING ELSE:
     "edges": [{"from_task_id": "...", "to_task_id": "..."}]
   }
 }
+
+PIVOT vs REVISION (the ``replaces_prior`` field):
+
+Set ``replaces_prior: true`` when the user is REPLACING prior intent
+rather than building on it — a topic pivot, an artefact abandonment,
+or any "forget X, do Y instead"-shaped instruction. A pivot is a
+fresh start: the runner mints a new plan id, terminal-task / edge
+preservation does NOT apply, and the new plan does not need to echo
+back COMPLETED tasks from the prior. Examples:
+
+  * "forget the slides, just give me bullet points" — different artefact
+  * "scratch that, do something completely different — translate this poem"
+  * "no, don't do any of that. Tell me about quantum mechanics instead."
+  * "stop, I want to switch topics entirely to dark matter"
+
+Set ``replaces_prior: false`` (the default) when the user is BUILDING
+on the prior plan — additive constraints, partial corrections,
+qualification tweaks, even topic-shifts that keep the same artefact
+shape. The runner installs the result as a revision of the prior
+plan id. Terminal tasks must be preserved verbatim in the new plan.
+Examples:
+
+  * "make it 2 slides instead of 5" — additive constraint
+  * "actually, make it about solar flares not solar panels" — topic
+    shift on the same artefact (still a presentation)
+  * "redo task 3 with the new data" — partial correction
+
+When in doubt, prefer ``false`` — a revision is the safer default;
+the structural-preservation overhead is small.
 
 WHEN TO RETURN A PLAN (plan is non-null):
 
@@ -3351,7 +3381,7 @@ SUMMARY POLICY (applies to ``plan.summary``):
             return None
         prior_plan = session.plan
         prior_goals = list(session.goals)
-        user_prompt = self._build_handle_turn_prompt(
+        base_user_prompt = self._build_handle_turn_prompt(
             user_input=text,
             prior_plan=prior_plan,
             prior_goals=prior_goals,
@@ -3366,45 +3396,111 @@ SUMMARY POLICY (applies to ``plan.summary``):
         # user input + prior plan summary doubles as ``input_preview``.
         prior_id = ((prior_plan.id or "") if prior_plan is not None else "")[:16] or "<none>"
         gate_input_preview = f"user_input: {text}\nprior_plan_id: {prior_id}"
-        try:
-            async with goldfive_llm_span(
-                **self._span_kwargs(),
-                name="planner_handle_turn",
-                input_preview=gate_input_preview,
-            ) as span:
-                # Bound the dispatch — see ``LLMPlanner.MAX_OUTPUT_TOKENS``.
-                # Disable thinking — handle_turn is a small JSON gate
-                # call ("does this user input need a re-plan?"), not
-                # deep reasoning.
-                from goldfive._llm import (
-                    call_llm_budget,
-                    call_llm_thinking_disabled,
-                )
 
-                with (
-                    call_llm_budget(self.MAX_OUTPUT_TOKENS),
-                    call_llm_thinking_disabled(),
-                ):
-                    raw = await self._call_llm(
-                        self._HANDLE_TURN_SYSTEM_PROMPT, user_prompt, self._model
+        # F7 (closes part of goldfive#322): validator-feedback retry.
+        # Mirrors the retry pattern in ``_call_and_validate_refine``
+        # (planner.py:1870+) but inlined for handle_turn so a one-off
+        # validation failure on the first LLM attempt — almost always
+        # a Rule 6 terminal-task / terminal->terminal-edge regression
+        # — gets a second chance with an explicit error message
+        # appended to the prompt. Capped at 2 attempts (one retry)
+        # so a misbehaving LLM doesn't burn the per-turn budget.
+        user_prompt = base_user_prompt
+        plan: Plan | None = None
+        last_error = ""
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with goldfive_llm_span(
+                    **self._span_kwargs(),
+                    name="planner_handle_turn",
+                    input_preview=gate_input_preview,
+                ) as span:
+                    # Bound the dispatch — see ``LLMPlanner.MAX_OUTPUT_TOKENS``.
+                    # Disable thinking — handle_turn is a small JSON gate
+                    # call ("does this user input need a re-plan?"), not
+                    # deep reasoning.
+                    from goldfive._llm import (
+                        call_llm_budget,
+                        call_llm_thinking_disabled,
                     )
-                span.output_preview = raw[:4096] if isinstance(raw, str) else "(non-str response)"
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "LLMPlanner.handle_turn: call_llm raised %s; "
-                "treating as conversational (no plan change)",
-                exc,
+
+                    with (
+                        call_llm_budget(self.MAX_OUTPUT_TOKENS),
+                        call_llm_thinking_disabled(),
+                    ):
+                        raw = await self._call_llm(
+                            self._HANDLE_TURN_SYSTEM_PROMPT,
+                            user_prompt,
+                            self._model,
+                        )
+                    span.output_preview = (
+                        raw[:4096] if isinstance(raw, str) else "(non-str response)"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "LLMPlanner.handle_turn: attempt %d/%d: call_llm raised %s; "
+                    "treating as conversational (no plan change)",
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                return None
+            candidate = self._parse_handle_turn_response(
+                raw=raw,
+                prior_plan=prior_plan,
+                context=context,
             )
-            return None
-        plan = self._parse_handle_turn_response(
-            raw=raw,
-            prior_plan=prior_plan,
-            context=context,
-        )
+            if candidate is None:
+                # Conversational verdict OR unparseable response. Either
+                # way, no plan to validate. Return None — the runner
+                # treats this as "reuse prior plan".
+                log.info(
+                    "LLMPlanner.handle_turn: attempt %d/%d: produced_plan=no "
+                    "prior_plan_id=%s",
+                    attempt,
+                    max_attempts,
+                    prior_id,
+                )
+                return None
+            # Validate now (mirrors what the steerer's install path
+            # would otherwise check) so a Rule-6 regression triggers
+            # the retry rather than the runner aborting the turn.
+            # Pivot installs go through ``install_initial_plan`` which
+            # validates against the empty seed — skip the prior here.
+            is_pivot = bool(getattr(candidate, "_goldfive_pivot", False))
+            try:
+                if is_pivot or prior_plan is None or not prior_plan.tasks:
+                    candidate.validate(for_revision=True, prior=None)
+                else:
+                    candidate.validate(for_revision=True, prior=prior_plan)
+            except ValueError as exc:
+                last_error = str(exc)
+                log.warning(
+                    "LLMPlanner.handle_turn: attempt %d/%d: validator rejected "
+                    "produced plan: %s",
+                    attempt,
+                    max_attempts,
+                    last_error,
+                )
+                if attempt < max_attempts:
+                    user_prompt = self._build_correction_prompt(
+                        base_user_prompt, last_error
+                    )
+                    continue
+                # Final attempt failed validation. Return the candidate
+                # anyway — the runner's install path will surface the
+                # validation error via SCHEMA_VIOLATION drift, matching
+                # the prior behaviour for callers that disable retry.
+                plan = candidate
+                break
+            plan = candidate
+            break
         log.info(
-            "LLMPlanner.handle_turn: produced_plan=%s prior_plan_id=%s",
+            "LLMPlanner.handle_turn: produced_plan=%s prior_plan_id=%s%s",
             "yes" if plan is not None else "no",
             prior_id,
+            f" (after {attempt} attempt(s))" if attempt > 1 else "",
         )
         return plan
 
@@ -3497,12 +3593,24 @@ SUMMARY POLICY (applies to ``plan.summary``):
         conversational by the Runner). The contract: this method MUST
         NOT raise.
 
-        When the LLM produces a plan, ALWAYS install the prior plan's
-        id verbatim — the steerer's ``_apply_revision`` then bumps
+        When the LLM produces a plan AND ``replaces_prior`` is False
+        (or absent — the safe default), install the prior plan's id
+        verbatim — the steerer's ``_apply_revision`` then bumps
         ``revision_index`` cleanly. Validation v3 confirmed
-        refine/replace collapse: even a topic-shift steer like
-        "forget solar panels, tell me about solar flares" lands as a
-        same-id revision_index bump rather than a fresh plan id.
+        refine/replace collapse for that path.
+
+        When ``replaces_prior`` is True (F5 — pivot routing,
+        goldfive#322 Layer 2 / #204), the LLM has signalled an
+        artefact-replacement intent. Mint a FRESH plan id (drop the
+        prior's id) and stash the pivot flag on the Plan via the
+        sentinel attribute :attr:`Plan._goldfive_pivot` so the
+        Runner's ``_install_revision`` routes through
+        ``install_initial_plan`` rather than
+        ``install_revision_for_drift``. The fresh id +
+        non-revision install path mean Rule 6
+        (terminal-task / terminal->terminal-edge preservation in
+        :meth:`Plan.validate`) does not gate the new plan against
+        the prior — a pivot is structurally a fresh start.
         """
         if not isinstance(raw, str) or not raw.strip():
             log.warning("LLMPlanner.handle_turn: empty / non-str response")
@@ -3533,10 +3641,17 @@ SUMMARY POLICY (applies to ``plan.summary``):
         run_id = ""
         if context is not None:
             run_id = str(context.get("run_id") or "")
-        # Reuse the prior plan's id so the steerer's _apply_revision
-        # bumps revision_index cleanly. This holds for the empty seed
-        # (revision 0 → revision 1) AND for every subsequent revision.
-        plan_id_override = prior_plan.id if prior_plan is not None and prior_plan.id else None
+        # F5: pivot detection. ``replaces_prior=true`` → mint a fresh
+        # plan_id and signal the runner to route through
+        # ``install_initial_plan``. False/absent (the safe default) →
+        # reuse the prior id so revision_index bumps cleanly.
+        replaces_prior = bool(parsed.get("replaces_prior"))
+        if replaces_prior:
+            plan_id_override = None  # _plan_from_json mints a fresh uuid
+        else:
+            plan_id_override = (
+                prior_plan.id if prior_plan is not None and prior_plan.id else None
+            )
         prior_goal_ids = list(prior_plan.goal_ids) if prior_plan is not None else []
         plan = _plan_from_json(
             plan_raw,
@@ -3549,6 +3664,13 @@ SUMMARY POLICY (applies to ``plan.summary``):
                 "LLMPlanner.handle_turn: 'plan' failed structural parse; treating as conversational"
             )
             return None
+        # F5: stamp the pivot flag onto the Plan so the runner's
+        # ``_install_revision`` can route to ``install_initial_plan``.
+        # Plain attribute on the dataclass instance (Plan is mutable);
+        # the runner reads via ``getattr(plan, "_goldfive_pivot", False)``
+        # so older Plans (no flag) trivially route as revisions.
+        if replaces_prior:
+            plan._goldfive_pivot = True  # type: ignore[attr-defined]
         return plan
 
 

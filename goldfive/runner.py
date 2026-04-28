@@ -38,6 +38,7 @@ and are loaded lazily by callers.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import logging
 import warnings
@@ -545,13 +546,40 @@ class Runner:
             )
             return outcome
 
+        # F9 (closes goldfive#322 Layer 4): mint fresh goal ids when
+        # the deriver's LLM-supplied id collides with an existing
+        # session goal. The deriver's prompt prompts ``g1`` every
+        # turn; the prior dedup-on-collision path silently dropped
+        # legitimate new goals, so multi-turn sessions accumulated
+        # only the first turn's goals. Renumber the new goal so it
+        # lands in ``session.goals`` instead of being discarded.
+        #
+        # Renumbering is done by replacing the Goal with a fresh
+        # ``dataclasses.replace`` copy so we never mutate the
+        # deriver's stored list in place — some derivers (e.g.
+        # :class:`PassthroughGoalDeriver`) return shallow copies
+        # that share Goal objects with their internal cache; an
+        # in-place mutation would silently rewrite the deriver's
+        # state for subsequent turns.
         existing_ids = {g.id for g in session.goals if g.id}
+        next_seq = len(session.goals) + 1
         for g in new_goals:
             if g.id and g.id in existing_ids:
-                continue
+                while True:
+                    candidate = f"g{next_seq}"
+                    next_seq += 1
+                    if candidate not in existing_ids:
+                        break
+                log.info(
+                    "Runner.run: goal id collision (%r) — renumbering to %r",
+                    g.id,
+                    candidate,
+                )
+                g = dataclasses.replace(g, id=candidate)
             session.goals.append(g)
             if g.id:
                 existing_ids.add(g.id)
+                next_seq = max(next_seq, len(session.goals) + 1)
 
         # goldfive#152: refresh the orchestration-state goals summary
         # so prompt templates / handle_turn / downstream planners see
@@ -699,11 +727,24 @@ class Runner:
             # Conversational follow-up on a real prior plan. Reuse
             # session.plan unchanged. No PlanRevised — the prior
             # revision is still the right one for this turn.
+            #
+            # F6 (closes goldfive#277): wrap ``user_input`` with a
+            # directive that tells the coordinator to answer briefly
+            # from history rather than re-delegating to sub-agents.
+            # The directive lives in the message body — NOT the system
+            # prompt — to preserve the no-prompt-contract principle:
+            # users bring their own coordinator prompts; goldfive must
+            # not require them to honour a specific system-prompt
+            # contract. The session flag below lets a parallel
+            # adapter-plugin layer (e.g. the ADK plugin's pre-dispatch
+            # interceptor) tighten the tool surface for this turn
+            # without coordinating through the message body.
             log.info(
                 "Runner.run: conversational turn — reusing prior plan_id=%s revision_index=%d",
                 (session.plan.id or "")[:16] or "<none>",
                 int(session.plan.revision_index),
             )
+            session._conversational_turn = True  # type: ignore[attr-defined]
 
         # 5. Register the canonical reporting tools on the adapter.
         # goldfive#196: ``drift_self_reporting`` decides whether the
@@ -807,10 +848,26 @@ class Runner:
                 # ``adapter.invoke_passthrough``. Best-effort via
                 # inspection — executors that don't accept
                 # ``user_input=`` keep working with the legacy kwargs.
+                #
+                # F6 (goldfive#277): on a conversational turn, hand the
+                # executor the wrapped directive (frames the input as a
+                # follow-up question, asks the coordinator not to
+                # delegate). The wrapping lives at the executor handoff
+                # so absorb_turn / event summaries above still see the
+                # user's actual question.
                 if isinstance(user_input, str):
                     run_sig = inspect.signature(self.executor.run)
                     if "user_input" in run_sig.parameters:
-                        executor_kwargs["user_input"] = user_input
+                        executor_user_input = user_input
+                        if (
+                            getattr(session, "_conversational_turn", False)
+                            and user_input.strip()
+                        ):
+                            executor_user_input = self._wrap_conversational_input(
+                                user_input=user_input,
+                                session=session,
+                            )
+                        executor_kwargs["user_input"] = executor_user_input
                 outcome = await self.executor.run(**executor_kwargs)
             except Exception as exc:  # noqa: BLE001
                 reason = f"executor.run raised: {exc}"
@@ -1336,14 +1393,40 @@ class Runner:
         # with this turn.
         if not revised_plan.run_id:
             revised_plan.run_id = session.run_id
-        # Branch on first-turn vs replan. ``session.plan`` is non-None
-        # on every turn (the Runner seeds Plan.empty on turn 1); the
-        # absence of tasks is the unambiguous "first install" signal.
+        # Branch on first-turn vs pivot vs replan.
+        #
+        # * First turn — ``session.plan`` is the empty seed (no tasks);
+        #   route through ``install_initial_plan`` (no Rule 6 binding).
+        # * Pivot turn (F5, goldfive#322 Layer 2 / #204) — the planner's
+        #   ``handle_turn`` set ``_goldfive_pivot`` on the revised plan
+        #   to signal that the user is replacing prior intent rather
+        #   than building on it. The plan already carries a fresh
+        #   plan_id (minted in ``_parse_handle_turn_response``); route
+        #   through ``install_initial_plan`` so Rule 6 doesn't reject
+        #   the legitimate pivot for "dropping" the prior's terminal
+        #   tasks.
+        # * Otherwise — replan via ``install_revision_for_drift`` with
+        #   a NEW_WORK_DISCOVERED drift (the existing path).
+        #
+        # ``session.plan`` is non-None on every turn (the Runner seeds
+        # Plan.empty on turn 1); the absence of tasks is the
+        # unambiguous "first install" signal.
         first_turn = session.plan is None or not session.plan.tasks
+        is_pivot = bool(getattr(revised_plan, "_goldfive_pivot", False))
         try:
-            if first_turn:
+            if first_turn or is_pivot:
+                if is_pivot:
+                    log.info(
+                        "Runner._install_revision: pivot detected — routing "
+                        "through install_initial_plan (fresh plan_id=%s, "
+                        "prior_plan_id=%s)",
+                        (revised_plan.id or "")[:16] or "<none>",
+                        (session.plan.id or "")[:16]
+                        if session.plan is not None
+                        else "<none>",
+                    )
                 installed = await self.steerer.install_initial_plan(
-                    session=session, plan=revised_plan
+                    session=session, plan=revised_plan, is_pivot=is_pivot
                 )
             else:
                 # Turn N+1 replan: the user's fresh message caused
@@ -1376,6 +1459,58 @@ class Runner:
             )
             return False
         return bool(installed)
+
+    @staticmethod
+    def _wrap_conversational_input(
+        *,
+        user_input: str,
+        session: Session,
+    ) -> str:
+        """Compose a directive that frames the user's input as a
+        conversational follow-up (F6, closes goldfive#277).
+
+        When :meth:`Planner.handle_turn` returns ``None`` on a turn
+        with a real prior plan, the runner reuses ``session.plan``
+        but still drives the executor over the input — without this
+        wrapper the coordinator typically treats the question as a
+        fresh task and re-delegates to sub-agents, wasting an
+        invocation. The wrapper:
+
+        * tags the message as a conversational follow-up,
+        * gives the coordinator the plan summary + completed task
+          context so it can answer from history,
+        * asks it explicitly NOT to delegate.
+
+        Lives in the message body (no system-prompt contract). A
+        parallel layer (the ADK plugin's pre-dispatch interceptor,
+        keyed off ``session._conversational_turn``) tightens the
+        tool surface so the coordinator literally cannot delegate
+        even if it tried; this wrapper is the cooperative half.
+        """
+        from goldfive.types import TaskStatus
+
+        plan = session.plan
+        plan_summary = (plan.summary if plan is not None else "") or "(no summary)"
+        completed_lines: list[str] = []
+        if plan is not None:
+            for t in plan.tasks:
+                if t.status is TaskStatus.COMPLETED:
+                    title = t.title or t.description or t.id
+                    assignee = t.assignee_agent_id or "(no-assignee)"
+                    completed_lines.append(f"  - [{t.id}] {title} (by {assignee})")
+        completed_block = (
+            "\n".join(completed_lines) if completed_lines else "  (none yet)"
+        )
+        return (
+            "[CONVERSATIONAL FOLLOW-UP — reuse prior plan, don't delegate "
+            "to sub-agents]\n\n"
+            "The user is asking a follow-up question about prior work. "
+            "Answer briefly using the conversation history and existing "
+            "artifacts. Do NOT call any AgentTool — answer directly.\n\n"
+            f"Plan summary: {plan_summary}\n"
+            f"Completed tasks:\n{completed_block}\n\n"
+            f"User question: {user_input}"
+        )
 
     async def _resolve_goals(
         self,
