@@ -4779,6 +4779,102 @@ class DefaultSteerer:
         if trigger_input:
             evt.drift_detected.trigger_input = self._truncate_trigger_input(trigger_input)
         await self._emit(evt)
+        # goldfive#271 follow-up: when a terminal drift fires the run
+        # cannot recover on its own — any boundary still open at this
+        # point belongs to an invocation that will not get a paired
+        # ``after_agent_callback`` (the executor is about to pause or
+        # tear down). Walk the plugin's still-open boundaries and emit
+        # the paired ``InvocationBoundaryExited(reason=terminal_drift:
+        # <kind>)`` so observability sinks (and harmonograf's Gantt)
+        # don't render permanently-open spans for coordinator /
+        # research / refine_steer LLM_CALLs that v15 left in
+        # ``dur=(open)``.
+        if self._is_terminal_drift(drift):
+            await self._close_open_boundaries_for_terminal_drift(drift)
+
+    # goldfive#271 follow-up: drift kinds that are unrecoverable on
+    # emit. Boundary cleanup hooks fire on these to close any
+    # still-open spans the cooperative-cancel path would otherwise
+    # leave dangling.
+    #
+    # Inclusion rationale (and why ``LOOPING_REASONING`` is NOT here
+    # despite being listed in the v15 stuck-span evidence):
+    #
+    # * ``HUMAN_INTERVENTION_REQUIRED`` — the ladder always emits this
+    #   at CRITICAL with PAUSE_ESCALATE / TERMINATE semantics; the run
+    #   pauses for an operator and no normal ``after_agent_callback``
+    #   will fire on the open invocations.
+    # * ``REPEATED_FAILURE`` — emitted from
+    #   :meth:`_record_refine_failure` ONLY after the offending task is
+    #   marked ``FAILED`` non-recoverable; the executor will not
+    #   resume it.
+    # * ``LOOPING_REASONING`` is deliberately NOT here despite being
+    #   listed in the v15 evidence: it is graduated (INFO / WARNING /
+    #   CRITICAL) and CRITICAL-first maps to ``NUDGE`` (recoverable —
+    #   refine + corrective follow-up). Closing on the LOOPING_REASONING
+    #   emission itself would corrupt the boundary pair when the run
+    #   actually recovers. The CRITICAL-repeat path escalates to
+    #   ``PAUSE_ESCALATE``, which emits a fresh
+    #   ``HUMAN_INTERVENTION_REQUIRED`` drift; that emission triggers
+    #   the close, so the v15 stuck-spans symptom is still cleaned up
+    #   on the actual terminal step.
+    _TERMINAL_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
+        {
+            DriftKind.HUMAN_INTERVENTION_REQUIRED,
+            DriftKind.REPEATED_FAILURE,
+        }
+    )
+
+    @classmethod
+    def _is_terminal_drift(cls, drift: DriftEvent) -> bool:
+        """Return True iff ``drift`` should trigger boundary cleanup.
+
+        Membership-only check against :attr:`_TERMINAL_DRIFT_KINDS`;
+        every kind in the set is unconditionally terminal at emit
+        time. See the set definition for the rationale on which kinds
+        are included (and why ``LOOPING_REASONING`` is NOT — its
+        CRITICAL-first tier is still recoverable; the eventual
+        ``HUMAN_INTERVENTION_REQUIRED`` emission on escalation triggers
+        cleanup instead).
+        """
+        return drift.kind in cls._TERMINAL_DRIFT_KINDS
+
+    async def _close_open_boundaries_for_terminal_drift(self, drift: DriftEvent) -> None:
+        """Ask the bound adapter's plugin to close every still-open boundary.
+
+        Reuses the canonical ``close_open_boundaries`` helper from
+        PR #307 so the cleanup path is identical to the
+        ``except CancelledError`` arc in
+        :meth:`ADKAdapter._invoke_internal`. The reason string is
+        ``terminal_drift:<kind>`` so sink consumers can distinguish a
+        steerer-driven cleanup from the cancel / error paths.
+
+        Best-effort: tolerates an unbound adapter, an adapter without
+        the plugin attribute, a plugin without the helper (third-party
+        / legacy), and any exception from the plugin (logged at DEBUG).
+        Never re-raises — the drift was already emitted on the wire,
+        and a failed cleanup must not corrupt the steerer's pause /
+        escalate flow.
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return
+        plugin = getattr(adapter, "_plugin", None)
+        if plugin is None:
+            return
+        helper = getattr(plugin, "close_open_boundaries", None)
+        if not callable(helper):
+            return
+        reason = f"terminal_drift:{drift.kind.value}"
+        try:
+            await helper(reason=reason)
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            log.debug(
+                "DefaultSteerer._close_open_boundaries_for_terminal_drift: "
+                "plugin.close_open_boundaries(reason=%r) raised: %s",
+                reason,
+                exc,
+            )
 
     # goldfive-steer-unification: drift kinds that are always "user"-
     # authored when no explicit source was stamped. Any other kind
