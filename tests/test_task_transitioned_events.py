@@ -178,7 +178,10 @@ async def test_report_task_started_emits_llm_report_transition() -> None:
         {"task_id": "t1", "detail": "begin"}, session, steerer
     )
 
-    assert result == {"acknowledged": True}, "LLM-visible response unchanged"
+    # F1 directive ack on the real transition (acknowledged=True
+    # remains the load-bearing field; the additional task + plan_state
+    # keys carry the next-action anchor).
+    assert result["acknowledged"] is True
     transitions = _transition_events(sink)
     assert len(transitions) == 1, "exactly one TaskTransitioned on report_task_started"
     payload = transitions[0].task_transitioned
@@ -212,7 +215,8 @@ async def test_report_task_completed_emits_llm_report_transition() -> None:
         {"task_id": "t1", "summary": "done"}, session, steerer
     )
 
-    assert result == {"acknowledged": True}
+    # F1 directive ack on the real transition.
+    assert result["acknowledged"] is True
     transitions = _transition_events(sink)
     assert len(transitions) == 1
     payload = transitions[0].task_transitioned
@@ -259,7 +263,8 @@ async def test_replace_supersedes_reroute_emits_supersedes_reroute_source() -> N
         {"task_id": "research_solar"}, session, steerer
     )
 
-    assert result == {"acknowledged": True}
+    # F1 directive ack on the rerouted transition.
+    assert result["acknowledged"] is True
     transitions = _transition_events(sink)
     assert len(transitions) == 1, "exactly one TaskTransitioned for the rerouted call"
     payload = transitions[0].task_transitioned
@@ -421,7 +426,8 @@ async def test_handler_default_emits_handler_default_source() -> None:
         {"detail": "begin"}, session, steerer
     )
 
-    assert result == {"acknowledged": True}
+    # F1 directive ack on the pin-from-state transition.
+    assert result["acknowledged"] is True
     transitions = _transition_events(sink)
     assert len(transitions) == 1
     payload = transitions[0].task_transitioned

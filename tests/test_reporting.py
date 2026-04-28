@@ -128,7 +128,12 @@ async def test_report_task_started_marks_running() -> None:
     out = await _tool("report_task_started").handler(
         {"task_id": "t1", "detail": "starting"}, session, steerer
     )
-    assert out == {"acknowledged": True}
+    # F1 directive ack: includes the live task pointer + plan_state so
+    # the LLM has a structural anchor for "next action" instead of an
+    # information-free ack.
+    assert out["acknowledged"] is True
+    assert out["task"] == {"id": "t1", "status": TaskStatus.RUNNING.value}
+    assert "plan_state" in out
     assert session.plan.tasks[0].status is TaskStatus.RUNNING
     # task_started lands in the stream (followed by goldfive#251 R4
     # TaskTransitioned envelope; see test_task_transitioned_events.py).
@@ -245,9 +250,11 @@ async def test_handler_tolerates_missing_optional_fields() -> None:
 async def test_handler_ignores_unknown_task_id_gracefully() -> None:
     steerer, session, sink, _ = _fresh()
     # Unknown task_id — the handler ack's but no event is emitted and
-    # no existing task is mutated.
+    # no existing task is mutated. F1: the directive shape still rides
+    # along (with task.id echoing the unknown id and plan_state showing
+    # whatever's pending) but no transition fires.
     out = await _tool("report_task_started").handler({"task_id": "bogus"}, session, steerer)
-    assert out == {"acknowledged": True}
+    assert out["acknowledged"] is True
     assert sink.events == []
     assert all(t.status is TaskStatus.PENDING for t in session.plan.tasks)
 
@@ -279,7 +286,9 @@ async def test_report_task_started_reroutes_to_replacement() -> None:
     out = await _tool("report_task_started").handler(
         {"task_id": "t1", "detail": "starting retry"}, session, steerer
     )
-    assert out == {"acknowledged": True}
+    # F1 directive ack: includes the rerouted task pointer.
+    assert out["acknowledged"] is True
+    assert out["task"]["id"] == "t1_retry"
     by_id = {t.id: t for t in session.plan.tasks}
     assert by_id["t1_retry"].status is TaskStatus.RUNNING
     assert by_id["t1"].status is TaskStatus.FAILED

@@ -318,7 +318,8 @@ async def test_handler_fresh_pin_proceeds_normally() -> None:
         steerer,
     )
 
-    assert result == {"acknowledged": True}
+    # F1 directive ack on the real transition.
+    assert result["acknowledged"] is True
     # No refusal events.
     assert _refused_events(sinks[0].events) == []
 
@@ -375,7 +376,8 @@ async def test_handler_stale_replace_routes_to_successor() -> None:
         steerer,
     )
 
-    assert result == {"acknowledged": True}
+    # F1 directive ack on the rerouted transition.
+    assert result["acknowledged"] is True
     assert seen["task_id"] == "research_solar_v2", (
         "stale REPLACE pin should route to the REPLACE-kind successor"
     )
@@ -649,6 +651,7 @@ async def test_handler_fresh_pin_routes_through_replace_chain() -> None:
         session,
         steerer,
     )
-    assert result == {"acknowledged": True}
+    # F1 directive ack on the rerouted transition.
+    assert result["acknowledged"] is True
     assert seen["task_id"] == "t_new"
     assert _refused_events(sinks[0].events) == []

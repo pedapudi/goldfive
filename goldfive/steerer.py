@@ -157,6 +157,15 @@ _ABSORB_NUDGE_KINDS: frozenset[DriftKind] = frozenset(
         DriftKind.LOOPING_REASONING,
         DriftKind.LOOPING_TOOL_CALL,
         DriftKind.SELF_REPORTED_STUCK,
+        # Tier 1 / F4 (loop prevention): GOAL_DRIFT now lives on the
+        # NUDGE path. The judge's signal is "agent stuck on completed
+        # work" — exactly the shape a corrective user-message can fix
+        # without refining the plan (the plan is correct; only the
+        # agent's next-action reasoning is stuck). When ABSORB fires
+        # (WARNING severity), queueing a nudge gives the overlay the
+        # mid-invocation rescue path; CRITICAL routes through NUDGE
+        # directly via the ladder table below.
+        DriftKind.GOAL_DRIFT,
     }
 )
 
@@ -213,6 +222,15 @@ _CORRECTIVE_TEMPLATES: dict[DriftKind, str] = {
         "without consulting external data. Refined plan: "
         "{next_task_title}."
     ),
+    # Tier 1 / F4 — GOAL_DRIFT corrective. The judge's signal is "agent
+    # is grinding on completed work / not advancing the goal". The plan
+    # itself is fine; the agent just needs a pointer at the next hand-
+    # off. Includes ``{next_task_agent}`` so the coordinator can route
+    # to the assignee directly rather than re-invoking the stuck agent.
+    DriftKind.GOAL_DRIFT: (
+        "Task '{current_task_id}' is already complete. "
+        "Please proceed to '{next_task_title}' via {next_task_agent}."
+    ),
 }
 
 
@@ -237,6 +255,7 @@ def compose_corrective_user_message(
     """
     current = drift.current_task_id or "the current task"
     next_title = _next_pending_task_title(refined_plan) or "the next planned step"
+    next_agent = _next_pending_task_agent(refined_plan) or "the next assigned agent"
     template = _CORRECTIVE_TEMPLATES.get(drift.kind)
     if template is None:
         # Generic fallback for drift kinds that didn't get a
@@ -248,6 +267,7 @@ def compose_corrective_user_message(
     return template.format(
         current_task_id=current,
         next_task_title=next_title,
+        next_task_agent=next_agent,
     )
 
 
@@ -262,6 +282,26 @@ def _next_pending_task_title(plan: Plan | None) -> str:
     for t in plan.tasks:
         if t.status is TaskStatus.PENDING:
             return (t.title or t.id or "").strip()
+    return ""
+
+
+def _next_pending_task_agent(plan: Plan | None) -> str:
+    """Return the bare agent name assigned to the next PENDING task.
+
+    Tier 1 / F4 — used by the GOAL_DRIFT corrective template, which
+    redirects the LLM's next action to a different agent. Returns the
+    last dot-separated segment of ``assignee_agent_id`` so the LLM sees
+    a name it can pass back as the AgentTool target. Empty string when
+    no eligible task exists or the task has no assignee.
+    """
+    if plan is None:
+        return ""
+    for t in plan.tasks:
+        if t.status is TaskStatus.PENDING:
+            assignee = (getattr(t, "assignee_agent_id", "") or "").strip()
+            if "." in assignee:
+                return assignee.rsplit(".", 1)[-1]
+            return assignee
     return ""
 
 
@@ -2959,14 +2999,26 @@ class DefaultSteerer:
             (InterventionLevel.PAUSE_ESCALATE, InterventionLevel.TERMINATE),
         ),
         # GOAL_DRIFT (goldfive#143) -- trajectory-level judgment that
-        # the tree is no longer advancing ``session.goals``. CRITICAL
-        # severity only; routed to Level 4 both on first occurrence
-        # and on repeat because goal drift is structural and refine
-        # cannot recover from it. Per the goldfive#142 table.
+        # the tree is no longer advancing ``session.goals``. The judge's
+        # signal in practice is "coordinator is looping on completed
+        # work; should advance to the next hand-off."
+        #
+        # Tier 1 / F4 (loop prevention): NUDGE-first, not PAUSE-first.
+        # ABSORB-side refine cannot recover structural goal drift —
+        # the plan is usually correct and the agent is stuck — but
+        # NUDGE *doesn't* refine the plan; it injects a corrective user
+        # message via ``compose_corrective_user_message`` that re-
+        # anchors the LLM on the next hand-off. Repeat occurrence
+        # escalates to CANCEL_REINVOKE (cancel + restart with the
+        # corrective body); only after CANCEL_REINVOKE didn't break
+        # the loop do we fall through to PAUSE_ESCALATE in the default
+        # ladder path. WARNING is also routed to NUDGE (the judge
+        # rarely emits WARNING but if it does, the corrective is the
+        # same shape).
         DriftKind.GOAL_DRIFT: (
             None,
-            None,
-            (InterventionLevel.PAUSE_ESCALATE, InterventionLevel.PAUSE_ESCALATE),
+            InterventionLevel.NUDGE,
+            (InterventionLevel.NUDGE, InterventionLevel.CANCEL_REINVOKE),
         ),
         # Self-reported stuck (from reflective check). WARNING by
         # default -- preserve pre-ladder behaviour (ABSORB / refine).

@@ -96,7 +96,11 @@ async def test_report_task_completed_on_already_completed_returns_idempotent_ack
     first = await _tool("report_task_completed").handler(
         {"task_id": "t1", "summary": "done"}, session, steerer
     )
-    assert first == {"acknowledged": True}
+    # F1 directive ack on the real transition: includes task pointer + plan_state.
+    assert first["acknowledged"] is True
+    assert first["task"] == {"id": "t1", "status": "COMPLETED"}
+    assert "plan_state" in first
+    assert "idempotent" not in first
     assert session.plan.tasks[0].status is TaskStatus.COMPLETED
     completed_events_after_first = sum(
         1 for e in sink.events if e.WhichOneof("payload") == "task_completed"
@@ -105,11 +109,13 @@ async def test_report_task_completed_on_already_completed_returns_idempotent_ack
     second = await _tool("report_task_completed").handler(
         {"task_id": "t1", "summary": "done (again)"}, session, steerer
     )
-    assert second == {
-        "acknowledged": True,
-        "idempotent": True,
-        "current_status": "COMPLETED",
-    }
+    # F1: idempotent re-report still surfaces plan_state so the LLM
+    # sees the live next-action anchor (the loop-prevention contract).
+    assert second["acknowledged"] is True
+    assert second["idempotent"] is True
+    assert second["current_status"] == "COMPLETED"
+    assert second["task"] == {"id": "t1", "status": "COMPLETED"}
+    assert "plan_state" in second
     # No additional task_completed event from the retry.
     assert (
         sum(1 for e in sink.events if e.WhichOneof("payload") == "task_completed")
@@ -119,28 +125,31 @@ async def test_report_task_completed_on_already_completed_returns_idempotent_ack
 
 
 async def test_report_task_completed_on_running_actually_transitions() -> None:
-    """First call (on RUNNING) transitions and returns ``acknowledged=True``
-    without the idempotent flag."""
+    """First call (on RUNNING) transitions and returns the F1 directive ack
+    (acknowledged=True + task + plan_state) without the idempotent flag."""
     steerer, session, _ = _fresh(task_status=TaskStatus.RUNNING)
 
     result = await _tool("report_task_completed").handler(
         {"task_id": "t1", "summary": "all done"}, session, steerer
     )
-    assert result == {"acknowledged": True}
+    assert result["acknowledged"] is True
     assert "idempotent" not in result
+    assert result["task"] == {"id": "t1", "status": "COMPLETED"}
+    assert "plan_state" in result
     assert session.plan.tasks[0].status is TaskStatus.COMPLETED
 
 
 async def test_report_task_completed_on_pending_also_transitions() -> None:
     """PENDING → COMPLETED is a legal (if unusual) skip-ahead — real
-    transition, not idempotent."""
+    transition, F1 directive ack, not idempotent."""
     steerer, session, _ = _fresh(task_status=TaskStatus.PENDING)
 
     result = await _tool("report_task_completed").handler(
         {"task_id": "t1", "summary": "zero-work complete"}, session, steerer
     )
-    assert result == {"acknowledged": True}
+    assert result["acknowledged"] is True
     assert "idempotent" not in result
+    assert result["task"] == {"id": "t1", "status": "COMPLETED"}
     assert session.plan.tasks[0].status is TaskStatus.COMPLETED
 
 
@@ -271,8 +280,12 @@ async def test_idempotency_matrix(
         assert result["attempted"]  # non-empty
         assert session.plan.tasks[0].status is initial_status
     else:  # transition
-        # Handler returns plain ACK when a real transition happens.
-        assert result == {"acknowledged": True}
+        # F1 directive ack on the real transition: acknowledged=True
+        # plus the task pointer + plan_state anchor.
+        assert result["acknowledged"] is True
+        assert "idempotent" not in result
+        assert "task" in result
+        assert "plan_state" in result
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +336,10 @@ async def test_unknown_task_id_still_acks_at_handler_level() -> None:
     result = await _tool("report_task_started").handler(
         {"task_id": "does-not-exist", "detail": "x"}, session, steerer
     )
-    assert result == {"acknowledged": True}
+    # F1: a directive ack still rides along. The unknown id reaches the
+    # steerer (which no-ops on unknown ids) and the response carries
+    # the task pointer + plan_state for the LLM's anchor.
+    assert result["acknowledged"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -385,9 +401,9 @@ async def test_idempotent_progress_retries_produce_zero_drifts() -> None:
     for _ in range(6):
         result = await _tool("report_task_progress").handler(args, session, steerer)
         # report_task_progress on RUNNING is a legal liveness tick —
-        # plain ACK every time; the handler does not reject benign
-        # retries.
-        assert result == {"acknowledged": True}
+        # F1 directive ack every time (the handler does not reject
+        # benign retries).
+        assert result["acknowledged"] is True
 
     # No drifts — the retired per-task loop guard would have fired
     # CRITICAL LOOPING_TOOL_CALL at the 6th call (exact=6 in window
