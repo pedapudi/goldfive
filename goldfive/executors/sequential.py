@@ -39,6 +39,7 @@ import re
 import warnings
 from typing import TYPE_CHECKING, Any
 
+from goldfive.adapters.adk_reentry import ReentryKind, reentry
 from goldfive.events import (
     emit,
     new_event,
@@ -857,16 +858,46 @@ class SequentialExecutor(Executor):
         current_user_input = user_input
         failure_reason = ""
         nudge_replays = 0
+        # Re-entry contract (harmonograf#234). The very first iteration
+        # of this loop carries the operator's verbatim user_input — for
+        # plugins observing the inner runner that's still a goldfive
+        # OVERLAY_REPLAY (the outer adk-web runner already emitted the
+        # USER_TURN); ADKAdapter.invoke_passthrough pins OVERLAY_REPLAY
+        # itself, so the default value here is "no executor-level pin".
+        # Subsequent iterations triggered by a STEER or queued nudge
+        # MUST carry the more-specific kind so plugins can attribute
+        # the replay to the correct cause (operator-issued steer vs
+        # autonomous drift-driven nudge); see ReentryKind.reentry()
+        # for stack-precedence rules.
+        next_reentry_kind: ReentryKind | None = None
         while True:
-            kind, payload = await self._invoke_passthrough_with_control(
-                adapter=adapter,
-                session=session,
-                steerer=steerer,
-                sinks=sinks,
-                control=control,
-                reconciler=reconciler,
-                user_input=current_user_input,
-            )
+            # ContextVars snapshot at ``asyncio.create_task`` time
+            # (which happens inside _invoke_passthrough_with_control),
+            # so the ``reentry()`` block must wrap the call site here.
+            if next_reentry_kind is None:
+                kind, payload = await self._invoke_passthrough_with_control(
+                    adapter=adapter,
+                    session=session,
+                    steerer=steerer,
+                    sinks=sinks,
+                    control=control,
+                    reconciler=reconciler,
+                    user_input=current_user_input,
+                )
+            else:
+                with reentry(next_reentry_kind):
+                    kind, payload = await self._invoke_passthrough_with_control(
+                        adapter=adapter,
+                        session=session,
+                        steerer=steerer,
+                        sinks=sinks,
+                        control=control,
+                        reconciler=reconciler,
+                        user_input=current_user_input,
+                    )
+                # One-shot: clear after consumption so the next iteration
+                # falls back to whatever the next branch decides.
+                next_reentry_kind = None
             if kind == "cancelled":
                 failure_reason = str(payload) or "cancelled by control"
                 # goldfive#205: overlay path doesn't have a single
@@ -922,6 +953,13 @@ class SequentialExecutor(Executor):
                 # tasks map fresh — stale task_id → agent claims from
                 # the pre-steer plan must not leak into the replay.
                 reconciler.reset_for_new_plan(session.plan)
+                # Re-entry contract (harmonograf#234): the next iteration
+                # re-feeds a goldfive-composed steer-restart message
+                # wrapped in USER STEERING CONTROL framing. Plugins
+                # observing the inner runner's user_message hook should
+                # see STEER_REPLAY, not USER_TURN, to suppress duplicate
+                # emission.
+                next_reentry_kind = ReentryKind.STEER_REPLAY
                 # Restart the invocation with the steer body as the
                 # new user input.
                 continue
@@ -957,6 +995,14 @@ class SequentialExecutor(Executor):
                 # likely added new PENDING tasks that reconciler-side
                 # agent claims should re-match against.
                 reconciler.reset_for_new_plan(session.plan)
+                # Re-entry contract (harmonograf#234): the next iteration
+                # re-feeds a goldfive-composed nudge body that the
+                # steerer authored in response to autonomous drift +
+                # plan revision (e.g. LOOPING_REASONING → refine spawned
+                # ``<task>_v2``). Plugins observing the inner runner's
+                # user_message hook should see NUDGE_REPLAY, not
+                # USER_TURN.
+                next_reentry_kind = ReentryKind.NUDGE_REPLAY
                 continue
             break
 

@@ -60,6 +60,7 @@ from goldfive.adapters._adk_plugin import (
     SessionContext,
     make_adk_plugin,
 )
+from goldfive.adapters.adk_reentry import ReentryKind, reentry
 from goldfive.results import InvocationResult
 from goldfive.types import TERMINAL_TASK_STATUSES
 
@@ -1869,13 +1870,28 @@ class ADKAdapter:
         Returns an :class:`InvocationResult` whose ``task_id`` is
         empty (no single task owns the whole invocation) and
         ``text`` is the final assistant text.
+
+        Re-entry contract (harmonograf#234)
+        -----------------------------------
+
+        Pins :data:`~goldfive.adapters.adk_reentry.current_reentry_kind`
+        to :attr:`~goldfive.adapters.adk_reentry.ReentryKind.OVERLAY_REPLAY`
+        for the lifetime of the inner ``runner.run_async`` call. This
+        signals plugins observing the inner runner's
+        ``on_user_message_callback`` that the user-message they are
+        about to see is goldfive re-feeding the operator's input — the
+        outer (adk-web) runner already observed it as a USER_TURN. A
+        more-specific NUDGE_REPLAY / STEER_REPLAY pinned by the executor
+        BEFORE we are entered survives the nesting (see
+        :func:`~goldfive.adapters.adk_reentry.reentry` semantics).
         """
-        return await self._invoke_internal(
-            task=None,
-            session=session,
-            new_message=_passthrough_message_parts(user_message),
-            reconciler=reconciler,
-        )
+        with reentry(ReentryKind.OVERLAY_REPLAY):
+            return await self._invoke_internal(
+                task=None,
+                session=session,
+                new_message=_passthrough_message_parts(user_message),
+                reconciler=reconciler,
+            )
 
     async def invoke_follow_up(self, task: Task, session: Session) -> InvocationResult:
         """Drive a gentle follow-up for a plan ``task`` missed during passthrough.
