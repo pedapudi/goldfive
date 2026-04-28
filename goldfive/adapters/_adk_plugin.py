@@ -214,6 +214,36 @@ def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
     return value if value is not None else default
 
 
+def _safe_task_cancel(task: asyncio.Task[Any], invocation_id: str) -> None:
+    """Cancel ``task`` and log the outcome — used as a deferred
+    ``loop.call_soon`` callback (goldfive#271 follow-up).
+
+    Wrapping the cancel in a free function keeps the
+    ``loop.call_soon(_safe_task_cancel, t, inv_id)`` site reference-
+    free of mutable plugin state — the loop holds only the task and
+    id strings until the cancel fires. Swallows any failure so an
+    already-finished task doesn't surface a spurious traceback to
+    the loop's exception handler.
+    """
+    if task.done():
+        return
+    try:
+        cancelled_now = task.cancel()
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "_safe_task_cancel: task.cancel() for invocation_id=%s raised: %s",
+            invocation_id,
+            exc,
+        )
+        return
+    if cancelled_now:
+        log.info(
+            "goldfive.cancel.task: cancelled in-flight task for "
+            "invocation_id=%s",
+            invocation_id,
+        )
+
+
 def _session_state_from_callback(ctx: Any) -> Any:
     """Return the ADK session.state mutable mapping for a callback ctx.
 
@@ -1560,6 +1590,37 @@ def make_adk_plugin(
             # without racing on the single ``goldfive.current_task_id``
             # slot. Cleared on ``clear_active_context``.
             self._invocation_pinned_task_id: dict[str, str] = {}
+            # Per-invocation asyncio.Task registry (goldfive#271 follow-up
+            # — concurrent-invocation cancel-on-refine bug exposed by v15).
+            # ``dict[str, asyncio.Task]`` mapping ``invocation_id`` to the
+            # asyncio task currently driving that invocation's
+            # ``runner.run_async`` stream. Populated in
+            # :meth:`before_run_callback` (which runs INSIDE the task
+            # ADK is using to drive the invocation, so
+            # ``asyncio.current_task()`` is the right handle). Consumed
+            # by :meth:`request_invocation_cancel` to fire
+            # ``task.cancel()`` on the live invocation when a refine
+            # produced a revised plan that supersedes whatever the
+            # in-flight LLM call is reasoning about.
+            #
+            # Without this, the existing cancel-state flag only
+            # short-circuits the NEXT ``before_model_callback`` /
+            # ``before_tool_callback`` on the same invocation; the
+            # already-running LLM streaming call (which can take
+            # 10+ minutes on a slow model) keeps generating output
+            # that triggers more drift, producing the refine loop
+            # observed in v15presmtx-1. Cancelling the asyncio task
+            # raises ``CancelledError`` inside the
+            # ``runner.run_async`` async-for in
+            # :meth:`ADKAdapter._invoke_internal`; the existing
+            # heal path already emits the synthetic
+            # ``function_response`` so the function_call/_response
+            # invariant is preserved.
+            #
+            # Cleared in :meth:`after_run_callback` (per-invocation
+            # release) and :meth:`clear_active_context` (full reset
+            # at dispatch teardown).
+            self._invocation_tasks: dict[str, asyncio.Task[Any]] = {}
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
@@ -1622,6 +1683,14 @@ def make_adk_plugin(
             self._invocation_parents.clear()
             # goldfive#264 — drop per-invocation pin map.
             self._invocation_pinned_task_id.clear()
+            # goldfive#271 follow-up — drop per-invocation task handles.
+            # We do NOT cancel registered tasks here: this method is
+            # called from ``ADKAdapter.invoke``'s ``finally`` block
+            # AFTER the dispatch has already terminated (normally,
+            # via cancel, or via error). Cancelling here would no-op
+            # because the task is already done; clearing the map
+            # avoids stale handles bleeding into the next dispatch.
+            self._invocation_tasks.clear()
 
         # --- Cooperative cancellation (goldfive#251 Stream C / 7a) -----
 
@@ -1631,6 +1700,7 @@ def make_adk_plugin(
             invocation_id: str,
             request: Any,
             propagate_to_children: bool = True,
+            cancel_inflight_task: bool = False,
         ) -> list[str]:
             """Flag ``invocation_id`` (and optionally its descendants)
             for cooperative cancellation.
@@ -1654,6 +1724,20 @@ def make_adk_plugin(
             Tree-agnostic: the parent/child map is per-invocation, the
             plugin has no notion of "coordinator" vs "sub-agent", and
             every level in the tree is flagged the same way.
+
+            When ``cancel_inflight_task`` is True (goldfive#271 follow-
+            up — v15 concurrent-invocation bug), ALSO fire
+            ``task.cancel()`` on the registered asyncio.Task for each
+            flagged invocation (deferred via
+            :meth:`asyncio.AbstractEventLoop.call_soon` so an inline
+            same-task caller still completes its current emission
+            work before the cancel lands). Default False so the
+            existing pre-refine cancel paths in
+            :meth:`DefaultSteerer._handle_drift` keep their flag-only
+            semantics — the post-refine path
+            :meth:`DefaultSteerer._cancel_inflight_for_revision`
+            opts in explicitly so the cancel only fires AFTER a
+            superseding plan has been installed.
             """
             if not invocation_id:
                 return []
@@ -1686,6 +1770,78 @@ def make_adk_plugin(
                 # overwrite semantics are only for same-id re-writes
                 # from the steerer itself.
                 self._cancel_state.setdefault(flagged_id, request)
+            # Fire ``task.cancel()`` on the registered asyncio.Task for
+            # each flagged invocation when the caller opted in via
+            # ``cancel_inflight_task=True`` (goldfive#271 follow-up —
+            # v15 concurrent-invocation bug). Without this step the
+            # cancel-state flag short-circuits only the NEXT
+            # ``before_model_callback`` / ``before_tool_callback``; the
+            # already-running LLM streaming call (potentially 10+
+            # minutes on a slow model) keeps generating output that
+            # triggers more drift, and the steerer's `refine_steer`
+            # span ends up overlapping the coordinator span by the
+            # full duration of the in-flight LLM call. Cancelling the
+            # task raises ``CancelledError`` inside
+            # ``ADKAdapter._invoke_internal``'s ``async for`` over
+            # ``runner.run_async``; the existing heal path emits the
+            # synthetic ``function_response`` so ADK's
+            # function_call/_response invariant holds.
+            #
+            # IMPORTANT — defer via :meth:`asyncio.AbstractEventLoop.call_soon`:
+            # Drift-detection paths can reach this method synchronously
+            # from inside the same asyncio task that drives the
+            # dispatch (e.g. PlanReconciler emits PLAN_DIVERGENCE from
+            # ``before_agent_callback`` and awaits the steerer's
+            # ``_handle_drift`` inline; the steerer's own
+            # post-refine helper calls us right before
+            # ``_emit_plan_revised``). Calling ``task.cancel()``
+            # directly there would schedule a ``CancelledError`` to
+            # land on the very next ``await`` in the caller's call
+            # chain — including the paired ``_emit_plan_revised``
+            # emit — losing the on-the-wire PlanRevised event.
+            # ``loop.call_soon`` queues the cancel for the NEXT
+            # event-loop turn so the calling
+            # ``_handle_drift`` / ``_promote_drift_to_steer`` /
+            # ``apply_user_steer_with_plan`` finishes its emission
+            # work before the dispatch task observes the cancellation
+            # at its next yield (typically the next iteration of the
+            # ``async for`` in the adapter).
+            #
+            # Best-effort: a missing entry (e.g. the cancel fired
+            # between ``before_run`` registering and the LLM stream
+            # starting) is OK — the cancel-state flag still
+            # short-circuits subsequent callbacks. A done task is also
+            # OK — ``cancel()`` no-ops and we move on. A loop that's
+            # not running falls back to a direct ``cancel()`` so
+            # tests driving the cancel under ``asyncio.run`` still see
+            # it applied.
+            if cancel_inflight_task:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                for flagged_id in flagged:
+                    t = self._invocation_tasks.get(flagged_id)
+                    if t is None or t.done():
+                        continue
+                    if loop is not None:
+                        loop.call_soon(_safe_task_cancel, t, flagged_id)
+                    else:
+                        try:
+                            if t.cancel():
+                                log.info(
+                                    "goldfive.cancel.task: cancelled "
+                                    "in-flight task for invocation_id=%s "
+                                    "(no running loop; direct cancel)",
+                                    flagged_id,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug(
+                                "_GoldfiveADKPlugin.request_invocation_cancel: "
+                                "task.cancel() for %s raised: %s",
+                                flagged_id,
+                                exc,
+                            )
             return flagged
 
         def consume_cancel_for_invocation(self, invocation_id: str) -> Any | None:
@@ -1806,6 +1962,21 @@ def make_adk_plugin(
             # steerer having to know the tree shape.
             if inv_id and parent_inv_id:
                 self._invocation_parents[inv_id] = parent_inv_id
+
+            # Register the asyncio.Task currently driving this invocation
+            # (goldfive#271 follow-up — v15 concurrent-invocation bug).
+            # ADK's ``Runner._exec_with_plugin`` runs ``before_run_callback``
+            # in the same task as the dispatch, so
+            # ``asyncio.current_task()`` here IS the task whose
+            # cancellation will raise ``CancelledError`` inside the
+            # adapter's ``async for event in runner.run_async(...)``
+            # loop. :meth:`request_invocation_cancel` consults this map
+            # to fire ``task.cancel()`` when a refine supersedes the
+            # in-flight plan.
+            if inv_id:
+                current = asyncio.current_task()
+                if current is not None:
+                    self._invocation_tasks[inv_id] = current
 
             # Cooperative-cancellation check (goldfive#251 Stream C / 7a).
             # If the adapter / steerer flagged this invocation before
@@ -3048,6 +3219,15 @@ def make_adk_plugin(
                 # so a future invocation_id collision (e.g. test
                 # harness reuse) doesn't inherit the cancel bit.
                 self._cancelled_invocations.discard(inv_id)
+                # Drop the registered task handle (goldfive#271 follow-
+                # up). The invocation has finished — successfully,
+                # cancelled, or errored — and the task will not be
+                # cancellable beyond this point. Leaving the entry in
+                # the map would be harmless but would let an unrelated
+                # late-firing ``request_invocation_cancel`` no-op (the
+                # task is done) AT BEST or, worse, target a future
+                # invocation that happens to reuse the id.
+                self._invocation_tasks.pop(inv_id, None)
             await self._emit_observability(
                 "agent_invocation_completed",
                 agent_name=agent_name,
