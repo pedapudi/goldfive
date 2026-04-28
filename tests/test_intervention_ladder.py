@@ -181,19 +181,31 @@ _CASES: list[tuple[DriftKind, DriftSeverity, int, InterventionLevel]] = [
         2,
         InterventionLevel.TERMINATE,
     ),
-    # GOAL_DRIFT (goldfive#143): CRITICAL -> PAUSE_ESCALATE both first
-    # and repeat; refine can't recover structural goal drift.
+    # GOAL_DRIFT (goldfive#143, retuned for Tier 1 / F4): the judge
+    # signals "agent is stuck on completed work" -- a NUDGE (corrective
+    # user message) is the right first response, since the plan is
+    # correct and only the agent's next-action reasoning needs an
+    # anchor. CRITICAL repeat escalates to CANCEL_REINVOKE; PAUSE_
+    # ESCALATE is the last-resort fallback that the default ladder
+    # path provides (no explicit entry needed once CANCEL_REINVOKE
+    # didn't break the loop).
+    (
+        DriftKind.GOAL_DRIFT,
+        DriftSeverity.WARNING,
+        0,
+        InterventionLevel.NUDGE,
+    ),
     (
         DriftKind.GOAL_DRIFT,
         DriftSeverity.CRITICAL,
         0,
-        InterventionLevel.PAUSE_ESCALATE,
+        InterventionLevel.NUDGE,
     ),
     (
         DriftKind.GOAL_DRIFT,
         DriftSeverity.CRITICAL,
         2,
-        InterventionLevel.PAUSE_ESCALATE,
+        InterventionLevel.CANCEL_REINVOKE,
     ),
     # SELF_REPORTED_STUCK (WARNING by default).
     (
@@ -256,20 +268,32 @@ def test_ladder_level_ordering_is_monotonic_by_intrusiveness() -> None:
 
 
 def test_ladder_covers_goal_drift() -> None:
-    """goldfive#143 ``GOAL_DRIFT`` -> Level 4 always per the goldfive#142 table."""
+    """Tier 1 / F4: GOAL_DRIFT routes through NUDGE first, not PAUSE.
+
+    The judge's signal is "agent is grinding on completed work"; the
+    plan is fine and a corrective user message (NUDGE) re-anchors the
+    LLM without refining the plan. CRITICAL repeat escalates to
+    CANCEL_REINVOKE — only if that also fails to break the loop does
+    the default-fallback path eventually surface PAUSE_ESCALATE.
+    """
     steerer = DefaultSteerer()
-    # CRITICAL first -> PAUSE_ESCALATE.
+    # WARNING -> NUDGE (corrective message; no plan change needed).
+    assert (
+        steerer._ladder_level_for(DriftKind.GOAL_DRIFT, DriftSeverity.WARNING, 0)
+        is InterventionLevel.NUDGE
+    )
+    # CRITICAL first occurrence -> NUDGE.
     assert (
         steerer._ladder_level_for(DriftKind.GOAL_DRIFT, DriftSeverity.CRITICAL, 0)
-        is InterventionLevel.PAUSE_ESCALATE
+        is InterventionLevel.NUDGE
     )
-    # CRITICAL repeat -> still PAUSE_ESCALATE (refine can't recover from
-    # structural goal drift).
+    # CRITICAL repeat -> CANCEL_REINVOKE (cancel + restart with the
+    # corrective body as the new user input).
     assert (
         steerer._ladder_level_for(
             DriftKind.GOAL_DRIFT,
             DriftSeverity.CRITICAL,
             DefaultSteerer.REFINE_FAILURE_THRESHOLD,
         )
-        is InterventionLevel.PAUSE_ESCALATE
+        is InterventionLevel.CANCEL_REINVOKE
     )
