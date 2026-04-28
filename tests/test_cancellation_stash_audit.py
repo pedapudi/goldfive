@@ -50,7 +50,6 @@ from goldfive._correction_injection import (  # noqa: E402
     pending_correction_key,
     write_correction,
 )
-from goldfive.adapters import _adk_state_protocol as _sp  # noqa: E402
 from goldfive.executors.parallel import ParallelDAGExecutor  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
@@ -63,7 +62,6 @@ from goldfive.types import (  # noqa: E402
     Task,
     TaskStatus,
 )
-
 
 # ---------------------------------------------------------------------------
 # Test doubles
