@@ -365,3 +365,150 @@ async def test_real_control_message_steer_writes_active_steer() -> None:
     assert body == "Refocus on solar flares", body
     assert author == "operator-Alice", author
     assert source == "user", source
+
+
+# ---------------------------------------------------------------------------
+# Synthetic-drift wire stamping (harmonograf intervention filter)
+# ---------------------------------------------------------------------------
+
+
+async def test_runner_synthesized_install_emits_synthetic_drift_event() -> None:
+    """The ``USER_STEER`` :class:`DriftEvent` :meth:`Runner._install_revision`
+    fabricates on every plan install MUST stamp ``synthetic=True`` on the
+    emitted ``DriftDetected`` envelope.
+
+    Harmonograf renders ``DriftDetected`` rows on a user-facing
+    "interventions" panel. Without the synthetic marker the install-path
+    plumbing drift surfaces as a phantom ``USER_STEER WARNING``
+    intervention attached to every fresh user turn (v15 UI
+    ``v15presmtx-1`` empirical evidence: REFINE:USER_STEER + STEER
+    WARNING cards on the FIRST install at 0:30s with no operator
+    action). The synthetic flag lets harmonograf filter the row out of
+    the interventions panel while keeping it on the full audit
+    timeline.
+
+    This test exercises the wire path end-to-end: drives a real
+    ``Runner.run`` install through ``_install_revision`` and asserts the
+    ``DriftDetected`` envelope on the sink carries ``synthetic=True``.
+    Pairs with the no-write active_steer test above — both gates
+    (``drift.raw`` for state-write, ``drift.synthetic`` for UI
+    filtering) must hold for the same plumbing drift.
+    """
+    plan1, _ = _two_plans()
+    sink = InMemorySink()
+    runner = _runner(_stub_planner([plan1]), sink)
+    try:
+        out = await asyncio.wait_for(
+            runner.run(
+                "Create a presentation about solar panels.",
+                session_id="synthetic-drift-A",
+            ),
+            timeout=10.0,
+        )
+        assert out.success, f"install failed: {out.reason!r}"
+
+        # Find the install-path USER_STEER drift on the sink and
+        # assert it is stamped synthetic. Other DriftDetected rows
+        # (validation failures, plan-divergence audits) MAY appear on
+        # the same sink in a richer scenario; here only one fires.
+        user_steer_drifts = []
+        for evt in sink.events:
+            which = evt.WhichOneof("payload") if hasattr(evt, "WhichOneof") else None
+            if which != "drift_detected":
+                continue
+            dd = evt.drift_detected
+            kind_val = int(dd.kind)
+            # DRIFT_KIND_USER_STEER is enum value 8 in types_pb2;
+            # rather than hard-code the int, cross-reference the proto
+            # module so a future renumber doesn't silently break this.
+            from goldfive.pb.goldfive.v1 import types_pb2 as _tpb
+            if kind_val == _tpb.DRIFT_KIND_USER_STEER:
+                user_steer_drifts.append(dd)
+        assert user_steer_drifts, (
+            "expected at least one USER_STEER DriftDetected from "
+            "Runner._install_revision; got "
+            f"{[evt.WhichOneof('payload') for evt in sink.events]!r}"
+        )
+        for dd in user_steer_drifts:
+            assert dd.synthetic is True, (
+                "Runner._install_revision USER_STEER drift must be "
+                f"synthetic=True on the wire; got synthetic={dd.synthetic!r}"
+            )
+    finally:
+        await runner.close()
+
+
+async def test_real_control_message_steer_drift_is_not_synthetic() -> None:
+    """The genuine operator STEER path (drift carries ``raw =
+    ControlMessage``) MUST emit a ``DriftDetected`` with
+    ``synthetic=False``.
+
+    Pairs with the synthetic-stamp test above so the marker is
+    conditional on the install-path plumbing, not a blanket "every
+    USER_STEER drift is synthetic". Real operator interventions MUST
+    surface on harmonograf's interventions panel; flipping this
+    invariant would silently hide every operator STEER from the
+    user-facing UI.
+    """
+    sink = InMemorySink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_stub_planner(["{}"]))
+    session = Session(run_id="synthetic-drift-control-B")
+    session.plan = Plan(
+        id="p1",
+        run_id=session.run_id,
+        goal_ids=["g"],
+        tasks=[Task(id="t1", title="T1", assignee_agent_id="w")],
+        edges=[],
+        summary="seed",
+    )
+
+    control = ControlMessage(
+        kind=ControlKind.STEER,
+        payload={
+            "note": "Refocus on solar flares",
+            "author": "operator-Alice",
+            "annotation_id": "ann-77",
+        },
+    )
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="by operator-Alice: Refocus on solar flares",
+        raw=control,
+        authored_by="user",
+        # synthetic defaults to False; set explicitly for clarity.
+        synthetic=False,
+    )
+    revised = Plan(
+        id=session.plan.id,
+        run_id=session.run_id,
+        goal_ids=["g"],
+        tasks=[
+            Task(id="t1", title="T1", assignee_agent_id="w"),
+            Task(id="t2", title="T2 (added)", assignee_agent_id="w"),
+        ],
+        edges=[],
+        summary="post-steer",
+    )
+    installed = await asyncio.wait_for(
+        steerer.apply_user_steer_with_plan(
+            drift=drift, session=session, revised_plan=revised
+        ),
+        timeout=5.0,
+    )
+    assert installed
+    drift_rows = [
+        evt.drift_detected
+        for evt in sink.events
+        if (evt.WhichOneof("payload") if hasattr(evt, "WhichOneof") else None)
+        == "drift_detected"
+    ]
+    assert drift_rows, "expected a DriftDetected on a real STEER"
+    # All drift rows from this control-message path must be
+    # non-synthetic — they represent genuine operator action.
+    for dd in drift_rows:
+        assert dd.synthetic is False, (
+            "real operator STEER drift must NOT be marked synthetic; "
+            f"got synthetic={dd.synthetic!r}"
+        )

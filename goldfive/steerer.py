@@ -4021,6 +4021,16 @@ class DefaultSteerer:
             "trigger_severity": drift.severity.value,
             "current_task_id": drift.current_task_id or "",
             "current_agent_id": drift.current_agent_id or "",
+            # goldfive#271 follow-up: forward the synthetic flag from the
+            # triggering drift so harmonograf's intervention deriver can
+            # filter the merged ``REFINE`` row out of the user-facing
+            # interventions panel when the underlying drift was just
+            # plumbing (e.g. ``Runner._install_revision`` synthesizing a
+            # USER_STEER drift on every plan install). Without this,
+            # synthetic-drift filtering on the drift row alone leaves a
+            # phantom ``REFINE:USER_STEER`` card on the panel for every
+            # fresh user turn (v15 UI ``v15presmtx-1`` evidence).
+            "synthetic": bool(getattr(drift, "synthetic", False)),
         }
         try:
             evt = make_event(
@@ -4525,6 +4535,13 @@ class DefaultSteerer:
         # ``_dispatch_pause_escalate`` / ``_emit_refine_failure``).
         evt.drift_detected.authored_by = self._resolve_authored_by(drift)
         evt.drift_detected.suppressed_by_user_steer = bool(drift.suppressed_by_user_steer)
+        # Forward the plumbing-marker so harmonograf can filter goldfive-
+        # synthesized drifts (e.g. the USER_STEER drift
+        # ``Runner._install_revision`` fabricates on every plan install)
+        # out of the user-facing interventions panel while keeping them
+        # in the full audit timeline. Always ``False`` on real
+        # user-control drifts and on autonomous detector drifts.
+        evt.drift_detected.synthetic = bool(getattr(drift, "synthetic", False))
         # goldfive#199: stamp the drift's own id on the wire so a
         # subsequent ``PlanRevised.trigger_event_id`` can strict-match the
         # drift row in harmonograf. Always non-empty — ``DriftEvent``

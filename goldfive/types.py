@@ -724,6 +724,21 @@ class DriftEvent:
     # ran; the cancel-in-flight + refine + restart-message machinery is
     # elided. Always ``False`` on user-authored drifts.
     suppressed_by_user_steer: bool = False
+    # True when this drift was synthesized internally by goldfive plumbing
+    # rather than minted from a real signal — e.g. the ``USER_STEER``
+    # drift :meth:`Runner._install_revision` fabricates on every plan
+    # install so the install pipeline can route uniformly through
+    # :meth:`DefaultSteerer.apply_user_steer_with_plan`. The drift is
+    # still emitted on the wire as a ``DriftDetected`` event for full
+    # audit fidelity, but consumers rendering an operator-facing
+    # "interventions" panel MUST filter ``synthetic = True`` rows out:
+    # they do not represent operator action or detector verdicts and
+    # would otherwise appear as phantom interventions on every fresh
+    # user turn (harmonograf#TBD). Sinks rendering the full event
+    # timeline (audit / debug views) should still surface synthetic
+    # drifts. Always ``False`` on real user-control drifts (those carry
+    # a ``raw`` ControlMessage) and on autonomous detector drifts.
+    synthetic: bool = False
 
 
 @dataclasses.dataclass
