@@ -25,7 +25,6 @@ import pytest
 
 from goldfive._llm import get_max_output_tokens
 
-
 # ---------------------------------------------------------------------------
 # Constant pins — fail loudly if anyone halves the cap and reintroduces
 # the v16 / Qwen 35B empty-judge regression.
