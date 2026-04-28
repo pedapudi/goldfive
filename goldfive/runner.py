@@ -10,10 +10,12 @@ A Runner composes the six pluggable components of a goldfive run:
 * :class:`EventSink` — persists / observes the event stream.
 
 ``Runner.run`` emits a ``RunStarted`` event, derives goals, generates a
-plan, registers the seven canonical reporting tools on the adapter,
-binds the steerer to the sinks+planner, and hands everything to the
-executor. The returned :class:`ExecutionOutcome` carries the final live
-:class:`Session` so callers can inspect completed tasks / artifacts.
+plan, registers the canonical reporting tools on the adapter (the
+lifecycle subset by default, the drift tools opted in via
+``drift_self_reporting=`` — see :class:`Runner`), binds the steerer to
+the sinks+planner, and hands everything to the executor. The returned
+:class:`ExecutionOutcome` carries the final live :class:`Session` so
+callers can inspect completed tasks / artifacts.
 
 Event lifecycle ownership
 -------------------------
@@ -54,7 +56,7 @@ from goldfive.events import (
     run_started_event,
 )
 from goldfive.goal_deriver import PassthroughGoalDeriver
-from goldfive.reporting import BUILTIN_REPORTING_TOOLS
+from goldfive.reporting import select_reporting_tools
 from goldfive.results import ExecutionOutcome
 from goldfive.steerer import DefaultSteerer
 from goldfive.types import (
@@ -143,6 +145,44 @@ class Runner:
 
         Skipped when ``user_input`` is already a ``list[Goal]`` (the
         caller has opted out of natural-language derivation).
+    drift_self_reporting:
+        Opt-in switch for the drift-related self-reporting tools
+        (goldfive#196). These are tools that ask the agent to volunteer
+        a drift opinion the framework can already observe by other
+        means:
+
+        * ``report_plan_divergence`` —
+          :class:`~goldfive.reconciler.PlanReconciler` covers this
+          observationally.
+        * ``declare_task_skipped`` / ``declare_task_not_needed`` —
+          observability-only declarations whose downstream consumer
+          (the next refine) is also fed by the imperative
+          ``report_task_*`` family.
+
+        Each registered tool inflates the sub-agent's prompt by
+        ~200-400 tokens AND expands the model's hallucination surface
+        (a confused agent can confabulate a drift call). Default
+        ``False`` registers ONLY the lifecycle subset
+        (``report_task_started`` / ``_progress`` / ``_completed`` /
+        ``_failed`` / ``_blocked`` / ``_awaiting_approval`` /
+        ``report_new_work_discovered``). The framework's observation
+        paths — ``classify_goal_drift``,
+        :class:`~goldfive.reconciler.PlanReconciler`, the steerer's
+        refine machinery — remain the canonical drift detectors.
+
+        Accepted shapes:
+
+        * ``False`` (default) — lifecycle subset only.
+        * ``True`` — full canonical set (pre-#196 behaviour).
+        * ``list[str]`` — lifecycle subset PLUS the named drift tools
+          (e.g. ``["report_plan_divergence"]`` re-enables that one
+          tool while leaving the declarations off). Names not in
+          :data:`~goldfive.reporting.DRIFT_SELF_REPORTING_TOOL_NAMES`
+          are silently ignored.
+
+        ``report_new_work_discovered`` is intentionally NOT a drift
+        tool — there is no observation analog for an agent surfacing
+        genuinely new work, so it stays default-on.
     """
 
     def __init__(
@@ -159,6 +199,7 @@ class Runner:
         conversation: Conversation | None = None,
         goal_drift_enabled: bool = True,
         planner_gate: Any = "auto",
+        drift_self_reporting: bool | list[str] = False,
         **legacy_kwargs: Any,
     ) -> None:
         if "max_plan_reinvocations" in legacy_kwargs:
@@ -282,6 +323,19 @@ class Runner:
         # via ``Planner.generate`` (pre-#271 behaviour, useful for
         # deterministic replay).
         self._planner_gate: Any = planner_gate
+        # goldfive#196: opt-in switch for the drift-related self-
+        # reporting tools (``report_plan_divergence``,
+        # ``declare_task_skipped``, ``declare_task_not_needed``).
+        # Stored as-is so :meth:`run` step 5 can pass it through to
+        # :func:`goldfive.reporting.select_reporting_tools` on every
+        # turn — supports the ``True`` / ``False`` / ``list[str]``
+        # shapes documented in :class:`Runner`. Materialise lists
+        # eagerly so callers passing a generator / mutable list see
+        # stable behaviour across turns.
+        if isinstance(drift_self_reporting, bool):
+            self.drift_self_reporting: bool | list[str] = drift_self_reporting
+        else:
+            self.drift_self_reporting = [str(n) for n in drift_self_reporting]
         # Cross-turn prior-plan stash lives on :class:`Conversation`
         # (keyed by session id) so a Runner shared across multiple
         # outer ADK sessions does not leak one session's plan into
@@ -650,9 +704,18 @@ class Runner:
                 int(session.plan.revision_index),
             )
 
-        # 5. Register the seven canonical reporting tools on the adapter.
+        # 5. Register the canonical reporting tools on the adapter.
+        # goldfive#196: ``drift_self_reporting`` decides whether the
+        # drift opinions (``report_plan_divergence``,
+        # ``declare_task_skipped``, ``declare_task_not_needed``) ride
+        # along with the lifecycle subset. Default is OFF — the
+        # framework's observation paths (``classify_goal_drift``,
+        # :class:`~goldfive.reconciler.PlanReconciler`, the steerer's
+        # refine machinery) are the canonical detectors.
         try:
-            await self.agent.register_reporting_tools(list(BUILTIN_REPORTING_TOOLS))
+            await self.agent.register_reporting_tools(
+                select_reporting_tools(self.drift_self_reporting)
+            )
         except Exception as exc:  # noqa: BLE001
             reason = f"register_reporting_tools raised: {exc}"
             log.exception("register_reporting_tools raised")

@@ -227,8 +227,17 @@ async def test_runner_aborts_when_planner_returns_none() -> None:
     assert run_kinds == ["RunStarted", "GoalDerived", "RunAborted"]
 
 
-async def test_runner_registers_builtin_reporting_tools() -> None:
-    """The adapter receives the canonical seven reporting tools verbatim."""
+async def test_runner_registers_lifecycle_reporting_tools_by_default() -> None:
+    """Default :class:`Runner` registers the lifecycle subset only.
+
+    goldfive#196 made the drift-related self-reporting tools opt-in,
+    so the default registration contains every BUILTIN tool EXCEPT
+    those in :data:`DRIFT_SELF_REPORTING_TOOL_NAMES`. ``True`` /
+    list-of-names variants are pinned in
+    ``tests/test_drift_reporting_optin.py``.
+    """
+    from goldfive import DRIFT_SELF_REPORTING_TOOL_NAMES, LIFECYCLE_REPORTING_TOOLS
+
     captured: dict[str, Any] = {}
 
     async def agent_fn(
@@ -243,6 +252,35 @@ async def test_runner_registers_builtin_reporting_tools() -> None:
         executor=SequentialExecutor(),
         goal_deriver=PassthroughGoalDeriver("any"),
         sinks=[InMemorySink()],
+    )
+    outcome = await runner.run("go")
+    await runner.close()
+    assert outcome.success
+
+    tools = captured["tools"]
+    names = [t.name for t in tools]
+    expected = [t.name for t in LIFECYCLE_REPORTING_TOOLS]
+    assert names == expected
+    assert set(names).isdisjoint(DRIFT_SELF_REPORTING_TOOL_NAMES)
+
+
+async def test_runner_drift_self_reporting_true_registers_full_set() -> None:
+    """``Runner(drift_self_reporting=True)`` restores the pre-#196 set."""
+    captured: dict[str, Any] = {}
+
+    async def agent_fn(
+        task: Task, session: Session, tools: list[ReportingToolSpec]
+    ) -> InvocationResult:
+        captured.setdefault("tools", tools)
+        return InvocationResult(task_id=task.id, text="ok")
+
+    runner = Runner(
+        agent=CallableAdapter(agent_fn, available_agents=["writer"]),
+        planner=StaticPlanner(_hand_built_plan()),
+        executor=SequentialExecutor(),
+        goal_deriver=PassthroughGoalDeriver("any"),
+        sinks=[InMemorySink()],
+        drift_self_reporting=True,
     )
     outcome = await runner.run("go")
     await runner.close()
