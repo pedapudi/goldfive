@@ -4132,6 +4132,7 @@ class DefaultSteerer:
         *,
         session: Session,
         plan: Plan,
+        is_pivot: bool = False,
     ) -> bool:
         """Install ``plan`` as the very first revision (rev 1) of ``session.plan``.
 
@@ -4141,6 +4142,16 @@ class DefaultSteerer:
         installing the first plan is not a corrective intervention,
         and stamping a USER_STEER drift here was the category error
         Option A (goldfive#271 follow-up) eliminates.
+
+        ``is_pivot`` (F5, goldfive#322 Layer 2 / #204): when ``True``,
+        the caller has classified the user's intent as a PIVOT —
+        replacement of the prior plan rather than a revision of it.
+        The validator runs WITHOUT ``prior`` so Rule 6
+        (terminal-task / terminal->terminal-edge preservation) does
+        not gate the new plan against a structurally-unrelated
+        predecessor. The runner sets this when
+        :meth:`Planner.handle_turn` flagged ``replaces_prior`` on the
+        produced plan.
 
         The internal ``DriftEvent`` placeholder this method passes to
         :meth:`_apply_revision` and :meth:`_emit_plan_revised` carries
@@ -4155,7 +4166,13 @@ class DefaultSteerer:
         Never raises.
         """
         try:
-            plan.validate(for_revision=True, prior=session.plan)
+            if is_pivot:
+                # Pivot: validate structurally only. Rule 6 (terminal
+                # preservation) is intentionally skipped — the user is
+                # replacing the prior plan, not revising it.
+                plan.validate(for_revision=True, prior=None)
+            else:
+                plan.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
             await self._emit_drift_detected(
                 session,
