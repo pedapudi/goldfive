@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import enum
 import inspect
 import json
@@ -455,13 +456,28 @@ class DefaultSteerer:
         # Per-session, per-kind last-refine bookkeeping. Purely advisory:
         # callers can subclass to throttle on top of this if needed.
         self._last_refine_kind: dict[tuple[str, DriftKind], int] = {}
-        # Scratchpad the steerer uses to plumb the active session into
-        # the planner's drift-emitter callback. Set just before calling
-        # ``planner.refine`` and cleared afterwards in ``_handle_drift``;
-        # ``None`` outside that window. Only consulted by the emitter
-        # the planner calls when its retry budget is spent
-        # (goldfive#133).
-        self._active_session: Session | None = None
+        # Per-async-task scratchpad the steerer uses to plumb the active
+        # session into the planner's drift-emitter and span-context
+        # callbacks. Set just before calling ``planner.refine`` /
+        # ``planner.synthesize_goal_from_steer`` and cleared afterwards;
+        # ``None`` outside that window. Only consulted by the emitter the
+        # planner calls when its retry budget is spent (goldfive#133) and
+        # by ``_span_context_for_planner``.
+        #
+        # ContextVar (not a plain attribute) so that two concurrent
+        # ``runner.run(...)`` calls sharing one Steerer (and therefore
+        # one Planner) do not stomp each other's session pointer.
+        # Without this isolation, session A can refine while session B
+        # is mid-refine, B's value overwrites A's, and A's planner-side
+        # span / drift callbacks then resolve to B's run_id -- the
+        # leak observed empirically across v12 -> v14 sessions in
+        # demo-v14.log. Per-instance ContextVar (not module-level) so
+        # parallel test cases instantiating their own Steerer never
+        # collide. See PR #294 audit + the regression test in
+        # ``tests/test_steerer_concurrent_sessions.py``.
+        self._active_session_var: contextvars.ContextVar[Session | None] = contextvars.ContextVar(
+            f"goldfive_active_session_{id(self)}", default=None
+        )
         # Reflective check wiring. When ``_reflective_call_llm`` is None
         # every entry point short-circuits so the feature is inert.
         self._reflective_call_llm: ReflectiveCallLLM | None = reflective_call_llm
@@ -643,14 +659,17 @@ class DefaultSteerer:
         or ``None`` when no session is in scope (e.g. tests that
         exercise the planner standalone).
 
-        The steerer plumbs ``self._active_session`` just before calling
+        The steerer plumbs ``self._active_session_var`` just before calling
         ``planner.refine`` / ``planner.refine_steer`` /
         ``planner.synthesize_goal_from_steer`` so every LLM call site
         inside those methods has a valid session to stamp onto its
-        spans. When called outside that window (``_active_session`` is
-        ``None``), spans are no-ops.
+        spans. When called outside that window (the ContextVar is
+        ``None``), spans are no-ops. The ContextVar is per-async-task,
+        so concurrent ``runner.run`` calls sharing one Steerer keep
+        their session pointers isolated (PR #294 / regression test
+        ``tests/test_steerer_concurrent_sessions.py``).
         """
-        session = self._active_session
+        session = self._active_session_var.get()
         if session is None:
             return None
         return (
@@ -673,10 +692,12 @@ class DefaultSteerer:
         refine again on this kind -- infinite-loop risk).
         """
         # The planner's emitter isn't bound to a specific session, so
-        # we route through the most recently-active session -- which in
-        # practice is the only session a single-threaded planner is
-        # handling. Store it on the instance when _handle_drift runs.
-        session = self._active_session
+        # we route through the per-async-task ContextVar set by the
+        # caller (``_handle_drift`` / ``_promote_drift_to_steer`` /
+        # ``observe_refine``). ContextVar isolation ensures concurrent
+        # runs sharing one Steerer route their planner-emitted drifts
+        # to the correct session.
+        session = self._active_session_var.get()
         if session is None:
             log.warning(
                 "DefaultSteerer: planner emitted %s but no active session bound; dropping signal",
@@ -2371,11 +2392,11 @@ class DefaultSteerer:
             # for the duration of synthesize_goal_from_steer so its LLM
             # call shows up as a span on the Gantt. Cleared in a
             # ``finally`` so exceptions don't leave a stale pointer.
-            self._active_session = session
+            _token = self._active_session_var.set(session)
             try:
                 await self._apply_user_steer_state(drift, session)
             finally:
-                self._active_session = None
+                self._active_session_var.reset(_token)
         # goldfive-steer-unification: consult the severity-aware
         # promotion policy BEFORE emitting DriftDetected so that a
         # suppressed goldfive steer carries the ``suppressed_by_user_steer``
@@ -2496,8 +2517,9 @@ class DefaultSteerer:
         # for the duration of this refine call so the planner can emit
         # REFINE_VALIDATION_FAILED drifts through the normal event
         # pipeline. Cleared in a ``finally`` so exceptions don't leave
-        # a stale session pointer. See goldfive#133.
-        self._active_session = session
+        # a stale session pointer. ContextVar isolation keeps concurrent
+        # runs from stomping each other (goldfive#133, PR #294 audit).
+        _active_session_token = self._active_session_var.set(session)
         # goldfive a4: mint a refine-attempt id for correlation across
         # ``refine_attempted`` and the paired success/failure event.
         attempt_id = self._new_attempt_id()
@@ -2561,7 +2583,7 @@ class DefaultSteerer:
                 await self._register_refine_failure(session, drift, counter_key)
                 return
         finally:
-            self._active_session = None
+            self._active_session_var.reset(_active_session_token)
         if revised is None:
             log.warning(
                 "DefaultSteerer._handle_drift: planner.refine(kind=%s) returned None; "
@@ -3449,7 +3471,10 @@ class DefaultSteerer:
             await self._emit_revision_cap_escalation(drift, session)
             return
         counter_key = (drift.kind.value, drift.current_task_id)
-        self._active_session = session
+        # ContextVar plumbing for the planner-side drift-emitter and
+        # span-context callbacks; per-async-task so concurrent runs
+        # sharing this Steerer keep their session pointers isolated.
+        _active_session_token = self._active_session_var.set(session)
         # goldfive a4: same attempt-id correlation contract as
         # ``_handle_drift``.
         attempt_id = self._new_attempt_id()
@@ -3474,7 +3499,7 @@ class DefaultSteerer:
             await self._register_refine_failure(session, drift, counter_key)
             return
         finally:
-            self._active_session = None
+            self._active_session_var.reset(_active_session_token)
         if revised is None:
             log.warning(
                 "DefaultSteerer._promote_drift_to_steer: refine returned None; "
@@ -4047,10 +4072,13 @@ class DefaultSteerer:
         On enter:
 
         * Mints a fresh ``attempt_id``.
-        * Stamps ``self._active_session = session`` so the planner's
-          ``_span_ctx_provider`` resolves correctly (this is what powers
-          the planner-side ``refine_orphaned_tasks`` emission and the
-          ``GoldfiveLLMCallStart/End`` spans).
+        * Stamps the per-async-task ``_active_session_var`` ContextVar
+          to ``session`` so the planner's ``_span_ctx_provider`` resolves
+          correctly (this is what powers the planner-side
+          ``refine_orphaned_tasks`` emission and the
+          ``GoldfiveLLMCallStart/End`` spans). ContextVar isolation
+          keeps concurrent runs sharing one Steerer from stomping each
+          other's session pointer.
         * Emits ``refine_attempted`` to the bound sinks.
 
         On exception:
@@ -4060,7 +4088,7 @@ class DefaultSteerer:
 
         On clean exit (no exception):
 
-        * Clears ``_active_session``.
+        * Resets ``_active_session_var``.
         * Caller is responsible for emitting either ``plan_revised``
           (success) or ``refine_failed`` (returned ``None`` / validator
           rejected) — the helper has no way to introspect the caller's
@@ -4078,12 +4106,13 @@ class DefaultSteerer:
           they bypass the steerer's hand-rolled emission blocks.
         """
         attempt_id = self._new_attempt_id()
-        # Setting ``_active_session`` before refine lets the planner's
-        # internal ``_emit_refine_orphaned_tasks`` resolve a sink target
-        # via the bound span-context provider. Without this, the planner's
+        # Setting the per-async-task ``_active_session_var`` ContextVar
+        # before refine lets the planner's internal
+        # ``_emit_refine_orphaned_tasks`` resolve a sink target via the
+        # bound span-context provider. Without this, the planner's
         # validator computes orphans, logs the WARNING, but no sink event
         # lands — exactly the symptom Bug A describes.
-        self._active_session = session
+        _active_session_token = self._active_session_var.set(session)
         try:
             await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
             try:
@@ -4103,7 +4132,7 @@ class DefaultSteerer:
                 )
                 raise
         finally:
-            self._active_session = None
+            self._active_session_var.reset(_active_session_token)
 
     async def _emit_plan_revised_correlation(
         self,
