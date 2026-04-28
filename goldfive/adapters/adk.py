@@ -452,6 +452,8 @@ def _rebind_goldfive_planners(
                     getattr(cur, "name", "?"),
                     exc,
                 )
+
+
 def _collect_reachable_agent_tree(root_agent: Any) -> list[dict[str, Any]]:
     """Return structured metadata for every agent reachable from ``root_agent``.
 
@@ -1153,8 +1155,23 @@ class ADKAdapter:
         # unexpected exception and keep the ADK session's conversation
         # history well-formed. Paired with _pending_tool_call_names so
         # the synthetic response can name its tool.
-        self._pending_tool_call_ids: set[str] = set()
-        self._pending_tool_call_names: dict[str, str] = {}
+        #
+        # PR #301 follow-up (goldfive#271): keyed by goldfive
+        # ``Session.id`` because one adapter is shared across every
+        # goldfive session driven by a :class:`Runner` — same hazard
+        # PR #301 fixed for ``_next_cancel_reason`` /
+        # ``_session_id`` / ``_outer_session_id``. Two concurrent
+        # invocations on different sessions used to share the same
+        # bare ``set`` / ``dict``, so session A's mid-invocation
+        # cancel could heal session B's still-pending function_call
+        # ids (and vice versa), corrupting both ADK sessions'
+        # function-call/response pairing. The legacy bare attributes
+        # survive as ``@property`` shims over the empty-key (``""``)
+        # bucket so single-session callers and tests that read /
+        # write ``adapter._pending_tool_call_ids`` directly keep
+        # working.
+        self._pending_tool_call_ids_by_session: dict[str, set[str]] = {}
+        self._pending_tool_call_names_by_session: dict[str, dict[str, str]] = {}
         # Short-lived tag for the NEXT mid-invocation cancel. Set by the
         # Steerer (on USER_STEER drift) or by refine-triggered paths
         # BEFORE they cancel the in-flight invoke so
@@ -1187,8 +1204,23 @@ class ADKAdapter:
         # on the in-flight invocation from a goldfive-promoted steer so
         # the contaminated LLM call terminates early instead of running
         # to completion while the steerer queues a restart for the next
-        # turn. ``None`` when no invocation is in-flight.
-        self._inflight_invoke_task: asyncio.Task[Any] | None = None
+        # turn.
+        #
+        # PR #301 follow-up (goldfive#271): keyed by goldfive
+        # ``Session.id`` because one adapter is shared across every
+        # goldfive session driven by a :class:`Runner`. The pre-fix
+        # single-handle slot meant a second concurrent invocation on
+        # session B would clobber session A's pinned task at entry,
+        # so a USER_STEER cancel intended for A's stream would target
+        # B's task instead — wrong-session attribution, B's stream
+        # cancelled while A's contaminated stream kept running. The
+        # legacy bare ``_inflight_invoke_task`` attribute survives as
+        # a ``@property`` shim over the empty-key (``""``) bucket so
+        # tests that drive ``adapter._inflight_invoke_task = task`` /
+        # ``adapter.request_cancel(...)`` directly keep working
+        # (single-session use case). Empty when no invocation is
+        # in-flight on any session.
+        self._inflight_invoke_tasks: dict[str, asyncio.Task[Any]] = {}
         # Outer session id pinned by :class:`GoldfiveADKAgent` when the
         # adapter runs inside adk-web. ``None`` for programmatic callers
         # and test harnesses; the adapter falls back to the lazy-uuid
@@ -1312,6 +1344,163 @@ class ADKAdapter:
         legacy = self.__legacy_next_cancel_reason
         self.__legacy_next_cancel_reason = ""
         return legacy
+
+    # ------------------------------------------------------------------
+    # Per-session pending-tool-call accessors (PR #301 follow-up)
+    # ------------------------------------------------------------------
+    #
+    # Two concurrent invocations on different goldfive sessions used to
+    # share one ``set`` / ``dict`` for tool-call pairing — session A's
+    # mid-invocation cancel could heal session B's still-pending ids
+    # (and vice versa), corrupting both ADK sessions' history. Now keyed
+    # by ``Session.id``; the legacy bare attributes survive as property
+    # shims over the empty-key (``""``) bucket so single-session callers
+    # and tests that read / write ``adapter._pending_tool_call_ids``
+    # directly keep working.
+
+    def _ensure_per_session_dicts(self) -> None:
+        """Lazy-init per-session bucket dicts.
+
+        Most callers go through ``__init__`` which sets these dicts
+        directly, but a handful of unit tests bypass construction via
+        ``ADKAdapter.__new__(ADKAdapter)`` and then set bare attributes.
+        The property shims and helpers below tolerate that idiom by
+        creating the dicts on first access.
+        """
+        if not hasattr(self, "_pending_tool_call_ids_by_session"):
+            self._pending_tool_call_ids_by_session = {}
+        if not hasattr(self, "_pending_tool_call_names_by_session"):
+            self._pending_tool_call_names_by_session = {}
+        if not hasattr(self, "_inflight_invoke_tasks"):
+            self._inflight_invoke_tasks = {}
+
+    def _pending_ids_for(self, session_id: str) -> set[str]:
+        """Return (creating if needed) the pending function_call-id set
+        for ``session_id``. Always the same object across calls so the
+        adapter's ``add`` / ``discard`` / ``clear`` mutations land on the
+        right session's bucket.
+        """
+        self._ensure_per_session_dicts()
+        bucket = self._pending_tool_call_ids_by_session.get(session_id)
+        if bucket is None:
+            bucket = set()
+            self._pending_tool_call_ids_by_session[session_id] = bucket
+        return bucket
+
+    def _pending_names_for(self, session_id: str) -> dict[str, str]:
+        """Return (creating if needed) the function_call-id -> tool-name
+        map for ``session_id``. Companion to :meth:`_pending_ids_for`.
+        """
+        self._ensure_per_session_dicts()
+        bucket = self._pending_tool_call_names_by_session.get(session_id)
+        if bucket is None:
+            bucket = {}
+            self._pending_tool_call_names_by_session[session_id] = bucket
+        return bucket
+
+    def _clear_pending_for(self, session_id: str) -> None:
+        """Empty both pending-id buckets for ``session_id``.
+
+        Drops the per-session entry entirely on empty state so a long-
+        lived adapter doesn't accumulate dict entries forever — every
+        re-invocation re-creates the bucket on first
+        :meth:`_pending_ids_for` access.
+        """
+        self._ensure_per_session_dicts()
+        bucket_ids = self._pending_tool_call_ids_by_session.get(session_id)
+        if bucket_ids is not None:
+            bucket_ids.clear()
+        bucket_names = self._pending_tool_call_names_by_session.get(session_id)
+        if bucket_names is not None:
+            bucket_names.clear()
+
+    @property
+    def _pending_tool_call_ids(self) -> set[str]:
+        """Legacy view — the empty-key bucket.
+
+        Single-session callers and tests that read / write
+        ``adapter._pending_tool_call_ids`` directly land on the
+        ``""`` bucket so their bare-attribute semantics keep working.
+        Production code routes through
+        :meth:`_pending_ids_for(session_id)` so concurrent sessions
+        cannot bleed into each other.
+        """
+        return self._pending_ids_for("")
+
+    @_pending_tool_call_ids.setter
+    def _pending_tool_call_ids(self, value: set[str]) -> None:
+        # Replace the empty-key bucket wholesale; tests do this when
+        # they pre-populate the set before driving _heal_pending_tool_calls
+        # directly (see tests/test_orchestration_state.py).
+        self._ensure_per_session_dicts()
+        self._pending_tool_call_ids_by_session[""] = set(value)
+
+    @property
+    def _pending_tool_call_names(self) -> dict[str, str]:
+        """Legacy view — the empty-key bucket.
+
+        See :attr:`_pending_tool_call_ids` for the shim's rationale.
+        """
+        return self._pending_names_for("")
+
+    @_pending_tool_call_names.setter
+    def _pending_tool_call_names(self, value: dict[str, str]) -> None:
+        self._ensure_per_session_dicts()
+        self._pending_tool_call_names_by_session[""] = dict(value)
+
+    # ------------------------------------------------------------------
+    # Per-session in-flight invoke task accessors (PR #301 follow-up)
+    # ------------------------------------------------------------------
+    #
+    # ``_invoke_internal`` pins ``asyncio.current_task()`` so a
+    # goldfive-promoted steer can fire ``task.cancel()`` mid-stream
+    # (goldfive#241). When two concurrent invocations on different
+    # sessions share one slot, the second invocation's pin clobbers
+    # the first — a steer for session A would target session B's
+    # task instead. Now keyed by ``Session.id``; the legacy bare
+    # ``_inflight_invoke_task`` attribute is a property shim over
+    # the empty-key (``""``) bucket so single-session tests that
+    # drive ``adapter._inflight_invoke_task = task`` /
+    # ``adapter.request_cancel(...)`` keep working.
+
+    def _set_inflight_invoke_task(self, session_id: str, task: asyncio.Task[Any] | None) -> None:
+        """Pin (or unpin) the in-flight ``invoke`` task for ``session_id``.
+
+        Passing ``None`` removes the entry entirely so a stale handle
+        cannot target a completed invocation and ``request_cancel``
+        with no ``session=`` kwarg sees an accurate set of live tasks.
+        """
+        self._ensure_per_session_dicts()
+        if task is None:
+            self._inflight_invoke_tasks.pop(session_id, None)
+        else:
+            self._inflight_invoke_tasks[session_id] = task
+
+    def _get_inflight_invoke_task(self, session_id: str) -> asyncio.Task[Any] | None:
+        """Return the pinned in-flight task for ``session_id`` or ``None``."""
+        self._ensure_per_session_dicts()
+        return self._inflight_invoke_tasks.get(session_id)
+
+    @property
+    def _inflight_invoke_task(self) -> asyncio.Task[Any] | None:
+        """Legacy view — the empty-key bucket's pinned task (or ``None``).
+
+        Tests that drive ``adapter._inflight_invoke_task = task`` see
+        their write through this shim's setter and a subsequent
+        ``adapter.request_cancel(...)`` (no ``session=`` kwarg) finds it
+        in ``_inflight_invoke_tasks[""]`` via :meth:`request_cancel`'s
+        cancel-all path.
+        """
+        self._ensure_per_session_dicts()
+        return self._inflight_invoke_tasks.get("")
+
+    @_inflight_invoke_task.setter
+    def _inflight_invoke_task(self, value: asyncio.Task[Any] | None) -> None:
+        self._ensure_per_session_dicts()
+        if value is None:
+            self._inflight_invoke_tasks.pop("", None)
+        else:
+            self._inflight_invoke_tasks[""] = value
 
     # ------------------------------------------------------------------
     # Post-construction plugin install
@@ -1532,7 +1721,7 @@ class ADKAdapter:
         """
         self._steerer = steerer
 
-    async def request_cancel(self, reason: str) -> None:
+    async def request_cancel(self, reason: str, *, session: Session | None = None) -> None:
         """Cancel the in-flight ADK invocation so a goldfive-promoted
         steer takes effect immediately rather than on the next turn.
 
@@ -1553,25 +1742,51 @@ class ADKAdapter:
         is already set by the steerer before this call; we log it here
         purely for the operator log.
 
+        PR #301 follow-up (goldfive#271): the in-flight task is now
+        keyed by ``Session.id``. When the caller supplies ``session``,
+        only that session's task is cancelled — production steerers
+        target a specific drift's session and must not collaterally
+        cancel a sibling session sharing the same adapter. When
+        ``session`` is omitted, every currently-in-flight task is
+        cancelled (back-compat with single-session callers and the
+        existing :class:`DefaultSteerer._request_adapter_cancel` shape;
+        in single-session use there's only one task to cancel anyway).
+
         No-op when no invocation is in-flight (e.g. the drift fires
         between turns) or when the pinned task is already finished —
         the steerer's restart message still arrives on the next turn.
         Never raises: adapters that ignore cancel still get the queued
         restart via the pre-existing pathway.
         """
-        task = self._inflight_invoke_task
-        if task is None or task.done():
+        # Resolve the candidate task(s) to cancel.
+        self._ensure_per_session_dicts()
+        if session is not None:
+            sid = getattr(session, "id", "") or ""
+            tasks: list[asyncio.Task[Any]] = []
+            t = self._inflight_invoke_tasks.get(sid)
+            if t is not None:
+                tasks.append(t)
+        else:
+            # Snapshot the values so a concurrent ``finally`` clearing
+            # an entry can't mutate the dict mid-iteration.
+            tasks = list(self._inflight_invoke_tasks.values())
+
+        live = [t for t in tasks if not t.done()]
+        if not live:
             log.debug(
-                "ADKAdapter.request_cancel(reason=%r): no in-flight "
-                "invocation; no-op",
+                "ADKAdapter.request_cancel(reason=%r, session=%r): no in-flight invocation; no-op",
                 reason,
+                getattr(session, "id", None),
             )
             return
         log.info(
-            "adapter.request_cancel(reason=%r): cancelling in-flight invocation",
+            "adapter.request_cancel(reason=%r, session=%r): cancelling %d in-flight invocation(s)",
             reason,
+            getattr(session, "id", None),
+            len(live),
         )
-        task.cancel()
+        for t in live:
+            t.cancel()
 
     async def emit_reasoning(
         self,
@@ -1774,15 +1989,23 @@ class ADKAdapter:
         err: Exception | None = None
         last_event: Any = None
         last_invocation_id = ""
-        # Reset per-invocation pending-id bookkeeping.
-        self._pending_tool_call_ids.clear()
-        self._pending_tool_call_names.clear()
+        # PR #301 follow-up (goldfive#271): pending-id buckets and
+        # the in-flight-task pin are keyed by ``Session.id`` so a
+        # second concurrent invocation on a different session cannot
+        # see (or clobber) ours.
+        gf_session_id = getattr(session, "id", "") or ""
+        # Reset per-invocation pending-id bookkeeping (this session only).
+        self._clear_pending_for(gf_session_id)
+        pending_ids = self._pending_ids_for(gf_session_id)
+        pending_names = self._pending_names_for(gf_session_id)
         was_cancelled = False
         # Pin the task driving this invocation so request_cancel() can
         # fire ``task.cancel()`` mid-stream (goldfive#241). Cleared in
         # the ``finally`` block below so a stale handle cannot target
-        # the next invocation.
-        self._inflight_invoke_task = asyncio.current_task()
+        # the next invocation. Keyed by goldfive ``Session.id`` so
+        # concurrent invocations on different sessions don't clobber
+        # each other (PR #301 follow-up).
+        self._set_inflight_invoke_task(gf_session_id, asyncio.current_task())
         try:
             async for event in self._runner.run_async(
                 user_id=self._user_id,
@@ -1803,13 +2026,16 @@ class ADKAdapter:
                     last_invocation_id = inv_id
                 # Track outstanding function_call ids so we can heal
                 # history on mid-invocation cancel (see _heal_pending_tool_calls).
+                # The buckets are session-keyed (PR #301 follow-up); we
+                # captured the per-session aliases above the loop so
+                # the hot path stays a plain set/dict mutation.
                 for fc_id, fc_name in _function_call_ids_in_event(event):
-                    self._pending_tool_call_ids.add(fc_id)
+                    pending_ids.add(fc_id)
                     if fc_name:
-                        self._pending_tool_call_names[fc_id] = fc_name
+                        pending_names[fc_id] = fc_name
                 for fr_id in _function_response_ids_in_event(event):
-                    self._pending_tool_call_ids.discard(fr_id)
-                    self._pending_tool_call_names.pop(fr_id, None)
+                    pending_ids.discard(fr_id)
+                    pending_names.pop(fr_id, None)
                 # Runaway-delegation cap: the plugin counts AgentTool
                 # spawns on the current top-level invocation. On exceed
                 # it requests a cancel; detect that signal here so we
@@ -1881,11 +2107,11 @@ class ADKAdapter:
             )
         finally:
             if not was_cancelled:
-                if self._pending_tool_call_ids:
+                if pending_ids:
                     log.warning(
                         "ADKAdapter.invoke: %d function_call id(s) ended without "
                         "responses on normal exit; healing session history",
-                        len(self._pending_tool_call_ids),
+                        len(pending_ids),
                     )
                     await self._heal_pending_tool_calls(
                         runner=self._runner,
@@ -1914,7 +2140,10 @@ class ADKAdapter:
                     pass
             # Release the in-flight task handle so a later
             # request_cancel() cannot target a completed invocation.
-            self._inflight_invoke_task = None
+            # Keyed by goldfive ``Session.id`` (PR #301 follow-up) so
+            # we don't accidentally clear another concurrent
+            # invocation's pin on a different session.
+            self._set_inflight_invoke_task(gf_session_id, None)
 
         return InvocationResult(
             task_id=task_id,
@@ -2093,20 +2322,45 @@ class ADKAdapter:
         de-duplicated) so downstream planners / prompt templates can see
         which tool-call ids were cancelled mid-invocation without poking
         adapter internals.
+
+        PR #301 follow-up (goldfive#271): the pending-id buckets are
+        keyed by goldfive ``Session.id``. The ``_invoke_internal``
+        production path populates the per-session bucket directly so
+        the heal resolves to ``session.id``'s entries. When the
+        per-session bucket is empty AND the legacy empty-key bucket
+        is non-empty (a unit-test idiom: pre-populate
+        ``adapter._pending_tool_call_ids`` then call this method
+        with a constructed ``session``), the heal transparently
+        falls back to the legacy bucket so existing tests keep
+        working. The session-keyed path always wins when present,
+        so the cross-session leak the refactor closes is unaffected.
         """
-        if not self._pending_tool_call_ids:
+        gf_session_id = getattr(session, "id", "") or "" if session is not None else ""
+        pending_ids_bucket = self._pending_ids_for(gf_session_id)
+        pending_names_bucket = self._pending_names_for(gf_session_id)
+        # Back-compat fallback for unit tests that pre-populate the
+        # legacy bare ``_pending_tool_call_ids`` attribute (lands in
+        # the empty-key bucket via the property shim) and then drive
+        # this method with a non-empty ``session``. The session-keyed
+        # path still wins when present.
+        if not pending_ids_bucket and gf_session_id != "":
+            legacy_ids = self._pending_ids_for("")
+            legacy_names = self._pending_names_for("")
+            if legacy_ids:
+                pending_ids_bucket = legacy_ids
+                pending_names_bucket = legacy_names
+                gf_session_id = ""
+        if not pending_ids_bucket:
             return
         # goldfive#152: snapshot the ids we're about to heal BEFORE we
         # clear the set so the orchestration-state stamp reflects the
         # full heal even if an early return fires below.
-        snapshot_ids = sorted(self._pending_tool_call_ids)
+        snapshot_ids = sorted(pending_ids_bucket)
         if session is not None and snapshot_ids:
             try:
                 from goldfive import orchestration_state as _ostate
 
-                _ostate.append_cancelled_function_call_ids(
-                    session.state, snapshot_ids
-                )
+                _ostate.append_cancelled_function_call_ids(session.state, snapshot_ids)
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "ADKAdapter._heal_pending_tool_calls: could not stamp "
@@ -2119,10 +2373,9 @@ class ADKAdapter:
             log.debug(
                 "ADKAdapter._heal_pending_tool_calls: runner has no "
                 "session_service; cannot heal %d orphan tool call(s)",
-                len(self._pending_tool_call_ids),
+                len(pending_ids_bucket),
             )
-            self._pending_tool_call_ids.clear()
-            self._pending_tool_call_names.clear()
+            self._clear_pending_for(gf_session_id)
             return
 
         append = getattr(session_service, "append_event", None)
@@ -2131,10 +2384,9 @@ class ADKAdapter:
             log.debug(
                 "ADKAdapter._heal_pending_tool_calls: session_service lacks "
                 "append_event/get_session; cannot heal %d orphan tool call(s)",
-                len(self._pending_tool_call_ids),
+                len(pending_ids_bucket),
             )
-            self._pending_tool_call_ids.clear()
-            self._pending_tool_call_names.clear()
+            self._clear_pending_for(gf_session_id)
             return
 
         app_name = str(getattr(runner, "app_name", "") or "") or self._app_name
@@ -2150,20 +2402,18 @@ class ADKAdapter:
                 "ADKAdapter._heal_pending_tool_calls: get_session raised: %s",
                 exc,
             )
-            self._pending_tool_call_ids.clear()
-            self._pending_tool_call_names.clear()
+            self._clear_pending_for(gf_session_id)
             return
 
         if adk_session is None:
-            self._pending_tool_call_ids.clear()
-            self._pending_tool_call_names.clear()
+            self._clear_pending_for(gf_session_id)
             return
 
         host_author = str(getattr(self._agent, "name", "") or "") or "user"
-        pending_ids = sorted(self._pending_tool_call_ids)
+        pending_ids = sorted(pending_ids_bucket)
         healed = 0
         for fc_id in pending_ids:
-            tool_name = self._pending_tool_call_names.get(fc_id, "")
+            tool_name = pending_names_bucket.get(fc_id, "")
             try:
                 synth = _build_cancelled_response_event(
                     function_call_id=fc_id,
@@ -2228,8 +2478,7 @@ class ADKAdapter:
                 pending_ids,
             )
 
-        self._pending_tool_call_ids.clear()
-        self._pending_tool_call_names.clear()
+        self._clear_pending_for(gf_session_id)
 
     async def _get_session_state(self, session_id: str) -> Any:
         """Fetch the ADK session's state dict for the runner."""
