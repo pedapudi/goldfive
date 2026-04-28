@@ -958,6 +958,7 @@ async def _run_judge(
     call_llm: JudgeCallLLM,
     model: str,
     sink: Any = None,
+    agent_name: str = "",
 ) -> DriftEvent | None:
     """Dispatch :func:`classify_reasoning_drift` against the current task.
 
@@ -970,9 +971,16 @@ async def _run_judge(
     regardless of verdict. ``run_id`` / ``session_id`` / a gap-free
     sequence are stamped from the session so downstream consumers can
     correlate the observability event with the session's other events.
+
+    ``agent_name`` is the live ADK agent whose reasoning produced
+    ``text``. Forwarded to the classifier as ``current_agent_id`` so
+    delegated sub-agent reasoning (e.g. ``research_agent`` invoked by
+    a coordinator) is correctly attributed on the resulting
+    :class:`DriftEvent` and the ``ReasoningJudgeInvoked`` observability
+    event. See goldfive#271 reasoning-judge delegated coverage.
     """
     verdict = await _run_judge_with_focus(
-        text, session, call_llm=call_llm, model=model, sink=sink
+        text, session, call_llm=call_llm, model=model, sink=sink, agent_name=agent_name
     )
     return verdict.drift
 
@@ -984,6 +992,7 @@ async def _run_judge_with_focus(
     call_llm: JudgeCallLLM,
     model: str,
     sink: Any = None,
+    agent_name: str = "",
 ) -> ReasoningJudgeVerdict:
     """Dispatch :func:`classify_reasoning_drift_with_focus` against the current task.
 
@@ -995,6 +1004,12 @@ async def _run_judge_with_focus(
     Same shape as :func:`_run_judge` for the LLM call itself; the only
     delta is the return type. Stamps ``plan`` so the prompt's
     plan-tasks-attribution section is populated.
+
+    ``agent_name`` is forwarded to the classifier as ``current_agent_id``
+    so reasoning produced by a delegated sub-agent (whose bound task
+    is still the parent's) is attributed to the actual agent on the
+    drift event and observability emission. See goldfive#271
+    reasoning-judge delegated coverage.
     """
     task = _current_task(session)
     return await classify_reasoning_drift_with_focus(
@@ -1005,6 +1020,7 @@ async def _run_judge_with_focus(
         model=model,
         call_llm=call_llm,
         current_task_id=session.current_task_id,
+        current_agent_id=agent_name,
         sink=sink,
         run_id=session.run_id,
         session_id=session.id,
@@ -1020,6 +1036,7 @@ async def analyze_reasoning_with_focus(
     call_llm: JudgeCallLLM | None = None,
     model: str = "",
     sink: Any = None,
+    agent_name: str = "",
 ) -> ReasoningJudgeVerdict:
     """Phase-1 sibling of :func:`analyze_reasoning` returning a focused verdict.
 
@@ -1055,14 +1072,24 @@ async def analyze_reasoning_with_focus(
         if call_llm is None:
             return ReasoningJudgeVerdict(drift=None)
         return await _run_judge_with_focus(
-            text, session, call_llm=call_llm, model=model, sink=sink
+            text,
+            session,
+            call_llm=call_llm,
+            model=model,
+            sink=sink,
+            agent_name=agent_name,
         )
     if mode == "both":
         embedding_drift = _embedding_pipeline(text, session)
         judge_verdict: ReasoningJudgeVerdict | None = None
         if call_llm is not None:
             judge_verdict = await _run_judge_with_focus(
-                text, session, call_llm=call_llm, model=model, sink=sink
+                text,
+                session,
+                call_llm=call_llm,
+                model=model,
+                sink=sink,
+                agent_name=agent_name,
             )
         if judge_verdict is None:
             return ReasoningJudgeVerdict(drift=embedding_drift)
@@ -1105,6 +1132,7 @@ async def analyze_reasoning(
     call_llm: JudgeCallLLM | None = None,
     model: str = "",
     sink: Any = None,
+    agent_name: str = "",
 ) -> DriftEvent | None:
     """Run the reasoning-drift pipeline against ``text``.
 
@@ -1158,14 +1186,24 @@ async def analyze_reasoning(
         if call_llm is None:
             return None
         return await _run_judge(
-            text, session, call_llm=call_llm, model=model, sink=sink
+            text,
+            session,
+            call_llm=call_llm,
+            model=model,
+            sink=sink,
+            agent_name=agent_name,
         )
     if mode == "both":
         embedding_drift = _embedding_pipeline(text, session)
         judge_drift: DriftEvent | None = None
         if call_llm is not None:
             judge_drift = await _run_judge(
-                text, session, call_llm=call_llm, model=model, sink=sink
+                text,
+                session,
+                call_llm=call_llm,
+                model=model,
+                sink=sink,
+                agent_name=agent_name,
             )
         if embedding_drift is None:
             return judge_drift

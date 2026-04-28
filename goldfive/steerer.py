@@ -1392,6 +1392,7 @@ class DefaultSteerer:
                     call_llm=call_llm,
                     model=self._reasoning_drift_model,
                     sink=judge_sink,
+                    agent_name=agent_name,
                 )
             finally:
                 # Restore the live history. Any entries appended by
