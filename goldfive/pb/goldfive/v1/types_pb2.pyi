@@ -71,6 +71,14 @@ class DriftKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     DRIFT_KIND_GOAL_DRIFT: _ClassVar[DriftKind]
     DRIFT_KIND_LLM_CALL_TIMEOUT: _ClassVar[DriftKind]
 
+class DriftLifecycle(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    DRIFT_LIFECYCLE_UNSPECIFIED: _ClassVar[DriftLifecycle]
+    DRIFT_LIFECYCLE_OPENED: _ClassVar[DriftLifecycle]
+    DRIFT_LIFECYCLE_ESCALATING: _ClassVar[DriftLifecycle]
+    DRIFT_LIFECYCLE_RESOLVED: _ClassVar[DriftLifecycle]
+    DRIFT_LIFECYCLE_HUMAN_INTERVENTION_REQUIRED: _ClassVar[DriftLifecycle]
+
 class SupersessionKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     SUPERSESSION_KIND_UNSPECIFIED: _ClassVar[SupersessionKind]
@@ -128,6 +136,11 @@ DRIFT_KIND_REFINE_VALIDATION_FAILED: DriftKind
 DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED: DriftKind
 DRIFT_KIND_GOAL_DRIFT: DriftKind
 DRIFT_KIND_LLM_CALL_TIMEOUT: DriftKind
+DRIFT_LIFECYCLE_UNSPECIFIED: DriftLifecycle
+DRIFT_LIFECYCLE_OPENED: DriftLifecycle
+DRIFT_LIFECYCLE_ESCALATING: DriftLifecycle
+DRIFT_LIFECYCLE_RESOLVED: DriftLifecycle
+DRIFT_LIFECYCLE_HUMAN_INTERVENTION_REQUIRED: DriftLifecycle
 SUPERSESSION_KIND_UNSPECIFIED: SupersessionKind
 SUPERSESSION_KIND_REPLACE: SupersessionKind
 SUPERSESSION_KIND_CORRECT: SupersessionKind

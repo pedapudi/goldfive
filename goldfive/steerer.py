@@ -2976,6 +2976,24 @@ class DefaultSteerer:
         if drift.kind is DriftKind.HUMAN_INTERVENTION_REQUIRED:
             # Already emitted at the top of _handle_drift; just pause.
             return
+        # goldfive#271 PR1 — close the originating condition with
+        # ``human_intervention_required`` so consumers tracking the
+        # condition_id see the terminal lifecycle on the *original*
+        # condition, not just on the synthesized HUMAN_INTERVENTION
+        # row. The originating drift was already emitted at the top of
+        # ``_handle_drift`` (legacy path) under its own condition_id;
+        # this call swaps that condition's recorded lifecycle so a
+        # later get_active_drift returns the terminal state.
+        try:
+            origin_cid = _ostate.compute_condition_id(
+                kind=drift.kind,
+                task_id=str(getattr(drift, "current_task_id", "") or ""),
+                agent_id=str(getattr(drift, "current_agent_id", "") or ""),
+                turn_id=str(getattr(session, "run_id", "") or ""),
+            )
+            _ostate.escalate_drift_to_human_intervention(session.state, origin_cid)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("DefaultSteerer: drift-lifecycle escalate skipped (%s)", exc)
         escalation = DriftEvent(
             kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
             severity=DriftSeverity.CRITICAL,
@@ -4898,6 +4916,15 @@ class DefaultSteerer:
         trigger_input = getattr(drift, "trigger_input", "") or ""
         if trigger_input:
             evt.drift_detected.trigger_input = self._truncate_trigger_input(trigger_input)
+        # goldfive#271 PR1 — drift-as-stateful-condition. Route the emit
+        # through the orchestration_state lifecycle helpers so multiple
+        # emits for the same logical condition (kind+task+agent within
+        # the current turn) collapse onto one ``condition_id`` and the
+        # wire carries lifecycle / prev_severity. Additive: legacy
+        # fields (kind/severity/detail/synthetic/id/...) are unchanged
+        # so any sink that doesn't know the new fields still sees one
+        # row per emit and renders it identically.
+        self._stamp_drift_lifecycle(session, drift, evt)
         await self._emit(evt)
         # goldfive#271 follow-up: when a terminal drift fires the run
         # cannot recover on its own — any boundary still open at this
@@ -4995,6 +5022,77 @@ class DefaultSteerer:
                 reason,
                 exc,
             )
+
+    def _stamp_drift_lifecycle(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        evt: Any,
+    ) -> None:
+        """Stamp ``condition_id`` / ``lifecycle`` / ``prev_severity`` on ``evt``.
+
+        Routes the emit through
+        :func:`orchestration_state.open_or_escalate_drift` keyed by
+        ``(kind, current_task_id, current_agent_id, run_id)``. The first
+        emit for a given tuple in a turn opens a new condition and stamps
+        ``DRIFT_LIFECYCLE_OPENED``; subsequent emits stamp
+        ``DRIFT_LIFECYCLE_ESCALATING`` and carry the previous severity in
+        ``prev_severity``. The drift's intrinsic ``id`` is NOT used as
+        the condition key — the condition is a logical group that the
+        same kind+task+agent can re-open within a turn, and the
+        per-event id (#199) is intentionally distinct from the
+        condition id (#271).
+
+        Tolerant of partial state: a drift with empty ``current_task_id``
+        / ``current_agent_id`` still produces a stable condition_id (the
+        sha1 just hashes the empty strings), so user-control drifts
+        without a pinned task collapse onto a single condition per turn
+        per kind.
+
+        Synthetic drifts are routed through the helpers as well so the
+        wire still carries the lifecycle metadata; sinks that filter
+        ``synthetic == true`` already drop them and continue to do so.
+        """
+        try:
+            from goldfive.pb.goldfive.v1 import types_pb2
+
+            turn_id = str(getattr(session, "run_id", "") or "")
+            tracked = _ostate.open_or_escalate_drift(
+                session.state,
+                kind=drift.kind,
+                task_id=str(getattr(drift, "current_task_id", "") or ""),
+                agent_id=str(getattr(drift, "current_agent_id", "") or ""),
+                turn_id=turn_id,
+                severity=drift.severity,
+            )
+            evt.drift_detected.condition_id = tracked.condition_id
+            evt.drift_detected.lifecycle = self._drift_lifecycle_pb_value(
+                tracked.lifecycle, types_pb2
+            )
+            if tracked.prev_severity is not None:
+                evt.drift_detected.prev_severity = self._drift_severity_pb_value(
+                    tracked.prev_severity
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Lifecycle stamping is observability-only; never let a
+            # bookkeeping bug break the wire emit. Log and fall through
+            # to the legacy single-shot view (UNSPECIFIED lifecycle,
+            # empty condition_id).
+            log.debug("DefaultSteerer: drift-lifecycle stamping skipped (%s)", exc)
+
+    @staticmethod
+    def _drift_lifecycle_pb_value(lifecycle: str, types_pb2: Any) -> int:
+        """Map an :mod:`orchestration_state` lifecycle string to the proto enum."""
+        mapping = {
+            _ostate.LIFECYCLE_OPENED: "DRIFT_LIFECYCLE_OPENED",
+            _ostate.LIFECYCLE_ESCALATING: "DRIFT_LIFECYCLE_ESCALATING",
+            _ostate.LIFECYCLE_RESOLVED: "DRIFT_LIFECYCLE_RESOLVED",
+            _ostate.LIFECYCLE_HUMAN_INTERVENTION_REQUIRED: (
+                "DRIFT_LIFECYCLE_HUMAN_INTERVENTION_REQUIRED"
+            ),
+        }
+        name = mapping.get(lifecycle, "DRIFT_LIFECYCLE_UNSPECIFIED")
+        return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_LIFECYCLE_UNSPECIFIED", 0))
 
     # goldfive-steer-unification: drift kinds that are always "user"-
     # authored when no explicit source was stamped. Any other kind

@@ -200,6 +200,34 @@ enum DriftKind {
   DRIFT_KIND_LLM_CALL_TIMEOUT = 39;
 }
 
+// Lifecycle phase of a drift condition (goldfive#271 PR1, additive).
+//
+// A drift "condition" is a logical occurrence of drift that may emit
+// multiple ``DriftDetected`` events as it evolves: it OPENS, may
+// ESCALATE (severity bumps + new occurrences), and eventually RESOLVES
+// or escalates to HUMAN_INTERVENTION_REQUIRED. Condition identity is
+// carried by ``DriftDetected.condition_id``; ``lifecycle`` annotates
+// the transition this particular emit represents.
+//
+// UNSPECIFIED is reserved as the proto3 default for sinks reading
+// older events (which never set the field) and for emit paths that
+// have not yet been routed through the lifecycle helpers. Treat it as
+// "single-shot, no condition tracking" — the legacy per-event view.
+enum DriftLifecycle {
+  DRIFT_LIFECYCLE_UNSPECIFIED = 0;
+  // First emit for this condition_id within the current turn.
+  DRIFT_LIFECYCLE_OPENED = 1;
+  // The same condition_id (kind+task+agent within a turn) re-emitted;
+  // typically with a higher severity or refreshed detail.
+  DRIFT_LIFECYCLE_ESCALATING = 2;
+  // The condition has been resolved and will not re-emit on the same
+  // condition_id within this turn.
+  DRIFT_LIFECYCLE_RESOLVED = 3;
+  // The condition has escalated to Level 4 of the intervention ladder
+  // (goldfive#142): the run is paused awaiting human input.
+  DRIFT_LIFECYCLE_HUMAN_INTERVENTION_REQUIRED = 4;
+}
+
 // Directed edge in a plan's task dependency DAG. `from_task_id` must
 // reach a terminal status (COMPLETED, or — depending on the planner's
 // policy — FAILED/CANCELLED) before `to_task_id` can transition to

@@ -93,7 +93,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -824,3 +824,78 @@ class OrchestrationStore:
             return
         with _ACTIVE_INVOCATION_LOCK:
             _ACTIVE_INVOCATION_TASKS.pop(self._session_id, None)
+
+    # -- Active drift conditions (goldfive#271 PR1) ---------------------
+
+    def active_drifts(self) -> list[_ostate.Drift]:
+        """Return all in-flight drift conditions on this session.
+
+        Backed by the ``goldfive.active_drifts`` slot on
+        ``session.state``. Each entry is a :class:`Drift` snapshot;
+        the list is freshly materialised from the underlying dict so
+        callers can mutate the results without affecting subsequent
+        reads.
+        """
+        return _ostate.list_active_drifts(self._state)
+
+    def get_active_drift(self, condition_id: str) -> _ostate.Drift | None:
+        """Look up an in-flight condition by id, or ``None`` when absent."""
+        return _ostate.get_active_drift(self._state, condition_id)
+
+    def open_or_escalate_drift(
+        self,
+        *,
+        kind: Any,
+        task_id: str,
+        agent_id: str,
+        turn_id: str,
+        severity: Any,
+    ) -> _ostate.Drift:
+        """Open a new condition or escalate an existing one (goldfive#271 PR1).
+
+        Routes through :func:`orchestration_state.open_or_escalate_drift`.
+        Same-turn re-emits for the same kind+task+agent collapse onto
+        the same condition_id; severity bumps are monotonic. The
+        returned :class:`Drift` carries the lifecycle / prev_severity
+        the caller stamps onto ``DriftDetected``.
+        """
+        if not isinstance(self._state, MutableMapping):
+            # No mutable state — fall back to a synthetic single-shot
+            # condition so the steerer's wire path still has stable
+            # condition_id / lifecycle to stamp.
+            return _ostate.Drift(
+                condition_id=_ostate.compute_condition_id(
+                    kind=kind,
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    turn_id=turn_id,
+                ),
+                kind=kind,
+                task_id=str(task_id or ""),
+                agent_id=str(agent_id or ""),
+                turn_id=str(turn_id or ""),
+                severity=severity,
+                prev_severity=None,
+                lifecycle=_ostate.LIFECYCLE_OPENED,
+                occurrences=1,
+            )
+        return _ostate.open_or_escalate_drift(
+            self._state,
+            kind=kind,
+            task_id=task_id,
+            agent_id=agent_id,
+            turn_id=turn_id,
+            severity=severity,
+        )
+
+    def resolve_drift(self, condition_id: str) -> _ostate.Drift | None:
+        """Mark a condition resolved + remove it from the active set."""
+        if not isinstance(self._state, MutableMapping):
+            return None
+        return _ostate.resolve_drift(self._state, condition_id)
+
+    def escalate_to_human_intervention(self, condition_id: str) -> _ostate.Drift | None:
+        """Mark a condition as escalated to human intervention."""
+        if not isinstance(self._state, MutableMapping):
+            return None
+        return _ostate.escalate_drift_to_human_intervention(self._state, condition_id)

@@ -70,6 +70,21 @@ Heal path (set by adapter ``_heal_pending_tool_calls``):
   refine paths may consult to reference "the cancelled tool call"
   without poking adapter internals.
 
+Active drift conditions (set by DefaultSteerer on every emit, goldfive#271 PR1):
+
+* ``goldfive.active_drifts`` — dict keyed by ``condition_id`` storing
+  the in-flight drift conditions for the current turn. A drift
+  "condition" is a logical occurrence (kind+task+agent within a turn)
+  that may emit multiple ``DriftDetected`` events (opened →
+  escalating → resolved / human_intervention_required). The helpers
+  :func:`open_or_escalate_drift`, :func:`resolve_drift`, and
+  :func:`escalate_drift_to_human_intervention` route lifecycle
+  transitions through this dict; the steerer's wire emit reads the
+  resulting :class:`Drift` to stamp ``condition_id``,
+  ``lifecycle``, and ``prev_severity`` on ``DriftDetected``. Same
+  kind+task+agent within the same turn collapses onto one
+  condition; a new turn opens a fresh condition.
+
 Design notes
 -------------
 * **No cooldown.** Per the goldfive#152 directive, steering is always
@@ -85,10 +100,12 @@ Design notes
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any
 
-from goldfive.types import Goal, Plan, Task, TaskStatus
+from goldfive.types import DriftKind, DriftSeverity, Goal, Plan, Task, TaskStatus
 
 GOLDFIVE_PREFIX = "goldfive."
 
@@ -138,6 +155,17 @@ KEY_PROCESSED_STEER_IDS = "goldfive.processed_steer_ids"
 # Heal path (ADKAdapter._heal_pending_tool_calls)
 KEY_CANCELLED_FUNCTION_CALL_IDS = "goldfive.cancelled_function_call_ids"
 
+# Active drift conditions (goldfive#271 PR1). Map condition_id ->
+# serialised :class:`Drift` (a small JSON-friendly dict). A drift
+# "condition" is a logical occurrence keyed by kind+task+agent within
+# the current turn; multiple emits within that scope share the same
+# condition_id and progress through ``opened -> escalating ->
+# resolved`` (or ``human_intervention_required``). Stored on
+# ``session.state`` so other goldfive components can read the active
+# set without poking steerer internals; serialisable so sinks that
+# want to round-trip the state dict (e.g. for replay) can do so.
+KEY_ACTIVE_DRIFTS = "goldfive.active_drifts"
+
 ALL_KEYS: tuple[str, ...] = (
     KEY_CURRENT_PLAN_ID,
     KEY_CURRENT_TASK_ID,
@@ -150,6 +178,7 @@ ALL_KEYS: tuple[str, ...] = (
     KEY_ACTIVE_STEER_SOURCE,
     KEY_PROCESSED_STEER_IDS,
     KEY_CANCELLED_FUNCTION_CALL_IDS,
+    KEY_ACTIVE_DRIFTS,
 )
 
 # Cap on how many processed steer ids we retain on ``session.state`` so
@@ -523,9 +552,343 @@ def sync_current_task_from_transition(
             clear_current_task(state)
 
 
+# ---------------------------------------------------------------------------
+# Drift conditions (goldfive#271 PR1)
+# ---------------------------------------------------------------------------
+
+# Lifecycle string constants — mirror the proto3 ``DriftLifecycle`` enum
+# values that the steerer stamps onto ``DriftDetected.lifecycle``. Kept
+# as plain lowercase strings here so :class:`Drift` round-trips through
+# ``state.dict`` without dragging the proto enum into stored state.
+LIFECYCLE_OPENED: str = "opened"
+LIFECYCLE_ESCALATING: str = "escalating"
+LIFECYCLE_RESOLVED: str = "resolved"
+LIFECYCLE_HUMAN_INTERVENTION_REQUIRED: str = "human_intervention_required"
+
+LIFECYCLE_VALUES: tuple[str, ...] = (
+    LIFECYCLE_OPENED,
+    LIFECYCLE_ESCALATING,
+    LIFECYCLE_RESOLVED,
+    LIFECYCLE_HUMAN_INTERVENTION_REQUIRED,
+)
+
+
+@dataclasses.dataclass
+class Drift:
+    """In-flight drift condition tracked on ``session.state`` (goldfive#271 PR1).
+
+    A *condition* is a logical occurrence of drift (kind+task+agent
+    within a turn) that may emit one or more ``DriftDetected`` events
+    as it evolves. Identity is the ``condition_id`` (sha1 prefix); the
+    other fields are bookkeeping the lifecycle helpers maintain so the
+    steerer's wire emit can stamp ``lifecycle`` + ``prev_severity``
+    onto ``DriftDetected`` without re-deriving them.
+
+    Attributes
+    ----------
+    condition_id:
+        Stable identifier — same kind+task+agent within the same turn
+        always hashes to the same value. See :func:`compute_condition_id`.
+    kind:
+        :class:`DriftKind` enum value — copied from the underlying
+        ``DriftEvent.kind`` for read-back without re-classifying.
+    task_id / agent_id / turn_id:
+        Tuple that hashes to ``condition_id``. Stored for diagnostics
+        / round-tripping.
+    severity:
+        Latest :class:`DriftSeverity` observed on the condition. Bumped
+        monotonically by :func:`open_or_escalate_drift`.
+    prev_severity:
+        Severity before the most-recent transition. Meaningful only on
+        an ``escalating`` step; ``None`` for the opening / resolving
+        transitions. Wire-stamped onto ``DriftDetected.prev_severity``
+        (the proto carries it as ``DRIFT_SEVERITY_UNSPECIFIED``) so
+        sinks can render "INFO -> WARNING" deltas without remembering
+        the previous emit.
+    lifecycle:
+        One of :data:`LIFECYCLE_OPENED`, :data:`LIFECYCLE_ESCALATING`,
+        :data:`LIFECYCLE_RESOLVED`,
+        :data:`LIFECYCLE_HUMAN_INTERVENTION_REQUIRED`. Wire-stamped onto
+        ``DriftDetected.lifecycle`` after enum conversion.
+    occurrences:
+        Count of times the condition has emitted on this turn (1 at
+        ``opened``, 2+ at successive ``escalating`` emits, frozen at
+        the final emit when the condition resolves / escalates to
+        human intervention).
+    """
+
+    condition_id: str
+    kind: DriftKind | None
+    task_id: str
+    agent_id: str
+    turn_id: str
+    severity: DriftSeverity | None
+    prev_severity: DriftSeverity | None = None
+    lifecycle: str = LIFECYCLE_OPENED
+    occurrences: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-friendly serialisation for round-tripping through state."""
+        return {
+            "condition_id": self.condition_id,
+            "kind": _kind_to_str(self.kind),
+            "task_id": self.task_id,
+            "agent_id": self.agent_id,
+            "turn_id": self.turn_id,
+            "severity": _severity_to_str(self.severity),
+            "prev_severity": _severity_to_str(self.prev_severity),
+            "lifecycle": self.lifecycle,
+            "occurrences": int(self.occurrences),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> Drift:
+        """Inverse of :meth:`to_dict`. Tolerant of unknown enum values
+        (falls back to ``None``) so a sink that round-trips an old
+        snapshot doesn't crash the helpers."""
+        return cls(
+            condition_id=str(data.get("condition_id", "") or ""),
+            kind=_kind_from_str(str(data.get("kind", "") or "")),
+            task_id=str(data.get("task_id", "") or ""),
+            agent_id=str(data.get("agent_id", "") or ""),
+            turn_id=str(data.get("turn_id", "") or ""),
+            severity=_severity_from_str(str(data.get("severity", "") or "")),
+            prev_severity=_severity_from_str(str(data.get("prev_severity", "") or "")),
+            lifecycle=str(data.get("lifecycle", LIFECYCLE_OPENED) or LIFECYCLE_OPENED),
+            occurrences=int(data.get("occurrences", 1) or 1),
+        )
+
+
+def _severity_to_str(severity: DriftSeverity | None) -> str:
+    if severity is None:
+        return ""
+    try:
+        return severity.value
+    except AttributeError:
+        return ""
+
+
+def _severity_from_str(name: str) -> DriftSeverity | None:
+    if not name:
+        return None
+    try:
+        return DriftSeverity(name)
+    except ValueError:
+        return None
+
+
+def _kind_to_str(kind: DriftKind | None) -> str:
+    if kind is None:
+        return ""
+    try:
+        return kind.value
+    except AttributeError:
+        return ""
+
+
+def _kind_from_str(name: str) -> DriftKind | None:
+    if not name:
+        return None
+    try:
+        return DriftKind(name)
+    except ValueError:
+        return None
+
+
+def compute_condition_id(
+    *,
+    kind: DriftKind,
+    task_id: str,
+    agent_id: str,
+    turn_id: str,
+) -> str:
+    """Return the stable condition_id for a (kind, task, agent, turn) tuple.
+
+    Identity rule (goldfive#271 PR1): ``sha1(f"{kind.value}|{task_id}|
+    {agent_id}|{turn_id}")[:16]``. Same kind+task+agent within the
+    same turn always hashes to the same 16-char prefix; a new turn
+    always opens a fresh condition. The 16-char prefix is well below
+    sha1's collision floor for the volumes the orchestrator emits in
+    practice (a single turn rarely exceeds a few hundred drift events
+    across all kinds + tasks + agents) but remains short enough to
+    surface inline in logs / debug views without truncation.
+    """
+    payload = f"{kind.value}|{task_id}|{agent_id}|{turn_id}".encode()
+    return hashlib.sha1(payload, usedforsecurity=False).hexdigest()[:16]
+
+
+def _read_active_drifts(state: Any) -> dict[str, dict[str, Any]]:
+    """Return the active-drifts dict, or ``{}`` when missing / malformed."""
+    raw = read(state, KEY_ACTIVE_DRIFTS, {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for cid, payload in raw.items():
+        if not isinstance(payload, dict):
+            continue
+        out[str(cid)] = dict(payload)
+    return out
+
+
+def _write_active_drifts(
+    state: MutableMapping[str, Any],
+    drifts: Mapping[str, Mapping[str, Any]],
+) -> None:
+    write(state, KEY_ACTIVE_DRIFTS, {str(k): dict(v) for k, v in drifts.items()})
+
+
+def get_active_drift(state: Any, condition_id: str) -> Drift | None:
+    """Return the in-flight :class:`Drift` for ``condition_id``, or ``None``."""
+    if not condition_id:
+        return None
+    payload = _read_active_drifts(state).get(condition_id)
+    if payload is None:
+        return None
+    return Drift.from_dict(payload)
+
+
+def list_active_drifts(state: Any) -> list[Drift]:
+    """Return all in-flight conditions on the session as :class:`Drift` objects."""
+    return [Drift.from_dict(payload) for payload in _read_active_drifts(state).values()]
+
+
+def open_or_escalate_drift(
+    state: MutableMapping[str, Any],
+    *,
+    kind: DriftKind,
+    task_id: str,
+    agent_id: str,
+    turn_id: str,
+    severity: DriftSeverity,
+) -> Drift:
+    """Open a new condition or escalate an existing one.
+
+    Returns the resulting :class:`Drift` with ``lifecycle`` set to
+    :data:`LIFECYCLE_OPENED` for first emits or
+    :data:`LIFECYCLE_ESCALATING` for repeats. The caller (typically the
+    steerer) reads the returned object's ``condition_id`` /
+    ``lifecycle`` / ``prev_severity`` to stamp the corresponding
+    fields on the wire ``DriftDetected``.
+
+    Severity bumping is monotonic in the ``DriftSeverity`` ordering
+    (INFO < WARNING < CRITICAL); a re-emit at lower severity preserves
+    the higher recorded value. ``prev_severity`` is the severity
+    *before* this transition — only meaningful on the
+    ``escalating`` step. ``occurrences`` increments on every escalate
+    so callers can render "fired N times" without crawling the event
+    stream.
+    """
+    cid = compute_condition_id(kind=kind, task_id=task_id, agent_id=agent_id, turn_id=turn_id)
+    active = _read_active_drifts(state)
+    existing = active.get(cid)
+    if existing is None:
+        drift = Drift(
+            condition_id=cid,
+            kind=kind,
+            task_id=str(task_id or ""),
+            agent_id=str(agent_id or ""),
+            turn_id=str(turn_id or ""),
+            severity=severity,
+            prev_severity=None,
+            lifecycle=LIFECYCLE_OPENED,
+            occurrences=1,
+        )
+        active[cid] = drift.to_dict()
+        _write_active_drifts(state, active)
+        return drift
+
+    existing_drift = Drift.from_dict(existing)
+    prev_severity = existing_drift.severity
+    new_severity = _max_severity(existing_drift.severity, severity)
+    updated = Drift(
+        condition_id=cid,
+        kind=kind,
+        task_id=existing_drift.task_id,
+        agent_id=existing_drift.agent_id,
+        turn_id=existing_drift.turn_id,
+        severity=new_severity,
+        prev_severity=prev_severity,
+        lifecycle=LIFECYCLE_ESCALATING,
+        occurrences=existing_drift.occurrences + 1,
+    )
+    active[cid] = updated.to_dict()
+    _write_active_drifts(state, active)
+    return updated
+
+
+def resolve_drift(
+    state: MutableMapping[str, Any],
+    condition_id: str,
+) -> Drift | None:
+    """Mark the condition resolved and remove it from the active set.
+
+    Returns the final :class:`Drift` (with ``lifecycle`` set to
+    :data:`LIFECYCLE_RESOLVED`) so the caller can stamp the resolving
+    wire emit. Returns ``None`` when the condition is unknown — the
+    helper is idempotent so a duplicate resolve is a no-op.
+    """
+    if not condition_id:
+        return None
+    active = _read_active_drifts(state)
+    payload = active.pop(condition_id, None)
+    if payload is None:
+        return None
+    drift = Drift.from_dict(payload)
+    drift.prev_severity = None
+    drift.lifecycle = LIFECYCLE_RESOLVED
+    _write_active_drifts(state, active)
+    return drift
+
+
+def escalate_drift_to_human_intervention(
+    state: MutableMapping[str, Any],
+    condition_id: str,
+) -> Drift | None:
+    """Mark the condition as requiring human intervention.
+
+    Sets ``severity`` to ``CRITICAL`` (the human-intervention tier is
+    always CRITICAL by contract — see ``DefaultSteerer`` Level 4) and
+    removes the entry from the active set: once a condition has
+    escalated to a human, further auto-escalation on the same condition
+    would be misleading. Returns the final :class:`Drift` so the caller
+    can stamp the ``human_intervention_required`` wire emit. Returns
+    ``None`` when the condition is unknown.
+    """
+    if not condition_id:
+        return None
+    active = _read_active_drifts(state)
+    payload = active.pop(condition_id, None)
+    if payload is None:
+        return None
+    drift = Drift.from_dict(payload)
+    drift.prev_severity = drift.severity
+    drift.severity = DriftSeverity.CRITICAL
+    drift.lifecycle = LIFECYCLE_HUMAN_INTERVENTION_REQUIRED
+    _write_active_drifts(state, active)
+    return drift
+
+
+_SEVERITY_ORDER: dict[DriftSeverity, int] = {
+    DriftSeverity.INFO: 0,
+    DriftSeverity.WARNING: 1,
+    DriftSeverity.CRITICAL: 2,
+}
+
+
+def _severity_rank(s: DriftSeverity | None) -> int:
+    if s is None:
+        return -1
+    return _SEVERITY_ORDER.get(s, -1)
+
+
+def _max_severity(a: DriftSeverity | None, b: DriftSeverity | None) -> DriftSeverity | None:
+    return a if _severity_rank(a) >= _severity_rank(b) else b
+
+
 __all__ = [
     "ALL_KEYS",
     "GOLDFIVE_PREFIX",
+    "KEY_ACTIVE_DRIFTS",
     "KEY_ACTIVE_STEER_AT_TURN",
     "KEY_ACTIVE_STEER_AUTHOR",
     "KEY_ACTIVE_STEER_BODY",
@@ -537,18 +900,30 @@ __all__ = [
     "KEY_CURRENT_TASK_TITLE",
     "KEY_GOALS_SUMMARY",
     "KEY_PROCESSED_STEER_IDS",
+    "LIFECYCLE_ESCALATING",
+    "LIFECYCLE_HUMAN_INTERVENTION_REQUIRED",
+    "LIFECYCLE_OPENED",
+    "LIFECYCLE_RESOLVED",
+    "LIFECYCLE_VALUES",
     "PROCESSED_STEER_IDS_CAP",
+    "Drift",
     "append_cancelled_function_call_ids",
     "clear",
     "clear_active_steer",
     "clear_current_task",
+    "compute_condition_id",
+    "escalate_drift_to_human_intervention",
     "format_goals_summary",
+    "get_active_drift",
     "has_processed_steer_id",
+    "list_active_drifts",
+    "open_or_escalate_drift",
     "read",
     "read_cancelled_function_call_ids",
     "read_current_task_revision",
     "record_processed_steer_id",
     "refresh_goals_summary",
+    "resolve_drift",
     "rotate_current_task_id",
     "set_active_steer",
     "set_current_plan",
