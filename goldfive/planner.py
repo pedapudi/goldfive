@@ -52,6 +52,17 @@ _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
 log = logging.getLogger("goldfive.planner")
 
 
+# Sentinel error message used by the refine / generate / steer retry loops
+# to signal "the LLM returned nothing usable" (empty string or non-string).
+# Detected by the loop body so we can short-circuit the retry: an empty
+# response is almost always a small-model artefact (Qwen 2B exhausting its
+# budget on thinking tokens with no final answer, see goldfive#182). Each
+# retry doubles cost without changing the outcome, so we treat empty as
+# terminal "no signal" and let the caller fall back to its no-drift /
+# no-revision branch.
+_EMPTY_RESPONSE_ERROR: str = "empty or non-string LLM response"
+
+
 # ---------------------------------------------------------------------------
 # System prompts (goal-oriented variants ported from harmonograf_client)
 # ---------------------------------------------------------------------------
@@ -1951,17 +1962,24 @@ class LLMPlanner:
                     user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
                 continue
             if not raw or not isinstance(raw, str):
-                last_error = "empty or non-string LLM response"
-                log.warning(
-                    "%s: attempt %d/%d: %s",
+                # Small-model artefact (goldfive#182): Qwen 2B and other
+                # small models routinely exhaust their output budget on
+                # internal reasoning and emit no final answer. Retrying
+                # doubles cost without changing the outcome, so treat the
+                # empty response as terminal "no signal" and let the
+                # caller fall back to its no-revision branch. Logged at
+                # INFO so operators can still see model-quality issues
+                # via observability without the WARNING noise that
+                # previously cascaded through retry/escalate paths.
+                last_error = _EMPTY_RESPONSE_ERROR
+                log.info(
+                    "%s: attempt %d/%d: %s; not retrying",
                     log_prefix,
                     attempt,
                     attempts,
                     last_error,
                 )
-                if attempt < attempts:
-                    user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
-                continue
+                break
             cleaned = _strip_code_fences(raw).strip()
             try:
                 parsed = json.loads(cleaned)
@@ -2286,16 +2304,17 @@ class LLMPlanner:
                     user_prompt = self._build_correction_prompt(base_prompt, last_error)
                 continue
             if not raw or not isinstance(raw, str):
-                last_error = "empty or non-string LLM response"
-                log.warning(
-                    "LLMPlanner.generate: attempt %d/%d: %s",
+                # See ``_call_and_validate_refine`` for the rationale —
+                # an empty response is treated as terminal "no signal"
+                # rather than retried (goldfive#182).
+                last_error = _EMPTY_RESPONSE_ERROR
+                log.info(
+                    "LLMPlanner.generate: attempt %d/%d: %s; not retrying",
                     attempt,
                     attempts,
                     last_error,
                 )
-                if attempt < attempts:
-                    user_prompt = self._build_correction_prompt(base_prompt, last_error)
-                continue
+                break
             cleaned = _strip_code_fences(raw).strip()
             try:
                 parsed = json.loads(cleaned)
@@ -2356,6 +2375,12 @@ class LLMPlanner:
                     user_prompt = self._build_correction_prompt(base_prompt, last_error)
                 continue
             return plan
+        # Empty / non-string responses already logged INFO at the
+        # short-circuit site (goldfive#182); avoid a redundant WARNING
+        # tail. Other exhausted-retry paths still log WARNING so a
+        # genuine model-output / validator failure stays visible.
+        if last_error == _EMPTY_RESPONSE_ERROR:
+            return None
         log.warning(
             "LLMPlanner.generate: exhausted %d attempt(s); last_error=%s",
             attempts,
@@ -2480,7 +2505,16 @@ class LLMPlanner:
             # as a successful no-op revision, which is exactly the
             # silent-fallback behaviour goldfive#133 set out to
             # eliminate.
-            await self._emit_refine_validation_failed(plan, drift, last_error)
+            #
+            # Exception (goldfive#182): when the failure is an empty /
+            # non-string LLM response, skip the validation-failed
+            # emission. That signal escalates through the intervention
+            # ladder, but a small-model "no answer" is not a planner
+            # failure — it's a model-quality issue we already log at
+            # INFO. Returning None still triggers the steerer's normal
+            # backoff path; we just don't add escalation noise on top.
+            if last_error != _EMPTY_RESPONSE_ERROR:
+                await self._emit_refine_validation_failed(plan, drift, last_error)
             return None
         # Stamp revision metadata so downstream sinks can render it.
         revised.revision_reason = drift.detail
@@ -2649,7 +2683,13 @@ class LLMPlanner:
             # Retries exhausted. Signal the failure explicitly, then
             # return the deterministic fallback so the looping task
             # cannot re-fire on the next tick.
-            await self._emit_refine_validation_failed(plan, drift, last_error)
+            #
+            # Exception (goldfive#182): an empty / non-string LLM
+            # response is a model-quality artefact, not a refine
+            # failure — skip the escalation event. The deterministic
+            # fallback still fires so the looping task can't re-arm.
+            if last_error != _EMPTY_RESPONSE_ERROR:
+                await self._emit_refine_validation_failed(plan, drift, last_error)
             return self._fallback_fail_loop_plan(plan, drift, looping_task)
         revised.revision_reason = drift.detail
         revised.revision_kind = drift.kind.value
@@ -2822,6 +2862,24 @@ class LLMPlanner:
             if merged_plan is not None:
                 return merged_plan
             last_error = error
+            if last_error == _EMPTY_RESPONSE_ERROR:
+                # Empty / non-string response is a small-model artefact
+                # (goldfive#182). Retrying doubles cost without changing
+                # the outcome AND emitting REFINE_VALIDATION_FAILED would
+                # cascade into the intervention ladder for what is just
+                # "model returned nothing useful". Log INFO and return
+                # None directly — the steerer's caller treats None the
+                # same way as exhausted retries (keep prior plan,
+                # increment backoff) but without the escalation noise.
+                log.info(
+                    "LLMPlanner._refine_steer(source=%s): attempt %d/%d: %s; "
+                    "not retrying",
+                    effective_source,
+                    attempt,
+                    attempts,
+                    last_error,
+                )
+                return None
             log.warning(
                 "LLMPlanner._refine_steer(source=%s): attempt %d/%d: %s",
                 effective_source,
@@ -2909,7 +2967,7 @@ class LLMPlanner:
         except Exception as exc:  # noqa: BLE001
             return None, f"call_llm raised: {exc}"
         if not raw or not isinstance(raw, str):
-            return None, "empty or non-string LLM response"
+            return None, _EMPTY_RESPONSE_ERROR
         cleaned = _strip_code_fences(raw).strip()
         try:
             parsed = json.loads(cleaned)
