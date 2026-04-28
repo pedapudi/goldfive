@@ -54,6 +54,7 @@ import uuid
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
+from goldfive import _state_audit
 from goldfive.adapters._adk_plugin import (
     SESSION_CONTEXT_STATE_KEY,
     SessionContext,
@@ -2056,7 +2057,7 @@ class ADKAdapter:
                 if task is not None and _task_is_terminal(task, session):
                     stop_reason = "task_terminal"
                     break
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled_exc:
             was_cancelled = True
             stop_reason = "cancelled"
             # Goldfive boundary catch site (goldfive#271 Phase 3.5
@@ -2078,6 +2079,22 @@ class ADKAdapter:
                         "ADKAdapter.invoke: close_open_boundaries(cancelled) raised: %s",
                         exc,
                     )
+            # Phase 3.5 component 2 (goldfive#271): assert every
+            # audited stash-owning site (CANCELLATION-CONTRACT.md
+            # §C1-C6) ran its compliance branch before the cancel
+            # propagated past it. Default-off — short-circuits when
+            # ``GOLDFIVE_STRICT_STATE_OWNERSHIP`` is unset. Raises
+            # :class:`CancellationStashViolation` (a ``BaseException``
+            # so ``except Exception`` blocks can't swallow it) when
+            # an audited site started but never called
+            # :func:`mark_stash_completed`. We invoke this BEFORE
+            # the heal / plugin-notify steps so the violation
+            # surfaces at the earliest possible point in the catch
+            # arm; the heal calls themselves wouldn't suppress the
+            # violation (they catch ``Exception``, not
+            # ``BaseException``) but raising early keeps the
+            # diagnostic close to the cancel that triggered it.
+            _state_audit.assert_stash_invariant(cause=cancelled_exc)
             # Consume the tag the steerer / executor stashed on us before
             # triggering the cancel (see goldfive#139). An unset tag
             # falls through to the legacy generic reason so existing
