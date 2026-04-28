@@ -844,19 +844,19 @@ class Session:
     # apply to USER_STEER (always honoured) or GOAL_DRIFT (has its own
     # task-boundary rate limit via ``_last_goal_drift_check_ts``).
     _last_plan_revision_at: dict[tuple[str, str], float] = dataclasses.field(default_factory=dict)
-    # Per-(task_id, drift_kind_value) count of plan revisions that
-    # actually landed (``_emit_plan_revised``). Goldfive#271 follow-up:
-    # the cooldown above gates by *time*, but the user-directive in
-    # ``project_structural_steering_plan.md`` is "NO cooldown" — this
-    # parallel counter gives up after N successful revisions of the
-    # same (kind, task) regardless of inter-arrival time. Without it,
-    # a drift judge that keeps re-firing on a corrected task (Qwen
-    # off-topic loop, demo-v8.log: rev 2→3→4 in 30 minutes) thrashes
-    # forever. Routed to ``HUMAN_INTERVENTION_REQUIRED`` once the
-    # threshold is crossed. Same exempt set as the cooldown
-    # (USER_STEER, USER_CANCEL, GOAL_DRIFT) so user actions are
-    # always honoured.
-    plan_revision_counts: dict[tuple[str, str], int] = dataclasses.field(default_factory=dict)
+    # Per-task ``time.monotonic()`` timestamp of the most recent
+    # task-progress signal — set on ``mark_task_running``,
+    # ``mark_task_progress``, and every ``_emit_task_transitioned`` call.
+    # Consumed by :class:`~goldfive.steerer.DefaultSteerer` to gate
+    # drift escalation: a drift firing on a task that has been silent
+    # for longer than the configured stall threshold escalates to
+    # ``HUMAN_INTERVENTION_REQUIRED`` instead of looping the planner.
+    # Replaces the deleted count-based cap (goldfive#271 follow-up):
+    # progress-grounded escalation is structural — a productively-
+    # iterating task has continuous progress events, a stuck task
+    # does not. Sentinel task_id ``""`` covers trajectory-wide signals
+    # which never gate (no task to be stalled).
+    task_last_progress_at: dict[str, float] = dataclasses.field(default_factory=dict)
     # Counter of LLM turns observed since the last reflective self-progress
     # check. Incremented by ``DefaultSteerer.note_llm_call`` (which adapters
     # call once per LLM invocation when the opt-in reflective check is

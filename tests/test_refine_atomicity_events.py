@@ -83,7 +83,14 @@ class ListSink:
 
 
 class StubPlanner:
-    """Planner whose ``refine`` is configurable per call (raise / None / plan)."""
+    """Planner whose ``refine`` is configurable per call (raise / None / plan).
+
+    Each successful ``refine`` call returns a *fresh* plan instance with
+    a per-call unique sentinel task appended so the steerer's no-op
+    revision rejection (goldfive#271) sees a real structural diff. The
+    caller-supplied ``revised`` template is preserved verbatim apart
+    from the appended sentinel.
+    """
 
     def __init__(
         self,
@@ -114,7 +121,37 @@ class StubPlanner:
         self.refine_calls.append({"plan": plan, "drift": drift, "goals": goals})
         if self.raise_exc is not None:
             raise self.raise_exc
-        return self.revised
+        if self.revised is None:
+            return None
+        # Fresh structural mutation per call so successive refines don't
+        # appear as no-op revisions to the steerer's structural check.
+        sentinel_id = f"stub-refine-{len(self.refine_calls)}"
+        return Plan(
+            id=self.revised.id,
+            run_id=self.revised.run_id,
+            goal_ids=list(self.revised.goal_ids),
+            tasks=[
+                Task(
+                    id=t.id,
+                    title=t.title,
+                    description=t.description,
+                    assignee_agent_id=t.assignee_agent_id,
+                    status=t.status,
+                )
+                for t in self.revised.tasks
+            ]
+            + [Task(id=sentinel_id, title=sentinel_id)],
+            edges=[
+                TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
+                for e in self.revised.edges
+            ],
+            summary=self.revised.summary,
+            revision_index=self.revised.revision_index,
+            revision_reason=self.revised.revision_reason,
+            revision_kind=self.revised.revision_kind,
+            revision_severity=self.revised.revision_severity,
+            revision_trigger_event_id=self.revised.revision_trigger_event_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +210,10 @@ async def test_successful_refine_emits_attempted_and_correlation_with_same_attem
       * the correlation event carries the same ``attempt_id`` as the
         ``refine_attempted`` event.
     """
-    revised = _make_plan(("t1", "t2"))
+    # Structurally-distinct revised plan so the steerer's no-op
+    # revision rejection (goldfive#271) doesn't short-circuit refine
+    # success — this test exercises the success path.
+    revised = _make_plan(("t1", "t2", "t3"))
     revised.revision_index = 1
     planner = StubPlanner(revised=revised)
     sink = ListSink()
@@ -290,7 +330,7 @@ async def test_validator_rejection_emits_failed_with_validator_kind() -> None:
 
 async def test_attempt_id_is_unique_per_attempt() -> None:
     """Two consecutive refines mint two distinct ``attempt_id`` values."""
-    revised = _make_plan(("t1", "t2"))
+    revised = _make_plan(("t1", "t2", "t3"))
     revised.revision_index = 1
     planner = StubPlanner(revised=revised)
     sink = ListSink()
@@ -315,7 +355,7 @@ async def test_refine_attempted_carries_drift_kind_and_severity() -> None:
     triggering drift's kind / severity / drift_id so harmonograf can
     render an intervention timeline without re-fetching the drift.
     """
-    revised = _make_plan(("t1", "t2"))
+    revised = _make_plan(("t1", "t2", "t3"))
     revised.revision_index = 1
     planner = StubPlanner(revised=revised)
     sink = ListSink()
@@ -360,7 +400,7 @@ async def test_wait_plan_stable_blocks_until_emit_plan_revised_completes() -> No
     mutation region releases. The barrier observes a stable plan: the
     revised one (post-mutation), never a partial state.
     """
-    revised = _make_plan(("t1", "t2"))
+    revised = _make_plan(("t1", "t2", "t3"))
     revised.revision_index = 1
     planner = StubPlanner(revised=revised)
     sink = ListSink()
@@ -504,7 +544,7 @@ async def test_report_handler_invokes_wait_plan_stable() -> None:
     """
     from goldfive.reporting import BUILTIN_REPORTING_TOOLS
 
-    revised = _make_plan(("t1", "t2"))
+    revised = _make_plan(("t1", "t2", "t3"))
     revised.revision_index = 1
     planner = StubPlanner(revised=revised)
     sink = ListSink()
@@ -569,7 +609,7 @@ async def test_proto_plan_revised_event_unchanged_on_success() -> None:
     fields it always has. The a4 attempt_id sidecar is purely additive;
     existing consumers don't observe any field change on the proto.
     """
-    revised = _make_plan(("t1", "t2"))
+    revised = _make_plan(("t1", "t2", "t3"))
     revised.revision_index = 1
     revised.revision_reason = ""
     planner = StubPlanner(revised=revised)

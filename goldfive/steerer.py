@@ -102,8 +102,29 @@ log = logging.getLogger(__name__)
 __all__ = [
     "DefaultSteerer",
     "InterventionLevel",
+    "RefineExhausted",
     "compose_corrective_user_message",
 ]
+
+
+class RefineExhausted(Exception):
+    """Sentinel raised by ``Planner.refine`` when no meaningful change is possible.
+
+    goldfive#271 — drift-handler exhaustion as the escalation primitive.
+    A refine handler that has tried and cannot produce a meaningful
+    change for a drift may raise this exception to signal "this drift
+    is unresolvable" up to the steerer. The steerer catches it and
+    emits ``HUMAN_INTERVENTION_REQUIRED`` for the originating drift,
+    pausing the runner for operator action.
+
+    Most planners do NOT need to raise this explicitly — the steerer's
+    structural no-op revision check (in
+    :meth:`DefaultSteerer._plans_structurally_identical`) catches the
+    common case where a refine returns a plan with no real change.
+    This sentinel is for planners that can detect exhaustion ahead of
+    producing a plan (e.g., the LLM explicitly responded "I cannot
+    refine this further").
+    """
 
 
 class InterventionLevel(enum.IntEnum):
@@ -796,6 +817,12 @@ class DefaultSteerer:
         # goldfive#152: stamp current_task_* on the orchestration-state
         # dict so downstream prompt templates / refine paths see it.
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.RUNNING)
+        # goldfive#271: stamp task progress liveness for the structural
+        # progress-stall escalation. A drift firing on this task within
+        # ``PROGRESS_STALL_THRESHOLD_SECONDS`` of any progress signal is
+        # considered productively iterating; outside that window, the
+        # next drift escalates to HUMAN_INTERVENTION_REQUIRED.
+        session.task_last_progress_at[task_id] = time.monotonic()
         await self._emit_task_started(session, task_id, detail)
         await self._emit_task_transitioned(
             session,
@@ -829,6 +856,10 @@ class DefaultSteerer:
         session.task_progress[task_id] = frac
         if detail:
             session.agent_notes[task_id] = detail
+        # goldfive#271: refresh progress liveness so a productively
+        # iterating task is not flagged as stalled by the structural
+        # escalation gate.
+        session.task_last_progress_at[task_id] = time.monotonic()
         await self._emit_task_progress(session, task_id, frac, detail)
 
     async def mark_task_completed(
@@ -2510,16 +2541,16 @@ class DefaultSteerer:
         # ``_is_plan_revision_cooldown_exempt``).
         if self._is_plan_revision_gated(drift, session):
             return
-        # Plan-revision *count* gate (goldfive#271 follow-up). Even when
-        # every refine succeeds, the same (drift_kind, task_id) re-firing
-        # can keep producing new revisions (Qwen off-topic judge loop in
-        # demo-v8.log: 4 successful PlanRevised events on the same
-        # off_topic+research_solar pair in 30 minutes). Once we cross the
-        # cap, escalate to HUMAN_INTERVENTION_REQUIRED so a human can
-        # decide whether to cancel or steer the run. Same exempt set as
-        # the cooldown so user actions never burn the budget.
-        if self._is_plan_revision_count_gated(drift, session):
-            await self._emit_revision_cap_escalation(drift, session)
+        # Progress-based escalation (goldfive#271 — replaces the deleted
+        # count cap). If the drift fires on a task that has had no
+        # progress signal (``mark_task_running`` / ``mark_task_progress``
+        # / ``_emit_task_transitioned``) for longer than the configured
+        # stall threshold, escalate to HUMAN_INTERVENTION_REQUIRED instead
+        # of looping the planner. A productively-iterating task has
+        # continuous progress events; a stuck task does not. Time-based,
+        # progress-grounded — no arbitrary numerical cap to thrash.
+        if self._is_task_progress_stalled(drift, session):
+            await self._emit_progress_stalled_escalation(drift, session)
             return
         # Plumb the session into the planner's drift-emitter callback
         # for the duration of this refine call so the planner can emit
@@ -2573,6 +2604,28 @@ class DefaultSteerer:
                             drift=drift,
                             goals=list(session.goals),
                         )
+                except RefineExhausted as exc:
+                    # goldfive#271: planner explicitly signals it cannot
+                    # produce a meaningful change. Same escalation path
+                    # as the structural no-op detector — pause for
+                    # human intervention rather than retrying.
+                    log.info(
+                        "DefaultSteerer._handle_drift: planner.refine raised "
+                        "RefineExhausted for kind=%s task=%r: %s",
+                        drift.kind.value,
+                        drift.current_task_id,
+                        exc,
+                    )
+                    await self._emit_refine_failed(
+                        session,
+                        drift,
+                        attempt_id=attempt_id,
+                        failure_kind="refine_exhausted",
+                        reason=str(exc) or "planner signalled handler exhaustion",
+                        detail="",
+                    )
+                    await self._emit_handler_exhausted_escalation(drift, session)
+                    return
                 except Exception as exc:  # noqa: BLE001 — refine errors must not break the run
                     # Surface the failure via logging + a synthetic follow-up
                     # drift so operators don't silently see the same plan loop
@@ -2669,6 +2722,31 @@ class DefaultSteerer:
                 ),
             )
             await self._register_refine_failure(session, drift, counter_key)
+            return
+        # No-op revision rejection (goldfive#271 — replaces the deleted
+        # count cap). If the LLM produced a "refine" that is structurally
+        # identical to the prior plan (same task ids, edges, assignees,
+        # statuses), treat the handler as exhausted: the planner cannot
+        # produce a meaningful change for this drift. Escalate to
+        # HUMAN_INTERVENTION_REQUIRED rather than bumping the revision
+        # index for a no-op, which would otherwise loop forever on a
+        # judge that keeps re-firing on a corrected task.
+        if self._plans_structurally_identical(session.plan, revised):
+            log.info(
+                "no-op revision skipped (kind=%s task=%r); escalating to "
+                "HUMAN_INTERVENTION_REQUIRED",
+                drift.kind.value,
+                drift.current_task_id,
+            )
+            await self._emit_refine_failed(
+                session,
+                drift,
+                attempt_id=attempt_id,
+                failure_kind="no_op_revision",
+                reason="planner returned structurally identical plan",
+                detail="",
+            )
+            await self._emit_handler_exhausted_escalation(drift, session)
             return
         # Successful refine — reset the back-off counter for this key
         # so a future drift of the same kind starts fresh.
@@ -3606,11 +3684,11 @@ class DefaultSteerer:
             return
         if self._is_plan_revision_gated(drift, session):
             return
-        # Plan-revision count gate (goldfive#271 follow-up). See
-        # ``PLAN_REVISION_COUNT_LIMIT`` and the parallel check in
-        # ``_handle_drift``.
-        if self._is_plan_revision_count_gated(drift, session):
-            await self._emit_revision_cap_escalation(drift, session)
+        # Progress-based escalation (goldfive#271 — replaces the deleted
+        # count cap). See the parallel check in ``_handle_drift`` and
+        # :meth:`_is_task_progress_stalled`.
+        if self._is_task_progress_stalled(drift, session):
+            await self._emit_progress_stalled_escalation(drift, session)
             return
         counter_key = (drift.kind.value, drift.current_task_id)
         # ContextVar plumbing for the planner-side drift-emitter and
@@ -3627,6 +3705,26 @@ class DefaultSteerer:
         ):
             try:
                 revised = await self._dispatch_goldfive_steer_refine(drift, session)
+            except RefineExhausted as exc:
+                # goldfive#271: planner explicitly signalled handler
+                # exhaustion. Pause for human intervention.
+                log.info(
+                    "DefaultSteerer._promote_drift_to_steer: refine raised "
+                    "RefineExhausted for kind=%s task=%r: %s",
+                    drift.kind.value,
+                    drift.current_task_id,
+                    exc,
+                )
+                await self._emit_refine_failed(
+                    session,
+                    drift,
+                    attempt_id=attempt_id,
+                    failure_kind="refine_exhausted",
+                    reason=str(exc) or "planner signalled handler exhaustion",
+                    detail="",
+                )
+                await self._emit_handler_exhausted_escalation(drift, session)
+                return
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "DefaultSteerer._promote_drift_to_steer: refine raised %s; plan unchanged",
@@ -3701,6 +3799,27 @@ class DefaultSteerer:
                 ),
             )
             await self._register_refine_failure(session, drift, counter_key)
+            return
+        # No-op revision rejection (goldfive#271). Same handler-
+        # exhaustion semantics as ``_handle_drift`` — a structurally
+        # identical plan means the planner cannot make progress on this
+        # drift; escalate to HUMAN_INTERVENTION_REQUIRED.
+        if self._plans_structurally_identical(session.plan, revised):
+            log.info(
+                "no-op refine_steer revision skipped (kind=%s task=%r); "
+                "escalating to HUMAN_INTERVENTION_REQUIRED",
+                drift.kind.value,
+                drift.current_task_id,
+            )
+            await self._emit_refine_failed(
+                session,
+                drift,
+                attempt_id=attempt_id,
+                failure_kind="no_op_revision",
+                reason="planner returned structurally identical plan",
+                detail="",
+            )
+            await self._emit_handler_exhausted_escalation(drift, session)
             return
         session.refine_failure_counts.pop(counter_key, None)
         prev_plan = session.plan
@@ -4065,6 +4184,24 @@ class DefaultSteerer:
                 ),
             )
             return False
+        # No-op revision rejection (goldfive#271 — replaces the deleted
+        # count cap). If the install would be structurally identical to
+        # the prior plan (same task ids, edges, assignees, statuses),
+        # skip the install entirely: bumping ``revision_index`` for an
+        # unchanged plan would emit a misleading PlanRevised with no
+        # actual diff. Returns False so the caller can surface the
+        # no-op. INFO-level so operators see why the install dropped.
+        if self._plans_structurally_identical(session.plan, revised_plan):
+            log.info(
+                "no-op revision skipped on _install_with_drift "
+                "(kind=%s task=%r); install dropped",
+                drift.kind.value,
+                drift.current_task_id,
+            )
+            return False
+        # Capture prev_plan BEFORE _apply_revision swaps it; the
+        # PlanRevisionDiff sidecar in _emit_plan_revised diffs the
+        # two.
         prev_plan = session.plan
         attempt_id = self._new_attempt_id()
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
@@ -4154,22 +4291,19 @@ class DefaultSteerer:
     # subclasses / tests can tune it without poking at instance state.
     REFINE_FAILURE_THRESHOLD: int = 2
 
-    # Maximum number of *successful* plan revisions tolerated for a
-    # given (drift_kind, task_id) before the steerer gives up and
-    # routes the drift to ``HUMAN_INTERVENTION_REQUIRED``
-    # (goldfive#271 follow-up). The existing ``REFINE_FAILURE_THRESHOLD``
-    # only fires when a refine fails (raises / returns None / fails
-    # validation) — but the v8 demo loop produced 4 *successful* plan
-    # revisions on the same off_topic+research_solar pair in 30 minutes,
-    # because each successful refine reset the failure counter to 0.
-    # This second cap is the loop-prevention backstop. USER_STEER /
-    # USER_CANCEL / GOAL_DRIFT bypass this cap (see
-    # ``_PLAN_REVISION_COOLDOWN_EXEMPT_KINDS``); user actions are always
-    # honoured. Default 3 is generous enough that legitimate "agent had
-    # two off-track turns and was corrected" trajectories complete, but
-    # tight enough that a Qwen judge that keeps re-firing on a corrected
-    # task can't burn the whole turn.
-    PLAN_REVISION_COUNT_LIMIT: int = 3
+    # Wall-clock seconds of task silence before a drift escalates to
+    # HUMAN_INTERVENTION_REQUIRED (goldfive#271 — replaces the deleted
+    # count cap). A productively-iterating task emits continuous
+    # progress events (``mark_task_running`` / ``mark_task_progress`` /
+    # ``_emit_task_transitioned`` updates ``Session.task_last_progress_at``);
+    # a stuck task does not. When a drift fires for a task whose last
+    # progress is older than this threshold, the steerer treats it as
+    # structurally unrecoverable and pauses for human intervention.
+    # Default 600s (10 minutes) — generous enough that legitimate slow
+    # work (model reasoning, multi-step research) is not interrupted,
+    # tight enough that a Qwen judge re-firing on a wedged task does
+    # not loop forever. ``0`` disables the gate (useful for tests).
+    PROGRESS_STALL_THRESHOLD_SECONDS: float = 600.0
 
     async def _register_refine_failure(
         self,
@@ -4719,6 +4853,14 @@ class DefaultSteerer:
         missing maps / proto stubs — emission failures are swallowed
         with a debug log rather than breaking the transition path.
         """
+        # goldfive#271: stamp task progress liveness on every transition
+        # so the structural progress-stall escalation gate sees the task
+        # as productively iterating. Done BEFORE the sink check because
+        # progress liveness must be tracked even when sinks are missing
+        # (test scenarios) — the gate consults this map regardless.
+        task_id_for_progress = str(getattr(task, "id", "") or "")
+        if task_id_for_progress:
+            session.task_last_progress_at[task_id_for_progress] = time.monotonic()
         sinks = self._sinks
         if not sinks:
             return
@@ -5044,16 +5186,17 @@ class DefaultSteerer:
         return str(payload.get("annotation_id", "") or "")
 
     # ------------------------------------------------------------------
-    # Plan-revision cooldown (drift-triggered replan rate limit)
+    # Plan-revision cooldown + structural escalation primitives
     # ------------------------------------------------------------------
 
-    # Drift kinds that always bypass the plan-revision cooldown. USER_STEER
-    # is an explicit user intervention -- user intent is always honoured
-    # immediately, even if a recent autonomous revision on the same task
-    # is still within the window. GOAL_DRIFT is trajectory-level and has
-    # its own rate limiting via ``_last_goal_drift_check_ts`` +
-    # ``_GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S`` (goldfive#220).
-    _PLAN_REVISION_COOLDOWN_EXEMPT_KINDS: frozenset[DriftKind] = frozenset(
+    # Drift kinds whose origin is a user intervention (USER_STEER /
+    # USER_CANCEL) or a trajectory-level signal that has its own rate
+    # limit (GOAL_DRIFT — task-boundary throttle via
+    # ``_last_goal_drift_check_ts``). These kinds bypass the time-based
+    # cooldown and the progress-stall escalation: user intent is always
+    # honoured, and trajectory-wide drifts have no single task whose
+    # progress could be measured.
+    _USER_OR_TRAJECTORY_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
         {
             DriftKind.USER_STEER,
             DriftKind.USER_CANCEL,
@@ -5072,12 +5215,12 @@ class DefaultSteerer:
 
         No-op (returns ``False``) when the cooldown is disabled
         (``plan_revision_cooldown_seconds <= 0``) or the drift kind is
-        in :data:`_PLAN_REVISION_COOLDOWN_EXEMPT_KINDS`.
+        a user / trajectory-level drift.
         """
         cooldown = self._plan_revision_cooldown_seconds
         if cooldown <= 0:
             return False
-        if drift.kind in self._PLAN_REVISION_COOLDOWN_EXEMPT_KINDS:
+        if drift.kind in self._USER_OR_TRAJECTORY_DRIFT_KINDS:
             return False
         key = (drift.current_task_id, drift.kind.value)
         last_at = session._last_plan_revision_at.get(key)
@@ -5105,58 +5248,109 @@ class DefaultSteerer:
         )
         return True
 
-    def _is_plan_revision_count_gated(self, drift: DriftEvent, session: Session) -> bool:
-        """Return ``True`` iff the (kind, task) revision cap has been hit.
+    def _is_task_progress_stalled(self, drift: DriftEvent, session: Session) -> bool:
+        """Return ``True`` iff the drift's task has had no progress recently.
 
-        Independent of the time-based cooldown -- consults
-        :attr:`Session.plan_revision_counts` and compares against
-        :attr:`PLAN_REVISION_COUNT_LIMIT`. Same exempt set as the
-        cooldown so user-driven revisions never burn the budget.
+        goldfive#271 — replaces the deleted count-based cap with a
+        progress-grounded structural guarantee. A productively-iterating
+        task continually emits progress events
+        (``mark_task_running`` / ``mark_task_progress`` /
+        ``_emit_task_transitioned``); a stuck task does not. When a
+        drift fires for a task whose ``Session.task_last_progress_at``
+        is older than :attr:`PROGRESS_STALL_THRESHOLD_SECONDS`, we
+        treat the drift as unresolvable by another refine and escalate
+        to ``HUMAN_INTERVENTION_REQUIRED``.
 
-        Used by ``_handle_drift`` and ``_promote_drift_to_steer`` to
-        suppress further drift-triggered refines once the cap is hit.
-        Returns ``False`` when the limit is non-positive (disabled) or
-        the drift kind is exempt.
+        Returns ``False`` (no gate) when:
+
+        * The threshold is non-positive (disabled).
+        * The drift kind is a user / trajectory-level drift (always
+          honoured / has its own rate limit).
+        * The drift carries no ``current_task_id`` (trajectory-wide
+          signals cannot be progress-stalled).
+        * The task has no recorded progress yet (a freshly-running
+          task may not have stamped ``task_last_progress_at`` if the
+          drift fires before the first transition is processed).
         """
-        limit = self.PLAN_REVISION_COUNT_LIMIT
-        if limit <= 0:
+        threshold = self.PROGRESS_STALL_THRESHOLD_SECONDS
+        if threshold <= 0:
             return False
-        if drift.kind in self._PLAN_REVISION_COOLDOWN_EXEMPT_KINDS:
+        if drift.kind in self._USER_OR_TRAJECTORY_DRIFT_KINDS:
             return False
-        key = (drift.current_task_id, drift.kind.value)
-        count = session.plan_revision_counts.get(key, 0)
-        if count < limit:
+        task_id = drift.current_task_id
+        if not task_id:
+            return False
+        last_at = session.task_last_progress_at.get(task_id)
+        if last_at is None:
+            # No progress signal yet — give the task the benefit of the
+            # doubt. The first ``mark_task_running`` stamps the table,
+            # so this branch only fires for the very first tick of a
+            # fresh task or a task that never transitioned.
+            return False
+        age = time.monotonic() - last_at
+        if age < threshold:
             return False
         log.warning(
-            "plan revision suppressed by count cap (task=%r kind=%s "
-            "count=%d limit=%d); escalating to HUMAN_INTERVENTION_REQUIRED",
-            drift.current_task_id,
+            "task progress stalled (task=%r kind=%s age=%.1fs threshold=%.1fs); "
+            "escalating to HUMAN_INTERVENTION_REQUIRED",
+            task_id,
             drift.kind.value,
-            count,
-            limit,
+            age,
+            threshold,
         )
         return True
 
-    async def _emit_revision_cap_escalation(self, drift: DriftEvent, session: Session) -> None:
-        """Emit a HUMAN_INTERVENTION_REQUIRED drift + pause the runner.
+    async def _emit_progress_stalled_escalation(
+        self, drift: DriftEvent, session: Session
+    ) -> None:
+        """Emit a ``HUMAN_INTERVENTION_REQUIRED`` drift + pause the runner.
 
         Called from ``_handle_drift`` / ``_promote_drift_to_steer`` when
-        :meth:`_is_plan_revision_count_gated` returns True. Pauses the
-        Runner via ``session.paused_for_human_intervention`` and emits a
-        CRITICAL drift carrying the underlying (kind, task) so sinks /
-        the UI can surface the cause.
+        :meth:`_is_task_progress_stalled` returns True. Pauses the
+        Runner via ``session.paused_for_human_intervention`` and emits
+        a CRITICAL drift carrying the underlying (kind, task) so sinks
+        / the UI can surface the stall.
         """
         session.paused_for_human_intervention = True
-        key = (drift.current_task_id, drift.kind.value)
-        count = session.plan_revision_counts.get(key, 0)
+        task_id = drift.current_task_id
+        last_at = session.task_last_progress_at.get(task_id) if task_id else None
+        age = (time.monotonic() - last_at) if last_at is not None else 0.0
         escalation = DriftEvent(
             kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
             severity=DriftSeverity.CRITICAL,
             detail=(
-                f"plan-revision cap reached for {drift.kind.value} on task "
+                f"task progress stalled for {drift.kind.value} on task "
+                f"{task_id or '(trajectory)'}: "
+                f"{age:.0f}s since last progress, threshold "
+                f"{self.PROGRESS_STALL_THRESHOLD_SECONDS:.0f}s"
+            ),
+            current_task_id=task_id,
+            current_agent_id=drift.current_agent_id,
+        )
+        # Emit directly; do NOT recurse through ``_handle_drift``.
+        await self._emit_drift_detected(session, escalation)
+
+    async def _emit_handler_exhausted_escalation(
+        self, drift: DriftEvent, session: Session
+    ) -> None:
+        """Emit a ``HUMAN_INTERVENTION_REQUIRED`` drift for handler exhaustion.
+
+        goldfive#271 — drift-handler exhaustion as the escalation
+        primitive. Called when a refine handler has tried and cannot
+        produce a meaningful change for this drift (today: a
+        structurally identical revision; future: explicit
+        ``RefineExhausted`` sentinel from a planner). Pauses the
+        Runner and emits a CRITICAL drift so the operator can decide
+        whether to cancel or steer.
+        """
+        session.paused_for_human_intervention = True
+        escalation = DriftEvent(
+            kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
+            severity=DriftSeverity.CRITICAL,
+            detail=(
+                f"refine handler exhausted for {drift.kind.value} on task "
                 f"{drift.current_task_id or '(trajectory)'}: "
-                f"{count} successful revisions, limit "
-                f"{self.PLAN_REVISION_COUNT_LIMIT}"
+                f"planner cannot produce a meaningful change"
             ),
             current_task_id=drift.current_task_id,
             current_agent_id=drift.current_agent_id,
@@ -5164,31 +5358,59 @@ class DefaultSteerer:
         # Emit directly; do NOT recurse through ``_handle_drift``.
         await self._emit_drift_detected(session, escalation)
 
+    @staticmethod
+    def _plans_structurally_identical(prior: Plan | None, revised: Plan) -> bool:
+        """Return ``True`` iff ``revised`` has the same structural shape as ``prior``.
+
+        goldfive#271 — no-op revision rejection (subsumes #188 / closes
+        the post-#305 loop pattern). Compares task ids, edges, assignees,
+        and statuses. Differences in plan id, revision metadata
+        (``revision_index`` / ``revision_kind`` / ``revision_severity`` /
+        ``revision_reason`` / ``revision_trigger_event_id``), summaries,
+        timing predictions, descriptions, and span bindings are
+        ignored — these can change without the plan actually meaning
+        anything different to the executor.
+
+        Returns ``False`` when ``prior`` is ``None`` (the seed case in
+        :meth:`Runner._install_revision`).
+        """
+        if prior is None:
+            return False
+        # Tasks: id + assignee + status (in declared order — order
+        # matters because executor scheduling reads tasks in list order
+        # for the topological tie-breaker).
+        if len(prior.tasks) != len(revised.tasks):
+            return False
+        for old, new in zip(prior.tasks, revised.tasks, strict=True):
+            if old.id != new.id:
+                return False
+            if old.assignee_agent_id != new.assignee_agent_id:
+                return False
+            if old.status != new.status:
+                return False
+        # Edges: order-independent, structural set comparison.
+        old_edges = {(e.from_task_id, e.to_task_id) for e in prior.edges}
+        new_edges = {(e.from_task_id, e.to_task_id) for e in revised.edges}
+        if old_edges != new_edges:
+            return False
+        return True
+
     def _record_plan_revision(self, drift: DriftEvent, session: Session) -> None:
         """Stamp ``session._last_plan_revision_at`` after a successful revision.
 
         Called at the very end of the refine path, after the new plan
-        is installed and ``PlanRevised`` has been emitted. Exempt
-        kinds (see :meth:`_is_plan_revision_gated`) are still recorded
-        for completeness -- the gate short-circuits on them
-        independently of whether a stamp exists.
-
-        Always bumps :attr:`Session.plan_revision_counts` regardless of
-        cooldown configuration -- the count gate is independent of the
-        time-based cooldown and is the loop-prevention backstop for the
-        "NO cooldown per user directive" stance (see
-        ``project_structural_steering_plan.md``).
+        is installed and ``PlanRevised`` has been emitted. Only stamps
+        when the time-based cooldown is active
+        (``plan_revision_cooldown_seconds > 0``). The count-based cap
+        was deleted in goldfive#271 — escalation is now driven by
+        progress stall (:meth:`_is_task_progress_stalled`) and handler
+        exhaustion (no-op revisions / ``RefineExhausted``), not by a
+        per-(kind, task) counter.
         """
+        if self._plan_revision_cooldown_seconds <= 0:
+            return
         key = (drift.current_task_id, drift.kind.value)
-        if self._plan_revision_cooldown_seconds > 0:
-            session._last_plan_revision_at[key] = time.monotonic()
-        # Bump the unconditional revision counter (goldfive#271
-        # follow-up). Exempt kinds (USER_STEER, USER_CANCEL, GOAL_DRIFT)
-        # do not contribute to the cap so user actions never burn the
-        # budget. GOAL_DRIFT has its own rate-limit via
-        # ``_last_goal_drift_check_ts``.
-        if drift.kind not in self._PLAN_REVISION_COOLDOWN_EXEMPT_KINDS:
-            session.plan_revision_counts[key] = session.plan_revision_counts.get(key, 0) + 1
+        session._last_plan_revision_at[key] = time.monotonic()
 
     @staticmethod
     def _integrate_correction_supersedes(revised: Plan) -> None:

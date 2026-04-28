@@ -74,14 +74,18 @@ class StubPlanner:
         goals: list[Goal],
     ) -> Plan | None:
         self.refine_calls.append({"drift": drift})
-        # Return a minimally-valid revised plan. Re-use the incoming
-        # plan's tasks/edges so ``Plan.validate(for_revision=True,
-        # prior=plan)`` passes -- the steerer runs that after refine.
+        # Return a structurally-distinct revised plan: append a fresh
+        # task with a unique id per call so the steerer's no-op revision
+        # rejection (goldfive#271) sees a real diff. ``Plan.validate
+        # (for_revision=True, prior=plan)`` still passes because the
+        # original tasks/edges are preserved verbatim.
+        new_task_id = f"refine-task-{len(self.refine_calls)}"
         revised = Plan(
             id=plan.id,
             run_id=plan.run_id,
             goal_ids=list(plan.goal_ids),
-            tasks=[Task(id=t.id, title=t.title, status=t.status) for t in plan.tasks],
+            tasks=[Task(id=t.id, title=t.title, status=t.status) for t in plan.tasks]
+            + [Task(id=new_task_id, title=new_task_id)],
             edges=[
                 TaskEdge(from_task_id=e.from_task_id, to_task_id=e.to_task_id)
                 for e in plan.edges
@@ -372,8 +376,10 @@ async def test_plan_revised_event_populates_refine_summaries(
     assert "task=t1" in pr.refine_input_summary
     assert "prior_plan=rev0" in pr.refine_input_summary
     # Output summary carries the revised index + task count + titles.
+    # The StubPlanner appends a structurally-distinct sentinel task per
+    # call (goldfive#271 no-op rejection) so the count is 3, not 2.
     assert "revision_index=1" in pr.refine_output_summary
-    assert "tasks=2" in pr.refine_output_summary
+    assert "tasks=3" in pr.refine_output_summary
 
 
 async def test_plan_revised_event_stamps_target_agent_id(
