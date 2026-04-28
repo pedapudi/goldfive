@@ -419,23 +419,25 @@ async def test_run_async_impl_without_on_run_end_plugins_still_works(
 
 
 # ---------------------------------------------------------------------------
-# Phase 2.X / goldfive#271 Gap 3: per-turn judge drain is bounded tightly
+# goldfive#319: per-turn boundary must NOT cancel background judge tasks
 # ---------------------------------------------------------------------------
 
 
-async def test_per_turn_drain_uses_short_timeout_not_runner_close_default(
+async def test_per_turn_boundary_does_not_call_steerer_shutdown(
     stub_call_llm: Any,
 ) -> None:
-    """``_drain_steerer_background_judges`` passes the
-    :data:`GoldfiveADKAgent._PER_TURN_DRAIN_TIMEOUT_S` to
-    ``Steerer.shutdown`` so a slow judge can't stall ADK's iterator
-    exit for the full :meth:`Steerer.shutdown` default (5s).
+    """``_run_async_impl``'s ``finally`` MUST NOT invoke
+    ``steerer.shutdown`` (goldfive#319).
 
-    Validation E2E (session 95ecda4c) saw the residual #275-style
-    stale-session race after the per-turn drain held ADK's outer
-    loop for 5s while a concurrent ``/run_sse`` invocation advanced
-    the SQLite session. Tightening the per-turn timeout to 0.5s
-    bounds the race window.
+    The previous Phase 2.X drain called ``shutdown(timeout=0.5)`` at
+    every adk-web outer-turn boundary, which fired ``task.cancel()`` on
+    every in-flight reasoning-judge task. That dropped slow judges'
+    drift verdicts on the floor whenever the judge took longer than
+    0.5s — even when the same Runner had many more turns ahead of it
+    and would have happily awaited the verdict on the next observe.
+
+    The fix is structural: judges live for the lifetime of the
+    :class:`Runner`, and the only canonical drain is :meth:`Runner.close`.
     """
     from unittest.mock import AsyncMock
 
@@ -454,78 +456,26 @@ async def test_per_turn_drain_uses_short_timeout_not_runner_close_default(
     wrapped.runner.agent.invoke = AsyncMock(side_effect=_fake_invoke)
     wrapped.runner.executor = SequentialExecutor(max_task_invocations=3)
 
-    # Spy the steerer's shutdown to capture the timeout argument.
-    captured_timeouts: list[float | None] = []
+    # Spy on ``shutdown`` and assert it is NEVER invoked during the
+    # per-turn run. ``Runner.close`` is the only path that should
+    # drain background judges, and it isn't called by
+    # ``_run_async_impl``.
+    shutdown_call_count = 0
 
     async def _spy_shutdown(*args: Any, **kwargs: Any) -> None:
-        captured_timeouts.append(kwargs.get("timeout"))
+        nonlocal shutdown_call_count
+        shutdown_call_count += 1
 
     wrapped.runner.steerer.shutdown = _spy_shutdown  # type: ignore[method-assign]
 
     ctx = _FakeCtx("do a thing")
     [evt async for evt in wrapped._run_async_impl(ctx)]
 
-    assert captured_timeouts, (
-        "_drain_steerer_background_judges did not call steerer.shutdown"
+    assert shutdown_call_count == 0, (
+        "per-turn ``_run_async_impl`` must not call ``steerer.shutdown`` "
+        "(goldfive#319 regression: that cancels in-flight background "
+        f"judges). Got {shutdown_call_count} call(s)."
     )
-    timeout = captured_timeouts[0]
-    assert timeout is not None, (
-        "per-turn drain must pass an explicit timeout (got None)"
-    )
-    # Tight enough that a 5s shutdown can't blow it open. We assert
-    # well under 1s as the regression bound.
-    assert timeout <= 1.0, (
-        f"per-turn drain timeout regressed to {timeout!r}; expected <= 1s"
-    )
-
-
-async def test_per_turn_drain_falls_back_when_steerer_shutdown_lacks_timeout(
-    stub_call_llm: Any,
-) -> None:
-    """Custom Steerers without the ``timeout=`` kwarg fall through to
-    the legacy default-call shape. This is the back-compat path for
-    third-party Steerers that haven't been updated for the per-turn
-    timeout knob.
-    """
-    from unittest.mock import AsyncMock
-
-    from goldfive import InvocationResult, SequentialExecutor
-
-    inner = _mk_inner()
-    wrapped = goldfive.wrap(
-        inner,
-        planner=_one_task_planner(),
-        sinks=[InMemorySink()],
-    )
-
-    async def _fake_invoke(task: Task, session: Any) -> InvocationResult:
-        return InvocationResult(task_id=task.id, text="ok")
-
-    wrapped.runner.agent.invoke = AsyncMock(side_effect=_fake_invoke)
-    wrapped.runner.executor = SequentialExecutor(max_task_invocations=3)
-
-    # Old-shape shutdown: no timeout kwarg, raises TypeError when one
-    # is passed. The drain helper must catch the TypeError and retry
-    # with no kwargs.
-    call_log: list[str] = []
-
-    async def _legacy_shutdown() -> None:
-        call_log.append("no-kwargs")
-
-    async def _entry_shutdown(*args: Any, **kwargs: Any) -> None:
-        if kwargs:
-            raise TypeError("legacy shutdown takes no kwargs")
-        call_log.append("entry")
-        await _legacy_shutdown()
-
-    wrapped.runner.steerer.shutdown = _entry_shutdown  # type: ignore[method-assign]
-
-    ctx = _FakeCtx("do a thing")
-    [evt async for evt in wrapped._run_async_impl(ctx)]
-
-    # The fallthrough call shape (no kwargs) was reached after the
-    # initial timeout-kwarg call raised TypeError.
-    assert "entry" in call_log
 
 
 # ---------------------------------------------------------------------------
