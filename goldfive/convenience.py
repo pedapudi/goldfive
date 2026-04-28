@@ -161,6 +161,7 @@ def wrap(
     plugins: list[Any] | None = None,
     runtime: RuntimeConfig | None = None,
     dynamic_instruction: bool = True,
+    drift_self_reporting: bool | list[str] = False,
     **legacy_kwargs: Any,
 ) -> Runner:
     """Build a :class:`Runner` that drives ``agent`` with goldfive.
@@ -242,6 +243,20 @@ def wrap(
         :class:`DefaultSteerer` via its config kwargs. An explicit
         ``steerer=`` kwarg wins — the caller keeps full control
         over the steerer they build themselves.
+    drift_self_reporting:
+        Forwarded to :class:`Runner`. Default ``False`` (goldfive#196):
+        only the lifecycle reporting tools (``report_task_started`` /
+        ``_progress`` / ``_completed`` / ``_failed`` / ``_blocked`` /
+        ``_awaiting_approval`` / ``report_new_work_discovered``) are
+        registered on the agent. The drift opinions —
+        ``report_plan_divergence``, ``declare_task_skipped``,
+        ``declare_task_not_needed`` — are NOT registered, so the
+        prompt is smaller and the model can't hallucinate a drift
+        call. The framework's observation paths
+        (``classify_goal_drift``, :class:`PlanReconciler`, the
+        steerer's refine machinery) remain the canonical detectors.
+        Pass ``True`` to restore the full pre-#196 set, or a list of
+        drift tool names to enable a subset.
 
     Returns
     -------
@@ -497,6 +512,7 @@ def wrap(
         sinks=resolved_sinks,
         control=control,
         max_task_invocations=max_task_invocations,
+        drift_self_reporting=drift_self_reporting,
     )
 
     # When the judges were routed through a dedicated JudgeConfig

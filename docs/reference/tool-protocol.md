@@ -29,6 +29,35 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
 
 Pre-built specs live in `goldfive.reporting.BUILTIN_REPORTING_TOOLS`.
 
+> **Default registration (goldfive#196).** The `Runner` registers only
+> the *lifecycle* subset of these tools by default. The drift-related
+> self-reporting tools — `report_plan_divergence`,
+> `declare_task_skipped`, `declare_task_not_needed` — are **opt-in**
+> via `Runner(drift_self_reporting=...)` (or
+> `goldfive.wrap(drift_self_reporting=...)`):
+>
+> * `False` (default) — register only the lifecycle subset
+>   (`report_task_*`, `report_awaiting_approval`,
+>   `report_new_work_discovered`). Each drift tool's schema costs
+>   ~200-400 prompt tokens AND expands the model's hallucination
+>   surface; the framework's observation paths
+>   (`classify_goal_drift`, `PlanReconciler`, the steerer's refine
+>   machinery) cover the same signal more reliably.
+> * `True` — register the full canonical set (legacy behaviour).
+> * `list[str]` — register the lifecycle subset PLUS the named drift
+>   tools, e.g. `["report_plan_divergence"]` re-enables that one tool
+>   while leaving the declarations off.
+>
+> `report_new_work_discovered` is intentionally NOT in the drift
+> bucket — there is no observation analog for an agent surfacing
+> genuinely new work, so it stays default-on.
+>
+> The lifecycle / drift split is exposed as
+> `goldfive.LIFECYCLE_REPORTING_TOOLS`,
+> `goldfive.DRIFT_SELF_REPORTING_TOOLS`, and
+> `goldfive.DRIFT_SELF_REPORTING_TOOL_NAMES` for adapters /
+> Runner-likes that want to derive the same subset.
+
 Related: [STATE-MACHINE.md](../design/STATE-MACHINE.md),
 [PROTOCOLS.md](../design/PROTOCOLS.md#agentadapter),
 [writing-an-agent-adapter.md](../guides/writing-an-agent-adapter.md),

@@ -1490,6 +1490,29 @@ _SCHEMA_DECLARE_TASK_NOT_NEEDED = _object_schema(
 # ---------------------------------------------------------------------------
 
 
+# goldfive#196: drift-related self-reporting tools. These overlap with
+# observation-driven detectors (``goldfive.reconciler.PlanReconciler``,
+# the trajectory-level ``classify_goal_drift`` judge, and the steerer's
+# refine machinery), so registering them on every sub-agent is pure
+# downside: they inflate prompt size by ~200-400 tokens each AND expand
+# the agent's hallucination surface (the model can confabulate a drift
+# call when it's confused). The Runner gates them behind an opt-in flag
+# (``Runner(drift_self_reporting=...)``) so the lifecycle subset stays
+# default-on while the drift opinions are off by default. ``True``
+# preserves the legacy behaviour of registering every canonical tool.
+#
+# Note: ``report_new_work_discovered`` is intentionally NOT in this set
+# — there is no observation analog for an agent surfacing genuinely new
+# work, so it stays default-on. See goldfive#196.
+DRIFT_SELF_REPORTING_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "report_plan_divergence",
+        "declare_task_skipped",
+        "declare_task_not_needed",
+    }
+)
+
+
 BUILTIN_REPORTING_TOOLS: list[ReportingToolSpec] = [
     ReportingToolSpec(
         name="report_task_started",
@@ -1616,13 +1639,87 @@ BUILTIN_REPORTING_TOOLS: list[ReportingToolSpec] = [
 ]
 
 
+# goldfive#196: lifecycle / observability subset — every BUILTIN tool
+# whose name is NOT in :data:`DRIFT_SELF_REPORTING_TOOL_NAMES`. This is
+# the default Runner registration set; the drift tools are gated behind
+# ``Runner(drift_self_reporting=...)``. Keep this derived (rather than
+# enumerated by hand) so adding a new lifecycle tool to
+# :data:`BUILTIN_REPORTING_TOOLS` flows through automatically.
+LIFECYCLE_REPORTING_TOOLS: list[ReportingToolSpec] = [
+    spec
+    for spec in BUILTIN_REPORTING_TOOLS
+    if spec.name not in DRIFT_SELF_REPORTING_TOOL_NAMES
+]
+
+
+# goldfive#196: drift-only subset — the BUILTIN tools whose names ARE
+# in :data:`DRIFT_SELF_REPORTING_TOOL_NAMES`. Convenience for callers
+# that want to register the drift tools explicitly via
+# ``Runner(drift_self_reporting=True)`` or
+# ``Runner(drift_self_reporting=[<name>, ...])``.
+DRIFT_SELF_REPORTING_TOOLS: list[ReportingToolSpec] = [
+    spec
+    for spec in BUILTIN_REPORTING_TOOLS
+    if spec.name in DRIFT_SELF_REPORTING_TOOL_NAMES
+]
+
+
+def select_reporting_tools(
+    drift_self_reporting: bool | list[str] | tuple[str, ...] | frozenset[str] | set[str],
+) -> list[ReportingToolSpec]:
+    """Return the reporting tool specs to register based on the opt-in flag.
+
+    ``drift_self_reporting`` semantics (matches ``Runner.__init__``):
+
+    * ``False`` (default for the Runner) — return the lifecycle subset
+      only. Drift tools are NOT registered; the agent cannot
+      self-report ``report_plan_divergence`` /
+      ``declare_task_skipped`` / ``declare_task_not_needed``. The
+      framework's observation paths (``classify_goal_drift``,
+      :class:`~goldfive.reconciler.PlanReconciler`, the steerer's
+      refine machinery) remain the canonical detectors.
+    * ``True`` — return the full ``BUILTIN_REPORTING_TOOLS`` list
+      (legacy behaviour). The agent can self-report every drift kind.
+    * iterable of tool names — return the lifecycle subset PLUS the
+      named drift tools. Names not in
+      :data:`DRIFT_SELF_REPORTING_TOOL_NAMES` are silently ignored
+      (so a typo doesn't accidentally enable a non-drift tool, and
+      there is nothing meaningful to do with a name that isn't a
+      drift tool — lifecycle tools are always on). An empty iterable
+      collapses to the ``False`` case.
+
+    Used by :class:`~goldfive.runner.Runner.run` step 5 to decide
+    which tool specs to hand to ``agent.register_reporting_tools``.
+    Exposed here (rather than as a private helper on Runner) so
+    custom Runner-likes / ad-hoc adapters can derive the same subset
+    from the same flag.
+    """
+    if drift_self_reporting is True:
+        return list(BUILTIN_REPORTING_TOOLS)
+    if drift_self_reporting is False:
+        return list(LIFECYCLE_REPORTING_TOOLS)
+    # Iterable of names — accept list / tuple / set / frozenset.
+    requested = {str(n).strip() for n in drift_self_reporting if str(n).strip()}
+    if not requested:
+        return list(LIFECYCLE_REPORTING_TOOLS)
+    selected: list[ReportingToolSpec] = list(LIFECYCLE_REPORTING_TOOLS)
+    for spec in DRIFT_SELF_REPORTING_TOOLS:
+        if spec.name in requested:
+            selected.append(spec)
+    return selected
+
+
 __all__ = [
     "DECLARATION_KIND_NOT_NEEDED",
     "DECLARATION_KIND_SKIPPED",
     "DECLARATION_KINDS",
     "DECLARATIONS_KEY",
+    "DRIFT_SELF_REPORTING_TOOL_NAMES",
+    "DRIFT_SELF_REPORTING_TOOLS",
+    "LIFECYCLE_REPORTING_TOOLS",
     "ReportingHandler",
     "ReportingToolSpec",
     "REPORTING_TOOL_NAMES",
     "BUILTIN_REPORTING_TOOLS",
+    "select_reporting_tools",
 ]

@@ -39,7 +39,13 @@ from goldfive.protocols import (
     Steerer,
 )
 from goldfive.quickstart import quickstart
-from goldfive.reporting import BUILTIN_REPORTING_TOOLS, ReportingToolSpec
+from goldfive.reporting import (
+    BUILTIN_REPORTING_TOOLS,
+    DRIFT_SELF_REPORTING_TOOL_NAMES,
+    DRIFT_SELF_REPORTING_TOOLS,
+    LIFECYCLE_REPORTING_TOOLS,
+    ReportingToolSpec,
+)
 from goldfive.results import ExecutionOutcome, InvocationResult
 from goldfive.runner import Runner
 from goldfive.sinks import (
@@ -70,6 +76,9 @@ __all__ = [
     "AgentAdapter",
     "BUILTIN_REPORTING_TOOLS",
     "CallableAdapter",
+    "DRIFT_SELF_REPORTING_TOOLS",
+    "DRIFT_SELF_REPORTING_TOOL_NAMES",
+    "LIFECYCLE_REPORTING_TOOLS",
     "ControlAck",
     "ControlChannel",
     "ControlKind",
