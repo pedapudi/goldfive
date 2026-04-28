@@ -3350,49 +3350,27 @@ class DefaultSteerer:
             return "user_pause"
         return "drift"
 
-    @staticmethod
-    def _is_synthetic_install_user_steer(drift: DriftEvent) -> bool:
-        """Return True for the synthetic USER_STEER drift that
-        :meth:`Runner._install_revision` synthesizes on every turn whose
-        ``handle_turn`` produced a plan.
-
-        That call site stamps a USER_STEER ``DriftEvent`` with
-        ``drift.raw is None`` purely to drive the structural install
-        pipeline through :meth:`apply_user_steer_with_plan`. It is
-        not a refine triggered by a problem with an in-flight
-        invocation, so cancel-on-revision MUST exempt it (cancelling
-        the just-starting coordinator turn against a freshly-installed
-        plan would defeat the whole point of installing it).
-
-        Genuine operator STEERs from a real ControlMessage land here
-        with ``drift.raw`` populated and SHOULD trigger a cancel of
-        the in-flight turn (matching pre-unification USER_STEER cancel
-        semantics). The two callers of
-        :meth:`apply_user_steer_with_plan` are documented in that
-        method's docstring.
-        """
-        return drift.kind is DriftKind.USER_STEER and getattr(drift, "raw", None) is None
-
     async def _cancel_inflight_for_revision(self, drift: DriftEvent, session: Session) -> list[str]:
         """Cancel the in-flight invocation(s) that produced ``drift``.
 
-        Called from every PlanRevised emission path right after the
-        revised plan has been applied to the session and BEFORE the
-        ``PlanRevised`` event is emitted. Closes the gap behind the v15
-        concurrent-invocation bug: a ``refine_steer`` call (10+ minutes
-        on a slow planner) used to overlap the coordinator's invocation
-        for its full duration because the existing cancel-state flag
-        only gates SUBSEQUENT callbacks — the already-running LLM
-        streaming call kept generating output that triggered more
-        drift, looping the refine.
+        Called from every drift-driven PlanRevised emission path right
+        after the revised plan has been applied to the session and
+        BEFORE the ``PlanRevised`` event is emitted. Closes the gap
+        behind the v15 concurrent-invocation bug: a ``refine_steer``
+        call (10+ minutes on a slow planner) used to overlap the
+        coordinator's invocation for its full duration because the
+        existing cancel-state flag only gates SUBSEQUENT callbacks —
+        the already-running LLM streaming call kept generating output
+        that triggered more drift, looping the refine.
 
-        Skips the synthetic USER_STEER drift
-        :meth:`Runner._install_revision` synthesizes on every turn
-        (see :meth:`_is_synthetic_install_user_steer`). Every other
-        drift kind that produces a successful PlanRevised (refine
-        from drift, refine_steer from goldfive-steer promotion,
-        operator USER_STEER from a real ControlMessage) flows through
-        this method. The plugin's
+        After Option A (goldfive#271 follow-up), turn-1 first-plan
+        installs no longer reach this path:
+        :meth:`install_initial_plan` skips it directly because there
+        is no in-flight invocation to cancel on a fresh session. Every
+        drift-driven install (refine from drift, refine_steer from
+        goldfive-steer promotion, operator USER_STEER from a real
+        ControlMessage, NEW_WORK_DISCOVERED from an N+1 user message)
+        flows through this method. The plugin's
         :meth:`request_invocation_cancel` then writes the cancel-state
         flag (sticky-gate from PR #299) AND fires ``task.cancel()`` on
         the registered asyncio.Task (goldfive#271 follow-up) so the
@@ -3406,8 +3384,6 @@ class DefaultSteerer:
         still lands; the in-flight invocation simply runs to
         completion under the older, less aggressive contract).
         """
-        if self._is_synthetic_install_user_steer(drift):
-            return []
         try:
             return await self.request_invocation_cancel(
                 drift=drift,
@@ -3890,83 +3866,190 @@ class DefaultSteerer:
                     exc,
                 )
 
-    async def apply_user_steer_with_plan(
+    async def install_initial_plan(
         self,
         *,
-        drift: DriftEvent,
         session: Session,
-        revised_plan: Plan,
+        plan: Plan,
     ) -> bool:
-        """Install ``revised_plan`` as a revision of ``session.plan``.
+        """Install ``plan`` as the very first revision (rev 1) of ``session.plan``.
 
-        Goldfive#271 Phase 4 entrypoint used by :meth:`Runner.run`
-        when :meth:`Planner.handle_turn` produced the next revision
-        directly. Replaces the prior pipeline of:
+        Used on turn 1 of a fresh conversation when ``session.plan`` is
+        a :meth:`Plan.empty` seed. Emits :class:`PlanRevised` with
+        ``revision_index = 1`` and **no** :class:`DriftDetected` event:
+        installing the first plan is not a corrective intervention,
+        and stamping a USER_STEER drift here was the category error
+        Option A (goldfive#271 follow-up) eliminates.
 
-        1. ``planner.synthesize_goal_from_steer`` (one LLM call)
-        2. regex-based qualification merge
-        3. ``_handle_drift`` → ladder dispatch → ``planner.refine``
-           (second LLM call)
+        The internal ``DriftEvent`` placeholder this method passes to
+        :meth:`_apply_revision` and :meth:`_emit_plan_revised` carries
+        ``DriftKind.NEW_WORK_DISCOVERED`` (``severity=INFO``) so the
+        :class:`PlanRevised` envelope's ``drift_kind`` field has a
+        coherent value — that field is required by the proto and
+        downstream consumers (harmonograf) read it for revision
+        framing. The placeholder is **never emitted** as a
+        ``DriftDetected``.
 
-        with:
-
-        1. ``planner.handle_turn`` (one LLM call producing the
-           revised plan directly)
-        2. this method (purely structural install, no LLM)
-
-        The full revision pipeline fires:
-
-        * :meth:`_apply_user_steer_state` — active_steer bookkeeping +
-          dedup. Only fires when the drift originated from a real
-          user-control STEER :class:`ControlMessage` (``drift.raw`` set);
-          Runner-synthesized USER_STEER drifts (no ``raw``) skip this so
-          ``goldfive.active_steer.*`` reflects only genuine operator
-          interventions, not every fresh user turn driven through
-          :meth:`Planner.handle_turn`.
-        * :meth:`_emit_drift_detected` — ``DriftDetected``
-        * :meth:`_apply_revision` — install revised + bump
-          ``revision_index`` + stamp metadata
-        * :meth:`_emit_plan_revised` — ``PlanRevised`` + paired
-          ``RefineAttempted``/``RefineSuccess`` envelopes for parity
-          with the legacy refine path
-
-        Returns ``True`` on success (revised plan installed,
-        ``PlanRevised`` emitted), ``False`` on validation failure
-        (revised plan rejected; session.plan reverts to the prior).
+        Returns ``True`` on success, ``False`` on validation failure.
         Never raises.
         """
-        # Normalise source attribution so DriftDetected carries
-        # the right ``authored_by``.
+        try:
+            plan.validate(for_revision=True, prior=session.plan)
+        except ValueError as exc:
+            await self._emit_drift_detected(
+                session,
+                DriftEvent(
+                    kind=DriftKind.SCHEMA_VIOLATION,
+                    severity=DriftSeverity.CRITICAL,
+                    detail=f"plan validation failed: {exc}",
+                    current_task_id=session.current_task_id,
+                    authored_by="goldfive",
+                ),
+            )
+            return False
+        # Placeholder drift used only to thread metadata through
+        # :meth:`_apply_revision` / :meth:`_emit_plan_revised`. Not
+        # emitted as a DriftDetected.
+        placeholder = DriftEvent(
+            kind=DriftKind.NEW_WORK_DISCOVERED,
+            severity=DriftSeverity.INFO,
+            detail="initial plan install",
+            authored_by="goldfive",
+        )
+        prev_plan = session.plan
+        self._apply_revision(session, plan, placeholder)
+        # No cancel-in-flight: nothing is running yet on the very
+        # first install.
+        await self._emit_plan_revised(
+            session,
+            plan,
+            placeholder,
+            prev_plan=prev_plan,
+            attempt_id=None,
+        )
+        return True
+
+    async def install_revision_for_drift(
+        self,
+        *,
+        session: Session,
+        drift: DriftEvent,
+        revised_plan: Plan,
+    ) -> bool:
+        """Install ``revised_plan`` in response to a real :class:`DriftEvent`.
+
+        The general-purpose install path for non-user-steer revisions:
+        an LLM-driven replan after the user's next-turn message
+        (``DriftKind.NEW_WORK_DISCOVERED``), an autonomous
+        detector-promoted refine, or any other drift-driven plan
+        revision the caller has already classified.
+
+        Pipeline:
+
+        * :meth:`_emit_drift_detected` — ``DriftDetected`` carrying
+          the **real** drift kind/severity/detail
+        * validate against prior plan; emit ``SCHEMA_VIOLATION`` and
+          return ``False`` on failure
+        * :meth:`_apply_revision` — bump ``revision_index`` + stamp
+          metadata
+        * :meth:`_cancel_inflight_for_revision` — preempt any
+          in-flight invocation per the drift's severity
+        * :meth:`_emit_plan_revised` — ``PlanRevised`` + the paired
+          refine-attempted / -success sidecar envelopes
+
+        Refuses :class:`DriftKind.USER_STEER` — callers must route
+        genuine operator steers through
+        :meth:`install_revision_for_user_steer` so the active_steer
+        bookkeeping and dedupe fire correctly.
+
+        Returns ``True`` on success, ``False`` on validation failure.
+        Never raises.
+        """
+        if drift.kind is DriftKind.USER_STEER:
+            raise ValueError(
+                "install_revision_for_drift refuses USER_STEER drifts; "
+                "use install_revision_for_user_steer for genuine "
+                "operator-pushed STEER ControlMessages."
+            )
         if not drift.authored_by:
             drift.authored_by = self._resolve_authored_by(drift)
-        # USER_STEER bookkeeping. Two callers reach this method:
-        #   (a) :meth:`Runner._install_revision` — synthesizes a
-        #       USER_STEER drift on EVERY turn whose handle_turn
-        #       produced a plan, with ``drift.raw is None``. This is
-        #       not a genuine operator STEER intervention — it's just
-        #       the structural install pipeline. Stamping
-        #       ``goldfive.active_steer.*`` here would smear every
-        #       fresh user turn into the active-steer slot the planner
-        #       prompt reads to remember the most recent operator
-        #       directive, and prepend the user's raw input onto
-        #       ``processed_steer_ids`` for no benefit (the dedupe id
-        #       is empty without a ControlMessage behind the drift).
-        #   (b) (no other callers today) — reserved for a future
-        #       direct-from-control STEER path that bypasses the
-        #       executor's steer-drain loop. Such callers will populate
-        #       ``drift.raw`` from the originating ControlMessage and
-        #       genuinely want the bookkeeping.
-        # Gate on ``drift.raw`` so (a) skips and (b) (when added) gets
-        # the bookkeeping naturally. Drift kind alone isn't enough:
-        # both callers use ``DriftKind.USER_STEER``; ``raw`` is the
-        # carrier of "this came from a real ControlMessage".
-        if drift.kind is DriftKind.USER_STEER and getattr(drift, "raw", None) is not None:
+        return await self._install_with_drift(
+            session=session,
+            drift=drift,
+            revised_plan=revised_plan,
+            apply_user_steer_state=False,
+        )
+
+    async def install_revision_for_user_steer(
+        self,
+        *,
+        session: Session,
+        raw: Any,
+        revised_plan: Plan,
+    ) -> bool:
+        """Install ``revised_plan`` in response to an operator
+        :class:`~goldfive.control.ControlMessage` STEER.
+
+        ``raw`` is the originating :class:`ControlMessage`; this method
+        builds the ``USER_STEER`` :class:`DriftEvent` internally so
+        callers cannot accidentally fabricate a USER_STEER from
+        plumbing (the category error #199/#302 papered over).
+
+        Pipeline:
+
+        * :meth:`_apply_user_steer_state` — active_steer bookkeeping +
+          dedup (always — every call here represents genuine operator
+          action)
+        * :meth:`_emit_drift_detected` — ``USER_STEER`` ``DriftDetected``
+          with ``raw`` populated and ``authored_by="user"``
+        * validate revised plan; emit ``SCHEMA_VIOLATION`` on failure
+        * :meth:`_apply_revision` + :meth:`_cancel_inflight_for_revision`
+          + :meth:`_emit_plan_revised`
+
+        Returns ``True`` on success, ``False`` on validation failure.
+        Never raises.
+        """
+        body, author, _dedupe = self._unpack_steer_context(
+            DriftEvent(
+                kind=DriftKind.USER_STEER,
+                severity=DriftSeverity.WARNING,
+                raw=raw,
+            )
+        )
+        detail = f"by {author}: {body}" if author else body
+        drift = DriftEvent(
+            kind=DriftKind.USER_STEER,
+            severity=DriftSeverity.WARNING,
+            detail=detail,
+            raw=raw,
+            authored_by="user",
+        )
+        return await self._install_with_drift(
+            session=session,
+            drift=drift,
+            revised_plan=revised_plan,
+            apply_user_steer_state=True,
+        )
+
+    async def _install_with_drift(
+        self,
+        *,
+        session: Session,
+        drift: DriftEvent,
+        revised_plan: Plan,
+        apply_user_steer_state: bool,
+    ) -> bool:
+        """Shared install pipeline for the two drift-driven install APIs.
+
+        Emits ``DriftDetected`` then validates + installs the revision
+        + emits ``PlanRevised``. The ``apply_user_steer_state`` flag
+        gates the ``goldfive.active_steer.*`` bookkeeping so genuine
+        operator STEERs write the slot and other drift-driven
+        installs do not.
+        """
+        if apply_user_steer_state:
             await self._apply_user_steer_state(drift, session)
         await self._emit_drift_detected(session, drift)
-        # Validate the revised plan against the prior. Use the same
-        # ``for_revision=True`` shape as the steerer's drift-handling
-        # pipeline so a malformed revision is rejected with the same
-        # SCHEMA_VIOLATION CRITICAL drift the legacy path emits.
         try:
             revised_plan.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
@@ -3977,26 +4060,14 @@ class DefaultSteerer:
                     severity=DriftSeverity.CRITICAL,
                     detail=f"plan validation failed: {exc}",
                     current_task_id=session.current_task_id,
+                    authored_by="goldfive",
                 ),
             )
             return False
-        # Capture prev_plan BEFORE _apply_revision swaps it; the
-        # PlanRevisionDiff sidecar in _emit_plan_revised diffs the
-        # two.
         prev_plan = session.plan
         attempt_id = self._new_attempt_id()
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         self._apply_revision(session, revised_plan, drift)
-        # Cancel the in-flight invocation when this is a genuine
-        # operator STEER (drift.raw populated) rather than the
-        # synthetic install USER_STEER from
-        # :meth:`Runner._install_revision`. The exemption lives
-        # inside :meth:`_cancel_inflight_for_revision` itself —
-        # see :meth:`_is_synthetic_install_user_steer` for the
-        # rationale (cancelling on every fresh-turn install would
-        # immediately preempt the just-starting coordinator
-        # against the freshly-installed plan, defeating the
-        # whole point of installing it).
         await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session,
@@ -4005,11 +4076,77 @@ class DefaultSteerer:
             prev_plan=prev_plan,
             attempt_id=attempt_id,
         )
-        # Stamp the cooldown table so a follow-up drift of the same
-        # kind+task within the cooldown is gated. Mirrors the legacy
-        # _handle_drift path so behavior is identical.
         self._record_plan_revision(drift, session)
         return True
+
+    async def apply_user_steer_with_plan(
+        self,
+        *,
+        drift: DriftEvent,
+        session: Session,
+        revised_plan: Plan,
+    ) -> bool:
+        """Back-compat shim — prefer :meth:`install_revision_for_drift`
+        or :meth:`install_revision_for_user_steer` instead.
+
+        Routes based on ``drift.kind`` + ``drift.raw``:
+
+        * ``USER_STEER`` with ``raw`` populated → routed to
+          :meth:`install_revision_for_user_steer`. The ``raw`` from
+          the supplied drift is forwarded; ``drift.detail`` /
+          ``drift.authored_by`` are ignored (the new API rebuilds
+          them from ``raw`` deterministically).
+        * ``USER_STEER`` with ``raw is None`` → was the
+          :meth:`Runner._install_revision` synthetic install path
+          before Option A. The new Runner path no longer reaches this
+          shim; callers in this state probably mean
+          :meth:`install_initial_plan` (turn 1) or
+          :meth:`install_revision_for_drift` with a real drift kind
+          (turn N+1). Routed defensively to ``install_initial_plan``
+          when ``session.plan`` is empty, otherwise to
+          ``install_revision_for_drift`` with a synthesized
+          ``NEW_WORK_DISCOVERED`` drift so legacy callers keep
+          working — but a deprecation warning fires.
+        * Any other drift kind → routed to
+          :meth:`install_revision_for_drift`.
+
+        Slated for removal once external callers migrate.
+        """
+        import warnings
+
+        warnings.warn(
+            "DefaultSteerer.apply_user_steer_with_plan is deprecated; "
+            "use install_initial_plan / install_revision_for_drift / "
+            "install_revision_for_user_steer (goldfive#271 Option A).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if drift.kind is DriftKind.USER_STEER and getattr(drift, "raw", None) is not None:
+            return await self.install_revision_for_user_steer(
+                session=session,
+                raw=drift.raw,
+                revised_plan=revised_plan,
+            )
+        if drift.kind is DriftKind.USER_STEER:
+            # Legacy synthetic-install path. Pick the new-API equivalent.
+            if session.plan is None or not session.plan.tasks:
+                return await self.install_initial_plan(
+                    session=session, plan=revised_plan
+                )
+            replan_drift = DriftEvent(
+                kind=DriftKind.NEW_WORK_DISCOVERED,
+                severity=DriftSeverity.INFO,
+                detail=drift.detail,
+                authored_by="goldfive",
+            )
+            return await self.install_revision_for_drift(
+                session=session,
+                drift=replan_drift,
+                revised_plan=revised_plan,
+            )
+        return await self.install_revision_for_drift(
+            session=session, drift=drift, revised_plan=revised_plan
+        )
 
     # Consecutive refine failures tolerated per (drift_kind, task_id)
     # before we give up and mark the task FAILED. Class attribute so
@@ -4205,16 +4342,6 @@ class DefaultSteerer:
             "trigger_severity": drift.severity.value,
             "current_task_id": drift.current_task_id or "",
             "current_agent_id": drift.current_agent_id or "",
-            # goldfive#271 follow-up: forward the synthetic flag from the
-            # triggering drift so harmonograf's intervention deriver can
-            # filter the merged ``REFINE`` row out of the user-facing
-            # interventions panel when the underlying drift was just
-            # plumbing (e.g. ``Runner._install_revision`` synthesizing a
-            # USER_STEER drift on every plan install). Without this,
-            # synthetic-drift filtering on the drift row alone leaves a
-            # phantom ``REFINE:USER_STEER`` card on the panel for every
-            # fresh user turn (v15 UI ``v15presmtx-1`` evidence).
-            "synthetic": bool(getattr(drift, "synthetic", False)),
         }
         try:
             evt = make_event(
@@ -4744,13 +4871,6 @@ class DefaultSteerer:
         # ``_dispatch_pause_escalate`` / ``_emit_refine_failure``).
         evt.drift_detected.authored_by = self._resolve_authored_by(drift)
         evt.drift_detected.suppressed_by_user_steer = bool(drift.suppressed_by_user_steer)
-        # Forward the plumbing-marker so harmonograf can filter goldfive-
-        # synthesized drifts (e.g. the USER_STEER drift
-        # ``Runner._install_revision`` fabricates on every plan install)
-        # out of the user-facing interventions panel while keeping them
-        # in the full audit timeline. Always ``False`` on real
-        # user-control drifts and on autonomous detector drifts.
-        evt.drift_detected.synthetic = bool(getattr(drift, "synthetic", False))
         # goldfive#199: stamp the drift's own id on the wire so a
         # subsequent ``PlanRevised.trigger_event_id`` can strict-match the
         # drift row in harmonograf. Always non-empty — ``DriftEvent``

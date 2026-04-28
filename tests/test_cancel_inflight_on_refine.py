@@ -25,14 +25,15 @@ This file pins the cancel-on-refine wiring:
 4. The deferred-cancel path lets the calling coroutine finish its
    PlanRevised emit before the dispatch task observes the cancel —
    no lost ``PlanRevised`` event.
-5. The steerer's ``_cancel_inflight_for_revision`` exempts the
-   synthetic install ``USER_STEER`` drift from
-   :meth:`Runner._install_revision` (``drift.raw is None``) so a
-   fresh-turn plan install doesn't immediately preempt the
-   just-starting coordinator.
+5. After Option A (goldfive#271 follow-up), turn-1 first-plan
+   installs no longer reach ``_cancel_inflight_for_revision`` at
+   all: :meth:`DefaultSteerer.install_initial_plan` skips the
+   cancel path because there is no in-flight invocation to cancel
+   on a fresh session.
 6. Successful refine paths
    (``_handle_drift`` / ``_promote_drift_to_steer`` /
-   ``apply_user_steer_with_plan``) call
+   ``install_revision_for_drift`` /
+   ``install_revision_for_user_steer``) call
    ``_cancel_inflight_for_revision`` BEFORE
    ``_emit_plan_revised`` so the cancel and the revision land
    adjacent to each other on the wire.
@@ -362,46 +363,22 @@ async def test_cancel_inflight_task_is_deferred_via_call_soon() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Steerer-level helper: _cancel_inflight_for_revision exempts the
-#    synthetic install USER_STEER drift
+# 6. Option A: install_initial_plan does not reach _cancel_inflight_for_revision
 # ---------------------------------------------------------------------------
 
 
-def test_is_synthetic_install_user_steer_classifier() -> None:
-    """The synthetic-install USER_STEER (``drift.raw is None``) is
-    exempt; a real operator USER_STEER (``drift.raw`` populated) is
-    NOT."""
-    synth = DriftEvent(
-        kind=DriftKind.USER_STEER,
-        severity=DriftSeverity.INFO,
-        detail="install pipeline",
-        # raw=None by default
-    )
-    operator = DriftEvent(
-        kind=DriftKind.USER_STEER,
-        severity=DriftSeverity.INFO,
-        detail="real steer",
-        raw={"body": "go that way"},
-    )
-    not_user = DriftEvent(
-        kind=DriftKind.PLAN_DIVERGENCE,
-        severity=DriftSeverity.WARNING,
-        detail="off-plan",
-    )
-    assert DefaultSteerer._is_synthetic_install_user_steer(synth) is True
-    assert DefaultSteerer._is_synthetic_install_user_steer(operator) is False
-    assert DefaultSteerer._is_synthetic_install_user_steer(not_user) is False
+async def test_install_initial_plan_does_not_cancel_inflight() -> None:
+    """:meth:`DefaultSteerer.install_initial_plan` MUST NOT touch the
+    cancel-inflight pipeline.
 
-
-# ---------------------------------------------------------------------------
-# 7. _cancel_inflight_for_revision no-ops the synthetic install drift
-# ---------------------------------------------------------------------------
-
-
-async def test_cancel_inflight_for_revision_skips_synthetic_install() -> None:
-    """A synthetic install USER_STEER (``drift.raw is None``) MUST NOT
-    cancel the in-flight invocation — it's the structural plan-install
-    pipeline, not a corrective steer."""
+    Goldfive#271 Option A: turn-1 installs go through
+    :meth:`install_initial_plan` which intentionally skips
+    :meth:`_cancel_inflight_for_revision` (no in-flight invocation
+    exists on a fresh session). Pre-Option-A this was achieved with a
+    synthetic-USER_STEER exemption inside
+    :meth:`_cancel_inflight_for_revision`; Option A makes it
+    structural by routing first installs to a separate API.
+    """
 
     class _CountingAdapter:
         def __init__(self) -> None:
@@ -422,15 +399,21 @@ async def test_cancel_inflight_for_revision_skips_synthetic_install() -> None:
     steerer = DefaultSteerer()
     adapter = _CountingAdapter()
     steerer.bind_adapter(adapter)
-    drift = DriftEvent(
-        kind=DriftKind.USER_STEER,
-        severity=DriftSeverity.INFO,
-        detail="install pipeline",
-        # raw=None — synthetic
+    session = _make_session()
+    session.plan = Plan.empty(run_id=session.run_id)
+    plan = Plan(
+        id="p1",
+        run_id=session.run_id,
+        goal_ids=["g"],
+        tasks=[Task(id="t1", title="T1", assignee_agent_id="w")],
+        edges=[],
+        summary="initial",
     )
-    flagged = await steerer._cancel_inflight_for_revision(drift, _make_session())
-    assert flagged == []
-    assert adapter._plugin.calls == []  # plugin must not be touched
+    installed = await steerer.install_initial_plan(session=session, plan=plan)
+    assert installed
+    # The plugin's cancel must NOT have been called: there is no
+    # in-flight invocation on a fresh-session install.
+    assert adapter._plugin.calls == []
 
 
 async def test_cancel_inflight_for_revision_fires_for_real_drift() -> None:

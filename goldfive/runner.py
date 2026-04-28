@@ -1294,21 +1294,29 @@ class Runner:
     ) -> bool:
         """Install ``revised_plan`` as the next revision of ``session.plan``.
 
-        Goldfive#271 Phase 4 unified install path: every plan change
-        becomes a revision (revision_index += 1, plan_id preserved).
-        On the very first turn ``session.plan`` was seeded with
-        :meth:`Plan.empty` so this still produces revision 1 with a
-        fresh PlanRevised event.
+        Goldfive#271 Option A: dispatches across two steerer APIs
+        based on what's actually happening:
 
-        Routes through :meth:`DefaultSteerer.apply_user_steer_with_plan`
-        so the steerer's USER_STEER bookkeeping (active_steer state,
-        dedup), drift event emission, validation, ``_apply_revision``
-        (revision_index bump, metadata stamp, current_plan refresh),
-        and ``_emit_plan_revised`` (with paired RefineAttempted
-        envelopes) all fire uniformly.
+        * Turn 1 install (``session.plan`` is the :meth:`Plan.empty`
+          seed) → :meth:`DefaultSteerer.install_initial_plan`. No
+          ``DriftDetected`` is emitted — installing the first plan
+          is structural, not an intervention. (Eliminates the
+          synthetic ``USER_STEER`` drift fabricated by the pre-Option-A
+          path.)
+        * Turn N+1 LLM-driven replan (``planner.handle_turn``
+          returned a new revision in response to a fresh user
+          message) → :meth:`DefaultSteerer.install_revision_for_drift`
+          with a ``NEW_WORK_DISCOVERED`` drift. The user genuinely
+          surfaced new work that prompted the replan; the drift is
+          real, not synthetic.
+
+        Genuine operator STEER ``ControlMessage`` deliveries do **not**
+        flow through this method — they take the executor's steer
+        loop and go straight to
+        :meth:`DefaultSteerer.install_revision_for_user_steer`.
 
         Returns ``True`` on success, ``False`` on validation failure
-        (the caller should surface RunAborted in that case).
+        (the caller surfaces RunAborted).
         """
         # Bind the steerer + adapter so the install pipeline has
         # sinks + planner + adapter wiring. bind() is idempotent —
@@ -1328,39 +1336,42 @@ class Runner:
         # with this turn.
         if not revised_plan.run_id:
             revised_plan.run_id = session.run_id
-        # Goldfive#271 Phase 4: USER_STEER drift coerces the natural-
-        # language input into the unified install pipeline. The
-        # steerer's apply_user_steer_with_plan does the bookkeeping +
-        # validation + revision install + PlanRevised emit.
-        #
-        # ``synthetic=True`` marks this drift as goldfive plumbing (not a
-        # real operator STEER): the steerer still emits a
-        # ``DriftDetected`` so the audit trail is complete, but the
-        # harmonograf interventions panel filters synthetic rows out so
-        # the user does not see a phantom STEER intervention attached to
-        # every fresh turn. The state-write gate
-        # (:meth:`_apply_user_steer_state` checks ``drift.raw is not
-        # None``) was added in PR #292; the ``synthetic`` flag layers on
-        # top so downstream UIs can also distinguish without inspecting
-        # the ``raw`` field.
-        user_text = (
-            user_input.strip() if isinstance(user_input, str) else _initial_goal_summary(user_input)
-        )
-        drift = DriftEvent(
-            kind=DriftKind.USER_STEER,
-            severity=DriftSeverity.WARNING,
-            detail=user_text,
-            synthetic=True,
-        )
+        # Branch on first-turn vs replan. ``session.plan`` is non-None
+        # on every turn (the Runner seeds Plan.empty on turn 1); the
+        # absence of tasks is the unambiguous "first install" signal.
+        first_turn = session.plan is None or not session.plan.tasks
         try:
-            installed = await self.steerer.apply_user_steer_with_plan(
-                drift=drift,
-                session=session,
-                revised_plan=revised_plan,
-            )
+            if first_turn:
+                installed = await self.steerer.install_initial_plan(
+                    session=session, plan=revised_plan
+                )
+            else:
+                # Turn N+1 replan: the user's fresh message caused
+                # handle_turn to surface new/revised work.
+                # NEW_WORK_DISCOVERED at INFO severity is the
+                # honest classification — not an intervention,
+                # not a USER_STEER (no operator ControlMessage
+                # exists), just additional work the planner
+                # integrated.
+                user_text = (
+                    user_input.strip()
+                    if isinstance(user_input, str)
+                    else _initial_goal_summary(user_input)
+                )
+                drift = DriftEvent(
+                    kind=DriftKind.NEW_WORK_DISCOVERED,
+                    severity=DriftSeverity.INFO,
+                    detail=user_text,
+                    authored_by="goldfive",
+                )
+                installed = await self.steerer.install_revision_for_drift(
+                    session=session,
+                    drift=drift,
+                    revised_plan=revised_plan,
+                )
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "Runner._install_revision: apply_user_steer_with_plan raised: %s",
+                "Runner._install_revision: steerer install raised: %s",
                 exc,
             )
             return False

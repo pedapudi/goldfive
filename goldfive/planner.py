@@ -3287,7 +3287,9 @@ PLAN SHAPE (when plan is non-null):
         change, or dropping tasks no longer relevant). The Runner
         installs the returned plan as the next revision of
         ``session.plan`` (revision_index += 1) via
-        ``DefaultSteerer.apply_user_steer_with_plan``.
+        ``DefaultSteerer.install_initial_plan`` on turn 1 or
+        ``DefaultSteerer.install_revision_for_drift`` on subsequent
+        turns (goldfive#271 Option A).
 
         The prior plan + goals are read off ``session.plan`` /
         ``session.goals`` — the planner doesn't need them as separate

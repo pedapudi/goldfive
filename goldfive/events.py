@@ -1045,10 +1045,4 @@ def drift_detected_event(
     evt.drift_detected.suppressed_by_user_steer = bool(
         getattr(drift, "suppressed_by_user_steer", False)
     )
-    # Forward the plumbing-marker so downstream sinks (harmonograf) can
-    # filter goldfive-synthesized drifts out of the user-facing
-    # interventions panel while preserving them in the full audit
-    # timeline. ``DriftEvent.synthetic`` defaults to False, so older
-    # producers / out-of-band callers see no behavioural change.
-    evt.drift_detected.synthetic = bool(getattr(drift, "synthetic", False))
     return evt

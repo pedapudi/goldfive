@@ -1949,10 +1949,11 @@ def make_adk_plugin(
             # ``loop.call_soon`` queues the cancel for the NEXT
             # event-loop turn so the calling
             # ``_handle_drift`` / ``_promote_drift_to_steer`` /
-            # ``apply_user_steer_with_plan`` finishes its emission
-            # work before the dispatch task observes the cancellation
-            # at its next yield (typically the next iteration of the
-            # ``async for`` in the adapter).
+            # ``install_revision_for_drift`` /
+            # ``install_revision_for_user_steer`` finishes its
+            # emission work before the dispatch task observes the
+            # cancellation at its next yield (typically the next
+            # iteration of the ``async for`` in the adapter).
             #
             # Best-effort: a missing entry (e.g. the cancel fired
             # between ``before_run`` registering and the LLM stream

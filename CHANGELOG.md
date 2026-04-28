@@ -2,6 +2,32 @@
 
 All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
+## Unreleased — 2026-04-27
+
+### Steerer
+
+- **Decouple plan installs from drift events
+  ([#271](https://github.com/pedapudi/goldfive/issues/271) Option A).**
+  `Runner._install_revision` no longer fabricates a synthetic
+  `USER_STEER` `DriftEvent` for every plan install. The
+  `DefaultSteerer` exposes three install APIs that name what is
+  actually happening:
+  - `install_initial_plan(session, plan)` — turn-1 install of the
+    very first plan. Emits `PlanRevised(rev=1)` with **no**
+    `DriftDetected`.
+  - `install_revision_for_drift(session, drift, revised_plan)` —
+    drift-driven replans (LLM `handle_turn` after a fresh user
+    message: `NEW_WORK_DISCOVERED`; autonomous detector promotion;
+    etc.). Emits the real drift, not a fabricated USER_STEER.
+  - `install_revision_for_user_steer(session, raw, revised_plan)` —
+    genuine operator `ControlMessage` STEER. Builds the USER_STEER
+    drift internally so callers cannot fabricate one from plumbing.
+  The `synthetic` field on `DriftEvent` and `DriftDetected` is
+  retired. The `apply_user_steer_with_plan` shim remains as a
+  back-compat router emitting `DeprecationWarning`. Eliminates the
+  category error PRs #292 / #302 papered over and lets harmonograf
+  drop its synthetic-drift filtering.
+
 ## Unreleased — 2026-04-21
 
 ### Dispatch
