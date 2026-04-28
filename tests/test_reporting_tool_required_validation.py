@@ -210,7 +210,8 @@ async def test_new_work_discovered_accepts_valid_payload() -> None:
         session,
         steerer,
     )
-    assert out == {"acknowledged": True}
+    # F1: directive ack on a real transition / accepted call.
+    assert out["acknowledged"] is True
     assert len(planner.refine_calls) == 1
 
 
@@ -434,7 +435,8 @@ async def test_task_started_no_required_fields_accepts_minimal_call() -> None:
     # Reset t1 to PENDING so the started transition is legal.
     session.plan.tasks[0].status = TaskStatus.PENDING
     out = await _tool("report_task_started").handler({"task_id": "t1"}, session, steerer)
-    assert out == {"acknowledged": True}
+    # F1: directive ack on a real transition / accepted call.
+    assert out["acknowledged"] is True
     assert session.plan.tasks[0].status is TaskStatus.RUNNING
 
 
@@ -445,7 +447,8 @@ async def test_task_progress_no_required_fields_accepts_minimal_call() -> None:
     out = await _tool("report_task_progress").handler(
         {"task_id": "t1", "fraction": 0.0}, session, steerer
     )
-    assert out == {"acknowledged": True}
+    # F1: directive ack on a real transition / accepted call.
+    assert out["acknowledged"] is True
 
 
 # ---------------------------------------------------------------------------

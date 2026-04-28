@@ -1857,8 +1857,11 @@ async def test_reporting_tool_duplicate_returns_idempotent_ack(state_ctx_cls) ->
         tool=_Tool(), tool_args=args, tool_context=state_ctx_cls(state)
     )
 
-    # First call: handler runs, task transitions, plain ACK.
-    assert first == {"acknowledged": True}
+    # First call: handler runs, task transitions, F1 directive ack
+    # (acknowledged=True + task pointer + plan_state).
+    assert first["acknowledged"] is True
+    assert "task" in first
+    assert "plan_state" in first
     assert steerer.running_calls == 1
     # Second call: handler detects the task is already RUNNING and
     # returns the idempotent shape — NO second transition.
