@@ -303,40 +303,48 @@ async def classify_goal_drift(
             input_preview=activity_block,
         ) as span:
             # Bound the dispatch — see ``GOAL_DRIFT_MAX_OUTPUT_TOKENS``.
-            from goldfive._llm import call_llm_budget
+            # Also disable thinking (goldfive#271 follow-up to #311):
+            # this is meta-cognition asking a small JSON progress
+            # question, not deep reasoning. See `call_llm_thinking_disabled`
+            # docstring for why we don't want to share the 16k cap with
+            # ``<think>`` reasoning here.
+            from goldfive._llm import call_llm_budget, call_llm_thinking_disabled
 
-            with call_llm_budget(GOAL_DRIFT_MAX_OUTPUT_TOKENS):
+            with call_llm_budget(GOAL_DRIFT_MAX_OUTPUT_TOKENS), call_llm_thinking_disabled():
                 raw = await call_llm(system, user, model)
             # Parse inside the with-block so span.decision_summary /
             # output_preview see the verdict before the End emission.
             parsed = _parse_response(raw)
             if parsed is None:
-                span.output_preview = "(unparseable verdict)"
-                span.decision_summary = (
-                    "judged trajectory: unparseable verdict (no drift emitted)"
-                )
+                # Distinguish "model returned all thinking, no answer"
+                # from "model returned garbage". The default ADK /
+                # OpenAI builders stash part counts on the call_llm
+                # closure; surface them when the raw text is empty.
+                _thought_n = int(getattr(call_llm, "last_thought_count", 0) or 0)
+                _raw_str = raw if isinstance(raw, str) else ""
+                if not _raw_str.strip() and _thought_n > 0:
+                    span.output_preview = (
+                        f"empty answer ({_thought_n} thought part(s); "
+                        f"the model spent its budget thinking and emitted "
+                        f"no JSON)"
+                    )
+                else:
+                    span.output_preview = "(unparseable verdict)"
+                span.decision_summary = "judged trajectory: unparseable verdict (no drift emitted)"
             else:
                 progressing_inline = parsed.get("progressing")
                 reason_inline = str(parsed.get("reason", "") or "").strip()
                 if isinstance(progressing_inline, bool):
                     span.output_preview = (
-                        f"progressing={progressing_inline}, "
-                        f"reason={reason_inline or '(none)'}"
+                        f"progressing={progressing_inline}, reason={reason_inline or '(none)'}"
                     )
-                    progressing_str = (
-                        "on-track" if progressing_inline else "off-track"
-                    )
-                    span.decision_summary = (
-                        f"judged trajectory: {progressing_str}"
-                        + (f" ({reason_inline})" if reason_inline else "")
+                    progressing_str = "on-track" if progressing_inline else "off-track"
+                    span.decision_summary = f"judged trajectory: {progressing_str}" + (
+                        f" ({reason_inline})" if reason_inline else ""
                     )
                 else:
-                    span.output_preview = (
-                        f"missing boolean 'progressing'; raw={parsed!r}"
-                    )
-                    span.decision_summary = (
-                        "judged trajectory: verdict missing 'progressing'"
-                    )
+                    span.output_preview = f"missing boolean 'progressing'; raw={parsed!r}"
+                    span.decision_summary = "judged trajectory: verdict missing 'progressing'"
     except Exception as exc:  # noqa: BLE001 - never break the run
         log.warning("classify_goal_drift: call_llm raised %s; no drift emitted", exc)
         return None
@@ -361,8 +369,7 @@ async def classify_goal_drift(
     progressing = parsed.get("progressing")
     if not isinstance(progressing, bool):
         log.debug(
-            "classify_goal_drift: parsed=%r lacks boolean 'progressing' key; "
-            "no drift emitted",
+            "classify_goal_drift: parsed=%r lacks boolean 'progressing' key; no drift emitted",
             parsed,
         )
         return None

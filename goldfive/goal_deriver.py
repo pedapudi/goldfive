@@ -149,9 +149,7 @@ def _coerce_goals(goals: str | list[str] | list[Goal]) -> list[Goal]:
             out.append(item)
         elif isinstance(item, str):
             if not item.strip():
-                raise ValueError(
-                    f"PassthroughGoalDeriver: empty summary string at index {i - 1}"
-                )
+                raise ValueError(f"PassthroughGoalDeriver: empty summary string at index {i - 1}")
             out.append(Goal(id=f"g{i}", summary=item))
         else:
             raise TypeError(
@@ -280,9 +278,16 @@ class LLMGoalDeriver:
                 input_preview=user_input,
             ) as span:
                 # Bound the dispatch — see ``LLMGoalDeriver.MAX_OUTPUT_TOKENS``.
-                from goldfive._llm import call_llm_budget
+                # Also disable thinking (goldfive#271 follow-up to #311):
+                # goal extraction is a small JSON dispatch ("what is the
+                # user asking for?"), not deep reasoning. Sharing the 8k
+                # cap with ``<think>`` produced empty responses in v16.
+                from goldfive._llm import call_llm_budget, call_llm_thinking_disabled
 
-                with call_llm_budget(self.MAX_OUTPUT_TOKENS):
+                with (
+                    call_llm_budget(self.MAX_OUTPUT_TOKENS),
+                    call_llm_thinking_disabled(),
+                ):
                     raw = await self._call_llm(self._system_prompt, prompt, self._model)
                 try:
                     parsed_goals = _parse_goals_response(raw)
@@ -292,16 +297,13 @@ class LLMGoalDeriver:
                         f"raw={raw[:200] if isinstance(raw, str) else '(non-str)'}"
                     )
                     span.decision_summary = (
-                        "goal-derive failed to parse LLM response; "
-                        "fell back to passthrough goal"
+                        "goal-derive failed to parse LLM response; fell back to passthrough goal"
                     )
                     raise
                 if parsed_goals:
                     goals = parsed_goals
                     parsed_ok = True
-                    titles = [
-                        (g.summary or g.id or "(no-summary)") for g in goals
-                    ]
+                    titles = [(g.summary or g.id or "(no-summary)") for g in goals]
                     span.output_preview = "goals=[" + ", ".join(titles) + "]"
                     span.decision_summary = (
                         f"derived {len(goals)} goal"
@@ -311,13 +313,11 @@ class LLMGoalDeriver:
                 else:
                     span.output_preview = "goals=[]"
                     span.decision_summary = (
-                        "goal-derive returned zero goals; "
-                        "fell back to passthrough goal"
+                        "goal-derive returned zero goals; fell back to passthrough goal"
                     )
         except Exception as e:  # pragma: no cover - exercised via tests w/ stub
             logger.warning(
-                "LLMGoalDeriver: call_llm or parse raised %s; "
-                "falling back to passthrough goal",
+                "LLMGoalDeriver: call_llm or parse raised %s; falling back to passthrough goal",
                 e,
             )
             return [Goal(id="g1", summary=user_input)]
@@ -346,9 +346,7 @@ class LLMGoalDeriver:
             except (TypeError, ValueError):
                 ctx_json = str(context)
             parts.append(f"Context:\n{ctx_json}")
-        parts.append(
-            'Return JSON: {"goals": [{"id": "g1", "summary": "..."}, ...]}.'
-        )
+        parts.append('Return JSON: {"goals": [{"id": "g1", "summary": "..."}, ...]}.')
         return "\n\n".join(parts)
 
 

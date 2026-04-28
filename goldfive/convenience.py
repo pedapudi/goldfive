@@ -72,8 +72,7 @@ def _build_judge_call_llm(config: JudgeConfig) -> tuple[CallLLM, str] | None:
         from openai import AsyncOpenAI  # type: ignore[import-not-found]
     except Exception as exc:  # noqa: BLE001
         log.debug(
-            "goldfive.wrap: openai SDK not importable for JudgeConfig "
-            "(base_url=%r): %s",
+            "goldfive.wrap: openai SDK not importable for JudgeConfig (base_url=%r): %s",
             base_url,
             exc,
         )
@@ -109,21 +108,84 @@ def _build_judge_call_llm(config: JudgeConfig) -> tuple[CallLLM, str] | None:
         # large enough for plan refines while bounding the worst case
         # under typical Q4 throughput. Pre-fix: unbounded → 9961-token
         # responses (goldfive#271 demo-v8.log).
-        from goldfive._llm import get_max_output_tokens
+        from goldfive._llm import get_max_output_tokens, get_thinking_disabled
 
-        resp = await client.chat.completions.create(
-            model=effective_model,
-            messages=[
-                {"role": "system", "content": system},
+        # Pull the per-callsite "disable thinking" signal (goldfive#271
+        # follow-up to #311). When goldfive's judges / goal_deriver /
+        # planner-refine dispatch we set ``enable_thinking=False`` via
+        # ``extra_body`` (the Qwen-via-litellm convention) AND prepend
+        # ``/no_think`` to the system prompt as a model-prompt-level
+        # fallback. Vendors that don't recognise the kwarg drop it
+        # server-side; vendors that don't recognise ``/no_think`` ignore
+        # the line. Belt-and-suspenders so a misconfigured endpoint
+        # still exits the think prelude.
+        thinking_disabled = get_thinking_disabled()
+        effective_system = system
+        extra_body: dict[str, Any] = {}
+        if thinking_disabled:
+            extra_body["enable_thinking"] = False
+            # ``/no_think`` is the Qwen prompt-level toggle. Cheap to
+            # include for non-Qwen models — they treat it as ordinary
+            # text and ignore it.
+            if "/no_think" not in (system or ""):
+                effective_system = f"/no_think\n{system}" if system else "/no_think"
+
+        create_kwargs: dict[str, Any] = {
+            "model": effective_model,
+            "messages": [
+                {"role": "system", "content": effective_system},
                 {"role": "user", "content": user},
             ],
-            max_tokens=get_max_output_tokens(),
-        )
+            "max_tokens": get_max_output_tokens(),
+        }
+        if extra_body:
+            create_kwargs["extra_body"] = extra_body
+        try:
+            resp = await client.chat.completions.create(**create_kwargs)
+        except TypeError as exc:
+            # Older OpenAI client versions don't accept ``extra_body``.
+            # Retry without it — the ``/no_think`` system-prompt prefix
+            # still does its job for Qwen. Other TypeErrors are real
+            # failures; fall through.
+            if "extra_body" not in create_kwargs:
+                raise
+            log.debug(
+                "goldfive.wrap: AsyncOpenAI rejected extra_body=%r (%s); retrying without it",
+                extra_body,
+                exc,
+            )
+            create_kwargs.pop("extra_body", None)
+            resp = await client.chat.completions.create(**create_kwargs)
         try:
             content = resp.choices[0].message.content or ""
         except Exception:  # noqa: BLE001
             return ""
-        return str(content)
+        # Diagnostic for empty-content + non-empty reasoning_content
+        # (the OpenAI-compatible analogue of "all-thought, no-answer").
+        # Qwen-via-litellm returns reasoning text on a sibling field
+        # (``reasoning_content``); when ``content == ""`` but reasoning
+        # is present, the model spent its budget thinking and produced
+        # no answer. Surface this rather than letting the parser see an
+        # indistinguishable empty string.
+        result = str(content)
+        reasoning_content = ""
+        try:
+            reasoning_content = getattr(resp.choices[0].message, "reasoning_content", "") or ""
+        except Exception:  # noqa: BLE001
+            reasoning_content = ""
+        _call_llm.last_thought_count = (  # type: ignore[attr-defined]
+            1 if reasoning_content else 0
+        )
+        _call_llm.last_answer_count = 1 if result else 0  # type: ignore[attr-defined]
+        if not result and reasoning_content:
+            log.info(
+                "goldfive.wrap._build_judge_call_llm: model returned "
+                "reasoning_content (%d chars) with empty content — check "
+                "thinking-mode config or max_output_tokens (the model spent "
+                "its budget thinking and emitted no answer).",
+                len(reasoning_content),
+            )
+        return result
 
     async def _close() -> None:
         for attr_name in ("aclose", "close"):
@@ -305,9 +367,7 @@ def wrap(
     # reasoning-drift module is installed later inside ``DefaultSteerer``
     # when the steerer-default branch runs (so callers who pass their
     # own ``steerer=`` can make their own installation decisions).
-    resolved_runtime: RuntimeConfig = (
-        runtime if runtime is not None else RuntimeConfig.from_env()
-    )
+    resolved_runtime: RuntimeConfig = runtime if runtime is not None else RuntimeConfig.from_env()
     from goldfive.drift import _embed as _embed_module
     from goldfive.drift import reasoning as _reasoning_module
     from goldfive.drift import tool_loops as _tool_loops_module
