@@ -89,16 +89,31 @@ def _steer_cancel_reason_prefix(steer_msg: Any) -> str:
     return "user_steer:steer"
 
 
-def _tag_adapter_cancel_user_steer(adapter: Any) -> None:
-    """Tag ``adapter._next_cancel_reason`` with the USER_STEER symbolic reason.
+def _tag_adapter_cancel_user_steer(adapter: Any, session: Any = None) -> None:
+    """Tag the adapter's next mid-invocation cancel with the USER_STEER reason.
 
     Called just before the executor triggers ``task.cancel()`` on the
     in-flight invoke task so the adapter's mid-invocation cancel
     handler picks up the tag and appends an LLM-actionable synthetic
-    ``function_response`` (instead of the legacy generic jargon). Adapters
-    that don't expose ``_next_cancel_reason`` are tolerated via a
-    duck-typed write. See goldfive#139.
+    ``function_response`` (instead of the legacy generic jargon). See
+    goldfive#139.
+
+    Routes through :meth:`ADKAdapter.set_next_cancel_reason` when the
+    adapter exposes it (PR #294 audit / goldfive#271 follow-up) so the
+    tag is keyed by ``session.id`` and cannot bleed across concurrent
+    goldfive sessions sharing one adapter. Falls back to the bare
+    ``_next_cancel_reason`` attribute for adapters / stubs that
+    predate the helper.
     """
+    setter = getattr(adapter, "set_next_cancel_reason", None)
+    if callable(setter) and session is not None:
+        try:
+            setter(session, _CANCEL_REASON_USER_STEER)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "SequentialExecutor: set_next_cancel_reason raised: %s", exc
+            )
     try:
         adapter._next_cancel_reason = _CANCEL_REASON_USER_STEER
     except Exception as exc:  # noqa: BLE001
@@ -1306,7 +1321,7 @@ class SequentialExecutor(Executor):
                 # handler (and the synthetic function_response it
                 # appends) carries LLM-actionable content instead of
                 # the legacy generic jargon. See goldfive#139.
-                _tag_adapter_cancel_user_steer(adapter)
+                _tag_adapter_cancel_user_steer(adapter, session=session)
                 await self._cancel_invoke_task(invoke_task)
                 return ("steer", outcome.steer_message)
 

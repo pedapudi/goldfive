@@ -2377,7 +2377,7 @@ class DefaultSteerer:
         # attribute (duck-typed) or no adapter is bound. See
         # goldfive#139 and
         # :func:`goldfive.adapters.adk._build_cancelled_response_event`.
-        self._tag_adapter_cancel_reason(drift)
+        self._tag_adapter_cancel_reason(drift, session=session)
         # goldfive#152: USER_STEER-specific side effects -- write the
         # active-steer bookkeeping onto the orchestration-state dict
         # and synthesize a durable Goal from the steer body so
@@ -2954,14 +2954,24 @@ class DefaultSteerer:
     # :data:`goldfive.adapters.adk.SYMBOLIC_REASON_USER_STEER` etc.
     _ADAPTER_CANCEL_REASON_USER_STEER: str = "user_steer"
 
-    def _tag_adapter_cancel_reason(self, drift: DriftEvent) -> None:
-        """Set ``adapter._next_cancel_reason`` based on ``drift.kind``.
+    def _tag_adapter_cancel_reason(
+        self, drift: DriftEvent, *, session: Session | None = None
+    ) -> None:
+        """Set the next adapter cancel reason based on ``drift.kind``.
 
         USER_STEER drift -> ``"user_steer"``. Other kinds currently leave
         the tag unset so the adapter falls through to the generic
         content variant. Tolerates adapters that don't carry the
         attribute (no-op) and an unbound adapter (no-op). See
         goldfive#139.
+
+        Routes the write through
+        :meth:`ADKAdapter.set_next_cancel_reason` when the adapter
+        exposes that helper (PR #294 audit / goldfive#271 follow-up)
+        so the tag is keyed by ``session.id`` and cannot bleed across
+        concurrent goldfive sessions sharing one adapter. Falls back
+        to the bare attribute write for adapters / stubs that predate
+        the helper.
 
         The goldfive-steer-unification promotion path uses a separate
         helper (:meth:`_tag_adapter_cancel_reason_for_promotion`) to
@@ -2977,36 +2987,51 @@ class DefaultSteerer:
             reason = self._ADAPTER_CANCEL_REASON_USER_STEER
         else:
             return
-        try:
-            adapter._next_cancel_reason = reason
-        except Exception as exc:  # noqa: BLE001
-            # Adapter doesn't expose the attribute — tolerated.
-            log.debug(
-                "DefaultSteerer: could not tag adapter cancel reason: %s",
-                exc,
-            )
+        self._write_adapter_cancel_reason(adapter, reason, session)
 
-    def _tag_adapter_cancel_reason_for_promotion(self, drift: DriftEvent) -> str:
+    def _tag_adapter_cancel_reason_for_promotion(
+        self, drift: DriftEvent, *, session: Session | None = None
+    ) -> str:
         """Stamp a goldfive-specific cancel reason on the bound adapter.
 
         Returns the reason string stamped (or synthesised) so callers
         can record it on the session for downstream observability.
         Mirrors :meth:`_tag_adapter_cancel_reason` semantics: adapters
-        without ``_next_cancel_reason`` are tolerated.
+        without the per-session helper are tolerated.
         """
         reason = f"goldfive_{drift.kind.name.lower()}"
         adapter = self._adapter
         if adapter is None:
             return reason
+        self._write_adapter_cancel_reason(adapter, reason, session)
+        return reason
+
+    @staticmethod
+    def _write_adapter_cancel_reason(
+        adapter: Any, reason: str, session: Session | None
+    ) -> None:
+        """Route the cancel-reason tag through the session-aware helper.
+
+        Falls back to the legacy bare-attribute write for adapters /
+        stubs that don't expose :meth:`set_next_cancel_reason`. See
+        :meth:`ADKAdapter.set_next_cancel_reason` for the rationale.
+        """
+        setter = getattr(adapter, "set_next_cancel_reason", None)
+        if callable(setter) and session is not None:
+            try:
+                setter(session, reason)
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "DefaultSteerer: set_next_cancel_reason raised: %s", exc
+                )
         try:
             adapter._next_cancel_reason = reason
         except Exception as exc:  # noqa: BLE001
             log.debug(
-                "DefaultSteerer: could not tag adapter cancel reason for "
-                "goldfive promotion: %s",
+                "DefaultSteerer: could not tag adapter cancel reason: %s",
                 exc,
             )
-        return reason
 
     async def _request_adapter_cancel(self, reason: str) -> None:
         """Invoke the optional ``adapter.request_cancel(reason)`` hook.
@@ -3383,7 +3408,9 @@ class DefaultSteerer:
         semantics identical to USER_STEER.
         """
         # 1. Tag adapter cancel reason.
-        cancel_reason = self._tag_adapter_cancel_reason_for_promotion(drift)
+        cancel_reason = self._tag_adapter_cancel_reason_for_promotion(
+            drift, session=session
+        )
         # Session-visible cancel prefix so ``_mark_cancelled_if_live``
         # stamps it on any TaskCancelled the executor emits for the
         # in-flight task as part of the promotion.
