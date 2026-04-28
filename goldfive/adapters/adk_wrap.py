@@ -386,67 +386,19 @@ class GoldfiveADKAgent(BaseAgent):
                 ):
                     yield adk_event
         finally:
-            # Drain any background reasoning-judge tasks the steerer
-            # scheduled during this run (goldfive#251). The judge is
-            # fire-and-forget so ADK tool dispatch isn't blocked behind
-            # a slow LLM; this is the paired run-end drain so judges
-            # don't leak into subsequent runs and so ``CancelledError``
-            # from an adk-web disconnect doesn't orphan the tasks.
-            # Bounded timeout keeps a hung judge from stalling exit.
-            await self._drain_steerer_background_judges()
+            # Background reasoning-judge tasks (goldfive#251) intentionally
+            # OUTLIVE the per-turn ``_run_async_impl`` boundary. They are
+            # fire-and-forget so ADK tool dispatch isn't blocked behind a
+            # slow LLM; the matching drain happens once per Runner at
+            # :meth:`Runner.close` (goldfive#319). Cancelling at every
+            # adk-web outer-turn boundary killed slow judges that hadn't
+            # completed within 0.5s, dropping their drift verdicts on the
+            # floor — even when the same Runner had many more turns ahead
+            # of it. Each judge's ``done_callback`` already removes its
+            # entry from ``DefaultSteerer._background_judges`` so there
+            # is no per-turn leak; the only thing the previous drain
+            # accomplished beyond that callback was the unwanted cancel.
             self._notify_plugins_on_run_end()
-
-    #: Per-turn drain timeout. Bounds how long ``_run_async_impl``'s
-    #: ``finally`` block can block ADK's iterator exit. Phase 2.X
-    #: (goldfive#271 Gap 3): the previous default of 5.0s was inherited
-    #: from :meth:`Steerer.shutdown` and was the root of the residual
-    #: #275-style stale-session race — while the per-turn drain held
-    #: ADK's outer loop for 5s, a concurrent ``/run_sse`` invocation on
-    #: the same outer session could advance the SQLite session's
-    #: ``last_update_time``, leaving the blocked turn's deferred event
-    #: appends behind. 0.5s is plenty for judges that are about to
-    #: complete; stragglers get cancelled and resume drift emit on
-    #: :meth:`Runner.close` (which keeps the longer 5s timeout for
-    #: programmatic teardown).
-    _PER_TURN_DRAIN_TIMEOUT_S: float = 0.5
-
-    async def _drain_steerer_background_judges(self) -> None:
-        """Call ``steerer.shutdown()`` on the bound runner's steerer, if any.
-
-        Duck-typed so custom ``Steerer`` implementations (or stubs used
-        in tests) without the method fall through cleanly. Exceptions
-        are swallowed: teardown must never mask the run's real outcome.
-
-        Uses a tight :data:`_PER_TURN_DRAIN_TIMEOUT_S` bound so the
-        ``finally`` block doesn't stall ADK's iterator exit when a
-        slow LLM judge is still in flight at run end. The default
-        :meth:`Steerer.shutdown` timeout (5s) survives on
-        :meth:`Runner.close`, where blocking is acceptable.
-        """
-        steerer = getattr(self._runner, "steerer", None)
-        shutdown = getattr(steerer, "shutdown", None)
-        if shutdown is None:
-            return
-        try:
-            await shutdown(timeout=self._PER_TURN_DRAIN_TIMEOUT_S)
-        except TypeError:
-            # Custom Steerers without the timeout kwarg get the legacy
-            # default. Best-effort fallthrough so we don't break third-
-            # party steerers that haven't been updated.
-            try:
-                await shutdown()
-            except Exception as exc:  # noqa: BLE001 — defensive
-                log.debug(
-                    "GoldfiveADKAgent: steerer.shutdown raised "
-                    "(swallowed): %s",
-                    exc,
-                )
-        except Exception as exc:  # noqa: BLE001 — defensive
-            log.debug(
-                "GoldfiveADKAgent: steerer.shutdown raised "
-                "(swallowed): %s",
-                exc,
-            )
 
     def _notify_plugins_on_run_end(self) -> None:
         """Fire ``on_run_end()`` on every adapter plugin that defines it.

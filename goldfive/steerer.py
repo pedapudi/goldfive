@@ -1448,6 +1448,34 @@ class DefaultSteerer:
                 return
             if not drift.trigger_input:
                 drift.trigger_input = self._truncate_trigger_input(text)
+            # Late-drift tolerance (goldfive#319). The judge is
+            # fire-and-forget so its verdict can land after the
+            # invocation that produced the reasoning has already
+            # terminated — adk-web outer-turn boundary crossed, agent
+            # moved on. Routing such a verdict through the cancel +
+            # ladder dispatch would either cancel an unrelated next
+            # invocation or refine against a plan whose offending step
+            # is already complete. We still want the drift on the wire
+            # for observability ("from past turn"), so we emit it
+            # directly via :meth:`_emit_drift_detected` and skip the
+            # rest of the dispatch. The guard is scoped to the
+            # background-judge path because only that path produces
+            # verdicts that may outlive the originating invocation —
+            # synchronous detectors run inline on the model-response
+            # callback and always see a live invocation.
+            if self._is_late_drift_for_terminated_invocation(drift, session):
+                log.info(
+                    "DefaultSteerer: stale judge verdict; invocation for "
+                    "agent=%r task=%r already terminated; drift kind=%s "
+                    "recorded but refine skipped",
+                    drift.current_agent_id or "-",
+                    drift.current_task_id or "-",
+                    drift.kind.value,
+                )
+                if not drift.authored_by:
+                    drift.authored_by = self._resolve_authored_by(drift)
+                await self._emit_drift_detected(session, drift)
+                return
             await self._handle_drift(drift, session)
         except asyncio.CancelledError:
             # Propagate cancellation so :meth:`shutdown` / event-loop
@@ -3210,6 +3238,49 @@ class DefaultSteerer:
     # ------------------------------------------------------------------
     # Cooperative cancellation (goldfive#251 Stream C / 7a)
     # ------------------------------------------------------------------
+
+    def _is_late_drift_for_terminated_invocation(
+        self, drift: DriftEvent, session: Session
+    ) -> bool:
+        """Return True iff a goldfive-authored drift's target is gone (goldfive#319).
+
+        Background reasoning-judge tasks (goldfive#251) run off the
+        critical path so the adapter's model-response callback can return
+        before the LLM judge finishes. With goldfive#319's removal of the
+        per-turn cancel-drain, a slow judge spawned in turn N may now
+        produce its verdict in turn N+1 — well after the original agent
+        invocation has terminated. Routing such a verdict through the
+        cancel + ladder dispatch is a category error: it could cancel an
+        unrelated invocation or trigger a refine against a plan whose
+        offending step is already complete. The drift is still emitted
+        on the sink (observability preserved); this guard short-circuits
+        the dispatch.
+
+        The check uses :class:`OrchestrationStore` as the live registry
+        of in-flight invocations (Phase 3.5 component 1, goldfive#271).
+        When the per-session bucket is empty, every agent has finished
+        its turn and any drift currently being handled is by definition
+        stale. User-authored drifts (USER_STEER / USER_CANCEL /
+        USER_PAUSE) always bypass this guard — they are forward-looking
+        operator directives, not tied to a specific in-flight invocation.
+        """
+        # User-authored drifts always pass through. ``authored_by`` was
+        # normalised at the top of :meth:`_handle_drift`.
+        if (drift.authored_by or "").lower() == "user":
+            return False
+        try:
+            from goldfive.orchestration_store import OrchestrationStore
+
+            store = OrchestrationStore.for_session(session)
+            active = store.active_invocation_ids()
+        except Exception as exc:  # noqa: BLE001 — defensive
+            log.debug(
+                "DefaultSteerer._is_late_drift_for_terminated_invocation: "
+                "active_invocation_ids lookup raised (treating as not-late): %s",
+                exc,
+            )
+            return False
+        return not active
 
     def _resolve_active_invocation_ids(self, drift: DriftEvent, session: Session) -> list[str]:
         """Resolve which invocation_id(s) a cancel should target.
