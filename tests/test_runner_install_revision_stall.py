@@ -2,21 +2,24 @@
 must not stall AND must not smear every fresh user turn into the
 ``goldfive.active_steer.*`` slot reserved for genuine operator
 :class:`~goldfive.control.ControlMessage` STEER interventions
-(goldfive#271 Phase 4 follow-up).
+(goldfive#271 Option A).
 
-Phase 4's :meth:`Runner._install_revision` synthesizes a ``USER_STEER``
-:class:`~goldfive.types.DriftEvent` on every plan install so the
-existing :meth:`DefaultSteerer.apply_user_steer_with_plan` pipeline can
-do the structural install (validate → :meth:`_apply_revision` →
-``PlanRevised``). The synthesized drift carries no
-:attr:`DriftEvent.raw` (no originating ControlMessage); the prior code
-path still ran the USER_STEER state-write side effects on it, which
-overwrote ``goldfive.active_steer.body`` with the user's raw turn input
-on EVERY turn whose :meth:`Planner.handle_turn` produced a plan —
-conflating "operator pushed a STEER mid-flight" with "user drove a
-fresh turn". The fix gates :meth:`_apply_user_steer_state` on
-``drift.raw is not None`` so only real ControlMessage-backed STEERs
-write the slot.
+Goldfive#271 Option A: :meth:`Runner._install_revision` dispatches
+across two steerer APIs based on what's actually happening:
+
+* Turn 1 (``Plan.empty`` seed) →
+  :meth:`DefaultSteerer.install_initial_plan` — emits ``PlanRevised``
+  only; no ``DriftDetected``.
+* Turn N+1 LLM-driven replan →
+  :meth:`DefaultSteerer.install_revision_for_drift` with a real
+  ``NEW_WORK_DISCOVERED`` drift.
+
+A genuine operator-pushed STEER (``ControlMessage`` arriving via the
+control channel) goes through
+:meth:`DefaultSteerer.install_revision_for_user_steer`, which is the
+**only** path that writes ``goldfive.active_steer.*`` — eliminating
+the category error pre-Option-A worked around with a ``synthetic``
+flag.
 
 These tests exercise:
 
@@ -28,9 +31,10 @@ These tests exercise:
 * The state hygiene: after Runner-driven installs,
   ``goldfive.active_steer.*`` must remain unwritten — the slot is
   reserved for genuine operator STEERs.
-* The control-message path is preserved: a real STEER ControlMessage
-  surfaced via :meth:`DefaultSteerer.apply_user_steer_with_plan`
-  (with ``drift.raw`` populated) DOES write the active_steer slot.
+* The wire shape: turn-1 installs emit no ``USER_STEER``
+  ``DriftDetected``; turn N+1 installs emit ``NEW_WORK_DISCOVERED``;
+  genuine STEER ``ControlMessage``s emit ``USER_STEER`` with the
+  source ``annotation_id`` preserved.
 """
 
 from __future__ import annotations
@@ -54,7 +58,6 @@ from goldfive import (
 from goldfive import orchestration_state as _ostate
 from goldfive.control import ControlKind, ControlMessage
 from goldfive.steerer import DefaultSteerer
-from goldfive.types import DriftEvent, DriftKind, DriftSeverity
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -250,22 +253,25 @@ async def test_install_revision_first_turn_fresh_session_no_stall() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_runner_synthesized_install_does_not_write_active_steer() -> None:
-    """Runner-synthesized USER_STEER drifts (no ``raw``) must NOT
-    smear the user's raw turn input into the
-    ``goldfive.active_steer.*`` orchestration-state slot.
+async def test_runner_install_does_not_write_active_steer() -> None:
+    """A Runner-driven install (turn 1 :meth:`install_initial_plan`,
+    turn N+1 :meth:`install_revision_for_drift`) MUST NOT smear the
+    user's raw turn input into the ``goldfive.active_steer.*``
+    orchestration-state slot.
 
     That slot is reserved for the most recent operator-pushed STEER
     :class:`~goldfive.control.ControlMessage` so the planner's
-    refine prompt can frame a steered turn as a directive. Writing it
-    on every fresh turn driven by :meth:`Runner._install_revision`
+    refine prompt can frame a steered turn as a directive. Writing
+    it on every fresh turn driven by :meth:`Runner._install_revision`
     would conflate two distinct intervention shapes and feed stale
     "active steer" framing into every downstream prompt.
 
-    The fix gates :meth:`_apply_user_steer_state` on
-    ``drift.raw is not None``; this test confirms a Runner-driven
-    install with the synthesized drift (``raw is None``) leaves the
-    state slot empty.
+    Goldfive#271 Option A guarantees this structurally: turn-1
+    installs route to :meth:`install_initial_plan` (no USER_STEER
+    bookkeeping at all) and turn N+1 LLM-driven replans route to
+    :meth:`install_revision_for_drift` with a ``NEW_WORK_DISCOVERED``
+    drift (also no USER_STEER bookkeeping). The active_steer slot
+    only gets written by :meth:`install_revision_for_user_steer`.
     """
     plan1, _ = _two_plans()
     sink = InMemorySink()
@@ -279,9 +285,6 @@ async def test_runner_synthesized_install_does_not_write_active_steer() -> None:
             timeout=10.0,
         )
         assert out.success
-        # Phase 4 install path: USER_STEER drift was synthesized
-        # by the Runner (drift.raw is None). The bookkeeping must
-        # have been skipped so the state slot stays unwritten.
         body = _ostate.read(
             out.session.state, _ostate.KEY_ACTIVE_STEER_BODY, ""
         )
@@ -298,101 +301,25 @@ async def test_runner_synthesized_install_does_not_write_active_steer() -> None:
         await runner.close()
 
 
-async def test_real_control_message_steer_writes_active_steer() -> None:
-    """The genuine operator STEER path (drift carries ``raw =
-    ControlMessage``) MUST still write ``goldfive.active_steer.*``.
-
-    Pairs with the no-write test above so the gate is conditional on
-    ``drift.raw``, not a blanket "skip USER_STEER bookkeeping in
-    apply_user_steer_with_plan". Without this case a future tightening
-    that disables USER_STEER bookkeeping entirely would silently
-    regress operator-driven steers (their state slot would never be
-    populated, breaking the planner's refine framing).
-    """
-    sink = InMemorySink()
-    steerer = DefaultSteerer()
-    steerer.bind(sinks=[sink], planner=_stub_planner(["{}"]))
-    session = Session(run_id="state-hygiene-control-B")
-    session.plan = Plan(
-        id="p1",
-        run_id=session.run_id,
-        goal_ids=["g"],
-        tasks=[Task(id="t1", title="T1", assignee_agent_id="w")],
-        edges=[],
-        summary="seed",
-    )
-
-    # Build the same shape :meth:`DefaultSteerer._drift_from_control`
-    # produces for an operator STEER ControlMessage so the
-    # ``drift.raw`` carries the genuine source.
-    control = ControlMessage(
-        kind=ControlKind.STEER,
-        payload={
-            "note": "Refocus on solar flares",
-            "author": "operator-Alice",
-            "annotation_id": "ann-42",
-        },
-    )
-    drift = DriftEvent(
-        kind=DriftKind.USER_STEER,
-        severity=DriftSeverity.WARNING,
-        detail="by operator-Alice: Refocus on solar flares",
-        raw=control,
-        authored_by="user",
-    )
-    revised = Plan(
-        id=session.plan.id,
-        run_id=session.run_id,
-        goal_ids=["g"],
-        tasks=[
-            Task(id="t1", title="T1", assignee_agent_id="w"),
-            Task(id="t2", title="T2 (added)", assignee_agent_id="w"),
-        ],
-        edges=[],
-        summary="post-steer",
-    )
-    installed = await asyncio.wait_for(
-        steerer.apply_user_steer_with_plan(
-            drift=drift, session=session, revised_plan=revised
-        ),
-        timeout=5.0,
-    )
-    assert installed
-    # The genuine STEER path populated active_steer slot.
-    body = _ostate.read(session.state, _ostate.KEY_ACTIVE_STEER_BODY, "")
-    author = _ostate.read(session.state, _ostate.KEY_ACTIVE_STEER_AUTHOR, "")
-    source = _ostate.read(session.state, _ostate.KEY_ACTIVE_STEER_SOURCE, "")
-    assert body == "Refocus on solar flares", body
-    assert author == "operator-Alice", author
-    assert source == "user", source
-
-
 # ---------------------------------------------------------------------------
-# Synthetic-drift wire stamping (harmonograf intervention filter)
+# Option A: install paths emit accurate drift kinds (no synthetic flag)
 # ---------------------------------------------------------------------------
 
 
-async def test_runner_synthesized_install_emits_synthetic_drift_event() -> None:
-    """The ``USER_STEER`` :class:`DriftEvent` :meth:`Runner._install_revision`
-    fabricates on every plan install MUST stamp ``synthetic=True`` on the
-    emitted ``DriftDetected`` envelope.
+async def test_first_turn_install_emits_no_user_steer_drift() -> None:
+    """The very first install (turn 1, ``Plan.empty`` seed) MUST NOT
+    emit a ``USER_STEER`` :class:`DriftDetected` on the wire.
 
-    Harmonograf renders ``DriftDetected`` rows on a user-facing
-    "interventions" panel. Without the synthetic marker the install-path
-    plumbing drift surfaces as a phantom ``USER_STEER WARNING``
-    intervention attached to every fresh user turn (v15 UI
-    ``v15presmtx-1`` empirical evidence: REFINE:USER_STEER + STEER
-    WARNING cards on the FIRST install at 0:30s with no operator
-    action). The synthetic flag lets harmonograf filter the row out of
-    the interventions panel while keeping it on the full audit
-    timeline.
-
-    This test exercises the wire path end-to-end: drives a real
-    ``Runner.run`` install through ``_install_revision`` and asserts the
-    ``DriftDetected`` envelope on the sink carries ``synthetic=True``.
-    Pairs with the no-write active_steer test above — both gates
-    (``drift.raw`` for state-write, ``drift.synthetic`` for UI
-    filtering) must hold for the same plumbing drift.
+    Goldfive#271 Option A regression. Before Option A,
+    :meth:`Runner._install_revision` fabricated a ``USER_STEER``
+    :class:`DriftEvent` for every plan install and routed it through
+    :meth:`DefaultSteerer.apply_user_steer_with_plan` — which always
+    emitted a ``DriftDetected`` of kind ``USER_STEER`` even though no
+    operator had pushed a STEER. PR #302 papered over the category
+    error with a ``synthetic=True`` flag and a harmonograf filter;
+    Option A eliminates the fabrication entirely by routing turn-1
+    installs through :meth:`DefaultSteerer.install_initial_plan`,
+    which emits only ``PlanRevised`` (no ``DriftDetected``).
     """
     plan1, _ = _two_plans()
     sink = InMemorySink()
@@ -401,59 +328,113 @@ async def test_runner_synthesized_install_emits_synthetic_drift_event() -> None:
         out = await asyncio.wait_for(
             runner.run(
                 "Create a presentation about solar panels.",
-                session_id="synthetic-drift-A",
+                session_id="option-a-first-turn",
             ),
             timeout=10.0,
         )
         assert out.success, f"install failed: {out.reason!r}"
 
-        # Find the install-path USER_STEER drift on the sink and
-        # assert it is stamped synthetic. Other DriftDetected rows
-        # (validation failures, plan-divergence audits) MAY appear on
-        # the same sink in a richer scenario; here only one fires.
+        from goldfive.pb.goldfive.v1 import types_pb2 as _tpb
+
         user_steer_drifts = []
         for evt in sink.events:
             which = evt.WhichOneof("payload") if hasattr(evt, "WhichOneof") else None
             if which != "drift_detected":
                 continue
             dd = evt.drift_detected
-            kind_val = int(dd.kind)
-            # DRIFT_KIND_USER_STEER is enum value 8 in types_pb2;
-            # rather than hard-code the int, cross-reference the proto
-            # module so a future renumber doesn't silently break this.
-            from goldfive.pb.goldfive.v1 import types_pb2 as _tpb
-            if kind_val == _tpb.DRIFT_KIND_USER_STEER:
+            if int(dd.kind) == _tpb.DRIFT_KIND_USER_STEER:
                 user_steer_drifts.append(dd)
-        assert user_steer_drifts, (
-            "expected at least one USER_STEER DriftDetected from "
-            "Runner._install_revision; got "
-            f"{[evt.WhichOneof('payload') for evt in sink.events]!r}"
+        assert not user_steer_drifts, (
+            "Option A: turn-1 install must NOT emit USER_STEER drift; "
+            f"got {len(user_steer_drifts)} on the sink"
         )
-        for dd in user_steer_drifts:
-            assert dd.synthetic is True, (
-                "Runner._install_revision USER_STEER drift must be "
-                f"synthetic=True on the wire; got synthetic={dd.synthetic!r}"
-            )
+        # PlanRevised still fires (revision_index 1 from Plan.empty).
+        which = [
+            e.WhichOneof("payload") if hasattr(e, "WhichOneof") else None
+            for e in sink.events
+        ]
+        assert "plan_revised" in which, which
     finally:
         await runner.close()
 
 
-async def test_real_control_message_steer_drift_is_not_synthetic() -> None:
-    """The genuine operator STEER path (drift carries ``raw =
-    ControlMessage``) MUST emit a ``DriftDetected`` with
-    ``synthetic=False``.
+async def test_second_turn_install_emits_new_work_discovered_drift() -> None:
+    """Turn N+1 (user message produces an LLM-driven replan) MUST emit
+    a ``NEW_WORK_DISCOVERED`` :class:`DriftDetected`, not ``USER_STEER``.
 
-    Pairs with the synthetic-stamp test above so the marker is
-    conditional on the install-path plumbing, not a blanket "every
-    USER_STEER drift is synthetic". Real operator interventions MUST
-    surface on harmonograf's interventions panel; flipping this
-    invariant would silently hide every operator STEER from the
-    user-facing UI.
+    The user typed a new message — that is genuinely new work the
+    planner integrated. Modelling it as ``NEW_WORK_DISCOVERED`` is
+    the honest classification (Option A); modelling it as
+    ``USER_STEER`` was the category error #302 worked around.
+    """
+    plan1, plan2 = _two_plans()
+    sink = InMemorySink()
+    runner = _runner(_stub_planner([plan1, plan2]), sink)
+    try:
+        out1 = await asyncio.wait_for(
+            runner.run(
+                "Create a presentation about solar panels.",
+                session_id="option-a-replan",
+            ),
+            timeout=10.0,
+        )
+        assert out1.success
+        # Snapshot which drift_detected events came from turn 1.
+        turn1_drift_count = sum(
+            1
+            for evt in sink.events
+            if (evt.WhichOneof("payload") if hasattr(evt, "WhichOneof") else None)
+            == "drift_detected"
+        )
+        out2 = await asyncio.wait_for(
+            runner.run(
+                "Forget solar panels, tell me about solar flares.",
+                session_id="option-a-replan",
+            ),
+            timeout=10.0,
+        )
+        assert out2.success
+        from goldfive.pb.goldfive.v1 import types_pb2 as _tpb
+
+        new_drifts = [
+            evt.drift_detected
+            for evt in sink.events
+            if (evt.WhichOneof("payload") if hasattr(evt, "WhichOneof") else None)
+            == "drift_detected"
+        ][turn1_drift_count:]
+        # Find the install-path drift among any other drifts that may
+        # fire concurrently in a richer scenario; here only the
+        # NEW_WORK_DISCOVERED install drift is expected.
+        assert any(
+            int(dd.kind) == _tpb.DRIFT_KIND_NEW_WORK_DISCOVERED for dd in new_drifts
+        ), (
+            "Option A: turn N+1 replan must emit NEW_WORK_DISCOVERED "
+            f"DriftDetected; got kinds={[int(dd.kind) for dd in new_drifts]!r}"
+        )
+        # And NOT USER_STEER.
+        assert not any(
+            int(dd.kind) == _tpb.DRIFT_KIND_USER_STEER for dd in new_drifts
+        ), "Option A: turn N+1 replan must NOT emit USER_STEER drift"
+    finally:
+        await runner.close()
+
+
+async def test_install_revision_for_user_steer_emits_user_steer_with_raw() -> None:
+    """A genuine operator STEER ControlMessage routed through
+    :meth:`DefaultSteerer.install_revision_for_user_steer` MUST emit a
+    ``USER_STEER`` :class:`DriftDetected` whose source survives:
+    ``authored_by="user"`` and the bridge-supplied ``annotation_id``
+    lands on the wire.
+
+    Pairs with the first-turn-install test: USER_STEER
+    ``DriftDetected`` is now reserved exclusively for genuine operator
+    STEERs. Flipping this invariant would silently hide every
+    operator STEER from harmonograf's interventions panel.
     """
     sink = InMemorySink()
     steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=_stub_planner(["{}"]))
-    session = Session(run_id="synthetic-drift-control-B")
+    session = Session(run_id="option-a-control-B")
     session.plan = Plan(
         id="p1",
         run_id=session.run_id,
@@ -471,14 +452,64 @@ async def test_real_control_message_steer_drift_is_not_synthetic() -> None:
             "annotation_id": "ann-77",
         },
     )
-    drift = DriftEvent(
-        kind=DriftKind.USER_STEER,
-        severity=DriftSeverity.WARNING,
-        detail="by operator-Alice: Refocus on solar flares",
-        raw=control,
-        authored_by="user",
-        # synthetic defaults to False; set explicitly for clarity.
-        synthetic=False,
+    revised = Plan(
+        id=session.plan.id,
+        run_id=session.run_id,
+        goal_ids=["g"],
+        tasks=[
+            Task(id="t1", title="T1", assignee_agent_id="w"),
+            Task(id="t2", title="T2 (added)", assignee_agent_id="w"),
+        ],
+        edges=[],
+        summary="post-steer",
+    )
+    installed = await asyncio.wait_for(
+        steerer.install_revision_for_user_steer(
+            session=session, raw=control, revised_plan=revised
+        ),
+        timeout=5.0,
+    )
+    assert installed
+    drift_rows = [
+        evt.drift_detected
+        for evt in sink.events
+        if (evt.WhichOneof("payload") if hasattr(evt, "WhichOneof") else None)
+        == "drift_detected"
+    ]
+    from goldfive.pb.goldfive.v1 import types_pb2 as _tpb
+
+    user_steer_rows = [
+        dd for dd in drift_rows if int(dd.kind) == _tpb.DRIFT_KIND_USER_STEER
+    ]
+    assert user_steer_rows, "expected a USER_STEER DriftDetected on a real STEER"
+    for dd in user_steer_rows:
+        assert dd.authored_by == "user", dd.authored_by
+        assert dd.annotation_id == "ann-77", dd.annotation_id
+
+
+async def test_install_revision_for_user_steer_writes_active_steer() -> None:
+    """The genuine operator STEER path MUST write the
+    ``goldfive.active_steer.*`` bookkeeping so the planner's refine
+    framing can read it next turn (goldfive#152)."""
+    sink = InMemorySink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_stub_planner(["{}"]))
+    session = Session(run_id="option-a-active-steer")
+    session.plan = Plan(
+        id="p1",
+        run_id=session.run_id,
+        goal_ids=["g"],
+        tasks=[Task(id="t1", title="T1", assignee_agent_id="w")],
+        edges=[],
+        summary="seed",
+    )
+    control = ControlMessage(
+        kind=ControlKind.STEER,
+        payload={
+            "note": "Refocus on solar flares",
+            "author": "operator-Alice",
+            "annotation_id": "ann-42",
+        },
     )
     revised = Plan(
         id=session.plan.id,
@@ -492,23 +523,51 @@ async def test_real_control_message_steer_drift_is_not_synthetic() -> None:
         summary="post-steer",
     )
     installed = await asyncio.wait_for(
-        steerer.apply_user_steer_with_plan(
-            drift=drift, session=session, revised_plan=revised
+        steerer.install_revision_for_user_steer(
+            session=session, raw=control, revised_plan=revised
         ),
         timeout=5.0,
     )
     assert installed
-    drift_rows = [
-        evt.drift_detected
-        for evt in sink.events
-        if (evt.WhichOneof("payload") if hasattr(evt, "WhichOneof") else None)
-        == "drift_detected"
+    body = _ostate.read(session.state, _ostate.KEY_ACTIVE_STEER_BODY, "")
+    author = _ostate.read(session.state, _ostate.KEY_ACTIVE_STEER_AUTHOR, "")
+    source = _ostate.read(session.state, _ostate.KEY_ACTIVE_STEER_SOURCE, "")
+    assert body == "Refocus on solar flares", body
+    assert author == "operator-Alice", author
+    assert source == "user", source
+
+
+async def test_install_initial_plan_emits_only_plan_revised() -> None:
+    """:meth:`DefaultSteerer.install_initial_plan` MUST emit
+    :class:`PlanRevised` with ``revision_index=1`` and **no**
+    :class:`DriftDetected`. This is the structural turn-1 path —
+    nothing went wrong, no intervention occurred."""
+    sink = InMemorySink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_stub_planner(["{}"]))
+    session = Session(run_id="option-a-install-initial")
+    session.plan = Plan.empty(run_id=session.run_id)
+
+    plan = Plan(
+        id="p1",
+        run_id=session.run_id,
+        goal_ids=["g"],
+        tasks=[Task(id="t1", title="T1", assignee_agent_id="w")],
+        edges=[],
+        summary="initial",
+    )
+    installed = await asyncio.wait_for(
+        steerer.install_initial_plan(session=session, plan=plan),
+        timeout=5.0,
+    )
+    assert installed
+    which = [
+        e.WhichOneof("payload") if hasattr(e, "WhichOneof") else None
+        for e in sink.events
     ]
-    assert drift_rows, "expected a DriftDetected on a real STEER"
-    # All drift rows from this control-message path must be
-    # non-synthetic — they represent genuine operator action.
-    for dd in drift_rows:
-        assert dd.synthetic is False, (
-            "real operator STEER drift must NOT be marked synthetic; "
-            f"got synthetic={dd.synthetic!r}"
-        )
+    assert "plan_revised" in which, which
+    # No DriftDetected envelope from a clean first install.
+    assert "drift_detected" not in which, (
+        f"install_initial_plan must not emit DriftDetected; got {which!r}"
+    )
+    assert session.plan.revision_index == 1
