@@ -2059,6 +2059,25 @@ class ADKAdapter:
         except asyncio.CancelledError:
             was_cancelled = True
             stop_reason = "cancelled"
+            # Goldfive boundary catch site (goldfive#271 Phase 3.5
+            # component 1). This is THE canonical place CancelledError
+            # is observed inside the goldfive runtime: the wrapper's
+            # ``try / except CancelledError`` arc that closes any
+            # boundary the plugin opened in ``before_agent_callback``
+            # but never paired in ``after_agent_callback`` (because
+            # ADK skips after-hooks when the generator is closed
+            # mid-stream). Emits ``InvocationBoundaryExited(reason=
+            # "cancelled")`` for every still-open boundary BEFORE the
+            # heal step so the operator-visible exit precedes any
+            # synthetic function_response insert.
+            if self._plugin is not None:
+                try:
+                    await self._plugin.close_open_boundaries(reason="cancelled")
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "ADKAdapter.invoke: close_open_boundaries(cancelled) raised: %s",
+                        exc,
+                    )
             # Consume the tag the steerer / executor stashed on us before
             # triggering the cancel (see goldfive#139). An unset tag
             # falls through to the legacy generic reason so existing
@@ -2098,6 +2117,17 @@ class ADKAdapter:
             err = exc
             stop_reason = f"error:{type(exc).__name__}"
             log.debug("ADKAdapter.invoke: runner.run_async raised: %s", exc)
+            # Goldfive boundary catch site for the error path
+            # (goldfive#271 Phase 3.5 component 1) — close any boundary
+            # the plugin opened but couldn't pair in the normal arc.
+            if self._plugin is not None:
+                try:
+                    await self._plugin.close_open_boundaries(reason=f"error:{type(exc).__name__}")
+                except Exception as boundary_exc:  # noqa: BLE001
+                    log.debug(
+                        "ADKAdapter.invoke: close_open_boundaries(error) raised: %s",
+                        boundary_exc,
+                    )
             await self._heal_pending_tool_calls(
                 runner=self._runner,
                 session_id=session_id,

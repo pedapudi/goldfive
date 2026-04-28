@@ -90,7 +90,9 @@ copies them onto ADK's state.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import threading
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -111,6 +113,36 @@ __all__ = [
     "REASONING_BINDINGS_KEY",
     "ReasoningBinding",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Active-invocation registry (goldfive#271 Phase 3.5 component 1)
+# ---------------------------------------------------------------------------
+#
+# Per-session asyncio.Task registry keyed by ``invocation_id``. Owned by
+# OrchestrationStore (the per-session orchestration-state surface) rather
+# than the ADK plugin instance, restoring the Phase 0 state-ownership
+# contract: per-session orchestration data lives on the store, not on
+# adapter plugin instances.
+#
+# Why a module-level dict rather than a goldfive ``Session.state`` slot:
+# :class:`asyncio.Task` is intentionally non-serializable (it holds a
+# reference to a live coroutine + the running loop), and
+# :mod:`goldfive.orchestration_state.write` enforces "values must
+# round-trip cleanly through sinks". Storing tasks under the
+# ``goldfive.*`` prefix would either break that invariant or force every
+# sink to special-case the slot. Instead we keep tasks in this
+# module-level registry and key the outer dict by ``Session.id`` so the
+# OrchestrationStore-as-view contract still holds: each store instance
+# only sees its own session's tasks.
+#
+# Lock: a process-wide :class:`threading.Lock` protects the outer dict's
+# structural mutations (sub-dict insert / pop). Inner-dict reads /
+# writes are single-threaded per session because ADK callbacks run on
+# one event loop, but a concurrent ``request_invocation_cancel`` from a
+# different session could otherwise race the structural setdefault.
+_ACTIVE_INVOCATION_TASKS: dict[str, dict[str, asyncio.Task[Any]]] = {}
+_ACTIVE_INVOCATION_LOCK = threading.Lock()
 
 
 # State key for the new reasoning-extracted bindings slot. Lives under
@@ -279,14 +311,21 @@ class OrchestrationStore:
     cache.
     """
 
-    __slots__ = ("_state",)
+    __slots__ = ("_state", "_session_id")
 
-    def __init__(self, state: Any) -> None:
+    def __init__(self, state: Any, *, session_id: str = "") -> None:
         # We accept any mapping-shaped object — goldfive's Session.state
         # is a plain dict; tests sometimes pass a ``MappingProxyType``
         # over the same dict. Read paths tolerate both; write paths
         # require :class:`MutableMapping` (raised lazily by the helper).
         self._state = state if isinstance(state, Mapping) else {}
+        # ``session_id`` keys the active-invocation task registry below.
+        # Empty when the store was built for an arbitrary state dict
+        # (test scaffolding, callbacks reaching the store with no
+        # Session in scope) — those callers cannot drive the
+        # active-invocation registry, but every other read/write path
+        # remains usable.
+        self._session_id = str(session_id or "")
 
     # -- Constructors ----------------------------------------------------
 
@@ -300,12 +339,15 @@ class OrchestrationStore:
         """
         if session is None:
             return cls({})
-        return cls(getattr(session, "state", {}))
+        return cls(
+            getattr(session, "state", {}),
+            session_id=str(getattr(session, "id", "") or ""),
+        )
 
     @classmethod
-    def for_state(cls, state: Any) -> OrchestrationStore:
+    def for_state(cls, state: Any, *, session_id: str = "") -> OrchestrationStore:
         """Build a store backed by an arbitrary state dict."""
-        return cls(state)
+        return cls(state, session_id=session_id)
 
     # -- Internal helpers -----------------------------------------------
 
@@ -484,7 +526,7 @@ class OrchestrationStore:
                 continue
             if not key.startswith(prefix):
                 continue
-            tid = key[len(prefix):]
+            tid = key[len(prefix) :]
             if tid:
                 out.append(tid)
         return out
@@ -700,3 +742,85 @@ class OrchestrationStore:
         if bare and bare != agent_name:
             registry.pop(bare, None)
         _ostate.write(self._state, REASONING_BINDINGS_KEY, registry)
+
+    # -- Active-invocation registry (goldfive#271 Phase 3.5 component 1) ---
+    #
+    # Per-session ``invocation_id -> asyncio.Task`` map. The goldfive task
+    # boundary (the wrapper around each agent invocation in the ADK
+    # plugin's ``before_agent_callback`` / ``after_agent_callback``
+    # try/finally arc) registers the running task here on entry and
+    # deregisters on exit. The steerer's
+    # :meth:`request_invocation_cancel` looks up the task to fire
+    # ``task.cancel()`` on the live invocation.
+    #
+    # Migrated off ``_GoldfiveADKPlugin._invocation_tasks`` (PR #303 →
+    # Phase 3.5 #305): per-session orchestration state belongs on the
+    # store, not on the adapter plugin instance. Restores the Phase 0
+    # state-ownership contract.
+
+    def register_invocation_task(
+        self,
+        invocation_id: str,
+        task: asyncio.Task[Any],
+    ) -> None:
+        """Register the running asyncio.Task driving ``invocation_id``.
+
+        Called from the goldfive boundary wrapper at entry. No-op when
+        ``invocation_id`` is empty or the store has no session id (e.g.
+        tests that construct a bare-state store).
+        """
+        if not invocation_id or not self._session_id:
+            return
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _ACTIVE_INVOCATION_TASKS.setdefault(self._session_id, {})
+        bucket[str(invocation_id)] = task
+
+    def deregister_invocation_task(self, invocation_id: str) -> None:
+        """Drop ``invocation_id`` from the registry. Idempotent.
+
+        Called from the goldfive boundary wrapper's ``finally`` clause
+        at exit. The bucket itself is left in place; cleanup of the
+        outer entry happens in :meth:`clear_active_invocations`.
+        """
+        if not invocation_id or not self._session_id:
+            return
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _ACTIVE_INVOCATION_TASKS.get(self._session_id)
+        if bucket is None:
+            return
+        bucket.pop(str(invocation_id), None)
+
+    def get_invocation_task(self, invocation_id: str) -> asyncio.Task[Any] | None:
+        """Return the registered task for ``invocation_id``, or ``None``."""
+        if not invocation_id or not self._session_id:
+            return None
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _ACTIVE_INVOCATION_TASKS.get(self._session_id)
+        if bucket is None:
+            return None
+        return bucket.get(str(invocation_id))
+
+    def active_invocation_ids(self) -> list[str]:
+        """Return the ids of every currently-registered invocation.
+
+        Diagnostic / test helper. Empty list when no session id or no
+        registered invocations.
+        """
+        if not self._session_id:
+            return []
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _ACTIVE_INVOCATION_TASKS.get(self._session_id)
+        if bucket is None:
+            return []
+        return list(bucket.keys())
+
+    def clear_active_invocations(self) -> None:
+        """Drop every registered task for this session. Idempotent.
+
+        Called from the adapter's dispatch teardown so a stale handle
+        cannot target the next invocation.
+        """
+        if not self._session_id:
+            return
+        with _ACTIVE_INVOCATION_LOCK:
+            _ACTIVE_INVOCATION_TASKS.pop(self._session_id, None)

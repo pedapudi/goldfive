@@ -35,6 +35,7 @@ tests to patch the base class with a stub when ADK is not installed.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import time
@@ -214,6 +215,136 @@ def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
     return value if value is not None else default
 
 
+@dataclasses.dataclass(frozen=True)
+class _InvocationCancelled:
+    """Structured marker produced by the goldfive boundary's canonical
+    ``except CancelledError`` catch site (goldfive#271 Phase 3.5
+    component 1).
+
+    The boundary catches ``CancelledError`` exactly once — inside
+    :meth:`ADKAdapter._invoke_internal` — converts it to this marker so
+    the rest of the runtime sees a normal completion shape, runs the
+    ``finally`` cleanup (heal pending tool calls, emit
+    ``InvocationBoundaryExited``, drop registered tasks), then
+    re-raises ``CancelledError`` per asyncio's contract.
+
+    The marker is operator-visible only — it never leaks to the LLM
+    (the parent agent sees ``{"status": "cancelled"}`` from the bare
+    sub-invocation response, not this marker). It exists so that any
+    follow-up Phase 3.5 work (the cancellation-stash tripwire) can
+    inspect WHY ``CancelledError`` reached the boundary.
+    """
+
+    invocation_id: str
+    reason: str = "cancelled"
+    detail: str = ""
+
+
+class _InvocationTaskRegistryView:
+    """Backwards-compat view over the OrchestrationStore-owned
+    invocation-task registry (goldfive#271 Phase 3.5 component 1).
+
+    PR #303 placed the per-invocation asyncio.Task registry on the
+    plugin instance as ``_invocation_tasks: dict[str, asyncio.Task]``.
+    Phase 3.5 relocates the storage to
+    :class:`~goldfive.orchestration_store.OrchestrationStore` per the
+    Phase 0 state-ownership contract, but keeps the legacy attribute
+    accessible: the steerer's cancel path and tests still index into
+    ``plugin._invocation_tasks[inv_id]``.
+
+    This view forwards the ``dict``-shaped operations the existing
+    callers use (``[]``, ``get``, ``setdefault`` via assignment,
+    ``pop``, ``clear``, ``in``) onto the store. The store is resolved
+    from the plugin's currently-active ``SessionContext`` so writes
+    reach the correct per-session bucket; reads / writes against an
+    unbound plugin (no session context) silently no-op (returning
+    ``None`` for reads, dropping writes), matching the pre-migration
+    behaviour of an empty dict.
+    """
+
+    __slots__ = ("_plugin",)
+
+    def __init__(self, plugin: Any) -> None:
+        self._plugin = plugin
+
+    def _store(self) -> Any:
+        # Lazy resolution: the active context is set by
+        # ``set_active_context`` before any callback fires, so a read
+        # path that runs outside an active dispatch (e.g. a unit test
+        # constructing the plugin and probing ``_invocation_tasks``
+        # without driving a callback) sees an empty registry.
+        ctx = getattr(self._plugin, "_active_ctx", None)
+        if ctx is None:
+            return None
+        from goldfive.orchestration_store import OrchestrationStore
+
+        return OrchestrationStore.for_session(ctx.session)
+
+    def __setitem__(self, invocation_id: str, task: asyncio.Task[Any]) -> None:
+        store = self._store()
+        if store is None:
+            return
+        store.register_invocation_task(invocation_id, task)
+
+    def __getitem__(self, invocation_id: str) -> asyncio.Task[Any]:
+        store = self._store()
+        if store is None:
+            raise KeyError(invocation_id)
+        task = store.get_invocation_task(invocation_id)
+        if task is None:
+            raise KeyError(invocation_id)
+        return task
+
+    def get(
+        self,
+        invocation_id: str,
+        default: Any = None,
+    ) -> asyncio.Task[Any] | None:
+        store = self._store()
+        if store is None:
+            return default
+        task = store.get_invocation_task(invocation_id)
+        return task if task is not None else default
+
+    def pop(self, invocation_id: str, *args: Any) -> Any:
+        store = self._store()
+        if store is None:
+            if args:
+                return args[0]
+            raise KeyError(invocation_id)
+        task = store.get_invocation_task(invocation_id)
+        store.deregister_invocation_task(invocation_id)
+        if task is None:
+            if args:
+                return args[0]
+            raise KeyError(invocation_id)
+        return task
+
+    def __contains__(self, invocation_id: str) -> bool:
+        store = self._store()
+        if store is None:
+            return False
+        return store.get_invocation_task(invocation_id) is not None
+
+    def clear(self) -> None:
+        store = self._store()
+        if store is None:
+            return
+        store.clear_active_invocations()
+
+    def keys(self) -> list[str]:
+        store = self._store()
+        if store is None:
+            return []
+        return store.active_invocation_ids()
+
+    def __iter__(self) -> Any:
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return len(self.keys())
+
+
 def _safe_task_cancel(task: asyncio.Task[Any], invocation_id: str) -> None:
     """Cancel ``task`` and log the outcome — used as a deferred
     ``loop.call_soon`` callback (goldfive#271 follow-up).
@@ -238,8 +369,7 @@ def _safe_task_cancel(task: asyncio.Task[Any], invocation_id: str) -> None:
         return
     if cancelled_now:
         log.info(
-            "goldfive.cancel.task: cancelled in-flight task for "
-            "invocation_id=%s",
+            "goldfive.cancel.task: cancelled in-flight task for invocation_id=%s",
             invocation_id,
         )
 
@@ -1590,37 +1720,36 @@ def make_adk_plugin(
             # without racing on the single ``goldfive.current_task_id``
             # slot. Cleared on ``clear_active_context``.
             self._invocation_pinned_task_id: dict[str, str] = {}
-            # Per-invocation asyncio.Task registry (goldfive#271 follow-up
-            # — concurrent-invocation cancel-on-refine bug exposed by v15).
-            # ``dict[str, asyncio.Task]`` mapping ``invocation_id`` to the
-            # asyncio task currently driving that invocation's
-            # ``runner.run_async`` stream. Populated in
-            # :meth:`before_run_callback` (which runs INSIDE the task
-            # ADK is using to drive the invocation, so
-            # ``asyncio.current_task()`` is the right handle). Consumed
-            # by :meth:`request_invocation_cancel` to fire
-            # ``task.cancel()`` on the live invocation when a refine
-            # produced a revised plan that supersedes whatever the
-            # in-flight LLM call is reasoning about.
+            # Per-invocation asyncio.Task registry — MIGRATED in Phase 3.5
+            # (goldfive#271 component 1) off this plugin instance and onto
+            # :class:`~goldfive.orchestration_store.OrchestrationStore`.
+            # The plugin no longer owns the registry; the store owns it
+            # keyed by ``Session.id``.
             #
-            # Without this, the existing cancel-state flag only
-            # short-circuits the NEXT ``before_model_callback`` /
-            # ``before_tool_callback`` on the same invocation; the
-            # already-running LLM streaming call (which can take
-            # 10+ minutes on a slow model) keeps generating output
-            # that triggers more drift, producing the refine loop
-            # observed in v15presmtx-1. Cancelling the asyncio task
-            # raises ``CancelledError`` inside the
-            # ``runner.run_async`` async-for in
-            # :meth:`ADKAdapter._invoke_internal`; the existing
-            # heal path already emits the synthetic
-            # ``function_response`` so the function_call/_response
-            # invariant is preserved.
+            # Backwards-compat shim: tests and the steerer's cancel path
+            # still touch ``plugin._invocation_tasks``. The
+            # :class:`_InvocationTaskRegistryView` exposed below presents
+            # the OrchestrationStore-backed registry through the legacy
+            # ``dict``-shaped attribute so existing call sites continue
+            # to work unchanged. Look up via OrchestrationStore directly
+            # for new code (see
+            # :meth:`~goldfive.orchestration_store.OrchestrationStore.get_invocation_task`).
             #
-            # Cleared in :meth:`after_run_callback` (per-invocation
-            # release) and :meth:`clear_active_context` (full reset
-            # at dispatch teardown).
-            self._invocation_tasks: dict[str, asyncio.Task[Any]] = {}
+            # Why migrated: per-session orchestration state belongs on
+            # OrchestrationStore — Phase 0 state-ownership contract.
+            # PR #303 placed the registry on the plugin as a bridge; this
+            # phase relocates the storage while preserving the API.
+            self._invocation_tasks: _InvocationTaskRegistryView = _InvocationTaskRegistryView(self)
+            # Goldfive boundary wrapper bookkeeping (goldfive#271 Phase 3.5
+            # component 1). The set tracks every invocation_id whose
+            # ``before_agent_callback`` emitted ``InvocationBoundaryEntered``
+            # and is therefore expected to emit a paired ``Exited`` —
+            # whether that comes from ``after_agent_callback`` (normal
+            # completion) or from the canonical ``except CancelledError``
+            # in :meth:`ADKAdapter._invoke_internal` (cancel/error path).
+            # Per-invocation pin ensures the pair is exactly-once even
+            # when ADK skips ``after_agent_callback`` on cancel.
+            self._boundary_entered_invocations: set[str] = set()
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
@@ -1652,6 +1781,15 @@ def make_adk_plugin(
             Called from ``ADKAdapter.invoke``'s ``finally`` block. Safe
             to call when no context is active.
             """
+            # Phase 3.5: clear OrchestrationStore-backed registry BEFORE
+            # dropping ``_active_ctx`` so the registry view can still
+            # resolve the session to clear. Once ``_active_ctx = None``
+            # the view no-ops and the OrchestrationStore-side bucket
+            # would leak across dispatches on the same plugin instance.
+            try:
+                self._invocation_tasks.clear()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("clear_active_context: registry clear raised: %s", exc)
             self._active_ctx = None
             self._top_invocation_id = ""
             self._agent_tool_spawn_count = 0
@@ -1683,14 +1821,19 @@ def make_adk_plugin(
             self._invocation_parents.clear()
             # goldfive#264 — drop per-invocation pin map.
             self._invocation_pinned_task_id.clear()
-            # goldfive#271 follow-up — drop per-invocation task handles.
-            # We do NOT cancel registered tasks here: this method is
-            # called from ``ADKAdapter.invoke``'s ``finally`` block
-            # AFTER the dispatch has already terminated (normally,
-            # via cancel, or via error). Cancelling here would no-op
-            # because the task is already done; clearing the map
-            # avoids stale handles bleeding into the next dispatch.
-            self._invocation_tasks.clear()
+            # goldfive#271 follow-up — invocation-task handle clearing
+            # already happened at the top of this method (Phase 3.5
+            # restructuring) so the registry view could still resolve
+            # the OrchestrationStore. Nothing to do here.
+            # goldfive#271 Phase 3.5 — drop boundary-pair bookkeeping.
+            # Anything still in this set means the boundary's exit emit
+            # never fired, which only happens when the dispatch was
+            # torn down outside the canonical try/finally arc (test
+            # scaffolding, bug). We do NOT emit a synthetic Exited here
+            # because the active context is already being cleared and
+            # the sinks may be unreachable; the operator-visible signal
+            # is the missing pair on the wire, surfaced by the audit.
+            self._boundary_entered_invocations.clear()
 
         # --- Cooperative cancellation (goldfive#251 Stream C / 7a) -----
 
@@ -2089,6 +2232,30 @@ def make_adk_plugin(
             if inv_id and self._top_invocation_id and inv_id != self._top_invocation_id:
                 parent_inv_id = self._top_invocation_id
 
+            # Goldfive boundary entry (goldfive#271 Phase 3.5 component 1).
+            # Mark this invocation_id as having entered the boundary and
+            # emit the paired ``InvocationBoundaryEntered`` sink event.
+            # The boundary is the single canonical try/finally arc the
+            # rest of Phase 3.5 hangs off of: the steerer's
+            # cancel-inflight-task path can now target the registered
+            # task knowing the canonical exit emit will land regardless
+            # of which path observes the CancelledError.
+            #
+            # Done BEFORE the cooperative-cancel short-circuit so a
+            # cancel flagged before the boundary fires still produces
+            # the entry/exit pair (the cancel checkpoint below emits
+            # InvocationCancelled then short-circuits, and the boundary
+            # exit emit fires from ``after_agent_callback`` or from
+            # the canonical CancelledError catch in _invoke_internal).
+            ctx_task = self._active_ctx.task if self._active_ctx else None
+            ctx_task_id = str(_safe_attr(ctx_task, "id", "") or "") if ctx_task else ""
+            if inv_id:
+                await self._emit_boundary_entered(
+                    invocation_id=inv_id,
+                    agent_name=agent_name,
+                    task_id=ctx_task_id,
+                )
+
             # Cooperative-cancellation checkpoint (goldfive#251 Stream C / 7a).
             # When a cancel was flagged for this invocation_id (by the
             # steerer's CRITICAL-severity ladder path, or by a programmatic
@@ -2106,6 +2273,17 @@ def make_adk_plugin(
                         invocation_id=inv_id,
                         agent_name=agent_name,
                         request=request,
+                    )
+                # Boundary exit emit fires here too — the agent's turn
+                # is being skipped, so the boundary's ``finally`` is
+                # logically about to run. Reason="cancelled" so the
+                # paired InvocationCancelled event explains why.
+                if inv_id:
+                    await self._emit_boundary_exited(
+                        invocation_id=inv_id,
+                        agent_name=agent_name,
+                        task_id=ctx_task_id,
+                        reason="cancelled",
                     )
                 return None
 
@@ -3125,10 +3303,9 @@ def make_adk_plugin(
             )
 
         async def after_agent_callback(self, *, agent: Any, callback_context: Any) -> None:
-            """Forward an agent-turn end to the overlay reconciler."""
-            reconciler = self._reconciler
-            if reconciler is None:
-                return None
+            """Forward an agent-turn end to the overlay reconciler and
+            emit ``InvocationBoundaryExited`` to close the goldfive
+            boundary wrapper (goldfive#271 Phase 3.5 component 1)."""
             agent_name = str(_safe_attr(agent, "name", "") or "")
             inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
                 callback_context, "invocation_context", None
@@ -3138,32 +3315,52 @@ def make_adk_plugin(
             if inv_id and self._top_invocation_id and inv_id != self._top_invocation_id:
                 parent_inv_id = self._top_invocation_id
             summary = self._invocation_last_text.get(inv_id, "") if inv_id else ""
+
+            # Boundary exit emit (Phase 3.5). Done in a finally-style
+            # block so a reconciler raise below cannot prevent the
+            # boundary from closing — the boundary is the canonical
+            # exit-point contract; observability must not depend on
+            # third-party reconciler hooks.
+            ctx_task = self._active_ctx.task if self._active_ctx else None
+            ctx_task_id = str(_safe_attr(ctx_task, "id", "") or "") if ctx_task else ""
+
+            reconciler = self._reconciler
             try:
-                await reconciler.on_after_agent(
-                    agent_name=agent_name,
-                    invocation_id=inv_id,
-                    error=None,
-                    summary=summary,
-                    parent_invocation_id=parent_inv_id,
-                )
-            except TypeError:
-                try:
-                    await reconciler.on_after_agent(
-                        agent_name=agent_name,
+                if reconciler is not None:
+                    try:
+                        await reconciler.on_after_agent(
+                            agent_name=agent_name,
+                            invocation_id=inv_id,
+                            error=None,
+                            summary=summary,
+                            parent_invocation_id=parent_inv_id,
+                        )
+                    except TypeError:
+                        try:
+                            await reconciler.on_after_agent(
+                                agent_name=agent_name,
+                                invocation_id=inv_id,
+                                error=None,
+                                summary=summary,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug(
+                                "after_agent_callback: reconciler.on_after_agent raised: %s",
+                                exc,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "after_agent_callback: reconciler.on_after_agent raised: %s",
+                            exc,
+                        )
+            finally:
+                if inv_id:
+                    await self._emit_boundary_exited(
                         invocation_id=inv_id,
-                        error=None,
-                        summary=summary,
+                        agent_name=agent_name,
+                        task_id=ctx_task_id,
+                        reason="completed",
                     )
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "after_agent_callback: reconciler.on_after_agent raised: %s",
-                        exc,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "after_agent_callback: reconciler.on_after_agent raised: %s",
-                    exc,
-                )
             return None
 
         async def after_run_callback(self, *, invocation_context: Any) -> None:
@@ -3634,6 +3831,161 @@ def make_adk_plugin(
                 log.debug(
                     "_emit_invocation_cancelled: failed to emit: %s",
                     exc,
+                )
+
+        # --- Goldfive boundary wrapper emits (goldfive#271 Phase 3.5) ---
+
+        async def _emit_boundary_entered(
+            self,
+            *,
+            invocation_id: str,
+            agent_name: str = "",
+            task_id: str = "",
+        ) -> None:
+            """Emit ``InvocationBoundaryEntered`` and pin the entry.
+
+            The pin (``_boundary_entered_invocations``) is what guarantees
+            the paired ``Exited`` fires exactly once even when ADK skips
+            ``after_agent_callback`` on cancel — the canonical
+            ``except CancelledError`` in
+            :meth:`ADKAdapter._invoke_internal` consults the set to
+            decide which boundaries still need an exit emit.
+            """
+            if not invocation_id:
+                return
+            if invocation_id in self._boundary_entered_invocations:
+                # Idempotent: a second ``before_agent_callback`` for the
+                # same invocation_id (transfer-to-agent inside one
+                # invocation) does not re-emit the boundary.
+                return
+            self._boundary_entered_invocations.add(invocation_id)
+            ctx = self._active_ctx
+            if ctx is None:
+                return
+            steerer = ctx.steerer
+            if steerer is None:
+                return
+            sinks = getattr(steerer, "_sinks", None) or []
+            if not sinks:
+                return
+            session = ctx.session
+            run_id = str(_safe_attr(session, "run_id", "") or "")
+            session_id = str(_safe_attr(session, "id", "") or "") or run_id
+            try:
+                seq = session.next_sequence()
+            except Exception:  # noqa: BLE001
+                seq = 0
+            try:
+                from goldfive.events import (  # noqa: PLC0415 — lazy
+                    emit,
+                    invocation_boundary_entered_event,
+                )
+
+                evt = invocation_boundary_entered_event(
+                    run_id,
+                    seq,
+                    invocation_id=str(invocation_id or ""),
+                    agent_name=str(agent_name or ""),
+                    task_id=str(task_id or ""),
+                    session_id=session_id,
+                )
+                await emit(sinks, evt)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_emit_boundary_entered: failed to emit: %s",
+                    exc,
+                )
+
+        async def _emit_boundary_exited(
+            self,
+            *,
+            invocation_id: str,
+            agent_name: str = "",
+            task_id: str = "",
+            reason: str = "completed",
+        ) -> None:
+            """Emit ``InvocationBoundaryExited`` paired with a prior Entered.
+
+            No-op when the invocation_id was never marked entered (or was
+            already exited). Exit-once semantic mirrors entry-once: ADK
+            can fire ``after_agent_callback`` on the same invocation
+            multiple times in degenerate flows, but the boundary pair is
+            recorded once.
+
+            Best-effort observability — every failure is logged and
+            swallowed.
+            """
+            if not invocation_id:
+                return
+            if invocation_id not in self._boundary_entered_invocations:
+                return
+            self._boundary_entered_invocations.discard(invocation_id)
+            ctx = self._active_ctx
+            if ctx is None:
+                return
+            steerer = ctx.steerer
+            if steerer is None:
+                return
+            sinks = getattr(steerer, "_sinks", None) or []
+            if not sinks:
+                return
+            session = ctx.session
+            run_id = str(_safe_attr(session, "run_id", "") or "")
+            session_id = str(_safe_attr(session, "id", "") or "") or run_id
+            try:
+                seq = session.next_sequence()
+            except Exception:  # noqa: BLE001
+                seq = 0
+            try:
+                from goldfive.events import (  # noqa: PLC0415 — lazy
+                    emit,
+                    invocation_boundary_exited_event,
+                )
+
+                evt = invocation_boundary_exited_event(
+                    run_id,
+                    seq,
+                    invocation_id=str(invocation_id or ""),
+                    agent_name=str(agent_name or ""),
+                    task_id=str(task_id or ""),
+                    reason=str(reason or "completed"),
+                    session_id=session_id,
+                )
+                await emit(sinks, evt)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_emit_boundary_exited: failed to emit: %s",
+                    exc,
+                )
+
+        async def close_open_boundaries(self, *, reason: str) -> None:
+            """Emit ``InvocationBoundaryExited`` for every still-open boundary.
+
+            Called from the canonical ``except CancelledError`` /
+            ``except Exception`` site in
+            :meth:`ADKAdapter._invoke_internal` so a CancelledError
+            tearing through ADK's machinery (which skips
+            ``after_agent_callback``) still produces the paired exit
+            emit. Iterates a snapshot of the entered set so the
+            individual ``_emit_boundary_exited`` calls (which discard
+            from the set) don't mutate during iteration.
+            """
+            if not self._boundary_entered_invocations:
+                return
+            ctx = self._active_ctx
+            agent_name = ""
+            task_id = ""
+            if ctx is not None:
+                agent_name = str(getattr(ctx, "host_agent_name", "") or "")
+                task = getattr(ctx, "task", None)
+                if task is not None:
+                    task_id = str(_safe_attr(task, "id", "") or "")
+            for inv_id in list(self._boundary_entered_invocations):
+                await self._emit_boundary_exited(
+                    invocation_id=inv_id,
+                    agent_name=agent_name,
+                    task_id=task_id,
+                    reason=reason,
                 )
 
         # --- Per-LLM-call wall-clock watcher (goldfive#271 follow-up) ---
