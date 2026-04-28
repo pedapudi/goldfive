@@ -35,9 +35,7 @@ from typing import Any
 import pytest
 
 pytest.importorskip("google.adk")
-
 from goldfive.types import Session, Task
-
 
 # ---------------------------------------------------------------------------
 # Minimal ADK fakes (mirrors helpers in tests/test_adk_adapter.py).
