@@ -400,10 +400,23 @@ You MUST:
 
 8. RETURN A COMPLETE PLAN. Always return the full plan, not a delta.
 
+SUMMARY POLICY. The ``summary`` field MUST be a noun phrase
+describing the GOAL the plan delivers. DO NOT include process
+commentary, meta-reasoning, or sentences explaining why you made
+(or didn't make) changes. DO NOT mention 'drift', 'revision', or
+'plan unchanged'. Even when nothing changes, the ``summary`` field
+MUST remain a noun phrase describing the plan's GOAL — never
+narrate the absence of changes ("plan unchanged", "no revision
+needed", "drift event lacked detail", etc.). Re-emit the prior
+plan's summary verbatim if no goal shift warrants a new one.
+  RIGHT: "Create a 2-slide presentation about solar panels."
+  RIGHT: "Generate a Python script that prints fibonacci numbers up to 100."
+  WRONG: "Plan unchanged because no specific details were provided."
+
 Respond with a single JSON object and NOTHING ELSE:
 
 {
-  "summary": "A noun phrase describing the GOAL the plan delivers. DO NOT include process commentary, meta-reasoning, or sentences explaining why you made (or didn't make) changes. DO NOT mention 'drift', 'revision', or 'plan unchanged'. Examples: 'Create a 2-slide presentation about solar panels.' / 'Generate a Python script that prints fibonacci numbers up to 100.' NOT: 'Plan unchanged because no specific details were provided.'",
+  "summary": "<noun phrase describing the GOAL — see SUMMARY POLICY>",
   "tasks": [
     {
       "id": "...",
@@ -419,12 +432,7 @@ Respond with a single JSON object and NOTHING ELSE:
 }
 
 If nothing needs to change, return the current plan unchanged (but
-still as a complete JSON plan, not an empty object). Even when
-nothing changes, the ``summary`` field MUST remain a noun phrase
-describing the plan's GOAL — never narrate the absence of changes
-("plan unchanged", "no revision needed", "drift event lacked detail",
-etc.). Re-emit the prior plan's summary verbatim if no goal shift
-warrants a new one.
+still as a complete JSON plan, not an empty object).
 """
 
 
@@ -3096,7 +3104,7 @@ Reply with a single JSON object and NOTHING ELSE:
   "reasoning": "<one-sentence why>",
   "plan": null OR {
     "id": "<short-id>",
-    "summary": "<A noun phrase describing the GOAL the plan delivers. DO NOT include process commentary, meta-reasoning, or sentences explaining why you made (or didn't make) changes. DO NOT mention 'drift', 'revision', or 'plan unchanged'. Examples: 'Create a 2-slide presentation about solar panels.' / 'Generate a Python script that prints fibonacci numbers up to 100.' NOT: 'Plan unchanged because no specific details were provided.'>",
+    "summary": "<noun phrase describing the GOAL — see SUMMARY POLICY in PLAN SHAPE>",
     "tasks": [
       {
         "id": "<short-id>",
@@ -3271,11 +3279,19 @@ PLAN SHAPE (when plan is non-null):
   * Task ids: short, unique, stable strings ("research", "draft_intro",
     "review_final"). Reuse prior task ids when the task is the same
     work; mint new ids for delta tasks.
-  * summary: a one-sentence PR-title-shaped noun phrase describing the
-    GOAL the plan delivers. Never narrate process or meta-reasoning
-    ("plan unchanged", "no revision needed", "drift event lacked
-    detail"). If the goal hasn't shifted relative to the prior plan,
-    reuse the prior plan's summary verbatim.
+
+SUMMARY POLICY (applies to ``plan.summary``):
+
+  * MUST be a one-sentence PR-title-shaped noun phrase describing the
+    GOAL the plan delivers.
+  * DO NOT include process commentary, meta-reasoning, or sentences
+    explaining why you made (or didn't make) changes. DO NOT mention
+    'drift', 'revision', or 'plan unchanged'.
+  * If the goal hasn't shifted relative to the prior plan, reuse the
+    prior plan's summary verbatim.
+  * RIGHT: "Create a 2-slide presentation about solar panels."
+  * RIGHT: "Generate a Python script that prints fibonacci numbers up to 100."
+  * WRONG: "Plan unchanged because no specific details were provided."
 """
 
     async def handle_turn(
