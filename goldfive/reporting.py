@@ -782,6 +782,97 @@ def _missing_task_id_response(tool_name: str) -> dict[str, Any]:
     }
 
 
+def _validate_required(
+    args: dict[str, Any],
+    schema: dict[str, Any],
+    tool_name: str,
+) -> dict[str, Any] | None:
+    """Enforce the schema's ``required[]`` list at handler dispatch.
+
+    The v15-cascade root cause: handlers ``_str``-coerced missing /
+    empty fields to ``""`` and forwarded the empty payload onto the
+    steerer, where it became drift detail like ``"new work under : :
+    "`` — semantically empty signals that the planner correctly
+    declined to act on, leaving the agent in a no-op revision tool
+    loop.
+
+    The fix: every handler validates each schema-``required`` field at
+    entry. A missing field, ``None``, or whitespace-only string is a
+    contract violation and the handler returns a structured error
+    instead of driving the steerer. Numbers and booleans are accepted
+    as-is when present (a literal ``0`` / ``False`` is a valid value;
+    only the absence of the key is a violation).
+
+    NOTE: schema-``required`` does NOT include ``task_id`` even on
+    handlers that need one — see goldfive#191. ``task_id`` rejection
+    flows through :func:`_missing_task_id_response` after the adapter
+    pin fallback. This helper enforces the *content* fields the LLM
+    must supply.
+
+    Returns ``None`` when validation passes (caller proceeds), or an
+    error response dict the handler should return verbatim.
+    """
+    required = schema.get("required") or []
+    for field in required:
+        if field not in args:
+            return _missing_required_field_response(
+                tool_name=tool_name,
+                field=field,
+                reason="missing",
+                schema=schema,
+            )
+        val = args[field]
+        if val is None:
+            return _missing_required_field_response(
+                tool_name=tool_name,
+                field=field,
+                reason="null",
+                schema=schema,
+            )
+        if isinstance(val, str) and not val.strip():
+            return _missing_required_field_response(
+                tool_name=tool_name,
+                field=field,
+                reason="empty",
+                schema=schema,
+            )
+    return None
+
+
+def _missing_required_field_response(
+    *,
+    tool_name: str,
+    field: str,
+    reason: str,
+    schema: dict[str, Any],
+) -> dict[str, Any]:
+    """Canonical rejection shape for a missing/empty required field.
+
+    Mirrors the structure of :func:`_missing_task_id_response` —
+    ``{"acknowledged": False, "error": ..., "tool": ..., "message":
+    ...}`` plus a ``field`` and ``schema`` so the LLM can self-correct
+    on the next turn. The ``schema`` echo is the parameters block the
+    handler is enforcing; tool dispatchers / observability layers can
+    use it to render a hint.
+    """
+    properties = schema.get("properties") or {}
+    expected = properties.get(field) or {}
+    return {
+        "acknowledged": False,
+        "error": "missing_required_field",
+        "tool": tool_name,
+        "field": field,
+        "reason": reason,
+        "expected": expected,
+        "required": list(schema.get("required") or []),
+        "message": (
+            f"Tool {tool_name!r} requires field {field!r} to be a non-empty "
+            f"value; received {reason}. Call the tool again with all "
+            f"required fields populated."
+        ),
+    }
+
+
 def _str(args: dict[str, Any], key: str, default: str = "") -> str:
     v = args.get(key, default)
     if v is None:
@@ -937,6 +1028,9 @@ async def _handle_task_progress(
 async def _handle_task_completed(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
+    err = _validate_required(args, _SCHEMA_TASK_COMPLETED, "report_task_completed")
+    if err is not None:
+        return err
     task_id, source = _resolve_task_id_with_source(args, session)
     summary = _str(args, "summary")
     artifacts_raw = args.get("artifacts")
@@ -985,6 +1079,9 @@ async def _handle_task_completed(
 async def _handle_task_failed(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
+    err = _validate_required(args, _SCHEMA_TASK_FAILED, "report_task_failed")
+    if err is not None:
+        return err
     task_id, source = _resolve_task_id_with_source(args, session)
     reason = _str(args, "reason")
     recoverable = _bool(args, "recoverable", default=True)
@@ -1029,6 +1126,9 @@ async def _handle_task_failed(
 async def _handle_task_blocked(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
+    err = _validate_required(args, _SCHEMA_TASK_BLOCKED, "report_task_blocked")
+    if err is not None:
+        return err
     task_id, source = _resolve_task_id_with_source(args, session)
     blocker = _str(args, "blocker")
     needed = _str(args, "needed")
@@ -1067,6 +1167,9 @@ async def _handle_task_blocked(
 async def _handle_new_work_discovered(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
+    err = _validate_required(args, _SCHEMA_NEW_WORK_DISCOVERED, "report_new_work_discovered")
+    if err is not None:
+        return err
     parent_task_id = _str(args, "parent_task_id")
     title = _str(args, "title")
     description = _str(args, "description")
@@ -1084,6 +1187,9 @@ async def _handle_new_work_discovered(
 async def _handle_plan_divergence(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
+    err = _validate_required(args, _SCHEMA_PLAN_DIVERGENCE, "report_plan_divergence")
+    if err is not None:
+        return err
     note = _str(args, "note")
     suggested_action = _str(args, "suggested_action")
     await steerer.report_plan_divergence(
@@ -1184,6 +1290,7 @@ async def _handle_declaration(
     *,
     kind: str,
     tool_name: str,
+    schema: dict[str, Any],
 ) -> dict[str, Any]:
     """Shared body for ``declare_task_skipped`` / ``declare_task_not_needed``.
 
@@ -1202,6 +1309,9 @@ async def _handle_declaration(
     declaration just queues an advisory signal that the next refine
     consumes (Phase 4 work).
     """
+    err = _validate_required(args, schema, tool_name)
+    if err is not None:
+        return err
     task_id, _source = _resolve_task_id_with_source(args, session)
     reason = _str(args, "reason")
     if not task_id:
@@ -1232,6 +1342,7 @@ async def _handle_declare_task_skipped(
         steerer,
         kind=DECLARATION_KIND_SKIPPED,
         tool_name="declare_task_skipped",
+        schema=_SCHEMA_DECLARE_TASK_SKIPPED,
     )
 
 
@@ -1244,6 +1355,7 @@ async def _handle_declare_task_not_needed(
         steerer,
         kind=DECLARATION_KIND_NOT_NEEDED,
         tool_name="declare_task_not_needed",
+        schema=_SCHEMA_DECLARE_TASK_NOT_NEEDED,
     )
 
 
@@ -1263,6 +1375,9 @@ async def _handle_awaiting_approval(
     decision lands returns ``{"decision": "timeout", "detail": ...}``
     and leaves the task blocked (the caller may re-prompt or fail).
     """
+    err = _validate_required(args, _SCHEMA_AWAITING_APPROVAL, "report_awaiting_approval")
+    if err is not None:
+        return err
     task_id, source = _resolve_task_id_with_source(args, session)
     prompt = _str(args, "prompt")
     timeout_ms = _int(args, "timeout_ms", 0)
