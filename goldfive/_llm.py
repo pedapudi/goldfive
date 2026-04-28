@@ -90,6 +90,83 @@ def get_max_output_tokens() -> int:
     return int(cap)
 
 
+# ---------------------------------------------------------------------------
+# Per-callsite "disable thinking" signal (goldfive#271 follow-up to #311)
+# ---------------------------------------------------------------------------
+#
+# Goldfive's judges / goal_deriver / planner refines ask small JSON-shaped
+# questions ("is this on-task?", "is the trajectory progressing?", "extract
+# the goal"). Running them through Qwen 3.5 / Gemini "thinking" mode wastes
+# the entire ``max_output_tokens`` ceiling on internal ``<think>`` reasoning
+# and leaves nothing for the JSON answer — the v16 / Qwen 35B failure mode
+# fixed by #311's 16k cap was the *symptom*; the *cause* is that judge
+# dispatches don't need thinking at all.
+#
+# Thinking mode is the user's model behaviour for their own agents
+# (coordinator / research / web_developer / ...) — we do NOT change that.
+# This ContextVar narrowly scopes "disable thinking" to goldfive's internal
+# meta-cognition dispatches. The default ADK / OpenAI builders read it and
+# attach the SDK-specific opt-out (``ThinkingConfig(thinking_budget=0)`` for
+# google.genai; ``extra_body={"enable_thinking": False}`` for Qwen-via-litellm
+# / OpenAI-compatible endpoints).
+
+#: ContextVar carrying the per-callsite disable-thinking flag. ``None`` /
+#: ``False`` means "use the model's natural thinking behaviour" — the
+#: default. ``True`` means "ask the SDK to suppress thinking for this
+#: dispatch".
+THINKING_DISABLED_VAR: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
+    "goldfive_call_llm_thinking_disabled", default=None
+)
+
+
+def get_thinking_disabled() -> bool:
+    """Return whether the per-callsite disable-thinking signal is set.
+
+    ``False`` by default — agent-side LLM calls (coordinator / research /
+    web_developer / etc.) keep their natural thinking behaviour. The
+    judges / goal_deriver / planner refine call sites enter
+    :func:`call_llm_thinking_disabled` to flip this on for the duration
+    of a single ``await call_llm(...)``.
+    """
+    flag = THINKING_DISABLED_VAR.get()
+    return bool(flag)
+
+
+@contextmanager
+def call_llm_thinking_disabled() -> Iterator[None]:
+    """Disable thinking-mode on the ``call_llm`` dispatch inside the with-block.
+
+    Used by goldfive consumers that ask small JSON-shaped questions
+    (judges / goal_deriver / planner refine / reflective check) to avoid
+    burning the ``max_output_tokens`` budget on ``<think>`` reasoning
+    that nobody reads. Restores the prior value on exit even if the body
+    raises.
+
+    Reads + writes :data:`THINKING_DISABLED_VAR`. The default ADK and
+    OpenAI builders inspect ``get_thinking_disabled()`` and attach the
+    SDK-specific opt-out:
+
+    * ``google.genai.types.ThinkingConfig(include_thoughts=False,
+      thinking_budget=0)`` on ``GenerateContentConfig`` for ADK / Gemini.
+    * ``extra_body={"enable_thinking": False}`` on
+      ``client.chat.completions.create`` for Qwen via litellm / OpenAI-
+      compatible endpoints. Vendors that don't recognise the field
+      ignore it (we also include ``/no_think`` in the system prompt as a
+      Qwen-prompt-level fallback when the SDK shape doesn't accept the
+      kwarg).
+
+    User-supplied ``call_llm`` callables can opt in by reading
+    :func:`get_thinking_disabled` themselves; they are not required to.
+    The cost of ignoring it is "the model thinks anyway" — exactly the
+    pre-fix behaviour that wasted the token budget in v16 evidence.
+    """
+    token = THINKING_DISABLED_VAR.set(True)
+    try:
+        yield
+    finally:
+        THINKING_DISABLED_VAR.reset(token)
+
+
 @contextmanager
 def call_llm_budget(max_output_tokens: int | None) -> Iterator[None]:
     """Set :data:`MAX_OUTPUT_TOKENS_VAR` for the duration of the with-block.
@@ -169,7 +246,10 @@ __all__ = [
     "ClosableCallLLM",
     "DEFAULT_MAX_OUTPUT_TOKENS",
     "MAX_OUTPUT_TOKENS_VAR",
+    "THINKING_DISABLED_VAR",
     "call_llm_budget",
+    "call_llm_thinking_disabled",
     "get_max_output_tokens",
+    "get_thinking_disabled",
     "maybe_close_call_llm",
 ]

@@ -550,9 +550,14 @@ async def classify_reasoning_drift_with_focus(
             target_task_id=current_task_id,
         ) as span:
             # Bound the dispatch — see ``REASONING_JUDGE_MAX_OUTPUT_TOKENS``.
-            from goldfive._llm import call_llm_budget
+            # Also disable thinking (goldfive#271 follow-up to #311):
+            # this is meta-cognition asking a small JSON question, not
+            # deep reasoning. Letting the model burn the 16k budget on
+            # ``<think>`` was the v16 / Qwen 35B failure mode — the cap
+            # bump was the symptom-fix, this is the cause-fix.
+            from goldfive._llm import call_llm_budget, call_llm_thinking_disabled
 
-            with call_llm_budget(REASONING_JUDGE_MAX_OUTPUT_TOKENS):
+            with call_llm_budget(REASONING_JUDGE_MAX_OUTPUT_TOKENS), call_llm_thinking_disabled():
                 raw = await call_llm(system, user, model)
             # Parse inside the with-block so we can stamp
             # decision-context onto the span before the End event fires
@@ -567,9 +572,7 @@ async def classify_reasoning_drift_with_focus(
                     on_task_parsed = on_task_raw
                     reason = str(parsed.get("reason", "") or "").strip()
                     if not on_task_raw:
-                        severity_str = _severity_from_verdict(
-                            parsed.get("severity")
-                        ).value.lower()
+                        severity_str = _severity_from_verdict(parsed.get("severity")).value.lower()
                 # Extended attribution fields — extracted regardless of
                 # the on_task verdict. The judge can name a focused
                 # task whether or not it considers the reasoning on the
@@ -586,9 +589,7 @@ async def classify_reasoning_drift_with_focus(
                     focus_confidence_parsed = 0.0
                 # Clamp to [0.0, 1.0]; the prompt asks for 0.0-1.0 but
                 # we don't trust the LLM not to drift outside.
-                focus_confidence_parsed = max(
-                    0.0, min(1.0, focus_confidence_parsed)
-                )
+                focus_confidence_parsed = max(0.0, min(1.0, focus_confidence_parsed))
                 intent_raw = parsed.get("stated_intent", "")
                 if isinstance(intent_raw, str):
                     stated_intent_parsed = intent_raw.strip()
@@ -596,9 +597,22 @@ async def classify_reasoning_drift_with_focus(
             # verdict so harmonograf can render "judged agent/task:
             # on-task" inline.
             if on_task_parsed is None:
-                span.output_preview = (
-                    f"unparseable verdict; raw={raw_str_inline[:200]!r}"
-                )
+                # Distinguish "model returned all thinking, no answer"
+                # from "model returned garbage" (goldfive#271 follow-up
+                # to #311). The default ADK / OpenAI builders stash the
+                # part counts on the call_llm closure; when the answer
+                # is empty AND we saw ``thought=True`` parts the
+                # diagnostic should say so rather than show an
+                # indistinguishable ``raw=''``.
+                _thought_n = int(getattr(call_llm, "last_thought_count", 0) or 0)
+                if not raw_str_inline.strip() and _thought_n > 0:
+                    span.output_preview = (
+                        f"empty answer ({_thought_n} thought part(s); "
+                        f"the model spent its budget thinking and emitted "
+                        f"no JSON)"
+                    )
+                else:
+                    span.output_preview = f"unparseable verdict; raw={raw_str_inline[:200]!r}"
                 span.decision_summary = (
                     f"reasoning-judge call on "
                     f"{current_agent_id or '(no-agent)'}"
@@ -615,9 +629,7 @@ async def classify_reasoning_drift_with_focus(
                     verdict_str = "on-task"
                 else:
                     verdict_str = (
-                        f"off-task ({severity_str.upper()})"
-                        if severity_str
-                        else "off-task"
+                        f"off-task ({severity_str.upper()})" if severity_str else "off-task"
                     )
                 span.decision_summary = (
                     f"judged {current_agent_id or '(no-agent)'}'s reasoning "
@@ -640,15 +652,13 @@ async def classify_reasoning_drift_with_focus(
         )
     if parsed is None and not call_failed:
         log.debug(
-            "classify_reasoning_drift: response was not JSON (raw=%r); "
-            "no drift emitted",
+            "classify_reasoning_drift: response was not JSON (raw=%r); no drift emitted",
             raw_str[:200],
         )
     elif parsed is not None:
         if on_task_parsed is None:
             log.debug(
-                "classify_reasoning_drift: parsed=%r lacks boolean 'on_task' "
-                "key; no drift emitted",
+                "classify_reasoning_drift: parsed=%r lacks boolean 'on_task' key; no drift emitted",
                 parsed,
             )
         elif on_task_parsed:
@@ -696,7 +706,9 @@ async def classify_reasoning_drift_with_focus(
             elapsed_ms=elapsed_ms,
             reasoning_input=reasoning,
             raw_response=raw_str,
-            on_task=bool(on_task_parsed) if on_task_parsed is not None else True
+            on_task=bool(on_task_parsed)
+            if on_task_parsed is not None
+            else True
             if drift is None
             else False,
             severity=severity_str,
@@ -763,7 +775,6 @@ async def _emit_judge_invoked(
         await sink.emit(evt)
     except Exception as exc:  # noqa: BLE001 - observability must never break
         log.warning(
-            "classify_reasoning_drift: sink.emit raised %s; "
-            "ReasoningJudgeInvoked dropped",
+            "classify_reasoning_drift: sink.emit raised %s; ReasoningJudgeInvoked dropped",
             exc,
         )

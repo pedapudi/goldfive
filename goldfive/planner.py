@@ -447,7 +447,7 @@ still as a complete JSON plan, not an empty object).
 # path that can reshape the plan in response to a drift.
 _REFINEMENT_GUIDANCE_BLOCK = (
     "REFINEMENT GUIDANCE:\n"
-    "- The drift you're correcting is usually \"small\" — a single "
+    '- The drift you\'re correcting is usually "small" — a single '
     "agent produced off-topic or flawed output on a task it's "
     "otherwise capable of. Default pattern: replace the drifted task "
     "with a corrected variant, KEEP THE SAME `assignee_agent_id`, "
@@ -711,9 +711,7 @@ def _check_supersedes_coverage(
         return []
     new_ids = {t.id for t in revised.tasks if t.id}
     supersedes_targets = {
-        (t.supersedes or "").strip()
-        for t in revised.tasks
-        if (t.supersedes or "").strip()
+        (t.supersedes or "").strip() for t in revised.tasks if (t.supersedes or "").strip()
     }
     orphans: list[Task] = []
     for old in prior.tasks:
@@ -1038,9 +1036,7 @@ class LLMPlanner:
         """
         self._drift_emitter = emitter
 
-    def set_span_context_provider(
-        self, provider: Callable[[], Any] | None
-    ) -> None:
+    def set_span_context_provider(self, provider: Callable[[], Any] | None) -> None:
         """Install (or remove) the callable that supplies span-emission context.
 
         The callable is invoked at every ``call_llm`` site to snapshot
@@ -1115,10 +1111,7 @@ class LLMPlanner:
         tasks = getattr(plan, "tasks", None) or []
         plan_line = f"current plan: rev{plan.revision_index}, {len(tasks)} task(s)"
         if tasks:
-            titles = [
-                f"{t.id} ({str(getattr(t, 'status', '') or '').lower()})"
-                for t in tasks[:8]
-            ]
+            titles = [f"{t.id} ({str(getattr(t, 'status', '') or '').lower()})" for t in tasks[:8]]
             plan_line += ": " + ", ".join(titles)
         parts.append(plan_line)
         return "\n".join(parts)
@@ -1132,11 +1125,7 @@ class LLMPlanner:
             f"tasks={len(tasks)}",
         ]
         assignees = sorted(
-            {
-                str(t.assignee_agent_id or "")
-                for t in tasks
-                if getattr(t, "assignee_agent_id", "")
-            }
+            {str(t.assignee_agent_id or "") for t in tasks if getattr(t, "assignee_agent_id", "")}
         )
         if assignees:
             parts.append("assignees=[" + ", ".join(assignees) + "]")
@@ -1822,8 +1811,7 @@ class LLMPlanner:
             from goldfive.events import emit, make_event  # noqa: PLC0415 — lazy
         except Exception as exc:  # noqa: BLE001
             log.debug(
-                "LLMPlanner: events module unavailable; dropping "
-                "refine_orphaned_tasks signal (%s)",
+                "LLMPlanner: events module unavailable; dropping refine_orphaned_tasks signal (%s)",
                 exc,
             )
             return
@@ -1847,8 +1835,7 @@ class LLMPlanner:
             seq = seq_fn()
         except Exception as exc:  # noqa: BLE001
             log.debug(
-                "LLMPlanner: sequence_fn raised; dropping "
-                "refine_orphaned_tasks signal (%s)",
+                "LLMPlanner: sequence_fn raised; dropping refine_orphaned_tasks signal (%s)",
                 exc,
             )
             return
@@ -1863,8 +1850,7 @@ class LLMPlanner:
             await emit(list(sinks), evt)
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "LLMPlanner: failed to emit refine_orphaned_tasks event "
-                "(%s); dropping signal",
+                "LLMPlanner: failed to emit refine_orphaned_tasks event (%s); dropping signal",
                 exc,
             )
 
@@ -1937,13 +1923,21 @@ class LLMPlanner:
                     # Cap the underlying LLM dispatch so a runaway
                     # generation (Qwen Q4 thinking-token explosion)
                     # cannot wedge the run for minutes. See
-                    # ``LLMPlanner.MAX_OUTPUT_TOKENS``.
-                    from goldfive._llm import call_llm_budget
+                    # ``LLMPlanner.MAX_OUTPUT_TOKENS``. Also disable
+                    # thinking (goldfive#271 follow-up to #311): refine
+                    # is a structured JSON revision call, not deep
+                    # reasoning — burning 16k on ``<think>`` produced
+                    # empty responses in v16 evidence.
+                    from goldfive._llm import (
+                        call_llm_budget,
+                        call_llm_thinking_disabled,
+                    )
 
-                    with call_llm_budget(self.MAX_OUTPUT_TOKENS):
-                        raw = await self._call_llm(
-                            system_prompt, user_prompt, self._model
-                        )
+                    with (
+                        call_llm_budget(self.MAX_OUTPUT_TOKENS),
+                        call_llm_thinking_disabled(),
+                    ):
+                        raw = await self._call_llm(system_prompt, user_prompt, self._model)
                     span.output_preview = (
                         raw[:4096] if isinstance(raw, str) else "(non-str response)"
                     )
@@ -2262,9 +2256,7 @@ class LLMPlanner:
         user_request = ""
         if context is not None:
             user_request = str(context.get("user_request") or "")
-        goal_lines = [
-            f"- [{g.id or '(no-id)'}] {g.summary or '(no summary)'}" for g in goals
-        ]
+        goal_lines = [f"- [{g.id or '(no-id)'}] {g.summary or '(no summary)'}" for g in goals]
         generate_input_preview = (
             (f"user_request: {user_request}\n\n" if user_request else "")
             + "goals:\n"
@@ -2281,12 +2273,18 @@ class LLMPlanner:
                     input_preview=generate_input_preview,
                 ) as span:
                     # Bound the dispatch — see ``LLMPlanner.MAX_OUTPUT_TOKENS``.
-                    from goldfive._llm import call_llm_budget
+                    # Disable thinking — plan_generate emits structured
+                    # JSON describing tasks, not deep reasoning.
+                    from goldfive._llm import (
+                        call_llm_budget,
+                        call_llm_thinking_disabled,
+                    )
 
-                    with call_llm_budget(self.MAX_OUTPUT_TOKENS):
-                        raw = await self._call_llm(
-                            self._system_prompt, user_prompt, self._model
-                        )
+                    with (
+                        call_llm_budget(self.MAX_OUTPUT_TOKENS),
+                        call_llm_thinking_disabled(),
+                    ):
+                        raw = await self._call_llm(self._system_prompt, user_prompt, self._model)
                     span.output_preview = (
                         raw[:4096] if isinstance(raw, str) else "(non-str response)"
                     )
@@ -2422,9 +2420,7 @@ class LLMPlanner:
         if plan is None:
             return None
         if drift.kind is DriftKind.USER_STEER:
-            return await self._refine_steer(
-                plan, drift, goals, available_agents, source="user"
-            )
+            return await self._refine_steer(plan, drift, goals, available_agents, source="user")
         if drift.kind in (
             DriftKind.LOOPING_TOOL_CALL,
             DriftKind.LOOPING_REASONING,
@@ -2874,8 +2870,7 @@ class LLMPlanner:
                 # same way as exhausted retries (keep prior plan,
                 # increment backoff) but without the escalation noise.
                 log.info(
-                    "LLMPlanner._refine_steer(source=%s): attempt %d/%d: %s; "
-                    "not retrying",
+                    "LLMPlanner._refine_steer(source=%s): attempt %d/%d: %s; not retrying",
                     effective_source,
                     attempt,
                     attempts,
@@ -2907,9 +2902,7 @@ class LLMPlanner:
         goals: list[Goal],
         available_agents: list[str] | list[dict[str, Any]] | None = None,
     ) -> Plan | None:
-        return await self._refine_steer(
-            plan, drift, goals, available_agents, source="user"
-        )
+        return await self._refine_steer(plan, drift, goals, available_agents, source="user")
 
     async def _user_steer_one_attempt(
         self,
@@ -2947,15 +2940,21 @@ class LLMPlanner:
                 target_task_id=drift.current_task_id or "",
             ) as span:
                 # Bound the dispatch — see ``LLMPlanner.MAX_OUTPUT_TOKENS``.
-                from goldfive._llm import call_llm_budget
+                # Disable thinking — user_steer is a structured JSON
+                # revision call, not deep reasoning.
+                from goldfive._llm import (
+                    call_llm_budget,
+                    call_llm_thinking_disabled,
+                )
 
-                with call_llm_budget(self.MAX_OUTPUT_TOKENS):
+                with (
+                    call_llm_budget(self.MAX_OUTPUT_TOKENS),
+                    call_llm_thinking_disabled(),
+                ):
                     raw = await self._call_llm(
                         self._user_steer_system_prompt, user_prompt, self._model
                     )
-                span.output_preview = (
-                    raw[:4096] if isinstance(raw, str) else "(non-str response)"
-                )
+                span.output_preview = raw[:4096] if isinstance(raw, str) else "(non-str response)"
                 decision_prefix = (
                     "refined plan (goldfive steer) in response to"
                     if source == "goldfive"
@@ -3011,9 +3010,7 @@ class LLMPlanner:
             merged_edges.append(e)
 
         if (source or "user").strip().lower() == "goldfive":
-            revision_reason = (
-                f"goldfive steer ({drift.kind.value}): {drift.detail}"
-            )
+            revision_reason = f"goldfive steer ({drift.kind.value}): {drift.detail}"
             # Preserve the underlying drift kind on the revision so sinks
             # see the ladder-promoted source, not a synthesised USER_STEER.
             revision_kind_value = drift.kind.value
@@ -3340,12 +3337,8 @@ PLAN SHAPE (when plan is non-null):
         # goes through planning at all), so ``target_agent_id`` /
         # ``target_task_id`` stay empty. A compact rendering of the
         # user input + prior plan summary doubles as ``input_preview``.
-        prior_id = (
-            (prior_plan.id or "") if prior_plan is not None else ""
-        )[:16] or "<none>"
-        gate_input_preview = (
-            f"user_input: {text}\nprior_plan_id: {prior_id}"
-        )
+        prior_id = ((prior_plan.id or "") if prior_plan is not None else "")[:16] or "<none>"
+        gate_input_preview = f"user_input: {text}\nprior_plan_id: {prior_id}"
         try:
             async with goldfive_llm_span(
                 **self._span_kwargs(),
@@ -3353,15 +3346,22 @@ PLAN SHAPE (when plan is non-null):
                 input_preview=gate_input_preview,
             ) as span:
                 # Bound the dispatch — see ``LLMPlanner.MAX_OUTPUT_TOKENS``.
-                from goldfive._llm import call_llm_budget
+                # Disable thinking — handle_turn is a small JSON gate
+                # call ("does this user input need a re-plan?"), not
+                # deep reasoning.
+                from goldfive._llm import (
+                    call_llm_budget,
+                    call_llm_thinking_disabled,
+                )
 
-                with call_llm_budget(self.MAX_OUTPUT_TOKENS):
+                with (
+                    call_llm_budget(self.MAX_OUTPUT_TOKENS),
+                    call_llm_thinking_disabled(),
+                ):
                     raw = await self._call_llm(
                         self._HANDLE_TURN_SYSTEM_PROMPT, user_prompt, self._model
                     )
-                span.output_preview = (
-                    raw[:4096] if isinstance(raw, str) else "(non-str response)"
-                )
+                span.output_preview = raw[:4096] if isinstance(raw, str) else "(non-str response)"
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "LLMPlanner.handle_turn: call_llm raised %s; "
@@ -3407,13 +3407,11 @@ PLAN SHAPE (when plan is non-null):
         chunks.append(self._render_prior_plan_block(prior_plan))
         if prior_goals:
             goal_lines = [
-                f"- [{g.id or '(no-id)'}] {g.summary or '(no summary)'}"
-                for g in prior_goals
+                f"- [{g.id or '(no-id)'}] {g.summary or '(no summary)'}" for g in prior_goals
             ]
             chunks.append(
                 "PRIOR GOALS (preserve their persistent qualifications "
-                "unless the user explicitly removes them):\n"
-                + "\n".join(goal_lines)
+                "unless the user explicitly removes them):\n" + "\n".join(goal_lines)
             )
         if conversation_history:
             # Cap to the most recent few entries — older context lives
@@ -3429,8 +3427,7 @@ PLAN SHAPE (when plan is non-null):
         if agents_block:
             chunks.append(agents_block)
         chunks.append(
-            'Decide and respond. Reply JSON only: '
-            '{"reasoning": "...", "plan": ... | null}'
+            'Decide and respond. Reply JSON only: {"reasoning": "...", "plan": ... | null}'
         )
         return "\n\n".join(chunks)
 
@@ -3512,12 +3509,8 @@ PLAN SHAPE (when plan is non-null):
         # Reuse the prior plan's id so the steerer's _apply_revision
         # bumps revision_index cleanly. This holds for the empty seed
         # (revision 0 → revision 1) AND for every subsequent revision.
-        plan_id_override = (
-            prior_plan.id if prior_plan is not None and prior_plan.id else None
-        )
-        prior_goal_ids = (
-            list(prior_plan.goal_ids) if prior_plan is not None else []
-        )
+        plan_id_override = prior_plan.id if prior_plan is not None and prior_plan.id else None
+        prior_goal_ids = list(prior_plan.goal_ids) if prior_plan is not None else []
         plan = _plan_from_json(
             plan_raw,
             run_id=run_id,
@@ -3526,8 +3519,7 @@ PLAN SHAPE (when plan is non-null):
         )
         if plan is None:
             log.warning(
-                "LLMPlanner.handle_turn: 'plan' failed structural parse; "
-                "treating as conversational"
+                "LLMPlanner.handle_turn: 'plan' failed structural parse; treating as conversational"
             )
             return None
         return plan

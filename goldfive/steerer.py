@@ -544,15 +544,11 @@ class DefaultSteerer:
             _conf_threshold = float(reasoning_binding_confidence_threshold)
         except (TypeError, ValueError):
             _conf_threshold = 0.7
-        self._reasoning_binding_confidence_threshold: float = max(
-            0.0, min(1.0, _conf_threshold)
-        )
+        self._reasoning_binding_confidence_threshold: float = max(0.0, min(1.0, _conf_threshold))
         # Drift-triggered plan-revision cooldown (goldfive#227).
         # Clamped to a non-negative float; ``0.0`` disables the gate
         # so callers can opt out without subclassing.
-        self._plan_revision_cooldown_seconds = max(
-            0.0, float(plan_revision_cooldown_seconds)
-        )
+        self._plan_revision_cooldown_seconds = max(0.0, float(plan_revision_cooldown_seconds))
         # goldfive-steer-unification: policy knob + freshness window for
         # promoting goldfive-detected drifts into the USER_STEER-style
         # cancel+refine+restart machinery. Precedence mirrors the other
@@ -567,8 +563,7 @@ class DefaultSteerer:
             _threshold = "warning"
         if _threshold not in {"off", "warning", "critical"}:
             log.warning(
-                "DefaultSteerer: unknown goldfive_steer_threshold=%r; "
-                "falling back to 'warning'",
+                "DefaultSteerer: unknown goldfive_steer_threshold=%r; falling back to 'warning'",
                 _threshold,
             )
             _threshold = "warning"
@@ -752,9 +747,7 @@ class DefaultSteerer:
         if to is TaskStatus.RUNNING:
             await self.mark_task_running(task_id, session=session, detail=detail, source=source)
         elif to is TaskStatus.COMPLETED:
-            await self.mark_task_completed(
-                task_id, summary=detail, session=session, source=source
-            )
+            await self.mark_task_completed(task_id, summary=detail, session=session, source=source)
         elif to is TaskStatus.FAILED:
             reason = cancel_reason or detail
             await self.mark_task_failed(task_id, reason=reason, session=session, source=source)
@@ -1295,9 +1288,7 @@ class DefaultSteerer:
         # Historically this awaited ``analyze_reasoning`` inline; as of
         # goldfive#251 the judge is fire-and-forget so the
         # model-response callback can return immediately.
-        rl_call_llm = self._maybe_take_reasoning_judge_slot(
-            session, agent_name=agent_name
-        )
+        rl_call_llm = self._maybe_take_reasoning_judge_slot(session, agent_name=agent_name)
         # Fast-exit when there's nothing for ``analyze_reasoning`` to
         # do: ``mode="off"``, or ``mode="judge"`` with no judge slot
         # (rate-limited or globally disabled). Embedding and "both"
@@ -1433,8 +1424,7 @@ class DefaultSteerer:
             raise
         except Exception as exc:  # noqa: BLE001 — background task
             log.warning(
-                "DefaultSteerer: background reasoning-judge raised "
-                "(swallowed): %s",
+                "DefaultSteerer: background reasoning-judge raised (swallowed): %s",
                 exc,
             )
 
@@ -1499,8 +1489,7 @@ class DefaultSteerer:
                 )
         except Exception as exc:  # noqa: BLE001 — never break the run
             log.warning(
-                "DefaultSteerer: record_reasoning_extracted_binding raised "
-                "(swallowed): %s",
+                "DefaultSteerer: record_reasoning_extracted_binding raised (swallowed): %s",
                 exc,
             )
 
@@ -1757,9 +1746,18 @@ class DefaultSteerer:
                 target_task_id=task.id,
             ) as span:
                 # Bound the dispatch — see ``REFLECTIVE_MAX_OUTPUT_TOKENS``.
-                from goldfive._llm import call_llm_budget
+                # Also disable thinking (goldfive#271 follow-up to #311):
+                # this is meta-cognition asking the agent if it's making
+                # progress, not deep reasoning.
+                from goldfive._llm import (
+                    call_llm_budget,
+                    call_llm_thinking_disabled,
+                )
 
-                with call_llm_budget(self.REFLECTIVE_MAX_OUTPUT_TOKENS):
+                with (
+                    call_llm_budget(self.REFLECTIVE_MAX_OUTPUT_TOKENS),
+                    call_llm_thinking_disabled(),
+                ):
                     raw = await call_llm(
                         self.REFLECTIVE_SYSTEM_PROMPT,
                         user_prompt,
@@ -1767,12 +1765,23 @@ class DefaultSteerer:
                     )
                 parsed = self._parse_reflective_response(raw)
                 if parsed is None:
-                    span.output_preview = (
-                        f"unparseable verdict; raw={raw!r:.200}"
-                    )
-                    span.decision_summary = (
-                        f"reflective check on {task.id}: unparseable verdict"
-                    )
+                    # Distinguish "model returned all thinking, no
+                    # answer" from "model returned garbage" — see
+                    # goldfive#271 follow-up to #311. ``call_llm`` is
+                    # the closure built by ``make_default_adk_call_llm``
+                    # / ``_build_judge_call_llm`` which stashes part
+                    # counts on itself.
+                    _thought_n = int(getattr(call_llm, "last_thought_count", 0) or 0)
+                    _raw_str = raw if isinstance(raw, str) else ""
+                    if not _raw_str.strip() and _thought_n > 0:
+                        span.output_preview = (
+                            f"empty answer ({_thought_n} thought "
+                            f"part(s); the model spent its budget thinking "
+                            f"and emitted no JSON)"
+                        )
+                    else:
+                        span.output_preview = f"unparseable verdict; raw={raw!r:.200}"
+                    span.decision_summary = f"reflective check on {task.id}: unparseable verdict"
                 else:
                     making_progress_inline = parsed.get("making_progress")
                     conf_inline = parsed.get("confidence")
@@ -1783,14 +1792,10 @@ class DefaultSteerer:
                         f"reason={reason_inline or '(none)'}"
                     )
                     if isinstance(making_progress_inline, bool):
-                        verdict_str = (
-                            "progressing" if making_progress_inline else "stuck"
-                        )
+                        verdict_str = "progressing" if making_progress_inline else "stuck"
                     else:
                         verdict_str = "malformed"
-                    span.decision_summary = (
-                        f"reflective check on {task.id}: {verdict_str}"
-                    )
+                    span.decision_summary = f"reflective check on {task.id}: {verdict_str}"
         except Exception as exc:  # noqa: BLE001 - never break the run
             log.warning("DefaultSteerer.maybe_run_reflective_check: call_llm raised %s", exc)
             await self._emit_reflective_failure(
@@ -2442,8 +2447,7 @@ class DefaultSteerer:
                 await self.request_invocation_cancel(drift=drift, session=session)
             except Exception as exc:  # noqa: BLE001 — cancel is best-effort
                 log.debug(
-                    "DefaultSteerer._handle_drift: "
-                    "request_invocation_cancel raised: %s",
+                    "DefaultSteerer._handle_drift: request_invocation_cancel raised: %s",
                     exc,
                 )
         if promote_to_steer:
@@ -2553,9 +2557,7 @@ class DefaultSteerer:
             # boundary catch site at ``ADKAdapter._invoke_internal``
             # asserts ``mark_stash_completed()`` fired before the
             # cancel propagated past us.
-            with _state_audit.cancellation_stash_audited(
-                "DefaultSteerer._handle_drift.refine"
-            ):
+            with _state_audit.cancellation_stash_audited("DefaultSteerer._handle_drift.refine"):
                 try:
                     if refine_accepts_registry:
                         revised = await self._planner.refine(
@@ -3048,9 +3050,7 @@ class DefaultSteerer:
         return reason
 
     @staticmethod
-    def _write_adapter_cancel_reason(
-        adapter: Any, reason: str, session: Session | None
-    ) -> None:
+    def _write_adapter_cancel_reason(adapter: Any, reason: str, session: Session | None) -> None:
         """Route the cancel-reason tag through the session-aware helper.
 
         Falls back to the legacy bare-attribute write for adapters /
@@ -3063,9 +3063,7 @@ class DefaultSteerer:
                 setter(session, reason)
                 return
             except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "DefaultSteerer: set_next_cancel_reason raised: %s", exc
-                )
+                log.debug("DefaultSteerer: set_next_cancel_reason raised: %s", exc)
         try:
             adapter._next_cancel_reason = reason
         except Exception as exc:  # noqa: BLE001
@@ -3107,8 +3105,7 @@ class DefaultSteerer:
                 await result
         except Exception as exc:  # noqa: BLE001
             log.debug(
-                "DefaultSteerer._request_adapter_cancel(reason=%r): "
-                "adapter raised: %s",
+                "DefaultSteerer._request_adapter_cancel(reason=%r): adapter raised: %s",
                 reason,
                 exc,
             )
@@ -3117,9 +3114,7 @@ class DefaultSteerer:
     # Cooperative cancellation (goldfive#251 Stream C / 7a)
     # ------------------------------------------------------------------
 
-    def _resolve_active_invocation_ids(
-        self, drift: DriftEvent, session: Session
-    ) -> list[str]:
+    def _resolve_active_invocation_ids(self, drift: DriftEvent, session: Session) -> list[str]:
         """Resolve which invocation_id(s) a cancel should target.
 
         Returns an ordered list of invocation ids that are "active"
@@ -3156,8 +3151,7 @@ class DefaultSteerer:
                             candidates.append(str(inv_id))
             except Exception as exc:  # noqa: BLE001
                 log.debug(
-                    "DefaultSteerer._resolve_active_invocation_ids: "
-                    "reconciler lookup raised: %s",
+                    "DefaultSteerer._resolve_active_invocation_ids: reconciler lookup raised: %s",
                     exc,
                 )
         # Fallback: the adapter's plugin pins a top-level invocation_id
@@ -3379,9 +3373,7 @@ class DefaultSteerer:
         """
         return drift.kind is DriftKind.USER_STEER and getattr(drift, "raw", None) is None
 
-    async def _cancel_inflight_for_revision(
-        self, drift: DriftEvent, session: Session
-    ) -> list[str]:
+    async def _cancel_inflight_for_revision(self, drift: DriftEvent, session: Session) -> list[str]:
         """Cancel the in-flight invocation(s) that produced ``drift``.
 
         Called from every PlanRevised emission path right after the
@@ -3521,9 +3513,7 @@ class DefaultSteerer:
                     return False
         return True
 
-    async def _promote_drift_to_steer(
-        self, drift: DriftEvent, session: Session
-    ) -> None:
+    async def _promote_drift_to_steer(self, drift: DriftEvent, session: Session) -> None:
         """Promote a goldfive-detected drift into a full steer.
 
         Ordered side effects (mirrors the USER_STEER path):
@@ -3559,9 +3549,7 @@ class DefaultSteerer:
         semantics identical to USER_STEER.
         """
         # 1. Tag adapter cancel reason.
-        cancel_reason = self._tag_adapter_cancel_reason_for_promotion(
-            drift, session=session
-        )
+        cancel_reason = self._tag_adapter_cancel_reason_for_promotion(drift, session=session)
         # Session-visible cancel prefix so ``_mark_cancelled_if_live``
         # stamps it on any TaskCancelled the executor emits for the
         # in-flight task as part of the promotion.
@@ -3631,8 +3619,7 @@ class DefaultSteerer:
                 _ostate.record_processed_steer_id(session.state, drift_id)
             except Exception as exc:  # noqa: BLE001
                 log.debug(
-                    "DefaultSteerer._promote_drift_to_steer: "
-                    "record_processed_steer_id raised: %s",
+                    "DefaultSteerer._promote_drift_to_steer: record_processed_steer_id raised: %s",
                     exc,
                 )
         # 4. Route to planner.refine_steer (source="goldfive") — falls
@@ -3665,8 +3652,7 @@ class DefaultSteerer:
                 revised = await self._dispatch_goldfive_steer_refine(drift, session)
             except Exception as exc:  # noqa: BLE001
                 log.warning(
-                    "DefaultSteerer._promote_drift_to_steer: refine raised %s; "
-                    "plan unchanged",
+                    "DefaultSteerer._promote_drift_to_steer: refine raised %s; plan unchanged",
                     exc,
                 )
                 await self._emit_refine_failed(
@@ -3701,8 +3687,7 @@ class DefaultSteerer:
                 self._active_session_var.reset(_active_session_token)
         if revised is None:
             log.warning(
-                "DefaultSteerer._promote_drift_to_steer: refine returned None; "
-                "plan unchanged"
+                "DefaultSteerer._promote_drift_to_steer: refine returned None; plan unchanged"
             )
             await self._emit_refine_failed(
                 session,
@@ -4352,9 +4337,7 @@ class DefaultSteerer:
         # Phase 3.5 (goldfive#271) tripwire wrapper — see §C4. The
         # ``except BaseException: stash; raise`` arm below is the
         # compliance branch (CANCELLATION-CONTRACT.md §1.2).
-        with _state_audit.cancellation_stash_audited(
-            "DefaultSteerer.observe_refine"
-        ):
+        with _state_audit.cancellation_stash_audited("DefaultSteerer.observe_refine"):
             try:
                 await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
                 try:
@@ -4905,9 +4888,7 @@ class DefaultSteerer:
         )
         return True
 
-    def _is_plan_revision_count_gated(
-        self, drift: DriftEvent, session: Session
-    ) -> bool:
+    def _is_plan_revision_count_gated(self, drift: DriftEvent, session: Session) -> bool:
         """Return ``True`` iff the (kind, task) revision cap has been hit.
 
         Independent of the time-based cooldown -- consults
@@ -4939,9 +4920,7 @@ class DefaultSteerer:
         )
         return True
 
-    async def _emit_revision_cap_escalation(
-        self, drift: DriftEvent, session: Session
-    ) -> None:
+    async def _emit_revision_cap_escalation(self, drift: DriftEvent, session: Session) -> None:
         """Emit a HUMAN_INTERVENTION_REQUIRED drift + pause the runner.
 
         Called from ``_handle_drift`` / ``_promote_drift_to_steer`` when
@@ -4992,9 +4971,7 @@ class DefaultSteerer:
         # budget. GOAL_DRIFT has its own rate-limit via
         # ``_last_goal_drift_check_ts``.
         if drift.kind not in self._PLAN_REVISION_COOLDOWN_EXEMPT_KINDS:
-            session.plan_revision_counts[key] = (
-                session.plan_revision_counts.get(key, 0) + 1
-            )
+            session.plan_revision_counts[key] = session.plan_revision_counts.get(key, 0) + 1
 
     @staticmethod
     def _integrate_correction_supersedes(revised: Plan) -> None:
