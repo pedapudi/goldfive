@@ -383,6 +383,7 @@ def to_pb_drift_event(evt: DriftEvent) -> Any:
         detail=evt.detail,
         current_task_id=evt.current_task_id,
         current_agent_id=evt.current_agent_id,
+        synthetic=bool(getattr(evt, "synthetic", False)),
     )
 
 
@@ -394,6 +395,7 @@ def from_pb_drift_event(msg: Any) -> DriftEvent:
         current_task_id=msg.current_task_id,
         current_agent_id=msg.current_agent_id,
         raw=None,
+        synthetic=bool(getattr(msg, "synthetic", False)),
     )
 
 

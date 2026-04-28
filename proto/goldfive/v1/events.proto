@@ -301,6 +301,21 @@ message DriftDetected {
   // detector fired — but no cancel-in-flight or refine was triggered on
   // goldfive's behalf. Always ``false`` on user-authored drifts.
   bool suppressed_by_user_steer = 10;
+  // True when the ``DriftEvent`` was synthesized internally by goldfive
+  // plumbing rather than minted from a real signal — e.g. the
+  // ``USER_STEER`` drift :meth:`Runner._install_revision` fabricates on
+  // every plan install so the install pipeline can route uniformly
+  // through :meth:`DefaultSteerer.apply_user_steer_with_plan`. The drift
+  // is still emitted on the wire for full audit fidelity, but consumers
+  // rendering an operator-facing "interventions" surface MUST filter out
+  // ``synthetic = true`` rows: they do not represent operator action or
+  // detector verdicts and would otherwise appear as phantom interventions
+  // attached to every fresh user turn. Sinks that render the full event
+  // timeline (audit / debug views) should still surface synthetic drifts
+  // — just not on the user-visible interventions panel. Always
+  // ``false`` on real user-control drifts (those carry a ``raw``
+  // ControlMessage) and on autonomous detector drifts.
+  bool synthetic = 11;
 }
 
 // Terminal event on a successful run.

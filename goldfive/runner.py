@@ -1254,6 +1254,17 @@ class Runner:
         # language input into the unified install pipeline. The
         # steerer's apply_user_steer_with_plan does the bookkeeping +
         # validation + revision install + PlanRevised emit.
+        #
+        # ``synthetic=True`` marks this drift as goldfive plumbing (not a
+        # real operator STEER): the steerer still emits a
+        # ``DriftDetected`` so the audit trail is complete, but the
+        # harmonograf interventions panel filters synthetic rows out so
+        # the user does not see a phantom STEER intervention attached to
+        # every fresh turn. The state-write gate
+        # (:meth:`_apply_user_steer_state` checks ``drift.raw is not
+        # None``) was added in PR #292; the ``synthetic`` flag layers on
+        # top so downstream UIs can also distinguish without inspecting
+        # the ``raw`` field.
         user_text = (
             user_input.strip() if isinstance(user_input, str) else _initial_goal_summary(user_input)
         )
@@ -1261,6 +1272,7 @@ class Runner:
             kind=DriftKind.USER_STEER,
             severity=DriftSeverity.WARNING,
             detail=user_text,
+            synthetic=True,
         )
         try:
             installed = await self.steerer.apply_user_steer_with_plan(
