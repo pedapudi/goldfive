@@ -221,7 +221,8 @@ async def test_completion_with_one_next_task_rotates() -> None:
     out = await _tool("report_task_completed").handler(
         {"task_id": "t1", "summary": "A done"}, session, steerer
     )
-    assert out == {"acknowledged": True}
+    # F1 directive ack: acknowledged=True plus task pointer + plan_state.
+    assert out["acknowledged"] is True
     assert session.state["goldfive.current_task_id"] == "t2"
     assert session.plan.tasks[0].status is TaskStatus.COMPLETED
     assert session.plan.tasks[1].status is TaskStatus.PENDING
@@ -356,5 +357,6 @@ async def test_rotation_after_completion_fallback_resolves_next_call() -> None:
     )
     # Second call: no task_id in args — must resolve t2 from rotated pin.
     result = await _tool("report_task_started").handler({"detail": "now on B"}, session, steerer)
-    assert result == {"acknowledged": True}
+    # F1 directive ack on the chained transition.
+    assert result["acknowledged"] is True
     assert session.plan.tasks[1].status is TaskStatus.RUNNING

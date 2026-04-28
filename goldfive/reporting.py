@@ -110,6 +110,142 @@ DECLARATION_KINDS: tuple[str, ...] = (
 _ACK: dict[str, Any] = {"acknowledged": True}
 
 
+# ---------------------------------------------------------------------------
+# Tier 1 / F1 — directive tool responses (loop prevention)
+# ---------------------------------------------------------------------------
+#
+# Every report_task_* handler returns a richer payload than the historical
+# ``{"acknowledged": True}`` ack. The payload anchors the LLM's "what do
+# I do next?" reasoning by embedding the live plan_state, so a coordinator
+# that just completed a task sees the next pending hand-off instead of an
+# information-free ack and looping back onto the just-finished work.
+#
+# Shape:
+#   {
+#     "acknowledged": True,
+#     "task": {"id": <task_id>, "status": <new_status_str>},
+#     "plan_state": {
+#        "completed_task_ids": [...sorted ids of COMPLETED tasks...],
+#        "next_pending": {
+#            "id": ..., "title": ..., "assigned_to": <bare agent name>,
+#            "predecessors_completed": True,
+#        } | None,
+#     },
+#   }
+#
+# Idempotent / invalid / refused responses keep their existing shapes —
+# they signal "do nothing" to the LLM and don't need the directive surface.
+# This is the pre-dispatch loop-source closure pattern (see
+# ``docs/design/`` for the loop-prevention strategy).
+
+
+def _next_pending_with_completed_predecessors(plan: Any) -> Any | None:
+    """Return the first PENDING task whose incoming edges all have terminal predecessors.
+
+    Walks ``plan.tasks`` in declared order (topological-ish — refine
+    preserves the original ordering for unmutated stages) and returns
+    the first ``Task`` whose every incoming-edge predecessor is in a
+    terminal status (``TERMINAL_TASK_STATUSES``). Returns ``None`` when
+    no such task exists.
+
+    Note: a task with NO incoming edges trivially passes the
+    "predecessors_completed" gate and is returned if PENDING.
+    """
+    if plan is None:
+        return None
+    tasks = list(getattr(plan, "tasks", None) or ())
+    if not tasks:
+        return None
+    edges = list(getattr(plan, "edges", None) or ())
+    by_id = {str(getattr(t, "id", "") or ""): t for t in tasks}
+    incoming: dict[str, list[str]] = {tid: [] for tid in by_id}
+    for e in edges:
+        to_id = str(getattr(e, "to_task_id", "") or "")
+        from_id = str(getattr(e, "from_task_id", "") or "")
+        if to_id in incoming and from_id:
+            incoming[to_id].append(from_id)
+    for task in tasks:
+        if getattr(task, "status", None) is not TaskStatus.PENDING:
+            continue
+        tid = str(getattr(task, "id", "") or "")
+        if not tid:
+            continue
+        preds = incoming.get(tid, [])
+        if all(
+            (by_id.get(p) is not None)
+            and (getattr(by_id[p], "status", None) in _TERMINAL_STATUSES)
+            for p in preds
+        ):
+            return task
+    return None
+
+
+def _bare_agent_name(name: str) -> str:
+    """Return the bare agent name (last dot-separated segment).
+
+    Mirrors the normalization used by ``_correction_injection`` —
+    fully-qualified ADK agent paths like ``coordinator.research_agent``
+    collapse to ``research_agent`` so the LLM sees a name it can pass
+    back as the AgentTool target.
+    """
+    s = (name or "").strip()
+    if not s:
+        return ""
+    if "." in s:
+        return s.rsplit(".", 1)[-1]
+    return s
+
+
+def _build_plan_state(plan: Any) -> dict[str, Any]:
+    """Return the F1 ``plan_state`` block for a directive tool response."""
+    if plan is None:
+        return {"completed_task_ids": [], "next_pending": None}
+    tasks = list(getattr(plan, "tasks", None) or ())
+    completed_ids = sorted(
+        str(getattr(t, "id", "") or "")
+        for t in tasks
+        if getattr(t, "status", None) is TaskStatus.COMPLETED
+        and getattr(t, "id", "")
+    )
+    next_pending = _next_pending_with_completed_predecessors(plan)
+    next_pending_payload: dict[str, Any] | None = None
+    if next_pending is not None:
+        next_pending_payload = {
+            "id": str(getattr(next_pending, "id", "") or ""),
+            "title": str(getattr(next_pending, "title", "") or ""),
+            "assigned_to": _bare_agent_name(
+                str(getattr(next_pending, "assignee_agent_id", "") or "")
+            ),
+            # The selector only returns tasks whose every predecessor is
+            # terminal; expose the assertion so the LLM doesn't have to
+            # re-derive it.
+            "predecessors_completed": True,
+        }
+    return {
+        "completed_task_ids": completed_ids,
+        "next_pending": next_pending_payload,
+    }
+
+
+def _directive_ack(
+    *,
+    session: Session,
+    task_id: str,
+    new_status: TaskStatus,
+) -> dict[str, Any]:
+    """Build the F1 directive payload for a report_task_* handler.
+
+    ``new_status`` is the status the call moved (or would move) the task
+    INTO. Idempotent / invalid / refused branches use their own shapes
+    and do not call this helper.
+    """
+    return {
+        "acknowledged": True,
+        "task": {"id": task_id, "status": new_status.value},
+        "plan_state": _build_plan_state(getattr(session, "plan", None)),
+    }
+
+
 def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
     """Return the task_id to act on, falling back to session state.
 
@@ -668,12 +804,30 @@ async def _await_plan_stable(session: Session, steerer: Steerer) -> None:
         )
 
 
-def _idempotent_response(current_status: TaskStatus) -> dict[str, Any]:
-    return {
+def _idempotent_response(
+    current_status: TaskStatus,
+    *,
+    session: Session | None = None,
+    task_id: str = "",
+) -> dict[str, Any]:
+    """Idempotent ack for a re-report on a task already in ``current_status``.
+
+    F1 (loop prevention): when the LLM re-reports a task that's already
+    terminal, the response still carries the live ``plan_state`` so the
+    coordinator sees the next pending hand-off instead of an
+    information-free ack — the same anchor the directive ack provides
+    on real transitions. Without ``session`` the helper degrades to the
+    pre-F1 shape (legacy callers, test stubs).
+    """
+    response: dict[str, Any] = {
         "acknowledged": True,
         "idempotent": True,
         "current_status": current_status.value,
     }
+    if session is not None:
+        response["task"] = {"id": task_id, "status": current_status.value}
+        response["plan_state"] = _build_plan_state(getattr(session, "plan", None))
+    return response
 
 
 def _invalid_transition_response(
@@ -933,7 +1087,7 @@ async def _handle_task_started(
     if task is not None:
         decision = _classify_transition(tool_name="report_task_started", current_status=task.status)
         if decision == "idempotent":
-            return _idempotent_response(task.status)
+            return _idempotent_response(task.status, session=session, task_id=task_id)
         if decision == "invalid":
             return _invalid_transition_response(
                 tool_name="report_task_started",
@@ -970,7 +1124,7 @@ async def _handle_task_started(
             # exited. The boundary catch site can now confirm we
             # didn't bypass the stash.
             _state_audit.mark_stash_completed()
-    return dict(_ACK)
+    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.RUNNING)
 
 
 def _clear_correction_on_started(session: Session, task: Task | None) -> None:
@@ -1043,7 +1197,7 @@ async def _handle_task_progress(
                 task_id=task_id,
             )
     await steerer.mark_task_progress(task_id, session=session, fraction=fraction, detail=detail)
-    return dict(_ACK)
+    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.RUNNING)
 
 
 async def _handle_task_completed(
@@ -1080,7 +1234,7 @@ async def _handle_task_completed(
             tool_name="report_task_completed", current_status=task.status
         )
         if decision == "idempotent":
-            return _idempotent_response(task.status)
+            return _idempotent_response(task.status, session=session, task_id=task_id)
         if decision == "invalid":
             return _invalid_transition_response(
                 tool_name="report_task_completed",
@@ -1094,7 +1248,7 @@ async def _handle_task_completed(
     # Rotate the current-task pin now that this one has landed terminal.
     if task is not None:
         _rotate_after_terminal(session, task)
-    return dict(_ACK)
+    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.COMPLETED)
 
 
 async def _handle_task_failed(
@@ -1124,7 +1278,7 @@ async def _handle_task_failed(
     if task is not None:
         decision = _classify_transition(tool_name="report_task_failed", current_status=task.status)
         if decision == "idempotent":
-            return _idempotent_response(task.status)
+            return _idempotent_response(task.status, session=session, task_id=task_id)
         if decision == "invalid":
             return _invalid_transition_response(
                 tool_name="report_task_failed",
@@ -1141,7 +1295,7 @@ async def _handle_task_failed(
     )
     if task is not None:
         _rotate_after_terminal(session, task)
-    return dict(_ACK)
+    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.FAILED)
 
 
 async def _handle_task_blocked(
@@ -1171,7 +1325,7 @@ async def _handle_task_blocked(
     if task is not None:
         decision = _classify_transition(tool_name="report_task_blocked", current_status=task.status)
         if decision == "idempotent":
-            return _idempotent_response(task.status)
+            return _idempotent_response(task.status, session=session, task_id=task_id)
         if decision == "invalid":
             return _invalid_transition_response(
                 tool_name="report_task_blocked",
@@ -1182,7 +1336,7 @@ async def _handle_task_blocked(
     await steerer.mark_task_blocked(
         task_id, session=session, blocker=blocker, needed=needed, source=source
     )
-    return dict(_ACK)
+    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.BLOCKED)
 
 
 async def _handle_new_work_discovered(

@@ -197,7 +197,8 @@ async def test_report_task_progress_routes_to_replacement() -> None:
         session,
         steerer,
     )
-    assert out == {"acknowledged": True}
+    # F1 directive ack on the rerouted progress tick.
+    assert out["acknowledged"] is True
     assert session.task_progress["research_solar_corrected"] == pytest.approx(0.42)
     assert "research_solar" not in session.task_progress
 

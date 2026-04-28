@@ -545,7 +545,8 @@ async def test_reporting_tool_uses_state_task_id_when_arg_missing() -> None:
         steerer,
     )
 
-    assert result == {"acknowledged": True}
+    # F1 directive ack on the real transition.
+    assert result["acknowledged"] is True
     # The handler ran with the state-derived id.
     assert steerer.transitions == [("t-1", "RUNNING", "starting")]
 
@@ -572,7 +573,8 @@ async def test_reporting_tool_honors_explicit_arg_over_state() -> None:
         steerer,
     )
 
-    assert result == {"acknowledged": True}
+    # F1 directive ack on the real transition.
+    assert result["acknowledged"] is True
     # Explicit arg is what reached the handler.
     assert steerer.transitions == [("t-2", "RUNNING", "explicit wins")]
 

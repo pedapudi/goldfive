@@ -1014,13 +1014,22 @@ class SequentialExecutor(Executor):
         # coordinators re-run their full pipeline on every new user
         # message, which amplifies a ~10 min run into 40+ min. STEER
         # is the user-driven path for exercising uncovered work.
+        #
+        # Tier 1 / F10 (loop prevention): gate the reap on
+        # ``session.paused_for_human_intervention``. When the steerer
+        # has just emitted ``HUMAN_INTERVENTION_REQUIRED`` (Level 4
+        # PAUSE_ESCALATE), the agents stay PENDING for the next user
+        # turn — sweeping them to NOT_NEEDED here silently lies about
+        # user intent (the user hasn't decided yet whether the work is
+        # still wanted). Skip the sweep so the pending tasks survive
+        # the pause; they're picked up again when control returns.
         live_plan = session.plan or plan
         pending_ids = [
             t.id
             for t in list(getattr(live_plan, "tasks", None) or ())
             if t.status is TaskStatus.PENDING and t.id
         ]
-        if pending_ids:
+        if pending_ids and not getattr(session, "paused_for_human_intervention", False):
             log.info(
                 "SequentialExecutor._run_overlay: marking %d PENDING task(s) "
                 "NOT_NEEDED at invocation end (no soft follow-up per #163): %s",
@@ -1034,6 +1043,18 @@ class SequentialExecutor(Executor):
                     detail="overlay: tree did not exercise; no follow-up dispatched (goldfive#163)",
                     session=session,
                 )
+        elif pending_ids:
+            # F10: surface the gated reap so operators see "reap
+            # suppressed: escalation pending" in logs rather than a
+            # silent skip. The tasks remain PENDING and are revisited
+            # on the next user turn after the human-intervention pause
+            # resolves.
+            log.info(
+                "SequentialExecutor._run_overlay: NOT_NEEDED reap suppressed "
+                "(paused_for_human_intervention); leaving %d PENDING task(s): %s",
+                len(pending_ids),
+                ", ".join(pending_ids),
+            )
 
         # --- Terminal emission: success if no failures. -----------
         # goldfive#202: a FAILED task with a live replacement (refine

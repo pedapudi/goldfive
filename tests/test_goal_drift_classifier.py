@@ -340,15 +340,17 @@ async def test_steerer_counter_fires_at_interval() -> None:
     assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
 
 
-async def test_steerer_off_track_emits_critical_drift_and_pauses() -> None:
-    """Judge returns False → CRITICAL GOAL_DRIFT → Level 4 pause.
+async def test_steerer_off_track_emits_critical_drift_and_nudges() -> None:
+    """Judge returns False → CRITICAL GOAL_DRIFT → Level 2 NUDGE.
 
-    goldfive#142's intervention ladder routes CRITICAL GOAL_DRIFT to
-    :data:`InterventionLevel.PAUSE_ESCALATE` rather than calling
-    ``planner.refine`` -- goal drift is a structural signal that refine
-    cannot recover from. The Steerer emits a ``HUMAN_INTERVENTION_REQUIRED``
-    escalation drift and flips ``session.paused_for_human_intervention``;
-    the executor blocks until a user-initiated RESUME / STEER arrives.
+    Tier 1 / F4 retuning of the goldfive#142 ladder: GOAL_DRIFT no
+    longer escalates straight to PAUSE_ESCALATE. The judge's signal in
+    practice is "agent is grinding on completed work and not advancing
+    the goal" — the plan is correct and a corrective user message
+    (queued on ``session.pending_nudges``) re-anchors the LLM on the
+    next pending hand-off without refining the plan. Repeat occurrence
+    escalates to CANCEL_REINVOKE; only after that fails does the
+    default-fallback path eventually surface PAUSE_ESCALATE.
     """
     call_llm = _stub_call_llm([{"progressing": False, "reason": "off in the weeds"}])
     steerer = DefaultSteerer(
@@ -370,15 +372,17 @@ async def test_steerer_off_track_emits_critical_drift_and_pauses() -> None:
     assert primary.drift_detected.kind == types_pb2.DRIFT_KIND_GOAL_DRIFT
     assert primary.drift_detected.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
     assert "off in the weeds" in primary.drift_detected.detail
-    # Level 4 pause-escalate: no refine, a HUMAN_INTERVENTION_REQUIRED
-    # follow-up drift, and the pause flag is set.
+    # Level 2 NUDGE: no refine, no HUMAN_INTERVENTION_REQUIRED follow-
+    # up, and a corrective message queued onto session.pending_nudges
+    # for the overlay's mid-invocation rescue path.
     assert planner.refine_calls == []
-    assert any(
+    assert not any(
         e.WhichOneof("payload") == "drift_detected"
         and e.drift_detected.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
         for e in sink.events
     )
-    assert session.paused_for_human_intervention is True
+    assert session.paused_for_human_intervention is False
+    assert len(session.pending_nudges) == 1
 
 
 async def test_steerer_disabled_by_default_no_check_ever_fires() -> None:

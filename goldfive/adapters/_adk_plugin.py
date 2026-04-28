@@ -513,6 +513,131 @@ def _agent_has_pending_candidates(ctx: Any, agent_name: str) -> bool:
     return False
 
 
+def _maybe_redirect_completed_agent(
+    *,
+    ctx: Any,
+    target_agent: str,
+) -> dict[str, Any] | None:
+    """Tier 1 / F3: pre-dispatch redirect for AgentTool calls on completed work.
+
+    Returns a redirect-error response dict when the coordinator is
+    invoking an AgentTool whose plan tasks are ALL terminal AND a
+    non-terminal next_pending task exists assigned to a different agent.
+    Returns ``None`` to allow the dispatch in every other case:
+
+    * the target agent has at least one PENDING / RUNNING / BLOCKED task
+      assigned (legitimate dispatch),
+    * the target agent has no plan match at all (off-plan agent — the
+      existing PLAN_DIVERGENCE drift detector handles that path; we do
+      NOT double-handle here),
+    * no plan is installed on the session (defensive),
+    * the next_pending task is also assigned to ``target_agent``
+      (re-dispatch onto the same agent for follow-up work — allow).
+
+    The "all terminal AND next_pending elsewhere" guard is the precise
+    shape of the loop the cap ``_MAX_NUDGE_REPLAYS`` was historically
+    catching post-hoc: the LLM has just received an "ack" for the
+    completed task and re-invokes the same agent because nothing told
+    it to stop. F1's directive payload is the proactive anchor; this
+    is the structural fence.
+    """
+    if not target_agent:
+        return None
+    try:
+        plan = _safe_attr(ctx, "session", None)
+        plan = _safe_attr(plan, "plan", None) if plan is not None else None
+        if plan is None:
+            return None
+        tasks = list(_safe_attr(plan, "tasks", None) or ())
+        if not tasks:
+            return None
+        from goldfive.types import TERMINAL_TASK_STATUSES, TaskStatus
+
+        # Collect tasks assigned to the target agent. Match on bare
+        # agent name (last dot-separated segment) so fully-qualified
+        # ADK paths like ``coordinator.research_agent`` round-trip.
+        def _bare(name: str) -> str:
+            n = (name or "").strip()
+            return n.rsplit(".", 1)[-1] if "." in n else n
+
+        target_bare = _bare(target_agent)
+        assigned: list[Any] = []
+        for task in tasks:
+            assignee = _bare(str(_safe_attr(task, "assignee_agent_id", "") or ""))
+            if assignee and assignee == target_bare:
+                assigned.append(task)
+        if not assigned:
+            # Off-plan agent — let PLAN_DIVERGENCE handle it.
+            return None
+
+        # If any assigned task is non-terminal, the dispatch is legitimate.
+        if any(
+            _safe_attr(t, "status", None) not in TERMINAL_TASK_STATUSES for t in assigned
+        ):
+            return None
+
+        # All assigned tasks are terminal. Find the next PENDING task
+        # whose every predecessor is terminal — same definition the F1
+        # plan_state helper uses, kept local so this module stays
+        # decoupled from goldfive.reporting.
+        edges = list(_safe_attr(plan, "edges", None) or ())
+        by_id = {str(_safe_attr(t, "id", "") or ""): t for t in tasks}
+        incoming: dict[str, list[str]] = {tid: [] for tid in by_id}
+        for e in edges:
+            to_id = str(_safe_attr(e, "to_task_id", "") or "")
+            from_id = str(_safe_attr(e, "from_task_id", "") or "")
+            if to_id in incoming and from_id:
+                incoming[to_id].append(from_id)
+
+        next_pending: Any = None
+        for task in tasks:
+            if _safe_attr(task, "status", None) is not TaskStatus.PENDING:
+                continue
+            tid = str(_safe_attr(task, "id", "") or "")
+            if not tid:
+                continue
+            preds = incoming.get(tid, [])
+            if all(
+                by_id.get(p) is not None
+                and _safe_attr(by_id[p], "status", None) in TERMINAL_TASK_STATUSES
+                for p in preds
+            ):
+                next_pending = task
+                break
+
+        if next_pending is None:
+            # Plan is effectively done; nothing useful to redirect to.
+            # Let the dispatch fall through — the runner's own end-of-
+            # plan handling will close out the run.
+            return None
+
+        next_assignee = _bare(
+            str(_safe_attr(next_pending, "assignee_agent_id", "") or "")
+        )
+        if next_assignee == target_bare:
+            # Next pending is on the same agent — this dispatch is
+            # legitimate follow-up work, not a loop.
+            return None
+
+        next_title = str(_safe_attr(next_pending, "title", "") or "") or str(
+            _safe_attr(next_pending, "id", "") or ""
+        )
+        return {
+            "error": (
+                f"All plan tasks for {target_bare} are complete. Next "
+                f"pending task is '{next_title}' assigned to "
+                f"{next_assignee or 'the next planned agent'}. "
+                "Please invoke that agent."
+            ),
+            "redirect_to": next_assignee,
+        }
+    except Exception as exc:  # noqa: BLE001 — defensive; never break dispatch
+        log.debug(
+            "_maybe_redirect_completed_agent: classification raised: %s", exc
+        )
+        return None
+
+
 def _inject_task_id_from_state(
     *,
     tool_name: str,
@@ -4596,6 +4721,33 @@ def make_adk_plugin(
                                 f"(spawn #{self._agent_tool_spawn_count})"
                             ),
                         }
+
+                # Tier 1 / F3 (loop prevention): pre-dispatch interception.
+                # When every plan task assigned to this AgentTool's
+                # target agent is terminal AND there is a non-terminal
+                # next_pending task assigned to a *different* agent,
+                # refuse the dispatch with a redirect error so the
+                # coordinator stops re-invoking a completed-work agent.
+                # The post-hoc PLAN_DIVERGENCE detector still exists as
+                # a safety net, but closing the loop at the dispatch
+                # point eliminates the round-trip-and-detect cost.
+                #
+                # We deliberately use a tool-error response shape rather
+                # than a richer structured payload — the LLM only needs
+                # to read "go to other agent" and the adapter's drift
+                # surface owns the operator-side observability.
+                redirect = _maybe_redirect_completed_agent(
+                    ctx=ctx,
+                    target_agent=to_agent,
+                )
+                if redirect is not None:
+                    log.info(
+                        "before_tool_callback: F3 redirect — all plan tasks "
+                        "for %s are terminal; redirecting coordinator to %s",
+                        to_agent,
+                        redirect.get("redirect_to") or "?",
+                    )
+                    return redirect
                 # Fall through: AgentTool still runs, we're just observing.
 
             # Tool-level approval (Flow B). If the tool opts into
