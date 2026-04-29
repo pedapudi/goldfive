@@ -210,34 +210,54 @@ You will receive:
   the start of the returned plan's task list.
 * The operator's STEERING NOTE describing the change in direction.
 
-Your job is to produce the REMAINING work (fresh PENDING tasks) that
-satisfies the goals in light of the steering note. Existing pending
-tasks should be treated as DELETED — the operator's steer overrides
-whatever was pending. Design the new tasks from the ground up.
+You will also receive:
+
+* A list of PENDING tasks ALREADY IN THE PLAN — these are the
+  remaining work the prior planning round produced. Treat them as
+  EVOLVABLE, not disposable: when one of your output tasks continues
+  the same logical step as a prior pending task (even with a new
+  title, description, or assignee), REUSE the prior task's `id`. The
+  runtime tracks task identity by id; minting a fresh id for
+  continuing work makes it look like brand-new work and re-runs
+  the work the operator just told you to keep.
+
+Your job is to produce the REMAINING work (PENDING tasks) that
+satisfies the goals in light of the steering note. Carry forward
+the prior pending tasks where the work continues, EVOLVING their
+title / description / assignee as needed; mint fresh ids only for
+genuinely new tasks. Omit a prior pending task entirely if the steer
+makes it unnecessary.
 
 Requirements:
 
 1. DO NOT repeat the completed tasks in your response. The caller
-   will prepend them to your task list. Respond only with the NEW
-   PENDING tasks and their edges.
+   will prepend them to your task list. Respond only with the
+   PENDING tasks (continuing or new) and their edges.
 2. Any edge whose ``from_task_id`` is one of the completed tasks is
    allowed — the caller will preserve those and wire them through.
-3. Stable ids: new task ids must be short, unique, and must not
-   collide with any completed-task id.
+3. Stable ids: task ids must be short and unique within your
+   response, and must not collide with any completed-task id. For
+   prior pending ids, REUSE them when the work continues; pick a
+   fresh id only when the task is fundamentally new.
 4. GOAL COVERAGE: every unsatisfied goal must still be addressed.
 5. Honour the steering note: if it says "skip review", don't add a
    review task; if it says "focus on X", center the remaining work
    on X.
-6. If any new task is REPLACING a task that has gone FAILED /
-   CANCELLED (same semantic intent, new shape), set
-   ``"supersedes": "<old_task_id>"`` on the replacement so the
-   framework can re-pin reporting onto it. Leave empty otherwise.
-   Also set ``"supersedes_kind"`` whenever ``supersedes`` is set:
-   ``"REPLACE"`` for a superseded task that was PENDING / RUNNING /
-   FAILED / CANCELLED, and ``"CORRECT"`` for a superseded task that
-   had already COMPLETED but whose output the steer judges drift-
-   contaminated (the correction re-does that work; the old task
-   stays in the plan as a historical node).
+6. ``supersedes`` / ``supersedes_kind`` are for cases where a task
+   STRUCTURALLY REPLACES another (not for evolution — evolution
+   just reuses the id with mutated fields). Set them when:
+   - your task replaces a task that has gone FAILED / CANCELLED
+     (``"supersedes_kind": "REPLACE"``), OR
+   - your task replaces a prior PENDING task that you judged the
+     steer wants structurally retired but with a different id
+     (``"supersedes_kind": "REPLACE"``), OR
+   - your task corrects work that had already COMPLETED but whose
+     output the steer judges drift-contaminated
+     (``"supersedes_kind": "CORRECT"`` — the correction re-does
+     that work; the old task stays in the plan as a historical
+     node).
+   Leave both fields empty when you are simply EVOLVING a prior
+   pending task (id reused, no supersession).
 
 Respond with a single JSON object and NOTHING ELSE:
 
@@ -1421,15 +1441,17 @@ class LLMPlanner:
         goals: list[Goal],
         *,
         source: str = "user",
+        prior_pending: list[Task] | None = None,
     ) -> str:
-        """Build the delete-and-replan user prompt for a steer drift.
+        """Build the steer-refine user prompt.
 
-        Completed tasks are shown as read-only context; the LLM is told
-        to produce only the remaining pending work in light of the
-        steer. The caller prepends the completed tasks back onto the
-        returned plan so lineage is preserved verbatim. The new PENDING
-        task ids must not collide with the history ids; this is stated
-        as an explicit invariant (goldfive#133).
+        Completed tasks are shown as read-only context; prior PENDING
+        tasks are shown as EVOLVABLE work whose ids the LLM should reuse
+        when continuing the same logical step. The caller prepends the
+        completed tasks back onto the returned plan so lineage is
+        preserved verbatim. PENDING task ids must not collide with
+        completed-history ids; this remains an explicit invariant
+        (goldfive#133).
 
         ``source`` selects the directive framing:
 
@@ -1453,33 +1475,54 @@ class LLMPlanner:
         ]
         history_json = json.dumps(history, default=str)
         history_ids = json.dumps([t.id for t in completed])
+        prior_pending = list(prior_pending or [])
+        prior_pending_json = json.dumps(
+            [
+                {
+                    "id": t.id,
+                    "title": t.title,
+                    "description": t.description,
+                    "assignee_agent_id": t.assignee_agent_id,
+                }
+                for t in prior_pending
+            ],
+            default=str,
+        )
+        prior_pending_ids = json.dumps([t.id for t in prior_pending])
         goals_block = self._render_goals_block(goals)
         sticky_block = self._render_sticky_goals_block(goals)
         note = drift.detail or "(no steering note provided)"
         invariants = (
             "STRUCTURAL INVARIANTS (the validator will REJECT any response "
             "that breaks these rules):\n"
-            "1. The new PENDING task ids you emit MUST NOT collide with "
-            f"any history id. Reserved ids: {history_ids}\n"
+            "1. The PENDING task ids you emit MUST NOT collide with "
+            f"any completed-history id. Reserved completed ids: {history_ids}\n"
             "2. Every edge's `from_task_id` and `to_task_id` must "
-            "reference either a reserved history id or a new-task id "
-            "from your own `tasks` array.\n"
+            "reference either a reserved history id, a prior-pending id "
+            "you reused, or a new-task id from your own `tasks` array.\n"
             "3. FORBIDDEN EDGES: no edges from history task ids whose "
-            "status is CANCELLED or FAILED to your new PENDING task "
+            "status is CANCELLED or FAILED to PENDING task "
             "ids. A PENDING task whose predecessor is CANCELLED or "
             "FAILED is unexecutable: the executor only schedules a "
             "PENDING task once every predecessor reaches COMPLETED, "
             "and CANCELLED/FAILED never fire that transition, so "
-            "grafting onto them stalls the whole sub-DAG. New work "
-            "must start fresh — do NOT add edges like "
-            '"cancelled_research -> new_research" to "chain" from '
-            "the prior plan to your new one. Your new tasks must form "
-            "an independent sub-DAG with their own root task (a new "
-            "task whose predecessors, if any, are themselves new "
-            "PENDING tasks from your response or COMPLETED history "
-            "tasks).\n"
+            "grafting onto them stalls the whole sub-DAG. PENDING work "
+            "must start from no predecessors, from a COMPLETED history "
+            "task, or from another PENDING task in your response — do "
+            "NOT add edges like \"cancelled_research -> new_research\" "
+            "to \"chain\" from the prior plan to your new one.\n"
             "4. Your task ids must be unique within your response.\n"
-            "5. Do not introduce edges that create a cycle."
+            "5. Do not introduce edges that create a cycle.\n"
+            "6. ID REUSE FOR CONTINUING WORK. When a task in your "
+            "response is the SAME logical step as one in 'Prior PENDING "
+            "work' — even if you rename it, retitle it, reassign it, or "
+            "refine its description — you MUST reuse the prior task's "
+            "`id`. Mint a fresh id ONLY for genuinely new work that did "
+            "not exist in the prior plan. Stable ids are how the runtime "
+            "tracks task identity across revisions; minting a new id for "
+            "continuing work makes the runtime treat it as brand-new and "
+            "re-runs work the operator just told you to keep. Reusable "
+            f"prior PENDING ids: {prior_pending_ids}"
         )
         if source == "goldfive":
             directive_header = (
@@ -1488,25 +1531,35 @@ class LLMPlanner:
                 "contaminated task):"
             )
             closing = (
-                "Generate only the NEW PENDING tasks (and their edges) that "
+                "Generate the PENDING tasks (and their edges) that "
                 "should run from here, applying the correction above. "
-                "Respond with JSON only."
+                "REUSE the prior pending id for any task that continues "
+                "prior work; mint new ids only for truly new tasks. "
+                "Omit a prior pending task entirely if the correction "
+                "makes it unnecessary. Respond with JSON only."
             )
         else:
             directive_header = "Operator steering note:"
             closing = (
-                "Generate only the NEW PENDING tasks (and their edges) that "
-                "should run from here, taking the steering note into account. "
-                "Respond with JSON only."
+                "Generate the PENDING tasks (and their edges) that "
+                "should run from here, taking the steering note into "
+                "account. REUSE the prior pending id for any task that "
+                "continues prior work; mint new ids only for truly new "
+                "tasks. Omit a prior pending task entirely if the steer "
+                "makes it unnecessary. Respond with JSON only."
             )
         return (
-            f"CURRENT GOALS (the new PENDING tasks must still advance "
+            f"CURRENT GOALS (the PENDING tasks must still advance "
             f"every goal, and MUST NOT silently drop any [STICKY] "
             f"goal carried from a prior USER_STEER):\n{goals_block}\n\n"
             f"{sticky_block}"
             f"Completed/Failed/Cancelled tasks (READ-ONLY CONTEXT — "
             "preserve these verbatim at the start of the returned plan; "
             f"do NOT repeat them in your response):\n{history_json}\n\n"
+            f"Prior PENDING work (EVOLVABLE — reuse the id when your "
+            "task continues this step; omit when the steer drops it; "
+            "supersede with a new id ONLY when structurally replacing):"
+            f"\n{prior_pending_json}\n\n"
             f"{directive_header}\n{note}\n\n"
             f"{_REFINEMENT_GUIDANCE_BLOCK}\n\n"
             f"{invariants}\n\n"
@@ -2845,9 +2898,14 @@ class LLMPlanner:
             effective_source = "user"
         completed = [t for t in plan.tasks if t.status in _TERMINAL_STATUSES]
         completed_ids = {t.id for t in completed}
+        prior_pending = [t for t in plan.tasks if t.status not in _TERMINAL_STATUSES]
         try:
             base_user_prompt = self._build_steer_prompt(
-                completed, drift, goals, source=effective_source
+                completed,
+                drift,
+                goals,
+                source=effective_source,
+                prior_pending=prior_pending,
             )
         except (TypeError, ValueError) as exc:
             log.warning(
@@ -3042,6 +3100,15 @@ class LLMPlanner:
             revision_severity=DriftSeverity.WARNING.value,
             revision_index=plan.revision_index + 1,
         )
+        # goldfive#251 Option B: coerce supersedes_kind on every merged
+        # task based on the OLD-task status in the prior plan. Mirrors
+        # the same call in :meth:`_refine_user`'s validation loop. The
+        # evolution path (id reuse without supersedes) is unaffected;
+        # the supersede-with-fresh-id path now gets the same parity
+        # the refine_user path has — an LLM that sets
+        # ``supersedes_kind=UNSPECIFIED`` against a prior PENDING is
+        # coerced to ``REPLACE`` so the executor's pin-redirect runs.
+        _normalize_supersession_kinds(merged_plan, prior=plan)
         try:
             merged_plan.validate(for_revision=True, prior=plan)
         except ValueError as exc:

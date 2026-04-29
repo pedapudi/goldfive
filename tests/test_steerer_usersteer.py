@@ -978,3 +978,350 @@ async def test_autonomous_refine_stamps_drift_id_on_plan_revised(
 # qualification-merge is now done by the planner LLM's handle_turn
 # prompt directly — see test_planner_handle_turn.py for the
 # replacement coverage.
+
+
+# ---------------------------------------------------------------------------
+# Evolution-aware refine_steer (goldfive#207 — refine cascade fix). When
+# the LLM reuses a prior PENDING id, the merge preserves the id and the
+# new title/description/assignee. When the LLM omits a prior PENDING id,
+# it's dropped. This stabilises condition_id keying across cascading
+# refines — see compute_condition_id in orchestration_state.py.
+# ---------------------------------------------------------------------------
+
+
+def _evolving_plan() -> Plan:
+    return Plan(
+        id="plan-evo",
+        run_id="run-evo",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="research", title="Research", status=TaskStatus.COMPLETED),
+            Task(
+                id="create_presentation",
+                title="Create presentation",
+                description="Create the presentation about solar panels",
+                assignee_agent_id="web_developer",
+                status=TaskStatus.PENDING,
+            ),
+        ],
+        edges=[TaskEdge(from_task_id="research", to_task_id="create_presentation")],
+        revision_index=1,
+    )
+
+
+async def test_refine_steer_reuses_prior_pending_id_when_llm_does() -> None:
+    plan = _evolving_plan()
+    goals = [Goal(id="g1", summary="ship the presentation")]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="focus on efficiency facts only",
+        current_task_id="create_presentation",
+    )
+    canned = json.dumps(
+        {
+            "summary": "Refined presentation focused on efficiency.",
+            "tasks": [
+                {
+                    "id": "create_presentation",  # REUSED
+                    "title": "Create efficiency-focused presentation",
+                    "description": "Create the presentation, efficiency facts only",
+                    "assignee_agent_id": "web_developer",
+                }
+            ],
+            "edges": [{"from_task_id": "research", "to_task_id": "create_presentation"}],
+        }
+    )
+    llm = _StubLLM(canned)
+    planner = LLMPlanner(call_llm=llm, model="test-model")
+
+    revised = await planner.refine(plan=plan, drift=drift, goals=goals)
+    assert revised is not None
+
+    ids = [t.id for t in revised.tasks]
+    assert ids == ["research", "create_presentation"]
+    evolved = next(t for t in revised.tasks if t.id == "create_presentation")
+    assert evolved.title == "Create efficiency-focused presentation"
+    assert "efficiency facts" in evolved.description
+
+
+async def test_refine_steer_drops_prior_pending_when_llm_omits() -> None:
+    plan = Plan(
+        id="plan-drop",
+        run_id="run-drop",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="research", title="Research", status=TaskStatus.COMPLETED),
+            Task(id="task_a", title="Task A", status=TaskStatus.PENDING),
+            Task(id="task_b", title="Task B", status=TaskStatus.PENDING),
+        ],
+        edges=[
+            TaskEdge(from_task_id="research", to_task_id="task_a"),
+            TaskEdge(from_task_id="research", to_task_id="task_b"),
+        ],
+        revision_index=2,
+    )
+    goals = [Goal(id="g1", summary="ship")]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="drop task A; only do task B",
+        current_task_id="task_a",
+    )
+    # LLM omits task_a; keeps task_b with reused id.
+    canned = json.dumps(
+        {
+            "summary": "Drop A; keep B.",
+            "tasks": [
+                {
+                    "id": "task_b",
+                    "title": "Task B",
+                    "description": "the only remaining work",
+                    "assignee_agent_id": "writer",
+                }
+            ],
+            "edges": [{"from_task_id": "research", "to_task_id": "task_b"}],
+        }
+    )
+    revised = await LLMPlanner(call_llm=_StubLLM(canned), model="m").refine(
+        plan=plan, drift=drift, goals=goals
+    )
+    assert revised is not None
+    ids = [t.id for t in revised.tasks]
+    assert "task_a" not in ids
+    assert "task_b" in ids
+
+
+async def test_refine_steer_supersedes_prior_pending_with_replace_kind() -> None:
+    plan = _evolving_plan()
+    goals = [Goal(id="g1", summary="ship the presentation")]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="completely different presentation now — drop the prior approach",
+        current_task_id="create_presentation",
+    )
+    # LLM mints a fresh id with supersedes pointing at the prior PENDING id.
+    canned = json.dumps(
+        {
+            "summary": "Brand-new presentation replacing prior.",
+            "tasks": [
+                {
+                    "id": "new_presentation",
+                    "title": "Different presentation",
+                    "description": "structurally different work",
+                    "assignee_agent_id": "web_developer",
+                    "supersedes": "create_presentation",
+                    "supersedes_kind": "REPLACE",
+                }
+            ],
+            "edges": [{"from_task_id": "research", "to_task_id": "new_presentation"}],
+        }
+    )
+    revised = await LLMPlanner(call_llm=_StubLLM(canned), model="m").refine(
+        plan=plan, drift=drift, goals=goals
+    )
+    assert revised is not None
+    ids = [t.id for t in revised.tasks]
+    assert "new_presentation" in ids
+    assert "create_presentation" not in ids
+    new = next(t for t in revised.tasks if t.id == "new_presentation")
+    assert new.supersedes == "create_presentation"
+    # supersedes_kind must round-trip as REPLACE (the LLM set it; the
+    # _normalize_supersession_kinds pass should leave a status-correct
+    # REPLACE alone).
+    from goldfive.types import SupersessionKind  # noqa: PLC0415
+
+    assert new.supersedes_kind is SupersessionKind.REPLACE
+
+
+async def test_refine_steer_normalizes_unspecified_kind_against_prior_pending() -> None:
+    """LLM forgets supersedes_kind on a PENDING-replacement; pass coerces to REPLACE.
+
+    Mirrors the parity ``_refine_user`` already had (planner.py:2111). Without
+    this, the executor's pin-redirect would not run on an LLM that emitted
+    only ``supersedes`` without the kind.
+    """
+    plan = _evolving_plan()
+    goals = [Goal(id="g1", summary="ship the presentation")]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="rebuild from scratch",
+        current_task_id="create_presentation",
+    )
+    canned = json.dumps(
+        {
+            "summary": "Replacement.",
+            "tasks": [
+                {
+                    "id": "rebuilt_presentation",
+                    "title": "Rebuild",
+                    "description": "structurally different",
+                    "assignee_agent_id": "web_developer",
+                    "supersedes": "create_presentation",
+                    # supersedes_kind intentionally omitted
+                }
+            ],
+            "edges": [{"from_task_id": "research", "to_task_id": "rebuilt_presentation"}],
+        }
+    )
+    revised = await LLMPlanner(call_llm=_StubLLM(canned), model="m").refine(
+        plan=plan, drift=drift, goals=goals
+    )
+    from goldfive.types import SupersessionKind  # noqa: PLC0415
+
+    assert revised is not None
+    new = next(t for t in revised.tasks if t.id == "rebuilt_presentation")
+    assert new.supersedes_kind is SupersessionKind.REPLACE
+
+
+def test_steer_prompt_handles_empty_prior_pending() -> None:
+    """A steer against a plan with no PENDING tasks renders a valid prompt.
+
+    Edge case: first refine after a session boot-up where every prior task
+    happens to be terminal (or none exist yet). The prior_pending block
+    must still serialise (empty list) without leaving stale references.
+    """
+    completed = [Task(id="research", title="Research", status=TaskStatus.COMPLETED)]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="next thing",
+    )
+    planner = LLMPlanner(call_llm=_StubLLM(""), model="m")
+    prompt = planner._build_steer_prompt(
+        completed,
+        drift,
+        [Goal(id="g1", summary="ship")],
+        source="user",
+        prior_pending=[],
+    )
+    # Block is rendered (with empty list) so the LLM sees "no prior pending".
+    assert "Prior PENDING work" in prompt
+    assert "[]" in prompt  # empty JSON list literal somewhere
+    # Reusable-ids list is empty.
+    assert "Reusable prior PENDING ids: []" in prompt
+
+
+async def test_refine_steer_id_reuse_with_assignee_change() -> None:
+    plan = _evolving_plan()
+    goals = [Goal(id="g1", summary="ship the presentation")]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="reassign to research_agent for the presentation drafting",
+        current_task_id="create_presentation",
+    )
+    canned = json.dumps(
+        {
+            "summary": "Reassigned.",
+            "tasks": [
+                {
+                    "id": "create_presentation",
+                    "title": "Create presentation",
+                    "description": "Create the presentation about solar panels",
+                    "assignee_agent_id": "research_agent",  # CHANGED
+                }
+            ],
+            "edges": [{"from_task_id": "research", "to_task_id": "create_presentation"}],
+        }
+    )
+    revised = await LLMPlanner(call_llm=_StubLLM(canned), model="m").refine(
+        plan=plan, drift=drift, goals=goals
+    )
+    assert revised is not None
+    evolved = next(t for t in revised.tasks if t.id == "create_presentation")
+    assert evolved.assignee_agent_id == "research_agent"
+
+
+def test_steer_prompt_surfaces_prior_pending_block() -> None:
+    plan = _evolving_plan()
+    goals = [Goal(id="g1", summary="ship")]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER, severity=DriftSeverity.WARNING, detail="evolve"
+    )
+    planner = LLMPlanner(call_llm=_StubLLM(""), model="m")
+    completed = [t for t in plan.tasks if t.status is TaskStatus.COMPLETED]
+    prior_pending = [t for t in plan.tasks if t.status is TaskStatus.PENDING]
+    prompt = planner._build_steer_prompt(
+        completed, drift, goals, source="user", prior_pending=prior_pending
+    )
+    assert "Prior PENDING work" in prompt
+    assert "create_presentation" in prompt
+    assert "ID REUSE FOR CONTINUING WORK" in prompt
+    assert "REUSE the prior pending id" in prompt
+
+
+def test_steer_prompt_goldfive_source_also_carries_id_reuse_block() -> None:
+    plan = _evolving_plan()
+    goals = [Goal(id="g1", summary="ship")]
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="reasoning drift",
+    )
+    planner = LLMPlanner(call_llm=_StubLLM(""), model="m")
+    completed = [t for t in plan.tasks if t.status is TaskStatus.COMPLETED]
+    prior_pending = [t for t in plan.tasks if t.status is TaskStatus.PENDING]
+    prompt = planner._build_steer_prompt(
+        completed, drift, goals, source="goldfive", prior_pending=prior_pending
+    )
+    assert "Prior PENDING work" in prompt
+    assert "ID REUSE FOR CONTINUING WORK" in prompt
+    # goldfive source also gets the closing line that prefers id reuse.
+    assert "REUSE the prior pending id" in prompt
+
+
+async def test_refine_steer_id_reuse_preserves_inter_pending_edges() -> None:
+    plan = Plan(
+        id="plan-edges",
+        run_id="run-edges",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="research", title="Research", status=TaskStatus.COMPLETED),
+            Task(id="step_a", title="Step A", status=TaskStatus.PENDING),
+            Task(id="step_b", title="Step B", status=TaskStatus.PENDING),
+        ],
+        edges=[
+            TaskEdge(from_task_id="research", to_task_id="step_a"),
+            TaskEdge(from_task_id="step_a", to_task_id="step_b"),
+        ],
+        revision_index=1,
+    )
+    goals = [Goal(id="g1", summary="ship")]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="evolve both steps",
+    )
+    canned = json.dumps(
+        {
+            "summary": "Evolved.",
+            "tasks": [
+                {
+                    "id": "step_a",
+                    "title": "Step A (evolved)",
+                    "description": "...",
+                    "assignee_agent_id": "writer",
+                },
+                {
+                    "id": "step_b",
+                    "title": "Step B (evolved)",
+                    "description": "...",
+                    "assignee_agent_id": "writer",
+                },
+            ],
+            "edges": [
+                {"from_task_id": "research", "to_task_id": "step_a"},
+                {"from_task_id": "step_a", "to_task_id": "step_b"},
+            ],
+        }
+    )
+    revised = await LLMPlanner(call_llm=_StubLLM(canned), model="m").refine(
+        plan=plan, drift=drift, goals=goals
+    )
+    assert revised is not None
+    edges = {(e.from_task_id, e.to_task_id) for e in revised.edges}
+    assert ("research", "step_a") in edges
+    assert ("step_a", "step_b") in edges
