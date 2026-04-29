@@ -465,6 +465,44 @@ def _is_reporting_tool_name(tool_name: str) -> bool:
     return tool_name.startswith("report_task_") or tool_name == _REPORT_AWAITING_APPROVAL
 
 
+def _is_agent_tool_dispatch(tool: Any) -> bool:
+    """Return True if ``tool`` is an ADK ``AgentTool`` (sub-agent delegation).
+
+    The cooperative-cancel short-circuit in :meth:`before_tool_callback`
+    discriminates on this: AgentTool dispatches spawn a fresh sub-Runner
+    and stream its full transcript back, so short-circuiting them is
+    correct (we don't want to spawn long sub-agent work on a cancelled
+    parent). Plain ``FunctionTool`` dispatches (write_webpage, patch_file,
+    user-provided side-effect helpers) finish in milliseconds and have
+    already had their args chosen by the LLM — short-circuiting them
+    discards committed work for no benefit, and the next
+    ``before_model_callback`` short-circuit ends the dispatch cleanly
+    anyway. See goldfive#211610 / Bug C from v23 validation.
+
+    Detection prefers an ``isinstance(tool, AgentTool)`` check when the
+    optional ``adk`` extra is importable, with a duck-typed fallback for
+    test stubs and forward-compatibility: AgentTool exposes ``.agent``
+    pointing at the wrapped ``BaseAgent``. A non-callable ``.agent``
+    attribute on a ``FunctionTool`` is unheard of upstream, but the
+    duck-typed branch is conservative anyway — when unsure, treat the
+    tool as a plain function and let it run.
+    """
+    if tool is None:
+        return False
+    try:
+        from google.adk.tools import AgentTool  # type: ignore
+
+        if isinstance(tool, AgentTool):
+            return True
+    except Exception:  # noqa: BLE001 — adk extra not installed / import edge
+        pass
+    # Duck-typed fallback: AgentTool carries a ``.agent`` BaseAgent
+    # pointer (the sub-agent it delegates to). FunctionTool carries a
+    # ``.func`` instead. Treat the presence of ``.agent`` as the AgentTool
+    # discriminator.
+    return _safe_attr(tool, "agent", None) is not None
+
+
 def _agent_has_pending_candidates(ctx: Any, agent_name: str) -> bool:
     """Return True if the plan has any PENDING/RUNNING task for ``agent_name``.
 
@@ -4628,20 +4666,37 @@ def make_adk_plugin(
             # Cooperative-cancellation checkpoint (goldfive#251 Stream C / 7a).
             # When this invocation was flagged for cancel (either the
             # steerer at CRITICAL severity or a user-initiated cancel),
-            # skip tool dispatch and return a MINIMAL LLM-visible tool
-            # response: ``{"status": "cancelled"}``. The minimal shape
-            # is deliberate — richer shapes (``reason``, ``detail``,
+            # skip *AgentTool* dispatch and return a MINIMAL LLM-visible
+            # tool response: ``{"status": "cancelled"}``. The minimal
+            # shape is deliberate — richer shapes (``reason``, ``detail``,
             # ``drift_kind``) become prompt-injection vectors (see
             # lessons from goldfive#250 / #252 / #253 where LLMs
             # pattern-matched on error strings and invented workarounds).
             # Rich context for operators lives on the
             # InvocationCancelled sink event emitted by
             # :meth:`_emit_invocation_cancelled`.
+            #
+            # FunctionTool dispatches (write_webpage, patch_file, and any
+            # user-provided side-effect helpers) are NOT short-circuited
+            # here — see :func:`_is_agent_tool_dispatch` and Bug C from
+            # v23 validation. Their work has already been committed by
+            # the model (args chosen, function_call event emitted) and
+            # discarding the actual call loses the side-effect (no file
+            # written, no row patched) for no semantic benefit: the very
+            # next ``before_model_callback`` on this same invocation
+            # short-circuits the LLM call regardless, ending the
+            # dispatch cleanly. Letting the FunctionTool run preserves
+            # committed work; short-circuiting it would silently strand
+            # it on every supersede-cancel.
             inv_ctx = _safe_attr(tool_context, "_invocation_context", None) or _safe_attr(
                 tool_context, "invocation_context", None
             )
             inv_id_check = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
-            if inv_id_check and self.is_invocation_cancelled(inv_id_check):
+            if (
+                inv_id_check
+                and self.is_invocation_cancelled(inv_id_check)
+                and _is_agent_tool_dispatch(tool)
+            ):
                 pending = self._cancel_state.get(inv_id_check)
                 if pending is not None:
                     request = self.consume_cancel_for_invocation(inv_id_check)
