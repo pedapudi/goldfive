@@ -2255,6 +2255,17 @@ class LLMPlanner:
                     if attempt < attempts:
                         user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
                     continue
+            # goldfive#213: backfill ``Task.supersedes`` for retry-named
+            # tasks the LLM emitted without an explicit causal link.
+            # Mirrors the call in ``_user_steer_one_attempt``'s merge
+            # so that LOOPING_TOOL_CALL / LOOPING_REASONING refines (and
+            # any other path through ``_call_and_validate_refine``)
+            # benefit from causal replacement detection identically to
+            # the user-steer path. Must run BEFORE
+            # ``_normalize_supersession_kinds`` so the kind coercion
+            # sees the backfilled link.
+            if prior_plan is not None:
+                _backfill_retry_supersedes(revised, prior=prior_plan)
             # goldfive#251: Option B validator -- coerce supersedes_kind
             # on every task based on old-task status. Runs before
             # ``revised.validate`` so the structural validator sees
