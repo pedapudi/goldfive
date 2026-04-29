@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import enum
 import inspect
 import json
@@ -4307,6 +4308,189 @@ class DefaultSteerer:
             drift=drift,
             revised_plan=revised_plan,
             apply_user_steer_state=True,
+        )
+
+    async def install_user_steer(
+        self,
+        *,
+        drift: DriftEvent,
+        prior: Plan,
+        llm_revision: Plan | None,
+        session: Session,
+    ) -> Plan:
+        """Install a user-authored revision. ALWAYS returns a valid Plan.
+
+        Contract (see ``docs/design/PLAN-LIFECYCLE.md`` §4.2.1): user-steer
+        rejection is **structurally impossible**. The return type is
+        ``Plan`` (never ``None``), and this method does not raise
+        ``ValueError`` from validation. If the LLM-produced revision
+        fails ``Plan.validate(for_revision=True, prior=...)``, this
+        method falls back to the deterministic minimum evolution shape
+        (per §4.2): preserve every terminal task verbatim, cancel every
+        PENDING / RUNNING / BLOCKED task, drop edges incident to the
+        cancelled set. The minimum is provably valid by construction.
+
+        Order of preference:
+
+        1. ``llm_revision`` if non-None and validates against ``prior``.
+        2. :meth:`_build_minimal_steer_evolution` — deterministic, always
+           valid, intentionally produces a plan with no PENDING tasks.
+
+        The deterministic minimum lands the user's pivot as a clean
+        terminal-only frontier; the next refine cycle or coordinator
+        turn can populate the new sub-DAG. This is acceptable
+        degradation — the turn does not abort. The contract sacrifices
+        a bit of "the LLM's first attempt drove forward progress" for
+        the much stronger "the user's intent ALWAYS lands".
+
+        Side effects (regardless of which branch fires):
+
+        * :meth:`_apply_user_steer_state` writes the
+          ``goldfive.active_steer.*`` slot from ``drift``.
+        * :meth:`_emit_drift_detected` emits the ``USER_STEER`` drift.
+        * :meth:`_apply_revision` swaps ``session.plan`` and bumps
+          ``revision_index``.
+        * :meth:`_cancel_inflight_for_revision` preempts in-flight work.
+        * :meth:`_emit_plan_revised` fires ``PlanRevised``.
+
+        The deterministic-fallback branch deliberately does NOT touch
+        ``session.refine_failure_counts`` — that counter governs
+        goldfive-authored autonomous refines (§4.5), not user-driven
+        changes. A USER_STEER never escalates via REPEATED_FAILURE.
+
+        Never raises.
+        """
+        # Normalise the drift's authored_by so downstream observability
+        # (DriftDetected.authored_by) carries the right attribution.
+        if not drift.authored_by:
+            drift.authored_by = "user"
+        # Branch 1: try the LLM's revision if it parses + validates.
+        chosen: Plan | None = None
+        if llm_revision is not None:
+            try:
+                llm_revision.validate(for_revision=True, prior=prior)
+                chosen = llm_revision
+            except ValueError as exc:
+                log.warning(
+                    "DefaultSteerer.install_user_steer: LLM revision rejected "
+                    "by validator (%s); falling back to deterministic minimum "
+                    "evolution shape (PLAN-LIFECYCLE.md §4.2.1)",
+                    exc,
+                )
+        # Branch 2: deterministic minimum. Always valid by construction.
+        if chosen is None:
+            chosen = self._build_minimal_steer_evolution(prior, drift)
+        # Always run the user-steer state bookkeeping — every call to
+        # this method represents a genuine operator action.
+        await self._apply_user_steer_state(drift, session)
+        await self._emit_drift_detected(session, drift)
+        # No-op short-circuit: the deterministic minimum on a prior with
+        # no PENDING/RUNNING/BLOCKED tasks degenerates to a structurally
+        # identical plan. Skip the install (avoids a misleading
+        # PlanRevised with empty diff) but still return ``prior`` so the
+        # contract (always a Plan) holds.
+        if self._plans_structurally_identical(prior, chosen):
+            log.info(
+                "DefaultSteerer.install_user_steer: deterministic minimum "
+                "is structurally identical to prior (no mutable tasks to "
+                "cancel); install skipped, returning prior plan"
+            )
+            return prior
+        prev_plan = session.plan
+        attempt_id = self._new_attempt_id()
+        await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
+        self._apply_revision(session, chosen, drift)
+        await self._cancel_inflight_for_revision(drift, session)
+        await self._emit_plan_revised(
+            session,
+            chosen,
+            drift,
+            prev_plan=prev_plan,
+            attempt_id=attempt_id,
+        )
+        self._record_plan_revision(drift, session)
+        return chosen
+
+    def _build_minimal_steer_evolution(
+        self, prior: Plan, drift: DriftEvent
+    ) -> Plan:
+        """Construct the canonical evolution shape per PLAN-LIFECYCLE.md §4.2.
+
+        Deterministic. Preserves terminal tasks verbatim (§3.1), cancels
+        every PENDING / RUNNING / BLOCKED task (so they enter the
+        absorbing CANCELLED terminal), and drops every edge incident to
+        a cancelled task. The result always passes
+        ``Plan.validate(for_revision=True, prior=prior)`` because:
+
+        * Every prior-terminal task is preserved with the same status →
+          §3.1 holds.
+        * Every prior terminal->terminal edge is preserved verbatim →
+          §3.2 holds.
+        * No PENDING tasks remain → reachability invariant (§5 rule 7,
+          goldfive#137) is vacuously satisfied (no PENDING task can
+          have a CANCELLED predecessor because there ARE no PENDING
+          tasks).
+        * Edges only span surviving terminal endpoints → no dangling
+          edges.
+
+        Uses :func:`dataclasses.replace` so the prior plan and tasks
+        are not mutated. The deriver caches Tasks by identity in a few
+        places (Tier 2 #323 found that mutating shared Task references
+        corrupts the cache); fresh copies sidestep that risk.
+
+        ``drift`` is consulted only for revision metadata (kind /
+        severity / detail go onto the new plan via
+        :meth:`_apply_revision`). It is not strictly required here, but
+        keeping the parameter mirrors the steerer's other revision
+        builders and makes future extensions (e.g. tagging which task
+        the steer named) easier.
+        """
+        _ = drift  # reserved for future per-task framing; see docstring
+        new_tasks: list[Task] = []
+        cancelled_ids: set[str] = set()
+        for t in prior.tasks:
+            if t.status.is_terminal:
+                # Preserve verbatim — fresh copy so callers cannot
+                # accidentally mutate the prior plan's task identity.
+                new_tasks.append(dataclasses.replace(t))
+            else:
+                # PENDING / RUNNING / BLOCKED → CANCELLED. Stamp a
+                # provenance reason so harmonograf's intervention view
+                # can attribute the cancel to a user-steer rollover.
+                cancelled = dataclasses.replace(
+                    t,
+                    status=TaskStatus.CANCELLED,
+                    cancel_reason=f"user_steer_rollover:{drift.id}"
+                    if getattr(drift, "id", "")
+                    else "user_steer_rollover",
+                )
+                new_tasks.append(cancelled)
+                cancelled_ids.add(t.id)
+        # Edges: drop any edge incident to a cancelled task. The
+        # surviving edges are exactly the prior terminal->terminal set
+        # plus any pre-existing terminal->cancelled (now both terminal,
+        # but we still drop those because the to-task transitioned in
+        # this revision and §3.2 only freezes edges that were
+        # terminal->terminal in PRIOR — not in the revision).
+        # Simpler: drop any edge touching a cancelled-this-rev id.
+        new_edges: list[TaskEdge] = []
+        for e in prior.edges:
+            if e.from_task_id in cancelled_ids or e.to_task_id in cancelled_ids:
+                continue
+            new_edges.append(dataclasses.replace(e))
+        # Construct the revised plan. ``revision_index`` is bumped by
+        # :meth:`_apply_revision`; ``revision_*`` metadata stamping
+        # happens there too. We populate ``id`` / ``run_id`` /
+        # ``goal_ids`` / ``summary`` from prior so identity stays
+        # stable across the revision (the plan_id-stable-across-turns
+        # invariant from goldfive#271 Phase 4).
+        return Plan(
+            id=prior.id,
+            run_id=prior.run_id,
+            goal_ids=list(prior.goal_ids),
+            tasks=new_tasks,
+            edges=new_edges,
+            summary=prior.summary,
         )
 
     async def _install_with_drift(

@@ -41,6 +41,7 @@ import asyncio
 import dataclasses
 import inspect
 import logging
+import os
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
@@ -185,6 +186,33 @@ class Runner:
         ``report_new_work_discovered`` is intentionally NOT a drift
         tool — there is no observation analog for an agent surfacing
         genuinely new work, so it stays default-on.
+    fail_fast_on_revision_rejection:
+        Strict-abort opt-in for goldfive-authored revisions that fail
+        ``Plan.validate(for_revision=True, prior=...)``. Default
+        (``False``) is non-fatal: when a goldfive-authored autonomous
+        refine produces an invalid revision, the runner keeps the
+        existing ``session.plan``, emits a
+        ``HUMAN_INTERVENTION_REQUIRED`` INFO ``DriftDetected`` for
+        observability, and continues the turn. The next refine cycle
+        gets another attempt; the existing
+        ``REFINE_FAILURE_THRESHOLD=2`` escalation still fires after two
+        consecutive failures of the same ``(kind, task_id)``.
+
+        Operators wanting strict abort-on-rejection — useful for CI,
+        regression testing, or debugging refine logic — opt in by
+        passing ``True`` (or setting the env var
+        ``GOLDFIVE_FAIL_FAST_REVISION_REJECTION=1``). When ``None``
+        (the default), the env var is consulted; explicit ``False`` /
+        ``True`` always wins over the env.
+
+        **User-authored** drifts (``USER_STEER`` from a
+        ``ControlMessage``) are NEVER affected by this flag — the
+        :meth:`DefaultSteerer.install_user_steer` API guarantees a
+        valid ``Plan`` returns even when the LLM revision fails
+        validation (PLAN-LIFECYCLE.md §4.2.1). User-steer rejection is
+        structurally impossible.
+
+        See PLAN-LIFECYCLE.md §4.5.1 for the full rationale.
     """
 
     def __init__(
@@ -202,6 +230,7 @@ class Runner:
         goal_drift_enabled: bool = True,
         planner_gate: Any = "auto",
         drift_self_reporting: bool | list[str] = False,
+        fail_fast_on_revision_rejection: bool | None = None,
         **legacy_kwargs: Any,
     ) -> None:
         if "max_plan_reinvocations" in legacy_kwargs:
@@ -338,6 +367,23 @@ class Runner:
             self.drift_self_reporting: bool | list[str] = drift_self_reporting
         else:
             self.drift_self_reporting = [str(n) for n in drift_self_reporting]
+        # Configurable abort policy on goldfive-authored revision
+        # rejection. See PLAN-LIFECYCLE.md §4.5.1. Default (kwarg
+        # ``None``): consult env var; falsy unless the env explicitly
+        # opts in. Explicit ``True`` / ``False`` from the kwarg wins
+        # over the env so tests can pin behaviour without unsetting the
+        # env first. User-authored drifts (USER_STEER) are never gated
+        # by this flag — see :meth:`DefaultSteerer.install_user_steer`.
+        if fail_fast_on_revision_rejection is None:
+            fail_fast_on_revision_rejection = (
+                os.environ.get(
+                    "GOLDFIVE_FAIL_FAST_REVISION_REJECTION", "0"
+                )
+                == "1"
+            )
+        self._fail_fast_on_revision_rejection: bool = bool(
+            fail_fast_on_revision_rejection
+        )
         # Cross-turn prior-plan stash lives on :class:`Conversation`
         # (keyed by session id) so a Runner shared across multiple
         # outer ADK sessions does not leak one session's plan into
@@ -701,15 +747,89 @@ class Runner:
                 revised_plan=next_plan,
             )
             if not installed:
-                reason = "plan revision rejected by validator"
-                await self._emit_run_aborted(session, reason)
-                outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-                convo.absorb_turn(
-                    outcome,
-                    user_input_summary=_initial_goal_summary(user_input),
-                    pinned=pinned,
+                # Configurable abort policy on goldfive-authored
+                # revision rejection (PLAN-LIFECYCLE.md §4.5.1). The
+                # install path here is always goldfive-authored — it
+                # handles handle_turn-driven NEW_WORK_DISCOVERED
+                # revisions; genuine operator USER_STEER takes the
+                # executor's STEER control loop and routes through the
+                # steerer's user-steer pipeline (which is structurally
+                # incapable of aborting — see PLAN-LIFECYCLE.md
+                # §4.2.1 and ``DefaultSteerer.install_user_steer``).
+                #
+                # Default (``fail_fast_on_revision_rejection=False``):
+                # keep ``session.plan`` unchanged, emit a
+                # HUMAN_INTERVENTION_REQUIRED INFO drift for
+                # observability, and continue the turn. The plan that
+                # was previously valid is still valid; agents can
+                # still make progress; the next refine cycle (if the
+                # underlying drift persists) gets another attempt.
+                # The existing ``REFINE_FAILURE_THRESHOLD=2``
+                # escalation in :meth:`DefaultSteerer._install_with_drift`
+                # still fires after two consecutive failures of the
+                # same ``(kind, task_id)``.
+                #
+                # Opt-in strict mode (``fail_fast_on_revision_rejection
+                # =True`` or ``GOLDFIVE_FAIL_FAST_REVISION_REJECTION=1``):
+                # emit ``run_aborted`` as the pre-PR1 behaviour. Useful
+                # for CI / regression / debugging refine logic.
+                log.warning(
+                    "Runner.run: goldfive-authored revision rejected "
+                    "by validator; keeping existing plan, continuing "
+                    "run (set fail_fast_on_revision_rejection=True or "
+                    "GOLDFIVE_FAIL_FAST_REVISION_REJECTION=1 for "
+                    "strict mode). prior_plan_id=%s revision_index=%d",
+                    (session.plan.id or "")[:16] or "<none>",
+                    int(getattr(session.plan, "revision_index", 0)),
                 )
-                return outcome
+                # Observability drift on the same sinks the steerer
+                # uses, so harmonograf / sinks see the rejection
+                # alongside the surrounding refine activity. Routed
+                # through the steerer's ``_emit_drift_detected`` so
+                # the lifecycle / condition_id stamping fires
+                # consistently.
+                obs_drift = DriftEvent(
+                    kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
+                    severity=DriftSeverity.INFO,
+                    detail=(
+                        "autonomous refine produced an invalid plan "
+                        "revision; existing plan retained; next "
+                        "refine cycle may try again"
+                    ),
+                    authored_by="goldfive",
+                )
+                emit_helper = getattr(
+                    self.steerer, "_emit_drift_detected", None
+                )
+                if callable(emit_helper):
+                    try:
+                        await emit_helper(session, obs_drift)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "Runner.run: emitting "
+                            "HUMAN_INTERVENTION_REQUIRED observability "
+                            "drift raised: %s",
+                            exc,
+                        )
+
+                if self._fail_fast_on_revision_rejection:
+                    reason = "plan revision rejected by validator"
+                    await self._emit_run_aborted(session, reason)
+                    outcome = ExecutionOutcome(
+                        success=False, session=session, reason=reason
+                    )
+                    convo.absorb_turn(
+                        outcome,
+                        user_input_summary=_initial_goal_summary(user_input),
+                        pinned=pinned,
+                    )
+                    return outcome
+                # Default: keep existing plan, continue. ``session.plan``
+                # is unchanged because ``_install_revision``'s
+                # rejection path returns False BEFORE applying the
+                # revision (see :meth:`_install_with_drift` —
+                # ``revised_plan.validate`` raises before
+                # ``_apply_revision`` runs).
         elif not session.plan.tasks:
             # First turn AND handle_turn returned None (purely
             # conversational on an empty seed). No plan to drive the
