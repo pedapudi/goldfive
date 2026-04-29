@@ -1106,23 +1106,34 @@ class SequentialExecutor(Executor):
                 continue
             break
 
-        # --- PENDING → NOT_NEEDED on invocation end (goldfive#163). ----
-        # The tree finished its natural flow. Any task still PENDING
-        # was not exercised by the tree. Mark terminal so sinks do not
-        # see stale PENDING entries and downstream runs do not wedge.
-        # We deliberately do NOT dispatch a follow-up: flow-prompted
-        # coordinators re-run their full pipeline on every new user
-        # message, which amplifies a ~10 min run into 40+ min. STEER
-        # is the user-driven path for exercising uncovered work.
+        # --- End-of-overlay PENDING disposition (goldfive#163, revised
+        #     by goldfive#208). The tree finished its natural flow; we
+        #     now have to decide what to do with PENDING tasks the tree
+        #     didn't exercise. The legacy policy (#163) was a blanket
+        #     NOT_NEEDED reap, which silently destroyed user intent
+        #     across turn boundaries: a user-pivoted plan whose first
+        #     stage completes but whose downstream stages haven't been
+        #     dispatched yet would have those downstream stages reaped
+        #     before the next turn could pick them up.
         #
-        # Tier 1 / F10 (loop prevention): gate the reap on
-        # ``session.paused_for_human_intervention``. When the steerer
-        # has just emitted ``HUMAN_INTERVENTION_REQUIRED`` (Level 4
-        # PAUSE_ESCALATE), the agents stay PENDING for the next user
-        # turn — sweeping them to NOT_NEEDED here silently lies about
-        # user intent (the user hasn't decided yet whether the work is
-        # still wanted). Skip the sweep so the pending tasks survive
-        # the pause; they're picked up again when control returns.
+        #     The revised policy is structural reachability:
+        #
+        #     * REACHABLE PENDING (every predecessor either COMPLETED
+        #       or itself a still-running PENDING/RUNNING task that can
+        #       reach COMPLETED) — leave PENDING. The Conversation
+        #       carry-forward (`stash_plan` / `prior_plan_for`) will
+        #       seed the next turn with this task still live.
+        #     * UNREACHABLE PENDING (at least one predecessor reached
+        #       a terminal-non-COMPLETED status — CANCELLED / FAILED /
+        #       NOT_NEEDED — with no live replacement in the lineage)
+        #       — CANCEL with the same `run_aborted:orphaned by plan
+        #       revision failure` reason the legacy executor's
+        #       reachability audit uses (`_run` body around L732).
+        #
+        #     Tier 1 / F10 still applies: when paused for human
+        #     intervention, leave EVERY PENDING alone — the operator
+        #     hasn't decided yet whether unreachable work should be
+        #     dropped, so we should not pre-empt that decision.
         live_plan = session.plan or plan
         pending_ids = [
             t.id
@@ -1130,19 +1141,31 @@ class SequentialExecutor(Executor):
             if t.status is TaskStatus.PENDING and t.id
         ]
         if pending_ids and not getattr(session, "paused_for_human_intervention", False):
-            log.info(
-                "SequentialExecutor._run_overlay: marking %d PENDING task(s) "
-                "NOT_NEEDED at invocation end (no soft follow-up per #163): %s",
-                len(pending_ids),
-                ", ".join(pending_ids),
-            )
-            for tid in pending_ids:
-                await steerer.transition(
-                    tid,
-                    TaskStatus.NOT_NEEDED,
-                    detail="overlay: tree did not exercise; no follow-up dispatched (goldfive#163)",
-                    session=session,
+            unreachable = _unreachable_pending_task_ids(live_plan)
+            reachable = [tid for tid in pending_ids if tid not in unreachable]
+            if reachable:
+                log.info(
+                    "SequentialExecutor._run_overlay: leaving %d reachable "
+                    "PENDING task(s) live for next turn: %s",
+                    len(reachable),
+                    ", ".join(reachable),
                 )
+            if unreachable:
+                log.info(
+                    "SequentialExecutor._run_overlay: cancelling %d unreachable "
+                    "PENDING task(s) (predecessor terminal-non-COMPLETED with "
+                    "no live replacement): %s",
+                    len(unreachable),
+                    ", ".join(unreachable),
+                )
+                for tid in unreachable:
+                    await steerer.transition(
+                        tid,
+                        TaskStatus.CANCELLED,
+                        detail="orphaned by plan revision failure",
+                        cancel_reason="run_aborted:orphaned by plan revision failure",
+                        session=session,
+                    )
         elif pending_ids:
             # F10: surface the gated reap so operators see "reap
             # suppressed: escalation pending" in logs rather than a
@@ -1150,8 +1173,9 @@ class SequentialExecutor(Executor):
             # on the next user turn after the human-intervention pause
             # resolves.
             log.info(
-                "SequentialExecutor._run_overlay: NOT_NEEDED reap suppressed "
-                "(paused_for_human_intervention); leaving %d PENDING task(s): %s",
+                "SequentialExecutor._run_overlay: PENDING disposition "
+                "suppressed (paused_for_human_intervention); leaving "
+                "%d PENDING task(s): %s",
                 len(pending_ids),
                 ", ".join(pending_ids),
             )
@@ -1890,6 +1914,76 @@ def _pending_task_ids(plan: Plan) -> list[str]:
     sinks see a coherent plan-end state instead of "stuck PENDING forever."
     """
     return [t.id for t in plan.tasks if t.status == TaskStatus.PENDING and t.id]
+
+
+_TERMINAL_NON_COMPLETED_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.CANCELLED, TaskStatus.FAILED, TaskStatus.NOT_NEEDED}
+)
+
+
+def _unreachable_pending_task_ids(plan: Plan) -> set[str]:
+    """Return the ids of PENDING tasks whose predecessor chain is broken.
+
+    A PENDING task is unreachable iff at least one transitive predecessor
+    is in a terminal-non-COMPLETED status (CANCELLED / FAILED / NOT_NEEDED)
+    with no live replacement in the plan. Reachability propagates:
+    A → B → C with A=CANCELLED makes both B and C unreachable. A
+    predecessor that is itself PENDING or RUNNING does NOT taint
+    downstream — those can still progress to COMPLETED (this turn or
+    a future one).
+
+    AND-join semantics: when a task has multiple predecessors, ANY
+    broken predecessor is fatal. This matches ``_pick_next_task``'s
+    scheduling rule (every predecessor must be COMPLETED to schedule
+    the task), so a join with one CANCELLED predecessor can never be
+    scheduled — orphan-cancelling it is consistent with the rest of
+    the executor.
+
+    A FAILED task with a live ``retry_<id>`` / ``<id>_v2`` lineage
+    replacement (goldfive#202) is NOT broken — the replacement carries
+    the work forward, so downstream PENDING remains reachable.
+
+    Used by the overlay end-of-invocation policy (goldfive#208): the
+    legacy policy unconditionally NOT_NEEDED-reaped every PENDING at
+    overlay exit, which destroyed cross-turn user intent. The new
+    policy is "leave reachable PENDING alone, cancel only the
+    structurally unreachable PENDING."
+    """
+    tasks_by_id = {t.id: t for t in plan.tasks if t.id}
+    deps_by_task: dict[str, list[str]] = {}
+    for e in plan.edges:
+        deps_by_task.setdefault(e.to_task_id, []).append(e.from_task_id)
+
+    # Seed: every task whose own status is terminal-non-COMPLETED with
+    # no live replacement is "broken" — a structural dead-end that
+    # downstream PENDING work can never get past.
+    seed_broken: set[str] = set()
+    for tid, t in tasks_by_id.items():
+        if t.status not in _TERMINAL_NON_COMPLETED_STATUSES:
+            continue
+        if t.status == TaskStatus.FAILED and _has_live_replacement(plan, t):
+            continue
+        seed_broken.add(tid)
+
+    # Forward-propagate to PENDING tasks only (other statuses already
+    # have their own correct disposition). Iterate to fixed point —
+    # plan size is small, O(N*E) is fine.
+    unreachable_pending: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for tid, t in tasks_by_id.items():
+            if tid in unreachable_pending or tid in seed_broken:
+                continue
+            if t.status != TaskStatus.PENDING:
+                continue
+            for dep_id in deps_by_task.get(tid, []):
+                if dep_id in seed_broken or dep_id in unreachable_pending:
+                    unreachable_pending.add(tid)
+                    changed = True
+                    break
+
+    return unreachable_pending
 
 
 async def _emit_pipeline_failure_drift(
