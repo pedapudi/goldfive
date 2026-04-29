@@ -238,10 +238,14 @@ async def test_overlay_mode_single_passthrough_no_missed_tasks() -> None:
 
 async def test_overlay_does_not_dispatch_follow_ups() -> None:
     """goldfive#163: even when the reconciler reports missed PENDING
-    tasks, the overlay MUST NOT dispatch ``invoke_follow_up``. The
-    missed tasks end up ``NOT_NEEDED`` instead.
+    tasks, the overlay MUST NOT dispatch ``invoke_follow_up``.
 
-    Regression guard: this is the core contract #163 added.
+    goldfive#208 (revised contract): missed tasks no longer become
+    NOT_NEEDED at end-of-invocation. They remain PENDING and are
+    carried forward to the next turn (Conversation.stash_plan /
+    prior_plan_for) where the next user message can drive them. Only
+    structurally UNREACHABLE PENDING tasks (predecessors broken) are
+    cancelled at overlay end.
     """
     plan = _three_task_plan()
     session = Session(run_id="r1")
@@ -277,26 +281,31 @@ async def test_overlay_does_not_dispatch_follow_ups() -> None:
     assert adapter.follow_up_calls == [], (
         f"overlay must not dispatch follow-ups (goldfive#163); got {adapter.follow_up_calls!r}"
     )
-    # t0 completed via the reconciler; t1 and t2 are NOT_NEEDED (not
-    # PENDING, not COMPLETED-via-follow-up, not FAILED).
+    # t0 completed via the reconciler. t1 and t2 stay PENDING — t1's
+    # predecessor t0 just COMPLETED so t1 is reachable next turn; t2's
+    # predecessor t1 is still PENDING (not broken). The overlay leaves
+    # both alone for the next turn to drive.
     by_id = {t.id: t.status for t in plan.tasks}
     assert by_id["t0"] is TaskStatus.COMPLETED
-    assert by_id["t1"] is TaskStatus.NOT_NEEDED, (
-        f"missed task t1 should be NOT_NEEDED, got {by_id['t1']}"
+    assert by_id["t1"] is TaskStatus.PENDING, (
+        f"reachable t1 should remain PENDING for next turn, got {by_id['t1']}"
     )
-    assert by_id["t2"] is TaskStatus.NOT_NEEDED, (
-        f"missed task t2 should be NOT_NEEDED, got {by_id['t2']}"
+    assert by_id["t2"] is TaskStatus.PENDING, (
+        f"reachable t2 should remain PENDING for next turn, got {by_id['t2']}"
     )
+    # No NOT_NEEDED transitions, no CANCELLED transitions — all
+    # PENDING tasks are reachable.
+    assert [tid for tid, to in steerer.transitions if to is TaskStatus.NOT_NEEDED] == []
+    assert [tid for tid, to in steerer.transitions if to is TaskStatus.CANCELLED] == []
 
 
-async def test_overlay_pending_to_not_needed_on_invocation_end() -> None:
-    """Explicit transition test: every PENDING task at the end of
-    ``invoke_passthrough`` is transitioned via
-    ``steerer.transition(..., TaskStatus.NOT_NEEDED, ...)``.
+async def test_overlay_pending_stays_pending_when_predecessors_pending() -> None:
+    """When the tree does nothing and all tasks remain PENDING with
+    no broken predecessor chain, the overlay leaves every task PENDING.
 
-    Verifies the exact transition API call (not just the terminal
-    status), so future refactors can't silently mutate task.status
-    without going through the steerer.
+    goldfive#208 contract: end-of-overlay alone is NOT a sufficient
+    reason to mark NOT_NEEDED. The next turn (or a USER_STEER) can
+    drive these tasks forward.
     """
     plan = _three_task_plan()
     session = Session(run_id="r1")
@@ -324,16 +333,104 @@ async def test_overlay_pending_to_not_needed_on_invocation_end() -> None:
     )
 
     assert outcome.success is True
-    # Exactly three NOT_NEEDED transitions (one per PENDING task).
-    not_needed_transitions = [tid for tid, to in steerer.transitions if to is TaskStatus.NOT_NEEDED]
-    assert set(not_needed_transitions) == {"t0", "t1", "t2"}, (
-        f"expected NOT_NEEDED transitions for t0/t1/t2, got {not_needed_transitions!r}"
-    )
-    # All tasks terminal.
+    # Zero NOT_NEEDED transitions and zero CANCELLED transitions.
+    assert [tid for tid, to in steerer.transitions if to is TaskStatus.NOT_NEEDED] == []
+    assert [tid for tid, to in steerer.transitions if to is TaskStatus.CANCELLED] == []
+    # All tasks remain PENDING for the next turn.
     for t in plan.tasks:
-        assert t.status is TaskStatus.NOT_NEEDED
+        assert t.status is TaskStatus.PENDING
     # And of course: no follow-up dispatch.
     assert adapter.follow_up_calls == []
+
+
+async def test_overlay_cancels_unreachable_pending_when_predecessor_failed() -> None:
+    """goldfive#208: a PENDING task whose predecessor went CANCELLED
+    (with no live replacement) is structurally unreachable. End-of-
+    overlay should CANCEL it (not NOT_NEEDED) so sinks see a coherent
+    plan-end and the next turn doesn't try to drive a dead task.
+    """
+    plan = Plan(
+        id="p_unreach",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[
+            Task(id="t0", title="root", assignee_agent_id="agent_a", status=TaskStatus.CANCELLED),
+            Task(id="t1", title="downstream", assignee_agent_id="agent_b"),
+        ],
+        edges=[TaskEdge(from_task_id="t0", to_task_id="t1")],
+    )
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    async def _passthrough(
+        user_message: str,  # noqa: ARG001
+        session: Session,  # noqa: ARG001
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        return InvocationResult(task_id="", text="")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    executor = SequentialExecutor(overlay_mode=True)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="anything",
+    )
+
+    assert outcome.success is True
+    cancelled = [tid for tid, to in steerer.transitions if to is TaskStatus.CANCELLED]
+    assert "t1" in cancelled, (
+        f"unreachable t1 should be CANCELLED, got transitions={steerer.transitions!r}"
+    )
+    # NOT_NEEDED is not the right disposition for unreachable.
+    assert [tid for tid, to in steerer.transitions if to is TaskStatus.NOT_NEEDED] == []
+
+
+async def test_overlay_does_not_emit_legacy_not_needed_reason() -> None:
+    """Regression guard: the legacy reason string ``tree did not
+    exercise; no follow-up dispatched`` must NOT appear post-#208.
+    """
+    plan = _three_task_plan()
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    async def _passthrough(
+        user_message: str,  # noqa: ARG001
+        session: Session,  # noqa: ARG001
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        return InvocationResult(task_id="", text="")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    executor = SequentialExecutor(overlay_mode=True)
+    await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="anything",
+    )
+
+    # No detail field on any recorded transition should mention the
+    # retired phrase.
+    for tid, to, *_rest in (
+        (t.id, t.to, getattr(t, "detail", "")) if hasattr(t, "to") else (None, None, "")
+        for t in []
+    ):
+        # placeholder — StubSteerer's transitions records (id, to_status)
+        del tid, to
+    # The transitions list itself should not contain a NOT_NEEDED with
+    # the legacy reason — the simpler assertion is that no NOT_NEEDED
+    # transition was emitted at all in this scenario.
+    assert [tid for tid, to in steerer.transitions if to is TaskStatus.NOT_NEEDED] == []
 
 
 async def test_overlay_no_pending_tasks_no_not_needed_transitions() -> None:
