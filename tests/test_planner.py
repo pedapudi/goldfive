@@ -2264,3 +2264,101 @@ def test_static_planner_template_clone_preserves_supersedes() -> None:
     assert isinstance(correction.supersedes, str)
     assert correction.supersedes == "research_solar"
     assert correction.supersedes_kind is SupersessionKind.CORRECT
+
+
+# ---------------------------------------------------------------------------
+# goldfive#214 (iter-7): SUPERSESSION INVARIANT prompt strengthening.
+# ---------------------------------------------------------------------------
+
+
+def test_supersession_invariant_in_user_steer_system_prompt() -> None:
+    """The canonical block lands in _USER_STEER_SYSTEM_PROMPT."""
+    from goldfive.planner import _USER_STEER_SYSTEM_PROMPT
+    assert "REUSE-OR-SUPERSEDE" in _USER_STEER_SYSTEM_PROMPT
+    assert "(b) MINT A NEW ID + SUPERSEDES" in _USER_STEER_SYSTEM_PROMPT
+    assert "fix_X" in _USER_STEER_SYSTEM_PROMPT or "fix_review_slides" in _USER_STEER_SYSTEM_PROMPT
+
+
+def test_supersession_invariant_in_refine_system_prompt() -> None:
+    """The canonical block lands in _REFINE_SYSTEM_PROMPT."""
+    from goldfive.planner import _REFINE_SYSTEM_PROMPT
+    assert "REUSE-OR-SUPERSEDE" in _REFINE_SYSTEM_PROMPT
+    assert "(b) MINT A NEW ID + SUPERSEDES" in _REFINE_SYSTEM_PROMPT
+
+
+def test_supersession_invariant_in_looping_system_prompt() -> None:
+    """The canonical block lands in _LOOPING_TOOL_CALL_SYSTEM_PROMPT."""
+    from goldfive.planner import _LOOPING_TOOL_CALL_SYSTEM_PROMPT
+    assert "REUSE-OR-SUPERSEDE" in _LOOPING_TOOL_CALL_SYSTEM_PROMPT
+    assert "(b) MINT A NEW ID + SUPERSEDES" in _LOOPING_TOOL_CALL_SYSTEM_PROMPT
+
+
+def test_supersession_invariant_NOT_in_plan_divergence_system_prompt() -> None:
+    """PLAN_DIVERGENCE path is about ABSORB/REJECT, not supersession.
+    Skipping the invariant there per iter-7 reviewer's note avoids
+    pulling LLM focus off the absorb-vs-reject decision.
+    """
+    from goldfive.planner import _PLAN_DIVERGENCE_SYSTEM_PROMPT
+    assert "REUSE-OR-SUPERSEDE" not in _PLAN_DIVERGENCE_SYSTEM_PROMPT
+
+
+def test_supersession_examples_present_in_user_steer_and_refine_prompts() -> None:
+    """Few-shot examples (positive + negative) anchor the
+    mutual-exclusivity framing in both user-facing prompts."""
+    from goldfive.planner import _REFINE_SYSTEM_PROMPT, _USER_STEER_SYSTEM_PROMPT
+    for prompt in (_USER_STEER_SYSTEM_PROMPT, _REFINE_SYSTEM_PROMPT):
+        # Negative example: id reuse with no supersedes
+        assert "Reused id (evolution; no supersedes)" in prompt
+        # Positive example: fresh id with supersedes
+        assert "fix_review_slides" in prompt
+        assert "supersedes_kind" in prompt
+
+
+def test_steer_prompt_invariants_block_contains_supersession_invariant() -> None:
+    """_build_steer_prompt's invariants block adds the SUPERSESSION
+    INVARIANT as item 7 (item 6 stays the id-reuse rule)."""
+    from goldfive.planner import LLMPlanner
+    from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Goal, Task, TaskStatus
+
+    class _NoopLLM:
+        async def __call__(self, system: str, user: str, model: str) -> str:
+            return ""
+
+    planner = LLMPlanner(call_llm=_NoopLLM(), model="m")
+    completed = [Task(id="research", title="r", status=TaskStatus.COMPLETED)]
+    prior_pending = [Task(id="draft", title="d", status=TaskStatus.PENDING)]
+    drift = DriftEvent(kind=DriftKind.USER_STEER, severity=DriftSeverity.WARNING, detail="pivot")
+    rendered = planner._build_steer_prompt(
+        completed,
+        drift,
+        [Goal(id="g1", summary="ship")],
+        source="user",
+        prior_pending=prior_pending,
+    )
+    assert "REUSE-OR-SUPERSEDE" in rendered
+    # Invariant 7 numbering preserved (6 = id reuse, 7 = supersession invariant)
+    assert "7. SUPERSESSION INVARIANT" in rendered
+    # Invariant 6 (id reuse) is unchanged
+    assert "6. ID REUSE FOR CONTINUING WORK" in rendered
+
+
+def test_render_structural_invariants_does_NOT_double_carry_supersession() -> None:
+    """Reviewer note (point 9): _render_structural_invariants_block
+    feeds 2 of the 4 system-prompt sites. The system prompts already
+    carry the invariant. Doubling it inflates per-call tokens. The
+    helper should NOT be modified to add the supersession block.
+    """
+    from goldfive.planner import LLMPlanner
+    from goldfive.types import Plan, Task, TaskStatus
+    plan = Plan(
+        id="p", run_id="r", goal_ids=[],
+        tasks=[Task(id="a", title="A", status=TaskStatus.PENDING)],
+        edges=[],
+    )
+    planner = LLMPlanner(call_llm=None, model="m")
+    rendered = planner._render_structural_invariants_block(plan)
+    # The structural invariants helper is concerned with terminal
+    # preservation and DAG shape; supersession semantics live in the
+    # system prompts. Asserting absence here pins the separation of
+    # concerns.
+    assert "REUSE-OR-SUPERSEDE" not in rendered
