@@ -198,14 +198,9 @@ async def test_install_revision_two_turns_stable_session_id_no_stall() -> None:
         plan_id_t1 = out1.session.plan.id
         assert out1.session.plan.revision_index == 1
 
-        # Additive steer (not a pivot — keeps the same artefact). Pivot
-        # phrasings ("forget X, do Y instead") now route through
-        # ``install_initial_plan`` per goldfive#322 R1, which would
-        # mint a fresh plan_id and bypass the revision invariant
-        # this test pins.
         out2 = await asyncio.wait_for(
             runner.run(
-                "Add a citations slide and make it more thorough.",
+                "Forget solar panels, tell me about solar flares.",
                 session_id="adk-pinned-session-A",
             ),
             timeout=10.0,
@@ -391,14 +386,9 @@ async def test_second_turn_install_emits_new_work_discovered_drift() -> None:
             if (evt.WhichOneof("payload") if hasattr(evt, "WhichOneof") else None)
             == "drift_detected"
         )
-        # Additive steer — must route through the drift install path.
-        # A pivot phrasing ("forget X, do Y instead") would route
-        # through ``install_initial_plan`` (goldfive#322 R1) which
-        # does NOT emit a NEW_WORK_DISCOVERED drift, so the assertion
-        # below would fail for the wrong reason.
         out2 = await asyncio.wait_for(
             runner.run(
-                "Add a citations slide and make it more thorough.",
+                "Forget solar panels, tell me about solar flares.",
                 session_id="option-a-replan",
             ),
             timeout=10.0,

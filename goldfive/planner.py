@@ -64,74 +64,6 @@ _EMPTY_RESPONSE_ERROR: str = "empty or non-string LLM response"
 
 
 # ---------------------------------------------------------------------------
-# Pivot heuristic (R1, goldfive#322 follow-up)
-# ---------------------------------------------------------------------------
-#
-# Tier 2 (#323) added an LLM-side ``replaces_prior: bool`` field that
-# ``handle_turn`` is supposed to set when the user is replacing prior
-# intent (e.g. "forget X, do Y instead"). v20 validation showed Qwen
-# 35B Q4 thinking is unreliable about this — turn 2 of session
-# 61ddf449-8ea3-470e-b175-c38211b81220 was a textbook pivot ("Forget
-# solar panels, tell me about solar flares instead") yet the LLM left
-# ``replaces_prior`` unset and the runner re-used the prior plan id,
-# bypassing the pivot route.
-#
-# This regex is a deterministic backstop. ``handle_turn`` OR's the
-# heuristic with the LLM flag — either signal triggers pivot routing
-# through ``install_initial_plan``. Keyword matching is intentionally
-# conservative: false positives are acceptable (the new initial plan
-# can still preserve relevant tasks if the planner thinks they're
-# useful), false negatives — the v20 failure mode — are not.
-_PIVOT_OPENERS_RE = re.compile(
-    r"""(?xi)
-    \b(?:
-        forget(?:\s+about)?                                  # forget / forget about
-        | instead\s+of                                       # instead of solar panels
-        | switch(?:ing)?\s+to                                # switch to / switching to
-        | scratch\s+that                                     # scratch that
-        | actually,?\s+(?:let'?s|let\s+me|do|tell)           # actually let's / actually do X
-        | no,?\s+(?:do|tell|let)                             # no, do X / no tell me
-        | wait,?\s+(?:do|tell|let|i)                         # wait, do X / wait, I want
-        | change\s+(?:the\s+)?topic                          # change topic / change the topic
-        | new\s+topic                                        # new topic
-        | replace\s+that                                     # replace that
-        | do\s+(?:something|this)\s+instead                  # do something instead
-    )\b
-    """
-)
-
-
-def detect_pivot_intent(user_input: str | None) -> bool:
-    """Heuristic backstop for pivot detection (goldfive#322 / R1).
-
-    Returns ``True`` when ``user_input`` contains language that
-    strongly signals "replace prior intent" rather than "build on
-    prior plan." Used in addition to the LLM-side ``replaces_prior``
-    flag — either signal triggers pivot routing through
-    :meth:`DefaultSteerer.install_initial_plan`.
-
-    Why heuristic + LLM flag (not LLM flag alone):
-
-    * Qwen 35B Q4 thinking does not reliably output the structured
-      flag even when the system prompt explicitly covers the case
-      (see Example B in the PIVOT vs REVISION block of the
-      ``handle_turn`` system prompt).
-    * Keyword matching catches the most common explicit-pivot
-      openers ("forget X", "instead of X", "scratch that", ...).
-      False positives are acceptable: routing through
-      ``install_initial_plan`` mints a fresh plan id but the new
-      plan can still preserve relevant tasks if the planner
-      decides to keep them.
-
-    Returns ``False`` for non-string / empty inputs (defensive —
-    the caller may pass ``None`` when no user input is available).
-    """
-    if not isinstance(user_input, str) or not user_input.strip():
-        return False
-    return bool(_PIVOT_OPENERS_RE.search(user_input))
-
-
-# ---------------------------------------------------------------------------
 # System prompts (goal-oriented variants ported from harmonograf_client)
 # ---------------------------------------------------------------------------
 
@@ -3518,7 +3450,6 @@ SUMMARY POLICY (applies to ``plan.summary``):
                 raw=raw,
                 prior_plan=prior_plan,
                 context=context,
-                user_input=text,
             )
             if candidate is None:
                 # Conversational verdict OR unparseable response. Either
@@ -3655,7 +3586,6 @@ SUMMARY POLICY (applies to ``plan.summary``):
         raw: Any,
         prior_plan: Plan | None,
         context: Mapping[str, Any] | None,
-        user_input: str | None = None,
     ) -> Plan | None:
         """Parse the LLM's JSON response into a :class:`Plan` or ``None``.
 
@@ -3681,13 +3611,6 @@ SUMMARY POLICY (applies to ``plan.summary``):
         (terminal-task / terminal->terminal-edge preservation in
         :meth:`Plan.validate`) does not gate the new plan against
         the prior — a pivot is structurally a fresh start.
-
-        ``user_input`` (R1 backstop, goldfive#322 follow-up): when
-        provided, :func:`detect_pivot_intent` runs against the raw
-        user message and is OR'd with the LLM's ``replaces_prior``
-        flag. The keyword heuristic catches the explicit-pivot
-        openers ("forget X", "instead of X", "scratch that", ...)
-        that small thinking models miss in the structured flag.
         """
         if not isinstance(raw, str) or not raw.strip():
             log.warning("LLMPlanner.handle_turn: empty / non-str response")
@@ -3722,21 +3645,7 @@ SUMMARY POLICY (applies to ``plan.summary``):
         # plan_id and signal the runner to route through
         # ``install_initial_plan``. False/absent (the safe default) →
         # reuse the prior id so revision_index bumps cleanly.
-        #
-        # R1 backstop (goldfive#322 follow-up): OR the LLM flag with
-        # the keyword heuristic against the raw user input. Either
-        # signal triggers pivot routing — the LLM-side flag is
-        # unreliable on small thinking models (Qwen 35B Q4 v20),
-        # the keyword pass catches the explicit-pivot openers the
-        # LLM misses. Either alone is sufficient; both is no-op.
-        llm_flag = bool(parsed.get("replaces_prior"))
-        heuristic_flag = detect_pivot_intent(user_input)
-        replaces_prior = llm_flag or heuristic_flag
-        if replaces_prior and not llm_flag:
-            log.info(
-                "LLMPlanner.handle_turn: pivot detected by heuristic backstop "
-                "(LLM flag was unset); routing through install_initial_plan"
-            )
+        replaces_prior = bool(parsed.get("replaces_prior"))
         if replaces_prior:
             plan_id_override = None  # _plan_from_json mints a fresh uuid
         else:

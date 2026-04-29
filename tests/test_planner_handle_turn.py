@@ -238,23 +238,17 @@ async def test_handle_turn_empty_user_input_returns_none_without_llm_call() -> N
 
 
 async def test_handle_turn_revision_preserves_prior_plan_id() -> None:
-    """Phase 4 invariant (revision branch): when the user input is an
-    additive / refining steer (no pivot keywords) AND the LLM does not
-    set ``replaces_prior``, the parser forces the returned plan id to
-    match the prior's so the steerer's ``_apply_revision`` finds it.
-
-    Pre-R1 this test used a "forget solar panels..." pivot phrasing,
-    which now correctly trips the heuristic backstop (goldfive#322
-    R1 follow-up). The original revision invariant is unchanged for
-    non-pivot inputs — covered here with an additive steer phrasing.
+    """Phase 4 invariant: every plan change is a revision of the same
+    plan_id. The handle_turn parser forces the returned plan's id to
+    match the prior's so the steerer's _apply_revision finds it.
     """
     scripted = _ScriptedLLM(
         json.dumps(
             {
-                "reasoning": "additive constraint",
+                "reasoning": "topic shift",
                 "plan": _plan_json(
                     plan_id="completely-different-id",
-                    summary="solar panel plan with citations",
+                    summary="solar flares plan",
                 ),
             }
         )
@@ -262,12 +256,12 @@ async def test_handle_turn_revision_preserves_prior_plan_id() -> None:
     planner = LLMPlanner(call_llm=scripted)
     session = _populated_session(plan_id="plan-prior-id")
     plan = await planner.handle_turn(
-        user_input="add citations to each slide",
+        user_input="forget solar panels, tell me about solar flares",
         session=session,
     )
     assert plan is not None
     # Even though the LLM emitted "completely-different-id", the parser
-    # overrides with the prior's id — Phase 4 invariant for revisions.
+    # overrides with the prior's id — Phase 4 invariant.
     assert plan.id == "plan-prior-id"
 
 
@@ -435,24 +429,15 @@ async def test_handle_turn_factual_question_about_prior_returns_none() -> None:
     assert plan is None
 
 
-async def test_handle_turn_topic_pivot_routes_through_pivot_branch() -> None:
-    """(b) 'forget solar panels, tell me about solar flares' — explicit
-    pivot phrasing. Per goldfive#322 R1 (heuristic backstop), this
-    input trips :func:`detect_pivot_intent` regardless of whether the
-    LLM sets ``replaces_prior``. The parser mints a fresh plan id and
-    stamps the ``_goldfive_pivot`` sentinel so the runner routes
-    through ``install_initial_plan``.
-
-    Prior goals (carrying '2 slides') are still threaded into the
-    prompt — the LLM is free to merge them into the new plan's summary.
+async def test_handle_turn_topic_pivot_produces_revision_with_carried_qualifications() -> None:
+    """(b) 'forget solar panels, tell me about solar flares' — produces
+    a revision. The prompt threads prior_goals (carrying '2 slides')
+    so the LLM merges the cap into the new plan's summary.
     """
     scripted = _ScriptedLLM(
         json.dumps(
             {
                 "reasoning": "topic shift; preserve 2-slide cap",
-                # Note: replaces_prior intentionally absent — the R1
-                # heuristic backstop must rescue the pivot route on
-                # its own, mirroring the v20 Qwen failure mode.
                 "plan": _plan_json(
                     summary=(
                         "Create a 2-slide presentation about solar flares."
@@ -468,10 +453,7 @@ async def test_handle_turn_topic_pivot_routes_through_pivot_branch() -> None:
         session=session,
     )
     assert plan is not None
-    # R1: pivot route — fresh plan id, NOT inherited from the prior.
-    assert plan.id != "plan-stable"
-    assert plan.id, "fresh plan id must be non-empty"
-    assert getattr(plan, "_goldfive_pivot", False) is True
+    assert plan.id == "plan-stable"  # revision-of-prior invariant
     # The prompt surfaced the 2-slide cap; assert the canned plan kept it.
     assert "2-slide" in plan.summary or "2 slide" in plan.summary
 
