@@ -3599,12 +3599,42 @@ class DefaultSteerer:
         within ~one event-loop tick instead of ~the LLM-call's
         full duration.
 
+        Supersede contract (Bug A fix from v22 validation): every call
+        to this method represents a goldfive-INTERNAL cancel — the
+        revised plan has just been applied, and the cancel is the
+        mechanism by which the in-flight agent is switched onto it.
+        Stamps ``session._supersede_pending = True`` BEFORE initiating
+        the cancel so the executor's overlay loop
+        (:meth:`SequentialExecutor._run_overlay` cancelled branch) can
+        distinguish this internal supersede from an external cancel
+        (USER_CANCEL via control channel, asyncio.CancelledError from
+        above) and restart the passthrough loop with the new plan
+        instead of aborting the turn. The executor consumes and clears
+        the flag; an unconsumed flag (e.g. cancel never lands because
+        the invocation already completed) is harmless — the next
+        cancel-branch entry will see and clear it, or the run finishes
+        normally and the Session is discarded.
+
         Best-effort: an unbound adapter, a non-ADK adapter without
         :meth:`request_invocation_cancel`, or an empty resolved
         invocation-id list each result in a no-op (the refined plan
         still lands; the in-flight invocation simply runs to
-        completion under the older, less aggressive contract).
+        completion under the older, less aggressive contract). The
+        supersede flag is still stamped in the no-op case — it costs
+        nothing and a downstream overlay that DOES observe a cancel
+        from a separate path stays correctly classified.
         """
+        # Stamp the supersede marker so the overlay loop can
+        # distinguish this internal cancel from an external one. See
+        # the supersede-contract paragraph in the docstring above.
+        try:
+            session._supersede_pending = True  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 — flag is best-effort
+            log.debug(
+                "DefaultSteerer._cancel_inflight_for_revision: "
+                "could not stamp supersede flag on session: %s",
+                exc,
+            )
         try:
             return await self.request_invocation_cancel(
                 drift=drift,
