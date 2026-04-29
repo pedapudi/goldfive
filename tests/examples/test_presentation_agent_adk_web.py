@@ -367,9 +367,11 @@ def test_presentation_agent_e2e_under_adk_web(
         # Inspect the run-end PENDING set on the latest plan_revised
         # snapshot. Every non-terminal planned task must be PENDING
         # AND reachable (no broken predecessors).
+        from goldfive.pb.goldfive.v1 import types_pb2  # noqa: PLC0415
+
         latest_plan = plan_events[-1].plan_revised.plan
         plan_tasks_by_id = {t.id: t for t in latest_plan.tasks}
-        plan_edges_to = {}
+        plan_edges_to: dict[str, list[str]] = {}
         for e in latest_plan.edges:
             plan_edges_to.setdefault(e.to_task_id, []).append(e.from_task_id)
         broken_statuses = {
@@ -380,9 +382,9 @@ def test_presentation_agent_e2e_under_adk_web(
         for tid in non_terminal_planned:
             t = plan_tasks_by_id.get(tid)
             assert t is not None, f"planned task {tid} missing from latest plan"
-            status_name = (
-                t.status.name if hasattr(t.status, "name") else str(t.status)
-            )
+            # ``t.status`` is a proto enum int; resolve to name via
+            # ``TaskStatus.Name`` so the assertion message is readable.
+            status_name = types_pb2.TaskStatus.Name(t.status)
             assert "PENDING" in status_name, (
                 f"non-terminal planned task {tid} has unexpected status {status_name}"
             )
@@ -390,9 +392,7 @@ def test_presentation_agent_e2e_under_adk_web(
                 dep = plan_tasks_by_id.get(dep_id)
                 if dep is None:
                     continue
-                dep_status_name = (
-                    dep.status.name if hasattr(dep.status, "name") else str(dep.status)
-                )
+                dep_status_name = types_pb2.TaskStatus.Name(dep.status)
                 assert dep_status_name not in broken_statuses, (
                     f"non-terminal planned task {tid} has broken predecessor "
                     f"{dep_id} (status={dep_status_name}); should have been "
