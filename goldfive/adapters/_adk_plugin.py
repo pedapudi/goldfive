@@ -571,9 +571,7 @@ def _maybe_redirect_completed_agent(
             return None
 
         # If any assigned task is non-terminal, the dispatch is legitimate.
-        if any(
-            _safe_attr(t, "status", None) not in TERMINAL_TASK_STATUSES for t in assigned
-        ):
+        if any(_safe_attr(t, "status", None) not in TERMINAL_TASK_STATUSES for t in assigned):
             return None
 
         # All assigned tasks are terminal. Find the next PENDING task
@@ -611,9 +609,7 @@ def _maybe_redirect_completed_agent(
             # plan handling will close out the run.
             return None
 
-        next_assignee = _bare(
-            str(_safe_attr(next_pending, "assignee_agent_id", "") or "")
-        )
+        next_assignee = _bare(str(_safe_attr(next_pending, "assignee_agent_id", "") or ""))
         if next_assignee == target_bare:
             # Next pending is on the same agent — this dispatch is
             # legitimate follow-up work, not a loop.
@@ -632,9 +628,7 @@ def _maybe_redirect_completed_agent(
             "redirect_to": next_assignee,
         }
     except Exception as exc:  # noqa: BLE001 — defensive; never break dispatch
-        log.debug(
-            "_maybe_redirect_completed_agent: classification raised: %s", exc
-        )
+        log.debug("_maybe_redirect_completed_agent: classification raised: %s", exc)
         return None
 
 
@@ -1843,6 +1837,195 @@ async def _inject_goldfive_planner_instruction(
             "_inject_goldfive_planner_instruction: append_instructions raised: %s",
             exc,
         )
+
+
+# R3 (F2 alternative) — runtime tool-surface hint.
+#
+# Tier 1's F2 wanted to mutate ``llm_request.config.tools`` mid-callback
+# to remove agents whose tasks have all completed, but mutating the
+# tool list mid-flight is fragile (ADK caches declarations on
+# ``tools_dict`` and the model API rejects requests where the
+# function declarations don't match the names referenced in
+# ``contents``). R3 takes the non-invasive route: keep all tools
+# available, but pre-emptively tell the LLM — at every model call —
+# which agents still have PENDING work and which agents' work is
+# already DONE. The LLM then has structural guidance to choose the
+# right next action without us having to alter the tool surface.
+#
+# Why a prefix marker: the hint is per-call. Each
+# ``before_model_callback`` invocation must inject the CURRENT plan
+# state, not accumulate prior snapshots. ``system_instruction`` in
+# ADK is a single string, so we detect-and-strip any previous
+# goldfive hint by its ``[GOLDFIVE PLAN-STATE HINT —`` opener before
+# appending the fresh one.
+_RUNTIME_TOOLS_HINT_PREFIX: str = "[GOLDFIVE PLAN-STATE HINT —"
+_RUNTIME_TOOLS_HINT_END: str = "[/GOLDFIVE PLAN-STATE HINT]"
+
+
+def _build_runtime_tools_hint(session: Any) -> str | None:
+    """Compose a 'currently-relevant tools' hint for injection into the LLM context.
+
+    Walks ``session.plan.tasks`` and groups them by ``assignee_agent_id``.
+    For each agent, summarise:
+
+    * tasks already DONE (terminal — COMPLETED / FAILED / CANCELLED / NOT_NEEDED)
+    * tasks PENDING (with their titles, capped at three for brevity)
+    * whether the agent has any remaining work
+
+    Returns a multi-line string suitable for prepending to the LLM
+    request as a system-level guidance message. Returns ``None`` when
+    there's no plan to summarise (turn 1, or pre-plan-install
+    windows), or when the plan groups produce no useful signal.
+
+    The output is bracketed by :data:`_RUNTIME_TOOLS_HINT_PREFIX` and
+    :data:`_RUNTIME_TOOLS_HINT_END` so a follow-up call can detect and
+    strip the previous hint from ``system_instruction`` before
+    appending the fresh one (R3 dedup contract).
+    """
+    plan = _safe_attr(session, "plan", None)
+    if plan is None:
+        return None
+    tasks = _safe_attr(plan, "tasks", None)
+    if not tasks:
+        return None
+
+    try:
+        from goldfive.types import TERMINAL_TASK_STATUSES
+    except ImportError:  # pragma: no cover — should never happen
+        return None
+
+    by_agent: dict[str, dict[str, list[str]]] = {}
+    for t in tasks:
+        agent = _safe_attr(t, "assignee_agent_id", "") or "<unassigned>"
+        bucket = by_agent.setdefault(agent, {"done": [], "remaining": []})
+        status = _safe_attr(t, "status", None)
+        title = _safe_attr(t, "title", "") or _safe_attr(t, "id", "") or "?"
+        if status in TERMINAL_TASK_STATUSES:
+            bucket["done"].append(str(title))
+        else:
+            bucket["remaining"].append(str(title))
+
+    body_lines: list[str] = []
+    for agent in sorted(by_agent):
+        info = by_agent[agent]
+        # Strip any namespace separator so the hint matches what the
+        # LLM sees as the bare tool / sub-agent name.
+        bare = agent.split(":")[-1] if ":" in agent else agent
+        if info["remaining"]:
+            tasks_summary = "; ".join(info["remaining"][:3])
+            body_lines.append(f"  {bare}: PENDING — {tasks_summary}")
+        elif info["done"]:
+            body_lines.append(f"  {bare}: all assigned tasks complete; do NOT re-invoke this agent")
+
+    if not body_lines:
+        return None
+
+    lines: list[str] = [f"{_RUNTIME_TOOLS_HINT_PREFIX} runtime guidance, not user-authored]"]
+    lines.extend(body_lines)
+    lines.append(
+        "Choose the agent whose tasks are still PENDING. Do not re-invoke "
+        "agents whose tasks are already complete."
+    )
+    lines.append(_RUNTIME_TOOLS_HINT_END)
+    return "\n".join(lines)
+
+
+def _strip_prior_runtime_tools_hint(existing: str) -> str:
+    """Remove a previously-injected runtime-tools hint from ``existing``.
+
+    The hint is bracketed by :data:`_RUNTIME_TOOLS_HINT_PREFIX` and
+    :data:`_RUNTIME_TOOLS_HINT_END`. When found, both markers and the
+    text between them are removed; surrounding ``\\n\\n`` separators
+    are normalised so the result has no orphan blank lines.
+
+    Returns the input unchanged when no prior hint marker is present.
+    """
+    if _RUNTIME_TOOLS_HINT_PREFIX not in existing:
+        return existing
+    start = existing.find(_RUNTIME_TOOLS_HINT_PREFIX)
+    end = existing.find(_RUNTIME_TOOLS_HINT_END, start)
+    if end == -1:
+        # Truncated / malformed — drop from prefix to end of string.
+        cleaned = existing[:start]
+    else:
+        cleaned = existing[:start] + existing[end + len(_RUNTIME_TOOLS_HINT_END) :]
+    # Collapse any 3+ consecutive newlines created by the removal.
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+    return cleaned.strip("\n")
+
+
+def _inject_runtime_tools_hint(
+    *,
+    callback_context: Any,
+    llm_request: Any,
+    session: Any,
+) -> None:
+    """Inject (or refresh) the runtime tool-surface hint on ``llm_request``.
+
+    R3 (F2 alternative). Builds the current plan-state hint via
+    :func:`_build_runtime_tools_hint` and writes it to
+    ``llm_request.config.system_instruction``. If a prior goldfive
+    hint is present (detected by :data:`_RUNTIME_TOOLS_HINT_PREFIX`),
+    it is stripped first so we don't accumulate snapshots across calls.
+
+    Best-effort: never raises. A None hint (no plan, or plan with no
+    informative groups) is a no-op so we don't pollute the prompt with
+    empty markers.
+    """
+    hint = _build_runtime_tools_hint(session)
+
+    config = _safe_attr(llm_request, "config", None)
+    if config is None:
+        return
+    existing = getattr(config, "system_instruction", None)
+
+    # Strip any prior hint regardless of whether we'll re-inject. A
+    # None ``hint`` (plan disappeared or all groups empty) should still
+    # remove the stale marker block from the request.
+    if isinstance(existing, str) and _RUNTIME_TOOLS_HINT_PREFIX in existing:
+        try:
+            config.system_instruction = _strip_prior_runtime_tools_hint(existing) or None
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "_inject_runtime_tools_hint: could not strip prior hint: %s",
+                exc,
+            )
+            return
+        existing = getattr(config, "system_instruction", None)
+
+    if not hint:
+        return
+
+    append = getattr(llm_request, "append_instructions", None)
+    if callable(append):
+        try:
+            append([hint])
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "_inject_runtime_tools_hint: append_instructions raised: %s",
+                exc,
+            )
+            # fall through to direct write
+
+    # Fallback for stubs that lack ``append_instructions`` (unit tests).
+    if not existing:
+        try:
+            config.system_instruction = hint
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "_inject_runtime_tools_hint: could not set system_instruction: %s",
+                exc,
+            )
+    elif isinstance(existing, str):
+        try:
+            config.system_instruction = existing + "\n\n" + hint
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "_inject_runtime_tools_hint: could not append system_instruction: %s",
+                exc,
+            )
 
 
 #: Default per-LLM-call wall-clock budget (milliseconds) enforced by
@@ -4597,6 +4780,34 @@ def make_adk_plugin(
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "before_model_callback: goldfive planner injection raised: %s",
+                    exc,
+                )
+
+            # R3 (F2 alternative) — runtime tool-surface hint.
+            #
+            # Tier 1's F1/F3/F4 fire AFTER the LLM has already emitted /
+            # received a tool call. They can't prevent the model's NEXT
+            # inference loop from picking the same already-completed
+            # agent. The hint here is the PRE-EMPTIVE signal: at every
+            # model call we tell the LLM which agents still have
+            # PENDING work and which are DONE, so the model has
+            # structural guidance about what to call next without
+            # needing user-prompt cooperation.
+            #
+            # Best-effort, like the planner injection above. The hint
+            # is bracketed with marker tags so subsequent calls can
+            # strip the stale block before appending the fresh one
+            # (per-call, not accumulated).
+            try:
+                if ctx is not None and ctx.session is not None:
+                    _inject_runtime_tools_hint(
+                        callback_context=callback_context,
+                        llm_request=llm_request,
+                        session=ctx.session,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "before_model_callback: runtime tools hint injection raised: %s",
                     exc,
                 )
 
