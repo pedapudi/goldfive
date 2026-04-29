@@ -2720,6 +2720,18 @@ class DefaultSteerer:
         # ``_is_plan_revision_cooldown_exempt``).
         if self._is_plan_revision_gated(drift, session):
             return
+        # Per-condition refine gate (goldfive I5 — iter_1 escalation
+        # report). The drift-as-stateful-condition refactor (#271 PR1 /
+        # #318) already minted a ``condition_id`` + ``lifecycle`` for
+        # this emit via :meth:`_stamp_drift_lifecycle` (called above
+        # inside ``_emit_drift_detected``). We read that lifecycle and
+        # skip the refine when the condition is being re-detected
+        # without change — same severity ``ESCALATING`` re-emits or
+        # terminal lifecycles. Structural gate on lifecycle state, not a
+        # numerical cap; complements the time-based ``_is_plan_revision_gated``
+        # cooldown by catching same-tick re-emits the cooldown lets through.
+        if self._is_refine_gated_by_lifecycle(drift, session):
+            return
         # Progress-based escalation (goldfive#271 — replaces the deleted
         # count cap). If the drift fires on a task that has had no
         # progress signal (``mark_task_running`` / ``mark_task_progress``
@@ -3973,6 +3985,12 @@ class DefaultSteerer:
         if self._planner is None or session.plan is None:
             return
         if self._is_plan_revision_gated(drift, session):
+            return
+        # Per-condition refine gate (goldfive I5). Mirror of the gate in
+        # ``_handle_drift``: skip ``refine_steer`` on a same-severity
+        # ``ESCALATING`` re-emit of an active condition or a terminal
+        # lifecycle. See :meth:`_is_refine_gated_by_lifecycle`.
+        if self._is_refine_gated_by_lifecycle(drift, session):
             return
         # Progress-based escalation (goldfive#271 — replaces the deleted
         # count cap). See the parallel check in ``_handle_drift`` and
@@ -5925,6 +5943,121 @@ class DefaultSteerer:
             cooldown,
         )
         return True
+
+    def _is_refine_gated_by_lifecycle(self, drift: DriftEvent, session: Session) -> bool:
+        """Return ``True`` iff ``drift``'s active condition does not warrant a refine.
+
+        Per-condition refine gate (goldfive I5 — iter_1 escalation report).
+        The drift-as-stateful-condition refactor (#271 PR1 / #318) gives
+        every emit a stable ``condition_id`` and a ``lifecycle`` stamped
+        on ``session.state``. Without this gate, every re-emit of the
+        same logical condition (``ESCALATING`` at the same severity)
+        triggered another ``planner.refine`` — empirically dominating
+        the LLM-call budget on long runs (V24: 7 ``refine_steer`` calls
+        for 18 theoretical task turns, 2/turn average).
+
+        The structural rule:
+
+        * ``OPENED`` — first emit of this condition; refine runs
+          (current baseline).
+        * ``ESCALATING`` with a severity bump (``prev_severity != severity``)
+          — escalation is real (e.g. INFO -> WARNING), refine runs.
+        * ``ESCALATING`` at the same severity — same condition being
+          re-detected without change; refine is a no-op replay, gate it.
+        * ``RESOLVED`` / ``HUMAN_INTERVENTION_REQUIRED`` — terminal lifecycle
+          for this condition; refine has either already happened or has
+          been lifted to the operator. Gate.
+
+        User / trajectory-level drifts (``USER_STEER`` / ``USER_CANCEL`` /
+        ``GOAL_DRIFT``) bypass the gate — operator intent must be
+        honoured even on a re-emit, and trajectory-wide drifts have
+        their own rate limiters.
+
+        The active-drift entry is read from
+        :func:`orchestration_state.get_active_drift` keyed by the same
+        condition_id :meth:`_stamp_drift_lifecycle` minted on the wire
+        emit. Reads ``session.state`` only — no mutation. Idempotent:
+        called twice for the same drift returns the same answer.
+
+        NB: ``_stamp_drift_lifecycle`` only ever writes ``OPENED`` or
+        ``ESCALATING`` to the active set (the resolving / human-intervention
+        helpers remove the entry rather than store it). So a missing
+        active-drift entry on a fresh ``_handle_drift`` tick means the
+        condition was previously resolved or escalated to a human;
+        treating that as "gate refine" is the correct, conservative
+        default.
+        """
+        # User / trajectory-level drifts bypass the gate (same exemption
+        # set as ``_is_plan_revision_gated``).
+        if drift.kind in self._USER_OR_TRAJECTORY_DRIFT_KINDS:
+            return False
+        # Re-derive the condition_id with the same args
+        # ``_stamp_drift_lifecycle`` used so this gate reads the same
+        # entry it stamped.
+        try:
+            cid = _ostate.compute_condition_id(
+                kind=drift.kind,
+                task_id=str(getattr(drift, "current_task_id", "") or ""),
+                agent_id=str(getattr(drift, "current_agent_id", "") or ""),
+                turn_id=str(getattr(session, "run_id", "") or ""),
+            )
+            tracked = _ostate.get_active_drift(session.state, cid)
+        except Exception as exc:  # noqa: BLE001
+            # Lifecycle bookkeeping is observability-only; never let a
+            # malformed state dict break dispatch. Fall through to the
+            # un-gated behaviour (legacy single-shot refine).
+            log.debug("DefaultSteerer: refine lifecycle gate skipped (%s)", exc)
+            return False
+        if tracked is None:
+            # Condition is no longer in the active set — either resolved
+            # or escalated to human intervention by a prior tick. Don't
+            # re-fire refine on a closed condition.
+            log.debug(
+                "refine gated by lifecycle (kind=%s task=%r): condition resolved/escalated",
+                drift.kind.value,
+                drift.current_task_id,
+            )
+            return True
+        lifecycle = tracked.lifecycle
+        if lifecycle == _ostate.LIFECYCLE_OPENED:
+            # First emit of the condition this turn — refine the baseline.
+            return False
+        if lifecycle == _ostate.LIFECYCLE_ESCALATING:
+            # Escalating: refine ONLY if the severity actually bumped.
+            # Same severity re-emit -> the underlying condition is being
+            # re-detected without change; the prior refine still applies.
+            if tracked.prev_severity != tracked.severity:
+                return False
+            log.debug(
+                "refine gated by lifecycle (kind=%s task=%r): escalating re-emit "
+                "at same severity %s",
+                drift.kind.value,
+                drift.current_task_id,
+                tracked.severity.value if tracked.severity else "",
+            )
+            log.info(
+                "goldfive observed a %s drift on task=%r as a same-severity re-emit "
+                "of an active condition; skipping replan",
+                drift.kind.value,
+                drift.current_task_id,
+            )
+            return True
+        # RESOLVED / HUMAN_INTERVENTION_REQUIRED in the active set is
+        # not normally produced by ``_stamp_drift_lifecycle`` (the helpers
+        # for those lifecycles remove the entry), but guard defensively
+        # so an out-of-tree mutation can't bypass the intent of the gate.
+        if lifecycle in (
+            _ostate.LIFECYCLE_RESOLVED,
+            _ostate.LIFECYCLE_HUMAN_INTERVENTION_REQUIRED,
+        ):
+            log.debug(
+                "refine gated by lifecycle (kind=%s task=%r): terminal lifecycle %s",
+                drift.kind.value,
+                drift.current_task_id,
+                lifecycle,
+            )
+            return True
+        return False
 
     def _is_task_progress_stalled(self, drift: DriftEvent, session: Session) -> bool:
         """Return ``True`` iff the drift's task has had no progress recently.
