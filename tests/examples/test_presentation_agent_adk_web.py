@@ -15,11 +15,14 @@ loads ``examples/presentation_agent`` in mock mode, POSTs a prompt via
 ``/run_sse``, and asserts:
 
 * a single ``plan_submitted`` with the expected four-task plan,
-* every planned task reaches a terminal state
-  (``task_completed`` / ``task_failed`` / ``task_cancelled`` — the
-  last covers both real cancellations and NOT_NEEDED tasks, which
-  emit ``task_cancelled`` with a ``not_needed:`` reason prefix per
-  ``Steerer.mark_task_not_needed``),
+* every planned task is either terminal (``task_completed`` /
+  ``task_failed`` / ``task_cancelled`` — the last covers real
+  cancellations AND NOT_NEEDED tasks, which emit ``task_cancelled``
+  with a ``not_needed:`` reason prefix per
+  ``Steerer.mark_task_not_needed``) OR still PENDING with all
+  predecessors reachable (post-#208: PENDING tasks can survive a
+  turn end and carry forward to the next turn rather than being
+  blanket-NOT_NEEDED-reaped),
 * at least one task progressed to a non-NOT_NEEDED terminal state
   (proving dispatch actually worked — the specific pathology we're
   guarding against was "plan submitted, but no task ever completes"),
@@ -303,17 +306,19 @@ def test_presentation_agent_e2e_under_adk_web(
         "debug": "debugger_agent",
     }, f"unexpected plan shape: {planned_tasks}"
 
-    # 2. Every planned task must reach a terminal state. Goldfive's
-    # terminal task events are task_completed / task_failed /
-    # task_cancelled. NOT_NEEDED tasks (goldfive#141) emit
-    # task_cancelled with a ``not_needed:`` reason prefix (no
+    # 2. Every planned task must reach a terminal state OR be a
+    # reachable PENDING that survived turn-end (post-#208).
+    # Goldfive's terminal task events are task_completed /
+    # task_failed / task_cancelled. NOT_NEEDED tasks (goldfive#141)
+    # emit task_cancelled with a ``not_needed:`` reason prefix (no
     # dedicated proto event) — see ``Steerer.mark_task_not_needed``.
     #
-    # Under the goldfive#163 overlay model, tasks the tree did not
-    # naturally exercise are transitioned PENDING → NOT_NEEDED
-    # directly (without going through RUNNING first), so we do NOT
-    # require a task_started event for every planned task — only
-    # that every planned task reaches SOME terminal state.
+    # Pre-#208, the overlay reaper unconditionally NOT_NEEDED-reaped
+    # every PENDING at end-of-turn, so every planned task became
+    # terminal even when the tree didn't exercise it. Post-#208,
+    # reachable PENDING tasks (predecessors COMPLETED or themselves
+    # PENDING/RUNNING) carry forward to the next turn instead of
+    # being reaped — this is the multi-turn carry-forward contract.
     started_ids = {
         e.task_started.task_id for e, k in zip(events, kinds, strict=True) if k == "task_started"
     }
@@ -340,17 +345,59 @@ def test_presentation_agent_e2e_under_adk_web(
 
     # task_started events only fire for tasks the reconciler
     # matched to an observed sub-agent invocation. Unmatched tasks
-    # land in NOT_NEEDED without a RUNNING announcement (#163). The
+    # may stay PENDING (reachable carry-forward) post-#208. The
     # only invariant is: any id with a task_started must also be in
     # terminal_ids (no dangling RUNNING).
     assert started_ids <= terminal_ids, (
         f"some task_started events had no matching terminal event. "
         f"started={started_ids} terminal={terminal_ids}"
     )
-    assert set(planned_tasks) <= terminal_ids, (
-        f"some planned tasks never reached terminal state. "
-        f"planned={set(planned_tasks)} terminal={terminal_ids}"
-    )
+    # Post-#208 invariant: every planned task is terminal OR still
+    # PENDING with reachable predecessors. The legacy "every planned
+    # task reaches terminal" was an artifact of the blanket-reap
+    # policy. The harness's mock LLM doesn't exercise the tree, so
+    # under the new policy all four tasks legitimately remain
+    # PENDING (research is a root task with no predecessors —
+    # reachable; build/review/debug have research as predecessor
+    # which is still PENDING — also reachable). The multi-turn
+    # contract is honoured: these tasks would carry forward to the
+    # next turn for the user (or operator) to drive.
+    non_terminal_planned = set(planned_tasks) - terminal_ids
+    if non_terminal_planned:
+        # Inspect the run-end PENDING set on the latest plan_revised
+        # snapshot. Every non-terminal planned task must be PENDING
+        # AND reachable (no broken predecessors).
+        latest_plan = plan_events[-1].plan_revised.plan
+        plan_tasks_by_id = {t.id: t for t in latest_plan.tasks}
+        plan_edges_to = {}
+        for e in latest_plan.edges:
+            plan_edges_to.setdefault(e.to_task_id, []).append(e.from_task_id)
+        broken_statuses = {
+            "TASK_STATUS_CANCELLED",
+            "TASK_STATUS_FAILED",
+            "TASK_STATUS_NOT_NEEDED",
+        }
+        for tid in non_terminal_planned:
+            t = plan_tasks_by_id.get(tid)
+            assert t is not None, f"planned task {tid} missing from latest plan"
+            status_name = (
+                t.status.name if hasattr(t.status, "name") else str(t.status)
+            )
+            assert "PENDING" in status_name, (
+                f"non-terminal planned task {tid} has unexpected status {status_name}"
+            )
+            for dep_id in plan_edges_to.get(tid, []):
+                dep = plan_tasks_by_id.get(dep_id)
+                if dep is None:
+                    continue
+                dep_status_name = (
+                    dep.status.name if hasattr(dep.status, "name") else str(dep.status)
+                )
+                assert dep_status_name not in broken_statuses, (
+                    f"non-terminal planned task {tid} has broken predecessor "
+                    f"{dep_id} (status={dep_status_name}); should have been "
+                    f"orphan-cancelled"
+                )
 
     # 3. Per-task progression check — informational under mock mode.
     # The original test required "at least one task_completed" to
