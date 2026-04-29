@@ -2016,6 +2016,16 @@ class DefaultSteerer:
         :meth:`note_llm_call`, the counter is trajectory-level and is
         NOT reset on task transitions -- GOAL_DRIFT is about the whole
         tree's direction, not one task's progress.
+
+        Spawn-and-detach (goldfive v22 regression fix). The judge is
+        dispatched as a fire-and-forget background task — see the
+        rationale on :meth:`_maybe_run_goal_drift_on_task_boundary`.
+        ``after_run_callback`` runs on the agent's invocation task,
+        which is the same cancellable scope a sibling drift can target
+        via :meth:`request_invocation_cancel`; an inline await on the
+        judge would die the same way the v22 ``judge_goal_drift`` span
+        did. Tests that drove the inline path can drain via
+        ``await asyncio.gather(*list(steerer._background_judges))``.
         """
         if self._goal_drift_call_llm is None:
             return
@@ -2025,7 +2035,7 @@ class DefaultSteerer:
         # Reset before running so a check that itself triggers further
         # invocations in the agent loop doesn't double-fire.
         session._agent_turns_since_goal_check = 0
-        await self.maybe_run_goal_drift_check(session)
+        self._spawn_goal_drift_judge_background(session)
 
     # Minimum spacing between two task-boundary-triggered GOAL_DRIFT
     # judge calls, in seconds (goldfive#219). Task transitions can
@@ -2059,6 +2069,24 @@ class DefaultSteerer:
         gate is enforced inside :meth:`maybe_run_goal_drift_check`;
         we short-circuit here only to avoid bumping the timestamp
         when no judge will run.
+
+        Spawn-and-detach (goldfive v22 regression fix). The judge LLM
+        call is dispatched as a fire-and-forget background task on
+        :attr:`_background_judges` rather than awaited inline. The
+        ``mark_task_*`` callers run on the agent's invocation task —
+        which is registered with the ADK plugin's ``_invocation_tasks``
+        for cooperative cancel — so a sibling cancel (supersede,
+        runaway delegation, refine-driven preempt) firing
+        ``task.cancel()`` on the agent's invocation task while the
+        inline judge was awaiting its LLM round-trip would surface a
+        ``CancelledError`` inside ``classify_goal_drift``. The
+        ``judge_goal_drift`` span ended with ``error=CancelledError``
+        and an empty stack, the verdict was lost, and operator-visible
+        evidence (v22 trace) showed the cancel landing the moment the
+        span opened. Detaching the judge from the cancellable task
+        scope — same pattern as the reasoning judge at
+        :meth:`_run_judge_background` — keeps it alive across cancel
+        propagation and drainable at :meth:`shutdown`.
         """
         if self._goal_drift_call_llm is None:
             return
@@ -2070,7 +2098,7 @@ class DefaultSteerer:
         # Reset the turn counter so the next turn-interval check starts
         # fresh rather than firing one more judge call on the next turn.
         session._agent_turns_since_goal_check = 0
-        await self.maybe_run_goal_drift_check(session)
+        self._spawn_goal_drift_judge_background(session)
 
     async def maybe_run_goal_drift_check(self, session: Session) -> None:
         """Run the trajectory-level GOAL_DRIFT judge once, cost-bounded.
@@ -2116,6 +2144,88 @@ class DefaultSteerer:
         if drift is None:
             return
         await self._handle_drift(drift, session)
+
+    def _spawn_goal_drift_judge_background(self, session: Session) -> None:
+        """Spawn :meth:`maybe_run_goal_drift_check` as a fire-and-forget task.
+
+        Goldfive v22 regression fix. The trajectory-level GOAL_DRIFT
+        judge used to be awaited inline from
+        :meth:`_maybe_run_goal_drift_on_task_boundary` (called from
+        ``mark_task_*``) and from :meth:`note_agent_turn` (called from
+        the ADK plugin's ``after_run_callback``). Both call sites run
+        on the agent's ADK invocation task, which is registered with
+        ``_GoldfiveADKPlugin._invocation_tasks`` for cooperative
+        cancellation. A sibling drift firing
+        :meth:`request_invocation_cancel(cancel_inflight_task=True)`
+        could therefore land a ``CancelledError`` inside the judge's
+        own ``await call_llm(...)`` — the v22 trace
+        (49b0eb10-5636-465d-b96b-9e9d03d91e81) shows exactly that:
+        immediately after research_panels transitioned to COMPLETED
+        the ``judge_goal_drift`` span opened and failed with
+        ``CancelledError`` and an empty stack, no LLM duration
+        recorded.
+
+        Detaching the judge into a separate ``asyncio.Task`` isolates
+        it from the agent invocation's cancel scope: ``task.cancel()``
+        on the agent's task does NOT propagate to children spawned via
+        :func:`asyncio.create_task` (asyncio Tasks do not form a
+        parent-child cancel tree the way ``asyncio.TaskGroup`` does).
+        The judge is tracked on :attr:`_background_judges` so
+        :meth:`shutdown` (called from ``Runner.close``) can drain it
+        with the same bounded wait the reasoning judge uses
+        (goldfive#251). Done-callback removes the entry on completion
+        so there is no per-turn leak.
+
+        No-op when no event loop is running (defensive — keeps
+        synchronous test harnesses that build a steerer outside an
+        async context from raising). No-op when no judge ``call_llm``
+        is configured.
+        """
+        if self._goal_drift_call_llm is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop — fall through silently. The synchronous callers
+            # of ``mark_task_*`` outside an async context (rare; only
+            # tests / synthetic harnesses) won't get a goal-drift
+            # check, but they wouldn't have anywhere to await the
+            # judge anyway.
+            return
+        bg_task = asyncio.create_task(
+            self._run_goal_drift_judge_background(session),
+            name="goldfive-goal-drift-judge",
+        )
+        self._background_judges.add(bg_task)
+        bg_task.add_done_callback(self._background_judges.discard)
+
+    async def _run_goal_drift_judge_background(self, session: Session) -> None:
+        """Body of the fire-and-forget GOAL_DRIFT judge task.
+
+        Mirrors :meth:`_run_judge_background` (the reasoning-judge
+        equivalent): swallows every exception so a flaky judge cannot
+        crash the run, and re-raises ``CancelledError`` cleanly so
+        :meth:`shutdown` can cancel still-running judges at teardown
+        without a stray ``WARNING`` muddying the signal.
+
+        Calls :meth:`maybe_run_goal_drift_check` directly — the public
+        method's synchronous semantics are preserved for operator-side
+        one-shot triggers; this background path just bypasses the
+        cancellable agent task that hosted us.
+        """
+        try:
+            await self.maybe_run_goal_drift_check(session)
+        except asyncio.CancelledError:
+            # Propagate so :meth:`shutdown` / teardown sees a clean
+            # cancel. The shutdown path expects this and counts it
+            # against the still-pending tally without warning.
+            raise
+        except Exception as exc:  # noqa: BLE001 — background task
+            log.warning(
+                "DefaultSteerer: background goal-drift judge raised "
+                "(swallowed): %s",
+                exc,
+            )
 
     async def _emit_reflective_failure(
         self, session: Session, *, task_id: str, reason: str
