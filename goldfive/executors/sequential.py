@@ -1812,35 +1812,83 @@ def _has_live_pending_or_running(plan: Plan) -> bool:
 def _has_live_replacement(plan: Plan, failed: Task) -> bool:
     """Return True iff ``failed`` has a *live* replacement task in ``plan``.
 
-    A replacement task is one the planner spawned to supersede
-    ``failed`` — a forward-progress successor, not a predecessor. We
-    require it to be PENDING or RUNNING (never COMPLETED) so a
-    COMPLETED sibling lineage peer (``t0`` when ``retry_retry_t0`` is
-    the failure) does NOT mask the failure — that's a predecessor, not
-    a replacement. See goldfive#202.
+    Two-tier match (goldfive#213): causal first, name-pattern fallback.
 
-    Matched via one of two id conventions goldfive's refine path
-    produces (structural inference; no proto ``replaces`` field):
+    **Tier 1 — causal (primary).** Walks the ``Task.supersedes`` link
+    chain. Build a ``{task.id → task.supersedes}`` map over the plan;
+    for each non-FAILED / non-CANCELLED candidate ``r``, follow
+    ``r.supersedes`` (with cycle protection capped at 16 hops, matching
+    :func:`_lineage_root`'s loop bound). If the chain transitively
+    reaches ``failed.id``, ``r`` is a live replacement at *any* status
+    (PENDING / RUNNING / COMPLETED). The chain link is unambiguous
+    about predecessor-vs-replacement direction — ``r.supersedes ==
+    failed.id`` means ``r`` was spawned to supersede ``failed``, never
+    the reverse — so a COMPLETED ``r`` that already finished its work
+    correctly satisfies the FAILED predecessor.
 
-    * Shared retry lineage: ``_lineage_root(R.id) == _lineage_root(failed.id)``.
-      Catches ``retry_<id>``, ``retry2_<id>`` etc. — the pattern the
-      refine system prompt historically emitted (see PLAN-LIFECYCLE.md
-      §7.3).
+    **Chain-of-retries case** (``t0 → retry_t0 → retry_retry_t0`` with
+    ``retry_retry_t0`` FAILED): walking forward from ``retry_retry_t0``,
+    no causal candidate links back to it (the chain points the other
+    way: ``retry_retry_t0.supersedes == retry_t0`` etc.). So
+    ``retry_retry_t0`` correctly remains fatally_failed regardless of
+    earlier links' status — only the LATEST link's outcome matters,
+    which is what the supersedes chain encodes.
+
+    **Tier 2 — name-pattern (fallback).** Used only when Tier 1 found
+    no match. Preserves backward compat with plans where the planner
+    LLM didn't populate ``supersedes`` and there was no auto-backfill:
+
     * Versioned replacement: ``R.id`` starts with ``<failed.id>_``
-      (``define_structure`` → ``define_structure_v2``, ``..._retry``,
-      etc.). Empirically the shape LLM planners emit when the refine
-      prompt does NOT encode a ``retry_`` convention.
+      (e.g. ``define_structure`` → ``define_structure_v2``). Live at
+      any non-FAILED / non-CANCELLED status (a planner would not emit
+      ``..._v2`` before ``v1`` had run, so chronology is
+      unambiguous).
+    * Shared retry lineage: ``_lineage_root(R.id) == _lineage_root(failed.id)``.
+      Catches ``retry_<id>``, ``retry2_<id>`` etc. CHRONOLOGY-AMBIGUOUS
+      under name-pattern alone (``t0`` COMPLETED could be a predecessor
+      of ``retry_retry_t0`` FAILED), so we only count peers at PENDING
+      or RUNNING here — the conservative legacy semantic.
 
-    Additionally require ``R.assignee_agent_id == failed.assignee_agent_id``
-    when both are populated, so a task owned by a different agent doesn't
-    accidentally mask a genuine failure.
-
-    Lives in the executor (not a proto field on :class:`Task`) to avoid
-    a cross-cutting contract change through planner JSON shapes and
-    prompt templates. Structural inference is adequate: the refine
-    output is always validated against :meth:`Plan.validate`, so the
-    shapes here are the shapes the planner actually emits.
+    **Assignee scoping** applies to both tiers but only when *both*
+    ids carry a populated ``assignee_agent_id`` — empty assignees mean
+    no scoping is enforced.
     """
+    # ----- Tier 1: causal supersedes-chain match -----
+    # Build the chain map once. Empty supersedes treated as no link.
+    chain: dict[str, str] = {
+        t.id: (t.supersedes or "").strip() for t in plan.tasks if t.id
+    }
+    for r in plan.tasks:
+        if not r.id or r.id == failed.id:
+            continue
+        if r.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            continue
+        # Walk r.supersedes chain with bounded hops + visited-set
+        # cycle protection. Bound matches _lineage_root: 16 hops is
+        # well above any realistic refine depth and bounds pathology.
+        visited: set[str] = set()
+        cursor = chain.get(r.id, "")
+        hit = False
+        for _ in range(16):
+            if not cursor or cursor in visited:
+                break
+            if cursor == failed.id:
+                hit = True
+                break
+            visited.add(cursor)
+            cursor = chain.get(cursor, "")
+        if not hit:
+            continue
+        # Assignee scoping when both are populated.
+        if (
+            failed.assignee_agent_id
+            and r.assignee_agent_id
+            and r.assignee_agent_id != failed.assignee_agent_id
+        ):
+            continue
+        return True
+
+    # ----- Tier 2: name-pattern fallback -----
     failed_root = _lineage_root(failed.id)
     for r in plan.tasks:
         if r.id == failed.id or not r.id:

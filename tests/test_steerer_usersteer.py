@@ -1325,3 +1325,249 @@ async def test_refine_steer_id_reuse_preserves_inter_pending_edges() -> None:
     edges = {(e.from_task_id, e.to_task_id) for e in revised.edges}
     assert ("research", "step_a") in edges
     assert ("step_a", "step_b") in edges
+
+
+# ---------------------------------------------------------------------------
+# goldfive#213: structural backfill of Task.supersedes for retry-named tasks.
+# ---------------------------------------------------------------------------
+#
+# When the LLM emits a retry-shaped task name (``retry_t0``, ``t0_v2``)
+# but forgets to populate ``supersedes``, the merge-time backfill
+# infers the link structurally — provided the candidate predecessor
+# exists in the prior plan AND is in a retry-warranting status (FAILED
+# / CANCELLED). Pure deterministic structural inference, no LLM trust.
+
+
+def _retry_steer_json(
+    *,
+    new_task_id: str,
+    supersedes: str | None = None,
+    title: str = "Retry it",
+) -> str:
+    """Build a steer-shaped LLM response that proposes a single retry task.
+
+    ``supersedes`` of None ⇒ key omitted from JSON (LLM didn't populate
+    the link). Pass an empty string to emit the key with empty value
+    (same observable shape after JSON parse).
+    """
+    task: dict[str, Any] = {
+        "id": new_task_id,
+        "title": title,
+        "description": "Retry of failed predecessor.",
+        "assignee_agent_id": "writer",
+    }
+    if supersedes is not None:
+        task["supersedes"] = supersedes
+    return json.dumps(
+        {
+            "summary": "Retry the failure.",
+            "tasks": [task],
+            "edges": [],
+        }
+    )
+
+
+def _plan_with_retry_predecessor(
+    *,
+    predecessor_id: str = "t0",
+    predecessor_status: TaskStatus = TaskStatus.FAILED,
+) -> Plan:
+    """Prior plan with a single predecessor in a configurable status."""
+    return Plan(
+        id="plan-r213",
+        run_id="run-r213",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id=predecessor_id,
+                title="Original",
+                status=predecessor_status,
+                assignee_agent_id="writer",
+            ),
+        ],
+        edges=[],
+        revision_index=0,
+    )
+
+
+def _user_steer_drift() -> DriftEvent:
+    return DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="please retry",
+        current_task_id="t0",
+    )
+
+
+def _find_task(plan: Plan, task_id: str) -> Task:
+    for t in plan.tasks:
+        if t.id == task_id:
+            return t
+    raise AssertionError(f"task {task_id!r} not in plan")
+
+
+async def test_backfill_supersedes_on_retry_name_when_old_failed() -> None:
+    """Prior ``t0 FAILED`` + LLM emits ``retry_t0`` with no
+    supersedes ⇒ backfill sets ``retry_t0.supersedes = "t0"``.
+    """
+    plan = _plan_with_retry_predecessor(predecessor_status=TaskStatus.FAILED)
+    goals = [Goal(id="g1", summary="ship it")]
+    llm = _StubLLM(_retry_steer_json(new_task_id="retry_t0", supersedes=None))
+    planner = LLMPlanner(call_llm=llm, model="test-model")
+
+    revised = await planner.refine(plan=plan, drift=_user_steer_drift(), goals=goals)
+    assert revised is not None
+
+    retry = _find_task(revised, "retry_t0")
+    assert retry.supersedes == "t0", (
+        f"expected backfill to set supersedes='t0', got {retry.supersedes!r}"
+    )
+    # Kind must also have been derived from FAILED status (REPLACE).
+    from goldfive.types import SupersessionKind
+
+    assert retry.supersedes_kind is SupersessionKind.REPLACE
+
+
+async def test_backfill_supersedes_on_retry_name_when_old_cancelled() -> None:
+    """CANCELLED predecessor also warrants backfill — same rationale
+    as FAILED (the old work is conclusively closed without delivering)."""
+    plan = _plan_with_retry_predecessor(predecessor_status=TaskStatus.CANCELLED)
+    goals = [Goal(id="g1", summary="ship it")]
+    llm = _StubLLM(_retry_steer_json(new_task_id="retry_t0", supersedes=None))
+    planner = LLMPlanner(call_llm=llm, model="test-model")
+
+    revised = await planner.refine(plan=plan, drift=_user_steer_drift(), goals=goals)
+    assert revised is not None
+
+    retry = _find_task(revised, "retry_t0")
+    assert retry.supersedes == "t0"
+
+
+async def test_no_backfill_when_old_completed() -> None:
+    """Prior ``t0 COMPLETED`` + LLM emits ``retry_t0`` ⇒ supersedes
+    stays empty (no spurious link over a successful predecessor).
+    """
+    plan = _plan_with_retry_predecessor(predecessor_status=TaskStatus.COMPLETED)
+    goals = [Goal(id="g1", summary="ship it")]
+    llm = _StubLLM(_retry_steer_json(new_task_id="retry_t0", supersedes=None))
+    planner = LLMPlanner(call_llm=llm, model="test-model")
+
+    revised = await planner.refine(plan=plan, drift=_user_steer_drift(), goals=goals)
+    assert revised is not None
+
+    retry = _find_task(revised, "retry_t0")
+    assert retry.supersedes == "", (
+        f"expected supersedes empty (COMPLETED predecessor), got {retry.supersedes!r}"
+    )
+
+
+async def test_no_backfill_when_old_absent() -> None:
+    """LLM emits ``retry_unknown`` with no ``unknown`` task in the
+    prior plan ⇒ supersedes stays empty.
+    """
+    plan = _plan_with_retry_predecessor(predecessor_id="t0")
+    goals = [Goal(id="g1", summary="ship it")]
+    llm = _StubLLM(
+        _retry_steer_json(new_task_id="retry_unknown", supersedes=None)
+    )
+    planner = LLMPlanner(call_llm=llm, model="test-model")
+
+    revised = await planner.refine(plan=plan, drift=_user_steer_drift(), goals=goals)
+    assert revised is not None
+
+    retry = _find_task(revised, "retry_unknown")
+    assert retry.supersedes == ""
+
+
+async def test_backfill_skips_already_populated() -> None:
+    """LLM emits explicit ``supersedes='other'`` ⇒ backfill leaves
+    it alone (LLM intent wins over structural inference).
+    """
+    # Add a second prior task ("other") so the explicit link resolves.
+    plan = Plan(
+        id="plan-r213",
+        run_id="run-r213",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="t0", title="t0", status=TaskStatus.FAILED),
+            Task(id="other", title="other", status=TaskStatus.FAILED),
+        ],
+        edges=[],
+        revision_index=0,
+    )
+    goals = [Goal(id="g1", summary="ship it")]
+    llm = _StubLLM(
+        _retry_steer_json(new_task_id="retry_t0", supersedes="other")
+    )
+    planner = LLMPlanner(call_llm=llm, model="test-model")
+
+    revised = await planner.refine(plan=plan, drift=_user_steer_drift(), goals=goals)
+    assert revised is not None
+
+    retry = _find_task(revised, "retry_t0")
+    assert retry.supersedes == "other", (
+        "explicit LLM-supplied supersedes link must not be overridden"
+    )
+
+
+async def test_self_supersede_stripped() -> None:
+    """LLM emits ``t0_v2`` with ``supersedes='t0_v2'`` (self-reference,
+    the v27 rev-2 anomaly). Normalization clears it.
+
+    NOTE: backfill ALSO clears self-references as defence in depth, so
+    this test pins the self-reference cleanup regardless of which
+    layer caught it.
+    """
+    plan = _plan_with_retry_predecessor(predecessor_status=TaskStatus.FAILED)
+    goals = [Goal(id="g1", summary="ship it")]
+    # The LLM emits a self-referencing supersedes on a NEW id (no
+    # collision with prior). Backfill / normalize must strip the
+    # self-reference. Versioned suffix backfill then runs on the
+    # cleared link and points to ``t0`` (the predecessor).
+    llm = _StubLLM(
+        _retry_steer_json(new_task_id="t0_v2", supersedes="t0_v2")
+    )
+    planner = LLMPlanner(call_llm=llm, model="test-model")
+
+    revised = await planner.refine(plan=plan, drift=_user_steer_drift(), goals=goals)
+    assert revised is not None
+
+    new_task = _find_task(revised, "t0_v2")
+    # Self-reference cleared. Backfill ran AFTER (sup was empty), so
+    # the structural inference points to ``t0`` (the FAILED prior).
+    assert new_task.supersedes == "t0", (
+        "self-reference must be cleared then backfill should infer "
+        f"the predecessor; got supersedes={new_task.supersedes!r}"
+    )
+
+
+async def test_versioned_pattern_t0_v2_backfilled() -> None:
+    """Prior ``t0 FAILED`` + LLM emits ``t0_v2`` (no retry_ prefix,
+    just ``_v2`` suffix) ⇒ backfill sets ``supersedes='t0'``.
+    """
+    plan = _plan_with_retry_predecessor(predecessor_status=TaskStatus.FAILED)
+    goals = [Goal(id="g1", summary="ship it")]
+    llm = _StubLLM(_retry_steer_json(new_task_id="t0_v2", supersedes=None))
+    planner = LLMPlanner(call_llm=llm, model="test-model")
+
+    revised = await planner.refine(plan=plan, drift=_user_steer_drift(), goals=goals)
+    assert revised is not None
+
+    versioned = _find_task(revised, "t0_v2")
+    assert versioned.supersedes == "t0"
+
+
+async def test_backfill_skips_unrelated_task_names() -> None:
+    """Tasks with names that don't match retry/version conventions
+    are left alone — the inference is conservative."""
+    plan = _plan_with_retry_predecessor(predecessor_status=TaskStatus.FAILED)
+    goals = [Goal(id="g1", summary="ship it")]
+    # New task id ``brand_new`` doesn't strip to any prior id.
+    llm = _StubLLM(_retry_steer_json(new_task_id="brand_new", supersedes=None))
+    planner = LLMPlanner(call_llm=llm, model="test-model")
+
+    revised = await planner.refine(plan=plan, drift=_user_steer_drift(), goals=goals)
+    assert revised is not None
+
+    new_task = _find_task(revised, "brand_new")
+    assert new_task.supersedes == ""
