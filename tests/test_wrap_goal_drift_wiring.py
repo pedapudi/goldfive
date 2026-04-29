@@ -19,6 +19,7 @@ which silently disarmed the trajectory-level GOAL_DRIFT judge
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -546,10 +547,19 @@ async def test_goal_drift_judge_fires_when_wired() -> None:
     # Below interval -- no judge call yet.
     for _ in range(2):
         await steerer.note_agent_turn(session)
+    # Drain any spawned judges (none expected below interval) so the
+    # call-llm count assertion is post-judge.
+    pending = list(steerer._background_judges)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
     assert len(call_llm.calls) == 0  # type: ignore[attr-defined]
 
     # Third turn crosses the interval -> judge fires, drift is emitted.
     await steerer.note_agent_turn(session)
+    pending = list(steerer._background_judges)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    await asyncio.sleep(0)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
 
     from goldfive.pb.goldfive.v1 import types_pb2
