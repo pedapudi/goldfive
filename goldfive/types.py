@@ -32,6 +32,22 @@ class TaskStatus(StrEnum):
     # redundant".
     NOT_NEEDED = "NOT_NEEDED"
 
+    @property
+    def is_terminal(self) -> bool:
+        """True iff this status is terminal (no further transitions allowed).
+
+        Mirrors :data:`TERMINAL_TASK_STATUSES` for ergonomic per-status
+        checks (``task.status.is_terminal``) without forcing callers to
+        import the module-level set. The two sources stay in lock-step:
+        if a new terminal member is added, update both.
+        """
+        return self in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.NOT_NEEDED,
+        )
+
 
 # Terminal statuses — a task in any of these cannot transition further
 # and must not be re-invoked. This set is the **single source of truth**

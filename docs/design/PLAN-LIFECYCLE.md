@@ -280,6 +280,28 @@ dropped set, so the plan lands in a consistent terminal-only shape
 with `success=False` and a clear `revision_reason`. This is
 implemented by the cascade semantics in §6.3.
 
+### 4.2.1 User-steer rejection is structurally impossible
+
+A USER_STEER drift NEVER produces a rejected revision. The
+`install_user_steer` API (`steerer.py`) returns `Plan` (not `Plan | None`)
+and never raises `ValueError`. When the LLM-produced revision fails
+`Plan.validate(for_revision=True, prior=...)`, the steerer falls back
+to a deterministic minimum evolution: preserve every terminal task
+verbatim (§3.1), cancel every PENDING/RUNNING/BLOCKED task, drop every
+edge incident to a cancelled task. The minimum is provably valid by
+construction.
+
+This is a contract, not a heuristic. The principle "user-provided
+steering is never rejected by the validator" is enforced at the type
+level (return type `Plan`), at the API level (no failure path), at the
+implementation level (deterministic fallback always validates), at the
+test level (property-based invariant in
+`tests/test_user_steer_invariant.py`), and at the doc level (here).
+
+Any change to `Plan.validate`, `_apply_revision`, or `install_user_steer`
+that could cause a user steer to abort the turn is a contract violation
+and MUST be reverted.
+
 ### 4.3 Fail-and-route (LOOPING_TOOL_CALL / LOOPING_REASONING)
 
 **Triggers:** `LOOPING_TOOL_CALL`, `LOOPING_REASONING`.
@@ -338,6 +360,29 @@ The steerer handles it in three layers (see TASK-LIFECYCLE.md §4):
    CANCEL dependents so the plan lands in a consistent shape.
 
 Successful refine resets the counter for that `(kind, task_id)`.
+
+### 4.5.1 Goldfive-authored revision rejection is non-fatal by default
+
+When `Plan.validate(for_revision=True)` rejects a goldfive-authored
+revision (autonomous refine output), the run does NOT abort by default.
+The existing plan is retained on `session.plan`, a
+HUMAN_INTERVENTION_REQUIRED INFO drift is emitted for observability,
+and execution continues. The next refine cycle (if the underlying drift
+persists) gets another attempt; the existing REFINE_FAILURE_THRESHOLD=2
+escalation (§4.5) still fires after two consecutive failures of the
+same (kind, task_id).
+
+Operators wanting strict abort-on-rejection — useful for CI, regression
+testing, or debugging refine logic — opt in via:
+
+- `Runner(fail_fast_on_revision_rejection=True)`
+- env var `GOLDFIVE_FAIL_FAST_REVISION_REJECTION=1`
+
+Default is non-fatal because plan-revision rejection is recoverable: the
+existing plan is still installed and valid, agents can still make
+progress, and aborting on transient LLM output unreliability is
+user-hostile. Loud aborts are a debugging affordance, not a default
+user contract.
 
 ---
 
