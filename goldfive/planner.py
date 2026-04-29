@@ -3100,6 +3100,15 @@ class LLMPlanner:
             revision_severity=DriftSeverity.WARNING.value,
             revision_index=plan.revision_index + 1,
         )
+        # goldfive#251 Option B: coerce supersedes_kind on every merged
+        # task based on the OLD-task status in the prior plan. Mirrors
+        # the same call in :meth:`_refine_user`'s validation loop. The
+        # evolution path (id reuse without supersedes) is unaffected;
+        # the supersede-with-fresh-id path now gets the same parity
+        # the refine_user path has — an LLM that sets
+        # ``supersedes_kind=UNSPECIFIED`` against a prior PENDING is
+        # coerced to ``REPLACE`` so the executor's pin-redirect runs.
+        _normalize_supersession_kinds(merged_plan, prior=plan)
         try:
             merged_plan.validate(for_revision=True, prior=plan)
         except ValueError as exc:

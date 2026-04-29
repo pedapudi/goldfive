@@ -1127,6 +1127,81 @@ async def test_refine_steer_supersedes_prior_pending_with_replace_kind() -> None
     assert "create_presentation" not in ids
     new = next(t for t in revised.tasks if t.id == "new_presentation")
     assert new.supersedes == "create_presentation"
+    # supersedes_kind must round-trip as REPLACE (the LLM set it; the
+    # _normalize_supersession_kinds pass should leave a status-correct
+    # REPLACE alone).
+    from goldfive.types import SupersessionKind  # noqa: PLC0415
+
+    assert new.supersedes_kind is SupersessionKind.REPLACE
+
+
+async def test_refine_steer_normalizes_unspecified_kind_against_prior_pending() -> None:
+    """LLM forgets supersedes_kind on a PENDING-replacement; pass coerces to REPLACE.
+
+    Mirrors the parity ``_refine_user`` already had (planner.py:2111). Without
+    this, the executor's pin-redirect would not run on an LLM that emitted
+    only ``supersedes`` without the kind.
+    """
+    plan = _evolving_plan()
+    goals = [Goal(id="g1", summary="ship the presentation")]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="rebuild from scratch",
+        current_task_id="create_presentation",
+    )
+    canned = json.dumps(
+        {
+            "summary": "Replacement.",
+            "tasks": [
+                {
+                    "id": "rebuilt_presentation",
+                    "title": "Rebuild",
+                    "description": "structurally different",
+                    "assignee_agent_id": "web_developer",
+                    "supersedes": "create_presentation",
+                    # supersedes_kind intentionally omitted
+                }
+            ],
+            "edges": [{"from_task_id": "research", "to_task_id": "rebuilt_presentation"}],
+        }
+    )
+    revised = await LLMPlanner(call_llm=_StubLLM(canned), model="m").refine(
+        plan=plan, drift=drift, goals=goals
+    )
+    from goldfive.types import SupersessionKind  # noqa: PLC0415
+
+    assert revised is not None
+    new = next(t for t in revised.tasks if t.id == "rebuilt_presentation")
+    assert new.supersedes_kind is SupersessionKind.REPLACE
+
+
+def test_steer_prompt_handles_empty_prior_pending() -> None:
+    """A steer against a plan with no PENDING tasks renders a valid prompt.
+
+    Edge case: first refine after a session boot-up where every prior task
+    happens to be terminal (or none exist yet). The prior_pending block
+    must still serialise (empty list) without leaving stale references.
+    """
+    completed = [Task(id="research", title="Research", status=TaskStatus.COMPLETED)]
+    drift = DriftEvent(
+        kind=DriftKind.USER_STEER,
+        severity=DriftSeverity.WARNING,
+        detail="next thing",
+    )
+    planner = LLMPlanner(call_llm=_StubLLM(""), model="m")
+    prompt = planner._build_steer_prompt(
+        completed,
+        drift,
+        [Goal(id="g1", summary="ship")],
+        source="user",
+        prior_pending=[],
+    )
+    # Block is rendered (with empty list) so the LLM sees "no prior pending".
+    assert "Prior PENDING work" in prompt
+    assert "[]" in prompt  # empty JSON list literal somewhere
+    # Reusable-ids list is empty.
+    assert "Reusable prior PENDING ids: []" in prompt
 
 
 async def test_refine_steer_id_reuse_with_assignee_change() -> None:
