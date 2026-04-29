@@ -1924,13 +1924,24 @@ _TERMINAL_NON_COMPLETED_STATUSES: frozenset[TaskStatus] = frozenset(
 def _unreachable_pending_task_ids(plan: Plan) -> set[str]:
     """Return the ids of PENDING tasks whose predecessor chain is broken.
 
-    A PENDING task is unreachable iff the transitive predecessor closure
-    contains at least one task in a terminal-non-COMPLETED status
-    (CANCELLED / FAILED / NOT_NEEDED) that has no live replacement in
-    the plan. Reachability propagates: if A → B → C and A is CANCELLED,
-    both B and C are unreachable. A predecessor that is itself PENDING
-    or RUNNING does NOT taint downstream — those can still progress to
-    COMPLETED (this turn or a future one).
+    A PENDING task is unreachable iff at least one transitive predecessor
+    is in a terminal-non-COMPLETED status (CANCELLED / FAILED / NOT_NEEDED)
+    with no live replacement in the plan. Reachability propagates:
+    A → B → C with A=CANCELLED makes both B and C unreachable. A
+    predecessor that is itself PENDING or RUNNING does NOT taint
+    downstream — those can still progress to COMPLETED (this turn or
+    a future one).
+
+    AND-join semantics: when a task has multiple predecessors, ANY
+    broken predecessor is fatal. This matches ``_pick_next_task``'s
+    scheduling rule (every predecessor must be COMPLETED to schedule
+    the task), so a join with one CANCELLED predecessor can never be
+    scheduled — orphan-cancelling it is consistent with the rest of
+    the executor.
+
+    A FAILED task with a live ``retry_<id>`` / ``<id>_v2`` lineage
+    replacement (goldfive#202) is NOT broken — the replacement carries
+    the work forward, so downstream PENDING remains reachable.
 
     Used by the overlay end-of-invocation policy (goldfive#208): the
     legacy policy unconditionally NOT_NEEDED-reaped every PENDING at
@@ -1944,45 +1955,35 @@ def _unreachable_pending_task_ids(plan: Plan) -> set[str]:
         deps_by_task.setdefault(e.to_task_id, []).append(e.from_task_id)
 
     # Seed: every task whose own status is terminal-non-COMPLETED with
-    # no live replacement is "broken." A FAILED task with a live
-    # replacement (goldfive#202) is NOT broken — its successor carries
-    # the work forward.
-    broken: set[str] = set()
+    # no live replacement is "broken" — a structural dead-end that
+    # downstream PENDING work can never get past.
+    seed_broken: set[str] = set()
     for tid, t in tasks_by_id.items():
         if t.status not in _TERMINAL_NON_COMPLETED_STATUSES:
             continue
         if t.status == TaskStatus.FAILED and _has_live_replacement(plan, t):
             continue
-        broken.add(tid)
+        seed_broken.add(tid)
 
-    # Forward-propagate: any task whose predecessor is broken is itself
-    # unreachable. Iterate to fixed point (plan size is small, O(N*E)
-    # is fine).
+    # Forward-propagate to PENDING tasks only (other statuses already
+    # have their own correct disposition). Iterate to fixed point —
+    # plan size is small, O(N*E) is fine.
+    unreachable_pending: set[str] = set()
     changed = True
     while changed:
         changed = False
         for tid, t in tasks_by_id.items():
-            if tid in broken:
+            if tid in unreachable_pending or tid in seed_broken:
                 continue
             if t.status != TaskStatus.PENDING:
-                # Only PENDING tasks can be marked unreachable here —
-                # COMPLETED / RUNNING / terminal statuses already have
-                # their own correct disposition.
                 continue
             for dep_id in deps_by_task.get(tid, []):
-                if dep_id in broken:
-                    broken.add(tid)
+                if dep_id in seed_broken or dep_id in unreachable_pending:
+                    unreachable_pending.add(tid)
                     changed = True
                     break
 
-    # Return only the PENDING-and-unreachable subset: callers want the
-    # ids to cancel, not the seed broken set.
-    return {
-        tid
-        for tid in broken
-        if tasks_by_id.get(tid) is not None
-        and tasks_by_id[tid].status == TaskStatus.PENDING
-    }
+    return unreachable_pending
 
 
 async def _emit_pipeline_failure_drift(

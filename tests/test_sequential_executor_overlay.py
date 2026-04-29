@@ -68,6 +68,9 @@ class StubSteerer:
         self._planner: Any = None
         self.observed: list[Any] = []
         self.transitions: list[tuple[str, TaskStatus]] = []
+        # Full call record including detail/cancel_reason so tests can
+        # assert on the structured reason strings the executor emits.
+        self.transition_details: list[tuple[str, TaskStatus, str, str]] = []
 
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks
@@ -84,11 +87,12 @@ class StubSteerer:
         task_id: str,
         to: TaskStatus,
         *,
-        detail: str = "",  # noqa: ARG002
+        detail: str = "",
         session: Session,
-        cancel_reason: str = "",  # noqa: ARG002
+        cancel_reason: str = "",
     ) -> None:
         self.transitions.append((task_id, to))
+        self.transition_details.append((task_id, to, detail, cancel_reason))
         if session.plan is None:
             return
         for t in session.plan.tasks:
@@ -394,8 +398,29 @@ async def test_overlay_cancels_unreachable_pending_when_predecessor_failed() -> 
 async def test_overlay_does_not_emit_legacy_not_needed_reason() -> None:
     """Regression guard: the legacy reason string ``tree did not
     exercise; no follow-up dispatched`` must NOT appear post-#208.
+
+    Sets up a plan where end-of-overlay would, under #163, have
+    transitioned every PENDING to NOT_NEEDED with that exact reason.
+    Asserts the literal string is not present in any recorded
+    transition's detail or cancel_reason.
     """
-    plan = _three_task_plan()
+    plan = Plan(
+        id="p_legacy_guard",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[
+            # Mix of reachable + unreachable so we exercise both branches.
+            Task(id="reachable_1", title="A", assignee_agent_id="agent_a"),
+            Task(
+                id="broken_root",
+                title="B",
+                assignee_agent_id="agent_b",
+                status=TaskStatus.CANCELLED,
+            ),
+            Task(id="unreachable_1", title="C", assignee_agent_id="agent_c"),
+        ],
+        edges=[TaskEdge(from_task_id="broken_root", to_task_id="unreachable_1")],
+    )
     session = Session(run_id="r1")
     steerer = StubSteerer()
     sink = RecordingSink()
@@ -419,18 +444,252 @@ async def test_overlay_does_not_emit_legacy_not_needed_reason() -> None:
         user_input="anything",
     )
 
-    # No detail field on any recorded transition should mention the
-    # retired phrase.
-    for tid, to, *_rest in (
-        (t.id, t.to, getattr(t, "detail", "")) if hasattr(t, "to") else (None, None, "")
-        for t in []
-    ):
-        # placeholder — StubSteerer's transitions records (id, to_status)
-        del tid, to
-    # The transitions list itself should not contain a NOT_NEEDED with
-    # the legacy reason — the simpler assertion is that no NOT_NEEDED
-    # transition was emitted at all in this scenario.
+    # No transition's detail or cancel_reason should mention the
+    # retired phrase, and NOT_NEEDED should not be produced by the
+    # overlay-end path at all.
+    legacy_phrase = "tree did not exercise"
+    for tid, to, detail, cancel_reason in steerer.transition_details:
+        assert legacy_phrase not in detail, (
+            f"task {tid} transition to {to} carries retired reason "
+            f"{detail!r} (PR #208 retired this)"
+        )
+        assert legacy_phrase not in cancel_reason, (
+            f"task {tid} transition to {to} carries retired cancel_reason "
+            f"{cancel_reason!r}"
+        )
     assert [tid for tid, to in steerer.transitions if to is TaskStatus.NOT_NEEDED] == []
+
+
+async def test_overlay_unreachable_propagates_through_chain() -> None:
+    """Multi-step propagation: A=CANCELLED -> B -> C -> D should mark
+    B, C, AND D unreachable. The fixed-point iteration must reach D.
+    """
+    plan = Plan(
+        id="p_chain",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[
+            Task(id="a", title="A", assignee_agent_id="agent_a", status=TaskStatus.CANCELLED),
+            Task(id="b", title="B", assignee_agent_id="agent_b"),
+            Task(id="c", title="C", assignee_agent_id="agent_c"),
+            Task(id="d", title="D", assignee_agent_id="agent_d"),
+        ],
+        edges=[
+            TaskEdge(from_task_id="a", to_task_id="b"),
+            TaskEdge(from_task_id="b", to_task_id="c"),
+            TaskEdge(from_task_id="c", to_task_id="d"),
+        ],
+    )
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    async def _passthrough(
+        user_message: str,  # noqa: ARG001
+        session: Session,  # noqa: ARG001
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        return InvocationResult(task_id="", text="")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    await SequentialExecutor(overlay_mode=True).run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="anything",
+    )
+
+    cancelled = {tid for tid, to in steerer.transitions if to is TaskStatus.CANCELLED}
+    assert cancelled == {"b", "c", "d"}, (
+        f"all three downstream tasks should be CANCELLED via propagation, got {cancelled!r}"
+    )
+
+
+async def test_overlay_diamond_partial_break_marks_join_unreachable() -> None:
+    """AND-join semantics (matching ``_pick_next_task``): when a join
+    task has multiple predecessors and at least one is broken with no
+    live replacement, the join is unreachable. The executor's
+    scheduler requires ALL predecessors COMPLETED to schedule a task,
+    so a join with one CANCELLED predecessor can never be scheduled.
+    """
+    plan = Plan(
+        id="p_diamond",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[
+            Task(id="a", title="A", assignee_agent_id="agent_a", status=TaskStatus.COMPLETED),
+            Task(id="b", title="B", assignee_agent_id="agent_b", status=TaskStatus.CANCELLED),
+            Task(id="c", title="C", assignee_agent_id="agent_c"),
+            Task(id="d", title="D", assignee_agent_id="agent_d"),
+        ],
+        edges=[
+            TaskEdge(from_task_id="a", to_task_id="b"),
+            TaskEdge(from_task_id="a", to_task_id="c"),
+            TaskEdge(from_task_id="b", to_task_id="d"),
+            TaskEdge(from_task_id="c", to_task_id="d"),
+        ],
+    )
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    async def _passthrough(
+        user_message: str,  # noqa: ARG001
+        session: Session,  # noqa: ARG001
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        return InvocationResult(task_id="", text="")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    await SequentialExecutor(overlay_mode=True).run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="anything",
+    )
+
+    cancelled = {tid for tid, to in steerer.transitions if to is TaskStatus.CANCELLED}
+    # D depends on b (CANCELLED) AND c — AND-join, b's broken status
+    # makes D unreachable. C remains reachable (its only predecessor a
+    # is COMPLETED).
+    assert "d" in cancelled, f"diamond join D should be CANCELLED, got {cancelled!r}"
+    assert "c" not in cancelled, f"reachable C should stay PENDING, got {cancelled!r}"
+
+
+async def test_overlay_failed_with_live_replacement_does_not_taint() -> None:
+    """A FAILED task with a live ``retry_<id>`` lineage replacement
+    in the plan is NOT broken. Downstream PENDING tasks remain
+    reachable because the replacement carries the work forward
+    (goldfive#202).
+    """
+    plan = Plan(
+        id="p_lineage",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[
+            Task(id="t0", title="A", assignee_agent_id="agent_a", status=TaskStatus.FAILED),
+            Task(id="retry_t0", title="A retry", assignee_agent_id="agent_a"),
+            Task(id="t1", title="B", assignee_agent_id="agent_b"),
+        ],
+        edges=[
+            TaskEdge(from_task_id="t0", to_task_id="t1"),
+            TaskEdge(from_task_id="retry_t0", to_task_id="t1"),
+        ],
+    )
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    async def _passthrough(
+        user_message: str,  # noqa: ARG001
+        session: Session,  # noqa: ARG001
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        return InvocationResult(task_id="", text="")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    await SequentialExecutor(overlay_mode=True).run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="anything",
+    )
+
+    # The FAILED predecessor has a live replacement, so downstream
+    # work is reachable; no CANCELLED transitions should be produced.
+    cancelled = [tid for tid, to in steerer.transitions if to is TaskStatus.CANCELLED]
+    assert cancelled == [], (
+        f"lineage replacement should keep downstream reachable; cancelled={cancelled!r}"
+    )
+
+
+async def test_overlay_paused_for_human_intervention_leaves_unreachable_pending() -> None:
+    """F10 guard: when paused for human intervention, EVERY PENDING
+    is left alone — including structurally unreachable ones. The
+    operator hasn't decided yet whether unreachable work should be
+    dropped, so the executor must not pre-empt that decision.
+    """
+    plan = Plan(
+        id="p_paused",
+        run_id="r1",
+        goal_ids=[],
+        tasks=[
+            Task(id="root", title="A", assignee_agent_id="agent_a", status=TaskStatus.CANCELLED),
+            Task(id="downstream", title="B", assignee_agent_id="agent_b"),
+        ],
+        edges=[TaskEdge(from_task_id="root", to_task_id="downstream")],
+    )
+    session = Session(run_id="r1")
+    # Simulate pause: HUMAN_INTERVENTION_REQUIRED was emitted just
+    # before the overlay end-of-invocation runs.
+    session.paused_for_human_intervention = True
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    async def _passthrough(
+        user_message: str,  # noqa: ARG001
+        session: Session,  # noqa: ARG001
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        return InvocationResult(task_id="", text="")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    await SequentialExecutor(overlay_mode=True).run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="anything",
+    )
+
+    # Despite "downstream" being structurally unreachable, the F10
+    # guard suppresses the cancel — the operator decides.
+    assert steerer.transitions == [], (
+        f"paused-for-HI must suppress all overlay-end transitions, got {steerer.transitions!r}"
+    )
+    by_id = {t.id: t.status for t in plan.tasks}
+    assert by_id["downstream"] is TaskStatus.PENDING
+
+
+async def test_overlay_empty_plan_no_transitions() -> None:
+    """A plan with no tasks (or all terminal) produces no overlay-end
+    transitions. Belt-and-braces against zero-task edge cases.
+    """
+    plan = Plan(id="p_empty", run_id="r1", goal_ids=[], tasks=[], edges=[])
+    session = Session(run_id="r1")
+    steerer = StubSteerer()
+    sink = RecordingSink()
+
+    async def _passthrough(
+        user_message: str,  # noqa: ARG001
+        session: Session,  # noqa: ARG001
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        return InvocationResult(task_id="", text="")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    await SequentialExecutor(overlay_mode=True).run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="anything",
+    )
+
+    assert steerer.transitions == []
 
 
 async def test_overlay_no_pending_tasks_no_not_needed_transitions() -> None:
