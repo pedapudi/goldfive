@@ -632,6 +632,278 @@ def _maybe_redirect_completed_agent(
         return None
 
 
+# R2 (#205) — topic-mismatch helpers.
+#
+# F3 (#324) caught the "all tasks terminal" loop by refusing AgentTool
+# dispatches onto agents whose plan tasks were all done. The remaining
+# gap: F3 says nothing about *what* is being asked. A coordinator can
+# still call ``research_agent`` with an off-topic request while the
+# agent has a PENDING / RUNNING task — F3 lets it through, the agent
+# runs off-plan, and the post-hoc PLAN_DIVERGENCE detector fires only
+# *after* the wasted dispatch (v20 validation: 2 sev=1 PLAN_DIVERGENCE
+# drifts on debugger_agent + web_developer_agent for exactly this
+# pattern). R2 closes the gap with a keyword-overlap topic check at
+# the same dispatch boundary.
+#
+# The check is OPTIMISTIC by design: false negatives (allowing an
+# off-topic call through) are preferred over false positives (blocking
+# legitimate work). A single shared meaningful word between the
+# AgentTool's ``request`` and the assigned plan task's
+# ``title + description`` is enough to consider the call on-topic.
+# The post-hoc PLAN_DIVERGENCE detector remains as the safety net for
+# misses; the goal here is to PREVENT the obvious off-plan dispatches.
+
+# Stop-words filtered out before the overlap check. Hand-curated to the
+# tokens that produce false matches in real plans:
+#
+# * articles + prepositions ("the", "of", "for") — saturate every pair,
+# * verbs that show up in *every* delegation request ("research",
+#   "draft", "write", "build") — they're the genre, not the topic,
+# * pronouns / filler ("please", "just", "you") — request-side noise.
+#
+# We keep the list small: aggressive pruning here flips false-negatives
+# into false-positives (every word looks topic-bearing once enough are
+# stripped), and the 4-character minimum already filters most short
+# noise tokens. Synced with :func:`_tokenize_for_matching` style: lowercase
+# alphanumeric tokens of length ≥4 (consistent with the delegation-pin
+# scorer) so the same intuition applies to both.
+_OVERLAP_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        # articles / prepositions / conjunctions ≥4 chars
+        "this",
+        "that",
+        "these",
+        "those",
+        "with",
+        "from",
+        "into",
+        "onto",
+        "upon",
+        "over",
+        "under",
+        "about",
+        # auxiliary verbs / copulas
+        "been",
+        "being",
+        "have",
+        "having",
+        "does",
+        "doing",
+        # delegation filler
+        "please",
+        "just",
+        "make",
+        "create",
+        "write",
+        "research",
+        "draft",
+        "review",
+        "build",
+        "help",
+        # generic pronouns / addressers
+        "your",
+        "yours",
+    }
+)
+
+
+def _normalize_for_overlap(text: Any) -> set[str]:
+    """Return a set of meaningful tokens from ``text`` for overlap checks.
+
+    Lowercases, strips non-alphanumeric to whitespace, drops stop-words
+    and tokens shorter than 4 characters. Mirrors the
+    :func:`_tokenize_for_matching` shape used by the delegation-pin
+    scorer so the two surfaces apply consistent rules.
+    """
+    if not isinstance(text, str):
+        text = str(text or "")
+    if not text:
+        return set()
+    tokens: set[str] = set()
+    buf: list[str] = []
+    for ch in text.lower():
+        if ch.isalnum():
+            buf.append(ch)
+        else:
+            if buf:
+                tok = "".join(buf)
+                if len(tok) >= 4 and tok not in _OVERLAP_STOP_WORDS:
+                    tokens.add(tok)
+                buf.clear()
+    if buf:
+        tok = "".join(buf)
+        if len(tok) >= 4 and tok not in _OVERLAP_STOP_WORDS:
+            tokens.add(tok)
+    return tokens
+
+
+def _extract_agent_tool_request_text(tool_args: Any) -> str:
+    """Pull the LLM's free-form request text out of an AgentTool args dict.
+
+    ADK's ``AgentTool`` packs the parent's prose under
+    ``tool_args["request"]``; defensively support a few alternate keys
+    seen in custom AgentTool wrappers. Falls back to the joined string
+    form of the args mapping so the caller still has *something* to
+    overlap-check on. Non-mapping inputs (rare) are stringified.
+    """
+    if isinstance(tool_args, Mapping):
+        for key in ("request", "input", "query", "prompt", "message"):
+            value = tool_args.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        # Last resort: concatenate every string-shaped value so a
+        # custom shape (e.g. ``{"topic": "raccoons"}``) still lights
+        # the overlap check.
+        parts: list[str] = []
+        for v in tool_args.values():
+            if isinstance(v, str) and v.strip():
+                parts.append(v)
+        return " ".join(parts)
+    if isinstance(tool_args, str):
+        return tool_args
+    return ""
+
+
+def _delegation_args_off_topic(
+    *,
+    tool_request_text: str,
+    plan_tasks: list[Any],
+    overlap_threshold: float = 0.0,
+) -> bool:
+    """Return True iff ``tool_request_text`` shares no meaningful keywords
+    with ANY of the candidate plan tasks.
+
+    ``plan_tasks`` should be the non-terminal assigned tasks for the
+    target agent. Multi-task agents pass: a request that matches at
+    least one candidate task is on-topic. Optimistic edge cases all
+    return ``False`` (allow):
+
+    * empty ``plan_tasks`` — caller decides whether off-plan dispatch
+      is its problem,
+    * a candidate with no checkable content (empty title + description),
+    * an empty / stop-word-only request — no signal to block on.
+
+    ``overlap_threshold`` of ``0.0`` (default) means "at least one
+    shared meaningful word". A positive threshold gates on the share of
+    the task's keywords that are present in the request.
+    """
+    if not plan_tasks:
+        return False
+    request_words = _normalize_for_overlap(tool_request_text)
+    if not request_words:
+        # No checkable content in the request — let it through.
+        return False
+    for task in plan_tasks:
+        title = _safe_attr(task, "title", "")
+        description = _safe_attr(task, "description", "")
+        task_words = _normalize_for_overlap(title) | _normalize_for_overlap(description)
+        if not task_words:
+            # Task has no checkable content — can't classify; assume on-topic.
+            return False
+        overlap = task_words & request_words
+        if overlap_threshold <= 0:
+            if overlap:
+                return False
+        else:
+            if (len(overlap) / max(len(task_words), 1)) >= overlap_threshold:
+                return False
+    # No candidate matched.
+    return True
+
+
+def _maybe_refuse_topic_mismatch(
+    *,
+    ctx: Any,
+    target_agent: str,
+    tool_args: Any,
+) -> dict[str, Any] | None:
+    """R2 / #205: pre-dispatch topic-mismatch refusal.
+
+    Refuses an AgentTool dispatch when the invocation args don't share
+    keywords with any of the target agent's non-terminal assigned plan
+    tasks. Returns ``None`` (allow) when:
+
+    * the target agent has no assigned plan task at all (off-plan —
+      the existing PLAN_DIVERGENCE drift detector handles it; we do
+      not double-flag),
+    * the agent has only terminal tasks (F3 already handles that),
+    * the request shares ≥1 meaningful keyword with at least one
+      non-terminal task (on-topic),
+    * the request text is empty or stop-word-only (no signal),
+    * any internal failure (defensive — never break dispatch).
+
+    The refusal payload mirrors F3's tool-error shape so the LLM
+    receives a uniform "go elsewhere" signal at this surface.
+    """
+    if not target_agent:
+        return None
+    try:
+        plan = _safe_attr(ctx, "session", None)
+        plan = _safe_attr(plan, "plan", None) if plan is not None else None
+        if plan is None:
+            return None
+        tasks = list(_safe_attr(plan, "tasks", None) or ())
+        if not tasks:
+            return None
+        from goldfive.types import TERMINAL_TASK_STATUSES
+
+        def _bare(name: str) -> str:
+            n = (name or "").strip()
+            return n.rsplit(".", 1)[-1] if "." in n else n
+
+        target_bare = _bare(target_agent)
+        non_terminal: list[Any] = []
+        for task in tasks:
+            assignee = _bare(str(_safe_attr(task, "assignee_agent_id", "") or ""))
+            if assignee != target_bare:
+                continue
+            if _safe_attr(task, "status", None) in TERMINAL_TASK_STATUSES:
+                continue
+            non_terminal.append(task)
+
+        if not non_terminal:
+            # Either off-plan (PLAN_DIVERGENCE handles it) or all
+            # terminal (F3 handles it). Don't double-flag.
+            return None
+
+        request_text = _extract_agent_tool_request_text(tool_args)
+        if not _delegation_args_off_topic(
+            tool_request_text=request_text,
+            plan_tasks=non_terminal,
+        ):
+            return None
+
+        # Build a redirect string. We surface the first non-terminal
+        # task's title as the "expected topic" — picking a single
+        # representative is enough; the LLM only needs to know the call
+        # was off-topic and what the assigned task actually is.
+        assigned_titles = [
+            str(_safe_attr(t, "title", "") or "") for t in non_terminal
+        ]
+        assigned_titles = [t for t in assigned_titles if t]
+        expected_topic = assigned_titles[0] if assigned_titles else ""
+        expected_blob = "; ".join(assigned_titles) or "(no titled task)"
+        snippet = (request_text or "").strip().replace("\n", " ")
+        if len(snippet) > 80:
+            snippet = snippet[:80] + "..."
+        return {
+            "error": (
+                f"Topic mismatch: the request '{snippet}' does not match "
+                f"the assigned plan task(s) for {target_bare}: "
+                f"'{expected_blob}'. Either rephrase the request to match "
+                f"the assigned task or invoke the agent whose plan task "
+                f"covers the requested topic."
+            ),
+            "topic_mismatch": True,
+            "expected_topic": expected_topic,
+        }
+    except Exception as exc:  # noqa: BLE001 — defensive; never break dispatch
+        log.debug(
+            "_maybe_refuse_topic_mismatch: classification raised: %s", exc
+        )
+        return None
+
+
 def _inject_task_id_from_state(
     *,
     tool_name: str,
@@ -4959,6 +5231,31 @@ def make_adk_plugin(
                         redirect.get("redirect_to") or "?",
                     )
                     return redirect
+
+                # R2 (#205): topic-mismatch check. F3 covered the
+                # "agent is done" loop; this covers the orthogonal
+                # "agent has work but the request is off-topic" case
+                # (v20 validation: 2 sev=1 PLAN_DIVERGENCE drifts on
+                # debugger / web_developer firing for unrelated topics).
+                # Refusal is OPTIMISTIC — at least one shared keyword
+                # is enough to consider the call on-topic, so legitimate
+                # rephrasings still pass. Operator visibility for the
+                # post-hoc miss case continues to flow through the
+                # PLAN_DIVERGENCE drift detector.
+                topic_refusal = _maybe_refuse_topic_mismatch(
+                    ctx=ctx,
+                    target_agent=to_agent,
+                    tool_args=tool_args,
+                )
+                if topic_refusal is not None:
+                    log.info(
+                        "before_tool_callback: R2 topic-mismatch — "
+                        "request to %s did not overlap assigned task "
+                        "keywords (expected_topic=%r); refusing dispatch",
+                        to_agent,
+                        topic_refusal.get("expected_topic") or "?",
+                    )
+                    return topic_refusal
                 # Fall through: AgentTool still runs, we're just observing.
 
             # Tool-level approval (Flow B). If the tool opts into
