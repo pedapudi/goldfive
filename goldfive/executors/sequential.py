@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import warnings
 from typing import TYPE_CHECKING, Any
@@ -161,6 +162,27 @@ class SequentialExecutor(Executor):
         the executor to emit ``RunAborted`` and stop. When ``False``, failed
         tasks are recorded and the executor continues walking remaining
         eligible tasks.
+    fail_fast_on_invoke_cancel:
+        Strict-abort opt-in for the overlay's cancelled branch when the
+        cancel was a goldfive-internal supersede-cancel (a refine-driven
+        cancel that switches the in-flight invocation to a freshly
+        installed revised plan). Default (``False``) is non-fatal: the
+        overlay restarts the passthrough loop with the new plan instead
+        of emitting ``run_aborted``. Mirrors the principle from PR #332's
+        ``fail_fast_on_revision_rejection`` knob — goldfive-internal
+        control flow should not, by default, terminate the user's turn.
+
+        When ``None`` (the default), the env var
+        ``GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL=1`` is consulted. Explicit
+        ``True`` / ``False`` from the kwarg always wins over the env.
+
+        **External cancels** — USER_CANCEL via the control channel,
+        asyncio cancellation propagated from the caller — ALWAYS abort
+        regardless of this flag. They reflect an external decision to
+        end the run; the flag only governs the goldfive-internal
+        supersede branch (discriminated by ``session._supersede_pending``,
+        which the steerer's :meth:`_cancel_inflight_for_revision` sets
+        before initiating the cancel).
     """
 
     def __init__(
@@ -170,6 +192,7 @@ class SequentialExecutor(Executor):
         max_retries_per_task_lineage: int = 3,
         fail_fast: bool = True,
         overlay_mode: bool = False,
+        fail_fast_on_invoke_cancel: bool | None = None,
         **legacy_kwargs: Any,
     ) -> None:
         # Backwards-compatible alias: accept the old name for one release
@@ -230,6 +253,18 @@ class SequentialExecutor(Executor):
         # already encode that model keep working. The ``goldfive.wrap``
         # convenience flips this to True by default.
         self.overlay_mode = bool(overlay_mode)
+        # goldfive#332-followup: configurable abort policy on the
+        # overlay's cancelled branch. ``None`` means "consult env";
+        # explicit ``True`` / ``False`` wins over the env so tests can
+        # pin behaviour without unsetting environment variables. Only
+        # affects goldfive-internal supersede-cancels — external cancels
+        # (USER_CANCEL, asyncio.CancelledError from the caller) always
+        # abort. See :meth:`_run_overlay`'s cancelled branch.
+        if fail_fast_on_invoke_cancel is None:
+            fail_fast_on_invoke_cancel = (
+                os.environ.get("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL", "0") == "1"
+            )
+        self._fail_fast_on_invoke_cancel: bool = bool(fail_fast_on_invoke_cancel)
 
     # goldfive#202: cap on the overlay's nudge-driven re-invoke loop.
     # Each pass that the steerer queues a Level 2 nudge burns one.
@@ -871,6 +906,22 @@ class SequentialExecutor(Executor):
         # for stack-precedence rules.
         next_reentry_kind: ReentryKind | None = None
         while True:
+            # Defensive: clear any stale supersede flag from a prior
+            # iteration. The flag is set by
+            # :meth:`DefaultSteerer._cancel_inflight_for_revision`
+            # immediately before the cancel that the cancelled branch
+            # below consumes. Branches that don't visit the cancelled
+            # branch (e.g. STEER, which calls ``_cancel_invoke_task``
+            # directly and routes through the "steer" return) can
+            # still trigger the flag-set as a side effect of
+            # ``steerer.observe`` → ``install_user_steer`` →
+            # ``_cancel_inflight_for_revision``; clearing here
+            # prevents that stale flag from misclassifying a genuine
+            # external cancel on the NEXT iteration as a supersede.
+            try:
+                session._supersede_pending = False  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
             # ContextVars snapshot at ``asyncio.create_task`` time
             # (which happens inside _invoke_passthrough_with_control),
             # so the ``reentry()`` block must wrap the call site here.
@@ -899,7 +950,56 @@ class SequentialExecutor(Executor):
                 # falls back to whatever the next branch decides.
                 next_reentry_kind = None
             if kind == "cancelled":
+                # Bug A from v22 validation: a goldfive-internal
+                # supersede-cancel (the steerer's
+                # :meth:`_cancel_inflight_for_revision` cancelling the
+                # in-flight invocation so the new revised plan can be
+                # exercised) used to fall through this branch and emit
+                # ``run_aborted``, terminating the user's turn even
+                # though the supersede was meant to *continue* the turn
+                # against the revised plan. The fix mirrors the STEER
+                # branch below: if the cancel was internal (the steerer
+                # stamped ``session._supersede_pending=True`` before
+                # initiating it), reset the reconciler for the new plan
+                # and restart the loop. Default is non-fatal; opt-in
+                # ``fail_fast_on_invoke_cancel`` (or
+                # ``GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL=1``) preserves
+                # the pre-fix abort behaviour for CI / regression /
+                # debugging. External cancels (USER_CANCEL via the
+                # control channel, asyncio.CancelledError propagated
+                # from the caller) ALWAYS abort regardless of the flag —
+                # they never set the supersede marker. See PR #332 for
+                # the principle this aligns with.
+                supersede_pending = bool(
+                    getattr(session, "_supersede_pending", False)
+                )
+                if supersede_pending and not self._fail_fast_on_invoke_cancel:
+                    session._supersede_pending = False
+                    log.info(
+                        "SequentialExecutor._run_overlay: goldfive-internal "
+                        "supersede cancel observed (revision_index=%d); "
+                        "restarting overlay loop with new plan instead of "
+                        "aborting",
+                        int(getattr(session.plan, "revision_index", -1) or -1),
+                    )
+                    # Reset reconciler bookkeeping so the revised plan's
+                    # tasks map fresh — stale task_id → agent claims from
+                    # the pre-supersede plan must not leak into the
+                    # restart. Mirrors the STEER branch below.
+                    reconciler.reset_for_new_plan(session.plan)
+                    # The user's input is unchanged — supersede swaps
+                    # the plan, not the user's request. Don't pin a
+                    # reentry kind: this is an autonomous-drift-driven
+                    # restart, not a STEER. Treat the next iteration as
+                    # a normal continuation.
+                    continue
+                # External cancel OR fail_fast_on_invoke_cancel=True:
+                # preserve the pre-fix abort path.
                 failure_reason = str(payload) or "cancelled by control"
+                # Clear any stale supersede flag so a subsequent run on
+                # the same Session does not inherit it.
+                if supersede_pending:
+                    session._supersede_pending = False
                 # goldfive#205: overlay path doesn't have a single
                 # "current task" to stamp — the orphan sweep below
                 # handles PENDING tasks. Clear the transient prefix so
