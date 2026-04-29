@@ -950,6 +950,140 @@ def _good_looping_revision_json() -> str:
     )
 
 
+async def test_looping_refine_backfills_supersedes_for_retry_named_replacement() -> None:
+    """goldfive#213: the LOOPING_TOOL_CALL refine path goes through
+    ``_call_and_validate_refine`` (not ``_user_steer_one_attempt``). The
+    backfill helper must run on this path too — otherwise the LOOPING
+    refine path would leave ``Task.supersedes`` empty for retry-named
+    replacement tasks the LLM emits, defeating causal replacement
+    detection in ``_has_live_replacement`` and producing the same
+    false-positive ``run_aborted`` symptom from v27.
+
+    Setup: a plan whose looping task is FAILED (the planner failed it
+    before refining). The LLM emits a ``retry_<id>`` replacement
+    without populating ``supersedes``. Assert backfill set it.
+    """
+    # Adapt _looping_plan but with draft_slides already FAILED (the
+    # state _refine_looping_tool_call sees: it fails the looper before
+    # asking the LLM for a replacement plan).
+    plan = Plan(
+        id="plan-loop-backfill",
+        run_id="run-1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="research_installation",
+                title="Research installation",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="structure_presentation",
+                title="Structure presentation",
+                assignee_agent_id="writer",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="draft_slides",
+                title="Draft slides",
+                assignee_agent_id="writer",
+                status=TaskStatus.FAILED,
+            ),
+        ],
+        edges=[
+            TaskEdge(
+                from_task_id="research_installation",
+                to_task_id="structure_presentation",
+            ),
+            TaskEdge(
+                from_task_id="structure_presentation",
+                to_task_id="draft_slides",
+            ),
+        ],
+        summary="Build the installation presentation.",
+        revision_index=1,
+    )
+    revision_json = json.dumps(
+        {
+            "summary": "retry the looper",
+            "tasks": [
+                {
+                    "id": "research_installation",
+                    "title": "Research installation",
+                    "assignee_agent_id": "researcher",
+                    "status": "COMPLETED",
+                },
+                {
+                    "id": "structure_presentation",
+                    "title": "Structure presentation",
+                    "assignee_agent_id": "writer",
+                    "status": "COMPLETED",
+                },
+                {
+                    "id": "draft_slides",
+                    "title": "Draft slides",
+                    "assignee_agent_id": "writer",
+                    "status": "FAILED",
+                },
+                {
+                    # Retry-named replacement; LLM omits supersedes — the
+                    # bug this test guards against.
+                    "id": "retry_draft_slides",
+                    "title": "Retry drafting slides with outline",
+                    "assignee_agent_id": "writer",
+                    "status": "PENDING",
+                },
+            ],
+            "edges": [
+                {
+                    "from_task_id": "research_installation",
+                    "to_task_id": "structure_presentation",
+                },
+                # Preserve the terminal->terminal edge (required by
+                # validator step 5 once draft_slides is FAILED).
+                {
+                    "from_task_id": "structure_presentation",
+                    "to_task_id": "draft_slides",
+                },
+                # New retry routes from the LAST COMPLETED predecessor
+                # (avoids the FAILED->PENDING reachability rejection).
+                {
+                    "from_task_id": "structure_presentation",
+                    "to_task_id": "retry_draft_slides",
+                },
+            ],
+        }
+    )
+    scripted = _ScriptedLLM([revision_json])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=1)
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="agent stuck calling read_file",
+        current_task_id="draft_slides",
+    )
+
+    revised = await planner.refine(plan=plan, drift=drift, goals=_goals())
+
+    assert revised is not None
+    by_id = {t.id: t for t in revised.tasks}
+    assert "retry_draft_slides" in by_id, "replacement task missing"
+    retry = by_id["retry_draft_slides"]
+    # Backfill must have run on the LOOPING path: supersedes is populated.
+    assert retry.supersedes == "draft_slides", (
+        f"expected backfill to set supersedes='draft_slides', "
+        f"got {retry.supersedes!r}"
+    )
+    # And _normalize_supersession_kinds derived REPLACE from the
+    # FAILED predecessor status.
+    from goldfive.types import SupersessionKind  # noqa: PLC0415
+
+    assert retry.supersedes_kind is SupersessionKind.REPLACE, (
+        f"expected supersedes_kind=REPLACE for FAILED predecessor, "
+        f"got {retry.supersedes_kind}"
+    )
+
+
 async def test_refine_retries_on_validation_failure_and_succeeds() -> None:
     """Attempt 1 emits a plan missing a terminal->terminal edge; attempt 2
     emits a valid plan. The planner must retry and succeed.

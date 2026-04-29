@@ -607,6 +607,11 @@ def _normalize_supersession_kinds(revised: Plan, *, prior: Plan | None) -> None:
 
     goldfive#251 Option B validator. Rules, in order:
 
+    0. (goldfive#213) If ``task.supersedes == task.id`` (self-reference
+       — the v27 rev-2 anomaly where an LLM mis-applied supersedes to
+       an id-reused task), clear the link. A task cannot be its own
+       predecessor; the empty-target case (Rule 1) then clears any
+       lingering kind.
     1. If ``task.supersedes`` is empty, clear ``supersedes_kind`` to
        ``UNSPECIFIED`` — a kind without a target is dangling.
     2. If the supersedes target does not resolve against either
@@ -635,6 +640,19 @@ def _normalize_supersession_kinds(revised: Plan, *, prior: Plan | None) -> None:
     revised_by_id: dict[str, Task] = {t.id: t for t in revised.tasks if t.id}
     for task in revised.tasks:
         sup_id = (task.supersedes or "").strip()
+        # Rule 0 (goldfive#213): a task can never supersede itself. The
+        # v27 rev-2 anomaly was the LLM emitting ``supersedes == self.id``
+        # on an id-reused task (a structural impossibility — a task
+        # is not its own predecessor). Strip the link and fall through
+        # so Rule 1's empty-target handling clears any kind.
+        if sup_id and task.id and sup_id == task.id:
+            log.warning(
+                "planner: task %r has supersedes pointing at itself; "
+                "clearing self-reference (a task cannot supersede itself)",
+                task.id,
+            )
+            task.supersedes = ""
+            sup_id = ""
         if not sup_id:
             # Rule 1: dangling kind with no target.
             if task.supersedes_kind is not SupersessionKind.UNSPECIFIED:
@@ -684,6 +702,141 @@ def _normalize_supersession_kinds(revised: Plan, *, prior: Plan | None) -> None:
                 expected.value,
             )
             task.supersedes_kind = expected
+
+
+#: Statuses that warrant a retry/replace — i.e. the old task did NOT
+#: succeed. Used by :func:`_backfill_retry_supersedes` to gate the
+#: structural inference: only retries that follow a non-success outcome
+#: get an inferred supersedes link. COMPLETED / PENDING / RUNNING /
+#: BLOCKED are intentionally excluded — those represent either durable
+#: provenance (don't quietly clobber) or work in flight (a "retry"
+#: spawned alongside a healthy in-flight task is a confused emit, not
+#: a structural successor).
+_RETRY_WARRANTING_OLD_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+
+
+# Precompiled prefix patterns matching goldfive's id conventions for
+# retry / version successor tasks. Mirrors
+# :data:`goldfive.executors.sequential._RETRY_PREFIX_RE` but lives here
+# to avoid an executor → planner import cycle (planner is a dependency
+# of executors via :class:`LLMPlanner`). These patterns are STRUCTURAL
+# inference over goldfive-emitted ids, not over user-content text — so
+# they don't violate the no-regex-heuristics-on-NL contract
+# (``feedback_no_regex_heuristics``).
+_RETRY_PREFIX_RE = re.compile(r"^retry(?:\d+)?_")
+#: Match a trailing ``_v<N>`` suffix on a task id (``t0_v2`` ⇒ root ``t0``).
+_VERSION_SUFFIX_RE = re.compile(r"_v\d+$")
+
+
+def _strip_retry_prefix_once(task_id: str) -> str:
+    """Strip exactly one ``retry_`` / ``retry<N>_`` prefix if present.
+
+    Returns the original id when no prefix is present. Differs from
+    :func:`goldfive.executors.sequential._lineage_root` in that this
+    is single-shot (one peel) — used by backfill to find the immediate
+    predecessor candidate of a single retry name. The full lineage
+    root is still useful for executor budgeting; the single-step peel
+    is the right granularity for "retry of WHICH task."
+    """
+    if not task_id:
+        return task_id
+    return _RETRY_PREFIX_RE.sub("", task_id, count=1)
+
+
+def _candidate_predecessor_id(task_id: str) -> str:
+    """Return the most likely predecessor id for a retry/version name.
+
+    Two patterns, tried in order:
+
+    * ``retry_<root>`` / ``retry<N>_<root>`` ⇒ ``<root>``.
+    * ``<root>_v<N>`` ⇒ ``<root>``.
+
+    Returns ``""`` when neither pattern matches (no inference). This is
+    deterministic structural inference — the candidate must still
+    resolve against the prior plan AND have a retry-warranting status
+    before backfill happens; see :func:`_backfill_retry_supersedes`.
+    """
+    if not task_id:
+        return ""
+    stripped = _strip_retry_prefix_once(task_id)
+    if stripped != task_id:
+        return stripped
+    # Try _v<N> suffix.
+    suffix_stripped = _VERSION_SUFFIX_RE.sub("", task_id)
+    if suffix_stripped != task_id and suffix_stripped:
+        return suffix_stripped
+    return ""
+
+
+def _backfill_retry_supersedes(revised: Plan, *, prior: Plan) -> None:
+    """In-place backfill ``Task.supersedes`` for retry-named tasks.
+
+    Goldfive#213 — when a planner LLM emits a retry-shaped task name
+    (``retry_t0``, ``t0_v2``) but forgets to populate the structural
+    ``supersedes`` link, replacement detection in
+    :func:`goldfive.executors.sequential._has_live_replacement` falls
+    through to the conservative name-pattern fallback. That makes a
+    COMPLETED retry incapable of satisfying the FAILED predecessor
+    (predecessors-as-replacements are chronologically ambiguous under
+    name-pattern alone). The fix is to make the structural link
+    deterministic at merge time so the executor's causal tier can use
+    it — no LLM trust, no prompt contract.
+
+    Backfill rule (per task in ``revised`` whose ``supersedes`` is
+    empty):
+
+    * Compute candidate predecessor id by stripping a leading
+      ``retry_`` / ``retry<N>_`` prefix OR a trailing ``_v<N>``
+      suffix (see :func:`_candidate_predecessor_id`).
+    * If the candidate exists in ``prior.tasks`` AND its status is
+      FAILED or CANCELLED (the retry-warranting set), set
+      ``task.supersedes = candidate``. Don't backfill against
+      COMPLETED, PENDING, RUNNING, or absent candidates — those would
+      be spurious links.
+    * Self-references (``task.supersedes == task.id``) are cleared
+      regardless. This is the v27 rev-2 anomaly where the LLM
+      mis-applied supersedes to an id-reused task. Empty-target
+      cleanup runs in :func:`_normalize_supersession_kinds` as a
+      defence in depth.
+
+    The post-backfill plan is still passed through
+    :func:`_normalize_supersession_kinds` to derive the right
+    ``supersedes_kind`` from old-task status — backfill ONLY sets the
+    target id; the kind is still status-driven.
+    """
+    if prior is None:
+        return
+    prior_by_id: dict[str, Task] = {t.id: t for t in prior.tasks if t.id}
+    for task in revised.tasks:
+        if not task.id:
+            continue
+        sup = (task.supersedes or "").strip()
+        # Self-reference cleanup runs unconditionally (defence in
+        # depth before normalize_supersession_kinds also runs).
+        if sup and sup == task.id:
+            task.supersedes = ""
+            sup = ""
+        if sup:
+            # LLM intent wins: never override an explicit link.
+            continue
+        candidate = _candidate_predecessor_id(task.id)
+        if not candidate or candidate == task.id:
+            continue
+        old = prior_by_id.get(candidate)
+        if old is None:
+            continue
+        if old.status not in _RETRY_WARRANTING_OLD_STATUSES:
+            continue
+        log.debug(
+            "planner: backfilling supersedes %r → %r on %r (prior status %s)",
+            task.id,
+            candidate,
+            task.id,
+            old.status.value,
+        )
+        task.supersedes = candidate
 
 
 #: Old-task statuses that don't require a supersedes link when dropped.
@@ -2102,6 +2255,17 @@ class LLMPlanner:
                     if attempt < attempts:
                         user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
                     continue
+            # goldfive#213: backfill ``Task.supersedes`` for retry-named
+            # tasks the LLM emitted without an explicit causal link.
+            # Mirrors the call in ``_user_steer_one_attempt``'s merge
+            # so that LOOPING_TOOL_CALL / LOOPING_REASONING refines (and
+            # any other path through ``_call_and_validate_refine``)
+            # benefit from causal replacement detection identically to
+            # the user-steer path. Must run BEFORE
+            # ``_normalize_supersession_kinds`` so the kind coercion
+            # sees the backfilled link.
+            if prior_plan is not None:
+                _backfill_retry_supersedes(revised, prior=prior_plan)
             # goldfive#251: Option B validator -- coerce supersedes_kind
             # on every task based on old-task status. Runs before
             # ``revised.validate`` so the structural validator sees
@@ -3054,6 +3218,18 @@ class LLMPlanner:
         if fresh is None:
             return None, "parsed JSON did not contain a usable plan"
 
+        # goldfive#213: backfill ``Task.supersedes`` for retry-named
+        # tasks (``retry_t0``, ``t0_v2``) when the LLM forgot the
+        # structural link. Pure structural inference over goldfive's
+        # own id conventions — no LLM-trust, no prompt contract.
+        # Runs against ``fresh`` (not the post-merge plan) so the
+        # predecessor candidates are resolved against the FULL prior
+        # plan (including completed tasks that were dropped from
+        # ``fresh``). This makes the executor's causal-tier
+        # replacement detection work even for plans where the LLM
+        # didn't populate ``supersedes``.
+        _backfill_retry_supersedes(fresh, prior=plan)
+
         # Prepend completed tasks verbatim; drop any new task whose id
         # collides with a completed id so lineage ids stay stable.
         new_pending = [t for t in fresh.tasks if t.id not in completed_ids]
@@ -3101,13 +3277,14 @@ class LLMPlanner:
             revision_index=plan.revision_index + 1,
         )
         # goldfive#251 Option B: coerce supersedes_kind on every merged
-        # task based on the OLD-task status in the prior plan. Mirrors
-        # the same call in :meth:`_refine_user`'s validation loop. The
+        # task based on the OLD-task status in the prior plan. The
         # evolution path (id reuse without supersedes) is unaffected;
-        # the supersede-with-fresh-id path now gets the same parity
-        # the refine_user path has — an LLM that sets
-        # ``supersedes_kind=UNSPECIFIED`` against a prior PENDING is
-        # coerced to ``REPLACE`` so the executor's pin-redirect runs.
+        # the supersede-with-fresh-id path gets parity with the
+        # refine_user path — an LLM that sets ``supersedes_kind=UNSPECIFIED``
+        # against a prior PENDING is coerced to ``REPLACE`` so the
+        # executor's pin-redirect runs. Runs AFTER the goldfive#213
+        # backfill (above) so the kind is derived against any
+        # freshly-populated retry link.
         _normalize_supersession_kinds(merged_plan, prior=plan)
         try:
             merged_plan.validate(for_revision=True, prior=plan)
