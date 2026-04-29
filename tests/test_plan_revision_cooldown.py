@@ -119,12 +119,14 @@ def _drift(
     task_id: str = "t1",
     severity: DriftSeverity = DriftSeverity.WARNING,
     detail: str = "drift",
+    agent_id: str = "",
 ) -> DriftEvent:
     return DriftEvent(
         kind=kind,
         severity=severity,
         detail=detail,
         current_task_id=task_id,
+        current_agent_id=agent_id,
     )
 
 
@@ -171,15 +173,24 @@ async def test_two_off_topic_drifts_within_window_emit_one_plan_revised(
 async def test_two_off_topic_drifts_past_cooldown_emit_twice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two OFF_TOPIC drifts 35s apart -> both plan_revised emissions fire."""
+    """Two OFF_TOPIC drifts 35s apart -> both plan_revised emissions fire.
+
+    Distinct ``current_agent_id`` per emit so the I5 per-condition gate
+    (kind+task+agent within a turn) doesn't fold them onto the same
+    condition; the time-based cooldown under test is orthogonal.
+    """
     steerer, session, sink, planner = _build(cooldown=30.0)
 
     clock = [1000.0]
     monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: clock[0])
 
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC), session)
+    await steerer._handle_drift(
+        _drift(DriftKind.OFF_TOPIC, agent_id="agent-a"), session
+    )
     clock[0] += 35.0
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC), session)
+    await steerer._handle_drift(
+        _drift(DriftKind.OFF_TOPIC, agent_id="agent-b"), session
+    )
 
     assert _plan_revised_count(sink) == 2
     assert len(planner.refine_calls) == 2
@@ -300,16 +311,22 @@ async def test_goal_drift_does_not_consume_cooldown(
 async def test_cooldown_zero_disables_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     """``plan_revision_cooldown_seconds=0.0`` disables the cooldown entirely.
 
-    Two back-to-back identical drifts both replan.
+    Two back-to-back drifts both replan when both the time-based cooldown
+    and the I5 per-condition gate are bypassed (distinct
+    ``current_agent_id`` mints fresh conditions for the latter).
     """
     steerer, session, sink, planner = _build(cooldown=0.0)
 
     clock = [1000.0]
     monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: clock[0])
 
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC), session)
-    # Same tick; with cooldown==0 the gate no-ops.
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC), session)
+    await steerer._handle_drift(
+        _drift(DriftKind.OFF_TOPIC, agent_id="agent-a"), session
+    )
+    # Same tick; with cooldown==0 and a fresh agent_id, both gates no-op.
+    await steerer._handle_drift(
+        _drift(DriftKind.OFF_TOPIC, agent_id="agent-b"), session
+    )
 
     assert _plan_revised_count(sink) == 2
     assert len(planner.refine_calls) == 2

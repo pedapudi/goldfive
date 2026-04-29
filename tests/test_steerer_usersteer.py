@@ -306,18 +306,18 @@ async def test_observe_dedupe_does_not_affect_heuristic_drifts() -> None:
     content-based classifiers (tool errors, refusals, loops) must
     remain free-running so repeated heuristic signals still escalate.
 
-    This test deliberately fires two identical back-to-back tool-error
-    drifts, which would otherwise be suppressed by the plan-revision
-    cooldown (goldfive feedback-loop fix). The cooldown is an
-    orthogonal rate limit covered by
-    ``tests/test_plan_revision_cooldown.py``; here we disable it so
-    the dedup-set assertion can stand on its own.
+    This test deliberately fires two heuristic tool-error drifts on
+    DIFFERENT current_task_ids so each opens a fresh drift condition
+    (goldfive I5 — same kind+task within a turn now collapses onto one
+    refine; cross-task dispatches still refine independently). The
+    plan-revision cooldown is also hot-patched off so a co-located
+    cluster doesn't shadow the dedupe-set assertion.
     """
     steerer, session, _sink, planner = _bind_fresh()
     # Hot-patch the cooldown off for this test only. ``_bind_fresh``
     # builds a default-configured steerer; we need the cooldown window
-    # at 0 so the two identical tool-error observations below both
-    # trigger refine.
+    # at 0 so the two tool-error observations below both reach the
+    # refine path.
     steerer._plan_revision_cooldown_seconds = 0.0
 
     # A steer populates processed_steer_ids.
@@ -327,11 +327,13 @@ async def test_observe_dedupe_does_not_affect_heuristic_drifts() -> None:
         payload={"note": "go", "annotation_id": "ann_s"},
     )
     await steerer.observe(msg, session)
-    # A tool-error event — classified as TOOL_ERROR, must still emit.
-    await steerer.observe({"error": "boom"}, session)
-    await steerer.observe({"error": "boom"}, session)
+    # Two tool-error events on DIFFERENT pinned tasks — each is its own
+    # drift condition (per-condition gate is keyed on kind+task+agent
+    # within a turn) and therefore gets its own refine.
+    await steerer.observe({"error": "boom", "task_id": "t1"}, session)
+    await steerer.observe({"error": "boom", "task_id": "t2"}, session)
 
-    # planner.refine: 1 steer + 2 tool_error observations.
+    # planner.refine: 1 steer + 2 tool_error observations across distinct tasks.
     assert len(planner.refine_calls) == 3
 
 
