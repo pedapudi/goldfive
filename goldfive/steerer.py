@@ -2871,6 +2871,14 @@ class DefaultSteerer:
             )
             await self._register_refine_failure(session, drift, counter_key)
             return
+        # I4 fix: fold runtime terminal statuses from the prior plan
+        # onto the revised plan BEFORE validation. A task that was
+        # cancelled / failed / NOT_NEEDED out-of-band between revisions
+        # (e.g. overlay reap → NOT_NEEDED, executor reachability audit
+        # → CANCELLED, coordinator reporting-tool → COMPLETED) should
+        # carry that status into the persisted snapshot, even when the
+        # LLM's view of the prior plan was stale.
+        self._fold_runtime_terminal_statuses(revised, session.plan)
         try:
             revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
@@ -4059,6 +4067,10 @@ class DefaultSteerer:
             )
             await self._register_refine_failure(session, drift, counter_key)
             return
+        # I4 fix: fold runtime terminal statuses from the prior plan
+        # onto the revised plan BEFORE validation (see _handle_drift
+        # for the full rationale).
+        self._fold_runtime_terminal_statuses(revised, session.plan)
         try:
             revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
@@ -4311,8 +4323,15 @@ class DefaultSteerer:
                 # Pivot: validate structurally only. Rule 6 (terminal
                 # preservation) is intentionally skipped — the user is
                 # replacing the prior plan, not revising it.
+                #
+                # No fold for pivots — the user is replacing the prior
+                # plan; runtime terminal statuses from the discarded
+                # plan are not relevant to the new sub-DAG.
                 plan.validate(for_revision=True, prior=None)
             else:
+                # I4 fix: fold runtime terminal statuses from the prior
+                # plan onto the candidate before validation.
+                self._fold_runtime_terminal_statuses(plan, session.plan)
                 plan.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
             await self._emit_drift_detected(
@@ -4507,6 +4526,12 @@ class DefaultSteerer:
         # Branch 1: try the LLM's revision if it parses + validates.
         chosen: Plan | None = None
         if llm_revision is not None:
+            # I4 fix: fold runtime terminal statuses from the prior plan
+            # onto the LLM revision before validation. Without this, an
+            # NOT_NEEDED reaped task that the LLM regressed to PENDING
+            # would force the deterministic-minimum fallback even when
+            # the LLM's *new* work was otherwise sound.
+            self._fold_runtime_terminal_statuses(llm_revision, prior)
             try:
                 llm_revision.validate(for_revision=True, prior=prior)
                 chosen = llm_revision
@@ -4652,6 +4677,12 @@ class DefaultSteerer:
         if apply_user_steer_state:
             await self._apply_user_steer_state(drift, session)
         await self._emit_drift_detected(session, drift)
+        # I4 fix: fold runtime terminal statuses from the prior plan
+        # onto the revised plan BEFORE validation. This is the path
+        # that NEW_WORK_DISCOVERED installs (Runner._install_revision)
+        # and USER_STEER ControlMessage installs travel through, which
+        # is where the v24 phantom-state regression was observed.
+        self._fold_runtime_terminal_statuses(revised_plan, session.plan)
         try:
             revised_plan.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
@@ -5170,6 +5201,80 @@ class DefaultSteerer:
             )
 
     @staticmethod
+    def _fold_runtime_terminal_statuses(revised: Plan, prior: Plan | None) -> list[str]:
+        """Fold runtime terminal statuses from ``prior`` onto ``revised``.
+
+        The persistence-boundary fix for the I4 phantom-state class of
+        bugs (escalation report iter_1 §I4, v24 session
+        ``2a324f78``): runtime terminal transitions emitted out-of-band
+        between revisions — the overlay-reaper's NOT_NEEDED reap, the
+        SequentialExecutor's reachability-audit cancels, an explicit
+        ``mark_task_*`` call from a coordinator's reporting-tool — all
+        mutate ``session.plan.tasks[*].status`` in place but the next
+        ``planner.refine`` / ``planner.handle_turn`` invocation builds
+        its candidate plan from the LLM's view, which may have lost or
+        regressed those terminal statuses.
+
+        For each task ``t`` in ``revised`` whose id matches a task in
+        ``prior`` with a status in :data:`TERMINAL_TASK_STATUSES`:
+
+        * If ``revised``'s entry is non-terminal (PENDING / RUNNING /
+          BLOCKED), OVERWRITE its status with the prior terminal status
+          and copy ``cancel_reason`` so the persisted snapshot matches
+          what actually happened.
+        * If ``revised`` already carries the same terminal status, no-op.
+        * If ``revised`` carries a *different* terminal status — a
+          genuine regression we must NOT silently rewrite — leave it
+          alone so the validator catches it.
+
+        Mutates ``revised`` in place. Returns the list of folded task
+        ids for log/test introspection.
+
+        Anti-pattern note: this is **not** a validator relaxation. The
+        validator (``Plan.validate(for_revision=True, prior=...)``)
+        remains the source of truth for terminal-task preservation. The
+        fold corrects the LLM's output to match runtime reality
+        BEFORE validation runs, so the validator only fires on a true
+        regression (e.g. terminal→different-terminal) rather than on
+        an ordinary "the LLM forgot a NOT_NEEDED reap fired since its
+        prompt was authored."
+        """
+        if prior is None or not getattr(prior, "tasks", None):
+            return []
+        prior_terminal: dict[str, Task] = {
+            t.id: t
+            for t in prior.tasks
+            if t.id and t.status in TERMINAL_TASK_STATUSES
+        }
+        if not prior_terminal:
+            return []
+        folded: list[str] = []
+        for t in revised.tasks:
+            prior_t = prior_terminal.get(t.id)
+            if prior_t is None:
+                continue
+            if t.status is prior_t.status:
+                continue
+            if t.status in TERMINAL_TASK_STATUSES:
+                # Different terminal in the revised plan — a genuine
+                # regression. Do not silently rewrite; let the
+                # validator surface it as SCHEMA_VIOLATION.
+                continue
+            # Non-terminal in revised, terminal in prior → fold.
+            t.status = prior_t.status
+            if not t.cancel_reason and prior_t.cancel_reason:
+                t.cancel_reason = prior_t.cancel_reason
+            folded.append(t.id)
+        if folded:
+            log.info(
+                "DefaultSteerer._fold_runtime_terminal_statuses: "
+                "folded %d task(s) from prior runtime state: %s",
+                len(folded),
+                ", ".join(folded),
+            )
+        return folded
+
+    @staticmethod
     def _apply_revision(session: Session, revised: Plan, drift: DriftEvent) -> None:
         """Stamp revision metadata and install ``revised`` on the session.
 
@@ -5182,8 +5287,19 @@ class DefaultSteerer:
         without corresponding plan events; without this log line a
         silent install (e.g. an exception in ``_emit_plan_revised``
         right after) leaves no goldfive-side trace of the swap.
+
+        Defensive fold (I4 fix): re-applies
+        :meth:`_fold_runtime_terminal_statuses` against ``session.plan``
+        even though install paths fold before validation. Idempotent —
+        a no-op if the caller already folded — but a last-line guard
+        against any future install path that forgets to fold before
+        calling here.
         """
         prev = session.plan
+        # I4 fix (defensive): fold runtime terminal statuses even if the
+        # caller already did. Idempotent — if every task's status
+        # already matches prior's terminal, this is a no-op.
+        DefaultSteerer._fold_runtime_terminal_statuses(revised, prev)
         prior_id = (getattr(prev, "id", "") or "") if prev is not None else ""
         next_index = (prev.revision_index + 1) if prev is not None else 1
         if revised.revision_index < next_index:

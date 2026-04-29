@@ -954,17 +954,24 @@ async def test_observe_rejects_revised_plan_with_unknown_edge() -> None:
     assert "unknown task id" in second.detail
 
 
-async def test_apply_revision_emits_schema_violation_on_terminal_regression() -> None:
-    """A refine that regresses a terminal task's status is rejected.
+async def test_apply_revision_silently_folds_terminal_regression(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refine that regresses a terminal task's status is silently folded.
 
-    PLAN-LIFECYCLE.md §3.1: terminal tasks are frozen — once a task
-    lands in COMPLETED / FAILED / CANCELLED, subsequent revisions must
-    preserve id AND status. The steerer must reject a revision that
-    flips a previously-COMPLETED task back to PENDING, emit a CRITICAL
-    SCHEMA_VIOLATION drift with the validator's reason, and keep the
-    original plan installed.
+    PLAN-LIFECYCLE.md §3.1 invariant (terminal tasks are frozen) is
+    preserved by the persistence-boundary fold added for the I4
+    phantom-state fix (escalation iter_1 §I4). When the planner
+    returns a revision where ``t1`` has regressed from COMPLETED back
+    to PENDING (typically because the LLM's view of the prior plan was
+    stale relative to runtime mutations), the steerer's
+    ``_fold_runtime_terminal_statuses`` overwrites the regressed
+    status with the prior terminal value BEFORE validation. The new
+    plan therefore validates and lands with ``t1`` still COMPLETED —
+    no SCHEMA_VIOLATION emitted, but the invariant still holds at
+    persistence time.
     """
-    from goldfive.pb.goldfive.v1 import types_pb2
+    import logging
 
     # Seed the session with a plan where t1 is COMPLETED, t2 is PENDING.
     prior = Plan(
@@ -977,35 +984,53 @@ async def test_apply_revision_emits_schema_violation_on_terminal_regression() ->
         ],
         edges=[TaskEdge("t1", "t2")],
     )
-    # Bad revision: t1 has regressed from COMPLETED -> PENDING.
-    bad_revised = Plan(
+    # Stale revision from the LLM: t1 has regressed from COMPLETED ->
+    # PENDING and a fresh task ``t3`` was introduced (so the post-fold
+    # revision is not structurally identical to the prior, which would
+    # otherwise short-circuit to HUMAN_INTERVENTION_REQUIRED).
+    stale_revised = Plan(
         id="p1",
         run_id="r1",
         goal_ids=["g1"],
         tasks=[
             Task(id="t1", title="done", status=TaskStatus.PENDING),
             Task(id="t2", title="next", status=TaskStatus.PENDING),
+            Task(id="t3", title="new", status=TaskStatus.PENDING),
         ],
-        edges=[TaskEdge("t1", "t2")],
+        edges=[TaskEdge("t1", "t2"), TaskEdge("t1", "t3")],
     )
-    planner = StubPlanner(revised=bad_revised)
+    planner = StubPlanner(revised=stale_revised)
     sink = ListSink()
     steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session(plan=prior)
 
-    await steerer.observe({"error": "trigger refine"}, session)
+    with caplog.at_level(logging.INFO, logger="goldfive.steerer"):
+        await steerer.observe({"error": "trigger refine"}, session)
 
-    # Plan unchanged; two drift events (the original trigger + the
-    # schema-violation report); no PlanRevised emitted.
-    assert session.plan is prior
+    # Plan was installed (revision_index advanced) and t1 is still
+    # COMPLETED — the fold corrected the regression.
+    assert session.plan is stale_revised
+    assert session.plan.revision_index == prior.revision_index + 1
+    new_by_id = {t.id: t for t in session.plan.tasks}
+    assert new_by_id["t1"].status is TaskStatus.COMPLETED
+    assert new_by_id["t3"].status is TaskStatus.PENDING
+    # The fold logged the silent correction at INFO so operators can
+    # grep for it in production.
+    assert any(
+        "_fold_runtime_terminal_statuses" in r.message and "t1" in r.message
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
+    # PlanRevised was emitted; no SCHEMA_VIOLATION.
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
-    assert kinds == ["drift_detected", "drift_detected"]
-    second = sink.proto_events[1].drift_detected
-    assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
-    assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
-    assert "plan validation failed" in second.detail
-    assert "terminal task 't1' regressed" in second.detail
+    assert "plan_revised" in kinds, kinds
+    schema_violations = [
+        e
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+        and "plan validation failed" in e.drift_detected.detail
+    ]
+    assert not schema_violations, schema_violations
 
 
 async def test_apply_revision_emits_schema_violation_on_missing_terminal_edge() -> None:
