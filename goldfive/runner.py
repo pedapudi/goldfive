@@ -58,6 +58,7 @@ from goldfive.events import (
     run_aborted_event,
     run_started_event,
 )
+from goldfive.executors.sequential import _pending_task_ids
 from goldfive.goal_deriver import PassthroughGoalDeriver
 from goldfive.reporting import select_reporting_tools
 from goldfive.results import ExecutionOutcome
@@ -69,6 +70,7 @@ from goldfive.types import (
     Goal,
     Plan,
     Session,
+    TaskStatus,
 )
 
 if TYPE_CHECKING:
@@ -1325,6 +1327,24 @@ class Runner:
             anchor = self._last_session_by_key.get(key)
             if not (announced and anchor is not None):
                 continue
+            # goldfive#212: audit and cancel any orphan PENDING tasks
+            # BEFORE the ConversationEnded marker. At conversation end
+            # there is no next turn that could engage them, so every
+            # PENDING task is by definition orphaned (no reachability
+            # split applies — that's a per-turn concern). The audit is
+            # idempotent: ``mark_task_cancelled`` no-ops on terminal
+            # tasks, and the outer ``self._closed`` gate prevents
+            # double-firing across repeated ``close()`` calls.
+            try:
+                await self._audit_conversation_pending_at_close(
+                    conversation=conv,
+                    anchor=anchor,
+                    key=key,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "conversation-end orphan-PENDING audit raised: %s", exc
+                )
             try:
                 await self._emit_conversation_ended(
                     conversation=conv,
@@ -1702,6 +1722,52 @@ class Runner:
             session_id=session.id,
         )
         await emit(self.sinks, evt)
+
+    async def _audit_conversation_pending_at_close(
+        self,
+        *,
+        conversation: Conversation,  # noqa: ARG002
+        anchor: Session | None,
+        key: str,
+    ) -> None:
+        """Cancel any orphan PENDING tasks at conversation end (goldfive#212).
+
+        Counterpart to the per-turn reachability audit in
+        :class:`SequentialExecutor` (PR #339): there, a PENDING task is
+        orphaned only when every path to it crosses a CANCELLED / FAILED
+        predecessor. At conversation end there is no next turn — so any
+        task still PENDING is by definition orphaned (no engaging turn
+        will ever pick it up). The audit reuses the existing
+        ``TaskCancelled`` envelope with the structured cancel reason
+        ``conversation_ended:no_engaging_turn`` so harmonograf's
+        Trajectory view can render it without a proto change.
+
+        Idempotent: ``mark_task_cancelled`` no-ops on already-terminal
+        tasks (steerer.py:1074), and the outer ``Runner.close()`` is
+        gated on ``self._closed`` so a second ``close()`` walk simply
+        finds every previously-PENDING task already CANCELLED and emits
+        nothing.
+        """
+        if anchor is None or anchor.plan is None:
+            return
+        pending = _pending_task_ids(anchor.plan)
+        if not pending:
+            return
+        for tid in pending:
+            await self.steerer.transition(
+                tid,
+                TaskStatus.CANCELLED,
+                detail="conversation ended; no further turns to engage this work",
+                cancel_reason="conversation_ended:no_engaging_turn",
+                session=anchor,
+            )
+        log.info(
+            "Runner._audit_conversation_pending_at_close: cancelled %d "
+            "orphan PENDING task(s) for key=%r: %s",
+            len(pending),
+            key,
+            ", ".join(pending),
+        )
 
     async def _emit_conversation_ended(
         self,
