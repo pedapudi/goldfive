@@ -129,6 +129,79 @@ markdown fences. Schema:
 """
 
 
+# goldfive#214 (iter-7): the canonical SUPERSESSION INVARIANT block.
+# Embedded verbatim in the user-facing refine / steer / looping system
+# prompts so the planner LLM receives one consistent instruction
+# regardless of drift kind. Backstops at the merge layer:
+#   * _backfill_retry_supersedes covers retry_X / X_v2 patterns when
+#     the LLM forgets supersedes (legacy goldfive-emitted patterns).
+#   * _normalize_supersession_kinds coerces wrong supersedes_kind based
+#     on old-task status.
+#   * _has_live_replacement causal tier consumes the supersedes link.
+# These run unchanged. Prompt strengthening reduces how often the
+# safety nets need to fire — it does NOT replace them.
+_SUPERSESSION_INVARIANT = (
+    "SUPERSESSION INVARIANT — REUSE-OR-SUPERSEDE (mutually exclusive):\n"
+    "\n"
+    "Whenever a task in your response carries forward, retries, fixes, or\n"
+    "re-does work from a prior task, you MUST pick exactly one of these two\n"
+    "shapes — never both, never neither:\n"
+    "\n"
+    "  (a) REUSE THE PRIOR ID. The continuing task keeps the prior task's\n"
+    "      `id`. Retitle / rewrite / reassign as needed; identity is the id.\n"
+    "      Do NOT set `supersedes` (id reuse already encodes continuity).\n"
+    "      A COMPLETED task cannot regress to PENDING under a reused id —\n"
+    "      if you need to redo completed work, use shape (b) with\n"
+    "      `supersedes_kind: CORRECT`, not id reuse.\n"
+    "\n"
+    "  (b) MINT A NEW ID + SUPERSEDES. The continuing task gets a fresh `id`\n"
+    "      AND `\"supersedes\": \"<prior_id>\"` AND `\"supersedes_kind\"`. Use this\n"
+    "      whenever the new id differs from the prior id for ANY reason —\n"
+    "      terminal failure (FAILED/CANCELLED), terminal cancellation,\n"
+    "      structural retry (`retry_X`, `X_v2`), corrective fix\n"
+    "      (`fix_X`, `redo_X`, `revised_X`, etc.), renamed evolution, or\n"
+    "      replacement under a different agent. The naming convention does\n"
+    "      NOT matter; if a new task semantically replaces an older one and\n"
+    "      its `id` is different, `supersedes` is REQUIRED.\n"
+    "\n"
+    "`supersedes_kind` rule:\n"
+    "  * REPLACE — superseded task is PENDING / RUNNING / BLOCKED /\n"
+    "    FAILED / CANCELLED (the new task takes its slot).\n"
+    "  * CORRECT — superseded task is COMPLETED but its output is\n"
+    "    drift-contaminated (the old task stays in the plan as a historical\n"
+    "    COMPLETED node; an edge old -> new is added).\n"
+    "\n"
+    "Forgetting `supersedes` on a renamed replacement is a runtime bug: the\n"
+    "executor cannot link the new task to the old one, the predecessor is\n"
+    "treated as fatally-failed, and the run aborts even though the\n"
+    "replacement is healthy."
+)
+
+# Few-shot examples paired (positive REPLACE + negative EVOLUTION) to
+# anchor the mutual-exclusivity framing. Without the negative example,
+# the LLM tends to over-apply supersedes on legitimate id-reuse-with-
+# evolved-title cases — the iter-7 reviewer's risk-mitigation note.
+_SUPERSESSION_EXAMPLES = (
+    "EXAMPLES:\n"
+    "\n"
+    "  Reused id (evolution; no supersedes):\n"
+    '    Prior: {"id": "research_solar", "title": "Research solar panels"}\n'
+    '    New:   {"id": "research_solar", "title": "Research solar + battery\n'
+    '            costs", "assignee_agent_id": "researcher"}\n'
+    "    No supersedes — id reuse already encodes that this is the same\n"
+    "    logical step.\n"
+    "\n"
+    "  New id with supersedes (replacement; ANY name shape):\n"
+    '    Prior: {"id": "review_slides", "status": "FAILED"}\n'
+    '    New:   {"id": "fix_review_slides", "title": "Re-do slide review\n'
+    '            with cleaner outline", "supersedes": "review_slides",\n'
+    '            "supersedes_kind": "REPLACE"}\n'
+    "    The id `fix_review_slides` is fresh; supersedes is REQUIRED. The\n"
+    "    same applies to `redo_review_slides`, `review_slides_again`,\n"
+    "    `slide_review_2`, etc."
+)
+
+
 _LOOPING_TOOL_CALL_SYSTEM_PROMPT = """\
 You are a task-planning assistant for a multi-agent system. The
 adapter's loop detector has just flagged a task whose agent is stuck
@@ -190,7 +263,7 @@ Respond with a single JSON object and NOTHING ELSE:
   ],
   "edges": [{"from_task_id": "...", "to_task_id": "..."}]
 }
-"""
+""" + "\n" + _SUPERSESSION_INVARIANT + "\n"
 
 
 _USER_STEER_SYSTEM_PROMPT = """\
@@ -275,7 +348,7 @@ Respond with a single JSON object and NOTHING ELSE:
   ],
   "edges": [{"from_task_id": "...", "to_task_id": "..."}]
 }
-"""
+""" + "\n" + _SUPERSESSION_INVARIANT + "\n\n" + _SUPERSESSION_EXAMPLES + "\n"
 
 
 _PLAN_DIVERGENCE_SYSTEM_PROMPT = """\
@@ -453,7 +526,7 @@ Respond with a single JSON object and NOTHING ELSE:
 
 If nothing needs to change, return the current plan unchanged (but
 still as a complete JSON plan, not an empty object).
-"""
+""" + "\n" + _SUPERSESSION_INVARIANT + "\n\n" + _SUPERSESSION_EXAMPLES + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1675,7 +1748,8 @@ class LLMPlanner:
             "tracks task identity across revisions; minting a new id for "
             "continuing work makes the runtime treat it as brand-new and "
             "re-runs work the operator just told you to keep. Reusable "
-            f"prior PENDING ids: {prior_pending_ids}"
+            f"prior PENDING ids: {prior_pending_ids}\n"
+            "7. " + _SUPERSESSION_INVARIANT
         )
         if source == "goldfive":
             directive_header = (
