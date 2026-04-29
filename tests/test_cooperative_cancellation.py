@@ -153,8 +153,29 @@ class _FakeToolContext(_FakeCallbackContext):
 
 
 class _FakeTool:
+    """FunctionTool-shaped stub: ``.name`` + ``.func`` (a callable)."""
+
     def __init__(self, *, name: str) -> None:
         self.name = name
+        self.func = lambda **_kw: {"ok": True}
+
+
+class _FakeAgentTool:
+    """AgentTool-shaped stub: ``.name`` + ``.agent`` (a sub-agent).
+
+    Mirrors ADK's :class:`google.adk.tools.AgentTool` discriminator —
+    the cooperative-cancel short-circuit in
+    :meth:`~goldfive.adapters._adk_plugin._GoldfiveADKPlugin.before_tool_callback`
+    distinguishes AgentTool dispatches from plain FunctionTool dispatches
+    via :func:`_is_agent_tool_dispatch`. The duck-typed branch keys on
+    ``getattr(tool, "agent", None) is not None``, so this stub trips
+    the AgentTool path even when the optional ``adk`` extra is not
+    importable in the test environment.
+    """
+
+    def __init__(self, *, name: str, agent_name: str = "sub_agent") -> None:
+        self.name = name
+        self.agent = _FakeAgent(name=agent_name)
 
 
 class _StubAdapter:
@@ -319,11 +340,15 @@ async def test_cancel_flag_consumed_on_first_callback() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. before_tool_callback returns {"status": "cancelled"} when cancelled
+# 3. before_tool_callback returns {"status": "cancelled"} for AgentTool
+#    dispatches when the invocation is cancelled. FunctionTool dispatches
+#    are NOT short-circuited (Bug C from v23 validation, goldfive#211610):
+#    short-circuiting them silently strands committed side-effects (e.g.
+#    write_webpage / patch_file file writes) on every supersede-cancel.
 # ---------------------------------------------------------------------------
 
 
-async def test_before_tool_returns_cancelled_status() -> None:
+async def test_before_tool_returns_cancelled_status_for_agent_tool() -> None:
     plugin, _sink, _session = _make_plugin()
     plugin.request_invocation_cancel(
         invocation_id="inv-1",
@@ -336,11 +361,107 @@ async def test_before_tool_returns_cancelled_status() -> None:
     )
     tool_ctx = _FakeToolContext(invocation_context=inv_ctx)
     response = await plugin.before_tool_callback(
-        tool=_FakeTool(name="search"),
+        tool=_FakeAgentTool(name="research_agent"),
         tool_args={"query": "test"},
         tool_context=tool_ctx,
     )
     assert response == {"status": "cancelled"}
+
+
+async def test_before_tool_does_not_short_circuit_function_tool_on_cancel() -> None:
+    """Bug C from v23 validation (goldfive#211610). Cancelling the
+    in-flight invocation must NOT cause a plain FunctionTool dispatch
+    (write_webpage, patch_file, …) to be skipped — the LLM has already
+    committed to the call (args chosen, function_call event emitted)
+    and the work is typically a side-effect (file write, DB row patch)
+    we want to land. The next ``before_model_callback`` short-circuits
+    the LLM call regardless, so the dispatch still ends cleanly.
+
+    A short-circuit here would synthesize ``{"status": "cancelled"}``
+    in place of the real tool result — exactly the v23 regression where
+    ``write_webpage`` / ``patch_file`` returned ``cancelled`` after a
+    GOAL_DRIFT-triggered supersede and no presentation file landed.
+    """
+    plugin, _sink, _session = _make_plugin()
+    plugin.request_invocation_cancel(
+        invocation_id="inv-1",
+        request=_make_request(drift_kind="goal_drift", reason="drift"),
+    )
+
+    inv_ctx = _FakeInvocationContext(
+        invocation_id="inv-1",
+        session_state={},
+    )
+    tool_ctx = _FakeToolContext(invocation_context=inv_ctx)
+    response = await plugin.before_tool_callback(
+        tool=_FakeTool(name="write_webpage"),
+        tool_args={"topic": "solar_flares", "html_content": "<html/>"},
+        tool_context=tool_ctx,
+    )
+    # No short-circuit — the callback returns ``None`` so ADK proceeds
+    # to dispatch the real FunctionTool. ``{"status": "cancelled"}``
+    # would be the buggy response.
+    assert response is None
+    # The cancel-state flag is still pending — the next
+    # ``before_model_callback`` will consume it and emit the
+    # ``InvocationCancelled`` sink event there. Pre-fix this method
+    # consumed it, blocking the LLM-call short-circuit from firing.
+    assert plugin.peek_cancel_for_invocation("inv-1") is not None
+
+
+async def test_before_tool_real_adk_function_tool_runs_during_supersede(tmp_path: Any) -> None:
+    """End-to-end shape of Bug C: a real ADK ``FunctionTool`` whose
+    ``func`` writes a file must actually run when the in-flight
+    invocation has been flagged for a supersede-cancel. Pre-fix the
+    callback returned ``{"status": "cancelled"}`` and the file was
+    never written.
+
+    We don't drive a full ADK ``Runner`` here (the cooperative-cancel
+    contract is per-plugin-callback) — instead we assert the callback
+    contract: ``before_tool_callback(...)`` returns ``None`` so ADK
+    proceeds to dispatch the wrapped function. Then we manually invoke
+    the function to model what ADK would do post-callback, and assert
+    the side-effect landed.
+    """
+    pytest.importorskip("google.adk")
+    from google.adk.tools import FunctionTool
+
+    output_path = tmp_path / "solar_flares.html"
+
+    def write_webpage(topic: str, html_content: str) -> str:
+        output_path.write_text(html_content)
+        return f"Wrote {topic}"
+
+    tool = FunctionTool(write_webpage)
+
+    plugin, _sink, _session = _make_plugin()
+    plugin.request_invocation_cancel(
+        invocation_id="inv-1",
+        request=_make_request(drift_kind="goal_drift", reason="drift"),
+    )
+
+    inv_ctx = _FakeInvocationContext(
+        invocation_id="inv-1",
+        session_state={},
+    )
+    tool_ctx = _FakeToolContext(invocation_context=inv_ctx)
+    response = await plugin.before_tool_callback(
+        tool=tool,
+        tool_args={"topic": "solar_flares", "html_content": "<html>flares</html>"},
+        tool_context=tool_ctx,
+    )
+    # Callback returned ``None`` — ADK is told "proceed normally".
+    assert response is None, (
+        f"FunctionTool dispatch was short-circuited (response={response!r}); "
+        "Bug C regression — write_webpage / patch_file must land their work "
+        "even on supersede-cancel."
+    )
+
+    # Model what ADK does next: invoke the wrapped function. The
+    # side-effect must land.
+    write_webpage(topic="solar_flares", html_content="<html>flares</html>")
+    assert output_path.exists()
+    assert output_path.read_text() == "<html>flares</html>"
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +610,16 @@ async def test_cancel_noop_when_no_active_invocation() -> None:
 
 
 async def test_llm_visible_cancelled_response_is_minimal() -> None:
-    """The tool response returned to the LLM must be ``{"status":
+    """The AgentTool response returned to the LLM must be ``{"status":
     "cancelled"}`` — bare shape. No ``reason`` / ``detail`` /
     ``drift_kind`` leak that the parent LLM could pattern-match on
     and invent workarounds (lesson from goldfive#250 / #252 / #253).
+
+    Asserted on AgentTool dispatch only — FunctionTool dispatches are
+    no longer short-circuited at this callback (Bug C from v23
+    validation, goldfive#211610). The minimal-shape invariant still
+    matters for the AgentTool path because the parent LLM reads that
+    response verbatim as the sub-agent's "result".
     """
     plugin, _sink, _session = _make_plugin()
     request = _make_request(
@@ -507,7 +634,7 @@ async def test_llm_visible_cancelled_response_is_minimal() -> None:
         session_state={},
     )
     response = await plugin.before_tool_callback(
-        tool=_FakeTool(name="search"),
+        tool=_FakeAgentTool(name="researcher"),
         tool_args={},
         tool_context=_FakeToolContext(invocation_context=inv_ctx),
     )

@@ -120,8 +120,27 @@ class _FakeToolContext(_FakeCallbackContext):
 
 
 class _FakeTool:
+    """FunctionTool-shaped stub (``.name`` + ``.func``)."""
+
     def __init__(self, *, name: str) -> None:
         self.name = name
+        self.func = lambda **_kw: {"ok": True}
+
+
+class _FakeAgentTool:
+    """AgentTool-shaped stub (``.name`` + ``.agent``).
+
+    Trips :func:`goldfive.adapters._adk_plugin._is_agent_tool_dispatch`
+    via the ``.agent is not None`` duck-typed branch so the
+    cooperative-cancel short-circuit fires on this stub even when the
+    optional ``adk`` extra is absent. FunctionTool dispatches must NOT
+    short-circuit (Bug C / goldfive#211610) — those tests use
+    :class:`_FakeTool` instead.
+    """
+
+    def __init__(self, *, name: str) -> None:
+        self.name = name
+        self.agent = type("_FakeAgent", (), {"name": name})()
 
 
 class _FakeLlmRequest:
@@ -310,11 +329,17 @@ async def test_before_model_no_short_circuit_for_unrelated_invocation() -> None:
 
 
 async def test_before_tool_short_circuits_with_cancelled_status() -> None:
+    """AgentTool dispatch on a cancelled invocation short-circuits.
+
+    Plain FunctionTool dispatches no longer short-circuit at this
+    callback (Bug C / goldfive#211610) — see the companion FunctionTool
+    test in tests/test_cooperative_cancellation.py.
+    """
     plugin, sink = _make_plugin_with_ctx()
     plugin.request_invocation_cancel(invocation_id="inv-1", request=_make_request("inv-1"))
     inv_ctx = _FakeInvocationContext(invocation_id="inv-1")
     response = await plugin.before_tool_callback(
-        tool=_FakeTool(name="search"),
+        tool=_FakeAgentTool(name="researcher"),
         tool_args={"q": "x"},
         tool_context=_FakeToolContext(invocation_context=inv_ctx),
     )
@@ -324,24 +349,24 @@ async def test_before_tool_short_circuits_with_cancelled_status() -> None:
 
 
 async def test_before_tool_sticky_short_circuit_no_double_emit() -> None:
-    """Subsequent tool calls on a cancelled invocation also return the
-    cancelled status without re-emitting the sink event."""
+    """Subsequent AgentTool calls on a cancelled invocation also return
+    the cancelled status without re-emitting the sink event."""
     plugin, sink = _make_plugin_with_ctx()
     plugin.request_invocation_cancel(invocation_id="inv-1", request=_make_request("inv-1"))
     inv_ctx = _FakeInvocationContext(invocation_id="inv-1")
     tool_ctx = _FakeToolContext(invocation_context=inv_ctx)
 
-    # First tool call — consumes the marker, emits InvocationCancelled.
+    # First AgentTool call — consumes the marker, emits InvocationCancelled.
     r1 = await plugin.before_tool_callback(
-        tool=_FakeTool(name="search"),
+        tool=_FakeAgentTool(name="researcher"),
         tool_args={},
         tool_context=tool_ctx,
     )
     assert r1 == {"status": "cancelled"}
     assert _cancelled_event_count(sink) == 1
-    # Second tool call — sticky bit shorts the dispatch silently.
+    # Second AgentTool call — sticky bit shorts the dispatch silently.
     r2 = await plugin.before_tool_callback(
-        tool=_FakeTool(name="another_tool"),
+        tool=_FakeAgentTool(name="reviewer"),
         tool_args={},
         tool_context=tool_ctx,
     )
