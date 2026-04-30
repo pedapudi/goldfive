@@ -881,6 +881,16 @@ class Session:
     # ``run_started`` boundary via :meth:`DefaultSteerer.reset_for_turn`,
     # so a fresh turn always starts with empty outcomes (per-turn scope
     # is the natural boundary for retry budgets).
+    #
+    # Concurrency: the dict is lock-free single-writer-per-session.
+    # Reads and writes happen exclusively from ``DefaultSteerer``'s
+    # ``observe`` / ``_handle_drift`` / ``_promote_drift_to_steer``
+    # paths; ADK's adapter callback contract serialises drift delivery
+    # per session, so concurrent writes for the same Session do not
+    # arise in practice. Cross-session writes target distinct dicts
+    # (one per Session). The same property held for the predecessor
+    # ``refine_failure_counts`` field — the lock-free pattern is the
+    # established contract, not a regression.
     refine_outcomes: dict[tuple[str, str], RefineOutcome] = dataclasses.field(default_factory=dict)
     # Per-task ``time.monotonic()`` timestamp of the most recent
     # task-progress signal — set on ``mark_task_running``,

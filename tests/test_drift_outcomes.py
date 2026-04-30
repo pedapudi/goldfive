@@ -433,3 +433,132 @@ def _task_status(session: Session, task_id: str) -> TaskStatus:
         if t.id == task_id:
             return t.status
     raise AssertionError(f"task {task_id!r} missing from plan")
+
+
+# ---------------------------------------------------------------------------
+# 8. REPEATED_FAILURE direct-emit non-recursion. Pin the bypass-via-direct-
+# emit property: when threshold is crossed, the synthesised
+# REPEATED_FAILURE drift goes through ``_emit_drift_detected`` (NOT
+# ``observe`` / ``_handle_drift``) so it does not trigger another
+# refine attempt that would in turn emit another REPEATED_FAILURE...
+# ---------------------------------------------------------------------------
+
+
+async def test_repeated_failure_does_not_recurse_into_handle_drift() -> None:
+    """Threshold-crossing emits REPEATED_FAILURE via _emit_drift_detected
+    directly. _handle_drift must NOT be entered for that drift; otherwise
+    the threshold mechanism would re-fire and we'd have a feedback loop.
+    """
+    planner = StubPlanner(raise_exc=RuntimeError("boom"))
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    # Drive two failures to cross the threshold.
+    await steerer._handle_drift(_drift(), session)
+    await steerer._handle_drift(_drift(), session)
+
+    # The threshold-crossed REPEATED_FAILURE is in the event stream.
+    from goldfive.pb.goldfive.v1 import types_pb2  # noqa: PLC0415
+
+    repeated = [
+        e for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+        and e.drift_detected.kind == types_pb2.DRIFT_KIND_REPEATED_FAILURE
+    ]
+    assert len(repeated) == 1, (
+        f"expected exactly one REPEATED_FAILURE; got {len(repeated)} "
+        f"(recursion would produce many)"
+    )
+
+    # The REPEATED_FAILURE emit did NOT increment refine_outcomes for
+    # its own (kind, task) — that key should be absent (kind doesn't
+    # match any outcome write site).
+    repeated_key = (DriftKind.REPEATED_FAILURE.value, "t1")
+    assert session.refine_outcomes.get(repeated_key) is None, (
+        "REPEATED_FAILURE should not feed back into the outcome dict"
+    )
+
+    # Non-recursion property: REPEATED_FAILURE itself didn't trigger
+    # a refine attempt. (TASK_FAILED_FATAL fired by mark_task_failed
+    # IS expected to attempt one refine — different (kind, task) tuple,
+    # documented non-recursion seam.)
+    refine_kinds = [c["drift"].kind for c in planner.refine_calls]
+    assert DriftKind.REPEATED_FAILURE not in refine_kinds, (
+        "REPEATED_FAILURE must not trigger a refine attempt — it would "
+        "loop the threshold mechanism on itself"
+    )
+    # The original TOOL_ERROR drift hit the threshold cleanly: exactly
+    # REFINE_FAILURE_THRESHOLD attempts on that kind, no more.
+    tool_error_attempts = sum(1 for k in refine_kinds if k is DriftKind.TOOL_ERROR)
+    assert tool_error_attempts == DefaultSteerer.REFINE_FAILURE_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# 9. GOAL_DRIFT bypass. Trajectory-level drifts must always reach refine
+# regardless of prior outcome state — they have their own rate limiters
+# and must not be silenced by a stale (kind, task) gate.
+# ---------------------------------------------------------------------------
+
+
+async def test_goal_drift_bypasses_outcome_gate() -> None:
+    """Pre-seed a 'failed' outcome that's already crossed the threshold
+    for (GOAL_DRIFT, t1). A fresh GOAL_DRIFT must STILL attempt refine —
+    these drifts route operator/trajectory intent and must not be gated
+    by per-task outcome state.
+    """
+    revised = _make_plan()
+    planner = StubPlanner(revised=revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    # Pre-seed a terminal-state outcome that would gate any non-bypass
+    # drift.
+    key = (DriftKind.GOAL_DRIFT.value, "t1")
+    session.refine_outcomes[key] = RefineOutcome(state="failed", fail_count=99)
+
+    drift = _drift(kind=DriftKind.GOAL_DRIFT, severity=DriftSeverity.CRITICAL)
+    await steerer._handle_drift(drift, session)
+
+    # GOAL_DRIFT bypassed the gate and reached refine.
+    assert len(planner.refine_calls) == 1, (
+        "GOAL_DRIFT must bypass the outcome gate; expected refine to fire"
+    )
+
+    # _record_refine_outcome's USER/trajectory bypass means the entry
+    # is NOT overwritten by the GOAL_DRIFT path.
+    assert session.refine_outcomes[key].fail_count == 99
+
+
+# ---------------------------------------------------------------------------
+# 10. Promote-to-steer outcome semantics. The escalation ladder routes
+# severity-CRITICAL drifts through ``_promote_drift_to_steer``. The new
+# outcome gate must apply identically there — same key, same bypass,
+# same threshold trip.
+# ---------------------------------------------------------------------------
+
+
+async def test_promote_to_steer_writes_outcome_on_failure() -> None:
+    """A goldfive-promoted CRITICAL drift that fails to refine must
+    increment the same (kind, task) outcome counter as ``_handle_drift``
+    — the two paths share a contract.
+    """
+    planner = StubPlanner(raise_exc=RuntimeError("boom"))
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    drift = _drift(severity=DriftSeverity.CRITICAL)
+    # Direct invocation of the promote path's refine driver — the
+    # public surface that _handle_drift's CRITICAL fall-through uses.
+    await steerer._promote_drift_to_steer(drift, session)
+
+    key = (DriftKind.TOOL_ERROR.value, "t1")
+    outcome = session.refine_outcomes.get(key)
+    assert outcome is not None
+    assert outcome.state == "failed"
+    assert outcome.fail_count == 1
