@@ -415,7 +415,7 @@ plan's per-task status. It also:
   can count per-kind occurrences.
 - Rebuilds `session.completed_results` from `TaskCompleted.summary`.
 - Does **not** rebuild `session.reasoning_history`,
-  `session.recent_agent_activity`, `session.refine_failure_counts`,
+  `session.recent_agent_activity`, `session.refine_outcomes`,
   or `session.pending_approvals` — those live only in-process and
   are reset on resume.
 

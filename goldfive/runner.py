@@ -552,6 +552,14 @@ class Runner:
         # 3. Emit RunStarted before anything else for this turn.
         await self._emit_run_started(session, user_input)
 
+        # goldfive#215 (iter-8) P2: reset per-turn refine-outcome
+        # bookkeeping immediately after the run-started boundary so
+        # each turn starts with an empty outcome table. ``getattr``
+        # so custom steerers without the hook degrade gracefully.
+        _reset_for_turn = getattr(self.steerer, "reset_for_turn", None)
+        if callable(_reset_for_turn):
+            _reset_for_turn(session)
+
         # 3a. Seed session.plan with the prior plan (or Plan.empty()
         # on the very first turn) so :meth:`Planner.handle_turn` always
         # sees a non-None ``session.plan``. The Runner has a single

@@ -372,14 +372,18 @@ Four invariants govern the refine path:
 3. **Refine is throttled.** Multiple drifts of the same kind within
    `DEFAULT_REFINE_THROTTLE_SECONDS` (2s) collapse into one refine
    call. `critical` drifts bypass the throttle.
-4. **Refine failures back off.** `session.refine_failure_counts`
-   tracks consecutive `planner.refine()` failures per
-   `(drift.kind, current_task_id)`. Once the counter crosses
+4. **Refine failures back off.** `session.refine_outcomes` tracks the
+   per-`(drift.kind, current_task_id)` outcome of the last refine
+   attempt this turn (goldfive#215 P2). On `state="failed"` the
+   `fail_count` increments; once it crosses
    `DefaultSteerer.REFINE_FAILURE_THRESHOLD` (default `2`), the
    steerer marks the current task FAILED and emits a CRITICAL
    `REPEATED_FAILURE` drift — the run does not loop forever on a
-   refine that cannot make progress. The counter resets on a
-   successful refine.
+   refine that cannot make progress. A successful refine writes
+   `state="succeeded"` (so a same-(kind, task) drift on the same turn
+   skips refine — the prior refine already addressed it). The whole
+   table resets every `run_started` boundary
+   (`DefaultSteerer.reset_for_turn`).
 
 ## Tool-call drift classification
 

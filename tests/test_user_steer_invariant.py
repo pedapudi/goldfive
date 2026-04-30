@@ -533,23 +533,29 @@ async def test_install_user_steer_falls_back_on_invalid_llm_revision(
 
 
 # ---------------------------------------------------------------------------
-# Side-effect contract: ``session.refine_failure_counts`` is NOT touched
-# by the deterministic-fallback path. That counter is for goldfive-
+# Side-effect contract: ``session.refine_outcomes`` is NOT touched
+# by the deterministic-fallback path. That table is for goldfive-
 # authored autonomous refines (§4.5), not user-driven changes.
 # ---------------------------------------------------------------------------
 
 
-async def test_install_user_steer_does_not_touch_refine_failure_counts() -> None:
+async def test_install_user_steer_does_not_touch_refine_outcomes() -> None:
+    from goldfive.types import RefineOutcome
+
     prior = _plan_mixed_terminals()
     invalid = _llm_revision_drops_terminal(prior)
     assert invalid is not None
 
     steerer, _sink = _new_steerer()
     session = _new_session(prior)
-    # Pre-seed an unrelated counter — invariant: it must NOT be cleared
-    # OR incremented by install_user_steer.
-    session.refine_failure_counts[("user_steer", "")] = 7
-    session.refine_failure_counts[("plan_divergence", "t3")] = 3
+    # Pre-seed unrelated outcomes — invariant: they must NOT be cleared
+    # OR mutated by install_user_steer.
+    session.refine_outcomes[("user_steer", "")] = RefineOutcome(
+        state="failed", fail_count=7
+    )
+    session.refine_outcomes[("plan_divergence", "t3")] = RefineOutcome(
+        state="failed", fail_count=3
+    )
 
     drift = _drift()
     await steerer.install_user_steer(
@@ -558,8 +564,8 @@ async def test_install_user_steer_does_not_touch_refine_failure_counts() -> None
         llm_revision=invalid,
         session=session,
     )
-    assert session.refine_failure_counts[("user_steer", "")] == 7
-    assert session.refine_failure_counts[("plan_divergence", "t3")] == 3
+    assert session.refine_outcomes[("user_steer", "")].fail_count == 7
+    assert session.refine_outcomes[("plan_divergence", "t3")].fail_count == 3
 
 
 # ---------------------------------------------------------------------------

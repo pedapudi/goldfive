@@ -75,6 +75,7 @@ from goldfive.types import (
     DriftKind,
     DriftSeverity,
     Plan,
+    RefineOutcome,
     Session,
     SupersessionKind,
     Task,
@@ -389,7 +390,6 @@ class DefaultSteerer:
         reasoning_drift_model: str = "",
         reasoning_drift_rate_limit: int = 3,
         reasoning_binding_confidence_threshold: float = 0.7,
-        plan_revision_cooldown_seconds: float = 0.0,
         steering_config: SteeringConfig | None = None,
         goldfive_steer_threshold: str | None = None,
         goldfive_steer_suppression_window_turns: int | None = None,
@@ -491,18 +491,6 @@ class DefaultSteerer:
             default) fires on the 1st, 4th, 7th ... per task. The
             first thinking message of every task always gets a judge
             call; counters reset on task transition.
-        plan_revision_cooldown_seconds:
-            Minimum interval, in seconds, between two drift-triggered
-            plan revisions for the same ``(task_id, drift_kind)`` key.
-            **Defaults to ``0.0`` — disabled.** Operators who observe
-            replan thrashing from aggressive drift detection can pass a
-            positive value (e.g. ``30.0``) to opt in. Cooldown is scoped
-            per-kind so genuinely different problems (e.g.
-            ``LOOPING_REASONING`` vs ``CONFUSION``) can still replan
-            independently. USER_STEER drifts bypass this gate (user
-            intent is always honoured immediately) and GOAL_DRIFT has
-            its own rate limiting via ``_last_goal_drift_check_ts``, so
-            it also bypasses this gate. See goldfive#227.
 
         See ``docs/design/DRIFT.md`` §"Reflective self-progress check"
         for the full feature-gate semantics. The GOAL_DRIFT check
@@ -607,10 +595,6 @@ class DefaultSteerer:
         except (TypeError, ValueError):
             _conf_threshold = 0.7
         self._reasoning_binding_confidence_threshold: float = max(0.0, min(1.0, _conf_threshold))
-        # Drift-triggered plan-revision cooldown (goldfive#227).
-        # Clamped to a non-negative float; ``0.0`` disables the gate
-        # so callers can opt out without subclassing.
-        self._plan_revision_cooldown_seconds = max(0.0, float(plan_revision_cooldown_seconds))
         # goldfive-steer-unification: policy knob + freshness window for
         # promoting goldfive-detected drifts into the USER_STEER-style
         # cancel+refine+restart machinery. Precedence mirrors the other
@@ -2568,17 +2552,19 @@ class DefaultSteerer:
         short-circuit, queue follow-ups, or escalate to a paused state
         for user intervention.
 
-        Refine failures (either a raised exception or a ``None`` return)
-        from Level 1 dispatch are tracked per
-        ``(drift.kind.value, drift.current_task_id)`` on
-        ``session.refine_failure_counts``. After
-        :attr:`REFINE_FAILURE_THRESHOLD` consecutive failures for the
-        same key we skip refine entirely, mark the offending task
-        ``FAILED`` (non-recoverable), and emit a CRITICAL
-        ``REPEATED_FAILURE`` drift so sinks see the back-off. This
-        bounds the loop that would otherwise re-fire the same drift
-        every tick until ``SequentialExecutor.max_task_invocations``
-        tripped (see TASK-LIFECYCLE.md §7.3).
+        Refine outcomes (success / failure) from Level 1 dispatch are
+        tracked per ``(drift.kind.value, drift.current_task_id)`` on
+        ``session.refine_outcomes`` (goldfive#215 iter-8 P2). A prior
+        ``"succeeded"`` outcome on this turn short-circuits a follow-up
+        same-key drift entirely (the prior refine already addressed
+        it). After :attr:`REFINE_FAILURE_THRESHOLD` consecutive
+        ``"failed"`` outcomes for the same key we skip refine, mark
+        the offending task ``FAILED`` (non-recoverable), and emit a
+        CRITICAL ``REPEATED_FAILURE`` drift so sinks see the back-off.
+        This bounds the loop that would otherwise re-fire the same
+        drift every tick until ``SequentialExecutor.max_task_invocations``
+        tripped (see TASK-LIFECYCLE.md §7.3). The outcome table is
+        cleared on every ``run_started`` boundary.
         """
         # Normalise source attribution early so every downstream
         # consumer (sinks, promotion policy, prompt framing) sees a
@@ -2667,9 +2653,12 @@ class DefaultSteerer:
         # Route through the intervention ladder. The per-(kind, task)
         # occurrence count drives the "first vs repeat" distinction in
         # the ladder table -- we read it BEFORE any mutation so the
-        # mapping sees the state at drift-fire time.
-        counter_key = (drift.kind.value, drift.current_task_id)
-        occurrence_count = session.refine_failure_counts.get(counter_key, 0)
+        # mapping sees the state at drift-fire time. ``occurrence_count``
+        # is derived from ``session.refine_outcomes`` via
+        # :meth:`_occurrence_count_for_ladder` (goldfive#215 iter-8 P2:
+        # the outcome dict replaces the deleted ``refine_failure_counts``
+        # int counter).
+        occurrence_count = self._occurrence_count_for_ladder(session, drift)
         level = self._ladder_level_for(drift.kind, drift.severity, occurrence_count)
         log.debug(
             "DefaultSteerer._handle_drift: kind=%s severity=%s occurrence=%d -> level=%s",
@@ -2705,41 +2694,40 @@ class DefaultSteerer:
             # again on it. The ladder already routes this to Level 4 so
             # control flow normally won't reach here, but belt-and-braces.
             return
-        if session.refine_failure_counts.get(counter_key, 0) >= self.REFINE_FAILURE_THRESHOLD:
-            return
-        # Plan-revision cooldown (goldfive feedback-loop fix). A cluster
-        # of related drifts (same kind, same task) should not each
-        # trigger a separate ``planner.refine`` -- an observed live run
-        # saw 6 drift events + 4 plan_revised rows in a single short
-        # session, burning LLM budget and thrashing the agent mid-task.
-        # The DriftDetected event already landed on the wire above, so
-        # observability is covered; we just suppress the replan. The
-        # gate is keyed on (task_id, drift_kind) so genuinely different
-        # problems can still replan independently, and USER_STEER /
-        # GOAL_DRIFT bypass it (see the method docstring on
-        # ``_is_plan_revision_cooldown_exempt``).
-        if self._is_plan_revision_gated(drift, session):
-            return
-        # Per-condition refine gate (goldfive I5 — iter_1 escalation
-        # report). The drift-as-stateful-condition refactor (#271 PR1 /
-        # #318) already minted a ``condition_id`` + ``lifecycle`` for
-        # this emit via :meth:`_stamp_drift_lifecycle` (called above
-        # inside ``_emit_drift_detected``). We read that lifecycle and
-        # skip the refine when the condition is being re-detected
-        # without change — same severity ``ESCALATING`` re-emits or
-        # terminal lifecycles. Structural gate on lifecycle state, not a
-        # numerical cap; complements the time-based ``_is_plan_revision_gated``
-        # cooldown by catching same-tick re-emits the cooldown lets through.
-        if self._is_refine_gated_by_lifecycle(drift, session):
-            return
-        # Progress-based escalation (goldfive#271 — replaces the deleted
-        # count cap). If the drift fires on a task that has had no
-        # progress signal (``mark_task_running`` / ``mark_task_progress``
-        # / ``_emit_task_transitioned``) for longer than the configured
-        # stall threshold, escalate to HUMAN_INTERVENTION_REQUIRED instead
-        # of looping the planner. A productively-iterating task has
-        # continuous progress events; a stuck task does not. Time-based,
-        # progress-grounded — no arbitrary numerical cap to thrash.
+        # Outcome-based gate (goldfive#215 iter-8 P2 — unified G1+G3).
+        # Skip refine when ``(kind, task)`` already has a terminal
+        # outcome on this turn: a prior refine already succeeded (the
+        # current drift is a same-turn replay of an addressed
+        # condition), or prior refines have failed
+        # >= REFINE_FAILURE_THRESHOLD times (the threshold trip already
+        # marked the task FAILED + emitted REPEATED_FAILURE; a third
+        # tick must not retry). USER_STEER / USER_CANCEL / GOAL_DRIFT
+        # bypass the gate — operator intent always honoured,
+        # trajectory drifts have their own rate limiters.
+        if drift.kind not in self._USER_OR_TRAJECTORY_DRIFT_KINDS:
+            outcome_key = (drift.kind.value, drift.current_task_id or "")
+            outcome = session.refine_outcomes.get(outcome_key)
+            if outcome is not None:
+                if outcome.state == "succeeded":
+                    log.debug(
+                        "refine skipped: prior succeeded outcome (kind=%s task=%r)",
+                        drift.kind.value,
+                        drift.current_task_id,
+                    )
+                    return
+                if outcome.fail_count >= self.REFINE_FAILURE_THRESHOLD:
+                    log.debug(
+                        "refine skipped: failure threshold reached (kind=%s task=%r count=%d)",
+                        drift.kind.value,
+                        drift.current_task_id,
+                        outcome.fail_count,
+                    )
+                    return
+        # Progress-based escalation (goldfive#271). Orthogonal to the
+        # outcome gate: a task that has been silent past the configured
+        # stall threshold escalates to HUMAN_INTERVENTION_REQUIRED
+        # instead of looping the planner. A productively-iterating task
+        # has continuous progress events; a stuck task does not.
         if self._is_task_progress_stalled(drift, session):
             await self._emit_progress_stalled_escalation(drift, session)
             return
@@ -2839,7 +2827,7 @@ class DefaultSteerer:
                         detail=type(exc).__name__,
                     )
                     await self._emit_refine_failure(session, drift, reason=str(exc))
-                    await self._register_refine_failure(session, drift, counter_key)
+                    await self._record_refine_outcome(session, drift, succeeded=False)
                     return
                 except BaseException as exc:  # noqa: BLE001
                     # Phase 3.5 (CANCELLATION-CONTRACT.md §C4): ``CancelledError``
@@ -2881,7 +2869,7 @@ class DefaultSteerer:
             await self._emit_refine_failure(
                 session, drift, reason="planner returned no revised plan"
             )
-            await self._register_refine_failure(session, drift, counter_key)
+            await self._record_refine_outcome(session, drift, succeeded=False)
             return
         # I4 fix: fold runtime terminal statuses from the prior plan
         # onto the revised plan BEFORE validation. A task that was
@@ -2920,7 +2908,7 @@ class DefaultSteerer:
                     current_task_id=session.current_task_id,
                 ),
             )
-            await self._register_refine_failure(session, drift, counter_key)
+            await self._record_refine_outcome(session, drift, succeeded=False)
             return
         # No-op revision rejection (goldfive#271 — replaces the deleted
         # count cap). If the LLM produced a "refine" that is structurally
@@ -2947,9 +2935,10 @@ class DefaultSteerer:
             )
             await self._emit_handler_exhausted_escalation(drift, session)
             return
-        # Successful refine — reset the back-off counter for this key
-        # so a future drift of the same kind starts fresh.
-        session.refine_failure_counts.pop(counter_key, None)
+        # Successful refine — record the "succeeded" outcome so a
+        # follow-up same-(kind, task) drift on this turn skips refine
+        # (the prior refine already addressed it).
+        await self._record_refine_outcome(session, drift, succeeded=True)
         # Capture the outgoing plan BEFORE _apply_revision installs the
         # revised one; _emit_plan_revised diffs the two to populate the
         # PlanRevisionDiff sidecar (PLAN-LIFECYCLE.md §2, §8 gap #4).
@@ -2966,12 +2955,6 @@ class DefaultSteerer:
         await self._emit_plan_revised(
             session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
         )
-        # Stamp the cooldown table so a follow-up drift of the same
-        # kind+task within ``plan_revision_cooldown_seconds`` is gated.
-        # Only recorded on a revision that *actually landed* (past all
-        # the error / validation short-circuits above) so a failed
-        # refine doesn't wedge the cooldown.
-        self._record_plan_revision(drift, session)
         # Level 3 (CANCEL_REINVOKE) handoff: compose a corrective user
         # message from the drift + refined plan and stash it on the
         # session so the Runner's overlay loop (goldfive#141) can cancel
@@ -3984,21 +3967,35 @@ class DefaultSteerer:
         # goldfive-specific entry point.
         if self._planner is None or session.plan is None:
             return
-        if self._is_plan_revision_gated(drift, session):
-            return
-        # Per-condition refine gate (goldfive I5). Mirror of the gate in
-        # ``_handle_drift``: skip ``refine_steer`` on a same-severity
-        # ``ESCALATING`` re-emit of an active condition or a terminal
-        # lifecycle. See :meth:`_is_refine_gated_by_lifecycle`.
-        if self._is_refine_gated_by_lifecycle(drift, session):
-            return
-        # Progress-based escalation (goldfive#271 — replaces the deleted
-        # count cap). See the parallel check in ``_handle_drift`` and
-        # :meth:`_is_task_progress_stalled`.
+        # Outcome-based gate (goldfive#215 iter-8 P2). Mirror of the
+        # gate in ``_handle_drift``: skip refine_steer when (kind, task)
+        # already has a terminal outcome on this turn. USER_STEER /
+        # USER_CANCEL / GOAL_DRIFT bypass.
+        if drift.kind not in self._USER_OR_TRAJECTORY_DRIFT_KINDS:
+            outcome_key = (drift.kind.value, drift.current_task_id or "")
+            outcome = session.refine_outcomes.get(outcome_key)
+            if outcome is not None:
+                if outcome.state == "succeeded":
+                    log.debug(
+                        "refine_steer skipped: prior succeeded outcome (kind=%s task=%r)",
+                        drift.kind.value,
+                        drift.current_task_id,
+                    )
+                    return
+                if outcome.fail_count >= self.REFINE_FAILURE_THRESHOLD:
+                    log.debug(
+                        "refine_steer skipped: failure threshold reached "
+                        "(kind=%s task=%r count=%d)",
+                        drift.kind.value,
+                        drift.current_task_id,
+                        outcome.fail_count,
+                    )
+                    return
+        # Progress-based escalation (goldfive#271). Orthogonal to the
+        # outcome gate: see parallel check in ``_handle_drift``.
         if self._is_task_progress_stalled(drift, session):
             await self._emit_progress_stalled_escalation(drift, session)
             return
-        counter_key = (drift.kind.value, drift.current_task_id)
         # ContextVar plumbing for the planner-side drift-emitter and
         # span-context callbacks; per-async-task so concurrent runs
         # sharing this Steerer keep their session pointers isolated.
@@ -4047,7 +4044,7 @@ class DefaultSteerer:
                     detail=type(exc).__name__,
                 )
                 await self._emit_refine_failure(session, drift, reason=str(exc))
-                await self._register_refine_failure(session, drift, counter_key)
+                await self._record_refine_outcome(session, drift, succeeded=False)
                 return
             except BaseException as exc:  # noqa: BLE001
                 # Phase 3.5 (CANCELLATION-CONTRACT.md §C4): ``CancelledError``
@@ -4083,7 +4080,7 @@ class DefaultSteerer:
             await self._emit_refine_failure(
                 session, drift, reason="planner returned no revised plan"
             )
-            await self._register_refine_failure(session, drift, counter_key)
+            await self._record_refine_outcome(session, drift, succeeded=False)
             return
         # I4 fix: fold runtime terminal statuses from the prior plan
         # onto the revised plan BEFORE validation (see _handle_drift
@@ -4110,7 +4107,7 @@ class DefaultSteerer:
                     authored_by="goldfive",
                 ),
             )
-            await self._register_refine_failure(session, drift, counter_key)
+            await self._record_refine_outcome(session, drift, succeeded=False)
             return
         # No-op revision rejection (goldfive#271). Same handler-
         # exhaustion semantics as ``_handle_drift`` — a structurally
@@ -4133,7 +4130,7 @@ class DefaultSteerer:
             )
             await self._emit_handler_exhausted_escalation(drift, session)
             return
-        session.refine_failure_counts.pop(counter_key, None)
+        await self._record_refine_outcome(session, drift, succeeded=True)
         prev_plan = session.plan
         self._apply_revision(session, revised, drift)
         # Cancel the in-flight coordinator invocation now that
@@ -4155,7 +4152,6 @@ class DefaultSteerer:
         await self._emit_plan_revised(
             session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
         )
-        self._record_plan_revision(drift, session)
 
     async def _dispatch_goldfive_steer_refine(
         self, drift: DriftEvent, session: Session
@@ -4531,9 +4527,9 @@ class DefaultSteerer:
         * :meth:`_emit_plan_revised` fires ``PlanRevised``.
 
         The deterministic-fallback branch deliberately does NOT touch
-        ``session.refine_failure_counts`` — that counter governs
-        goldfive-authored autonomous refines (§4.5), not user-driven
-        changes. A USER_STEER never escalates via REPEATED_FAILURE.
+        ``session.refine_outcomes`` — that table governs goldfive-
+        authored autonomous refines (§4.5), not user-driven changes.
+        A USER_STEER never escalates via REPEATED_FAILURE.
 
         Never raises.
         """
@@ -4591,7 +4587,6 @@ class DefaultSteerer:
             prev_plan=prev_plan,
             attempt_id=attempt_id,
         )
-        self._record_plan_revision(drift, session)
         return chosen
 
     def _build_minimal_steer_evolution(
@@ -4745,7 +4740,6 @@ class DefaultSteerer:
             prev_plan=prev_plan,
             attempt_id=attempt_id,
         )
-        self._record_plan_revision(drift, session)
         return True
 
     async def apply_user_steer_with_plan(
@@ -4836,29 +4830,60 @@ class DefaultSteerer:
     # not loop forever. ``0`` disables the gate (useful for tests).
     PROGRESS_STALL_THRESHOLD_SECONDS: float = 600.0
 
-    async def _register_refine_failure(
+    # --- Refine outcome tracking (goldfive#215 iter-8 P2) ------------
+    #
+    # Single outcome-tracked state machine replacing the split
+    # ``refine_failure_counts`` (numerical cap) +
+    # ``KEY_ACTIVE_DRIFTS`` lifecycle gate. Reset every turn boundary
+    # by :meth:`reset_for_turn`.
+
+    async def _record_refine_outcome(
         self,
         session: Session,
         drift: DriftEvent,
-        counter_key: tuple[str, str],
+        *,
+        succeeded: bool,
     ) -> None:
-        """Bump the per-(kind, task) refine-failure counter and, if we
-        just crossed :attr:`REFINE_FAILURE_THRESHOLD`, mark the task
-        ``FAILED`` and emit a ``REPEATED_FAILURE`` drift.
+        """Record the outcome of a refine attempt for ``(kind, task)``.
 
-        Below the threshold this is a no-op beyond the increment:
-        callers return normally so the next trigger of the same drift
-        gets another chance to refine. See TASK-LIFECYCLE.md §7.3.
+        On ``succeeded=True`` writes a ``RefineOutcome(state="succeeded",
+        fail_count=0)`` entry. The "succeeded" state still encodes the
+        "attempted" signal so a follow-up same-(kind, task) drift on
+        the same turn skips refine — the prior refine already produced
+        a landed revision, re-running it is a no-op replay.
+
+        On ``succeeded=False`` increments ``fail_count`` (or initialises
+        to 1 if no prior failure entry) and, when the count crosses
+        :attr:`REFINE_FAILURE_THRESHOLD`, marks the offending task
+        FAILED (non-recoverable) and emits a CRITICAL
+        ``REPEATED_FAILURE`` drift directly (NOT through
+        ``_handle_drift`` — the REPEATED_FAILURE drift keys on a
+        different (kind, task) tuple than the source so it does not
+        feed back into this counter).
+
+        ``USER_STEER`` / ``USER_CANCEL`` / ``GOAL_DRIFT`` bypass the
+        write entirely — operator intent must always be honoured and
+        trajectory-level drifts have their own rate limiters.
         """
-        count = session.refine_failure_counts.get(counter_key, 0) + 1
-        session.refine_failure_counts[counter_key] = count
-        if count < self.REFINE_FAILURE_THRESHOLD:
+        if drift.kind in self._USER_OR_TRAJECTORY_DRIFT_KINDS:
             return
+        key = (drift.kind.value, drift.current_task_id or "")
+        if succeeded:
+            session.refine_outcomes[key] = RefineOutcome(state="succeeded", fail_count=0)
+            return
+        prior = session.refine_outcomes.get(key)
+        new_count = (prior.fail_count + 1) if prior is not None and prior.state == "failed" else 1
+        session.refine_outcomes[key] = RefineOutcome(state="failed", fail_count=new_count)
+        if new_count < self.REFINE_FAILURE_THRESHOLD:
+            return
+        # Crossed the threshold: mark the offending task FAILED (which
+        # routes through _handle_drift on a TASK_FAILED_FATAL key —
+        # different (kind, task) tuple, so no recursion into this
+        # counter) and emit REPEATED_FAILURE directly via
+        # _emit_drift_detected (NOT _handle_drift, which would try to
+        # refine again on the fresh drift). See TASK-LIFECYCLE.md §7.3.
         task_id = drift.current_task_id
         reason = f"refine repeatedly failed for {drift.kind.value}"
-        # mark_task_failed routes through _handle_drift for the TASK_FAILED
-        # drift; that path keys on a different drift kind so it cannot
-        # feed back into *this* counter and recurse.
         if task_id:
             await self.mark_task_failed(
                 task_id,
@@ -4870,15 +4895,40 @@ class DefaultSteerer:
             kind=DriftKind.REPEATED_FAILURE,
             severity=DriftSeverity.CRITICAL,
             detail=(
-                f"refine failed {count} consecutive times for "
+                f"refine failed {new_count} consecutive times for "
                 f"{drift.kind.value} (task {task_id or 'n/a'})"
             ),
             current_task_id=task_id,
             current_agent_id=drift.current_agent_id,
         )
-        # Emit directly — do NOT go back through _handle_drift, which
-        # would try to refine again on the fresh drift.
         await self._emit_drift_detected(session, repeated)
+
+    def reset_for_turn(self, session: Session) -> None:
+        """Clear per-turn refine-outcome bookkeeping.
+
+        Wired from :meth:`Runner.run` immediately after the
+        ``run_started`` event so each turn starts with an empty
+        outcome table. The (kind, task) retry budget is naturally
+        per-turn — a wedged drift from a prior turn should not
+        carry over its failure count and short-circuit a fresh
+        refine attempt on the new turn.
+        """
+        session.refine_outcomes.clear()
+
+    def _occurrence_count_for_ladder(self, session: Session, drift: DriftEvent) -> int:
+        """Return the per-(kind, task) failure count consumed by the ladder.
+
+        Maps ``RefineOutcome`` back onto the int the
+        :meth:`_ladder_level_for` table reads. ``"succeeded"`` returns
+        ``0`` so a fresh same-(kind, task) drift is treated as the
+        first occurrence (the gate above the ladder will short-circuit
+        anyway, but keeping the ladder invariant intact is cheaper
+        than re-deriving the ``is_repeat`` semantics inside the ladder).
+        """
+        outcome = session.refine_outcomes.get((drift.kind.value, drift.current_task_id or ""))
+        if outcome is None or outcome.state == "succeeded":
+            return 0
+        return outcome.fail_count
 
     async def _emit_refine_failure(
         self, session: Session, source: DriftEvent, *, reason: str
@@ -5900,165 +5950,6 @@ class DefaultSteerer:
         }
     )
 
-    def _is_plan_revision_gated(self, drift: DriftEvent, session: Session) -> bool:
-        """Return ``True`` iff a drift-triggered revision should be suppressed.
-
-        Consults ``session._last_plan_revision_at`` keyed on
-        ``(drift.current_task_id, drift.kind.value)``. If the age of
-        the last revision for that key is below
-        ``plan_revision_cooldown_seconds``, logs at DEBUG + INFO and
-        returns ``True``. Otherwise returns ``False``.
-
-        No-op (returns ``False``) when the cooldown is disabled
-        (``plan_revision_cooldown_seconds <= 0``) or the drift kind is
-        a user / trajectory-level drift.
-        """
-        cooldown = self._plan_revision_cooldown_seconds
-        if cooldown <= 0:
-            return False
-        if drift.kind in self._USER_OR_TRAJECTORY_DRIFT_KINDS:
-            return False
-        key = (drift.current_task_id, drift.kind.value)
-        last_at = session._last_plan_revision_at.get(key)
-        if last_at is None:
-            return False
-        now = time.monotonic()
-        age = now - last_at
-        if age >= cooldown:
-            return False
-        # Within the cooldown window -- suppress.
-        log.debug(
-            "plan revision suppressed by cooldown (task=%r age=%.1fs cooldown=%.1fs trigger=%r)",
-            drift.current_task_id,
-            age,
-            cooldown,
-            drift.kind.value,
-        )
-        log.info(
-            "goldfive observed a %s drift on task=%r within the plan-revision "
-            "cooldown (%.1fs < %.1fs); skipping replan",
-            drift.kind.value,
-            drift.current_task_id,
-            age,
-            cooldown,
-        )
-        return True
-
-    def _is_refine_gated_by_lifecycle(self, drift: DriftEvent, session: Session) -> bool:
-        """Return ``True`` iff ``drift``'s active condition does not warrant a refine.
-
-        Per-condition refine gate (goldfive I5 — iter_1 escalation report).
-        The drift-as-stateful-condition refactor (#271 PR1 / #318) gives
-        every emit a stable ``condition_id`` and a ``lifecycle`` stamped
-        on ``session.state``. Without this gate, every re-emit of the
-        same logical condition (``ESCALATING`` at the same severity)
-        triggered another ``planner.refine`` — empirically dominating
-        the LLM-call budget on long runs (V24: 7 ``refine_steer`` calls
-        for 18 theoretical task turns, 2/turn average).
-
-        The structural rule:
-
-        * ``OPENED`` — first emit of this condition; refine runs
-          (current baseline).
-        * ``ESCALATING`` with a severity bump (``prev_severity != severity``)
-          — escalation is real (e.g. INFO -> WARNING), refine runs.
-        * ``ESCALATING`` at the same severity — same condition being
-          re-detected without change; refine is a no-op replay, gate it.
-        * ``RESOLVED`` / ``HUMAN_INTERVENTION_REQUIRED`` — terminal lifecycle
-          for this condition; refine has either already happened or has
-          been lifted to the operator. Gate.
-
-        User / trajectory-level drifts (``USER_STEER`` / ``USER_CANCEL`` /
-        ``GOAL_DRIFT``) bypass the gate — operator intent must be
-        honoured even on a re-emit, and trajectory-wide drifts have
-        their own rate limiters.
-
-        The active-drift entry is read from
-        :func:`orchestration_state.get_active_drift` keyed by the same
-        condition_id :meth:`_stamp_drift_lifecycle` minted on the wire
-        emit. Reads ``session.state`` only — no mutation. Idempotent:
-        called twice for the same drift returns the same answer.
-
-        NB: ``_stamp_drift_lifecycle`` only ever writes ``OPENED`` or
-        ``ESCALATING`` to the active set (the resolving / human-intervention
-        helpers remove the entry rather than store it). So a missing
-        active-drift entry on a fresh ``_handle_drift`` tick means the
-        condition was previously resolved or escalated to a human;
-        treating that as "gate refine" is the correct, conservative
-        default.
-        """
-        # User / trajectory-level drifts bypass the gate (same exemption
-        # set as ``_is_plan_revision_gated``).
-        if drift.kind in self._USER_OR_TRAJECTORY_DRIFT_KINDS:
-            return False
-        # Re-derive the condition_id with the same args
-        # ``_stamp_drift_lifecycle`` used so this gate reads the same
-        # entry it stamped.
-        try:
-            cid = _ostate.compute_condition_id(
-                kind=drift.kind,
-                task_id=str(getattr(drift, "current_task_id", "") or ""),
-                agent_id=str(getattr(drift, "current_agent_id", "") or ""),
-                turn_id=str(getattr(session, "run_id", "") or ""),
-            )
-            tracked = _ostate.get_active_drift(session.state, cid)
-        except Exception as exc:  # noqa: BLE001
-            # Lifecycle bookkeeping is observability-only; never let a
-            # malformed state dict break dispatch. Fall through to the
-            # un-gated behaviour (legacy single-shot refine).
-            log.debug("DefaultSteerer: refine lifecycle gate skipped (%s)", exc)
-            return False
-        if tracked is None:
-            # Condition is no longer in the active set — either resolved
-            # or escalated to human intervention by a prior tick. Don't
-            # re-fire refine on a closed condition.
-            log.debug(
-                "refine gated by lifecycle (kind=%s task=%r): condition resolved/escalated",
-                drift.kind.value,
-                drift.current_task_id,
-            )
-            return True
-        lifecycle = tracked.lifecycle
-        if lifecycle == _ostate.LIFECYCLE_OPENED:
-            # First emit of the condition this turn — refine the baseline.
-            return False
-        if lifecycle == _ostate.LIFECYCLE_ESCALATING:
-            # Escalating: refine ONLY if the severity actually bumped.
-            # Same severity re-emit -> the underlying condition is being
-            # re-detected without change; the prior refine still applies.
-            if tracked.prev_severity != tracked.severity:
-                return False
-            log.debug(
-                "refine gated by lifecycle (kind=%s task=%r): escalating re-emit "
-                "at same severity %s",
-                drift.kind.value,
-                drift.current_task_id,
-                tracked.severity.value if tracked.severity else "",
-            )
-            log.info(
-                "goldfive observed a %s drift on task=%r as a same-severity re-emit "
-                "of an active condition; skipping replan",
-                drift.kind.value,
-                drift.current_task_id,
-            )
-            return True
-        # RESOLVED / HUMAN_INTERVENTION_REQUIRED in the active set is
-        # not normally produced by ``_stamp_drift_lifecycle`` (the helpers
-        # for those lifecycles remove the entry), but guard defensively
-        # so an out-of-tree mutation can't bypass the intent of the gate.
-        if lifecycle in (
-            _ostate.LIFECYCLE_RESOLVED,
-            _ostate.LIFECYCLE_HUMAN_INTERVENTION_REQUIRED,
-        ):
-            log.debug(
-                "refine gated by lifecycle (kind=%s task=%r): terminal lifecycle %s",
-                drift.kind.value,
-                drift.current_task_id,
-                lifecycle,
-            )
-            return True
-        return False
-
     def _is_task_progress_stalled(self, drift: DriftEvent, session: Session) -> bool:
         """Return ``True`` iff the drift's task has had no progress recently.
 
@@ -6205,23 +6096,6 @@ class DefaultSteerer:
         if old_edges != new_edges:
             return False
         return True
-
-    def _record_plan_revision(self, drift: DriftEvent, session: Session) -> None:
-        """Stamp ``session._last_plan_revision_at`` after a successful revision.
-
-        Called at the very end of the refine path, after the new plan
-        is installed and ``PlanRevised`` has been emitted. Only stamps
-        when the time-based cooldown is active
-        (``plan_revision_cooldown_seconds > 0``). The count-based cap
-        was deleted in goldfive#271 — escalation is now driven by
-        progress stall (:meth:`_is_task_progress_stalled`) and handler
-        exhaustion (no-op revisions / ``RefineExhausted``), not by a
-        per-(kind, task) counter.
-        """
-        if self._plan_revision_cooldown_seconds <= 0:
-            return
-        key = (drift.current_task_id, drift.kind.value)
-        session._last_plan_revision_at[key] = time.monotonic()
 
     @staticmethod
     def _integrate_correction_supersedes(revised: Plan) -> None:

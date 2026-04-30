@@ -57,6 +57,7 @@ from goldfive.types import (
     DriftKind,
     DriftSeverity,
     Plan,
+    RefineOutcome,
     Session,
     Task,
     TaskStatus,
@@ -362,12 +363,14 @@ class ParallelDAGExecutor:
                     )
                     if refined is not None and refined is not (session.plan or plan):
                         refinements_used += 1
-                        # Refine succeeded: clear any per-(kind, task)
-                        # failure history so a future drift of the same
-                        # kind on the same task starts fresh.
-                        session.refine_failure_counts.pop(
-                            (drift.kind.value, drift.current_task_id), None
-                        )
+                        # Refine succeeded: record the "succeeded" outcome
+                        # so a follow-up same-(kind, task) drift on this
+                        # turn skips refine (goldfive#215 iter-8 P2). The
+                        # outcome dict is the single source of truth — no
+                        # separate ``refine_failure_counts`` to pop.
+                        session.refine_outcomes[
+                            (drift.kind.value, drift.current_task_id or "")
+                        ] = RefineOutcome(state="succeeded", fail_count=0)
                         session.plan = refined
                         await emit_event(
                             sinks,
@@ -766,9 +769,10 @@ class ParallelDAGExecutor:
         fails structural validation) emits a CRITICAL follow-up
         ``DriftDetected`` event so sinks see "refine failed" instead of
         silently observing the old plan. A per-``(kind, task_id)``
-        failure counter is bumped on ``session.refine_failure_counts``
-        and mirrors the steerer's back-off threshold. Returns the
-        validated revised plan on success or ``None`` on any failure;
+        failure counter is bumped on ``session.refine_outcomes``
+        (goldfive#215 P2) and mirrors the steerer's back-off threshold.
+        Returns the validated revised plan on success or ``None`` on
+        any failure;
         callers should fall through to the next stage when ``None`` is
         returned (downstream tasks that depended on a replacement still
         block via ``_pick_next_task`` and the reachability audit).
@@ -1047,13 +1051,18 @@ class ParallelDAGExecutor:
 
         Returns the new count. Callers compare against
         :attr:`REFINE_FAILURE_THRESHOLD` to decide whether to abort the
-        run. Uses ``session.refine_failure_counts`` so the counter is
-        shared with :class:`~goldfive.steerer.DefaultSteerer`.
+        run. Uses ``session.refine_outcomes`` so the counter is shared
+        with :class:`~goldfive.steerer.DefaultSteerer` (goldfive#215
+        iter-8 P2 — outcome dict replaces the deleted
+        ``refine_failure_counts`` int counter).
         """
-        key = (drift.kind.value, drift.current_task_id)
-        count = session.refine_failure_counts.get(key, 0) + 1
-        session.refine_failure_counts[key] = count
-        return count
+        key = (drift.kind.value, drift.current_task_id or "")
+        prior = session.refine_outcomes.get(key)
+        new_count = (
+            prior.fail_count + 1 if prior is not None and prior.state == "failed" else 1
+        )
+        session.refine_outcomes[key] = RefineOutcome(state="failed", fail_count=new_count)
+        return new_count
 
     # ------------------------------------------------------------------
     # Control helpers

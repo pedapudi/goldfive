@@ -314,11 +314,10 @@ async def test_observe_dedupe_does_not_affect_heuristic_drifts() -> None:
     cluster doesn't shadow the dedupe-set assertion.
     """
     steerer, session, _sink, planner = _bind_fresh()
-    # Hot-patch the cooldown off for this test only. ``_bind_fresh``
-    # builds a default-configured steerer; we need the cooldown window
-    # at 0 so the two tool-error observations below both reach the
-    # refine path.
-    steerer._plan_revision_cooldown_seconds = 0.0
+    # The plan-revision cooldown was deleted in goldfive#215 iter-8 P2;
+    # the new outcome gate keys on ``(kind, task)`` so the two
+    # tool-error observations below — on distinct pinned tasks — each
+    # mint their own outcome and reach refine independently.
 
     # A steer populates processed_steer_ids.
     msg = ControlMessage(
