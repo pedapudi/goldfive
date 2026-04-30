@@ -412,7 +412,14 @@ async def test_goldfive_steer_threshold_off_disables_promotion() -> None:
 
 
 async def test_goldfive_steer_threshold_critical_skips_warning() -> None:
-    """threshold='critical' promotes only CRITICAL drifts."""
+    """threshold='critical' promotes only CRITICAL drifts.
+
+    Use distinct tasks for the WARNING and CRITICAL emits so the
+    goldfive#215 iter-8 P2 outcome gate (keyed on (kind, task)) does
+    not fold the CRITICAL onto the WARNING's already-succeeded
+    outcome — the test exercises the promotion-threshold branch,
+    not the outcome-replay short-circuit.
+    """
     steerer, session, _sink, planner, _adapter = _bind(threshold="critical")
 
     # WARNING -> legacy path
@@ -425,12 +432,12 @@ async def test_goldfive_steer_threshold_critical_skips_warning() -> None:
     await steerer._handle_drift(warn, session)
     assert planner.refine_steer_calls == []
 
-    # CRITICAL -> promoted
+    # CRITICAL -> promoted (distinct task so the outcome gate doesn't gate it).
     crit = DriftEvent(
         kind=DriftKind.OFF_TOPIC,
         severity=DriftSeverity.CRITICAL,
         detail="critical-promoted",
-        current_task_id="t2",
+        current_task_id="t1",
     )
     await steerer._handle_drift(crit, session)
     assert len(planner.refine_steer_calls) == 1

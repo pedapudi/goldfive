@@ -618,13 +618,13 @@ def _tool_error_drift(
 ) -> DriftEvent:
     """Build a canned WARNING-severity drift routed through _handle_drift.
 
-    ``severity`` and ``agent_id`` are parameterised so callers exercising
-    the per-condition refine gate (goldfive I5) can mint a DISTINCT
-    drift condition on a re-emit. The gate keys on
-    ``(kind, task, agent, turn)`` — without varying one of these, the
-    second emit collapses onto the same condition_id and is treated as
-    a no-op replay (skipped). The failure-counter, by contrast, keys
-    only on ``(kind, task)`` so the assertions below still trip.
+    Under the goldfive#215 iter-8 P2 outcome gate, the (kind, task)
+    key is the SOLE backoff key — varying ``current_agent_id`` was
+    only ever needed to bypass the deleted lifecycle gate. Keep
+    ``agent_id`` parameterised for callers that want to exercise the
+    preserved ``_stamp_drift_lifecycle`` bookkeeping (still consumed
+    by harmonograf for condition_id grouping); the assertions in
+    this module no longer require it.
     """
     return DriftEvent(
         kind=DriftKind.TOOL_ERROR,
@@ -643,28 +643,32 @@ async def test_refine_failure_counter_increments_on_exception() -> None:
     session = _make_session()
 
     key = (DriftKind.TOOL_ERROR.value, "t1")
-    assert session.refine_failure_counts.get(key, 0) == 0
+    assert session.refine_outcomes.get(key) is None
 
-    # Same drift is classified by detect_drift — use a dict the tool-error
-    # classifier picks up and that carries a task via current_task_id.
-    # Simpler: drive _handle_drift directly so the drift identity is stable.
-    await steerer._handle_drift(_tool_error_drift(agent_id="agent-a"), session)
-    assert session.refine_failure_counts[key] == 1
+    # Drive _handle_drift directly so the drift identity is stable.
+    # Outcome gate keys only on (kind, task) so back-to-back drifts
+    # of the same TOOL_ERROR on t1 are now legitimately tracked on a
+    # single counter — no agent_id dance required.
+    await steerer._handle_drift(_tool_error_drift(), session)
+    outcome_after_1 = session.refine_outcomes[key]
+    assert outcome_after_1.state == "failed"
+    assert outcome_after_1.fail_count == 1
     assert len(planner.refine_calls) == 1
 
-    # Second observation must mint a DISTINCT drift condition so the
-    # I5 per-condition refine gate (which keys on kind+task+agent+turn)
-    # doesn't suppress it. Vary ``current_agent_id``: same counter key
-    # (counter only keys on kind+task) but a fresh lifecycle bucket.
-    await steerer._handle_drift(_tool_error_drift(agent_id="agent-b"), session)
-    # Second failure hits the threshold: _register_refine_failure calls
+    await steerer._handle_drift(_tool_error_drift(), session)
+    # Second failure hits the threshold: _record_refine_outcome calls
     # mark_task_failed, which fires a TASK_FAILED_FATAL drift that routes
     # through _handle_drift and triggers one more refine attempt (keyed
     # on a different (kind, task) tuple, so the TOOL_ERROR counter stays
     # at 2 and the TASK_FAILED_FATAL counter reaches 1).
-    assert session.refine_failure_counts[key] == 2
+    outcome_after_2 = session.refine_outcomes[key]
+    assert outcome_after_2.state == "failed"
+    assert outcome_after_2.fail_count == 2
     fatal_key = (DriftKind.TASK_FAILED_FATAL.value, "t1")
-    assert session.refine_failure_counts.get(fatal_key, 0) == 1
+    fatal_outcome = session.refine_outcomes.get(fatal_key)
+    assert fatal_outcome is not None
+    assert fatal_outcome.state == "failed"
+    assert fatal_outcome.fail_count == 1
 
 
 async def test_refine_failure_counter_increments_on_none_return() -> None:
@@ -676,22 +680,25 @@ async def test_refine_failure_counter_increments_on_none_return() -> None:
     session = _make_session()
 
     key = (DriftKind.TOOL_ERROR.value, "t1")
-    assert session.refine_failure_counts.get(key, 0) == 0
+    assert session.refine_outcomes.get(key) is None
 
-    await steerer._handle_drift(_tool_error_drift(agent_id="agent-a"), session)
-    assert session.refine_failure_counts[key] == 1
+    await steerer._handle_drift(_tool_error_drift(), session)
+    outcome_after_1 = session.refine_outcomes[key]
+    assert outcome_after_1.state == "failed"
+    assert outcome_after_1.fail_count == 1
     assert len(planner.refine_calls) == 1
 
-    # Distinct ``current_agent_id`` mints a fresh drift condition (I5
-    # gate exemption) while preserving the (kind, task) failure-counter
-    # key.
-    await steerer._handle_drift(_tool_error_drift(agent_id="agent-b"), session)
+    await steerer._handle_drift(_tool_error_drift(), session)
     # Same cascade as the exception case: the TOOL_ERROR counter is
     # clamped at the threshold (2), the cascaded TASK_FAILED_FATAL drift
     # kicks off its own independent counter at 1.
-    assert session.refine_failure_counts[key] == 2
+    outcome_after_2 = session.refine_outcomes[key]
+    assert outcome_after_2.state == "failed"
+    assert outcome_after_2.fail_count == 2
     fatal_key = (DriftKind.TASK_FAILED_FATAL.value, "t1")
-    assert session.refine_failure_counts.get(fatal_key, 0) == 1
+    fatal_outcome = session.refine_outcomes.get(fatal_key)
+    assert fatal_outcome is not None
+    assert fatal_outcome.fail_count == 1
 
 
 async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
@@ -702,13 +709,12 @@ async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
     session = _make_session()
 
     # First failure: visibility-only, task stays PENDING.
-    await steerer._handle_drift(_tool_error_drift(agent_id="agent-a"), session)
+    await steerer._handle_drift(_tool_error_drift(), session)
     assert _task(session, "t1").status is TaskStatus.PENDING
 
     # Second failure: backoff trips — task marked FAILED, REPEATED_FAILURE
-    # drift emitted. Distinct ``current_agent_id`` so the I5 lifecycle
-    # gate doesn't fold this onto the prior condition.
-    await steerer._handle_drift(_tool_error_drift(agent_id="agent-b"), session)
+    # drift emitted.
+    await steerer._handle_drift(_tool_error_drift(), session)
     assert _task(session, "t1").status is TaskStatus.FAILED
 
     from goldfive.pb.goldfive.v1 import types_pb2
@@ -741,7 +747,7 @@ async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
     assert len(repeated_events) == 1
     assert repeated_events[0].drift_detected.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
     # After the threshold trip, a *third* trigger of the same drift must
-    # short-circuit without calling refine again — the counter wall
+    # short-circuit without calling refine again — the outcome gate
     # prevents the loop that §7.3 targets.
     calls_before = len(planner.refine_calls)
     await steerer._handle_drift(_tool_error_drift(), session)
@@ -759,21 +765,20 @@ async def test_successful_refine_resets_failure_counter() -> None:
 
     key = (DriftKind.TOOL_ERROR.value, "t1")
 
-    await steerer._handle_drift(_tool_error_drift(agent_id="agent-a"), session)
-    assert session.refine_failure_counts[key] == 1
+    await steerer._handle_drift(_tool_error_drift(), session)
+    assert session.refine_outcomes[key].state == "failed"
+    assert session.refine_outcomes[key].fail_count == 1
 
     # Flip planner to success mode BEFORE the counter hits the threshold
-    # so the next call takes the happy path and must clear the counter.
+    # so the next call takes the happy path. Below-threshold failed
+    # outcome still allows refine (gate: state != succeeded AND
+    # fail_count < THRESHOLD); the success path then OVERWRITES the
+    # outcome with state="succeeded", fail_count=0.
     planner.raise_exc = None
     planner.revised = revised
-
-    # Distinct ``current_agent_id`` mints a fresh drift condition (I5
-    # gate exemption) so the success path runs and clears the failure
-    # counter.
-    await steerer._handle_drift(_tool_error_drift(agent_id="agent-b"), session)
-    # Successful refine clears the key entirely (pop) — the counter is
-    # reset, not decremented, so a fresh run of failures starts at 0.
-    assert key not in session.refine_failure_counts
+    await steerer._handle_drift(_tool_error_drift(), session)
+    assert session.refine_outcomes[key].state == "succeeded"
+    assert session.refine_outcomes[key].fail_count == 0
     # And the plan actually got revised on the success.
     assert session.plan is not None
     assert [t.id for t in session.plan.tasks] == ["t1", "t2", "t3"]

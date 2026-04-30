@@ -107,7 +107,7 @@ class Session:
     pending_approvals: dict[str, asyncio.Event]
     pending_approvals_meta: dict[str, dict[str, Any]]
     reasoning_history: list[str]              # bounded ring for reasoning-drift detectors
-    refine_failure_counts: dict[tuple[str, str], int]
+    refine_outcomes: dict[tuple[str, str], RefineOutcome]   # per-(kind, task) refine outcome (#215 P2)
     # Intervention-ladder handoffs (goldfive#142):
     paused_for_human_intervention: bool       # Level 4 handoff
     pending_nudges: list[str]                 # Level 2 soft-follow-up queue

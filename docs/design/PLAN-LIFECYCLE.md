@@ -350,16 +350,18 @@ The steerer handles it in three layers (see TASK-LIFECYCLE.md §4):
 
 1. Visibility: emit a follow-up CRITICAL `DriftDetected` with
    `detail="refine failed (<kind>): <reason>"`.
-2. Backoff: increment `session.refine_failure_counts[(kind,
-   task_id)]`; at `REFINE_FAILURE_THRESHOLD=2` consecutive failures,
-   mark the originating task FAILED and emit a CRITICAL
-   `REPEATED_FAILURE` drift (instead of attempting refine a third
-   time).
+2. Backoff: bump the `fail_count` on
+   `session.refine_outcomes[(kind, task_id)]` (goldfive#215 P2);
+   at `REFINE_FAILURE_THRESHOLD=2` consecutive failures, mark the
+   originating task FAILED and emit a CRITICAL `REPEATED_FAILURE`
+   drift (instead of attempting refine a third time).
 3. Partial-state atomicity (§4.2 / §6.3): if the triggering drift
    was `USER_STEER`, the delete has already happened — cascade-
    CANCEL dependents so the plan lands in a consistent shape.
 
-Successful refine resets the counter for that `(kind, task_id)`.
+Successful refine writes `state="succeeded"` for that `(kind,
+task_id)` (which short-circuits a follow-up same-turn drift of the
+same key — the prior refine already handled it).
 
 ### 4.5.1 Goldfive-authored revision rejection is non-fatal by default
 

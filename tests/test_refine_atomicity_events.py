@@ -334,14 +334,14 @@ async def test_attempt_id_is_unique_per_attempt() -> None:
     revised.revision_index = 1
     planner = StubPlanner(revised=revised)
     sink = ListSink()
-    # Disable cooldown gate so back-to-back drifts both refine.
-    steerer = DefaultSteerer(plan_revision_cooldown_seconds=0.0)
+    steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
     await steerer._handle_drift(_drift(kind=DriftKind.TOOL_ERROR), session)
-    # Use a different drift kind so the cooldown / counter machinery
-    # doesn't gate the second attempt.
+    # Use a different drift kind so the outcome gate (goldfive#215 P2,
+    # keyed on (kind, task)) doesn't fold the second attempt onto the
+    # first's "succeeded" outcome and short-circuit it.
     await steerer._handle_drift(_drift(kind=DriftKind.LOOPING_REASONING), session)
 
     attempted = sink.by_kind("refine_attempted")
@@ -633,3 +633,120 @@ async def test_proto_plan_revised_event_unchanged_on_success() -> None:
     # the dict sidecar. This assertion guards against future proto
     # changes promoting attempt_id without explicit migration intent.
     assert not hasattr(pr, "attempt_id") or pr.attempt_id == ""
+
+
+# ---------------------------------------------------------------------------
+# PlanRevised refine-context observability (judge-observability event).
+# Migrated from test_plan_revision_cooldown.py during the goldfive#215
+# iter-8 P2 cleanup; these exercise PlanRevised content fields and are
+# orthogonal to the (now-deleted) cooldown gate.
+# ---------------------------------------------------------------------------
+
+
+def _plan_revised_events(sink: ListSink) -> list[Any]:
+    return [e for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised"]
+
+
+async def test_plan_revised_event_populates_refine_summaries() -> None:
+    """PlanRevised carries refine_input_summary + refine_output_summary."""
+    revised = _make_plan(("t1", "t2"))
+    planner = StubPlanner(revised=revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="agent drifted to raccoons",
+        current_task_id="t1",
+        current_agent_id="researcher",
+    )
+    await steerer._handle_drift(drift, session)
+
+    events = _plan_revised_events(sink)
+    assert len(events) == 1
+    pr = events[0].plan_revised
+    # Input summary names the drift kind + severity + detail + prior plan shape.
+    # ``DriftKind.value`` is lowercase (e.g. "off_topic"), so that's what
+    # gets rendered into the human-readable summary.
+    assert "off_topic" in pr.refine_input_summary
+    assert "warning" in pr.refine_input_summary
+    assert "raccoons" in pr.refine_input_summary
+    assert "task=t1" in pr.refine_input_summary
+    assert "prior_plan=rev0" in pr.refine_input_summary
+    # Output summary carries the revised index + task count + titles.
+    # The StubPlanner appends a structurally-distinct sentinel task per
+    # call (goldfive#271 no-op rejection) so the count is 3, not 2.
+    assert "revision_index=1" in pr.refine_output_summary
+    assert "tasks=3" in pr.refine_output_summary
+
+
+async def test_plan_revised_event_stamps_target_agent_id() -> None:
+    """target_agent_id mirrors DriftEvent.current_agent_id for agent-scoped refines."""
+    revised = _make_plan(("t1", "t2"))
+    planner = StubPlanner(revised=revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="off topic",
+        current_task_id="t1",
+        current_agent_id="researcher",
+    )
+    await steerer._handle_drift(drift, session)
+
+    pr = _plan_revised_events(sink)[0].plan_revised
+    assert pr.target_agent_id == "researcher"
+
+
+async def test_plan_revised_event_target_agent_id_empty_for_trajectory_drift() -> None:
+    """A drift with no current_agent_id → target_agent_id == ""."""
+    revised = _make_plan(("t1", "t2"))
+    planner = StubPlanner(revised=revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="unscoped",
+        current_task_id="t1",
+        current_agent_id="",  # no agent bound — trajectory-level
+    )
+    await steerer._handle_drift(drift, session)
+
+    pr = _plan_revised_events(sink)[0].plan_revised
+    assert pr.target_agent_id == ""
+
+
+async def test_plan_revised_refine_input_summary_truncates_when_long() -> None:
+    """A pathological drift.detail does not blow the refine_input_summary field."""
+    revised = _make_plan(("t1", "t2"))
+    planner = StubPlanner(revised=revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    huge_detail = "x" * 5000
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail=huge_detail,
+        current_task_id="t1",
+        current_agent_id="researcher",
+    )
+    await steerer._handle_drift(drift, session)
+
+    pr = _plan_revised_events(sink)[0].plan_revised
+    assert pr.refine_input_summary.endswith(" … [truncated]")
+    # 2048 + suffix length.
+    assert len(pr.refine_input_summary) == 2048 + len(" … [truncated]")

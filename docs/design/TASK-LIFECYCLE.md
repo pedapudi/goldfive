@@ -595,13 +595,16 @@ supplied — terminal-task and terminal→terminal-edge preservation
 
 ### 7.3 Refine failure retry backoff (closed)
 
-Closed by #99. `session.refine_failure_counts: dict[(kind, task),
-int]` tracks consecutive `planner.refine()` failures per drift
-key. When the counter crosses
+Closed by #99. `session.refine_outcomes: dict[(kind, task),
+RefineOutcome]` tracks the per-drift-key outcome of the last
+refine attempt this turn (goldfive#215 P2 — replaces the older
+`refine_failure_counts` int counter). When `fail_count` crosses
 `DefaultSteerer.REFINE_FAILURE_THRESHOLD` (default `2`), the
-steerer marks the task FAILED, emits a CRITICAL `REPEATED_FAILURE`
-drift, and resets the counter. A successful refine also resets the
-counter so a future drift of the same kind starts fresh.
+steerer marks the task FAILED and emits a CRITICAL
+`REPEATED_FAILURE` drift. A successful refine writes
+`state="succeeded"`, which short-circuits a follow-up same-(kind,
+task) drift on the same turn. The whole table resets every
+`run_started` boundary (`DefaultSteerer.reset_for_turn`).
 
 ### 7.4 Orphaned tool_call_ids on mid-invocation cancel (closed)
 

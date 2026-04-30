@@ -784,6 +784,34 @@ class ObservedAction:
     summary: str
 
 
+@dataclasses.dataclass(slots=True)
+class RefineOutcome:
+    """Per-(kind, task) outcome of the last refine attempt this turn.
+
+    goldfive#215 (iter-8) P2: replaces the split
+    ``Session.refine_failure_counts`` (numerical cap) +
+    ``KEY_ACTIVE_DRIFTS`` lifecycle gate with a single outcome-tracked
+    state machine. Cleared on every ``run_started`` boundary by
+    :meth:`DefaultSteerer.reset_for_turn`.
+
+    ``state``:
+        ``"succeeded"`` — the most recent refine for this (kind, task)
+        produced a landed plan revision; subsequent same-(kind, task)
+        drifts on the same turn skip refine (the prior refine already
+        addressed it). ``fail_count`` is reset to ``0``.
+
+        ``"failed"`` — the most recent refine raised, returned None,
+        or produced a no-op / validator-rejected revision; same-
+        (kind, task) drifts continue retrying until ``fail_count``
+        reaches :attr:`DefaultSteerer.REFINE_FAILURE_THRESHOLD`, then
+        escalate via the REPEATED_FAILURE drift + non-recoverable
+        ``mark_task_failed``.
+    """
+
+    state: str  # "succeeded" | "failed"
+    fail_count: int = 0
+
+
 @dataclasses.dataclass
 class Session:
     """Live state for one Runner.run() invocation.
@@ -843,23 +871,27 @@ class Session:
     # avoid drift-spam when the same off-topic reasoning block repeats
     # across turns.
     unreferenced_keyword_flagged: set[str] = dataclasses.field(default_factory=set)
-    # Per-(drift_kind_value, task_id) consecutive refine-failure counter.
-    # Incremented each time ``planner.refine`` raises or returns ``None``
-    # for the given (kind, task) tuple; reset on a successful refine.
-    # Consumed by :class:`~goldfive.steerer.DefaultSteerer` to back off
-    # and mark the task FAILED after N consecutive failures, preventing
-    # the same drift from looping until ``max_task_invocations`` trips.
-    refine_failure_counts: dict[tuple[str, str], int] = dataclasses.field(default_factory=dict)
-    # Per-(task_id, drift_kind_value) ``time.monotonic()`` timestamp of the
-    # last plan revision that actually landed (``_emit_plan_revised``).
-    # Consumed by :class:`~goldfive.steerer.DefaultSteerer` to gate
-    # drift-triggered revisions through a short cooldown window so a
-    # cluster of closely-spaced drifts of the same kind on the same task
-    # does not thrash ``planner.refine`` (goldfive feedback-loop fix).
-    # Sentinel task_id ``""`` covers trajectory-wide revisions. Does NOT
-    # apply to USER_STEER (always honoured) or GOAL_DRIFT (has its own
-    # task-boundary rate limit via ``_last_goal_drift_check_ts``).
-    _last_plan_revision_at: dict[tuple[str, str], float] = dataclasses.field(default_factory=dict)
+    # Per-(drift_kind_value, task_id) outcome of the last refine attempt
+    # this turn. goldfive#215 (iter-8) P2 — single-source-of-truth
+    # replacement for the split ``refine_failure_counts`` (numerical cap)
+    # + ``KEY_ACTIVE_DRIFTS`` lifecycle gate. Each entry is a
+    # :class:`RefineOutcome` carrying ``state`` (``"succeeded"`` /
+    # ``"failed"``) and a ``fail_count`` consulted by the intervention
+    # ladder + the REPEATED_FAILURE escalation. Cleared on every
+    # ``run_started`` boundary via :meth:`DefaultSteerer.reset_for_turn`,
+    # so a fresh turn always starts with empty outcomes (per-turn scope
+    # is the natural boundary for retry budgets).
+    #
+    # Concurrency: the dict is lock-free single-writer-per-session.
+    # Reads and writes happen exclusively from ``DefaultSteerer``'s
+    # ``observe`` / ``_handle_drift`` / ``_promote_drift_to_steer``
+    # paths; ADK's adapter callback contract serialises drift delivery
+    # per session, so concurrent writes for the same Session do not
+    # arise in practice. Cross-session writes target distinct dicts
+    # (one per Session). The same property held for the predecessor
+    # ``refine_failure_counts`` field — the lock-free pattern is the
+    # established contract, not a regression.
+    refine_outcomes: dict[tuple[str, str], RefineOutcome] = dataclasses.field(default_factory=dict)
     # Per-task ``time.monotonic()`` timestamp of the most recent
     # task-progress signal — set on ``mark_task_running``,
     # ``mark_task_progress``, and every ``_emit_task_transitioned`` call.

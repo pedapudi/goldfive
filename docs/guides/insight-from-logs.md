@@ -144,9 +144,9 @@ for task_id, summary in s.completed_results.items():
 # Approvals still open (non-empty is a red flag after a run ends).
 print("pending_approvals:", list(s.pending_approvals))
 
-# Per-(drift_kind, task_id) refine failure counters.
-# Non-zero means refine couldn't recover from that drift.
-print("refine_failure_counts:", dict(s.refine_failure_counts))
+# Per-(drift_kind, task_id) refine outcomes (goldfive#215 P2).
+# state="failed" means refine couldn't recover from that drift.
+print("refine_outcomes:", dict(s.refine_outcomes))
 
 # Last 20 reasoning blocks. Useful for post-hoc reasoning-drift.
 print(f"reasoning_history: {len(s.reasoning_history)} blocks")
