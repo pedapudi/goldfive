@@ -256,6 +256,9 @@ async def test_mark_task_failed_recoverable_fires_drift() -> None:
     steerer, session, sink, planner = _fresh()
     await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
     assert _task(session, "t1").status is TaskStatus.FAILED
+    # iter-11A: drift cascade is fire-and-forget; drain before
+    # asserting on its observable side effects.
+    await steerer._wait_background_drifts_idle()
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # TaskFailed + DriftDetected + refine-failure DriftDetected (planner
     # returns None so no PlanRevised; the follow-up drift surfaces that).
@@ -275,6 +278,9 @@ async def test_mark_task_failed_recoverable_fires_drift() -> None:
 async def test_mark_task_failed_fatal_fires_critical_drift() -> None:
     steerer, session, sink, _planner = _fresh()
     await steerer.mark_task_failed("t1", session=session, reason="unrecoverable", recoverable=False)
+    # iter-11A: drift cascade is fire-and-forget; drain before
+    # asserting on its observable side effects.
+    await steerer._wait_background_drifts_idle()
     # Event order: TaskFailed(t1) → TaskCancelled(t2, cascade) → DriftDetected(TASK_FAILED_FATAL) →
     # refine-failure DriftDetected (stub planner returns None). The
     # cascade fires before the fatal drift so planner.refine (if it ran)
@@ -301,6 +307,9 @@ async def test_mark_task_blocked_transitions_and_emits_drift() -> None:
         "t1", session=session, blocker="need API key", needed="credentials.json"
     )
     assert _task(session, "t1").status is TaskStatus.BLOCKED
+    # iter-11A: drift cascade is fire-and-forget; drain before
+    # asserting on its observable side effects.
+    await steerer._wait_background_drifts_idle()
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # TaskBlocked + DriftDetected + refine-failure DriftDetected (stub
     # planner returns None; the follow-up drift surfaces that).
@@ -661,6 +670,10 @@ async def test_refine_failure_counter_increments_on_exception() -> None:
     # through _handle_drift and triggers one more refine attempt (keyed
     # on a different (kind, task) tuple, so the TOOL_ERROR counter stays
     # at 2 and the TASK_FAILED_FATAL counter reaches 1).
+    # iter-11A: the TASK_FAILED_FATAL refine attempt now lands
+    # asynchronously via mark_task_failed's spawned cascade — drain
+    # before asserting on the fatal-key outcome.
+    await steerer._wait_background_drifts_idle()
     outcome_after_2 = session.refine_outcomes[key]
     assert outcome_after_2.state == "failed"
     assert outcome_after_2.fail_count == 2
@@ -692,6 +705,9 @@ async def test_refine_failure_counter_increments_on_none_return() -> None:
     # Same cascade as the exception case: the TOOL_ERROR counter is
     # clamped at the threshold (2), the cascaded TASK_FAILED_FATAL drift
     # kicks off its own independent counter at 1.
+    # iter-11A: drain the spawned mark_task_failed cascade before
+    # asserting on the fatal-key outcome.
+    await steerer._wait_background_drifts_idle()
     outcome_after_2 = session.refine_outcomes[key]
     assert outcome_after_2.state == "failed"
     assert outcome_after_2.fail_count == 2
