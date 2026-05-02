@@ -1026,6 +1026,28 @@ class Session:
     # the reasoning judge) can use this to distinguish "child of a
     # delegation chain rooted at the assignee" from "off-plan agent".
     task_lineage: dict[str, set[str]] = dataclasses.field(default_factory=dict)
+    # Ring buffer of recent tool-call observations consumed by the
+    # iter-10 three-state reasoning judge so it can distinguish a
+    # provoked deviation (the agent saw a tool error / surprising
+    # result and pivoted) from an unprovoked one. Adapters push
+    # entries via ``DefaultSteerer.note_tool_observation`` from their
+    # ``after_tool_callback`` / ``on_tool_error_callback`` hooks; the
+    # steerer trims to ``recent_tool_observations_max`` so the prompt
+    # stays bounded regardless of run length. Each entry is a small
+    # dict (``ts_ms``, ``agent_name``, ``task_id``, ``tool_name``,
+    # ``args_preview``, ``result_preview``, ``is_error``,
+    # ``error_message``) — framework-neutral, no protos, so sinks /
+    # tests can introspect cheaply. Per-task scoping is applied at
+    # READ time by the judge's prompt renderer (PR 3): writers store
+    # everything so a deviation rooted in an earlier task's artefact
+    # remains visible.
+    recent_tool_observations: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # Cap for ``recent_tool_observations``. Default 16 covers a couple
+    # of agent invocations on typical traces while keeping the prompt
+    # block under ~1.5KB even before the per-entry truncation. Tunable
+    # via the ``Steerer`` config so operators on tight context budgets
+    # can drop it.
+    recent_tool_observations_max: int = 16
     # Monotonic event sequence counter for sinks. When this Session was
     # built by :meth:`Conversation.next_turn_session`, the seed value is
     # the Conversation's running cursor (lifted from the previous turn's
