@@ -165,6 +165,20 @@ class DriftKind(StrEnum):
     # demo-v8.log) — without it, a single bad turn wedges the run for
     # minutes. See goldfive#271 follow-up.
     LLM_CALL_TIMEOUT = "llm_call_timeout"
+    # Reasoning-judge produced a "justified_deviation" verdict (iter-10).
+    # The bound agent's chain-of-thought departed from the bound task,
+    # but the judge's prompt context (recent tool error, surprising
+    # result, discovered dependency, new information) plausibly
+    # justifies the departure. Routes through the same goal-aware refine
+    # path as OFF_TOPIC, but the steerer ladder always ABSORBs (no
+    # escalation): a reality-provoked deviation is the right input for
+    # plan-extension at every severity. Distinct from OFF_TOPIC so
+    # condition_id / per-(kind, task_id) cooldown lifecycle stays
+    # separable from unprovoked drift. PR 1 (proto + dataclass) ships
+    # the kind only; PR 4 wires the steerer ladder entry and planner
+    # prompt-selection. Until then no production code path constructs
+    # this kind, so the lack of a ``_LADDER`` row is intentional.
+    JUSTIFIED_DEVIATION = "justified_deviation"
 
 
 class DriftSeverity(StrEnum):
