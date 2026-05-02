@@ -258,8 +258,11 @@ async def test_missing_on_task_key_returns_none_with_debug_log(
             call_llm=call_llm,
         )
     assert drift is None
+    # iter-10 PR 3 retitled the log line: now mentions BOTH the
+    # three-state ``classification`` key and the legacy ``on_task``
+    # bool, since the parser tries both before quiet-failing.
     assert any(
-        "lacks boolean 'on_task'" in r.getMessage()
+        "lacks both 'classification' and boolean 'on_task'" in r.getMessage()
         and r.name == "goldfive.drift.reasoning_judge"
         for r in caplog.records
     )
@@ -1020,8 +1023,665 @@ def test_classify_with_focus_renders_plan_tasks_into_prompt() -> None:
         task_block="(no task bound)",
         reasoning_block="thinking",
         current_agent_id="(unknown)",
+        task_lineage_block="(no task lineage observed)",
+        tool_obs_block="(no recent tool observations)",
+        tool_obs_count=0,
     )
     assert "PLAN TASKS" in rendered
     assert "t1 -> Alpha" in rendered
     assert "focused_task_id" in rendered
     assert "focus_confidence" in rendered
+
+
+# ---------------------------------------------------------------------------
+# iter-10 PR 3 — three-state classification parser
+# ---------------------------------------------------------------------------
+
+
+async def test_parser_accepts_on_task_classification() -> None:
+    """``classification: "on_task"`` (no legacy on_task field) → no drift."""
+    call_llm = _stub_call_llm([{"classification": "on_task", "reason": "ok"}])
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thought",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is None
+    assert verdict.classification == "on_task"
+    assert verdict.provenance == ""
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    ["tool_error", "surprising_result", "discovered_dependency", "new_information"],
+)
+async def test_parser_accepts_justified_deviation_with_each_provenance(
+    provenance: str,
+) -> None:
+    """All four provenance enum values produce a JUSTIFIED_DEVIATION drift."""
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "justified_deviation",
+                "severity": "warning",
+                "reason": "Got a surprise",
+                "provenance": provenance,
+            }
+        ]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="reasoning that pivots after a tool result",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+        current_task_id="t1",
+        current_agent_id="a1",
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.JUSTIFIED_DEVIATION
+    assert verdict.drift.severity is DriftSeverity.WARNING
+    assert verdict.classification == "justified_deviation"
+    assert verdict.provenance == provenance
+    # Detail prefix carries the provenance string so the refine prompt
+    # surfaces it via _render_off_topic_reasoning_block.
+    assert f"justified deviation ({provenance})" in verdict.drift.detail
+
+
+async def test_parser_accepts_erroneous_deviation_classification() -> None:
+    """``classification: "erroneous_deviation"`` produces an OFF_TOPIC drift."""
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "erroneous_deviation",
+                "severity": "warning",
+                "reason": "drifted to raccoons",
+            }
+        ]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="raccoons have stripes; let me look those up",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+        current_task_id="t1",
+        current_agent_id="a1",
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.OFF_TOPIC
+    assert verdict.classification == "erroneous_deviation"
+    assert verdict.provenance == ""
+    assert "raccoons" in verdict.drift.detail
+
+
+async def test_parser_demotes_justified_deviation_with_none_provenance(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``provenance: "none"`` on a justified verdict → demote to OFF_TOPIC.
+
+    Per §2.4 rule 3: ``"none"`` is a legal value only on the on_task
+    or erroneous branches. On a justified_deviation it is treated as
+    "model couldn't name a signal" → demote.
+    """
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "justified_deviation",
+                "severity": "warning",
+                "reason": "claimed-justified-but-unsourced",
+                "provenance": "none",
+            }
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="goldfive.drift.reasoning_judge"):
+        verdict = await rjudge.classify_reasoning_drift_with_focus(
+            reasoning="thought",
+            task=_task(),
+            goals=_goals(),
+            plan=None,
+            model="fake",
+            call_llm=call_llm,
+        )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.OFF_TOPIC
+    assert verdict.classification == "erroneous_deviation"
+    assert verdict.provenance == ""
+    # Demotion is audited at INFO so operators can grep the rate.
+    assert any(
+        "demoted to erroneous_deviation" in r.getMessage()
+        and r.name == "goldfive.drift.reasoning_judge"
+        for r in caplog.records
+    )
+
+
+async def test_parser_demotes_justified_deviation_with_unknown_provenance() -> None:
+    """An unrecognised provenance string → demote to erroneous_deviation."""
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "justified_deviation",
+                "severity": "warning",
+                "reason": "claimed-justified-with-bogus-provenance",
+                "provenance": "guesswork",
+            }
+        ]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thought",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.OFF_TOPIC
+    assert verdict.classification == "erroneous_deviation"
+    assert verdict.provenance == ""
+
+
+async def test_parser_demotes_justified_deviation_with_missing_provenance() -> None:
+    """Missing ``provenance`` key on a justified verdict → demote."""
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "justified_deviation",
+                "severity": "warning",
+                "reason": "no-provenance-key",
+            }
+        ]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thought",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.OFF_TOPIC
+    assert verdict.classification == "erroneous_deviation"
+    assert verdict.provenance == ""
+
+
+async def test_parser_legacy_on_task_true_yields_on_task() -> None:
+    """Legacy ``{"on_task": true}`` (no classification) → on_task / no drift.
+
+    §2.4 rule 2: back-compat for custom prompt-template overrides.
+    """
+    call_llm = _stub_call_llm([{"on_task": True}])
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thought",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is None
+    assert verdict.classification == "on_task"
+
+
+async def test_parser_legacy_on_task_false_yields_erroneous() -> None:
+    """Legacy ``{"on_task": false, ...}`` → erroneous_deviation / OFF_TOPIC."""
+    call_llm = _stub_call_llm(
+        [{"on_task": False, "severity": "warning", "reason": "drifted"}]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thought",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.OFF_TOPIC
+    assert verdict.classification == "erroneous_deviation"
+
+
+async def test_parser_quiet_fail_on_missing_classification_and_on_task() -> None:
+    """Neither ``classification`` nor a boolean ``on_task`` → quiet-fail."""
+    call_llm = _stub_call_llm([{"severity": "warning"}])
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thought",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is None
+    assert verdict.classification == ""
+    assert verdict.provenance == ""
+
+
+async def test_parser_tolerates_markdown_fences_three_state() -> None:
+    """Three-state JSON wrapped in ```json fences``` parses cleanly."""
+    raw = (
+        "```json\n"
+        '{"classification": "justified_deviation", '
+        '"severity": "warning", '
+        '"reason": "tool 503", '
+        '"provenance": "tool_error"}\n'
+        "```"
+    )
+    call_llm = _stub_call_llm([raw])
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="retrying after 503",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.JUSTIFIED_DEVIATION
+    assert verdict.classification == "justified_deviation"
+    assert verdict.provenance == "tool_error"
+
+
+async def test_parser_unknown_classification_falls_back_to_legacy_on_task() -> None:
+    """Half-correct ``classification`` (not in the enum) → legacy fallback.
+
+    Defensive: if the model returns ``classification: "drift"`` or
+    similar, the parser must still fall through to the legacy
+    ``on_task`` field. This protects custom-prompt operators who may
+    inadvertently trigger novel verdict shapes.
+    """
+    call_llm = _stub_call_llm(
+        [{"classification": "drift", "on_task": False, "severity": "warning", "reason": "x"}]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="thought",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.OFF_TOPIC
+    assert verdict.classification == "erroneous_deviation"
+
+
+# ---------------------------------------------------------------------------
+# iter-10 PR 3 — prompt rendering helpers
+# ---------------------------------------------------------------------------
+
+
+def test_format_task_lineage_empty() -> None:
+    """No lineage → ``(no task lineage observed)``."""
+    assert (
+        rjudge._format_task_lineage("t1", None, "a1") == "(no task lineage observed)"
+    )
+    assert (
+        rjudge._format_task_lineage("t1", {}, "a1") == "(no task lineage observed)"
+    )
+    # Task not in lineage map → also empty.
+    assert (
+        rjudge._format_task_lineage("t1", {"t2": {"a1"}}, "a1")
+        == "(no task lineage observed)"
+    )
+    # Empty set for task → also empty.
+    assert (
+        rjudge._format_task_lineage("t1", {"t1": set()}, "a1")
+        == "(no task lineage observed)"
+    )
+
+
+def test_format_task_lineage_includes_agent_when_in_lineage() -> None:
+    rendered = rjudge._format_task_lineage("t1", {"t1": {"a1", "b1"}}, "a1")
+    # Sorted membership-list, with "IS in this lineage" suffix.
+    assert "observed agents for this task: a1, b1" in rendered
+    assert "a1 IS in this lineage" in rendered
+
+
+def test_format_task_lineage_when_agent_not_in_lineage() -> None:
+    rendered = rjudge._format_task_lineage("t1", {"t1": {"a1", "b1"}}, "c1")
+    assert "observed agents for this task: a1, b1" in rendered
+    assert "c1 is NOT in this lineage" in rendered
+
+
+def test_format_tool_observations_empty() -> None:
+    block, count = rjudge._format_tool_observations(None, task_id="t1")
+    assert block == "(no recent tool observations)"
+    assert count == 0
+    block, count = rjudge._format_tool_observations([], task_id="t1")
+    assert block == "(no recent tool observations)"
+    assert count == 0
+
+
+def test_format_tool_observations_filters_by_task() -> None:
+    """Per-task filtering: when current task has obs, render ONLY those."""
+    obs = [
+        {
+            "task_id": "t_other",
+            "agent_name": "a1",
+            "tool_name": "fetch",
+            "args_preview": "{}",
+            "result_preview": "ok",
+            "is_error": False,
+        },
+        {
+            "task_id": "t1",
+            "agent_name": "a2",
+            "tool_name": "search",
+            "args_preview": '{"q": "x"}',
+            "result_preview": "[]",
+            "is_error": False,
+        },
+    ]
+    block, count = rjudge._format_tool_observations(obs, task_id="t1")
+    assert count == 1
+    assert "search" in block
+    assert "fetch" not in block
+
+
+def test_format_tool_observations_falls_back_to_global() -> None:
+    """When current task has no obs, fall back to the global slice."""
+    obs = [
+        {
+            "task_id": "t_other",
+            "agent_name": "a1",
+            "tool_name": "fetch",
+            "args_preview": "{}",
+            "result_preview": "ok",
+            "is_error": False,
+        },
+        {
+            "task_id": "t_other2",
+            "agent_name": "a2",
+            "tool_name": "search",
+            "args_preview": "{}",
+            "result_preview": "[]",
+            "is_error": True,
+        },
+    ]
+    block, count = rjudge._format_tool_observations(obs, task_id="t_missing")
+    assert count == 2
+    assert "fetch" in block
+    assert "search" in block
+    # Error marker rendered for the failing entry.
+    assert "ERROR" in block
+    assert "ok" in block  # the success marker prefix
+
+
+def test_format_tool_observations_caps_at_max_chars() -> None:
+    """Block stays ≤ 1500 chars even when fed many observations.
+
+    Each entry's args_preview / result_preview are already bounded at
+    write time (240 / 480 chars). The helper enforces total block
+    size as the second-line defence.
+    """
+    big_arg = "x" * 240
+    big_result = "y" * 480
+    obs = [
+        {
+            "task_id": "t1",
+            "agent_name": f"a{i}",
+            "tool_name": "tool",
+            "args_preview": big_arg,
+            "result_preview": big_result,
+            "is_error": False,
+        }
+        for i in range(50)
+    ]
+    block, count = rjudge._format_tool_observations(obs, task_id="t1")
+    assert len(block) <= rjudge.REASONING_DRIFT_TOOL_OBS_MAX_CHARS
+    # Count must be > 0 (we got at least one entry rendered) and < 50
+    # (the cap kicked in before we ran out of entries).
+    assert 0 < count < 50
+
+
+def test_prompt_includes_lineage_block_when_set() -> None:
+    """Render lineage with two agents into the user prompt."""
+    rendered = rjudge.REASONING_DRIFT_USER_PROMPT_TEMPLATE.format(
+        plan_tasks_summary="(no plan tasks)",
+        goals_block="(no goals)",
+        task_block="(no task bound)",
+        reasoning_block="thinking",
+        current_agent_id="a1",
+        task_lineage_block=rjudge._format_task_lineage(
+            "t1", {"t1": {"a1", "b1"}}, "a1"
+        ),
+        tool_obs_block="(no recent tool observations)",
+        tool_obs_count=0,
+    )
+    assert "Task lineage:" in rendered
+    assert "observed agents for this task: a1, b1" in rendered
+    assert "a1 IS in this lineage" in rendered
+
+
+def test_prompt_lineage_block_when_absent() -> None:
+    rendered = rjudge.REASONING_DRIFT_USER_PROMPT_TEMPLATE.format(
+        plan_tasks_summary="(no plan tasks)",
+        goals_block="(no goals)",
+        task_block="(no task bound)",
+        reasoning_block="thinking",
+        current_agent_id="a1",
+        task_lineage_block=rjudge._format_task_lineage("t1", None, "a1"),
+        tool_obs_block="(no recent tool observations)",
+        tool_obs_count=0,
+    )
+    assert "Task lineage: (no task lineage observed)" in rendered
+
+
+def test_prompt_lineage_block_when_agent_not_in_set() -> None:
+    rendered = rjudge.REASONING_DRIFT_USER_PROMPT_TEMPLATE.format(
+        plan_tasks_summary="(no plan tasks)",
+        goals_block="(no goals)",
+        task_block="(no task bound)",
+        reasoning_block="thinking",
+        current_agent_id="c1",
+        task_lineage_block=rjudge._format_task_lineage(
+            "t1", {"t1": {"a1", "b1"}}, "c1"
+        ),
+        tool_obs_block="(no recent tool observations)",
+        tool_obs_count=0,
+    )
+    assert "c1 is NOT in this lineage" in rendered
+
+
+def test_prompt_renders_three_state_decision_section() -> None:
+    """The user prompt template carries the iter-10 'Decide THREE things' block.
+
+    Snapshot-style contains-check: pins the literal markers so a
+    well-meaning prompt edit that drops one of the three decisions
+    fails this test.
+    """
+    rendered = rjudge.REASONING_DRIFT_USER_PROMPT_TEMPLATE.format(
+        plan_tasks_summary="(no plan tasks)",
+        goals_block="(no goals)",
+        task_block="(no task bound)",
+        reasoning_block="thinking",
+        current_agent_id="a1",
+        task_lineage_block="(no task lineage observed)",
+        tool_obs_block="(no recent tool observations)",
+        tool_obs_count=0,
+    )
+    assert "Decide THREE things:" in rendered
+    # The three decisions are listed.
+    assert "1. CLASSIFICATION." in rendered
+    assert "2. ATTRIBUTION." in rendered
+    assert "3. PROVENANCE." in rendered
+    # Provenance enum literals appear verbatim (the LLM's output must
+    # match these strings; the parser strip+lowercases before
+    # comparison but the prompt asks for the canonical names).
+    for token in (
+        "tool_error",
+        "surprising_result",
+        "discovered_dependency",
+        "new_information",
+    ):
+        assert token in rendered, token
+    # Three-state classification literals also appear verbatim.
+    for token in ("on_task", "justified_deviation", "erroneous_deviation"):
+        assert token in rendered, token
+    # GUIDANCE block is present (LLM behaviour depends on its specifics).
+    assert "GUIDANCE:" in rendered
+
+
+# ---------------------------------------------------------------------------
+# iter-10 PR 3 — verdict propagation through the legacy wrapper
+# ---------------------------------------------------------------------------
+
+
+async def test_classify_reasoning_drift_legacy_wrapper_threads_lineage() -> None:
+    """The back-compat wrapper accepts and threads the new kwargs.
+
+    Pins the API surface — external callers who upgrade to iter-10
+    can pass lineage / tool observations through the legacy wrapper
+    too without switching to ``classify_reasoning_drift_with_focus``.
+    """
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "justified_deviation",
+                "severity": "warning",
+                "reason": "tool 503",
+                "provenance": "tool_error",
+            }
+        ]
+    )
+    drift = await rjudge.classify_reasoning_drift(
+        reasoning="retrying after 503",
+        task=_task(),
+        goals=_goals(),
+        model="fake",
+        call_llm=call_llm,
+        task_lineage={"t1": {"a1"}},
+        recent_tool_observations=[
+            {
+                "task_id": "t1",
+                "agent_name": "a1",
+                "tool_name": "fetch",
+                "args_preview": "{}",
+                "result_preview": "503",
+                "is_error": True,
+            }
+        ],
+    )
+    assert drift is not None
+    assert drift.kind is DriftKind.JUSTIFIED_DEVIATION
+
+
+# ---------------------------------------------------------------------------
+# iter-10 PR 3 — span / observability event
+# ---------------------------------------------------------------------------
+
+
+async def test_reasoning_judge_invoked_carries_classification_three_state() -> None:
+    """ReasoningJudgeInvoked event payload populates ``classification`` for each
+    of the three states.
+
+    Pins the proto-event wiring: PR 1 added the field; PR 3 starts
+    populating it from the parser. on_task / justified_deviation /
+    erroneous_deviation must all surface their canonical
+    classification name on the wire.
+    """
+    cases: list[tuple[dict[str, Any], str]] = [
+        ({"classification": "on_task", "reason": "ok"}, "on_task"),
+        (
+            {
+                "classification": "justified_deviation",
+                "severity": "warning",
+                "reason": "503",
+                "provenance": "tool_error",
+            },
+            "justified_deviation",
+        ),
+        (
+            {
+                "classification": "erroneous_deviation",
+                "severity": "warning",
+                "reason": "drifted",
+            },
+            "erroneous_deviation",
+        ),
+    ]
+    for response, expected in cases:
+        sink = ListSink()
+        call_llm = _stub_call_llm([response])
+        await rjudge.classify_reasoning_drift_with_focus(
+            reasoning="thinking",
+            task=_task(),
+            goals=_goals(),
+            plan=None,
+            model="fake",
+            call_llm=call_llm,
+            current_task_id="t1",
+            current_agent_id="a1",
+            sink=sink,
+            run_id="r1",
+            session_id="s1",
+        )
+        # Pull the ReasoningJudgeInvoked event out of the sink stream.
+        invoked: list[Any] = []
+        for evt in sink.events:
+            payload = getattr(evt, "reasoning_judge_invoked", None)
+            if payload is None:
+                continue
+            # Distinguish between an unset oneof (returns the default
+            # message but the envelope's WhichOneof is something else)
+            # and a real RJI envelope by checking model is set.
+            if getattr(payload, "model", "") == "fake":
+                invoked.append(payload)
+        assert len(invoked) == 1, (expected, invoked)
+        assert invoked[0].classification == expected, (expected, invoked[0])
+
+
+async def test_judge_span_decision_summary_three_state() -> None:
+    """Span ``decision_summary`` carries the three-state classification.
+
+    For justified_deviation, the provenance is rendered alongside
+    (e.g. ``"justified_deviation (tool_error)"``).
+    """
+    sink = ListSink()
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "justified_deviation",
+                "severity": "warning",
+                "reason": "503",
+                "provenance": "tool_error",
+            }
+        ]
+    )
+    await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="retrying after 503",
+        task=_task(),
+        goals=_goals(),
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+        current_task_id="t1",
+        current_agent_id="a1",
+        sink=sink,
+        run_id="r1",
+        session_id="s1",
+    )
+    # Span end events are emitted onto the sink; find the
+    # judge_reasoning span end and check its decision_summary.
+    decision_summaries: list[str] = []
+    for evt in sink.events:
+        end = getattr(evt, "goldfive_llm_call_end", None)
+        if end is None:
+            continue
+        # Distinguish unset oneof from a real End — only consider
+        # envelopes whose ``span_id`` is populated (the End helper
+        # always sets it).
+        if not getattr(end, "span_id", ""):
+            continue
+        if getattr(end, "decision_summary", ""):
+            decision_summaries.append(end.decision_summary)
+    assert any(
+        "justified_deviation (tool_error)" in s for s in decision_summaries
+    ), decision_summaries

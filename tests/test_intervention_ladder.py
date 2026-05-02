@@ -137,6 +137,36 @@ _CASES: list[tuple[DriftKind, DriftSeverity, int, InterventionLevel]] = [
         2,
         InterventionLevel.PAUSE_ESCALATE,
     ),
+    # JUSTIFIED_DEVIATION (iter-10 PR 4): provoked deviation. Always-
+    # ABSORB at every severity; CRITICAL repeat does NOT escalate
+    # because the deviation is a response to a real provoking signal.
+    # Backstops upstream of the ladder (per-(kind, task_id) refine
+    # cooldown + task_last_progress_at stall gate) catch runaway
+    # justified_deviation without involving PAUSE_ESCALATE.
+    (
+        DriftKind.JUSTIFIED_DEVIATION,
+        DriftSeverity.INFO,
+        0,
+        InterventionLevel.OBSERVE,
+    ),
+    (
+        DriftKind.JUSTIFIED_DEVIATION,
+        DriftSeverity.WARNING,
+        0,
+        InterventionLevel.ABSORB,
+    ),
+    (
+        DriftKind.JUSTIFIED_DEVIATION,
+        DriftSeverity.CRITICAL,
+        0,
+        InterventionLevel.ABSORB,
+    ),
+    (
+        DriftKind.JUSTIFIED_DEVIATION,
+        DriftSeverity.CRITICAL,
+        2,
+        InterventionLevel.ABSORB,
+    ),
     # INTENT_DIVERGENCE: CRITICAL -> pause-escalate even on first occurrence.
     (DriftKind.INTENT_DIVERGENCE, DriftSeverity.WARNING, 0, InterventionLevel.ABSORB),
     (
@@ -313,4 +343,82 @@ def test_ladder_covers_goal_drift() -> None:
             DefaultSteerer.REFINE_FAILURE_THRESHOLD,
         )
         is InterventionLevel.CANCEL_REINVOKE
+    )
+
+
+def test_justified_deviation_routes_to_absorb_at_all_severities() -> None:
+    """iter-10 PR 4: JUSTIFIED_DEVIATION always-ABSORBs.
+
+    A provoked deviation is the right input for plan-extension at
+    every severity — penalising it with a PAUSE_ESCALATE on CRITICAL
+    repeat would punish the agent for responding to reality. The
+    backstops are upstream (per-(kind, task_id) refine cooldown +
+    task_last_progress_at stall gate), not on the ladder.
+    """
+    steerer = DefaultSteerer()
+    assert (
+        steerer._ladder_level_for(
+            DriftKind.JUSTIFIED_DEVIATION, DriftSeverity.INFO, 0
+        )
+        is InterventionLevel.OBSERVE
+    )
+    assert (
+        steerer._ladder_level_for(
+            DriftKind.JUSTIFIED_DEVIATION, DriftSeverity.WARNING, 0
+        )
+        is InterventionLevel.ABSORB
+    )
+    # CRITICAL first occurrence — ABSORB, NOT cancel-reinvoke.
+    assert (
+        steerer._ladder_level_for(
+            DriftKind.JUSTIFIED_DEVIATION, DriftSeverity.CRITICAL, 0
+        )
+        is InterventionLevel.ABSORB
+    )
+    # CRITICAL repeat — STILL ABSORB. Specifically NOT pause_escalate.
+    assert (
+        steerer._ladder_level_for(
+            DriftKind.JUSTIFIED_DEVIATION,
+            DriftSeverity.CRITICAL,
+            DefaultSteerer.REFINE_FAILURE_THRESHOLD,
+        )
+        is InterventionLevel.ABSORB
+    )
+    # And way past the repeat threshold for paranoia.
+    assert (
+        steerer._ladder_level_for(
+            DriftKind.JUSTIFIED_DEVIATION, DriftSeverity.CRITICAL, 99
+        )
+        is InterventionLevel.ABSORB
+    )
+
+
+def test_off_topic_unchanged_by_justified_deviation_addition() -> None:
+    """Regression: #345's OFF_TOPIC ladder row didn't move.
+
+    iter-10 PR 4 adds a sibling JUSTIFIED_DEVIATION row but must not
+    perturb OFF_TOPIC routing. Pin the four key cells.
+    """
+    steerer = DefaultSteerer()
+    assert (
+        steerer._ladder_level_for(DriftKind.OFF_TOPIC, DriftSeverity.INFO, 0)
+        is InterventionLevel.OBSERVE
+    )
+    assert (
+        steerer._ladder_level_for(DriftKind.OFF_TOPIC, DriftSeverity.WARNING, 0)
+        is InterventionLevel.ABSORB
+    )
+    assert (
+        steerer._ladder_level_for(
+            DriftKind.OFF_TOPIC, DriftSeverity.CRITICAL, 0
+        )
+        is InterventionLevel.CANCEL_REINVOKE
+    )
+    assert (
+        steerer._ladder_level_for(
+            DriftKind.OFF_TOPIC,
+            DriftSeverity.CRITICAL,
+            DefaultSteerer.REFINE_FAILURE_THRESHOLD,
+        )
+        is InterventionLevel.PAUSE_ESCALATE
     )

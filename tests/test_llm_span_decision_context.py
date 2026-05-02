@@ -303,7 +303,12 @@ async def test_classify_reasoning_drift_off_task_decision_wording() -> None:
     assert "on_task=False" in end.output_preview
     assert "warning" in end.output_preview
     assert "tangential" in end.output_preview
-    assert "off-task" in end.decision_summary
+    # iter-10 PR 3: decision_summary now carries the three-state
+    # classification name. A legacy ``{"on_task": false, ...}`` response
+    # routes through the §2.4 rule-2 fallback and is rendered as
+    # ``erroneous_deviation`` — the iter-10 equivalent of
+    # off-task-without-provenance.
+    assert "erroneous_deviation" in end.decision_summary
     # Severity surfaced in UPPERCASE.
     assert "WARNING" in end.decision_summary
     assert "research_agent" in end.decision_summary

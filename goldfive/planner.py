@@ -2502,16 +2502,19 @@ class LLMPlanner:
                 'return a JSON object of the form {"reject": true, "reason": '
                 '"..."} (the caller will escalate to human intervention).\n\n'
             )
-        elif drift.kind is DriftKind.OFF_TOPIC:
-            # OFF_TOPIC has no observed-actions channel — the deviation
-            # is in the agent's reasoning, surfaced by the reasoning
-            # judge. Render an analogous "what the agent did" block from
-            # the drift's reasoning context (``trigger_input`` is the
+        elif drift.kind in (DriftKind.OFF_TOPIC, DriftKind.JUSTIFIED_DEVIATION):
+            # OFF_TOPIC and JUSTIFIED_DEVIATION (iter-10 PR 4) have no
+            # observed-actions channel — the deviation is in the
+            # agent's reasoning, surfaced by the reasoning judge.
+            # Render an analogous "what the agent did" block from the
+            # drift's reasoning context (``trigger_input`` is the
             # truncated reasoning text the judge saw; ``raw`` is the
             # original, when set; ``detail`` is the judge's free-form
-            # reason). Frame it with the same ABSORB/REJECT contract so
-            # the goal-aware system prompt's decision shape carries
-            # through.
+            # reason — for JUSTIFIED_DEVIATION the detail string
+            # already carries the provenance prefix from the parser,
+            # e.g. "justified deviation (tool_error): ..."). Frame it
+            # with the same ABSORB/REJECT contract so the goal-aware
+            # system prompt's decision shape carries through.
             observed_block = (
                 f"{self._render_off_topic_reasoning_block(drift)}\n\n"
                 "The agent's reasoning has drifted from the bound task. "
@@ -2802,8 +2805,15 @@ class LLMPlanner:
         # right shape for "agent reasoning wandered off goal".
         is_plan_divergence = drift.kind is DriftKind.PLAN_DIVERGENCE
         is_off_topic = drift.kind is DriftKind.OFF_TOPIC
+        # iter-10 PR 4: JUSTIFIED_DEVIATION shares the goal-aware
+        # ABSORB/REJECT path with OFF_TOPIC. The drift's ``detail``
+        # already carries the provenance prefix (e.g. "justified
+        # deviation (tool_error): ...") which
+        # ``_render_off_topic_reasoning_block`` surfaces verbatim, so
+        # the LLM sees the provoking signal in the rendered context.
+        is_justified = drift.kind is DriftKind.JUSTIFIED_DEVIATION
         has_observed_actions = is_plan_divergence and observed_actions is not None
-        use_divergence_prompt = has_observed_actions or is_off_topic
+        use_divergence_prompt = has_observed_actions or is_off_topic or is_justified
         try:
             base_user_prompt = self._build_refine_prompt(
                 plan,
