@@ -2014,6 +2014,100 @@ class DefaultSteerer:
         if overflow > 0:
             del hist[:overflow]
 
+    def note_tool_observation(
+        self,
+        session: Session,
+        *,
+        agent_name: str,
+        task_id: str,
+        tool_name: str,
+        args: Any,
+        result: Any,
+        error: Exception | str | None = None,
+    ) -> None:
+        """Append a bounded tool-observation entry to ``session.recent_tool_observations``.
+
+        Iter-10 PR 2. Population path for the three-state reasoning
+        judge (PR 3 reads this buffer to distinguish a provoked
+        deviation from an unprovoked one). Adapters call this from
+        their ``after_tool_callback`` (success + acknowledged-failure)
+        and ``on_tool_error_callback`` hooks.
+
+        Push-only and trim-on-write — mirrors
+        :meth:`note_agent_activity`. The buffer is bounded by
+        ``session.recent_tool_observations_max`` (default 16) so the
+        prompt the judge eventually reads stays small regardless of
+        run length. Per-task filtering happens at READ time in the
+        judge's prompt renderer; this writer captures every call.
+
+        Always swallow internal errors. Observability must never break
+        tool dispatch — a malformed ``args`` / ``result`` repr, a
+        broken clock, or a pathological session must not raise out of
+        an ADK callback. The catch is intentionally broad.
+        """
+        try:
+            ts_ms = time.monotonic_ns() // 1_000_000
+            try:
+                args_preview = repr(args)[:240]
+            except Exception:  # noqa: BLE001
+                args_preview = "(unrepresentable args)"
+            if result is None:
+                result_preview = "(none)"
+            else:
+                try:
+                    result_preview = repr(result)[:480]
+                except Exception:  # noqa: BLE001
+                    result_preview = "(unrepresentable result)"
+            # Error detection: an explicit ``error=`` from the caller
+            # (the on_tool_error path) wins; otherwise look for the
+            # acknowledged-failure shape ``{"error": ...}`` in the
+            # tool result. The reporting tools and most goldfive
+            # tools return that shape on a soft failure.
+            is_error = False
+            error_message = ""
+            if error is not None:
+                is_error = True
+                try:
+                    error_message = str(error)[:240]
+                except Exception:  # noqa: BLE001
+                    error_message = "(unrepresentable error)"
+            elif isinstance(result, dict) and "error" in result:
+                is_error = True
+                try:
+                    error_message = str(result.get("error", ""))[:240]
+                except Exception:  # noqa: BLE001
+                    error_message = "(unrepresentable error)"
+            entry: dict[str, Any] = {
+                "ts_ms": ts_ms,
+                "agent_name": agent_name,
+                "task_id": task_id,
+                "tool_name": tool_name,
+                "args_preview": args_preview,
+                "result_preview": result_preview,
+                "is_error": is_error,
+                "error_message": error_message,
+            }
+            hist = session.recent_tool_observations
+            hist.append(entry)
+            # Cap defaults to 16 (§3.1) but honour any session-local
+            # override; clamp to >=1 so a pathological 0 / negative
+            # value doesn't disable the buffer entirely (we always
+            # want at least the most-recent entry).
+            try:
+                cap_raw = int(session.recent_tool_observations_max)
+            except (TypeError, ValueError):
+                cap_raw = 16
+            cap = max(1, cap_raw)
+            overflow = len(hist) - cap
+            if overflow > 0:
+                # Slice-delete is amortized O(1) on average for the
+                # bounded ``overflow == 1`` case (the steady state once
+                # the buffer is full), and is the same pattern
+                # ``note_agent_activity`` uses.
+                del hist[:overflow]
+        except Exception as exc:  # noqa: BLE001
+            log.debug("note_tool_observation: swallowed: %s", exc)
+
     async def note_agent_turn(self, session: Session) -> None:
         """Record one agent invocation against ``session``.
 

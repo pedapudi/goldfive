@@ -5282,6 +5282,39 @@ def make_adk_plugin(
                 await ctx.steerer.observe(observation, ctx.session)
             except Exception as exc:  # noqa: BLE001
                 log.debug("on_tool_error_callback: steerer.observe raised: %s", exc)
+            # Iter-10 PR 2: also record the raised-error path on
+            # ``session.recent_tool_observations`` so the three-state
+            # reasoning judge (PR 3) can recognise a provoked
+            # deviation rooted in a hard tool exception. The one-shot
+            # ``Observation`` above is consumed for drift dispatch
+            # (e.g. ``classify_tool_error``) but never persisted on
+            # the session.
+            try:
+                note_obs = getattr(ctx.steerer, "note_tool_observation", None)
+                if note_obs is not None:
+                    gf_session = ctx.session
+                    pinned_agent = (
+                        str(_safe_attr(gf_session, "current_agent_id", "") or "")
+                        or self._host_agent_name
+                    )
+                    pinned_task = (
+                        str(_safe_attr(gf_session, "current_task_id", "") or "")
+                        or str(_safe_attr(ctx.task, "id", "") or "")
+                    )
+                    note_obs(
+                        gf_session,
+                        agent_name=pinned_agent,
+                        task_id=pinned_task,
+                        tool_name=tool_name,
+                        args=tool_args,
+                        result=None,
+                        error=error,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "on_tool_error_callback: note_tool_observation raised: %s",
+                    exc,
+                )
             return None
 
         # --- Tool-loop drift detection (goldfive#181) ------------------
@@ -5371,6 +5404,48 @@ def make_adk_plugin(
                     exc,
                 )
                 return None
+
+            # Iter-10 PR 2: record the call in the session-scoped
+            # ``recent_tool_observations`` ring buffer so the
+            # three-state reasoning judge (PR 3) can distinguish a
+            # provoked deviation (the agent saw a tool error or
+            # surprising result and pivoted) from an unprovoked one.
+            # We capture both successful calls and acknowledged
+            # failures (``result`` is a dict with shape
+            # ``{"error": ...}``); raised exceptions are captured by
+            # ``on_tool_error_callback`` instead. The live agent /
+            # task pin set by iter-9's ``before_agent_callback`` is
+            # the authoritative source — fall back to the ADK-resolved
+            # agent_name and the ctx-task id when those are empty.
+            try:
+                note_obs = getattr(ctx.steerer, "note_tool_observation", None)
+                if note_obs is not None:
+                    gf_session = ctx.session
+                    pinned_agent = (
+                        str(_safe_attr(gf_session, "current_agent_id", "") or "")
+                        or agent_name
+                        or self._host_agent_name
+                    )
+                    pinned_task = (
+                        str(_safe_attr(gf_session, "current_task_id", "") or "")
+                        or task_id
+                    )
+                    note_obs(
+                        gf_session,
+                        agent_name=pinned_agent,
+                        task_id=pinned_task,
+                        tool_name=tool_name,
+                        args=tool_args,
+                        result=result,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # Defensive — observability must never break tool
+                # dispatch. The steerer method already swallows its
+                # own internals; this catches the lookup path.
+                log.debug(
+                    "after_tool_callback: note_tool_observation raised: %s",
+                    exc,
+                )
 
             # Post-observation: reset the window only on acknowledged
             # success for progress-reporting tools. An errored report
