@@ -961,6 +961,25 @@ class Session:
     # call ids so prompt templates / refine paths / downstream planners
     # can read a single, framework-agnostic source of truth.
     state: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Runtime-reasoning agent pin. Set by the ADK plugin's
+    # ``before_agent_callback`` to the agent that is about to reason
+    # (``last writer wins`` — reasoning is sequential within an
+    # invocation). Distinct from ``Task.assignee_agent_id`` which
+    # encodes the static plan intent: when a coordinator (assignee)
+    # delegates to a child via ``AgentTool``, the child reasons under
+    # the parent's task pin; ``current_agent_id`` reflects the actual
+    # reasoner so the reasoning judge attributes drift correctly.
+    # Defaults to ``""`` for legacy callers / pre-pin races; consumers
+    # should fall back to ``task.assignee_agent_id`` when empty.
+    current_agent_id: str = ""
+    # Observed delegation lineage per-task. Keyed by ``task.id`` →
+    # set of ``agent_id`` strings observed reasoning under that task
+    # (initialised to ``{task.assignee_agent_id}`` on RUNNING and
+    # extended by each ``delegation_observed`` whose pinned task_id
+    # matches). Cleared on task terminal transition. Consumers (e.g.
+    # the reasoning judge) can use this to distinguish "child of a
+    # delegation chain rooted at the assignee" from "off-plan agent".
+    task_lineage: dict[str, set[str]] = dataclasses.field(default_factory=dict)
     # Monotonic event sequence counter for sinks. When this Session was
     # built by :meth:`Conversation.next_turn_session`, the seed value is
     # the Conversation's running cursor (lifted from the previous turn's
