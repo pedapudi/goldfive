@@ -3113,6 +3113,21 @@ class DefaultSteerer:
             InterventionLevel.ABSORB,
             (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
         ),
+        # OFF_TOPIC is plan-context drift from the reasoning judge — the
+        # agent is reasoning about something that doesn't fit the bound
+        # task. Mirrors PLAN_DIVERGENCE's ladder mapping so the ABSORB
+        # path engages the goal-aware refine prompt (planner.refine
+        # routes both PLAN_DIVERGENCE and OFF_TOPIC through
+        # ``_PLAN_DIVERGENCE_SYSTEM_PROMPT``). Without this entry the
+        # default fallback (WARNING -> ABSORB) still triggered refine
+        # but the planner picked the generic ``_REFINE_SYSTEM_PROMPT``
+        # which has no goal-alignment guidance and could silently
+        # absorb off-goal reasoning into the plan.
+        DriftKind.OFF_TOPIC: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
         DriftKind.INTENT_DIVERGENCE: (
             InterventionLevel.OBSERVE,
             InterventionLevel.ABSORB,

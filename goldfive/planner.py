@@ -1559,6 +1559,28 @@ class LLMPlanner:
         return "\n".join(lines)
 
     @staticmethod
+    def _render_off_topic_reasoning_block(drift: DriftEvent) -> str:
+        """Render the reasoning context for an OFF_TOPIC drift refine.
+
+        OFF_TOPIC drifts come from the reasoning judge (or sentence-level
+        cosine detector); the deviation is in the agent's reasoning, not
+        in the observed agent activity. To give the goal-aware refine
+        prompt an analogue of ``OBSERVED AGENT ACTIVITY`` we render the
+        reason and the truncated reasoning text the judge saw. Falls back
+        to ``"(no reasoning excerpt available)"`` when the drift carries
+        no preview, so the prompt shape is invariant for tests.
+        """
+        header = "OFF-TOPIC REASONING (what the agent has been reasoning about):"
+        reason = drift.detail or "(judge returned no reason)"
+        excerpt = drift.trigger_input or ""
+        if not excerpt and isinstance(drift.raw, str):
+            excerpt = drift.raw
+        excerpt = excerpt.strip()
+        if not excerpt:
+            excerpt = "(no reasoning excerpt available)"
+        return f"{header}\n- judge reason: {reason}\n- excerpt: {excerpt}"
+
+    @staticmethod
     def _render_prior_turns_block(context: Mapping[str, Any] | None) -> str:
         """Render cross-turn context from a Conversation into a prompt block.
 
@@ -2480,6 +2502,31 @@ class LLMPlanner:
                 'return a JSON object of the form {"reject": true, "reason": '
                 '"..."} (the caller will escalate to human intervention).\n\n'
             )
+        elif drift.kind is DriftKind.OFF_TOPIC:
+            # OFF_TOPIC has no observed-actions channel — the deviation
+            # is in the agent's reasoning, surfaced by the reasoning
+            # judge. Render an analogous "what the agent did" block from
+            # the drift's reasoning context (``trigger_input`` is the
+            # truncated reasoning text the judge saw; ``raw`` is the
+            # original, when set; ``detail`` is the judge's free-form
+            # reason). Frame it with the same ABSORB/REJECT contract so
+            # the goal-aware system prompt's decision shape carries
+            # through.
+            observed_block = (
+                f"{self._render_off_topic_reasoning_block(drift)}\n\n"
+                "The agent's reasoning has drifted from the bound task. "
+                "Decide:\n"
+                "- ABSORB: if the new reasoning topic plausibly moves toward "
+                "the GOALS (and preserves every STICKY goal), produce a "
+                "revised plan that reflects the new direction (add or revise "
+                "tasks so the work the agent is now reasoning about has a "
+                "place in the plan).\n"
+                "- REJECT: if the new reasoning topic CONTRADICTS any goal "
+                "-- especially any STICKY goal added by a prior USER_STEER "
+                "-- or simply does not advance any goal, return a JSON "
+                'object of the form {"reject": true, "reason": "..."} '
+                "(the caller will escalate to human intervention).\n\n"
+            )
         return (
             f"{agents_block}"
             f"CURRENT GOALS (the revision must still advance every goal, "
@@ -2740,20 +2787,29 @@ class LLMPlanner:
         # kind; defending here too is a belt-and-braces guard.
         if drift.kind is DriftKind.REFINE_VALIDATION_FAILED:
             return None
-        # PLAN_DIVERGENCE with observed_actions goes through the
-        # reconciler prompt: the LLM must either ABSORB observed agent
-        # activity into a revised plan or REJECT (emit the reject
-        # sentinel). Without observed_actions we fall through to the
-        # generic refine path so callers that wire PLAN_DIVERGENCE the
-        # old way keep working.
+        # Plan-context drifts (PLAN_DIVERGENCE with observed_actions, or
+        # OFF_TOPIC reasoning drift) take the goal-aware ABSORB/REJECT
+        # prompt: the LLM must either revise the plan to reflect / accept
+        # the observed deviation, or emit the reject sentinel when the
+        # deviation contradicts the goals. PLAN_DIVERGENCE without
+        # observed_actions falls through to the generic refine path so
+        # legacy callers that wire PLAN_DIVERGENCE the old way keep
+        # working. OFF_TOPIC has no observed-actions channel — the
+        # reconciler context comes from the drift's ``detail`` /
+        # ``trigger_input`` (the reasoning the judge flagged) which the
+        # generic refine prompt also surfaces in the drift block, but
+        # the goal-aware system prompt's ABSORB/REJECT contract is the
+        # right shape for "agent reasoning wandered off goal".
         is_plan_divergence = drift.kind is DriftKind.PLAN_DIVERGENCE
-        use_divergence_prompt = is_plan_divergence and observed_actions is not None
+        is_off_topic = drift.kind is DriftKind.OFF_TOPIC
+        has_observed_actions = is_plan_divergence and observed_actions is not None
+        use_divergence_prompt = has_observed_actions or is_off_topic
         try:
             base_user_prompt = self._build_refine_prompt(
                 plan,
                 drift,
                 goals,
-                observed_actions=observed_actions if use_divergence_prompt else None,
+                observed_actions=observed_actions if has_observed_actions else None,
                 available_agents=available_agents,
             )
         except (TypeError, ValueError) as exc:
