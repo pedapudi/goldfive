@@ -353,6 +353,11 @@ async def test_synchronous_tool_flow_unaffected_by_late_drift_guard() -> None:
     )
 
     assert _task_status(session, "t1") is TaskStatus.FAILED
+    # iter-11A: drift cascade is fire-and-forget; drain before
+    # asserting on planner.refine. The late-drift guard rationale
+    # below still applies — what changed is the dispatch mechanism,
+    # not the guard scope.
+    await steerer._wait_background_drifts_idle()
     # planner.refine WAS called: synchronous tool-flow drifts route
     # through ``_handle_drift`` directly and are not gated.
     assert len(planner.refine_calls) >= 1, (

@@ -631,6 +631,17 @@ class DefaultSteerer:
         # at run end. Tasks auto-discard themselves via
         # ``add_done_callback(self._background_judges.discard)``.
         self._background_judges: set[asyncio.Task[Any]] = set()
+        # Background drift-handler tasks (iter-11A). The drift cascade
+        # triggered from ``mark_task_failed`` / ``mark_task_blocked``
+        # awaits ``planner.refine`` (an LLM round-trip) plus its
+        # cancellation / supersedes side effects. Awaiting that inline
+        # from a reporting-tool call site (e.g. ``report_task_failed``)
+        # blocked the tool from returning for ~minutes on slow local
+        # LLMs, which in turn blocked the agent's next ADK turn. We
+        # now spawn the cascade fire-and-forget through this set,
+        # mirroring :attr:`_background_judges`. ``shutdown`` drains
+        # both sets symmetrically.
+        self._background_drifts: set[asyncio.Task[None]] = set()
         # Per-session plan-state mutation lock. Held only across the
         # consistency-critical region of ``_emit_plan_revised`` (revision
         # index bump + supersedes integration + correction GC + repin +
@@ -922,6 +933,20 @@ class DefaultSteerer:
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.COMPLETED)
         # Drop the observed-agent lineage now the task is terminal.
         session.task_lineage.pop(task_id, None)
+        # iter-11B: pair the prior ``agent_invocation_started`` entry
+        # so the GOAL_DRIFT judge does not see an orphan-start +
+        # task-COMPLETED shape and false-positive on "looping".
+        # ``after_run_callback`` will append the real
+        # ``agent_invocation_completed`` slightly later when the agent
+        # actually returns; duplicate completed entries are harmless
+        # (each is benign and the ring buffer trims naturally).
+        if task.assignee_agent_id:
+            self.note_agent_activity(
+                session,
+                kind="agent_invocation_completed",
+                agent_name=task.assignee_agent_id,
+                task_id=task_id,
+            )
         await self._emit_task_completed(session, task_id, summary, artifacts or {})
         await self._emit_task_transitioned(
             session,
@@ -972,6 +997,17 @@ class DefaultSteerer:
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.FAILED)
         # Drop the observed-agent lineage now the task is terminal.
         session.task_lineage.pop(task_id, None)
+        # iter-11B: pair the prior ``agent_invocation_started`` entry
+        # so the GOAL_DRIFT judge does not see an orphan-start +
+        # task-FAILED shape and false-positive on "looping".  See the
+        # matching write in :meth:`mark_task_completed` for rationale.
+        if task.assignee_agent_id:
+            self.note_agent_activity(
+                session,
+                kind="agent_invocation_completed",
+                agent_name=task.assignee_agent_id,
+                task_id=task_id,
+            )
         await self._emit_task_failed(session, task_id, reason, recoverable)
         await self._emit_task_transitioned(
             session,
@@ -999,7 +1035,13 @@ class DefaultSteerer:
             detail=f"task {task_id} failed: {reason}" if reason else f"task {task_id} failed",
             current_task_id=task_id,
         )
-        await self._handle_drift(drift, session)
+        # iter-11A: spawn the drift cascade fire-and-forget so the
+        # reporting tool that triggered us (``report_task_failed``)
+        # can return immediately. The cascade
+        # (refine → supersedes → cancellation) lands asynchronously;
+        # tests that need the post-cascade plan state await
+        # :meth:`_wait_background_drifts_idle`.
+        self._spawn_drift_handler_background(drift, session)
 
     async def mark_task_blocked(
         self,
@@ -1043,7 +1085,11 @@ class DefaultSteerer:
             detail=detail,
             current_task_id=task_id,
         )
-        await self._handle_drift(drift, session)
+        # iter-11A: spawn the drift cascade fire-and-forget so the
+        # reporting tool that triggered us (``report_task_blocked``)
+        # can return immediately. See :meth:`mark_task_failed` for
+        # the matching call-site comment.
+        self._spawn_drift_handler_background(drift, session)
 
     async def mark_task_cancelled(
         self,
@@ -1601,24 +1647,47 @@ class DefaultSteerer:
             )
 
     async def shutdown(self, *, timeout: float = 5.0) -> None:
-        """Drain background reasoning-judge tasks with a bounded wait.
+        """Drain background reasoning-judge + drift tasks with a bounded wait.
 
         Called at run / runner teardown so ``asyncio.create_task``
-        handles scheduled by :meth:`observe_reasoning` do not leak
-        beyond the event loop's lifetime. Waits at most ``timeout``
-        seconds (default 5.0) for all tracked judges to finish; any
-        still-running tasks past the timeout are cancelled and awaited
-        briefly so their ``CancelledError`` propagation settles before
-        we return.
+        handles scheduled by :meth:`observe_reasoning` (judges) and
+        :meth:`mark_task_failed` / :meth:`mark_task_blocked` (drift
+        cascades, iter-11A) do not leak beyond the event loop's
+        lifetime. Waits at most ``timeout`` seconds (default 5.0) for
+        all tracked tasks to finish; any still-running tasks past the
+        timeout are cancelled and awaited briefly so their
+        ``CancelledError`` propagation settles before we return.
 
-        Idempotent: a second call on an empty ``_background_judges``
-        set is a no-op.
+        Idempotent: a second call when both tracking sets are empty
+        is a no-op.
         """
-        if not self._background_judges:
-            return
+        # Drain reasoning-judge tasks.
+        if self._background_judges:
+            await self._drain_background_set(
+                self._background_judges, label="judge", timeout=timeout
+            )
+        # Drain drift-handler tasks (iter-11A).
+        if self._background_drifts:
+            await self._drain_background_set(
+                self._background_drifts, label="drift", timeout=timeout
+            )
+
+    async def _drain_background_set(
+        self,
+        bg_set: set[asyncio.Task[Any]],
+        *,
+        label: str,
+        timeout: float,
+    ) -> None:
+        """Bounded-wait drain for a background-task tracking set.
+
+        Shared between :attr:`_background_judges` and
+        :attr:`_background_drifts` (iter-11A). ``label`` is used in
+        log messages only.
+        """
         # Snapshot: tasks may be removed from the set by their
         # done-callbacks while we're iterating.
-        pending = list(self._background_judges)
+        pending = list(bg_set)
         if not pending:
             return
         try:
@@ -1648,17 +1717,19 @@ class DefaultSteerer:
             # signal.
             if still_pending:
                 log.warning(
-                    "DefaultSteerer.shutdown: %d background judge task(s) "
+                    "DefaultSteerer.shutdown: %d background %s task(s) "
                     "exceeded %.2fs timeout; cancelled",
                     len(still_pending),
+                    label,
                     float(timeout),
                 )
             else:
                 log.debug(
                     "DefaultSteerer.shutdown: %.2fs timeout expired but "
-                    "all judges completed in the same instant; nothing "
+                    "all %s tasks completed in the same instant; nothing "
                     "to cancel",
                     float(timeout),
+                    label,
                 )
 
     @staticmethod
@@ -2334,6 +2405,97 @@ class DefaultSteerer:
                 "(swallowed): %s",
                 exc,
             )
+
+    # ------------------------------------------------------------------
+    # iter-11A: fire-and-forget drift-cascade dispatch.
+    #
+    # ``mark_task_failed`` / ``mark_task_blocked`` previously awaited
+    # ``_handle_drift`` inline. The cascade traverses planner.refine
+    # (an LLM round-trip), supersedes integration, and downstream
+    # cancellation — on a slow local LLM (e.g. Qwen3.6-35B-A3B-FP8) the
+    # full chain can take 60-120s. Awaiting that from the reporting
+    # tool blocked the tool's return, which blocked the agent's next
+    # ADK turn end-to-end. Spawning the cascade lets the tool ack the
+    # transition immediately; the cascade's side effects
+    # (PlanRevised emission, supersedes, follow-up nudges) land on the
+    # sink bus exactly as before, just slightly later.
+    #
+    # Mirrors :meth:`_spawn_goal_drift_judge_background`. ``shutdown``
+    # drains :attr:`_background_drifts` symmetrically with
+    # :attr:`_background_judges`.
+    # ------------------------------------------------------------------
+    def _spawn_drift_handler_background(
+        self, drift: DriftEvent, session: Session
+    ) -> None:
+        """Dispatch :meth:`_handle_drift` off the critical path.
+
+        Mirrors :meth:`_spawn_goal_drift_judge_background`. The
+        reporting tool that triggered this drift returns immediately;
+        the downstream cascade (refine, supersedes, cancellation)
+        happens asynchronously on a tracked task.
+
+        No-op when no event loop is running (defensive — keeps
+        synchronous test harnesses that build a steerer outside an
+        async context from raising; the inline-awaiting callers of
+        ``mark_task_*`` outside an async context are vanishingly rare
+        and cannot drive a refine round-trip anyway).
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop — fall through silently. Same defensive pattern
+            # as :meth:`_spawn_goal_drift_judge_background`.
+            log.debug(
+                "DefaultSteerer._spawn_drift_handler_background: no running "
+                "loop; skipping spawn for kind=%s",
+                drift.kind.value,
+            )
+            return
+        bg_task = asyncio.create_task(
+            self._run_drift_handler_background(drift, session),
+            name=f"goldfive-drift-{drift.kind.value}",
+        )
+        self._background_drifts.add(bg_task)
+        bg_task.add_done_callback(self._background_drifts.discard)
+
+    async def _run_drift_handler_background(
+        self, drift: DriftEvent, session: Session
+    ) -> None:
+        """Body of the fire-and-forget drift handler.
+
+        Mirrors :meth:`_run_goal_drift_judge_background`: swallows
+        every exception so a flaky cascade cannot crash the run, and
+        re-raises ``CancelledError`` cleanly so :meth:`shutdown` can
+        cancel still-running cascades at teardown without a stray
+        ``WARNING`` muddying the signal.
+        """
+        try:
+            await self._handle_drift(drift, session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — background task
+            log.warning(
+                "DefaultSteerer: background drift handler raised "
+                "(swallowed): kind=%s exc=%s",
+                drift.kind.value,
+                exc,
+            )
+
+    async def _wait_background_drifts_idle(self) -> None:
+        """Wait for every pending background drift task to settle.
+
+        Test helper. Mirrors the goal-drift drain pattern used by
+        :func:`tests.test_goal_drift_classifier._drain_background_judges`.
+        Production callers should never need this — the run-end
+        :meth:`shutdown` drains pending cascades with a bounded wait.
+        """
+        pending = list(self._background_drifts)
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+        # One yield so the ``add_done_callback(...discard)`` has run
+        # and the set is fully empty for the next assertion / spawn.
+        await asyncio.sleep(0)
 
     async def _emit_reflective_failure(
         self, session: Session, *, task_id: str, reason: str
