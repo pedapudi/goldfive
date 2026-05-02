@@ -848,6 +848,15 @@ class DefaultSteerer:
         # considered productively iterating; outside that window, the
         # next drift escalates to HUMAN_INTERVENTION_REQUIRED.
         session.task_last_progress_at[task_id] = time.monotonic()
+        # Seed the observed-agent lineage with the static plan
+        # assignee. ``before_tool_callback`` extends the set with each
+        # delegated child agent so consumers (e.g. the reasoning judge)
+        # can distinguish "child of a delegation chain rooted at the
+        # assignee" from "off-plan agent". Cleared on every terminal
+        # transition.
+        session.task_lineage[task_id] = (
+            {task.assignee_agent_id} if task.assignee_agent_id else set()
+        )
         await self._emit_task_started(session, task_id, detail)
         await self._emit_task_transitioned(
             session,
@@ -911,6 +920,8 @@ class DefaultSteerer:
             session.completed_results[task_id] = summary
         # goldfive#152: clear current_task_* if we were the active task.
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.COMPLETED)
+        # Drop the observed-agent lineage now the task is terminal.
+        session.task_lineage.pop(task_id, None)
         await self._emit_task_completed(session, task_id, summary, artifacts or {})
         await self._emit_task_transitioned(
             session,
@@ -959,6 +970,8 @@ class DefaultSteerer:
         from_status = task.status
         task.status = TaskStatus.FAILED
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.FAILED)
+        # Drop the observed-agent lineage now the task is terminal.
+        session.task_lineage.pop(task_id, None)
         await self._emit_task_failed(session, task_id, reason, recoverable)
         await self._emit_task_transitioned(
             session,
@@ -1063,6 +1076,8 @@ class DefaultSteerer:
         from_status = task.status
         task.status = TaskStatus.CANCELLED
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.CANCELLED)
+        # Drop the observed-agent lineage now the task is terminal.
+        session.task_lineage.pop(task_id, None)
         await self._emit_task_cancelled(session, task_id, reason)
         await self._emit_task_transitioned(
             session,
@@ -1111,6 +1126,8 @@ class DefaultSteerer:
         from_status = task.status
         task.status = TaskStatus.NOT_NEEDED
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.NOT_NEEDED)
+        # Drop the observed-agent lineage now the task is terminal.
+        session.task_lineage.pop(task_id, None)
         # There is no dedicated ``TaskNotNeeded`` proto message;
         # reuse TaskCancelled with the reason prefix so sinks that
         # inspect reason can differentiate if they wish. The live
@@ -1205,6 +1222,11 @@ class DefaultSteerer:
             # emission count stay deterministic.
             dep_from = dep.status
             dep.status = TaskStatus.CANCELLED
+            # Drop the observed-agent lineage now the task is terminal —
+            # mirrors the cleanup that ``mark_task_cancelled`` performs
+            # for the initiator (this BFS does not recurse through that
+            # method so the cleanup is duplicated explicitly).
+            session.task_lineage.pop(next_id, None)
             await self._emit_task_cancelled(session, next_id, cascade_reason)
             await self._emit_task_transitioned(
                 session,
@@ -1910,6 +1932,14 @@ class DefaultSteerer:
             conf_val = float(confidence) if confidence is not None else 0.0
         except (TypeError, ValueError):
             conf_val = 0.0
+        # Prefer the runtime-reasoning agent pin (set by the ADK
+        # plugin's ``before_agent_callback``) over the static plan
+        # assignee — when a coordinator delegates to a child the
+        # child's reasoning produced this drift, not the assignee's.
+        # Fall back to ``task.assignee_agent_id`` when the session
+        # pin is empty (pre-pin race or non-ADK adapter that doesn't
+        # populate it) so we keep back-compat.
+        agent_id_for_drift = session.current_agent_id or task.assignee_agent_id
         if not making_progress:
             drift = DriftEvent(
                 kind=DriftKind.SELF_REPORTED_STUCK,
@@ -1920,7 +1950,7 @@ class DefaultSteerer:
                     + f" (confidence={conf_val:.2f})"
                 ),
                 current_task_id=task.id,
-                current_agent_id=task.assignee_agent_id,
+                current_agent_id=agent_id_for_drift,
             )
             await self._handle_drift(drift, session)
             return
@@ -1933,7 +1963,7 @@ class DefaultSteerer:
                     f"(confidence={conf_val:.2f})" + (f": {reason}" if reason else "")
                 ),
                 current_task_id=task.id,
-                current_agent_id=task.assignee_agent_id,
+                current_agent_id=agent_id_for_drift,
             )
             await self._handle_drift(drift, session)
             return

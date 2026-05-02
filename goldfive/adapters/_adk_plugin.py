@@ -2638,6 +2638,30 @@ def make_adk_plugin(
                     )
                 return None
 
+            # Pin the runtime-reasoning agent on the goldfive Session
+            # so the reasoning-drift judge can attribute reasoning to
+            # the agent that actually produced it (rather than the
+            # static plan assignee). When a coordinator delegates to a
+            # child via AgentTool the child reasons under the parent's
+            # task pin; reading ``task.assignee_agent_id`` on the
+            # judge dispatch path mis-attributed every drift to the
+            # coordinator. Last writer wins — reasoning is sequential
+            # within an invocation, so by the time the model-response
+            # callback fires the most recent ``before_agent_callback``
+            # is the agent producing the reasoning. Pre-pin races
+            # (the LLM judge calling before this fires for the first
+            # time) read empty and the consumer falls back to
+            # ``task.assignee_agent_id`` for back-compat.
+            try:
+                gf_session = self._active_ctx.session if self._active_ctx else None
+                if gf_session is not None and agent_name:
+                    gf_session.current_agent_id = agent_name
+            except Exception as exc:  # noqa: BLE001 — pinning must never raise
+                log.debug(
+                    "before_agent_callback: current_agent_id pin raised: %s",
+                    exc,
+                )
+
             # Layer 1: pin the starting sub-agent's task_id so its
             # reporting-tool calls can default the arg from state
             # (goldfive#191). Best-effort: a raise here must never
@@ -4915,6 +4939,29 @@ def make_adk_plugin(
                     task_id=task_id,
                     invocation_id=inv_id,
                 )
+                # Extend the per-task observed-agent lineage with the
+                # delegated child. Idempotent ``set.add`` so repeat
+                # delegations to the same child do not balloon the set.
+                # No-op when there is no current task pin (race with
+                # task in_progress) or no delegated agent name — those
+                # are best-effort observability signals, not invariants.
+                try:
+                    gf_session = ctx.session if ctx is not None else None
+                    pinned_task_id = (
+                        gf_session.current_task_id if gf_session is not None else ""
+                    )
+                    if (
+                        gf_session is not None
+                        and pinned_task_id
+                        and to_agent
+                        and pinned_task_id in gf_session.task_lineage
+                    ):
+                        gf_session.task_lineage[pinned_task_id].add(to_agent)
+                except Exception as exc:  # noqa: BLE001 — observability is best-effort
+                    log.debug(
+                        "before_tool_callback: task_lineage update raised: %s",
+                        exc,
+                    )
                 if self._reconciler is not None:
                     try:
                         await self._reconciler.on_delegation_observed(

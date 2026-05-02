@@ -135,6 +135,7 @@ REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     "is on task.\n\n"
     "PLAN TASKS (id -> title):\n{plan_tasks_summary}\n\n"
     "CURRENTLY BOUND TASK:\n{task_block}\n\n"
+    "Currently reasoning agent: {current_agent_id}\n\n"
     "GOALS:\n{goals_block}\n\n"
     "REASONING (the agent's most recent chain-of-thought block):\n"
     "{reasoning_block}\n\n"
@@ -505,6 +506,7 @@ async def classify_reasoning_drift_with_focus(
         goals_block=_format_goals(goals),
         task_block=_format_task(task),
         reasoning_block=_format_reasoning(reasoning),
+        current_agent_id=current_agent_id or "(unknown)",
     )
     started = time.monotonic()
     call_failed = False

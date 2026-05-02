@@ -1019,6 +1019,7 @@ def test_classify_with_focus_renders_plan_tasks_into_prompt() -> None:
         goals_block="(no goals)",
         task_block="(no task bound)",
         reasoning_block="thinking",
+        current_agent_id="(unknown)",
     )
     assert "PLAN TASKS" in rendered
     assert "t1 -> Alpha" in rendered
