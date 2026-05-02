@@ -198,6 +198,7 @@ def to_pb_task(task: Task) -> Any:
         bound_span_id=task.bound_span_id,
         supersedes=task.supersedes,
         supersedes_kind=_supersession_kind_to_pb(task.supersedes_kind),
+        required_tool_calls=list(task.required_tool_calls),
     )
     return msg
 
@@ -214,6 +215,7 @@ def from_pb_task(msg: Any) -> Task:
         bound_span_id=msg.bound_span_id,
         supersedes=getattr(msg, "supersedes", "") or "",
         supersedes_kind=_supersession_kind_from_pb(getattr(msg, "supersedes_kind", 0) or 0),
+        required_tool_calls=list(getattr(msg, "required_tool_calls", []) or []),
     )
 
 

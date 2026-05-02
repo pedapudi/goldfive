@@ -3249,6 +3249,24 @@ class DefaultSteerer:
             InterventionLevel.ABSORB,
             (InterventionLevel.ABSORB, InterventionLevel.ABSORB),
         ),
+        # INCOMPLETE_TOOL_CALLS (iter-11E) is plan-context drift emitted
+        # when ``report_task_succeeded`` fires for a task with
+        # ``required_tool_calls`` but those tools weren't observed
+        # during the task's execution span. Routes through goal-aware
+        # refine because the planner needs to revise the plan to
+        # address the unfinished work; the agent claimed completion
+        # but the artifact-producing tool wasn't called. Mirrors the
+        # PLAN_DIVERGENCE / OFF_TOPIC ladder shape so the ABSORB path
+        # picks the goal-aware system prompt (planner.refine routes
+        # this kind through ``_PLAN_DIVERGENCE_SYSTEM_PROMPT``), and
+        # escalates to PAUSE_ESCALATE on repeat-CRITICAL because
+        # repeated false completion is a serious agent-correctness
+        # issue that the planner alone cannot resolve.
+        DriftKind.INCOMPLETE_TOOL_CALLS: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
+        ),
         DriftKind.INTENT_DIVERGENCE: (
             InterventionLevel.OBSERVE,
             InterventionLevel.ABSORB,
