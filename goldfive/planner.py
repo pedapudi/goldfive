@@ -2036,6 +2036,39 @@ class LLMPlanner:
         )
 
     @staticmethod
+    def _extract_rejection_kind(error: str) -> str | None:
+        """Bucket validator rejection messages by structural class.
+
+        Returns one of ``"terminal_missing"``, ``"terminal_regressed"``,
+        ``"edge_missing"``, or ``None`` when the error does not match a
+        known validator-rejection pattern (e.g. plumbing failure, parse
+        error, goal-coverage / assignee error). Used by the refine
+        retry loop to short-circuit when consecutive attempts produce
+        the same structural-class violation — feeding the LLM its own
+        last error a second time on the same class is empirically
+        unproductive on Qwen 35B and burns ~10s/attempt.
+
+        Matching is substring-based (case-insensitive) so the helper is
+        robust to the ``_user_steer_one_attempt`` wrapper that prefixes
+        the validator message with ``"validator rejected revision: "``.
+        Validator strings come from ``Plan.validate`` in ``types.py``:
+
+        * ``"terminal task {id!r} missing in revision"``
+        * ``"terminal task {id!r} regressed to {status!r}"``
+        * ``"terminal->terminal edge {a!r} -> {b!r} missing in revision"``
+        """
+        if not error:
+            return None
+        lowered = error.lower()
+        if "terminal task" in lowered and "missing in revision" in lowered:
+            return "terminal_missing"
+        if "terminal task" in lowered and "regressed to" in lowered:
+            return "terminal_regressed"
+        if "terminal->terminal edge" in lowered and "missing in revision" in lowered:
+            return "edge_missing"
+        return None
+
+    @staticmethod
     def _build_correction_prompt(base_prompt: str, error: str) -> str:
         """Append validator / parser feedback to a refine prompt for retry.
 
@@ -3243,6 +3276,7 @@ class LLMPlanner:
         user_prompt = base_user_prompt
         attempts = max(1, self._max_refine_attempts)
         last_error = ""
+        prior_error_kind: str | None = None
         for attempt in range(1, attempts + 1):
             merged_plan, error = await self._user_steer_one_attempt(
                 plan=plan,
@@ -3281,6 +3315,31 @@ class LLMPlanner:
                 attempts,
                 last_error,
             )
+            # iter-11C: short-circuit when consecutive attempts produce
+            # the same structural-class validator rejection. Feeding the
+            # LLM its own previous error a second time on the same class
+            # of invariant violation is empirically unproductive on Qwen
+            # 35B (live e2e: same "terminal task missing/regressed"
+            # rejection on attempt 1 and 2, ~10s burned per attempt).
+            # Returning None here lets the caller fall through to the
+            # supersede path immediately. We still emit
+            # REFINE_VALIDATION_FAILED so the steerer's escalation
+            # ladder sees a uniform signal regardless of whether retries
+            # were exhausted by exhaustion or by short-circuit.
+            error_kind = self._extract_rejection_kind(last_error)
+            if attempt > 1 and error_kind is not None and error_kind == prior_error_kind:
+                log.info(
+                    "LLMPlanner._refine_steer(source=%s): rejection kind "
+                    "%r repeated across attempts %d-%d; short-circuiting "
+                    "to supersede",
+                    effective_source,
+                    error_kind,
+                    attempt - 1,
+                    attempt,
+                )
+                await self._emit_refine_validation_failed(plan, drift, last_error)
+                return None
+            prior_error_kind = error_kind
             if attempt < attempts:
                 user_prompt = self._build_correction_prompt(base_user_prompt, last_error)
         # Retries exhausted -- signal and fall back to None (the steerer
