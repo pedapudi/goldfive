@@ -559,6 +559,17 @@ message ReasoningJudgeInvoked {
   bool on_task = 8;
   string severity = 9;
   string reason = 10;
+
+  // iter-10 three-state verdict. One of:
+  //   "on_task" | "justified_deviation" | "erroneous_deviation" | ""
+  // Empty string is the quiet-fail sentinel (judge raised, malformed
+  // response, missing key, etc.). Mirrored on
+  // ``ReasoningJudgeVerdict.classification`` (the dataclass) and on
+  // every ``DriftDetected`` row paired with this judge call. ``on_task``
+  // (field 8) remains the legacy boolean projection: true iff
+  // ``classification == "on_task"``. PR 1 emits the field unconditionally
+  // (defaults to "" until the parser starts populating it in PR 3).
+  string classification = 11;
 }
 
 // ---------------------------------------------------------------------------

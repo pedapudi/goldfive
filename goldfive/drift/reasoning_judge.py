@@ -321,12 +321,36 @@ class ReasoningJudgeVerdict:
     ``stated_intent`` is the judge's one-sentence summary of what the
     agent claims to be doing. Optional — surfaced for sinks /
     observability; not consumed by any current pin-resolution logic.
+
+    iter-10 (PR 1) adds two scaffolding fields ahead of the three-state
+    classification work:
+
+    * ``classification`` — three-state verdict, one of
+      ``"on_task"``, ``"justified_deviation"``, ``"erroneous_deviation"``,
+      or the empty string. The empty string is the quiet-fail sentinel:
+      callers MUST treat it as identical to ``"on_task"`` for routing
+      so the pre-iter-10 fail-quiet contract from #143 / #226 is
+      preserved. Defaults to ``""`` so PR 1 ships pure scaffolding —
+      until PR 3 lands the parser still produces an empty string here.
+    * ``provenance`` — only meaningful when
+      ``classification == "justified_deviation"``. One of
+      ``"tool_error"``, ``"surprising_result"``,
+      ``"discovered_dependency"``, ``"new_information"``, or the empty
+      string. The provenance enum names the signal in the judge prompt
+      that justified the deviation; an empty / unrecognised value on a
+      ``"justified_deviation"`` verdict is treated as malformed by PR 3
+      (demoted to ``"erroneous_deviation"``). Defaults to ``""`` for
+      back-compat in PR 1.
     """
 
     drift: DriftEvent | None
     focused_task_id: str = ""
     focus_confidence: float = 0.0
     stated_intent: str = ""
+    # iter-10 PR 1 additions — defaults preserve back-compat. Behaviour
+    # change ships in PR 3 (parser) + PR 4 (routing).
+    classification: str = ""
+    provenance: str = ""
 
 
 # Map the judge's ``severity`` string to a :class:`DriftSeverity`. Missing
@@ -739,6 +763,7 @@ async def _emit_judge_invoked(
     on_task: bool,
     severity: str,
     reason: str,
+    classification: str = "",
 ) -> None:
     """Build and emit a ``ReasoningJudgeInvoked`` envelope onto ``sink``.
 
@@ -746,6 +771,10 @@ async def _emit_judge_invoked(
     logged at WARNING. Proto-import failures are handled the same way
     so a partially-regenerated tree (``make proto`` not re-run) does
     not crash the judge path.
+
+    ``classification`` is the iter-10 three-state verdict string; PR 1
+    accepts the kwarg with a default of ``""`` so existing call sites
+    don't break. PR 3 starts populating it from the parser.
     """
     try:
         from goldfive.events import new_event
@@ -774,6 +803,7 @@ async def _emit_judge_invoked(
         payload.on_task = on_task
         payload.severity = severity
         payload.reason = reason
+        payload.classification = classification
         await sink.emit(evt)
     except Exception as exc:  # noqa: BLE001 - observability must never break
         log.warning(

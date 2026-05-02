@@ -371,7 +371,7 @@ class DelegationObserved(_message.Message):
     def __init__(self, from_agent: _Optional[str] = ..., to_agent: _Optional[str] = ..., task_id: _Optional[str] = ..., invocation_id: _Optional[str] = ..., observed_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
 
 class ReasoningJudgeInvoked(_message.Message):
-    __slots__ = ("run_id", "task_id", "subject_agent_id", "model", "elapsed_ms", "reasoning_input", "raw_response", "on_task", "severity", "reason")
+    __slots__ = ("run_id", "task_id", "subject_agent_id", "model", "elapsed_ms", "reasoning_input", "raw_response", "on_task", "severity", "reason", "classification")
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     TASK_ID_FIELD_NUMBER: _ClassVar[int]
     SUBJECT_AGENT_ID_FIELD_NUMBER: _ClassVar[int]
@@ -382,6 +382,7 @@ class ReasoningJudgeInvoked(_message.Message):
     ON_TASK_FIELD_NUMBER: _ClassVar[int]
     SEVERITY_FIELD_NUMBER: _ClassVar[int]
     REASON_FIELD_NUMBER: _ClassVar[int]
+    CLASSIFICATION_FIELD_NUMBER: _ClassVar[int]
     run_id: str
     task_id: str
     subject_agent_id: str
@@ -392,7 +393,8 @@ class ReasoningJudgeInvoked(_message.Message):
     on_task: bool
     severity: str
     reason: str
-    def __init__(self, run_id: _Optional[str] = ..., task_id: _Optional[str] = ..., subject_agent_id: _Optional[str] = ..., model: _Optional[str] = ..., elapsed_ms: _Optional[int] = ..., reasoning_input: _Optional[str] = ..., raw_response: _Optional[str] = ..., on_task: bool = ..., severity: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
+    classification: str
+    def __init__(self, run_id: _Optional[str] = ..., task_id: _Optional[str] = ..., subject_agent_id: _Optional[str] = ..., model: _Optional[str] = ..., elapsed_ms: _Optional[int] = ..., reasoning_input: _Optional[str] = ..., raw_response: _Optional[str] = ..., on_task: bool = ..., severity: _Optional[str] = ..., reason: _Optional[str] = ..., classification: _Optional[str] = ...) -> None: ...
 
 class GoldfiveLLMCallStart(_message.Message):
     __slots__ = ("span_id", "name", "model", "task_id", "start_time_ns", "input_preview", "target_agent_id", "target_task_id")
