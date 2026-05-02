@@ -5178,60 +5178,97 @@ def make_adk_plugin(
             except Exception as exc:  # noqa: BLE001
                 log.debug("after_model_callback: steerer.observe raised: %s", exc)
             if reasoning:
-                observe_reasoning = getattr(ctx.steerer, "observe_reasoning", None)
-                if observe_reasoning is not None:
-                    # Resolve the live agent name so the steerer's
-                    # per-(agent, task) reasoning-judge rate-limit
-                    # bucket isolates agents (goldfive#252 follow-up).
-                    # Prefer the invocation's running agent, fall back
-                    # to the host agent so single-agent runs keep their
-                    # historical bucketing.
-                    reasoning_agent_name = ""
-                    try:
-                        running_agent = _safe_attr(inv_ctx, "agent", None)
-                        reasoning_agent_name = str(_safe_attr(running_agent, "name", "") or "")
-                    except Exception:  # noqa: BLE001
+                # Cooperative-cancel gate (iter-11D, goldfive#251 follow-up).
+                # Skip reasoning observation for cancelled invocations:
+                # the agent has been told to stop, so judging its
+                # still-streaming or already-buffered reasoning
+                # produces noise (CONFUSION drifts on zombie reasoning,
+                # wasted LLM judge calls). The plugin's sticky cancel
+                # flag is already battle-tested by 6+ other callbacks
+                # (before_model, before_tool, before/after_agent,
+                # before_run, on_event) so reusing it here keeps the
+                # behaviour aligned with the rest of the cancel-aware
+                # surface.
+                if inv_id and self.is_invocation_cancelled(inv_id):
+                    log.debug(
+                        "after_model_callback: skipping observe_reasoning for "
+                        "cancelled invocation inv_id=%s",
+                        inv_id,
+                    )
+                else:
+                    observe_reasoning = getattr(ctx.steerer, "observe_reasoning", None)
+                    if observe_reasoning is not None:
+                        # Resolve the live agent name so the steerer's
+                        # per-(agent, task) reasoning-judge rate-limit
+                        # bucket isolates agents (goldfive#252 follow-up).
+                        # Prefer the invocation's running agent, fall back
+                        # to the host agent so single-agent runs keep their
+                        # historical bucketing.
                         reasoning_agent_name = ""
-                    if not reasoning_agent_name:
-                        reasoning_agent_name = self._host_agent_name or ""
-                    try:
-                        await observe_reasoning(
-                            reasoning,
-                            task=ctx.task,
-                            session=ctx.session,
-                            provider=_infer_provider(llm_response),
-                            agent_name=reasoning_agent_name,
-                        )
-                    except TypeError:
-                        # Back-compat: custom steerer without the
-                        # ``agent_name`` kwarg. Fall back silently.
+                        try:
+                            running_agent = _safe_attr(inv_ctx, "agent", None)
+                            reasoning_agent_name = str(_safe_attr(running_agent, "name", "") or "")
+                        except Exception:  # noqa: BLE001
+                            reasoning_agent_name = ""
+                        if not reasoning_agent_name:
+                            reasoning_agent_name = self._host_agent_name or ""
                         try:
                             await observe_reasoning(
                                 reasoning,
                                 task=ctx.task,
                                 session=ctx.session,
                                 provider=_infer_provider(llm_response),
+                                agent_name=reasoning_agent_name,
                             )
+                        except TypeError:
+                            # Back-compat: custom steerer without the
+                            # ``agent_name`` kwarg. Fall back silently.
+                            try:
+                                await observe_reasoning(
+                                    reasoning,
+                                    task=ctx.task,
+                                    session=ctx.session,
+                                    provider=_infer_provider(llm_response),
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                log.debug(
+                                    "after_model_callback: observe_reasoning (fallback) raised: %s",
+                                    exc,
+                                )
                         except Exception as exc:  # noqa: BLE001
                             log.debug(
-                                "after_model_callback: observe_reasoning (fallback) raised: %s",
+                                "after_model_callback: observe_reasoning raised: %s",
                                 exc,
                             )
-                    except Exception as exc:  # noqa: BLE001
-                        log.debug(
-                            "after_model_callback: observe_reasoning raised: %s",
-                            exc,
-                        )
             # Note this turn for the opt-in reflective self-progress check.
             # ``note_llm_call`` is a no-op unless the steerer was
             # constructed with ``reflective_call_llm``; adapters that
             # don't ship this hook simply skip the counter.
-            note_llm_call = getattr(ctx.steerer, "note_llm_call", None)
-            if note_llm_call is not None:
-                try:
-                    await note_llm_call(ctx.session)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("after_model_callback: note_llm_call raised: %s", exc)
+            #
+            # Also gate on cancellation: ``note_llm_call`` is not pure
+            # book-keeping — when its counter hits
+            # ``reflective_check_interval`` it fires
+            # ``maybe_run_reflective_check`` which makes a fresh LLM
+            # call against the cancelled invocation's tool-call /
+            # reasoning summary. That's the same "judging zombie work"
+            # failure mode the reasoning-observation gate above
+            # protects against, so it gets the same treatment. Skipping
+            # the counter increment on cancelled turns is also correct:
+            # those turns aren't meaningful work, so they shouldn't
+            # consume the next reflective check's window.
+            if inv_id and self.is_invocation_cancelled(inv_id):
+                log.debug(
+                    "after_model_callback: skipping note_llm_call for "
+                    "cancelled invocation inv_id=%s",
+                    inv_id,
+                )
+            else:
+                note_llm_call = getattr(ctx.steerer, "note_llm_call", None)
+                if note_llm_call is not None:
+                    try:
+                        await note_llm_call(ctx.session)
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("after_model_callback: note_llm_call raised: %s", exc)
             return None
 
         async def on_event_callback(self, *, invocation_context: Any, event: Any) -> None:
@@ -5427,8 +5464,7 @@ def make_adk_plugin(
                         or self._host_agent_name
                     )
                     pinned_task = (
-                        str(_safe_attr(gf_session, "current_task_id", "") or "")
-                        or task_id
+                        str(_safe_attr(gf_session, "current_task_id", "") or "") or task_id
                     )
                     note_obs(
                         gf_session,

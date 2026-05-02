@@ -749,3 +749,247 @@ def test_state_protocol_descendants_walk() -> None:
     # Unrelated chain not touched.
     assert "X" not in descendants
     assert "Y" not in descendants
+
+
+# ---------------------------------------------------------------------------
+# iter-11D: after_model_callback skips observe_reasoning on cancelled invocations
+# ---------------------------------------------------------------------------
+#
+# Live e2e log (raccoon-research replay): after a CRITICAL drift cancels an
+# invocation, the reasoning judges keep firing on the cancelled invocation's
+# still-buffered thought blocks, producing CONFUSION drifts on zombie
+# reasoning and burning LLM-judge calls. The fix gates ``observe_reasoning``
+# (and the opt-in ``note_llm_call`` reflective check) on the same sticky
+# cancel flag the rest of the cancel-aware callbacks consult.
+
+
+class _ReasoningPart:
+    """ADK ``content.parts[i]`` shape with ``thought=True`` so
+    :func:`goldfive.adapters._adk_plugin._extract_reasoning` returns a
+    non-empty string for the test response.
+    """
+
+    def __init__(self, text: str, *, thought: bool = True) -> None:
+        self.text = text
+        self.thought = thought
+        self.function_call = None
+
+
+class _ReasoningContent:
+    def __init__(self, parts: list[_ReasoningPart]) -> None:
+        self.parts = parts
+
+
+class _ReasoningLlmResponse:
+    """LlmResponse-shaped stub carrying both a regular text part and a
+    thought part. ``_extract_reasoning`` picks up the thought; the
+    after_model_callback path also runs ``_extract_text_parts`` which
+    reads the non-thought text for the regular ``steerer.observe``
+    fan-out.
+    """
+
+    def __init__(self, *, text: str, reasoning: str) -> None:
+        self.content = _ReasoningContent(
+            [
+                _ReasoningPart(text=text, thought=False),
+                _ReasoningPart(text=reasoning, thought=True),
+            ]
+        )
+        self.finish_reason = None
+
+
+class _SteererSpy:
+    """Wraps a real :class:`DefaultSteerer` so a test can assert which
+    of ``observe`` / ``observe_reasoning`` / ``note_llm_call`` ran on
+    a given ``after_model_callback`` invocation.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.observe_calls = 0
+        self.observe_reasoning_calls = 0
+        self.note_llm_calls = 0
+
+    async def observe(self, observation: Any, session: Any) -> None:
+        self.observe_calls += 1
+        await self._inner.observe(observation, session)
+
+    async def observe_reasoning(self, text: str, **kwargs: Any) -> None:
+        self.observe_reasoning_calls += 1
+        await self._inner.observe_reasoning(text, **kwargs)
+
+    async def note_llm_call(self, session: Any) -> None:
+        self.note_llm_calls += 1
+        # Forward to inner so the counter on the real steerer advances
+        # only when we actually delegate (no-op anyway when the inner
+        # steerer wasn't given a reflective_call_llm).
+        await self._inner.note_llm_call(session)
+
+    # Plugin reads other attrs (e.g. ``request_invocation_cancel``,
+    # ``_background_judges``) directly off the steerer; forward those.
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _install_steerer_spy(plugin: Any) -> _SteererSpy:
+    """Replace the ``SessionContext.steerer`` on the plugin's active
+    context with a spy wrapping the real steerer. Returns the spy so
+    the test can read its call counters.
+    """
+    ctx = plugin._active_ctx  # noqa: SLF001 -- test fixture poke
+    spy = _SteererSpy(ctx.steerer)
+    # ``SessionContext`` uses ``__slots__`` so direct attribute
+    # assignment is supported and avoids a rebuild.
+    ctx.steerer = spy
+    return spy
+
+
+def _make_after_model_callback_context(
+    *,
+    invocation_id: str,
+    agent_name: str = "coordinator",
+) -> _FakeCallbackContext:
+    inv_ctx = _FakeInvocationContext(
+        invocation_id=invocation_id,
+        session_state={},
+        agent_name=agent_name,
+    )
+    return _FakeCallbackContext(invocation_context=inv_ctx)
+
+
+async def test_observe_reasoning_skipped_after_cancel(caplog: Any) -> None:
+    """When the invocation is flagged cancelled, the
+    after_model_callback path:
+
+    * Does NOT call ``steerer.observe_reasoning`` (the reasoning judge
+      / pattern detectors don't run on zombie reasoning).
+    * Does NOT spawn a background judge task — ``_background_judges``
+      is unchanged.
+    * Does NOT bump the reflective-check counter via ``note_llm_call``.
+    * Logs the "skipping observe_reasoning for cancelled invocation"
+      debug line.
+    * Still runs the regular ``steerer.observe`` LLM-response fan-out
+      (operators need the cancelled turn's text observable; the gate
+      is local to reasoning).
+    """
+    plugin, _sink, _session = _make_plugin()
+    spy = _install_steerer_spy(plugin)
+    bg_judges_before = set(spy._background_judges)  # noqa: SLF001 -- test asserts
+
+    # Mark inv-1 cancelled BEFORE the after_model_callback fires —
+    # mimics the real flow where a critical drift on an earlier
+    # callback cancelled the invocation, and we're now looking at
+    # already-buffered reasoning streaming back from the LLM.
+    plugin.request_invocation_cancel(invocation_id="inv-1", request=_make_request())
+
+    cb_ctx = _make_after_model_callback_context(invocation_id="inv-1")
+    response = _ReasoningLlmResponse(
+        text="ok let me think...",
+        reasoning="I am uncertain. Maybe? Possibly? Perhaps? I don't know.",
+    )
+
+    import logging
+
+    with caplog.at_level(logging.DEBUG, logger="goldfive.adapters.adk"):
+        await plugin.after_model_callback(
+            callback_context=cb_ctx,
+            llm_response=response,
+        )
+
+    # Reasoning observation was skipped.
+    assert spy.observe_reasoning_calls == 0
+    # Reflective-check counter was skipped (zombie work shouldn't
+    # consume the next reflective-check window).
+    assert spy.note_llm_calls == 0
+    # No background judge was spawned.
+    assert set(spy._background_judges) == bg_judges_before  # noqa: SLF001
+    # The regular llm_response observation still ran (the gate is
+    # local to reasoning + reflective).
+    assert spy.observe_calls == 1
+    # Debug log records the skip with the inv id.
+    skip_logs = [
+        r
+        for r in caplog.records
+        if "skipping observe_reasoning for cancelled invocation" in r.getMessage()
+    ]
+    assert len(skip_logs) == 1, (
+        f"expected exactly one skip log, got {[r.getMessage() for r in caplog.records]!r}"
+    )
+    assert "inv-1" in skip_logs[0].getMessage()
+
+
+async def test_observe_reasoning_runs_when_not_cancelled() -> None:
+    """Regression: when the invocation is NOT cancelled, the
+    after_model_callback path runs ``observe_reasoning`` and
+    ``note_llm_call`` as before. Guards against an over-broad gate
+    that accidentally short-circuits every turn.
+    """
+    plugin, _sink, _session = _make_plugin()
+    spy = _install_steerer_spy(plugin)
+
+    cb_ctx = _make_after_model_callback_context(invocation_id="inv-2")
+    response = _ReasoningLlmResponse(
+        text="here is my answer",
+        reasoning="the user asked X, so I will Y.",
+    )
+
+    await plugin.after_model_callback(
+        callback_context=cb_ctx,
+        llm_response=response,
+    )
+
+    # Both observation paths ran.
+    assert spy.observe_calls == 1
+    assert spy.observe_reasoning_calls == 1
+    # And the reflective-check counter advanced (no-op inside the
+    # inner steerer because reflective_call_llm wasn't configured,
+    # but the spy still records the delegation).
+    assert spy.note_llm_calls == 1
+
+
+async def test_observe_reasoning_skip_does_not_break_other_observation() -> None:
+    """The cancel gate must be local to the reasoning + reflective
+    paths. The plain ``steerer.observe`` LLM-response fan-out (kind=
+    'llm_response') should fire even on cancelled invocations so
+    operators retain visibility into the cancelled turn's text.
+    """
+    plugin, _sink, _session = _make_plugin()
+    spy = _install_steerer_spy(plugin)
+
+    plugin.request_invocation_cancel(invocation_id="inv-3", request=_make_request())
+
+    # Same cancelled invocation; this turn carries text + reasoning.
+    cb_ctx = _make_after_model_callback_context(invocation_id="inv-3")
+    response = _ReasoningLlmResponse(
+        text="post-cancel buffered text",
+        reasoning="post-cancel buffered reasoning",
+    )
+
+    # Capture observations the steerer received via the regular
+    # observation path so we can confirm it was the llm_response fan-out.
+    observed: list[Any] = []
+    real_observe = spy._inner.observe  # noqa: SLF001
+
+    async def _capturing_observe(observation: Any, session: Any) -> None:
+        observed.append(observation)
+        await real_observe(observation, session)
+
+    spy._inner.observe = _capturing_observe  # type: ignore[method-assign] # noqa: SLF001
+
+    await plugin.after_model_callback(
+        callback_context=cb_ctx,
+        llm_response=response,
+    )
+
+    # The reasoning + reflective gates short-circuited.
+    assert spy.observe_reasoning_calls == 0
+    assert spy.note_llm_calls == 0
+    # But the llm_response observation ran exactly once.
+    assert spy.observe_calls == 1
+    assert len(observed) == 1
+    obs = observed[0]
+    # The observation kind is the llm_response fan-out; the cancelled
+    # turn's text is still surfaced to sinks. ``_as_observation``
+    # builds a plain dict in this adapter.
+    obs_kind = obs.get("kind") if isinstance(obs, dict) else getattr(obs, "kind", "")
+    assert obs_kind == "llm_response"
