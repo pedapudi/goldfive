@@ -676,3 +676,155 @@ async def test_refine_repeated_failure_keeps_generic_prompt() -> None:
         assert "OFF-TOPIC REASONING" not in user_prompt
         # No OBSERVED AGENT ACTIVITY block (no observed_actions provided).
         assert "OBSERVED AGENT ACTIVITY" not in user_prompt
+
+
+# ---------------------------------------------------------------------------
+# 9. JUSTIFIED_DEVIATION (iter-10 PR 4) routes to the goal-aware refine prompt
+# ---------------------------------------------------------------------------
+
+
+async def test_refine_justified_deviation_uses_goal_aware_prompt() -> None:
+    """JUSTIFIED_DEVIATION (iter-10) shares OFF_TOPIC's refine path.
+
+    The drift's ``detail`` carries the provenance prefix from the
+    parser ("justified deviation (tool_error): ...") which the
+    existing ``_render_off_topic_reasoning_block`` surfaces verbatim
+    so the LLM sees the provoking signal.
+    """
+    stub = _StubLLM(_absorbed_revision_json())
+    planner = LLMPlanner(call_llm=stub)
+    drift = DriftEvent(
+        kind=DriftKind.JUSTIFIED_DEVIATION,
+        severity=DriftSeverity.WARNING,
+        detail=(
+            "justified deviation (tool_error): tool 503; falling back "
+            "to a different fact source"
+        ),
+        current_task_id="draft",
+        trigger_input=(
+            "The fact API returned 503; let me retry against the "
+            "alternate endpoint."
+        ),
+    )
+
+    revised = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
+
+    assert revised is not None
+    system, user_prompt, _model = stub.calls[0]
+    # Goal-aware system prompt selected (ABSORB / REJECT framing).
+    assert "ABSORB" in system
+    assert "REJECT" in system
+    # The user prompt carries the OFF-TOPIC reasoning context block —
+    # _render_off_topic_reasoning_block is shared with OFF_TOPIC by
+    # design (the drift detail / trigger_input shape is identical).
+    assert "OFF-TOPIC REASONING" in user_prompt
+    # Provenance prefix from the parser appears verbatim in the
+    # rendered context, so the LLM sees the exact provoking signal
+    # rather than a generic "agent drifted" framing.
+    assert "justified deviation (tool_error)" in user_prompt
+    assert "alternate endpoint" in user_prompt
+    # Not the observed_actions channel.
+    assert "OBSERVED AGENT ACTIVITY" not in user_prompt
+
+
+async def test_refine_justified_deviation_honours_reject_sentinel() -> None:
+    """When the LLM judges the justified deviation to actually contradict
+    a sticky goal, it returns ``{"reject": true, ...}`` and refine
+    returns None (caller escalates via the ladder)."""
+    stub = _StubLLM(json.dumps({"reject": True, "reason": "off-goal even with provenance"}))
+    planner = LLMPlanner(call_llm=stub)
+    drift = DriftEvent(
+        kind=DriftKind.JUSTIFIED_DEVIATION,
+        severity=DriftSeverity.WARNING,
+        detail=(
+            "justified deviation (surprising_result): the source disagrees "
+            "with the sticky goal"
+        ),
+        current_task_id="draft",
+    )
+
+    revised = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
+
+    assert revised is None
+    # Reject is final — no retry on the goal-aware path.
+    assert len(stub.calls) == 1
+
+
+async def test_refine_repeated_failure_does_not_pull_in_justified_deviation() -> None:
+    """Regression: JUSTIFIED_DEVIATION must not pull REPEATED_FAILURE /
+    BLOCKED into the goal-aware path.
+
+    The prompt-selection condition expanded in iter-10 PR 4 must NOT
+    accidentally light up structural-recovery drifts — they continue
+    to use the generic refine prompt.
+    """
+    payload = {
+        "summary": "same",
+        "tasks": [
+            {
+                "id": "research",
+                "title": "Research",
+                "assignee_agent_id": "researcher",
+                "status": "COMPLETED",
+            },
+            {
+                "id": "draft",
+                "title": "Draft",
+                "assignee_agent_id": "writer",
+                "status": "RUNNING",
+            },
+            {
+                "id": "review",
+                "title": "Review",
+                "assignee_agent_id": "editor",
+                "status": "PENDING",
+            },
+        ],
+        "edges": [
+            {"from_task_id": "research", "to_task_id": "draft"},
+            {"from_task_id": "draft", "to_task_id": "review"},
+        ],
+    }
+    for kind in (DriftKind.REPEATED_FAILURE, DriftKind.BLOCKED):
+        stub = _StubLLM(json.dumps(payload))
+        planner = LLMPlanner(call_llm=stub)
+        drift = DriftEvent(
+            kind=kind,
+            severity=DriftSeverity.WARNING,
+            detail="recovery",
+            current_task_id="draft",
+        )
+        await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
+        system, user_prompt, _model = stub.calls[0]
+        assert "ABSORB" not in system, (
+            f"{kind.value} accidentally migrated to the goal-aware prompt"
+        )
+        assert "maintaining an ACTIVE plan" in system
+        # Neither reasoning block leaks.
+        assert "OFF-TOPIC REASONING" not in user_prompt
+        assert "justified deviation" not in user_prompt
+
+
+async def test_refine_justified_deviation_drift_detail_carries_provenance() -> None:
+    """The drift the parser builds from a justified-deviation verdict
+    carries the provenance string in ``detail`` — the refine prompt
+    renders it verbatim. Pinned end-to-end.
+    """
+    # Build a JUSTIFIED_DEVIATION drift the way the parser does.
+    drift = DriftEvent(
+        kind=DriftKind.JUSTIFIED_DEVIATION,
+        severity=DriftSeverity.WARNING,
+        detail=(
+            "justified deviation (discovered_dependency): the writer needs "
+            "the editor's style guide first"
+        ),
+        current_task_id="draft",
+        trigger_input="The plan didn't list the style guide as a dep",
+    )
+    stub = _StubLLM(_absorbed_revision_json())
+    planner = LLMPlanner(call_llm=stub)
+    await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
+
+    _system, user_prompt, _model = stub.calls[0]
+    assert "justified deviation (discovered_dependency)" in user_prompt
+    assert "style guide" in user_prompt

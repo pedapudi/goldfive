@@ -3222,6 +3222,33 @@ class DefaultSteerer:
             InterventionLevel.ABSORB,
             (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
         ),
+        # JUSTIFIED_DEVIATION (iter-10 PR 3+4) is plan-context drift
+        # WITH provenance — the agent saw a real provoking signal (tool
+        # error, surprising result, discovered dependency, new
+        # information) that pulled it off the bound task. The refine
+        # path is identical to OFF_TOPIC (goal-aware ABSORB/REJECT via
+        # ``_PLAN_DIVERGENCE_SYSTEM_PROMPT``), but we never escalate:
+        # CRITICAL repeat does NOT escalate to PAUSE_ESCALATE because a
+        # provoked deviation is the right input for plan-extension at
+        # every severity. Penalising it would punish the agent for
+        # responding to reality.
+        #
+        # Backstops against runaway justified_deviation are upstream of
+        # the ladder, not on it (per design §7.3):
+        #
+        # * The per-(kind, task_id) refine cooldown ``_is_plan_revision_
+        #   gated`` collapses a cluster of JUSTIFIED_DEVIATION drifts on
+        #   the same task to one refine attempt; subsequent ones drop.
+        # * The ``task_last_progress_at`` stall gate
+        #   (``_is_task_progress_stalled``) catches the pathological
+        #   case where the agent KEEPS justifying drift on the same
+        #   task without making progress, escalating to
+        #   HUMAN_INTERVENTION_REQUIRED.
+        DriftKind.JUSTIFIED_DEVIATION: (
+            InterventionLevel.OBSERVE,
+            InterventionLevel.ABSORB,
+            (InterventionLevel.ABSORB, InterventionLevel.ABSORB),
+        ),
         DriftKind.INTENT_DIVERGENCE: (
             InterventionLevel.OBSERVE,
             InterventionLevel.ABSORB,

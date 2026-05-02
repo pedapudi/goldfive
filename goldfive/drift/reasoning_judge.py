@@ -61,6 +61,8 @@ __all__ = [
     "REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS",
     "REASONING_DRIFT_MAX_REASONING_CHARS",
     "REASONING_DRIFT_SYSTEM_PROMPT",
+    "REASONING_DRIFT_TOOL_OBS_MAX_CHARS",
+    "REASONING_DRIFT_TOOL_OBS_MAX_ENTRIES",
     "REASONING_DRIFT_USER_PROMPT_TEMPLATE",
     "ReasoningJudgeVerdict",
     "classify_reasoning_drift",
@@ -130,42 +132,78 @@ REASONING_DRIFT_SYSTEM_PROMPT: str = (
     "single JSON object and nothing else."
 )
 
+# iter-10 PR 3: three-state classification + lineage / tool-observation
+# context. The template asks the judge for THREE decisions (classify,
+# attribute, name provenance) instead of TWO. Sections in order:
+# 1. PLAN TASKS               (existing)
+# 2. CURRENTLY BOUND TASK     (existing)
+# 3. Currently reasoning agent line  (existing — added in iter-9)
+# 4. Task lineage line        (NEW — _format_task_lineage)
+# 5. GOALS                    (existing)
+# 6. RECENT TOOL OBSERVATIONS (NEW — _format_tool_observations)
+# 7. REASONING                (existing, ≤1500 chars)
+# 8. "Decide THREE things"    (NEW — classification, attribution, provenance)
+# 9. JSON shape spec          (UPDATED — adds classification + provenance fields)
+# 10. GUIDANCE block          (NEW — per-provenance criteria)
+# 11. Severity guidance       (UPDATED for non-on_task)
 REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     "You are assessing whether an autonomous agent's chain-of-thought "
     "is on task.\n\n"
     "PLAN TASKS (id -> title):\n{plan_tasks_summary}\n\n"
     "CURRENTLY BOUND TASK:\n{task_block}\n\n"
-    "Currently reasoning agent: {current_agent_id}\n\n"
+    "Currently reasoning agent: {current_agent_id}\n"
+    "Task lineage: {task_lineage_block}\n\n"
     "GOALS:\n{goals_block}\n\n"
+    "RECENT TOOL OBSERVATIONS (last {tool_obs_count}, oldest first):\n"
+    "{tool_obs_block}\n\n"
     "REASONING (the agent's most recent chain-of-thought block):\n"
     "{reasoning_block}\n\n"
-    "Decide TWO things:\n"
-    "1. Does the reasoning stay focused on the explicit task and "
-    "goals above? (the on-task verdict)\n"
-    "2. Which task in the PLAN TASKS list above is the reasoning "
-    "actually working on right now? (the attribution verdict — answer "
-    "with a task id from the list, or '' when the reasoning is not "
-    "working on any plan task / is off-plan)\n\n"
+    "Decide THREE things:\n"
+    "1. CLASSIFICATION. Which best describes the reasoning?\n"
+    "   - on_task: it advances the BOUND TASK or the GOALS.\n"
+    "   - justified_deviation: it departs from the BOUND TASK, but a recent\n"
+    "     tool observation, surprising result, discovered dependency, or new\n"
+    "     information visible above plausibly provoked the departure.\n"
+    "   - erroneous_deviation: it departs from the BOUND TASK with no such\n"
+    "     provoking signal in the context above.\n"
+    "2. ATTRIBUTION. Which task in the PLAN TASKS list is the reasoning\n"
+    "   actually working on right now? Use the literal id, or '' when the\n"
+    "   reasoning is off-plan.\n"
+    "3. PROVENANCE. ONLY when classification is justified_deviation, name the\n"
+    "   signal that justifies the deviation. Pick exactly one of:\n"
+    "     tool_error | surprising_result | discovered_dependency | new_information\n"
+    "   When classification is on_task or erroneous_deviation, set\n"
+    '   provenance to "none".\n\n'
     "Reply with a single JSON object and nothing else, in this shape:\n"
     "{{\n"
-    '  "on_task": true|false,\n'
-    '  "severity": "info"|"warning"|"critical",\n'
+    '  "classification": "on_task" | "justified_deviation" | "erroneous_deviation",\n'
+    '  "severity": "info" | "warning" | "critical",\n'
     '  "reason": "one-sentence explanation",\n'
+    '  "provenance": "tool_error" | "surprising_result" | '
+    '"discovered_dependency" | "new_information" | "none",\n'
     '  "focused_task_id": "<id from PLAN TASKS, or \'\' if off-plan>",\n'
     '  "focus_confidence": 0.0-1.0,\n'
     '  "stated_intent": "one-sentence summary of what the agent says it '
     'is doing"\n'
     "}}\n\n"
-    "on_task=true = reasoning is working toward the bound task / goals "
-    "(clarifying sub-steps, exploring tradeoffs, working through a "
-    "calculation all count as on_task). When on_task=true, severity / "
-    "reason may be omitted or empty.\n"
-    "on_task=false = reasoning has drifted to an unrelated topic, is "
-    "proposing to abandon the task, or is otherwise off-course.\n"
-    "Severity guidance when on_task=false:\n"
-    "- info = mild tangent that may self-correct next turn.\n"
-    "- warning = clear off-topic content that deserves a nudge.\n"
-    "- critical = proposing to abandon or replace the task/goal.\n\n"
+    "GUIDANCE:\n"
+    "- on_task includes clarifying sub-steps, exploring tradeoffs, and\n"
+    "  working through calculations.\n"
+    "- A tool_error provenance requires a recent tool observation with\n"
+    "  is_error=true OR an error_message.\n"
+    "- A surprising_result provenance requires a tool observation whose\n"
+    "  result contradicts the reasoning's prior assumption.\n"
+    "- A discovered_dependency provenance requires the reasoning to name a\n"
+    "  prerequisite that was not in the plan or task description.\n"
+    "- A new_information provenance requires the reasoning to cite a fact\n"
+    "  surfaced by a recent tool result.\n"
+    "- If you cannot point to a specific signal in the RECENT TOOL\n"
+    "  OBSERVATIONS or REASONING above to justify a deviation, classify it\n"
+    "  as erroneous_deviation.\n\n"
+    "Severity guidance when classification is non-on_task:\n"
+    "  info     = mild deviation that may self-correct next turn.\n"
+    "  warning  = clear deviation that deserves a refine.\n"
+    "  critical = proposing to abandon the goal entirely.\n\n"
     "focused_task_id MUST be the literal id of one of the listed plan "
     "tasks, or an empty string when the reasoning is not working on "
     "any plan task. focus_confidence is your subjective certainty in "
@@ -239,6 +277,113 @@ def _format_reasoning(reasoning: str) -> str:
     if len(reasoning) <= REASONING_DRIFT_MAX_REASONING_CHARS:
         return reasoning
     return reasoning[:REASONING_DRIFT_MAX_REASONING_CHARS] + " ... [truncated]"
+
+
+# ---------------------------------------------------------------------------
+# iter-10 PR 3: lineage + recent-tool-observation prompt blocks
+# ---------------------------------------------------------------------------
+#
+# Lineage and recent tool observations are surfaced to the judge as
+# additional CONTEXT, never as a structural pre-gate. The LLM still
+# decides; the new context just lets it distinguish a provoked
+# deviation (justified_deviation) from an unprovoked one
+# (erroneous_deviation). See iter10-design.md §3.3 / §5 for the
+# rationale.
+
+
+def _format_task_lineage(
+    task_id: str,
+    lineage: dict[str, set[str]] | None,
+    current_agent_id: str,
+) -> str:
+    """Render the task-lineage block for the judge prompt.
+
+    ``lineage`` is the per-task ``{task_id: set(agent_id)}`` map kept
+    on :class:`~goldfive.types.Session` and populated by the ADK plugin
+    (assignee + every observed AgentTool ``to_agent`` for the task).
+    The empty / missing case renders ``"(no task lineage observed)"``
+    so the prompt shape is invariant for tests; populated cases render
+    a one-line set with a suffix indicating whether the currently
+    reasoning agent is structurally inside the bound task's delegation
+    tree.
+
+    The judge uses this as one signal among several — never as the
+    sole basis for an on-task vs deviation decision (per §5 of the
+    design doc).
+    """
+    if not task_id or not lineage:
+        return "(no task lineage observed)"
+    raw = lineage.get(task_id)
+    if not raw:
+        return "(no task lineage observed)"
+    agents = sorted(str(a) for a in raw if a)
+    if not agents:
+        return "(no task lineage observed)"
+    line = ", ".join(agents)
+    in_lineage = current_agent_id in agents
+    suffix = (
+        f" — {current_agent_id} IS in this lineage"
+        if in_lineage
+        else f" — {current_agent_id} is NOT in this lineage"
+    )
+    return f"observed agents for this task: {line}{suffix}"
+
+
+# Cap the rendered tool-observations block at 1500 chars (matches the
+# REASONING block cap). Per-entry truncation is already enforced at
+# write time by ``DefaultSteerer.note_tool_observation`` (args_preview
+# 240 chars / result_preview 480 chars), so this helper only bounds
+# the total block size.
+REASONING_DRIFT_TOOL_OBS_MAX_CHARS: int = 1500
+REASONING_DRIFT_TOOL_OBS_MAX_ENTRIES: int = 8
+
+
+def _format_tool_observations(
+    obs: list[dict[str, Any]] | None,
+    *,
+    task_id: str,
+    max_entries: int = REASONING_DRIFT_TOOL_OBS_MAX_ENTRIES,
+    max_chars: int = REASONING_DRIFT_TOOL_OBS_MAX_CHARS,
+) -> tuple[str, int]:
+    """Render the recent-tool-observations prompt block.
+
+    Returns ``(rendered_block, count_used)`` where ``count_used`` is the
+    number of entries that actually made it into the block (so the
+    template can stamp it onto the "(last N, oldest first)" header).
+
+    Filters to the current task's observations first; falls back to a
+    global slice when the per-task slice is empty (the §3.4 design
+    decision: per-task is more relevant on average, but a deviation
+    rooted in an earlier task's tool result remains useful context, so
+    don't drop it entirely). Per-entry truncation is already done at
+    write time; this helper enforces the total ``max_chars`` cap so
+    the prompt stays bounded.
+    """
+    if not obs:
+        return "(no recent tool observations)", 0
+    scoped = [e for e in obs if isinstance(e, dict) and e.get("task_id") == task_id]
+    if not scoped:
+        scoped = [e for e in obs if isinstance(e, dict)]
+    if not scoped:
+        return "(no recent tool observations)", 0
+    tail = scoped[-max_entries:]
+    lines: list[str] = []
+    rendered_chars = 0
+    for e in tail:
+        marker = "ERROR" if e.get("is_error") else "ok"
+        agent = str(e.get("agent_name", "") or "?")
+        tool = str(e.get("tool_name", "") or "?")
+        args_preview = str(e.get("args_preview", "") or "")
+        result_preview = str(e.get("result_preview", "") or "")
+        line = f"- {marker} {agent} {tool}({args_preview}) -> {result_preview}"
+        # +1 for the join newline between lines.
+        if rendered_chars + len(line) + 1 > max_chars and lines:
+            break
+        lines.append(line)
+        rendered_chars += len(line) + 1
+    if not lines:
+        return "(no recent tool observations)", 0
+    return "\n".join(lines), len(lines)
 
 
 # Hard cap on the plan-tasks-summary section of the prompt. Phase-1
@@ -369,6 +514,17 @@ def _severity_from_verdict(raw: Any) -> DriftSeverity:
     return _SEVERITY_MAP.get(raw.strip().lower(), DriftSeverity.WARNING)
 
 
+# iter-10 PR 3: three-state classification + provenance enums. Keep
+# these as frozenset literals so misspellings are caught at parse
+# time (the parser strips + lowercases before membership-checking).
+_VALID_CLASSIFICATIONS: frozenset[str] = frozenset(
+    {"on_task", "justified_deviation", "erroneous_deviation"}
+)
+_VALID_PROVENANCES: frozenset[str] = frozenset(
+    {"tool_error", "surprising_result", "discovered_dependency", "new_information"}
+)
+
+
 async def classify_reasoning_drift(
     *,
     reasoning: str,
@@ -385,6 +541,8 @@ async def classify_reasoning_drift(
     session_id: str = "",
     sequence_fn: Callable[[], int] | None = None,
     plan: Plan | None = None,
+    task_lineage: dict[str, set[str]] | None = None,
+    recent_tool_observations: list[dict[str, Any]] | None = None,
 ) -> DriftEvent | None:
     """Ask an LLM-judge whether ``reasoning`` is on-task.
 
@@ -416,6 +574,8 @@ async def classify_reasoning_drift(
         session_id=session_id,
         sequence_fn=sequence_fn,
         plan=plan,
+        task_lineage=task_lineage,
+        recent_tool_observations=recent_tool_observations,
     )
     return verdict.drift
 
@@ -436,6 +596,8 @@ async def classify_reasoning_drift_with_focus(
     session_id: str = "",
     sequence_fn: Callable[[], int] | None = None,
     plan: Plan | None = None,
+    task_lineage: dict[str, set[str]] | None = None,
+    recent_tool_observations: list[dict[str, Any]] | None = None,
 ) -> ReasoningJudgeVerdict:
     """Ask an LLM-judge whether ``reasoning`` is on-task AND which task it works on.
 
@@ -525,12 +687,23 @@ async def classify_reasoning_drift_with_focus(
         return ReasoningJudgeVerdict(drift=None)
     system = system_prompt or REASONING_DRIFT_SYSTEM_PROMPT
     template = user_prompt_template or REASONING_DRIFT_USER_PROMPT_TEMPLATE
+    # iter-10 PR 3: lineage + recent tool observations are passed as
+    # CONTEXT to the LLM (per §3.3 / §5 — never as a structural pre-gate).
+    task_lineage_block = _format_task_lineage(
+        current_task_id, task_lineage, current_agent_id or "(unknown)"
+    )
+    tool_obs_block, tool_obs_count = _format_tool_observations(
+        recent_tool_observations, task_id=current_task_id
+    )
     user = template.format(
         plan_tasks_summary=format_plan_tasks_summary(plan),
         goals_block=_format_goals(goals),
         task_block=_format_task(task),
         reasoning_block=_format_reasoning(reasoning),
         current_agent_id=current_agent_id or "(unknown)",
+        task_lineage_block=task_lineage_block,
+        tool_obs_block=tool_obs_block,
+        tool_obs_count=tool_obs_count,
     )
     started = time.monotonic()
     call_failed = False
@@ -562,6 +735,12 @@ async def classify_reasoning_drift_with_focus(
     focused_task_id_parsed: str = ""
     focus_confidence_parsed: float = 0.0
     stated_intent_parsed: str = ""
+    # iter-10 PR 3 — three-state classification + provenance. Empty
+    # strings are the quiet-fail sentinel (call raised, malformed JSON,
+    # neither classification nor legacy on_task readable). The parser
+    # below populates these post-call.
+    classification_parsed: str = ""
+    provenance_parsed: str = ""
     try:
         async with goldfive_llm_span(
             sinks=span_sinks,
@@ -593,12 +772,71 @@ async def classify_reasoning_drift_with_focus(
             raw_str_inline = raw if isinstance(raw, str) else ""
             parsed = _parse_response(raw)
             if parsed is not None:
-                on_task_raw = parsed.get("on_task")
-                if isinstance(on_task_raw, bool):
-                    on_task_parsed = on_task_raw
+                # iter-10 PR 3: three-state classification (§2.4 rules
+                # 1 + 2). Read ``classification`` first; fall back to
+                # the legacy ``on_task`` boolean when it's missing or
+                # unrecognised. Both paths converge on a populated
+                # ``classification_parsed`` (or "" for quiet-fail).
+                classification_raw = parsed.get("classification", "")
+                if isinstance(classification_raw, str):
+                    candidate = classification_raw.strip().lower()
+                    if candidate in _VALID_CLASSIFICATIONS:
+                        classification_parsed = candidate
+                if not classification_parsed:
+                    # Legacy fallback — the pre-iter-10 prompt only
+                    # asked for a bool. Custom prompt-template
+                    # overrides operators ship may still produce that
+                    # shape, and we promised back-compat in §2.4 rule 2.
+                    on_task_legacy = parsed.get("on_task")
+                    if isinstance(on_task_legacy, bool):
+                        classification_parsed = (
+                            "on_task" if on_task_legacy else "erroneous_deviation"
+                        )
+                # ``on_task_parsed`` mirrors the classification for the
+                # legacy proto event payload AND for the span
+                # output_preview / decision_summary below — set it as
+                # soon as we have a classification (success path), or
+                # leave it None (quiet-fail path).
+                if classification_parsed == "on_task":
+                    on_task_parsed = True
+                elif classification_parsed in (
+                    "justified_deviation",
+                    "erroneous_deviation",
+                ):
+                    on_task_parsed = False
+                # Reason + severity are useful regardless of which
+                # branch we're on (the prompt allows them empty on
+                # on_task; the parser below treats empty reason
+                # gracefully when constructing drift detail).
+                if classification_parsed:
                     reason = str(parsed.get("reason", "") or "").strip()
-                    if not on_task_raw:
-                        severity_str = _severity_from_verdict(parsed.get("severity")).value.lower()
+                    if classification_parsed != "on_task":
+                        severity_str = _severity_from_verdict(
+                            parsed.get("severity")
+                        ).value.lower()
+                # iter-10 PR 3 §2.4 rule 3: provenance validation +
+                # demotion. justified_deviation REQUIRES one of the
+                # four enum values (tool_error | surprising_result |
+                # discovered_dependency | new_information). Anything
+                # else (missing key, "none", unknown free-text) demotes
+                # the verdict to erroneous_deviation. Doing this inside
+                # the span scope so ``span.output_preview`` /
+                # ``decision_summary`` reflect the post-demotion shape.
+                # The actual INFO-level demotion log fires below in
+                # the drift-construction branch.
+                if classification_parsed == "justified_deviation":
+                    provenance_raw = parsed.get("provenance", "")
+                    candidate = ""
+                    if isinstance(provenance_raw, str):
+                        candidate = provenance_raw.strip().lower()
+                    if candidate in _VALID_PROVENANCES:
+                        provenance_parsed = candidate
+                    else:
+                        # Demote — keep raw value around for the
+                        # post-with-block log message.
+                        classification_parsed = "erroneous_deviation"
+                        provenance_parsed = ""
+                        on_task_parsed = False
                 # Extended attribution fields — extracted regardless of
                 # the on_task verdict. The judge can name a focused
                 # task whether or not it considers the reasoning on the
@@ -646,12 +884,39 @@ async def classify_reasoning_drift_with_focus(
                     "unparseable verdict"
                 )
             else:
+                # iter-10 PR 3: span's output_preview + decision_summary
+                # surface the three-state classification (post-demotion,
+                # since the §2.4 rule-3 check ran above inside this
+                # span scope). For justified_deviation the verdict
+                # string carries the provenance suffix so the
+                # harmonograf Gantt shows the provoking signal at a
+                # glance.
                 span.output_preview = (
+                    f"classification={classification_parsed or '(none)'}, "
+                    f"provenance={provenance_parsed or '(none)'}, "
                     f"on_task={on_task_parsed}, "
                     f"severity={severity_str or '(none)'}, "
                     f"reason={reason or '(none)'}"
                 )
-                if on_task_parsed:
+                if classification_parsed == "on_task":
+                    # Keep the legacy "on-task" wording so existing
+                    # observability assertions (and harmonograf's
+                    # display-string scrapers) continue to match. The
+                    # output_preview above already exposes the
+                    # canonical ``classification=on_task`` axis for
+                    # callers that prefer the new field.
+                    verdict_str = "on-task"
+                elif classification_parsed == "justified_deviation":
+                    verdict_str = f"justified_deviation ({provenance_parsed})"
+                elif classification_parsed == "erroneous_deviation":
+                    sev_suffix = (
+                        f" [{severity_str.upper()}]" if severity_str else ""
+                    )
+                    verdict_str = f"erroneous_deviation{sev_suffix}"
+                elif on_task_parsed:
+                    # Defensive: only reached if classification fell
+                    # through to a falsy string but on_task_parsed was
+                    # set — keep legacy text for the proto event mirror.
                     verdict_str = "on-task"
                 else:
                     verdict_str = (
@@ -682,21 +947,84 @@ async def classify_reasoning_drift_with_focus(
             raw_str[:200],
         )
     elif parsed is not None:
-        if on_task_parsed is None:
+        # iter-10 PR 3 §2.4: three-state classification routing. The
+        # parser inside the with-block populated
+        # ``classification_parsed`` (legacy fallback applied) and ran
+        # the §2.4 rule-3 provenance demotion when needed. This branch
+        # only logs + builds the drift event.
+        if not classification_parsed:
+            # Quiet-fail: neither a recognised ``classification`` nor a
+            # boolean ``on_task`` legacy field. Empty verdict, no drift.
             log.debug(
-                "classify_reasoning_drift: parsed=%r lacks boolean 'on_task' key; no drift emitted",
+                "classify_reasoning_drift: parsed=%r lacks both "
+                "'classification' and boolean 'on_task' keys; no drift emitted",
                 parsed,
             )
-        elif on_task_parsed:
+        elif classification_parsed == "on_task":
             log.debug(
                 "classify_reasoning_drift: judge says on-track (reason=%r)",
                 reason,
             )
-        else:
+        elif classification_parsed == "justified_deviation":
             severity_enum = _severity_from_verdict(parsed.get("severity"))
             log.info(
-                "classify_reasoning_drift: drift detected (severity=%s, "
-                "reason=%r); emitting OFF_TOPIC event",
+                "classify_reasoning_drift: justified deviation "
+                "(provenance=%s, severity=%s, reason=%r); emitting "
+                "JUSTIFIED_DEVIATION event",
+                provenance_parsed,
+                severity_enum.value,
+                reason,
+            )
+            detail_body = reason or "(judge returned no reason)"
+            detail = f"justified deviation ({provenance_parsed}): {detail_body}"
+            drift = DriftEvent(
+                kind=DriftKind.JUSTIFIED_DEVIATION,
+                severity=severity_enum,
+                detail=detail,
+                current_task_id=current_task_id,
+                current_agent_id=current_agent_id,
+                raw=reasoning,
+                trigger_input=truncate_for_observability(
+                    reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
+                ),
+            )
+        else:
+            # erroneous_deviation — same wire shape as the pre-iter-10
+            # OFF_TOPIC path. This branch ALSO catches a
+            # justified_deviation that was demoted by the §2.4 rule-3
+            # check above; in that case the original raw provenance
+            # value is gone (we logged the demotion when it fired), and
+            # the rendered drift looks identical to a model-emitted
+            # erroneous_deviation. That's intentional — once demoted,
+            # the verdict IS erroneous_deviation by every downstream
+            # surface.
+            assert classification_parsed == "erroneous_deviation", (
+                classification_parsed
+            )
+            severity_enum = _severity_from_verdict(parsed.get("severity"))
+            # Surface the demotion at INFO so operators can grep the
+            # rate of "model claimed justified but couldn't name a
+            # provenance" in production logs. The branch above
+            # (provenance check inside the with-block) intentionally
+            # does NOT log so the message contains the original raw
+            # value and the parsed-after-demotion classification — both
+            # readable here.
+            raw_classification = ""
+            if isinstance(parsed.get("classification"), str):
+                raw_classification = parsed["classification"].strip().lower()
+            if raw_classification == "justified_deviation":
+                provenance_raw_log = parsed.get("provenance", "")
+                log.info(
+                    "classify_reasoning_drift: justified_deviation "
+                    "demoted to erroneous_deviation — provenance=%r is "
+                    "missing or not in the allowed enum "
+                    "(tool_error|surprising_result|"
+                    "discovered_dependency|new_information)",
+                    provenance_raw_log,
+                )
+            log.info(
+                "classify_reasoning_drift: drift detected "
+                "(severity=%s, reason=%r); emitting OFF_TOPIC event",
                 severity_enum.value,
                 reason,
             )
@@ -721,6 +1049,17 @@ async def classify_reasoning_drift_with_focus(
     # parsed outcome but independent of it — on-task, off-task, and
     # plumbing-failure paths all produce an observability event.
     if sink is not None:
+        # iter-10 PR 3: pass the post-demotion classification onto the
+        # ReasoningJudgeInvoked event payload. ``on_task`` is the
+        # legacy mirror — kept for back-compat with existing harmonograf
+        # columns. The mirror is computed from the final
+        # ``classification_parsed`` so it stays consistent with the new
+        # field even after a §2.4 rule-3 demotion.
+        on_task_for_event = (
+            classification_parsed == "on_task"
+            if classification_parsed
+            else (drift is None)
+        )
         await _emit_judge_invoked(
             sink=sink,
             run_id=run_id,
@@ -732,19 +1071,18 @@ async def classify_reasoning_drift_with_focus(
             elapsed_ms=elapsed_ms,
             reasoning_input=reasoning,
             raw_response=raw_str,
-            on_task=bool(on_task_parsed)
-            if on_task_parsed is not None
-            else True
-            if drift is None
-            else False,
+            on_task=on_task_for_event,
             severity=severity_str,
             reason=reason,
+            classification=classification_parsed,
         )
     return ReasoningJudgeVerdict(
         drift=drift,
         focused_task_id=focused_task_id_parsed,
         focus_confidence=focus_confidence_parsed,
         stated_intent=stated_intent_parsed,
+        classification=classification_parsed,
+        provenance=provenance_parsed,
     )
 
 

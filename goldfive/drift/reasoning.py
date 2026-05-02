@@ -1012,6 +1012,12 @@ async def _run_judge_with_focus(
     reasoning-judge delegated coverage.
     """
     task = _current_task(session)
+    # iter-10 PR 3: surface lineage + recent tool observations to the
+    # judge as additional context. ``task_lineage`` was added in iter-9
+    # (#344); ``recent_tool_observations`` was added in iter-10 PR 2
+    # (#347). Both are passed by attribute lookup so older Session
+    # snapshots without the fields still parse cleanly (the helpers
+    # treat None as "no data").
     return await classify_reasoning_drift_with_focus(
         reasoning=text,
         task=task,
@@ -1025,6 +1031,8 @@ async def _run_judge_with_focus(
         run_id=session.run_id,
         session_id=session.id,
         sequence_fn=session.next_sequence,
+        task_lineage=getattr(session, "task_lineage", None),
+        recent_tool_observations=getattr(session, "recent_tool_observations", None),
     )
 
 
