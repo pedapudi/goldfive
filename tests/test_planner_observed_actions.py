@@ -518,3 +518,161 @@ def test_observed_action_dataclass_shape() -> None:
     assert a.completed_at is None
     assert a.parent_invocation_id == ""
     assert a.status == "running"
+
+
+# ---------------------------------------------------------------------------
+# 8. OFF_TOPIC routes to the goal-aware refine prompt
+# ---------------------------------------------------------------------------
+
+
+async def test_refine_off_topic_uses_plan_divergence_system_prompt() -> None:
+    """OFF_TOPIC drift is plan-context drift from the reasoning judge:
+    the agent is reasoning about something that doesn't fit the bound
+    task. The ABSORB path must use the goal-aware
+    ``_PLAN_DIVERGENCE_SYSTEM_PROMPT`` so the LLM either revises the
+    plan to absorb the new direction (when it advances a goal) or
+    emits the ``{"reject": true, ...}`` sentinel (when it doesn't),
+    rather than silently absorbing off-goal reasoning via the generic
+    ``_REFINE_SYSTEM_PROMPT``.
+    """
+    stub = _StubLLM(_absorbed_revision_json())
+    planner = LLMPlanner(call_llm=stub)
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="reasoning drift: agent began researching tropical fish, not goldfish",
+        current_task_id="draft",
+        trigger_input="Let me research tropical fish habitats and breeding patterns...",
+    )
+
+    revised = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
+
+    assert revised is not None
+    system, user_prompt, _model = stub.calls[0]
+    # The divergence (goal-aware) system prompt was selected, NOT the
+    # generic refine prompt. Two structural markers:
+    #   1. Goal-aware prompt frames PLAN_DIVERGENCE / ABSORB / REJECT.
+    #   2. Generic prompt opens with "maintaining an ACTIVE plan" without
+    #      the ABSORB/REJECT contract.
+    assert "ABSORB" in system
+    assert "REJECT" in system
+    # The user prompt carries the OFF_TOPIC reasoning context block —
+    # the analogue of OBSERVED AGENT ACTIVITY for a reasoning-judge
+    # drift — so the system prompt's referenced "what the agent did"
+    # channel is honoured.
+    assert "OFF-TOPIC REASONING" in user_prompt
+    assert "tropical fish" in user_prompt
+    assert "judge reason" in user_prompt
+    # The user prompt should NOT include the OBSERVED AGENT ACTIVITY
+    # header — that's the PLAN_DIVERGENCE+observed_actions channel and
+    # OFF_TOPIC has no observed actions.
+    assert "OBSERVED AGENT ACTIVITY" not in user_prompt
+
+
+async def test_refine_off_topic_honours_reject_sentinel() -> None:
+    """When the LLM judges the off-topic reasoning to be off-goal, it
+    emits ``{"reject": true, "reason": "..."}`` and refine returns
+    ``None`` (so the steerer can escalate via the intervention ladder).
+    No REFINE_VALIDATION_FAILED is emitted because reject is a
+    successful decision, not a parse failure.
+    """
+    stub = _StubLLM(json.dumps({"reject": True, "reason": "off-goal excursion"}))
+    planner = LLMPlanner(call_llm=stub)
+
+    emitted: list[DriftEvent] = []
+
+    async def capture(d: DriftEvent) -> None:
+        emitted.append(d)
+
+    planner.set_drift_emitter(capture)
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="reasoning drifted to unrelated topic",
+        current_task_id="draft",
+    )
+
+    revised = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
+
+    assert revised is None
+    assert emitted == []
+    # Reject is final — no retry.
+    assert len(stub.calls) == 1
+
+
+async def test_refine_off_topic_without_trigger_input_renders_placeholder() -> None:
+    """The OFF_TOPIC reasoning block has invariant shape: when the drift
+    carries no ``trigger_input`` / ``raw`` / ``detail`` excerpt the
+    block still renders with a placeholder so the prompt is well-formed
+    (mirrors the ``(no observed activity)`` fallback on the
+    PLAN_DIVERGENCE path)."""
+    stub = _StubLLM(_absorbed_revision_json())
+    planner = LLMPlanner(call_llm=stub)
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="",
+        current_task_id="draft",
+    )
+
+    await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
+    _system, user_prompt, _model = stub.calls[0]
+    assert "OFF-TOPIC REASONING" in user_prompt
+    assert "(no reasoning excerpt available)" in user_prompt
+
+
+async def test_refine_repeated_failure_keeps_generic_prompt() -> None:
+    """REPEATED_FAILURE / BLOCKED are structural-recovery drifts, not
+    plan-context drifts. They must continue to use the generic
+    ``_REFINE_SYSTEM_PROMPT`` — accidentally migrating them to the
+    goal-aware ABSORB/REJECT prompt would let the LLM emit
+    ``{"reject": true}`` for what is just a structural recovery and
+    that path is wired to escalate to human intervention.
+    """
+    payload = {
+        "summary": "same",
+        "tasks": [
+            {
+                "id": "research",
+                "title": "Research",
+                "assignee_agent_id": "researcher",
+                "status": "COMPLETED",
+            },
+            {
+                "id": "draft",
+                "title": "Draft",
+                "assignee_agent_id": "writer",
+                "status": "RUNNING",
+            },
+            {
+                "id": "review",
+                "title": "Review",
+                "assignee_agent_id": "editor",
+                "status": "PENDING",
+            },
+        ],
+        "edges": [
+            {"from_task_id": "research", "to_task_id": "draft"},
+            {"from_task_id": "draft", "to_task_id": "review"},
+        ],
+    }
+    for kind in (DriftKind.REPEATED_FAILURE, DriftKind.BLOCKED):
+        stub = _StubLLM(json.dumps(payload))
+        planner = LLMPlanner(call_llm=stub)
+        drift = DriftEvent(
+            kind=kind,
+            severity=DriftSeverity.WARNING,
+            detail="recovery",
+            current_task_id="draft",
+        )
+        await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
+        system, user_prompt, _model = stub.calls[0]
+        # Generic refine system prompt selected, NOT the goal-aware one.
+        assert "ABSORB" not in system, (
+            f"{kind.value} accidentally migrated to the goal-aware prompt"
+        )
+        assert "maintaining an ACTIVE plan" in system
+        # No OFF_TOPIC reasoning block leaks onto non-OFF_TOPIC kinds.
+        assert "OFF-TOPIC REASONING" not in user_prompt
+        # No OBSERVED AGENT ACTIVITY block (no observed_actions provided).
+        assert "OBSERVED AGENT ACTIVITY" not in user_prompt

@@ -120,6 +120,23 @@ _CASES: list[tuple[DriftKind, DriftSeverity, int, InterventionLevel]] = [
         2,
         InterventionLevel.PAUSE_ESCALATE,
     ),
+    # OFF_TOPIC: plan-context drift from the reasoning judge. Ladder
+    # mirrors PLAN_DIVERGENCE so the ABSORB path can route to the
+    # goal-aware refine prompt rather than the generic refine prompt.
+    (DriftKind.OFF_TOPIC, DriftSeverity.INFO, 0, InterventionLevel.OBSERVE),
+    (DriftKind.OFF_TOPIC, DriftSeverity.WARNING, 0, InterventionLevel.ABSORB),
+    (
+        DriftKind.OFF_TOPIC,
+        DriftSeverity.CRITICAL,
+        0,
+        InterventionLevel.CANCEL_REINVOKE,
+    ),
+    (
+        DriftKind.OFF_TOPIC,
+        DriftSeverity.CRITICAL,
+        2,
+        InterventionLevel.PAUSE_ESCALATE,
+    ),
     # INTENT_DIVERGENCE: CRITICAL -> pause-escalate even on first occurrence.
     (DriftKind.INTENT_DIVERGENCE, DriftSeverity.WARNING, 0, InterventionLevel.ABSORB),
     (
