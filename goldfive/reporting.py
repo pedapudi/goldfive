@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from goldfive import _state_audit
-from goldfive.types import SupersessionKind, TaskStatus
+from goldfive.types import DriftEvent, DriftKind, DriftSeverity, SupersessionKind, TaskStatus
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
@@ -852,6 +852,116 @@ def _invalid_transition_response(
     }
 
 
+def _verify_required_tool_calls(
+    task: Task,
+    session: Session,
+    task_id: str,
+) -> DriftEvent | None:
+    """Check that every tool in ``task.required_tool_calls`` was observed.
+
+    iter-11E PR 2 — structural artifact verification at
+    ``report_task_completed`` time. The plan declares the artifact-
+    producing tools each task must call (``Task.required_tool_calls``)
+    and the verification rejects a completion report whose execution
+    span did not include those tool calls. Catches false-success
+    reports — agents (notably Qwen3.6-32B-A3B-FP8 in our traces) that
+    skip the actual write but still fire ``report_task_succeeded``.
+
+    Scoping: ``Session.recent_tool_observations`` is a global ring
+    buffer (every agent + every task), so this filter narrows to
+    entries pinned to ``task_id`` before checking membership. An
+    observation of ``write_webpage_tool`` produced under a different
+    task does NOT satisfy the requirement on this task — the
+    artefact-producing call must have happened in the failing task's
+    own execution span.
+
+    Returns
+    -------
+    A ``DriftEvent`` with kind ``INCOMPLETE_TOOL_CALLS`` and
+    ``CRITICAL`` severity when one or more required tools are missing.
+    The drift carries the missing-tool list (and the per-task observed
+    set) on its ``detail`` so the planner's goal-aware refine prompt
+    can render them via ``_render_off_topic_reasoning_block``. The
+    same lists also flow into the agent-facing rejection response so
+    the call site does not have to recompute them.
+
+    ``None`` when the task has no requirements or every requirement
+    was satisfied. The completion report proceeds normally in that
+    case.
+    """
+    required = list(task.required_tool_calls or [])
+    if not required:
+        return None
+
+    observed_tools: set[str] = set()
+    for obs in session.recent_tool_observations or []:
+        if not isinstance(obs, dict):
+            continue
+        if obs.get("task_id") != task_id:
+            continue
+        tool_name = obs.get("tool_name")
+        if tool_name:
+            observed_tools.add(str(tool_name))
+
+    missing = [t for t in required if t not in observed_tools]
+    if not missing:
+        return None
+
+    observed_sorted = sorted(observed_tools)
+    detail = (
+        f"task {task_id!r} reported succeeded but required tools "
+        f"were not observed during execution: missing={missing}, "
+        f"observed={observed_sorted}"
+    )
+    drift = DriftEvent(
+        kind=DriftKind.INCOMPLETE_TOOL_CALLS,
+        severity=DriftSeverity.CRITICAL,
+        detail=detail,
+        current_task_id=task_id,
+        current_agent_id=str(getattr(task, "assignee_agent_id", "") or ""),
+    )
+    # Stash the structured missing/observed lists on ``raw`` so the
+    # caller can build the rejection response without re-walking
+    # ``recent_tool_observations``. Sinks read ``detail`` (which
+    # already carries the rendered list); ``raw`` is the call-site-
+    # friendly machine-readable shape.
+    drift.raw = {"missing": list(missing), "observed": list(observed_sorted)}
+    return drift
+
+
+def _incomplete_tool_calls_response(
+    *,
+    task_id: str,
+    missing: list[str],
+    observed: list[str],
+    detail: str,
+) -> dict[str, Any]:
+    """Canonical rejection shape for a completion report missing required tools.
+
+    Mirrors :func:`_invalid_transition_response` and
+    :func:`_missing_required_field_response`: ``acknowledged=False``,
+    a stable ``error`` string the LLM can branch on, and a
+    human-readable ``message`` it can act on. The agent should call
+    the missing tools and only then re-report completion.
+
+    The dispatched ``INCOMPLETE_TOOL_CALLS`` drift handles the
+    plan-side correction (goal-aware refine via
+    ``_PLAN_DIVERGENCE_SYSTEM_PROMPT``); this response handles the
+    LLM-side correction (the agent that issued the false report
+    learns its report did not take effect and the task remains
+    RUNNING).
+    """
+    return {
+        "acknowledged": False,
+        "error": "incomplete_tool_calls",
+        "tool": "report_task_completed",
+        "task_id": task_id,
+        "missing_tool_calls": list(missing),
+        "observed_tool_calls": list(observed),
+        "message": detail,
+    }
+
+
 def _classify_transition(
     *,
     tool_name: str,
@@ -1241,6 +1351,46 @@ async def _handle_task_completed(
                 current_status=task.status,
                 attempted=TaskStatus.COMPLETED,
                 task_id=task_id,
+            )
+        # iter-11E PR 2: structural artifact verification. Reject the
+        # completion when the task declared ``required_tool_calls`` but
+        # those tools weren't observed in this task's execution span.
+        # The dispatched INCOMPLETE_TOOL_CALLS drift drives the
+        # plan-side correction via goal-aware refine; the rejection
+        # response tells the calling agent its report did not take
+        # effect so it can call the missing tools and re-report.
+        incomplete_drift = _verify_required_tool_calls(task, session, task_id)
+        if incomplete_drift is not None:
+            log.warning(
+                "reporting: report_task_completed REJECTED for task_id=%s "
+                "(missing required tool calls); dispatching "
+                "INCOMPLETE_TOOL_CALLS drift",
+                task_id,
+            )
+            # Dispatch via the same fire-and-forget cascade that
+            # ``mark_task_failed`` / ``mark_task_blocked`` use post
+            # iter-11A. The reporting tool returns the rejection
+            # immediately; the planner.refine round-trip lands
+            # asynchronously on the sink bus.
+            spawner = getattr(steerer, "_spawn_drift_handler_background", None)
+            if callable(spawner):
+                spawner(incomplete_drift, session)
+            else:
+                # Custom Steerer / test stub without the iter-11A
+                # spawner: fall back to inline ``_handle_drift`` so the
+                # drift still flows through the ladder.
+                handler = getattr(steerer, "_handle_drift", None)
+                if callable(handler):
+                    await handler(incomplete_drift, session)
+            # ``_verify_required_tool_calls`` already computed both
+            # lists for the drift detail; reuse them via ``drift.raw``
+            # so we don't re-walk the ring buffer.
+            raw = incomplete_drift.raw if isinstance(incomplete_drift.raw, dict) else {}
+            return _incomplete_tool_calls_response(
+                task_id=task_id,
+                missing=list(raw.get("missing") or []),
+                observed=list(raw.get("observed") or []),
+                detail=incomplete_drift.detail,
             )
     await steerer.mark_task_completed(
         task_id, session=session, summary=summary, artifacts=artifacts, source=source

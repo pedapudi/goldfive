@@ -107,3 +107,37 @@ def test_adk_web_wrapped_app_name_is_identifier() -> None:
 
     assert app.name == "goldfive_wrapped_demo"
     assert app.name.isidentifier()
+
+
+def test_mock_plan_declares_required_tool_calls_for_artifact_tasks() -> None:
+    """iter-11E PR 3 regression — artifact-producing tasks declare the
+    tools that must be observed during their execution span.
+
+    Pins:
+
+    * ``build`` (web_developer_agent) declares ``write_webpage``.
+    * ``review`` (reviewer_agent) declares ``read_presentation_files``.
+    * ``debug`` (debugger_agent) declares ``patch_file``.
+    * ``research`` is intentionally NOT declared — the researcher's
+      deliverable is reasoning, not a file artifact.
+
+    Without these declarations the verification at
+    ``report_task_completed`` time (PR 2) cannot tell a real
+    artefact-producing run from an agent that fires a false-success
+    report; the example doubles as the canonical opt-in shape for
+    downstream callers.
+    """
+    import json
+
+    from examples.presentation_agent.agent import _mock_planner_call_llm
+
+    call = _mock_planner_call_llm("waffles")
+    raw = asyncio.run(call("system", "user", "model"))
+    plan = json.loads(raw)
+    by_id = {t["id"]: t for t in plan["tasks"]}
+
+    assert by_id["build"].get("required_tool_calls") == ["write_webpage"]
+    assert by_id["review"].get("required_tool_calls") == ["read_presentation_files"]
+    assert by_id["debug"].get("required_tool_calls") == ["patch_file"]
+    # Research has no file artifact — must NOT carry a requirement.
+    assert "required_tool_calls" not in by_id["research"]
