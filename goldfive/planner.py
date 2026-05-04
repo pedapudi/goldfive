@@ -2535,11 +2535,7 @@ class LLMPlanner:
                 'return a JSON object of the form {"reject": true, "reason": '
                 '"..."} (the caller will escalate to human intervention).\n\n'
             )
-        elif drift.kind in (
-            DriftKind.OFF_TOPIC,
-            DriftKind.JUSTIFIED_DEVIATION,
-            DriftKind.INCOMPLETE_TOOL_CALLS,
-        ):
+        elif drift.kind in (DriftKind.OFF_TOPIC, DriftKind.JUSTIFIED_DEVIATION):
             # OFF_TOPIC and JUSTIFIED_DEVIATION (iter-10 PR 4) have no
             # observed-actions channel — the deviation is in the
             # agent's reasoning, surfaced by the reasoning judge.
@@ -2552,15 +2548,6 @@ class LLMPlanner:
             # e.g. "justified deviation (tool_error): ..."). Frame it
             # with the same ABSORB/REJECT contract so the goal-aware
             # system prompt's decision shape carries through.
-            #
-            # INCOMPLETE_TOOL_CALLS (iter-11E) shares this rendering
-            # path: it has no observed-actions channel either, and the
-            # drift's ``detail`` string carries the list of missing
-            # tools (populated by PR 2's verification logic at
-            # ``report_task_succeeded`` time). The goal-aware ABSORB/
-            # REJECT contract is the right shape — the planner should
-            # either revise the plan to address the unfinished work or
-            # reject when the gap is irreconcilable.
             observed_block = (
                 f"{self._render_off_topic_reasoning_block(drift)}\n\n"
                 "The agent's reasoning has drifted from the bound task. "
@@ -2858,17 +2845,8 @@ class LLMPlanner:
         # ``_render_off_topic_reasoning_block`` surfaces verbatim, so
         # the LLM sees the provoking signal in the rendered context.
         is_justified = drift.kind is DriftKind.JUSTIFIED_DEVIATION
-        # iter-11E: INCOMPLETE_TOOL_CALLS shares the goal-aware ABSORB/
-        # REJECT path with OFF_TOPIC / JUSTIFIED_DEVIATION. The drift's
-        # ``detail`` carries the list of missing tools (populated by
-        # PR 2's verification logic). The planner should either revise
-        # the plan to address the unfinished work or reject when the
-        # gap is irreconcilable with the goals.
-        is_incomplete_tools = drift.kind is DriftKind.INCOMPLETE_TOOL_CALLS
         has_observed_actions = is_plan_divergence and observed_actions is not None
-        use_divergence_prompt = (
-            has_observed_actions or is_off_topic or is_justified or is_incomplete_tools
-        )
+        use_divergence_prompt = has_observed_actions or is_off_topic or is_justified
         try:
             base_user_prompt = self._build_refine_prompt(
                 plan,

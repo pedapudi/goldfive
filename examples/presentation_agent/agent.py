@@ -327,16 +327,7 @@ class _MockLlm(BaseLlm):
 
 
 def _mock_planner_call_llm(topic: str) -> Callable[[str, str, str], Any]:
-    """Canned ``LLMPlanner.call_llm`` — one task per specialist subagent.
-
-    iter-11E PR 3: artifact-producing tasks declare
-    ``required_tool_calls`` so the verification at
-    ``report_task_completed`` time (PR 2) catches false-success
-    reports — an agent that fires the report without actually
-    invoking the artifact tool. ``research`` has no requirement
-    (the researcher's deliverable is reasoning, not a file artifact)
-    and is intentionally left at the empty-list default.
-    """
+    """Canned ``LLMPlanner.call_llm`` — one task per specialist subagent."""
     plan = {
         "summary": f"Build a slideshow presentation on '{topic}'.",
         "tasks": [
@@ -351,21 +342,18 @@ def _mock_planner_call_llm(topic: str) -> Callable[[str, str, str], Any]:
                 "title": "Generate HTML/CSS/JS slideshow",
                 "description": "Produce the presentation files and save them.",
                 "assignee_agent_id": "web_developer_agent",
-                "required_tool_calls": ["write_webpage"],
             },
             {
                 "id": "review",
                 "title": "Review the generated presentation",
                 "description": "Critique the generated slideshow for issues.",
                 "assignee_agent_id": "reviewer_agent",
-                "required_tool_calls": ["read_presentation_files"],
             },
             {
                 "id": "debug",
                 "title": "Patch any critical issues the reviewer flagged",
                 "description": "Apply fixes to the presentation files.",
                 "assignee_agent_id": "debugger_agent",
-                "required_tool_calls": ["patch_file"],
             },
         ],
         "edges": [

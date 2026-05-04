@@ -179,22 +179,6 @@ class DriftKind(StrEnum):
     # prompt-selection. Until then no production code path constructs
     # this kind, so the lack of a ``_LADDER`` row is intentional.
     JUSTIFIED_DEVIATION = "justified_deviation"
-    # Structural artifact-verification miss (iter-11E). Emitted when
-    # ``report_task_succeeded`` fires for a task that declared
-    # :attr:`Task.required_tool_calls` but those tools were not observed
-    # during the task's execution span (per
-    # ``Session.recent_tool_observations``). Catches agents — Qwen3.6-
-    # 35B-A3B-FP8 has been seen doing this — that call
-    # ``report_task_succeeded`` without invoking the tools that produce
-    # the actual artifact (e.g. claiming a draft is written without ever
-    # calling ``write_webpage_tool``). Routes through the goal-aware
-    # refine path (same as PLAN_DIVERGENCE / OFF_TOPIC) so the planner
-    # can revise the plan to address the unfinished work, and escalates
-    # to PAUSE_ESCALATE on repeat-CRITICAL because repeated false
-    # completion is a serious agent-correctness failure. PR 1 (proto +
-    # dataclass + ladder + planner prompt-selection) ships the kind;
-    # PR 2 wires the verification at ``report_task_succeeded`` time.
-    INCOMPLETE_TOOL_CALLS = "incomplete_tool_calls"
 
 
 class DriftSeverity(StrEnum):
@@ -372,16 +356,6 @@ class Task:
     #: (CORRECT suppresses the rerouting of reports from the old id to
     #: the new id — the old work is legitimately done).
     supersedes_kind: SupersessionKind = SupersessionKind.UNSPECIFIED
-    #: iter-11E: tools that must be observed during this task's
-    #: execution span before ``report_task_succeeded`` is accepted.
-    #: Empty list (the default) means "no requirement" — legacy /
-    #: opt-in semantics, so existing plans and tasks continue to work
-    #: unchanged. PR 2 wires the verification at
-    #: ``report_task_succeeded`` time and emits
-    #: :attr:`DriftKind.INCOMPLETE_TOOL_CALLS` when any declared tool
-    #: is missing from ``Session.recent_tool_observations`` for the
-    #: task's execution span.
-    required_tool_calls: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
