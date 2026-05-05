@@ -477,6 +477,44 @@ You MUST:
        child: an edge ``old -> new`` is added and any downstream
        edges are rewired so work flows through the correction.
 
+3a. CORRECTIVE PREDECESSORS (goldfive#248). When you insert a NEW
+   PENDING task X meant to RUN BEFORE an existing non-terminal task
+   Y (so Y's eventual execution depends on X's output — e.g.
+   ``fix_research_tomatoes`` correcting a hallucinated research
+   task that was already COMPLETED, or a clarifying step that must
+   precede a still-PENDING ``draft_slides``), set
+   ``"supersedes": "<Y_id>"`` on X. The validator then enforces
+   corrective topology: every downstream Z of Y in the prior plan
+   must now depend on X (i.e. add an edge X -> Z), OR the plan
+   must keep Y as PENDING and add an edge X -> Y so Y itself
+   waits on X. Inserting X as an independent root while leaving
+   Y still root-eligible against COMPLETED predecessors is a
+   structural bug: the executor will pick whichever happens to
+   match first, producing out-of-order plan execution. The
+   validator REJECTS that shape.
+
+   Example. Prior plan: research_X (COMPLETED) -> draft_slides
+   (PENDING). Drift: research_X output was off-topic. Correct
+   revision (Shape B — re-edge consumers through X):
+
+     tasks:
+       research_X      (COMPLETED, preserved)
+       fix_research_X  (PENDING, supersedes=research_X,
+                        supersedes_kind=CORRECT)
+       draft_slides    (PENDING, unchanged title/assignee)
+     edges:
+       research_X      -> fix_research_X
+       fix_research_X  -> draft_slides   <-- re-edged via X
+       (drop the prior research_X -> draft_slides edge or keep it
+        — both forms are accepted as long as fix_research_X ->
+        draft_slides exists)
+
+   Wrong revision (rejected by validator): adding fix_research_X
+   as an independent root with no edge to draft_slides. The
+   validator emits "task 'fix_research_X' supersedes
+   'research_X' but downstream consumers of 'research_X' not
+   re-edged through 'fix_research_X'".
+
 4. DROP OBSOLETE PENDING TASKS. If the drift makes a PENDING task
    unnecessary (e.g., a goal has been satisfied early, a dependency
    collapsed), you may omit it from the returned plan. Never drop
@@ -1909,6 +1947,20 @@ class LLMPlanner:
             "that exists in your `tasks` array.",
             "",
             "5. The task graph must be ACYCLIC. Do not introduce edges that would create a cycle.",
+            "",
+            "6. CORRECTIVE PREDECESSORS (goldfive#248). When you insert "
+            "a new PENDING task X with `supersedes: <Y_id>` and Y is "
+            "non-terminal in the current plan (PENDING / RUNNING / "
+            "BLOCKED — Y's status above is one of those), X must be "
+            "wired as a structural predecessor of Y's downstreams. "
+            "Either: (a) add edges from X to every prior consumer of "
+            "Y so the corrective work runs before any task that "
+            "depended on Y, OR (b) keep Y as PENDING in your plan and "
+            "add a single edge X -> Y so Y itself waits on X. "
+            "Inserting X as an independent root while leaving Y's "
+            "downstreams reachable without going through X first is "
+            "REJECTED — the executor would race the corrective work "
+            "against the work it was meant to correct.",
         ]
         return "\n".join(lines)
 

@@ -443,6 +443,33 @@ class Plan:
            that is the natural in-flight DAG shape: a finished stage
            feeding into a still-PENDING next stage.
 
+        8. **Corrective-predecessor topology (PLAN-LIFECYCLE.md §3.6,
+           goldfive#248).** When a revised task ``X`` declares
+           ``X.supersedes == Y`` and ``Y`` exists in ``prior`` AND
+           ``Y.status`` is *non-terminal* (PENDING / RUNNING / BLOCKED),
+           the revision must wire ``X`` in as a structural predecessor
+           of every task that previously depended on ``Y``. Concretely,
+           for every ``prior`` edge ``Y -> Z`` (where ``Z`` exists in
+           the revision and is non-terminal), the revision must contain
+           an edge ``X -> Z`` (the edge is re-routed through ``X``);
+           OR the revision must contain ``Y`` re-marked PENDING with an
+           edge ``X -> Y`` so ``Y`` itself waits on ``X``. The
+           validator rejects any revision that inserts ``X`` as an
+           independent root while ``Y`` (and its downstreams) remain
+           reachable without going through ``X`` first. Motivation:
+           the tomato e2e (#248) showed a corrective ``fix_research_X``
+           landing as an independent root while the original
+           ``draft_slides`` stayed PENDING and root-eligible against
+           ``research_X``; the reconciler picked whichever happened to
+           match first, producing out-of-order plan execution. When
+           ``Y`` is *terminal* in ``prior`` the existing #214 REPLACE/
+           CORRECT path (§3.5) governs and this check is a no-op
+           — supersedes-of-terminal does not require re-edging.
+           Self-supersedes (``X.supersedes == X.id``) and mutual
+           supersedes (``X.supersedes == Y.id`` and
+           ``Y.supersedes == X.id``) are rejected by this step as
+           structurally meaningless.
+
         This is a pure-data validator: it does not mutate the plan. It
         is intended to be called at plan creation (``LLMPlanner.generate``)
         and at plan revision (``LLMPlanner.refine`` /
@@ -577,6 +604,151 @@ class Plan:
                     f"FAILED tasks (their status never transitions to COMPLETED, "
                     f"so downstream PENDING tasks can never become eligible)."
                 )
+
+        # 8. corrective-predecessor topology (PLAN-LIFECYCLE.md §3.6,
+        # goldfive#248). When a revised task X has ``supersedes = Y``
+        # and Y is non-terminal in the prior plan, X must be wired in
+        # as a true predecessor of Y's downstream consumers — otherwise
+        # X lands as an independent root and the prior PENDING work
+        # downstream of Y stays root-eligible against the (still
+        # non-terminal) Y, producing out-of-order plan execution.
+        #
+        # See ``Plan.validate`` step 8 in the docstring above for the
+        # full motivation; the tomato-e2e false-positive (#248) is the
+        # canonical failure shape.
+        #
+        # Only runs on the revision path with a prior — creation-time
+        # plans (``for_revision=False``) cannot have supersedes against
+        # non-terminal prior tasks because there is no prior.
+        if for_revision and prior is not None:
+            prior_by_id: dict[str, Task] = {t.id: t for t in prior.tasks if t.id}
+            new_by_id_step8: dict[str, Task] = {t.id: t for t in self.tasks if t.id}
+            new_edge_set: set[tuple[str, str]] = {
+                (e.from_task_id, e.to_task_id) for e in self.edges
+            }
+
+            # Pre-compute prior outgoing edges keyed by source task.
+            prior_outgoing: dict[str, list[str]] = {}
+            for e in prior.edges:
+                prior_outgoing.setdefault(e.from_task_id, []).append(e.to_task_id)
+
+            for x in self.tasks:
+                sup_id = (x.supersedes or "").strip()
+                if not sup_id:
+                    continue
+
+                # 8a. Self-supersedes is structurally meaningless.
+                if sup_id == x.id:
+                    raise ValueError(
+                        f"task {x.id!r} supersedes itself; a task cannot be its "
+                        f"own predecessor / replacement"
+                    )
+
+                # 8b. supersedes must reference a known task — either in
+                # the revision (forward chain like C.supersedes=B with B
+                # added in the same rev) or in the prior (the typical
+                # backward reference). A target that resolves nowhere is
+                # a dangling reference.
+                resolves_in_prior = sup_id in prior_by_id
+                resolves_in_revised = sup_id in new_by_id_step8
+                if not resolves_in_prior and not resolves_in_revised:
+                    raise ValueError(
+                        f"task {x.id!r} supersedes unknown task {sup_id!r} "
+                        f"(not present in prior plan or in revision)"
+                    )
+
+                # 8c. mutual supersedes (X->Y and Y->X) is a structural
+                # cycle in the supersession graph regardless of where it
+                # is observed. Check both directions in the revision.
+                other = new_by_id_step8.get(sup_id)
+                if other is not None:
+                    other_sup = (other.supersedes or "").strip()
+                    if other_sup == x.id:
+                        raise ValueError(
+                            f"mutual supersedes between {x.id!r} and {sup_id!r}; "
+                            f"a supersession chain must be acyclic"
+                        )
+
+                # 8d. corrective-topology check: only enforced when Y is
+                # in prior AND Y is non-terminal in prior. Terminal-
+                # supersedes (REPLACE / CORRECT in #214 semantics) is
+                # already governed by the §3.1 / §3.2 preservation rules
+                # and the existing terminal-edge invariant — this step
+                # is a no-op for that path.
+                y_prior = prior_by_id.get(sup_id)
+                if y_prior is None or y_prior.status in TERMINAL_TASK_STATUSES:
+                    continue
+
+                # Y is also accepted as a no-op when the *revision* has
+                # advanced Y to terminal: the corrective ordering has
+                # already been resolved in time (X ran before Y) so the
+                # revision-time graph is legitimate even without an X->Z
+                # re-edge. This handles the chained-revision case where
+                # a prior valid Shape A becomes Y-COMPLETED in a later
+                # revision (the X->Y edge from prior_v2 is the §3.2
+                # frozen historical edge that survives; downstream
+                # PENDING consumers now wait on Y's terminal status as
+                # they always did).
+                y_revised = new_by_id_step8.get(sup_id)
+                if y_revised is not None and y_revised.status in TERMINAL_TASK_STATUSES:
+                    continue
+
+                # Y was non-terminal in prior. The revision must satisfy
+                # one of two shapes:
+                #
+                # Shape A: Y stays in the revision (re-marked PENDING)
+                #   AND there is an edge X -> Y.
+                # Shape B: every prior consumer Z of Y (i.e. every
+                #   prior edge Y -> Z) where Z still exists in the
+                #   revision and is non-terminal must now have an
+                #   edge X -> Z.
+                shape_a_ok = (
+                    sup_id in new_by_id_step8
+                    and new_by_id_step8[sup_id].status is TaskStatus.PENDING
+                    and (x.id, sup_id) in new_edge_set
+                )
+
+                downstream_consumers = prior_outgoing.get(sup_id, [])
+                # Filter to consumers that survive into the revision
+                # and remain non-terminal (terminal Z's edge would be a
+                # frozen historical edge governed by §3.2, not a new
+                # routing decision).
+                live_consumers: list[str] = []
+                for z_id in downstream_consumers:
+                    z_new = new_by_id_step8.get(z_id)
+                    if z_new is None:
+                        # Z was dropped by the revision; no re-edge
+                        # obligation for this consumer.
+                        continue
+                    if z_new.status in TERMINAL_TASK_STATUSES:
+                        # Z already terminal — its edges are frozen
+                        # historical structure; not a routing target
+                        # for the corrective predecessor.
+                        continue
+                    live_consumers.append(z_id)
+
+                # Shape B: every live consumer of Y must be re-edged
+                # through X. Y may stay or be dropped from the revision
+                # — the structural property the validator cares about
+                # is that no PENDING task previously gated on Y is still
+                # gated on Y alone (without going through X first).
+                missing_reedge = [
+                    z_id for z_id in live_consumers if (x.id, z_id) not in new_edge_set
+                ]
+                shape_b_ok = not missing_reedge
+
+                if not (shape_a_ok or shape_b_ok):
+                    raise ValueError(
+                        f"task {x.id!r} supersedes {sup_id!r} but downstream "
+                        f"consumers of {sup_id!r} not re-edged through "
+                        f"{x.id!r}: missing edges "
+                        f"{[(x.id, z) for z in missing_reedge]!r}. Either "
+                        f"add an edge {x.id!r} -> Z for every prior "
+                        f"consumer Z of {sup_id!r}, OR re-mark "
+                        f"{sup_id!r} PENDING in the revision and add an "
+                        f"edge {x.id!r} -> {sup_id!r}. See "
+                        f"PLAN-LIFECYCLE.md §3.6 (goldfive#248)."
+                    )
 
     @classmethod
     def empty(cls, *, run_id: str = "") -> Plan:
