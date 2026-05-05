@@ -551,8 +551,8 @@ both paths route through `DefaultSteerer._handle_drift` which maps
 | **0** | `OBSERVE` | Emit `DriftDetected`; no further action. |
 | **1** | `ABSORB` | Call `planner.refine`; install revised plan; continue. This is where USER_STEER lands. |
 | **2** | `NUDGE` | Queue a corrective user message on `session.pending_nudges`. Not on the default table today; reserved for future policies. |
-| **3** | `CANCEL_REINVOKE` | Cancel the in-flight invocation; refine; compose a corrective user message for overlay re-invoke. |
-| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; set `session.paused_for_human_intervention = True`; runner blocks for user input. |
+| **3** | `CANCEL_REINVOKE` | Refine; install revised plan; **dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel** so the executor's invoke loop cancels the in-flight invocation and restarts with a `[GOLDFIVE STEERING CONTROL …]` framed corrective. |
+| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel** so the executor's pre-task loop blocks for user input. (Phase 2 of #246 replaced the deleted `session.paused_for_human_intervention` flag with this channel-routed signal.) |
 | **5** | `TERMINATE` | Run-level abort. Only reached on repeat Level-4 that didn't resolve. |
 
 The per-`(drift_kind, severity)` mapping lives in

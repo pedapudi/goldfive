@@ -12,7 +12,7 @@ All three surface through proto events the harmonograf UI (or any
 sink) can render. Approvals use `ApprovalRequested` / `ApprovalGranted`
 / `ApprovalRejected`; escalation uses `DriftDetected` with kind
 `HUMAN_INTERVENTION_REQUIRED` plus the session's
-`paused_for_human_intervention` flag.
+`GOLDFIVE_PAUSE_ESCALATE` channel dispatch (Phase 2 of #246 replaced the deleted `paused_for_human_intervention` flag).
 
 ## Flow A — Task-level approval (framework-agnostic)
 
@@ -219,7 +219,11 @@ Unlike flows A and B — which are agent-initiated approvals — flow C is
 (`DefaultSteerer._ladder_level_for`) routes a drift to Level 4
 (`PAUSE_ESCALATE`), the steerer:
 
-1. Sets `session.paused_for_human_intervention = True`.
+1. Dispatches a `ControlMessage(kind=GOLDFIVE_PAUSE_ESCALATE, ...)` on
+   the bound `ControlChannel` (Phase 2 of #246 — see CANCELLATION-CONTRACT.md §4).
+   The executor's pre-task loop honours `request_pause=True` from the
+   dispatch outcome, blocking on the channel until a `RESUME` /
+   `STEER` / `CANCEL` arrives.
 2. Emits a `DriftDetected` event of kind
    `HUMAN_INTERVENTION_REQUIRED` (proto enum value 37, CRITICAL
    severity) carrying `detail="escalated from {orig_kind}: {orig_detail}"`.
@@ -237,8 +241,10 @@ Typical Level-4 triggers:
   didn't resolve and it repeats.
 
 The Runner's overlay loop blocks before picking up the next step
-when `session.paused_for_human_intervention` is set. To unpause, the
-operator sends one of:
+when a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage has been drained
+from the channel (the dispatch outcome's `request_pause=True` flips
+the executor's pre-task loop into the same blocking wait a user
+`PAUSE` uses). To unpause, the operator sends one of:
 
 - **`ControlKind.RESUME`** — clear the flag and continue (if the
   operator believes the drift was spurious).

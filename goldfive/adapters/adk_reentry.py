@@ -82,6 +82,17 @@ class ReentryKind(enum.Enum):
     #: is goldfive-authored framing around operator text.
     STEER_REPLAY = "steer_replay"
 
+    #: Goldfive-authored steer-restart replay (Phase 2 of the path-
+    #: duality fix). Goldfive detected drift mid-invocation, refined
+    #: the plan, and signalled a ``GOLDFIVE_STEER`` ControlMessage on
+    #: the channel. The executor's overlay loop cancelled in-flight
+    #: work and re-invokes passthrough with the corrective body wrapped
+    #: in a ``GOLDFIVE STEERING CONTROL`` override header. Distinct
+    #: from STEER_REPLAY so plugins observing the inner runner's
+    #: ``on_user_message_callback`` can distinguish operator-authored
+    #: from goldfive-authored corrective restarts.
+    GOLDFIVE_STEER_REPLAY = "goldfive_steer_replay"
+
 
 current_reentry_kind: ContextVar[ReentryKind] = ContextVar(
     "goldfive_reentry_kind", default=ReentryKind.USER_TURN
@@ -118,6 +129,7 @@ def reentry(kind: ReentryKind) -> Iterator[ReentryKind]:
     if prior is ReentryKind.USER_TURN or kind in (
         ReentryKind.STEER_REPLAY,
         ReentryKind.NUDGE_REPLAY,
+        ReentryKind.GOLDFIVE_STEER_REPLAY,
     ):
         token = current_reentry_kind.set(kind)
         try:

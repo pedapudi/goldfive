@@ -1,8 +1,10 @@
 """Adapter.request_cancel wiring for goldfive-promoted steers (goldfive#241).
 
 Pre-#241 a goldfive-detected drift that cleared the promotion
-threshold queued a restart message via ``pending_corrective_message``
-and tagged ``adapter._next_cancel_reason``, but the in-flight
+threshold queued a restart message via the deleted
+``pending_corrective_message`` slot (Phase 2 of the path-duality fix
+replaced that with a ``GOLDFIVE_STEER`` ControlMessage on the bound
+channel) and tagged ``adapter._next_cancel_reason``, but the in-flight
 ``runner.run_async`` stream kept running to completion. Observed
 consequence: the coordinator kept emitting contaminated reasoning /
 tool calls for tens of seconds after the drift fired, and the

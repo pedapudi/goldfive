@@ -1,14 +1,19 @@
 """Tests for Level 4 (PAUSE_ESCALATE) of the intervention ladder.
 
-Checks that:
+Phase 2 of the path-duality fix re-routed Level 4 through a
+``GOLDFIVE_PAUSE_ESCALATE`` ControlMessage on the bound channel,
+replacing the deleted ``Session.paused_for_human_intervention`` flag.
+These tests now check that:
 
-* A drift routing to Level 4 sets ``session.paused_for_human_intervention``.
+* A drift routing to Level 4 dispatches a ``GOLDFIVE_PAUSE_ESCALATE``
+  ControlMessage on the bound channel.
 * A ``HUMAN_INTERVENTION_REQUIRED`` drift is emitted at CRITICAL.
-* A subsequent ``CONTROL_RESUME`` or ``CONTROL_STEER`` clears the flag.
-* The executor's pre-task loop blocks while the flag is set (integration
-  test using a real ``ControlChannel``).
+* A subsequent ``CONTROL_RESUME`` or ``CONTROL_STEER`` unblocks the
+  executor's pre-task loop (the channel-state semantics are unchanged).
+* The executor's pre-task loop blocks until that resume/steer arrives.
 
-See goldfive#142 for the ladder spec.
+See goldfive#142 for the original ladder spec; the path-duality fix
+brief in ``docs/design/DRIFT.md`` for the Phase 2 routing change.
 """
 
 from __future__ import annotations
@@ -74,12 +79,16 @@ class StubPlanner:
         return None
 
 
-def _fresh() -> tuple[DefaultSteerer, Session, ListSink, StubPlanner]:
+def _fresh() -> tuple[DefaultSteerer, Session, ListSink, StubPlanner, ControlChannel]:
     # goldfive-steer-unification: pause-escalate tests exercise the
     # LEGACY ladder semantics (INTENT_DIVERGENCE CRITICAL -> pause,
     # HUMAN_INTERVENTION_REQUIRED -> pause) so we explicitly disable
     # the new drift-to-steer promotion. The promotion path itself is
     # covered in tests/test_steer_unification.py.
+    #
+    # Phase 2 of the path-duality fix: bind a real ControlChannel so
+    # the steerer's ``GOLDFIVE_PAUSE_ESCALATE`` dispatch lands somewhere
+    # observable to the assertions.
     steerer = DefaultSteerer(goldfive_steer_threshold="off")
     session = Session(run_id="pause-test", current_task_id="t1")
     session.plan = Plan(
@@ -91,8 +100,32 @@ def _fresh() -> tuple[DefaultSteerer, Session, ListSink, StubPlanner]:
     )
     sink = ListSink()
     planner = StubPlanner()
+    channel = ControlChannel()
     steerer.bind(sinks=[sink], planner=planner)
-    return steerer, session, sink, planner
+    steerer.bind_control_channel(channel)
+    return steerer, session, sink, planner, channel
+
+
+def _drain_goldfive_pause(channel: ControlChannel) -> list[ControlMessage]:
+    """Pop every queued ``GOLDFIVE_PAUSE_ESCALATE`` from the channel."""
+    drained: list[ControlMessage] = []
+    inbox = channel._inbox  # noqa: SLF001 — test inspection
+    while not inbox.empty():
+        msg = inbox.get_nowait()
+        if msg.kind is ControlKind.GOLDFIVE_PAUSE_ESCALATE:
+            drained.append(msg)
+    return drained
+
+
+def _drain_goldfive_steer(channel: ControlChannel) -> list[ControlMessage]:
+    """Pop every queued ``GOLDFIVE_STEER`` from the channel."""
+    drained: list[ControlMessage] = []
+    inbox = channel._inbox  # noqa: SLF001 — test inspection
+    while not inbox.empty():
+        msg = inbox.get_nowait()
+        if msg.kind is ControlKind.GOLDFIVE_STEER:
+            drained.append(msg)
+    return drained
 
 
 def _drift_kind_pb(name: str) -> Any:
@@ -106,8 +139,8 @@ def _drift_kind_pb(name: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
-async def test_pause_escalate_sets_session_flag_and_emits_drift() -> None:
-    steerer, session, sink, planner = _fresh()
+async def test_pause_escalate_dispatches_control_and_emits_drift() -> None:
+    steerer, session, sink, planner, channel = _fresh()
     drift = DriftEvent(
         kind=DriftKind.INTENT_DIVERGENCE,
         severity=DriftSeverity.CRITICAL,
@@ -116,7 +149,9 @@ async def test_pause_escalate_sets_session_flag_and_emits_drift() -> None:
     )
     await steerer._handle_drift(drift, session)
 
-    assert session.paused_for_human_intervention is True
+    pause_msgs = _drain_goldfive_pause(channel)
+    assert len(pause_msgs) == 1
+    assert pause_msgs[0].payload["drift_kind"] == DriftKind.INTENT_DIVERGENCE.value
     # Sink got the original drift + the HUMAN_INTERVENTION_REQUIRED escalation.
     kinds = [
         evt.drift_detected.kind
@@ -134,7 +169,7 @@ async def test_pause_escalate_does_not_double_emit_human_intervention() -> None:
     NOT be re-escalated into a second HUMAN_INTERVENTION_REQUIRED
     drift -- the original emission at the top of _handle_drift already
     carried the signal."""
-    steerer, session, sink, _planner = _fresh()
+    steerer, session, sink, _planner, channel = _fresh()
     drift = DriftEvent(
         kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
         severity=DriftSeverity.CRITICAL,
@@ -143,7 +178,7 @@ async def test_pause_escalate_does_not_double_emit_human_intervention() -> None:
     )
     await steerer._handle_drift(drift, session)
 
-    assert session.paused_for_human_intervention is True
+    assert _drain_goldfive_pause(channel)  # at least one dispatched
     human_intervention_events = [
         e
         for e in sink.events
@@ -154,7 +189,7 @@ async def test_pause_escalate_does_not_double_emit_human_intervention() -> None:
 
 
 async def test_refine_validation_failed_pauses_without_refining() -> None:
-    steerer, session, sink, planner = _fresh()
+    steerer, session, sink, planner, channel = _fresh()
     drift = DriftEvent(
         kind=DriftKind.REFINE_VALIDATION_FAILED,
         severity=DriftSeverity.CRITICAL,
@@ -162,7 +197,7 @@ async def test_refine_validation_failed_pauses_without_refining() -> None:
         current_task_id="t1",
     )
     await steerer._handle_drift(drift, session)
-    assert session.paused_for_human_intervention is True
+    assert _drain_goldfive_pause(channel)
     assert planner.refine_calls == []
     # HUMAN_INTERVENTION_REQUIRED escalation is on the sink.
     assert any(
@@ -199,23 +234,32 @@ async def test_ladder_level_for_pause_escalate_on_repeat() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_resume_clears_paused_flag() -> None:
-    _steerer, session, sink, _planner = _fresh()
-    session.paused_for_human_intervention = True
+async def test_resume_unblocks_pause() -> None:
+    """RESUME on the channel emits ``request_resume=True``; the executor's
+    pre-task pause loop unwinds when it sees this. Phase 2 of the
+    path-duality fix collapsed the goldfive-side pause flag onto the
+    same channel state, so a single RESUME unblocks both
+    user-initiated PAUSE and goldfive-initiated PAUSE_ESCALATE."""
+    _steerer, _session, sink, _planner, _channel = _fresh()
     msg = ControlMessage(kind=ControlKind.RESUME)
 
     class _NullSteerer:
         async def observe(self, *args: Any, **kwargs: Any) -> None:
             return
 
-    outcome = await dispatch_control(msg, session=session, steerer=_NullSteerer(), sinks=[sink])
+    outcome = await dispatch_control(
+        msg, session=_session, steerer=_NullSteerer(), sinks=[sink]
+    )
     assert outcome.request_resume is True
-    assert session.paused_for_human_intervention is False
 
 
-async def test_steer_clears_paused_flag() -> None:
-    _steerer, session, sink, _planner = _fresh()
-    session.paused_for_human_intervention = True
+async def test_steer_acts_as_resume() -> None:
+    """A STEER ControlMessage carries the implicit RESUME semantics:
+    when the executor's pre-task loop sees a steer_message it breaks
+    out of the paused wait. Phase 2 of the path-duality fix relies on
+    this: a STEER from the operator unblocks any goldfive-initiated
+    pause so the corrective intent can land."""
+    _steerer, _session, sink, _planner, _channel = _fresh()
     msg = ControlMessage(
         kind=ControlKind.STEER,
         payload={"note": "try a different approach"},
@@ -225,9 +269,10 @@ async def test_steer_clears_paused_flag() -> None:
         async def observe(self, *args: Any, **kwargs: Any) -> None:
             return
 
-    outcome = await dispatch_control(msg, session=session, steerer=_NullSteerer(), sinks=[sink])
+    outcome = await dispatch_control(
+        msg, session=_session, steerer=_NullSteerer(), sinks=[sink]
+    )
     assert outcome.steer_message is not None
-    assert session.paused_for_human_intervention is False
 
 
 # ---------------------------------------------------------------------------
@@ -235,16 +280,24 @@ async def test_steer_clears_paused_flag() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_executor_pre_task_blocks_on_session_pause_flag() -> None:
+async def test_executor_pre_task_blocks_on_goldfive_pause_control() -> None:
     """The sequential executor's ``_apply_pre_task_controls`` should
-    block when ``session.paused_for_human_intervention`` is set, and
-    unblock when a RESUME arrives on the control channel.
+    block when the steerer queues a ``GOLDFIVE_PAUSE_ESCALATE`` on the
+    channel, and unblock when a RESUME arrives. This is the channel-
+    routed replacement for the deleted
+    ``session.paused_for_human_intervention`` flag.
     """
     from goldfive.executors.sequential import SequentialExecutor
 
-    _steerer, session, sink, _planner = _fresh()
-    session.paused_for_human_intervention = True
-    channel = ControlChannel()
+    _steerer, session, sink, _planner, channel = _fresh()
+    # Pre-queue a goldfive pause on the channel so the drain picks it
+    # up and request_pause flips on.
+    await channel.send(
+        ControlMessage(
+            kind=ControlKind.GOLDFIVE_PAUSE_ESCALATE,
+            payload={"reason": "test pause"},
+        )
+    )
 
     executor = SequentialExecutor()
 
@@ -257,9 +310,11 @@ async def test_executor_pre_task_blocks_on_session_pause_flag() -> None:
             sinks=[sink],
         )
     )
-    # Yield once so the wait task has a chance to enter its paused loop.
+    # Yield so the wait task drains the queued pause and enters its
+    # paused loop.
     await asyncio.sleep(0)
-    assert not wait_task.done(), "executor should block while pause flag is set"
+    await asyncio.sleep(0)
+    assert not wait_task.done(), "executor should block on goldfive pause"
 
     # Send RESUME; the wait task should complete.
     await channel.send(ControlMessage(kind=ControlKind.RESUME))
@@ -267,18 +322,18 @@ async def test_executor_pre_task_blocks_on_session_pause_flag() -> None:
     stop, steer_msg = result
     assert stop is False
     assert steer_msg is None
-    assert session.paused_for_human_intervention is False
 
 
-async def test_executor_pre_task_no_control_channel_clears_flag() -> None:
-    """Without a control channel the executor cannot wait for a user
-    action. Preserve liveness by clearing the flag -- the
-    HUMAN_INTERVENTION_REQUIRED drift on the sink stream is the
+async def test_executor_pre_task_no_control_channel_does_not_wedge() -> None:
+    """Without a control channel the steerer's
+    ``GOLDFIVE_PAUSE_ESCALATE`` dispatch is a best-effort no-op;
+    the executor's pre-task loop must not wedge waiting for a
+    pause that has nowhere to land. The
+    ``HUMAN_INTERVENTION_REQUIRED`` drift on the sink stream is the
     durable signal."""
     from goldfive.executors.sequential import SequentialExecutor
 
-    _steerer, session, sink, _planner = _fresh()
-    session.paused_for_human_intervention = True
+    _steerer, session, sink, _planner, _channel = _fresh()
 
     executor = SequentialExecutor()
     result = await executor._apply_pre_task_controls(
@@ -290,7 +345,6 @@ async def test_executor_pre_task_no_control_channel_clears_flag() -> None:
     stop, steer_msg = result
     assert stop is False
     assert steer_msg is None
-    assert session.paused_for_human_intervention is False
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +355,7 @@ async def test_executor_pre_task_no_control_channel_clears_flag() -> None:
 async def test_nudge_queues_message_on_session() -> None:
     """Level 2 dispatch queues a nudge the Runner's overlay loop
     (goldfive#141) picks up after the current invocation ends."""
-    steerer, session, _sink, _planner = _fresh()
+    steerer, session, _sink, _planner, _channel = _fresh()
     # Direct ``_dispatch_nudge`` exercise: any drift kind that maps
     # to ABSORB at WARNING in the ladder works as input here -- the
     # test pins the queueing behaviour, not the kind-specific routing.
@@ -316,12 +370,16 @@ async def test_nudge_queues_message_on_session() -> None:
     assert "t1" in session.pending_nudges[0]
 
 
-async def test_cancel_reinvoke_queues_corrective_message() -> None:
-    """Level 3 handoff stashes a composed corrective message on the
-    session for the Runner's overlay loop to pick up. A refine that
-    returns a revised plan is a prerequisite; with a stub planner that
-    returns None the Level 3 slot stays clear."""
-    steerer, session, _sink, _planner = _fresh()
+async def test_cancel_reinvoke_dispatches_goldfive_steer_control() -> None:
+    """Level 3 handoff dispatches a ``GOLDFIVE_STEER`` ControlMessage
+    on the bound channel so the executor cancels the in-flight invoke
+    and restarts with a corrective body. A refine that returns a
+    revised plan is a prerequisite; with a stub planner that returns
+    None the dispatch stays empty.
+
+    Phase 2 of the path-duality fix: replaces the deleted
+    ``session.pending_corrective_message`` write."""
+    steerer, session, _sink, _planner, channel = _fresh()
 
     # Force the level-3 codepath by using a planner that returns a
     # real revised plan (we already have a bound StubPlanner that
@@ -360,6 +418,9 @@ async def test_cancel_reinvoke_queues_corrective_message() -> None:
         current_task_id="t1",
     )
     await steerer._handle_drift(drift, session)
-    assert session.pending_corrective_message is not None
-    assert "t1" in session.pending_corrective_message
-    assert "Try a different approach" in session.pending_corrective_message
+    steer_msgs = _drain_goldfive_steer(channel)
+    assert len(steer_msgs) == 1
+    payload = steer_msgs[0].payload
+    assert payload["drift_kind"] == DriftKind.TOOL_ERROR.value
+    assert "t1" in payload["body"]
+    assert "Try a different approach" in payload["body"]

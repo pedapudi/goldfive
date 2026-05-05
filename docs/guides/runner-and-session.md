@@ -108,9 +108,11 @@ class Session:
     reasoning_history: list[str]              # bounded ring for reasoning-drift detectors
     refine_outcomes: dict[tuple[str, str], RefineOutcome]   # per-(kind, task) refine outcome (#215 P2)
     # Intervention-ladder handoffs (goldfive#142):
-    paused_for_human_intervention: bool       # Level 4 handoff
     pending_nudges: list[str]                 # Level 2 soft-follow-up queue
-    pending_corrective_message: str | None    # Level 3 cancel-reinvoke slot
+    # Phase 2 of #246 removed `paused_for_human_intervention` and
+    # `pending_corrective_message`. Levels 3 (CANCEL_REINVOKE) and 4
+    # (PAUSE_ESCALATE) now route through the bound ControlChannel via
+    # `GOLDFIVE_STEER` / `GOLDFIVE_PAUSE_ESCALATE` ControlMessages.
     # Orchestration-level state dict (see below):
     state: dict[str, Any]
 ```
@@ -144,15 +146,19 @@ Goldfive owns keys under the `goldfive.*` namespace. See `goldfive.orchestration
 
 The ADK side of the bridge is implemented in `goldfive.adapters._adk_state_protocol`. On every ADK `before_run_callback`, the `_GoldfiveADKPlugin` mirrors the relevant `Session.state` keys onto the live ADK `InvocationContext.session.state` so agents see them through the `GoldfivePlanner`-built orchestration block. Without this bridge, the block would always render `(none)` even when a steer is active (fixed in PR #173).
 
-### Intervention-ladder handoff slots
+### Intervention-ladder handoff
 
-The Steerer doesn't directly reach into the executor's control loop; it writes to three Session fields and the executor reads them:
+Phase 2 of [#246](https://github.com/pedapudi/goldfive/issues/246) collapsed the steerer-to-executor handoff onto a single junction: the bound `ControlChannel`. Pre-Phase-2 the steerer wrote three Session fields the executor read; the read paths had drifted from the write paths, causing the brussels-sprouts / tomato false-positive cascades.
 
-- `pending_nudges: list[str]` — Level 2 (NUDGE). The overlay loop pops from the front on each invocation end and dispatches as a soft follow-up user message.
-- `pending_corrective_message: str | None` — Level 3 (CANCEL + re-invoke). A single slot; a second Level 3 overwrites the first.
-- `paused_for_human_intervention: bool` — Level 4 (pause + escalate). The executor blocks in the pre-task loop until a CONTROL_RESUME or CONTROL_STEER arrives.
+The current handoff:
 
-Level 0 (observe) and Level 1 (absorb into plan revision) don't need Session handoff — the steerer just emits events or calls `planner.refine` directly. Level 5 (terminate) trips a `run_aborted_event`.
+- **Level 2 (NUDGE)** — `pending_nudges: list[str]`. The overlay loop pops from the front on each invocation end and dispatches as a soft follow-up user message. Soft (post-invocation) handoff; the channel is not involved.
+- **Level 3 (CANCEL + re-invoke)** — the steerer dispatches a `ControlMessage(kind=GOLDFIVE_STEER, payload={...})` on the bound channel. The executor's invoke loop polls the channel concurrently with the adapter call, cancels the in-flight invoke, and re-invokes the passthrough with a `[GOLDFIVE STEERING CONTROL …]` framed corrective.
+- **Level 4 (pause + escalate)** — the steerer dispatches a `ControlMessage(kind=GOLDFIVE_PAUSE_ESCALATE, payload={...})` on the bound channel. The executor blocks in the pre-task loop until a `CONTROL_RESUME` / `CONTROL_STEER` / `CONTROL_CANCEL` arrives — the same channel state a user-issued `PAUSE` uses.
+
+The deleted `Session.pending_corrective_message` and `Session.paused_for_human_intervention` fields are gone. A `bind_control_channel(channel)` call wires the channel into the steerer; this is done by the Runner immediately after `bind(...)`.
+
+Level 0 (observe) and Level 1 (absorb into plan revision) don't need a handoff — the steerer just emits events or calls `planner.refine` directly. Level 5 (terminate) trips a `run_aborted_event`.
 
 ## Sub-Runners, AgentTool, and session propagation
 

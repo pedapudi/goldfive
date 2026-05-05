@@ -431,6 +431,14 @@ _CONTROL_KIND_TO_PB: dict[ControlKind, str] = {
     ControlKind.STATUS_QUERY: "CONTROL_KIND_STATUS_QUERY",
     ControlKind.INTERCEPT_TRANSFER: "CONTROL_KIND_INTERCEPT_TRANSFER",
     ControlKind.INJECT_MESSAGE: "CONTROL_KIND_INJECT_MESSAGE",
+    # Goldfive-internal kinds (Phase 2 of the path-duality fix). They
+    # ride the wire as payloadless events — the rich payload (drift
+    # kind, drift id, body, superseded/replacement task ids) lives in
+    # the in-process ``ControlMessage.payload`` dict only. Reserved on
+    # the wire so observers can render the kind verbatim; no external
+    # bridge originates these.
+    ControlKind.GOLDFIVE_STEER: "CONTROL_KIND_GOLDFIVE_STEER",
+    ControlKind.GOLDFIVE_PAUSE_ESCALATE: "CONTROL_KIND_GOLDFIVE_PAUSE_ESCALATE",
 }
 _PB_TO_CONTROL_KIND: dict[str, ControlKind] = {v: k for k, v in _CONTROL_KIND_TO_PB.items()}
 

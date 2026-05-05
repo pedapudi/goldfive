@@ -175,3 +175,106 @@ cascade across every catalogued site. The ordering was:
    `cancellation_stash_audited` + `mark_stash_completed`; boundary
    catch site invokes `assert_stash_invariant`.
 5. **Phase 4+.** Hard cancel wires `task.cancel()` from the steerer.
+
+## §4 Channel-routed atomic cancel-and-restart (Phase 2 of #246)
+
+The audit catalog above covers `CancelledError` propagation through
+`await` boundaries. Phase 2 of [#246](https://github.com/pedapudi/goldfive/issues/246)
+adds a complementary contract for **goldfive-authored cancel-and-
+restart**: when the steerer detects drift mid-invocation and decides
+to redirect the LLM, the cancel + restart must be atomic from the
+operator's point of view. Pre-Phase-2 the steerer wrote
+`session.pending_corrective_message` and let the overlay loop pick
+it up at the next invocation boundary — but the in-flight LLM kept
+running for the duration, generating contaminated output that
+triggered more drift.
+
+### §4.1 The two new ControlMessage kinds
+
+* **`ControlKind.GOLDFIVE_STEER`** — minted by
+  `DefaultSteerer._dispatch_goldfive_steer_control` from the
+  CANCEL_REINVOKE branch of `_handle_drift` and from
+  `_promote_drift_to_steer`. Payload:
+  ```python
+  {
+      "drift_kind": str,            # the originating drift's kind value
+      "drift_id": str,              # for dedupe / tracing
+      "body": str,                  # corrective text to wrap in the
+                                    # [GOLDFIVE STEERING CONTROL …] header
+      "superseded_task_ids": [str], # tasks the LLM should NOT resume
+      "replacement_task_ids": [str],# tasks that supersede the above
+  }
+  ```
+  Atomic semantics: by the time this message lands on the channel,
+  the steerer has ALREADY swapped `session.plan` (via
+  `_apply_revision`) and run `_cancel_inflight_for_revision`. The
+  channel message is the executor-side signal that the swap happened
+  and a goldfive-authored corrective should now be injected as the
+  new user message on the next passthrough invocation.
+
+* **`ControlKind.GOLDFIVE_PAUSE_ESCALATE`** — minted by
+  `DefaultSteerer._dispatch_goldfive_pause_control` from
+  `_dispatch_pause_escalate`,
+  `_emit_progress_stalled_escalation`, and
+  `_emit_handler_exhausted_escalation`. Payload:
+  ```python
+  {
+      "drift_kind": str,
+      "drift_id": str,
+      "reason": str,                # human-readable explanation
+  }
+  ```
+  Atomic semantics: cancel any in-flight invoke task and park the
+  run in the same blocking pre-task wait that a user-issued PAUSE
+  uses. The originating drift event on the sink stream
+  (`HUMAN_INTERVENTION_REQUIRED`) is the durable signal sinks /
+  observers see; the control message is the channel-side signal
+  that drives the executor.
+
+### §4.2 Executor handling
+
+The executor's `_invoke_passthrough_with_control` polls the channel
+concurrently with `adapter.invoke_passthrough` (`asyncio.wait` on
+both the invoke task and `channel.receive()`). When a
+`GOLDFIVE_STEER` arrives:
+
+1. The dispatch helper returns `goldfive_steer_message=msg` on the
+   `ControlOutcome` (see `goldfive/executors/_control.py`).
+2. The invoke loop calls `_cancel_invoke_task(invoke_task)` — same
+   helper as the user-`STEER` branch.
+3. It returns `("goldfive_steer", msg)` to the overlay loop.
+4. The overlay loop's `goldfive_steer` branch composes the framed
+   restart via
+   `SequentialExecutor._compose_steer_restart_message(msg, source="goldfive", ...)`,
+   resets the reconciler against the freshly-installed plan, pins
+   `ReentryKind.GOLDFIVE_STEER_REPLAY`, and re-invokes the
+   passthrough with the framed body as the new user input.
+
+When a `GOLDFIVE_PAUSE_ESCALATE` arrives:
+
+1. The dispatch helper returns
+   `goldfive_pause_message=msg, request_pause=True`.
+2. The invoke loop cancels the in-flight invoke and returns
+   `("goldfive_pause", msg)`.
+3. The overlay loop drains background steerer tasks and returns an
+   `ExecutionOutcome(success=True, ...)` with a
+   `goldfive_pause_escalate:<reason>` reason string. The pre-task
+   loop on the next run cycle sees `request_pause` from the channel
+   drain and blocks waiting for an operator `RESUME` / `STEER` /
+   `CANCEL`.
+
+### §4.3 Why this is part of the cancellation contract
+
+The atomic cancel-and-restart these new kinds drive *uses* the
+`CancelledError` propagation paths the rest of this document
+catalogs. The `_cancel_invoke_task(invoke_task)` call is the
+boundary where `CancelledError` lands inside the adapter's
+streaming loop; the audit invariants in §1-§3 must hold for both
+user-`STEER` cancels and the new goldfive-internal cancels — and
+they do, because the boundary catch site at
+`ADKAdapter._invoke_internal` is unchanged.
+
+The deleted `Session.pending_corrective_message` and
+`Session.paused_for_human_intervention` fields are gone (see
+`goldfive/types.py`). A future re-introduction is caught by
+`tests/test_goldfive_drift_routing.py::test_deleted_fields_have_no_residue_in_goldfive_package`.

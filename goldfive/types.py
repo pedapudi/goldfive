@@ -158,9 +158,12 @@ class DriftKind(StrEnum):
     # Level 4 of the intervention ladder (goldfive#142) on persistent
     # refine failures, GOAL_DRIFT (CRITICAL), REFINE_VALIDATION_FAILED,
     # and other terminal drifts that shouldn't auto-recover. CRITICAL
-    # severity only. Puts the Runner into a paused state
-    # (``session.paused_for_human_intervention``) until a user-initiated
-    # ``CONTROL_RESUME`` or ``CONTROL_STEER`` arrives.
+    # severity only. The steerer dispatches a
+    # ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessage on the bound channel
+    # so the executor's pre-task loop blocks waiting for an operator
+    # ``CONTROL_RESUME`` / ``CONTROL_STEER`` / ``CONTROL_CANCEL``
+    # (Phase 2 of the path-duality fix; replaces the deleted
+    # ``Session.paused_for_human_intervention`` flag).
     HUMAN_INTERVENTION_REQUIRED = "human_intervention_required"
     # A single ADK LLM dispatch exceeded the configured wall-clock
     # budget (default 120s; configurable via ``make_adk_plugin
@@ -1189,15 +1192,6 @@ class Session:
     # from every agent collapsed onto the ``""`` bucket and legitimate
     # first-block judge firings were skipped.
     _reasoning_judge_counters: dict[tuple[str, str], int] = dataclasses.field(default_factory=dict)
-    # Set to ``True`` by :class:`DefaultSteerer` when it escalates a
-    # drift to Level 4 of the intervention ladder (goldfive#142).
-    # Executors honour this flag the same way they honour a PAUSE
-    # control: the pre-task loop blocks on the control channel until the
-    # user issues a CONTROL_RESUME or CONTROL_STEER, which clears the
-    # flag. Independent of the control-channel's own paused state so a
-    # Runner without a bound control channel can still reflect the
-    # pause to its sinks.
-    paused_for_human_intervention: bool = False
     # Level 2 ladder handoff (goldfive#142). Set by :class:`DefaultSteerer`
     # when a WARNING-tier drift maps to Level 2 (NUDGE). The Runner /
     # overlay loop introduced by goldfive#141 picks this up after the
@@ -1205,15 +1199,18 @@ class Session:
     # Plain list so two drifts in the same turn can queue independently;
     # the consumer pops from the front. Each entry is a short human-readable
     # directive; serialization not required.
+    #
+    # NOTE: ``paused_for_human_intervention`` and
+    # ``pending_corrective_message`` were removed in Phase 2 of the
+    # path-duality fix. Both were write-only flags whose readers
+    # (executor) had drifted from their writers (steerer); the
+    # parallel-tracked indirection caused the brussels-sprouts /
+    # tomato false-positive cascades. Their replacement is in-process
+    # ``ControlMessage`` dispatch through the same channel that
+    # USER_STEER / PAUSE / RESUME ride — see
+    # :class:`goldfive.control.ControlKind.GOLDFIVE_STEER` and
+    # :class:`goldfive.control.ControlKind.GOLDFIVE_PAUSE_ESCALATE`.
     pending_nudges: list[str] = dataclasses.field(default_factory=list)
-    # Level 3 ladder handoff (goldfive#142). Set by :class:`DefaultSteerer`
-    # when a Level 3 escalation wants the Runner / overlay loop (goldfive#141)
-    # to cancel the in-flight invocation and re-invoke with a composed
-    # corrective user message. ``None`` outside a pending dispatch. The
-    # consumer reads the value and clears it. Using a single slot (rather
-    # than a queue) is deliberate: a second Level 3 while one is pending
-    # overwrites the first -- the more-recent directive wins.
-    pending_corrective_message: str | None = None
     # Orchestration-level session state dict (goldfive#152). Goldfive
     # owns keys under the ``goldfive.*`` namespace — see
     # :mod:`goldfive.orchestration_state` for the documented key names

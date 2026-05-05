@@ -612,12 +612,19 @@ async def test_overlay_failed_with_live_replacement_does_not_taint() -> None:
     )
 
 
-async def test_overlay_paused_for_human_intervention_leaves_unreachable_pending() -> None:
-    """F10 guard: when paused for human intervention, EVERY PENDING
-    is left alone — including structurally unreachable ones. The
-    operator hasn't decided yet whether unreachable work should be
-    dropped, so the executor must not pre-empt that decision.
-    """
+async def test_overlay_goldfive_pause_leaves_unreachable_pending() -> None:
+    """Phase 2 (#246) F10 guard: when a ``GOLDFIVE_PAUSE_ESCALATE``
+    arrives mid-invocation, the overlay loop returns early — the
+    orphan sweep is unreachable past the pause branch — so EVERY
+    PENDING is left alone, including structurally unreachable ones.
+    The operator hasn't decided yet whether unreachable work should
+    be dropped, so the executor must not pre-empt that decision.
+
+    Pre-Phase-2 this gate consulted ``session.paused_for_human_intervention``;
+    Phase 2 replaced the flag-set with a channel-routed ControlMessage
+    so the same invariant is enforced via structural early return."""
+    from goldfive.control import ControlChannel, ControlKind, ControlMessage
+
     plan = Plan(
         id="p_paused",
         run_id="r1",
@@ -629,17 +636,29 @@ async def test_overlay_paused_for_human_intervention_leaves_unreachable_pending(
         edges=[TaskEdge(from_task_id="root", to_task_id="downstream")],
     )
     session = Session(run_id="r1")
-    # Simulate pause: HUMAN_INTERVENTION_REQUIRED was emitted just
-    # before the overlay end-of-invocation runs.
-    session.paused_for_human_intervention = True
     steerer = StubSteerer()
     sink = RecordingSink()
+
+    # Pre-queue the goldfive pause so the invoke loop sees it the
+    # moment it polls the channel.
+    channel = ControlChannel()
+    await channel.send(
+        ControlMessage(
+            kind=ControlKind.GOLDFIVE_PAUSE_ESCALATE,
+            payload={"reason": "F10 guard test"},
+        )
+    )
+
+    import asyncio
 
     async def _passthrough(
         user_message: str,  # noqa: ARG001
         session: Session,  # noqa: ARG001
         reconciler: Any,  # noqa: ARG001
     ) -> InvocationResult:
+        # Block long enough for the channel poll to win the race; the
+        # invoke loop should cancel us with the goldfive_pause outcome.
+        await asyncio.sleep(60)
         return InvocationResult(task_id="", text="")
 
     adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
@@ -651,12 +670,15 @@ async def test_overlay_paused_for_human_intervention_leaves_unreachable_pending(
         planner=StubPlanner(),
         sinks=[sink],
         user_input="anything",
+        control=channel,
     )
 
-    # Despite "downstream" being structurally unreachable, the F10
-    # guard suppresses the cancel — the operator decides.
+    # F10 invariant preserved: structural early return means no orphan-
+    # sweep transitions were produced, even though "downstream" is
+    # structurally unreachable.
     assert steerer.transitions == [], (
-        f"paused-for-HI must suppress all overlay-end transitions, got {steerer.transitions!r}"
+        "goldfive_pause must trigger structural early return before "
+        f"orphan sweep, got {steerer.transitions!r}"
     )
     by_id = {t.id: t.status for t in plan.tasks}
     assert by_id["downstream"] is TaskStatus.PENDING

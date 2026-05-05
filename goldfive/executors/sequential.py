@@ -1115,6 +1115,91 @@ class SequentialExecutor(Executor):
                 # Restart the invocation with the steer body as the
                 # new user input.
                 continue
+            if kind == "goldfive_steer":
+                # Phase 2 of the path-duality fix: goldfive-authored
+                # drift triggered a ``GOLDFIVE_STEER`` ControlMessage
+                # on the channel. The steerer has already swapped
+                # ``session.plan`` and bundled the corrective body +
+                # superseded/replacement task ids on the message
+                # payload before dispatching, so the executor's only
+                # job is to compose the framed restart message and
+                # re-invoke. Mirrors the user-STEER branch above but
+                # with ``source="goldfive"`` framing and no
+                # ``steerer.observe`` call (the steerer originated the
+                # message; observing again would loop).
+                control_msg = payload
+                payload_dict = (
+                    getattr(control_msg, "payload", None) or {}
+                ) if control_msg is not None else {}
+                body_text = str(payload_dict.get("body", "") or "")
+                superseded_ids = [
+                    str(t)
+                    for t in (payload_dict.get("superseded_task_ids") or [])
+                    if t
+                ]
+                replacement_ids = [
+                    str(t)
+                    for t in (payload_dict.get("replacement_task_ids") or [])
+                    if t
+                ]
+                log.info(
+                    "SequentialExecutor._run_overlay: GOLDFIVE_STEER "
+                    "received (drift_kind=%s); restarting invoke with "
+                    "[GOLDFIVE STEERING CONTROL] framed corrective",
+                    payload_dict.get("drift_kind", "<unknown>"),
+                )
+                current_user_input = self._compose_steer_restart_message(
+                    control_msg,
+                    fallback=body_text or current_user_input,
+                    source="goldfive",
+                    superseded_task_ids=superseded_ids,
+                    replacement_task_ids=replacement_ids,
+                )
+                # Reset reconciler bookkeeping so the revised plan's
+                # tasks map fresh — stale task_id → agent claims from
+                # the pre-revision plan must not leak into the replay.
+                reconciler.reset_for_new_plan(session.plan)
+                # Re-entry contract: the next iteration re-feeds the
+                # goldfive-composed corrective. Plugins observing the
+                # inner runner's ``on_user_message_callback`` should
+                # see ``GOLDFIVE_STEER_REPLAY``, not ``USER_TURN``, so
+                # they can suppress duplicate envelope emission.
+                next_reentry_kind = ReentryKind.GOLDFIVE_STEER_REPLAY
+                continue
+            if kind == "goldfive_pause":
+                # Phase 2 of the path-duality fix: replaces the dead
+                # ``session.paused_for_human_intervention`` flag-set.
+                # The steerer signalled a Level-4 pause via the
+                # channel; we cancelled the in-flight invoke (above)
+                # and now break out of the overlay loop. The next
+                # ``run`` cycle's pre-task loop blocks on the channel
+                # waiting for an operator RESUME / CANCEL / STEER.
+                # The originating ``HUMAN_INTERVENTION_REQUIRED``
+                # drift the steerer emitted is the durable signal on
+                # the sink stream.
+                control_msg = payload
+                pause_payload = (
+                    getattr(control_msg, "payload", None) or {}
+                ) if control_msg is not None else {}
+                pause_reason = str(pause_payload.get("reason", "") or "")
+                log.info(
+                    "SequentialExecutor._run_overlay: GOLDFIVE_PAUSE_ESCALATE "
+                    "received (reason=%r); ending overlay turn — pre-task "
+                    "loop will block for operator intervention",
+                    pause_reason or "<no reason>",
+                )
+                # Drain background steerer tasks so any in-flight
+                # judges complete before we return.
+                await _drain_steerer_at_run_boundary(steerer, session)
+                return ExecutionOutcome(
+                    success=True,
+                    session=session,
+                    reason=(
+                        f"goldfive_pause_escalate: {pause_reason}"
+                        if pause_reason
+                        else "goldfive_pause_escalate"
+                    ),
+                )
             # kind == "result": invocation ended normally. Before
             # falling through to the NOT_NEEDED sweep, check whether
             # the steerer queued a Level 2 nudge during this invocation
@@ -1192,7 +1277,7 @@ class SequentialExecutor(Executor):
             for t in list(getattr(live_plan, "tasks", None) or ())
             if t.status is TaskStatus.PENDING and t.id
         ]
-        if pending_ids and not getattr(session, "paused_for_human_intervention", False):
+        if pending_ids:
             unreachable = _unreachable_pending_task_ids(live_plan)
             reachable = [tid for tid in pending_ids if tid not in unreachable]
             if reachable:
@@ -1218,19 +1303,6 @@ class SequentialExecutor(Executor):
                         cancel_reason="run_aborted:orphaned by plan revision failure",
                         session=session,
                     )
-        elif pending_ids:
-            # F10: surface the gated reap so operators see "reap
-            # suppressed: escalation pending" in logs rather than a
-            # silent skip. The tasks remain PENDING and are revisited
-            # on the next user turn after the human-intervention pause
-            # resolves.
-            log.info(
-                "SequentialExecutor._run_overlay: PENDING disposition "
-                "suppressed (paused_for_human_intervention); leaving "
-                "%d PENDING task(s): %s",
-                len(pending_ids),
-                ", ".join(pending_ids),
-            )
 
         # --- Terminal emission: success if no failures. -----------
         # goldfive#202: a FAILED task with a live replacement (refine
@@ -1371,6 +1443,27 @@ class SequentialExecutor(Executor):
                 # steerer swapped) and re-enter on the next run() cycle.
                 return ("steer", outcome.steer_message)
 
+            if outcome.goldfive_steer_message is not None:
+                # Phase 2 of the path-duality fix: the steerer has
+                # already swapped ``session.plan`` and is signalling
+                # via the channel that we should cancel the in-flight
+                # invoke and restart with a goldfive-authored
+                # corrective. The overlay loop's ``goldfive_steer``
+                # branch composes the framed restart message and
+                # re-invokes the passthrough.
+                await self._cancel_invoke_task(invoke_task)
+                return ("goldfive_steer", outcome.goldfive_steer_message)
+
+            if outcome.goldfive_pause_message is not None:
+                # Phase 2 of the path-duality fix: replaces the
+                # ``session.paused_for_human_intervention`` flag-set.
+                # Cancel the in-flight invoke and return a "pause"
+                # outcome so the overlay loop can break out and the
+                # executor's pre-task loop blocks for operator
+                # intervention.
+                await self._cancel_invoke_task(invoke_task)
+                return ("goldfive_pause", outcome.goldfive_pause_message)
+
             # Non-cancelling controls: keep waiting.
 
     # ------------------------------------------------------------------
@@ -1394,24 +1487,20 @@ class SequentialExecutor(Executor):
 
         A PAUSE here blocks on ``channel.receive()`` until a RESUME (or
         CANCEL) arrives. The steerer's intervention-ladder Level 4
-        pause (goldfive#142) triggers the same blocking wait via
-        ``session.paused_for_human_intervention``, so a Level 4
-        escalation is indistinguishable from an explicit user-initiated
-        PAUSE from the executor's perspective.
+        pause (goldfive#142) triggers the same blocking wait by
+        dispatching a ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessage
+        (Phase 2 of the path-duality fix) — that message sets
+        ``request_pause=True`` so the executor's pause loop is
+        indistinguishable from an explicit user-initiated PAUSE.
         """
         if control is None:
             # Without a control channel the ladder-initiated pause has
-            # nothing to wait on -- the run would wedge forever. Clear
-            # the flag and let the drift event the steerer already
-            # emitted stand as the signal.
-            if session.paused_for_human_intervention:
-                log.warning(
-                    "SequentialExecutor: session.paused_for_human_intervention "
-                    "is set but no control channel is attached; clearing flag "
-                    "so the run does not wedge. Sinks still see the "
-                    "HUMAN_INTERVENTION_REQUIRED drift."
-                )
-                session.paused_for_human_intervention = False
+            # nothing to wait on. The steerer's
+            # ``GOLDFIVE_PAUSE_ESCALATE`` dispatch is best-effort; when
+            # there is no channel attached the dispatch is dropped at
+            # the source. The originating
+            # ``HUMAN_INTERVENTION_REQUIRED`` drift on the sink stream
+            # remains the durable signal so observers can react.
             return False, None
 
         outcomes = await drain_controls(control, session=session, steerer=steerer, sinks=sinks)
@@ -1441,13 +1530,6 @@ class SequentialExecutor(Executor):
             if cancel_prefix:
                 session._last_cancel_reason_prefix = cancel_prefix
             raise _ControlCancelled(cancel_reason or "cancelled by control")
-
-        # Intervention-ladder pause (goldfive#142). The steerer sets
-        # this flag from Level 4 PAUSE_ESCALATE dispatch; block the
-        # same way we block on an explicit user PAUSE. RESUME / STEER
-        # handlers clear the flag via dispatch_control.
-        if session.paused_for_human_intervention:
-            paused = True
 
         # Honour PAUSE by blocking on the channel until a RESUME /
         # CANCEL / STEER arrives.

@@ -1013,6 +1013,22 @@ class Runner:
             except Exception as exc:  # noqa: BLE001
                 log.debug("steerer.bind_adapter raised: %s", exc)
 
+        # 6d. Wire the control channel into the steerer (Phase 2 of
+        # the path-duality fix). The steerer mints
+        # ``GOLDFIVE_STEER`` and ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessages
+        # onto this channel so goldfive-authored drift rides the same
+        # cancel-and-restart junction as user-authored ``STEER`` /
+        # ``PAUSE``. Duck-typed on purpose — custom Steerers that
+        # don't implement ``bind_control_channel`` skip this silently;
+        # their CANCEL_REINVOKE / PAUSE_ESCALATE paths fall back to
+        # the originating drift event on the sink stream.
+        bind_steerer_channel = getattr(self.steerer, "bind_control_channel", None)
+        if callable(bind_steerer_channel):
+            try:
+                bind_steerer_channel(self._control)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("steerer.bind_control_channel raised: %s", exc)
+
         # 7. Hand off to the executor.
         # Phase 3.5 (goldfive#271): wrap the executor.run call site
         # in the cancellation-stash audit context so the boundary's

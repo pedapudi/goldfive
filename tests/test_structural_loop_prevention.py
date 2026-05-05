@@ -221,7 +221,9 @@ async def test_no_op_revision_escalates_to_human_intervention_after_one_attempt(
     # Exactly ONE refine call (no retry loop).
     assert len(planner.refine_calls) == 1
     # Session is paused for human intervention.
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause now signalled by
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage; HUMAN_INTERVENTION_REQUIRED
+    # drift on the sink stream is the durable observable signal.
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +264,9 @@ async def test_progress_stall_escalates_when_task_silent(
     # Refine was NOT called — the gate fired before refine.
     assert planner.refine_calls == []
     # Escalation: paused for human intervention.
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause now signalled by
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage; HUMAN_INTERVENTION_REQUIRED
+    # drift on the sink stream is the durable observable signal.
 
 
 @pytest.mark.asyncio
@@ -294,7 +298,10 @@ async def test_progress_stall_does_not_fire_when_task_is_iterating(
     # Refine WAS called (the gate did not fire).
     assert len(planner.refine_calls) == 1
     # Session is NOT paused.
-    assert session.paused_for_human_intervention is False
+    # Phase 2 (path-duality fix): paused_for_human_intervention
+    # field has been deleted. Absence of HUMAN_INTERVENTION_REQUIRED
+    # drift on the sink (asserted above where applicable) is the
+    # durable observable signal for non-pause cases.
 
 
 @pytest.mark.asyncio
@@ -324,7 +331,10 @@ async def test_progress_stall_skipped_when_task_has_no_progress_record(
 
     # Refine WAS called (no record => no gate).
     assert len(planner.refine_calls) == 1
-    assert session.paused_for_human_intervention is False
+    # Phase 2 (path-duality fix): paused_for_human_intervention
+    # field has been deleted. Absence of HUMAN_INTERVENTION_REQUIRED
+    # drift on the sink (asserted above where applicable) is the
+    # durable observable signal for non-pause cases.
 
 
 @pytest.mark.asyncio
@@ -405,7 +415,9 @@ async def test_refine_exhausted_sentinel_escalates_immediately() -> None:
     # Refine was called exactly once (no retry).
     assert len(planner.refine_calls) == 1
     # Session paused.
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause now signalled by
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage; HUMAN_INTERVENTION_REQUIRED
+    # drift on the sink stream is the durable observable signal.
 
 
 @pytest.mark.asyncio

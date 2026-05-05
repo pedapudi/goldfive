@@ -40,6 +40,19 @@ members and their raw string equivalents — ``ControlKind`` is a
   ``report_awaiting_approval`` task-level waiter, Flow A, or an ADK
   ``require_confirmation=True`` tool-level waiter, Flow B). Emits
   ``ApprovalGranted`` / ``ApprovalRejected`` through the sinks.
+* ``GOLDFIVE_STEER`` — goldfive-internal kind minted by the steerer
+  (Phase 2 of the path-duality fix). Routes goldfive-detected drift
+  through the same cancel-and-restart junction as user-authored
+  ``STEER``. The executor cancels the in-flight invoke and restarts
+  the passthrough with a ``[GOLDFIVE STEERING CONTROL …]`` framed
+  corrective. The steerer has already swapped ``session.plan`` before
+  dispatching; this control message is purely the cancel-and-restart
+  signal + the corrective body.
+* ``GOLDFIVE_PAUSE_ESCALATE`` — goldfive-internal kind minted by the
+  steerer (Phase 2 of the path-duality fix) replacing the deleted
+  ``session.paused_for_human_intervention`` flag. Cancels in-flight
+  work and parks the run in the same blocking wait as a user-issued
+  ``PAUSE`` — the next ``RESUME`` / ``CANCEL`` / ``STEER`` unwinds it.
 """
 
 from __future__ import annotations
@@ -90,6 +103,24 @@ class ControlOutcome:
     # The STEER ControlMessage (if any) — the executor feeds this to the
     # steerer so planner.refine can build a fresh plan.
     steer_message: ControlMessage | None = None
+    # The GOLDFIVE_STEER ControlMessage (if any). Phase 2 of the path-
+    # duality fix: goldfive-authored drift dispatches this kind so the
+    # executor's invoke loop cancels in-flight work and restarts with a
+    # ``[GOLDFIVE STEERING CONTROL …]`` framed corrective. Distinct
+    # from ``steer_message`` so the executor keeps the operator-vs-
+    # goldfive provenance straight when composing the restart prompt.
+    # The plan swap has already happened on the steerer side — this
+    # outcome only carries the cancel-and-restart signal + the
+    # corrective body to inject.
+    goldfive_steer_message: ControlMessage | None = None
+    # The GOLDFIVE_PAUSE_ESCALATE ControlMessage (if any). Phase 2 of
+    # the path-duality fix: replaces the dead
+    # ``session.paused_for_human_intervention`` flag-set with a
+    # channel-routed signal. The executor's invoke loop cancels the
+    # in-flight invocation, then the pre-task loop blocks waiting for
+    # an operator RESUME / CANCEL / STEER (the existing PAUSE channel
+    # state).
+    goldfive_pause_message: ControlMessage | None = None
     # True when the executor should enter its paused wait after the
     # current in-flight task (if any) finishes.
     request_pause: bool = False
@@ -212,27 +243,60 @@ async def dispatch_control(
         )
 
     if kind == "RESUME":
-        # Clear the steerer-initiated pause flag (goldfive#142). A
-        # RESUME here unwinds both the control-channel's own pause
-        # state (via request_resume) AND any Level 4 intervention-
-        # ladder pause the steerer set on the session. Always reset
-        # even when the flag was never set -- no-op by design.
-        session.paused_for_human_intervention = False
+        # RESUME unwinds the control channel's pause state (via
+        # request_resume). Phase 2 of the path-duality fix: the
+        # in-process ``GOLDFIVE_PAUSE_ESCALATE`` dispatch now drives
+        # the same pause state as a user-issued PAUSE, so a RESUME
+        # here unblocks both transparently — no separate Session flag
+        # to clear.
         return ControlOutcome(
             ack=_build_ack(msg, result=AckResult.SUCCESS, detail="resumed"),
             request_resume=True,
         )
 
     if kind == "STEER":
-        # A STEER also clears a steerer-initiated pause (goldfive#142):
-        # user-supplied corrective intent is itself the resolution the
-        # pause was waiting for. The steer message is queued for the
-        # executor to feed through ``steerer.observe`` so the planner
-        # can produce a USER_STEER-driven plan revision.
-        session.paused_for_human_intervention = False
+        # The steer message is queued for the executor to feed through
+        # ``steerer.observe`` so the planner can produce a USER_STEER-
+        # driven plan revision. Phase 2 of the path-duality fix: a
+        # STEER also acts as a RESUME for any goldfive-initiated pause
+        # — the executor honours that by treating ``steer_message`` as
+        # an implicit unblock in the pre-task loop.
         return ControlOutcome(
             ack=_build_ack(msg, result=AckResult.SUCCESS, detail="steer queued"),
             steer_message=msg,
+        )
+
+    if kind == "GOLDFIVE_STEER":
+        # Phase 2 of the path-duality fix: a goldfive-authored steer.
+        # The steerer has already swapped ``session.plan`` and queued
+        # the corrective body; the channel message instructs the
+        # executor to cancel any in-flight invoke task and restart the
+        # passthrough with a ``[GOLDFIVE STEERING CONTROL …]`` framed
+        # corrective. The executor branch consumes ``payload["body"]``
+        # (and the optional ``superseded_task_ids`` /
+        # ``replacement_task_ids`` lists) to compose the restart
+        # message.
+        return ControlOutcome(
+            ack=_build_ack(
+                msg, result=AckResult.SUCCESS, detail="goldfive_steer queued"
+            ),
+            goldfive_steer_message=msg,
+        )
+
+    if kind == "GOLDFIVE_PAUSE_ESCALATE":
+        # Phase 2 of the path-duality fix: replaces the dead
+        # ``session.paused_for_human_intervention`` flag-set. Cancels
+        # any in-flight invoke task and parks the run in the same
+        # blocking wait as a user-issued PAUSE — the next RESUME /
+        # CANCEL / STEER on the channel unwinds it.
+        return ControlOutcome(
+            ack=_build_ack(
+                msg,
+                result=AckResult.SUCCESS,
+                detail="goldfive_pause_escalate queued",
+            ),
+            goldfive_pause_message=msg,
+            request_pause=True,
         )
 
     if kind == "REWIND_TO":

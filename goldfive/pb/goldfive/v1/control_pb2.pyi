@@ -22,6 +22,8 @@ class ControlKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     CONTROL_KIND_STATUS_QUERY: _ClassVar[ControlKind]
     CONTROL_KIND_INTERCEPT_TRANSFER: _ClassVar[ControlKind]
     CONTROL_KIND_INJECT_MESSAGE: _ClassVar[ControlKind]
+    CONTROL_KIND_GOLDFIVE_STEER: _ClassVar[ControlKind]
+    CONTROL_KIND_GOLDFIVE_PAUSE_ESCALATE: _ClassVar[ControlKind]
 
 class ControlAckResult(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -40,6 +42,8 @@ CONTROL_KIND_REJECT: ControlKind
 CONTROL_KIND_STATUS_QUERY: ControlKind
 CONTROL_KIND_INTERCEPT_TRANSFER: ControlKind
 CONTROL_KIND_INJECT_MESSAGE: ControlKind
+CONTROL_KIND_GOLDFIVE_STEER: ControlKind
+CONTROL_KIND_GOLDFIVE_PAUSE_ESCALATE: ControlKind
 CONTROL_ACK_RESULT_UNSPECIFIED: ControlAckResult
 CONTROL_ACK_RESULT_SUCCESS: ControlAckResult
 CONTROL_ACK_RESULT_FAILURE: ControlAckResult
