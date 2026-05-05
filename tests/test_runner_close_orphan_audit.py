@@ -118,7 +118,15 @@ class StubSteerer:
         if task is None or task.status in self._TERMINAL:
             return
         self.transitions.append((task_id, to, cancel_reason))
-        task.status = to
+        # goldfive#247: Plan + Task are frozen — derive a new plan via
+        # with_task_status and swap. Mirrors what DefaultSteerer does.
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, to))
         # Emit a synthetic envelope on every bound sink so tests can
         # verify event order. We don't depend on the goldfive.events
         # factory here — a dict is enough for ordering / payload-kind
@@ -310,7 +318,11 @@ async def test_close_cancels_orphan_pending_at_session_end() -> None:
     )
 
     # Plan now has both PENDING tasks flipped to CANCELLED.
-    by_id = {t.id: t.status for t in plan.tasks}
+    # goldfive#247: read from the live session.plan; the local
+    # ``plan`` reference is the pre-mutation snapshot.
+    live_session = runner._last_session_by_key.get("")
+    assert live_session is not None and live_session.plan is not None
+    by_id = {t.id: t.status for t in live_session.plan.tasks}
     assert by_id["a"] is TaskStatus.COMPLETED
     assert by_id["b"] is TaskStatus.CANCELLED
     assert by_id["c"] is TaskStatus.CANCELLED
@@ -410,7 +422,10 @@ async def test_close_with_failed_task_having_live_replacement_only_cancels_pendi
     )
     # b stays FAILED — the steerer's terminal guard prevented a
     # double-transition even if the audit had asked.
-    by_id = {t.id: t.status for t in plan.tasks}
+    # goldfive#247: read from the live session.plan after the swap.
+    live_session = runner._last_session_by_key.get("")
+    assert live_session is not None and live_session.plan is not None
+    by_id = {t.id: t.status for t in live_session.plan.tasks}
     assert by_id["a"] is TaskStatus.COMPLETED
     assert by_id["b"] is TaskStatus.FAILED, (
         f"b must remain FAILED (terminal); got {by_id['b']}"

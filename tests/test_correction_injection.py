@@ -173,7 +173,7 @@ async def _emit(
     steerer: DefaultSteerer, session: Session, revised: Plan, drift: DriftEvent
 ) -> None:
     prev = session.plan
-    steerer._apply_revision(session, revised, drift)
+    revised = steerer._apply_revision(session, revised, drift)  # goldfive#247: rebind
     await steerer._emit_plan_revised(session, revised, drift, prev_plan=prev)
 
 
@@ -378,9 +378,11 @@ async def test_correction_cleared_on_report_task_started() -> None:
 async def test_correction_not_cleared_on_report_task_failed() -> None:
     plan = _revised_with_one_correct()
     # Mark the correction task RUNNING so failed is a legal transition.
-    for t in plan.tasks:
-        if t.id == "research_solar_corrected":
-            t.status = TaskStatus.RUNNING
+    # goldfive#247: Plan + Task are frozen — derive a new plan via
+    # with_task_status.
+    from goldfive.types import with_task_status as _wts
+
+    plan = _wts(plan, "research_solar_corrected", TaskStatus.RUNNING)
     session = _session(plan)
     key = pending_correction_key("research_agent", "research_solar_corrected")
     session.state[key] = {

@@ -2,17 +2,48 @@
 
 Pinned by ``docs/design/PROTOCOLS.md`` (v0.1). Types in this module are
 pure data — mutation of live state happens only through a ``Steerer``.
+
+**Plan and Task immutability (goldfive#247).** :class:`Plan` and
+:class:`Task` are ``frozen=True`` dataclasses. Their list fields
+(``tasks``, ``edges``, ``goal_ids``) are tuples. The bug class this
+fix targets is "torn read": a judge or sink reads ``session.plan`` /
+``task.status``, awaits an LLM, and produces a verdict against a
+snapshot the live state has mutated past. With frozen types, every
+"mutation" constructs a NEW object. ``session.plan`` is a pointer that
+swaps atomically; readers who captured a ``Plan`` reference keep
+operating on that snapshot for the duration of their work.
+
+The ONLY blessed way to "mutate" a plan is via the helper functions in
+this module: :func:`replace_task`, :func:`with_task_status`,
+:func:`add_tasks`, :func:`replace_edges`, :func:`bump_revision`. Each
+returns a new :class:`Plan` and never touches the input.
+
+The single-writer invariant on ``session.plan`` is enforced at runtime
+by :func:`set_session_plan` paired with the
+:data:`_CHANNEL_PROCESSOR_ACTIVE` contextvar (see
+:func:`channel_processor_active`). Channel-processor paths in
+:mod:`goldfive.steerer` enter the contextvar before swapping
+``session.plan``; sites that swap from outside the channel processor
+emit a WARNING (or, under ``GOLDFIVE_STRICT_STATE_OWNERSHIP=1``, raise
+:class:`PlanOwnershipViolation`).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import dataclasses
+import logging
+import os
+import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 class TaskStatus(StrEnum):
@@ -321,8 +352,21 @@ class CancellationRequest:
     drift_kind: str = ""
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class Task:
+    """Immutable task record (goldfive#247).
+
+    ``frozen=True`` is structural enforcement of the "no torn read"
+    invariant: a judge or sink that captures a ``Task`` reference
+    cannot have its snapshot mutated underneath it. Every status
+    transition in the framework constructs a NEW :class:`Task` (via
+    ``dataclasses.replace`` or one of the :mod:`goldfive.types`
+    helpers); the live :class:`Plan` is rebuilt with the new task and
+    swapped onto :attr:`Session.plan` atomically. Readers who got an
+    older :class:`Task` keep operating on it; they can compare ids
+    against the live plan if they need to follow the transition.
+    """
+
     id: str
     title: str
     description: str = ""
@@ -368,19 +412,40 @@ class Task:
     supersedes_kind: SupersessionKind = SupersessionKind.UNSPECIFIED
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class TaskEdge:
+    """Immutable directed edge in a :class:`Plan` DAG (goldfive#247)."""
+
     from_task_id: str
     to_task_id: str
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class Plan:
+    """Immutable DAG of :class:`Task` vertices (goldfive#247).
+
+    ``frozen=True`` so every "edit" — adding tasks, marking a task
+    completed, replacing the edge set, bumping the revision index —
+    constructs a NEW :class:`Plan`. The live plan reference is held by
+    :attr:`Session.plan`; swap it via :func:`set_session_plan` (which
+    enforces the single-writer invariant via the
+    :data:`_CHANNEL_PROCESSOR_ACTIVE` contextvar). Use the helpers
+    :func:`replace_task`, :func:`with_task_status`, :func:`add_tasks`,
+    :func:`replace_edges`, :func:`bump_revision` to derive a revision
+    without hand-rolling ``dataclasses.replace`` at the call site.
+
+    The list fields ``goal_ids`` / ``tasks`` / ``edges`` are tuples (an
+    invariant of frozen-and-shareable types — a frozen dataclass that
+    holds mutable lists is a footgun). Constructors accept any
+    :class:`Sequence` and coerce to tuples in ``__post_init__`` so
+    legacy call sites that pass lists keep working.
+    """
+
     id: str
     run_id: str
-    goal_ids: list[str]
-    tasks: list[Task]
-    edges: list[TaskEdge]
+    goal_ids: tuple[str, ...]
+    tasks: tuple[Task, ...]
+    edges: tuple[TaskEdge, ...]
     summary: str = ""
     revision_reason: str = ""
     revision_kind: str = ""  # DriftKind value (str) or ""
@@ -401,6 +466,36 @@ class Plan:
     # See goldfive#199 / harmonograf#95 (rescope). Replaces the narrower
     # ``revision_annotation_id`` from #196/#197 which was user-control only.
     revision_trigger_event_id: str = ""
+    #: F5 / goldfive#322 Layer 2 pivot marker. Set by
+    #: :meth:`LLMPlanner.handle_turn` to ``True`` when the turn's
+    #: classification was ``pivot`` so :meth:`Runner._install_revision`
+    #: routes through ``install_initial_plan`` (no Rule 6 binding).
+    #: Pre-#247 this was a dynamically-attached attribute (``plan._goldfive_pivot``);
+    #: with :class:`Plan` ``frozen=True`` (goldfive#247) the slot has
+    #: to be a declared dataclass field. Default ``False`` keeps every
+    #: legacy / non-pivot install path unchanged.
+    _goldfive_pivot: bool = False
+
+    def __post_init__(self) -> None:
+        """Coerce list-typed inputs into tuples (goldfive#247).
+
+        :class:`Plan` stores ``goal_ids`` / ``tasks`` / ``edges`` as
+        tuples to match the frozen-and-shareable contract. Many call
+        sites (tests, the planner's JSON parser, persistence-sink
+        round-trips) construct a Plan with the legacy ``list[...]``
+        shape; coercing here keeps those sites working without
+        forcing every caller to wrap in ``tuple(...)``. Equivalent
+        ``tuple`` inputs are passed through unchanged. Frozen
+        dataclasses cannot use plain attribute assignment; we go
+        through ``object.__setattr__`` per the standard library's
+        documented frozen-dataclass coercion pattern.
+        """
+        if not isinstance(self.goal_ids, tuple):
+            object.__setattr__(self, "goal_ids", tuple(self.goal_ids))
+        if not isinstance(self.tasks, tuple):
+            object.__setattr__(self, "tasks", tuple(self.tasks))
+        if not isinstance(self.edges, tuple):
+            object.__setattr__(self, "edges", tuple(self.edges))
 
     def validate(self, for_revision: bool = False, *, prior: Plan | None = None) -> None:
         """Structurally validate this plan. Raise ``ValueError`` on failure.
@@ -768,9 +863,9 @@ class Plan:
         return cls(
             id=uuid.uuid4().hex,
             run_id=run_id,
-            goal_ids=[],
-            tasks=[],
-            edges=[],
+            goal_ids=(),
+            tasks=(),
+            edges=(),
             summary="",
         )
 
@@ -866,6 +961,218 @@ def task_upstream_ready(plan: Plan, task_id: str) -> bool:
         if upstream.status is not TaskStatus.COMPLETED:
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Plan / Task derivation helpers (goldfive#247)
+# ---------------------------------------------------------------------------
+#
+# :class:`Plan` and :class:`Task` are frozen — every "mutation" produces a
+# new object. The helpers below give framework code a small, named
+# vocabulary for the common derivation patterns so the call sites stay
+# readable. Each returns a new :class:`Plan`; the input is never touched.
+#
+# Helpers DELIBERATELY do not swap the new plan onto a session — that
+# remains the caller's responsibility (via :func:`set_session_plan`,
+# which performs the single-writer enforcement on :attr:`Session.plan`
+# under the :data:`_CHANNEL_PROCESSOR_ACTIVE` contextvar). Separating
+# "build a derived plan" from "install it on the session" preserves
+# the snapshot-vs-pointer split that motivates the freeze in the first
+# place.
+
+
+def replace_task(plan: Plan, task_id: str, **changes: Any) -> Plan:
+    """Return a new :class:`Plan` with ``task_id`` replaced via ``dataclasses.replace``.
+
+    Walks ``plan.tasks``, finds the entry whose id matches ``task_id``,
+    and rebuilds the tasks tuple with that entry replaced by
+    ``dataclasses.replace(task, **changes)``. Other tasks are preserved
+    by reference (they're frozen — sharing is safe). Order is preserved.
+
+    Raises :class:`KeyError` when ``task_id`` is not in the plan; callers
+    that want a no-op semantics should check ``task_id`` first.
+    """
+    new_tasks: list[Task] = []
+    found = False
+    for t in plan.tasks:
+        if t.id == task_id and not found:
+            new_tasks.append(dataclasses.replace(t, **changes))
+            found = True
+        else:
+            new_tasks.append(t)
+    if not found:
+        raise KeyError(f"task_id {task_id!r} not in plan {plan.id!r}")
+    return dataclasses.replace(plan, tasks=tuple(new_tasks))
+
+
+def with_task_status(plan: Plan, task_id: str, status: TaskStatus) -> Plan:
+    """Sugar over :func:`replace_task` for the common status-transition path.
+
+    Returns a new :class:`Plan` with ``task_id``'s status set to
+    ``status``; every other field on the task and on the plan is
+    preserved. The most common derivation in the framework — e.g.
+    :meth:`DefaultSteerer.mark_task_completed` flips PENDING/RUNNING →
+    COMPLETED through this helper.
+    """
+    return replace_task(plan, task_id, status=status)
+
+
+def add_tasks(plan: Plan, new_tasks: Sequence[Task]) -> Plan:
+    """Return a new :class:`Plan` with ``new_tasks`` appended.
+
+    Existing tasks are preserved in their original order; ``new_tasks``
+    is appended after them. No de-duplication is performed — callers are
+    expected to validate id uniqueness via :meth:`Plan.validate` after
+    the merge if their input might collide with the plan's existing ids.
+    """
+    return dataclasses.replace(plan, tasks=tuple(plan.tasks) + tuple(new_tasks))
+
+
+def replace_edges(plan: Plan, edges: Sequence[tuple[str, str] | TaskEdge]) -> Plan:
+    """Return a new :class:`Plan` with the edge list replaced.
+
+    Accepts either :class:`TaskEdge` instances or ``(from_id, to_id)``
+    tuples for caller convenience; both shapes are normalised to
+    :class:`TaskEdge`. Order is preserved.
+    """
+    coerced: list[TaskEdge] = []
+    for e in edges:
+        if isinstance(e, TaskEdge):
+            coerced.append(e)
+        else:
+            frm, to = e  # type: ignore[misc]
+            coerced.append(TaskEdge(from_task_id=frm, to_task_id=to))
+    return dataclasses.replace(plan, edges=tuple(coerced))
+
+
+def bump_revision(
+    plan: Plan,
+    *,
+    revision_index: int | None = None,
+    revision_kind: str | None = None,
+    revision_severity: str | None = None,
+    revision_reason: str | None = None,
+    revision_trigger_event_id: str | None = None,
+) -> Plan:
+    """Return a new :class:`Plan` with revision metadata updated.
+
+    Every parameter except ``plan`` is keyword-only; ``None`` means
+    "leave that field unchanged". When ``revision_index`` is omitted, the
+    helper returns a plan whose ``revision_index`` is the input plan's
+    value plus one. Used by :meth:`DefaultSteerer._apply_revision` to
+    stamp the new plan's revision metadata before installation.
+    """
+    next_index = plan.revision_index + 1 if revision_index is None else revision_index
+    fields: dict[str, Any] = {"revision_index": next_index}
+    if revision_kind is not None:
+        fields["revision_kind"] = revision_kind
+    if revision_severity is not None:
+        fields["revision_severity"] = revision_severity
+    if revision_reason is not None:
+        fields["revision_reason"] = revision_reason
+    if revision_trigger_event_id is not None:
+        fields["revision_trigger_event_id"] = revision_trigger_event_id
+    return dataclasses.replace(plan, **fields)
+
+
+# ---------------------------------------------------------------------------
+# Single-writer enforcement on Session.plan (goldfive#247)
+# ---------------------------------------------------------------------------
+
+
+class PlanOwnershipViolation(RuntimeError):
+    """A ``Session.plan`` swap fired outside the channel-processor.
+
+    Raised by :func:`set_session_plan` only when
+    ``GOLDFIVE_STRICT_STATE_OWNERSHIP=1``. In production the same
+    condition logs a WARNING and proceeds — the runtime stays
+    defensive. The strict mode is a developer / CI tripwire.
+    """
+
+
+_CHANNEL_PROCESSOR_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "goldfive_channel_processor_active",
+    default=False,
+)
+
+
+@contextlib.contextmanager
+def channel_processor_active() -> Iterator[None]:
+    """Mark a region as the channel-processor's exclusive plan-writer scope.
+
+    The single writer onto :attr:`Session.plan` is the steerer's
+    channel processor (:meth:`DefaultSteerer._invoke_passthrough_with_control`,
+    :meth:`DefaultSteerer._handle_drift`, :meth:`DefaultSteerer._apply_revision`,
+    and the executor install paths they delegate to). Any
+    :func:`set_session_plan` swap originating outside this region is a
+    structural smell — it means a sink, judge, or out-of-band caller
+    has reached past the channel processor into the steady-state plan.
+
+    Implemented via a :class:`contextvars.ContextVar` so concurrent
+    Sessions (parallel sub-Runners) each maintain an independent flag
+    without cross-talk. The value is set to ``True`` on entry and
+    reset on exit — exception-safe via the contextlib decorator.
+
+    Tests can drive this context manually to simulate the
+    channel-processor envelope around a synthesised plan swap.
+    """
+    token = _CHANNEL_PROCESSOR_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _CHANNEL_PROCESSOR_ACTIVE.reset(token)
+
+
+def _strict_state_ownership_enabled() -> bool:
+    """Return whether ``GOLDFIVE_STRICT_STATE_OWNERSHIP`` is on.
+
+    Mirrors the resolution in :mod:`goldfive._state_audit`: explicit
+    1/0 wins; otherwise default-on under pytest, default-off in
+    production. We intentionally don't ``import _state_audit`` here to
+    avoid a typing-time circular import (state-audit imports
+    Session). The duplication is a few lines and bracketed by a unit
+    test in ``tests/test_immutable_plan.py``.
+    """
+    raw = os.environ.get("GOLDFIVE_STRICT_STATE_OWNERSHIP", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return "pytest" in sys.modules
+
+
+def set_session_plan(session: Session, plan: Plan | None) -> None:
+    """Atomically swap ``session.plan`` to ``plan``, with single-writer guard.
+
+    The blessed mutation primitive for :attr:`Session.plan`. Performs
+    the runtime channel-processor check from goldfive#247 step 5: when
+    :data:`_CHANNEL_PROCESSOR_ACTIVE` is ``False`` (i.e. we're outside
+    the steerer's mutation region), log a WARNING with a one-line
+    stack hint. Under ``GOLDFIVE_STRICT_STATE_OWNERSHIP=1`` the same
+    condition raises :class:`PlanOwnershipViolation` so CI / dev
+    environments fail fast on the architectural violation.
+
+    The check is intentionally a runtime smell-test, not a type-system
+    guarantee — the type system already prevents `task.status = X`
+    style mutations via the ``frozen=True`` dataclass. This helper
+    catches the remaining axis: who owns the *pointer* swap. Callers
+    inside the steerer / executor channel-processor paths wrap their
+    region in :func:`channel_processor_active`; sinks and judges are
+    expected to read ``session.plan`` and never write to it.
+    """
+    if not _CHANNEL_PROCESSOR_ACTIVE.get(False):
+        if _strict_state_ownership_enabled():
+            raise PlanOwnershipViolation(
+                "set_session_plan called outside channel_processor_active(). "
+                "Plan swaps are owned exclusively by the steerer's channel "
+                "processor (see docs/design/PLAN-LIFECYCLE.md §7)."
+            )
+        log.warning(
+            "set_session_plan called outside channel_processor_active(); "
+            "the channel-processor is the single owner of session.plan swaps "
+            "(goldfive#247). Caller should wrap mutation in channel_processor_active()."
+        )
+    session.plan = plan
 
 
 #: Conventional value for :attr:`Goal.source` indicating a goal was added

@@ -123,9 +123,20 @@ def test_one_shot_per_task() -> None:
     second = dreason.detect_unreferenced_keyword(text, session)
     assert second is None
     # Switching to a new task re-enables firing.
-    session.plan.tasks.append(
-        Task(id="t2", title="Research solar panels", description="Slideshow")
+    # goldfive#247: Plan is frozen — extend via add_tasks.
+    from goldfive.types import (
+        add_tasks,
+        channel_processor_active,
+        set_session_plan,
     )
+    with channel_processor_active():
+        set_session_plan(
+            session,
+            add_tasks(
+                session.plan,
+                [Task(id="t2", title="Research solar panels", description="Slideshow")],
+            ),
+        )
     session.current_task_id = "t2"
     third = dreason.detect_unreferenced_keyword(text, session)
     assert third is not None

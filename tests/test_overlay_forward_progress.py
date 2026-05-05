@@ -91,10 +91,17 @@ class StubSteerer:
         self.transitions.append((task_id, to))
         if session.plan is None:
             return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                t.status = to
-                return
+        # goldfive#247: Plan + Task are frozen — derive a new Plan
+        # via with_task_status and swap.
+        if not any(t.id == task_id for t in session.plan.tasks):
+            return
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, to))
 
     def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:  # noqa: ARG002
         return None
@@ -488,19 +495,38 @@ async def test_level_2_nudge_triggers_overlay_replay() -> None:
         # replacement, and queue a nudge.
         if replay_count == 0:
             replay_count += 1
-            session.plan.tasks[0].status = TaskStatus.FAILED
-            session.plan.tasks.append(
-                Task(
-                    id="define_structure_v2",
-                    title="define (v2)",
-                    status=TaskStatus.PENDING,
-                    assignee_agent_id="planner",
-                )
+            # goldfive#247: Plan + Task are frozen — derive a new plan
+            # via the helpers and swap. The fake path simulates a refine
+            # so we wrap in :func:`channel_processor_active` to satisfy
+            # the runtime single-writer check on session.plan swaps.
+            from goldfive.types import (
+                add_tasks,
+                channel_processor_active,
+                replace_edges,
+                set_session_plan,
+                with_task_status,
             )
-            # Wire replacement into the DAG so draft_slide_1 depends on it.
-            session.plan.edges.append(
-                TaskEdge(from_task_id="define_structure_v2", to_task_id="draft_slide_1")
+            new_plan = with_task_status(
+                session.plan, session.plan.tasks[0].id, TaskStatus.FAILED
             )
+            new_plan = add_tasks(
+                new_plan,
+                [
+                    Task(
+                        id="define_structure_v2",
+                        title="define (v2)",
+                        status=TaskStatus.PENDING,
+                        assignee_agent_id="planner",
+                    )
+                ],
+            )
+            new_plan = replace_edges(
+                new_plan,
+                list(new_plan.edges)
+                + [TaskEdge(from_task_id="define_structure_v2", to_task_id="draft_slide_1")],
+            )
+            with channel_processor_active():
+                set_session_plan(session, new_plan)
             session.pending_nudges.append(
                 "The prior attempt looped on define_structure. Refined plan: "
                 "define (v2). Please try a different approach."
@@ -663,8 +689,13 @@ async def test_absorb_on_looping_reasoning_queues_nudge() -> None:
     )
     await steerer._handle_drift(drift, session)
 
-    # Refine applied (plan swapped in).
-    assert session.plan is revised
+    # Refine applied (plan swapped in). goldfive#247: _apply_revision
+    # builds a NEW Plan via bump_revision; identity is no longer the
+    # right check. Verify the plan id is preserved (revision lineage)
+    # and the revised content landed.
+    assert session.plan is not None
+    assert session.plan.id == revised.id
+    assert session.plan.revision_index == 1
     # Nudge queued for consumption by the overlay.
     assert len(session.pending_nudges) == 1
     nudge = session.pending_nudges[0]

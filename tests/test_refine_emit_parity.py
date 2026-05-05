@@ -493,7 +493,30 @@ class _ScriptedRefinePlanner:
         self.refine_calls.append(drift)
         if self._raise is not None:
             raise self._raise
-        return self._revised
+        if self._revised is None:
+            return None
+        # goldfive#247: pre-#247 this returned the cached
+        # ``self._revised`` instance verbatim; the parallel executor's
+        # fold-back mutated its tasks in place, and successive refines
+        # observed an "already-COMPLETED" view that satisfied the
+        # terminal-preservation validator on the second hop. With
+        # frozen :class:`Plan` the cached instance never changes — so
+        # we hand the planner a fresh derivation that copies the prior
+        # plan's terminal statuses onto the cached template's task
+        # ids. The behaviour matches what the real LLMPlanner.refine
+        # contract requires (preserve prior terminal status) and what
+        # the test was implicitly relying on pre-#247.
+        from goldfive.types import TERMINAL_TASK_STATUSES
+        from goldfive.types import with_task_status as _wts
+
+        out = self._revised
+        prior_terms = {
+            t.id: t.status for t in plan.tasks if t.status in TERMINAL_TASK_STATUSES
+        }
+        for tid, status in prior_terms.items():
+            if any(t.id == tid for t in out.tasks):
+                out = _wts(out, tid, status)
+        return out
 
     def set_drift_emitter(self, emitter: Any) -> None:
         pass

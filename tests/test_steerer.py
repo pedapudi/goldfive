@@ -34,6 +34,9 @@ from goldfive.types import (  # noqa: E402
     Task,
     TaskEdge,
     TaskStatus,
+    channel_processor_active,
+    set_session_plan,
+    with_task_status,
 )
 
 # ---------------------------------------------------------------------------
@@ -196,7 +199,13 @@ async def test_mark_task_running_transitions_and_emits() -> None:
 
 async def test_mark_task_running_no_op_on_terminal() -> None:
     steerer, session, sink, _ = _fresh()
-    _task(session, "t1").status = TaskStatus.COMPLETED
+    # goldfive#247: Plan + Task are frozen — derive a new plan via
+    # with_task_status and swap. The contextvar wrap is the
+    # structural envelope every plan-pointer swap goes through.
+    with channel_processor_active():
+        set_session_plan(
+            session, with_task_status(session.plan, "t1", TaskStatus.COMPLETED)
+        )
     await steerer.mark_task_running("t1", session=session)
     assert _task(session, "t1").status is TaskStatus.COMPLETED
     assert sink.events == []
@@ -513,9 +522,11 @@ def test_detect_drift_prefers_tool_error_then_refusal_then_stop_reason() -> None
 async def test_observe_emits_drift_and_refines() -> None:
     from goldfive.pb.goldfive.v1 import types_pb2
 
+    # _make_plan already sets id="p1" and run_id="r1". Pre-#247 the
+    # test then reassigned them; with frozen Plan (goldfive#247) those
+    # reassigns would FrozenInstanceError, and they were redundant
+    # anyway, so they're dropped here.
     revised = _make_plan(("t1", "t2", "t3"))
-    revised.id = "p1"
-    revised.run_id = "r1"
     planner = StubPlanner(revised=revised)
     sink = ListSink()
     steerer = DefaultSteerer()
@@ -528,8 +539,12 @@ async def test_observe_emits_drift_and_refines() -> None:
     assert kinds == ["drift_detected", "plan_revised"]
     assert sink.events[0].drift_detected.kind == types_pb2.DRIFT_KIND_TOOL_ERROR
     assert len(planner.refine_calls) == 1
-    # Session's plan is replaced with revised, and revision metadata stamped.
-    assert session.plan is revised
+    # goldfive#247: Plan is frozen — _apply_revision builds a NEW Plan
+    # via bump_revision; identity is no longer the assertion. Verify
+    # the same plan_id is preserved across the swap and metadata is
+    # stamped.
+    assert session.plan is not None
+    assert session.plan.id == revised.id
     assert session.plan.revision_kind == DriftKind.TOOL_ERROR.value
     assert session.plan.revision_severity == DriftSeverity.WARNING.value
     assert session.plan.revision_index >= 1
@@ -1108,8 +1123,13 @@ async def test_apply_revision_silently_folds_terminal_regression(
         await steerer.observe({"error": "trigger refine"}, session)
 
     # Plan was installed (revision_index advanced) and t1 is still
-    # COMPLETED — the fold corrected the regression.
-    assert session.plan is stale_revised
+    # COMPLETED — the fold corrected the regression. goldfive#247: the
+    # frozen-Plan refactor made the install path build a NEW Plan via
+    # `_fold_runtime_terminal_statuses`, so identity is no longer the
+    # check; we assert the post-install plan id matches the LLM
+    # revision (same id is preserved across the swap).
+    assert session.plan is not None
+    assert session.plan.id == stale_revised.id
     assert session.plan.revision_index == prior.revision_index + 1
     new_by_id = {t.id: t for t in session.plan.tasks}
     assert new_by_id["t1"].status is TaskStatus.COMPLETED
@@ -1762,7 +1782,11 @@ async def test_mark_task_cancelled_does_not_cascade_to_completed() -> None:
     steerer = DefaultSteerer()
     plan = _make_plan(("t1", "t2"))
     session = _make_session(plan)
-    _task(session, "t2").status = TaskStatus.COMPLETED
+    # goldfive#247: derive a new plan with t2 marked COMPLETED.
+    with channel_processor_active():
+        set_session_plan(
+            session, with_task_status(session.plan, "t2", TaskStatus.COMPLETED)
+        )
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=StubPlanner())
 

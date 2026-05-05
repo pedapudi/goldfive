@@ -980,7 +980,10 @@ async def test_invoke_breaks_when_task_reported_terminal_mid_stream() -> None:
                 observed.append(i)
                 if i == 2:
                     # Simulate a reporting-tool handler marking the task terminal.
-                    session.plan.tasks[0].status = TaskStatus.FAILED
+                    # goldfive#247: Plan + Task are frozen — derive via helper.
+                    from tests._immutable_plan_helpers import force_task_status
+
+                    force_task_status(session, session.plan.tasks[0].id, TaskStatus.FAILED)
                 yield _Event(marker=i)
 
     task = Task(id="t1", title="do the thing")
@@ -1812,12 +1815,23 @@ async def test_reporting_tool_duplicate_returns_idempotent_ack(state_ctx_cls) ->
 
         async def mark_task_running(self, task_id: str, *, session: Any, **kwargs: Any) -> None:
             self.running_calls += 1
-            task = next(
-                (t for t in session.plan.tasks if t.id == task_id),
-                None,
+            # goldfive#247: Plan + Task are frozen — derive a new plan
+            # via with_task_status. This stub mimics what the real
+            # DefaultSteerer.mark_task_running does.
+            from goldfive.types import (
+                channel_processor_active,
+                set_session_plan,
+                with_task_status,
             )
-            if task is not None:
-                task.status = TaskStatus.RUNNING
+            if session.plan is None:
+                return
+            if not any(t.id == task_id for t in session.plan.tasks):
+                return
+            with channel_processor_active():
+                set_session_plan(
+                    session,
+                    with_task_status(session.plan, task_id, TaskStatus.RUNNING),
+                )
 
     spec = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_started")
 

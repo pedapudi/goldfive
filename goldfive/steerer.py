@@ -84,6 +84,11 @@ from goldfive.types import (
     Task,
     TaskEdge,
     TaskStatus,
+    bump_revision,
+    channel_processor_active,
+    replace_edges,
+    set_session_plan,
+    with_task_status,
 )
 
 if TYPE_CHECKING:
@@ -893,7 +898,15 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         from_status = task.status
-        task.status = TaskStatus.RUNNING
+        # goldfive#247: Plan + Task are frozen. Mutate by deriving a new
+        # plan via :func:`with_task_status` and swapping the pointer
+        # under :func:`channel_processor_active`. The local ``task``
+        # reference becomes stale; refresh from the live plan so
+        # downstream side-effects see the new status.
+        with channel_processor_active():
+            assert session.plan is not None
+            set_session_plan(session, with_task_status(session.plan, task_id, TaskStatus.RUNNING))
+        task = self._find_task(session, task_id) or task
         session.current_task_id = task_id
         if detail:
             session.agent_notes[task_id] = detail
@@ -973,7 +986,11 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         from_status = task.status
-        task.status = TaskStatus.COMPLETED
+        # goldfive#247: derive a new immutable Plan and swap the pointer.
+        with channel_processor_active():
+            assert session.plan is not None
+            set_session_plan(session, with_task_status(session.plan, task_id, TaskStatus.COMPLETED))
+        task = self._find_task(session, task_id) or task
         if summary:
             session.completed_results[task_id] = summary
         # goldfive#152: clear current_task_* if we were the active task.
@@ -1040,7 +1057,11 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         from_status = task.status
-        task.status = TaskStatus.FAILED
+        # goldfive#247: derive a new immutable Plan and swap the pointer.
+        with channel_processor_active():
+            assert session.plan is not None
+            set_session_plan(session, with_task_status(session.plan, task_id, TaskStatus.FAILED))
+        task = self._find_task(session, task_id) or task
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.FAILED)
         # Drop the observed-agent lineage now the task is terminal.
         session.task_lineage.pop(task_id, None)
@@ -1112,7 +1133,11 @@ class DefaultSteerer:
         # BLOCKED is not a terminal status but we still guard against
         # re-blocking a task that's already blocked (idempotent).
         from_status = task.status
-        task.status = TaskStatus.BLOCKED
+        # goldfive#247: derive a new immutable Plan and swap the pointer.
+        with channel_processor_active():
+            assert session.plan is not None
+            set_session_plan(session, with_task_status(session.plan, task_id, TaskStatus.BLOCKED))
+        task = self._find_task(session, task_id) or task
         if blocker or needed:
             session.agent_notes[task_id] = f"blocked: {blocker}" + (
                 f" (needed: {needed})" if needed else ""
@@ -1167,7 +1192,11 @@ class DefaultSteerer:
             # TaskCancelled events for downstream tasks on every call.
             return
         from_status = task.status
-        task.status = TaskStatus.CANCELLED
+        # goldfive#247: derive a new immutable Plan and swap the pointer.
+        with channel_processor_active():
+            assert session.plan is not None
+            set_session_plan(session, with_task_status(session.plan, task_id, TaskStatus.CANCELLED))
+        task = self._find_task(session, task_id) or task
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.CANCELLED)
         # Drop the observed-agent lineage now the task is terminal.
         session.task_lineage.pop(task_id, None)
@@ -1217,7 +1246,14 @@ class DefaultSteerer:
         if task.status in _TERMINAL_TASK_STATUSES:
             return
         from_status = task.status
-        task.status = TaskStatus.NOT_NEEDED
+        # goldfive#247: derive a new immutable Plan and swap the pointer.
+        assert session.plan is not None
+        with channel_processor_active():
+            set_session_plan(
+                session,
+                with_task_status(session.plan, task_id, TaskStatus.NOT_NEEDED),
+            )
+        task = self._find_task(session, task_id) or task
         _ostate.sync_current_task_from_transition(session.state, task, TaskStatus.NOT_NEEDED)
         # Drop the observed-agent lineage now the task is terminal.
         session.task_lineage.pop(task_id, None)
@@ -1309,21 +1345,36 @@ class DefaultSteerer:
                 # completion; cascading past it would mean cancelling
                 # tasks whose preserved prerequisite is still valid.
                 continue
-            # Transition in place and emit. We deliberately do NOT
-            # recurse through ``mark_task_cancelled`` here; we fan out
-            # via our own BFS queue so the surrounding summary log and
-            # emission count stay deterministic.
+            # Transition by deriving a new plan and swapping it in. We
+            # deliberately do NOT recurse through ``mark_task_cancelled``
+            # here; we fan out via our own BFS queue so the surrounding
+            # summary log and emission count stay deterministic.
+            #
+            # goldfive#247: the local ``dep`` reference becomes stale
+            # after the swap (frozen Task) — re-resolve from the live
+            # plan so the emit reads the new status. Note that
+            # ``tasks_by_id`` was built from the *original* plan; the
+            # iteration loop only inspects ``status`` for terminal
+            # gating which is monotonic (a task that wasn't terminal
+            # at loop start is the one we're cancelling).
             dep_from = dep.status
-            dep.status = TaskStatus.CANCELLED
+            assert session.plan is not None
+            with channel_processor_active():
+                set_session_plan(
+                    session,
+                    with_task_status(session.plan, next_id, TaskStatus.CANCELLED),
+                )
             # Drop the observed-agent lineage now the task is terminal —
             # mirrors the cleanup that ``mark_task_cancelled`` performs
             # for the initiator (this BFS does not recurse through that
             # method so the cleanup is duplicated explicitly).
             session.task_lineage.pop(next_id, None)
             await self._emit_task_cancelled(session, next_id, cascade_reason)
+            # Re-fetch so the transition emit reads the swapped task.
+            updated_dep = self._find_task(session, next_id) or dep
             await self._emit_task_transitioned(
                 session,
-                dep,
+                updated_dep,
                 from_status=dep_from,
                 to_status=TaskStatus.CANCELLED,
                 source=source,
@@ -3409,7 +3460,8 @@ class DefaultSteerer:
         # → CANCELLED, coordinator reporting-tool → COMPLETED) should
         # carry that status into the persisted snapshot, even when the
         # LLM's view of the prior plan was stale.
-        self._fold_runtime_terminal_statuses(revised, session.plan)
+        # goldfive#247: fold returns a NEW Plan (Plan is frozen).
+        revised = self._fold_runtime_terminal_statuses(revised, session.plan)
         try:
             revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
@@ -3483,7 +3535,8 @@ class DefaultSteerer:
         # revised one; _emit_plan_revised diffs the two to populate the
         # PlanRevisionDiff sidecar (PLAN-LIFECYCLE.md §2, §8 gap #4).
         prev_plan = session.plan
-        self._apply_revision(session, revised, drift)
+        # goldfive#247: _apply_revision returns the stamped instance.
+        revised = self._apply_revision(session, revised, drift)
         # Cancel the in-flight coordinator invocation now that the plan
         # it was reasoning against has been superseded (goldfive#271
         # follow-up — v15 concurrent-invocation bug). Order: cancel
@@ -4859,8 +4912,8 @@ class DefaultSteerer:
             return
         # I4 fix: fold runtime terminal statuses from the prior plan
         # onto the revised plan BEFORE validation (see _handle_drift
-        # for the full rationale).
-        self._fold_runtime_terminal_statuses(revised, session.plan)
+        # for the full rationale). goldfive#247: returns a NEW Plan.
+        revised = self._fold_runtime_terminal_statuses(revised, session.plan)
         try:
             revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
@@ -4915,7 +4968,8 @@ class DefaultSteerer:
             return
         await self._record_refine_outcome(session, drift, succeeded=True)
         prev_plan = session.plan
-        self._apply_revision(session, revised, drift)
+        # goldfive#247: rebind to the stamped instance.
+        revised = self._apply_revision(session, revised, drift)
         # Cancel the in-flight coordinator invocation now that
         # ``refine_steer`` produced a superseding plan (goldfive#271
         # follow-up — v15 concurrent-invocation bug). This is the
@@ -5079,7 +5133,9 @@ class DefaultSteerer:
             else:
                 # I4 fix: fold runtime terminal statuses from the prior
                 # plan onto the candidate before validation.
-                self._fold_runtime_terminal_statuses(plan, session.plan)
+                # goldfive#247: returns a NEW Plan; assign so the caller
+                # uses the folded variant downstream.
+                plan = self._fold_runtime_terminal_statuses(plan, session.plan)
                 plan.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
             await self._emit_drift_detected(
@@ -5103,7 +5159,8 @@ class DefaultSteerer:
             authored_by="goldfive",
         )
         prev_plan = session.plan
-        self._apply_revision(session, plan, placeholder)
+        # goldfive#247: rebind to the stamped instance.
+        plan = self._apply_revision(session, plan, placeholder)
         # No cancel-in-flight: nothing is running yet on the very
         # first install.
         await self._emit_plan_revised(
@@ -5279,7 +5336,9 @@ class DefaultSteerer:
             # NOT_NEEDED reaped task that the LLM regressed to PENDING
             # would force the deterministic-minimum fallback even when
             # the LLM's *new* work was otherwise sound.
-            self._fold_runtime_terminal_statuses(llm_revision, prior)
+            # goldfive#247: fold returns a NEW Plan; rebind so the
+            # validator + downstream selection see the folded variant.
+            llm_revision = self._fold_runtime_terminal_statuses(llm_revision, prior)
             try:
                 llm_revision.validate(for_revision=True, prior=prior)
                 chosen = llm_revision
@@ -5312,7 +5371,8 @@ class DefaultSteerer:
         prev_plan = session.plan
         attempt_id = self._new_attempt_id()
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
-        self._apply_revision(session, chosen, drift)
+        # goldfive#247: rebind to the stamped instance.
+        chosen = self._apply_revision(session, chosen, drift)
         await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session,
@@ -5399,9 +5459,9 @@ class DefaultSteerer:
         return Plan(
             id=prior.id,
             run_id=prior.run_id,
-            goal_ids=list(prior.goal_ids),
-            tasks=new_tasks,
-            edges=new_edges,
+            goal_ids=tuple(prior.goal_ids),
+            tasks=tuple(new_tasks),
+            edges=tuple(new_edges),
             summary=prior.summary,
         )
 
@@ -5429,7 +5489,9 @@ class DefaultSteerer:
         # that NEW_WORK_DISCOVERED installs (Runner._install_revision)
         # and USER_STEER ControlMessage installs travel through, which
         # is where the v24 phantom-state regression was observed.
-        self._fold_runtime_terminal_statuses(revised_plan, session.plan)
+        # goldfive#247: returns a NEW Plan; rebind so validation +
+        # _apply_revision below see the folded variant.
+        revised_plan = self._fold_runtime_terminal_statuses(revised_plan, session.plan)
         try:
             revised_plan.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
@@ -5465,7 +5527,8 @@ class DefaultSteerer:
         prev_plan = session.plan
         attempt_id = self._new_attempt_id()
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
-        self._apply_revision(session, revised_plan, drift)
+        # goldfive#247: rebind to the stamped instance.
+        revised_plan = self._apply_revision(session, revised_plan, drift)
         await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session,
@@ -6003,7 +6066,7 @@ class DefaultSteerer:
             )
 
     @staticmethod
-    def _fold_runtime_terminal_statuses(revised: Plan, prior: Plan | None) -> list[str]:
+    def _fold_runtime_terminal_statuses(revised: Plan, prior: Plan | None) -> Plan:
         """Fold runtime terminal statuses from ``prior`` onto ``revised``.
 
         The persistence-boundary fix for the I4 phantom-state class of
@@ -6012,7 +6075,7 @@ class DefaultSteerer:
         between revisions — the overlay-reaper's NOT_NEEDED reap, the
         SequentialExecutor's reachability-audit cancels, an explicit
         ``mark_task_*`` call from a coordinator's reporting-tool — all
-        mutate ``session.plan.tasks[*].status`` in place but the next
+        flip the live plan's task status, but the next
         ``planner.refine`` / ``planner.handle_turn`` invocation builds
         its candidate plan from the LLM's view, which may have lost or
         regressed those terminal statuses.
@@ -6029,8 +6092,10 @@ class DefaultSteerer:
           genuine regression we must NOT silently rewrite — leave it
           alone so the validator catches it.
 
-        Mutates ``revised`` in place. Returns the list of folded task
-        ids for log/test introspection.
+        Returns a NEW :class:`Plan` (goldfive#247: Plan is frozen). When
+        no folds are needed the input is returned unchanged so callers
+        can share the reference. The fold list is logged at INFO when
+        non-empty for downstream observability.
 
         Anti-pattern note: this is **not** a validator relaxation. The
         validator (``Plan.validate(for_revision=True, prior=...)``)
@@ -6042,46 +6107,63 @@ class DefaultSteerer:
         prompt was authored."
         """
         if prior is None or not getattr(prior, "tasks", None):
-            return []
+            return revised
         prior_terminal: dict[str, Task] = {
             t.id: t
             for t in prior.tasks
             if t.id and t.status in TERMINAL_TASK_STATUSES
         }
         if not prior_terminal:
-            return []
+            return revised
+        new_tasks: list[Task] = []
         folded: list[str] = []
         for t in revised.tasks:
             prior_t = prior_terminal.get(t.id)
             if prior_t is None:
+                new_tasks.append(t)
                 continue
             if t.status is prior_t.status:
+                new_tasks.append(t)
                 continue
             if t.status in TERMINAL_TASK_STATUSES:
                 # Different terminal in the revised plan — a genuine
                 # regression. Do not silently rewrite; let the
                 # validator surface it as SCHEMA_VIOLATION.
+                new_tasks.append(t)
                 continue
             # Non-terminal in revised, terminal in prior → fold.
-            t.status = prior_t.status
-            if not t.cancel_reason and prior_t.cancel_reason:
-                t.cancel_reason = prior_t.cancel_reason
-            folded.append(t.id)
-        if folded:
-            log.info(
-                "DefaultSteerer._fold_runtime_terminal_statuses: "
-                "folded %d task(s) from prior runtime state: %s",
-                len(folded),
-                ", ".join(folded),
+            replacement = dataclasses.replace(
+                t,
+                status=prior_t.status,
+                cancel_reason=t.cancel_reason or prior_t.cancel_reason,
             )
-        return folded
+            new_tasks.append(replacement)
+            folded.append(t.id)
+        if not folded:
+            return revised
+        log.info(
+            "DefaultSteerer._fold_runtime_terminal_statuses: "
+            "folded %d task(s) from prior runtime state: %s",
+            len(folded),
+            ", ".join(folded),
+        )
+        return dataclasses.replace(revised, tasks=tuple(new_tasks))
 
     @staticmethod
-    def _apply_revision(session: Session, revised: Plan, drift: DriftEvent) -> None:
+    def _apply_revision(session: Session, revised: Plan, drift: DriftEvent) -> Plan:
         """Stamp revision metadata and install ``revised`` on the session.
 
         Preserves the existing ``revision_index`` monotonicity: the new
         plan's index is at least ``old.revision_index + 1``.
+
+        goldfive#247: returns the post-stamp Plan that was actually
+        installed onto :attr:`Session.plan`. Pre-#247 the function
+        mutated ``revised`` in place AND ``session.plan = revised``, so
+        callers who reused their local ``revised`` reference saw the
+        stamped metadata. With frozen Plan, the stamp produces a NEW
+        instance; the helper returns it so callers can rebind their
+        local variable and pass the same instance to
+        :meth:`_emit_plan_revised`.
 
         Phase 2.X / goldfive#271 Gap 2: log the install at INFO so the
         prior_plan_id → revised_plan_id transition is grep-able in the
@@ -6100,26 +6182,19 @@ class DefaultSteerer:
         prev = session.plan
         # I4 fix (defensive): fold runtime terminal statuses even if the
         # caller already did. Idempotent — if every task's status
-        # already matches prior's terminal, this is a no-op.
-        DefaultSteerer._fold_runtime_terminal_statuses(revised, prev)
+        # already matches prior's terminal, this is a no-op. Returns a
+        # NEW Plan (goldfive#247: Plan is frozen).
+        revised = DefaultSteerer._fold_runtime_terminal_statuses(revised, prev)
         prior_id = (getattr(prev, "id", "") or "") if prev is not None else ""
         next_index = (prev.revision_index + 1) if prev is not None else 1
-        if revised.revision_index < next_index:
-            revised.revision_index = next_index
-        if not revised.revision_kind:
-            revised.revision_kind = drift.kind.value
-        if not revised.revision_severity:
-            revised.revision_severity = drift.severity.value
-        if not revised.revision_reason:
-            revised.revision_reason = drift.detail
-        log.info(
-            "DefaultSteerer._apply_revision: prior_plan_id=%s "
-            "revised_plan_id=%s revision_index=%d drift_kind=%s",
-            prior_id[:16] or "<none>",
-            (revised.id or "")[:16] or "<empty>",
-            int(revised.revision_index),
-            drift.kind.value,
-        )
+        # goldfive#247: Plan is frozen — derive a new instance with the
+        # stamped revision metadata via :func:`bump_revision`. Preserves
+        # caller-supplied non-empty values (matches the legacy
+        # "only set if blank" guards).
+        new_index = max(int(revised.revision_index), next_index)
+        new_kind = revised.revision_kind or drift.kind.value
+        new_severity = revised.revision_severity or drift.severity.value
+        new_reason = revised.revision_reason or drift.detail
         # goldfive#199: stamp the trigger_event_id from the drift onto the
         # plan so out-of-band PlanRevised emitters (the SequentialExecutor's
         # plan-swap detector) can thread it through without needing the
@@ -6130,13 +6205,29 @@ class DefaultSteerer:
         # dataclass defaults to a UUID4 ``id``. Preserves any pre-existing
         # stamp (e.g. validator-retry chains that re-use the original
         # attempt's trigger id).
-        if not revised.revision_trigger_event_id:
-            trig_id = DefaultSteerer._drift_annotation_id(drift) or str(
+        new_trigger_id = revised.revision_trigger_event_id
+        if not new_trigger_id:
+            new_trigger_id = DefaultSteerer._drift_annotation_id(drift) or str(
                 getattr(drift, "id", "") or ""
             )
-            if trig_id:
-                revised.revision_trigger_event_id = trig_id
-        session.plan = revised
+        revised = bump_revision(
+            revised,
+            revision_index=new_index,
+            revision_kind=new_kind,
+            revision_severity=new_severity,
+            revision_reason=new_reason,
+            revision_trigger_event_id=new_trigger_id,
+        )
+        log.info(
+            "DefaultSteerer._apply_revision: prior_plan_id=%s "
+            "revised_plan_id=%s revision_index=%d drift_kind=%s",
+            prior_id[:16] or "<none>",
+            (revised.id or "")[:16] or "<empty>",
+            int(revised.revision_index),
+            drift.kind.value,
+        )
+        with channel_processor_active():
+            set_session_plan(session, revised)
         # goldfive#245 follow-up — stamp the per-(kind, target) addressed
         # watermark so the verdict-freshness gate in :meth:`_handle_drift`
         # can drop subsequent same-(kind, target) verdicts observed at
@@ -6150,6 +6241,7 @@ class DefaultSteerer:
         # goldfive#152: refresh the orchestration-state current plan id
         # so downstream reads see the revised id, not the stale one.
         _ostate.set_current_plan(session.state, revised)
+        return revised
 
     # --- Event construction ------------------------------------------
 
@@ -6855,7 +6947,7 @@ class DefaultSteerer:
         return True
 
     @staticmethod
-    def _integrate_correction_supersedes(revised: Plan) -> None:
+    def _integrate_correction_supersedes(revised: Plan) -> Plan:
         """Rewire DAG edges for every ``CORRECT``-kind supersedes link.
 
         goldfive#251 Option B topology. For a new task
@@ -6880,11 +6972,17 @@ class DefaultSteerer:
         downstream edges rewritten to the replacement) was already
         correct and this method does not touch that path.
 
+        goldfive#247: Plan.edges is an immutable tuple of frozen
+        :class:`TaskEdge`. The rewrite builds a fresh edge list and
+        returns a new :class:`Plan` via :func:`replace_edges`. When no
+        rewrite is needed the original is returned unchanged so callers
+        can keep their reference.
+
         Runs BEFORE :meth:`_repin_current_task_on_supersedes` so that
         helper's downstream rewrites see the already-correct DAG.
         """
         if revised is None:
-            return
+            return revised
         tasks_by_id: dict[str, Task] = {t.id: t for t in revised.tasks if t.id}
         corrections: list[tuple[str, str]] = []  # (old_id, new_id)
         for task in revised.tasks:
@@ -6899,46 +6997,45 @@ class DefaultSteerer:
                 continue
             corrections.append((old_id, new_id))
         if not corrections:
-            return
-        # Index existing edges as a set for idempotence checks.
-        existing_edges: set[tuple[str, str]] = {
-            (e.from_task_id, e.to_task_id) for e in revised.edges
-        }
+            return revised
+        # Build a fresh edge list as plain tuples; coerce to TaskEdges
+        # at the end via :func:`replace_edges` (which also handles
+        # dedup-while-preserving-order).
+        edges: list[tuple[str, str]] = [(e.from_task_id, e.to_task_id) for e in revised.edges]
+        existing_edges: set[tuple[str, str]] = set(edges)
         for old_id, new_id in corrections:
             # 1. Ensure old -> new edge exists.
             if (old_id, new_id) not in existing_edges:
-                revised.edges.append(TaskEdge(from_task_id=old_id, to_task_id=new_id))
+                edges.append((old_id, new_id))
                 existing_edges.add((old_id, new_id))
             # 2. Rewrite outgoing edges of the old task to originate
             #    from the new (correction) task. Skip the old -> new
             #    edge we just ensured.
-            for edge in revised.edges:
-                if edge.from_task_id != old_id:
+            for i, edge in enumerate(edges):
+                frm, to = edge
+                if frm != old_id:
                     continue
-                if edge.to_task_id == new_id:
+                if to == new_id:
                     continue
                 # Avoid duplicating an edge that already exists from the
                 # new task to the same downstream.
-                if (new_id, edge.to_task_id) in existing_edges:
-                    # Mark for removal by setting a sentinel; we
-                    # prune the duplicates after the loop.
-                    edge.from_task_id = new_id  # same content as existing; dedup below
+                if (new_id, to) in existing_edges:
+                    # Mark for dedup below; same content as existing.
+                    edges[i] = (new_id, to)
                     continue
-                existing_edges.discard((old_id, edge.to_task_id))
-                edge.from_task_id = new_id
-                existing_edges.add((new_id, edge.to_task_id))
+                existing_edges.discard((old_id, to))
+                edges[i] = (new_id, to)
+                existing_edges.add((new_id, to))
         # Final dedup: rewriting may have produced structurally-duplicate
         # edges. Preserve insertion order while dropping repeats.
         seen: set[tuple[str, str]] = set()
-        deduped: list[TaskEdge] = []
-        for e in revised.edges:
-            key = (e.from_task_id, e.to_task_id)
-            if key in seen:
+        deduped: list[tuple[str, str]] = []
+        for e in edges:
+            if e in seen:
                 continue
-            seen.add(key)
+            seen.add(e)
             deduped.append(e)
-        if len(deduped) != len(revised.edges):
-            revised.edges = deduped
+        return replace_edges(revised, deduped)
 
     def _repin_current_task_on_supersedes(
         self,
@@ -7090,7 +7187,16 @@ class DefaultSteerer:
             # the old task are rewritten so work flows through the
             # correction. No-op for REPLACE-kind (existing behaviour is
             # preserved) and for plans without supersedes.
-            self._integrate_correction_supersedes(revised)
+            # goldfive#247: returns a NEW Plan (Plan is frozen). The
+            # pre-frozen code mutated ``revised`` in place; with frozen
+            # types, we swap the new variant onto ``session.plan`` so
+            # the live pointer matches the rewired DAG that's about to
+            # be emitted as PlanRevised.
+            integrated = self._integrate_correction_supersedes(revised)
+            if integrated is not revised:
+                revised = integrated
+                with channel_processor_active():
+                    set_session_plan(session, revised)
 
             # goldfive#251 Stream D: GC corrections for tasks superseded by
             # this revision BEFORE queuing new ones. A task whose correction

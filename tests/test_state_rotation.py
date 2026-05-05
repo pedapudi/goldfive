@@ -110,8 +110,10 @@ def test_rotate_with_one_pending_pins_the_next_task() -> None:
     state: dict[str, Any] = {"goldfive.current_task_id": "t1"}
 
     # Mark t1 terminal externally (the helper's job is rotation, not
-    # transition).
-    plan.tasks[0].status = TaskStatus.COMPLETED
+    # transition). goldfive#247: Plan is frozen — derive new plan.
+    from goldfive.types import with_task_status as _wts
+
+    plan = _wts(plan, plan.tasks[0].id, TaskStatus.COMPLETED)
 
     out = _ostate.rotate_current_task_id(state, plan, "worker")
 

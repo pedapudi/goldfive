@@ -417,7 +417,14 @@ async def test_rate_limit_resets_on_task_transition() -> None:
     # Task transition: add a fresh task and bind it as current.
     new_task = Task(id="t2", title="Different task", description="...")
     assert session.plan is not None
-    session.plan.tasks.append(new_task)
+    # goldfive#247: Plan is frozen — extend via add_tasks.
+    from goldfive.types import (
+        add_tasks,
+        channel_processor_active,
+        set_session_plan,
+    )
+    with channel_processor_active():
+        set_session_plan(session, add_tasks(session.plan, [new_task]))
     session.current_task_id = "t2"
 
     # First reasoning on t2 -> fresh judge call (the counter for t2 is 0).

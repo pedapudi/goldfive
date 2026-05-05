@@ -90,10 +90,16 @@ class StubSteerer:
     ) -> None:
         if session.plan is None:
             return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                t.status = to
-                return
+        # goldfive#247: derive new plan + swap (frozen Plan).
+        if not any(t.id == task_id for t in session.plan.tasks):
+            return
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, to))
 
     def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
         return None
@@ -218,7 +224,9 @@ async def test_linear_plan_runs_to_completion() -> None:
     assert outcome.success is True
     assert outcome.session is session
     assert adapter.invocations == ["t0", "t1", "t2"]
-    for t in plan.tasks:
+    # goldfive#247: read from session.plan (live).
+    assert session.plan is not None
+    for t in session.plan.tasks:
         assert t.status == TaskStatus.COMPLETED
 
     # The executor itself owns only the terminal RunCompleted (Runner
@@ -474,7 +482,7 @@ async def test_fail_fast_false_continues_past_failure() -> None:
     # Terminal event is RunAborted with a fail_fast=False reason.
     assert sink.payload_kinds()[-1] == "run_aborted"
     # Remaining tasks a and c are COMPLETED, b stayed FAILED.
-    by_id = {t.id: t.status for t in plan.tasks}
+    by_id = {t.id: t.status for t in (outcome.session.plan or plan).tasks}
     assert by_id == {
         "a": TaskStatus.COMPLETED,
         "b": TaskStatus.FAILED,
@@ -844,7 +852,7 @@ async def test_retry_lineage_cap_collapses_nested_retry_prefixes() -> None:
     # lineage cap and marked FAILED without hitting the adapter.
     assert adapter.invocations == ["t0", "retry_t0"]
     assert outcome.success is False  # one task ended FAILED (retry_retry_t0)
-    by_id = {t.id: t.status for t in plan.tasks}
+    by_id = {t.id: t.status for t in (outcome.session.plan or plan).tasks}
     assert by_id["t0"] == TaskStatus.COMPLETED
     assert by_id["retry_t0"] == TaskStatus.COMPLETED
     assert by_id["retry_retry_t0"] == TaskStatus.FAILED
@@ -904,7 +912,7 @@ async def test_executor_run_with_orphaned_pending_reports_failure() -> None:
     # ended the run as failure. Without the audit, outcome.success
     # would be True and t1 would stay PENDING forever.
     assert outcome.success is False
-    by_id = {t.id: t.status for t in plan.tasks}
+    by_id = {t.id: t.status for t in (outcome.session.plan or plan).tasks}
     assert by_id["t0"] == TaskStatus.CANCELLED
     assert by_id["t1"] == TaskStatus.CANCELLED
     # Terminal event is RunAborted (not RunCompleted).
@@ -1198,7 +1206,10 @@ async def test_max_task_invocations_unbounded_default_completes_large_plan() -> 
 
     assert outcome.success is True
     assert len(adapter.invocations) == n
-    for t in plan.tasks:
+    # goldfive#247: read from session.plan (live) — local ``plan`` is
+    # the pre-mutation snapshot.
+    assert outcome.session.plan is not None
+    for t in outcome.session.plan.tasks:
         assert t.status == TaskStatus.COMPLETED
     assert sink.payload_kinds()[-1] == "run_completed"
 

@@ -83,6 +83,10 @@ class StubSteerer:
         self.observed: list[Any] = []
         self.refine_result = refine_result
         self.last_cancel_reason: str = ""
+        # goldfive#247: per-transition record for tests that need to
+        # verify cancellation happened even when the refine swap
+        # produces a plan that doesn't include the cancelled task id.
+        self.transitions: list[tuple[str, TaskStatus, str]] = []
 
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks
@@ -98,7 +102,13 @@ class StubSteerer:
             and kind is not None
             and str(getattr(kind, "value", kind)).upper() == "STEER"
         ):
-            session.plan = self.refine_result
+            # goldfive#247: route through the channel-processor primitive.
+            from goldfive.types import (
+                channel_processor_active,
+                set_session_plan,
+            )
+            with channel_processor_active():
+                set_session_plan(session, self.refine_result)
 
     async def transition(
         self,
@@ -109,16 +119,27 @@ class StubSteerer:
         session: Session,
         cancel_reason: str = "",
     ) -> None:
+        # goldfive#247: record the transition before any plan-shape
+        # check so tests can verify cancellation fired even when the
+        # refine swap that follows replaces the plan without the
+        # cancelled task id.
+        self.transitions.append((task_id, to, detail))
         if session.plan is None:
             return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                t.status = to
-                if to == TaskStatus.COMPLETED and detail:
-                    session.completed_results[task_id] = detail
-                if to == TaskStatus.CANCELLED:
-                    self.last_cancel_reason = cancel_reason or detail
-                return
+        # goldfive#247: Plan + Task are frozen — derive new plan + swap.
+        if not any(t.id == task_id for t in session.plan.tasks):
+            return
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, to))
+        if to == TaskStatus.COMPLETED and detail:
+            session.completed_results[task_id] = detail
+        if to == TaskStatus.CANCELLED:
+            self.last_cancel_reason = cancel_reason or detail
 
     def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
         return None
@@ -257,8 +278,10 @@ async def test_sequential_cancel_mid_task_aborts_run() -> None:
     assert sink.payload_kinds()[-1] == "run_aborted"
     # Second task never ran.
     assert adapter.invocations == ["t0"]
-    # Task was marked CANCELLED.
-    assert plan.tasks[0].status == TaskStatus.CANCELLED
+    # Task was marked CANCELLED. goldfive#247: read from the live
+    # session.plan because the local ``plan`` reference is the
+    # pre-mutation snapshot.
+    assert session.plan.tasks[0].status == TaskStatus.CANCELLED
     # Ack published.
     acks = await _drain_acks(channel, count=1, timeout=1.0)
     assert len(acks) == 1 and acks[0].result == AckResult.SUCCESS
@@ -303,10 +326,11 @@ async def test_sequential_steer_mid_task_cancels_and_replans() -> None:
             except asyncio.CancelledError:
                 raise
         # Subsequent tasks: complete immediately.
-        for t in session.plan.tasks:
-            if t.id == task.id:
-                t.status = TaskStatus.COMPLETED
-                break
+        # goldfive#247: derive new plan via helper
+
+        from tests._immutable_plan_helpers import force_task_status
+
+        force_task_status(session, task.id, TaskStatus.COMPLETED)
         return InvocationResult(task_id=task.id, text=f"done:{task.id}")
 
     adapter = StubAdapter(on_invoke=_handler)
@@ -346,9 +370,16 @@ async def test_sequential_steer_mid_task_cancels_and_replans() -> None:
         if str(getattr(getattr(o, "kind", None), "value", "")).upper() == "STEER"
     ]
     assert len(steer_obs) == 1
-    # Original t0 was marked CANCELLED.
-    original_t0 = next(t for t in plan.tasks if t.id == "t0")
-    assert original_t0.status == TaskStatus.CANCELLED
+    # Original t0 was marked CANCELLED. goldfive#247: with frozen
+    # Plan, the refined plan installed in session.plan no longer
+    # contains t0 (the LLM dropped it). Verify the cancel via the
+    # steerer's recorded transitions instead — that's the authoritative
+    # signal that t0 transitioned to CANCELLED before the swap.
+    cancel_transitions = [
+        (tid, st) for (tid, st, _detail) in steerer.transitions
+        if tid == "t0" and st == TaskStatus.CANCELLED
+    ]
+    assert cancel_transitions, steerer.transitions
 
 
 # ---------------------------------------------------------------------------
@@ -369,17 +400,16 @@ async def test_sequential_pause_blocks_next_task_until_resume() -> None:
     t1_started = asyncio.Event()
 
     async def _handler(task: Task, session: Session) -> InvocationResult:
+        # goldfive#247: derive via helper (frozen Plan).
+        from tests._immutable_plan_helpers import force_task_status
+
         if task.id == "t0":
-            for t in session.plan.tasks:
-                if t.id == "t0":
-                    t.status = TaskStatus.COMPLETED
+            force_task_status(session, "t0", TaskStatus.COMPLETED)
             t0_done.set()
             return InvocationResult(task_id=task.id, text="done:t0")
         if task.id == "t1":
             t1_started.set()
-        for t in session.plan.tasks:
-            if t.id == task.id:
-                t.status = TaskStatus.COMPLETED
+        force_task_status(session, task.id, TaskStatus.COMPLETED)
         return InvocationResult(task_id=task.id, text=f"done:{task.id}")
 
     adapter = StubAdapter(on_invoke=_handler)
@@ -442,9 +472,10 @@ async def test_sequential_rewind_between_tasks_re_executes_target() -> None:
 
     async def _handler(task: Task, session: Session) -> InvocationResult:
         counts[task.id] += 1
-        for t in session.plan.tasks:
-            if t.id == task.id:
-                t.status = TaskStatus.COMPLETED
+        # goldfive#247: derive via helper (frozen Plan).
+        from tests._immutable_plan_helpers import force_task_status
+
+        force_task_status(session, task.id, TaskStatus.COMPLETED)
         # After t0's first run, queue PAUSE / REWIND t0 / RESUME so the
         # next pre-task drain reinstates t0 as PENDING before picking.
         if task.id == "t0" and counts["t0"] == 1:
@@ -477,7 +508,10 @@ async def test_sequential_rewind_between_tasks_re_executes_target() -> None:
     # t0 re-executed once after the rewind; t1 ran once (since rewind
     # was to t0, t1 was also downstream and re-set to PENDING).
     assert counts == {"t0": 2, "t1": 1}
-    for t in plan.tasks:
+    # goldfive#247: read from the live session.plan; the local ``plan``
+    # reference is the pre-mutation snapshot.
+    assert session.plan is not None
+    for t in session.plan.tasks:
         assert t.status == TaskStatus.COMPLETED
 
 
@@ -486,10 +520,16 @@ async def test_rewind_helper_resets_target_and_downstream_only() -> None:
     from goldfive.executors._control import dispatch_control
 
     plan = _linear_plan(["t0", "t1", "t2"])
-    for t in plan.tasks:
-        t.status = TaskStatus.COMPLETED
+    # goldfive#247: Plan is frozen — derive a new plan with all
+    # tasks COMPLETED before pinning to the session.
+    from goldfive.types import with_task_status as _wts
+
+    for t in list(plan.tasks):
+        plan = _wts(plan, t.id, TaskStatus.COMPLETED)
     session = _fresh_session()
-    session.plan = plan
+    from tests._immutable_plan_helpers import force_plan
+
+    force_plan(session, plan)
     session.completed_results = {"t0": "a", "t1": "b", "t2": "c"}
     steerer = StubSteerer()
 
@@ -501,9 +541,10 @@ async def test_rewind_helper_resets_target_and_downstream_only() -> None:
     assert outcome.ack.result == AckResult.SUCCESS
     assert outcome.rewind_task_id == "t1"
     # t0 unchanged; t1 and t2 reset to PENDING with completed_results cleared.
-    assert plan.tasks[0].status == TaskStatus.COMPLETED
-    assert plan.tasks[1].status == TaskStatus.PENDING
-    assert plan.tasks[2].status == TaskStatus.PENDING
+    # goldfive#247: read from the live session.plan after the rewind.
+    assert session.plan.tasks[0].status == TaskStatus.COMPLETED
+    assert session.plan.tasks[1].status == TaskStatus.PENDING
+    assert session.plan.tasks[2].status == TaskStatus.PENDING
     assert "t0" in session.completed_results
     assert "t1" not in session.completed_results
     assert "t2" not in session.completed_results
@@ -552,9 +593,10 @@ async def test_sequential_status_query_emits_no_drift_and_returns_snapshot_in_ac
                 )
             status_sent.set()
             await asyncio.sleep(0.1)
-        for t in session.plan.tasks:
-            if t.id == task.id:
-                t.status = TaskStatus.COMPLETED
+        # goldfive#247: derive via helper (frozen Plan).
+        from tests._immutable_plan_helpers import force_task_status
+
+        force_task_status(session, task.id, TaskStatus.COMPLETED)
         return InvocationResult(task_id=task.id, text=f"done:{task.id}")
 
     adapter = StubAdapter(on_invoke=_handler)

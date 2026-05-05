@@ -806,6 +806,9 @@ class TestTaskUpstreamReady:
         # as ready).
         assert task_upstream_ready(plan, "C") is False
 
-        # Flip B to COMPLETED — C becomes ready.
-        plan.tasks[1].status = TaskStatus.COMPLETED
+        # Flip B to COMPLETED — C becomes ready. goldfive#247: Plan is
+        # frozen — derive a new plan via with_task_status.
+        from goldfive.types import with_task_status as _wts
+
+        plan = _wts(plan, "B", TaskStatus.COMPLETED)
         assert task_upstream_ready(plan, "C") is True

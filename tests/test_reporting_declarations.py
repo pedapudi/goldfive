@@ -160,7 +160,9 @@ async def test_declare_task_skipped_does_not_mutate_plan() -> None:
     steerer, session, sink = _fresh()
     plan_before = session.plan
     statuses_before = [t.status for t in session.plan.tasks]
-    edges_before = list(session.plan.edges)
+    # goldfive#247: Plan.edges is a tuple — capture as tuple so the
+    # equality check below compares like-for-like.
+    edges_before = tuple(session.plan.edges)
     await _tool("declare_task_skipped").handler(
         {"task_id": "t1", "reason": "skip me"}, session, steerer
     )

@@ -54,13 +54,17 @@ class _RecordingSteerer:
         self.transitions.append((task_id, to, detail))
         if session.plan is None:
             return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                # Treat every recorded transition as authoritative —
-                # the reconciler doesn't re-emit already-terminal
-                # transitions so duplicate writes are fine.
-                t.status = to
-                return
+        # goldfive#247: Plan + Task are frozen — derive a new Plan via
+        # with_task_status and swap. Mirrors what DefaultSteerer does.
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
+        if not any(t.id == task_id for t in session.plan.tasks):
+            return
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, to))
 
     async def observe(self, event: Any, session: Session) -> None:
         if isinstance(event, DriftEvent):

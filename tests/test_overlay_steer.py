@@ -117,16 +117,29 @@ class SteerAwareStubSteerer:
             current_task_id=session.current_task_id,
         )
         self.drift_events.append(drift)
+        # goldfive#247: Plan + Task are frozen — derive a new plan
+        # via the helpers and swap. The fold cascade-cancels every
+        # PENDING/RUNNING task in one rebuild.
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
         if session.plan is not None:
-            for t in session.plan.tasks:
+            new_plan = session.plan
+            for t in list(session.plan.tasks):
                 if t.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
-                    t.status = TaskStatus.CANCELLED
+                    new_plan = with_task_status(new_plan, t.id, TaskStatus.CANCELLED)
                     self.cascade_cancelled.append(t.id)
+            if new_plan is not session.plan:
+                with channel_processor_active():
+                    set_session_plan(session, new_plan)
         # Emulate planner.refine being called by the intervention ladder.
         if session.plan is not None:
             self.planner_refine_calls.append((session.plan, drift))
         if self._refined_plans:
-            session.plan = self._refined_plans.pop(0)
+            with channel_processor_active():
+                set_session_plan(session, self._refined_plans.pop(0))
 
     async def _handle_drift(self, drift: DriftEvent, session: Session) -> None:  # noqa: ARG002
         self.drift_events.append(drift)
@@ -142,10 +155,16 @@ class SteerAwareStubSteerer:
     ) -> None:
         if session.plan is None:
             return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                t.status = to
-                return
+        # goldfive#247: Plan + Task are frozen — derive new plan + swap.
+        if not any(t.id == task_id for t in session.plan.tasks):
+            return
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, to))
 
     def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:  # noqa: ARG002
         return None
@@ -340,13 +359,17 @@ async def test_overlay_steer_triggers_user_steer_drift_and_refine() -> None:
     assert len(steerer.planner_refine_calls) == 1
     assert steerer.planner_refine_calls[0][1].kind is DriftKind.USER_STEER
 
-    # session.plan is now the revised plan.
-    assert session.plan is refined
+    # session.plan is now the revised plan. goldfive#247: Plan is
+    # frozen — the executor's transitions build NEW Plan instances,
+    # so identity is no longer the right check. Verify the plan id
+    # matches the LLM revision and tasks reached terminal.
+    assert session.plan is not None
+    assert session.plan.id == refined.id
 
     # The run completed successfully on the revised plan.
     assert outcome.success is True
-    # Revised tasks are terminal.
-    for t in refined.tasks:
+    # Revised tasks are terminal — read from the live (post-swap) plan.
+    for t in session.plan.tasks:
         assert t.status in (
             TaskStatus.COMPLETED,
             TaskStatus.NOT_NEEDED,
@@ -654,8 +677,11 @@ async def test_overlay_steer_after_steer() -> None:
     ]
     assert len(user_steer_drifts) == 2
     assert len(steerer.planner_refine_calls) == 2
-    # Final plan is the v2 revision.
-    assert session.plan is refined2
+    # Final plan is the v2 revision. goldfive#247: identity check
+    # replaced with id check (Plan is frozen — every transition
+    # rebuilds a Plan).
+    assert session.plan is not None
+    assert session.plan.id == refined2.id
 
 
 # ---------------------------------------------------------------------------

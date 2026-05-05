@@ -655,6 +655,86 @@ Violating any of them is a bug in goldfive.
    PENDING, RUNNING, or BLOCKED tasks remaining.
 9. **Success is not the default verdict.** `Outcome.success = True`
    is computed from §6.1's conjunction, not "did anything fail?"
+10. **Plan and Task are immutable; the channel processor is the
+    sole writer onto `session.plan` (goldfive#247).** See §7.1
+    below.
+
+### 7.1 Immutable Plan/Task and the single-writer rule (goldfive#247)
+
+`Plan` and `Task` are `@dataclasses.dataclass(frozen=True)` (see
+`goldfive/types.py`). Every "mutation" — flipping a task's status,
+appending tasks, replacing the edge list, bumping `revision_index` —
+constructs a NEW object via the helpers in `goldfive.types`:
+
+| helper | purpose |
+|---|---|
+| `replace_task(plan, task_id, **changes)` | Return a new Plan with one task replaced via `dataclasses.replace`. |
+| `with_task_status(plan, task_id, status)` | Sugar over `replace_task` for the common status-transition path. |
+| `add_tasks(plan, new_tasks)` | Return a new Plan with tasks appended; preserves order. |
+| `replace_edges(plan, edges)` | Return a new Plan with the edge list replaced. |
+| `bump_revision(plan, *, revision_index=..., revision_kind=..., ...)` | Return a new Plan with revision metadata updated. |
+
+These helpers NEVER mutate the input. They are pure functions over
+`Plan`/`Task`.
+
+**Why the freeze fixes a bug class.** Pre-#247, judges and sinks
+read `session.plan` / `task.status`, awaited an LLM, and produced a
+verdict against a snapshot the live state had mutated past. The
+brussels-sprouts and tomato e2e sessions surfaced this as the
+"torn-read" symptom: the reconciler's `mark_task_completed` flipped
+`task.status` in place, `_apply_revision` swapped `session.plan`
+whole-cloth, and both happened DURING a judge's LLM round-trip. With
+frozen types the bug class is impossible: anyone who captured a
+`Plan` reference keeps operating on that snapshot for the duration
+of their work; the live `session.plan` may move, but their snapshot
+doesn't.
+
+**Single-writer enforcement.** The pointer swap onto `session.plan`
+is owned by the steerer's channel processor — `mark_task_*`,
+`_apply_revision`, `cascade_cancel_downstream`, and the executor
+install paths. Every blessed swap site goes through:
+
+```python
+from goldfive.types import channel_processor_active, set_session_plan, with_task_status
+
+with channel_processor_active():
+    set_session_plan(session, with_task_status(session.plan, task_id, TaskStatus.RUNNING))
+```
+
+`set_session_plan` checks the `_CHANNEL_PROCESSOR_ACTIVE` contextvar
+on every call. Outside the contextvar:
+
+* **Default (production):** logs a `WARNING` and proceeds. The
+  runtime stays defensive — a sink that accidentally writes to
+  `session.plan` does not crash the run, but the smell is recorded.
+* **`GOLDFIVE_STRICT_STATE_OWNERSHIP=1` (CI / dev):** raises
+  `goldfive.types.PlanOwnershipViolation`. Pytest auto-enables this
+  unless explicitly disabled, mirroring the existing
+  `goldfive._state_audit` opt-in tripwire.
+
+This is structural enforcement of "single writer onto session.plan"
+without forcing every reader to defensively copy. Sinks and judges
+read freely; the steerer's channel processor is the only path that
+swaps the pointer.
+
+**Cross-references.**
+
+* Phase 1 (#245) adds `observed_revision_index` to `DriftEvent` so
+  drift handlers can detect when a drift was minted against an
+  earlier plan. The frozen Plan refactor makes this signal honest:
+  the drift's `observed_revision_index` is forever associated with
+  the plan revision the drift was minted from, even if `session.plan`
+  has moved on.
+* Phase 2 (#246) routes drift handling through `ControlMessage`. The
+  ControlMessage routing site enters `channel_processor_active`
+  before delegating into the steerer's mutation helpers.
+* Phase 4 (#248) adds `Task.supersedes` validation. The
+  `supersedes: tuple[str, ...] = ()`-style default is in place from
+  Phase 3 so Phase 4 only has to wire the validator + prompt + tests.
+  (Note: in this revision the field stays `str = ""` for back-compat
+  with the existing supersedes-by-id design; Phase 4 may evolve it.)
+* Phase 5 (#249) is the top-level design doc; orthogonal to the
+  type-level fix here.
 
 ---
 

@@ -61,7 +61,11 @@ from goldfive.types import (
     Session,
     Task,
     TaskStatus,
+    bump_revision,
+    channel_processor_active,
+    set_session_plan,
     severity_rank,
+    with_task_status,
 )
 
 if TYPE_CHECKING:
@@ -197,7 +201,14 @@ class ParallelDAGExecutor:
         sinks: list[EventSink],
         control: ControlChannel | None = None,
     ) -> ExecutionOutcome:
-        session.plan = plan
+        # goldfive#247: even the initial pin runs through the
+        # channel-processor primitive so the runtime check stays
+        # consistent. ``set_session_plan`` warns (or, in strict
+        # mode, raises) when called outside
+        # :func:`channel_processor_active` — that's the structural
+        # enforcement of "single writer onto session.plan".
+        with channel_processor_active():
+            set_session_plan(session, plan)
 
         # Bind sinks + planner into the steerer so its own observe/
         # transition calls fan out alongside ours.
@@ -281,8 +292,19 @@ class ParallelDAGExecutor:
                 # tools (status is terminal), leave it alone. Otherwise
                 # auto-transition on its behalf so clean returns count as
                 # COMPLETED, not silently PENDING/RUNNING.
+                # goldfive#247: ``task`` is the pre-mutation snapshot;
+                # the framework auto-start via ``steerer.transition(...
+                # RUNNING)`` produced a NEW Plan, so the captured ``task``
+                # reference still says PENDING. Refresh status from the
+                # live ``session.plan`` so terminal-task detection (set
+                # by reporting tools through the steerer) is honoured.
+                live_plan = session.plan
+                live_status_by_id: dict[str, TaskStatus] = (
+                    {t.id: t.status for t in live_plan.tasks} if live_plan is not None else {}
+                )
                 for task, inv, _task_drift, error in stage_results:
-                    already_terminal = task.status in _TERMINAL_TASK_STATUSES
+                    live_status = live_status_by_id.get(task.id, task.status)
+                    already_terminal = live_status in _TERMINAL_TASK_STATUSES
                     if error is not None and not isinstance(error, asyncio.CancelledError):
                         if not already_terminal:
                             await steerer.transition(
@@ -371,7 +393,8 @@ class ParallelDAGExecutor:
                         session.refine_outcomes[
                             (drift.kind.value, drift.current_task_id or "")
                         ] = RefineOutcome(state="succeeded", fail_count=0)
-                        session.plan = refined
+                        with channel_processor_active():
+                            set_session_plan(session, refined)
                         await emit_event(
                             sinks,
                             plan_revised_event(
@@ -537,15 +560,48 @@ class ParallelDAGExecutor:
                 # Emit BEFORE the adapter invoke so the transition row
                 # lands in the wire order operators expect (transition
                 # then activity).
+                # F10 / goldfive#251 R4: framework auto-start of a task
+                # is a real PENDING -> RUNNING transition; emit
+                # TaskTransitioned with source="executor_dispatch" so
+                # operators distinguish it from LLM reporting-tool
+                # (handler_default) and other (catch-all). goldfive#247:
+                # the in-place ``task.status = RUNNING`` mutation is
+                # gone; we derive a NEW Plan via :func:`with_task_status`
+                # and swap, then emit. The captured ``task`` reference
+                # used by the surrounding fold-back stays stale (it's a
+                # Task snapshot) but the live ``session.plan.tasks[*]``
+                # carries the new status — :meth:`_run_stage`'s caller
+                # consults the live plan post-fold for terminal
+                # detection.
                 prev_status = task.status
-                task.status = TaskStatus.RUNNING
-                if prev_status is not TaskStatus.RUNNING:
+                if prev_status is not TaskStatus.RUNNING and prev_status not in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.NOT_NEEDED,
+                ):
+                    if session.plan is not None and any(
+                        t.id == task.id for t in session.plan.tasks
+                    ):
+                        with channel_processor_active():
+                            set_session_plan(
+                                session,
+                                with_task_status(session.plan, task.id, TaskStatus.RUNNING),
+                            )
                     emit_transition = getattr(steerer, "_emit_task_transitioned", None)
                     if callable(emit_transition):
+                        # Refresh the task reference so the emit reads
+                        # the new status from the swapped plan.
+                        live_task = task
+                        if session.plan is not None:
+                            live_task = next(
+                                (t for t in session.plan.tasks if t.id == task.id),
+                                task,
+                            )
                         try:
                             await emit_transition(
                                 session,
-                                task,
+                                live_task,
                                 from_status=prev_status,
                                 to_status=TaskStatus.RUNNING,
                                 source="executor_dispatch",
@@ -969,12 +1025,18 @@ class ParallelDAGExecutor:
         # inline here. Resolution mirrors steerer._apply_revision: source
         # annotation_id (user-control) → drift.id (autonomous). Preserves
         # any pre-existing stamp from the planner path.
+        # goldfive#247: Plan is frozen — derive a new instance via
+        # :func:`bump_revision` rather than mutating in place.
         if not refined.revision_trigger_event_id:
             from goldfive.events import _trigger_id_from_drift
 
             trig_id = _trigger_id_from_drift(drift)
             if trig_id:
-                refined.revision_trigger_event_id = trig_id
+                refined = bump_revision(
+                    refined,
+                    revision_index=refined.revision_index,
+                    revision_trigger_event_id=trig_id,
+                )
         return refined, attempt_id
 
     @staticmethod

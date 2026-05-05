@@ -878,9 +878,11 @@ async def test_apply_revision_stamps_trigger_event_id_from_annotation(
         ],
         edges=[TaskEdge(from_task_id="t1", to_task_id="t2b")],
     )
-    DefaultSteerer._apply_revision(session, revised, drift)
+    # goldfive#247: _apply_revision returns the stamped Plan; the
+    # input Plan stays unchanged (frozen).
+    revised = DefaultSteerer._apply_revision(session, revised, drift)
 
-    assert session.plan is revised
+    assert session.plan is not None and session.plan.id == revised.id
     assert revised.revision_trigger_event_id == "ann_ar_77"
 
 
@@ -911,7 +913,9 @@ async def test_apply_revision_stamps_drift_id_on_autonomous_drift(
         tasks=[Task(id="t1", title="T1", status=TaskStatus.COMPLETED)],
         edges=[],
     )
-    DefaultSteerer._apply_revision(session, revised, drift)
+    # goldfive#247: _apply_revision returns the stamped Plan; the input
+    # stays unchanged (frozen).
+    revised = DefaultSteerer._apply_revision(session, revised, drift)
     assert revised.revision_trigger_event_id == drift.id
 
 

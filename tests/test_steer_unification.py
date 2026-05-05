@@ -204,8 +204,9 @@ async def test_goldfive_steer_promotes_at_warning_severity() -> None:
     assert session.state[_ostate.KEY_ACTIVE_STEER_SOURCE] == "goldfive"
     # Adapter cancel reason tagged.
     assert adapter._next_cancel_reason == "goldfive_off_topic"
-    # Revised plan installed.
-    assert session.plan is planner.revised
+    # Revised plan installed. goldfive#247: identity check replaced
+    # with id check (Plan is frozen).
+    assert session.plan is not None and session.plan.id == planner.revised.id
 
 
 async def test_goldfive_steer_does_not_promote_at_info_severity() -> None:
