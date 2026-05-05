@@ -3,7 +3,7 @@
 
 Covers:
 
-* Pattern-based detectors (always on): CONFUSION, INTENT_DIVERGENCE.
+* Pattern-based detectors (always on): INTENT_DIVERGENCE.
 * Hash-based loop detection (always on).
 * Embedding-based detectors (gated on ``sentence-transformers``).
 * Steerer integration: observe_reasoning -> drift emission -> refine.
@@ -135,31 +135,6 @@ def _clear_embedding_model() -> Any:
     yield
     set_model(None)
     _embed_mod._MODEL_UNAVAILABLE = True
-
-
-# ---------------------------------------------------------------------------
-# Pattern-based CONFUSION
-# ---------------------------------------------------------------------------
-
-
-def test_confusion_fires_on_three_or_more_uncertainty_markers() -> None:
-    text = (
-        "Hmm, I'm not sure what to do here. I don't know if the user wants "
-        "a summary. Wait, should I re-read the prompt?"
-    )
-    session = _session_with_task()
-    drift = dreason.detect_confusion(text, session)
-    assert drift is not None
-    assert drift.kind is DriftKind.CONFUSION
-    assert drift.severity is DriftSeverity.INFO
-    assert "markers" in drift.detail
-
-
-def test_confusion_suppressed_below_threshold() -> None:
-    text = "I'm not sure about this, but let's try."
-    session = _session_with_task()
-    drift = dreason.detect_confusion(text, session)
-    assert drift is None
 
 
 # ---------------------------------------------------------------------------
@@ -675,15 +650,15 @@ def test_reasoning_cluster_skipped_when_embeddings_unavailable(
 # ---------------------------------------------------------------------------
 
 
-async def test_analyze_reasoning_prefers_intent_divergence_over_confusion() -> None:
+async def test_analyze_reasoning_returns_intent_divergence_on_off_goal_proposal() -> None:
     session = _session_with_task(
         goals=[Goal(id="g1", summary="write tax report")]
     )
-    # Has uncertainty markers AND an off-goal proposal. INTENT_DIVERGENCE
-    # wins because it is CRITICAL.
+    # An off-goal proposal triggers INTENT_DIVERGENCE (CRITICAL) ahead
+    # of any other detector in the pipeline.
     text = (
-        "Hmm, I'm not sure. Wait, let me change goals -- actually, let's "
-        "focus on building a video game instead. I don't know about taxes."
+        "Let me change goals -- actually, let's focus on building a "
+        "video game instead. Forget about taxes."
     )
     drift = await dreason.analyze_reasoning(text, session, mode="embedding")
     assert drift is not None
@@ -718,38 +693,6 @@ async def test_observe_reasoning_appends_to_history_and_caps() -> None:
         await steerer.observe_reasoning(f"thought {i}", session=session)
 
     assert session.reasoning_history == ["thought 2", "thought 3", "thought 4"]
-
-
-async def test_observe_reasoning_emits_confusion_drift_but_no_refine() -> None:
-    steerer = DefaultSteerer()
-    # Build a session whose goals+task reference contains every 5+ char
-    # non-stopword token the reasoning uses, so the standalone
-    # ``detect_unreferenced_keyword`` path stays silent and CONFUSION
-    # (INFO) owns the signal. The pipeline runs UNREFERENCED_KEYWORD
-    # before CONFUSION, so any surplus token would steal the event.
-    session = _session_with_task(
-        title="review slides produce",
-        description=(
-            "review slides produce report typos found summary prompt "
-            "should check needs"
-        ),
-        goals=[Goal(id="g1", summary="produce a slide review report summary")],
-    )
-    sink = ListSink()
-    planner = RecordingPlanner()
-    steerer.bind(sinks=[sink], planner=planner)
-
-    text = (
-        "Hmm, I'm not sure what the report summary needs. I don't know if "
-        "they want the slides prompt. Wait, should I re-check?"
-    )
-    await steerer.observe_reasoning(text, session=session)
-
-    assert len(sink.events) == 1
-    evt = sink.events[0]
-    assert evt.WhichOneof("payload") == "drift_detected"
-    # CONFUSION is INFO severity -> no refine.
-    assert planner.refine_calls == []
 
 
 async def test_observe_reasoning_emits_looping_drift_and_refines() -> None:
@@ -858,112 +801,80 @@ def test_adk_extract_reasoning_returns_empty_for_plain_text_response() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Acceptance test from the issue: feed 3 "not sure" into DefaultSteerer,
-# assert CONFUSION drift fires.
-# ---------------------------------------------------------------------------
-
-
-async def test_issue_acceptance_confusion_from_reasoning_block() -> None:
-    # Session reference intentionally covers "wants" and "should" (not
-    # stopwords but generic enough to slip past the keyword detector);
-    # the reasoning's 5+ char non-stopword tokens are all present in
-    # goals+task so UNREFERENCED_KEYWORD stays silent and CONFUSION
-    # (the acceptance target) wins.
-    steerer = DefaultSteerer()
-    session = _session_with_task(
-        title="wants review",
-        description="wants review slides user should list",
-        goals=[Goal(id="g1", summary="wants a slide review report should list")],
-    )
-    sink = ListSink()
-    planner = NullPlanner()
-    steerer.bind(sinks=[sink], planner=planner)
-
-    text = (
-        "I'm not sure what to do. I'm not sure if the user wants a list. "
-        "I'm not sure if I should stop here."
-    )
-    await steerer.observe_reasoning(text, session=session)
-
-    # Exactly one drift event emitted, kind=CONFUSION, severity=INFO.
-    kinds = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
-    assert len(kinds) == 1
-    evt = kinds[0]
-    from goldfive.pb.goldfive.v1 import types_pb2
-
-    assert evt.drift_detected.kind == types_pb2.DRIFT_KIND_CONFUSION
-    assert evt.drift_detected.severity == types_pb2.DRIFT_SEVERITY_INFO
-
-
-# ---------------------------------------------------------------------------
 # DriftDetected.trigger_input enrichment (judge-observability event)
 # ---------------------------------------------------------------------------
 
 
+def _drift_pb_events(sink: ListSink) -> list[Any]:
+    """Filter sink.events to ``DriftDetected``-bearing proto events.
+
+    LOOPING_REASONING is WARNING severity, so when refine fails the
+    sink also carries a ``refine_failed`` dict envelope (see
+    :func:`goldfive.events.make_event`). The pb-typed predicate filters
+    to drift events only.
+    """
+    out: list[Any] = []
+    for e in sink.events:
+        # Dict envelopes (make_event) lack ``WhichOneof``; skip.
+        if not hasattr(e, "WhichOneof"):
+            continue
+        if e.WhichOneof("payload") == "drift_detected":
+            out.append(e)
+    return out
+
+
 async def test_observe_reasoning_populates_drift_trigger_input() -> None:
-    """Always-on detectors populate ``DriftDetected.trigger_input``.
+    """The always-on loop detector populates ``DriftDetected.trigger_input``.
 
-    The always-on pattern detectors (looping / confusion) don't
-    construct ``trigger_input`` themselves — ``observe_reasoning``
-    fills it in from the reasoning text before emitting the drift.
-    Harmonograf uses this to explain "why did goldfive flag this
-    reasoning block?".
-
-    Uses the confusion detector (INFO severity -> no refine path) so
-    the test isn't entangled with the refine-failure emission path.
+    The always-on pattern detector doesn't construct ``trigger_input``
+    itself — ``observe_reasoning`` fills it in from the reasoning text
+    before emitting the drift. Harmonograf uses this to explain "why
+    did goldfive flag this reasoning block?".
     """
     steerer = DefaultSteerer()
-    session = _session_with_task(
-        title="review slides produce",
-        description=(
-            "review slides produce report typos found summary prompt "
-            "should check needs"
-        ),
-        goals=[Goal(id="g1", summary="produce a slide review report summary")],
-    )
+    session = _session_with_task()
     sink = ListSink()
     planner = NullPlanner()
     steerer.bind(sinks=[sink], planner=planner)
 
-    text = (
-        "Hmm, I'm not sure what the report summary needs. I don't know if "
-        "they want the slides prompt. Wait, should I re-check?"
-    )
+    text = "I should re-check the slides for typos"
+    # Prime the history so the next observation repeats and the loop
+    # detector fires.
+    session.reasoning_history = [text, text, text]
     await steerer.observe_reasoning(text, session=session)
 
-    drift_events = [
-        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
-    ]
-    assert len(drift_events) == 1
+    # LOOPING_REASONING is WARNING, so the steerer attempts refine. With
+    # NullPlanner the refine returns None and the steerer escalates,
+    # emitting a second DriftDetected with lifecycle=ESCALATING. Both
+    # carry the same trigger_input — the assertion targets the OPENED
+    # event for clarity.
+    drift_events = _drift_pb_events(sink)
+    assert len(drift_events) >= 1
     assert drift_events[0].drift_detected.trigger_input == text
 
 
 async def test_observe_reasoning_truncates_long_trigger_input() -> None:
     """trigger_input is capped so long reasoning does not blow up sinks."""
     steerer = DefaultSteerer()
-    session = _session_with_task(
-        title="review slides produce",
-        description=(
-            "review slides produce report typos found summary prompt "
-            "should check needs"
-        ),
-        goals=[Goal(id="g1", summary="produce a slide review report summary")],
-    )
+    session = _session_with_task()
     sink = ListSink()
     planner = NullPlanner()
     steerer.bind(sinks=[sink], planner=planner)
 
-    # Pathological confusion block: 3 KB+, well over the 2048-char cap.
+    # Pathological repeated block: 3 KB+, well over the 2048-char cap.
     huge = (
-        "Hmm, I'm not sure what the report summary needs. I don't know if "
-        "they want the slides prompt. Wait, should I re-check? "
+        "Reviewing the next slide for typos and double-checking the "
+        "summary against the task description. "
     ) * 60
+    # Prime the history so the loop detector fires on the same text.
+    session.reasoning_history = [huge, huge, huge]
     await steerer.observe_reasoning(huge, session=session)
 
-    drift_events = [
-        e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
-    ]
-    assert len(drift_events) == 1
+    # See note in test_observe_reasoning_populates_drift_trigger_input:
+    # WARNING-severity drift + NullPlanner refine triggers an
+    # ESCALATING follow-up. Inspect the first (OPENED) drift.
+    drift_events = _drift_pb_events(sink)
+    assert len(drift_events) >= 1
     trigger_input = drift_events[0].drift_detected.trigger_input
     assert trigger_input.endswith(" … [truncated]")
     # At the 2048-char cap + suffix length.

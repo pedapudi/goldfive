@@ -4,6 +4,24 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ## Unreleased — 2026-04-27
 
+### Drift
+
+- **Retire `CONFUSION` (regex-based reasoning drift detector).**
+  The `DriftKind.CONFUSION` enum value (proto value 28; `"confusion"`)
+  and its always-on `detect_confusion` regex over reasoning text are
+  removed. The detector counted occurrences of "I'm not sure" /
+  "wait" / "hmm" / etc. and fired `INFO`-severity drift after three
+  hits — exactly the regex-over-natural-language anti-pattern
+  goldfive walked back twice already (#166 retired
+  `_GENERIC_VERB_PREFIX_RE`, #167 retired `_FACTUAL_QUESTION_RE`).
+  Live e2e signal was 19 markers in a single block on routine
+  reasoning. The reasoning judge (iter-10 three-state classifier)
+  covers the same semantic ground robustly. Wire-incompatible: the
+  proto value is `reserved`. Same precedent as iter-11E's removal of
+  `INCOMPLETE_TOOL_CALLS = 41` shortly after introduction. Strict
+  policy: do NOT replace with another regex/keyword detector — if
+  the signal is wanted back, teach the LLM judge.
+
 ### Steerer
 
 - **Decouple plan installs from drift events

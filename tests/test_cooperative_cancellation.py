@@ -544,7 +544,7 @@ async def test_info_drift_does_not_request_cancel() -> None:
     plugin._top_invocation_id = "inv-A"
 
     drift = DriftEvent(
-        kind=DriftKind.CONFUSION,
+        kind=DriftKind.REASONING_CLUSTER_TIGHTENING,
         severity=DriftSeverity.INFO,
         current_task_id="t1",
         current_agent_id="sub_agent",
@@ -757,7 +757,7 @@ def test_state_protocol_descendants_walk() -> None:
 #
 # Live e2e log (raccoon-research replay): after a CRITICAL drift cancels an
 # invocation, the reasoning judges keep firing on the cancelled invocation's
-# still-buffered thought blocks, producing CONFUSION drifts on zombie
+# still-buffered thought blocks, producing spurious drifts on zombie
 # reasoning and burning LLM-judge calls. The fix gates ``observe_reasoning``
 # (and the opt-in ``note_llm_call`` reflective check) on the same sticky
 # cancel flag the rest of the cancel-aware callbacks consult.

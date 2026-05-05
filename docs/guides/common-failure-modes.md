@@ -154,8 +154,8 @@ LLM keeps re-routing. Goldfive cannot require prompt cooperation
 1. **`ToolLoopTracker`** (§1) — catches tight AgentTool loops before
    the cap trips.
 2. **Reasoning-content drift detectors.** `LOOPING_REASONING` (hash-
-   or embedding-based), `INTENT_DIVERGENCE`, `CONFUSION` fire when
-   the coordinator's chain-of-thought shows the pattern.
+   or embedding-based) and `INTENT_DIVERGENCE` fire when the
+   coordinator's chain-of-thought shows the pattern.
 3. **Refine-driven recovery.** A WARNING-or-higher drift flows
    through the ladder into `planner.refine`, which can narrow the
    assignee hint or split into sub-tasks before the next turn.

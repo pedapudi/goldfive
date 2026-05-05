@@ -416,7 +416,7 @@ session-state mutation, not drift synthesis.
 
 The tables above cover the core trigger-driven kinds. The live
 `DriftKind` in `goldfive/types.py` also carries the reasoning-category
-kinds (`LOOPING_REASONING`, `REASONING_CLUSTER_TIGHTENING`, `CONFUSION`,
+kinds (`LOOPING_REASONING`, `REASONING_CLUSTER_TIGHTENING`,
 `OFF_TOPIC`, `INTENT_DIVERGENCE`), the reflective / confabulation
 signals (`UNCERTAIN_PROGRESS`, `SELF_REPORTED_STUCK`,
 `CONFABULATION_RISK`), the looping-signal kinds (`LOOPING_TOOL_CALL`),

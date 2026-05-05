@@ -304,7 +304,7 @@ use snake_case for forward compatibility with sinks.
 | 25 | CUSTOM | `"custom"` | Escape hatch paired with `DriftDetected.detail`. |
 | 26 | LOOPING_TOOL_CALL | `"looping_tool_call"` | Legacy reporting-tool loop guard kind; retired in goldfive#206. The enum value is preserved for proto stability; `ToolLoopTracker` emits `LOOPING_REASONING` instead. |
 | 27 | LOOPING_REASONING | `"looping_reasoning"` | Reasoning-content loop (hash/embedding) **or** tool-loop detector (#181). |
-| 28 | CONFUSION | `"confusion"` | Reasoning expresses uncertainty; INFO. |
+| 28 | _(reserved)_ | _(reserved)_ | Was `CONFUSION` (regex-based uncertainty-marker count); retired. The reasoning judge (iter-10 three-state classifier) covers the same semantic ground without the regex-NL anti-pattern. |
 | 29 | OFF_TOPIC | `"off_topic"` | Reasoning topic distant from task description (embedding). |
 | 30 | INTENT_DIVERGENCE | `"intent_divergence"` | Reasoning mentions a non-session goal; graduated severity. |
 | 31 | UNCERTAIN_PROGRESS | `"uncertain_progress"` | Opt-in reflective check: yes-but-low-confidence. |

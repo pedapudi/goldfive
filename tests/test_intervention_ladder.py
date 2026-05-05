@@ -26,22 +26,7 @@ from goldfive.types import DriftKind, DriftSeverity  # noqa: E402
 # Each case is (kind, severity, occurrence_count, expected_level).
 # REFINE_FAILURE_THRESHOLD is 2 so occurrence_count >= 2 means "repeat".
 _CASES: list[tuple[DriftKind, DriftSeverity, int, InterventionLevel]] = [
-    # CONFUSION (INFO is observe-only to preserve pre-ladder behaviour).
-    (DriftKind.CONFUSION, DriftSeverity.INFO, 0, InterventionLevel.OBSERVE),
-    (DriftKind.CONFUSION, DriftSeverity.WARNING, 0, InterventionLevel.ABSORB),
-    (
-        DriftKind.CONFUSION,
-        DriftSeverity.CRITICAL,
-        0,
-        InterventionLevel.CANCEL_REINVOKE,
-    ),
-    (
-        DriftKind.CONFUSION,
-        DriftSeverity.CRITICAL,
-        2,
-        InterventionLevel.PAUSE_ESCALATE,
-    ),
-    # CONFABULATION_RISK: identical shape to CONFUSION.
+    # CONFABULATION_RISK (INFO is observe-only to preserve pre-ladder behaviour).
     (DriftKind.CONFABULATION_RISK, DriftSeverity.INFO, 0, InterventionLevel.OBSERVE),
     (
         DriftKind.CONFABULATION_RISK,

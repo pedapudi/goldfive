@@ -256,7 +256,7 @@ class Steerer(Protocol):
   once per LLM response that carries chain-of-thought (OpenAI
   `reasoning_content`, Anthropic `thinking`, Google thought parts).
   Feeds `Session.reasoning_history` and the reasoning-drift pipeline
-  (`LOOPING_REASONING`, `CONFUSION`, `OFF_TOPIC`, `INTENT_DIVERGENCE`).
+  (`LOOPING_REASONING`, `OFF_TOPIC`, `INTENT_DIVERGENCE`).
   Adapters that cannot surface reasoning simply never call this.
 - `transition(task_id, to, session)` — the single source-of-truth
   state-mutating method. Enforces monotonicity (see

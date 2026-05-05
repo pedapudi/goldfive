@@ -118,7 +118,6 @@ def test_message_avoids_goldfive_jargon() -> None:
         DriftKind.INTENT_DIVERGENCE,
         DriftKind.TOOL_ERROR,
         DriftKind.RUNAWAY_DELEGATION,
-        DriftKind.CONFUSION,
         DriftKind.CONFABULATION_RISK,
         DriftKind.SELF_REPORTED_STUCK,
     ):

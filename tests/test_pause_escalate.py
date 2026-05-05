@@ -302,13 +302,13 @@ async def test_nudge_queues_message_on_session() -> None:
     """Level 2 dispatch queues a nudge the Runner's overlay loop
     (goldfive#141) picks up after the current invocation ends."""
     steerer, session, _sink, _planner = _fresh()
-    # CONFUSION at WARNING -> Level 2 (NUDGE) in the issue table. My
-    # implementation maps this to ABSORB to preserve existing refine-
-    # on-WARNING semantics; force the level via a direct dispatch.
+    # Direct ``_dispatch_nudge`` exercise: any drift kind that maps
+    # to ABSORB at WARNING in the ladder works as input here -- the
+    # test pins the queueing behaviour, not the kind-specific routing.
     drift = DriftEvent(
-        kind=DriftKind.CONFUSION,
+        kind=DriftKind.SELF_REPORTED_STUCK,
         severity=DriftSeverity.WARNING,
-        detail="agent uncertain",
+        detail="agent reported no progress",
         current_task_id="t1",
     )
     await steerer._dispatch_nudge(drift, session)

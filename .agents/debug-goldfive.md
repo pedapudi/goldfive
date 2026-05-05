@@ -271,12 +271,11 @@ A LOOPING_REASONING drift appeared on the stream — what triggered it?
      first.
 ```
 
-For `CONFUSION` / `OFF_TOPIC` / `INTENT_DIVERGENCE` the same detail
-field explains which pattern or distance threshold tripped. The four
-kinds live in `goldfive/drift/reasoning.py`; tune the module-level
-constants (`CONFUSION_MIN_HITS`, `OFF_TOPIC_DISTANCE_THRESHOLD`,
-`CONFUSION_MARKERS` regex, `_INTENT_DIVERGENCE_MARKERS` regex) to
-project needs.
+For `OFF_TOPIC` / `INTENT_DIVERGENCE` the same detail field explains
+which pattern or distance threshold tripped. The kinds live in
+`goldfive/drift/reasoning.py`; tune the module-level constants
+(`OFF_TOPIC_DISTANCE_THRESHOLD`, `_INTENT_DIVERGENCE_MARKERS` regex)
+to project needs.
 
 ## Common pitfalls
 
