@@ -588,11 +588,14 @@ async def test_observe_swallows_planner_exceptions() -> None:
 
 
 async def test_observe_surfaces_refine_none_return() -> None:
-    """When refine returns None, a CRITICAL follow-up drift is emitted.
+    """When refine returns None, the run pauses for human intervention.
 
-    Without this, a silently-swallowed refine leaves session.plan pinned
-    to the stale plan and the executor will re-enter the same state on
-    the next tick with no observable signal.
+    iter-12 (#204): refine returning None at the steerer level means the
+    planner has exhausted its internal retry budget. The steerer
+    escalates to ``HUMAN_INTERVENTION_REQUIRED`` rather than emitting a
+    follow-up CRITICAL drift that would recurse through ``_handle_drift``
+    and eventually abort the run. The session is paused so the Runner
+    surfaces the failure to the operator.
     """
     planner = StubPlanner(revised=None)  # refine returns None
     sink = ListSink()
@@ -606,12 +609,20 @@ async def test_observe_surfaces_refine_none_return() -> None:
     from goldfive.pb.goldfive.v1 import types_pb2
 
     follow_up = sink.proto_events[1].drift_detected
+    # Escalation drift, not a recursing CRITICAL of the same kind.
+    assert follow_up.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
     assert follow_up.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
-    assert "refine failed" in follow_up.detail
-    assert "no revised plan" in follow_up.detail
+    assert "refine handler exhausted" in follow_up.detail
     # Session plan is unchanged.
     assert session.plan is not None
     assert session.plan.revision_index == 0
+    # Session paused for human intervention.
+    assert session.paused_for_human_intervention is True
+    # The paired ``refine_failed`` envelope landed on the dict-event bus
+    # carrying the planner's failure_kind for operator/sink visibility.
+    refine_failed = [e for e in sink.dict_events if e.get("kind") == "refine_failed"]
+    assert len(refine_failed) == 1
+    assert refine_failed[0]["payload"]["failure_kind"] == "parse_error"
 
 
 # ---------------------------------------------------------------------------
@@ -902,9 +913,12 @@ async def test_observe_rejects_invalid_revised_plan() -> None:
     """A refine() that returns a structurally-broken plan is rejected.
 
     The steerer must not install a plan with duplicate ids / cycles /
-    unknown edges. Instead it emits a CRITICAL ``SCHEMA_VIOLATION``
-    DriftDetected carrying the validator's reason, and the session
-    keeps its original plan.
+    unknown edges. iter-12 (#204): in addition to the observability-only
+    ``SCHEMA_VIOLATION`` drift carrying the validator's reason, the
+    steerer escalates to ``HUMAN_INTERVENTION_REQUIRED`` so the run
+    pauses for an operator instead of recursing through ``_handle_drift``
+    on the synthetic CRITICAL drift. The session keeps its original
+    plan.
     """
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -929,22 +943,33 @@ async def test_observe_rejects_invalid_revised_plan() -> None:
     await steerer.observe({"error": "trigger refine"}, session)
 
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
-    # The initial TOOL_ERROR drift, then a CRITICAL validation-failure
-    # drift when the bad revised plan is rejected. No PlanRevised is
-    # emitted because the revision was not installed.
-    assert kinds == ["drift_detected", "drift_detected"]
+    # Three drift_detected events:
+    #   1. the initial TOOL_ERROR drift,
+    #   2. the SCHEMA_VIOLATION (INFO — observability-only),
+    #   3. the HUMAN_INTERVENTION_REQUIRED escalation (CRITICAL).
+    # No PlanRevised is emitted because the revision was not installed.
+    assert kinds == ["drift_detected", "drift_detected", "drift_detected"]
     # Original plan is still in place.
     assert session.plan is original_plan
-    # The second drift is the validation-failure signal.
+    # The second drift carries the validator's reason at INFO severity.
     second = sink.proto_events[1].drift_detected
     assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
-    assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert second.severity == types_pb2.DRIFT_SEVERITY_INFO
     assert "plan validation failed" in second.detail
     assert "duplicate task id" in second.detail
+    # The third drift is the escalation; session is paused.
+    third = sink.proto_events[2].drift_detected
+    assert third.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
+    assert third.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert session.paused_for_human_intervention is True
 
 
 async def test_observe_rejects_revised_plan_with_cycle() -> None:
-    """Cycle in the revised plan is rejected with a CRITICAL drift."""
+    """Cycle in the revised plan is rejected.
+
+    iter-12 (#204): SCHEMA_VIOLATION downgraded to INFO observability;
+    the run pauses via a HUMAN_INTERVENTION_REQUIRED escalation drift.
+    """
     from goldfive.pb.goldfive.v1 import types_pb2
 
     bad_revised = Plan(
@@ -968,15 +993,22 @@ async def test_observe_rejects_revised_plan_with_cycle() -> None:
 
     assert session.plan is original_plan
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
-    assert kinds == ["drift_detected", "drift_detected"]
+    assert kinds == ["drift_detected", "drift_detected", "drift_detected"]
     second = sink.proto_events[1].drift_detected
     assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
-    assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert second.severity == types_pb2.DRIFT_SEVERITY_INFO
     assert "cycle" in second.detail
+    third = sink.proto_events[2].drift_detected
+    assert third.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
+    assert session.paused_for_human_intervention is True
 
 
 async def test_observe_rejects_revised_plan_with_unknown_edge() -> None:
-    """An edge referencing a missing task id is rejected."""
+    """An edge referencing a missing task id is rejected.
+
+    iter-12 (#204): SCHEMA_VIOLATION downgraded to INFO observability;
+    the run pauses via a HUMAN_INTERVENTION_REQUIRED escalation drift.
+    """
     from goldfive.pb.goldfive.v1 import types_pb2
 
     bad_revised = Plan(
@@ -998,7 +1030,11 @@ async def test_observe_rejects_revised_plan_with_unknown_edge() -> None:
     assert session.plan is original_plan
     second = sink.proto_events[1].drift_detected
     assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
+    assert second.severity == types_pb2.DRIFT_SEVERITY_INFO
     assert "unknown task id" in second.detail
+    third = sink.proto_events[2].drift_detected
+    assert third.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
+    assert session.paused_for_human_intervention is True
 
 
 async def test_apply_revision_silently_folds_terminal_regression(
@@ -1086,7 +1122,13 @@ async def test_apply_revision_emits_schema_violation_on_missing_terminal_edge() 
     PLAN-LIFECYCLE.md §3.2: edges whose both endpoints were terminal in
     the outgoing plan are frozen and must appear verbatim in any
     revision. The steerer must reject a revision that drops such an
-    edge, emit a CRITICAL SCHEMA_VIOLATION, and keep the prior plan.
+    edge and keep the prior plan.
+
+    iter-12 (#204): the SCHEMA_VIOLATION drift is preserved at INFO
+    severity for operator/sink visibility (carries the validator's
+    reason); the actionable signal is the HUMAN_INTERVENTION_REQUIRED
+    escalation that follows it, which pauses the run instead of
+    recursing through ``_handle_drift``.
     """
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -1125,12 +1167,16 @@ async def test_apply_revision_emits_schema_violation_on_missing_terminal_edge() 
 
     assert session.plan is prior
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
-    assert kinds == ["drift_detected", "drift_detected"]
+    assert kinds == ["drift_detected", "drift_detected", "drift_detected"]
     second = sink.proto_events[1].drift_detected
     assert second.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
-    assert second.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert second.severity == types_pb2.DRIFT_SEVERITY_INFO
     assert "plan validation failed" in second.detail
     assert "terminal->terminal edge 't1' -> 't2'" in second.detail
+    third = sink.proto_events[2].drift_detected
+    assert third.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
+    assert third.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    assert session.paused_for_human_intervention is True
 
 
 async def test_plan_revised_carries_diff() -> None:
@@ -1231,6 +1277,365 @@ async def test_no_op_revision_is_rejected_and_escalates() -> None:
     assert len(drift_kinds) >= 2
     # Session paused for human intervention.
     assert session.paused_for_human_intervention is True
+
+
+# ---------------------------------------------------------------------------
+# iter-12 (#204): graceful refine fallback. When refine cannot produce a
+# usable revision after exhausting its internal retries, escalate to
+# HUMAN_INTERVENTION_REQUIRED instead of emitting a follow-up CRITICAL
+# drift that recurses through ``_handle_drift`` and aborts the run.
+# ---------------------------------------------------------------------------
+
+
+async def test_refine_returns_none_escalates_to_pause() -> None:
+    """When ``planner.refine`` returns None, escalate to PAUSE_ESCALATE.
+
+    Mirrors the ``RefineExhausted`` and no-op-revision paths: the
+    steerer treats refine returning None at the steerer level as
+    handler exhaustion (the planner has exhausted its internal retry
+    budget per iter-11C), pauses the run, and emits exactly one
+    ``HUMAN_INTERVENTION_REQUIRED`` escalation drift. NO recursive
+    same-kind CRITICAL drift is emitted (which the pre-#204 code did
+    via ``_emit_refine_failure``).
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    planner = StubPlanner(revised=None)  # refine returns None
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="off-topic reasoning on t1",
+        current_task_id="t1",
+    )
+    await steerer._handle_drift(drift, session)
+
+    # Refine was called exactly once.
+    assert len(planner.refine_calls) == 1
+    # Session paused.
+    assert session.paused_for_human_intervention is True
+
+    # Exactly one ``HUMAN_INTERVENTION_REQUIRED`` drift emitted (the
+    # escalation). NO follow-up CRITICAL drift of the same kind as the
+    # original drift (which the pre-#204 ``_emit_refine_failure``
+    # synthesised) — that would have recursed through ``_handle_drift``.
+    drift_events = [
+        e.drift_detected
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+    ]
+    escalations = [
+        d for d in drift_events
+        if d.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
+    ]
+    assert len(escalations) == 1
+    assert escalations[0].severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+    # No synthetic CRITICAL drift carrying the original drift kind +
+    # ``refine failed`` detail (the pre-fix shape).
+    same_kind_critical = [
+        d for d in drift_events
+        if d.kind == types_pb2.DRIFT_KIND_OFF_TOPIC
+        and d.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+        and "refine failed" in d.detail
+    ]
+    assert same_kind_critical == [], (
+        "pre-#204 recursing CRITICAL drift was emitted; the graceful "
+        "fallback should pause via HUMAN_INTERVENTION_REQUIRED instead."
+    )
+
+    # The paired ``refine_failed`` envelope landed for sink visibility.
+    refine_failed = [e for e in sink.dict_events if e.get("kind") == "refine_failed"]
+    assert len(refine_failed) == 1
+    assert refine_failed[0]["payload"]["failure_kind"] == "parse_error"
+
+
+async def test_refine_validator_rejected_escalates_to_pause() -> None:
+    """When the revised plan fails validation, escalate to PAUSE_ESCALATE.
+
+    iter-12 (#204): pre-fix the steerer emitted a CRITICAL
+    ``SCHEMA_VIOLATION`` drift that recursed through ``_handle_drift``
+    on its own. Post-fix the schema violation is preserved at INFO
+    severity for sink/observability (so harmonograf still sees the
+    validator's reason), and the actionable signal is the
+    ``HUMAN_INTERVENTION_REQUIRED`` escalation that pauses the run.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    # Revised plan with duplicate task ids — validate() rejects it.
+    bad_revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="dup", title="first", status=TaskStatus.PENDING),
+            Task(id="dup", title="second", status=TaskStatus.PENDING),
+        ],
+        edges=[],
+    )
+    planner = StubPlanner(revised=bad_revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+    original_plan = session.plan
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="trigger refine",
+        current_task_id="t1",
+    )
+    await steerer._handle_drift(drift, session)
+
+    # Refine was called exactly once.
+    assert len(planner.refine_calls) == 1
+    # Session paused.
+    assert session.paused_for_human_intervention is True
+    # Original plan retained.
+    assert session.plan is original_plan
+
+    drift_events = [
+        e.drift_detected
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+    ]
+    # Schema-violation observability event preserved at INFO severity.
+    schema_violations = [
+        d for d in drift_events
+        if d.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
+    ]
+    assert len(schema_violations) == 1
+    assert schema_violations[0].severity == types_pb2.DRIFT_SEVERITY_INFO
+    assert "plan validation failed" in schema_violations[0].detail
+    # Escalation drift fires — this is the actionable signal.
+    escalations = [
+        d for d in drift_events
+        if d.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
+    ]
+    assert len(escalations) == 1
+    assert escalations[0].severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+
+
+async def test_refine_returns_none_does_not_cascade_further_drifts() -> None:
+    """End-to-end shape: refine None → single PAUSE, no cascade.
+
+    Reproduces the cauliflower-presentation scenario the iter-12 fix
+    targets (#204). Pre-fix: drift → refine returns None →
+    ``_emit_refine_failure`` synthesises a CRITICAL same-kind drift →
+    recurses through ``_handle_drift`` → refine again → may itself
+    fail → eventually the run aborts. Post-fix: a single
+    ``HUMAN_INTERVENTION_REQUIRED`` escalation, refine called exactly
+    once, no follow-up drift cascade.
+    """
+    planner = StubPlanner(revised=None)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    drift = DriftEvent(
+        kind=DriftKind.PLAN_DIVERGENCE,
+        severity=DriftSeverity.WARNING,
+        detail="reviewer reported BLOCKED",
+        current_task_id="t1",
+    )
+    await steerer._handle_drift(drift, session)
+
+    # Refine called exactly once — no cascade-driven retry.
+    assert len(planner.refine_calls) == 1
+    # Session paused.
+    assert session.paused_for_human_intervention is True
+
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    drift_kinds = [
+        e.drift_detected.kind
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+    ]
+    # Exactly the original drift + the escalation. No follow-up
+    # PLAN_DIVERGENCE CRITICAL (the pre-fix shape) and no cascade
+    # through TASK_FAILED_FATAL / REPEATED_FAILURE on a single tick.
+    assert types_pb2.DRIFT_KIND_PLAN_DIVERGENCE in drift_kinds
+    assert types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED in drift_kinds
+    plan_divergence_count = drift_kinds.count(types_pb2.DRIFT_KIND_PLAN_DIVERGENCE)
+    # Only the originating drift, no recursing CRITICAL clone.
+    assert plan_divergence_count == 1, drift_kinds
+
+
+async def test_refine_exhausted_path_unchanged() -> None:
+    """Regression: ``RefineExhausted`` still escalates the same way.
+
+    iter-12 (#204) only changes the refine-None and validator-rejected
+    paths to mirror the existing ``RefineExhausted`` escalation. Verify
+    the existing path still pauses the run + emits exactly one
+    ``HUMAN_INTERVENTION_REQUIRED`` drift.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+    from goldfive.steerer import RefineExhausted
+
+    class _ExhaustedPlanner:
+        def __init__(self) -> None:
+            self.refine_calls: list[DriftEvent] = []
+
+        async def refine(self, *, plan, drift, goals, **kwargs):  # noqa: ANN001
+            self.refine_calls.append(drift)
+            raise RefineExhausted("planner cannot make progress")
+
+    planner = _ExhaustedPlanner()
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="off-topic",
+        current_task_id="t1",
+    )
+    await steerer._handle_drift(drift, session)
+
+    assert len(planner.refine_calls) == 1
+    assert session.paused_for_human_intervention is True
+    drift_kinds = [
+        e.drift_detected.kind
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED in drift_kinds
+
+
+async def test_no_op_revision_path_unchanged() -> None:
+    """Regression: structural no-op revision still escalates the same way.
+
+    iter-12 (#204) does not touch the no-op-revision rejection path —
+    confirm it still pauses the run on a structurally identical
+    revision.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    # A "revised" plan that is a distinct object but structurally equal
+    # to the prior (same task ids, edges, assignees, statuses).
+    tasks_a = [Task(id="t1", title="T1"), Task(id="t2", title="T2")]
+    tasks_b = [Task(id="t1", title="T1"), Task(id="t2", title="T2")]
+    edges_a = [TaskEdge(from_task_id="t1", to_task_id="t2")]
+    edges_b = [TaskEdge(from_task_id="t1", to_task_id="t2")]
+    old = Plan(id="p1", run_id="r1", goal_ids=["g1"], tasks=tasks_a, edges=edges_a)
+    revised = Plan(id="p1", run_id="r1", goal_ids=["g1"], tasks=tasks_b, edges=edges_b)
+
+    planner = StubPlanner(revised=revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session(old)
+
+    await steerer.observe({"error": "trigger refine"}, session)
+
+    assert session.paused_for_human_intervention is True
+    drift_kinds = [
+        e.drift_detected.kind
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED in drift_kinds
+
+
+async def test_promote_drift_to_steer_refine_none_escalates_to_pause() -> None:
+    """``_promote_drift_to_steer`` mirrors the ``_handle_drift`` graceful fallback.
+
+    iter-12 (#204) parallel site: the goldfive-steer path also pauses
+    the run on refine=None instead of recursing through a synthetic
+    CRITICAL drift.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    planner = StubPlanner(revised=None)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="trigger goldfive-steer",
+        current_task_id="t1",
+    )
+    await steerer._promote_drift_to_steer(drift, session)
+
+    assert len(planner.refine_calls) == 1
+    assert session.paused_for_human_intervention is True
+    drift_kinds = [
+        e.drift_detected.kind
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED in drift_kinds
+    # No same-kind CRITICAL recursion.
+    same_kind_critical = [
+        e.drift_detected
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+        and e.drift_detected.kind == types_pb2.DRIFT_KIND_OFF_TOPIC
+        and e.drift_detected.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
+        and "refine failed" in e.drift_detected.detail
+    ]
+    assert same_kind_critical == []
+
+
+async def test_promote_drift_to_steer_validator_rejected_escalates_to_pause() -> None:
+    """``_promote_drift_to_steer`` graceful fallback on validator rejection.
+
+    iter-12 (#204) parallel site: SCHEMA_VIOLATION downgraded to INFO,
+    plus a ``HUMAN_INTERVENTION_REQUIRED`` escalation that pauses.
+    """
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    bad_revised = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="dup", title="first", status=TaskStatus.PENDING),
+            Task(id="dup", title="second", status=TaskStatus.PENDING),
+        ],
+        edges=[],
+    )
+    planner = StubPlanner(revised=bad_revised)
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = _make_session()
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="trigger goldfive-steer",
+        current_task_id="t1",
+    )
+    await steerer._promote_drift_to_steer(drift, session)
+
+    assert session.paused_for_human_intervention is True
+    drift_events = [
+        e.drift_detected
+        for e in sink.proto_events
+        if e.WhichOneof("payload") == "drift_detected"
+    ]
+    schema_violations = [
+        d for d in drift_events if d.kind == types_pb2.DRIFT_KIND_SCHEMA_VIOLATION
+    ]
+    assert len(schema_violations) == 1
+    assert schema_violations[0].severity == types_pb2.DRIFT_SEVERITY_INFO
+    escalations = [
+        d for d in drift_events
+        if d.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
+    ]
+    assert len(escalations) == 1
 
 
 async def test_bind_replaces_sinks() -> None:
