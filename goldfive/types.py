@@ -1123,7 +1123,9 @@ class Session:
     # drifts bypass the gate so they don't need to stamp). Key is
     # ``(drift.kind.value, drift.current_task_id or "")`` — empty target
     # captures trajectory-level drifts that coalesce on a single key.
-    last_addressed_revision_by_drift_key: dict[tuple[str, str], int] = dataclasses.field(default_factory=dict)
+    last_addressed_revision_by_drift_key: dict[tuple[str, str], int] = (
+        dataclasses.field(default_factory=dict)
+    )
     # Per-task ``time.monotonic()`` timestamp of the most recent
     # task-progress signal — set on ``mark_task_running``,
     # ``mark_task_progress``, and every ``_emit_task_transitioned`` call.
