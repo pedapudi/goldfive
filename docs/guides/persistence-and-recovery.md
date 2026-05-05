@@ -411,8 +411,6 @@ plan's per-task status. It also:
 
 - Replays `PlanRevised` in order so the final `session.plan` matches
   the last revision.
-- Replays `DriftDetected` into `session.history` so post-run analysis
-  can count per-kind occurrences.
 - Rebuilds `session.completed_results` from `TaskCompleted.summary`.
 - Does **not** rebuild `session.reasoning_history`,
   `session.recent_agent_activity`, `session.refine_outcomes`,

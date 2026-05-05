@@ -260,10 +260,6 @@ def reconstruct_session(events: list[Any]) -> Any:
         # run_completed / run_aborted are terminal markers; the caller
         # decides whether to resume. We leave session state as-is.
 
-        # Mirror the event-history convention used by live runs so
-        # downstream consumers see the raw stream as well.
-        session.history.append(evt)
-
     if max_seq >= 0:
         session._next_sequence = max_seq + 1
     return session

@@ -67,7 +67,7 @@ pair makes this cheap, so even in that limit the cost is minimal.
 
 **Observation.** `Plan` is a DAG of tasks; `Session` holds `plan:
 Plan | None` plus `run_id`, `goals`, `completed_results`,
-`task_progress`, `agent_notes`, `history`, `divergence_flag`, and a
+`task_progress`, `agent_notes`, `divergence_flag`, and a
 sequence counter. The Plan can be swapped by `refine` mid-run; the
 Session persists across the swap.
 
@@ -101,8 +101,8 @@ out for free.
 
 **Signals this might be wrong.** If callers frequently want to iterate
 a session's task history and find themselves reaching for
-`session.plan.tasks + session.history` patterns, we may need a helper
-method or a flatter layout.
+`session.plan.tasks` plus an external event log to stitch state, we may
+need a helper method or a flatter layout.
 
 **Related.** [ARCHITECTURE.md](ARCHITECTURE.md),
 [VOCABULARY.md §4](VOCABULARY.md#4-taskstatus-state-machine).

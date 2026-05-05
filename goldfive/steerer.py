@@ -2555,39 +2555,41 @@ class DefaultSteerer:
     def _summarize_recent_tool_calls(session: Session, *, limit: int = 10) -> str:
         """Build a short human-readable summary of the last N tool calls.
 
-        Reads from ``session.history`` when the adapter writes tool-call
-        observations there; falls back to "(no recent tool calls)" when
-        no tool-call-shaped entries are found. Args are trimmed to 120
-        chars per call to keep the prompt bounded.
+        Reads from ``session.recent_tool_observations`` (populated by
+        :meth:`note_tool_observation` from the adapter's
+        ``after_tool_callback`` / ``on_tool_error_callback`` hooks).
+        Falls back to "(no recent tool calls)" when the buffer is empty.
+
+        Each rendered entry is ``tool_name(args_preview)`` with an
+        ``[ERROR: ...]`` suffix when the observation was flagged as an
+        error. ``args_preview`` is already truncated to 240 chars by the
+        writer; we further trim to 120 here to keep the reflective-check
+        prompt bounded. The most recent ``limit`` entries are emitted
+        oldest-first for readability.
 
         Adapters that want richer summaries can subclass and override.
         """
-        hist = getattr(session, "history", None)
+        hist = getattr(session, "recent_tool_observations", None) or []
         if not hist:
             return "(no recent tool calls)"
+        # Take the tail (most recent ``limit`` entries) oldest-first.
+        tail = list(hist)[-limit:]
         lines: list[str] = []
-        for entry in reversed(list(hist)):
-            name = ""
-            args: Any = None
-            if isinstance(entry, dict):
-                if entry.get("kind") == "tool_call":
-                    name = str(entry.get("name", "") or "")
-                    args = entry.get("args")
-            else:
-                kind = getattr(entry, "kind", "") or ""
-                if kind == "tool_call":
-                    name = str(getattr(entry, "name", "") or "")
-                    args = getattr(entry, "args", None)
+        for entry in tail:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("tool_name", "") or "")
             if not name:
                 continue
-            args_str = repr(args)[:120] if args is not None else ""
-            lines.append(f"{name}({args_str})")
-            if len(lines) >= limit:
-                break
+            args_preview = str(entry.get("args_preview", "") or "")[:120]
+            rendered = f"{name}({args_preview})"
+            if entry.get("is_error"):
+                err = str(entry.get("error_message", "") or "")[:80]
+                rendered += f" [ERROR: {err}]" if err else " [ERROR]"
+            lines.append(rendered)
         if not lines:
             return "(no recent tool calls)"
-        # Oldest first for readability.
-        return ", ".join(reversed(lines))
+        return ", ".join(lines)
 
     @staticmethod
     def _summarize_recent_reasoning(session: Session, *, limit: int = 3) -> str:

@@ -34,7 +34,7 @@ Goldfive's "orchestration state" (the first row) is a framework-agnostic dict wi
 ### 3.1 Goldfive owns
 
 - `goldfive.types.Session.state` — direct read/write from any goldfive component. The `goldfive.orchestration_state` module is the conventional namespace owner; ad-hoc keys are tolerated for app-level use but discouraged in goldfive core.
-- `goldfive.types.Session.plan`, `Session.completed_results`, `Session.history`, `Session.goals`, `Session.run_id`. Typed fields, not strings — read these instead of poking through `Session.state` keys for the same fact.
+- `goldfive.types.Session.plan`, `Session.completed_results`, `Session.goals`, `Session.run_id`. Typed fields, not strings — read these instead of poking through `Session.state` keys for the same fact.
 - Every plugin-instance dict (`self._cancel_state`, etc.). These are not part of any session contract; they live and die with the plugin instance.
 
 ### 3.2 ADK owns

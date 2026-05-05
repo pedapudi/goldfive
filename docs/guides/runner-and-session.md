@@ -102,7 +102,6 @@ class Session:
     completed_results: dict[str, str]
     task_progress: dict[str, float]
     agent_notes: dict[str, str]
-    history: list[Any]
     started_at_ms: int
     pending_approvals: dict[str, asyncio.Event]
     pending_approvals_meta: dict[str, dict[str, Any]]
