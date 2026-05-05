@@ -198,28 +198,111 @@ async def test_drift_stamped_with_current_revision_is_dispatched() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_drift_stamped_with_older_revision_is_rejected() -> None:
-    """Drift observed against revision N is rejected when session is on N+1.
+async def test_redundant_same_kind_same_target_drift_is_rejected() -> None:
+    """Drift observed against (kind, target) already addressed at later revision is rejected.
 
-    The gate fires: ``DriftDetected`` is still emitted (so operators see
-    the detector ran) but the cancel + refine machinery is skipped. We
-    detect the skip by asserting the planner was never called.
+    Per-key gating semantics: a verdict is rejected only when the SAME
+    (drift kind, target task) was already addressed at a later revision.
+    Set the per-key watermark to revision 4; drift observed at revision 3
+    for the same (kind, target) is redundant.
+
+    DriftDetected still emits for observability; cancel + refine skipped.
     """
     sink = _ListSink()
     planner = _NullPlanner()
     steerer = _build_steerer(sinks=[sink], planner=planner)
-    # Session has advanced to revision 4; drift was observed at revision 3.
     session = _session(revision_index=4)
+    # Stamp the per-(kind, target) watermark as if a prior refine for
+    # the same (OFF_TOPIC, t-draft) addressed the concern at revision 4.
+    session.last_addressed_revision_by_drift_key[
+        (DriftKind.OFF_TOPIC.value, "t-draft")
+    ] = 4
     drift = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
 
     await steerer._handle_drift(drift, session)
 
     # DriftDetected fires for observability.
-    assert _emitted_drift_kinds(sink), "stale drift must still emit DriftDetected"
+    assert _emitted_drift_kinds(sink), "redundant drift must still emit DriftDetected"
     # The dispatch (planner.refine) does NOT fire — the gate skipped it.
     assert planner.refine_calls == [], (
-        "stale verdict must not trigger planner.refine; "
-        f"refine called {len(planner.refine_calls)} time(s)"
+        "redundant verdict (same key, older observation) must not trigger "
+        f"planner.refine; refine called {len(planner.refine_calls)} time(s)"
+    )
+
+
+async def test_orthogonal_kind_drift_dispatches_after_unrelated_revision() -> None:
+    """Drift on a DIFFERENT (kind, target) is NOT rejected by an unrelated revision bump.
+
+    The bug class this guards against: parallel judges fire on
+    *orthogonal* concerns. Judge A observes revision N → fires OFF_TOPIC
+    on task T_A → refine produces revision N+1 (addresses OFF_TOPIC/T_A).
+    Judge B observes revision N → fires PLAN_DIVERGENCE on task T_B; B's
+    verdict returns AFTER A's refine landed. Naive global ``observed <
+    live`` gating would drop B; per-(kind, target) gating preserves it
+    because (PLAN_DIVERGENCE, T_B) was never specifically addressed.
+
+    Both PLAN_DIVERGENCE and OFF_TOPIC at WARNING severity route to the
+    refine path (CANCEL_REINVOKE), so we assert ``planner.refine_calls``
+    fires for the orthogonal drift.
+    """
+    sink = _ListSink()
+    planner = _NullPlanner()
+    steerer = _build_steerer(sinks=[sink], planner=planner)
+    session = _session(
+        revision_index=4,
+        statuses=[("t-draft", TaskStatus.COMPLETED), ("t-other", TaskStatus.PENDING)],
+    )
+    # Watermark records an unrelated key was addressed at revision 4.
+    session.last_addressed_revision_by_drift_key[
+        (DriftKind.OFF_TOPIC.value, "t-draft")
+    ] = 4
+    # The drift is PLAN_DIVERGENCE on a different task — orthogonal
+    # concern, also a refine-routing kind so we can assert the
+    # dispatch path ran.
+    drift = _drift(
+        kind=DriftKind.PLAN_DIVERGENCE,
+        severity=DriftSeverity.WARNING,
+        observed_revision_index=3,
+        task="t-other",
+    )
+
+    await steerer._handle_drift(drift, session)
+
+    # DriftDetected fires AND the dispatch runs (planner.refine called).
+    assert _emitted_drift_kinds(sink), "orthogonal drift must emit DriftDetected"
+    assert planner.refine_calls, (
+        "orthogonal-key drift must dispatch even when an unrelated key was "
+        "addressed at a later revision; got 0 refine calls"
+    )
+
+
+async def test_same_kind_different_target_drift_dispatches() -> None:
+    """Drift on same kind but DIFFERENT target task dispatches.
+
+    Watermark on (OFF_TOPIC, t-draft) at revision 4 must NOT suppress a
+    later (OFF_TOPIC, t-other) drift — they're distinct claims about
+    distinct tasks.
+    """
+    sink = _ListSink()
+    planner = _NullPlanner()
+    steerer = _build_steerer(sinks=[sink], planner=planner)
+    session = _session(
+        revision_index=4,
+        statuses=[("t-draft", TaskStatus.COMPLETED), ("t-other", TaskStatus.PENDING)],
+    )
+    session.last_addressed_revision_by_drift_key[
+        (DriftKind.OFF_TOPIC.value, "t-draft")
+    ] = 4
+    drift = _drift(
+        kind=DriftKind.OFF_TOPIC,
+        observed_revision_index=3,
+        task="t-other",
+    )
+
+    await steerer._handle_drift(drift, session)
+
+    assert planner.refine_calls, (
+        "same-kind-different-target drift must dispatch; got 0 refine calls"
     )
 
 
@@ -473,12 +556,12 @@ async def test_reasoning_judge_stamps_observed_revision_on_drift() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_end_to_end_stale_drift_emits_but_does_not_refine() -> None:
+async def test_end_to_end_redundant_drift_emits_but_does_not_refine() -> None:
     """The full path: detector emits a stamped drift; before dispatch
-    the plan revision_index advances (refine landed in parallel); the
-    gate rejects the verdict but ``DriftDetected`` is still on the wire.
-    Operators see the detector fired but the framework does not act on
-    a stale view.
+    a refine for the SAME (kind, target) lands and stamps the watermark;
+    the gate rejects the verdict as redundant but ``DriftDetected`` is
+    still on the wire. Operators see the detector fired but the
+    framework does not re-act on a concern already addressed.
     """
     sink = _ListSink()
     planner = _NullPlanner()
@@ -487,9 +570,14 @@ async def test_end_to_end_stale_drift_emits_but_does_not_refine() -> None:
     session = _session(revision_index=2)
     # Detector observed at revision 2 (the live revision at observation).
     drift = _drift(observed_revision_index=2)
-    # Now a refine lands externally — revision bumps to 3 BEFORE the
-    # detector's drift reaches dispatch.
+    # Now a refine for the SAME (kind, target) lands externally —
+    # watermark advances to revision 3 BEFORE the detector's drift
+    # reaches dispatch. (In production this happens via _apply_revision
+    # stamping; we simulate it here by setting the dict directly.)
     session.plan.revision_index = 3
+    session.last_addressed_revision_by_drift_key[
+        (DriftKind.OFF_TOPIC.value, "t-draft")
+    ] = 3
 
     await steerer._handle_drift(drift, session)
 
@@ -497,6 +585,73 @@ async def test_end_to_end_stale_drift_emits_but_does_not_refine() -> None:
     assert _emitted_drift_kinds(sink), "DriftDetected must still be emitted"
     # ... but no refine fired.
     assert planner.refine_calls == [], (
-        "stale verdict must not drive a refine; "
-        f"got {len(planner.refine_calls)} refine call(s)"
+        "redundant verdict (same key, older observation) must not drive a "
+        f"refine; got {len(planner.refine_calls)} refine call(s)"
+    )
+
+
+async def test_apply_revision_stamps_per_key_watermark() -> None:
+    """``_apply_revision`` stamps ``last_addressed_revision_by_drift_key``.
+
+    This is the producer side of the gate: every successful goldfive-
+    authored refine that lands a new plan must stamp the watermark so
+    subsequent same-(kind, target) verdicts observed at older revisions
+    are correctly identified as redundant.
+    """
+    session = _session(revision_index=2)
+    drift = _drift(
+        kind=DriftKind.OFF_TOPIC,
+        observed_revision_index=2,
+        task="t-draft",
+    )
+    revised = Plan(
+        id="p-revised",
+        run_id=session.run_id,
+        goal_ids=["g-245"],
+        tasks=list(session.plan.tasks),
+        edges=[],
+        revision_index=3,
+    )
+
+    DefaultSteerer._apply_revision(session, revised, drift)
+
+    key = (DriftKind.OFF_TOPIC.value, "t-draft")
+    assert key in session.last_addressed_revision_by_drift_key, (
+        "_apply_revision must stamp the per-(kind, target) watermark"
+    )
+    assert session.last_addressed_revision_by_drift_key[key] == 3, (
+        "watermark must equal the new revision_index"
+    )
+
+
+async def test_apply_revision_does_not_stamp_for_user_authored_drifts() -> None:
+    """User-authored drifts bypass the gate AND don't stamp the watermark.
+
+    Rationale: a user redirect doesn't suppress orthogonal goldfive
+    concerns observed before the redirect. Goldfive verdicts whose
+    (kind, target) was NEVER goldfive-addressed flow through to dispatch
+    even if a USER_STEER bumped the plan in between.
+    """
+    session = _session(revision_index=2)
+    drift = _drift(
+        kind=DriftKind.USER_STEER,
+        observed_revision_index=2,
+        task="t-draft",
+        authored_by="user",
+    )
+    revised = Plan(
+        id="p-revised",
+        run_id=session.run_id,
+        goal_ids=["g-245"],
+        tasks=list(session.plan.tasks),
+        edges=[],
+        revision_index=3,
+    )
+
+    DefaultSteerer._apply_revision(session, revised, drift)
+
+    key = (DriftKind.USER_STEER.value, "t-draft")
+    assert key not in session.last_addressed_revision_by_drift_key, (
+        "user-authored drifts must NOT stamp the watermark — they're operator "
+        "directives, not goldfive-issued addressings of a structural concern"
     )

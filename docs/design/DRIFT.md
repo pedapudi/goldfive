@@ -423,15 +423,33 @@ The structural fix has three layers:
    pre-#245" so external producers and serialised events from older
    code path emit the unset sentinel and are treated as legacy.
 
-2. **Dispatch-time gate.** The TOP of
-   `DefaultSteerer._handle_drift` (after the `authored_by`
-   normalisation, before the cancel-tag and the ladder dispatch)
-   compares the drift's stamp against the live
-   `session.plan.revision_index`. When the stamp is strictly less
-   than the live revision, the drift is a stale verdict against a
-   plan-state the system has moved past: the gate emits
-   `DriftDetected` for observability and skips the cancel + refine
-   machinery. Bypasses:
+2. **Dispatch-time gate (per-(kind, target) addressed-watermark).**
+   The TOP of `DefaultSteerer._handle_drift` (after the
+   `authored_by` normalisation, before the cancel-tag and the
+   ladder dispatch) compares the drift's stamp against a per-key
+   watermark — NOT the global live `revision_index`. The watermark
+   is `Session.last_addressed_revision_by_drift_key`, keyed by
+   `(drift.kind.value, drift.current_task_id or "")` and stamped
+   inside `_apply_revision` after every successful goldfive-authored
+   refine. When the drift's `observed_revision_index` is strictly
+   less than the watermark for its (kind, target), the verdict is
+   *redundant* — the system has already addressed this specific
+   concern at a later revision — and the gate emits `DriftDetected`
+   for observability while skipping the cancel + refine machinery.
+
+   Per-(kind, target) gating is narrower than naive `observed <
+   live_revision` gating, which would over-reject parallel judges
+   firing on orthogonal concerns: a `GOAL_DRIFT` verdict observed at
+   revision N is NOT invalidated by an unrelated `OFF_TOPIC` refine
+   that produced revision N+1 — they're distinct claims. The
+   per-key watermark drops only verdicts whose specific `(kind,
+   target)` was already addressed.
+
+   Trajectory-level drifts (no `current_task_id`) coalesce on the
+   `""` empty-target key, so trajectory-wide addressing applies
+   correctly across all such verdicts.
+
+   Bypasses:
 
    * **Unstamped drifts** (`observed_revision_index == 0`) flow
      through unchanged — back-compat for legacy / external
@@ -440,7 +458,9 @@ The structural fix has three layers:
      `USER_PAUSE`, `authored_by == "user"`) bypass the gate even
      when stamped — operator directives must be honoured regardless
      of the framework's plan-state cursor (preserves the iter-11D /
-     #242 contract).
+     #242 contract). User-authored drifts also do NOT stamp the
+     watermark, so a user redirect doesn't suppress orthogonal
+     goldfive concerns observed before the redirect.
 
 3. **Post-LLM re-read in the goal-drift judge.** After
    `classify_goal_drift`'s LLM call returns,

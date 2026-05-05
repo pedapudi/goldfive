@@ -3007,22 +3007,38 @@ class DefaultSteerer:
         #     framework's plan-state cursor (preserves the iter-11D /
         #     #242 contract).
         if drift.observed_revision_index and (drift.authored_by or "").lower() != "user":
-            live_plan = getattr(session, "plan", None)
-            if live_plan is not None:
-                live_revision = int(getattr(live_plan, "revision_index", 0) or 0)
-                if drift.observed_revision_index < live_revision:
-                    log.info(
-                        "DefaultSteerer._handle_drift: stale verdict — drift "
-                        "kind=%s observed revision %d but session is on "
-                        "revision %d; skipping dispatch",
-                        drift.kind.value,
-                        drift.observed_revision_index,
-                        live_revision,
-                    )
-                    # Emit for observability so operators see the detector
-                    # ran; do NOT cancel / refine on a stale view.
-                    await self._emit_drift_detected(session, drift)
-                    return
+            # Per-(kind, target) addressed-watermark check — narrower
+            # than naive ``observed < live_revision`` gating so parallel
+            # judges firing on *orthogonal* concerns aren't over-rejected.
+            # Naive gating drops a GOAL_DRIFT verdict observed at N just
+            # because an unrelated OFF_TOPIC refine bumped the plan to
+            # N+1; this gate drops only when the SAME (kind, target) was
+            # already addressed at a later revision (genuinely redundant).
+            #
+            # ``last_addressed_revision_by_drift_key`` is stamped by
+            # :meth:`_apply_revision` after every successful goldfive-
+            # authored refine. Empty target (``""``) coalesces trajectory-
+            # level drifts on one key, so trajectory-wide addressing
+            # works correctly.
+            key = (drift.kind.value, drift.current_task_id or "")
+            last_addressed = int(
+                session.last_addressed_revision_by_drift_key.get(key, 0)
+            )
+            if last_addressed and drift.observed_revision_index < last_addressed:
+                log.info(
+                    "DefaultSteerer._handle_drift: redundant verdict — "
+                    "drift kind=%s target=%r observed revision %d but "
+                    "same (kind, target) was already addressed at "
+                    "revision %d; skipping dispatch",
+                    drift.kind.value,
+                    drift.current_task_id or "<trajectory>",
+                    drift.observed_revision_index,
+                    last_addressed,
+                )
+                # Emit for observability so operators see the detector
+                # ran; do NOT cancel / refine on a redundant view.
+                await self._emit_drift_detected(session, drift)
+                return
         # Tag the bound adapter's next cancel with a symbolic reason so
         # the synthetic function_response the adapter appends on cancel
         # carries LLM-actionable content. Done BEFORE the drift event
@@ -5951,6 +5967,16 @@ class DefaultSteerer:
             if trig_id:
                 revised.revision_trigger_event_id = trig_id
         session.plan = revised
+        # goldfive#245 follow-up — stamp the per-(kind, target) addressed
+        # watermark so the verdict-freshness gate in :meth:`_handle_drift`
+        # can drop subsequent same-(kind, target) verdicts observed at
+        # older revisions as redundant. User-authored drifts bypass the
+        # gate entirely so they don't stamp here.
+        if (drift.authored_by or "").lower() != "user":
+            key = (drift.kind.value, drift.current_task_id or "")
+            session.last_addressed_revision_by_drift_key[key] = int(
+                revised.revision_index
+            )
         # goldfive#152: refresh the orchestration-state current plan id
         # so downstream reads see the revised id, not the stale one.
         _ostate.set_current_plan(session.state, revised)
