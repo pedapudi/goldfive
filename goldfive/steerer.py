@@ -236,7 +236,6 @@ def compose_corrective_user_message(
     *,
     drift: DriftEvent,
     refined_plan: Plan | None,
-    observed_actions: list[Any] | None = None,  # noqa: ARG001
 ) -> str:
     """Build a short directive user message for Level 3 re-invoke.
 
@@ -244,12 +243,6 @@ def compose_corrective_user_message(
     message is deliberately short, action-focused, and avoids goldfive
     jargon -- the consumer is the agent's LLM, which should read a
     natural instruction rather than a framework postmortem.
-
-    ``observed_actions`` is accepted for forward-compat with
-    goldfive#144 (PLAN_DIVERGENCE refine with observed_actions=...) but
-    is NOT interpolated today -- the planner owns action summarization
-    and the composer just stitches drift + refined plan. Adding the
-    parameter now keeps the signature stable when #144 lands.
     """
     current = drift.current_task_id or "the current task"
     next_title = _next_pending_task_title(refined_plan) or "the next planned step"
