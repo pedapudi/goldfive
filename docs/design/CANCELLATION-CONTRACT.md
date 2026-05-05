@@ -1,5 +1,10 @@
 # Cancellation propagation contract
 
+See [CONTROL-CHANNEL.md](CONTROL-CHANNEL.md) for the actor-model
+context: cancellations propagate as part of channel-mediated plan
+revisions, and the audit catalog below covers the channel-processor
+sites where post-cancel state stash must survive `CancelledError`.
+
 **Status.** Phase 3 Addition A of goldfive#271. Sibling to
 [`STATE-OWNERSHIP-CONTRACT.md`](STATE-OWNERSHIP-CONTRACT.md).
 

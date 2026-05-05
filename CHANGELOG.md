@@ -4,6 +4,11 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ## Unreleased — 2026-04-27
 
+### Architecture
+
+- Adopted actor-model architecture for plan-state mutations; see
+  [docs/design/CONTROL-CHANNEL.md](docs/design/CONTROL-CHANNEL.md).
+
 ### Drift
 
 - **Retire `CONFUSION` (regex-based reasoning drift detector).**

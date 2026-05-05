@@ -1,5 +1,10 @@
 # Drift
 
+See [CONTROL-CHANNEL.md](CONTROL-CHANNEL.md) for the actor-model
+context: every drift verdict carries `observed_revision_index` and
+is rejected at dispatch if the plan has advanced past the epoch the
+verdict observed.
+
 A **drift** is a structured observation that execution has diverged
 from the plan. goldfive treats drift as first-class: it has a
 taxonomy, a severity, a classification function, and a refine policy

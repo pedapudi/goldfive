@@ -1,5 +1,10 @@
 # Plan lifecycle & refinement contract
 
+See [CONTROL-CHANNEL.md](CONTROL-CHANNEL.md) for the actor-model
+context: every revision documented below is applied inside the
+channel processor (the actor's serialization point), and `Plan` /
+`Task` are immutable so each revision is an atomic epoch swap.
+
 This document specifies goldfive's **plan-level** state machine — how a
 Plan evolves across refinements, what a refined plan must preserve
 relative to the plan it replaces, and what "run complete" actually
