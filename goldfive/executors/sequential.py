@@ -125,6 +125,44 @@ def _tag_adapter_cancel_user_steer(adapter: Any, session: Any = None) -> None:
         )
 
 
+async def _drain_steerer_at_run_boundary(
+    steerer: Any, session: Session
+) -> None:
+    """Drain pending background drift / judge tasks tagged for ``session``.
+
+    Goldfive#243. The steerer's ``_background_drifts`` /
+    ``_background_judges`` sets used to be drained only by
+    :meth:`Steerer.shutdown`, which on long-running adk-web /
+    shared-Runner deployments is invoked at process shutdown — NOT
+    between user turns. A drift cascade dispatched at the end of turn
+    N (e.g. a JUSTIFIED_DEVIATION refine triggered from a ``report_*``
+    tool) outlived turn N's RunAborted / RunCompleted and ran against
+    an abandoned session, burning compute on retry-buried HTTP
+    attempts and emitting spurious post-abort drifts. This helper is
+    invoked by :class:`SequentialExecutor` immediately before each
+    terminal ``run_aborted_event`` / ``run_completed_event`` emission
+    so the drain is symmetric with the run lifecycle.
+
+    Duck-typed: custom :class:`~goldfive.protocols.Steerer`
+    implementations that don't expose
+    ``drain_session_background_tasks`` fall through cleanly. The
+    default (:class:`~goldfive.steerer.DefaultSteerer`) does expose
+    it; bounded wait + cancel-stragglers semantics match the existing
+    :meth:`shutdown` drain.
+    """
+    drain = getattr(steerer, "drain_session_background_tasks", None)
+    if not callable(drain):
+        return
+    try:
+        await drain(session_id=session.id)
+    except Exception as exc:  # noqa: BLE001 — never block run termination
+        log.warning(
+            "SequentialExecutor: steerer.drain_session_background_tasks "
+            "raised at run boundary (swallowed): %s",
+            exc,
+        )
+
+
 _DEFAULT_MAX_NUDGE_REPLAYS: int = 3
 
 
@@ -660,6 +698,10 @@ class SequentialExecutor(Executor):
         # ------------------------------------------------------------------
 
         if run_failed:
+            # goldfive#243: drain any background drift / judge tasks the
+            # steerer dispatched mid-run before the terminal emission.
+            # See ``_drain_steerer_at_run_boundary`` docstring.
+            await _drain_steerer_at_run_boundary(steerer, session)
             await emit(
                 sinks,
                 run_aborted_event(
@@ -686,6 +728,7 @@ class SequentialExecutor(Executor):
                 f"exhausted max_task_invocations={self.max_task_invocations} "
                 f"with pending task {remaining.id}"
             )
+            await _drain_steerer_at_run_boundary(steerer, session)
             await emit(
                 sinks,
                 run_aborted_event(
@@ -708,6 +751,7 @@ class SequentialExecutor(Executor):
                 "one or more tasks failed without a live replacement "
                 f"(fail_fast=False): {', '.join(tid for tid in fatally_failed if tid)}"
             )
+            await _drain_steerer_at_run_boundary(steerer, session)
             await emit(
                 sinks,
                 run_aborted_event(
@@ -762,6 +806,7 @@ class SequentialExecutor(Executor):
                 sinks,
                 _plan_divergence_drift_event(session, reason),
             )
+            await _drain_steerer_at_run_boundary(steerer, session)
             await emit(
                 sinks,
                 run_aborted_event(
@@ -779,6 +824,7 @@ class SequentialExecutor(Executor):
         # False or raises fails the run with a descriptive reason.
         unmet = evaluate_goal_predicates(session)
         if unmet is not None:
+            await _drain_steerer_at_run_boundary(steerer, session)
             await emit(
                 sinks,
                 run_aborted_event(
@@ -790,6 +836,7 @@ class SequentialExecutor(Executor):
             )
             return ExecutionOutcome(success=False, session=session, reason=unmet)
 
+        await _drain_steerer_at_run_boundary(steerer, session)
         await emit(
             sinks,
             run_completed_event(
@@ -1005,6 +1052,10 @@ class SequentialExecutor(Executor):
                 # handles PENDING tasks. Clear the transient prefix so
                 # it doesn't leak to a subsequent run.
                 session._last_cancel_reason_prefix = ""
+                # goldfive#243: drain any background drift / judge tasks
+                # the steerer dispatched mid-run before the terminal
+                # emission. See ``_drain_steerer_at_run_boundary``.
+                await _drain_steerer_at_run_boundary(steerer, session)
                 await emit(
                     sinks,
                     run_aborted_event(
@@ -1019,6 +1070,7 @@ class SequentialExecutor(Executor):
                 exc = payload
                 failure_reason = f"adapter.invoke_passthrough raised: {exc}"
                 log.exception("SequentialExecutor._run_overlay: passthrough raised")
+                await _drain_steerer_at_run_boundary(steerer, session)
                 await emit(
                     sinks,
                     run_aborted_event(
@@ -1192,6 +1244,7 @@ class SequentialExecutor(Executor):
                 "one or more tasks failed without a live replacement: "
                 f"{', '.join(tid for tid in fatally_failed if tid)}"
             )
+            await _drain_steerer_at_run_boundary(steerer, session)
             await emit(
                 sinks,
                 run_aborted_event(
@@ -1205,6 +1258,7 @@ class SequentialExecutor(Executor):
 
         unmet = evaluate_goal_predicates(session)
         if unmet is not None:
+            await _drain_steerer_at_run_boundary(steerer, session)
             await emit(
                 sinks,
                 run_aborted_event(
@@ -1216,6 +1270,7 @@ class SequentialExecutor(Executor):
             )
             return ExecutionOutcome(success=False, session=session, reason=unmet)
 
+        await _drain_steerer_at_run_boundary(steerer, session)
         await emit(
             sinks,
             run_completed_event(
