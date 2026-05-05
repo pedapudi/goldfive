@@ -28,6 +28,7 @@ class DriftEvent:
     current_task_id: str = ""
     current_agent_id: str = ""
     raw: Any = None          # original trigger (event, exception, tool call)
+    observed_revision_index: int = 0  # plan revision the detector saw (#245)
 ```
 
 `kind` and `severity` together determine whether refine runs. `detail`
@@ -35,7 +36,11 @@ is the human-readable one-liner that flows through to the UI / logs /
 planner prompt. `current_task_id` and `current_agent_id` are filled in
 from `session` at emission time. `raw` is the trigger — a tool error,
 an adapter-streamed block, a reporting-tool call — preserved for
-post-hoc analysis.
+post-hoc analysis. `observed_revision_index` is the
+`session.plan.revision_index` value the detector observed at
+observation time (BEFORE any LLM await it performs); the dispatch
+gate consults it to drop stale verdicts. See
+[Verdict freshness](#verdict-freshness-goldfive245) below.
 
 ## Severity levels
 
@@ -389,6 +394,95 @@ Four invariants govern the refine path:
    skips refine — the prior refine already addressed it). The whole
    table resets every `run_started` boundary
    (`DefaultSteerer.reset_for_turn`).
+
+## Verdict freshness (goldfive#245)
+
+LLM-as-a-judge detectors (the trajectory-level `classify_goal_drift`,
+the per-thinking-message reasoning judge) take milliseconds to seconds
+to round-trip. During that window the reconciler can transition tasks
+under the judge: a `mark_task_completed` flips PENDING → COMPLETED, a
+`PlanRevised` bumps `Plan.revision_index`. The brussels-sprouts and
+tomato e2e sessions exposed the resulting false-positive class — the
+1:13 GOAL_DRIFT in tomato said *"drafting still pending"* against a
+state where draft was already DONE because the prompt's task block was
+materialised BEFORE the LLM await and the live plan moved during the
+round-trip.
+
+The structural fix has three layers:
+
+1. **Observation-time stamp on `DriftEvent`.** Every detector that
+   constructs a `DriftEvent` captures
+   `session.plan.revision_index` at the TOP of its function (BEFORE
+   any `await call_llm(...)`) and stamps it onto
+   `DriftEvent.observed_revision_index`. The synchronous primitive
+   classifiers (`classify_tool_error`, `classify_refusal`,
+   `classify_stop_reason`, `classify_confabulation_risk`) are stamped
+   at their nearest call-site that has access to the session
+   (`DefaultSteerer.detect_drift`, the ADK plugin's
+   `_maybe_emit_confabulation_risk`). Default `0` means "unset /
+   pre-#245" so external producers and serialised events from older
+   code path emit the unset sentinel and are treated as legacy.
+
+2. **Dispatch-time gate (per-(kind, target) addressed-watermark).**
+   The TOP of `DefaultSteerer._handle_drift` (after the
+   `authored_by` normalisation, before the cancel-tag and the
+   ladder dispatch) compares the drift's stamp against a per-key
+   watermark — NOT the global live `revision_index`. The watermark
+   is `Session.last_addressed_revision_by_drift_key`, keyed by
+   `(drift.kind.value, drift.current_task_id or "")` and stamped
+   inside `_apply_revision` after every successful goldfive-authored
+   refine. When the drift's `observed_revision_index` is strictly
+   less than the watermark for its (kind, target), the verdict is
+   *redundant* — the system has already addressed this specific
+   concern at a later revision — and the gate emits `DriftDetected`
+   for observability while skipping the cancel + refine machinery.
+
+   Per-(kind, target) gating is narrower than naive `observed <
+   live_revision` gating, which would over-reject parallel judges
+   firing on orthogonal concerns: a `GOAL_DRIFT` verdict observed at
+   revision N is NOT invalidated by an unrelated `OFF_TOPIC` refine
+   that produced revision N+1 — they're distinct claims. The
+   per-key watermark drops only verdicts whose specific `(kind,
+   target)` was already addressed.
+
+   Trajectory-level drifts (no `current_task_id`) coalesce on the
+   `""` empty-target key, so trajectory-wide addressing applies
+   correctly across all such verdicts.
+
+   Bypasses:
+
+   * **Unstamped drifts** (`observed_revision_index == 0`) flow
+     through unchanged — back-compat for legacy / external
+     producers.
+   * **User-authored drifts** (`USER_STEER` / `USER_CANCEL` /
+     `USER_PAUSE`, `authored_by == "user"`) bypass the gate even
+     when stamped — operator directives must be honoured regardless
+     of the framework's plan-state cursor (preserves the iter-11D /
+     #242 contract). User-authored drifts also do NOT stamp the
+     watermark, so a user redirect doesn't suppress orthogonal
+     goldfive concerns observed before the redirect.
+
+3. **Post-LLM re-read in the goal-drift judge.** After
+   `classify_goal_drift`'s LLM call returns,
+   `goldfive/drift/goals.py` re-reads `session.plan` and drops the
+   verdict when:
+
+   * the verdict's reason text names a specific plan-task id and
+     that task has transitioned out of PENDING during the
+     round-trip, OR
+   * the verdict is generic ("drafting", "research", no id) AND
+     either `revision_index` advanced OR the `(task.id, task.status)`
+     set materially changed since the snapshot the judge saw.
+
+   The dispatch-time gate (layer 2) is the second line of defence;
+   it picks up stale verdicts even when the detector didn't run this
+   re-read (custom detectors, future judges).
+
+The proto wire surface mirrors the dataclass: `DriftDetected`
+carries an `observed_revision_index` field
+(`proto/goldfive/v1/events.proto`) so sinks rendering a Gantt /
+timeline can render the verdict-vs-revision delta and dedup
+gate-skipped emits.
 
 ## Tool-call drift classification
 

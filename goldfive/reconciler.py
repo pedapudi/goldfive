@@ -587,12 +587,21 @@ class PlanReconciler:
             f"assigned to this agent"
         )
         self.divergence_events.append(detail)
+        # goldfive#245 — stamp observation-time plan revision so the
+        # dispatch-time gate can drop a stale verdict.
+        _gf_plan = getattr(self._session, "plan", None)
+        _observed_rev = (
+            int(getattr(_gf_plan, "revision_index", 0) or 0)
+            if _gf_plan is not None
+            else 0
+        )
         drift = DriftEvent(
             kind=DriftKind.PLAN_DIVERGENCE,
             severity=DriftSeverity.INFO,
             detail=detail,
             current_task_id=self._session.current_task_id or "",
             current_agent_id=agent_name,
+            observed_revision_index=_observed_rev,
         )
         # Prefer the steerer's internal _handle_drift (pre-built
         # DriftEvent → DriftDetected emission + refine policy). The

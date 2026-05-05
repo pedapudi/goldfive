@@ -335,6 +335,30 @@ message DriftDetected {
   // INFO -> WARNING" view read this without having to remember the
   // previous emit's severity themselves.
   DriftSeverity prev_severity = 14;
+  // Plan revision the detector observed when it minted this verdict
+  // (goldfive#245). Stamped at observation time from
+  // ``session.plan.revision_index``, BEFORE any LLM await the
+  // detector performs. Consumed by the dispatch-time gate in
+  // :meth:`DefaultSteerer._handle_drift`: when the session's plan
+  // revision_index has advanced past this value by the time the
+  // verdict arrives, the drift is a stale observation of a
+  // plan-state the system has moved past. The gate emits
+  // ``DriftDetected`` for observability and skips the cancel +
+  // refine machinery.
+  //
+  // Default ``0`` means "unset / pre-#245". Treat as a no-op for
+  // gating: external producers and serialised events from older code
+  // path emit ``0`` and continue to flow through the dispatch path
+  // unchanged. User-authored drifts (USER_STEER / USER_CANCEL /
+  // USER_PAUSE) additionally bypass the gate regardless of the stamp,
+  // preserving the iter-11D / #242 contract that operator directives
+  // are honoured even when the framework's plan-state cursor has
+  // advanced.
+  //
+  // Recorded as ``int32`` for parity with
+  // ``TaskTransitioned.revision_stamp``; negative values are not
+  // produced.
+  int32 observed_revision_index = 15;
 }
 
 // Terminal event on a successful run.

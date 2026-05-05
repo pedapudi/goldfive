@@ -669,12 +669,26 @@ class GoldfivePlanner(BasePlanner):
         state = _extract_state(callback_context)
         current_task_id = _state_get(state, KEY_CURRENT_TASK_ID, "")
 
+        # goldfive#245 — stamp observation-time plan revision so the
+        # dispatch-time gate drops the verdict if the plan moved.
+        _session_for_rev = self._session
+        _gf_plan = (
+            getattr(_session_for_rev, "plan", None)
+            if _session_for_rev is not None
+            else None
+        )
+        _observed_rev = (
+            int(getattr(_gf_plan, "revision_index", 0) or 0)
+            if _gf_plan is not None
+            else 0
+        )
         drift = DriftEvent(
             kind=kind,
             severity=DriftSeverity.WARNING,
             detail=detail,
             current_task_id=current_task_id,
             current_agent_id=function_call_name,
+            observed_revision_index=_observed_rev,
         )
         handle = getattr(steerer, "_handle_drift", None)
         if not callable(handle):

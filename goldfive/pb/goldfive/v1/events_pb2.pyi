@@ -206,7 +206,7 @@ class TaskCancelled(_message.Message):
     def __init__(self, task_id: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
 
 class DriftDetected(_message.Message):
-    __slots__ = ("kind", "severity", "detail", "current_task_id", "current_agent_id", "annotation_id", "id", "trigger_input", "authored_by", "suppressed_by_user_steer", "condition_id", "lifecycle", "prev_severity")
+    __slots__ = ("kind", "severity", "detail", "current_task_id", "current_agent_id", "annotation_id", "id", "trigger_input", "authored_by", "suppressed_by_user_steer", "condition_id", "lifecycle", "prev_severity", "observed_revision_index")
     KIND_FIELD_NUMBER: _ClassVar[int]
     SEVERITY_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
@@ -220,6 +220,7 @@ class DriftDetected(_message.Message):
     CONDITION_ID_FIELD_NUMBER: _ClassVar[int]
     LIFECYCLE_FIELD_NUMBER: _ClassVar[int]
     PREV_SEVERITY_FIELD_NUMBER: _ClassVar[int]
+    OBSERVED_REVISION_INDEX_FIELD_NUMBER: _ClassVar[int]
     kind: _types_pb2.DriftKind
     severity: _types_pb2.DriftSeverity
     detail: str
@@ -233,7 +234,8 @@ class DriftDetected(_message.Message):
     condition_id: str
     lifecycle: _types_pb2.DriftLifecycle
     prev_severity: _types_pb2.DriftSeverity
-    def __init__(self, kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., detail: _Optional[str] = ..., current_task_id: _Optional[str] = ..., current_agent_id: _Optional[str] = ..., annotation_id: _Optional[str] = ..., id: _Optional[str] = ..., trigger_input: _Optional[str] = ..., authored_by: _Optional[str] = ..., suppressed_by_user_steer: bool = ..., condition_id: _Optional[str] = ..., lifecycle: _Optional[_Union[_types_pb2.DriftLifecycle, str]] = ..., prev_severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ...) -> None: ...
+    observed_revision_index: int
+    def __init__(self, kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., detail: _Optional[str] = ..., current_task_id: _Optional[str] = ..., current_agent_id: _Optional[str] = ..., annotation_id: _Optional[str] = ..., id: _Optional[str] = ..., trigger_input: _Optional[str] = ..., authored_by: _Optional[str] = ..., suppressed_by_user_steer: bool = ..., condition_id: _Optional[str] = ..., lifecycle: _Optional[_Union[_types_pb2.DriftLifecycle, str]] = ..., prev_severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., observed_revision_index: _Optional[int] = ...) -> None: ...
 
 class RunCompleted(_message.Message):
     __slots__ = ("outcome_summary",)

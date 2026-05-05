@@ -3875,6 +3875,18 @@ def make_adk_plugin(
             )
             if drift is None:
                 return
+            # goldfive#245 — stamp observation-time plan revision so the
+            # dispatch-time gate can drop a stale verdict if the plan
+            # advanced between observation and dispatch.
+            try:
+                _gf_session = ctx.session
+                _gf_plan = getattr(_gf_session, "plan", None) if _gf_session is not None else None
+                if _gf_plan is not None and not drift.observed_revision_index:
+                    drift.observed_revision_index = int(
+                        getattr(_gf_plan, "revision_index", 0) or 0
+                    )
+            except Exception:  # noqa: BLE001 — best-effort stamp
+                pass
             observation = _as_observation(
                 kind="confabulation_risk",
                 detail=drift.detail,
@@ -3956,12 +3968,24 @@ def make_adk_plugin(
                 f"{from_agent or '?'} -> {to_agent or '?'} at invocation "
                 f"{invocation_id or '?'}"
             )
+            # goldfive#245 — stamp the plan revision the detector
+            # observes BEFORE any dispatch await so the dispatch-time
+            # gate can drop a stale verdict if the plan advances.
+            _gf_plan = (
+                getattr(ctx.session, "plan", None) if ctx.session is not None else None
+            )
+            _observed_rev = (
+                int(getattr(_gf_plan, "revision_index", 0) or 0)
+                if _gf_plan is not None
+                else 0
+            )
             drift = DriftEvent(
                 kind=DriftKind.RUNAWAY_DELEGATION,
                 severity=DriftSeverity.CRITICAL,
                 detail=detail,
                 current_task_id=task_id,
                 current_agent_id=from_agent or self._host_agent_name,
+                observed_revision_index=_observed_rev,
             )
             # Prefer _handle_drift so the full refine/emit path fires.
             handle = getattr(steerer, "_handle_drift", None)
@@ -4041,12 +4065,24 @@ def make_adk_plugin(
                 f"pin_unresolved: {tool_name} for agent={agent_name or '?'}; "
                 f"candidates=[{', '.join(candidate_ids)}]"
             )
+            # goldfive#245 — stamp observation-time plan revision (no
+            # dispatch path here, but kept for shape parity with other
+            # observation-emitted drifts and so a sink dedup can match).
+            _gf_plan = (
+                getattr(ctx.session, "plan", None) if ctx.session is not None else None
+            )
+            _observed_rev = (
+                int(getattr(_gf_plan, "revision_index", 0) or 0)
+                if _gf_plan is not None
+                else 0
+            )
             drift = DriftEvent(
                 kind=DriftKind.OFF_TOPIC,
                 severity=DriftSeverity.WARNING,
                 detail=detail,
                 current_task_id=str(_safe_attr(ctx.task, "id", "") or ""),
                 current_agent_id=agent_name or self._host_agent_name,
+                observed_revision_index=_observed_rev,
             )
             # Direct sink emission (bypass _handle_drift): this signal is
             # purely observability — no refine needed. A pin_unresolved
@@ -4423,6 +4459,13 @@ def make_adk_plugin(
             # effort: any failure must not block the cancel-flag write.
             if steerer is not None and session is not None:
                 try:
+                    # goldfive#245 — stamp observation-time plan revision.
+                    _gf_plan = getattr(session, "plan", None)
+                    _observed_rev = (
+                        int(getattr(_gf_plan, "revision_index", 0) or 0)
+                        if _gf_plan is not None
+                        else 0
+                    )
                     drift = DriftEvent(
                         kind=DriftKind.LLM_CALL_TIMEOUT,
                         severity=DriftSeverity.CRITICAL,
@@ -4433,6 +4476,7 @@ def make_adk_plugin(
                         ),
                         current_task_id=str(_safe_attr(getattr(ctx, "task", None), "id", "") or ""),
                         current_agent_id=self._host_agent_name or "",
+                        observed_revision_index=_observed_rev,
                     )
                     observation = _as_observation(
                         kind="llm_call_timeout",
@@ -5428,12 +5472,24 @@ def make_adk_plugin(
                 # tool_args may be None / missing on adapter edge cases;
                 # the tracker's hash helper copes with both.
                 args_payload = tool_args if isinstance(tool_args, Mapping) else {}
+                # goldfive#245 — stamp the plan-revision the detector
+                # observes so the dispatch-time gate in
+                # :meth:`DefaultSteerer._handle_drift` can drop verdicts
+                # whose observed revision is older than the live plan's.
+                _gf_session = ctx.session
+                _gf_plan = getattr(_gf_session, "plan", None) if _gf_session is not None else None
+                _observed_rev = (
+                    int(getattr(_gf_plan, "revision_index", 0) or 0)
+                    if _gf_plan is not None
+                    else 0
+                )
                 drifts = self._tool_loop_tracker.observe_tool_call(
                     invocation_id=inv_id,
                     agent_name=agent_name,
                     tool_name=tool_name,
                     args=dict(args_payload),
                     task_id=task_id,
+                    observed_revision_index=_observed_rev,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.debug(

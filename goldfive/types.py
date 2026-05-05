@@ -933,6 +933,30 @@ class DriftEvent:
     # ran; the cancel-in-flight + refine + restart-message machinery is
     # elided. Always ``False`` on user-authored drifts.
     suppressed_by_user_steer: bool = False
+    # goldfive#245 — plan revision the detector observed when it minted
+    # this verdict. Stamped at observation time (before any LLM await
+    # the detector performs) from ``session.plan.revision_index`` if a
+    # plan exists, else 0. Consumed by the dispatch-time gate in
+    # :meth:`DefaultSteerer._handle_drift`: when the session has moved
+    # to a strictly-greater revision_index by the time the verdict
+    # arrives, the drift is a stale verdict against a plan-state the
+    # system has moved past — the gate emits ``DriftDetected`` for
+    # observability and skips the cancel + refine machinery.
+    #
+    # Default ``0`` means "unset / pre-#245" so external producers and
+    # serialised events from older code do not crash, and so the gate
+    # is a no-op for unstamped legacy events (the gate is keyed on a
+    # truthy stamp). User-authored drifts (USER_STEER / USER_CANCEL /
+    # USER_PAUSE) bypass the gate unconditionally to preserve the
+    # iter-11D / #242 contract that operator directives are honoured
+    # regardless of the framework's plan-state cursor.
+    #
+    # Stamp sites: every detector that constructs a ``DriftEvent``
+    # captures ``session.plan.revision_index`` at the TOP of its
+    # function, BEFORE any ``await call_llm(...)``, so the LLM
+    # round-trip cannot move the cursor between observation and emit
+    # without the gate noticing.
+    observed_revision_index: int = 0
 
 
 @dataclasses.dataclass
@@ -1084,6 +1108,22 @@ class Session:
     # ``refine_failure_counts`` field — the lock-free pattern is the
     # established contract, not a regression.
     refine_outcomes: dict[tuple[str, str], RefineOutcome] = dataclasses.field(default_factory=dict)
+    # goldfive#245 follow-up — per-(drift_kind, target_task_id) watermark
+    # of the most recent revision_index that successfully addressed a
+    # drift of this shape. Read by ``DefaultSteerer._handle_drift``'s
+    # verdict-freshness gate to detect *redundant* verdicts only:
+    # naive ``observed_revision_index < live_revision_index`` over-rejects
+    # parallel judges firing on orthogonal concerns (a GOAL_DRIFT verdict
+    # observed at revision N is not invalidated by a later OFF_TOPIC
+    # refine that produced revision N+1 — they're distinct claims). The
+    # gate compares ``observed_revision_index`` against this per-key
+    # watermark instead, so only same-(kind, target) verdicts observed
+    # *before* a same-key addressing pass get dropped. Stamped in
+    # ``_apply_revision`` (only for non-user drifts; user-authored
+    # drifts bypass the gate so they don't need to stamp). Key is
+    # ``(drift.kind.value, drift.current_task_id or "")`` — empty target
+    # captures trajectory-level drifts that coalesce on a single key.
+    last_addressed_revision_by_drift_key: dict[tuple[str, str], int] = dataclasses.field(default_factory=dict)
     # Per-task ``time.monotonic()`` timestamp of the most recent
     # task-progress signal — set on ``mark_task_running``,
     # ``mark_task_progress``, and every ``_emit_task_transitioned`` call.
