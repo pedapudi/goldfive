@@ -54,6 +54,8 @@ log = logging.getLogger(__name__)
 
 
 __all__ = [
+    "AGENT_TREE_BLOCK_MAX_CHARS",
+    "AGENT_TREE_SYSTEM_PROMPT_SUFFIX",
     "CallLLM",
     "PLAN_TASKS_SUMMARY_MAX_CHARS",
     "REASONING_JUDGE_MAX_OUTPUT_TOKENS",
@@ -67,6 +69,7 @@ __all__ = [
     "ReasoningJudgeVerdict",
     "classify_reasoning_drift",
     "classify_reasoning_drift_with_focus",
+    "format_available_agents_block",
     "format_plan_tasks_summary",
     "truncate_for_observability",
 ]
@@ -399,6 +402,7 @@ def format_plan_tasks_summary(
     plan: Plan | None,
     *,
     max_chars: int = PLAN_TASKS_SUMMARY_MAX_CHARS,
+    available_agents: Any = None,
 ) -> str:
     """Render ``plan.tasks`` as a one-per-line ``id -> title`` summary.
 
@@ -411,9 +415,34 @@ def format_plan_tasks_summary(
     head of the list (most recently planned tasks tend to be most
     relevant for a "what is the agent working on right now?" judgement
     — they are at the front of typical refines).
+
+    ``available_agents`` (goldfive#244) is the structured tree (same
+    shape as
+    :attr:`goldfive.adapters.adk.ADKAdapter.available_agents_tree`).
+    When provided AND non-empty, lines are extended with the task's
+    ``assignee_agent_id`` and a comma-separated list of that
+    assignee's known sub-agents — so the judge can see at a glance
+    that a coordinator-style assignee is allowed to delegate to its
+    sub-agents for that task. Default ``None`` produces the byte-
+    identical pre-#244 ``id -> title`` rendering required for back-
+    compat with existing prompt assertions and external callers.
     """
     if plan is None or not getattr(plan, "tasks", None):
         return "(no plan tasks)"
+    # Build a parent -> [child names] index from the agent tree once
+    # so per-line lookup is O(1). Falsy / non-tree inputs short-circuit
+    # to the legacy render (byte-identical pre-#244).
+    children_by_parent: dict[str, list[str]] = {}
+    has_tree = False
+    if available_agents and isinstance(available_agents, (list, tuple)):
+        for entry in available_agents:
+            if isinstance(entry, dict) and "name" in entry:
+                has_tree = True
+                parent = str(entry.get("parent", "") or "")
+                name = str(entry.get("name", "") or "")
+                if not name or not parent:
+                    continue
+                children_by_parent.setdefault(parent, []).append(name)
     lines: list[str] = []
     rendered_chars = 0
     truncated = 0
@@ -421,7 +450,22 @@ def format_plan_tasks_summary(
     for i, task in enumerate(tasks):
         tid = str(getattr(task, "id", "") or "")
         title = str(getattr(task, "title", "") or "(untitled)")
-        line = f"- {tid} -> {title}" if tid else f"- (no id) -> {title}"
+        if has_tree:
+            assignee = str(getattr(task, "assignee_agent_id", "") or "").strip()
+            base = f"- {tid} -> {title}" if tid else f"- (no id) -> {title}"
+            if assignee:
+                kids = children_by_parent.get(assignee, [])
+                if kids:
+                    line = (
+                        f"{base} [assignee={assignee}; "
+                        f"delegates to: {', '.join(kids)}]"
+                    )
+                else:
+                    line = f"{base} [assignee={assignee}]"
+            else:
+                line = base
+        else:
+            line = f"- {tid} -> {title}" if tid else f"- (no id) -> {title}"
         if rendered_chars + len(line) + 1 > max_chars and lines:
             truncated = len(tasks) - i
             break
@@ -431,6 +475,141 @@ def format_plan_tasks_summary(
         lines.append(f"... [{truncated} more task(s) elided]")
     if not lines:
         return "(no plan tasks)"
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# goldfive#244 — agent-tree section
+# ---------------------------------------------------------------------------
+#
+# When the steerer can resolve the wrapped agent tree (typically via
+# :attr:`goldfive.adapters.adk.ADKAdapter.available_agents_tree`), we
+# render a separate "AGENT TREE" section into the judge prompt and append
+# a one-paragraph clarification to the system prompt. Without this
+# context the judge cannot distinguish a coordinator-style agent
+# delegating to its known sub-agent (legitimate goldfive.wrap usage —
+# see ``feedback_goldfive_wrap_contract.md``) from arbitrary off-plan
+# work, and it tends to fire OFF_TOPIC for the legitimate case (see
+# brussels-sprouts session OFF_TOPIC at 0:26: "agent deviates from the
+# plan by invoking an unlisted web_developer_agent instead of proceeding
+# to the draft_slides task" — web_developer_agent was a known sub-agent
+# of coordinator_agent in the wrapped tree).
+#
+# This is purely additional CONTEXT — the judge still decides. We do
+# NOT mutate the existing user-prompt template (existing tests render
+# it via ``.format(...)`` with the current key set; introducing a new
+# placeholder breaks them) and we do NOT add regex / structural pre-
+# gates. The default-``available_agents=None`` path produces the
+# byte-identical pre-#244 prompt so existing tests, classifications,
+# and external callers see no behavioural change.
+
+#: Hard cap on the rendered AGENT TREE section. ~1200 chars (~300
+#: tokens) keeps the prompt bounded for very large trees while leaving
+#: enough room to enumerate ~25-40 named agents at typical name length.
+AGENT_TREE_BLOCK_MAX_CHARS: int = 1200
+
+
+#: System-prompt suffix appended ONLY when ``available_agents`` is
+#: provided. Strengthens the on-task definition so the judge does not
+#: treat sub-agent delegation as an off-plan deviation. Kept as a
+#: separate constant so operators can A/B the wording without forking
+#: :data:`REASONING_DRIFT_SYSTEM_PROMPT`.
+AGENT_TREE_SYSTEM_PROMPT_SUFFIX: str = (
+    " The user prompt may include an AGENT TREE section listing the "
+    "wrapped agents and their parent/child relationships. If the agent "
+    "in question invokes a known sub-agent (per that tree) to perform "
+    "its assigned task, treat that as ON-TASK execution of the bound "
+    "task — delegation is normal coordinator behaviour and is NOT a "
+    "deviation. Mark a deviation only when the agent invokes something "
+    "not in the tree, or when its reasoning wanders semantically away "
+    "from the bound task and goals."
+)
+
+
+def format_available_agents_block(
+    available_agents: Any,
+    *,
+    max_chars: int = AGENT_TREE_BLOCK_MAX_CHARS,
+) -> str:
+    """Render the AGENT TREE section listing parent/child relationships.
+
+    ``available_agents`` mirrors the shape exposed by
+    :attr:`goldfive.adapters.adk.ADKAdapter.available_agents_tree`: a
+    list of dicts with at least a ``name`` key and optionally
+    ``parent``, ``role``, ``kind``, ``depth``. The legacy ``list[str]``
+    form (plain agent names without tree edges) is also accepted for
+    parity with the planner's :func:`LLMPlanner._render_agents_block`;
+    string entries render as bullets without a "delegates to" suffix
+    because we don't have edge data.
+
+    Empty / ``None`` inputs yield ``""`` so the caller can short-circuit
+    on the empty string and skip appending the section entirely (the
+    default-None code path stays byte-identical to pre-#244).
+
+    Truncation: when the rendered text would exceed ``max_chars`` we
+    drop suffix lines and append a ``"... [N more agent(s) elided]"``
+    marker so the judge knows the listing is incomplete. Bounded so a
+    pathologically deep tree cannot blow the prompt budget.
+    """
+    if not available_agents:
+        return ""
+    if not isinstance(available_agents, (list, tuple)):
+        return ""
+    structured: list[dict[str, Any]] = []
+    flat_names: list[str] = []
+    for entry in available_agents:
+        if isinstance(entry, dict) and "name" in entry:
+            structured.append(entry)
+        elif isinstance(entry, str) and entry:
+            flat_names.append(entry)
+    if not structured and not flat_names:
+        return ""
+    lines: list[str] = []
+    truncated = 0
+    rendered_chars = 0
+    if structured:
+        # Index children by parent name (order-preserving).
+        children_by_parent: dict[str, list[str]] = {}
+        for entry in structured:
+            parent = str(entry.get("parent", "") or "")
+            name = str(entry.get("name", "") or "")
+            if not name:
+                continue
+            children_by_parent.setdefault(parent, []).append(name)
+        for i, entry in enumerate(structured):
+            name = str(entry.get("name", "") or "")
+            if not name:
+                continue
+            kids = children_by_parent.get(name, [])
+            role = str(entry.get("role", "") or "")
+            kind = str(entry.get("kind", "") or "")
+            meta_bits: list[str] = []
+            if role:
+                meta_bits.append(f"role={role}")
+            if kind:
+                meta_bits.append(f"kind={kind}")
+            meta = f" ({', '.join(meta_bits)})" if meta_bits else ""
+            if kids:
+                line = f"- {name}{meta} delegates to: {', '.join(kids)}"
+            else:
+                line = f"- {name}{meta}"
+            if rendered_chars + len(line) + 1 > max_chars and lines:
+                truncated = len(structured) - i
+                break
+            lines.append(line)
+            rendered_chars += len(line) + 1
+    else:
+        for i, name in enumerate(flat_names):
+            line = f"- {name}"
+            if rendered_chars + len(line) + 1 > max_chars and lines:
+                truncated = len(flat_names) - i
+                break
+            lines.append(line)
+            rendered_chars += len(line) + 1
+    if truncated > 0:
+        lines.append(f"... [{truncated} more agent(s) elided]")
+    if not lines:
+        return ""
     return "\n".join(lines)
 
 
@@ -543,6 +722,7 @@ async def classify_reasoning_drift(
     plan: Plan | None = None,
     task_lineage: dict[str, set[str]] | None = None,
     recent_tool_observations: list[dict[str, Any]] | None = None,
+    available_agents: list[str] | list[dict[str, Any]] | None = None,
 ) -> DriftEvent | None:
     """Ask an LLM-judge whether ``reasoning`` is on-task.
 
@@ -557,7 +737,10 @@ async def classify_reasoning_drift(
     goldfive#271 added an optional ``plan`` keyword that the extended
     function uses to render the plan-tasks attribution prompt; legacy
     callers can omit it and the prompt renders ``"(no plan tasks)"``
-    for that section.
+    for that section. goldfive#244 added an optional ``available_agents``
+    keyword that, when provided, surfaces the wrapped agent tree
+    (parent → sub-agents) so the judge does not flag legitimate
+    coordinator → sub-agent delegation as off-topic.
     """
     verdict = await classify_reasoning_drift_with_focus(
         reasoning=reasoning,
@@ -576,6 +759,7 @@ async def classify_reasoning_drift(
         plan=plan,
         task_lineage=task_lineage,
         recent_tool_observations=recent_tool_observations,
+        available_agents=available_agents,
     )
     return verdict.drift
 
@@ -598,6 +782,7 @@ async def classify_reasoning_drift_with_focus(
     plan: Plan | None = None,
     task_lineage: dict[str, set[str]] | None = None,
     recent_tool_observations: list[dict[str, Any]] | None = None,
+    available_agents: list[str] | list[dict[str, Any]] | None = None,
 ) -> ReasoningJudgeVerdict:
     """Ask an LLM-judge whether ``reasoning`` is on-task AND which task it works on.
 
@@ -696,7 +881,9 @@ async def classify_reasoning_drift_with_focus(
         recent_tool_observations, task_id=current_task_id
     )
     user = template.format(
-        plan_tasks_summary=format_plan_tasks_summary(plan),
+        plan_tasks_summary=format_plan_tasks_summary(
+            plan, available_agents=available_agents
+        ),
         goals_block=_format_goals(goals),
         task_block=_format_task(task),
         reasoning_block=_format_reasoning(reasoning),
@@ -705,6 +892,23 @@ async def classify_reasoning_drift_with_focus(
         tool_obs_block=tool_obs_block,
         tool_obs_count=tool_obs_count,
     )
+    # goldfive#244: when the steerer can resolve the wrapped agent tree,
+    # append a separate AGENT TREE section to the user prompt and a
+    # one-paragraph clarification to the system prompt. The default-None
+    # path skips both so existing callers / tests see the byte-identical
+    # pre-#244 prompt. We append (vs templating) so existing
+    # ``REASONING_DRIFT_USER_PROMPT_TEMPLATE.format(...)`` call sites
+    # don't need a new key. See module-level rationale at
+    # :data:`AGENT_TREE_SYSTEM_PROMPT_SUFFIX` for why this is purely
+    # additional context, never a structural pre-gate.
+    agent_tree_block = format_available_agents_block(available_agents)
+    if agent_tree_block:
+        user = (
+            f"{user}\n\nAGENT TREE (parent → sub-agents; sub-agent "
+            f"delegation by a listed parent is ON-TASK execution of "
+            f"the bound task):\n{agent_tree_block}"
+        )
+        system = f"{system}{AGENT_TREE_SYSTEM_PROMPT_SUFFIX}"
     started = time.monotonic()
     call_failed = False
     # Wrap the judge call in the shared LLM span helper so harmonograf

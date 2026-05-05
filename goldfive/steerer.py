@@ -1491,6 +1491,17 @@ class DefaultSteerer:
                 # :class:`ReasoningJudgeVerdict` instead of just the
                 # drift; legacy callers of ``analyze_reasoning`` keep
                 # their existing return shape.
+                #
+                # goldfive#244 — also forward the wrapped agent tree so
+                # the judge can recognise legitimate coordinator → sub-
+                # agent delegation as ON-TASK rather than OFF_TOPIC.
+                # Reuses the same shape the planner already consumes
+                # (``ADKAdapter.available_agents_tree``); legacy adapters
+                # without the property fall back to a flat
+                # ``available_agents`` list, and adapters with neither
+                # leave ``available_agents=None`` — the judge prompt
+                # then renders byte-identically to pre-#244.
+                judge_available_agents = self._resolve_available_agents()
                 verdict = await analyze_reasoning_with_focus(
                     text,
                     session,
@@ -1499,6 +1510,7 @@ class DefaultSteerer:
                     model=self._reasoning_drift_model,
                     sink=judge_sink,
                     agent_name=agent_name,
+                    available_agents=judge_available_agents,
                 )
             finally:
                 # Restore the live history. Any entries appended by
@@ -1727,6 +1739,35 @@ class DefaultSteerer:
         if len(text) <= limit:
             return text
         return text[:limit] + " … [truncated]"
+
+    def _resolve_available_agents(self) -> list[str] | list[dict[str, Any]] | None:
+        """Return the wrapped agent tree for a downstream prompt.
+
+        Mirrors the resolution used by ``_handle_drift`` when threading
+        ``available_agents`` into ``planner.refine``: prefer the
+        structured ``ADKAdapter.available_agents_tree`` (goldfive#151,
+        list of dicts with name/parent/role/kind/depth); fall back to
+        the flat ``available_agents`` (list[str]) when the structured
+        property is missing or empty; return ``None`` when the adapter
+        is missing or exposes neither surface.
+
+        Used by :meth:`_run_judge_background` to feed the reasoning
+        judge's :data:`~goldfive.drift.reasoning_judge.AGENT_TREE_BLOCK_MAX_CHARS`
+        bounded "AGENT TREE" prompt section (goldfive#244) so the judge
+        can recognise legitimate coordinator → sub-agent delegation as
+        ON-TASK rather than OFF_TOPIC. ``None`` keeps the judge's
+        prompt byte-identical to the pre-#244 shape.
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return None
+        tree = getattr(adapter, "available_agents_tree", None)
+        if isinstance(tree, list) and tree:
+            return list(tree)
+        flat = getattr(adapter, "available_agents", None)
+        if flat:
+            return list(flat)
+        return None
 
     def _maybe_take_reasoning_judge_slot(
         self,
