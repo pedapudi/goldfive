@@ -205,8 +205,8 @@ async def test_pipeline_does_not_fire_keyword_drift_in_embedding_mode(
 
 async def test_pipeline_off_mode_is_silent() -> None:
     """``mode="off"`` skips every mode-selected detector. The always-on
-    loop + confusion detectors live in the steerer (see
-    ``test_drift_reasoning.py::test_observe_reasoning_*``) and are not
+    loop detector lives in the steerer (see
+    ``test_drift_reasoning.py::test_observe_reasoning_*``) and is not
     consulted by :func:`analyze_reasoning` itself.
     """
     from goldfive.drift import _embed as _embed_mod

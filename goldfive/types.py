@@ -91,7 +91,14 @@ class DriftKind(StrEnum):
     LOOPING_TOOL_CALL = "looping_tool_call"
     LOOPING_REASONING = "looping_reasoning"
     REASONING_CLUSTER_TIGHTENING = "reasoning_cluster_tightening"
-    CONFUSION = "confusion"
+    # CONFUSION (proto value 28) was retired in this revert: a
+    # regex-based uncertainty-marker count over reasoning text is the
+    # exact NL-classification anti-pattern goldfive walked back twice
+    # already (#166 retired _GENERIC_VERB_PREFIX_RE, #167 retired
+    # _FACTUAL_QUESTION_RE). The reasoning judge (iter-10 three-state
+    # classifier) covers the same ground semantically and is robust to
+    # phrasing. Do NOT replace with another regex/keyword detector;
+    # if the signal is wanted back, teach the LLM judge.
     OFF_TOPIC = "off_topic"
     # INTENT_DIVERGENCE fires at a *variable* severity
     # (INFO / WARNING / CRITICAL) based on how far the reasoning has

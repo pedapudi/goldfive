@@ -342,7 +342,7 @@ async def test_looping_reasoning_alone_does_not_close_boundaries() -> None:
 
 
 async def test_non_terminal_drift_does_not_close_boundaries() -> None:
-    """A garden-variety drift (e.g. CONFUSION at WARNING) must not
+    """A garden-variety drift (e.g. AGENT_REFUSAL at WARNING) must not
     invoke the boundary-cleanup helper."""
     steerer, session, sink, plugin = _build_steerer_with_open_boundaries(
         ("inv-coordinator",),
@@ -350,9 +350,9 @@ async def test_non_terminal_drift_does_not_close_boundaries() -> None:
     await _open_boundaries(plugin, sink, ("inv-coordinator",))
 
     drift = DriftEvent(
-        kind=DriftKind.CONFUSION,
+        kind=DriftKind.AGENT_REFUSAL,
         severity=DriftSeverity.WARNING,
-        detail="model confused",
+        detail="model declined",
         current_task_id="t1",
         current_agent_id="coordinator",
     )

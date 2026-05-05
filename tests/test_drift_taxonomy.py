@@ -48,7 +48,6 @@ EXPECTED_DRIFT_KINDS = {
     "LOOPING_TOOL_CALL": "looping_tool_call",
     "LOOPING_REASONING": "looping_reasoning",
     "REASONING_CLUSTER_TIGHTENING": "reasoning_cluster_tightening",
-    "CONFUSION": "confusion",
     "OFF_TOPIC": "off_topic",
     "INTENT_DIVERGENCE": "intent_divergence",
     "UNCERTAIN_PROGRESS": "uncertain_progress",

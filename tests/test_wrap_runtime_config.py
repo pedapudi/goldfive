@@ -65,7 +65,7 @@ def _scrub_module_state(monkeypatch: pytest.MonkeyPatch) -> Any:
         "GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD",
         "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD",
         "GOLDFIVE_DRIFT_OFF_TOPIC_DISTANCE",
-        "GOLDFIVE_DRIFT_CONFUSION_MIN_HITS",
+        "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
         "GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL",
         "GOLDFIVE_GOAL_DRIFT_ACTIVITY_WINDOW",
     ):
@@ -99,7 +99,7 @@ def test_wrap_threads_runtime_config() -> None:
         ),
         reasoning_drift=ReasoningDriftConfig(
             off_topic_distance_threshold=0.55,
-            confusion_min_hits=6,
+            looping_reasoning_hash_window=9,
         ),
         goal_drift=GoalDriftConfig(check_interval=8, activity_window=25),
     )
@@ -112,7 +112,7 @@ def test_wrap_threads_runtime_config() -> None:
     assert _reasoning._CONFIG is cfg.reasoning_drift
     # The helper accessors honour the installed config.
     assert _reasoning._off_topic_distance_threshold() == 0.55
-    assert _reasoning._confusion_min_hits() == 6
+    assert cfg.reasoning_drift.looping_reasoning_hash_window == 9
 
     # Tool-loops module sees its sub-config.
     assert _tool_loops._CONFIG is cfg.tool_loops
@@ -164,7 +164,7 @@ def test_wrap_falls_back_to_from_env_when_runtime_none(
     monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL", "11")
     monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_ACTIVITY_WINDOW", "30")
     monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_WINDOW", "13")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_CONFUSION_MIN_HITS", "7")
+    monkeypatch.setenv("GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW", "11")
     monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://envfall:1234")
 
     runner = goldfive.wrap(_noop_agent, sinks=[])
@@ -175,7 +175,8 @@ def test_wrap_falls_back_to_from_env_when_runtime_none(
     assert steerer._goal_drift_activity_window == 30
 
     assert _tool_loops.resolve_thresholds()["window"] == 13
-    assert _reasoning._confusion_min_hits() == 7
+    assert _reasoning._CONFIG is not None
+    assert _reasoning._CONFIG.looping_reasoning_hash_window == 11
     assert _embed._CONFIG is not None
     assert _embed._CONFIG.base_url == "http://envfall:1234"
 

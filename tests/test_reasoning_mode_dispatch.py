@@ -89,7 +89,6 @@ async def test_mode_off_returns_none_regardless_of_input(
         "detect_looping_reasoning",
         "detect_off_topic",
         "detect_reasoning_cluster_tightening",
-        "detect_confusion",
     ):
         monkeypatch.setattr(dreason, fn, _track(fn))
 
@@ -130,7 +129,6 @@ async def test_mode_embedding_runs_embedding_detectors_and_skips_judge(
         "detect_looping_reasoning",
         "detect_off_topic",
         "detect_reasoning_cluster_tightening",
-        "detect_confusion",
     ):
         monkeypatch.setattr(dreason, fn, _track(fn))
 
@@ -154,7 +152,6 @@ async def test_mode_embedding_runs_embedding_detectors_and_skips_judge(
         "detect_looping_reasoning",
         "detect_off_topic",
         "detect_reasoning_cluster_tightening",
-        "detect_confusion",
     ]
     assert judge_calls == []
 
@@ -174,7 +171,6 @@ async def test_mode_judge_skips_embedding_and_runs_judge(
         "detect_off_topic",
         "detect_unreferenced_keyword",
         "detect_reasoning_cluster_tightening",
-        "detect_confusion",
     ):
         def _maker(name):
             def _f(text, session):

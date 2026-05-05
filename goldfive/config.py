@@ -375,7 +375,6 @@ class ReasoningDriftConfig:
     looping_reasoning_similarity_threshold: float = 0.9
     reasoning_cluster_similarity_threshold: float = 0.75
     looping_reasoning_hash_window: int = 5
-    confusion_min_hits: int = 3
 
     @classmethod
     def from_env(cls) -> ReasoningDriftConfig:
@@ -418,10 +417,6 @@ class ReasoningDriftConfig:
             looping_reasoning_hash_window=_read_int_env(
                 "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
                 defaults.looping_reasoning_hash_window,
-            ),
-            confusion_min_hits=_read_int_env(
-                "GOLDFIVE_DRIFT_CONFUSION_MIN_HITS",
-                defaults.confusion_min_hits,
             ),
         )
 

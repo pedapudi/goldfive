@@ -6,7 +6,7 @@ adapter captures those blocks and hands them to
 :meth:`goldfive.steerer.DefaultSteerer.observe_reasoning`, which runs
 the pipeline defined here.
 
-Five drift kinds live in this module:
+Four drift kinds live in this module:
 
 * :data:`~goldfive.types.DriftKind.LOOPING_REASONING` -- consecutive
   reasoning blocks semantically identical (hash-exact fallback; cosine
@@ -16,8 +16,6 @@ Five drift kinds live in this module:
   graduated early-warning tier, fires when cosine similarity is in
   ``[0.75, 0.9)`` against any of the last N reasoning blocks. INFO
   severity; informational only, no refine. One-shot per task.
-* :data:`~goldfive.types.DriftKind.CONFUSION` -- uncertainty markers
-  in the reasoning text.
 * :data:`~goldfive.types.DriftKind.OFF_TOPIC` -- reasoning topic is
   far from the task description (requires the ``embedding`` extra).
 * :data:`~goldfive.types.DriftKind.INTENT_DIVERGENCE` -- reasoning
@@ -28,10 +26,15 @@ Five drift kinds live in this module:
 The pipeline emits at most one drift per call to keep cost bounded.
 Detectors run in severity order: INTENT_DIVERGENCE (up to CRITICAL) ->
 LOOPING_REASONING (WARNING) -> OFF_TOPIC (WARNING) ->
-REASONING_CLUSTER_TIGHTENING (INFO) -> CONFUSION (INFO).
+REASONING_CLUSTER_TIGHTENING (INFO).
 When INTENT_DIVERGENCE resolves to a non-CRITICAL severity (INFO /
 WARNING), the pipeline still returns it first — the kind is stable,
 severity differentiates.
+
+Note: a regex-based ``CONFUSION`` detector (uncertainty-marker count)
+used to live here. It was retired -- see ``DriftKind.CONFUSION`` (now
+absent) for the rationale. The LLM-as-a-judge path covers the same
+semantic ground robustly.
 """
 
 from __future__ import annotations
@@ -62,23 +65,20 @@ log = logging.getLogger(__name__)
 
 # Pipeline-selection mode. See :func:`analyze_reasoning` for semantics.
 #
-# * ``"judge"``    — LLM-as-a-judge only (plus the always-on loop /
-#                    confusion detectors which live upstream in
+# * ``"judge"``    — LLM-as-a-judge only (plus the always-on loop
+#                    detector which lives upstream in
 #                    :meth:`DefaultSteerer.observe_reasoning`).
 # * ``"embedding"`` — the legacy embedding-based pipeline.
 # * ``"both"``     — run both; the higher-severity drift wins. Ties
 #                    are broken by the embedding path (runs first,
 #                    synchronous).
 # * ``"off"``      — no off-topic / intent / keyword checks. The
-#                    always-on loop + confusion detectors continue to
-#                    run upstream.
+#                    always-on loop detector continues to run upstream.
 ReasoningDriftMode = Literal["judge", "embedding", "both", "off"]
 DEFAULT_REASONING_DRIFT_MODE: ReasoningDriftMode = "judge"
 
 
 __all__ = [
-    "CONFUSION_MARKERS",
-    "CONFUSION_MIN_HITS",
     "DEFAULT_REASONING_DRIFT_MODE",
     "INTENT_DIVERGENCE_HEALTHY_SIMILARITY",
     "INTENT_DIVERGENCE_MINOR_SIMILARITY",
@@ -92,7 +92,6 @@ __all__ = [
     "SENTENCE_LEVEL_MAX_SENTENCES",
     "analyze_reasoning",
     "analyze_reasoning_with_focus",
-    "detect_confusion",
     "detect_intent_divergence",
     "detect_looping_reasoning",
     "detect_off_topic",
@@ -106,29 +105,6 @@ __all__ = [
 # Tunables
 # ---------------------------------------------------------------------------
 
-
-# Matches against uncertainty phrases in reasoning text. Three or more
-# matches in a single block trips CONFUSION. Case-insensitive.
-CONFUSION_MARKERS: re.Pattern[str] = re.compile(
-    r"\b("
-    r"i'?m not sure|"
-    r"i don'?t know|"
-    r"it'?s unclear|"
-    r"should i |"
-    r"need more info|"
-    r"let me think(?: about this)? again|"
-    r"wait,? |"
-    r"actually,? |"
-    r"hmm,? |"
-    r"on second thought|"
-    r"maybe i should|"
-    r"i'?m confused"
-    r")",
-    re.IGNORECASE,
-)
-
-# Number of uncertainty-marker matches required for CONFUSION to fire.
-CONFUSION_MIN_HITS: int = 3
 
 # Window of prior reasoning blocks to compare against for loop detection.
 LOOPING_REASONING_HASH_WINDOW: int = 5
@@ -282,12 +258,6 @@ def _intent_warning_similarity() -> float:
     if _CONFIG is not None:
         return _CONFIG.intent_divergence_warning_similarity
     return INTENT_DIVERGENCE_WARNING_SIMILARITY
-
-
-def _confusion_min_hits() -> int:
-    if _CONFIG is not None:
-        return _CONFIG.confusion_min_hits
-    return CONFUSION_MIN_HITS
 
 
 # ---------------------------------------------------------------------------
@@ -879,28 +849,6 @@ def detect_unreferenced_keyword(
     )
 
 
-def detect_confusion(text: str, session: Session) -> DriftEvent | None:
-    """Return :data:`DriftKind.CONFUSION` when the reasoning text has
-    at least :data:`CONFUSION_MIN_HITS` uncertainty markers.
-
-    The threshold is read from the installed
-    :class:`~goldfive.config.ReasoningDriftConfig` when one is set
-    (goldfive#225), else from :data:`CONFUSION_MIN_HITS`.
-    """
-    if not text:
-        return None
-    hits = CONFUSION_MARKERS.findall(text)
-    if len(hits) < _confusion_min_hits():
-        return None
-    return DriftEvent(
-        kind=DriftKind.CONFUSION,
-        severity=DriftSeverity.INFO,
-        detail=f"{len(hits)} uncertainty markers in reasoning",
-        current_task_id=session.current_task_id,
-        raw=text,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
@@ -919,8 +867,8 @@ def _embedding_pipeline(text: str, session: Session) -> DriftEvent | None:
     Detectors run in worst-signal-wins order:
     INTENT_DIVERGENCE -> LOOPING_REASONING -> OFF_TOPIC (with the
     sentence-level min-cosine path from #224) ->
-    REASONING_CLUSTER_TIGHTENING -> CONFUSION. Ordering rationale
-    lives in :func:`analyze_reasoning`.
+    REASONING_CLUSTER_TIGHTENING. Ordering rationale lives in
+    :func:`analyze_reasoning`.
 
     .. note::
 
@@ -943,9 +891,6 @@ def _embedding_pipeline(text: str, session: Session) -> DriftEvent | None:
     if drift is not None:
         return drift
     drift = detect_reasoning_cluster_tightening(text, session)
-    if drift is not None:
-        return drift
-    drift = detect_confusion(text, session)
     if drift is not None:
         return drift
     return None
@@ -1150,20 +1095,20 @@ async def analyze_reasoning(
     * ``"embedding"`` — embedding-based pipeline. Detectors are tried
       in worst-signal-wins order: INTENT_DIVERGENCE ->
       LOOPING_REASONING -> OFF_TOPIC (whole-text + sentence-level
-      min-cosine from #224) -> REASONING_CLUSTER_TIGHTENING ->
-      CONFUSION. INTENT_DIVERGENCE runs first even at INFO severity so
-      its kind is stable; callers that only care about warning-and-up
-      simply filter by ``severity``. LOOPING_REASONING (cosine >= 0.9)
-      runs before REASONING_CLUSTER_TIGHTENING (0.75 <= cosine < 0.9)
-      so tight-loop observations emit the cliff drift and never the
+      min-cosine from #224) -> REASONING_CLUSTER_TIGHTENING.
+      INTENT_DIVERGENCE runs first even at INFO severity so its kind
+      is stable; callers that only care about warning-and-up simply
+      filter by ``severity``. LOOPING_REASONING (cosine >= 0.9) runs
+      before REASONING_CLUSTER_TIGHTENING (0.75 <= cosine < 0.9) so
+      tight-loop observations emit the cliff drift and never the
       INFO tier.
 
     * ``"judge"`` — LLM-as-a-judge (goldfive#226). Dispatches to
       :func:`classify_reasoning_drift` with ``call_llm`` / ``model``.
       When ``call_llm`` is ``None`` the judge path silently no-ops so
       tests without a live LLM do not crash. The cheap orthogonal
-      always-on detectors (LOOPING_REASONING, CONFUSION) run upstream
-      in :meth:`DefaultSteerer.observe_reasoning` in every mode.
+      always-on loop detector runs upstream in
+      :meth:`DefaultSteerer.observe_reasoning` in every mode.
 
     * ``"both"`` — run the embedding pipeline and the judge; the
       higher-severity drift wins. Tie-breaker is embedding (runs first,
@@ -1171,7 +1116,7 @@ async def analyze_reasoning(
       ``"embedding"``.
 
     * ``"off"`` — skip the mode-selected pipeline entirely. The
-      always-on loop + confusion detectors continue to run upstream in
+      always-on loop detector continues to run upstream in
       :meth:`DefaultSteerer.observe_reasoning`.
 
     .. note::

@@ -426,7 +426,7 @@ def test_invocation_cancelled_event_round_trips_through_wire() -> None:
         reason="drift",
         severity="warning",
         drift_id="d-1",
-        drift_kind="confusion",
+        drift_kind="agent_refusal",
         detail="loopy",
         tool_name="lookup",
         session_id="sess-rt",
@@ -444,6 +444,6 @@ def test_invocation_cancelled_event_round_trips_through_wire() -> None:
     assert payload.reason == "drift"
     assert payload.severity == "warning"
     assert payload.drift_id == "d-1"
-    assert payload.drift_kind == "confusion"
+    assert payload.drift_kind == "agent_refusal"
     assert payload.detail == "loopy"
     assert payload.tool_name == "lookup"

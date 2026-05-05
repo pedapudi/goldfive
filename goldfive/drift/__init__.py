@@ -39,7 +39,6 @@ __all__ = [
     "classify_refusal",
     "classify_stop_reason",
     "analyze_reasoning",
-    "detect_confusion",
     "detect_intent_divergence",
     "detect_looping_reasoning",
     "detect_off_topic",
@@ -51,7 +50,6 @@ __all__ = [
 _REASONING_EXPORTS = frozenset(
     {
         "analyze_reasoning",
-        "detect_confusion",
         "detect_intent_divergence",
         "detect_looping_reasoning",
         "detect_off_topic",

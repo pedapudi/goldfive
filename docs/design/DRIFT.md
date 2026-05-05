@@ -134,17 +134,23 @@ parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
 |---|---|---|---|
 | `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). Also fired by the tool-call-loop detector in `goldfive.drift.tool_loops` when the ADK plugin's `after_tool_callback` observes repeated `(tool_name, args_hash)` patterns (exact / name / alternating) — see goldfive#181 and the graduated-severity table in goldfive#204. | `info` · `warning` · `critical` (graduated per tool category + count; `info` for the alternating-cycle variant) | yes |
 | `REASONING_CLUSTER_TIGHTENING` | Max cosine similarity between current reasoning and the last N=5 blocks falls in `[0.75, 0.9)` (opt-in, `goldfive[embedding]`). Graduated early-warning tier below the `LOOPING_REASONING` cliff. One-shot per task. | `info` | yes |
-| `CONFUSION` | Reasoning text has ≥ 3 uncertainty markers ("I'm not sure", "wait", "hmm", …). | `info` | yes |
 | `OFF_TOPIC` | Reasoning cosine-distance from the current task description ≥ `0.7` (requires `goldfive[embedding]`). | `warning` | yes |
 | `INTENT_DIVERGENCE` | Reasoning has drifted from `session.goals` + the current task topic. Severity is **graduated** — see table below. | `info` · `warning` · `critical` | depends on severity |
 
+> **Note.** A `CONFUSION` kind (regex over uncertainty markers) lived in this
+> module briefly. It was retired: regex-based NL classification over
+> reasoning text encodes one model's frozen failure modes and gets cemented
+> by tests as "expected behaviour." Same precedent as `_GENERIC_VERB_PREFIX_RE`
+> (#166) and `_FACTUAL_QUESTION_RE` (#167). The reasoning judge (iter-10
+> three-state classifier) covers the same semantic ground robustly.
+
 Each observation produces at most one drift (the first match wins) in
 severity order: `INTENT_DIVERGENCE` → `LOOPING_REASONING` →
-`REASONING_CLUSTER_TIGHTENING` → `OFF_TOPIC` → `CONFUSION`. Detectors
-short-circuit so the pipeline cost stays bounded regardless of
-reasoning block size. `INTENT_DIVERGENCE` runs first even when it
-resolves to `info` severity, because the kind is stable — callers that
-only care about warning-and-up simply filter on the `severity` field.
+`REASONING_CLUSTER_TIGHTENING` → `OFF_TOPIC`. Detectors short-circuit
+so the pipeline cost stays bounded regardless of reasoning block size.
+`INTENT_DIVERGENCE` runs first even when it resolves to `info`
+severity, because the kind is stable — callers that only care about
+warning-and-up simply filter on the `severity` field.
 
 #### Graduated `INTENT_DIVERGENCE` severity
 
@@ -252,8 +258,7 @@ observability signal, not a gate.
 **Why this is graduated-risk.** Observation-based drift detection
 (pattern matches, embedding cosine) cannot catch "agent is varying
 tool args but not actually advancing" — the behaviour isn't repetitive
-enough to match a loop detector and the reasoning content doesn't
-contain confusion markers. Asking the model to self-assess is a
+enough to match a loop detector. Asking the model to self-assess is a
 powerful signal for that failure mode, but it costs an extra LLM call
 per check. Operators opt in when the cost is acceptable.
 

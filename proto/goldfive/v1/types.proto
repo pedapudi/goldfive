@@ -117,9 +117,15 @@ enum DriftKind {
   // it. Detected via hash-of-reasoning (always on) or embedding cosine
   // similarity (opt-in). WARNING severity; triggers refine.
   DRIFT_KIND_LOOPING_REASONING = 27;
-  // Reasoning-content expresses uncertainty ("I'm not sure", "unclear",
-  // repeated self-directed questions). INFO severity; observational only.
-  DRIFT_KIND_CONFUSION = 28;
+  // 28 was DRIFT_KIND_CONFUSION (regex-based uncertainty-marker count).
+  // Retired: regex over reasoning text encodes one model's frozen
+  // failure modes and gets cemented by tests. The reasoning judge
+  // (iter-10 three-state classifier) covers the same ground
+  // semantically and is robust to phrasing. Same precedent as #166
+  // (`_GENERIC_VERB_PREFIX_RE`) and #167 (`_FACTUAL_QUESTION_RE`):
+  // no regex-based NL classification in goldfive core.
+  reserved 28;
+  reserved "DRIFT_KIND_CONFUSION";
   // Reasoning-content topic is distant from the current task description
   // or plan goals. Detected via embedding-based cosine distance when the
   // `embedding` extra is installed. WARNING severity.

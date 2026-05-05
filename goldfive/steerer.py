@@ -215,10 +215,6 @@ _CORRECTIVE_TEMPLATES: dict[DriftKind, str] = {
         "The prior attempt reported being stuck on {current_task_id}. "
         "Refined plan: try {next_task_title}."
     ),
-    DriftKind.CONFUSION: (
-        "The prior attempt showed uncertainty on {current_task_id}. "
-        "Refined plan: proceed with {next_task_title}."
-    ),
     DriftKind.CONFABULATION_RISK: (
         "The prior attempt may have produced {current_task_id} "
         "without consulting external data. Refined plan: "
@@ -475,7 +471,7 @@ class DefaultSteerer:
             ``"embedding"`` runs the legacy embedding pipeline;
             ``"both"`` runs both with higher-severity-wins reconciliation;
             ``"off"`` disables off-topic detection (the always-on loop
-            and confusion detectors continue to run).
+            detector continues to run).
         reasoning_drift_call_llm:
             Optional async ``(system_prompt, user_prompt, model) -> str``
             callable used by the LLM-as-a-judge reasoning-drift detector.
@@ -1343,13 +1339,13 @@ class DefaultSteerer:
 
         Pipeline dispatch (goldfive#226, refined in #251):
 
-        * Always-on detectors — :func:`~goldfive.drift.reasoning.detect_looping_reasoning`
-          and :func:`~goldfive.drift.reasoning.detect_confusion` — run
-          first on every call. They catch patterns (repetition,
-          uncertainty) that the LLM judge does not, and they are cheap.
-          Their drift verdicts are handled SYNCHRONOUSLY: callers
-          awaiting this method see the resulting ``DriftDetected`` sink
-          emission and any refine dispatch before control returns.
+        * Always-on detector — :func:`~goldfive.drift.reasoning.detect_looping_reasoning`
+          runs first on every call. It catches the byte-identical /
+          near-identical repetition pattern that the LLM judge does
+          not, and it is cheap. Its drift verdict is handled
+          SYNCHRONOUSLY: callers awaiting this method see the resulting
+          ``DriftDetected`` sink emission and any refine dispatch
+          before control returns.
         * Mode-selected pipeline — :func:`~goldfive.drift.reasoning.analyze_reasoning`
           runs in the configured ``reasoning_drift_mode``. The LLM judge
           path is rate-limited to at most one call every
@@ -1384,24 +1380,17 @@ class DefaultSteerer:
         overflow = len(history) - cap
         if overflow > 0:
             del history[:overflow]
-        from goldfive.drift.reasoning import (
-            detect_confusion,
-            detect_looping_reasoning,
-        )
+        from goldfive.drift.reasoning import detect_looping_reasoning
 
-        # Always-on pattern detectors. They emit in severity order
-        # (LOOPING_REASONING WARNING before CONFUSION INFO) and any
-        # fire short-circuits before the mode-selected pipeline so
-        # they remain the canonical signal for "repetitive / uncertain"
-        # reasoning regardless of mode. These are cheap and their
-        # verdicts can affect the current turn, so they remain inline.
+        # Always-on loop detector. A fire short-circuits before the
+        # mode-selected pipeline so it remains the canonical signal
+        # for "repetitive" reasoning regardless of mode. Cheap, and
+        # its verdict can affect the current turn, so it stays inline.
         drift = detect_looping_reasoning(text, session)
-        if drift is None:
-            drift = detect_confusion(text, session)
         if drift is not None:
             # Populate ``trigger_input`` on drifts produced by the
-            # always-on pattern detectors (they do not set it
-            # themselves — they are framework-agnostic).
+            # always-on detector (it does not set it itself — it is
+            # framework-agnostic).
             if not drift.trigger_input:
                 drift.trigger_input = self._truncate_trigger_input(text)
             await self._handle_drift(drift, session)
@@ -3267,9 +3256,9 @@ class DefaultSteerer:
         # LOOPING_REASONING / LOOPING_TOOL_CALL (detector fires while
         # the coordinator retries the same tool call), SELF_REPORTED_STUCK
         # (reflective self-check reports no progress). Other ABSORB
-        # kinds (CONFUSION, CONFABULATION_RISK, etc.) do not need
-        # mid-invocation rescue — their corrective path fires at the
-        # next task boundary or via Level 3 CANCEL_REINVOKE.
+        # kinds (CONFABULATION_RISK, etc.) do not need mid-invocation
+        # rescue — their corrective path fires at the next task
+        # boundary or via Level 3 CANCEL_REINVOKE.
         if level is InterventionLevel.ABSORB and drift.kind in _ABSORB_NUDGE_KINDS:
             nudge_msg = compose_corrective_user_message(
                 drift=drift,
@@ -3304,10 +3293,10 @@ class DefaultSteerer:
     # The ladder preserves that invariant by mapping every INFO entry
     # to :data:`InterventionLevel.OBSERVE`. The issue's suggested
     # table labels some INFO tiers as "Level 1 (absorb)" but a Level 1
-    # at INFO would trigger refine for every INFO hint (CONFUSION
-    # detector, CONFABULATION_RISK, etc.), which regresses existing
-    # behaviour. If an operator later wants a refine-on-hint policy,
-    # they subclass and override :meth:`_ladder_level_for`.
+    # at INFO would trigger refine for every INFO hint
+    # (CONFABULATION_RISK, etc.), which regresses existing behaviour.
+    # If an operator later wants a refine-on-hint policy, they
+    # subclass and override :meth:`_ladder_level_for`.
     _LADDER: dict[
         DriftKind,
         tuple[
@@ -3316,11 +3305,6 @@ class DefaultSteerer:
             tuple[InterventionLevel, InterventionLevel],  # CRITICAL (first, repeat)
         ],
     ] = {
-        DriftKind.CONFUSION: (
-            InterventionLevel.OBSERVE,
-            InterventionLevel.ABSORB,
-            (InterventionLevel.CANCEL_REINVOKE, InterventionLevel.PAUSE_ESCALATE),
-        ),
         DriftKind.CONFABULATION_RISK: (
             InterventionLevel.OBSERVE,
             InterventionLevel.ABSORB,

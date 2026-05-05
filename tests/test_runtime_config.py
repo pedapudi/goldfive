@@ -162,7 +162,6 @@ def test_reasoning_drift_config_defaults() -> None:
     assert cfg.looping_reasoning_similarity_threshold == 0.9
     assert cfg.reasoning_cluster_similarity_threshold == 0.75
     assert cfg.looping_reasoning_hash_window == 5
-    assert cfg.confusion_min_hits == 3
 
 
 @pytest.mark.parametrize("mode", ["judge", "embedding", "both", "off"])
@@ -210,7 +209,6 @@ def test_reasoning_drift_config_from_env_all_vars(
     monkeypatch.setenv("GOLDFIVE_DRIFT_LOOPING_SIMILARITY", "0.85")
     monkeypatch.setenv("GOLDFIVE_DRIFT_CLUSTER_SIMILARITY", "0.7")
     monkeypatch.setenv("GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW", "8")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_CONFUSION_MIN_HITS", "5")
     cfg = ReasoningDriftConfig.from_env()
     assert cfg.off_topic_distance_threshold == 0.55
     assert cfg.intent_divergence_healthy_similarity == 0.7
@@ -219,7 +217,6 @@ def test_reasoning_drift_config_from_env_all_vars(
     assert cfg.looping_reasoning_similarity_threshold == 0.85
     assert cfg.reasoning_cluster_similarity_threshold == 0.7
     assert cfg.looping_reasoning_hash_window == 8
-    assert cfg.confusion_min_hits == 5
 
 
 def test_reasoning_drift_config_from_env_missing_falls_back(
@@ -234,7 +231,6 @@ def test_reasoning_drift_config_from_env_missing_falls_back(
         "GOLDFIVE_DRIFT_LOOPING_SIMILARITY",
         "GOLDFIVE_DRIFT_CLUSTER_SIMILARITY",
         "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
-        "GOLDFIVE_DRIFT_CONFUSION_MIN_HITS",
     ):
         monkeypatch.delenv(name, raising=False)
     cfg = ReasoningDriftConfig.from_env()
@@ -367,13 +363,13 @@ def test_runtime_config_from_env_aggregates_all_four(
     """Each sub-``from_env`` is called and the results are aggregated."""
     monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://agg:7000")
     monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_WINDOW", "14")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_CONFUSION_MIN_HITS", "6")
+    monkeypatch.setenv("GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW", "9")
     monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL", "7")
     monkeypatch.setenv("GOLDFIVE_JUDGE_BASE_URL", "http://judge-agg:9001")
     cfg = RuntimeConfig.from_env()
     assert cfg.embedding.base_url == "http://agg:7000"
     assert cfg.tool_loops.window == 14
-    assert cfg.reasoning_drift.confusion_min_hits == 6
+    assert cfg.reasoning_drift.looping_reasoning_hash_window == 9
     assert cfg.goal_drift.check_interval == 7
     assert cfg.judge.base_url == "http://judge-agg:9001"
 

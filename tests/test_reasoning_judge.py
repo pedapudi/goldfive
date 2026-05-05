@@ -438,7 +438,7 @@ async def test_judge_disabled_when_call_llm_is_none() -> None:
 
     await steerer.observe_reasoning("any thought", session=session)
     await _wait_for_judges(steerer)
-    # Only confusion/looping always-on detectors ran, and neither fires
+    # Only the looping always-on detector ran, and it does not fire
     # on a single clean-text thinking message with no history.
     assert sink.events == []
 

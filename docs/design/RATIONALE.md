@@ -515,8 +515,8 @@ architecture was the wrong fix for the underlying problem.
    is not a routing key.
 2. **Termination without prompt cooperation** — generator-end on
    `runner.run_async` is the authoritative signal. Existing drift
-   detectors (AGENT_REFUSAL, LOOPING_REASONING, CONFUSION,
-   INTENT_DIVERGENCE, PLAN_DIVERGENCE) classify semantic outcomes.
+   detectors (AGENT_REFUSAL, LOOPING_REASONING, INTENT_DIVERGENCE,
+   PLAN_DIVERGENCE) classify semantic outcomes.
    Reporting-tool calls stay as a useful early-exit optimization
    but are not required.
 3. **AgentTool-per-invoke cap** — a configurable per-invocation
@@ -1269,10 +1269,13 @@ inference round and spent a tool call. Reasoning content
 (`reasoning_content` on OpenAI-compat surfaces, `thinking` blocks on
 Anthropic, `thought` parts on Google) exposes the model's
 chain-of-thought *before* the tool calls resolve — catching a loop
-there costs half as many tokens per intervention. The four kinds
-(`LOOPING_REASONING`, `CONFUSION`, `OFF_TOPIC`,
-`INTENT_DIVERGENCE`) map one-for-one onto the most common reasoning
-pathologies we see in practice.
+there costs half as many tokens per intervention. The three kinds
+(`LOOPING_REASONING`, `OFF_TOPIC`, `INTENT_DIVERGENCE`) map onto the
+most common reasoning pathologies we see in practice. A
+regex-keyword `CONFUSION` detector lived here briefly and was
+retired (see "no regex-based NL classification" in this document
+and DRIFT.md); the LLM-as-a-judge pipeline covers the same
+semantic signal robustly.
 
 The separation also keeps the existing classifier contract
 (framework-neutral `event` shapes; no session state required) clean.
@@ -1290,13 +1293,7 @@ the default path pays nothing. The optional embedding path
 one drift per call, so cost does not scale with reasoning-block
 size.
 
-**Tradeoffs.** Pattern-based `CONFUSION` detection will false-fire
-on models that are merely verbose about their process (GPT-4o's
-"Let me think about this again…" pattern is benign in many
-contexts). We mitigate by leaving it at `INFO` severity so it does
-not trigger refine by default — callers that want action can
-subclass `DefaultSteerer` and override `should_refine`.
-`INTENT_DIVERGENCE` uses *graduated* severity
+**Tradeoffs.** `INTENT_DIVERGENCE` uses *graduated* severity
 (`INFO` / `WARNING` / `CRITICAL`) based on cosine similarity to the
 goals + task topic. That keeps the kind stable (callers that filter
 by kind see one signal) while letting refine policy hinge on

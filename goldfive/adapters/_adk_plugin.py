@@ -5182,7 +5182,7 @@ def make_adk_plugin(
                 # Skip reasoning observation for cancelled invocations:
                 # the agent has been told to stop, so judging its
                 # still-streaming or already-buffered reasoning
-                # produces noise (CONFUSION drifts on zombie reasoning,
+                # produces noise (spurious drifts on zombie reasoning,
                 # wasted LLM judge calls). The plugin's sticky cancel
                 # flag is already battle-tested by 6+ other callbacks
                 # (before_model, before_tool, before/after_agent,
