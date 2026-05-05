@@ -3139,9 +3139,17 @@ class DefaultSteerer:
         finally:
             self._active_session_var.reset(_active_session_token)
         if revised is None:
+            # iter-12 (#204): refine returning None at the steerer level
+            # means the planner has already exhausted its internal retry
+            # budget (iter-11C's repeat-rejection guard). Treat as
+            # handler exhaustion and pause for human intervention rather
+            # than emitting a follow-up CRITICAL drift that would
+            # recurse through ``_handle_drift`` and eventually abort the
+            # run. Mirrors the ``RefineExhausted`` and no-op-revision
+            # escalation paths.
             log.warning(
                 "DefaultSteerer._handle_drift: planner.refine(kind=%s) returned None; "
-                "plan unchanged",
+                "plan unchanged — escalating to HUMAN_INTERVENTION_REQUIRED",
                 drift.kind.value,
             )
             await self._emit_refine_failed(
@@ -3152,10 +3160,8 @@ class DefaultSteerer:
                 reason="planner returned no revised plan",
                 detail="",
             )
-            await self._emit_refine_failure(
-                session, drift, reason="planner returned no revised plan"
-            )
             await self._record_refine_outcome(session, drift, succeeded=False)
+            await self._emit_handler_exhausted_escalation(drift, session)
             return
         # I4 fix: fold runtime terminal statuses from the prior plan
         # onto the revised plan BEFORE validation. A task that was
@@ -3168,12 +3174,20 @@ class DefaultSteerer:
         try:
             revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
-            # Reject the revision and surface the failure as a CRITICAL
-            # DriftDetected so operators can see the bad plan upstream.
-            # The session keeps its old plan. A bad revision also counts
-            # as a refine failure for backoff purposes — the planner
-            # produced an unusable plan, which is functionally the same
-            # as returning None. Passing ``prior=session.plan`` enables
+            # iter-12 (#204): the revised plan is structurally invalid
+            # AND the planner has already exhausted its internal
+            # validator-rejection retry budget (iter-11C). Treat as
+            # handler exhaustion and pause for human intervention.
+            #
+            # Operator visibility: the SCHEMA_VIOLATION drift is
+            # preserved at INFO severity (observability-only — does NOT
+            # recurse through ``_handle_drift``) so harmonograf and
+            # other sinks still see the schema-failure signal carrying
+            # the validator's reason. The actionable signal is the
+            # paired ``refine_failed(validator_rejected)`` envelope and
+            # the HUMAN_INTERVENTION_REQUIRED escalation that follows.
+            #
+            # Passing ``prior=session.plan`` to ``validate`` enables
             # PLAN-LIFECYCLE.md §3.1 (terminal task preservation) and
             # §3.2 (terminal->terminal edge preservation) on top of the
             # usual structural checks.
@@ -3189,12 +3203,13 @@ class DefaultSteerer:
                 session,
                 DriftEvent(
                     kind=DriftKind.SCHEMA_VIOLATION,
-                    severity=DriftSeverity.CRITICAL,
+                    severity=DriftSeverity.INFO,
                     detail=f"plan validation failed: {exc}",
                     current_task_id=session.current_task_id,
                 ),
             )
             await self._record_refine_outcome(session, drift, succeeded=False)
+            await self._emit_handler_exhausted_escalation(drift, session)
             return
         # No-op revision rejection (goldfive#271 — replaces the deleted
         # count cap). If the LLM produced a "refine" that is structurally
@@ -4394,8 +4409,15 @@ class DefaultSteerer:
             finally:
                 self._active_session_var.reset(_active_session_token)
         if revised is None:
+            # iter-12 (#204): mirror the ``_handle_drift`` graceful
+            # fallback — refine returning None means the planner has
+            # exhausted its internal retry budget; escalate to
+            # HUMAN_INTERVENTION_REQUIRED rather than emitting a
+            # recursing CRITICAL follow-up drift that would eventually
+            # abort the run.
             log.warning(
-                "DefaultSteerer._promote_drift_to_steer: refine returned None; plan unchanged"
+                "DefaultSteerer._promote_drift_to_steer: refine returned None; "
+                "plan unchanged — escalating to HUMAN_INTERVENTION_REQUIRED"
             )
             await self._emit_refine_failed(
                 session,
@@ -4405,10 +4427,8 @@ class DefaultSteerer:
                 reason="planner returned no revised plan",
                 detail="",
             )
-            await self._emit_refine_failure(
-                session, drift, reason="planner returned no revised plan"
-            )
             await self._record_refine_outcome(session, drift, succeeded=False)
+            await self._emit_handler_exhausted_escalation(drift, session)
             return
         # I4 fix: fold runtime terminal statuses from the prior plan
         # onto the revised plan BEFORE validation (see _handle_drift
@@ -4417,6 +4437,13 @@ class DefaultSteerer:
         try:
             revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
+            # iter-12 (#204): mirror the ``_handle_drift`` graceful
+            # fallback — keep the SCHEMA_VIOLATION emission at INFO
+            # severity for operator/sink observability (does NOT
+            # recurse through ``_handle_drift``) and escalate to
+            # HUMAN_INTERVENTION_REQUIRED. The actionable signal is
+            # the paired ``refine_failed(validator_rejected)`` envelope
+            # plus the escalation drift.
             await self._emit_refine_failed(
                 session,
                 drift,
@@ -4429,13 +4456,14 @@ class DefaultSteerer:
                 session,
                 DriftEvent(
                     kind=DriftKind.SCHEMA_VIOLATION,
-                    severity=DriftSeverity.CRITICAL,
+                    severity=DriftSeverity.INFO,
                     detail=f"plan validation failed: {exc}",
                     current_task_id=session.current_task_id,
                     authored_by="goldfive",
                 ),
             )
             await self._record_refine_outcome(session, drift, succeeded=False)
+            await self._emit_handler_exhausted_escalation(drift, session)
             return
         # No-op revision rejection (goldfive#271). Same handler-
         # exhaustion semantics as ``_handle_drift`` — a structurally
