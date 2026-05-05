@@ -3748,11 +3748,22 @@ class DefaultSteerer:
 
         The check uses :class:`OrchestrationStore` as the live registry
         of in-flight invocations (Phase 3.5 component 1, goldfive#271).
-        When the per-session bucket is empty, every agent has finished
-        its turn and any drift currently being handled is by definition
-        stale. User-authored drifts (USER_STEER / USER_CANCEL /
-        USER_PAUSE) always bypass this guard — they are forward-looking
-        operator directives, not tied to a specific in-flight invocation.
+        Two conditions count as "late":
+
+        * **No active invocations** — every agent has finished its turn
+          and any drift currently being handled is by definition stale.
+        * **Cancel-pending on the session** (goldfive#242) — a previous
+          drift already requested a cooperative cancel for one or more
+          invocations. The active-task registry takes 4-8s to drain
+          while ADK winds those invocations down; during that window
+          any newly-arriving goldfive-authored drift would dispatch a
+          refine against an effectively-dead session. Stamping the
+          cancel-pending flag synchronously at
+          :meth:`request_invocation_cancel` time closes that race.
+
+        User-authored drifts (USER_STEER / USER_CANCEL / USER_PAUSE)
+        always bypass this guard — they are forward-looking operator
+        directives, not tied to a specific in-flight invocation.
         """
         # User-authored drifts always pass through. ``authored_by`` was
         # normalised at the top of :meth:`_handle_drift`.
@@ -3763,6 +3774,7 @@ class DefaultSteerer:
 
             store = OrchestrationStore.for_session(session)
             active = store.active_invocation_ids()
+            cancel_pending = store.cancel_requested_invocation_ids()
         except Exception as exc:  # noqa: BLE001 — defensive
             log.debug(
                 "DefaultSteerer._is_late_drift_for_terminated_invocation: "
@@ -3770,7 +3782,12 @@ class DefaultSteerer:
                 exc,
             )
             return False
-        return not active
+        # Symmetric predicate: late when the active list is empty OR
+        # any cancel is pending on the session. The cancel-pending
+        # branch closes the iter-11D race (goldfive#242) where the
+        # cancel-request has landed but ADK hasn't yet finished
+        # winding down the cancelled invocation.
+        return (not active) or bool(cancel_pending)
 
     def _resolve_active_invocation_ids(self, drift: DriftEvent, session: Session) -> list[str]:
         """Resolve which invocation_id(s) a cancel should target.
@@ -3884,6 +3901,30 @@ class DefaultSteerer:
         if not callable(fn):
             return []
         invocation_ids = self._resolve_active_invocation_ids(drift, session)
+        # Stamp the cancel-pending flag SYNCHRONOUSLY before any
+        # plugin / async work (goldfive#242). The active-task
+        # registry takes 4-8s to drain while ADK winds the cancelled
+        # invocations down; during that window the late-drift gate
+        # would otherwise see ``active_invocation_ids()`` non-empty
+        # and let a freshly-arriving goldfive-authored drift dispatch
+        # a refine against an effectively-dead session. Flipping the
+        # flag here closes the race: any drift handled after this
+        # point sees ``cancel_requested_invocation_ids()`` non-empty
+        # via :meth:`_is_late_drift_for_terminated_invocation` and
+        # short-circuits.
+        if invocation_ids:
+            try:
+                from goldfive.orchestration_store import OrchestrationStore
+
+                store = OrchestrationStore.for_session(session)
+                for inv_id in invocation_ids:
+                    store.mark_invocation_cancel_requested(inv_id)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                log.debug(
+                    "DefaultSteerer.request_invocation_cancel: "
+                    "cancel-pending stamp raised (continuing): %s",
+                    exc,
+                )
         if not invocation_ids:
             # Empty invocation-id guard — drift has no identifiable
             # in-flight invocation. Don't fabricate one; the cancel
