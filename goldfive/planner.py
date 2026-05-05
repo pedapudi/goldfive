@@ -21,6 +21,7 @@ is logged and becomes ``None``.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
@@ -41,6 +42,8 @@ from goldfive.types import (
     Task,
     TaskEdge,
     TaskStatus,
+    bump_revision,
+    replace_task,
 )
 
 # Task statuses that are "done" from a steering perspective — they are
@@ -713,8 +716,8 @@ _REPLACE_ELIGIBLE_OLD_STATUSES: frozenset[TaskStatus] = frozenset(
 )
 
 
-def _normalize_supersession_kinds(revised: Plan, *, prior: Plan | None) -> None:
-    """In-place coerce ``supersedes_kind`` on every task in ``revised``.
+def _normalize_supersession_kinds(revised: Plan, *, prior: Plan | None) -> Plan:
+    """Return a Plan with ``supersedes_kind`` normalised on every task.
 
     goldfive#251 Option B validator. Rules, in order:
 
@@ -742,77 +745,93 @@ def _normalize_supersession_kinds(revised: Plan, *, prior: Plan | None) -> None:
 
     The coercion honours Option B's contract: the LLM's semantic signal
     is preserved when it aligns with status; when it disagrees, old-
-    task status is ground truth. Writes proceed in place so callers can
-    pass the revised plan straight through to ``validate``.
+    task status is ground truth.
+
+    goldfive#247: returns a NEW :class:`Plan` (Plan is frozen). When no
+    coercion is needed the input is returned unchanged so callers can
+    keep their reference.
     """
     prior_by_id: dict[str, Task] = (
         {t.id: t for t in getattr(prior, "tasks", ()) or () if t.id} if prior is not None else {}
     )
     revised_by_id: dict[str, Task] = {t.id: t for t in revised.tasks if t.id}
+    new_tasks: list[Task] = []
+    changed = False
     for task in revised.tasks:
+        new_supersedes = task.supersedes
+        new_supersedes_kind = task.supersedes_kind
         sup_id = (task.supersedes or "").strip()
-        # Rule 0 (goldfive#213): a task can never supersede itself. The
-        # v27 rev-2 anomaly was the LLM emitting ``supersedes == self.id``
-        # on an id-reused task (a structural impossibility — a task
-        # is not its own predecessor). Strip the link and fall through
-        # so Rule 1's empty-target handling clears any kind.
+        # Rule 0 (goldfive#213): a task can never supersede itself.
         if sup_id and task.id and sup_id == task.id:
             log.warning(
                 "planner: task %r has supersedes pointing at itself; "
                 "clearing self-reference (a task cannot supersede itself)",
                 task.id,
             )
-            task.supersedes = ""
+            new_supersedes = ""
             sup_id = ""
         if not sup_id:
             # Rule 1: dangling kind with no target.
-            if task.supersedes_kind is not SupersessionKind.UNSPECIFIED:
+            if new_supersedes_kind is not SupersessionKind.UNSPECIFIED:
                 log.warning(
                     "planner: task %r has supersedes_kind=%s without a "
                     "supersedes target; clearing to UNSPECIFIED",
                     task.id,
-                    task.supersedes_kind.value,
+                    new_supersedes_kind.value,
                 )
-                task.supersedes_kind = SupersessionKind.UNSPECIFIED
-            continue
-        old = prior_by_id.get(sup_id) or revised_by_id.get(sup_id)
-        if old is None:
-            # Rule 2: unresolved target — clear the kind; the plan's
-            # structural validator (step 3) will reject the dangling
-            # edge separately.
-            if task.supersedes_kind is not SupersessionKind.UNSPECIFIED:
-                log.warning(
-                    "planner: task %r supersedes %r which is not in the plan; "
-                    "clearing supersedes_kind from %s to UNSPECIFIED",
-                    task.id,
-                    sup_id,
-                    task.supersedes_kind.value,
-                )
-                task.supersedes_kind = SupersessionKind.UNSPECIFIED
-            continue
-        # Rule 3: resolve based on old-task status.
-        if old.status is TaskStatus.COMPLETED:
-            expected = SupersessionKind.CORRECT
-        elif old.status in _REPLACE_ELIGIBLE_OLD_STATUSES:
-            expected = SupersessionKind.REPLACE
+                new_supersedes_kind = SupersessionKind.UNSPECIFIED
         else:
-            # Defensive: any unknown / future status falls through to
-            # REPLACE (the pre-#251 behaviour), which preserves the old
-            # topology rewrite path.
-            expected = SupersessionKind.REPLACE
-        if task.supersedes_kind is SupersessionKind.UNSPECIFIED:
-            task.supersedes_kind = expected
-        elif task.supersedes_kind is not expected:
-            log.warning(
-                "planner: task %r supersedes %r (status=%s) with kind=%s; "
-                "coercing to %s based on old-task status (Option B)",
-                task.id,
-                sup_id,
-                old.status.value,
-                task.supersedes_kind.value,
-                expected.value,
+            old = prior_by_id.get(sup_id) or revised_by_id.get(sup_id)
+            if old is None:
+                # Rule 2: unresolved target — clear the kind; the plan's
+                # structural validator (step 3) will reject the dangling
+                # edge separately.
+                if new_supersedes_kind is not SupersessionKind.UNSPECIFIED:
+                    log.warning(
+                        "planner: task %r supersedes %r which is not in the plan; "
+                        "clearing supersedes_kind from %s to UNSPECIFIED",
+                        task.id,
+                        sup_id,
+                        new_supersedes_kind.value,
+                    )
+                    new_supersedes_kind = SupersessionKind.UNSPECIFIED
+            else:
+                # Rule 3: resolve based on old-task status.
+                if old.status is TaskStatus.COMPLETED:
+                    expected = SupersessionKind.CORRECT
+                elif old.status in _REPLACE_ELIGIBLE_OLD_STATUSES:
+                    expected = SupersessionKind.REPLACE
+                else:
+                    # Defensive: any unknown / future status falls through
+                    # to REPLACE (pre-#251 behaviour).
+                    expected = SupersessionKind.REPLACE
+                if new_supersedes_kind is SupersessionKind.UNSPECIFIED:
+                    new_supersedes_kind = expected
+                elif new_supersedes_kind is not expected:
+                    log.warning(
+                        "planner: task %r supersedes %r (status=%s) with kind=%s; "
+                        "coercing to %s based on old-task status (Option B)",
+                        task.id,
+                        sup_id,
+                        old.status.value,
+                        new_supersedes_kind.value,
+                        expected.value,
+                    )
+                    new_supersedes_kind = expected
+        if new_supersedes != task.supersedes or new_supersedes_kind != task.supersedes_kind:
+            changed = True
+            new_tasks.append(
+                dataclasses.replace(
+                    task,
+                    supersedes=new_supersedes,
+                    supersedes_kind=new_supersedes_kind,
+                )
             )
-            task.supersedes_kind = expected
+        else:
+            new_tasks.append(task)
+    if not changed:
+        return revised
+    return dataclasses.replace(revised, tasks=tuple(new_tasks))
 
 
 #: Statuses that warrant a retry/replace — i.e. the old task did NOT
@@ -881,8 +900,8 @@ def _candidate_predecessor_id(task_id: str) -> str:
     return ""
 
 
-def _backfill_retry_supersedes(revised: Plan, *, prior: Plan) -> None:
-    """In-place backfill ``Task.supersedes`` for retry-named tasks.
+def _backfill_retry_supersedes(revised: Plan, *, prior: Plan) -> Plan:
+    """Backfill ``Task.supersedes`` for retry-named tasks.
 
     Goldfive#213 — when a planner LLM emits a retry-shaped task name
     (``retry_t0``, ``t0_v2``) but forgets to populate the structural
@@ -916,29 +935,48 @@ def _backfill_retry_supersedes(revised: Plan, *, prior: Plan) -> None:
     :func:`_normalize_supersession_kinds` to derive the right
     ``supersedes_kind`` from old-task status — backfill ONLY sets the
     target id; the kind is still status-driven.
+
+    goldfive#247: returns a NEW :class:`Plan` (Plan is frozen). When
+    no backfill is needed the input is returned unchanged.
     """
     if prior is None:
-        return
+        return revised
     prior_by_id: dict[str, Task] = {t.id: t for t in prior.tasks if t.id}
+    new_tasks: list[Task] = []
+    changed = False
     for task in revised.tasks:
         if not task.id:
+            new_tasks.append(task)
             continue
         sup = (task.supersedes or "").strip()
         # Self-reference cleanup runs unconditionally (defence in
-        # depth before normalize_supersession_kinds also runs).
-        if sup and sup == task.id:
-            task.supersedes = ""
+        # depth before normalize_supersession_kinds also runs). Pre-#247
+        # this was an in-place clear that fell through to the candidate
+        # backfill; we mirror the same logic by clearing ``sup`` and
+        # tracking that the task already changed (so the final emit
+        # always uses the cleaned variant rather than the raw input).
+        cleared_self_ref = bool(sup and sup == task.id)
+        if cleared_self_ref:
             sup = ""
         if sup:
             # LLM intent wins: never override an explicit link.
+            new_tasks.append(task)
             continue
         candidate = _candidate_predecessor_id(task.id)
         if not candidate or candidate == task.id:
+            if cleared_self_ref:
+                new_tasks.append(dataclasses.replace(task, supersedes=""))
+                changed = True
+            else:
+                new_tasks.append(task)
             continue
         old = prior_by_id.get(candidate)
-        if old is None:
-            continue
-        if old.status not in _RETRY_WARRANTING_OLD_STATUSES:
+        if old is None or old.status not in _RETRY_WARRANTING_OLD_STATUSES:
+            if cleared_self_ref:
+                new_tasks.append(dataclasses.replace(task, supersedes=""))
+                changed = True
+            else:
+                new_tasks.append(task)
             continue
         log.debug(
             "planner: backfilling supersedes %r → %r on %r (prior status %s)",
@@ -947,7 +985,11 @@ def _backfill_retry_supersedes(revised: Plan, *, prior: Plan) -> None:
             task.id,
             old.status.value,
         )
-        task.supersedes = candidate
+        new_tasks.append(dataclasses.replace(task, supersedes=candidate))
+        changed = True
+    if not changed:
+        return revised
+    return dataclasses.replace(revised, tasks=tuple(new_tasks))
 
 
 #: Old-task statuses that don't require a supersedes link when dropped.
@@ -2450,14 +2492,18 @@ class LLMPlanner:
             # ``_normalize_supersession_kinds`` so the kind coercion
             # sees the backfilled link.
             if prior_plan is not None:
-                _backfill_retry_supersedes(revised, prior=prior_plan)
+                # goldfive#247: returns a NEW Plan; rebind so subsequent
+                # validator + normalize sees the backfilled tasks.
+                revised = _backfill_retry_supersedes(revised, prior=prior_plan)
             # goldfive#251: Option B validator -- coerce supersedes_kind
             # on every task based on old-task status. Runs before
             # ``revised.validate`` so the structural validator sees
-            # self-consistent kinds. In-place; warnings only, never
-            # rejects (Option B is about making the LLM's intent
-            # survive rather than blocking a structurally-valid plan).
-            _normalize_supersession_kinds(revised, prior=prior_plan)
+            # self-consistent kinds. Warnings only, never rejects
+            # (Option B is about making the LLM's intent survive rather
+            # than blocking a structurally-valid plan). goldfive#247:
+            # returns a NEW Plan; rebind so the validator sees the
+            # coerced kinds.
+            revised = _normalize_supersession_kinds(revised, prior=prior_plan)
             try:
                 revised.validate(for_revision=True, prior=prior_plan)
             except ValueError as exc:
@@ -2982,11 +3028,15 @@ class LLMPlanner:
                 await self._emit_refine_validation_failed(plan, drift, last_error)
             return None
         # Stamp revision metadata so downstream sinks can render it.
-        revised.revision_reason = drift.detail
-        revised.revision_kind = str(drift.kind)
-        revised.revision_severity = str(drift.severity)
-        revised.revision_index = plan.revision_index + 1
-        return revised
+        # goldfive#247: Plan is frozen — derive a new instance with the
+        # stamped metadata via :func:`bump_revision`.
+        return bump_revision(
+            revised,
+            revision_index=plan.revision_index + 1,
+            revision_reason=drift.detail,
+            revision_kind=str(drift.kind),
+            revision_severity=str(drift.severity),
+        )
 
     def _build_looping_tool_call_prompt(
         self,
@@ -3100,32 +3150,41 @@ class LLMPlanner:
 
             The protocol contract is that the looper cannot survive its
             own drift, so even if the LLM forgot we force the status.
+
+            goldfive#247: Plan + Task are frozen — produce a NEW plan
+            with the looper transitioned via :func:`replace_task` (or,
+            when the looper was missing, prepended via dataclass
+            replace + tuple concat).
             """
             if not loop_id:
                 return revised
-            for t in revised.tasks:
-                if t.id == loop_id and t.status not in _TERMINAL_STATUSES:
-                    t.status = TaskStatus.FAILED
+            # Step 1: flip the looper if it's still in the plan.
+            existing = next((t for t in revised.tasks if t.id == loop_id), None)
+            if existing is not None and existing.status not in _TERMINAL_STATUSES:
+                revised = replace_task(revised, loop_id, status=TaskStatus.FAILED)
+            # Step 2: prepend a synthetic FAILED looper if the LLM
+            # dropped it and we have a snapshot to re-inject.
             if not any(t.id == loop_id for t in revised.tasks) and looping_task is not None:
-                revised.tasks.insert(
-                    0,
-                    Task(
-                        id=looping_task.id,
-                        title=looping_task.title,
-                        description=looping_task.description,
-                        assignee_agent_id=looping_task.assignee_agent_id,
-                        status=TaskStatus.FAILED,
-                        # goldfive#251: preserve the supersession provenance
-                        # when re-inserting the looping task into the
-                        # revised plan. Dropping these fields here turned a
-                        # CORRECT-kind chain into an orphan, which the
-                        # downstream supersedes-coverage validator would
-                        # then flag as a regression (or, worse, the steerer
-                        # would re-pin to the wrong successor). See the
-                        # paired regression in test_planner.py.
-                        supersedes=looping_task.supersedes,
-                        supersedes_kind=looping_task.supersedes_kind,
-                    ),
+                synthetic = Task(
+                    id=looping_task.id,
+                    title=looping_task.title,
+                    description=looping_task.description,
+                    assignee_agent_id=looping_task.assignee_agent_id,
+                    status=TaskStatus.FAILED,
+                    # goldfive#251: preserve the supersession provenance
+                    # when re-inserting the looping task into the
+                    # revised plan. Dropping these fields here turned a
+                    # CORRECT-kind chain into an orphan, which the
+                    # downstream supersedes-coverage validator would
+                    # then flag as a regression (or, worse, the steerer
+                    # would re-pin to the wrong successor). See the
+                    # paired regression in test_planner.py.
+                    supersedes=looping_task.supersedes,
+                    supersedes_kind=looping_task.supersedes_kind,
+                )
+                revised = dataclasses.replace(
+                    revised,
+                    tasks=(synthetic,) + tuple(revised.tasks),
                 )
             return revised
 
@@ -3156,11 +3215,14 @@ class LLMPlanner:
             if last_error != _EMPTY_RESPONSE_ERROR:
                 await self._emit_refine_validation_failed(plan, drift, last_error)
             return self._fallback_fail_loop_plan(plan, drift, looping_task)
-        revised.revision_reason = drift.detail
-        revised.revision_kind = drift.kind.value
-        revised.revision_severity = str(drift.severity)
-        revised.revision_index = plan.revision_index + 1
-        return revised
+        # goldfive#247: Plan is frozen — stamp via :func:`bump_revision`.
+        return bump_revision(
+            revised,
+            revision_index=plan.revision_index + 1,
+            revision_reason=drift.detail,
+            revision_kind=drift.kind.value,
+            revision_severity=str(drift.severity),
+        )
 
     @staticmethod
     def _fallback_fail_loop_plan(
@@ -3490,8 +3552,9 @@ class LLMPlanner:
         # plan (including completed tasks that were dropped from
         # ``fresh``). This makes the executor's causal-tier
         # replacement detection work even for plans where the LLM
-        # didn't populate ``supersedes``.
-        _backfill_retry_supersedes(fresh, prior=plan)
+        # didn't populate ``supersedes``. goldfive#247: returns a NEW
+        # Plan; rebind so downstream merge sees the backfilled tasks.
+        fresh = _backfill_retry_supersedes(fresh, prior=plan)
 
         # Prepend completed tasks verbatim; drop any new task whose id
         # collides with a completed id so lineage ids stay stable.
@@ -3547,8 +3610,9 @@ class LLMPlanner:
         # against a prior PENDING is coerced to ``REPLACE`` so the
         # executor's pin-redirect runs. Runs AFTER the goldfive#213
         # backfill (above) so the kind is derived against any
-        # freshly-populated retry link.
-        _normalize_supersession_kinds(merged_plan, prior=plan)
+        # freshly-populated retry link. goldfive#247: returns a NEW
+        # Plan; rebind so the validator below sees the coerced kinds.
+        merged_plan = _normalize_supersession_kinds(merged_plan, prior=plan)
         try:
             merged_plan.validate(for_revision=True, prior=plan)
         except ValueError as exc:
@@ -4174,10 +4238,13 @@ SUMMARY POLICY (applies to ``plan.summary``):
         # F5: stamp the pivot flag onto the Plan so the runner's
         # ``_install_revision`` can route to ``install_initial_plan``.
         # Plain attribute on the dataclass instance (Plan is mutable);
-        # the runner reads via ``getattr(plan, "_goldfive_pivot", False)``
+        # the runner reads via ``getattr(plan, "_goldfive_pivot", False)``.
+        # goldfive#247: ``_goldfive_pivot`` is a declared field on the
+        # frozen ``Plan`` dataclass; we derive a new instance with the
+        # flag set rather than dynamically adding the attribute.
         # so older Plans (no flag) trivially route as revisions.
         if replaces_prior:
-            plan._goldfive_pivot = True  # type: ignore[attr-defined]
+            plan = dataclasses.replace(plan, _goldfive_pivot=True)
         return plan
 
 

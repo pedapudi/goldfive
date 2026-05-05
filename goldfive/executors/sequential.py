@@ -55,7 +55,16 @@ from goldfive.executors._control import (
 )
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
-from goldfive.types import DriftKind, DriftSeverity, Plan, Session, Task, TaskStatus
+from goldfive.types import (
+    DriftKind,
+    DriftSeverity,
+    Plan,
+    Session,
+    Task,
+    TaskStatus,
+    channel_processor_active,
+    set_session_plan,
+)
 
 if TYPE_CHECKING:
     from goldfive.control import ControlChannel
@@ -345,8 +354,13 @@ class SequentialExecutor(Executor):
         False.
         """
         # Pin the plan onto the session so the steerer / reporting handlers
-        # see the same object the executor is iterating.
-        session.plan = plan
+        # see the same object the executor is iterating. goldfive#247:
+        # routed through :func:`set_session_plan` for the
+        # single-writer enforcement; the initial pin is a legitimate
+        # channel-processor write so we wrap in
+        # :func:`channel_processor_active`.
+        with channel_processor_active():
+            set_session_plan(session, plan)
 
         # Wire sinks + planner into the steerer so reporting-tool handlers
         # can emit events and trigger planner.refine on drift.

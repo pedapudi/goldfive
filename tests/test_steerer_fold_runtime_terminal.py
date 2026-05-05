@@ -52,6 +52,24 @@ from goldfive.types import (  # noqa: E402
     TaskStatus,
 )
 
+
+def _fold_ids(revised: Plan, prior: Plan | None) -> tuple[list[str], Plan]:
+    """Compatibility shim around the goldfive#247-changed fold signature.
+
+    Pre-#247 ``_fold_runtime_terminal_statuses`` mutated ``revised`` in
+    place and returned the folded task ids as a list. With the frozen
+    Plan refactor it returns a NEW Plan; this helper computes the
+    folded-id list by diffing input vs output so the existing test
+    assertions ``folded == [...]`` keep working.
+    """
+    folded_plan = DefaultSteerer._fold_runtime_terminal_statuses(revised, prior)
+    if folded_plan is revised:
+        return [], folded_plan
+    before = {t.id: t.status for t in revised.tasks}
+    after = {t.id: t.status for t in folded_plan.tasks}
+    folded_ids = [tid for tid, status in after.items() if before.get(tid) is not status]
+    return folded_ids, folded_plan
+
 # ---------------------------------------------------------------------------
 # Local stubs (mirrored from test_steerer.py for self-containment)
 # ---------------------------------------------------------------------------
@@ -164,7 +182,9 @@ def test_fold_overwrites_pending_with_prior_not_needed() -> None:
         ],
     )
 
-    folded = DefaultSteerer._fold_runtime_terminal_statuses(revised, prior)
+    # goldfive#247: fold returns a NEW Plan; use the shim to recover
+    # the folded-id list and bind to the post-fold plan.
+    folded, revised = _fold_ids(revised, prior)
 
     assert folded == ["correct_research"], folded
     new_by_id = {t.id: t for t in revised.tasks}
@@ -199,7 +219,9 @@ def test_fold_no_op_when_revised_already_matches_prior_terminal() -> None:
         edges=[],
     )
 
-    folded = DefaultSteerer._fold_runtime_terminal_statuses(revised, prior)
+    # goldfive#247: fold returns a NEW Plan; use the shim to recover
+    # the folded-id list and bind to the post-fold plan.
+    folded, revised = _fold_ids(revised, prior)
 
     assert folded == []
     assert revised.tasks[0].status is TaskStatus.CANCELLED
@@ -231,7 +253,9 @@ def test_fold_preserves_genuine_terminal_to_terminal_regression() -> None:
         edges=[],
     )
 
-    folded = DefaultSteerer._fold_runtime_terminal_statuses(revised, prior)
+    # goldfive#247: fold returns a NEW Plan; use the shim to recover
+    # the folded-id list and bind to the post-fold plan.
+    folded, revised = _fold_ids(revised, prior)
 
     # No fold — the validator owns this rejection.
     assert folded == []
@@ -247,9 +271,11 @@ def test_fold_handles_none_or_empty_prior() -> None:
         edges=[],
     )
 
-    assert DefaultSteerer._fold_runtime_terminal_statuses(revised, None) == []
+    # goldfive#247: fold returns the input unchanged on no-op; verify
+    # via _fold_ids shim which yields the empty folded-id list.
+    assert _fold_ids(revised, None)[0] == []
     empty = Plan(id="p1", run_id="r1", goal_ids=["g1"], tasks=[], edges=[])
-    assert DefaultSteerer._fold_runtime_terminal_statuses(revised, empty) == []
+    assert _fold_ids(revised, empty)[0] == []
 
 
 def test_fold_skips_tasks_present_only_in_prior() -> None:
@@ -278,7 +304,9 @@ def test_fold_skips_tasks_present_only_in_prior() -> None:
         edges=[],
     )
 
-    folded = DefaultSteerer._fold_runtime_terminal_statuses(revised, prior)
+    # goldfive#247: fold returns a NEW Plan; use the shim to recover
+    # the folded-id list and bind to the post-fold plan.
+    folded, revised = _fold_ids(revised, prior)
 
     assert folded == []
     assert {t.id for t in revised.tasks} == {"t1", "t2"}
@@ -324,7 +352,10 @@ async def test_install_with_drift_folds_runtime_not_needed_into_snapshot() -> No
         edges=[TaskEdge("research", "correct_research")],
     )
     # Bump the prior's revision_index so we can see monotonic advance.
-    prior.revision_index = 3
+    # goldfive#247: Plan is frozen — derive via bump_revision.
+    from goldfive.types import bump_revision
+
+    prior = bump_revision(prior, revision_index=3)
     session = _make_session(plan=prior)
 
     revised = Plan(
@@ -374,7 +405,8 @@ async def test_install_with_drift_folds_runtime_not_needed_into_snapshot() -> No
         "install must succeed: the fold corrects the regression before "
         "validation runs"
     )
-    assert session.plan is revised
+    # goldfive#247: identity check replaced with id check (Plan is frozen)
+    assert session.plan is not None and session.plan.id == revised.id
     assert session.plan.revision_index == 4
     new_by_id = {t.id: t for t in session.plan.tasks}
     assert new_by_id["correct_research"].status is TaskStatus.NOT_NEEDED, (
@@ -448,7 +480,8 @@ async def test_install_with_drift_genuine_terminal_regression_still_rejected() -
 
     assert installed is False
     # Plan unchanged.
-    assert session.plan is prior
+    # goldfive#247: identity check replaced with id check (Plan is frozen)
+    assert session.plan is not None and session.plan.id == prior.id
     assert prior.tasks[0].status is TaskStatus.CANCELLED
     # SCHEMA_VIOLATION drift surfaced.
     schema_violations = [
@@ -520,8 +553,12 @@ async def test_install_user_steer_folds_before_validating_llm_revision() -> None
     )
 
     # The LLM revision was used (not the deterministic minimum) because
-    # the fold corrected the regression before validation.
-    assert returned is llm_revision
+    # the fold corrected the regression before validation. goldfive#247:
+    # _apply_revision returns a NEW Plan (frozen Plan); identity is no
+    # longer the right check — verify the plan id matches and the
+    # post-fold contents.
+    assert returned is not None
+    assert returned.id == llm_revision.id
     new_by_id = {t.id: t for t in session.plan.tasks}
     assert new_by_id["correct_research"].status is TaskStatus.NOT_NEEDED
     assert new_by_id["finalize"].status is TaskStatus.PENDING
@@ -614,7 +651,9 @@ async def test_apply_revision_defensive_fold_idempotent_when_caller_already_fold
     session = _make_session(plan=prior)
 
     # First fold (caller-equivalent): no-op.
-    folded_first = DefaultSteerer._fold_runtime_terminal_statuses(revised, prior)
+    # goldfive#247: shim to compute the folded-id list from the new
+    # Plan-returning signature.
+    folded_first, _ = _fold_ids(revised, prior)
     assert folded_first == []
 
     # _apply_revision's internal defensive fold: also no-op.
@@ -623,9 +662,10 @@ async def test_apply_revision_defensive_fold_idempotent_when_caller_already_fold
         severity=DriftSeverity.INFO,
         detail="x",
     )
-    DefaultSteerer._apply_revision(session, revised, drift)
+    revised = DefaultSteerer._apply_revision(session, revised, drift)  # goldfive#247: rebind
 
-    assert session.plan is revised
+    # goldfive#247: identity check replaced with id check (Plan is frozen)
+    assert session.plan is not None and session.plan.id == revised.id
     new_by_id = {t.id: t for t in session.plan.tasks}
     assert new_by_id["t1"].status is TaskStatus.NOT_NEEDED
     assert new_by_id["t2"].status is TaskStatus.PENDING

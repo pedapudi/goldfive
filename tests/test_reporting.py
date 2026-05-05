@@ -146,7 +146,10 @@ async def test_report_task_progress_records_progress() -> None:
     # goldfive#201: progress ticks are only valid on RUNNING tasks —
     # transition t1 first so the handler actually records progress
     # instead of returning invalid_transition.
-    session.plan.tasks[0].status = TaskStatus.RUNNING
+    # goldfive#247: Plan + Task are frozen — derive via helper.
+    from tests._immutable_plan_helpers import force_task_status
+
+    force_task_status(session, "t1", TaskStatus.RUNNING)
     await _tool("report_task_progress").handler(
         {"task_id": "t1", "fraction": 0.75, "detail": "three of four done"},
         session,
@@ -289,10 +292,20 @@ async def test_report_task_started_reroutes_to_replacement() -> None:
     """A report_task_started against a terminal+superseded id lands on the replacement."""
     steerer, session, sink, _ = _fresh()
     # Mark t1 FAILED and add a replacement superseding it.
-    session.plan.tasks[0].status = TaskStatus.FAILED
-    session.plan.tasks.append(
-        Task(id="t1_retry", title="A retry", supersedes="t1"),
+    # goldfive#247: Plan + Task are frozen — derive via helpers.
+    from goldfive.types import (
+        add_tasks,
+        channel_processor_active,
+        set_session_plan,
+        with_task_status,
     )
+    new_plan = with_task_status(session.plan, "t1", TaskStatus.FAILED)
+    new_plan = add_tasks(
+        new_plan,
+        [Task(id="t1_retry", title="A retry", supersedes="t1")],
+    )
+    with channel_processor_active():
+        set_session_plan(session, new_plan)
     out = await _tool("report_task_started").handler(
         {"task_id": "t1", "detail": "starting retry"}, session, steerer
     )

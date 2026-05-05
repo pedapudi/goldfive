@@ -273,7 +273,17 @@ async def test_two_back_to_back_task_transitions_do_not_clobber_running_judge() 
     # should NOT spawn a second judge AND must not cancel the first.
     plan = session.plan
     assert plan is not None
-    plan.tasks.append(Task(id="t2", title="t2", description=""))
+    # goldfive#247: Plan is frozen — extend via add_tasks.
+    from goldfive.types import (
+        add_tasks,
+        channel_processor_active,
+        set_session_plan,
+    )
+    with channel_processor_active():
+        set_session_plan(
+            session,
+            add_tasks(plan, [Task(id="t2", title="t2", description="")]),
+        )
     await steerer.mark_task_completed("t2", session=session, summary="also done")
     # First judge still pending.
     assert len(steerer._background_judges) == 1

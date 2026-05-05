@@ -433,7 +433,10 @@ async def test_task_started_no_required_fields_accepts_minimal_call() -> None:
     rejection."""
     steerer, session, _sink, _planner = _fresh()
     # Reset t1 to PENDING so the started transition is legal.
-    session.plan.tasks[0].status = TaskStatus.PENDING
+    # goldfive#247: Plan is frozen — derive new plan via helper.
+    from tests._immutable_plan_helpers import force_task_status
+
+    force_task_status(session, "t1", TaskStatus.PENDING)
     out = await _tool("report_task_started").handler({"task_id": "t1"}, session, steerer)
     # F1: directive ack on a real transition / accepted call.
     assert out["acknowledged"] is True

@@ -50,6 +50,7 @@ from goldfive.types import (  # noqa: E402
     Task,
     TaskEdge,
     TaskStatus,
+    bump_revision,
 )
 
 # ---------------------------------------------------------------------------
@@ -213,8 +214,8 @@ async def test_successful_refine_emits_attempted_and_correlation_with_same_attem
     # Structurally-distinct revised plan so the steerer's no-op
     # revision rejection (goldfive#271) doesn't short-circuit refine
     # success — this test exercises the success path.
-    revised = _make_plan(("t1", "t2", "t3"))
-    revised.revision_index = 1
+    # goldfive#247: Plan is frozen — derive via bump_revision.
+    revised = bump_revision(_make_plan(("t1", "t2", "t3")), revision_index=1)
     planner = StubPlanner(revised=revised)
     sink = ListSink()
     steerer = DefaultSteerer()
@@ -330,8 +331,8 @@ async def test_validator_rejection_emits_failed_with_validator_kind() -> None:
 
 async def test_attempt_id_is_unique_per_attempt() -> None:
     """Two consecutive refines mint two distinct ``attempt_id`` values."""
-    revised = _make_plan(("t1", "t2", "t3"))
-    revised.revision_index = 1
+    # goldfive#247: Plan is frozen — derive via bump_revision.
+    revised = bump_revision(_make_plan(("t1", "t2", "t3")), revision_index=1)
     planner = StubPlanner(revised=revised)
     sink = ListSink()
     steerer = DefaultSteerer()
@@ -355,8 +356,8 @@ async def test_refine_attempted_carries_drift_kind_and_severity() -> None:
     triggering drift's kind / severity / drift_id so harmonograf can
     render an intervention timeline without re-fetching the drift.
     """
-    revised = _make_plan(("t1", "t2", "t3"))
-    revised.revision_index = 1
+    # goldfive#247: Plan is frozen — derive via bump_revision.
+    revised = bump_revision(_make_plan(("t1", "t2", "t3")), revision_index=1)
     planner = StubPlanner(revised=revised)
     sink = ListSink()
     steerer = DefaultSteerer()
@@ -400,8 +401,8 @@ async def test_wait_plan_stable_blocks_until_emit_plan_revised_completes() -> No
     mutation region releases. The barrier observes a stable plan: the
     revised one (post-mutation), never a partial state.
     """
-    revised = _make_plan(("t1", "t2", "t3"))
-    revised.revision_index = 1
+    # goldfive#247: Plan is frozen — derive via bump_revision.
+    revised = bump_revision(_make_plan(("t1", "t2", "t3")), revision_index=1)
     planner = StubPlanner(revised=revised)
     sink = ListSink()
     steerer = DefaultSteerer()
@@ -544,14 +545,18 @@ async def test_report_handler_invokes_wait_plan_stable() -> None:
     """
     from goldfive.reporting import BUILTIN_REPORTING_TOOLS
 
+    # goldfive#247: Plan is frozen — derive via helpers.
+    from goldfive.types import bump_revision as _bump
+    from tests._immutable_plan_helpers import force_task_status
+
     revised = _make_plan(("t1", "t2", "t3"))
-    revised.revision_index = 1
+    revised = _bump(revised, revision_index=1)
     planner = StubPlanner(revised=revised)
     sink = ListSink()
     steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
-    session.plan.tasks[0].status = TaskStatus.RUNNING
+    force_task_status(session, "t1", TaskStatus.RUNNING)
     session.current_task_id = "t1"
 
     # Spy on _wait_plan_stable.
@@ -591,7 +596,10 @@ async def test_report_handler_tolerates_steerer_without_wait_plan_stable() -> No
             pass
 
     session = _make_session()
-    session.plan.tasks[0].status = TaskStatus.RUNNING
+    # goldfive#247: Plan + Task are frozen — derive via helper.
+    from tests._immutable_plan_helpers import force_task_status
+
+    force_task_status(session, "t1", TaskStatus.RUNNING)
     handler = next(
         t.handler for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_completed"
     )
@@ -609,9 +617,12 @@ async def test_proto_plan_revised_event_unchanged_on_success() -> None:
     fields it always has. The a4 attempt_id sidecar is purely additive;
     existing consumers don't observe any field change on the proto.
     """
-    revised = _make_plan(("t1", "t2", "t3"))
-    revised.revision_index = 1
-    revised.revision_reason = ""
+    # goldfive#247: Plan is frozen — derive via bump_revision.
+    revised = bump_revision(
+        _make_plan(("t1", "t2", "t3")),
+        revision_index=1,
+        revision_reason="",
+    )
     planner = StubPlanner(revised=revised)
     sink = ListSink()
     steerer = DefaultSteerer()

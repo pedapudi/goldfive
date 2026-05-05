@@ -458,7 +458,14 @@ async def test_pin_supersedes_redirection_tracks_replacement() -> None:
     assert session.state[KEY_CURRENT_TASK_ID] == "C"
 
     # Flip B to COMPLETED; now C is DAG-ready -> signal 2 binds.
-    plan.tasks[1].status = TaskStatus.COMPLETED
+    # goldfive#247: Plan is frozen — derive via helper. ``session.plan``
+    # is the same Plan object as the local ``plan`` variable, but since
+    # ``_session_with(plan)`` doesn't copy, swapping ``session.plan``
+    # to the new derivation also serves the plugin's reads.
+    from tests._immutable_plan_helpers import force_task_status
+
+    force_task_status(session, "B", TaskStatus.COMPLETED)
+    plan = session.plan
     await plugin.before_agent_callback(
         agent=_Agent("research_agent"),
         callback_context=ctx,

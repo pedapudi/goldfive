@@ -202,17 +202,17 @@ async def test_lineage_clears_on_cascade_cancel_downstream() -> None:
     """
     upstream = Task(id="u", title="Upstream", assignee_agent_id="a1")
     downstream = Task(id="d", title="Downstream", assignee_agent_id="a2")
+    # goldfive#247: build the plan with edges at construction (Plan
+    # is frozen — no in-place mutation).
+    from goldfive.types import TaskEdge
+
     plan = Plan(
         id="p1",
         run_id="r1",
         goal_ids=["g1"],
         tasks=[upstream, downstream],
-        edges=[],
+        edges=[TaskEdge(from_task_id="u", to_task_id="d")],
     )
-    # Edge "upstream → downstream" so the cascade reaches d.
-    from goldfive.types import TaskEdge
-
-    plan.edges = [TaskEdge(from_task_id="u", to_task_id="d")]
     session = Session(
         run_id="r1",
         goals=[Goal(id="g1", summary="demo")],
@@ -231,7 +231,11 @@ async def test_lineage_clears_on_cascade_cancel_downstream() -> None:
     await steerer.mark_task_failed("u", session=session, recoverable=False)
     assert "u" not in session.task_lineage
     assert "d" not in session.task_lineage
-    assert downstream.status is TaskStatus.CANCELLED
+    # goldfive#247: read live status from session.plan; the local
+    # ``downstream`` reference is the pre-mutation snapshot.
+    assert session.plan is not None
+    live_d = next(t for t in session.plan.tasks if t.id == "d")
+    assert live_d.status is TaskStatus.CANCELLED
 
 
 async def test_delegation_observed_with_no_pinned_task_is_noop() -> None:

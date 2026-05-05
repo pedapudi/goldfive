@@ -48,6 +48,9 @@ from goldfive.types import (  # noqa: E402
     Session,
     Task,
     TaskStatus,
+    bump_revision,
+    channel_processor_active,
+    set_session_plan,
 )
 
 # ---------------------------------------------------------------------------
@@ -573,8 +576,10 @@ async def test_end_to_end_redundant_drift_emits_but_does_not_refine() -> None:
     # Now a refine for the SAME (kind, target) lands externally —
     # watermark advances to revision 3 BEFORE the detector's drift
     # reaches dispatch. (In production this happens via _apply_revision
-    # stamping; we simulate it here by setting the dict directly.)
-    session.plan.revision_index = 3
+    # stamping; we simulate it here via the channel-processor primitive
+    # since Plan is frozen post-#247.)
+    with channel_processor_active():
+        set_session_plan(session, bump_revision(session.plan, revision_index=3))
     session.last_addressed_revision_by_drift_key[
         (DriftKind.OFF_TOPIC.value, "t-draft")
     ] = 3

@@ -125,10 +125,16 @@ class _MinimalStubSteerer:
     ) -> None:
         if session.plan is None:
             return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                t.status = to
-                return
+        # goldfive#247: Plan + Task are frozen — derive new plan + swap.
+        if not any(t.id == task_id for t in session.plan.tasks):
+            return
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, to))
 
     def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:  # noqa: ARG002
         return None
@@ -232,7 +238,9 @@ async def test_overlay_supersede_cancel_restarts_loop_by_default() -> None:
     """
     plan = _two_task_plan()
     session = Session(run_id="r1")
-    session.plan = plan
+    # goldfive#247: route through helper
+    from tests._immutable_plan_helpers import force_plan as _fp_helper
+    _fp_helper(session, plan)
     refined = _revised_plan()
     steerer = _MinimalStubSteerer()
     sink = RecordingSink()
@@ -251,7 +259,9 @@ async def test_overlay_supersede_cancel_restarts_loop_by_default() -> None:
         # 3. raise CancelledError (mirrors the plugin firing
         #    task.cancel() on the registered asyncio.Task).
         if len(adapter.passthrough_calls) == 1:
-            session.plan = refined
+            # goldfive#247: route through helper
+            from tests._immutable_plan_helpers import force_plan as _fp_helper
+            _fp_helper(session, refined)
             session._supersede_pending = True  # type: ignore[attr-defined]
             raise asyncio.CancelledError()
         # Second invocation: run the revised plan to completion. The
@@ -300,8 +310,11 @@ async def test_overlay_supersede_cancel_restarts_loop_by_default() -> None:
     # Final event is run_completed.
     assert sink.payload_kinds()[-1] == "run_completed"
     # session.plan is the revised plan and its tasks are terminal.
-    assert session.plan is refined
-    for t in refined.tasks:
+    # goldfive#247: identity check replaced with id check (Plan is frozen).
+    # Read tasks from session.plan (live) — the local ``refined`` is
+    # the pre-mutation snapshot.
+    assert session.plan is not None and session.plan.id == refined.id
+    for t in session.plan.tasks:
         assert t.status in (TaskStatus.COMPLETED, TaskStatus.NOT_NEEDED), (
             f"revised task {t.id} ended in {t.status}"
         )
@@ -323,7 +336,9 @@ async def test_overlay_external_cancel_still_aborts() -> None:
     """
     plan = _two_task_plan()
     session = Session(run_id="r1")
-    session.plan = plan
+    # goldfive#247: route through helper
+    from tests._immutable_plan_helpers import force_plan as _fp_helper
+    _fp_helper(session, plan)
     steerer = _MinimalStubSteerer()
     sink = RecordingSink()
     channel = ControlChannel()
@@ -381,7 +396,9 @@ async def test_overlay_external_cancel_still_aborts() -> None:
 async def test_overlay_supersede_cancel_aborts_when_fail_fast_kwarg_set() -> None:
     plan = _two_task_plan()
     session = Session(run_id="r1")
-    session.plan = plan
+    # goldfive#247: route through helper
+    from tests._immutable_plan_helpers import force_plan as _fp_helper
+    _fp_helper(session, plan)
     steerer = _MinimalStubSteerer()
     sink = RecordingSink()
     channel = ControlChannel()
@@ -434,7 +451,9 @@ async def test_overlay_env_var_enables_fail_fast(
 
     plan = _two_task_plan()
     session = Session(run_id="r1")
-    session.plan = plan
+    # goldfive#247: route through helper
+    from tests._immutable_plan_helpers import force_plan as _fp_helper
+    _fp_helper(session, plan)
     steerer = _MinimalStubSteerer()
     sink = RecordingSink()
     channel = ControlChannel()
@@ -510,7 +529,9 @@ async def test_overlay_supersede_then_external_cancel_aborts() -> None:
     (it has no supersede marker)."""
     plan = _two_task_plan()
     session = Session(run_id="r1")
-    session.plan = plan
+    # goldfive#247: route through helper
+    from tests._immutable_plan_helpers import force_plan as _fp_helper
+    _fp_helper(session, plan)
     refined = _revised_plan()
     steerer = _MinimalStubSteerer()
     sink = RecordingSink()
@@ -524,7 +545,9 @@ async def test_overlay_supersede_then_external_cancel_aborts() -> None:
         reconciler: Any,  # noqa: ARG001
     ) -> InvocationResult | None:
         if len(adapter.passthrough_calls) == 1:
-            session.plan = refined
+            # goldfive#247: route through helper
+            from tests._immutable_plan_helpers import force_plan as _fp_helper
+            _fp_helper(session, refined)
             session._supersede_pending = True  # type: ignore[attr-defined]
             raise asyncio.CancelledError()
         # Second invocation: signal then block. The test will then
@@ -595,7 +618,9 @@ async def test_overlay_stale_supersede_flag_cleared_per_iteration() -> None:
     """
     plan = _two_task_plan()
     session = Session(run_id="r1")
-    session.plan = plan
+    # goldfive#247: route through helper
+    from tests._immutable_plan_helpers import force_plan as _fp_helper
+    _fp_helper(session, plan)
     # Pre-stamp the flag as if some prior side-effect set it. The
     # executor's per-iteration clear at the top of the while loop must
     # wipe this before the first invocation completes.

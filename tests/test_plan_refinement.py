@@ -28,6 +28,8 @@ def _mk_plan(
     edges: list[Any] | None = None,
     revision_index: int = 0,
     revision_reason: str = "",
+    revision_kind: str = "",
+    revision_severity: str = "",
 ) -> Any:
     return types.Plan(
         id=f"plan-{revision_index}",
@@ -37,6 +39,8 @@ def _mk_plan(
         edges=edges or [],
         revision_index=revision_index,
         revision_reason=revision_reason,
+        revision_kind=revision_kind,
+        revision_severity=revision_severity,
     )
 
 
@@ -57,7 +61,8 @@ def test_refined_plan_preserves_completed_task_ids() -> None:
 
     run_id = "refine-preserve"
     original = _mk_plan(run_id=run_id, tasks=[_mk_task("t1"), _mk_task("t2")])
-    original.tasks[0].status = types.TaskStatus.COMPLETED
+    # goldfive#247: Plan is frozen — derive via with_task_status.
+    original = types.with_task_status(original, "t1", types.TaskStatus.COMPLETED)
 
     refined = _mk_plan(
         run_id=run_id,
@@ -99,8 +104,12 @@ async def test_planner_refine_increments_revision_and_preserves_completed() -> N
         goals=[types.Goal(id="g1", summary="do things")],
         available_agents=["default"],
     )
-    session.plan = p0
-    p0.tasks[0].status = types.TaskStatus.COMPLETED
+    # goldfive#247: install via the test helper so the channel-processor
+    # gate is satisfied; flip t1 COMPLETED via with_task_status.
+    p0 = types.with_task_status(p0, "t1", types.TaskStatus.COMPLETED)
+    from tests._immutable_plan_helpers import force_plan
+
+    force_plan(session, p0)
 
     drift = types.DriftEvent(
         kind=types.DriftKind.NEW_WORK_DISCOVERED,
@@ -163,15 +172,16 @@ async def test_revision_reason_and_kind_propagate() -> None:
             return _mk_plan(run_id="tag", tasks=[_mk_task("t1")])
 
         async def refine(self, *, plan, drift, goals):
-            refined = _mk_plan(
+            # goldfive#247: Plan is frozen — pass all metadata at
+            # construction.
+            return _mk_plan(
                 run_id=plan.run_id,
                 tasks=[*plan.tasks, _mk_task("t2")],
                 revision_index=plan.revision_index + 1,
                 revision_reason=drift.detail,
+                revision_kind=drift.kind.value,
+                revision_severity=drift.severity.value,
             )
-            refined.revision_kind = drift.kind.value
-            refined.revision_severity = drift.severity.value
-            return refined
 
     planner = _TaggingPlanner()
     plan = await planner.generate(goals=[], available_agents=["default"])

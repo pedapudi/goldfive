@@ -152,7 +152,7 @@ async def test_runner_drives_goal_plan_parallel_dag_and_persists(tmp_path: Path)
     assert outcome.success is True
     session = outcome.session
     assert session.plan is not None
-    assert session.plan.goal_ids == ["g1"]
+    assert session.plan.goal_ids == ("g1",)
 
     # All four tasks should have reached COMPLETED.
     statuses = {t.id: t.status for t in session.plan.tasks}

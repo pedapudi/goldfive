@@ -36,6 +36,7 @@ from goldfive import (
     StaticPlanner,
     Task,
     TaskEdge,
+    TaskStatus,
     TurnRecord,
 )
 from goldfive.conversation import Conversation as _ConversationClass  # noqa: F401
@@ -132,9 +133,12 @@ def test_conversation_absorb_turn_merges_goals_and_results() -> None:
     # Turn adds a new goal and one completed result.
     session.goals.append(Goal(id="g2", summary="second"))
     session.completed_results["task1"] = "researched"
-    session.plan = _linear_plan()
+    # goldfive#247: Plan is frozen — install via helper.
+    from tests._immutable_plan_helpers import force_plan, force_task_status
+
+    force_plan(session, _linear_plan())
     # Mark one task completed so the record reflects it.
-    session.plan.tasks[0].status = session.plan.tasks[0].status.COMPLETED
+    force_task_status(session, session.plan.tasks[0].id, TaskStatus.COMPLETED)
 
     outcome = ExecutionOutcome(success=True, session=session)
     record = conv.absorb_turn(outcome, user_input_summary="write a haiku")

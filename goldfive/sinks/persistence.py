@@ -190,7 +190,13 @@ def reconstruct_session(events: list[Any]) -> Any:
     # which is fine, but keeping the import local matches the lazy proto
     # import above).
     from goldfive.conv import from_pb_goal, from_pb_plan
-    from goldfive.types import Session, TaskStatus
+    from goldfive.types import (
+        Session,
+        TaskStatus,
+        channel_processor_active,
+        set_session_plan,
+        with_task_status,
+    )
 
     session = Session(run_id="")
 
@@ -198,12 +204,19 @@ def reconstruct_session(events: list[Any]) -> Any:
     max_seq = -1
 
     def _update_task_status(task_id: str, status: TaskStatus) -> None:
+        # goldfive#247: Plan + Task are frozen — derive a new Plan via
+        # :func:`with_task_status` and swap it onto the session under
+        # :func:`channel_processor_active`. ``reconstruct_session`` is a
+        # crash-recovery synthetic writer (no live channel processor),
+        # but it IS the sole writer for the duration of replay so the
+        # contextvar is the right scope.
         if session.plan is None or not task_id:
             return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                t.status = status
-                return
+        # Fast path: skip if no task with this id is in the plan.
+        if not any(t.id == task_id for t in session.plan.tasks):
+            return
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, status))
 
     for evt in events:
         seq = int(getattr(evt, "sequence", 0) or 0)
@@ -222,9 +235,11 @@ def reconstruct_session(events: list[Any]) -> Any:
         elif payload == "goal_derived":
             session.goals = [from_pb_goal(g) for g in evt.goal_derived.goals]
         elif payload == "plan_submitted":
-            session.plan = from_pb_plan(evt.plan_submitted.plan)
+            with channel_processor_active():
+                set_session_plan(session, from_pb_plan(evt.plan_submitted.plan))
         elif payload == "plan_revised":
-            session.plan = from_pb_plan(evt.plan_revised.plan)
+            with channel_processor_active():
+                set_session_plan(session, from_pb_plan(evt.plan_revised.plan))
         elif payload == "task_started":
             ts = evt.task_started
             session.current_task_id = ts.task_id

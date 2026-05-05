@@ -423,9 +423,12 @@ async def test_user_steer_refine_preserves_prior_user_steer_goals() -> None:
     )
     # Start from a plan where draft is COMPLETED so the USER_STEER
     # merge path has something to preserve.
+    # goldfive#247: Plan is frozen — derive via with_task_status.
+    from goldfive.types import with_task_status as _wts
+
     plan = _running_plan()
-    plan.tasks[1].status = TaskStatus.COMPLETED  # draft done
-    plan.tasks[2].status = TaskStatus.COMPLETED  # review done
+    plan = _wts(plan, plan.tasks[1].id, TaskStatus.COMPLETED)  # draft done
+    plan = _wts(plan, plan.tasks[2].id, TaskStatus.COMPLETED)  # review done
 
     revised = await planner.refine(
         plan=plan,

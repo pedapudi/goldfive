@@ -577,8 +577,12 @@ async def test_handler_waits_for_plan_stable_during_concurrent_refine() -> None:
 
     async def _bump_during_wait(_session: Any) -> None:
         # Simulate the refine landing while the handler is parked at
-        # the barrier — increments revision_index in place.
-        plan.revision_index = 1
+        # the barrier — bumps revision_index. goldfive#247: Plan is
+        # frozen — derive a new instance and swap onto session.plan.
+        from goldfive.types import bump_revision
+        from tests._immutable_plan_helpers import force_plan
+
+        force_plan(_session, bump_revision(_session.plan, revision_index=1))
 
     steerer = _SinkingSteerer(sinks, on_wait=_bump_during_wait)
 

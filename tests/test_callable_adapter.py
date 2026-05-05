@@ -48,11 +48,20 @@ class _StubSteerer:
     ) -> None:
         self.transitions.append((task_id, to, detail))
         # Mirror real steerer behaviour: update session state.
+        # goldfive#247: Plan + Task are frozen — derive a new Plan via
+        # with_task_status and swap onto the session.
         session.current_task_id = task_id
-        if session.plan is not None:
-            for t in session.plan.tasks:
-                if t.id == task_id:
-                    t.status = to
+        if session.plan is None:
+            return
+        if not any(t.id == task_id for t in session.plan.tasks):
+            return
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, to))
 
     # Unused in these tests but kept so the stub is Steerer-shaped.
     async def observe(self, event: Any, session: Session) -> None:  # pragma: no cover
@@ -232,7 +241,12 @@ async def test_tool_routing_drives_session_transitions() -> None:
 
     assert result.task_id == "t1"
     assert result.text == "done deal"
-    assert task.status == TaskStatus.COMPLETED
+    # goldfive#247: Task is frozen — the local ``task`` reference is
+    # the pre-mutation snapshot. The live status sits on the post-swap
+    # plan in session.plan.
+    assert session.plan is not None
+    live_task = next(t for t in session.plan.tasks if t.id == task.id)
+    assert live_task.status == TaskStatus.COMPLETED
     assert session.completed_results == {"t1": "done deal"}
     assert steerer.transitions == [
         ("t1", TaskStatus.RUNNING, "kicking off"),

@@ -168,7 +168,7 @@ async def test_current_task_id_repins_on_revision() -> None:
     planner = _StubPlanner(revised=revised)
     steerer = DefaultSteerer()
     steerer.bind(sinks=[ListSink()], planner=planner)
-    steerer._apply_revision(session, revised, _drift())
+    revised = steerer._apply_revision(session, revised, _drift())  # goldfive#247: rebind
     await steerer._emit_plan_revised(session, revised, _drift(), prev_plan=None)
 
     assert session.current_task_id == "research_solar_corrected"
@@ -182,10 +182,10 @@ async def test_report_task_progress_routes_to_replacement() -> None:
         plan=_revised_with_replacement(),
     )
     # Transition the replacement into RUNNING so the progress tick is
-    # a legal transition target.
-    for t in session.plan.tasks:
-        if t.id == "research_solar_corrected":
-            t.status = TaskStatus.RUNNING
+    # a legal transition target. goldfive#247: derive via helper.
+    from tests._immutable_plan_helpers import force_task_status
+
+    force_task_status(session, "research_solar_corrected", TaskStatus.RUNNING)
 
     sink = ListSink()
     planner = _StubPlanner()
@@ -436,7 +436,7 @@ async def test_integrate_correction_supersedes_keeps_old_task() -> None:
         revision_index=1,
     )
 
-    DefaultSteerer._integrate_correction_supersedes(revised)
+    revised = DefaultSteerer._integrate_correction_supersedes(revised)
 
     by_id = {t.id: t for t in revised.tasks}
     # Old task preserved with its COMPLETED status intact.
@@ -461,7 +461,7 @@ async def test_integrate_correction_supersedes_replace_kind_no_dag_rewrite() -> 
     """
     revised = _revised_with_replacement()
     original_edges = [(e.from_task_id, e.to_task_id) for e in revised.edges]
-    DefaultSteerer._integrate_correction_supersedes(revised)
+    revised = DefaultSteerer._integrate_correction_supersedes(revised)
     # No edge mutations.
     assert [(e.from_task_id, e.to_task_id) for e in revised.edges] == original_edges
 
@@ -495,7 +495,7 @@ async def test_validator_coerces_replace_to_correct_on_completed() -> None:
         edges=[],
         revision_index=1,
     )
-    _normalize_supersession_kinds(revised, prior=prior)
+    revised = _normalize_supersession_kinds(revised, prior=prior)
     by_id = {t.id: t for t in revised.tasks}
     assert by_id["research_solar_corrected"].supersedes_kind is SupersessionKind.CORRECT
 
@@ -506,7 +506,10 @@ async def test_validator_coerces_correct_to_replace_on_pending() -> None:
 
     prior = _plan_with_failed_research()
     # Swap research_solar back to PENDING for this scenario.
-    prior.tasks[0].status = TaskStatus.PENDING
+    # goldfive#247: Plan is frozen — derive a new prior via with_task_status.
+    from goldfive.types import with_task_status as _wts
+
+    prior = _wts(prior, prior.tasks[0].id, TaskStatus.PENDING)
     revised = Plan(
         id="p1",
         run_id="r1",
@@ -530,7 +533,7 @@ async def test_validator_coerces_correct_to_replace_on_pending() -> None:
         edges=[],
         revision_index=1,
     )
-    _normalize_supersession_kinds(revised, prior=prior)
+    revised = _normalize_supersession_kinds(revised, prior=prior)
     by_id = {t.id: t for t in revised.tasks}
     assert by_id["research_solar_v2"].supersedes_kind is SupersessionKind.REPLACE
 
@@ -556,7 +559,7 @@ async def test_validator_clears_kind_with_empty_target() -> None:
         edges=[],
         revision_index=1,
     )
-    _normalize_supersession_kinds(revised, prior=prior)
+    revised = _normalize_supersession_kinds(revised, prior=prior)
     assert revised.tasks[0].supersedes_kind is SupersessionKind.UNSPECIFIED
 
 
@@ -586,7 +589,7 @@ async def test_validator_unspecified_resolves_from_status() -> None:
         edges=[],
         revision_index=1,
     )
-    _normalize_supersession_kinds(revised, prior=prior)
+    revised = _normalize_supersession_kinds(revised, prior=prior)
     by_id = {t.id: t for t in revised.tasks}
     assert by_id["research_solar_corrected"].supersedes_kind is SupersessionKind.CORRECT
 
@@ -636,7 +639,7 @@ async def test_downstream_edge_rewrite_on_correct_chain() -> None:
         revision_index=1,
     )
 
-    DefaultSteerer._integrate_correction_supersedes(revised)
+    revised = DefaultSteerer._integrate_correction_supersedes(revised)
 
     edges_set = {(e.from_task_id, e.to_task_id) for e in revised.edges}
     # Chain is now a -> a_prime -> b -> c.
@@ -816,7 +819,7 @@ async def test_correct_integration_via_emit_plan_revised_end_to_end() -> None:
     planner = _StubPlanner(revised=revised)
     steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=planner)
-    steerer._apply_revision(session, revised, _drift())
+    revised = steerer._apply_revision(session, revised, _drift())  # goldfive#247: rebind
     await steerer._emit_plan_revised(session, revised, _drift(), prev_plan=None)
 
     # Session plan now has the corrected topology.

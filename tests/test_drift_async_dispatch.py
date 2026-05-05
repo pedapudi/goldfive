@@ -200,9 +200,13 @@ async def test_mark_task_completed_skips_pairing_when_no_assignee() -> None:
     """
     steerer, session, _sink, _planner = _bind(_NullPlanner())
     # Wipe the assignee on the test session's tasks.
+    # goldfive#247: Plan + Task are frozen — derive a new plan with
+    # every task's assignee cleared.
     assert session.plan is not None
-    for t in session.plan.tasks:
-        t.assignee_agent_id = ""
+    from tests._immutable_plan_helpers import force_task_replace
+
+    for t in list(session.plan.tasks):
+        force_task_replace(session, t.id, assignee_agent_id="")
     # Pre-existing started entry from a prior agent's run.
     steerer.note_agent_activity(
         session,
@@ -223,8 +227,11 @@ async def test_mark_task_failed_skips_pairing_when_no_assignee() -> None:
     """Mirror of the completed-path "no assignee" guard."""
     steerer, session, _sink, _planner = _bind(_NullPlanner())
     assert session.plan is not None
-    for t in session.plan.tasks:
-        t.assignee_agent_id = ""
+    # goldfive#247: derive a new plan with every task's assignee cleared.
+    from tests._immutable_plan_helpers import force_task_replace
+
+    for t in list(session.plan.tasks):
+        force_task_replace(session, t.id, assignee_agent_id="")
 
     await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
     await steerer._wait_background_drifts_idle()

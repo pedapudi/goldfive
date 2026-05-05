@@ -293,14 +293,21 @@ async def test_drift_in_parallel_task_finish_stage_then_refine() -> None:
     # logs a PlanRevised event and advances. Because B/C/D all share
     # the same stage, finish_stage must let B and D complete before
     # refine is called.
+    # goldfive#247: Plan is frozen — derive via helpers.
+    from goldfive.types import bump_revision as _bump
+    from goldfive.types import with_task_status as _wts
+
     revised = _diamond_plan()
-    revised.revision_reason = "observed drift in C"
-    revised.revision_kind = DriftKind.PLAN_DIVERGENCE.value
-    revised.revision_severity = DriftSeverity.WARNING.value
-    revised.revision_index = 1
+    revised = _bump(
+        revised,
+        revision_index=1,
+        revision_reason="observed drift in C",
+        revision_kind=DriftKind.PLAN_DIVERGENCE.value,
+        revision_severity=DriftSeverity.WARNING.value,
+    )
     # Mark A as already completed so the refined plan resumes at the
     # drifted stage; otherwise the walker would replay A.
-    revised.tasks[0].status = TaskStatus.COMPLETED
+    revised = _wts(revised, revised.tasks[0].id, TaskStatus.COMPLETED)
     planner = RecordingPlanner(refined_plan=revised)
 
     executor = ParallelDAGExecutor(
@@ -363,9 +370,13 @@ async def test_drift_cancel_stage_cancels_siblings() -> None:
 
     adapter = VariableDelayAdapter(drift_for={"C": drift})
     steerer = RecordingSteerer()
+    # goldfive#247: Plan is frozen — derive via helpers.
+    from goldfive.types import bump_revision as _bump
+    from goldfive.types import with_task_status as _wts
+
     revised = _diamond_plan()
-    revised.revision_index = 1
-    revised.tasks[0].status = TaskStatus.COMPLETED
+    revised = _bump(revised, revision_index=1)
+    revised = _wts(revised, revised.tasks[0].id, TaskStatus.COMPLETED)
     planner = RecordingPlanner(refined_plan=revised)
     executor = ParallelDAGExecutor(
         max_concurrency=0, drift_policy="cancel_stage"
@@ -429,9 +440,13 @@ async def test_cancel_stage_no_task_leak() -> None:
     adapter = BDriftsQuicklyAdapter(drift_for={"B": drift})
     before_tasks = {t for t in asyncio.all_tasks()}
 
+    # goldfive#247: Plan is frozen — derive via helpers.
+    from goldfive.types import bump_revision as _bump
+    from goldfive.types import with_task_status as _wts
+
     revised = _diamond_plan()
-    revised.revision_index = 1
-    revised.tasks[0].status = TaskStatus.COMPLETED
+    revised = _bump(revised, revision_index=1)
+    revised = _wts(revised, revised.tasks[0].id, TaskStatus.COMPLETED)
     executor = ParallelDAGExecutor(
         max_concurrency=0, drift_policy="cancel_stage"
     )

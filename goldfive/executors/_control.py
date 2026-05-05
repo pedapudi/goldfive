@@ -62,7 +62,14 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from goldfive.types import Session, TaskStatus
+from goldfive.types import (
+    Session,
+    Task,
+    TaskStatus,
+    channel_processor_active,
+    set_session_plan,
+    with_task_status,
+)
 
 if TYPE_CHECKING:
     from goldfive.control import ControlAck, ControlChannel, ControlMessage
@@ -513,7 +520,7 @@ async def _resolve_approval(
 
 def _rewind_plan(
     session: Session, target_task_id: str
-) -> list[tuple[Any, TaskStatus]] | None:
+) -> list[tuple[Task, TaskStatus]] | None:
     """Reset ``target`` and every downstream task back to ``PENDING``.
 
     Any task transitively reachable from ``target`` via ``plan.edges``
@@ -523,6 +530,15 @@ def _rewind_plan(
     actually changed (i.e. was non-PENDING before the rewind). The
     caller uses this list to emit one ``TaskTransitioned`` event per
     affected task with ``source="control_rewind"``.
+
+    goldfive#247: :class:`Plan` and :class:`Task` are frozen — the
+    rewind no longer mutates ``task.status`` in place. Each affected
+    task is replaced via :func:`with_task_status`; the resulting
+    plan is swapped onto :attr:`Session.plan` under
+    :func:`channel_processor_active` (this is a control-plane
+    mutation, hence channel-processor-owned). The ``Task`` objects
+    in the returned tuples are the **post-swap** instances so the
+    dispatcher's downstream emit reads consistent fields.
 
     F10 / goldfive#251 R4: emitting from the dispatcher (rather than
     here) keeps this helper sync + dependency-free, while still giving
@@ -553,13 +569,29 @@ def _rewind_plan(
             if child not in affected:
                 stack.append(child)
 
-    transitions: list[tuple[Any, TaskStatus]] = []
+    # Build a single new Plan with every affected task transitioned to
+    # PENDING; capture the (task, prev_status) pairs for the dispatcher's
+    # emission. The fold runs over the *new* plan after each
+    # ``with_task_status`` so the post-swap Task instance is what we
+    # return to the caller.
+    transitions: list[tuple[Task, TaskStatus]] = []
+    new_plan = plan
     for tid in affected:
-        task = tasks_by_id[tid]
-        prev = task.status
-        if prev is not TaskStatus.PENDING:
-            transitions.append((task, prev))
-        task.status = TaskStatus.PENDING
+        prev_task = tasks_by_id[tid]
+        prev = prev_task.status
+        if prev is TaskStatus.PENDING:
+            session.completed_results.pop(tid, None)
+            session.task_progress.pop(tid, None)
+            continue
+        new_plan = with_task_status(new_plan, tid, TaskStatus.PENDING)
+        # The freshly-replaced task lives in ``new_plan.tasks``; resolve
+        # it once per fold so the caller emits transitions against the
+        # post-swap instance.
+        new_task = next((t for t in new_plan.tasks if t.id == tid), prev_task)
+        transitions.append((new_task, prev))
         session.completed_results.pop(tid, None)
         session.task_progress.pop(tid, None)
+    if new_plan is not plan:
+        with channel_processor_active():
+            set_session_plan(session, new_plan)
     return transitions

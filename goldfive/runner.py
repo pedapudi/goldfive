@@ -74,6 +74,8 @@ from goldfive.types import (
     Plan,
     Session,
     TaskStatus,
+    channel_processor_active,
+    set_session_plan,
 )
 
 if TYPE_CHECKING:
@@ -637,11 +639,20 @@ class Runner:
         # Conversation-level continuity the original ``_last_plan``
         # field provided.
         prior_plan = convo.prior_plan_for(session.id, pinned=pinned)
-        if prior_plan is not None:
-            prior_plan.run_id = session.run_id
-            session.plan = prior_plan
-        else:
-            session.plan = Plan.empty(run_id=session.run_id)
+        # goldfive#247: Plan is frozen — derive a stamped variant via
+        # ``dataclasses.replace`` rather than mutating in place. The
+        # initial pin onto ``session.plan`` is the run-setup phase of
+        # the channel-processor's mutation lifecycle, so we wrap in
+        # :func:`channel_processor_active` to satisfy the runtime
+        # single-writer check.
+        with channel_processor_active():
+            if prior_plan is not None:
+                set_session_plan(
+                    session,
+                    dataclasses.replace(prior_plan, run_id=session.run_id),
+                )
+            else:
+                set_session_plan(session, Plan.empty(run_id=session.run_id))
         _ostate.set_current_plan(session.state, session.plan)
 
         # 4. Derive (or accept) goals for this turn. Cross-turn state
@@ -1614,9 +1625,11 @@ class Runner:
             log.warning("Runner._install_revision: steerer/adapter bind raised: %s", exc)
             return False
         # Stamp run_id on the revised plan so sink emissions correlate
-        # with this turn.
+        # with this turn. goldfive#247: Plan is frozen — derive a new
+        # instance with the run_id stamped rather than mutating in
+        # place.
         if not revised_plan.run_id:
-            revised_plan.run_id = session.run_id
+            revised_plan = dataclasses.replace(revised_plan, run_id=session.run_id)
         # Branch on first-turn vs pivot vs replan.
         #
         # * First turn — ``session.plan`` is the empty seed (no tasks);

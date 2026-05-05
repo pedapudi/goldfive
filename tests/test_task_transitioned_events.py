@@ -332,7 +332,7 @@ async def test_refine_replace_supersedes_emits_plan_revision_transition() -> Non
     # Mirror the live order: _apply_revision installs ``revised`` on the
     # session, then _emit_plan_revised diffs prev_plan vs. revised and
     # emits the proto + per-transition envelopes.
-    steerer._apply_revision(session, revised, drift)
+    revised = steerer._apply_revision(session, revised, drift)  # goldfive#247: rebind
     await steerer._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
 
     transitions = _transition_events(sink)
@@ -796,11 +796,13 @@ async def test_control_rewind_emits_control_rewind_transition() -> None:
         msg, session=session, steerer=steerer, sinks=[sink]
     )
 
-    # Sanity: rewind succeeded.
+    # Sanity: rewind succeeded. goldfive#247: read from session.plan
+    # since the local ``plan`` reference is the pre-rewind snapshot.
     assert outcome.rewind_task_id == "t1"
-    assert plan.tasks[0].status == TaskStatus.COMPLETED  # t0 unchanged
-    assert plan.tasks[1].status == TaskStatus.PENDING
-    assert plan.tasks[2].status == TaskStatus.PENDING
+    assert session.plan is not None
+    assert session.plan.tasks[0].status == TaskStatus.COMPLETED  # t0 unchanged
+    assert session.plan.tasks[1].status == TaskStatus.PENDING
+    assert session.plan.tasks[2].status == TaskStatus.PENDING
 
     transitions = _transition_events(sink)
     rewind_transitions = [

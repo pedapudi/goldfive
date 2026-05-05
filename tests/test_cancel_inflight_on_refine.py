@@ -568,4 +568,5 @@ async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> Non
     assert cancelled.is_set()
     # Plan was actually revised — the cancel did not preempt the
     # PlanRevised emit (the deferral contract is upheld).
-    assert session.plan is revised
+    # goldfive#247: identity check replaced with id check (Plan is frozen)
+    assert session.plan is not None and session.plan.id == revised.id

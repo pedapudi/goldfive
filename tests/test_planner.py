@@ -155,7 +155,7 @@ def test_plan_from_json_happy_path() -> None:
     )
     assert plan is not None
     assert plan.run_id == "run-abc"
-    assert plan.goal_ids == ["g1", "g2"]
+    assert plan.goal_ids == ("g1", "g2")
     assert [t.id for t in plan.tasks] == ["research", "draft", "review"]
     assert all(t.status == TaskStatus.PENDING for t in plan.tasks)
     assert plan.summary == "Draft and review a goldfish blog post."
@@ -211,7 +211,7 @@ async def test_llm_planner_generate_parses_canned_json() -> None:
     )
     assert plan is not None
     assert plan.run_id == "run-xyz"
-    assert plan.goal_ids == ["g1", "g2"]
+    assert plan.goal_ids == ("g1", "g2")
     assert [t.id for t in plan.tasks] == ["research", "draft", "review"]
 
     # Sanity: the prompt the LLM saw mentioned the goals and agents.
@@ -542,7 +542,7 @@ async def test_llm_planner_refine_preserves_completed_tasks() -> None:
     # Plan envelope identity is preserved across refinement.
     assert revised.id == plan.id
     assert revised.run_id == plan.run_id
-    assert revised.goal_ids == ["g1", "g2"]
+    assert revised.goal_ids == ("g1", "g2")
 
     # Revision metadata stamped from the drift.
     assert revised.revision_reason == "Reviewer asked for citations before review"
@@ -619,8 +619,10 @@ async def test_llm_planner_refine_increments_revision_index() -> None:
     planner = LLMPlanner(call_llm=stub)
     drift = DriftEvent(kind=DriftKind.TOOL_ERROR, severity=DriftSeverity.WARNING)
 
-    plan = _running_plan()
-    plan.revision_index = 3
+    # goldfive#247: Plan is frozen — derive via bump_revision.
+    from goldfive.types import bump_revision
+
+    plan = bump_revision(_running_plan(), revision_index=3)
     revised = await planner.refine(plan=plan, drift=drift, goals=_goals())
     assert revised is not None
     assert revised.revision_index == 4

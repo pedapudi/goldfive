@@ -95,10 +95,16 @@ class StubSteerer:
         self.transition_details.append((task_id, to, detail, cancel_reason))
         if session.plan is None:
             return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                t.status = to
-                return
+        # goldfive#247: derive new plan + swap (frozen Plan).
+        if not any(t.id == task_id for t in session.plan.tasks):
+            return
+        from goldfive.types import (
+            channel_processor_active,
+            set_session_plan,
+            with_task_status,
+        )
+        with channel_processor_active():
+            set_session_plan(session, with_task_status(session.plan, task_id, to))
 
     def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:  # noqa: ARG002
         return None
@@ -235,7 +241,7 @@ async def test_overlay_mode_single_passthrough_no_missed_tasks() -> None:
     assert outcome.success is True
     assert adapter.passthrough_calls == ["make it"]
     assert adapter.follow_up_calls == [], "no follow-ups should ever fire under #163"
-    for t in plan.tasks:
+    for t in (outcome.session.plan or plan).tasks:  # goldfive#247
         assert t.status is TaskStatus.COMPLETED
     assert sink.payload_kinds()[-1] == "run_completed"
 
@@ -289,7 +295,7 @@ async def test_overlay_does_not_dispatch_follow_ups() -> None:
     # predecessor t0 just COMPLETED so t1 is reachable next turn; t2's
     # predecessor t1 is still PENDING (not broken). The overlay leaves
     # both alone for the next turn to drive.
-    by_id = {t.id: t.status for t in plan.tasks}
+    by_id = {t.id: t.status for t in (outcome.session.plan or plan).tasks}  # goldfive#247
     assert by_id["t0"] is TaskStatus.COMPLETED
     assert by_id["t1"] is TaskStatus.PENDING, (
         f"reachable t1 should remain PENDING for next turn, got {by_id['t1']}"
@@ -341,7 +347,7 @@ async def test_overlay_pending_stays_pending_when_predecessors_pending() -> None
     assert [tid for tid, to in steerer.transitions if to is TaskStatus.NOT_NEEDED] == []
     assert [tid for tid, to in steerer.transitions if to is TaskStatus.CANCELLED] == []
     # All tasks remain PENDING for the next turn.
-    for t in plan.tasks:
+    for t in (outcome.session.plan or plan).tasks:  # goldfive#247
         assert t.status is TaskStatus.PENDING
     # And of course: no follow-up dispatch.
     assert adapter.follow_up_calls == []
@@ -680,7 +686,9 @@ async def test_overlay_goldfive_pause_leaves_unreachable_pending() -> None:
         "goldfive_pause must trigger structural early return before "
         f"orphan sweep, got {steerer.transitions!r}"
     )
-    by_id = {t.id: t.status for t in plan.tasks}
+    # goldfive#247: read from session.plan (live).
+    live_plan = session.plan or plan
+    by_id = {t.id: t.status for t in live_plan.tasks}
     assert by_id["downstream"] is TaskStatus.PENDING
 
 
@@ -729,9 +737,18 @@ async def test_overlay_no_pending_tasks_no_not_needed_transitions() -> None:
         reconciler: Any,  # noqa: ARG001
     ) -> InvocationResult:
         # Simulate the tree completing every task directly.
+        # goldfive#247: derive new plan via helpers (frozen Plan).
         if session.plan is not None:
-            for t in session.plan.tasks:
-                t.status = TaskStatus.COMPLETED
+            from goldfive.types import (
+                channel_processor_active,
+                set_session_plan,
+                with_task_status,
+            )
+            new_plan = session.plan
+            for t in list(session.plan.tasks):
+                new_plan = with_task_status(new_plan, t.id, TaskStatus.COMPLETED)
+            with channel_processor_active():
+                set_session_plan(session, new_plan)
         return InvocationResult(task_id="", text="")
 
     adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
@@ -825,9 +842,18 @@ async def test_overlay_steer_restart_still_works() -> None:
             )()
             return ("steer", msg)
         # Second invocation: mark every task COMPLETED directly.
+        # goldfive#247: derive new plan via helpers (frozen Plan).
         if session.plan is not None:
-            for t in session.plan.tasks:
-                t.status = TaskStatus.COMPLETED
+            from goldfive.types import (
+                channel_processor_active,
+                set_session_plan,
+                with_task_status,
+            )
+            new_plan = session.plan
+            for t in list(session.plan.tasks):
+                new_plan = with_task_status(new_plan, t.id, TaskStatus.COMPLETED)
+            with channel_processor_active():
+                set_session_plan(session, new_plan)
         return ("result", InvocationResult(task_id="", text="done"))
 
     executor._invoke_passthrough_with_control = _fake_invoke_passthrough_with_control  # type: ignore[assignment]
@@ -896,7 +922,7 @@ async def test_overlay_cancel_still_works() -> None:
     # No follow-ups, no NOT_NEEDED sweep on cancel — we exit early.
     assert adapter.follow_up_calls == []
     # Tasks remain PENDING (we aborted; didn't reach the sweep).
-    for t in plan.tasks:
+    for t in (outcome.session.plan or plan).tasks:  # goldfive#247
         assert t.status is TaskStatus.PENDING
 
 
@@ -957,10 +983,21 @@ class LegacyStubAdapter:
 
     async def invoke(self, task: Task, session: Session) -> InvocationResult:
         self.invocations.append(task.id)
-        for t in session.plan.tasks:
-            if t.id == task.id:
-                t.status = TaskStatus.COMPLETED
-                return InvocationResult(task_id=task.id, text=f"done:{task.id}")
+        # goldfive#247: derive new plan + swap (frozen Plan).
+        if session.plan is not None and any(
+            t.id == task.id for t in session.plan.tasks
+        ):
+            from goldfive.types import (
+                channel_processor_active,
+                set_session_plan,
+                with_task_status,
+            )
+            with channel_processor_active():
+                set_session_plan(
+                    session,
+                    with_task_status(session.plan, task.id, TaskStatus.COMPLETED),
+                )
+            return InvocationResult(task_id=task.id, text=f"done:{task.id}")
         return InvocationResult(task_id=task.id, text="")
 
 
