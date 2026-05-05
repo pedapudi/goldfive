@@ -144,6 +144,20 @@ __all__ = [
 _ACTIVE_INVOCATION_TASKS: dict[str, dict[str, asyncio.Task[Any]]] = {}
 _ACTIVE_INVOCATION_LOCK = threading.Lock()
 
+# Companion registry: per-session set of invocation ids for which a
+# cooperative cancel has been requested (goldfive#242). Stamped
+# synchronously at the top of
+# :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`
+# so the late-drift gate can short-circuit drifts that fire during the
+# 4-8s window between the cancel-request landing and ADK winding down
+# the cancelled invocations (during which ``active_invocation_ids()``
+# still lists them).
+#
+# Same locking discipline as the active-task registry above. Cleared by
+# :meth:`OrchestrationStore.clear_active_invocations` so a session
+# teardown wipes both registries in one shot.
+_CANCEL_REQUESTED_INVOCATIONS: dict[str, set[str]] = {}
+
 
 # State key for the new reasoning-extracted bindings slot. Lives under
 # the goldfive prefix so :func:`goldfive.orchestration_state.write`
@@ -818,12 +832,67 @@ class OrchestrationStore:
         """Drop every registered task for this session. Idempotent.
 
         Called from the adapter's dispatch teardown so a stale handle
-        cannot target the next invocation.
+        cannot target the next invocation. Also clears the companion
+        cancel-requested registry (goldfive#242) so a fresh dispatch
+        on the same session id starts with a clean slate.
         """
         if not self._session_id:
             return
         with _ACTIVE_INVOCATION_LOCK:
             _ACTIVE_INVOCATION_TASKS.pop(self._session_id, None)
+            _CANCEL_REQUESTED_INVOCATIONS.pop(self._session_id, None)
+
+    # -- Cancel-requested registry (goldfive#242) -----------------------
+    #
+    # Closes the iter-11D race between
+    # :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`
+    # (synchronous flag flip) and
+    # :meth:`active_invocation_ids` (transitions to empty only AFTER
+    # ADK winds down each cancelled invocation, ~4-8s later). The
+    # late-drift gate consults this set; a drift that fires during that
+    # window sees ``cancel_requested_invocation_ids()`` non-empty and
+    # is treated as late, even though the active-task registry still
+    # lists the cancelled invocation.
+
+    def mark_invocation_cancel_requested(self, invocation_id: str) -> None:
+        """Stamp ``invocation_id`` as having a pending cancel request.
+
+        Called synchronously from the top of
+        :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`
+        before any plugin / async work. Idempotent; multiple cancel
+        requests for the same id collapse to one entry.
+
+        No-op when ``invocation_id`` is empty or the store has no
+        session id (e.g. tests that construct a bare-state store).
+        """
+        if not invocation_id or not self._session_id:
+            return
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _CANCEL_REQUESTED_INVOCATIONS.setdefault(self._session_id, set())
+            bucket.add(str(invocation_id))
+
+    def is_invocation_cancel_requested(self, invocation_id: str) -> bool:
+        """Return True iff a cancel was requested for ``invocation_id``."""
+        if not invocation_id or not self._session_id:
+            return False
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _CANCEL_REQUESTED_INVOCATIONS.get(self._session_id)
+        if bucket is None:
+            return False
+        return str(invocation_id) in bucket
+
+    def cancel_requested_invocation_ids(self) -> list[str]:
+        """Return the ids of every invocation with a pending cancel.
+
+        Empty list when no session id or no pending cancels.
+        """
+        if not self._session_id:
+            return []
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _CANCEL_REQUESTED_INVOCATIONS.get(self._session_id)
+        if bucket is None:
+            return []
+        return list(bucket)
 
     # -- Active drift conditions (goldfive#271 PR1) ---------------------
 
