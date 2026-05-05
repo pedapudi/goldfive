@@ -3096,7 +3096,9 @@ class DefaultSteerer:
                         reason=str(exc),
                         detail=type(exc).__name__,
                     )
-                    await self._emit_refine_failure(session, drift, reason=str(exc))
+                    await self._escalate_refine_failure_as_critical_drift(
+                        session, drift, reason=str(exc)
+                    )
                     await self._record_refine_outcome(session, drift, succeeded=False)
                     return
                 except BaseException as exc:  # noqa: BLE001
@@ -4403,7 +4405,9 @@ class DefaultSteerer:
                     reason=str(exc),
                     detail=type(exc).__name__,
                 )
-                await self._emit_refine_failure(session, drift, reason=str(exc))
+                await self._escalate_refine_failure_as_critical_drift(
+                    session, drift, reason=str(exc)
+                )
                 await self._record_refine_outcome(session, drift, succeeded=False)
                 return
             except BaseException as exc:  # noqa: BLE001
@@ -5254,7 +5258,7 @@ class DefaultSteerer:
             return 0
         return outcome.fail_count
 
-    async def _emit_refine_failure(
+    async def _escalate_refine_failure_as_critical_drift(
         self, session: Session, source: DriftEvent, *, reason: str
     ) -> None:
         """Surface a failed refine as a follow-up CRITICAL drift.
@@ -5513,7 +5517,7 @@ class DefaultSteerer:
                     # Emit failure event with the same attempt_id so consumers
                     # can pair attempted ↔ failed. We do NOT swallow the
                     # exception — re-raise so the caller's existing error path
-                    # (e.g. _emit_refine_failure / fallback plans) runs.
+                    # (e.g. _escalate_refine_failure_as_critical_drift / fallback plans) runs.
                     await self._emit_refine_failed(
                         session,
                         drift,
@@ -6001,7 +6005,7 @@ class DefaultSteerer:
         # never see an unattributed event from goldfive-internal paths
         # (the ladder dispatcher normalises pre-emit; this is a belt-
         # and-braces for direct ``_emit_drift_detected`` callers like
-        # ``_dispatch_pause_escalate`` / ``_emit_refine_failure``).
+        # ``_dispatch_pause_escalate`` / ``_escalate_refine_failure_as_critical_drift``).
         evt.drift_detected.authored_by = self._resolve_authored_by(drift)
         evt.drift_detected.suppressed_by_user_steer = bool(drift.suppressed_by_user_steer)
         # goldfive#199: stamp the drift's own id on the wire so a

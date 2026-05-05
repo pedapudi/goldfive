@@ -1296,7 +1296,7 @@ async def test_refine_returns_none_escalates_to_pause() -> None:
     budget per iter-11C), pauses the run, and emits exactly one
     ``HUMAN_INTERVENTION_REQUIRED`` escalation drift. NO recursive
     same-kind CRITICAL drift is emitted (which the pre-#204 code did
-    via ``_emit_refine_failure``).
+    via ``_escalate_refine_failure_as_critical_drift``).
     """
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -1321,7 +1321,7 @@ async def test_refine_returns_none_escalates_to_pause() -> None:
 
     # Exactly one ``HUMAN_INTERVENTION_REQUIRED`` drift emitted (the
     # escalation). NO follow-up CRITICAL drift of the same kind as the
-    # original drift (which the pre-#204 ``_emit_refine_failure``
+    # original drift (which the pre-#204 ``_escalate_refine_failure_as_critical_drift``
     # synthesised) — that would have recursed through ``_handle_drift``.
     drift_events = [
         e.drift_detected
@@ -1425,7 +1425,7 @@ async def test_refine_returns_none_does_not_cascade_further_drifts() -> None:
 
     Reproduces the cauliflower-presentation scenario the iter-12 fix
     targets (#204). Pre-fix: drift → refine returns None →
-    ``_emit_refine_failure`` synthesises a CRITICAL same-kind drift →
+    ``_escalate_refine_failure_as_critical_drift`` synthesises a CRITICAL same-kind drift →
     recurses through ``_handle_drift`` → refine again → may itself
     fail → eventually the run aborts. Post-fix: a single
     ``HUMAN_INTERVENTION_REQUIRED`` escalation, refine called exactly
