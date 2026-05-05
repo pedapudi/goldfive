@@ -189,9 +189,12 @@ trigger it and pay no LLM cost.
 
 ## 6. Human intervention required
 
-The steerer escalated a drift to Level 4. Paused the run on
-`session.paused_for_human_intervention`; the executor blocks waiting
-for a `CONTROL_RESUME` or `CONTROL_STEER`. Emitted for:
+The steerer escalated a drift to Level 4. Paused the run by
+dispatching a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound
+channel (Phase 2 of #246 replaced the deleted
+`session.paused_for_human_intervention` flag); the executor's
+pre-task loop blocks waiting for a `CONTROL_RESUME` /
+`CONTROL_STEER` / `CONTROL_CANCEL`. Emitted for:
 
 - Persistent refine failures.
 - `GOAL_DRIFT` (CRITICAL).
@@ -206,7 +209,7 @@ for a `CONTROL_RESUME` or `CONTROL_STEER`. Emitted for:
   buttons are armed.
 
 **Recovery path.** A user-initiated `CONTROL_RESUME` or
-`CONTROL_STEER` clears the flag.
+`CONTROL_STEER` unblocks the executor's pre-task pause.
 
 ## 7. Qwen coordinator hallucinates tool success (model-specific)
 

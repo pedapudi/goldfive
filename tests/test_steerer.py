@@ -617,7 +617,11 @@ async def test_observe_surfaces_refine_none_return() -> None:
     assert session.plan is not None
     assert session.plan.revision_index == 0
     # Session paused for human intervention.
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
     # The paired ``refine_failed`` envelope landed on the dict-event bus
     # carrying the planner's failure_kind for operator/sink visibility.
     refine_failed = [e for e in sink.dict_events if e.get("kind") == "refine_failed"]
@@ -961,7 +965,11 @@ async def test_observe_rejects_invalid_revised_plan() -> None:
     third = sink.proto_events[2].drift_detected
     assert third.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
     assert third.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
 
 
 async def test_observe_rejects_revised_plan_with_cycle() -> None:
@@ -1000,7 +1008,11 @@ async def test_observe_rejects_revised_plan_with_cycle() -> None:
     assert "cycle" in second.detail
     third = sink.proto_events[2].drift_detected
     assert third.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
 
 
 async def test_observe_rejects_revised_plan_with_unknown_edge() -> None:
@@ -1034,7 +1046,11 @@ async def test_observe_rejects_revised_plan_with_unknown_edge() -> None:
     assert "unknown task id" in second.detail
     third = sink.proto_events[2].drift_detected
     assert third.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
 
 
 async def test_apply_revision_silently_folds_terminal_regression(
@@ -1176,7 +1192,11 @@ async def test_apply_revision_emits_schema_violation_on_missing_terminal_edge() 
     third = sink.proto_events[2].drift_detected
     assert third.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
     assert third.severity == types_pb2.DRIFT_SEVERITY_CRITICAL
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
 
 
 async def test_plan_revised_carries_diff() -> None:
@@ -1276,7 +1296,11 @@ async def test_no_op_revision_is_rejected_and_escalates() -> None:
     ]
     assert len(drift_kinds) >= 2
     # Session paused for human intervention.
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
 
 
 # ---------------------------------------------------------------------------
@@ -1317,7 +1341,11 @@ async def test_refine_returns_none_escalates_to_pause() -> None:
     # Refine was called exactly once.
     assert len(planner.refine_calls) == 1
     # Session paused.
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
 
     # Exactly one ``HUMAN_INTERVENTION_REQUIRED`` drift emitted (the
     # escalation). NO follow-up CRITICAL drift of the same kind as the
@@ -1394,7 +1422,11 @@ async def test_refine_validator_rejected_escalates_to_pause() -> None:
     # Refine was called exactly once.
     assert len(planner.refine_calls) == 1
     # Session paused.
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
     # Original plan retained.
     assert session.plan is original_plan
 
@@ -1448,7 +1480,11 @@ async def test_refine_returns_none_does_not_cascade_further_drifts() -> None:
     # Refine called exactly once — no cascade-driven retry.
     assert len(planner.refine_calls) == 1
     # Session paused.
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
 
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -1501,7 +1537,11 @@ async def test_refine_exhausted_path_unchanged() -> None:
     await steerer._handle_drift(drift, session)
 
     assert len(planner.refine_calls) == 1
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
     drift_kinds = [
         e.drift_detected.kind
         for e in sink.proto_events
@@ -1536,7 +1576,11 @@ async def test_no_op_revision_path_unchanged() -> None:
 
     await steerer.observe({"error": "trigger refine"}, session)
 
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
     drift_kinds = [
         e.drift_detected.kind
         for e in sink.proto_events
@@ -1569,7 +1613,11 @@ async def test_promote_drift_to_steer_refine_none_escalates_to_pause() -> None:
     await steerer._promote_drift_to_steer(drift, session)
 
     assert len(planner.refine_calls) == 1
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
     drift_kinds = [
         e.drift_detected.kind
         for e in sink.proto_events
@@ -1620,7 +1668,11 @@ async def test_promote_drift_to_steer_validator_rejected_escalates_to_pause() ->
     )
     await steerer._promote_drift_to_steer(drift, session)
 
-    assert session.paused_for_human_intervention is True
+    # Phase 2 (path-duality fix): pause is now signalled by a
+    # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
+    # not a session flag. The HUMAN_INTERVENTION_REQUIRED drift
+    # above is the durable observable signal for these unit tests
+    # (which do not bind a channel).
     drift_events = [
         e.drift_detected
         for e in sink.proto_events

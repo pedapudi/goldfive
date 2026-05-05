@@ -415,9 +415,11 @@ class Session:
     reasoning_history_max: int = 20
 
     # Intervention-ladder handoffs (goldfive#142)
-    paused_for_human_intervention: bool = False
     pending_nudges: list[str] = field(default_factory=list)
-    pending_corrective_message: str | None = None
+    # Phase 2 of #246 deleted ``paused_for_human_intervention`` and
+    # ``pending_corrective_message``; Levels 3 (CANCEL_REINVOKE) and
+    # 4 (PAUSE_ESCALATE) now route through the bound ControlChannel
+    # via GOLDFIVE_STEER / GOLDFIVE_PAUSE_ESCALATE ControlMessages.
 
     # Goldfive-orchestration session state (goldfive#152). Owned key
     # names live in ``goldfive.orchestration_state``; see below.
@@ -632,8 +634,8 @@ Intervention ladder (goldfive#142):
 | 0 | OBSERVE | Emit `DriftDetected`; no further action. |
 | 1 | ABSORB | Call `planner.refine`; continue. |
 | 2 | NUDGE | Queue a soft follow-up on `session.pending_nudges`; overlay loop picks it up at the next invocation boundary. |
-| 3 | CANCEL_REINVOKE | Cancel in-flight, refine, stash a corrective message on `session.pending_corrective_message`. |
-| 4 | PAUSE_ESCALATE | Emit `HUMAN_INTERVENTION_REQUIRED`; set `session.paused_for_human_intervention`. |
+| 3 | CANCEL_REINVOKE | Refine; install revised plan; dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel so the executor cancels the in-flight invoke and restarts with a `[GOLDFIVE STEERING CONTROL …]` framed corrective. (Phase 2 of #246.) |
+| 4 | PAUSE_ESCALATE | Emit `HUMAN_INTERVENTION_REQUIRED`; dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel so the executor's pre-task loop blocks for operator intervention. (Phase 2 of #246.) |
 | 5 | TERMINATE | Run-level abort (reserved for unhandled Level 4 timeouts). |
 
 Mapping from `(drift_kind, severity, occurrence_count)` to level lives

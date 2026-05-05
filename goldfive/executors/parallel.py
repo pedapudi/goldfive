@@ -1081,21 +1081,20 @@ class ParallelDAGExecutor:
         Returns ``(cancel_run, steer_message)``. Pre-stage PAUSE blocks
         on :meth:`ControlChannel.receive` until RESUME / CANCEL / STEER
         arrives. The steerer's intervention-ladder Level 4 pause
-        (goldfive#142) triggers the same blocking wait via
-        ``session.paused_for_human_intervention``.
+        (goldfive#142) triggers the same blocking wait by dispatching
+        a ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessage (Phase 2 of the
+        path-duality fix) — that message sets ``request_pause=True``
+        so the executor's pause loop is indistinguishable from an
+        explicit user-initiated PAUSE.
         """
         if control is None:
             # Without a control channel the ladder-initiated pause has
-            # nowhere to wait. Clear the flag so the run doesn't wedge;
-            # the HUMAN_INTERVENTION_REQUIRED drift the steerer emitted
-            # remains on the sink stream as the durable signal.
-            if session.paused_for_human_intervention:
-                log.warning(
-                    "ParallelDAGExecutor: session.paused_for_human_intervention "
-                    "is set but no control channel is attached; clearing flag "
-                    "so the run does not wedge."
-                )
-                session.paused_for_human_intervention = False
+            # nowhere to wait. The steerer's
+            # ``GOLDFIVE_PAUSE_ESCALATE`` dispatch is best-effort; when
+            # there is no channel attached the dispatch is dropped at
+            # the source. The originating
+            # ``HUMAN_INTERVENTION_REQUIRED`` drift on the sink stream
+            # remains the durable signal so observers can react.
             return False, None
 
         outcomes = await drain_controls(control, session=session, steerer=steerer, sinks=sinks)
@@ -1124,11 +1123,6 @@ class ParallelDAGExecutor:
             if cancel_prefix:
                 session._last_cancel_reason_prefix = cancel_prefix
             raise _ControlCancelled(cancel_reason or "cancelled by control")
-
-        # Intervention-ladder pause (goldfive#142). See the Sequential
-        # executor for the matching hook.
-        if session.paused_for_human_intervention:
-            paused = True
 
         while paused:
             msg = await control.receive()

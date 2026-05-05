@@ -416,7 +416,10 @@ async def test_steerer_off_track_emits_critical_drift_and_nudges() -> None:
         and e.drift_detected.kind == types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED
         for e in sink.events
     )
-    assert session.paused_for_human_intervention is False
+    # Phase 2 (path-duality fix): Level 2 NUDGE does not pause the
+    # run; the absence of HUMAN_INTERVENTION_REQUIRED above is the
+    # observable signal. ``paused_for_human_intervention`` field has
+    # been deleted.
     assert len(session.pending_nudges) == 1
 
 

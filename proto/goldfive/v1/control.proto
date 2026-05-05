@@ -27,6 +27,14 @@ option go_package = "github.com/pedapudi/goldfive/gen/goldfive/v1;goldfivev1";
 // don't understand a kind SHOULD forward it verbatim; the executor
 // acknowledges unknown kinds with ``UNSUPPORTED`` rather than closing
 // the channel.
+//
+// CONTROL_KIND_GOLDFIVE_STEER and CONTROL_KIND_GOLDFIVE_PAUSE_ESCALATE
+// are goldfive-internal kinds: minted by :class:`DefaultSteerer` to
+// route goldfive-detected drift through the same cancel-and-restart
+// junction as USER_STEER (Phase 2 of the path-duality fix). They are
+// reserved on the wire so external bridges that observe them in flight
+// can forward verbatim, but bridges SHOULD NOT originate these kinds —
+// they encode a goldfive-side decision, not an operator directive.
 enum ControlKind {
   CONTROL_KIND_UNSPECIFIED = 0;
   CONTROL_KIND_PAUSE = 1;
@@ -39,6 +47,8 @@ enum ControlKind {
   CONTROL_KIND_STATUS_QUERY = 8;
   CONTROL_KIND_INTERCEPT_TRANSFER = 9;
   CONTROL_KIND_INJECT_MESSAGE = 10;
+  CONTROL_KIND_GOLDFIVE_STEER = 11;
+  CONTROL_KIND_GOLDFIVE_PAUSE_ESCALATE = 12;
 }
 
 // Result of dispatching a ControlEvent. Every event produces exactly

@@ -89,11 +89,16 @@ def test_control_ack_result_enum_alignment() -> None:
         ControlKind.CANCEL,
         ControlKind.STATUS_QUERY,
         ControlKind.INTERCEPT_TRANSFER,
+        ControlKind.GOLDFIVE_STEER,
+        ControlKind.GOLDFIVE_PAUSE_ESCALATE,
     ],
 )
 def test_payloadless_kind_round_trip(kind: ControlKind) -> None:
-    """PAUSE / RESUME / CANCEL / STATUS_QUERY / INTERCEPT_TRANSFER carry
-    no structured payload; the oneof stays unset on the wire."""
+    """PAUSE / RESUME / CANCEL / STATUS_QUERY / INTERCEPT_TRANSFER /
+    GOLDFIVE_STEER / GOLDFIVE_PAUSE_ESCALATE carry no structured wire
+    payload; the oneof stays unset on the wire. (The goldfive-internal
+    kinds keep their rich data on the in-process payload dict only —
+    external bridges should not originate them.)"""
     msg = ControlMessage(kind=kind, id="ctl-1", issued_at_ms=1700000000000)
     pb_msg = to_pb_control_event(msg)
     assert pb_msg.WhichOneof("payload") is None

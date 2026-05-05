@@ -35,6 +35,28 @@ class ControlKind(StrEnum):
     STATUS_QUERY = "STATUS_QUERY"        # no payload
     INTERCEPT_TRANSFER = "INTERCEPT_TRANSFER"  # payload: {"enabled": bool}
     INJECT_MESSAGE = "INJECT_MESSAGE"    # payload: {"role": "...", "text": "..."}
+    # Goldfive-internal kinds (Phase 2 of the path-duality fix). The
+    # steerer mints these to route goldfive-authored drift through the
+    # same cancel-and-restart junction as user-authored STEER. External
+    # bridges SHOULD NOT originate these — they encode a goldfive-side
+    # decision, not an operator directive. They ride the same
+    # :class:`ControlChannel` so the executor's invoke loop has a single
+    # junction to consult.
+    #
+    # GOLDFIVE_STEER payload:
+    #   * ``drift_kind``: str (drift kind value that triggered the steer)
+    #   * ``drift_id``: str (originating ``DriftEvent.id`` for dedupe)
+    #   * ``body``: str (corrective body to wrap in the
+    #     ``[GOLDFIVE STEERING CONTROL ...]`` framing on restart)
+    #   * ``superseded_task_ids``: list[str] (task ids the LLM should NOT
+    #     resume)
+    #   * ``replacement_task_ids``: list[str] (task ids that supersede
+    #     the above)
+    GOLDFIVE_STEER = "GOLDFIVE_STEER"
+    # GOLDFIVE_PAUSE_ESCALATE payload:
+    #   * ``reason``: str (human-readable explanation of the escalation)
+    #   * ``drift_id``: str (originating ``DriftEvent.id``)
+    GOLDFIVE_PAUSE_ESCALATE = "GOLDFIVE_PAUSE_ESCALATE"
 
 
 class AckResult(StrEnum):

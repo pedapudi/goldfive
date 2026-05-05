@@ -26,10 +26,13 @@ tangle of conditionals. Levels, ordered by intrusiveness:
 * Level 1 — ABSORB: call ``planner.refine``; continue.
 * Level 2 — NUDGE: queue a soft follow-up message on the session for
   the Runner's overlay loop to pick up at the next invocation boundary.
-* Level 3 — CANCEL_REINVOKE: cancel in-flight, refine, and compose a
-  corrective user message for the overlay loop to re-invoke with.
-* Level 4 — PAUSE_ESCALATE: emit ``HUMAN_INTERVENTION_REQUIRED``, set
-  ``session.paused_for_human_intervention``, and wait for user action.
+* Level 3 — CANCEL_REINVOKE: dispatch a ``GOLDFIVE_STEER`` control
+  message on the bound channel so the executor cancels in-flight work
+  and restarts with a goldfive-authored corrective. Phase 2 of the
+  path-duality fix routes this through the same junction as USER_STEER.
+* Level 4 — PAUSE_ESCALATE: dispatch a ``GOLDFIVE_PAUSE_ESCALATE``
+  control message and emit ``HUMAN_INTERVENTION_REQUIRED`` so the
+  executor's pre-task loop blocks waiting for operator action.
 * Level 5 — TERMINATE: run-level abort (currently only reached when an
   unhandled Level 4 times out; actual termination is driven by the
   executor, not the steerer).
@@ -493,6 +496,16 @@ class DefaultSteerer:
         # ``task.cancel()`` on the invoke task. See goldfive#139 and
         # :attr:`goldfive.adapters.adk.ADKAdapter._next_cancel_reason`.
         self._adapter: Any | None = None
+        # Optional control-channel back-reference (Phase 2 of the path-
+        # duality fix). Wired via :meth:`bind_control_channel` so the
+        # steerer can mint ``GOLDFIVE_STEER`` and
+        # ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessages onto the same
+        # channel that user-issued PAUSE / RESUME / CANCEL / STEER ride.
+        # ``None`` outside a bound run; dispatches are best-effort
+        # no-ops when unbound (the originating drift event on the sink
+        # stream remains the durable signal). Cleared at run boundary
+        # by the Runner.
+        self._control_channel: Any | None = None
         # Per-session, per-kind last-refine bookkeeping. Purely advisory:
         # callers can subclass to throttle on top of this if needed.
         self._last_refine_kind: dict[tuple[str, DriftKind], int] = {}
@@ -679,6 +692,51 @@ class DefaultSteerer:
         variant.
         """
         self._adapter = adapter
+
+    def bind_control_channel(self, channel: Any | None) -> None:
+        """Attach (or detach, on ``None``) the active control channel.
+
+        Phase 2 of the path-duality fix. The steerer mints
+        ``GOLDFIVE_STEER`` and ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessages
+        onto this channel so goldfive-authored drift rides the same
+        cancel-and-restart junction as user-authored ``STEER`` /
+        ``PAUSE``. Dispatches are best-effort: when no channel is
+        bound (or ``channel is None`` was passed at run end), the
+        steerer falls back to the originating drift event on the sink
+        stream as the durable signal — no exception, no wedge.
+
+        Wired by ``Runner.run`` immediately after :meth:`bind` and
+        unwired (passed ``None``) at the run boundary so a Steerer
+        shared across runs cannot leak a stale channel into a later
+        unrelated run.
+        """
+        self._control_channel = channel
+
+    async def _dispatch_goldfive_control(
+        self, msg: Any
+    ) -> bool:
+        """Send a goldfive-internal ControlMessage on the bound channel.
+
+        Returns ``True`` when the dispatch landed on a channel,
+        ``False`` when no channel is bound or the send raised. The
+        send raise path is logged at DEBUG and swallowed: the
+        originating drift event on the sink stream remains the
+        durable signal regardless of channel state.
+        """
+        channel = self._control_channel
+        if channel is None:
+            return False
+        try:
+            await channel.send(msg)
+        except Exception as exc:  # noqa: BLE001 — best-effort dispatch
+            log.debug(
+                "DefaultSteerer._dispatch_goldfive_control: "
+                "channel.send raised (kind=%s, swallowed): %s",
+                getattr(getattr(msg, "kind", None), "value", "?"),
+                exc,
+            )
+            return False
+        return True
 
     def get_tool_loop_config(self) -> ToolLoopConfig | None:
         """Return the :class:`~goldfive.config.ToolLoopConfig` stashed at init, if any.
@@ -3437,18 +3495,17 @@ class DefaultSteerer:
         await self._emit_plan_revised(
             session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
         )
-        # Level 3 (CANCEL_REINVOKE) handoff: compose a corrective user
-        # message from the drift + refined plan and stash it on the
-        # session so the Runner's overlay loop (goldfive#141) can cancel
-        # the in-flight invocation and re-invoke with the composed text.
-        # Until #141 lands, this slot is inert -- nobody reads it -- but
-        # the data is durably attached to the session and a later-landing
-        # overlay will pick it up automatically.
+        # Level 3 (CANCEL_REINVOKE) handoff (Phase 2 of the path-
+        # duality fix). Pre-Phase-2 this stuffed
+        # ``session.pending_corrective_message`` — a write-only slot
+        # nobody read after the overlay loop took shape, leaving the
+        # coordinator running its original chain blind to the plan
+        # swap. Phase 2 dispatches a ``GOLDFIVE_STEER`` ControlMessage
+        # so the executor's invoke loop cancels in-flight work and
+        # restarts with the corrective body framed as ``[GOLDFIVE
+        # STEERING CONTROL …]`` — the same junction USER_STEER uses.
         if level is InterventionLevel.CANCEL_REINVOKE:
-            session.pending_corrective_message = compose_corrective_user_message(
-                drift=drift,
-                refined_plan=session.plan,
-            )
+            await self._dispatch_goldfive_steer_control(drift, session)
         # goldfive#202: for drifts where the coordinator has no way to
         # observe the plan revision on its own (it is still mid-
         # invocation, retrying the superseded task), ALSO queue a
@@ -3743,6 +3800,114 @@ class DefaultSteerer:
             msg,
         )
 
+    async def _dispatch_goldfive_steer_control(
+        self,
+        drift: DriftEvent,
+        session: Session,
+        *,
+        body_override: str = "",
+    ) -> bool:
+        """Mint and dispatch a ``GOLDFIVE_STEER`` ControlMessage.
+
+        Phase 2 of the path-duality fix. Replaces the dead
+        ``session.pending_corrective_message`` write at every
+        CANCEL_REINVOKE / promote-to-steer site so goldfive-authored
+        drift rides the same cancel-and-restart junction as
+        user-authored ``STEER``.
+
+        ``body_override``: optional text to use as the corrective
+        body. The promotion path passes its already-composed
+        :meth:`_compose_goldfive_steer_body` output; the Level 3
+        CANCEL_REINVOKE path leaves it empty and falls back to
+        :func:`compose_corrective_user_message` against the freshly
+        revised plan.
+
+        Returns ``True`` on successful dispatch, ``False`` on no
+        bound channel / send failure (best-effort — see
+        :meth:`_dispatch_goldfive_control`).
+        """
+        from goldfive.control import ControlKind, ControlMessage
+
+        if body_override:
+            body = body_override
+        else:
+            body = compose_corrective_user_message(
+                drift=drift,
+                refined_plan=session.plan,
+            )
+        superseded_ids = (
+            [str(drift.current_task_id)] if drift.current_task_id else []
+        )
+        # Replacement task ids: pick the first PENDING task on the
+        # revised plan as the natural successor — the executor uses
+        # this to render an explicit "pick these up instead" block in
+        # the restart message.
+        replacement_ids: list[str] = []
+        plan = session.plan
+        if plan is not None:
+            for task in plan.tasks:
+                if task.status is TaskStatus.PENDING and task.id:
+                    replacement_ids.append(task.id)
+                    break
+        msg = ControlMessage(
+            kind=ControlKind.GOLDFIVE_STEER,
+            payload={
+                "drift_kind": drift.kind.value,
+                "drift_id": str(getattr(drift, "id", "") or ""),
+                "body": body,
+                "superseded_task_ids": superseded_ids,
+                "replacement_task_ids": replacement_ids,
+            },
+        )
+        landed = await self._dispatch_goldfive_control(msg)
+        log.debug(
+            "DefaultSteerer._dispatch_goldfive_steer_control: "
+            "kind=%s task=%s landed=%s",
+            drift.kind.value,
+            drift.current_task_id or "-",
+            landed,
+        )
+        return landed
+
+    async def _dispatch_goldfive_pause_control(
+        self,
+        drift: DriftEvent,
+        session: Session,
+        *,
+        reason: str,
+    ) -> bool:
+        """Mint and dispatch a ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessage.
+
+        Phase 2 of the path-duality fix. Replaces the dead
+        ``session.paused_for_human_intervention = True`` flag-set at
+        every Level-4 / progress-stall / handler-exhausted escalation
+        site so the executor's pre-task loop blocks via the same
+        channel state as a user-issued ``PAUSE``.
+
+        Returns ``True`` on successful dispatch, ``False`` on no
+        bound channel / send failure.
+        """
+        from goldfive.control import ControlKind, ControlMessage
+
+        msg = ControlMessage(
+            kind=ControlKind.GOLDFIVE_PAUSE_ESCALATE,
+            payload={
+                "reason": reason,
+                "drift_id": str(getattr(drift, "id", "") or ""),
+                "drift_kind": drift.kind.value,
+            },
+        )
+        landed = await self._dispatch_goldfive_control(msg)
+        log.debug(
+            "DefaultSteerer._dispatch_goldfive_pause_control: "
+            "kind=%s task=%s landed=%s reason=%r",
+            drift.kind.value,
+            drift.current_task_id or "-",
+            landed,
+            reason,
+        )
+        return landed
+
     async def _dispatch_pause_escalate(
         self,
         drift: DriftEvent,
@@ -3751,11 +3916,18 @@ class DefaultSteerer:
         """Level 4 dispatch: emit HUMAN_INTERVENTION_REQUIRED and pause.
 
         Does NOT call ``planner.refine`` -- Level 4 signals that the
-        planner cannot recover. Sets
-        ``session.paused_for_human_intervention`` so the Runner's loop
-        blocks before the next task, and emits a CRITICAL
-        ``HUMAN_INTERVENTION_REQUIRED`` drift so sinks / the UI can
-        surface the pause and let the user decide what to do.
+        planner cannot recover. Phase 2 of the path-duality fix:
+        dispatches a ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessage on the
+        bound channel so the executor's pre-task loop blocks via the
+        same channel state as a user ``PAUSE``. Pre-Phase-2 this
+        flipped ``session.paused_for_human_intervention = True`` — a
+        flag the executor read on its next iteration; the indirection
+        was synonymous with the channel signal but parallel-tracked
+        from the user-PAUSE path.
+
+        Emits a CRITICAL ``HUMAN_INTERVENTION_REQUIRED`` drift so
+        sinks / the UI can surface the pause and let the user decide
+        what to do.
 
         When the drift reaching Level 4 is *already* a
         ``HUMAN_INTERVENTION_REQUIRED`` (e.g. landed here via the
@@ -3763,7 +3935,15 @@ class DefaultSteerer:
         a second time -- the original DriftDetected emission at the
         top of :meth:`_handle_drift` already carried the signal.
         """
-        session.paused_for_human_intervention = True
+        await self._dispatch_goldfive_pause_control(
+            drift,
+            session,
+            reason=(
+                f"pause_escalate from {drift.kind.value}: {drift.detail}"
+                if drift.detail
+                else f"pause_escalate from {drift.kind.value}"
+            ),
+        )
         if drift.kind is DriftKind.HUMAN_INTERVENTION_REQUIRED:
             # Already emitted at the top of _handle_drift; just pause.
             return
@@ -4488,29 +4668,19 @@ class DefaultSteerer:
                 "DefaultSteerer._promote_drift_to_steer: set_active_steer raised: %s",
                 exc,
             )
-        # Queue the wrapped restart message on the session so the
-        # overlay loop re-invokes the passthrough with a
-        # ``[GOLDFIVE STEERING CONTROL …]`` framing. Reuses
-        # ``pending_corrective_message`` — the same slot the Level 3
-        # CANCEL_REINVOKE path writes to. The steer framing is richer
-        # than the corrective-message template, so callers see the
-        # goldfive authorship banner.
-        try:
-            from goldfive.executors.sequential import SequentialExecutor
-
-            restart = SequentialExecutor._compose_steer_restart_message(
-                None,
-                fallback=body,
-                source="goldfive",
-                superseded_task_ids=[drift.current_task_id] if drift.current_task_id else [],
-                replacement_task_ids=[],
-            )
-            session.pending_corrective_message = restart
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "DefaultSteerer._promote_drift_to_steer: restart compose raised: %s",
-                exc,
-            )
+        # Phase 2 of the path-duality fix: dispatch a
+        # ``GOLDFIVE_STEER`` ControlMessage on the bound channel so
+        # the executor's invoke loop cancels the in-flight invocation
+        # and restarts the passthrough with a ``[GOLDFIVE STEERING
+        # CONTROL …]`` framed corrective. The body, drift kind, and
+        # superseded task ids ride the message payload; the executor
+        # composes the restart text from those fields. Pre-Phase-2
+        # this wrote ``session.pending_corrective_message`` — a
+        # write-only slot that left the coordinator blind to the plan
+        # swap.
+        await self._dispatch_goldfive_steer_control(
+            drift, session, body_override=body
+        )
         # 3. Record the drift id in processed_steer_ids so a redelivery
         # (same drift id) doesn't re-cancel / re-refine.
         drift_id = str(getattr(drift, "id", "") or "")
@@ -6589,24 +6759,27 @@ class DefaultSteerer:
         """Emit a ``HUMAN_INTERVENTION_REQUIRED`` drift + pause the runner.
 
         Called from ``_handle_drift`` / ``_promote_drift_to_steer`` when
-        :meth:`_is_task_progress_stalled` returns True. Pauses the
-        Runner via ``session.paused_for_human_intervention`` and emits
-        a CRITICAL drift carrying the underlying (kind, task) so sinks
-        / the UI can surface the stall.
+        :meth:`_is_task_progress_stalled` returns True. Phase 2 of the
+        path-duality fix: dispatches a ``GOLDFIVE_PAUSE_ESCALATE``
+        ControlMessage so the executor's pre-task loop blocks via the
+        same channel state as a user ``PAUSE``. Emits a CRITICAL drift
+        carrying the underlying (kind, task) so sinks / the UI can
+        surface the stall.
         """
-        session.paused_for_human_intervention = True
         task_id = drift.current_task_id
         last_at = session.task_last_progress_at.get(task_id) if task_id else None
         age = (time.monotonic() - last_at) if last_at is not None else 0.0
+        reason = (
+            f"task progress stalled for {drift.kind.value} on task "
+            f"{task_id or '(trajectory)'}: "
+            f"{age:.0f}s since last progress, threshold "
+            f"{self.PROGRESS_STALL_THRESHOLD_SECONDS:.0f}s"
+        )
+        await self._dispatch_goldfive_pause_control(drift, session, reason=reason)
         escalation = DriftEvent(
             kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
             severity=DriftSeverity.CRITICAL,
-            detail=(
-                f"task progress stalled for {drift.kind.value} on task "
-                f"{task_id or '(trajectory)'}: "
-                f"{age:.0f}s since last progress, threshold "
-                f"{self.PROGRESS_STALL_THRESHOLD_SECONDS:.0f}s"
-            ),
+            detail=reason,
             current_task_id=task_id,
             current_agent_id=drift.current_agent_id,
         )
@@ -6622,19 +6795,22 @@ class DefaultSteerer:
         primitive. Called when a refine handler has tried and cannot
         produce a meaningful change for this drift (today: a
         structurally identical revision; future: explicit
-        ``RefineExhausted`` sentinel from a planner). Pauses the
-        Runner and emits a CRITICAL drift so the operator can decide
-        whether to cancel or steer.
+        ``RefineExhausted`` sentinel from a planner). Phase 2 of the
+        path-duality fix: dispatches a ``GOLDFIVE_PAUSE_ESCALATE``
+        ControlMessage so the executor's pre-task loop blocks via the
+        same channel state as a user ``PAUSE``. Emits a CRITICAL
+        drift so the operator can decide whether to cancel or steer.
         """
-        session.paused_for_human_intervention = True
+        reason = (
+            f"refine handler exhausted for {drift.kind.value} on task "
+            f"{drift.current_task_id or '(trajectory)'}: "
+            f"planner cannot produce a meaningful change"
+        )
+        await self._dispatch_goldfive_pause_control(drift, session, reason=reason)
         escalation = DriftEvent(
             kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
             severity=DriftSeverity.CRITICAL,
-            detail=(
-                f"refine handler exhausted for {drift.kind.value} on task "
-                f"{drift.current_task_id or '(trajectory)'}: "
-                f"planner cannot produce a meaningful change"
-            ),
+            detail=reason,
             current_task_id=drift.current_task_id,
             current_agent_id=drift.current_agent_id,
         )

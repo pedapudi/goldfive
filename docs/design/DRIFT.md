@@ -656,9 +656,43 @@ the authoritative table.
 | **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift. |
 | **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `PLAN_DIVERGENCE`, `TOOL_ERROR`, `AGENT_REFUSAL`, `INTENT_DIVERGENCE`, etc.); CRITICAL first-occurrence of most kinds. |
 | **2** | `NUDGE` | Queue a short corrective user message on `session.pending_nudges` for the Runner's overlay loop to pick up at the next invocation boundary. | `LOOPING_REASONING` at CRITICAL (first occurrence) after goldfive#204 — gives the agent a soft corrective prompt before escalating. Also available for caller overrides. |
-| **3** | `CANCEL_REINVOKE` | Cancel in-flight invocation; refine; compose a corrective user message via `compose_corrective_user_message` for the overlay loop to re-invoke with. | CRITICAL first-occurrence for most refinable kinds (`PLAN_DIVERGENCE`, `TOOL_ERROR`, `RUNAWAY_DELEGATION`, ...). (`LOOPING_REASONING` CRITICAL-first now routes to Level 2 via goldfive#204.) |
-| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; set `session.paused_for_human_intervention = True`; do NOT call `planner.refine`. Runner blocks until a user `RESUME` / `STEER` arrives. | `GOAL_DRIFT` (first & repeat); `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind. |
+| **3** | `CANCEL_REINVOKE` | Refine the plan; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel**. The executor's invoke loop cancels the in-flight invocation and restarts the passthrough with a `[GOLDFIVE STEERING CONTROL …]` framed corrective body. | CRITICAL first-occurrence for most refinable kinds (`PLAN_DIVERGENCE`, `TOOL_ERROR`, `RUNAWAY_DELEGATION`, ...). (`LOOPING_REASONING` CRITICAL-first now routes to Level 2 via goldfive#204.) |
+| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives on the channel. | `GOAL_DRIFT` (first & repeat); `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind. |
 | **5** | `TERMINATE` | Run-level abort. Currently only reachable when a Level-4-initiated pause times out and `HUMAN_INTERVENTION_REQUIRED` re-fires as a repeat CRITICAL. | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
+
+### Dispatch routing — single junction (Phase 2 of #246)
+
+Pre-Phase-2 the steerer's CANCEL_REINVOKE and PAUSE_ESCALATE paths
+flowed through write-only session fields
+(`session.pending_corrective_message`, `session.paused_for_human_intervention`).
+Those fields had readers — the overlay loop / pre-task loop — but the
+read paths had drifted from the write paths in subtle ways: the
+overlay loop only consulted them at invocation boundaries, so a
+goldfive-detected drift mid-invocation flipped the plan but left the
+in-flight LLM call running blind to the swap. Empirically this
+caused the brussels-sprouts / tomato false-positive cascades (an
+`OFF_TOPIC` true positive at `0:12` flipped the plan; the
+coordinator continued its original chain; at `1:01` the judge fired
+again on the unsynced redirect).
+
+Phase 2 of [#246](https://github.com/pedapudi/goldfive/issues/246)
+collapsed both paths onto a single junction: the bound
+`ControlChannel`. The steerer now mints
+`ControlKind.GOLDFIVE_STEER` and `ControlKind.GOLDFIVE_PAUSE_ESCALATE`
+messages and `await channel.send(...)` them on the same channel that
+user-issued `STEER` / `PAUSE` / `RESUME` / `CANCEL` ride. The
+executor's invoke loop drains the channel concurrently with its
+adapter call (`asyncio.wait` on both the invoke task and
+`channel.receive()`), so a goldfive-authored drift gets the same
+mid-invocation cancel-and-restart that USER_STEER has always had.
+The deleted session fields are gone (see `goldfive/types.py`).
+
+The `[GOLDFIVE STEERING CONTROL — supersedes prior task context]`
+restart header (composed by `SequentialExecutor._compose_steer_restart_message`
+with `source="goldfive"`) is byte-distinct from the `[USER STEERING
+CONTROL …]` header, so plugins / sinks can attribute the corrective
+to its actual origin. See `tests/test_goldfive_drift_routing.py` for
+the contract pins.
 
 **Repeat detection.** Occurrence count per `(drift.kind, task_id)` is
 tracked on the session; a drift crosses "repeat" once

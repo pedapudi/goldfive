@@ -128,8 +128,8 @@ levels (goldfive#142), dictating what the steerer does next:
 | 0 | OBSERVE | Record only; no refine. |
 | 1 | ABSORB | Call `planner.refine`; continue. |
 | 2 | NUDGE | Queue a soft follow-up message on `session.pending_nudges`; overlay loop picks it up at next invocation boundary. |
-| 3 | CANCEL_REINVOKE | Cancel in-flight invoke (`_tag_adapter_cancel_user_steer`), refine, compose corrective message on `session.pending_corrective_message`, overlay loop re-dispatches. |
-| 4 | PAUSE_ESCALATE | Emit `HUMAN_INTERVENTION_REQUIRED`, set `session.paused_for_human_intervention`; executor blocks until CONTROL_RESUME / STEER. |
+| 3 | CANCEL_REINVOKE | Refine; install revised plan; dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel — executor cancels in-flight invoke and restarts with a `[GOLDFIVE STEERING CONTROL …]` framed corrective (Phase 2 of #246; replaced the deleted `pending_corrective_message` slot). |
+| 4 | PAUSE_ESCALATE | Emit `HUMAN_INTERVENTION_REQUIRED`; dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel — executor's pre-task loop blocks until CONTROL_RESUME / STEER (Phase 2 of #246; replaced the deleted `paused_for_human_intervention` flag). |
 | 5 | TERMINATE | Run-level abort (rarely reached directly; actual termination is executor-driven on unhandled Level 4 timeouts). |
 
 The mapping lives in `DefaultSteerer._ladder_level_for` as a

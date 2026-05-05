@@ -15,9 +15,13 @@ rather than the sole structural fence:
   The judge's signal is "agent stuck on completed work"; a corrective
   user message re-anchors the LLM without refining a plan that's
   already correct.
-* **F10** — the executor's NOT_NEEDED reaper is gated on
-  ``session.paused_for_human_intervention`` so the steerer's Level 4
-  pause does not turn into a silent "tasks done" lie about user intent.
+* **F10** — Phase 2 of the path-duality fix (#246) replaced the
+  reaper's session-flag gate with a structural early return: the
+  overlay loop's ``goldfive_pause`` branch returns from
+  ``_run_overlay`` BEFORE reaching the orphan sweep, so PENDING tasks
+  survive the pause for the next user turn rather than being silently
+  lied-about as ``NOT_NEEDED``. The original F10 gate is gone; this
+  file's F10 tests now pin the structural early-return invariant.
 """
 
 from __future__ import annotations
@@ -490,123 +494,119 @@ def test_f4_goal_drift_uses_bare_agent_name() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_f10_reaper_suppresses_when_paused_for_human_intervention() -> None:
-    """F10: when the steerer has flagged human intervention, the overlay
-    reaper must NOT sweep PENDING tasks to NOT_NEEDED — those tasks
-    survive the pause for the next user turn rather than being silently
-    lied-about as "done"."""
+async def test_f10_overlay_returns_early_on_goldfive_pause() -> None:
+    """Phase 2 (#246) F10 invariant: when a ``GOLDFIVE_PAUSE_ESCALATE``
+    arrives, the overlay loop's ``goldfive_pause`` branch returns from
+    ``_run_overlay`` BEFORE the orphan-sweep block is reached. The
+    structural early-return is the F10 protection — PENDING tasks
+    survive the pause for the next user turn.
+
+    This test exercises the executor branch directly: it pre-queues a
+    ``GOLDFIVE_PAUSE_ESCALATE`` on the channel and asserts the invoke
+    loop returns ``("goldfive_pause", ...)`` rather than ``("result",
+    ...)``. The orphan sweep is unreachable past that early return."""
+    from goldfive.control import ControlChannel, ControlKind, ControlMessage
     from goldfive.executors.sequential import SequentialExecutor
 
-    plan = Plan(
-        id="p1",
-        run_id="r1",
-        goal_ids=["g1"],
-        tasks=[
-            Task(id="t1", title="A", assignee_agent_id="a", status=TaskStatus.PENDING),
-            Task(id="t2", title="B", assignee_agent_id="b", status=TaskStatus.PENDING),
-        ],
-        edges=[],
+    channel = ControlChannel()
+    await channel.send(
+        ControlMessage(
+            kind=ControlKind.GOLDFIVE_PAUSE_ESCALATE,
+            payload={"reason": "F10 protection test"},
+        )
     )
+
+    class _StubAdapter:
+        async def invoke_passthrough(
+            self, user_input: str, *, session: Any, reconciler: Any
+        ) -> Any:
+            # Block forever; the channel-side pause should cancel us.
+            import asyncio
+
+            await asyncio.sleep(60)
+
+    class _StubSteerer:
+        pass
+
+    class _StubReconciler:
+        def reset_for_new_plan(self, plan: Any) -> None:
+            pass
+
     session = Session(
         run_id="r1",
         goals=[Goal(id="g1", summary="x")],
-        plan=plan,
+        plan=Plan(
+            id="p1",
+            run_id="r1",
+            goal_ids=["g1"],
+            tasks=[
+                Task(id="t1", title="A", status=TaskStatus.PENDING),
+                Task(id="t2", title="B", status=TaskStatus.PENDING),
+            ],
+            edges=[],
+        ),
     )
-    session.paused_for_human_intervention = True
 
-    transitions: list[tuple[str, TaskStatus]] = []
-
-    class _RecordingSteerer:
-        async def transition(
-            self,
-            task_id: str,
-            new_status: TaskStatus,
-            *,
-            detail: str = "",
-            session: Session | None = None,
-        ) -> None:
-            transitions.append((task_id, new_status))
-            # Mirror real behaviour to keep the assertion meaningful.
-            if session is not None:
-                for t in session.plan.tasks:
-                    if t.id == task_id:
-                        t.status = new_status
-
-    # Drive just the reaper logic directly. The block sits inside
-    # ``_run_overlay`` so we extract the gate condition: F10's
-    # invariant is "if pending and not paused -> reap; if paused ->
-    # log + leave PENDING".
-    pending_ids = [t.id for t in session.plan.tasks if t.status is TaskStatus.PENDING]
-    assert pending_ids == ["t1", "t2"]
-    if pending_ids and not getattr(session, "paused_for_human_intervention", False):
-        steerer = _RecordingSteerer()
-        for tid in pending_ids:
-            await steerer.transition(
-                tid,
-                TaskStatus.NOT_NEEDED,
-                detail="overlay",
-                session=session,
-            )
-
-    # Reaper was suppressed — no transitions, tasks still PENDING.
-    assert transitions == []
+    executor = SequentialExecutor()
+    kind, payload = await executor._invoke_passthrough_with_control(
+        adapter=_StubAdapter(),
+        session=session,
+        steerer=_StubSteerer(),
+        sinks=[],
+        control=channel,
+        reconciler=_StubReconciler(),
+        user_input="go",
+    )
+    assert kind == "goldfive_pause"
+    assert payload is not None
+    # Structural F10 guarantee: PENDING tasks remain PENDING because
+    # the orphan sweep is unreachable past the early return.
     assert all(t.status is TaskStatus.PENDING for t in session.plan.tasks)
-    # Sanity: the executor exposes a private constant we can assert
-    # against just so a future rename of ``paused_for_human_intervention``
-    # trips this regression rather than letting the gate silently
-    # devolve back to the unconditional sweep.
-    assert hasattr(SequentialExecutor, "_MAX_NUDGE_REPLAYS")
 
 
-async def test_f10_reaper_runs_normally_when_not_paused() -> None:
-    """F10: control case — when ``paused_for_human_intervention`` is
-    False, the reaper still transitions PENDING tasks to NOT_NEEDED
-    (preserving the goldfive#163 contract)."""
-    plan = Plan(
-        id="p1",
-        run_id="r1",
-        goal_ids=["g1"],
-        tasks=[
-            Task(id="t1", title="A", assignee_agent_id="a", status=TaskStatus.PENDING),
-        ],
-        edges=[],
-    )
+async def test_f10_overlay_returns_result_when_no_pause() -> None:
+    """F10 control case (Phase 2 of #246): when no ``GOLDFIVE_PAUSE_ESCALATE``
+    is on the channel, the invoke loop returns ``("result", ...)`` and
+    the overlay loop proceeds to the orphan sweep as normal."""
+    from goldfive.control import ControlChannel
+    from goldfive.executors.sequential import SequentialExecutor
+
+    channel = ControlChannel()
+
+    class _StubAdapter:
+        async def invoke_passthrough(
+            self, user_input: str, *, session: Any, reconciler: Any
+        ) -> str:
+            return "completed"
+
+    class _StubSteerer:
+        pass
+
+    class _StubReconciler:
+        def reset_for_new_plan(self, plan: Any) -> None:
+            pass
+
     session = Session(
         run_id="r1",
         goals=[Goal(id="g1", summary="x")],
-        plan=plan,
+        plan=Plan(
+            id="p1",
+            run_id="r1",
+            goal_ids=["g1"],
+            tasks=[Task(id="t1", title="A", status=TaskStatus.PENDING)],
+            edges=[],
+        ),
     )
-    # Default: not paused.
-    assert session.paused_for_human_intervention is False
 
-    transitions: list[tuple[str, TaskStatus]] = []
-
-    class _RecordingSteerer:
-        async def transition(
-            self,
-            task_id: str,
-            new_status: TaskStatus,
-            *,
-            detail: str = "",
-            session: Session | None = None,
-        ) -> None:
-            transitions.append((task_id, new_status))
-            if session is not None:
-                for t in session.plan.tasks:
-                    if t.id == task_id:
-                        t.status = new_status
-
-    pending_ids = [t.id for t in session.plan.tasks if t.status is TaskStatus.PENDING]
-    if pending_ids and not getattr(session, "paused_for_human_intervention", False):
-        steerer = _RecordingSteerer()
-        for tid in pending_ids:
-            await steerer.transition(
-                tid,
-                TaskStatus.NOT_NEEDED,
-                detail="overlay",
-                session=session,
-            )
-
-    # Reaper fired normally.
-    assert transitions == [("t1", TaskStatus.NOT_NEEDED)]
-    assert session.plan.tasks[0].status is TaskStatus.NOT_NEEDED
+    executor = SequentialExecutor()
+    kind, payload = await executor._invoke_passthrough_with_control(
+        adapter=_StubAdapter(),
+        session=session,
+        steerer=_StubSteerer(),
+        sinks=[],
+        control=channel,
+        reconciler=_StubReconciler(),
+        user_input="go",
+    )
+    assert kind == "result"
+    assert payload == "completed"
