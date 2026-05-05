@@ -183,6 +183,78 @@ On validation failure, the revision is discarded, a CRITICAL
 `SCHEMA_VIOLATION` drift is emitted, and `session.plan` is
 unchanged. The refine-failure counter (§4.5) is also incremented.
 
+### 3.6 Corrective predecessors via `supersedes` (non-terminal)
+
+**Motivation (goldfive#248 — tomato e2e false-positive).** When the
+planner-LLM produces a corrective revision (e.g. `fix_research_X`
+correcting a hallucinated research task), it sometimes attaches the
+new task as an *independent root* rather than wiring it in as a
+predecessor of the existing PENDING tasks that depended on the
+contaminated work. The pre-#248 validator only enforced terminal
+preservation (§3.1, §3.2), so this shape passed validation. The
+empirical consequence: with REV 2 carrying both `fix_research_X`
+(corrective) and `draft_slides` (PENDING, still reachable from
+COMPLETED `research_X`), the reconciler claimed `draft_slides` for
+the in-flight coordinator's drafting work while `fix_research_X`
+sat unrun — out-of-order plan execution, with the slides being
+drafted from the very output the correction was meant to fix.
+
+**Contract.** Whenever a revised task `X` declares
+`X.supersedes == Y` and `Y` exists in `prior` AND `Y.status` is
+*non-terminal* (PENDING / RUNNING / BLOCKED), the revision must
+take exactly one of these two shapes:
+
+- **Shape A — keep Y, prepend X.** `Y` stays in the revision with
+  status PENDING and the revision contains an edge `X -> Y`. The
+  corrective `X` runs first; `Y`'s eventual execution is gated on
+  `X`'s output. Y's prior downstream edges (`Y -> Z`) carry forward
+  unchanged: the ordering chain becomes `X -> Y -> Z`.
+- **Shape B — re-edge consumers through X.** Every prior edge
+  `Y -> Z` (where `Z` is non-terminal in the revision) is replaced
+  by `X -> Z`. `Y` may stay or be dropped; if it stays, its
+  remaining downstream edges to terminal tasks are preserved per
+  §3.2. The corrective `X` becomes the new gating predecessor for
+  every consumer that previously waited on `Y`.
+
+Inserting `X` as an independent root while leaving `Y` (and its
+PENDING downstreams) reachable without going through `X` first is
+REJECTED with:
+
+```
+task 'X' supersedes 'Y' but downstream consumers of 'Y' not
+re-edged through 'X': missing edges [...]. Either add an edge
+'X' -> Z for every prior consumer Z of 'Y', OR re-mark 'Y'
+PENDING in the revision and add an edge 'X' -> 'Y'.
+```
+
+**Interaction with #214 REPLACE / CORRECT.** When `Y` is *terminal*
+in the prior plan (COMPLETED / FAILED / CANCELLED / NOT_NEEDED),
+this §3.6 check is a no-op — the existing #214 REPLACE path
+(failed/cancelled task replaced by a new PENDING successor) and
+CORRECT path (completed-but-drift-contaminated task corrected by
+an inserted child) already handle the topology correctly via §3.1
+/ §3.2's terminal-preservation rules and the planner's
+`_emit_plan_revised` re-pinning logic. §3.6 specifically addresses
+the gap: superseding work that has not yet finished.
+
+**Self-supersedes and mutual supersedes are rejected.** A task
+cannot be its own predecessor (`X.supersedes == X.id`) and a pair
+cannot mutually supersede each other (`X.supersedes == Y.id` and
+`Y.supersedes == X.id`) — both shapes are structurally meaningless
+for a corrective predecessor and surface a confused emit at the
+LLM layer (the safety-net `_normalize_supersession_kinds` pass
+also clears self-references at parse time, but the validator
+catches the pair-cycle case the parser cannot reason about).
+
+**Field shape.** `Task.supersedes` is a single string id (the
+existing goldfive#237 field). The §3.6 invariant treats one
+target per task; planner LLM prompts ask for one supersedes id
+per X. (A future evolution to `tuple[str, ...]` for multi-target
+supersession was scoped against the existing single-string proto
+schema and the broad reach of the field across reporting,
+executor causal-tier matching, and steerer routing — out of scope
+for #248.)
+
 ---
 
 ## 4. Refinement modes
