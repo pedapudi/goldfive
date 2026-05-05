@@ -904,6 +904,7 @@ async def _run_judge(
     model: str,
     sink: Any = None,
     agent_name: str = "",
+    available_agents: list[str] | list[dict[str, Any]] | None = None,
 ) -> DriftEvent | None:
     """Dispatch :func:`classify_reasoning_drift` against the current task.
 
@@ -923,9 +924,23 @@ async def _run_judge(
     a coordinator) is correctly attributed on the resulting
     :class:`DriftEvent` and the ``ReasoningJudgeInvoked`` observability
     event. See goldfive#271 reasoning-judge delegated coverage.
+
+    ``available_agents`` (goldfive#244) is the wrapped agent tree (in
+    the shape exposed by
+    :attr:`goldfive.adapters.adk.ADKAdapter.available_agents_tree`)
+    forwarded into the judge prompt so legitimate coordinator → sub-
+    agent delegation is treated as ON-TASK execution rather than an
+    OFF_TOPIC deviation. ``None`` (the default) preserves the byte-
+    identical pre-#244 prompt.
     """
     verdict = await _run_judge_with_focus(
-        text, session, call_llm=call_llm, model=model, sink=sink, agent_name=agent_name
+        text,
+        session,
+        call_llm=call_llm,
+        model=model,
+        sink=sink,
+        agent_name=agent_name,
+        available_agents=available_agents,
     )
     return verdict.drift
 
@@ -938,6 +953,7 @@ async def _run_judge_with_focus(
     model: str,
     sink: Any = None,
     agent_name: str = "",
+    available_agents: list[str] | list[dict[str, Any]] | None = None,
 ) -> ReasoningJudgeVerdict:
     """Dispatch :func:`classify_reasoning_drift_with_focus` against the current task.
 
@@ -978,6 +994,7 @@ async def _run_judge_with_focus(
         sequence_fn=session.next_sequence,
         task_lineage=getattr(session, "task_lineage", None),
         recent_tool_observations=getattr(session, "recent_tool_observations", None),
+        available_agents=available_agents,
     )
 
 
@@ -990,6 +1007,7 @@ async def analyze_reasoning_with_focus(
     model: str = "",
     sink: Any = None,
     agent_name: str = "",
+    available_agents: list[str] | list[dict[str, Any]] | None = None,
 ) -> ReasoningJudgeVerdict:
     """Phase-1 sibling of :func:`analyze_reasoning` returning a focused verdict.
 
@@ -1031,6 +1049,7 @@ async def analyze_reasoning_with_focus(
             model=model,
             sink=sink,
             agent_name=agent_name,
+            available_agents=available_agents,
         )
     if mode == "both":
         embedding_drift = _embedding_pipeline(text, session)
@@ -1043,6 +1062,7 @@ async def analyze_reasoning_with_focus(
                 model=model,
                 sink=sink,
                 agent_name=agent_name,
+                available_agents=available_agents,
             )
         if judge_verdict is None:
             return ReasoningJudgeVerdict(drift=embedding_drift)
@@ -1086,6 +1106,7 @@ async def analyze_reasoning(
     model: str = "",
     sink: Any = None,
     agent_name: str = "",
+    available_agents: list[str] | list[dict[str, Any]] | None = None,
 ) -> DriftEvent | None:
     """Run the reasoning-drift pipeline against ``text``.
 
@@ -1145,6 +1166,7 @@ async def analyze_reasoning(
             model=model,
             sink=sink,
             agent_name=agent_name,
+            available_agents=available_agents,
         )
     if mode == "both":
         embedding_drift = _embedding_pipeline(text, session)
@@ -1157,6 +1179,7 @@ async def analyze_reasoning(
                 model=model,
                 sink=sink,
                 agent_name=agent_name,
+                available_agents=available_agents,
             )
         if embedding_drift is None:
             return judge_drift
