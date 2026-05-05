@@ -4333,12 +4333,50 @@ class DefaultSteerer:
         # ``_handle_drift``.
         attempt_id = self._new_attempt_id()
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
+        # Resolve the registry constraint (goldfive#151) the same way
+        # ``_handle_drift`` does so the goldfive steer refine honours it.
+        planner = self._planner
+        available_agents: Any = None
+        adapter = self._adapter
+        if adapter is not None:
+            tree = getattr(adapter, "available_agents_tree", None)
+            if isinstance(tree, list) and tree:
+                available_agents = list(tree)
+            else:
+                flat = getattr(adapter, "available_agents", None)
+                if flat:
+                    available_agents = list(flat)
         # Phase 3.5 (goldfive#271) tripwire wrapper — see §C4.
         with _state_audit.cancellation_stash_audited(
             "DefaultSteerer._promote_drift_to_steer.refine"
         ):
             try:
-                revised = await self._dispatch_goldfive_steer_refine(drift, session)
+                # Call ``planner.refine_steer`` when available; fall back
+                # to ``planner.refine``. The fallback exists for test
+                # stubs / third-party planners that don't expose the
+                # goldfive-specific entry point — the generic path is
+                # better than no refine at all.
+                refine_steer = getattr(planner, "refine_steer", None)
+                if callable(refine_steer):
+                    revised = await refine_steer(
+                        plan=session.plan,
+                        drift=drift,
+                        goals=list(session.goals),
+                        available_agents=available_agents,
+                    )
+                elif _planner_refine_accepts_available_agents(planner):
+                    revised = await planner.refine(
+                        plan=session.plan,
+                        drift=drift,
+                        goals=list(session.goals),
+                        available_agents=available_agents,
+                    )
+                else:
+                    revised = await planner.refine(
+                        plan=session.plan,
+                        drift=drift,
+                        goals=list(session.goals),
+                    )
             except RefineExhausted as exc:
                 # goldfive#271: planner explicitly signalled handler
                 # exhaustion. Pause for human intervention.
@@ -4493,55 +4531,6 @@ class DefaultSteerer:
         await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
-        )
-
-    async def _dispatch_goldfive_steer_refine(
-        self, drift: DriftEvent, session: Session
-    ) -> Plan | None:
-        """Call ``planner.refine_steer`` when available; fall back to
-        ``planner.refine``.
-
-        Threads the same ``available_agents`` resolution used by
-        :meth:`_handle_drift` so the goldfive steer refine honours the
-        #151 registry constraint.
-        """
-        planner = self._planner
-        if planner is None or session.plan is None:
-            return None
-        available_agents: Any = None
-        adapter = self._adapter
-        if adapter is not None:
-            tree = getattr(adapter, "available_agents_tree", None)
-            if isinstance(tree, list) and tree:
-                available_agents = list(tree)
-            else:
-                flat = getattr(adapter, "available_agents", None)
-                if flat:
-                    available_agents = list(flat)
-        refine_steer = getattr(planner, "refine_steer", None)
-        if callable(refine_steer):
-            return await refine_steer(
-                plan=session.plan,
-                drift=drift,
-                goals=list(session.goals),
-                available_agents=available_agents,
-            )
-        # Fallback: planner doesn't expose the goldfive-specific entry
-        # point (test stubs, third-party planners). Call plain
-        # ``refine`` with the drift as-is; the generic path is better
-        # than no refine at all.
-        refine_accepts_registry = _planner_refine_accepts_available_agents(planner)
-        if refine_accepts_registry:
-            return await planner.refine(
-                plan=session.plan,
-                drift=drift,
-                goals=list(session.goals),
-                available_agents=available_agents,
-            )
-        return await planner.refine(
-            plan=session.plan,
-            drift=drift,
-            goals=list(session.goals),
         )
 
     @staticmethod
