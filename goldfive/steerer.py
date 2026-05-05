@@ -2410,6 +2410,11 @@ class DefaultSteerer:
             run_id=session.run_id,
             session_id=session.id,
             sequence_fn=session.next_sequence,
+            # goldfive#245 — pass the live session so the judge can
+            # post-LLM re-read ``session.plan`` after its await and
+            # drop verdicts whose target task transitioned during the
+            # round-trip.
+            session=session,
         )
         if drift is None:
             return
@@ -2836,20 +2841,42 @@ class DefaultSteerer:
     def detect_drift(
         self,
         event: Any,
-        session: Session,  # noqa: ARG002 — reserved for future heuristics
+        session: Session,
     ) -> DriftEvent | None:
         """Classify ``event`` via the modular classifiers in :mod:`drift`.
 
         Classifiers are tried in order of specificity: tool-error shapes
         first (most structured), then refusal markers in text, then
         stop-reason tokens. The first match wins.
+
+        The primitive classifiers in :mod:`goldfive.drift` (tool-error,
+        refusal, stop-reason) don't take a session, so we stamp the
+        observation-time plan revision (goldfive#245) here on the
+        positive side of the funnel — same observation moment, same
+        snapshot the call sees. The dispatch-time gate in
+        :meth:`_handle_drift` then drops verdicts whose revision is
+        older than the live plan's.
         """
-        drift = classify_tool_error(event)
+        observed_revision_index = 0
+        plan = getattr(session, "plan", None)
+        if plan is not None:
+            observed_revision_index = int(getattr(plan, "revision_index", 0) or 0)
+
+        def _stamp(d: DriftEvent | None) -> DriftEvent | None:
+            if d is None:
+                return None
+            # Only stamp when unset so explicit observation-time stamps
+            # from inner classifiers win.
+            if not d.observed_revision_index and observed_revision_index:
+                d.observed_revision_index = observed_revision_index
+            return d
+
+        drift = _stamp(classify_tool_error(event))
         if drift is not None:
             return drift
 
         # Refusal scan — tolerates raw strings, dicts, objects.
-        drift = classify_refusal(event)
+        drift = _stamp(classify_refusal(event))
         if drift is not None:
             return drift
 
@@ -2862,7 +2889,7 @@ class DefaultSteerer:
                 event, "finish_reason", None
             )
         if stop_reason is not None:
-            drift = classify_stop_reason(stop_reason)
+            drift = _stamp(classify_stop_reason(stop_reason))
             if drift is not None:
                 return drift
 
@@ -2961,6 +2988,41 @@ class DefaultSteerer:
         # :meth:`_resolve_authored_by`.
         if not drift.authored_by:
             drift.authored_by = self._resolve_authored_by(drift)
+        # goldfive#245 — verdict-freshness gate. Every observation/
+        # detector stamps ``observed_revision_index`` from
+        # ``session.plan.revision_index`` BEFORE its LLM await; the
+        # reconciler may transition tasks during that round-trip, so a
+        # verdict that arrives after the framework moved on is moot.
+        # Drop it here: emit ``DriftDetected`` for observability
+        # (operators see the detector ran) and skip the cancel + refine
+        # machinery.
+        #
+        # Bypasses:
+        #   * Unstamped drifts (``observed_revision_index == 0``) are
+        #     legacy / external producers / pre-#245 emit paths — flow
+        #     through unchanged so the gate is purely additive.
+        #   * User-authored drifts (USER_STEER / USER_CANCEL /
+        #     USER_PAUSE) bypass the gate even when stamped: an
+        #     operator directive must be honoured regardless of the
+        #     framework's plan-state cursor (preserves the iter-11D /
+        #     #242 contract).
+        if drift.observed_revision_index and (drift.authored_by or "").lower() != "user":
+            live_plan = getattr(session, "plan", None)
+            if live_plan is not None:
+                live_revision = int(getattr(live_plan, "revision_index", 0) or 0)
+                if drift.observed_revision_index < live_revision:
+                    log.info(
+                        "DefaultSteerer._handle_drift: stale verdict — drift "
+                        "kind=%s observed revision %d but session is on "
+                        "revision %d; skipping dispatch",
+                        drift.kind.value,
+                        drift.observed_revision_index,
+                        live_revision,
+                    )
+                    # Emit for observability so operators see the detector
+                    # ran; do NOT cancel / refine on a stale view.
+                    await self._emit_drift_detected(session, drift)
+                    return
         # Tag the bound adapter's next cancel with a symbolic reason so
         # the synthetic function_response the adapter appends on cancel
         # carries LLM-actionable content. Done BEFORE the drift event
@@ -6158,6 +6220,13 @@ class DefaultSteerer:
         evt.drift_detected.detail = drift.detail
         evt.drift_detected.current_task_id = drift.current_task_id
         evt.drift_detected.current_agent_id = drift.current_agent_id
+        # goldfive#245 — forward the observation-time plan revision so
+        # downstream sinks can render "this verdict was against
+        # revision N, current is M" and dedup gate-skipped drifts.
+        if drift.observed_revision_index:
+            evt.drift_detected.observed_revision_index = int(
+                drift.observed_revision_index
+            )
         # goldfive-steer-unification: source attribution. Normalise a
         # missing ``authored_by`` on the drift here so downstream sinks
         # never see an unattributed event from goldfive-internal paths

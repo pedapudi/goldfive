@@ -761,6 +761,30 @@ class DriftEvent:
     # ran; the cancel-in-flight + refine + restart-message machinery is
     # elided. Always ``False`` on user-authored drifts.
     suppressed_by_user_steer: bool = False
+    # goldfive#245 — plan revision the detector observed when it minted
+    # this verdict. Stamped at observation time (before any LLM await
+    # the detector performs) from ``session.plan.revision_index`` if a
+    # plan exists, else 0. Consumed by the dispatch-time gate in
+    # :meth:`DefaultSteerer._handle_drift`: when the session has moved
+    # to a strictly-greater revision_index by the time the verdict
+    # arrives, the drift is a stale verdict against a plan-state the
+    # system has moved past — the gate emits ``DriftDetected`` for
+    # observability and skips the cancel + refine machinery.
+    #
+    # Default ``0`` means "unset / pre-#245" so external producers and
+    # serialised events from older code do not crash, and so the gate
+    # is a no-op for unstamped legacy events (the gate is keyed on a
+    # truthy stamp). User-authored drifts (USER_STEER / USER_CANCEL /
+    # USER_PAUSE) bypass the gate unconditionally to preserve the
+    # iter-11D / #242 contract that operator directives are honoured
+    # regardless of the framework's plan-state cursor.
+    #
+    # Stamp sites: every detector that constructs a ``DriftEvent``
+    # captures ``session.plan.revision_index`` at the TOP of its
+    # function, BEFORE any ``await call_llm(...)``, so the LLM
+    # round-trip cannot move the cursor between observation and emit
+    # without the gate noticing.
+    observed_revision_index: int = 0
 
 
 @dataclasses.dataclass

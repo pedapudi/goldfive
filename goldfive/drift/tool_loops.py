@@ -510,6 +510,7 @@ class ToolLoopTracker:
         tool_name: str,
         args: Any,
         task_id: str = "",
+        observed_revision_index: int = 0,
     ) -> list[DriftEvent]:
         """Record one tool call; return any drift observations it triggers.
 
@@ -518,11 +519,22 @@ class ToolLoopTracker:
         (matches how other drift classifiers populate the field).
         Passing ``""`` is safe -- sinks just won't associate the drift
         with a specific task.
+
+        ``observed_revision_index`` (goldfive#245) is stamped onto every
+        produced :class:`DriftEvent` so the dispatch-time gate in
+        :meth:`DefaultSteerer._handle_drift` can drop verdicts whose
+        observed revision is older than the live plan's. Defaults to
+        ``0`` (the "unset / pre-#245" sentinel) for legacy callers and
+        unit tests that don't thread the session's plan revision.
         """
         key = (invocation_id or "", agent_name or "")
         signature = (tool_name or "", args_hash(args))
         self._buffers[key].append(signature)
-        return self._classify(key, current_task_id=task_id)
+        return self._classify(
+            key,
+            current_task_id=task_id,
+            observed_revision_index=observed_revision_index,
+        )
 
     def on_task_progress(
         self,
@@ -585,6 +597,7 @@ class ToolLoopTracker:
         key: tuple[str, str],
         *,
         current_task_id: str,
+        observed_revision_index: int = 0,
     ) -> list[DriftEvent]:
         """Return zero or more drift observations for the current window.
 
@@ -694,6 +707,7 @@ class ToolLoopTracker:
                     current_agent_id=agent_name,
                     raw=raw,
                     trigger_input=trigger_input,
+                    observed_revision_index=observed_revision_index,
                 )
                 # Keep the highest-severity candidate seen across all
                 # tools. tier_index is 0 for CRITICAL, so "lower is
@@ -741,6 +755,7 @@ class ToolLoopTracker:
                                 f"tool_loop alternating ({len(tail)} calls): "
                                 + " -> ".join(names)
                             ),
+                            observed_revision_index=observed_revision_index,
                         )
                     )
         return observations

@@ -872,6 +872,12 @@ async def classify_reasoning_drift_with_focus(
         return ReasoningJudgeVerdict(drift=None)
     system = system_prompt or REASONING_DRIFT_SYSTEM_PROMPT
     template = user_prompt_template or REASONING_DRIFT_USER_PROMPT_TEMPLATE
+    # goldfive#245 — capture the plan revision the judge is observing
+    # BEFORE we render the prompt or await the LLM. Stamped onto the
+    # drift below; the dispatch-time gate in
+    # :meth:`DefaultSteerer._handle_drift` drops verdicts whose
+    # observed revision is older than the live plan's.
+    observed_revision_index = int(getattr(plan, "revision_index", 0) or 0)
     # iter-10 PR 3: lineage + recent tool observations are passed as
     # CONTEXT to the LLM (per §3.3 / §5 — never as a structural pre-gate).
     task_lineage_block = _format_task_lineage(
@@ -1191,6 +1197,7 @@ async def classify_reasoning_drift_with_focus(
                 trigger_input=truncate_for_observability(
                     reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
                 ),
+                observed_revision_index=observed_revision_index,
             )
         else:
             # erroneous_deviation — same wire shape as the pre-iter-10
@@ -1247,6 +1254,7 @@ async def classify_reasoning_drift_with_focus(
                 trigger_input=truncate_for_observability(
                     reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
                 ),
+                observed_revision_index=observed_revision_index,
             )
     # Emit ReasoningJudgeInvoked on every invocation, regardless of
     # verdict. Done after the drift decision so the event carries the

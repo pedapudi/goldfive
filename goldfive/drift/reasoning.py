@@ -300,6 +300,22 @@ def _goals_text(session: Session) -> str:
     return " ".join(g.summary for g in session.goals if g.summary).strip()
 
 
+def _observed_revision_index(session: Session) -> int:
+    """Return ``session.plan.revision_index`` or ``0`` when no plan exists.
+
+    Captured at observation time by every reasoning-detector (goldfive#245)
+    and stamped onto the produced :class:`DriftEvent`. The dispatch-time
+    gate in :meth:`goldfive.steerer.DefaultSteerer._handle_drift` drops
+    drifts whose observed revision is older than the live plan's, so a
+    detector that observed against revision ``N`` cannot move the
+    framework on a state-snapshot the reconciler already advanced past.
+    """
+    plan = getattr(session, "plan", None)
+    if plan is None:
+        return 0
+    return int(getattr(plan, "revision_index", 0) or 0)
+
+
 # ---------------------------------------------------------------------------
 # Individual detectors
 # ---------------------------------------------------------------------------
@@ -384,6 +400,7 @@ def detect_intent_divergence(
             detail=detail,
             current_task_id=session.current_task_id,
             raw=text,
+            observed_revision_index=_observed_revision_index(session),
         )
 
     # Pattern-based fallback (no embeddings).
@@ -439,6 +456,7 @@ def _pattern_intent_divergence(
         detail=f"reasoning proposes off-goal focus: {snippet!r}",
         current_task_id=session.current_task_id,
         raw=text,
+        observed_revision_index=_observed_revision_index(session),
     )
 
 
@@ -538,6 +556,7 @@ def detect_looping_reasoning(
                 ),
                 current_task_id=session.current_task_id,
                 raw=text,
+                observed_revision_index=_observed_revision_index(session),
             )
     sim = _embed.max_similarity(text, history)
     loop_threshold = _looping_similarity_threshold()
@@ -557,6 +576,7 @@ def detect_looping_reasoning(
             ),
             current_task_id=session.current_task_id,
             raw=text,
+            observed_revision_index=_observed_revision_index(session),
         )
     return None
 
@@ -628,6 +648,7 @@ def detect_reasoning_cluster_tightening(
         ),
         current_task_id=session.current_task_id,
         raw=text,
+        observed_revision_index=_observed_revision_index(session),
     )
 
 
@@ -681,6 +702,7 @@ def detect_off_topic(text: str, session: Session) -> DriftEvent | None:
             ),
             current_task_id=session.current_task_id,
             raw=text,
+            observed_revision_index=_observed_revision_index(session),
         )
 
     # Sentence-level path. Whole-text cosine came in either healthy or
@@ -722,6 +744,7 @@ def detect_off_topic(text: str, session: Session) -> DriftEvent | None:
         ),
         current_task_id=session.current_task_id,
         raw=text,
+        observed_revision_index=_observed_revision_index(session),
     )
 
 
@@ -846,6 +869,7 @@ def detect_unreferenced_keyword(
         detail=f"reasoning mentions off-task keywords: {preview}",
         current_task_id=session.current_task_id,
         raw=text,
+        observed_revision_index=_observed_revision_index(session),
     )
 
 

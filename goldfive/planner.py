@@ -2110,6 +2110,10 @@ class LLMPlanner:
             ),
             current_task_id=drift.current_task_id,
             current_agent_id=drift.current_agent_id,
+            # Inherit the originating drift's observed revision so the
+            # dispatch-time gate (goldfive#245) treats this synthetic
+            # escalation with the same freshness contract as its parent.
+            observed_revision_index=drift.observed_revision_index,
         )
         try:
             await self._drift_emitter(signal)

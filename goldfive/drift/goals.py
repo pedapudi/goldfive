@@ -223,6 +223,7 @@ async def classify_goal_drift(
     run_id: str = "",
     session_id: str = "",
     sequence_fn: Callable[[], int] | None = None,
+    session: Any | None = None,
 ) -> DriftEvent | None:
     """Ask an LLM-judge whether recent activity is progressing the goals.
 
@@ -273,6 +274,25 @@ async def classify_goal_drift(
     """
     system = system_prompt or GOAL_DRIFT_SYSTEM_PROMPT
     template = user_prompt_template or GOAL_DRIFT_USER_PROMPT_TEMPLATE
+    # goldfive#245 — capture the plan-revision the judge is observing
+    # BEFORE we render the prompt or await the LLM. The post-LLM
+    # re-read below uses this snapshot to detect when the plan moved
+    # under the judge during the round-trip; the dispatch-time gate in
+    # :meth:`DefaultSteerer._handle_drift` uses it to drop verdicts
+    # against revisions the system has already moved past.
+    observed_revision_index = int(getattr(plan, "revision_index", 0) or 0)
+    # Snapshot the (id -> status) set of the plan as observed at this
+    # call-time. Used by the post-LLM re-read fallback (no specific
+    # task id in the verdict reason) to decide whether ANY task
+    # transitioned during the LLM round-trip.
+    pre_call_task_status: dict[str, str] = {}
+    if plan is not None:
+        for t in getattr(plan, "tasks", None) or []:
+            tid = str(getattr(t, "id", "") or "")
+            if not tid:
+                continue
+            status = getattr(t, "status", "")
+            pre_call_task_status[tid] = str(getattr(status, "value", status) or "")
     goals_block = _format_goals(goals)
     tasks_block = _format_tasks(plan)
     activity_block, activity_count = _format_activity(observed_actions)
@@ -380,6 +400,90 @@ async def classify_goal_drift(
         )
         return None
     reason = str(parsed.get("reason", "") or "").strip()
+    # goldfive#245 — post-LLM re-read. While the judge was running the
+    # reconciler may have transitioned tasks (the brussels/tomato
+    # false-positive class: judge complained "drafting still pending"
+    # against a snapshot where draft was already DONE by the time the
+    # verdict arrived). Re-read ``session.plan`` here and drop the
+    # verdict if the plan-state the judge complained about no longer
+    # matches reality.
+    #
+    # Two specificity tiers:
+    #
+    # 1. **Targeted task** — when the judge's reason names a specific
+    #    plan task by id (e.g. mentions ``[t-draft]``), check that
+    #    task's status. If it has transitioned out of PENDING the
+    #    verdict is moot.
+    # 2. **Generic narrative** — when the reason talks generally about
+    #    "drafting" / "research" without an id, we cannot disambiguate.
+    #    Fall back to comparing the plan's ``revision_index`` and the
+    #    ``(task.id, task.status)`` set: if either changed materially
+    #    since the snapshot, the judge's view is stale and we drop.
+    #
+    # ``session`` is optional so legacy / out-of-tree callers that
+    # don't thread it keep their pre-#245 behaviour. The dispatch-time
+    # gate in :meth:`DefaultSteerer._handle_drift` is the second line
+    # of defence — it picks up stale verdicts even when the detector
+    # didn't run this re-read.
+    if session is not None:
+        live_plan = getattr(session, "plan", None)
+        if live_plan is not None:
+            live_tasks_by_id: dict[str, Any] = {
+                str(getattr(t, "id", "") or ""): t
+                for t in (getattr(live_plan, "tasks", None) or [])
+                if getattr(t, "id", None)
+            }
+            # Tier 1: specific task id mentioned in the reason text.
+            targeted_id = ""
+            for tid in live_tasks_by_id:
+                if tid and tid in reason:
+                    targeted_id = tid
+                    break
+            if targeted_id:
+                live_t = live_tasks_by_id[targeted_id]
+                live_status = getattr(live_t, "status", "")
+                live_status_str = str(
+                    getattr(live_status, "value", live_status) or ""
+                )
+                pre_status_str = pre_call_task_status.get(targeted_id, "")
+                if live_status_str and live_status_str != pre_status_str:
+                    log.info(
+                        "classify_goal_drift: post-LLM re-read — task %r "
+                        "transitioned %s -> %s during judge call; "
+                        "verdict dropped",
+                        targeted_id,
+                        pre_status_str or "(unknown)",
+                        live_status_str,
+                    )
+                    return None
+            else:
+                # Tier 2: generic verdict — compare revision_index +
+                # (id, status) set against the pre-call snapshot.
+                live_revision = int(
+                    getattr(live_plan, "revision_index", 0) or 0
+                )
+                live_status_set: dict[str, str] = {}
+                for t in getattr(live_plan, "tasks", None) or []:
+                    tid = str(getattr(t, "id", "") or "")
+                    if not tid:
+                        continue
+                    s = getattr(t, "status", "")
+                    live_status_set[tid] = str(getattr(s, "value", s) or "")
+                if live_revision != observed_revision_index or (
+                    live_status_set != pre_call_task_status
+                ):
+                    log.info(
+                        "classify_goal_drift: post-LLM re-read — plan "
+                        "moved during judge call (revision %d -> %d, "
+                        "status delta=%s); verdict dropped",
+                        observed_revision_index,
+                        live_revision,
+                        sorted(
+                            set(live_status_set.items())
+                            ^ set(pre_call_task_status.items())
+                        ),
+                    )
+                    return None
     log.info(
         "classify_goal_drift: drift detected (reason=%r); emitting GOAL_DRIFT event",
         reason,
@@ -401,6 +505,7 @@ async def classify_goal_drift(
         current_task_id=current_task_id,
         current_agent_id=current_agent_id,
         trigger_input=trigger_input,
+        observed_revision_index=observed_revision_index,
     )
 
 
