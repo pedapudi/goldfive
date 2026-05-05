@@ -819,7 +819,7 @@ class ParallelDAGExecutor:
                     # ALSO emit the CRITICAL DriftDetected mirror so the
                     # legacy operator-visible signal still lands.
                     log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
-                    await self._emit_refine_failure(
+                    await self._escalate_refine_failure_as_critical_drift(
                         session=session,
                         sinks=sinks,
                         source=drift,
@@ -839,7 +839,7 @@ class ParallelDAGExecutor:
                         "ParallelDAGExecutor: planner.refine cancelled: %s",
                         type(exc).__name__,
                     )
-                    await self._emit_refine_failure(
+                    await self._escalate_refine_failure_as_critical_drift(
                         session=session,
                         sinks=sinks,
                         source=drift,
@@ -868,7 +868,7 @@ class ParallelDAGExecutor:
                     reason="planner returned no revised plan",
                     detail="",
                 )
-                await self._emit_refine_failure(
+                await self._escalate_refine_failure_as_critical_drift(
                     session=session,
                     sinks=sinks,
                     source=drift,
@@ -891,7 +891,7 @@ class ParallelDAGExecutor:
                     reason=f"plan validation failed: {exc}",
                     detail=type(exc).__name__,
                 )
-                await self._emit_refine_failure(
+                await self._escalate_refine_failure_as_critical_drift(
                     session=session,
                     sinks=sinks,
                     source=drift,
@@ -911,7 +911,7 @@ class ParallelDAGExecutor:
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("ParallelDAGExecutor: planner.refine raised: %s", exc)
-                    await self._emit_refine_failure(
+                    await self._escalate_refine_failure_as_critical_drift(
                         session=session,
                         sinks=sinks,
                         source=drift,
@@ -928,7 +928,7 @@ class ParallelDAGExecutor:
                         "ParallelDAGExecutor: planner.refine cancelled (legacy path): %s",
                         type(exc).__name__,
                     )
-                    await self._emit_refine_failure(
+                    await self._escalate_refine_failure_as_critical_drift(
                         session=session,
                         sinks=sinks,
                         source=drift,
@@ -942,7 +942,7 @@ class ParallelDAGExecutor:
                     "ParallelDAGExecutor: planner.refine(kind=%s) returned None; plan unchanged",
                     drift.kind.value,
                 )
-                await self._emit_refine_failure(
+                await self._escalate_refine_failure_as_critical_drift(
                     session=session,
                     sinks=sinks,
                     source=drift,
@@ -956,7 +956,7 @@ class ParallelDAGExecutor:
                     "ParallelDAGExecutor: revised plan failed validation (%s); keeping prior plan",
                     exc,
                 )
-                await self._emit_refine_failure(
+                await self._escalate_refine_failure_as_critical_drift(
                     session=session,
                     sinks=sinks,
                     source=drift,
@@ -1020,7 +1020,7 @@ class ParallelDAGExecutor:
                 exc,
             )
 
-    async def _emit_refine_failure(
+    async def _escalate_refine_failure_as_critical_drift(
         self,
         *,
         session: Session,
@@ -1030,7 +1030,7 @@ class ParallelDAGExecutor:
     ) -> None:
         """Surface a failed refine as a CRITICAL follow-up ``DriftDetected``.
 
-        Mirrors ``DefaultSteerer._emit_refine_failure`` so the parallel
+        Mirrors ``DefaultSteerer._escalate_refine_failure_as_critical_drift`` so the parallel
         executor's direct refine path produces the same sink-level
         signal the sequential path does. Without this, a planner.refine
         that raises or returns a garbage plan leaves the session pinned

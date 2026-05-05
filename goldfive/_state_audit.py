@@ -724,7 +724,7 @@ def cancellation_stash_audited(name: str) -> _AuditedSite:
                 try:
                     refined = await planner.refine(...)
                 except BaseException:
-                    await self._emit_refine_failure(...)
+                    await self._escalate_refine_failure_as_critical_drift(...)
                     mark_stash_completed()
                     raise
     """
