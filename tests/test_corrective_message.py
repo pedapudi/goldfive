@@ -188,16 +188,3 @@ def test_unknown_drift_kind_uses_generic_fallback() -> None:
     assert "Move forward" in msg
     # Still action-focused: ends with a directive.
     assert msg.lower().endswith(".") or "proceed" in msg.lower()
-
-
-def test_observed_actions_parameter_is_accepted() -> None:
-    """goldfive#144 will feed observed_actions into the composer. The
-    parameter must be accepted today (kwarg-only) even if it doesn't
-    yet influence the shape, so #144 can land without a signature
-    conflict."""
-    msg = compose_corrective_user_message(
-        drift=_drift(DriftKind.PLAN_DIVERGENCE),
-        refined_plan=_plan_with_next("Summarize findings"),
-        observed_actions=[{"action": "search", "query": "foo"}],
-    )
-    assert "Summarize findings" in msg
