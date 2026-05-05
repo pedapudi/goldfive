@@ -408,7 +408,6 @@ class Session:
     task_progress: dict[str, float] = field(default_factory=dict)
     agent_notes: dict[str, str] = field(default_factory=dict)
     divergence_flag: bool = False
-    history: list[Any] = field(default_factory=list)
     started_at_ms: int = 0
 
     # Reasoning-drift pipeline (goldfive#96)

@@ -81,7 +81,6 @@ When turn `N` runs, the `Session` the executor receives starts with:
 | `goals`                  | `conversation.goals` (copy)    |
 | `completed_results`      | `conversation.completed_results` (copy) |
 | `plan`                   | `None` — planned per turn      |
-| `history`                | `[]` (v1)                      |
 
 The planner additionally receives a `context` dict that includes:
 

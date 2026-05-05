@@ -66,7 +66,6 @@ class TestTaskDefaults:
         assert s.task_progress == {}
         assert s.agent_notes == {}
         assert s.divergence_flag is False
-        assert s.history == []
         assert s.started_at_ms == 0
 
 

@@ -847,7 +847,6 @@ class Session:
     # task_id -> last agent note
     agent_notes: dict[str, str] = dataclasses.field(default_factory=dict)
     divergence_flag: bool = False
-    history: list[Any] = dataclasses.field(default_factory=list)
     started_at_ms: int = 0
     # Waiters for outstanding human-in-the-loop approvals. Keyed by
     # ``target_id``: task_id for Flow A (report_awaiting_approval) and the
