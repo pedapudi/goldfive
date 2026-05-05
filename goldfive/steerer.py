@@ -1429,7 +1429,12 @@ class DefaultSteerer:
                 judge_sink=judge_sink,
                 history_length=history_length,
                 agent_name=agent_name,
-            )
+            ),
+            # goldfive#243: encode session.id in the task name so
+            # :meth:`drain_session_background_tasks` can filter pending
+            # tasks by the run boundary that's terminating, leaving any
+            # other concurrent session's tasks alone.
+            name=f"goldfive-reasoning-judge:{session.id}",
         )
         self._background_judges.add(bg_task)
         bg_task.add_done_callback(self._background_judges.discard)
@@ -1652,6 +1657,69 @@ class DefaultSteerer:
         if self._background_drifts:
             await self._drain_background_set(
                 self._background_drifts, label="drift", timeout=timeout
+            )
+
+    async def drain_session_background_tasks(
+        self, *, session_id: str, timeout: float = 2.0
+    ) -> None:
+        """Drain background drift / judge tasks for a single session at run end.
+
+        Goldfive#243. The pre-existing drain in :meth:`shutdown` only
+        fires from :meth:`Runner.close`, which on long-running adk-web
+        / shared-Runner deployments is invoked at process shutdown,
+        NOT between user turns. A drift cascade dispatched at the end
+        of turn N (e.g. a JUSTIFIED_DEVIATION refine triggered from a
+        ``report_*`` tool) outlives turn N's ``RunAborted`` /
+        ``RunCompleted`` and runs against an abandoned session — burning
+        compute on retry-buried HTTP attempts and emitting spurious
+        post-abort drifts (the brussels-sprouts e2e leaked ~10 minutes
+        of compute and produced a HUMAN_INTERVENTION_REQUIRED on a
+        long-dead session).
+
+        Executors call this right before each terminal
+        ``run_aborted_event`` / ``run_completed_event`` emission so the
+        symmetry the iter-11A docstring already claims ("drained at run
+        end") actually holds at run boundaries, not just process
+        teardown. Same bounded-wait + cancel-stragglers semantics as
+        :meth:`shutdown`; idempotent (second call shortly after the
+        first is a no-op because the tracking sets are empty).
+
+        Filtering: each background task is named
+        ``goldfive-<kind>:<session_id>`` (see :meth:`_spawn_*_background`)
+        so this method drains ONLY the tasks belonging to the run that
+        is terminating, leaving any other concurrent session's tasks
+        alone. Tasks predating goldfive#243 (or future spawns that
+        forget the suffix) fall back to a session-prefix-aware match;
+        if the session_id is the empty string we drain nothing and
+        warn — that signals a caller bug rather than legitimate work.
+
+        User-authored drifts (``USER_STEER`` / ``USER_CANCEL`` /
+        ``USER_PAUSE``) are dispatched through :meth:`_handle_drift`
+        synchronously from :meth:`observe`, so they never land on
+        ``_background_drifts`` and are therefore not affected by this
+        drain — operator intent survives across turns by construction.
+        """
+        if not session_id:
+            log.warning(
+                "DefaultSteerer.drain_session_background_tasks: empty "
+                "session_id; refusing to drain (would otherwise match "
+                "every pending background task)",
+            )
+            return
+        suffix = f":{session_id}"
+        drift_subset = {
+            t for t in self._background_drifts if t.get_name().endswith(suffix)
+        }
+        judge_subset = {
+            t for t in self._background_judges if t.get_name().endswith(suffix)
+        }
+        if drift_subset:
+            await self._drain_background_set(
+                drift_subset, label="drift", timeout=timeout
+            )
+        if judge_subset:
+            await self._drain_background_set(
+                judge_subset, label="judge", timeout=timeout
             )
 
     async def _drain_background_set(
@@ -2355,7 +2423,11 @@ class DefaultSteerer:
             return
         bg_task = asyncio.create_task(
             self._run_goal_drift_judge_background(session),
-            name="goldfive-goal-drift-judge",
+            # goldfive#243: encode session.id in the task name so
+            # :meth:`drain_session_background_tasks` can filter pending
+            # tasks by the run boundary that's terminating, leaving any
+            # other concurrent session's tasks alone.
+            name=f"goldfive-goal-drift-judge:{session.id}",
         )
         self._background_judges.add(bg_task)
         bg_task.add_done_callback(self._background_judges.discard)
@@ -2435,7 +2507,11 @@ class DefaultSteerer:
             return
         bg_task = asyncio.create_task(
             self._run_drift_handler_background(drift, session),
-            name=f"goldfive-drift-{drift.kind.value}",
+            # goldfive#243: encode session.id in the task name so
+            # :meth:`drain_session_background_tasks` can filter pending
+            # tasks by the run boundary that's terminating, leaving any
+            # other concurrent session's tasks alone.
+            name=f"goldfive-drift-{drift.kind.value}:{session.id}",
         )
         self._background_drifts.add(bg_task)
         bg_task.add_done_callback(self._background_drifts.discard)
