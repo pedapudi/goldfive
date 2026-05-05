@@ -2823,36 +2823,44 @@ class LLMPlanner:
         # kind; defending here too is a belt-and-braces guard.
         if drift.kind is DriftKind.REFINE_VALIDATION_FAILED:
             return None
-        # Plan-context drifts (PLAN_DIVERGENCE with observed_actions, or
-        # OFF_TOPIC reasoning drift) take the goal-aware ABSORB/REJECT
-        # prompt: the LLM must either revise the plan to reflect / accept
-        # the observed deviation, or emit the reject sentinel when the
-        # deviation contradicts the goals. PLAN_DIVERGENCE without
-        # observed_actions falls through to the generic refine path so
-        # legacy callers that wire PLAN_DIVERGENCE the old way keep
-        # working. OFF_TOPIC has no observed-actions channel — the
-        # reconciler context comes from the drift's ``detail`` /
-        # ``trigger_input`` (the reasoning the judge flagged) which the
-        # generic refine prompt also surfaces in the drift block, but
-        # the goal-aware system prompt's ABSORB/REJECT contract is the
-        # right shape for "agent reasoning wandered off goal".
+        # Plan-context drifts (PLAN_DIVERGENCE, OFF_TOPIC reasoning drift,
+        # JUSTIFIED_DEVIATION) take the goal-aware ABSORB/REJECT prompt:
+        # the LLM must either revise the plan to reflect / accept the
+        # observed deviation, or emit the reject sentinel when the
+        # deviation contradicts the goals.
+        #
+        # iter-12 (#220): prompt selection is by drift kind ALONE, not
+        # gated on ``observed_actions is not None``. Production callers
+        # (steerer ``_handle_drift``, the steer-promotion fallback, the
+        # reconciler emission path) all invoke ``refine`` without the
+        # ``observed_actions`` parameter, so the previous gate caused
+        # PLAN_DIVERGENCE drifts in production to silently fall through
+        # to the generic refine prompt. Selecting by kind makes drift
+        # routing emission-site-independent: any PLAN_DIVERGENCE gets
+        # the goal-aware framing, with the drift's ``detail`` carrying
+        # the divergence context (e.g. "off-plan agent X",
+        # "cross-layer delegation Y"). The OBSERVED ACTIVITY block is
+        # still rendered only when ``observed_actions`` is supplied;
+        # without it the goal-aware prompt still receives goals + plan
+        # + drift detail, which PR #345 demonstrated is sufficient
+        # context for the OFF_TOPIC path.
+        #
+        # OFF_TOPIC and JUSTIFIED_DEVIATION (iter-10 PR 4) have no
+        # observed-actions channel — the deviation is in the agent's
+        # reasoning, surfaced by the reasoning judge. The drift's
+        # ``detail`` / ``trigger_input`` carries the judge's reasoning
+        # excerpt, which ``_render_off_topic_reasoning_block`` surfaces
+        # verbatim under the same ABSORB/REJECT framing.
         is_plan_divergence = drift.kind is DriftKind.PLAN_DIVERGENCE
         is_off_topic = drift.kind is DriftKind.OFF_TOPIC
-        # iter-10 PR 4: JUSTIFIED_DEVIATION shares the goal-aware
-        # ABSORB/REJECT path with OFF_TOPIC. The drift's ``detail``
-        # already carries the provenance prefix (e.g. "justified
-        # deviation (tool_error): ...") which
-        # ``_render_off_topic_reasoning_block`` surfaces verbatim, so
-        # the LLM sees the provoking signal in the rendered context.
         is_justified = drift.kind is DriftKind.JUSTIFIED_DEVIATION
-        has_observed_actions = is_plan_divergence and observed_actions is not None
-        use_divergence_prompt = has_observed_actions or is_off_topic or is_justified
+        use_divergence_prompt = is_plan_divergence or is_off_topic or is_justified
         try:
             base_user_prompt = self._build_refine_prompt(
                 plan,
                 drift,
                 goals,
-                observed_actions=observed_actions if has_observed_actions else None,
+                observed_actions=observed_actions,
                 available_agents=available_agents,
             )
         except (TypeError, ValueError) as exc:
@@ -2865,14 +2873,14 @@ class LLMPlanner:
         )
         # Allow the reject sentinel whenever the LLM might legitimately
         # conclude the drift cannot be reconciled with the current goals
-        # (goldfive#154). That's always true on the PLAN_DIVERGENCE +
-        # observed_actions path (it's the reconciler's explicit
-        # ABSORB/REJECT contract from #144), and also true whenever the
-        # session carries a sticky USER_STEER goal -- an unrelated drift
-        # might surface work that irreconcilably contradicts the
-        # operator's steer, and escalating via reject is cleaner than
-        # exhausting retries. Other callers keep the legacy "parse or
-        # bust" semantics.
+        # (goldfive#154). True on every plan-context drift path
+        # (PLAN_DIVERGENCE / OFF_TOPIC / JUSTIFIED_DEVIATION) -- those
+        # are the kinds wired to the goal-aware ABSORB/REJECT contract
+        # from #144 / #345. Also true whenever the session carries a
+        # sticky USER_STEER goal -- an unrelated drift might surface
+        # work that irreconcilably contradicts the operator's steer,
+        # and escalating via reject is cleaner than exhausting retries.
+        # Other callers keep the legacy "parse or bust" semantics.
         allow_reject = use_divergence_prompt or bool(self._user_steer_goals(goals))
         refine_input_preview = self._build_refine_span_input_preview(drift, plan)
         revised, last_error, rejected = await self._call_and_validate_refine(

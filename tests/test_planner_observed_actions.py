@@ -285,13 +285,16 @@ async def test_refine_plan_divergence_observed_actions_off_goal_returns_none() -
 
 
 # ---------------------------------------------------------------------------
-# 3. Back-compat: refine() without observed_actions behaves as before
+# 3. Back-compat: refine() without observed_actions still returns a plan
 # ---------------------------------------------------------------------------
 
 
 async def test_refine_without_observed_actions_unchanged() -> None:
     """The legacy calling convention (no ``observed_actions``) still
-    returns a refined plan using the generic refine prompt."""
+    returns a refined plan. iter-12 (#220) routes PLAN_DIVERGENCE to
+    the goal-aware system prompt regardless of ``observed_actions``,
+    but the OBSERVED AGENT ACTIVITY block is only rendered when
+    ``observed_actions`` is supplied."""
     payload = {
         "summary": "same",
         "tasks": [
@@ -328,8 +331,8 @@ async def test_refine_without_observed_actions_unchanged() -> None:
         current_task_id="draft",
     )
 
-    # No observed_actions -> generic refine path, observed block absent,
-    # reject sentinel not honoured.
+    # No observed_actions -> observed block absent from user prompt,
+    # but goal-aware system prompt still applies (iter-12 #220).
     revised = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
     assert revised is not None
     assert len(revised.tasks) == 3
@@ -378,10 +381,16 @@ async def test_refine_prompt_includes_observed_actions_section() -> None:
     assert "TERMINAL" in user_prompt.upper()
 
 
-async def test_refine_without_observed_actions_uses_generic_system_prompt() -> None:
-    """Even on PLAN_DIVERGENCE, if observed_actions is None the planner
-    falls back to the generic refine system prompt (not the divergence
-    one) — keeps legacy callers unchanged."""
+async def test_plan_divergence_routes_to_goal_aware_prompt_without_observed_actions() -> None:
+    """iter-12 (#220): PLAN_DIVERGENCE drifts route to the goal-aware
+    ``_PLAN_DIVERGENCE_SYSTEM_PROMPT`` regardless of whether
+    ``observed_actions`` was passed. Production callers in the
+    steerer's ``_handle_drift`` and the steer-promotion fallback never
+    pass ``observed_actions``, so gating prompt selection on it would
+    leave PLAN_DIVERGENCE drifts in production silently using the
+    generic refine prompt — emission-site-dependent leakage. Selecting
+    by drift kind alone makes drift routing emission-independent.
+    """
     payload = {
         "summary": "same",
         "tasks": [
@@ -414,16 +423,62 @@ async def test_refine_without_observed_actions_uses_generic_system_prompt() -> N
     drift = DriftEvent(
         kind=DriftKind.PLAN_DIVERGENCE,
         severity=DriftSeverity.WARNING,
-        detail="divergence",
+        detail="off-plan agent invoked: citation_bot",
         current_task_id="draft",
     )
+    # No observed_actions parameter — the production calling shape.
     await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
-    system, _user, _model = stub.calls[0]
-    # The divergence system prompt has the ABSORB/REJECT sections; the
-    # generic refine prompt does not.
-    assert "ABSORB" not in system
-    # The generic refine prompt references "maintaining an ACTIVE plan".
-    assert "maintaining an ACTIVE plan" in system
+    system, user_prompt, _model = stub.calls[0]
+    # Goal-aware (PLAN_DIVERGENCE) system prompt selected. The
+    # discriminating markers vs. the generic _REFINE_SYSTEM_PROMPT are
+    # the explicit ABSORB / REJECT contract and the PLAN_DIVERGENCE
+    # framing in the system prompt header.
+    assert "ABSORB" in system
+    assert "REJECT" in system
+    assert "PLAN_DIVERGENCE" in system
+    # Identity check — the planner's _plan_divergence_system_prompt is
+    # the one that was sent (not the generic _refine_system_prompt).
+    assert system == planner._plan_divergence_system_prompt
+    assert system != planner._refine_system_prompt
+    # No OBSERVED AGENT ACTIVITY block — observed_actions is None.
+    assert "OBSERVED AGENT ACTIVITY" not in user_prompt
+    # The drift's detail (the divergence context the emission site
+    # provided) is still surfaced via the rendered drift JSON.
+    assert "off-plan agent invoked: citation_bot" in user_prompt
+
+
+async def test_plan_divergence_routes_to_goal_aware_prompt_with_observed_actions() -> None:
+    """iter-12 (#220) regression: the existing reconciler path that
+    DOES pass ``observed_actions`` still gets the goal-aware prompt
+    AND the OBSERVED AGENT ACTIVITY block. Selecting by drift kind
+    must not regress the established reconciler contract from #144.
+    """
+    stub = _StubLLM(_absorbed_revision_json())
+    planner = LLMPlanner(call_llm=stub)
+    drift = DriftEvent(
+        kind=DriftKind.PLAN_DIVERGENCE,
+        severity=DriftSeverity.WARNING,
+        detail="tree called citation_bot, not in plan",
+        current_task_id="draft",
+    )
+
+    revised = await planner.refine(
+        plan=_running_plan(),
+        drift=drift,
+        goals=_goals(),
+        observed_actions=_observed_actions(),
+    )
+
+    assert revised is not None
+    system, user_prompt, _model = stub.calls[0]
+    # Goal-aware system prompt -- identity check.
+    assert system == planner._plan_divergence_system_prompt
+    assert "ABSORB" in system
+    assert "REJECT" in system
+    # OBSERVED AGENT ACTIVITY block IS rendered when observed_actions
+    # is supplied (#144 reconciler contract preserved).
+    assert "OBSERVED AGENT ACTIVITY" in user_prompt
+    assert "citation_bot" in user_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -472,19 +527,28 @@ async def test_refine_retry_loop_with_observed_actions() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Reject sentinel is NOT honoured when observed_actions is absent
+# 6. Reject sentinel is honoured on every plan-context drift (iter-12 #220)
 # ---------------------------------------------------------------------------
 
 
-async def test_reject_sentinel_ignored_without_observed_actions() -> None:
-    """The reject sentinel is only valid on the PLAN_DIVERGENCE-with-
-    observed-actions path. Without observed_actions, a ``{"reject": ...}``
-    response is treated as an invalid plan (no usable tasks) and refine
-    returns None via the normal exhaustion path."""
-    # Single attempt so we can assert the "no plan found" exhaustion
-    # path collapses to None without engaging reject-sentinel logic.
-    scripted = _ScriptedLLM([json.dumps({"reject": True, "reason": "x"})])
-    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=1)
+async def test_reject_sentinel_honoured_without_observed_actions() -> None:
+    """iter-12 (#220): the reject sentinel is now honoured on every
+    plan-context drift kind (PLAN_DIVERGENCE / OFF_TOPIC /
+    JUSTIFIED_DEVIATION) regardless of whether ``observed_actions`` is
+    supplied. Production callers don't pass ``observed_actions``, so
+    gating reject-sentinel acceptance on it would have left the
+    intervention-ladder escalation path (the LLM judging a divergence
+    irreconcilable) silently disabled in real runs.
+    """
+    stub = _StubLLM(json.dumps({"reject": True, "reason": "off-goal"}))
+    planner = LLMPlanner(call_llm=stub)
+
+    emitted: list[DriftEvent] = []
+
+    async def capture(d: DriftEvent) -> None:
+        emitted.append(d)
+
+    planner.set_drift_emitter(capture)
     drift = DriftEvent(
         kind=DriftKind.PLAN_DIVERGENCE,
         severity=DriftSeverity.WARNING,
@@ -492,9 +556,13 @@ async def test_reject_sentinel_ignored_without_observed_actions() -> None:
         current_task_id="draft",
     )
     revised = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
-    # Without observed_actions, the response is not a reject; it's just
-    # a malformed plan, which the normal "no usable plan" path rejects.
+    # Reject sentinel honoured -> refine returns None (caller escalates
+    # via the intervention ladder).
     assert revised is None
+    # Reject is a successful decision, not a parse failure.
+    assert emitted == []
+    # Single LLM call -- no retry on a valid reject.
+    assert len(stub.calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -697,14 +765,10 @@ async def test_refine_justified_deviation_uses_goal_aware_prompt() -> None:
         kind=DriftKind.JUSTIFIED_DEVIATION,
         severity=DriftSeverity.WARNING,
         detail=(
-            "justified deviation (tool_error): tool 503; falling back "
-            "to a different fact source"
+            "justified deviation (tool_error): tool 503; falling back to a different fact source"
         ),
         current_task_id="draft",
-        trigger_input=(
-            "The fact API returned 503; let me retry against the "
-            "alternate endpoint."
-        ),
+        trigger_input=("The fact API returned 503; let me retry against the alternate endpoint."),
     )
 
     revised = await planner.refine(plan=_running_plan(), drift=drift, goals=_goals())
@@ -737,8 +801,7 @@ async def test_refine_justified_deviation_honours_reject_sentinel() -> None:
         kind=DriftKind.JUSTIFIED_DEVIATION,
         severity=DriftSeverity.WARNING,
         detail=(
-            "justified deviation (surprising_result): the source disagrees "
-            "with the sticky goal"
+            "justified deviation (surprising_result): the source disagrees with the sticky goal"
         ),
         current_task_id="draft",
     )
