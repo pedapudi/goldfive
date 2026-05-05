@@ -42,8 +42,11 @@ import dataclasses
 import inspect
 import logging
 import os
+import subprocess
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from importlib import metadata as _importlib_metadata
+from pathlib import Path as _Path
 from typing import TYPE_CHECKING, Any
 
 from goldfive import _state_audit
@@ -85,6 +88,57 @@ if TYPE_CHECKING:
     )
 
 log = logging.getLogger("goldfive.runner")
+
+
+def _detect_build_identity() -> tuple[str, str]:
+    """Return ``(version, sha)`` for the running goldfive build.
+
+    Both fields default to ``"unknown"`` and the function never raises —
+    callers log the result on Runner construction so users can answer
+    "is the change actually deployed?" from the logs (the diagnostic
+    trap captured by ``feedback_verify_running_build.md``).
+
+    Detection order:
+
+    * ``importlib.metadata.version("goldfive")`` — set when goldfive is
+      installed as a wheel / editable install.
+    * ``goldfive.__version__`` — fallback for source checkouts that
+      bypass the metadata path.
+    * ``git rev-parse --short HEAD`` run from the package's install
+      directory — only attempted when a ``.git`` directory exists at
+      the repo root, and all exceptions are swallowed so missing-git
+      environments still construct cleanly.
+    """
+    version = "unknown"
+    try:
+        version = _importlib_metadata.version("goldfive")
+    except Exception:
+        try:
+            from goldfive import __version__ as _pkg_version
+
+            version = _pkg_version or "unknown"
+        except Exception:
+            log.debug("goldfive version detection failed", exc_info=True)
+
+    sha = "unknown"
+    try:
+        pkg_root = _Path(__file__).resolve().parent
+        repo_root = pkg_root.parent
+        if (repo_root / ".git").exists():
+            result = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if result.returncode == 0:
+                sha = result.stdout.strip() or "unknown"
+    except Exception:
+        log.debug("goldfive git sha detection failed", exc_info=True)
+
+    return version, sha
 
 
 class Runner:
@@ -235,6 +289,12 @@ class Runner:
         fail_fast_on_revision_rejection: bool | None = None,
         **legacy_kwargs: Any,
     ) -> None:
+        # Stamp the running build's identity at construction so logs
+        # answer "did the change actually deploy?" without spelunking.
+        # See ``feedback_verify_running_build.md`` for the motivating
+        # 30-minute diagnosis trap. INFO once per Runner; never raises.
+        _version, _sha = _detect_build_identity()
+        log.info("goldfive runner starting: version=%s sha=%s", _version, _sha)
         if "max_plan_reinvocations" in legacy_kwargs:
             legacy_value = legacy_kwargs.pop("max_plan_reinvocations")
             warnings.warn(
