@@ -8,6 +8,18 @@ Related: [PROTOCOLS.md](../design/PROTOCOLS.md),
 [ARCHITECTURE.md](../design/ARCHITECTURE.md),
 [DRIFT.md](../design/DRIFT.md).
 
+## Architecture overview
+
+goldfive's session is an actor; the `ControlChannel` is its only
+mailbox; state mutations to `session.plan` and task status happen
+only inside the channel processor. Every drift verdict carries
+`observed_revision_index` so stale verdicts can be rejected at
+dispatch. The full design — motivation (a pair of false-positive
+cascade traces), invariants, and migration story — is in
+[../design/CONTROL-CHANNEL.md](../design/CONTROL-CHANNEL.md). Read it
+before adding a new control kind, a new drift judge, or any code
+that mutates `session.plan`.
+
 ## Top-level imports
 
 Everything documented here is re-exported from `goldfive.__init__`
