@@ -220,6 +220,19 @@ class DriftKind(StrEnum):
     # prompt-selection. Until then no production code path constructs
     # this kind, so the lack of a ``_LADDER`` row is intentional.
     JUSTIFIED_DEVIATION = "justified_deviation"
+    # Structural capability mismatch detected at delegation_observed
+    # time (goldfive#253). The agent the coordinator delegated to
+    # cannot perform the bound task because its tools structurally
+    # cannot do the work — e.g. a coordinator-style agent (whose only
+    # tools are ``AgentTool`` wrappers) was assigned a leaf authoring
+    # task like "draft the presentation", or the task's
+    # ``required_tools`` advisory is not satisfied by the invoked
+    # agent's tool surface. CRITICAL severity. Distinct from the
+    # planner-LLM PLAN_DIVERGENCE check (which compares the planner's
+    # *predicted* assignee to the runtime delegation): CAPABILITY_MISMATCH
+    # grounds the comparison in actual tool capability. Detector lives
+    # at :func:`goldfive.drift.capability_check.detect_capability_mismatch`.
+    CAPABILITY_MISMATCH = "capability_mismatch"
 
 
 class DriftSeverity(StrEnum):
@@ -410,6 +423,16 @@ class Task:
     #: (CORRECT suppresses the rerouting of reports from the old id to
     #: the new id — the old work is legitimately done).
     supersedes_kind: SupersessionKind = SupersessionKind.UNSPECIFIED
+    #: goldfive#253 — advisory list of tool names the planner judged this
+    #: task structurally requires. Consumed by
+    #: :func:`goldfive.drift.capability_check.detect_capability_mismatch`
+    #: to fire ``CAPABILITY_MISMATCH`` at ``delegation_observed`` time
+    #: when the invoked agent's tool surface does not cover the listed
+    #: names. Empty tuple is the no-op default — legacy plans and any
+    #: planner that does not populate the field are unaffected (Rule B
+    #: of the detector skips out). Tuple (not list) so the dataclass
+    #: stays hashable and shareable across the frozen-Plan invariant.
+    required_tools: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)

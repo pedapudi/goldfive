@@ -3924,6 +3924,129 @@ def make_adk_plugin(
                     exc,
                 )
 
+        async def _maybe_emit_capability_mismatch(
+            self,
+            *,
+            ctx: SessionContext,
+            invoked_agent: Any,
+            invoked_agent_name: str,
+            invocation_id: str,
+        ) -> None:
+            """Run the structural capability-mismatch detector at delegation time (goldfive#253).
+
+            Looks up the plan task being delegated (PENDING/RUNNING task
+            assigned to ``invoked_agent_name``) and feeds the live tool
+            list off the ADK ``invoked_agent`` to
+            :func:`goldfive.drift.capability_check.detect_capability_mismatch`.
+            When the detector returns a drift, route it through
+            ``steerer._handle_drift`` so the standard intervention
+            ladder fires (cancel + refine), with a direct sink-emission
+            fallback when the steerer stub does not expose the helper.
+
+            Silent on every failure mode — observability cannot block
+            the in-flight invocation.
+            """
+            steerer = ctx.steerer
+            if steerer is None:
+                return
+            try:
+                from goldfive.drift.capability_check import (  # noqa: PLC0415 — lazy
+                    detect_capability_mismatch,
+                )
+                from goldfive.types import (  # noqa: PLC0415 — lazy
+                    TaskStatus,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_maybe_emit_capability_mismatch: cannot import deps: %s",
+                    exc,
+                )
+                return
+
+            # Resolve the bound task: prefer a PENDING/RUNNING task whose
+            # ``assignee_agent_id`` matches the invoked agent. Mirrors
+            # ``_pin_delegation_task_id``'s candidate filter without the
+            # tool-args scoring (we don't need tie-breaking — the first
+            # qualifying candidate is enough to feed the detector).
+            plan = _safe_attr(ctx.session, "plan", None)
+            if plan is None:
+                return
+            tasks = _safe_attr(plan, "tasks", None) or ()
+            chosen_task: Any = None
+            for task in tasks:
+                assignee = str(_safe_attr(task, "assignee_agent_id", "") or "")
+                if assignee != invoked_agent_name:
+                    continue
+                status = _safe_attr(task, "status", None)
+                if status is not TaskStatus.PENDING and status is not TaskStatus.RUNNING:
+                    continue
+                chosen_task = task
+                break
+            if chosen_task is None:
+                # No plan task names this agent — leave the
+                # planner-side checks to handle the assignee mismatch.
+                # The detector cannot decide capability without a task.
+                return
+
+            tool_list = list(_safe_attr(invoked_agent, "tools", None) or [])
+            try:
+                drift = detect_capability_mismatch(
+                    invoked_agent_name=invoked_agent_name,
+                    invoked_agent_tools=tool_list,
+                    task=chosen_task,
+                )
+            except Exception as exc:  # noqa: BLE001 — detector must not block
+                log.debug(
+                    "_maybe_emit_capability_mismatch: detector raised: %s",
+                    exc,
+                )
+                return
+            if drift is None:
+                return
+
+            # goldfive#245 — stamp the plan revision the detector
+            # observed so a stale verdict against an already-revised
+            # plan can be dropped by the dispatch-time gate.
+            _observed_rev = int(_safe_attr(plan, "revision_index", 0) or 0)
+            try:
+                drift.observed_revision_index = _observed_rev
+            except Exception:  # noqa: BLE001
+                pass
+
+            handle = getattr(steerer, "_handle_drift", None)
+            if callable(handle):
+                try:
+                    await handle(drift, ctx.session)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "_maybe_emit_capability_mismatch: _handle_drift raised: %s",
+                        exc,
+                    )
+            # Fallback: direct sink emission so observability still flows.
+            sinks = getattr(steerer, "_sinks", None) or []
+            if not sinks:
+                return
+            try:
+                from goldfive.events import (  # noqa: PLC0415 — lazy
+                    drift_detected_event,
+                    emit,
+                )
+
+                run_id = str(_safe_attr(ctx.session, "run_id", "") or "")
+                session_id = str(_safe_attr(ctx.session, "id", "") or "") or run_id
+                try:
+                    seq = ctx.session.next_sequence()
+                except Exception:  # noqa: BLE001
+                    seq = 0
+                evt = drift_detected_event(run_id, seq, drift, session_id=session_id)
+                await emit(sinks, evt)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_maybe_emit_capability_mismatch: direct sink emit failed: %s",
+                    exc,
+                )
+
         async def _emit_runaway_delegation_drift(
             self,
             *,
@@ -5018,6 +5141,26 @@ def make_adk_plugin(
                             "before_tool_callback: reconciler.on_delegation_observed raised: %s",
                             exc,
                         )
+
+                # goldfive#253 — structural capability check at delegation
+                # time. Replaces the planner-LLM PLAN_DIVERGENCE
+                # comparison for the wrong-assignee case with a ground-
+                # truth check on the invoked agent's tool surface. Fires
+                # CAPABILITY_MISMATCH when the agent has only AgentTool
+                # wrappers but was bound to a leaf authoring task, or
+                # when ``Task.required_tools`` are not covered.
+                try:
+                    await self._maybe_emit_capability_mismatch(
+                        ctx=ctx,
+                        invoked_agent=nested_agent,
+                        invoked_agent_name=to_agent,
+                        invocation_id=inv_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_tool_callback: capability_mismatch hook raised: %s",
+                        exc,
+                    )
 
                 # goldfive#241 Item 3-bis — delegation-site task_id
                 # pinning. When the coordinator fires multiple parallel

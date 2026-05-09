@@ -216,6 +216,19 @@ enum DriftKind {
   // unprovoked drift. PR 1 (proto + dataclass) ships the kind only;
   // PR 4 wires the ladder + planner routing.
   DRIFT_KIND_JUSTIFIED_DEVIATION = 40;
+  // Structural capability mismatch detected at delegation_observed time
+  // (goldfive#253). The agent the coordinator delegated to cannot
+  // perform the bound task because its tools structurally cannot do
+  // the work — e.g. a coordinator-style agent (whose only tools are
+  // ``AgentTool`` wrappers) was assigned a leaf authoring task like
+  // "draft the presentation", or the task's ``required_tools`` are
+  // not satisfied by the invoked agent's tool surface. CRITICAL
+  // severity. Replaces the planner-LLM PLAN_DIVERGENCE comparison
+  // for the assignee-mismatch case with a structural ground-truth
+  // check. Live on the steer-time path; drift-id pairs with the
+  // ``DelegationObserved`` event that triggered it. Detector:
+  // :func:`goldfive.drift.capability_check.detect_capability_mismatch`.
+  DRIFT_KIND_CAPABILITY_MISMATCH = 41;
 }
 
 // Lifecycle phase of a drift condition (goldfive#271 PR1, additive).
