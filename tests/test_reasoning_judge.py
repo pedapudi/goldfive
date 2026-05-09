@@ -409,8 +409,18 @@ async def test_rate_limit_resets_on_task_transition() -> None:
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
     # Two thinking messages on t1 -> one judge call (1st fires, 2nd skips).
-    await steerer.observe_reasoning("t1 turn 1", session=session)
-    await steerer.observe_reasoning("t1 turn 2", session=session)
+    # NB: the strings must be semantically distinct so the always-on
+    # ``detect_looping_reasoning`` embedding detector does NOT classify
+    # them as a near-duplicate cluster (which would short-circuit
+    # ``observe_reasoning`` before the judge dispatches and break this
+    # test under any venv that has sentence-transformers installed).
+    await steerer.observe_reasoning(
+        "investigating solar panel efficiency curves", session=session
+    )
+    await steerer.observe_reasoning(
+        "comparing inverter topologies for residential rooftops",
+        session=session,
+    )
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
 
@@ -428,7 +438,12 @@ async def test_rate_limit_resets_on_task_transition() -> None:
     session.current_task_id = "t2"
 
     # First reasoning on t2 -> fresh judge call (the counter for t2 is 0).
-    await steerer.observe_reasoning("t2 turn 1", session=session)
+    # Use a topic that's semantically far from the two t1 strings above
+    # so the looping detector does not flag this as a continuation.
+    await steerer.observe_reasoning(
+        "examining hydroponic tomato yield variance under LED grow lights",
+        session=session,
+    )
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
 
