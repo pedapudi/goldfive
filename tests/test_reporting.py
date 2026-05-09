@@ -234,7 +234,14 @@ async def test_report_new_work_discovered_fires_refine() -> None:
     assert planner.refine_calls[0]["drift"].kind is DriftKind.NEW_WORK_DISCOVERED
 
 
-async def test_report_plan_divergence_fires_refine_and_sets_flag() -> None:
+async def test_report_plan_divergence_sets_flag_only() -> None:
+    """goldfive#252: PLAN_DIVERGENCE drift is silenced.
+
+    The reporting tool still flips ``session.divergence_flag`` so
+    observers see "something happened", but no drift fires through
+    the steerer pipeline (the kind is being replaced by
+    CAPABILITY_MISMATCH in #253).
+    """
     steerer, session, _sink, planner = _fresh()
     await _tool("report_plan_divergence").handler(
         {
@@ -245,7 +252,7 @@ async def test_report_plan_divergence_fires_refine_and_sets_flag() -> None:
         steerer,
     )
     assert session.divergence_flag is True
-    assert planner.refine_calls[0]["drift"].kind is DriftKind.PLAN_DIVERGENCE
+    assert planner.refine_calls == []
 
 
 async def test_handler_tolerates_missing_optional_fields() -> None:

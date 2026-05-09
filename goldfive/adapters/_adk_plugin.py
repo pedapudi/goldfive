@@ -3963,11 +3963,31 @@ def make_adk_plugin(
                 )
                 return
 
-            # Resolve the bound task: prefer a PENDING/RUNNING task whose
-            # ``assignee_agent_id`` matches the invoked agent. Mirrors
-            # ``_pin_delegation_task_id``'s candidate filter without the
-            # tool-args scoring (we don't need tie-breaking — the first
-            # qualifying candidate is enough to feed the detector).
+            # Resolve the bound task. Two-strategy lookup:
+            #
+            # 1. Legacy / explicit-assignee path: prefer a PENDING/RUNNING
+            #    task whose ``assignee_agent_id`` matches the invoked
+            #    agent. This covers test fixtures and any caller that
+            #    still constructs plans with explicit assignees, plus
+            #    cases where an upstream tool (or future planner mode)
+            #    re-introduces declarative binding.
+            # 2. Post-#252 fallback: when no assignee matches (the
+            #    common case now — the goldfive planner zeroes
+            #    ``assignee_agent_id`` at parse time), read the
+            #    currently pinned task id off the goldfive Session.
+            #    ``before_tool_callback`` has already pinned the task
+            #    for the parent agent's turn via
+            #    :meth:`_pin_current_task_id_for_agent` /
+            #    :meth:`_stamp_current_task_id`; that pin describes the
+            #    work this delegation is enacting, which is the
+            #    capability surface we want to validate against the
+            #    invoked sub-agent's tools.
+            #
+            # If neither strategy resolves a task (plan empty, fresh
+            # session, no pin), skip the detector — Rule A wants a task
+            # to consult; without one it would have to invent one.
+            # Best-effort: the detector no-ops, which is fine given the
+            # failure mode it catches is rare.
             plan = _safe_attr(ctx.session, "plan", None)
             if plan is None:
                 return
@@ -3983,9 +4003,45 @@ def make_adk_plugin(
                 chosen_task = task
                 break
             if chosen_task is None:
-                # No plan task names this agent — leave the
-                # planner-side checks to handle the assignee mismatch.
-                # The detector cannot decide capability without a task.
+                # Strategy 2 — read the goldfive Session's current pin.
+                pinned_task_id = ""
+                try:
+                    pinned_task_id = str(
+                        _safe_attr(ctx.session, "current_task_id", "") or ""
+                    )
+                    if not pinned_task_id:
+                        # Fallback to the OrchestrationStore-backed pin
+                        # (the primary single-writer slot post-#271
+                        # Phase 2.1).
+                        from goldfive.orchestration_store import (  # noqa: PLC0415 — lazy
+                            OrchestrationStore,
+                        )
+
+                        store = OrchestrationStore.for_session(ctx.session)
+                        pinned_task_id = store.pin_current_task()
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "_maybe_emit_capability_mismatch: pin lookup raised: %s",
+                        exc,
+                    )
+                    return
+                if not pinned_task_id:
+                    return
+                for task in tasks:
+                    tid = str(_safe_attr(task, "id", "") or "")
+                    if tid != pinned_task_id:
+                        continue
+                    status = _safe_attr(task, "status", None)
+                    if (
+                        status is not TaskStatus.PENDING
+                        and status is not TaskStatus.RUNNING
+                    ):
+                        return
+                    chosen_task = task
+                    break
+            if chosen_task is None:
+                # Pin missing or pinned task not live in the plan. The
+                # detector cannot decide capability without a task.
                 return
 
             tool_list = list(_safe_attr(invoked_agent, "tools", None) or [])

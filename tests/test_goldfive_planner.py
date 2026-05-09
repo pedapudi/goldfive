@@ -287,6 +287,7 @@ def test_goldfive_planner_process_response_noop_when_no_filters_fire() -> None:
     assert out is None
 
 
+@pytest.mark.skip(reason="goldfive#252: PLAN_DIVERGENCE replaced by CAPABILITY_MISMATCH (#253)")
 async def test_goldfive_planner_process_response_emits_divergence_on_off_registry_agent() -> None:
     """Three-stage classification: cross-layer → PLAN_DIVERGENCE;
     hallucinated → CONFABULATION_RISK; report_ prefix → skipped.
@@ -431,6 +432,7 @@ async def test_own_tool_call_no_drift() -> None:
     assert out is None
 
 
+@pytest.mark.skip(reason="goldfive#252: PLAN_DIVERGENCE replaced by CAPABILITY_MISMATCH (#253)")
 async def test_cross_layer_agent_call_fires_plan_divergence() -> None:
     """Stage 2: name matches a registry agent but is not in this agent's tools.
 
@@ -561,13 +563,19 @@ async def test_cancelled_id_stripped_across_all_stages() -> None:
     assert "fc-cancel-stage2" not in remaining_ids
     assert "fc-cancel-stage3" not in remaining_ids
 
-    # Drifts fired only for the retained cross-layer + hallucinated
-    # parts — the cancelled ones never reach classification because
-    # the cancelled-id filter runs first.
+    # Drifts fired only for the retained hallucinated part — the
+    # cancelled ones never reach classification because the cancelled-id
+    # filter runs first.
+    #
+    # goldfive#252: PLAN_DIVERGENCE is silenced (replaced by
+    # CAPABILITY_MISMATCH in #253); the retained stage-2 cross-layer
+    # part is still classified but produces no drift. Only the stage-3
+    # hallucination still fires CONFABULATION_RISK.
     await asyncio.sleep(0)
     kinds = sorted(d.kind.value for d in steerer.drifts)
-    assert kinds == ["confabulation_risk", "plan_divergence"], (
-        f"expected one PLAN_DIVERGENCE + one CONFABULATION_RISK, got {steerer.drifts!r}"
+    assert kinds == ["confabulation_risk"], (
+        f"expected one CONFABULATION_RISK (PLAN_DIVERGENCE silenced per "
+        f"#252), got {steerer.drifts!r}"
     )
 
 

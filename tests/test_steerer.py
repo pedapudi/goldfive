@@ -892,7 +892,14 @@ async def test_report_new_work_discovered_fires_drift() -> None:
     assert planner.refine_calls[0]["drift"].kind is DriftKind.NEW_WORK_DISCOVERED
 
 
-async def test_report_plan_divergence_sets_flag_and_fires_drift() -> None:
+async def test_report_plan_divergence_sets_flag_only() -> None:
+    """goldfive#252: PLAN_DIVERGENCE drift creation is disabled.
+
+    ``report_plan_divergence`` keeps the ``divergence_flag`` write so
+    observers see "something happened", but no drift fires through
+    the steerer pipeline (the kind is being replaced by
+    CAPABILITY_MISMATCH in #253).
+    """
     steerer, session, sink, planner = _fresh()
     await steerer.report_plan_divergence(
         session=session,
@@ -900,10 +907,9 @@ async def test_report_plan_divergence_sets_flag_and_fires_drift() -> None:
         suggested_action="replan from here",
     )
     assert session.divergence_flag is True
-    from goldfive.pb.goldfive.v1 import types_pb2
-
-    assert sink.events[0].drift_detected.kind == types_pb2.DRIFT_KIND_PLAN_DIVERGENCE
-    assert planner.refine_calls[0]["drift"].kind is DriftKind.PLAN_DIVERGENCE
+    # No DriftDetected emitted, no refine called.
+    assert sink.events == []
+    assert planner.refine_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1489,8 +1495,12 @@ async def test_refine_returns_none_does_not_cascade_further_drifts() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
+    # goldfive#252: PLAN_DIVERGENCE handling is disabled at the top
+    # of ``_handle_drift``, so use OFF_TOPIC (which routes through
+    # the same goal-aware refine path) to exercise the no-cascade
+    # contract this test was filed for (#204).
     drift = DriftEvent(
-        kind=DriftKind.PLAN_DIVERGENCE,
+        kind=DriftKind.OFF_TOPIC,
         severity=DriftSeverity.WARNING,
         detail="reviewer reported BLOCKED",
         current_task_id="t1",
@@ -1514,13 +1524,13 @@ async def test_refine_returns_none_does_not_cascade_further_drifts() -> None:
         if e.WhichOneof("payload") == "drift_detected"
     ]
     # Exactly the original drift + the escalation. No follow-up
-    # PLAN_DIVERGENCE CRITICAL (the pre-fix shape) and no cascade
-    # through TASK_FAILED_FATAL / REPEATED_FAILURE on a single tick.
-    assert types_pb2.DRIFT_KIND_PLAN_DIVERGENCE in drift_kinds
+    # OFF_TOPIC CRITICAL (the pre-fix shape) and no cascade through
+    # TASK_FAILED_FATAL / REPEATED_FAILURE on a single tick.
+    assert types_pb2.DRIFT_KIND_OFF_TOPIC in drift_kinds
     assert types_pb2.DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED in drift_kinds
-    plan_divergence_count = drift_kinds.count(types_pb2.DRIFT_KIND_PLAN_DIVERGENCE)
+    off_topic_count = drift_kinds.count(types_pb2.DRIFT_KIND_OFF_TOPIC)
     # Only the originating drift, no recursing CRITICAL clone.
-    assert plan_divergence_count == 1, drift_kinds
+    assert off_topic_count == 1, drift_kinds
 
 
 async def test_refine_exhausted_path_unchanged() -> None:

@@ -83,9 +83,6 @@ from typing import TYPE_CHECKING
 from goldfive import orchestration_state as _ostate
 from goldfive.types import (
     TERMINAL_TASK_STATUSES,
-    DriftEvent,
-    DriftKind,
-    DriftSeverity,
     Plan,
     Session,
     Task,
@@ -573,13 +570,20 @@ class PlanReconciler:
         agent_name: str,
         invocation_id: str,
     ) -> None:
-        """Emit a PLAN_DIVERGENCE drift via the steerer.
+        """Detector hook for off-plan agents (drift emission disabled).
 
-        INFO severity by default. The steerer's drift pipeline
-        (and, once #142 lands, the intervention ladder) decides
-        whether to escalate. We deliberately do not refine here:
-        an off-plan agent observation is informational until the
-        steerer has enough context to decide.
+        goldfive#252: PLAN_DIVERGENCE replaced by CAPABILITY_MISMATCH
+        (#253) — disabled here. Pre-#252 this fired a PLAN_DIVERGENCE
+        drift comparing the planner-predicted ``assignee_agent_id``
+        against runtime delegation. With #252 the planner no longer
+        declares assignees (assignment is observational), so the
+        comparison's premise is gone. Detection coverage moves to
+        CAPABILITY_MISMATCH, which is grounded in actual agent tools.
+
+        The detector still records the divergence string on
+        ``self.divergence_events`` so existing observers and tests that
+        read the list keep working; we just don't construct a
+        ``DriftEvent`` and we don't dispatch through the steerer.
         """
         detail = (
             f"observed off-plan agent {agent_name!r} "
@@ -587,49 +591,13 @@ class PlanReconciler:
             f"assigned to this agent"
         )
         self.divergence_events.append(detail)
-        # goldfive#245 — stamp observation-time plan revision so the
-        # dispatch-time gate can drop a stale verdict.
-        _gf_plan = getattr(self._session, "plan", None)
-        _observed_rev = (
-            int(getattr(_gf_plan, "revision_index", 0) or 0)
-            if _gf_plan is not None
-            else 0
+        log.debug(
+            "PlanReconciler._emit_divergence: detector observed "
+            "off-plan agent %r but PLAN_DIVERGENCE drift is disabled "
+            "(goldfive#252); no drift fired",
+            agent_name,
         )
-        drift = DriftEvent(
-            kind=DriftKind.PLAN_DIVERGENCE,
-            severity=DriftSeverity.INFO,
-            detail=detail,
-            current_task_id=self._session.current_task_id or "",
-            current_agent_id=agent_name,
-            observed_revision_index=_observed_rev,
-        )
-        # Prefer the steerer's internal _handle_drift (pre-built
-        # DriftEvent → DriftDetected emission + refine policy). The
-        # steerer's ``observe`` path expects a raw event to classify,
-        # not a DriftEvent, so passing the pre-built drift through
-        # ``observe`` would round-trip through detect_drift and
-        # almost certainly return None. ``_handle_drift`` is the
-        # same entry point other plugin-side drifts (CONFABULATION_RISK,
-        # RUNAWAY_DELEGATION) already use.
-        handle = getattr(self._steerer, "_handle_drift", None)
-        if callable(handle):
-            try:
-                await handle(drift, self._session)
-                return
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "PlanReconciler._emit_divergence: _handle_drift raised: %s",
-                    exc,
-                )
-        # Fallback for steerer stubs without _handle_drift: feed
-        # the DriftEvent through observe() and let custom steerers
-        # decide. Tests that stub the steerer lean on this path.
-        try:
-            observe = getattr(self._steerer, "observe", None)
-            if observe is not None:
-                await observe(drift, self._session)
-        except Exception as exc:  # noqa: BLE001
-            log.debug("PlanReconciler._emit_divergence: observe raised: %s", exc)
+        return
 
 
 __all__ = ["PlanReconciler"]

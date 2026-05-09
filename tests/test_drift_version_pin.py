@@ -239,14 +239,18 @@ async def test_orthogonal_kind_drift_dispatches_after_unrelated_revision() -> No
     The bug class this guards against: parallel judges fire on
     *orthogonal* concerns. Judge A observes revision N → fires OFF_TOPIC
     on task T_A → refine produces revision N+1 (addresses OFF_TOPIC/T_A).
-    Judge B observes revision N → fires PLAN_DIVERGENCE on task T_B; B's
+    Judge B observes revision N → fires INTENT_DIVERGENCE on task T_B; B's
     verdict returns AFTER A's refine landed. Naive global ``observed <
     live`` gating would drop B; per-(kind, target) gating preserves it
-    because (PLAN_DIVERGENCE, T_B) was never specifically addressed.
+    because (INTENT_DIVERGENCE, T_B) was never specifically addressed.
 
-    Both PLAN_DIVERGENCE and OFF_TOPIC at WARNING severity route to the
-    refine path (CANCEL_REINVOKE), so we assert ``planner.refine_calls``
-    fires for the orthogonal drift.
+    Both INTENT_DIVERGENCE and OFF_TOPIC at WARNING severity route to
+    the refine path, so we assert ``planner.refine_calls`` fires for
+    the orthogonal drift.
+
+    goldfive#252: prior shape used PLAN_DIVERGENCE; that kind is now
+    silenced at the top of ``_handle_drift`` so we use
+    INTENT_DIVERGENCE which has the same routing characteristics.
     """
     sink = _ListSink()
     planner = _NullPlanner()
@@ -259,11 +263,11 @@ async def test_orthogonal_kind_drift_dispatches_after_unrelated_revision() -> No
     session.last_addressed_revision_by_drift_key[
         (DriftKind.OFF_TOPIC.value, "t-draft")
     ] = 4
-    # The drift is PLAN_DIVERGENCE on a different task — orthogonal
+    # The drift is INTENT_DIVERGENCE on a different task — orthogonal
     # concern, also a refine-routing kind so we can assert the
     # dispatch path ran.
     drift = _drift(
-        kind=DriftKind.PLAN_DIVERGENCE,
+        kind=DriftKind.INTENT_DIVERGENCE,
         severity=DriftSeverity.WARNING,
         observed_revision_index=3,
         task="t-other",

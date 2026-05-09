@@ -349,7 +349,11 @@ async def test_generate_prompt_renders_agent_tree_when_tree_given() -> None:
 
 
 async def test_generate_prompt_flat_list_renders_legacy_header() -> None:
-    """Legacy ``list[str]`` callers still see the old 'Available agents:' header."""
+    """Legacy ``list[str]`` callers still see an 'Available agents' header.
+
+    goldfive#252: header now flags the block as context-only since the
+    LLM is no longer asked to pick an assignee.
+    """
     stub = _StubLLM(_canned_plan_json())
     planner = LLMPlanner(call_llm=stub)
     await planner.generate(
@@ -357,15 +361,18 @@ async def test_generate_prompt_flat_list_renders_legacy_header() -> None:
         available_agents=["researcher", "writer", "editor"],
     )
     _sys, user, _model = stub.calls[0]
-    assert "Available agents:" in user
+    assert "Available agents" in user
     assert "AGENT TREE" not in user
 
 
-async def test_validator_rejects_off_registry_assignee() -> None:
-    """Plans whose assignees aren't in the registry are rejected on every attempt.
+async def test_off_registry_assignee_dropped_silently() -> None:
+    """goldfive#252: planner output drops any LLM-supplied assignee.
 
-    Exhausts the retry budget because the stub always returns the same
-    off-registry JSON; ``generate`` eventually returns ``None``.
+    Pre-#252 the validator rejected off-registry assignees and the
+    retry loop fed the error back. Now the parser unconditionally
+    drops the value, so off-registry / on-registry / compound names
+    all collapse to the empty string and the plan validates on the
+    first attempt.
     """
 
     class _AlwaysOffRegistry:
@@ -382,20 +389,19 @@ async def test_validator_rejects_off_registry_assignee() -> None:
         goals=_goals(),
         available_agents=_tree_registry(),
     )
-    assert result is None
-    # The retry loop fired the full budget.
-    assert len(stub.calls) == 2
-    # The retry prompt fed the validator error back to the LLM.
-    _sys, retry_user, _ = stub.calls[1]
-    assert "off-registry assignee" in retry_user
+    assert result is not None
+    # First attempt suffices because the parser drops the assignee
+    # before the registry check sees anything to reject.
+    assert len(stub.calls) == 1
+    assert all(t.assignee_agent_id == "" for t in result.tasks)
 
 
-async def test_retry_loop_corrects_off_registry_assignee() -> None:
-    """First attempt uses bogus assignees; second attempt picks the real names.
+async def test_planner_normalization_drops_assignees_unconditionally() -> None:
+    """goldfive#252: the parser drops every LLM-supplied assignee.
 
-    Demonstrates the #133/#136 retry-with-correction loop wired into
-    the #151 registry check: the validator's error message feeds the
-    second prompt, and the second response validates cleanly.
+    Whether or not the LLM picks a registry-legal name, the framework
+    overwrites it with the empty string — assignment is observational,
+    not declarative.
     """
 
     class _Correcting:
@@ -404,8 +410,6 @@ async def test_retry_loop_corrects_off_registry_assignee() -> None:
 
         async def __call__(self, system: str, user: str, model: str) -> str:
             self.calls.append((system, user, model))
-            if len(self.calls) == 1:
-                return _off_registry_plan_json()
             return _canned_plan_json()
 
     stub = _Correcting()
@@ -415,12 +419,9 @@ async def test_retry_loop_corrects_off_registry_assignee() -> None:
         available_agents=_tree_registry(),
     )
     assert plan is not None
-    # Second attempt used the real registry names.
+    # Even on-registry names get dropped to the empty string.
     assignees = {t.assignee_agent_id for t in plan.tasks}
-    assert assignees <= {"researcher", "writer", "editor"}
-    # Correction feedback landed in the retry prompt.
-    _sys, retry_user, _ = stub.calls[1]
-    assert "off-registry assignee" in retry_user
+    assert assignees == {""}
 
 
 async def test_generate_accepts_none_registry_backcompat() -> None:
@@ -1584,9 +1585,12 @@ def test_normalize_assignee_uses_last_colon() -> None:
     assert _normalize_assignee("a:b:c:research_agent") == "research_agent"
 
 
-def test_plan_from_json_normalizes_compound_assignees(
+def test_plan_from_json_drops_compound_assignees(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # goldfive#252: assignee is observational, not declarative. The
+    # parser unconditionally drops any LLM-supplied value (compound or
+    # bare) so coordinator-style mis-picks never reach the runtime.
     payload = {
         "summary": "s",
         "tasks": [
@@ -1605,16 +1609,15 @@ def test_plan_from_json_normalizes_compound_assignees(
     with caplog.at_level("WARNING", logger="goldfive.planner"):
         plan = _plan_from_json(payload, run_id="r", goal_ids=[])
     assert plan is not None
-    assert [t.assignee_agent_id for t in plan.tasks] == ["research_agent", "writer"]
-    compound_warnings = [
-        r for r in caplog.records if "compound assignee_agent_id" in r.getMessage()
-    ]
-    assert len(compound_warnings) == 2
+    assert [t.assignee_agent_id for t in plan.tasks] == ["", ""]
 
 
-def test_plan_from_json_leaves_bare_assignees_unchanged(
+def test_plan_from_json_drops_bare_assignees(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # goldfive#252: bare LLM-emitted names are dropped too — the
+    # framework populates assignee observationally regardless of what
+    # the LLM said.
     payload = {
         "summary": "s",
         "tasks": [
@@ -1625,16 +1628,13 @@ def test_plan_from_json_leaves_bare_assignees_unchanged(
     with caplog.at_level("WARNING", logger="goldfive.planner"):
         plan = _plan_from_json(payload, run_id="r", goal_ids=[])
     assert plan is not None
-    assert [t.assignee_agent_id for t in plan.tasks] == ["research_agent", "writer"]
-    compound_warnings = [
-        r for r in caplog.records if "compound assignee_agent_id" in r.getMessage()
-    ]
-    assert compound_warnings == []
+    assert [t.assignee_agent_id for t in plan.tasks] == ["", ""]
 
 
-def test_plan_from_json_normalizes_mixed_assignees(
+def test_plan_from_json_drops_mixed_assignees(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # goldfive#252: same drop applies regardless of compound/bare mix.
     payload = {
         "summary": "s",
         "tasks": [
@@ -1650,23 +1650,14 @@ def test_plan_from_json_normalizes_mixed_assignees(
     with caplog.at_level("WARNING", logger="goldfive.planner"):
         plan = _plan_from_json(payload, run_id="r", goal_ids=[])
     assert plan is not None
-    assert [t.assignee_agent_id for t in plan.tasks] == [
-        "research_agent",
-        "writer",
-        "reviewer",
-    ]
-    compound_warnings = [
-        r for r in caplog.records if "compound assignee_agent_id" in r.getMessage()
-    ]
-    assert len(compound_warnings) == 1
-    assert "'client-xyz:writer'" in compound_warnings[0].getMessage()
-    assert "'writer'" in compound_warnings[0].getMessage()
+    assert [t.assignee_agent_id for t in plan.tasks] == ["", "", ""]
 
 
-def test_default_system_prompt_forbids_compound_assignee() -> None:
-    # Regression guard against the planner prompt drifting away from the
-    # explicit "bare name only" directive added alongside #214.
-    assert "do NOT add a namespace" in _DEFAULT_SYSTEM_PROMPT
+def test_default_system_prompt_forbids_assignee_population() -> None:
+    # goldfive#252 regression guard: the prompt MUST instruct the LLM
+    # not to populate ``assignee_agent_id`` (the framework owns that
+    # field observationally).
+    assert "Do NOT populate `assignee_agent_id`" in _DEFAULT_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
