@@ -1207,7 +1207,15 @@ def test_steer_prompt_handles_empty_prior_pending() -> None:
     assert "Reusable prior PENDING ids: []" in prompt
 
 
-async def test_refine_steer_id_reuse_with_assignee_change() -> None:
+async def test_refine_steer_id_reuse_drops_llm_assignee() -> None:
+    """goldfive#252: any LLM-emitted ``assignee_agent_id`` is dropped.
+
+    Pre-#252 the LLM could redirect a task to a different agent by
+    naming the new agent in ``assignee_agent_id`` on the same id-reused
+    task. Post-#252 the parser unconditionally drops the value — the
+    framework will populate the field observationally when a delegation
+    actually happens.
+    """
     plan = _evolving_plan()
     goals = [Goal(id="g1", summary="ship the presentation")]
     drift = DriftEvent(
@@ -1224,7 +1232,7 @@ async def test_refine_steer_id_reuse_with_assignee_change() -> None:
                     "id": "create_presentation",
                     "title": "Create presentation",
                     "description": "Create the presentation about solar panels",
-                    "assignee_agent_id": "research_agent",  # CHANGED
+                    "assignee_agent_id": "research_agent",  # IGNORED post-#252
                 }
             ],
             "edges": [{"from_task_id": "research", "to_task_id": "create_presentation"}],
@@ -1235,7 +1243,8 @@ async def test_refine_steer_id_reuse_with_assignee_change() -> None:
     )
     assert revised is not None
     evolved = next(t for t in revised.tasks if t.id == "create_presentation")
-    assert evolved.assignee_agent_id == "research_agent"
+    # LLM-emitted assignee dropped (goldfive#252).
+    assert evolved.assignee_agent_id == ""
 
 
 def test_steer_prompt_surfaces_prior_pending_block() -> None:

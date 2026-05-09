@@ -556,18 +556,21 @@ class GoldfivePlanner(BasePlanner):
 
                 # Stage 2 — name matches an agent in the registry but
                 # wasn't exposed to this agent. Cross-layer delegation.
+                #
+                # goldfive#252: PLAN_DIVERGENCE replaced by
+                # CAPABILITY_MISMATCH (#253) — disabled here. The
+                # detection still runs (so we log the cross-layer
+                # delegation attempt at DEBUG and mark
+                # ``divergence_fired`` so the kept-list returns), but
+                # we no longer construct a ``DriftEvent``. CAPABILITY_
+                # MISMATCH replaces this signal with one grounded in
+                # actual agent tools rather than declared assignees.
                 if self._agent_registry is not None and name in self._agent_registry:
-                    self._emit_tool_call_drift(
+                    log.debug(
+                        "GoldfivePlanner: detector observed cross-layer "
+                        "delegation to %r but PLAN_DIVERGENCE drift is "
+                        "disabled (goldfive#252); no drift fired",
                         name,
-                        callback_context,
-                        kind_name="PLAN_DIVERGENCE",
-                        detail=(
-                            f"LLM emitted function_call to agent "
-                            f"{name!r} which is in the tree registry "
-                            f"but was not exposed as a tool to the "
-                            f"currently-running agent — cross-layer "
-                            f"delegation attempt, call not blocked"
-                        ),
                     )
                     divergence_fired = True
                     continue

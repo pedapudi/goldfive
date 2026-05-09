@@ -3037,16 +3037,21 @@ class DefaultSteerer:
         note: str,
         suggested_action: str = "",
     ) -> None:
-        """Fire a ``PLAN_DIVERGENCE`` drift event → triggers refine."""
+        """No-op: PLAN_DIVERGENCE drift is disabled (goldfive#252).
+
+        # goldfive#252: PLAN_DIVERGENCE replaced by CAPABILITY_MISMATCH
+        (#253) — disabled here. The detector path still records the
+        ``divergence_flag`` so observers see "something happened", but
+        no drift fires through the steerer pipeline.
+        """
         session.divergence_flag = True
         detail = f"{note} (suggested: {suggested_action})" if suggested_action else note
-        drift = DriftEvent(
-            kind=DriftKind.PLAN_DIVERGENCE,
-            severity=DriftSeverity.WARNING,
-            detail=detail,
-            current_task_id=session.current_task_id,
+        log.debug(
+            "DefaultSteerer.report_plan_divergence: PLAN_DIVERGENCE "
+            "drift disabled (goldfive#252); detector observed %r",
+            detail,
         )
-        await self._handle_drift(drift, session)
+        return
 
     # ==================================================================
     # Internals
@@ -3086,9 +3091,28 @@ class DefaultSteerer:
         CRITICAL ``REPEATED_FAILURE`` drift so sinks see the back-off.
         This bounds the loop that would otherwise re-fire the same
         drift every tick until ``SequentialExecutor.max_task_invocations``
-        tripped (see TASK-LIFECYCLE.md §7.3). The outcome table is
+        tripped (see TASK-LIFECYCLE.md). The outcome table is
         cleared on every ``run_started`` boundary.
+
+        goldfive#252: PLAN_DIVERGENCE replaced by CAPABILITY_MISMATCH
+        (#253) — disabled here. Drop the drift at the very top of the
+        handler so any external producer (legacy callers, replays,
+        sinks that build raw ``DriftEvent`` instances) cannot revive
+        the signal. Detection coverage moves to CAPABILITY_MISMATCH,
+        which is grounded in actual agent tools rather than the
+        planner's declared ``assignee_agent_id``.
         """
+        # goldfive#252: PLAN_DIVERGENCE replaced by CAPABILITY_MISMATCH
+        # (#253) — disabled here. Guard at the very top so any external
+        # producer (legacy callers, replays, sinks) cannot revive it.
+        if drift.kind is DriftKind.PLAN_DIVERGENCE:
+            log.debug(
+                "DefaultSteerer._handle_drift: PLAN_DIVERGENCE drift "
+                "received but handling is disabled (goldfive#252); "
+                "detail=%r",
+                drift.detail,
+            )
+            return
         # Normalise source attribution early so every downstream
         # consumer (sinks, promotion policy, prompt framing) sees a
         # non-empty ``authored_by``. USER_* kinds → "user"; anything

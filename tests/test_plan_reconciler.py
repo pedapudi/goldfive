@@ -316,6 +316,9 @@ async def test_get_missed_tasks_reads_live_plan() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(
+    reason="goldfive#252: PLAN_DIVERGENCE replaced by CAPABILITY_MISMATCH (#253)"
+)
 async def test_off_plan_agent_emits_plan_divergence() -> None:
     session = _make_session(
         [
@@ -334,6 +337,9 @@ async def test_off_plan_agent_emits_plan_divergence() -> None:
     assert "stranger_agent" in d.detail
 
 
+@pytest.mark.skip(
+    reason="goldfive#252: PLAN_DIVERGENCE replaced by CAPABILITY_MISMATCH (#253)"
+)
 async def test_off_plan_divergence_deduped_per_agent() -> None:
     """Repeated invocations of the same off-plan agent should fire the
     drift once, not on every observation.
@@ -452,6 +458,11 @@ async def test_task_without_assignee_not_claimed() -> None:
     """A PENDING task with empty ``assignee_agent_id`` must not be
     opportunistically claimed by any agent — the reconciler
     requires explicit assignee matching to avoid over-attribution.
+
+    goldfive#252: the divergence is still recorded on the
+    reconciler's own ``divergence_events`` list for observability,
+    but PLAN_DIVERGENCE drift creation is disabled (the kind is
+    being replaced by CAPABILITY_MISMATCH in #253).
     """
     session = _make_session(
         [
@@ -466,9 +477,10 @@ async def test_task_without_assignee_not_claimed() -> None:
     # No transitions; the unassigned task stays PENDING.
     assert steerer.transitions == []
     assert session.plan.tasks[0].status is TaskStatus.PENDING
-    # And the no-assignee agent is recorded as divergent (there's no
-    # plan task targeting any_agent and no ancestor chain to resolve).
-    assert len(steerer.drifts) == 1
+    # PLAN_DIVERGENCE drift no longer fires (goldfive#252) but the
+    # detector still records the observation.
+    assert steerer.drifts == []
+    assert any("any_agent" in d for d in rec.divergence_events)
 
 
 # ---------------------------------------------------------------------------

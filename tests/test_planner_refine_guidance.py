@@ -89,14 +89,16 @@ def _plan_with_running_task() -> Plan:
 
 def test_guidance_block_constant_contains_key_instructions() -> None:
     """Sanity-pin the constant's wording so accidental edits that
-    dilute the guidance fail loudly. The three load-bearing phrases
-    are the preserve-assignee rule, the supersedes requirement, and
-    the don't-collapse-stages clause."""
+    dilute the guidance fail loudly. The load-bearing phrases are the
+    leave-assignee-empty rule (goldfive#252), the supersedes
+    requirement, and the don't-collapse-stages clause."""
     text = _REFINEMENT_GUIDANCE_BLOCK
     assert "REFINEMENT GUIDANCE" in text
-    assert "KEEP THE SAME `assignee_agent_id`" in text
+    # goldfive#252: assignee is observational; the prompt now tells the
+    # LLM to leave the field empty rather than to "keep the same"
+    # value the planner previously emitted.
+    assert "Leave `assignee_agent_id` empty" in text
     assert "supersedes" in text
-    assert "systemically incapable" in text
     assert "Do NOT collapse a multi-stage plan to a single task" in text
 
 
@@ -117,7 +119,8 @@ def test_guidance_appears_in_steer_prompt_user_source() -> None:
         source="user",
     )
     assert "REFINEMENT GUIDANCE" in prompt
-    assert "KEEP THE SAME `assignee_agent_id`" in prompt
+    # goldfive#252: prompt now tells the LLM to leave assignee empty.
+    assert "Leave `assignee_agent_id` empty" in prompt
 
 
 def test_guidance_appears_in_steer_prompt_goldfive_source() -> None:

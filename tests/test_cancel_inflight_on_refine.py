@@ -453,13 +453,13 @@ async def test_cancel_inflight_for_revision_fires_for_real_drift() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. End-to-end: PLAN_DIVERGENCE → refine_steer → cancel fires on the
+# 8. End-to-end: WARNING-severity drift → refine_steer → cancel fires on the
 #    coordinator's task before its long sleep finishes
 # ---------------------------------------------------------------------------
 
 
 async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> None:
-    """Regression test for the v15 bug: a PLAN_DIVERGENCE drift fires
+    """Regression test for the v15 bug: a WARNING-severity drift fires
     refine_steer; the coordinator's in-flight asyncio task is cancelled
     within the 1s propagation budget instead of running for the full
     refine duration.
@@ -470,11 +470,17 @@ async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> Non
        run ``refine_steer`` (returning a revised plan).
     2. Pinning a long-running coordinator task in the plugin's
        per-invocation registry.
-    3. Firing a ``PLAN_DIVERGENCE`` (WARNING) drift through
+    3. Firing an ``OFF_TOPIC`` (WARNING) drift through
        ``_handle_drift`` — which routes to ``_promote_drift_to_steer``
        given the goldfive-steer eligibility set.
     4. Asserting the coordinator's task observes ``CancelledError``
        within 1s.
+
+    goldfive#252: this test originally fired PLAN_DIVERGENCE; that kind
+    is now silenced at the top of ``_handle_drift`` (replaced by
+    CAPABILITY_MISMATCH in #253). The cancel-inflight contract is
+    independent of which drift kind triggers it, so we exercise the
+    same code path with ``OFF_TOPIC`` (also WARNING → ABSORB → refine).
     """
 
     revised = Plan(
@@ -486,7 +492,7 @@ async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> Non
             Task(id="t2b", title="Replanned T2"),
         ],
         edges=[TaskEdge(from_task_id="t1", to_task_id="t2b")],
-        revision_kind=DriftKind.PLAN_DIVERGENCE.value,
+        revision_kind=DriftKind.OFF_TOPIC.value,
         revision_severity=DriftSeverity.WARNING.value,
         revision_index=1,
     )
@@ -548,9 +554,9 @@ async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> Non
     plugin._invocation_tasks["inv-coord-1"] = coord_task
 
     drift = DriftEvent(
-        kind=DriftKind.PLAN_DIVERGENCE,
+        kind=DriftKind.OFF_TOPIC,
         severity=DriftSeverity.WARNING,
-        detail="coordinator emitted off-plan tool call",
+        detail="coordinator reasoning off the bound task",
         current_task_id="t1",
         current_agent_id="coordinator",
     )
@@ -562,7 +568,7 @@ async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> Non
         pass
     except TimeoutError:
         pytest.fail(
-            "coordinator task was not cancelled within 1s of PLAN_DIVERGENCE "
+            "coordinator task was not cancelled within 1s of OFF_TOPIC "
             "refine — v15 concurrent-invocation bug regressed"
         )
     assert cancelled.is_set()

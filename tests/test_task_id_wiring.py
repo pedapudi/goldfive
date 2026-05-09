@@ -739,6 +739,14 @@ async def test_missing_task_id_still_rejects_when_state_empty() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(
+    reason="goldfive#252: planner-side assignee_agent_id is dropped at parse "
+    "time (always ''); the #214 compound-assignee normalization path no "
+    "longer applies because there is no assignee to normalize. Pin "
+    "resolution at before_agent_callback now relies on observational "
+    "matching (current_task_id, span topology) rather than the planner's "
+    "declared assignee."
+)
 async def test_before_agent_callback_pins_when_plan_came_from_compound_json() -> None:
     """Plans built from compound-form planner JSON still pin the right task.
 

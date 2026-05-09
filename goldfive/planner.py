@@ -97,12 +97,11 @@ Requirements for the plan:
    may run concurrently. Build a real DAG, not a single linear chain,
    when independent work exists.
 
-4. ASSIGNMENTS. Every task's `assignee_agent_id` MUST be drawn from
-   the provided available_agents list. If multiple agents could do a
-   task, pick the most specialised one. If no agent fits, assign it
-   to the coordinator/root agent rather than inventing an id.
-   `assignee_agent_id` must be the bare agent name as listed above —
-   do NOT add a namespace, client prefix, or `<something>:` qualifier.
+4. ASSIGNMENTS. Do NOT populate `assignee_agent_id`; leave it as the
+   empty string. The framework will populate it observationally when
+   a delegation actually happens (goldfive#252). The available_agents
+   block is supplied for context only — describe each task in terms of
+   the work that needs doing, not which agent will perform it.
 
 5. STABILITY. Task ids must be short, unique, and stable strings
    (e.g. "research", "draft_intro", "review_final"). Descriptions
@@ -121,8 +120,7 @@ markdown fences. Schema:
     {
       "id": "research",
       "title": "short human-readable title",
-      "description": "one sentence defining 'done' for this task",
-      "assignee_agent_id": "<agent id from available list>"
+      "description": "one sentence defining 'done' for this task"
     }
   ],
   "edges": [
@@ -190,7 +188,7 @@ _SUPERSESSION_EXAMPLES = (
     "  Reused id (evolution; no supersedes):\n"
     '    Prior: {"id": "research_solar", "title": "Research solar panels"}\n'
     '    New:   {"id": "research_solar", "title": "Research solar + battery\n'
-    '            costs", "assignee_agent_id": "researcher"}\n'
+    '            costs"}\n'
     "    No supersedes — id reuse already encodes that this is the same\n"
     "    logical step.\n"
     "\n"
@@ -249,6 +247,11 @@ Requirements:
 5. GOAL COVERAGE: every unsatisfied goal must still be addressed by at
    least one task in the returned plan.
 
+Do NOT populate `assignee_agent_id` on any new or rewritten task; leave
+it as the empty string. The framework populates it observationally
+(goldfive#252). Tasks you preserve verbatim from the prior plan keep
+their existing assignee value.
+
 Respond with a single JSON object and NOTHING ELSE:
 
 {
@@ -258,7 +261,6 @@ Respond with a single JSON object and NOTHING ELSE:
       "id": "...",
       "title": "...",
       "description": "...",
-      "assignee_agent_id": "...",
       "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED",
       "supersedes": "<optional: id of a terminal task this one replaces>",
       "supersedes_kind": "<REPLACE|CORRECT — required when supersedes is set>"
@@ -300,9 +302,11 @@ You will also receive:
 Your job is to produce the REMAINING work (PENDING tasks) that
 satisfies the goals in light of the steering note. Carry forward
 the prior pending tasks where the work continues, EVOLVING their
-title / description / assignee as needed; mint fresh ids only for
-genuinely new tasks. Omit a prior pending task entirely if the steer
-makes it unnecessary.
+title / description as needed; mint fresh ids only for genuinely
+new tasks. Omit a prior pending task entirely if the steer
+makes it unnecessary. Do NOT populate `assignee_agent_id`; leave
+it as the empty string. The framework populates it observationally
+(goldfive#252).
 
 Requirements:
 
@@ -344,7 +348,6 @@ Respond with a single JSON object and NOTHING ELSE:
       "id": "...",
       "title": "...",
       "description": "...",
-      "assignee_agent_id": "...",
       "supersedes": "<optional: id of a terminal task this one replaces>",
       "supersedes_kind": "<REPLACE|CORRECT — required when supersedes is set>"
     }
@@ -407,6 +410,11 @@ validation):
 6. Every unsatisfied goal must still be addressed by at least one
    task in the returned plan.
 
+Do NOT populate `assignee_agent_id` on new or rewritten tasks; leave it
+as the empty string. The framework populates it observationally
+(goldfive#252). Tasks you preserve verbatim from the prior plan keep
+their existing assignee value.
+
 Respond with a single JSON object and NOTHING else. For ABSORB:
 
 {
@@ -416,7 +424,6 @@ Respond with a single JSON object and NOTHING else. For ABSORB:
       "id": "...",
       "title": "...",
       "description": "...",
-      "assignee_agent_id": "...",
       "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED"
     }
   ],
@@ -523,8 +530,10 @@ You MUST:
    collapsed), you may omit it from the returned plan. Never drop
    tasks that already ran.
 
-5. REASSIGN. If a task is better handled by a different available
-   agent in light of the drift, update its `assignee_agent_id`.
+5. ASSIGNMENTS. Do NOT populate `assignee_agent_id` on new or
+   rewritten tasks; leave it as the empty string. The framework
+   populates it observationally (goldfive#252). Tasks you preserve
+   verbatim from the prior plan keep their existing assignee value.
 
 6. KEEP IDS STABLE. When the underlying work is the same, keep the
    task id unchanged. Reuse ids only for the same logical task.
@@ -556,7 +565,6 @@ Respond with a single JSON object and NOTHING ELSE:
       "id": "...",
       "title": "...",
       "description": "...",
-      "assignee_agent_id": "...",
       "status": "PENDING|RUNNING|COMPLETED|FAILED|CANCELLED|BLOCKED",
       "supersedes": "<optional: id of a terminal task this one replaces>",
       "supersedes_kind": "<REPLACE|CORRECT — required when supersedes is set>"
@@ -597,15 +605,16 @@ _REFINEMENT_GUIDANCE_BLOCK = (
     '- The drift you\'re correcting is usually "small" — a single '
     "agent produced off-topic or flawed output on a task it's "
     "otherwise capable of. Default pattern: replace the drifted task "
-    "with a corrected variant, KEEP THE SAME `assignee_agent_id`, "
-    "and populate `supersedes: <old_task_id>` on the replacement. "
-    "Preserve the surrounding DAG structure (edges, sibling tasks, "
-    "stage count).\n"
-    "- Only reshape the plan (reassign tasks to different agents, "
-    "collapse stages, drop tasks) when the drift indicates the "
-    "agent is systemically incapable — repeated failures on the "
-    "same task, tool errors it can't recover from, refusal-by-the-"
-    "agent, or a pattern the original agent has already failed at.\n"
+    "with a corrected variant and populate `supersedes: <old_task_id>` "
+    "on the replacement. Leave `assignee_agent_id` empty on the "
+    "replacement — the framework populates it observationally "
+    "(goldfive#252). Preserve the surrounding DAG structure (edges, "
+    "sibling tasks, stage count).\n"
+    "- Only reshape the plan (collapse stages, drop tasks) when the "
+    "drift indicates the work itself needs restructuring — repeated "
+    "failures on the same task, tool errors that can't be recovered "
+    "from, or a pattern the prior shape of the work has already "
+    "failed at.\n"
     "- Do NOT collapse a multi-stage plan to a single task unless "
     "the user request genuinely warrants it.\n"
     "- The `supersedes` field is required on every replacement — "
@@ -1092,12 +1101,14 @@ def _plan_from_json(
         title = str(t.get("title") or "").strip()
         if not tid or not title:
             continue
+        # goldfive#252: assignee is observational, not declarative. Drop
+        # any LLM-supplied value.
         tasks.append(
             Task(
                 id=tid,
                 title=title,
                 description=str(t.get("description") or ""),
-                assignee_agent_id=_normalize_assignee(str(t.get("assignee_agent_id") or "")),
+                assignee_agent_id="",
                 status=_coerce_status(t.get("status")),
                 predicted_start_ms=int(t.get("predicted_start_ms") or 0),
                 predicted_duration_ms=int(t.get("predicted_duration_ms") or 0),
@@ -1712,9 +1723,12 @@ class LLMPlanner:
         goals_block = self._render_goals_block(goals)
         agents_block = self._render_agents_block(available_agents)
         agents_header = (
-            "AGENT TREE (pick assignee_agent_id from this registry):"
+            # goldfive#252: assignee is observational, not declarative.
+            # Render the tree as context only — do NOT instruct the LLM
+            # to pick an assignee from it.
+            "AGENT TREE (context only — do NOT populate assignee_agent_id):"
             if _is_tree_entry_list(available_agents)
-            else "Available agents:"
+            else "Available agents (context only):"
         )
         prior_block = self._render_prior_turns_block(context)
         context_block = ""
@@ -3775,7 +3789,6 @@ Reply with a single JSON object and NOTHING ELSE:
         "id": "<short-id>",
         "title": "<one-sentence what 'done' looks like>",
         "description": "<optional longer description>",
-        "assignee_agent_id": "<bare agent name from registry>",
         "status": "PENDING"
       }
     ],
@@ -3886,11 +3899,11 @@ COMPLETED tasks back in ``tasks`` with the SAME id and SAME status:
       "summary": "Draft and review a 2-slide presentation about solar panels.",
       "tasks": [
         {"id": "research_solar", "title": "Research solar panels",
-         "assignee_agent_id": "research_agent", "status": "COMPLETED"},
+         "status": "COMPLETED"},
         {"id": "draft_slides",   "title": "Draft EXACTLY 2 slides",
-         "assignee_agent_id": "presentation_agent", "status": "PENDING"},
+         "status": "PENDING"},
         {"id": "review",         "title": "Review the 2-slide presentation",
-         "assignee_agent_id": "reviewer_agent", "status": "PENDING"}
+         "status": "PENDING"}
       ],
       "edges": [
         {"from_task_id": "research_solar", "to_task_id": "draft_slides"},
@@ -3922,13 +3935,13 @@ output):
       "summary": "Create a 2-slide presentation about solar flares.",
       "tasks": [
         {"id": "research_solar",   "title": "Research solar panels",
-         "assignee_agent_id": "research_agent", "status": "COMPLETED"},
+         "status": "COMPLETED"},
         {"id": "research_flares",  "title": "Research solar flares",
-         "assignee_agent_id": "research_agent", "status": "PENDING"},
+         "status": "PENDING"},
         {"id": "draft_flares",     "title": "Draft 2-slide presentation about solar flares",
-         "assignee_agent_id": "presentation_agent", "status": "PENDING"},
+         "status": "PENDING"},
         {"id": "review_flares",    "title": "Review the 2-slide solar flares presentation",
-         "assignee_agent_id": "reviewer_agent", "status": "PENDING"}
+         "status": "PENDING"}
       ],
       "edges": [
         {"from_task_id": "research_flares", "to_task_id": "draft_flares"},
@@ -3967,9 +3980,10 @@ PLAN SHAPE (when plan is non-null):
 
   * 5-20 tasks typically. Smaller is OK for trivial follow-ups
     (revisions often add 1-3 delta tasks).
-  * Every task's assignee_agent_id MUST be drawn from the available
-    agents registry passed in the user prompt. Use the bare name only
-    — no namespace, no prefix.
+  * Do NOT populate `assignee_agent_id`; leave it as the empty string.
+    The framework populates it observationally when a delegation
+    actually happens (goldfive#252). The available_agents block in
+    the user prompt is supplied for context only.
   * Task ids: short, unique, stable strings ("research", "draft_intro",
     "review_final"). Reuse prior task ids when the task is the same
     work; mint new ids for delta tasks.

@@ -297,14 +297,24 @@ def test_presentation_agent_e2e_under_adk_web(
         f"expected at least one plan_revised; got 0 (kinds: {kinds})"
     )
     # The first plan_revised holds the initial four-task plan.
+    # goldfive#252: planner no longer populates ``assignee_agent_id``;
+    # the framework binds tasks to agents observationally at delegation
+    # time. Assert the planned task IDs only — assignees are now ``""``
+    # on every plan task.
     plan_pb = plan_events[0].plan_revised.plan
+    planned_task_ids = {t.id for t in plan_pb.tasks}
+    assert planned_task_ids == {
+        "research",
+        "build",
+        "review",
+        "debug",
+    }, f"unexpected plan shape: {sorted(planned_task_ids)}"
     planned_tasks = {t.id: t.assignee_agent_id for t in plan_pb.tasks}
-    assert planned_tasks == {
-        "research": "research_agent",
-        "build": "web_developer_agent",
-        "review": "reviewer_agent",
-        "debug": "debugger_agent",
-    }, f"unexpected plan shape: {planned_tasks}"
+    # Every task's assignee is empty post-#252. Document that here so
+    # future test edits don't reintroduce the assignee assertion.
+    assert all(a == "" for a in planned_tasks.values()), (
+        f"planner emitted non-empty assignee_agent_id post-#252: {planned_tasks}"
+    )
 
     # 2. Every planned task must reach a terminal state OR be a
     # reachable PENDING that survived turn-end (post-#208).
