@@ -114,6 +114,64 @@ def read_presentation_files(topic: str) -> dict[str, str]:
     return files
 
 
+def find_presentation_files(topic: str) -> dict[str, Any]:
+    """Locate the generated presentation directory by fuzzy-matching ``topic``.
+
+    The web developer often slugifies an embellished topic (e.g.
+    ``"NAND Flash Memory Presentation"`` → ``nand_flash_memory_presentation``)
+    while the reviewer asks for the bare slug (``nand_flash_memory``). This
+    tool searches ``output/`` for a directory whose name either contains the
+    bare slug or, after stripping the common ``_presentation`` /
+    ``_interactive_presentation`` / ``_slideshow`` suffixes, equals it. On a
+    match it reads the three presentation files and returns their contents.
+    """
+    topic_slug = topic.lower().replace(" ", "_").replace("/", "_")
+    base_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "output"))
+
+    if not os.path.isdir(base_dir):
+        return {"found": False, "candidates": []}
+
+    suffixes = ("_interactive_presentation", "_presentation", "_slideshow")
+    entries = sorted(
+        name
+        for name in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, name))
+    )
+
+    match: str | None = None
+    for name in entries:
+        stripped = name
+        for suffix in suffixes:
+            if stripped.endswith(suffix):
+                stripped = stripped[: -len(suffix)]
+                break
+        if topic_slug and (topic_slug in name or stripped == topic_slug):
+            match = name
+            break
+
+    if match is None:
+        return {"found": False, "candidates": entries}
+
+    candidate_dir = os.path.realpath(os.path.join(base_dir, match))
+    # Defence in depth: refuse anything that escaped the sandbox via symlink.
+    if not (
+        candidate_dir == base_dir
+        or candidate_dir.startswith(base_dir + os.sep)
+    ):
+        return {"found": False, "candidates": entries}
+
+    files: dict[str, str] = {}
+    for fname in ("index.html", "styles.css", "script.js"):
+        path = os.path.join(candidate_dir, fname)
+        try:
+            with open(path) as f:
+                files[fname] = f.read()
+        except OSError as e:
+            files[fname] = f"<error reading {path}: {e}>"
+
+    return {"found": True, "directory": candidate_dir, "files": files}
+
+
 def patch_file(path: str, new_content: str) -> str:
     """Overwrite ``path`` with ``new_content`` in place.
 
@@ -133,6 +191,7 @@ def patch_file(path: str, new_content: str) -> str:
 
 write_webpage_tool = FunctionTool(write_webpage)
 read_presentation_files_tool = FunctionTool(read_presentation_files)
+find_presentation_files_tool = FunctionTool(find_presentation_files)
 patch_file_tool = FunctionTool(patch_file)
 
 
@@ -207,7 +266,14 @@ def _build_agent_tree(model: Any) -> Agent:
             '`<script src="script.js"></script>` so the files are connected '
             "properly.\nRemember to output the absolute final HTML, CSS, and "
             "JS using the `write_webpage` tool! Do not just print the code "
-            "out, you must invoke the tool once everything is ready."
+            "out, you must invoke the tool once everything is ready.\n"
+            "Pass the ``topic`` argument to ``write_webpage`` exactly as the "
+            "coordinator gave it to you — the bare task title, with no "
+            "``_presentation`` suffix and no embellishments — because the "
+            "reviewer will derive its read path from that same string. When "
+            "you reply to the coordinator, surface the absolute output "
+            "directory path that ``write_webpage`` returned so downstream "
+            "agents can use it."
         ),
         description=(
             "An expert frontend developer agent that generates interactive "
@@ -228,7 +294,15 @@ def _build_agent_tree(model: Any) -> Agent:
             "include a short description and a severity of 'critical', "
             "'major', or 'minor'. If there are no issues, return an empty "
             "list and say so explicitly so the coordinator knows to skip "
-            "debugging."
+            "debugging.\n"
+            "If ``read_presentation_files`` returns ``<error reading ...>`` "
+            "for ALL three files, the developer almost certainly wrote them "
+            "under a different slug. Do NOT call ``read_presentation_files`` "
+            "again with a guessed alternative topic — that will only loop. "
+            "Instead, stop reviewing and report a single structured "
+            "``files_not_found`` critique to the coordinator that includes "
+            "the exact ``topic`` string you tried and an explicit request to "
+            "invoke ``debugger_agent`` to locate the files."
         ),
         description=(
             "A reviewer agent that reads the generated presentation files "
@@ -241,19 +315,30 @@ def _build_agent_tree(model: Any) -> Agent:
         name="debugger_agent",
         model=model,
         instruction=(
-            "You are a debugging agent. You are invoked when "
-            "``write_webpage`` failed or when ``reviewer_agent`` flagged "
-            "critical issues in the generated presentation. Read the issues "
-            "and their file paths, then call the ``patch_file`` tool with "
-            "the full corrected content of each file that needs to change. "
-            "Report which files you patched when you are done."
+            "You are a debugging agent with two distinct failure modes to "
+            "handle. The first is broken files: when ``reviewer_agent`` "
+            "flagged critical issues or ``write_webpage`` failed, read the "
+            "issues and their file paths, then call the ``patch_file`` tool "
+            "with the full corrected content of each file that needs to "
+            "change, and report which files you patched when you are done. "
+            "The second is missing files: when the reviewer reports "
+            "``files_not_found`` because ``read_presentation_files`` could "
+            "not find the developer's output under the topic slug, call the "
+            "``find_presentation_files`` tool with the topic the reviewer "
+            "tried. If it returns ``found=True``, report the discovered "
+            "absolute directory and the file contents back to the "
+            "coordinator so the review can proceed at that path. If it "
+            "returns ``found=False``, report the candidate directory list "
+            "back to the coordinator so it can re-dispatch the developer "
+            "with the correct topic — do not attempt to patch files you "
+            "have not located."
         ),
         description=(
-            "A debugger agent that patches generated presentation files in "
-            "place to resolve critical issues flagged by the reviewer or by "
-            "a failing write_webpage call."
+            "A debugger agent that either patches generated presentation "
+            "files in place to resolve critical issues, or locates the "
+            "developer's output directory when the reviewer cannot find it."
         ),
-        tools=[patch_file_tool],
+        tools=[find_presentation_files_tool, patch_file_tool],
     )
 
     return Agent(
@@ -275,9 +360,20 @@ def _build_agent_tree(model: Any) -> Agent:
             "issues, transfer control to the 'debugger_agent' with the "
             "reviewer's critique and have it patch the affected files. Skip "
             "this step when the reviewer reports no critical issues.\n"
-            "Finally, report back to the user when the task is complete.\n"
-            "Flow: research → web_developer → reviewer → (if critical "
-            "issues) debugger → report."
+            "If the reviewer instead reports ``files_not_found``, transfer "
+            "control to the 'debugger_agent' with the exact topic string the "
+            "reviewer tried and ask it to call ``find_presentation_files`` "
+            "to locate the output. When the debugger reports ``found=True``, "
+            "the run can proceed: hand the discovered directory and file "
+            "contents back to the reviewer so it can produce its critique "
+            "against those files. When the debugger reports ``found=False``, "
+            "transfer control back to 'web_developer_agent' with explicit "
+            "instructions to re-run ``write_webpage`` using the bare task "
+            "title as the ``topic`` argument — no ``_presentation`` suffix, "
+            "no embellishments — so that the reviewer's read path will "
+            "match.\nFinally, report back to the user when the task is "
+            "complete.\nFlow: research → web_developer → reviewer → (if "
+            "critical issues OR files_not_found) debugger → report."
         ),
         description=(
             "The main coordinator agent that drives the overall process of "
