@@ -70,6 +70,7 @@ class DriftKind(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     DRIFT_KIND_GOAL_DRIFT: _ClassVar[DriftKind]
     DRIFT_KIND_LLM_CALL_TIMEOUT: _ClassVar[DriftKind]
     DRIFT_KIND_JUSTIFIED_DEVIATION: _ClassVar[DriftKind]
+    DRIFT_KIND_CAPABILITY_MISMATCH: _ClassVar[DriftKind]
 
 class DriftLifecycle(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
@@ -136,6 +137,7 @@ DRIFT_KIND_HUMAN_INTERVENTION_REQUIRED: DriftKind
 DRIFT_KIND_GOAL_DRIFT: DriftKind
 DRIFT_KIND_LLM_CALL_TIMEOUT: DriftKind
 DRIFT_KIND_JUSTIFIED_DEVIATION: DriftKind
+DRIFT_KIND_CAPABILITY_MISMATCH: DriftKind
 DRIFT_LIFECYCLE_UNSPECIFIED: DriftLifecycle
 DRIFT_LIFECYCLE_OPENED: DriftLifecycle
 DRIFT_LIFECYCLE_ESCALATING: DriftLifecycle
