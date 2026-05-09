@@ -65,6 +65,50 @@ def no_state_audit() -> Iterator[None]:
         else:
             os.environ["GOLDFIVE_STRICT_STATE_OWNERSHIP"] = prior
 
+
+@pytest.fixture(autouse=True)
+def _isolate_orchestration_store_registries() -> Iterator[None]:
+    """Clear OrchestrationStore's per-session registries between tests.
+
+    ``_ACTIVE_INVOCATION_TASKS`` and ``_CANCEL_REQUESTED_INVOCATIONS``
+    are module-level dicts in ``goldfive.orchestration_store`` keyed
+    by ``session.id`` (which is a property aliased to ``run_id``).
+    Many tests share ``run_id="r1"``, so a test that calls
+    ``request_invocation_cancel`` or ``register_invocation_task``
+    without explicit cleanup leaks its bucket into the next test's
+    session and silently flips the late-drift gate
+    (``_is_late_drift_for_terminated_invocation``) — manifesting as a
+    flaky CI-only failure of e.g.
+    ``test_judge_verdict_with_live_invocation_proceeds_normally``
+    where ``planner.refine`` is unexpectedly skipped because a stale
+    cancel-pending entry from an earlier test makes the gate think
+    the verdict is late.
+
+    Clearing both dicts before and after every test makes test
+    ordering irrelevant. Cheap (dict.clear() under the existing
+    module-level lock) and idempotent.
+    """
+    try:
+        from goldfive.orchestration_store import (
+            _ACTIVE_INVOCATION_LOCK,
+            _ACTIVE_INVOCATION_TASKS,
+            _CANCEL_REQUESTED_INVOCATIONS,
+        )
+    except ImportError:
+        # Module not importable yet (pre-Phase-1 worktree) — degrade
+        # to a no-op so this fixture doesn't block other tests.
+        yield
+        return
+    with _ACTIVE_INVOCATION_LOCK:
+        _ACTIVE_INVOCATION_TASKS.clear()
+        _CANCEL_REQUESTED_INVOCATIONS.clear()
+    try:
+        yield
+    finally:
+        with _ACTIVE_INVOCATION_LOCK:
+            _ACTIVE_INVOCATION_TASKS.clear()
+            _CANCEL_REQUESTED_INVOCATIONS.clear()
+
 # ---------------------------------------------------------------------------
 # stub_call_llm factory
 # ---------------------------------------------------------------------------
