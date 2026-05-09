@@ -2162,8 +2162,87 @@ class LLMPlanner:
             return "edge_missing"
         return None
 
-    @staticmethod
-    def _build_correction_prompt(base_prompt: str, error: str) -> str:
+    # Regexes for parsing structural-class validator rejections so the
+    # retry prompt can render a copy-paste-ready snippet of the missing
+    # piece. Tolerate single OR double quotes — Python's ``!r`` always
+    # emits single quotes for ASCII strings, but be defensive in case a
+    # future validator change switches to double quotes. The capture
+    # groups intentionally use a non-greedy ``[^'"]*`` body so we never
+    # span across multiple quoted segments if two errors get
+    # concatenated in a single string.
+    _EDGE_MISSING_RE: re.Pattern[str] = re.compile(
+        r"terminal->terminal edge ['\"]([^'\"]*)['\"] -> ['\"]([^'\"]*)['\"] missing in revision",
+        re.IGNORECASE,
+    )
+    _TERMINAL_MISSING_RE: re.Pattern[str] = re.compile(
+        r"terminal task ['\"]([^'\"]*)['\"] missing in revision",
+        re.IGNORECASE,
+    )
+    _TERMINAL_REGRESSED_RE: re.Pattern[str] = re.compile(
+        r"terminal task ['\"]([^'\"]*)['\"] regressed to ['\"]([^'\"]*)['\"]",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _structural_correction_snippet(cls, error: str) -> str:
+        """Render a copy-paste-ready snippet for a structural rejection.
+
+        Returns ``""`` when the error doesn't match a structural class or
+        when the matched class's regex fails to recover the expected
+        capture groups (e.g. malformed validator output). The caller
+        falls back silently to the unenriched correction prompt in that
+        case — never raises.
+
+        The snippets intentionally name only the missing piece (the id
+        or the (from, to) pair); the full prior-plan terminal block is
+        already rendered upstream by
+        :meth:`_render_structural_invariants_block`, so we don't need
+        to reconstruct task objects here.
+        """
+        if not error:
+            return ""
+        kind = cls._extract_rejection_kind(error)
+        if kind is None:
+            return ""
+        if kind == "edge_missing":
+            m = cls._EDGE_MISSING_RE.search(error)
+            if m is None:
+                return ""
+            from_id, to_id = m.group(1), m.group(2)
+            edge_json = json.dumps({"from_task_id": from_id, "to_task_id": to_id})
+            return (
+                "ADD THIS EDGE VERBATIM TO YOUR `edges` ARRAY (keep all "
+                "other edges you already have; just add this one):\n"
+                f"    {edge_json}"
+            )
+        if kind == "terminal_missing":
+            m = cls._TERMINAL_MISSING_RE.search(error)
+            if m is None:
+                return ""
+            task_id = m.group(1)
+            return (
+                "KEEP THIS TASK VERBATIM IN YOUR `tasks` ARRAY with its "
+                "current terminal status (do not regress it to "
+                "PENDING/RUNNING/BLOCKED):\n"
+                f'    task id: "{task_id}"'
+            )
+        if kind == "terminal_regressed":
+            m = cls._TERMINAL_REGRESSED_RE.search(error)
+            if m is None:
+                return ""
+            task_id, regressed_status = m.group(1), m.group(2)
+            return (
+                "RESTORE THIS TASK'S TERMINAL STATUS verbatim from the "
+                "prior plan (do not regress it):\n"
+                f'    task id: "{task_id}" (currently regressed to '
+                f'"{regressed_status}" — must remain its prior terminal '
+                "status as listed in the STRUCTURAL INVARIANTS block "
+                "above)"
+            )
+        return ""
+
+    @classmethod
+    def _build_correction_prompt(cls, base_prompt: str, error: str) -> str:
         """Append validator / parser feedback to a refine prompt for retry.
 
         The retry appends the specific error the previous attempt hit and
@@ -2171,7 +2250,20 @@ class LLMPlanner:
         verbatim means the LLM sees the same goals, history, and drift
         context, so the retry is a real second attempt, not a cold
         re-prompt.
+
+        For structurally-classified rejections (terminal task missing,
+        terminal task regressed, terminal->terminal edge missing) the
+        prompt also embeds a copy-paste-ready snippet of EXACTLY what
+        the LLM must add or preserve. Empirically the LLM drops at least
+        one terminal-edge on long-context refines even with the
+        invariants block present further up; naming the missing piece
+        right next to the rejection text fixes that on attempt 2.
+        Snippet rendering falls back silently on parse failure so
+        unbucketed / malformed errors retain the prior unenriched
+        behaviour exactly.
         """
+        snippet = cls._structural_correction_snippet(error)
+        snippet_block = f"\n\n{snippet}" if snippet else ""
         return (
             f"{base_prompt}\n\n"
             "PREVIOUS ATTEMPT FAILED. The response you just emitted was "
@@ -2181,7 +2273,8 @@ class LLMPlanner:
             "corrected JSON plan that preserves every terminal task and "
             "every terminal->terminal edge verbatim, and does NOT add "
             "any edge from a CANCELLED or FAILED task to a new PENDING "
-            "task. Respond with JSON only; no prose, no markdown fences."
+            "task. Respond with JSON only; no prose, no markdown "
+            f"fences.{snippet_block}"
         )
 
     async def _emit_refine_validation_failed(
