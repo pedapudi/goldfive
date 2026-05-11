@@ -154,6 +154,27 @@ runner = goldfive.wrap(
 outcome = await runner.run("make a presentation about waffles")
 ```
 
+**Observation-only steering is the default** (goldfive#254). Detection
+still runs in full and `planner.refine_steer` still runs — operators
+see what the planner WOULD have produced via `PlanRevised` events
+stamped with `dry_run=true` — but goldfive does NOT mutate
+`session.plan`, enqueue a `GOLDFIVE_STEER` ControlMessage, or call
+`request_invocation_cancel` on the live in-flight invocation. To
+restore the prior active-steering behaviour:
+
+```python
+from goldfive.config import RuntimeConfig, SteeringConfig
+
+runner = goldfive.wrap(
+    agent,
+    runtime=RuntimeConfig(steering=SteeringConfig(observation_only=False)),
+)
+```
+
+Or set the env var `GOLDFIVE_STEER_OBSERVATION_ONLY=0`. See
+[docs/design/CONTROL-CHANNEL.md §5.5](docs/design/CONTROL-CHANNEL.md)
+for the full contract.
+
 Every default component is overridable. Keyword arguments accepted by
 both `wrap` and `run`:
 

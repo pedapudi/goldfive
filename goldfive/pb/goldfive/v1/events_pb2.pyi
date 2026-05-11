@@ -119,7 +119,7 @@ class PlanRevisionDiff(_message.Message):
     def __init__(self, added_task_ids: _Optional[_Iterable[str]] = ..., removed_task_ids: _Optional[_Iterable[str]] = ..., modified_task_ids: _Optional[_Iterable[str]] = ..., added_edges: _Optional[_Iterable[_Union[_types_pb2.TaskEdge, _Mapping]]] = ..., removed_edges: _Optional[_Iterable[_Union[_types_pb2.TaskEdge, _Mapping]]] = ...) -> None: ...
 
 class PlanRevised(_message.Message):
-    __slots__ = ("plan", "drift_kind", "severity", "reason", "revision_index", "diff", "trigger_event_id", "refine_input_summary", "refine_output_summary", "target_agent_id")
+    __slots__ = ("plan", "drift_kind", "severity", "reason", "revision_index", "diff", "trigger_event_id", "refine_input_summary", "refine_output_summary", "target_agent_id", "dry_run")
     PLAN_FIELD_NUMBER: _ClassVar[int]
     DRIFT_KIND_FIELD_NUMBER: _ClassVar[int]
     SEVERITY_FIELD_NUMBER: _ClassVar[int]
@@ -130,6 +130,7 @@ class PlanRevised(_message.Message):
     REFINE_INPUT_SUMMARY_FIELD_NUMBER: _ClassVar[int]
     REFINE_OUTPUT_SUMMARY_FIELD_NUMBER: _ClassVar[int]
     TARGET_AGENT_ID_FIELD_NUMBER: _ClassVar[int]
+    DRY_RUN_FIELD_NUMBER: _ClassVar[int]
     plan: _types_pb2.Plan
     drift_kind: _types_pb2.DriftKind
     severity: _types_pb2.DriftSeverity
@@ -140,7 +141,8 @@ class PlanRevised(_message.Message):
     refine_input_summary: str
     refine_output_summary: str
     target_agent_id: str
-    def __init__(self, plan: _Optional[_Union[_types_pb2.Plan, _Mapping]] = ..., drift_kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., reason: _Optional[str] = ..., revision_index: _Optional[int] = ..., diff: _Optional[_Union[PlanRevisionDiff, _Mapping]] = ..., trigger_event_id: _Optional[str] = ..., refine_input_summary: _Optional[str] = ..., refine_output_summary: _Optional[str] = ..., target_agent_id: _Optional[str] = ...) -> None: ...
+    dry_run: bool
+    def __init__(self, plan: _Optional[_Union[_types_pb2.Plan, _Mapping]] = ..., drift_kind: _Optional[_Union[_types_pb2.DriftKind, str]] = ..., severity: _Optional[_Union[_types_pb2.DriftSeverity, str]] = ..., reason: _Optional[str] = ..., revision_index: _Optional[int] = ..., diff: _Optional[_Union[PlanRevisionDiff, _Mapping]] = ..., trigger_event_id: _Optional[str] = ..., refine_input_summary: _Optional[str] = ..., refine_output_summary: _Optional[str] = ..., target_agent_id: _Optional[str] = ..., dry_run: bool = ...) -> None: ...
 
 class TaskStarted(_message.Message):
     __slots__ = ("task_id", "detail")

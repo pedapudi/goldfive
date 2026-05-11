@@ -190,6 +190,17 @@ message PlanRevised {
   // Empty string for trajectory-level refines (goal-drift and any drift
   // that was not bound to a specific agent).
   string target_agent_id = 10;
+  // True when this PlanRevised was emitted under observation-only mode
+  // (``SteeringConfig.observation_only``): the planner produced a revised
+  // plan AND every detector ran in full, but the three actual injection
+  // points (``session.plan`` mutation, ``GOLDFIVE_STEER`` ControlMessage
+  // enqueue, ``request_invocation_cancel`` flag) were SKIPPED. Operators
+  // can use this to surface a "would-have-applied" preview lane without
+  // touching the in-flight agent. False on every revision that did mutate
+  // session.plan (the historical / pre-observation-only producers also
+  // emit false because the field defaults to ``false``). Added in
+  // goldfive#254.
+  bool dry_run = 11;
 }
 
 // Task transitioned PENDING -> RUNNING.

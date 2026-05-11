@@ -2,6 +2,35 @@
 
 All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
+## Unreleased — 2026-05-11
+
+### Steering
+
+- **BREAKING:
+  [#254](https://github.com/pedapudi/goldfive/issues/254) —
+  observation-only is the new default on `goldfive.wrap()`.**
+  `SteeringConfig.observation_only` (default `True`) gates the three
+  actual steering injection points in `DefaultSteerer`:
+  - the `set_session_plan` write in
+    `DefaultSteerer._apply_revision`,
+  - the `GOLDFIVE_STEER` ControlMessage enqueue in
+    `DefaultSteerer._dispatch_goldfive_steer_control`,
+  - the `request_invocation_cancel` plugin call in
+    `DefaultSteerer.request_invocation_cancel`.
+  Detection still runs in full and `planner.refine_steer` still
+  runs (operators see what the planner WOULD have produced via
+  `PlanRevised` with `dry_run=true`), but the in-flight invocation
+  is otherwise untouched. To restore the prior active-steering
+  behaviour, pass
+  `RuntimeConfig(steering=SteeringConfig(observation_only=False))`
+  to `goldfive.wrap()` or set
+  `GOLDFIVE_STEER_OBSERVATION_ONLY=0`. The flag lives on
+  `SteeringConfig` — no new constructor parameter was added to
+  `DefaultSteerer.__init__`, `Runner.__init__`, or
+  `goldfive.wrap()`. Adds the `dry_run` field on the `PlanRevised`
+  proto event (additive; legacy producers emit `false`). See
+  [docs/design/CONTROL-CHANNEL.md §5.5](docs/design/CONTROL-CHANNEL.md).
+
 ## Unreleased — 2026-04-27
 
 ### Architecture

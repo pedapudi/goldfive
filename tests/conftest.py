@@ -67,6 +67,43 @@ def no_state_audit() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _goldfive_active_steering_default() -> Iterator[None]:
+    """Flip :class:`SteeringConfig.observation_only`'s implicit default to
+    ``False`` for the test suite (goldfive#254).
+
+    Production default is ``True`` (passive observation — see the
+    docstring on :class:`goldfive.config.SteeringConfig`). The existing
+    test corpus was written against the prior active-steering default
+    and asserts e.g. ``session.plan`` mutating after a refine; flipping
+    every test to construct a ``RuntimeConfig`` explicitly is overkill.
+    This fixture sets a module-level test-only override
+    (``goldfive.config._OBSERVATION_ONLY_DEFAULT``) that the
+    ``observation_only`` field consults via a ``default_factory`` — so
+    any test that constructs ``SteeringConfig()`` (or builds a
+    ``DefaultSteerer`` without a config) sees active steering.
+
+    Tests that explicitly pass ``observation_only=True`` (or
+    ``observation_only=False``) still win — the dataclass honours
+    explicit kwargs over the default factory, and a
+    ``SteeringConfig(observation_only=True)`` instance retains the
+    True the test asked for regardless of this fixture.
+    """
+    try:
+        from goldfive import config as _gf_config
+    except ImportError:
+        # Config module not importable yet — no-op for back-compat with
+        # pre-#225 worktrees.
+        yield
+        return
+    prior = _gf_config._OBSERVATION_ONLY_DEFAULT
+    _gf_config._OBSERVATION_ONLY_DEFAULT = False
+    try:
+        yield
+    finally:
+        _gf_config._OBSERVATION_ONLY_DEFAULT = prior
+
+
+@pytest.fixture(autouse=True)
 def _isolate_orchestration_store_registries() -> Iterator[None]:
     """Clear OrchestrationStore's per-session registries between tests.
 

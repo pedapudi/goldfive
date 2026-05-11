@@ -588,6 +588,69 @@ that allowed stale verdicts to cascade is gone.
 
 ---
 
+## §5.5 Observation-only mode (goldfive#254)
+
+`SteeringConfig.observation_only` gates the three actual steering
+**injection points** in `DefaultSteerer`. When the flag is `True`
+(the production default — operators graduate to active steering
+explicitly), detection still runs in full and `planner.refine_steer`
+still runs, but no side effect lands on the in-flight invocation.
+
+The three gated sites — all routed through a single named helper
+`DefaultSteerer._should_inject()` so the contract is grep-able:
+
+1. **Plan mutation** — `DefaultSteerer._apply_revision` skips the
+   `set_session_plan(session, revised)` write and the
+   `last_addressed_revision_by_drift_key` watermark stamp. The
+   stamped `revised` instance is still returned so the paired
+   `_emit_plan_revised` can render the would-have-applied preview.
+2. **`GOLDFIVE_STEER` ControlMessage** —
+   `DefaultSteerer._dispatch_goldfive_steer_control` skips the
+   actor-mailbox enqueue (`§3.1` Invariant 1). No cancel-and-restart
+   fires on the executor; the live invocation keeps running the
+   prior plan.
+3. **`request_invocation_cancel`** — `DefaultSteerer.request_invocation_cancel`
+   returns `[]` without consulting the plugin, so no
+   `CancellationRequest` is written and the
+   `cancel_requested_invocation_ids()` registry stays empty.
+
+The paired `PlanRevised` event carries `dry_run=true` so consumers
+(harmonograf, custom sinks) can surface a "would-have-applied"
+preview lane without confusing it with a real revision. Replay-side
+consumers (`goldfive.sinks.persistence`) honour the flag and skip
+the rehydrate-time `session.plan` install so the replayed state
+tracks the producer's live state.
+
+`DriftDetected` still fires unchanged — detection is independent of
+injection. Suppression accounting (`suppressed_by_user_steer`),
+drift lifecycle (PR #271), and reporting events (`ReasoningJudgeInvoked`,
+`GoldfiveLLMCallStart`/`End`, sink-side observability) all keep
+running. The mode is purely about whether the steerer's three
+**write** paths fire.
+
+Operators opt in / out via the typed config surface — no
+constructor parameter was added to `DefaultSteerer.__init__`,
+`Runner.__init__`, or `goldfive.wrap()`:
+
+```python
+goldfive.wrap(
+    tree,
+    runtime=RuntimeConfig(
+        steering=SteeringConfig(observation_only=False)
+    ),
+)
+```
+
+Or via env: `GOLDFIVE_STEER_OBSERVATION_ONLY=0` /
+`false` / `no` for active steering; `=1` / `true` / `yes` for
+passive observation. The test suite flips the implicit default to
+`False` via the autouse `_goldfive_active_steering_default`
+fixture in `tests/conftest.py` so the existing test corpus
+(written against the prior active-steering default) stays green
+without per-test surgery.
+
+---
+
 ## §6. References
 
 ### §6.1 Sibling design docs
