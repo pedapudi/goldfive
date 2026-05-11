@@ -3584,7 +3584,10 @@ class DefaultSteerer:
         # PlanRevisionDiff sidecar (PLAN-LIFECYCLE.md §2, §8 gap #4).
         prev_plan = session.plan
         # goldfive#247: _apply_revision returns the stamped instance.
-        revised = self._apply_revision(session, revised, drift)
+        # goldfive#255: _apply_revision returns ``(revised, was_installed)``
+        # so the caller can thread the install outcome into PlanRevised's
+        # ``dry_run`` marker.
+        revised, was_installed = self._apply_revision(session, revised, drift)
         # Cancel the in-flight coordinator invocation now that the plan
         # it was reasoning against has been superseded (goldfive#271
         # follow-up — v15 concurrent-invocation bug). Order: cancel
@@ -3594,7 +3597,12 @@ class DefaultSteerer:
         # raises — a no-op cancel still leaves the new plan installed.
         await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
-            session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
+            session,
+            revised,
+            drift,
+            prev_plan=prev_plan,
+            attempt_id=attempt_id,
+            dry_run=not was_installed,
         )
         # Level 3 (CANCEL_REINVOKE) handoff (Phase 2 of the path-
         # duality fix). Pre-Phase-2 this stuffed
@@ -5078,7 +5086,8 @@ class DefaultSteerer:
         await self._record_refine_outcome(session, drift, succeeded=True)
         prev_plan = session.plan
         # goldfive#247: rebind to the stamped instance.
-        revised = self._apply_revision(session, revised, drift)
+        # goldfive#255: thread ``was_installed`` into PlanRevised.dry_run.
+        revised, was_installed = self._apply_revision(session, revised, drift)
         # Cancel the in-flight coordinator invocation now that
         # ``refine_steer`` produced a superseding plan (goldfive#271
         # follow-up — v15 concurrent-invocation bug). This is the
@@ -5096,7 +5105,12 @@ class DefaultSteerer:
         # gantt timeline.
         await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
-            session, revised, drift, prev_plan=prev_plan, attempt_id=attempt_id
+            session,
+            revised,
+            drift,
+            prev_plan=prev_plan,
+            attempt_id=attempt_id,
+            dry_run=not was_installed,
         )
 
     @staticmethod
@@ -5269,7 +5283,12 @@ class DefaultSteerer:
         )
         prev_plan = session.plan
         # goldfive#247: rebind to the stamped instance.
-        plan = self._apply_revision(session, plan, placeholder)
+        # goldfive#255: bootstrap installs always land — the carve-out
+        # inside ``_apply_revision`` (``prev is None``) covers the
+        # fresh-session case; the ``Plan.empty`` seed path bypasses the
+        # gate via this method's contract (``install_initial_plan`` is
+        # structural, never a corrective intervention).
+        plan, was_installed = self._apply_revision(session, plan, placeholder)
         # No cancel-in-flight: nothing is running yet on the very
         # first install.
         await self._emit_plan_revised(
@@ -5278,6 +5297,7 @@ class DefaultSteerer:
             placeholder,
             prev_plan=prev_plan,
             attempt_id=None,
+            dry_run=not was_installed,
         )
         return True
 
@@ -5481,7 +5501,10 @@ class DefaultSteerer:
         attempt_id = self._new_attempt_id()
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         # goldfive#247: rebind to the stamped instance.
-        chosen = self._apply_revision(session, chosen, drift)
+        # goldfive#255: user-authored revisions always land (the carve-out
+        # inside ``_apply_revision`` honours ``drift.authored_by == "user"``)
+        # so ``was_installed`` is True even under observation_only.
+        chosen, was_installed = self._apply_revision(session, chosen, drift)
         await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session,
@@ -5489,6 +5512,7 @@ class DefaultSteerer:
             drift,
             prev_plan=prev_plan,
             attempt_id=attempt_id,
+            dry_run=not was_installed,
         )
         return chosen
 
@@ -5637,7 +5661,14 @@ class DefaultSteerer:
         attempt_id = self._new_attempt_id()
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         # goldfive#247: rebind to the stamped instance.
-        revised_plan = self._apply_revision(session, revised_plan, drift)
+        # goldfive#255: thread ``was_installed`` into PlanRevised.dry_run.
+        # ``install_revision_for_user_steer`` and the user-steer routing
+        # in ``apply_user_steer_with_plan`` enter through here too — the
+        # ``authored_by == "user"`` carve-out inside ``_apply_revision``
+        # makes ``was_installed`` True for those even under observation_only.
+        revised_plan, was_installed = self._apply_revision(
+            session, revised_plan, drift
+        )
         await self._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session,
@@ -5645,6 +5676,7 @@ class DefaultSteerer:
             drift,
             prev_plan=prev_plan,
             attempt_id=attempt_id,
+            dry_run=not was_installed,
         )
         return True
 
@@ -6258,20 +6290,41 @@ class DefaultSteerer:
         )
         return dataclasses.replace(revised, tasks=tuple(new_tasks))
 
-    def _apply_revision(self, session: Session, revised: Plan, drift: DriftEvent) -> Plan:
+    def _apply_revision(
+        self, session: Session, revised: Plan, drift: DriftEvent
+    ) -> tuple[Plan, bool]:
         """Stamp revision metadata and install ``revised`` on the session.
+
+        Returns ``(revised, was_installed)``: ``was_installed`` is
+        ``True`` iff the revision was actually swapped onto
+        ``session.plan`` (so the caller — and downstream
+        :meth:`_emit_plan_revised` — can stamp ``dry_run`` on the
+        emitted ``PlanRevised`` faithfully).
 
         Preserves the existing ``revision_index`` monotonicity: the new
         plan's index is at least ``old.revision_index + 1``.
 
-        Observation-only mode (goldfive#254): when
-        :meth:`_should_inject` is ``False`` the revision metadata is
-        STILL stamped (so the returned Plan accurately reflects the
-        index/kind/severity the planner produced and downstream
-        :meth:`_emit_plan_revised` can render a faithful preview), but
-        the actual ``set_session_plan`` write to ``session.plan`` and
-        the ``last_addressed_revision_by_drift_key`` stamp are SKIPPED
-        — the live agent keeps reasoning against the prior plan. The
+        Observation-only mode (goldfive#254 / goldfive#255): when
+        ``observation_only`` is set the gate suppresses **only**
+        goldfive-authored corrective drifts. The brief carve-outs:
+
+        * **bootstrap** (``prev is None``) — the very first install of
+          a session's plan is structural, not a corrective intervention.
+          Without this carve-out the gate would leave ``session.plan``
+          permanently ``None`` in observation mode and detectors would
+          collapse (goldfive#255 root cause: harmonograf showed an empty
+          DAG because the bootstrap was rendered as dry-run).
+        * **user-authored** (``drift.authored_by == "user"``) — genuine
+          operator STEER ``ControlMessage`` deliveries always land. The
+          operator has the authority to override observation mode.
+
+        When the gate fires, the revision metadata is STILL stamped (so
+        the returned Plan accurately reflects the index/kind/severity
+        the planner produced and downstream :meth:`_emit_plan_revised`
+        can render a faithful preview), but the actual
+        ``set_session_plan`` write to ``session.plan`` and the
+        ``last_addressed_revision_by_drift_key`` stamp are SKIPPED —
+        the live agent keeps reasoning against the prior plan. The
         paired ``PlanRevised`` event from :meth:`_emit_plan_revised`
         carries ``dry_run=True`` so consumers can distinguish a
         would-have-applied revision from a real one.
@@ -6338,11 +6391,28 @@ class DefaultSteerer:
             revision_reason=new_reason,
             revision_trigger_event_id=new_trigger_id,
         )
-        if not self._should_inject():
+        # goldfive#255: refine the observation-only gate so it captures
+        # ONLY goldfive-authored corrective drifts on an already-bootstrapped
+        # session. ``gate_active`` is True iff this specific revision is
+        # being suppressed; the bootstrap (``prev is None``) and user-
+        # authored (``drift.authored_by == "user"``) carve-outs are named
+        # explicitly so a future reader can grep for the reasons the gate
+        # does NOT fire.
+        is_bootstrap = prev is None
+        is_user_authored = (drift.authored_by or "").lower() == "user"
+        gate_active = (
+            (not is_bootstrap)
+            and (not is_user_authored)
+            and (not self._should_inject())
+        )
+        if gate_active:
             log.info(
                 "DefaultSteerer._apply_revision: observation_only=True — "
-                "SKIPPING plan install. prior_plan_id=%s "
-                "would_have_installed_plan_id=%s revision_index=%d drift_kind=%s",
+                "SKIPPING plan install (gate_active; bootstrap=%s user=%s). "
+                "prior_plan_id=%s would_have_installed_plan_id=%s "
+                "revision_index=%d drift_kind=%s",
+                is_bootstrap,
+                is_user_authored,
                 prior_id[:16] or "<none>",
                 (revised.id or "")[:16] or "<empty>",
                 int(revised.revision_index),
@@ -6354,7 +6424,7 @@ class DefaultSteerer:
             # ``revised`` instance is still returned so
             # :meth:`_emit_plan_revised` can render the would-have-applied
             # preview into ``PlanRevised`` (with ``dry_run=True``).
-            return revised
+            return revised, False
         log.info(
             "DefaultSteerer._apply_revision: prior_plan_id=%s "
             "revised_plan_id=%s revision_index=%d drift_kind=%s",
@@ -6378,7 +6448,7 @@ class DefaultSteerer:
         # goldfive#152: refresh the orchestration-state current plan id
         # so downstream reads see the revised id, not the stale one.
         _ostate.set_current_plan(session.state, revised)
-        return revised
+        return revised, True
 
     # --- Event construction ------------------------------------------
 
@@ -7297,6 +7367,7 @@ class DefaultSteerer:
         *,
         prev_plan: Plan | None = None,
         attempt_id: str | None = None,
+        dry_run: bool | None = None,
     ) -> None:
         from goldfive._correction_injection import (
             clear_obsolete_corrections_on_revision,
@@ -7409,7 +7480,19 @@ class DefaultSteerer:
             # requested) from a real revision. Wire-default is ``false``
             # so legacy producers and historical events round-trip as
             # "real revision" without surprise.
-            evt.plan_revised.dry_run = not self._should_inject()
+            #
+            # goldfive#255: the caller threads the value through from
+            # :meth:`_apply_revision`'s ``was_installed`` return so the
+            # marker reflects whether this SPECIFIC revision was actually
+            # suppressed (a bootstrap install or user-authored steer
+            # under observation_only is a REAL revision — dry_run False
+            # — even though ``self._should_inject()`` is False). Legacy
+            # callers that don't pass ``dry_run`` fall back to the
+            # pre-#255 behaviour for back-compat.
+            if dry_run is not None:
+                evt.plan_revised.dry_run = bool(dry_run)
+            else:
+                evt.plan_revised.dry_run = not self._should_inject()
             # Phase 2.X / goldfive#271 Gap 2: log the emission so a
             # raise-mid-fire scenario (proto build OK, sink emit raises)
             # leaves a goldfive-side trace before the harmonograf side

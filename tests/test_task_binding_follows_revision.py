@@ -168,7 +168,9 @@ async def test_current_task_id_repins_on_revision() -> None:
     planner = _StubPlanner(revised=revised)
     steerer = DefaultSteerer()
     steerer.bind(sinks=[ListSink()], planner=planner)
-    revised = steerer._apply_revision(session, revised, _drift())  # goldfive#247: rebind
+    # goldfive#247: rebind to the stamped instance.
+    # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
+    revised, _was_installed = steerer._apply_revision(session, revised, _drift())
     await steerer._emit_plan_revised(session, revised, _drift(), prev_plan=None)
 
     assert session.current_task_id == "research_solar_corrected"
@@ -819,7 +821,9 @@ async def test_correct_integration_via_emit_plan_revised_end_to_end() -> None:
     planner = _StubPlanner(revised=revised)
     steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=planner)
-    revised = steerer._apply_revision(session, revised, _drift())  # goldfive#247: rebind
+    # goldfive#247: rebind to the stamped instance.
+    # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
+    revised, _was_installed = steerer._apply_revision(session, revised, _drift())
     await steerer._emit_plan_revised(session, revised, _drift(), prev_plan=None)
 
     # Session plan now has the corrected topology.

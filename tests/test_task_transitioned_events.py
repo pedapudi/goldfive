@@ -332,7 +332,9 @@ async def test_refine_replace_supersedes_emits_plan_revision_transition() -> Non
     # Mirror the live order: _apply_revision installs ``revised`` on the
     # session, then _emit_plan_revised diffs prev_plan vs. revised and
     # emits the proto + per-transition envelopes.
-    revised = steerer._apply_revision(session, revised, drift)  # goldfive#247: rebind
+    # goldfive#247: rebind to the stamped instance.
+    # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
+    revised, _was_installed = steerer._apply_revision(session, revised, drift)
     await steerer._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
 
     transitions = _transition_events(sink)

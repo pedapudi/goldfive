@@ -345,7 +345,9 @@ async def _drive_refine_cycle(
     steerer.bind(sinks=[sink], planner=planner)
 
     prev = session.plan
-    revised = steerer._apply_revision(session, revised, drift)  # goldfive#247: rebind
+    # goldfive#247: rebind to the stamped instance.
+    # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
+    revised, _was_installed = steerer._apply_revision(session, revised, drift)
     await steerer._emit_plan_revised(session, revised, drift, prev_plan=prev)
     return steerer, planner, sink
 
@@ -664,7 +666,9 @@ async def test_critical_drift_composes_cancel_with_correction() -> None:
     # correction lands unperturbed by the cancel. This is the
     # composition claim.
     revised = _revised_with_correct_supersedes()
-    revised = steerer._apply_revision(session, revised, drift)  # goldfive#247: rebind
+    # goldfive#247: rebind to the stamped instance.
+    # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
+    revised, _was_installed = steerer._apply_revision(session, revised, drift)
     await steerer._emit_plan_revised(
         session, revised, drift, prev_plan=_presentation_style_plan()
     )
