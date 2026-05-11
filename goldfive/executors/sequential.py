@@ -700,6 +700,29 @@ class SequentialExecutor(Executor):
                             task.id,
                         )
                         failure_reason = ""  # not actually fatal
+                    elif getattr(steerer, "_observation_only", False):
+                        # goldfive#260: under observation_only, do NOT
+                        # enforce the "failed-task must have a live
+                        # replacement" invariant. The replacement-
+                        # producing refine is dry-run under
+                        # observation_only (see SteeringConfig.
+                        # observation_only docstring), so the executor
+                        # has no replacement to install. Aborting here
+                        # would defeat observation_only's "passive —
+                        # observe, don't enforce" contract: the
+                        # coordinator's autonomous flow may still
+                        # recover (try another path, surface to user).
+                        # If it can't, the run terminates naturally
+                        # when no eligible task remains and we fall
+                        # through to run_completed below.
+                        log.info(
+                            "SequentialExecutor: observation_only=True — "
+                            "skipping abort-on-failed-without-replacement "
+                            "for task=%s; coordinator's autonomous flow "
+                            "decides next steps",
+                            task.id,
+                        )
+                        failure_reason = ""  # not enforced
                     else:
                         run_failed = True
                         break
@@ -761,21 +784,37 @@ class SequentialExecutor(Executor):
         # task whose refine-spawned successor is live is not fatal).
         fatally_failed = _fatally_failed_task_ids(session.plan or plan)
         if fatally_failed and not self.fail_fast:
-            reason = (
-                "one or more tasks failed without a live replacement "
-                f"(fail_fast=False): {', '.join(tid for tid in fatally_failed if tid)}"
-            )
-            await _drain_steerer_at_run_boundary(steerer, session)
-            await emit(
-                sinks,
-                run_aborted_event(
-                    run_id=session.run_id,
-                    sequence=session.next_sequence(),
-                    reason=reason,
-                    session_id=session.id,
-                ),
-            )
-            return ExecutionOutcome(success=False, session=session, reason=reason)
+            # goldfive#260: under observation_only, skip the abort
+            # enforcement. The replacement-producing refine is dry-run
+            # under observation_only, so goldfive has no replacement
+            # to install. Letting the run abort here would defeat
+            # observation_only's "passive — observe, don't enforce"
+            # contract; the coordinator's autonomous flow decides
+            # whether the failure is recoverable.
+            if getattr(steerer, "_observation_only", False):
+                log.info(
+                    "SequentialExecutor: observation_only=True — "
+                    "skipping abort-on-failed-without-replacement "
+                    "(fail_fast=False) for tasks=%r; falling through "
+                    "to run_completed",
+                    sorted(tid for tid in fatally_failed if tid),
+                )
+            else:
+                reason = (
+                    "one or more tasks failed without a live replacement "
+                    f"(fail_fast=False): {', '.join(tid for tid in fatally_failed if tid)}"
+                )
+                await _drain_steerer_at_run_boundary(steerer, session)
+                await emit(
+                    sinks,
+                    run_aborted_event(
+                        run_id=session.run_id,
+                        sequence=session.next_sequence(),
+                        reason=reason,
+                        session_id=session.id,
+                    ),
+                )
+                return ExecutionOutcome(success=False, session=session, reason=reason)
 
         # Reachability audit: belt-and-suspenders for any cancellation path
         # that failed to cascade. If we are about to report success but
@@ -1326,21 +1365,41 @@ class SequentialExecutor(Executor):
         # in the current plan revision.
         fatally_failed = _fatally_failed_task_ids(session.plan or plan)
         if fatally_failed and self.fail_fast:
-            reason = (
-                "one or more tasks failed without a live replacement: "
-                f"{', '.join(tid for tid in fatally_failed if tid)}"
-            )
-            await _drain_steerer_at_run_boundary(steerer, session)
-            await emit(
-                sinks,
-                run_aborted_event(
-                    run_id=session.run_id,
-                    sequence=session.next_sequence(),
-                    reason=reason,
-                    session_id=session.id,
-                ),
-            )
-            return ExecutionOutcome(success=False, session=session, reason=reason)
+            # goldfive#260: under observation_only, skip the abort
+            # enforcement. The replacement-producing refine is dry-run
+            # under observation_only (see SteeringConfig.observation_only
+            # docstring), so the executor has no replacement to install.
+            # Letting the run abort here would defeat observation_only's
+            # "passive — observe, don't enforce" contract: the ADK
+            # coordinator's autonomous flow may still recover (try
+            # another path, dispatch a different agent, surface the
+            # failure to the user). If it can't, the run terminates
+            # naturally when the coordinator stops dispatching
+            # invocations and we fall through to run_completed below.
+            if getattr(steerer, "_observation_only", False):
+                log.info(
+                    "SequentialExecutor._run_overlay: observation_only=True "
+                    "— skipping abort-on-failed-without-replacement for "
+                    "tasks=%r; coordinator's autonomous flow decides next "
+                    "steps, falling through to run_completed",
+                    sorted(tid for tid in fatally_failed if tid),
+                )
+            else:
+                reason = (
+                    "one or more tasks failed without a live replacement: "
+                    f"{', '.join(tid for tid in fatally_failed if tid)}"
+                )
+                await _drain_steerer_at_run_boundary(steerer, session)
+                await emit(
+                    sinks,
+                    run_aborted_event(
+                        run_id=session.run_id,
+                        sequence=session.next_sequence(),
+                        reason=reason,
+                        session_id=session.id,
+                    ),
+                )
+                return ExecutionOutcome(success=False, session=session, reason=reason)
 
         unmet = evaluate_goal_predicates(session)
         if unmet is not None:
