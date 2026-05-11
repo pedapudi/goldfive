@@ -879,8 +879,11 @@ async def test_apply_revision_stamps_trigger_event_id_from_annotation(
         edges=[TaskEdge(from_task_id="t1", to_task_id="t2b")],
     )
     # goldfive#247: _apply_revision returns the stamped Plan; the
-    # input Plan stays unchanged (frozen).
-    revised = DefaultSteerer._apply_revision(session, revised, drift)
+    # input Plan stays unchanged (frozen). goldfive#254: instance
+    # method (consults ``self._should_inject()`` to gate the install
+    # in observation-only mode); the test-suite fixture flips the
+    # default to active-steering so the install lands.
+    revised = DefaultSteerer()._apply_revision(session, revised, drift)
 
     assert session.plan is not None and session.plan.id == revised.id
     assert revised.revision_trigger_event_id == "ann_ar_77"
@@ -914,8 +917,8 @@ async def test_apply_revision_stamps_drift_id_on_autonomous_drift(
         edges=[],
     )
     # goldfive#247: _apply_revision returns the stamped Plan; the input
-    # stays unchanged (frozen).
-    revised = DefaultSteerer._apply_revision(session, revised, drift)
+    # stays unchanged (frozen). goldfive#254: instance method now.
+    revised = DefaultSteerer()._apply_revision(session, revised, drift)
     assert revised.revision_trigger_event_id == drift.id
 
 
@@ -945,7 +948,8 @@ async def test_apply_revision_preserves_prestamped_trigger_event_id() -> None:
         edges=[],
         revision_trigger_event_id="ann_prestamped",
     )
-    DefaultSteerer._apply_revision(session, revised, drift)
+    # goldfive#254: instance method now.
+    DefaultSteerer()._apply_revision(session, revised, drift)
     assert revised.revision_trigger_event_id == "ann_prestamped"
 
 

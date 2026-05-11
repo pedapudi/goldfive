@@ -238,8 +238,16 @@ def reconstruct_session(events: list[Any]) -> Any:
             with channel_processor_active():
                 set_session_plan(session, from_pb_plan(evt.plan_submitted.plan))
         elif payload == "plan_revised":
-            with channel_processor_active():
-                set_session_plan(session, from_pb_plan(evt.plan_revised.plan))
+            # goldfive#254 — observation-only producers stamp
+            # ``dry_run=true`` on the envelope to signal "the planner
+            # produced this revision but it was NOT installed onto
+            # session.plan in the upstream Runner". Replay must match
+            # the producer-side decision: skip the local install so
+            # the rehydrated session.plan tracks the producer's live
+            # session.plan, not the would-have-applied preview.
+            if not evt.plan_revised.dry_run:
+                with channel_processor_active():
+                    set_session_plan(session, from_pb_plan(evt.plan_revised.plan))
         elif payload == "task_started":
             ts = evt.task_started
             session.current_task_id = ts.task_id

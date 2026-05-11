@@ -15,6 +15,26 @@ subsystems, each with a different mechanism:
    :class:`~goldfive.steerer.DefaultSteerer` that ``goldfive.wrap()``
    does not thread through.
 
+Steering policy (goldfive#254). :class:`SteeringConfig` now also
+gates the THREE actual steering injection points in
+:class:`~goldfive.steerer.DefaultSteerer`:
+
+* the would-be revised plan replacing ``session.plan`` in
+  :meth:`~goldfive.steerer.DefaultSteerer._apply_revision`;
+* the ``GOLDFIVE_STEER`` ControlMessage being enqueued onto the
+  executor's control channel in
+  :meth:`~goldfive.steerer.DefaultSteerer._dispatch_goldfive_steer_control`;
+* the ``request_invocation_cancel`` plugin call in
+  :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`.
+
+The ``observation_only`` field on :class:`SteeringConfig` controls
+whether those three injections fire. Default is ``True`` (passive
+observation) — detection still runs in full, ``planner.refine_steer``
+still runs (operators can see what the planner WOULD have produced via
+``PlanRevised`` with ``dry_run=True``), but the in-flight invocation is
+not touched. Operators graduate to active steering explicitly via
+``RuntimeConfig(steering=SteeringConfig(observation_only=False))``.
+
 This module introduces a typed :class:`RuntimeConfig` dataclass with
 four sub-configs that collapses those four surfaces into a single
 object operators can pass to :func:`goldfive.wrap`. The ``from_env()``
@@ -58,6 +78,58 @@ __all__ = [
 
 
 _VALID_STEER_THRESHOLDS: frozenset[str] = frozenset({"off", "warning", "critical"})
+
+
+# Test-only override hook for :class:`SteeringConfig.observation_only`'s
+# default (goldfive#254). Production code path: this stays ``None`` and
+# every fresh ``SteeringConfig()`` instance gets the documented production
+# default of ``True`` (passive observation). The pytest autouse fixture
+# ``tests/conftest.py::_goldfive_active_steering_default`` flips this to
+# ``False`` for the test suite so the broad existing test corpus —
+# written against the prior active-steering default — stays green
+# without per-test surgery. Tests that explicitly pass
+# ``observation_only=True`` (or ``=False``) still win — the override
+# only applies when the field was not explicitly set by the caller.
+_OBSERVATION_ONLY_DEFAULT: bool | None = None
+
+
+def _resolve_observation_only_default() -> bool:
+    """Resolve the active default for :class:`SteeringConfig.observation_only`.
+
+    Reads :data:`_OBSERVATION_ONLY_DEFAULT`. ``None`` means "no test
+    override is in effect" — return the production default (``True``).
+    Anything else means a test fixture has flipped the default
+    explicitly; honour the override.
+    """
+    if _OBSERVATION_ONLY_DEFAULT is None:
+        return True
+    return bool(_OBSERVATION_ONLY_DEFAULT)
+
+
+def _read_bool_env(name: str, default: bool) -> bool:
+    """Read ``os.environ[name]`` as a boolean; fall back to ``default``.
+
+    Accepted truthy values (case-insensitive): ``1``, ``true``, ``yes``,
+    ``on``, ``y``, ``t``. Accepted falsy values: ``0``, ``false``,
+    ``no``, ``off``, ``n``, ``f``, ``""``. Anything else logs a WARNING
+    and falls back to ``default`` so a typo never silently flips an
+    operator-visible policy knob.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on", "y", "t"}:
+        return True
+    if value in {"0", "false", "no", "off", "n", "f", ""}:
+        return False
+    log.warning(
+        "ignoring unknown %s=%r (expected a boolean literal); using default %r",
+        name,
+        raw,
+        default,
+    )
+    return default
 
 
 def _read_steer_threshold_env(name: str, default: str) -> str:
@@ -480,14 +552,58 @@ class SteeringConfig:
     event with ``suppressed_by_user_steer=true``; no cancel or refine
     fires. Default ``3`` keeps a live operator override dominant
     across a few detector ticks.
+
+    ``observation_only`` (goldfive#254) gates the three actual steering
+    injection points on :class:`~goldfive.steerer.DefaultSteerer`:
+
+    * the would-be revised plan replacing ``session.plan`` in
+      :meth:`~goldfive.steerer.DefaultSteerer._apply_revision`;
+    * the ``GOLDFIVE_STEER`` ControlMessage enqueue in
+      :meth:`~goldfive.steerer.DefaultSteerer._dispatch_goldfive_steer_control`;
+    * the ``request_invocation_cancel`` plugin call in
+      :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`.
+
+    Detection still runs in full (reasoning judges, embedding
+    detectors, goal-drift, looping detectors, CAPABILITY_MISMATCH, …)
+    and ``planner.refine_steer`` still runs — operators can see what
+    the planner WOULD have produced via the ``PlanRevised`` event with
+    ``dry_run=True``. The in-flight invocation is otherwise untouched.
+
+    **Default is ``True``** — a deliberate behaviour change from the
+    pre-#254 implicit active-steering default. Operators graduate to
+    active steering explicitly by passing
+    ``RuntimeConfig(steering=SteeringConfig(observation_only=False))``
+    to :func:`goldfive.wrap`, or by setting the env var
+    ``GOLDFIVE_STEER_OBSERVATION_ONLY=0`` / ``false`` / ``no``.
+
+    The ``DriftDetected`` event still fires unchanged in observation
+    mode — detection is independent of injection. Only the three
+    write-paths above are skipped; everything else (logging, sink
+    emission, drift lifecycle, suppression accounting) keeps running.
     """
 
     threshold: str = "warning"
     suppression_window_turns: int = 3
+    observation_only: bool = dataclasses.field(
+        default_factory=_resolve_observation_only_default
+    )
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
-        """Read ``GOLDFIVE_STEER_*`` env vars into an instance."""
+        """Read ``GOLDFIVE_STEER_*`` env vars into an instance.
+
+        Env surface:
+
+        * ``GOLDFIVE_STEER_THRESHOLD`` — ``off`` / ``warning`` /
+          ``critical`` (case-insensitive).
+        * ``GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS`` — positive int.
+        * ``GOLDFIVE_STEER_OBSERVATION_ONLY`` — boolean
+          (``1``/``true``/``yes``/``on`` truthy; ``0``/``false``/
+          ``no``/``off`` falsy; case-insensitive). Defaults to the
+          built-in default (``True`` in production, flipped to
+          ``False`` for the goldfive test suite via the autouse
+          ``_goldfive_active_steering_default`` fixture).
+        """
         defaults = cls()
         return cls(
             threshold=_read_steer_threshold_env(
@@ -496,6 +612,10 @@ class SteeringConfig:
             suppression_window_turns=_read_int_env(
                 "GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS",
                 defaults.suppression_window_turns,
+            ),
+            observation_only=_read_bool_env(
+                "GOLDFIVE_STEER_OBSERVATION_ONLY",
+                defaults.observation_only,
             ),
         )
 

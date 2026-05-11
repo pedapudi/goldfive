@@ -629,6 +629,30 @@ class DefaultSteerer:
             _window = 3
         self._goldfive_steer_suppression_window_turns = max(0, _window)
         self._steering_config: SteeringConfig | None = steering_config
+        # goldfive#254: observation-only mode. Detection still runs in
+        # full and ``planner.refine_steer`` still runs (operators see the
+        # would-have-applied plan via ``PlanRevised`` with
+        # ``dry_run=True``), but the three actual injection points
+        # (``session.plan`` mutation in ``_apply_revision``, the
+        # ``GOLDFIVE_STEER`` ControlMessage enqueue, the
+        # ``request_invocation_cancel`` plugin call) are gated by
+        # :meth:`_should_inject`. The flag lives on :class:`SteeringConfig`
+        # — NOT a constructor parameter on this class — so operators
+        # set it via ``RuntimeConfig(steering=SteeringConfig(...))``
+        # at :func:`goldfive.wrap` time. Default for the bare
+        # ``DefaultSteerer()`` constructor (no config) is the safer
+        # passive observation (``True``) — matches the production
+        # default on :class:`SteeringConfig` and avoids surprising
+        # third-party callers who construct ``DefaultSteerer`` directly.
+        if steering_config is not None:
+            self._observation_only: bool = bool(steering_config.observation_only)
+        else:
+            # Honour the test-only override hook so the autouse fixture
+            # in ``tests/conftest.py`` can flip the implicit default for
+            # the entire test suite without touching every call site.
+            from goldfive.config import _resolve_observation_only_default
+
+            self._observation_only = _resolve_observation_only_default()
         # Background reasoning-judge tasks (goldfive#251). The LLM-judge
         # path in :meth:`observe_reasoning` is fire-and-forget so the
         # adapter's model-response callback can return immediately and
@@ -3936,6 +3960,25 @@ class DefaultSteerer:
                 "replacement_task_ids": replacement_ids,
             },
         )
+        # goldfive#254 — observation-only: skip the actual ControlMessage
+        # enqueue but log the would-be payload at INFO so operators can
+        # see what would have been dispatched (drift kind, task id, body).
+        # No cancel-and-restart fires on the executor; the live invocation
+        # continues against the prior plan.
+        if not self._should_inject():
+            log.info(
+                "DefaultSteerer._dispatch_goldfive_steer_control: "
+                "observation_only=True — SKIPPING GOLDFIVE_STEER enqueue. "
+                "would_have_dispatched kind=%s task=%s drift_id=%s "
+                "superseded=%s replacement=%s body=%r",
+                drift.kind.value,
+                drift.current_task_id or "-",
+                str(getattr(drift, "id", "") or ""),
+                superseded_ids,
+                replacement_ids,
+                body[:200],
+            )
+            return False
         landed = await self._dispatch_goldfive_control(msg)
         log.debug(
             "DefaultSteerer._dispatch_goldfive_steer_control: "
@@ -4342,7 +4385,26 @@ class DefaultSteerer:
           ``cancel_inflight_task`` (TypeError on the kwarg) fall back
           to the kwarg-less call so older third-party plugins don't
           break — the task-cancel step is silently skipped.
+
+        Observation-only mode (goldfive#254): when
+        :meth:`_should_inject` is ``False`` this method returns ``[]``
+        without consulting the plugin or stamping
+        ``cancel_requested_invocation_ids``. Logged at INFO so an
+        operator can see WHAT would have been cancelled (drift kind,
+        task / agent id) without the cancel actually firing on the
+        live invocation.
         """
+        if not self._should_inject():
+            log.info(
+                "DefaultSteerer.request_invocation_cancel: "
+                "observation_only=True — SKIPPING cancel for "
+                "drift kind=%s severity=%s agent=%s task=%s",
+                drift.kind.value,
+                drift.severity.value,
+                drift.current_agent_id or "-",
+                drift.current_task_id or "-",
+            )
+            return []
         adapter = self._adapter
         if adapter is None:
             return []
@@ -4602,6 +4664,29 @@ class DefaultSteerer:
             DriftKind.PLAN_DIVERGENCE,
         }
     )
+
+    def _should_inject(self) -> bool:
+        """Return ``True`` iff the steerer should actually inject side effects.
+
+        Single named gate for the three steering injection points
+        (goldfive#254):
+
+        * plan mutation in :meth:`_apply_revision`
+          (``set_session_plan`` + ``last_addressed_revision_by_drift_key``);
+        * ``GOLDFIVE_STEER`` ControlMessage enqueue in
+          :meth:`_dispatch_goldfive_steer_control`;
+        * the plugin ``request_invocation_cancel`` flag in
+          :meth:`request_invocation_cancel`.
+
+        ``False`` when :class:`~goldfive.config.SteeringConfig.observation_only`
+        is in effect — detection still runs, ``planner.refine_steer``
+        still runs, ``PlanRevised`` still emits (with ``dry_run=True``),
+        but the in-flight invocation is not touched. Defined as a tiny
+        helper rather than inlining ``not self._observation_only`` at
+        three sites so the intent is grep-able and a future fourth
+        injection point has a single gate to honour.
+        """
+        return not self._observation_only
 
     def _severity_meets_promotion_threshold(self, severity: DriftSeverity) -> bool:
         """True iff ``severity`` satisfies the configured promotion threshold."""
@@ -6173,12 +6258,23 @@ class DefaultSteerer:
         )
         return dataclasses.replace(revised, tasks=tuple(new_tasks))
 
-    @staticmethod
-    def _apply_revision(session: Session, revised: Plan, drift: DriftEvent) -> Plan:
+    def _apply_revision(self, session: Session, revised: Plan, drift: DriftEvent) -> Plan:
         """Stamp revision metadata and install ``revised`` on the session.
 
         Preserves the existing ``revision_index`` monotonicity: the new
         plan's index is at least ``old.revision_index + 1``.
+
+        Observation-only mode (goldfive#254): when
+        :meth:`_should_inject` is ``False`` the revision metadata is
+        STILL stamped (so the returned Plan accurately reflects the
+        index/kind/severity the planner produced and downstream
+        :meth:`_emit_plan_revised` can render a faithful preview), but
+        the actual ``set_session_plan`` write to ``session.plan`` and
+        the ``last_addressed_revision_by_drift_key`` stamp are SKIPPED
+        — the live agent keeps reasoning against the prior plan. The
+        paired ``PlanRevised`` event from :meth:`_emit_plan_revised`
+        carries ``dry_run=True`` so consumers can distinguish a
+        would-have-applied revision from a real one.
 
         goldfive#247: returns the post-stamp Plan that was actually
         installed onto :attr:`Session.plan`. Pre-#247 the function
@@ -6242,6 +6338,23 @@ class DefaultSteerer:
             revision_reason=new_reason,
             revision_trigger_event_id=new_trigger_id,
         )
+        if not self._should_inject():
+            log.info(
+                "DefaultSteerer._apply_revision: observation_only=True — "
+                "SKIPPING plan install. prior_plan_id=%s "
+                "would_have_installed_plan_id=%s revision_index=%d drift_kind=%s",
+                prior_id[:16] or "<none>",
+                (revised.id or "")[:16] or "<empty>",
+                int(revised.revision_index),
+                drift.kind.value,
+            )
+            # Observation-only: do NOT swap ``session.plan``, do NOT stamp
+            # the per-(kind, target) addressed watermark, do NOT update the
+            # orchestration-state current_plan pointer. The stamped
+            # ``revised`` instance is still returned so
+            # :meth:`_emit_plan_revised` can render the would-have-applied
+            # preview into ``PlanRevised`` (with ``dry_run=True``).
+            return revised
         log.info(
             "DefaultSteerer._apply_revision: prior_plan_id=%s "
             "revised_plan_id=%s revision_index=%d drift_kind=%s",
@@ -7289,6 +7402,14 @@ class DefaultSteerer:
             )
             evt.plan_revised.refine_output_summary = self._build_refine_output_summary(revised)
             evt.plan_revised.target_agent_id = drift.current_agent_id or ""
+            # goldfive#254 — stamp the dry_run marker so consumers can
+            # distinguish a would-have-applied revision (observation-only
+            # mode, plan was NOT installed onto ``session.plan``, no
+            # GOLDFIVE_STEER ControlMessage was enqueued, no cancel was
+            # requested) from a real revision. Wire-default is ``false``
+            # so legacy producers and historical events round-trip as
+            # "real revision" without surprise.
+            evt.plan_revised.dry_run = not self._should_inject()
             # Phase 2.X / goldfive#271 Gap 2: log the emission so a
             # raise-mid-fire scenario (proto build OK, sink emit raises)
             # leaves a goldfive-side trace before the harmonograf side
