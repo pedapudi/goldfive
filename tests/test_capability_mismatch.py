@@ -32,6 +32,7 @@ from goldfive.types import (
     DriftKind,
     DriftSeverity,
     Task,
+    TaskStatus,
 )
 
 # ---------------------------------------------------------------------------
@@ -412,6 +413,12 @@ async def test_integration_capability_mismatch_flows_through_handle_drift() -> N
 
     # Plan task is the leaf authoring task assigned to the
     # underqualified sub-agent — exactly the structural mismatch.
+    # goldfive#259: the coord task is marked RUNNING (not PENDING) so
+    # the observational delegation-time pin (#259) only treats the leaf
+    # task as eligible. Otherwise the pin would pick the
+    # delegation-shaped coord_task by plan order (zero-overlap topic
+    # match falls back to first) and Rule A's "Coordinate" delegation
+    # marker would suppress the drift.
     leaf_task = Task(
         id="t-draft",
         title="Draft a presentation about LLM observability",
@@ -421,6 +428,7 @@ async def test_integration_capability_mismatch_flows_through_handle_drift() -> N
         id="t-coord",
         title="Coordinate the presentation",
         assignee_agent_id="coord",
+        status=TaskStatus.RUNNING,
     )
     plan = Plan(
         id="p1",
@@ -478,6 +486,11 @@ async def test_integration_no_capability_mismatch_when_agent_has_leaf_tool() -> 
     steerer = _RecordingSteerer()
     adapter.bind_steerer(steerer)
 
+    # goldfive#259: mark coord_task RUNNING (not PENDING) so only the
+    # leaf task is eligible for the observational delegation-time pin.
+    # Otherwise the pin would pick coord_task by plan order (zero-
+    # overlap topic match → first eligible), and Rule A would be
+    # suppressed by the "Coordinate" delegation marker anyway.
     leaf_task = Task(
         id="t-draft",
         title="Draft a presentation",
@@ -487,6 +500,7 @@ async def test_integration_no_capability_mismatch_when_agent_has_leaf_tool() -> 
         id="t-coord",
         title="Coordinate the work",
         assignee_agent_id="coord",
+        status=TaskStatus.RUNNING,
     )
     plan = Plan(
         id="p1",

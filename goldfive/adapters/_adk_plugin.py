@@ -4018,6 +4018,174 @@ def make_adk_plugin(
                     exc,
                 )
 
+        def _maybe_pin_delegation_task(
+            self,
+            *,
+            ctx: SessionContext,
+            invoked_agent_name: str,
+            tool_args: Any,
+        ) -> None:
+            """Observationally bind a plan task to ``invoked_agent_name`` at
+            delegation_observed time (goldfive#259).
+
+            #252 zeroed ``Task.assignee_agent_id`` at plan-parse time so the
+            LLM cannot pre-declare which sub-agent will pick up a task; the
+            assignment is supposed to be observational (described as what
+            actually happened, not predicted). This hook is the observational
+            re-population — when the coordinator dispatches an AgentTool, we
+            walk the plan, pick the eligible plan task this delegation is
+            enacting, stamp ``task.assignee_agent_id`` and
+            ``session.current_task_id`` so the reporting-tool pin lookup in
+            :func:`_resolve_pinned_task_id` finds the task without needing a
+            pre-declared assignee.
+
+            Selection algorithm:
+
+            1. Eligible set = PENDING tasks whose every upstream-edge
+               predecessor is COMPLETED (DAG-ready).
+            2. If exactly one eligible -> bind it.
+            3. If multiple eligible -> topic-match by tokenising
+               ``tool_args`` against each candidate's title+description
+               (same scorer the delegation pin uses). Top non-zero score
+               wins; tie or zero overlap -> fall back to plan-tasks order
+               (first eligible).
+            4. If zero eligible -> log DEBUG and return.
+
+            The stamp is a real mutation, not a dry run. Assignee
+            repopulation is observational in the same sense that
+            ``NEW_WORK_DISCOVERED`` is — describing observed reality, not a
+            revision — so it does NOT emit ``PlanRevised``.
+
+            Silent on every failure mode.
+            """
+            if not invoked_agent_name:
+                return
+            plan = _safe_attr(ctx.session, "plan", None)
+            if plan is None:
+                return
+            tasks = tuple(_safe_attr(plan, "tasks", None) or ())
+            if not tasks:
+                return
+            try:
+                from goldfive.types import (  # noqa: PLC0415 — lazy
+                    TaskStatus,
+                    channel_processor_active,
+                    replace_task,
+                    set_session_plan,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_maybe_pin_delegation_task: cannot import deps: %s",
+                    exc,
+                )
+                return
+
+            edges = tuple(_safe_attr(plan, "edges", None) or ())
+            completed_ids: set[str] = set()
+            for t in tasks:
+                if _safe_attr(t, "status", None) is TaskStatus.COMPLETED:
+                    tid = str(_safe_attr(t, "id", "") or "")
+                    if tid:
+                        completed_ids.add(tid)
+
+            def _upstream_ok(task_id: str) -> bool:
+                for e in edges:
+                    to_id = str(_safe_attr(e, "to_task_id", "") or "")
+                    if to_id != task_id:
+                        continue
+                    from_id = str(_safe_attr(e, "from_task_id", "") or "")
+                    if from_id and from_id not in completed_ids:
+                        return False
+                return True
+
+            eligible: list[Any] = []
+            for task in tasks:
+                if _safe_attr(task, "status", None) is not TaskStatus.PENDING:
+                    continue
+                tid = str(_safe_attr(task, "id", "") or "")
+                if not tid or not _upstream_ok(tid):
+                    continue
+                eligible.append(task)
+
+            if not eligible:
+                log.debug(
+                    "_maybe_pin_delegation_task: no eligible PENDING task "
+                    "to bind for delegation to %s; leaving unpinned",
+                    invoked_agent_name,
+                )
+                return
+
+            chosen: Any
+            if len(eligible) == 1:
+                chosen = eligible[0]
+            else:
+                scored = _score_candidates_by_args(eligible, tool_args)
+                chosen = scored if scored is not None else eligible[0]
+
+            chosen_id = str(_safe_attr(chosen, "id", "") or "")
+            if not chosen_id:
+                return
+
+            # Stamp assignee onto the chosen task by deriving a new Plan
+            # under the channel-processor envelope. Skip when the assignee
+            # already matches (idempotent on parallel same-agent calls).
+            current_assignee = str(
+                _safe_attr(chosen, "assignee_agent_id", "") or ""
+            )
+            try:
+                if current_assignee != invoked_agent_name:
+                    with channel_processor_active():
+                        new_plan = replace_task(
+                            plan,
+                            chosen_id,
+                            assignee_agent_id=invoked_agent_name,
+                        )
+                        set_session_plan(ctx.session, new_plan)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_maybe_pin_delegation_task: assignee stamp raised: %s",
+                    exc,
+                )
+                return
+
+            # Pin the chosen task as session.current_task_id via the
+            # OrchestrationStore so the reporting-tool pin lookup
+            # (:func:`_resolve_pinned_task_id`) resolves on the
+            # delegated sub-invocation's tool calls.
+            try:
+                store = OrchestrationStore.for_session(ctx.session)
+                live_plan = _safe_attr(ctx.session, "plan", None)
+                try:
+                    pin_revision = int(
+                        _safe_attr(live_plan, "revision_index", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    pin_revision = 0
+                store.set_pin_current_task(
+                    chosen_id,
+                    source=BindingSource.DELEGATION_PIN,
+                    revision=pin_revision,
+                    title=str(_safe_attr(chosen, "title", "") or ""),
+                )
+                try:
+                    ctx.session.current_task_id = chosen_id
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_maybe_pin_delegation_task: current_task pin raised: %s",
+                    exc,
+                )
+                return
+
+            log.info(
+                "goldfive.delegation.assignee_observed: task_id=%s "
+                "agent=%s eligible=%d",
+                chosen_id,
+                invoked_agent_name,
+                len(eligible),
+            )
+
         async def _maybe_emit_capability_mismatch(
             self,
             *,
@@ -5320,6 +5488,27 @@ def make_adk_plugin(
                             "before_tool_callback: reconciler.on_delegation_observed raised: %s",
                             exc,
                         )
+
+                # goldfive#259 — observational assignee re-population.
+                # #252 zeroed Task.assignee_agent_id at parse time; this
+                # hook stamps the chosen plan task's assignee with the
+                # invoked agent and pins session.current_task_id so the
+                # reporting-tool pin lookup resolves on the delegated
+                # sub-invocation's tool calls. Runs BEFORE the capability
+                # check so the latter's Strategy 1 (assignee-based) can
+                # find the bound task instead of falling through to the
+                # weaker Strategy 2 (current_task_id only).
+                try:
+                    self._maybe_pin_delegation_task(
+                        ctx=ctx,
+                        invoked_agent_name=to_agent,
+                        tool_args=tool_args,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_tool_callback: delegation_pin hook raised: %s",
+                        exc,
+                    )
 
                 # goldfive#253 — structural capability check at delegation
                 # time. Replaces the planner-LLM PLAN_DIVERGENCE
