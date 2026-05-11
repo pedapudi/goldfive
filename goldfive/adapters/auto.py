@@ -114,7 +114,13 @@ def _looks_like_async_agent_callable(agent: Any) -> bool:
     return asyncio.iscoroutinefunction(call_attr)
 
 
-def auto_adapter(agent: Any, *, plugins: list[Any] | None = None) -> AgentAdapter:
+def auto_adapter(
+    agent: Any,
+    *,
+    plugins: list[Any] | None = None,
+    llm_call_timeout_ms: int | None = None,
+    agent_max_output_tokens: int | None = None,
+) -> AgentAdapter:
     """Return a concrete :class:`AgentAdapter` for ``agent``.
 
     Dispatch order:
@@ -135,6 +141,13 @@ def auto_adapter(agent: Any, *, plugins: list[Any] | None = None) -> AgentAdapte
     target is an ADK agent/runner. It is ignored for the other shapes —
     there is no analogous plugin surface in the Claude SDK or callable
     adapters today. See goldfive#121.
+
+    ``llm_call_timeout_ms`` (goldfive#271 follow-up) and
+    ``agent_max_output_tokens`` (goldfive#256) forward to
+    :class:`ADKAdapter` so the typed :class:`~goldfive.config.AgentConfig`
+    threaded through :func:`goldfive.wrap` reaches the plugin's
+    per-LLM-call structural caps. Ignored for non-ADK adapters (no
+    analogous surface).
     """
     if isinstance(agent, AgentAdapter):
         return agent
@@ -142,7 +155,12 @@ def auto_adapter(agent: Any, *, plugins: list[Any] | None = None) -> AgentAdapte
     if _looks_like_adk_agent(agent) or _looks_like_adk_runner(agent):
         from goldfive.adapters.adk import ADKAdapter  # lazy: requires extra
 
-        return ADKAdapter(agent, plugins=plugins)
+        adk_kwargs: dict[str, Any] = {"plugins": plugins}
+        if llm_call_timeout_ms is not None:
+            adk_kwargs["llm_call_timeout_ms"] = int(llm_call_timeout_ms)
+        if agent_max_output_tokens is not None:
+            adk_kwargs["agent_max_output_tokens"] = int(agent_max_output_tokens)
+        return ADKAdapter(agent, **adk_kwargs)
 
     if _looks_like_claude_client_factory(agent):
         from goldfive.adapters.claude import ClaudeAgentSDKAdapter  # lazy

@@ -357,8 +357,6 @@ def wrap(
         else:
             log_dynamic_instruction_opt_out(agent)
 
-    adapter = auto_adapter(agent, plugins=plugins)
-
     # Resolve the runtime config (goldfive#225). When ``runtime`` is
     # not supplied we build one from the environment so pre-#225
     # callers — and the env-var tests they already ship — keep working
@@ -375,6 +373,18 @@ def wrap(
     _embed_module.configure(resolved_runtime.embedding)
     _reasoning_module.configure(resolved_runtime.reasoning_drift)
     _tool_loops_module.configure(resolved_runtime.tool_loops)
+
+    # Thread :class:`AgentConfig` (goldfive#256) into the ADK adapter so
+    # the plugin's structural ``max_output_tokens`` ceiling AND the
+    # per-LLM-call wall-clock budget reflect the runtime config. Both
+    # kwargs are ignored for non-ADK adapter shapes (the typed config
+    # has no analogous surface on Claude / callable adapters today).
+    adapter = auto_adapter(
+        agent,
+        plugins=plugins,
+        llm_call_timeout_ms=resolved_runtime.agent.call_timeout_ms,
+        agent_max_output_tokens=resolved_runtime.agent.max_output_tokens,
+    )
 
     resolved_call_llm: CallLLM | None = call_llm
     resolved_model: str = model or ""

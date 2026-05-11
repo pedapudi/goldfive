@@ -67,6 +67,7 @@ from goldfive.drift.reasoning import (
 )
 
 __all__ = [
+    "AgentConfig",
     "EmbeddingConfig",
     "GoalDriftConfig",
     "JudgeConfig",
@@ -620,6 +621,73 @@ class SteeringConfig:
         )
 
 
+@dataclasses.dataclass
+class AgentConfig:
+    """Per-agent LLM-call budget for ADK sub-agent invocations (goldfive#256).
+
+    Distinct from :class:`JudgeConfig` (goldfive's internal judge calls)
+    and :attr:`goldfive.planner.LLMPlanner.MAX_OUTPUT_TOKENS` (the planner's
+    own LLM calls); this covers the user-tree sub-agent calls flowing
+    through ADK / litellm — coordinator, research_agent, web_developer_agent,
+    reviewer_agent, debugger_agent, and anyone else wrapped by
+    :func:`goldfive.wrap`.
+
+    ``max_output_tokens`` caps the generation per ADK sub-agent LLM call.
+    Without it, a wandering / looping generation can run for many minutes
+    and consume tens of thousands of tokens with no framework
+    intervention (live e2e 2026-05-11, ice cream session ``62dde1a6``:
+    30K+ tokens for a 5-bullet-point research task at ~55 tok/s with
+    sustained 100% speculative-decoding acceptance — low-entropy
+    repetitive output that nothing was bounding). The cap is applied as
+    a STRUCTURAL CEILING in
+    :meth:`goldfive.adapters._adk_plugin._GoldfiveADKPlugin.before_model_callback`:
+    if the sub-agent (or ADK's defaults) already supplied a smaller
+    ``max_output_tokens`` on ``llm_request.config``, that smaller value
+    wins — goldfive only ratchets the cap DOWN, never up.
+
+    ``call_timeout_ms`` is the wall-clock budget per call. On expiry the
+    call cancels and an ``LLM_CALL_TIMEOUT`` drift fires (CRITICAL,
+    capacity-shaped) so the existing drift dispatch handles escalation.
+    Default 120s — Qwen 35B-class models can take 60-90s on long
+    prompts; operators who genuinely need longer (slow judges, weak
+    hardware, multi-step research synthesis) override via env or the
+    typed config. This default is dramatically tighter than the
+    pre-goldfive#256
+    :data:`goldfive.adapters._adk_plugin.DEFAULT_LLM_CALL_TIMEOUT_MS`
+    (30 min), which was sized as a pathological-hang ceiling, not a
+    latency SLO. Operators who want the legacy 30-minute backstop pass
+    ``call_timeout_ms=1_800_000`` (or set
+    ``GOLDFIVE_AGENT_CALL_TIMEOUT_MS=1800000``).
+
+    Both fields can be overridden via env (``GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS``
+    / ``GOLDFIVE_AGENT_CALL_TIMEOUT_MS``) so operators tune without code
+    changes.
+    """
+
+    max_output_tokens: int = 16384
+    call_timeout_ms: int = 120_000
+
+    @classmethod
+    def from_env(cls) -> AgentConfig:
+        """Read ``GOLDFIVE_AGENT_*`` env vars into an instance.
+
+        Missing vars fall back to the field defaults. Non-integer /
+        non-positive values are ignored (same semantics as the other
+        sub-configs — see :func:`_read_int_env`).
+        """
+        defaults = cls()
+        return cls(
+            max_output_tokens=_read_int_env(
+                "GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS",
+                defaults.max_output_tokens,
+            ),
+            call_timeout_ms=_read_int_env(
+                "GOLDFIVE_AGENT_CALL_TIMEOUT_MS",
+                defaults.call_timeout_ms,
+            ),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Aggregate
 # ---------------------------------------------------------------------------
@@ -644,6 +712,7 @@ class RuntimeConfig:
     goal_drift: GoalDriftConfig = dataclasses.field(default_factory=GoalDriftConfig)
     judge: JudgeConfig = dataclasses.field(default_factory=JudgeConfig)
     steering: SteeringConfig = dataclasses.field(default_factory=SteeringConfig)
+    agent: AgentConfig = dataclasses.field(default_factory=AgentConfig)
 
     @classmethod
     def from_env(cls) -> RuntimeConfig:
@@ -661,4 +730,5 @@ class RuntimeConfig:
             goal_drift=GoalDriftConfig.from_env(),
             judge=JudgeConfig.from_env(),
             steering=SteeringConfig.from_env(),
+            agent=AgentConfig.from_env(),
         )

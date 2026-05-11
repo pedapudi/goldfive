@@ -1027,6 +1027,7 @@ class ADKAdapter:
         plugins: list[Any] | None = None,
         agent_tool_cap: int | None = None,
         llm_call_timeout_ms: int | None = None,
+        agent_max_output_tokens: int | None = None,
     ) -> None:
         self._user_id = user_id
         # Per-(goldfive session.conversation_id) cached ADK session id
@@ -1089,9 +1090,19 @@ class ADKAdapter:
         }
         if llm_call_timeout_ms is not None:
             plugin_kwargs["llm_call_timeout_ms"] = int(llm_call_timeout_ms)
+        # Structural ``max_output_tokens`` ceiling for sub-agent LLM
+        # dispatches (goldfive#256). ``None`` leaves the plugin on its
+        # built-in default (:data:`DEFAULT_AGENT_MAX_OUTPUT_TOKENS`);
+        # :func:`goldfive.wrap` threads the :class:`AgentConfig` here
+        # so operators can tune via ``RuntimeConfig`` without code
+        # changes. Pass ``0`` (or any negative int) to disable
+        # ratcheting entirely (pre-#256 behaviour).
+        if agent_max_output_tokens is not None:
+            plugin_kwargs["agent_max_output_tokens"] = int(agent_max_output_tokens)
         self._plugin = make_adk_plugin(**plugin_kwargs)
         self._agent_tool_cap = cap
         self._llm_call_timeout_ms = llm_call_timeout_ms
+        self._agent_max_output_tokens = agent_max_output_tokens
 
         # Install the goldfive plugin on the one runner. ADK propagates
         # the plugin manager into any AgentTool-spawned sub-Runner so the
