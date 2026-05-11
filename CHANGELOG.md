@@ -2,6 +2,41 @@
 
 All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
+## Unreleased — 2026-05-11
+
+### Steerer
+
+- **BREAKING:** **Observation-only mode is the new default
+  ([#254](https://github.com/pedapudi/goldfive/issues/254)).**
+  `goldfive.wrap()`, `Runner.__init__`, and `DefaultSteerer.__init__`
+  now default `observation_only=True`. Detection still runs in full
+  (judges, drift classifiers, CAPABILITY_MISMATCH, …) and
+  `planner.refine` / `planner.refine_steer` still execute, but the
+  three injection points are suppressed:
+
+  1. The revised plan is NOT installed onto `session.plan`
+     (`_apply_revision` returns the stamped plan but skips the
+     in-place mutation; the addressed-revision watermark is not
+     stamped so dry-runs don't dampen subsequent real detection).
+  2. No `GOLDFIVE_STEER` (or `GOLDFIVE_PAUSE_ESCALATE`)
+     ControlMessage is dispatched onto the bound control channel.
+  3. `request_invocation_cancel` returns `[]` without writing to the
+     cancel-pending registry.
+
+  Sinks STILL see `DriftDetected` (operators must see what goldfive
+  saw) AND a `PlanRevised` event with the new `dry_run=true` proto
+  field set, so harmonograf can render a "would have applied"
+  preview. Pre-built steerers passed via `steerer=...` keep their
+  own `observation_only` flag; an INFO log line records the mismatch
+  when the Runner's parameter is ignored. Opt back into active
+  steering with `observation_only=False`. See
+  [docs/design/OBSERVATION-ONLY.md](docs/design/OBSERVATION-ONLY.md).
+
+### Proto
+
+- `PlanRevised.dry_run` (bool, field number 11) added. Default
+  `false` is byte-identical to pre-#254 producers.
+
 ## Unreleased — 2026-04-27
 
 ### Architecture

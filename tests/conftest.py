@@ -16,6 +16,47 @@ from typing import Any
 import pytest
 
 # ---------------------------------------------------------------------------
+# observation_only default override (goldfive#254)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _goldfive_active_steering() -> Iterator[None]:
+    """Flip ``DefaultSteerer``'s ``observation_only`` default to ``False``
+    for the test suite.
+
+    goldfive#254 made ``observation_only=True`` the production default
+    on :func:`goldfive.wrap`, :class:`~goldfive.runner.Runner`, and
+    :class:`~goldfive.steerer.DefaultSteerer`. The pre-existing test
+    suite was written against the pre-#254 active-steering default, so
+    flipping the production default would force a sweeping rewrite of
+    every test that asserts on plan mutation / ControlMessage dispatch
+    / cancel-registry side effects.
+
+    This autouse fixture sets
+    :data:`goldfive.steerer._test_default_observation_only` to
+    ``False`` for the duration of every test, restoring the pre-#254
+    behaviour. Tests that explicitly want to exercise the
+    observation-only path pass ``observation_only=True`` to their
+    :class:`DefaultSteerer` / :class:`Runner` / :func:`goldfive.wrap`
+    call — the override consulted by :class:`DefaultSteerer` only
+    governs the **unspecified** default, so explicit-True from a test
+    is always honoured.
+    """
+    try:
+        import goldfive.steerer as _steerer_mod
+    except ImportError:
+        yield
+        return
+    prior = _steerer_mod._test_default_observation_only
+    _steerer_mod._test_default_observation_only = False
+    try:
+        yield
+    finally:
+        _steerer_mod._test_default_observation_only = prior
+
+
+# ---------------------------------------------------------------------------
 # State-ownership audit (goldfive#271 Phase 0)
 # ---------------------------------------------------------------------------
 

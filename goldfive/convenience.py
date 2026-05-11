@@ -224,6 +224,7 @@ def wrap(
     runtime: RuntimeConfig | None = None,
     dynamic_instruction: bool = True,
     drift_self_reporting: bool | list[str] = False,
+    observation_only: bool | None = None,
     **legacy_kwargs: Any,
 ) -> Runner:
     """Build a :class:`Runner` that drives ``agent`` with goldfive.
@@ -305,6 +306,28 @@ def wrap(
         :class:`DefaultSteerer` via its config kwargs. An explicit
         ``steerer=`` kwarg wins — the caller keeps full control
         over the steerer they build themselves.
+    observation_only:
+        **Default ``True`` (goldfive#254 — user-facing behaviour
+        change).** Forwarded to :class:`Runner` and through to the
+        default :class:`DefaultSteerer` when ``steerer=`` is omitted.
+        ``None`` (the signature default for the test-fixture override
+        pathway) defers to the steerer's own default resolution
+        (production ``True``); explicit ``True`` / ``False`` always
+        wins. When ``True``, goldfive runs every detector and every
+        ``planner.refine`` LLM call but DOES NOT inject into the
+        coordinator's runtime — no plan mutation, no
+        ``GOLDFIVE_STEER`` ControlMessage dispatch, no cooperative
+        cancel. Sinks still see ``DriftDetected`` AND a
+        ``PlanRevised`` with ``dry_run=True`` so operators see the
+        full would-have-steered preview. Pass
+        ``observation_only=False`` to opt back into active steering
+        (the pre-#254 default behaviour). See
+        ``docs/design/OBSERVATION-ONLY.md`` for the rationale.
+
+        When the caller supplies their own ``steerer=``, the
+        steerer's pre-baked ``observation_only`` flag wins — the
+        :class:`Runner` ignores this parameter and logs the mismatch
+        at INFO.
     drift_self_reporting:
         Forwarded to :class:`Runner`. Default ``False`` (goldfive#196):
         only the lifecycle reporting tools (``report_task_started`` /
@@ -534,6 +557,7 @@ def wrap(
             reasoning_drift_call_llm=judge_call_llm,
             reasoning_drift_model=judge_model,
             steering_config=resolved_runtime.steering,
+            observation_only=observation_only,
         )
     else:
         resolved_steerer = DefaultSteerer(
@@ -542,6 +566,7 @@ def wrap(
             reasoning_drift_config=resolved_runtime.reasoning_drift,
             reasoning_drift_mode=resolved_runtime.reasoning_drift.mode,
             steering_config=resolved_runtime.steering,
+            observation_only=observation_only,
         )
         # Judges inherit ``call_llm`` from :func:`goldfive.wrap`; with
         # no callable wired here, both the trajectory-level GOAL_DRIFT
@@ -573,6 +598,7 @@ def wrap(
         control=control,
         max_task_invocations=max_task_invocations,
         drift_self_reporting=drift_self_reporting,
+        observation_only=observation_only,
     )
 
     # When the judges were routed through a dedicated JudgeConfig

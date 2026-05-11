@@ -190,6 +190,19 @@ message PlanRevised {
   // Empty string for trajectory-level refines (goal-drift and any drift
   // that was not bound to a specific agent).
   string target_agent_id = 10;
+  // Observation-only / dry-run preview marker (goldfive#254). When
+  // ``true``, the revision was synthesized by ``planner.refine`` but
+  // intentionally NOT installed onto ``session.plan`` — the steerer was
+  // built with ``observation_only=True`` so detection + refine still
+  // run, but the three injection sites (plan mutation, GOLDFIVE_STEER
+  // ControlMessage dispatch, request_invocation_cancel) are suppressed.
+  //
+  // Sinks (harmonograf) MAY render dry-run rows differently
+  // (e.g. greyed-out "would have applied" annotation) but the proto
+  // payload is otherwise identical to a live revision. Default
+  // ``false`` is byte-identical to pre-#254 producers — active
+  // steering keeps its current wire shape.
+  bool dry_run = 11;
 }
 
 // Task transitioned PENDING -> RUNNING.

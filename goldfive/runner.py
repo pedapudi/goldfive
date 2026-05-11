@@ -244,6 +244,32 @@ class Runner:
         ``report_new_work_discovered`` is intentionally NOT a drift
         tool — there is no observation analog for an agent surfacing
         genuinely new work, so it stays default-on.
+    observation_only:
+        **Default ``True`` (goldfive#254 — user-facing behaviour change).**
+        Forwarded to the default :class:`DefaultSteerer` constructed
+        when ``steerer=`` is omitted. ``None`` (the signature default
+        for the test-fixture override pathway) defers to the steerer's
+        own default resolution (production ``True``); explicit
+        ``True`` / ``False`` always wins. When ``True``, detection
+        and the ``planner.refine`` LLM round-trip still run, but the
+        three injection sites — in-place ``session.plan`` mutation,
+        the ``GOLDFIVE_STEER`` ControlMessage dispatch, and
+        :meth:`DefaultSteerer.request_invocation_cancel` — are
+        suppressed. Sinks still see ``DriftDetected`` AND a
+        ``PlanRevised`` event with the new ``dry_run=True`` proto
+        flag so operators see what goldfive *would* have steered
+        without the framework actually injecting into the
+        coordinator's runtime. Pass ``observation_only=False`` to opt
+        back into active steering.
+
+        When the caller supplies their own ``steerer=``, the
+        Runner's ``observation_only`` parameter is **ignored** — the
+        steerer's own flag wins — and an INFO log line records the
+        mismatch so it is visible from logs. Operators who pre-build
+        their own steerer must set its ``observation_only`` flag
+        directly.
+
+        See ``docs/design/OBSERVATION-ONLY.md`` for the design notes.
     fail_fast_on_revision_rejection:
         Strict-abort opt-in for goldfive-authored revisions that fail
         ``Plan.validate(for_revision=True, prior=...)``. Default
@@ -289,6 +315,7 @@ class Runner:
         planner_gate: Any = "auto",
         drift_self_reporting: bool | list[str] = False,
         fail_fast_on_revision_rejection: bool | None = None,
+        observation_only: bool | None = None,
         **legacy_kwargs: Any,
     ) -> None:
         # Stamp the running build's identity at construction so logs
@@ -314,7 +341,32 @@ class Runner:
         self.planner = planner
         self.executor = executor
         self.goal_deriver: GoalDeriver = goal_deriver or PassthroughGoalDeriver("run")
-        self.steerer: Steerer = steerer or DefaultSteerer()
+        # goldfive#254 — observation_only governs the default Steerer
+        # constructed below. ``None`` defers to the steerer's own
+        # default resolution (production default ``True``, test override
+        # via :mod:`tests.conftest`). When the caller supplies their
+        # own Steerer we DO NOT silently overwrite its flag — log at
+        # INFO so the mismatch is visible. See the constructor
+        # docstring for the full contract.
+        self.observation_only: bool | None = (
+            None if observation_only is None else bool(observation_only)
+        )
+        if steerer is None:
+            self.steerer: Steerer = DefaultSteerer(observation_only=observation_only)
+        else:
+            self.steerer = steerer
+            if observation_only is not None:
+                steerer_obs = getattr(steerer, "observation_only", None)
+                if steerer_obs is not None and bool(steerer_obs) != bool(observation_only):
+                    log.info(
+                        "Runner: observation_only=%s on the Runner does NOT "
+                        "override the pre-built steerer's "
+                        "observation_only=%s; the steerer's flag wins. "
+                        "Construct the steerer with the matching flag if you "
+                        "want the Runner's parameter to apply.",
+                        bool(observation_only),
+                        bool(steerer_obs),
+                    )
         # goldfive#143: opt-in gate for the trajectory-level GOAL_DRIFT
         # periodic check. ``True`` (default) is a no-op -- the steerer's
         # own ``goal_drift_call_llm`` wiring governs whether the check

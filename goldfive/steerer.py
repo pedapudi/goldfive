@@ -360,6 +360,28 @@ def _planner_refine_accepts_available_agents(planner: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# goldfive#254 — suite-level override for the ``observation_only`` default.
+# Production callers passing no explicit value get ``True`` (the user-facing
+# default per the brief). The autouse fixture in :mod:`tests.conftest` flips
+# this to ``False`` so the existing test suite — written against the active-
+# steering pre-#254 behaviour — does not need a sweeping rewrite. Tests that
+# exercise the observation-only path explicitly pass ``observation_only=True``
+# to their :class:`DefaultSteerer` / :class:`Runner` / :func:`goldfive.wrap`
+# call sites; the autouse override only governs the unspecified default.
+_test_default_observation_only: bool | None = None
+
+
+def _default_observation_only() -> bool:
+    """Resolve the default value for ``DefaultSteerer.observation_only``.
+
+    Returns the suite-level override when set (tests), else ``True``
+    (the production default per goldfive#254). Never raises.
+    """
+    if _test_default_observation_only is not None:
+        return bool(_test_default_observation_only)
+    return True
+
+
 class DefaultSteerer:
     """The canonical :class:`Steerer` implementation.
 
@@ -390,6 +412,7 @@ class DefaultSteerer:
         steering_config: SteeringConfig | None = None,
         goldfive_steer_threshold: str | None = None,
         goldfive_steer_suppression_window_turns: int | None = None,
+        observation_only: bool | None = None,
     ) -> None:
         """Build a steerer.
 
@@ -488,6 +511,36 @@ class DefaultSteerer:
             default) fires on the 1st, 4th, 7th ... per task. The
             first thinking message of every task always gets a judge
             call; counters reset on task transition.
+        observation_only:
+            **Default ``True`` (goldfive#254 — user-facing behaviour
+            change).** When ``True`` the steerer runs every detector
+            and every ``planner.refine`` / ``refine_steer`` call
+            normally so operators see the full set of would-have-
+            steered signals, but the three injection sites are
+            suppressed:
+
+            * The would-be revised plan is NOT written onto
+              ``session.plan`` (``_apply_revision`` short-circuits and
+              ``last_addressed_revision_by_drift_key`` stays unstamped
+              so dry-runs don't dampen subsequent real detection).
+            * No ``GOLDFIVE_STEER`` ControlMessage is enqueued onto
+              the bound control channel — the coordinator does not
+              receive a framed corrective.
+            * :meth:`request_invocation_cancel` returns the empty
+              list without writing to the cancel registry — the
+              in-flight invocation runs to completion.
+
+            ``PlanRevised`` events are STILL emitted (with the new
+            ``dry_run=True`` proto flag) so sinks render a "would
+            have applied" preview. ``DriftDetected`` is also still
+            emitted — operators must see that goldfive saw the drift.
+            Pass ``observation_only=False`` to opt back into active
+            steering (the pre-#254 default). Pass ``None`` to inherit
+            the suite-level test override (see
+            :mod:`tests.conftest`).
+
+            See ``docs/design/OBSERVATION-ONLY.md`` for the rationale
+            and the dry-run sink-event semantics.
 
         See ``docs/design/DRIFT.md`` §"Reflective self-progress check"
         for the full feature-gate semantics. The GOAL_DRIFT check
@@ -658,6 +711,18 @@ class DefaultSteerer:
         # a consistent plan call :meth:`_wait_plan_stable` to acquire +
         # immediately release the lock. Keyed by ``session.id``.
         self._plan_locks: dict[str, asyncio.Lock] = {}
+        # goldfive#254 — observation-only mode (default ON). When True,
+        # detection + refine still run, but the three injection sites
+        # (plan mutation, GOLDFIVE_STEER ControlMessage, cooperative
+        # cancel) are suppressed. ``observation_only=None`` here means
+        # "no explicit caller intent" — consult the suite-level test
+        # override (defaults to True in production, set to False by the
+        # autouse fixture in :mod:`tests.conftest`). The explicit-True /
+        # explicit-False contract is preserved through this branch.
+        if observation_only is None:
+            self._observation_only: bool = bool(_default_observation_only())
+        else:
+            self._observation_only = bool(observation_only)
 
     # ------------------------------------------------------------------
     # Protocol-required: wiring
@@ -716,6 +781,32 @@ class DefaultSteerer:
         unrelated run.
         """
         self._control_channel = channel
+
+    @property
+    def observation_only(self) -> bool:
+        """Whether this steerer is in observation-only mode (goldfive#254).
+
+        Read-only. The value is captured once at construction and
+        consulted at every injection chokepoint via
+        :meth:`_should_inject`. See the constructor docstring for the
+        full semantics.
+        """
+        return self._observation_only
+
+    def _should_inject(self) -> bool:
+        """Single source of truth for "should goldfive actually steer?" (goldfive#254).
+
+        Returns ``True`` when the steerer is in active-steering mode (the
+        pre-#254 default), ``False`` when in observation-only mode.
+        The three injection chokepoints — :meth:`_apply_revision` (plan
+        mutation), :meth:`_dispatch_goldfive_steer_control` (control
+        message), :meth:`request_invocation_cancel` (cancel registry) —
+        all consult this helper before performing their side effect.
+        Detection + ``DriftDetected`` emission + the ``planner.refine`` /
+        ``refine_steer`` call + ``PlanRevised`` emission (with
+        ``dry_run=True``) remain unaffected.
+        """
+        return not self._observation_only
 
     async def _dispatch_goldfive_control(
         self, msg: Any
@@ -3936,6 +4027,25 @@ class DefaultSteerer:
                 "replacement_task_ids": replacement_ids,
             },
         )
+        # goldfive#254 — observation-only gate. The corrective body is
+        # composed and the payload is fully assembled so operators can
+        # see (at INFO) what would have been dispatched, but the actual
+        # ``channel.send`` is suppressed: the coordinator never receives
+        # the framed ``[GOLDFIVE STEERING CONTROL …]`` message.
+        if not self._should_inject():
+            log.info(
+                "DefaultSteerer._dispatch_goldfive_steer_control: "
+                "observation_only — would have dispatched "
+                "GOLDFIVE_STEER kind=%s task=%s drift_id=%s body=%r "
+                "superseded=%s replacement=%s",
+                drift.kind.value,
+                drift.current_task_id or "-",
+                str(getattr(drift, "id", "") or "")[:16],
+                (body or "")[:200],
+                superseded_ids,
+                replacement_ids,
+            )
+            return False
         landed = await self._dispatch_goldfive_control(msg)
         log.debug(
             "DefaultSteerer._dispatch_goldfive_steer_control: "
@@ -3974,6 +4084,23 @@ class DefaultSteerer:
                 "drift_kind": drift.kind.value,
             },
         )
+        # goldfive#254 — observation-only gate. Pause-escalate is the
+        # peer injection point of GOLDFIVE_STEER on the same control
+        # channel; suppress it under the same passive-observer
+        # semantics. Log the would-have-paused payload at INFO so
+        # operators see the signal.
+        if not self._should_inject():
+            log.info(
+                "DefaultSteerer._dispatch_goldfive_pause_control: "
+                "observation_only — would have dispatched "
+                "GOLDFIVE_PAUSE_ESCALATE drift_kind=%s task=%s "
+                "drift_id=%s reason=%r",
+                drift.kind.value,
+                drift.current_task_id or "-",
+                str(getattr(drift, "id", "") or "")[:16],
+                (reason or "")[:200],
+            )
+            return False
         landed = await self._dispatch_goldfive_control(msg)
         log.debug(
             "DefaultSteerer._dispatch_goldfive_pause_control: "
@@ -4343,6 +4470,27 @@ class DefaultSteerer:
           to the kwarg-less call so older third-party plugins don't
           break — the task-cancel step is silently skipped.
         """
+        # goldfive#254 — observation-only gate. Skip BOTH the
+        # cancel-pending registry write AND the plugin's
+        # request_invocation_cancel side effect. Logs at INFO with the
+        # resolved drift kind / severity so operators see what would
+        # have been cancelled. The downstream guard at
+        # :meth:`_is_late_drift_for_terminated_invocation` consults
+        # :meth:`OrchestrationStore.cancel_requested_invocation_ids` —
+        # leaving that empty in observation-only mode is the correct
+        # semantics for a passive observer (no in-flight invocation is
+        # actually being preempted).
+        if not self._should_inject():
+            log.info(
+                "DefaultSteerer.request_invocation_cancel: "
+                "observation_only — skipping cancel for drift kind=%s "
+                "severity=%s agent=%s task=%s",
+                drift.kind.value,
+                drift.severity.value,
+                drift.current_agent_id or "-",
+                drift.current_task_id or "-",
+            )
+            return []
         adapter = self._adapter
         if adapter is None:
             return []
@@ -6173,8 +6321,7 @@ class DefaultSteerer:
         )
         return dataclasses.replace(revised, tasks=tuple(new_tasks))
 
-    @staticmethod
-    def _apply_revision(session: Session, revised: Plan, drift: DriftEvent) -> Plan:
+    def _apply_revision(self, session: Session, revised: Plan, drift: DriftEvent) -> Plan:
         """Stamp revision metadata and install ``revised`` on the session.
 
         Preserves the existing ``revision_index`` monotonicity: the new
@@ -6250,6 +6397,25 @@ class DefaultSteerer:
             int(revised.revision_index),
             drift.kind.value,
         )
+        # goldfive#254 — observation-only gate. The revision is fully
+        # constructed (stamped revision_index / kind / severity /
+        # trigger_event_id) so :meth:`_emit_plan_revised` can render the
+        # would-have-applied preview to sinks, but the in-place mutation
+        # of ``session.plan`` is skipped. The per-(kind, target)
+        # addressed watermark and the orchestration-state current-plan
+        # refresh are ALSO skipped: a dry-run must not dampen subsequent
+        # real detection on the same condition (the brief, §2 last
+        # bullet under "Plan mutation").
+        if not self._should_inject():
+            log.info(
+                "DefaultSteerer._apply_revision: observation_only — "
+                "skipping in-place plan mutation (would have installed "
+                "plan_id=%s revision_index=%d kind=%s)",
+                (revised.id or "")[:16] or "<empty>",
+                int(revised.revision_index),
+                drift.kind.value,
+            )
+            return revised
         with channel_processor_active():
             set_session_plan(session, revised)
         # goldfive#245 follow-up — stamp the per-(kind, target) addressed
@@ -7204,56 +7370,65 @@ class DefaultSteerer:
         # handlers.
         lock = self._get_plan_lock(session)
         async with lock:
-            # goldfive#251: integrate CORRECT-kind supersedes links into
-            # the DAG. The old task stays in the plan as a historical
-            # COMPLETED node; the new correction-task is inserted as a
-            # child with an edge old -> new, and any downstream edges of
-            # the old task are rewritten so work flows through the
-            # correction. No-op for REPLACE-kind (existing behaviour is
-            # preserved) and for plans without supersedes.
-            # goldfive#247: returns a NEW Plan (Plan is frozen). The
-            # pre-frozen code mutated ``revised`` in place; with frozen
-            # types, we swap the new variant onto ``session.plan`` so
-            # the live pointer matches the rewired DAG that's about to
-            # be emitted as PlanRevised.
-            integrated = self._integrate_correction_supersedes(revised)
-            if integrated is not revised:
-                revised = integrated
-                with channel_processor_active():
-                    set_session_plan(session, revised)
+            # goldfive#254 — observation-only mode skips every session-
+            # mutating side effect (correction integration, correction
+            # queueing, pin repointing) so the steerer behaves as a
+            # passive observer. ``revised`` is the as-built revision the
+            # planner returned; we emit it on the sink with
+            # ``dry_run=True`` so harmonograf can render it as a
+            # preview, but the live session is unchanged.
+            mutate_session = self._should_inject()
+            if mutate_session:
+                # goldfive#251: integrate CORRECT-kind supersedes links into
+                # the DAG. The old task stays in the plan as a historical
+                # COMPLETED node; the new correction-task is inserted as a
+                # child with an edge old -> new, and any downstream edges of
+                # the old task are rewritten so work flows through the
+                # correction. No-op for REPLACE-kind (existing behaviour is
+                # preserved) and for plans without supersedes.
+                # goldfive#247: returns a NEW Plan (Plan is frozen). The
+                # pre-frozen code mutated ``revised`` in place; with frozen
+                # types, we swap the new variant onto ``session.plan`` so
+                # the live pointer matches the rewired DAG that's about to
+                # be emitted as PlanRevised.
+                integrated = self._integrate_correction_supersedes(revised)
+                if integrated is not revised:
+                    revised = integrated
+                    with channel_processor_active():
+                        set_session_plan(session, revised)
 
-            # goldfive#251 Stream D: GC corrections for tasks superseded by
-            # this revision BEFORE queuing new ones. A task whose correction
-            # is about to be obsoleted (because the new revision supersedes
-            # the correction task itself) must have its stale correction
-            # dropped. Runs first so a same-revision CORRECT->CORRECT chain
-            # (T -> T' -> T'') doesn't race: the T correction is cleared
-            # here, then T''s correction is written below.
-            clear_obsolete_corrections_on_revision(session, revised)
+                # goldfive#251 Stream D: GC corrections for tasks superseded by
+                # this revision BEFORE queuing new ones. A task whose correction
+                # is about to be obsoleted (because the new revision supersedes
+                # the correction task itself) must have its stale correction
+                # dropped. Runs first so a same-revision CORRECT->CORRECT chain
+                # (T -> T' -> T'') doesn't race: the T correction is cleared
+                # here, then T''s correction is written below.
+                clear_obsolete_corrections_on_revision(session, revised)
 
-            # goldfive#251 Stream D: for every NEW task with supersedes_kind
-            # == CORRECT, stamp a structured correction dict on the
-            # orchestration session state under
-            # ``goldfive.pending_corrections.<agent_name>.<task_id>``. The
-            # dynamic instruction resolver (Stream B) reads this on the next
-            # turn and appends a directive-style correction block to the
-            # agent's system prompt. No-op on refines with no CORRECT links.
-            queue_corrections_for_revision(
-                session=session,
-                revised=revised,
-                prev_plan=prev_plan,
-                drift=drift,
-            )
+                # goldfive#251 Stream D: for every NEW task with supersedes_kind
+                # == CORRECT, stamp a structured correction dict on the
+                # orchestration session state under
+                # ``goldfive.pending_corrections.<agent_name>.<task_id>``. The
+                # dynamic instruction resolver (Stream B) reads this on the next
+                # turn and appends a directive-style correction block to the
+                # agent's system prompt. No-op on refines with no CORRECT links.
+                queue_corrections_for_revision(
+                    session=session,
+                    revised=revised,
+                    prev_plan=prev_plan,
+                    drift=drift,
+                )
 
-            # goldfive#237: re-pin ``current_task_id`` onto any replacement
-            # task the revision introduces. Without this, agents keep
-            # reporting on the superseded (FAILED/CANCELLED) task and the
-            # replacement stays PENDING despite active work — the contradiction
-            # live sessions surfaced. Done before the event is emitted so
-            # downstream observers see the revised pin consistently with the
-            # revised plan. Additive: when no task has ``supersedes`` set,
-            # nothing changes.
-            self._repin_current_task_on_supersedes(session, revised)
+                # goldfive#237: re-pin ``current_task_id`` onto any replacement
+                # task the revision introduces. Without this, agents keep
+                # reporting on the superseded (FAILED/CANCELLED) task and the
+                # replacement stays PENDING despite active work — the contradiction
+                # live sessions surfaced. Done before the event is emitted so
+                # downstream observers see the revised pin consistently with the
+                # revised plan. Additive: when no task has ``supersedes`` set,
+                # nothing changes.
+                self._repin_current_task_on_supersedes(session, revised)
 
             evt = self._new_envelope(session)
             evt.plan_revised.plan.CopyFrom(to_pb_plan(revised))
@@ -7289,6 +7464,15 @@ class DefaultSteerer:
             )
             evt.plan_revised.refine_output_summary = self._build_refine_output_summary(revised)
             evt.plan_revised.target_agent_id = drift.current_agent_id or ""
+            # goldfive#254 — stamp ``dry_run`` so sinks (harmonograf) can
+            # render observation-only previews differently from live
+            # revisions. The proto default is ``false``; we only set
+            # ``true`` when the steerer is in observation-only mode.
+            # When the dry-run framing applies, ``session.plan`` was
+            # NOT mutated by :meth:`_apply_revision` — the ``plan``
+            # field on this envelope is the would-have-applied revision.
+            if self._observation_only:
+                evt.plan_revised.dry_run = True
             # Phase 2.X / goldfive#271 Gap 2: log the emission so a
             # raise-mid-fire scenario (proto build OK, sink emit raises)
             # leaves a goldfive-side trace before the harmonograf side
@@ -7333,7 +7517,12 @@ class DefaultSteerer:
             # consumer that processes events strictly in order sees the
             # plan flip first, then the per-task status changes that flow
             # from it.
-            await self._emit_plan_revision_transitions(session, prev_plan, revised)
+            #
+            # goldfive#254 — skip in observation-only mode. The plan was
+            # NOT installed, so no actual status changes happened;
+            # emitting TaskTransitioned rows would be a fiction.
+            if mutate_session:
+                await self._emit_plan_revision_transitions(session, prev_plan, revised)
             # goldfive a4: paired correlation envelope. The proto
             # ``PlanRevised`` carries no ``attempt_id`` field today; emit
             # a sidecar dict event so consumers can pair this success

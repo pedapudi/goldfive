@@ -880,7 +880,7 @@ async def test_apply_revision_stamps_trigger_event_id_from_annotation(
     )
     # goldfive#247: _apply_revision returns the stamped Plan; the
     # input Plan stays unchanged (frozen).
-    revised = DefaultSteerer._apply_revision(session, revised, drift)
+    revised = DefaultSteerer(observation_only=False)._apply_revision(session, revised, drift)
 
     assert session.plan is not None and session.plan.id == revised.id
     assert revised.revision_trigger_event_id == "ann_ar_77"
@@ -915,7 +915,7 @@ async def test_apply_revision_stamps_drift_id_on_autonomous_drift(
     )
     # goldfive#247: _apply_revision returns the stamped Plan; the input
     # stays unchanged (frozen).
-    revised = DefaultSteerer._apply_revision(session, revised, drift)
+    revised = DefaultSteerer(observation_only=False)._apply_revision(session, revised, drift)
     assert revised.revision_trigger_event_id == drift.id
 
 
@@ -945,7 +945,7 @@ async def test_apply_revision_preserves_prestamped_trigger_event_id() -> None:
         edges=[],
         revision_trigger_event_id="ann_prestamped",
     )
-    DefaultSteerer._apply_revision(session, revised, drift)
+    DefaultSteerer(observation_only=False)._apply_revision(session, revised, drift)
     assert revised.revision_trigger_event_id == "ann_prestamped"
 
 

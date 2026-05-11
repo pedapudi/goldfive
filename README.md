@@ -169,6 +169,7 @@ both `wrap` and `run`:
 | `max_task_invocations=` | `None` (unbounded) | Cap on adapter invocations per run |
 | `plugins=` | `None` | List of ADK `BasePlugin` instances installed on the runner |
 | `control=` | `None` | `ControlChannel` for live PAUSE / STEER / CANCEL / etc. |
+| `observation_only=` | `True` (#254) | Detection + refine still run + sinks see `PlanRevised` with `dry_run=true`, but goldfive does NOT mutate `session.plan`, dispatch `GOLDFIVE_STEER`, or cancel the in-flight invocation. Pass `False` to opt into active steering — see [`docs/design/OBSERVATION-ONLY.md`](docs/design/OBSERVATION-ONLY.md). |
 
 `goldfive.wrap(any_adk_tree)` works regardless of tree shape — single
 agent, coordinator with `AgentTool`-wrapped specialists, deep

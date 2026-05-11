@@ -238,8 +238,13 @@ def reconstruct_session(events: list[Any]) -> Any:
             with channel_processor_active():
                 set_session_plan(session, from_pb_plan(evt.plan_submitted.plan))
         elif payload == "plan_revised":
-            with channel_processor_active():
-                set_session_plan(session, from_pb_plan(evt.plan_revised.plan))
+            # goldfive#254 — a dry-run PlanRevised is a "would have
+            # applied" preview, not an actual revision. Skip it during
+            # replay so the reconstructed session matches what live
+            # observation-only consumers see (no plan mutation).
+            if not evt.plan_revised.dry_run:
+                with channel_processor_active():
+                    set_session_plan(session, from_pb_plan(evt.plan_revised.plan))
         elif payload == "task_started":
             ts = evt.task_started
             session.current_task_id = ts.task_id

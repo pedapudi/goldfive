@@ -622,7 +622,7 @@ async def test_apply_revision_stamps_per_key_watermark() -> None:
         revision_index=3,
     )
 
-    DefaultSteerer._apply_revision(session, revised, drift)
+    DefaultSteerer(observation_only=False)._apply_revision(session, revised, drift)
 
     key = (DriftKind.OFF_TOPIC.value, "t-draft")
     assert key in session.last_addressed_revision_by_drift_key, (
@@ -657,7 +657,7 @@ async def test_apply_revision_does_not_stamp_for_user_authored_drifts() -> None:
         revision_index=3,
     )
 
-    DefaultSteerer._apply_revision(session, revised, drift)
+    DefaultSteerer(observation_only=False)._apply_revision(session, revised, drift)
 
     key = (DriftKind.USER_STEER.value, "t-draft")
     assert key not in session.last_addressed_revision_by_drift_key, (
