@@ -921,3 +921,196 @@ async def test_goldfive_corrective_drift_lands_with_observation_only_false() -> 
         "dry_run must be False on a real revision so consumers don't "
         "treat it as a preview"
     )
+
+
+# ---------------------------------------------------------------------------
+# goldfive#258 carve-out: NEW_WORK_DISCOVERED revisions always land
+# ---------------------------------------------------------------------------
+
+
+async def test_discovery_revision_lands_under_observation_only() -> None:
+    """goldfive#258: a goldfive-authored ``NEW_WORK_DISCOVERED`` drift on
+    an already-bootstrapped session must land as a real revision under
+    ``observation_only=True``.
+
+    Discovery represents observed/described work (the planner integrated
+    new work from the user's next-turn message; a sub-agent reported
+    new work via ``report_new_work_discovered``) — NOT a framework-driven
+    correction. The pre-#258 gate fired here because ``prev`` is non-None
+    (an existing plan is on the session) and ``authored_by`` is
+    ``"goldfive"``, leaving the discovery as a dry-run preview.
+    """
+    cfg = SteeringConfig(observation_only=True)
+    steerer = DefaultSteerer(steering_config=cfg)
+    session = _make_session()
+    prior_plan = session.plan
+    assert prior_plan is not None
+    sink = ListSink()
+    planner = RecordingPlanner()
+    control = RecordingControlChannel()
+    adapter = RecordingAdapter()
+    steerer.bind(sinks=[sink], planner=planner)
+    steerer.bind_control_channel(control)
+    steerer.bind_adapter(adapter)
+
+    # Build a structurally-distinct revised plan so the no-op revision
+    # rejection in ``_install_with_drift`` doesn't short-circuit before
+    # the gate decision.
+    revised = _revised_plan(prior_plan)
+    drift = DriftEvent(
+        kind=DriftKind.NEW_WORK_DISCOVERED,
+        severity=DriftSeverity.INFO,
+        detail="planner integrated new work from the user's next turn",
+        authored_by="goldfive",
+    )
+
+    installed = await steerer.install_revision_for_drift(
+        session=session,
+        drift=drift,
+        revised_plan=revised,
+    )
+    assert installed is True, "discovery revision must install"
+
+    # session.plan WAS mutated to the revised plan.
+    assert session.plan is not prior_plan, (
+        "NEW_WORK_DISCOVERED revision must land session.plan even under "
+        "observation_only=True — discovery is a description of observed "
+        "work, not a corrective intervention. goldfive#258 carve-out."
+    )
+    assert session.plan is not None and session.plan.id == revised.id
+
+    # PlanRevised emitted with dry_run=False (real revision, not preview).
+    revised_events = _plan_revised_events(sink)
+    assert len(revised_events) == 1
+    assert revised_events[0].plan_revised.dry_run is False, (
+        "dry_run must be False for a NEW_WORK_DISCOVERED revision under "
+        "observation_only — discovery is authoritative, not a preview"
+    )
+
+
+async def test_discovery_revision_lands_under_observation_only_initial_plan_seed() -> (
+    None
+):
+    """goldfive#258 live-bug path: turn-1 ``install_initial_plan`` with a
+    pre-seeded ``Plan.empty()`` must still land under observation_only.
+
+    The runner seeds ``session.plan = Plan.empty(run_id=...)`` before
+    :meth:`Planner.handle_turn` runs (so the planner always sees a
+    non-None ``session.plan``). By the time
+    :meth:`install_initial_plan`'s placeholder
+    ``NEW_WORK_DISCOVERED`` drift reaches ``_apply_revision``, ``prev``
+    is that empty seed — **not** ``None`` — so the original #255
+    ``prev is None`` carve-out did NOT match.
+
+    Pre-#258 reproduction (live session ``793ef00b``, gemma-4-26B):
+
+        DefaultSteerer._apply_revision: observation_only=True —
+        SKIPPING plan install (gate_active; bootstrap=False user=False).
+        ... revision_index=1 drift_kind=new_work_discovered
+
+    The fresh discovery drift on revision 1 was rendered as a dry-run,
+    leaving ``session.plan`` permanently the empty seed. This test is
+    the regression guard.
+    """
+    from goldfive.types import channel_processor_active, set_session_plan
+
+    cfg = SteeringConfig(observation_only=True)
+    steerer = DefaultSteerer(steering_config=cfg)
+
+    # Build the live runner's turn-1 state: session.plan is the
+    # ``Plan.empty()`` seed (non-None, but tasks empty + revision_index 0).
+    session = Session(
+        run_id="r-seed",
+        goals=[Goal(id="g1", summary="Publish a memo on solar panels")],
+        plan=None,
+        current_task_id="",
+    )
+    with channel_processor_active():
+        set_session_plan(session, Plan.empty(run_id="r-seed"))
+    seed = session.plan
+    assert seed is not None, "Plan.empty() seed should populate session.plan"
+    assert seed.tasks == (), "empty seed must have no tasks"
+
+    sink = ListSink()
+    planner = RecordingPlanner()
+    steerer.bind(sinks=[sink], planner=planner)
+
+    # The runner builds a real plan via Planner.handle_turn then routes
+    # through install_initial_plan with first_turn=True (because
+    # session.plan.tasks is empty). install_initial_plan synthesises a
+    # NEW_WORK_DISCOVERED placeholder for _apply_revision metadata
+    # stamping — the same placeholder that fires in the live bug.
+    initial = Plan(
+        id="p-initial",
+        run_id="r-seed",
+        goal_ids=["g1"],
+        tasks=[Task(id="t1", title="Research solar panels")],
+        edges=[],
+    )
+    installed = await steerer.install_initial_plan(session=session, plan=initial)
+    assert installed is True, "initial plan install must succeed"
+
+    # session.plan was swapped from the empty seed onto the real plan.
+    assert session.plan is not seed, (
+        "install_initial_plan must swap the empty seed for the real plan "
+        "even under observation_only — goldfive#258 regression guard"
+    )
+    assert session.plan is not None and session.plan.id == initial.id
+    assert session.plan.tasks, (
+        "post-install session.plan must carry the planner-authored tasks; "
+        "the empty seed leaking past the install is the goldfive#258 bug"
+    )
+
+    # PlanRevised emitted with dry_run=False — the install is
+    # authoritative, not a preview.
+    revised_events = _plan_revised_events(sink)
+    assert len(revised_events) == 1
+    assert revised_events[0].plan_revised.dry_run is False, (
+        "dry_run must be False on the turn-1 install under observation_only "
+        "— the empty-seed -> real-plan transition is a discovery, not a "
+        "corrective intervention. goldfive#258."
+    )
+
+
+async def test_discovery_via_install_revision_for_drift_under_observation_only() -> None:
+    """goldfive#258: turn N+1 replan path with ``NEW_WORK_DISCOVERED``.
+
+    Mirrors the runner's :meth:`Runner._install_revision` non-first-turn
+    branch (``runner.py`` ≈ line 1681): the user's fresh message caused
+    ``Planner.handle_turn`` to surface new work, and the runner installs
+    via ``install_revision_for_drift`` with
+    ``DriftKind.NEW_WORK_DISCOVERED, authored_by="goldfive"``. Under
+    observation_only this must still produce a real revision — the
+    discovery is a description of observed work, not a correction.
+    """
+    cfg = SteeringConfig(observation_only=True)
+    steerer = DefaultSteerer(steering_config=cfg)
+    session = _make_session()
+    prior_plan = session.plan
+    assert prior_plan is not None
+    sink = ListSink()
+    planner = RecordingPlanner()
+    steerer.bind(sinks=[sink], planner=planner)
+
+    revised = _revised_plan(prior_plan)
+    drift = DriftEvent(
+        kind=DriftKind.NEW_WORK_DISCOVERED,
+        severity=DriftSeverity.INFO,
+        detail="the user asked a follow-up that surfaced new work",
+        authored_by="goldfive",
+    )
+    installed = await steerer.install_revision_for_drift(
+        session=session,
+        drift=drift,
+        revised_plan=revised,
+    )
+    assert installed is True
+
+    # session.plan was mutated.
+    assert session.plan is not prior_plan
+    assert session.plan is not None and session.plan.id == revised.id
+
+    # dry_run False on the emitted PlanRevised — the install is real.
+    revised_events = _plan_revised_events(sink)
+    assert len(revised_events) == 1
+    assert revised_events[0].plan_revised.dry_run is False

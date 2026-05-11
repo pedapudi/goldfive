@@ -6304,19 +6304,42 @@ class DefaultSteerer:
         Preserves the existing ``revision_index`` monotonicity: the new
         plan's index is at least ``old.revision_index + 1``.
 
-        Observation-only mode (goldfive#254 / goldfive#255): when
+        Observation-only mode (goldfive#254 / #255 / #258): when
         ``observation_only`` is set the gate suppresses **only**
-        goldfive-authored corrective drifts. The brief carve-outs:
+        goldfive-authored **corrective** drifts (``OFF_TOPIC``,
+        ``GOAL_DRIFT``, ``LOOPING_*``, ``TASK_FAILED_*``, ``BLOCKED``,
+        ``CAPABILITY_MISMATCH``, etc.). The carve-outs land as **real**
+        revisions even under ``observation_only=True``:
 
-        * **bootstrap** (``prev is None``) — the very first install of
-          a session's plan is structural, not a corrective intervention.
-          Without this carve-out the gate would leave ``session.plan``
-          permanently ``None`` in observation mode and detectors would
-          collapse (goldfive#255 root cause: harmonograf showed an empty
-          DAG because the bootstrap was rendered as dry-run).
+        * **bootstrap** (``prev is None``) — a cold start with no prior
+          plan on the session. Structural, not corrective.
         * **user-authored** (``drift.authored_by == "user"``) — genuine
           operator STEER ``ControlMessage`` deliveries always land. The
           operator has the authority to override observation mode.
+        * **discovery** (``drift.kind is DriftKind.NEW_WORK_DISCOVERED``,
+          goldfive#258) — a description of work the planner or a
+          sub-agent reported / discovered, not a framework-driven
+          correction. This covers two paths the ``prev is None``
+          bootstrap predicate missed:
+
+          - The runner's turn-1 install through
+            :meth:`install_initial_plan`: the runner seeds
+            ``session.plan = Plan.empty(run_id=...)`` before
+            :meth:`Planner.handle_turn` runs, so by the time the
+            placeholder ``NEW_WORK_DISCOVERED`` drift reaches
+            ``_apply_revision`` ``prev`` is the empty seed (non-None).
+          - The runner's turn N+1 replan through
+            :meth:`install_revision_for_drift` with a
+            ``NEW_WORK_DISCOVERED`` drift: the planner integrated new
+            work from the user's fresh message. This is a description
+            of what happened, not a corrective intervention.
+
+          Sub-agent ``report_new_work_discovered`` calls fold into the
+          same kind for the same reason.
+
+        observation-only is about suppressing framework-driven
+        **corrections** — not framework-driven **observability** of
+        what the planner / agents are doing.
 
         When the gate fires, the revision metadata is STILL stamped (so
         the returned Plan accurately reflects the index/kind/severity
@@ -6391,28 +6414,40 @@ class DefaultSteerer:
             revision_reason=new_reason,
             revision_trigger_event_id=new_trigger_id,
         )
-        # goldfive#255: refine the observation-only gate so it captures
-        # ONLY goldfive-authored corrective drifts on an already-bootstrapped
-        # session. ``gate_active`` is True iff this specific revision is
-        # being suppressed; the bootstrap (``prev is None``) and user-
-        # authored (``drift.authored_by == "user"``) carve-outs are named
-        # explicitly so a future reader can grep for the reasons the gate
-        # does NOT fire.
+        # goldfive#255 / #258: refine the observation-only gate so it
+        # captures ONLY goldfive-authored corrective drifts. The three
+        # carve-outs — bootstrap, user-authored, and discovery — are
+        # named explicitly so a future reader can grep for the reasons
+        # the gate does NOT fire:
+        #
+        # * bootstrap (``prev is None``) — cold session.
+        # * user-authored (``drift.authored_by == "user"``) — operator
+        #   STEER deliveries.
+        # * discovery (``drift.kind is DriftKind.NEW_WORK_DISCOVERED``,
+        #   #258) — the planner / a sub-agent describing new work, not
+        #   a framework-driven correction. Covers both turn-1 installs
+        #   through ``install_initial_plan`` (where ``prev`` is the
+        #   ``Plan.empty()`` seed, NOT None) and turn N+1 replans
+        #   through ``install_revision_for_drift``.
         is_bootstrap = prev is None
         is_user_authored = (drift.authored_by or "").lower() == "user"
+        is_discovery = drift.kind is DriftKind.NEW_WORK_DISCOVERED
         gate_active = (
             (not is_bootstrap)
             and (not is_user_authored)
+            and (not is_discovery)
             and (not self._should_inject())
         )
         if gate_active:
             log.info(
                 "DefaultSteerer._apply_revision: observation_only=True — "
-                "SKIPPING plan install (gate_active; bootstrap=%s user=%s). "
-                "prior_plan_id=%s would_have_installed_plan_id=%s "
-                "revision_index=%d drift_kind=%s",
+                "SKIPPING plan install (gate_active; bootstrap=%s user=%s "
+                "discovery=%s). prior_plan_id=%s "
+                "would_have_installed_plan_id=%s revision_index=%d "
+                "drift_kind=%s",
                 is_bootstrap,
                 is_user_authored,
+                is_discovery,
                 prior_id[:16] or "<none>",
                 (revised.id or "")[:16] or "<empty>",
                 int(revised.revision_index),
