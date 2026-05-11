@@ -1805,8 +1805,75 @@ def _inject_runtime_tools_hint(
 #: multi-step research synthesis). The watcher's job is catching wedged
 #: invocations, not enforcing latency SLOs — operators who want a
 #: tighter SLO pass an explicit ``llm_call_timeout_ms`` to
-#: :func:`make_adk_plugin`.
+#: :func:`make_adk_plugin` (the :class:`~goldfive.config.AgentConfig`
+#: surface introduced in goldfive#256 routes a much tighter default —
+#: 120s — through :func:`goldfive.wrap`).
 DEFAULT_LLM_CALL_TIMEOUT_MS: int = 1_800_000
+
+
+#: Default per-ADK-sub-agent ``max_output_tokens`` ceiling enforced by
+#: :class:`_GoldfiveADKPlugin` (goldfive#256). When a sub-agent's
+#: ``llm_request.config.max_output_tokens`` is unset, OR is greater
+#: than this value, the plugin RATCHETS IT DOWN to this ceiling. When
+#: the sub-agent (or ADK's defaults) already supplied a smaller cap,
+#: the smaller value wins — this is a structural CEILING, not an
+#: override. Set to ``0`` (or any negative int) to disable the
+#: ratcheting entirely (the plugin then leaves ``max_output_tokens``
+#: untouched, which is the pre-#256 behaviour). Default 16384 matches
+#: :attr:`goldfive.planner.LLMPlanner.MAX_OUTPUT_TOKENS` — the same
+#: budget the planner uses for refine-shaped completions. Operators
+#: tune via the typed :class:`~goldfive.config.AgentConfig`
+#: (``RuntimeConfig(agent=AgentConfig(max_output_tokens=...))``) or
+#: the env var ``GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS``.
+DEFAULT_AGENT_MAX_OUTPUT_TOKENS: int = 16384
+
+
+def _apply_agent_max_output_tokens_cap(llm_request: Any, ceiling: int) -> tuple[int, int]:
+    """Ratchet ``llm_request.config.max_output_tokens`` down to ``ceiling`` (goldfive#256).
+
+    Smaller-wins semantics: when ``config.max_output_tokens`` is already
+    set to a value smaller than ``ceiling`` we leave it alone — the
+    sub-agent / ADK chose a tighter cap and goldfive only ratchets DOWN.
+    When the existing value is missing, zero, negative, or larger than
+    ``ceiling``, we write ``ceiling``.
+
+    ``ceiling <= 0`` is the operator opt-out: the function returns
+    ``(0, 0)`` and leaves ``llm_request`` untouched (the same shape as
+    setting ``GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS`` to a non-positive int).
+
+    Returns ``(previous_value, applied_value)`` where ``previous_value``
+    is what the request carried on entry (``0`` for "missing / unset")
+    and ``applied_value`` is what it carries on exit. Useful for tests
+    and the diagnostic INFO log the caller emits.
+
+    Best-effort: any failure reading or writing ``llm_request.config``
+    is swallowed at DEBUG so a future ADK schema change can't crash the
+    callback. The cap is a structural safety net, not a hard invariant
+    — the watcher and the planner cap still bound runaway calls when
+    this helper short-circuits.
+    """
+    if ceiling <= 0:
+        return (0, 0)
+    config = getattr(llm_request, "config", None)
+    if config is None:
+        return (0, 0)
+    try:
+        existing = getattr(config, "max_output_tokens", None)
+    except Exception:  # noqa: BLE001
+        existing = None
+    previous = int(existing) if isinstance(existing, int) and existing > 0 else 0
+    # Smaller-wins: a sub-agent / ADK that pinned a tighter cap keeps it.
+    if previous > 0 and previous <= ceiling:
+        return (previous, previous)
+    try:
+        config.max_output_tokens = int(ceiling)
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "_apply_agent_max_output_tokens_cap: could not set max_output_tokens: %s",
+            exc,
+        )
+        return (previous, previous)
+    return (previous, int(ceiling))
 
 
 def _make_cancelled_llm_response() -> Any:
@@ -1853,6 +1920,7 @@ def make_adk_plugin(
     host_agent_name: str = "",
     agent_tool_cap: int = 16,
     llm_call_timeout_ms: int = DEFAULT_LLM_CALL_TIMEOUT_MS,
+    agent_max_output_tokens: int = DEFAULT_AGENT_MAX_OUTPUT_TOKENS,
 ) -> Any:
     """Build the ADK plugin class bound to goldfive's protocol.
 
@@ -1887,7 +1955,25 @@ def make_adk_plugin(
     minutes. Set to ``0`` or any negative int to disable the watcher.
     Default ``DEFAULT_LLM_CALL_TIMEOUT_MS`` (1800000 / 30 minutes) —
     sized as the pathological-hang ceiling for slow local models on
-    compute-bound generation, not an SLO.
+    compute-bound generation, not an SLO. :func:`goldfive.wrap` threads
+    a much tighter default (120s) through via the
+    :class:`~goldfive.config.AgentConfig` surface introduced in
+    goldfive#256.
+
+    ``agent_max_output_tokens`` (goldfive#256) is the structural
+    ``max_output_tokens`` CEILING applied to every ADK sub-agent LLM
+    dispatch (research_agent, web_developer_agent, reviewer_agent,
+    debugger_agent, coordinator, …). The plugin mutates
+    ``llm_request.config.max_output_tokens`` in
+    :meth:`before_model_callback`, taking the SMALLER of the configured
+    ceiling and any value the sub-agent / ADK already supplied — so a
+    user-set lower cap still wins; goldfive only ratchets DOWN, never
+    up. Set to ``0`` or a negative int to disable the ratcheting (the
+    plugin then leaves ``max_output_tokens`` untouched). Default
+    :data:`DEFAULT_AGENT_MAX_OUTPUT_TOKENS` (16384). Without this cap a
+    wandering / looping generation can run for minutes and consume
+    tens of thousands of tokens (live e2e 2026-05-11 ice cream session
+    62dde1a6: 30K+ tokens for a 5-bullet-point research task).
     """
     try:
         from google.adk.plugins.base_plugin import BasePlugin  # type: ignore
@@ -1912,6 +1998,14 @@ def make_adk_plugin(
             # ``0`` or negative disables the watcher entirely. See
             # ``make_adk_plugin`` docstring.
             self._llm_call_timeout_ms = int(llm_call_timeout_ms)
+            # Structural ``max_output_tokens`` ceiling for ADK sub-agent
+            # LLM calls (goldfive#256). ``0`` or negative disables the
+            # ratcheting entirely (the plugin leaves
+            # ``llm_request.config.max_output_tokens`` untouched). See
+            # the ``agent_max_output_tokens`` paragraph of
+            # ``make_adk_plugin``'s docstring for the smaller-wins
+            # semantics.
+            self._agent_max_output_tokens = int(agent_max_output_tokens)
             # Active :class:`SessionContext` for the invocation that is
             # currently driving this plugin's runner. Set by
             # :meth:`ADKAdapter.invoke` before ``run_async`` and cleared
@@ -4795,6 +4889,35 @@ def make_adk_plugin(
                     "before_model_callback: goldfive planner injection raised: %s",
                     exc,
                 )
+
+            # Structural ``max_output_tokens`` ceiling for sub-agent
+            # LLM calls (goldfive#256). Applied AFTER GoldfivePlanner
+            # injection so the system instruction is already in place
+            # but BEFORE any further instrumentation reads
+            # ``llm_request.config``. Smaller-wins (a sub-agent / ADK
+            # that pinned a tighter cap keeps it); the plugin only
+            # ratchets DOWN. Set ``agent_max_output_tokens=0`` on
+            # :func:`make_adk_plugin` to disable entirely (best-effort
+            # — see helper docstring).
+            if self._agent_max_output_tokens > 0:
+                try:
+                    previous, applied = _apply_agent_max_output_tokens_cap(
+                        llm_request,
+                        self._agent_max_output_tokens,
+                    )
+                    if applied and applied != previous:
+                        log.debug(
+                            "goldfive.llm.cap agent=%s ceiling=%d previous=%d applied=%d",
+                            self._host_agent_name or "?",
+                            self._agent_max_output_tokens,
+                            previous,
+                            applied,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_model_callback: max_output_tokens cap raised: %s",
+                        exc,
+                    )
 
             # R3 (F2 alternative) — runtime tool-surface hint.
             #
