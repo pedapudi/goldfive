@@ -27,3 +27,7 @@ htmlcov/
 .vscode/
 .DS_Store
 .claude/
+
+# Example run artifacts (generated presentations, ADK session DBs)
+examples/*/output/
+examples/*/.adk/
