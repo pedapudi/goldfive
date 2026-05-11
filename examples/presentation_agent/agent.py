@@ -771,7 +771,10 @@ async def _run(*, topic: str, mock: bool) -> Any:
     # the ``elif mock`` branch) which would lose the ``str`` arm.
     agent_model: str | BaseLlm
     if use_claude_sdk:
-        from goldfive.integrations.claude_sdk import make_call_llm
+        from goldfive.integrations.claude_sdk import (
+            ClaudeAgentSDKLlm,
+            make_call_llm,
+        )
 
         if mock:
             # The Claude SDK branch supersedes ``--mock`` when both are
@@ -783,15 +786,20 @@ async def _run(*, topic: str, mock: bool) -> Any:
                 "ignoring --mock and routing planner/goal-deriver/judges "
                 "through claude-agent-sdk."
             )
-        # Planner + goal-deriver + judges go through claude-agent-sdk →
-        # Max billing. Subagent model uses ``GOLDFIVE_EXAMPLE_MODEL`` and
-        # must be one ADK natively routes (litellm string like
-        # ``openai/gpt-4o-mini`` or bare Google Gemini name with
-        # ``GOOGLE_API_KEY``). A Claude ``BaseLlm`` adapter for subagents
-        # is in development — see the PR thread for status.
-        agent_model = os.environ.get(
-            "GOLDFIVE_EXAMPLE_MODEL", "gemini-2.5-flash-lite"
-        )
+        # Planner + goal-deriver + judges always go through claude-agent-sdk
+        # → Max billing. Subagents use ``GOLDFIVE_EXAMPLE_MODEL`` — if it's
+        # a ``claude-*`` model we wrap with ``ClaudeAgentSDKLlm`` so the
+        # subagent's BaseLlm goes through claude-agent-sdk too; otherwise we
+        # hand the model string to ADK's native routing (litellm style for
+        # ``gemini/...`` / ``openai/...``, or a bare Google Gemini name with
+        # ``GOOGLE_API_KEY``). That way an operator can keep planner/judges
+        # on Max while running subagents on a cheaper / less rate-limited
+        # model.
+        agent_model_name = os.environ.get("GOLDFIVE_EXAMPLE_MODEL", "claude-sonnet-4-6")
+        if agent_model_name.startswith("claude-"):
+            agent_model = ClaudeAgentSDKLlm(model=agent_model_name)
+        else:
+            agent_model = agent_model_name
         planner_call_llm = make_call_llm("claude-haiku-4-5")
         goal_call_llm = planner_call_llm
         judge_fallback_call_llm = planner_call_llm
