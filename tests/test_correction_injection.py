@@ -173,7 +173,9 @@ async def _emit(
     steerer: DefaultSteerer, session: Session, revised: Plan, drift: DriftEvent
 ) -> None:
     prev = session.plan
-    revised = steerer._apply_revision(session, revised, drift)  # goldfive#247: rebind
+    # goldfive#247: rebind to the stamped instance.
+    # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
+    revised, _was_installed = steerer._apply_revision(session, revised, drift)
     await steerer._emit_plan_revised(session, revised, drift, prev_plan=prev)
 
 

@@ -663,7 +663,8 @@ async def test_apply_revision_defensive_fold_idempotent_when_caller_already_fold
         detail="x",
     )
     # goldfive#254: instance method now.
-    revised = DefaultSteerer()._apply_revision(session, revised, drift)  # goldfive#247: rebind
+    # goldfive#255: _apply_revision returns ``(revised, was_installed)``.
+    revised, _was_installed = DefaultSteerer()._apply_revision(session, revised, drift)
 
     # goldfive#247: identity check replaced with id check (Plan is frozen)
     assert session.plan is not None and session.plan.id == revised.id
