@@ -638,20 +638,24 @@ def _build_app() -> Any:
     planner = LLMPlanner(call_llm=call_llm, model=planner_model)
     goal_deriver = LLMGoalDeriver(call_llm=goal_call_llm, model=planner_model)
 
-    wrapped = goldfive.wrap(tree, planner=planner, goal_deriver=goal_deriver)
-
+    sinks: list[Any] = [LoggingSink()]
     plugins: list[Any] = []
     client = _get_or_create_harmonograf_client()
     if client is not None:
         try:
-            from harmonograf_client import HarmonografTelemetryPlugin
+            from harmonograf_client import HarmonografSink, HarmonografTelemetryPlugin
         except ImportError as e:
             log.warning(
-                "HarmonografTelemetryPlugin unavailable (%s); running without spans",
+                "HarmonografSink/Plugin unavailable (%s); running without telemetry",
                 e,
             )
         else:
+            sinks.append(HarmonografSink(client))
             plugins.append(HarmonografTelemetryPlugin(client))
+
+    wrapped = goldfive.wrap(
+        tree, planner=planner, goal_deriver=goal_deriver, sinks=sinks
+    )
 
     return App(name="presentation_agent", root_agent=wrapped, plugins=plugins)
 
@@ -679,8 +683,28 @@ async def _run(*, topic: str, mock: bool) -> Any:
     directly (``asyncio.run(_run(topic=..., mock=True))``) without
     scraping argv.
     """
-    if mock:
-        agent_model: str | BaseLlm = _MockLlm(model="mock/presentation-agent")
+    use_claude_sdk = bool(os.environ.get("GOLDFIVE_USE_CLAUDE_SDK"))
+    judge_fallback_call_llm: Any | None = None
+    if use_claude_sdk:
+        from goldfive.integrations.claude_sdk import make_call_llm
+
+        # Planner + goal-deriver + judges go through claude-agent-sdk →
+        # Max billing. Subagent model uses ``GOLDFIVE_EXAMPLE_MODEL`` and
+        # must be one ADK natively routes (litellm string like
+        # ``openai/gpt-4o-mini`` or bare Google Gemini name with
+        # ``GOOGLE_API_KEY``). A Claude ``BaseLlm`` adapter for subagents
+        # is in development — see the PR thread for status.
+        agent_model: str | BaseLlm = os.environ.get(
+            "GOLDFIVE_EXAMPLE_MODEL", "gemini-2.5-flash-lite"
+        )
+        planner_call_llm = make_call_llm("claude-haiku-4-5")
+        goal_call_llm = planner_call_llm
+        judge_fallback_call_llm = planner_call_llm
+        model_tag = os.environ.get(
+            "GOLDFIVE_EXAMPLE_PLANNER_MODEL", "claude-haiku-4-5"
+        )
+    elif mock:
+        agent_model = _MockLlm(model="mock/presentation-agent")
         planner_call_llm = _mock_planner_call_llm(topic)
         goal_call_llm = _mock_goal_call_llm(topic)
         model_tag = "mock/planner"
@@ -702,13 +726,19 @@ async def _run(*, topic: str, mock: bool) -> Any:
         except ImportError as e:
             log.warning("HarmonografSink unavailable (%s)", e)
 
-    runner = goldfive.wrap(
-        tree,
+    wrap_kwargs: dict[str, Any] = dict(
         planner=LLMPlanner(call_llm=planner_call_llm, model=model_tag),
         goal_deriver=LLMGoalDeriver(call_llm=goal_call_llm, model=model_tag),
         executor=SequentialExecutor(max_task_invocations=8),
         sinks=sinks,
     )
+    if judge_fallback_call_llm is not None:
+        # Route judges (goal-drift, reasoning) through the same callable so
+        # they don't inherit the agent's mock model and produce
+        # "unparseable verdict". Per goldfive.wrap precedence:
+        # explicit > JudgeConfig > detected.
+        wrap_kwargs["call_llm"] = judge_fallback_call_llm
+    runner = goldfive.wrap(tree, **wrap_kwargs)
 
     try:
         outcome = await runner.run(f"Make a short presentation about {topic}.")
