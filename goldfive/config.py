@@ -564,6 +564,21 @@ class SteeringConfig:
     * the ``request_invocation_cancel`` plugin call in
       :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`.
 
+    The plan-install gate suppresses only **corrective**
+    goldfive-authored revisions. Three categories always land as real
+    revisions even under ``observation_only=True``:
+
+    * **bootstrap** — first install on a cold session (``prev is None``);
+    * **user-authored** — operator ``ControlMessage`` STEER deliveries
+      (``drift.authored_by == "user"``);
+    * **discovery** — ``DriftKind.NEW_WORK_DISCOVERED`` revisions
+      (goldfive#258), covering both the runner's turn-1 install through
+      :meth:`install_initial_plan` (where ``session.plan`` was seeded
+      with ``Plan.empty()`` so ``prev is None`` no longer holds) and
+      the turn N+1 replan through :meth:`install_revision_for_drift`.
+      Discovery is the planner / a sub-agent describing observed work,
+      not a framework-driven correction.
+
     Detection still runs in full (reasoning judges, embedding
     detectors, goal-drift, looping detectors, CAPABILITY_MISMATCH, …)
     and ``planner.refine_steer`` still runs — operators can see what
