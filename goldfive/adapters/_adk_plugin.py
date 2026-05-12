@@ -5441,11 +5441,56 @@ def make_adk_plugin(
             if nested_agent is not None or tool_cls_name == "AgentTool":
                 to_agent = str(_safe_attr(nested_agent, "name", "") or "") or tool_name
                 from_agent = str(_safe_attr(ctx, "host_agent_name", "") or "")
-                task_id = str(_safe_attr(ctx.task, "id", "") or "")
                 inv_id = ""
                 inv_ctx = _safe_attr(tool_context, "_invocation_context", None)
                 if inv_ctx is not None:
                     inv_id = str(_safe_attr(inv_ctx, "invocation_id", "") or "")
+
+                # goldfive#259 / #262 — observational assignee
+                # re-population. #252 zeroed Task.assignee_agent_id at
+                # parse time; this hook stamps the chosen plan task's
+                # assignee with the invoked agent and pins
+                # session.current_task_id so:
+                #   * The reporting-tool pin lookup resolves on the
+                #     delegated sub-invocation's tool calls.
+                #   * The DelegationObserved emit below carries the
+                #     bound task id (closes #262 — harmonograf's ingest
+                #     stamps ``tasks.assignee_agent_id`` from this).
+                #   * The capability check's Strategy 1 (assignee-
+                #     based) finds the bound task instead of falling
+                #     through to the weaker Strategy 2.
+                # MUST run before the emit so ``task_id`` below is
+                # non-empty for the typical orchestration-only
+                # coordinator turn (``ctx.task is None``).
+                try:
+                    self._maybe_pin_delegation_task(
+                        ctx=ctx,
+                        invoked_agent_name=to_agent,
+                        tool_args=tool_args,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_tool_callback: delegation_pin hook raised: %s",
+                        exc,
+                    )
+
+                # Resolve task_id for the emit AFTER the pin has run.
+                # Prefer the freshly-pinned ``session.current_task_id``
+                # (which the pin above just stamped) — that's the bound
+                # plan task this delegation is enacting. Fall back to
+                # ``ctx.task.id`` for sub-agent invocations where the
+                # adapter was entered with an explicit task (the bound
+                # outer task, e.g. in tests that pre-seed assignees).
+                bound_task_id = ""
+                try:
+                    bound_task_id = str(
+                        _safe_attr(ctx.session, "current_task_id", "") or ""
+                    )
+                except Exception:  # noqa: BLE001 — defensive
+                    bound_task_id = ""
+                if not bound_task_id:
+                    bound_task_id = str(_safe_attr(ctx.task, "id", "") or "")
+                task_id = bound_task_id
                 await self._emit_observability(
                     "delegation_observed",
                     from_agent=from_agent,
@@ -5488,27 +5533,6 @@ def make_adk_plugin(
                             "before_tool_callback: reconciler.on_delegation_observed raised: %s",
                             exc,
                         )
-
-                # goldfive#259 — observational assignee re-population.
-                # #252 zeroed Task.assignee_agent_id at parse time; this
-                # hook stamps the chosen plan task's assignee with the
-                # invoked agent and pins session.current_task_id so the
-                # reporting-tool pin lookup resolves on the delegated
-                # sub-invocation's tool calls. Runs BEFORE the capability
-                # check so the latter's Strategy 1 (assignee-based) can
-                # find the bound task instead of falling through to the
-                # weaker Strategy 2 (current_task_id only).
-                try:
-                    self._maybe_pin_delegation_task(
-                        ctx=ctx,
-                        invoked_agent_name=to_agent,
-                        tool_args=tool_args,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "before_tool_callback: delegation_pin hook raised: %s",
-                        exc,
-                    )
 
                 # goldfive#253 — structural capability check at delegation
                 # time. Replaces the planner-LLM PLAN_DIVERGENCE
