@@ -992,6 +992,190 @@ def _score_candidates_by_args(candidates: list[Any], tool_args: Any) -> Any:
     return best
 
 
+#: Trailing role-suffix tokens stripped from an invoked-agent name during
+#: stem extraction for the goldfive#265 tier-2 semantic match. Conservative
+#: by design: only role-marker tokens that almost never carry topic
+#: meaning. Keep small — adding common verbs/nouns here would suppress
+#: legitimate matches (e.g. dropping "researcher" from "researcher_agent"
+#: leaves the empty stem and nothing matches).
+_AGENT_NAME_ROLE_SUFFIXES: frozenset[str] = frozenset(
+    {"agent", "worker", "assistant", "bot", "tool"}
+)
+
+
+def _agent_name_stems(agent_name: str) -> tuple[str, ...]:
+    """Return ordered lowercase stem tokens derived from an ADK agent name.
+
+    Goldfive#265 tier-2 semantic match. The invoked agent's display name
+    (e.g. ``reviewer_agent``) is split on underscore/hyphen/space, lower-
+    cased, role-suffix tokens (``agent``, ``worker``, …) trimmed from the
+    tail, and remaining tokens of length >= 4 returned. Length filter
+    matches :func:`_tokenize_for_matching` so the stems are comparable
+    against title/description tokens.
+
+    Examples
+    --------
+    >>> _agent_name_stems("reviewer_agent")
+    ('reviewer',)
+    >>> _agent_name_stems("web_developer_agent")
+    ('developer',)  # 'web' is < 4 chars and filtered out
+    >>> _agent_name_stems("helper_agent")
+    ('helper',)
+    >>> _agent_name_stems("agent")
+    ()
+
+    Deliberately **no regex** — goldfive#166 / #167 retired the regex-
+    based NL classifiers. Pure str ops only.
+    """
+    if not isinstance(agent_name, str) or not agent_name:
+        return ()
+    # Normalise common separators to spaces, then split.
+    norm = agent_name.replace("_", " ").replace("-", " ").lower()
+    raw_tokens = [tok for tok in norm.split() if tok]
+    # Trim role-suffix tokens off the tail (left-to-right) so
+    # ``reviewer_agent`` -> ``reviewer`` and
+    # ``draft_writer_assistant_bot`` -> ``draft writer``.
+    while raw_tokens and raw_tokens[-1] in _AGENT_NAME_ROLE_SUFFIXES:
+        raw_tokens.pop()
+    # Length filter mirrors _tokenize_for_matching's >=4 threshold so
+    # noisy short tokens ("ui", "qa") don't saturate matches.
+    out = tuple(tok for tok in raw_tokens if len(tok) >= 4)
+    return out
+
+
+def _agent_tool_names(invoked_agent: Any) -> tuple[str, ...]:
+    """Return the public tool names exposed by an ADK agent object.
+
+    Best-effort introspection used by goldfive#265 tier-1
+    required-tools cover. Walks ``invoked_agent.tools`` and pulls
+    ``.name`` (or ``.func.__name__`` for FunctionTool stand-ins), the
+    same name surface :mod:`goldfive.drift.capability_check` consumes.
+    Returns empty tuple on any failure so the caller falls through.
+    """
+    if invoked_agent is None:
+        return ()
+    tools = _safe_attr(invoked_agent, "tools", None)
+    if not tools:
+        return ()
+    names: list[str] = []
+    try:
+        for tool in tools:
+            name = getattr(tool, "name", None)
+            if isinstance(name, str) and name:
+                names.append(name)
+                continue
+            func = getattr(tool, "func", None)
+            if func is not None:
+                fname = getattr(func, "__name__", None)
+                if isinstance(fname, str) and fname:
+                    names.append(fname)
+    except Exception:  # noqa: BLE001 — introspection must not block pinning
+        return ()
+    return tuple(names)
+
+
+def _select_by_required_tools(
+    candidates: list[Any],
+    agent_tool_names: tuple[str, ...],
+) -> Any:
+    """Tier-1 selector for goldfive#265: required-tools cover.
+
+    Returns the unique candidate whose non-empty ``required_tools`` is
+    fully covered by ``agent_tool_names``. Returns ``None`` when zero or
+    multiple candidates match — the caller falls through to tier 2.
+
+    Candidates with empty ``required_tools`` are skipped entirely: an
+    empty advisory is "no opinion" (matching the
+    :func:`detect_capability_mismatch` Rule B contract), not a match
+    against every agent.
+    """
+    if not candidates or not agent_tool_names:
+        return None
+    available = set(agent_tool_names)
+    matched: list[Any] = []
+    for cand in candidates:
+        required = tuple(_safe_attr(cand, "required_tools", ()) or ())
+        if not required:
+            continue
+        if all(name in available for name in required):
+            matched.append(cand)
+    if len(matched) == 1:
+        return matched[0]
+    return None
+
+
+def _stem_token_match(stem: str, token: str) -> bool:
+    """Return True when ``stem`` and ``token`` share a meaningful root.
+
+    Bi-directional substring match: catches both stem-is-prefix-of-token
+    (``review`` -> ``reviewer``) and token-is-prefix-of-stem
+    (``reviewer`` -> ``review``). This handles the common
+    role-noun/verb pair where the agent name carries the agent-noun
+    form and the task carries the verb form (or vice versa).
+
+    Pure str ops — no regex (goldfive#166 / #167).
+    """
+    if not stem or not token:
+        return False
+    # Short-circuit on exact and direct substring matches; covers the
+    # most common case.
+    if stem == token:
+        return True
+    # Bi-directional containment: ``reviewer`` ⊇ ``review`` AND
+    # ``review`` ⊆ ``reviewer``. Both are length-bounded by the >=4
+    # filter applied upstream so noise like "is" / "of" cannot reach
+    # this check.
+    if stem in token or token in stem:
+        return True
+    return False
+
+
+def _select_by_agent_name_stems(
+    candidates: list[Any],
+    agent_name: str,
+) -> Any:
+    """Tier-2 selector for goldfive#265: agent-name semantic match.
+
+    Returns the unique candidate whose title+description contains a
+    token that semantically matches a stem extracted from
+    ``agent_name`` (bi-directional substring; see
+    :func:`_stem_token_match`). Returns ``None`` on zero or multiple
+    matches so the caller falls through to the existing topo-order
+    tier-3 fallback.
+
+    The matching is intentionally narrow: tokenise the candidate's
+    title+description into >= 4-char tokens (same threshold as
+    :func:`_tokenize_for_matching`), then compare each agent stem to
+    each task token by bi-directional containment. No regex
+    (goldfive#166 / #167), no LLM call, no embedding — this is a
+    pure structural disambiguation step that runs before the weaker
+    topic-args scorer.
+    """
+    stems = _agent_name_stems(agent_name)
+    if not stems or not candidates:
+        return None
+    matched: list[Any] = []
+    for cand in candidates:
+        title = str(_safe_attr(cand, "title", "") or "")
+        desc = str(_safe_attr(cand, "description", "") or "")
+        cand_tokens = _tokenize_for_matching(f"{title} {desc}")
+        if not cand_tokens:
+            continue
+        hit = False
+        for stem in stems:
+            for tok in cand_tokens:
+                if _stem_token_match(stem, tok):
+                    hit = True
+                    break
+            if hit:
+                break
+        if hit:
+            matched.append(cand)
+    if len(matched) == 1:
+        return matched[0]
+    return None
+
+
 def _measure_request_chars(llm_request: Any) -> tuple[int, int]:
     """Return ``(total_chars, messages_count)`` for an ADK ``LlmRequest``.
 
@@ -4060,9 +4244,10 @@ def make_adk_plugin(
             ctx: SessionContext,
             invoked_agent_name: str,
             tool_args: Any,
+            invoked_agent: Any = None,
         ) -> None:
             """Observationally bind a plan task to ``invoked_agent_name`` at
-            delegation_observed time (goldfive#259).
+            delegation_observed time (goldfive#259, refined by #265).
 
             #252 zeroed ``Task.assignee_agent_id`` at plan-parse time so the
             LLM cannot pre-declare which sub-agent will pick up a task; the
@@ -4075,17 +4260,39 @@ def make_adk_plugin(
             :func:`_resolve_pinned_task_id` finds the task without needing a
             pre-declared assignee.
 
-            Selection algorithm:
+            Selection algorithm (multi-eligible disambiguation tiers):
 
             1. Eligible set = PENDING tasks whose every upstream-edge
                predecessor is COMPLETED (DAG-ready).
             2. If exactly one eligible -> bind it.
-            3. If multiple eligible -> topic-match by tokenising
-               ``tool_args`` against each candidate's title+description
-               (same scorer the delegation pin uses). Top non-zero score
-               wins; tie or zero overlap -> fall back to plan-tasks order
-               (first eligible).
+            3. Multi-eligible disambiguation, short-circuiting on first
+               unique pick (goldfive#265):
+
+               * **Tier 1 — required-tools cover.** When ``invoked_agent``
+                 is supplied, pick the unique candidate whose non-empty
+                 :attr:`Task.required_tools` is fully covered by the
+                 agent's live tool names. Highest-confidence signal —
+                 grounded in the same surface
+                 :func:`detect_capability_mismatch` Rule B consumes.
+               * **Tier 2 — agent-name semantic match.** Pick the unique
+                 candidate whose title+description contains a stem
+                 extracted from ``invoked_agent_name``
+                 (e.g. ``reviewer_agent`` -> stem ``reviewer``).
+                 Substring match against a small fixed role-suffix
+                 list — **no regex** (goldfive#166 / #167 retired
+                 regex-based NL classifiers; don't reintroduce).
+               * **Tier 3 — topic-args scorer + topo-order fallback.**
+                 The pre-#265 behaviour: tokenise ``tool_args`` against
+                 each candidate's title+description; top non-zero score
+                 wins; tie or zero overlap -> first eligible by plan
+                 order.
+
             4. If zero eligible -> log DEBUG and return.
+
+            Tier 1 wins on conflict with Tier 2 by construction: it runs
+            first and short-circuits. ``invoked_agent`` is optional so
+            legacy callers (and tests that don't carry an ADK agent
+            object) still get the tier-2 + tier-3 path.
 
             The stamp is a real mutation, not a dry run. Assignee
             repopulation is observational in the same sense that
@@ -4155,8 +4362,25 @@ def make_adk_plugin(
             if len(eligible) == 1:
                 chosen = eligible[0]
             else:
-                scored = _score_candidates_by_args(eligible, tool_args)
-                chosen = scored if scored is not None else eligible[0]
+                # goldfive#265 — structural disambiguation tiers run
+                # BEFORE the topic-args scorer + plan-order fallback.
+                # Order: tier 1 (required-tools cover) -> tier 2
+                # (agent-name semantic match) -> tier 3 (existing
+                # scorer + topo-order). Each tier short-circuits on a
+                # unique pick; ambiguous tiers fall through.
+                chosen = None
+                tier1_agent_tool_names = _agent_tool_names(invoked_agent)
+                if tier1_agent_tool_names:
+                    chosen = _select_by_required_tools(
+                        eligible, tier1_agent_tool_names
+                    )
+                if chosen is None:
+                    chosen = _select_by_agent_name_stems(
+                        eligible, invoked_agent_name
+                    )
+                if chosen is None:
+                    scored = _score_candidates_by_args(eligible, tool_args)
+                    chosen = scored if scored is not None else eligible[0]
 
             chosen_id = str(_safe_attr(chosen, "id", "") or "")
             if not chosen_id:
@@ -5503,6 +5727,11 @@ def make_adk_plugin(
                         ctx=ctx,
                         invoked_agent_name=to_agent,
                         tool_args=tool_args,
+                        # goldfive#265 — pass the nested ADK agent so the
+                        # tier-1 required-tools cover step can introspect
+                        # ``agent.tools``. Optional; falls through to the
+                        # tier-2/3 paths when absent (legacy callers).
+                        invoked_agent=nested_agent,
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.debug(

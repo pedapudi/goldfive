@@ -263,6 +263,268 @@ def test_no_eligible_task_leaves_session_unpinned(
     ), f"expected DEBUG log; got {[r.getMessage() for r in caplog.records]}"
 
 
+# ---------------------------------------------------------------------------
+# goldfive#265 — structural disambiguation tiers (required-tools + agent-name)
+# ---------------------------------------------------------------------------
+
+
+class _FakeFunctionToolForCover:
+    """Stand-in for an ADK FunctionTool: carries a ``.name`` attribute.
+
+    Used by goldfive#265 tier-1 tests where the pin introspects
+    ``invoked_agent.tools[*].name`` to compute the required-tools cover.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeInvokedAgent:
+    """Stand-in for an ADK ``BaseAgent``: carries ``.name`` and ``.tools``."""
+
+    def __init__(self, name: str, tools: list[Any] | None = None) -> None:
+        self.name = name
+        self.tools = list(tools or [])
+
+
+def test_tier1_required_tools_cover_wins_over_topo_order() -> None:
+    """goldfive#265 tier 1: required-tools cover picks the matching task
+    even when it is not topo-first.
+
+    Two parallel DAG-ready PENDING tasks A and B. A.required_tools =
+    ("patch_file",); B.required_tools = (). The invoked agent has only
+    a ``patch_file`` tool. Tier 1 picks A; if we had fallen through to
+    tier 3 we'd have picked B (first by plan order). Asserts the tier
+    fired by checking A is bound.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        # B FIRST in plan order so the topo-order fallback would pick B.
+        Task(id="B", title="general task"),
+        Task(
+            id="A",
+            title="apply patch",
+            required_tools=("patch_file",),
+        ),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    invoked_agent = _FakeInvokedAgent(
+        name="patcher",
+        tools=[_FakeFunctionToolForCover("patch_file")],
+    )
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="patcher",
+        tool_args={"x": "go"},
+        invoked_agent=invoked_agent,
+    )
+
+    a = _find_task(session.plan, "A")
+    b = _find_task(session.plan, "B")
+    assert a is not None and b is not None
+    assert a.assignee_agent_id == "patcher", (
+        f"tier-1 should pick A (required_tools=[patch_file] covered by "
+        f"agent); got A={a.assignee_agent_id!r} B={b.assignee_agent_id!r}"
+    )
+    assert b.assignee_agent_id == ""
+    assert session.current_task_id == "A"
+
+
+def test_tier2_agent_name_match_picks_reviewer_task() -> None:
+    """goldfive#265 tier 2: agent name ``reviewer_agent`` picks
+    ``review_presentation`` over ``outline_presentation`` and
+    ``draft_presentation``.
+
+    Reproduces the session-4538863f bug: the coordinator delegated to
+    ``reviewer_agent``, but the old tier-3-only pin picked
+    ``draft_presentation`` because it was DAG-next. With tier 2 the
+    stem ``reviewer`` substring-matches ``review_presentation``'s
+    title and the pin selects it.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    # All three DAG-ready PENDING (no edges between them).
+    plan = _plan(
+        Task(id="outline_presentation", title="Outline the presentation"),
+        Task(id="draft_presentation", title="Draft the presentation"),
+        Task(id="review_presentation", title="Review the presentation"),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="reviewer_agent",
+        # tool_args carries a generic prompt that does NOT topic-match
+        # any specific candidate — proves tier 2 (not tier 3) fired.
+        tool_args={"request": "please proceed"},
+    )
+
+    outline = _find_task(session.plan, "outline_presentation")
+    draft = _find_task(session.plan, "draft_presentation")
+    review = _find_task(session.plan, "review_presentation")
+    assert outline is not None and draft is not None and review is not None
+    assert review.assignee_agent_id == "reviewer_agent", (
+        f"tier-2 should pick review_presentation for reviewer_agent; got "
+        f"outline={outline.assignee_agent_id!r} "
+        f"draft={draft.assignee_agent_id!r} "
+        f"review={review.assignee_agent_id!r}"
+    )
+    assert outline.assignee_agent_id == ""
+    assert draft.assignee_agent_id == ""
+    assert session.current_task_id == "review_presentation"
+
+
+def test_tier2_works_when_required_tools_empty() -> None:
+    """goldfive#265 tier 2 still picks correctly when no Tier 1 match
+    is possible (all candidates have empty required_tools).
+
+    Same fixture as the reviewer_agent case but explicitly with
+    ``invoked_agent`` passed and no tools — tier 1 returns ``None``
+    (no required_tools on any candidate), tier 2 fires.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        Task(id="outline_presentation", title="Outline the presentation"),
+        Task(id="draft_presentation", title="Draft the presentation"),
+        Task(id="review_presentation", title="Review the presentation"),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    invoked_agent = _FakeInvokedAgent(name="reviewer_agent", tools=[])
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="reviewer_agent",
+        tool_args={"request": "please proceed"},
+        invoked_agent=invoked_agent,
+    )
+
+    review = _find_task(session.plan, "review_presentation")
+    assert review is not None and review.assignee_agent_id == "reviewer_agent"
+    assert session.current_task_id == "review_presentation"
+
+
+def test_tier3_fallback_when_no_name_overlap() -> None:
+    """goldfive#265 tier 3 (existing topo-order fallback) still wins
+    when agent name doesn't match any task title/description and no
+    required_tools are populated.
+
+    Agent ``web_developer_agent``; tasks have titles unrelated to
+    "developer" or "web". Tier 1 vacuous (no required_tools), tier 2
+    vacuous (no stem match), tier 3 picks the first eligible by plan
+    order.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        Task(id="t1", title="Compose the executive summary"),
+        Task(id="t2", title="Format the bibliography"),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="web_developer_agent",
+        # No useful tokens (all sub-4-char so scorer is a no-op too).
+        tool_args={"x": "go"},
+    )
+
+    t1 = _find_task(session.plan, "t1")
+    t2 = _find_task(session.plan, "t2")
+    assert t1 is not None and t2 is not None
+    # Tier 3 fallback: first eligible by plan order.
+    assert t1.assignee_agent_id == "web_developer_agent"
+    assert t2.assignee_agent_id == ""
+    assert session.current_task_id == "t1"
+
+
+def test_tier2_ambiguous_agent_name_falls_through_to_tier3() -> None:
+    """goldfive#265 negative case: ambiguous agent name (e.g.
+    ``helper_agent``) doesn't match any task — tier 2 returns ``None``
+    and tier 3 (topo-order fallback) takes over cleanly without
+    crashing.
+
+    Also covers the "no stems after role-suffix strip" edge: the agent
+    name ``agent`` alone would strip to an empty stem tuple; ensure no
+    crash.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        Task(id="t1", title="Compose the executive summary"),
+        Task(id="t2", title="Format the bibliography"),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="helper_agent",
+        tool_args={"x": "go"},
+    )
+
+    # Tier 3 fallback: helper doesn't match t1 or t2 titles, so we
+    # fall through to first-by-plan-order.
+    t1 = _find_task(session.plan, "t1")
+    assert t1 is not None
+    assert t1.assignee_agent_id == "helper_agent"
+    assert session.current_task_id == "t1"
+
+
+def test_tier1_wins_over_tier2_on_conflict() -> None:
+    """goldfive#265: when tier 1 (required_tools) and tier 2 (agent
+    name) would pick different tasks, tier 1 wins.
+
+    Two tasks:
+
+    * ``review_data``: required_tools=("query_db",), title contains
+      "review" so tier 2 would pick it.
+    * ``compile_report``: required_tools=("compile_report_tool",),
+      no agent-name overlap.
+
+    The agent is ``reviewer_agent`` (tier 2 stem ``reviewer``) but
+    only has the ``compile_report_tool`` tool — so tier 1 covers
+    ``compile_report`` uniquely. Tier 1 should win.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        Task(
+            id="review_data",
+            title="review the dataset",
+            required_tools=("query_db",),
+        ),
+        Task(
+            id="compile_report",
+            title="produce the report",
+            required_tools=("compile_report_tool",),
+        ),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    invoked_agent = _FakeInvokedAgent(
+        name="reviewer_agent",
+        tools=[_FakeFunctionToolForCover("compile_report_tool")],
+    )
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="reviewer_agent",
+        tool_args={"x": "go"},
+        invoked_agent=invoked_agent,
+    )
+
+    review = _find_task(session.plan, "review_data")
+    compile_t = _find_task(session.plan, "compile_report")
+    assert review is not None and compile_t is not None
+    # Tier 1 wins on conflict — picked by required_tools cover.
+    assert compile_t.assignee_agent_id == "reviewer_agent"
+    assert review.assignee_agent_id == ""
+
+
 def test_idempotent_on_already_assigned_task() -> None:
     """Re-running the pin with the same agent on the same eligible task
     is a no-op (assignee already matches, no spurious plan swap)."""
