@@ -4042,9 +4042,46 @@ class DefaultSteerer:
 
         Returns ``True`` on successful dispatch, ``False`` on no
         bound channel / send failure.
+
+        goldfive#264 — observation-only carve-out. Under
+        ``SteeringConfig.observation_only`` the would-be
+        ``GOLDFIVE_PAUSE_ESCALATE`` is SKIPPED: dispatching it on the
+        channel sets ``goldfive_pause_message`` on the executor's
+        :class:`~goldfive.executors._control.ControlOutcome`, which in
+        turn drives ``_cancel_invoke_task`` and ends the overlay turn.
+        That kills the live invocation — exactly the enforcement
+        ``observation_only`` exists to suppress. The originating
+        ``HUMAN_INTERVENTION_REQUIRED`` drift emitted by the caller
+        (e.g. :meth:`_emit_handler_exhausted_escalation`,
+        :meth:`_emit_progress_stall_escalation`,
+        :meth:`_dispatch_pause_escalate`) is OUTSIDE this dispatch and
+        continues to fire — observers/sinks still see the escalation,
+        the operator can still react, but goldfive does NOT cancel the
+        in-flight invocation. Mirrors the gate pattern at
+        :meth:`_dispatch_goldfive_steer_control` (goldfive#254) and
+        :meth:`request_invocation_cancel`.
+
+        Live reproduction (2026-05-11, session
+        ``4538863f-0dea-4fe8-97b4-5f660ee2cb7f``): an OFF_TOPIC drift
+        under ``observation_only=True`` reached refine handler
+        exhaustion (#271 no-op-revision path), which called this
+        method, which dispatched the channel message, which cancelled
+        the in-flight invoke. The carve-out below stops that chain.
         """
         from goldfive.control import ControlKind, ControlMessage
 
+        if not self._should_inject():
+            log.info(
+                "DefaultSteerer._dispatch_goldfive_pause_control: "
+                "observation_only=True — SKIPPING GOLDFIVE_PAUSE_ESCALATE "
+                "dispatch. would_have_dispatched kind=%s task=%s "
+                "drift_id=%s reason=%r",
+                drift.kind.value,
+                drift.current_task_id or "-",
+                str(getattr(drift, "id", "") or ""),
+                reason,
+            )
+            return False
         msg = ControlMessage(
             kind=ControlKind.GOLDFIVE_PAUSE_ESCALATE,
             payload={
