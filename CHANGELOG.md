@@ -4,6 +4,29 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ## Unreleased — 2026-05-11
 
+### Delegation pin
+
+- **[#265](https://github.com/pedapudi/goldfive/issues/265) — agent-name
+  and required-tools semantic match before topo-order in
+  `_maybe_pin_delegation_task`.** The observational pin (#259) used
+  topo-next DAG-ready PENDING plus a topic-args scorer to disambiguate
+  multi-eligible candidates. When the coordinator's autonomous
+  delegation order does not match the planner's DAG order
+  (e.g. delegating to `reviewer_agent` while `draft_presentation` is
+  topo-first), the pin chose the wrong task and the reasoning judge
+  fired `OFF_TOPIC` drift. The fix adds two structural tiers before the
+  topo-order fallback: **Tier 1** picks the unique candidate whose
+  non-empty `Task.required_tools` is fully covered by the invoked
+  agent's live tool names; **Tier 2** picks the unique candidate whose
+  title+description contains a stem extracted from the invoked agent's
+  name (e.g. `reviewer_agent` -> stem `reviewer`, bi-directional
+  substring match against title/description tokens). **Tier 3**
+  (existing scorer + topo-order) is unchanged. Both new tiers use only
+  pure `str` ops (no regex; see #166 / #167). The pin call site now
+  passes the nested ADK agent to enable Tier 1 introspection;
+  `invoked_agent` is an optional kwarg so legacy callers fall through
+  to Tier 2 + Tier 3.
+
 ### Steering
 
 - **BREAKING:
