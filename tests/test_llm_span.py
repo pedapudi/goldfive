@@ -394,3 +394,152 @@ async def test_planner_without_span_context_provider_noops() -> None:
 
     planner = LLMPlanner(call_llm=fake_call_llm, model="gpt-x")
     assert planner._span_kwargs() == {"sinks": [], "model": "gpt-x"}
+
+
+# ---------------------------------------------------------------------------
+# goldfive#266 — shutdown-initiated cancel surfaces as ``cancelled``, not
+# ``failed``. Live session 4538863f-0dea-4fe8-97b4-5f660ee2cb7f surfaced
+# routine ``_drain_steerer_at_run_boundary`` teardowns as red
+# ``judge_reasoning`` spans with CancelledError stack traces. The fix
+# threads a per-task marker the drain stamps before issuing
+# ``task.cancel()`` so the span helper can emit
+# ``status="cancelled"`` with a benign reason — preserving the cancel
+# BEHAVIOUR, correcting only the observability. Genuine cancels (caller-
+# driven asyncio.CancelledError from outside the drain) still surface as
+# ``failed`` so operators can spot real cancel-induced aborts.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancel_inside_drain_marker_surfaces_as_cancelled() -> None:
+    """When the steerer-drain marker is on the current task, a CancelledError
+    inside the span body produces ``status="cancelled"``."""
+    from goldfive._llm_span import DRAIN_INITIATED_ATTR
+
+    sink = InMemorySink()
+    started = asyncio.Event()
+
+    async def body() -> None:
+        # Simulate the drain having marked us BEFORE issuing the cancel.
+        # In production this is set by ``_drain_background_set`` on the
+        # judge task object; in this unit test we stamp the same marker
+        # on the current task so the span helper observes the same
+        # signal.
+        current = asyncio.current_task()
+        assert current is not None
+        setattr(current, DRAIN_INITIATED_ATTR, True)
+        async with goldfive_llm_span(
+            sinks=[sink], name="judge_reasoning", model="gpt-judge"
+        ):
+            started.set()
+            # Sleep until cancelled — the drain-issued cancel arrives
+            # here, propagates into the span helper, and the helper
+            # detects the marker.
+            await asyncio.sleep(60)
+
+    task = asyncio.create_task(body())
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    events = _span_events(sink)
+    assert len(events) == 2, f"expected start+end, got {events}"
+    end = events[1].goldfive_llm_call_end
+    assert end.status == "cancelled", (
+        f"drain-initiated cancel should surface as status=cancelled, "
+        f"got status={end.status!r}, error={end.error!r}"
+    )
+    assert "drained" in end.error.lower() or "boundary" in end.error.lower(), (
+        f"cancelled span should carry a benign drain reason; "
+        f"got error={end.error!r}"
+    )
+    # Genuine error indicators MUST be absent — operators must not see
+    # ``CancelledError`` or a stack-trace fragment for routine drains.
+    assert "CancelledError" not in end.error
+    assert "Traceback" not in end.error
+
+
+@pytest.mark.asyncio
+async def test_cancel_outside_drain_preserves_failed() -> None:
+    """A CancelledError WITHOUT the drain marker still surfaces as
+    ``status="failed"`` — the legacy behaviour for genuine cancels
+    (e.g. caller-driven asyncio.CancelledError, USER_CANCEL) is
+    preserved."""
+    sink = InMemorySink()
+    started = asyncio.Event()
+
+    async def body() -> None:
+        # No DRAIN_INITIATED_ATTR set on the current task.
+        async with goldfive_llm_span(
+            sinks=[sink], name="judge_reasoning", model="gpt-judge"
+        ):
+            started.set()
+            await asyncio.sleep(60)
+
+    task = asyncio.create_task(body())
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    events = _span_events(sink)
+    assert len(events) == 2
+    end = events[1].goldfive_llm_call_end
+    assert end.status == "failed", (
+        f"non-drain cancel should preserve status=failed; "
+        f"got status={end.status!r}"
+    )
+    # The error text still carries the CancelledError diagnostic for
+    # genuine cancels — that's the back-compat behaviour the negative
+    # case relies on.
+    assert "CancelledError" in end.error
+
+
+@pytest.mark.asyncio
+async def test_drain_marker_tags_judge_task_and_span_records_cancelled() -> None:
+    """End-to-end: the steerer's drain stamps the marker on the
+    in-flight judge task, the cancellation propagates into the
+    ``judge_reasoning`` span body, and the resulting
+    ``GoldfiveLLMCallEnd`` reports ``status="cancelled"``.
+
+    This is the goldfive#266 fix exercised through the actual drain
+    code path — not just the span helper unit. Pins the integration
+    between :meth:`DefaultSteerer._drain_background_set` and the
+    span's CancelledError handler."""
+    from goldfive._llm_span import DRAIN_INITIATED_ATTR, goldfive_llm_span
+
+    sink = InMemorySink()
+    started = asyncio.Event()
+    saw_cancel: dict[str, bool] = {"hit": False}
+
+    async def judge_body() -> None:
+        # Reproduce the reasoning-judge body shape: open the
+        # judge_reasoning span and block on a long await that
+        # ``task.cancel()`` will interrupt — exactly the live-session
+        # symptom shape.
+        try:
+            async with goldfive_llm_span(
+                sinks=[sink], name="judge_reasoning", model="m"
+            ):
+                started.set()
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            saw_cancel["hit"] = True
+            raise
+
+    task = asyncio.create_task(judge_body(), name="goldfive-reasoning-judge:s-fix")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    # Reproduce ``_drain_background_set``'s tag-then-cancel pattern.
+    setattr(task, DRAIN_INITIATED_ATTR, True)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert saw_cancel["hit"] is True
+
+    events = _span_events(sink)
+    assert len(events) == 2
+    end = events[1].goldfive_llm_call_end
+    assert end.name == "judge_reasoning"
+    assert end.status == "cancelled"
+    assert "drained" in end.error.lower() or "boundary" in end.error.lower()
