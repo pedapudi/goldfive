@@ -7488,6 +7488,33 @@ class DefaultSteerer:
         # handlers.
         lock = self._get_plan_lock(session)
         async with lock:
+            # goldfive#267: resolve the effective dry_run for THIS emit so
+            # every side-effect site below can gate consistently. Mirrors
+            # the wire-stamp resolution further down (caller threads through
+            # ``not was_installed``; legacy callers pass ``None`` and fall
+            # back to ``not self._should_inject()``). Computed once,
+            # consumed by:
+            #   * the supersedes-integration ``set_session_plan`` swap;
+            #   * ``clear_obsolete_corrections_on_revision`` (state pop);
+            #   * ``queue_corrections_for_revision`` (state write);
+            #   * ``_repin_current_task_on_supersedes`` (session +
+            #     session.state pin + adapter rewrite hook).
+            # Under ``dry_run=True`` (observation_only's dry-run preview),
+            # every one of these is suppressed so the would-have-applied
+            # revision never end-runs ``_apply_revision``'s gate via the
+            # emit path. The PlanRevised wire event still fires — dry_run
+            # is observability, not silence.
+            effective_dry_run = (
+                bool(dry_run)
+                if dry_run is not None
+                else (not self._should_inject())
+            )
+            prior_plan_id_short = (
+                (session.plan.id if session.plan is not None else "")[:16]
+                or "<none>"
+            )
+            would_be_plan_id_short = (revised.id or "")[:16] or "<empty>"
+
             # goldfive#251: integrate CORRECT-kind supersedes links into
             # the DAG. The old task stays in the plan as a historical
             # COMPLETED node; the new correction-task is inserted as a
@@ -7500,11 +7527,34 @@ class DefaultSteerer:
             # types, we swap the new variant onto ``session.plan`` so
             # the live pointer matches the rewired DAG that's about to
             # be emitted as PlanRevised.
+            #
+            # goldfive#267: under ``dry_run=True`` we still compute the
+            # integrated plan (the PlanRevised emit payload needs the
+            # rewired DAG so operators can preview what the corrective
+            # refine WOULD have installed), but we MUST NOT call
+            # ``set_session_plan`` — doing so end-runs the gate at
+            # :meth:`_apply_revision`, which returned ``(revised, False)``
+            # specifically so the live ``session.plan`` would NOT be
+            # swapped. The local ``revised`` variable still gets rebound
+            # to the integrated variant so the rest of this method emits
+            # the rewired shape on the wire.
             integrated = self._integrate_correction_supersedes(revised)
             if integrated is not revised:
                 revised = integrated
-                with channel_processor_active():
-                    set_session_plan(session, revised)
+                if effective_dry_run:
+                    log.info(
+                        "DefaultSteerer._emit_plan_revised: dry_run=True — "
+                        "SKIPPING supersedes-integration set_session_plan. "
+                        "prior_plan_id=%s would_have_installed_plan_id=%s "
+                        "revision_index=%d drift_kind=%s",
+                        prior_plan_id_short,
+                        would_be_plan_id_short,
+                        int(revised.revision_index),
+                        drift.kind.value,
+                    )
+                else:
+                    with channel_processor_active():
+                        set_session_plan(session, revised)
 
             # goldfive#251 Stream D: GC corrections for tasks superseded by
             # this revision BEFORE queuing new ones. A task whose correction
@@ -7513,21 +7563,40 @@ class DefaultSteerer:
             # dropped. Runs first so a same-revision CORRECT->CORRECT chain
             # (T -> T' -> T'') doesn't race: the T correction is cleared
             # here, then T''s correction is written below.
-            clear_obsolete_corrections_on_revision(session, revised)
+            #
+            # goldfive#267: both clear_obsolete and queue_corrections write
+            # to ``session.state`` (``goldfive.pending_corrections.*``
+            # keys); under ``dry_run=True`` those writes would end-run the
+            # gate by injecting correction directives into the next-turn
+            # agent prompt for a revision that was never installed. Skip
+            # both under dry_run.
+            if effective_dry_run:
+                log.info(
+                    "DefaultSteerer._emit_plan_revised: dry_run=True — "
+                    "SKIPPING pending-corrections GC + queue. "
+                    "prior_plan_id=%s would_have_installed_plan_id=%s "
+                    "revision_index=%d drift_kind=%s",
+                    prior_plan_id_short,
+                    would_be_plan_id_short,
+                    int(revised.revision_index),
+                    drift.kind.value,
+                )
+            else:
+                clear_obsolete_corrections_on_revision(session, revised)
 
-            # goldfive#251 Stream D: for every NEW task with supersedes_kind
-            # == CORRECT, stamp a structured correction dict on the
-            # orchestration session state under
-            # ``goldfive.pending_corrections.<agent_name>.<task_id>``. The
-            # dynamic instruction resolver (Stream B) reads this on the next
-            # turn and appends a directive-style correction block to the
-            # agent's system prompt. No-op on refines with no CORRECT links.
-            queue_corrections_for_revision(
-                session=session,
-                revised=revised,
-                prev_plan=prev_plan,
-                drift=drift,
-            )
+                # goldfive#251 Stream D: for every NEW task with supersedes_kind
+                # == CORRECT, stamp a structured correction dict on the
+                # orchestration session state under
+                # ``goldfive.pending_corrections.<agent_name>.<task_id>``. The
+                # dynamic instruction resolver (Stream B) reads this on the next
+                # turn and appends a directive-style correction block to the
+                # agent's system prompt. No-op on refines with no CORRECT links.
+                queue_corrections_for_revision(
+                    session=session,
+                    revised=revised,
+                    prev_plan=prev_plan,
+                    drift=drift,
+                )
 
             # goldfive#237: re-pin ``current_task_id`` onto any replacement
             # task the revision introduces. Without this, agents keep
@@ -7537,7 +7606,28 @@ class DefaultSteerer:
             # downstream observers see the revised pin consistently with the
             # revised plan. Additive: when no task has ``supersedes`` set,
             # nothing changes.
-            self._repin_current_task_on_supersedes(session, revised)
+            #
+            # goldfive#267: under ``dry_run=True`` skip the repin — it
+            # mutates ``session.current_task_id``, the orchestration
+            # ``session.state`` pin, and per-agent ADK state copies via
+            # the adapter hook. All three are session-pointer writes that
+            # would end-run the gate (the next coordinator turn would pick
+            # up the would-have-been-installed corrective task because
+            # the pin was moved onto it).
+            if effective_dry_run:
+                log.info(
+                    "DefaultSteerer._emit_plan_revised: dry_run=True — "
+                    "SKIPPING goldfive#237 current_task_id repin "
+                    "(session + session.state + adapter hook). "
+                    "prior_plan_id=%s would_have_installed_plan_id=%s "
+                    "revision_index=%d drift_kind=%s",
+                    prior_plan_id_short,
+                    would_be_plan_id_short,
+                    int(revised.revision_index),
+                    drift.kind.value,
+                )
+            else:
+                self._repin_current_task_on_supersedes(session, revised)
 
             evt = self._new_envelope(session)
             evt.plan_revised.plan.CopyFrom(to_pb_plan(revised))
@@ -7589,10 +7679,15 @@ class DefaultSteerer:
             # — even though ``self._should_inject()`` is False). Legacy
             # callers that don't pass ``dry_run`` fall back to the
             # pre-#255 behaviour for back-compat.
-            if dry_run is not None:
-                evt.plan_revised.dry_run = bool(dry_run)
-            else:
-                evt.plan_revised.dry_run = not self._should_inject()
+            #
+            # goldfive#267: resolved once at the top of this method into
+            # ``effective_dry_run`` (same fallback logic) so the wire
+            # stamp and every side-effect carve-out above key off the
+            # SAME value — a future refactor that drifts those two
+            # resolutions apart would silently re-introduce the bug
+            # this issue closed (gate-skipped on install, applied on
+            # emit).
+            evt.plan_revised.dry_run = effective_dry_run
             # Phase 2.X / goldfive#271 Gap 2: log the emission so a
             # raise-mid-fire scenario (proto build OK, sink emit raises)
             # leaves a goldfive-side trace before the harmonograf side
