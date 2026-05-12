@@ -260,6 +260,24 @@ def _intent_warning_similarity() -> float:
     return INTENT_DIVERGENCE_WARNING_SIMILARITY
 
 
+def _fallback_to_content_when_no_reasoning() -> bool:
+    """Return the installed
+    :attr:`~goldfive.config.ReasoningDriftConfig.fallback_to_content_when_no_reasoning`
+    flag, or ``False`` when no config is installed (goldfive#263).
+
+    Read by :func:`goldfive.adapters._adk_plugin._choose_reasoning_text`
+    in the ADK plugin's ``after_model_callback`` to decide whether to
+    synthesise a reasoning signal from the response body on non-thinking
+    models. The flag lives on the reasoning-drift config (rather than
+    being threaded through ``make_adk_plugin``) so it tracks the rest of
+    the reasoning-drift surface and stays consistent with how the other
+    fields propagate via :func:`configure`.
+    """
+    if _CONFIG is not None:
+        return _CONFIG.fallback_to_content_when_no_reasoning
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
