@@ -80,10 +80,20 @@ Design notes
   callers that set them before the raise get retrospective context on
   the failure event; callers that don't see empty strings. The
   exception is re-raised.
+* Special case (goldfive#266): when the wrapped body raises
+  :class:`asyncio.CancelledError` AND the current task carries
+  :data:`DRAIN_INITIATED_ATTR` (stamped by the steerer's drain path at
+  run boundary), the ``SpanEnd`` is emitted with ``status="cancelled"``
+  + a benign reason ("drained at run boundary") instead of
+  ``status="failed"``. This distinguishes routine shutdown-initiated
+  teardowns from genuine errors so harmonograf renders the span
+  neutrally on the Gantt rather than red with a CancelledError stack.
+  The cancel BEHAVIOUR is unchanged — only the observability axis.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -93,6 +103,30 @@ from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+# goldfive#266 — task-attribute marker that the steerer's drain path stamps
+# onto in-flight background judge / drift tasks before issuing
+# ``task.cancel()`` at run boundary. ``goldfive_llm_span`` reads this off
+# ``asyncio.current_task()`` on its ``CancelledError`` path so the resulting
+# ``GoldfiveLLMCallEnd`` reports ``status="cancelled"`` with a benign reason
+# instead of ``status="failed"`` with a ``CancelledError`` traceback. The
+# cancel BEHAVIOUR is unchanged — only the observability is corrected so
+# operators stop seeing red ``judge_reasoning`` spans for routine
+# shutdown-initiated teardowns. See ``_drain_background_set`` for the
+# producer side. Public-ish (single underscore, exported through __all__)
+# so the steerer can reference it without resorting to a magic string.
+DRAIN_INITIATED_ATTR = "_goldfive_drain_initiated"
+
+# Wire-level status string emitted when a drain-initiated cancel is
+# detected. Distinct from ``"failed"`` (genuine error) and ``"completed"``
+# (normal exit) so harmonograf can map it to ``SPAN_STATUS_CANCELLED``.
+_STATUS_CANCELLED = "cancelled"
+_STATUS_FAILED = "failed"
+_STATUS_COMPLETED = "completed"
+# Reason text stamped onto ``GoldfiveLLMCallEnd.error`` for drain-initiated
+# cancels. Benign — operators reading the field see the lifecycle reason
+# instead of a CancelledError traceback fragment.
+_CANCEL_REASON_DRAIN = "drained at run boundary"
 
 # Error text on ``GoldfiveLLMCallEnd.error`` is capped so a pathological
 # traceback can't blow the event wire budget. Matches the truncation
@@ -115,6 +149,31 @@ def _truncate(s: str, limit: int = _MAX_ERROR_CHARS) -> str:
     if len(s) <= limit:
         return s
     return s[: max(0, limit - len(_TRUNC_SUFFIX))] + _TRUNC_SUFFIX
+
+
+def _is_drain_initiated_cancel() -> bool:
+    """Return True when the currently-running task was tagged by the
+    steerer's drain path before its ``task.cancel()`` arrived.
+
+    The steerer's :meth:`DefaultSteerer._drain_background_set` stamps
+    :data:`DRAIN_INITIATED_ATTR` onto each background judge / drift task
+    immediately before calling :meth:`task.cancel()`. Reading the
+    attribute off :func:`asyncio.current_task` lets the span helper —
+    which lives several frames inside the cancelled task — distinguish
+    a lifecycle-initiated teardown from a genuine cancel without
+    plumbing a flag through every classifier call signature.
+
+    Returns False when no task is current (rare; only synchronous test
+    harnesses) so the legacy ``failed`` branch wins by default — the
+    cancel obviously didn't come from goldfive's drain in that case.
+    """
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        return False
+    if task is None:
+        return False
+    return bool(getattr(task, DRAIN_INITIATED_ATTR, False))
 
 
 @dataclass
@@ -273,6 +332,15 @@ async def goldfive_llm_span(
     ``decision_summary`` are still read — a caller that partially
     populated them before the raise gets that context on the failure
     event; a caller that didn't populate them sees empty strings.
+
+    goldfive#266 — drain-initiated CancelledError exception (the
+    steerer's :meth:`drain_session_background_tasks` stamps
+    :data:`DRAIN_INITIATED_ATTR` on the task before issuing
+    ``task.cancel()``) is special-cased: ``status="cancelled"`` +
+    a benign reason replaces the ``failed`` classification so live
+    sessions don't render routine run-boundary teardowns of
+    in-flight judge calls as red error spans. Cancel BEHAVIOUR is
+    unchanged; this is an observability-only refinement.
     """
     span_id = uuid.uuid4().hex
     start_ns = time.time_ns()
@@ -316,13 +384,27 @@ async def goldfive_llm_span(
                     exc,
                 )
 
-    status = "completed"
+    status = _STATUS_COMPLETED
     error_text = ""
     try:
         yield handle
     except BaseException as exc:
-        status = "failed"
-        error_text = _truncate(f"{type(exc).__name__}: {exc}")
+        # goldfive#266 — when a CancelledError is raised AND the current
+        # task carries the drain-initiated marker the steerer stamped on
+        # before cancelling us, classify the span as ``cancelled`` rather
+        # than ``failed``. Live sessions used to surface routine
+        # run-boundary teardowns as red ``judge_reasoning`` spans with
+        # CancelledError stack traces; this preserves the cancel
+        # behaviour and only corrects the observability. Genuine
+        # cancels from elsewhere (caller-driven asyncio.CancelledError,
+        # USER_CANCEL flow) keep the ``failed`` classification so
+        # operators can still spot real cancel-induced aborts.
+        if isinstance(exc, asyncio.CancelledError) and _is_drain_initiated_cancel():
+            status = _STATUS_CANCELLED
+            error_text = _CANCEL_REASON_DRAIN
+        else:
+            status = _STATUS_FAILED
+            error_text = _truncate(f"{type(exc).__name__}: {exc}")
         raise
     finally:
         end_ns = time.time_ns()
@@ -362,4 +444,4 @@ async def goldfive_llm_span(
                     )
 
 
-__all__ = ["GoldfiveLLMSpanHandle", "goldfive_llm_span"]
+__all__ = ["DRAIN_INITIATED_ATTR", "GoldfiveLLMSpanHandle", "goldfive_llm_span"]

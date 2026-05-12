@@ -1885,6 +1885,32 @@ class DefaultSteerer:
         pending = list(bg_set)
         if not pending:
             return
+        # goldfive#266 — tag every pending task BEFORE the bounded wait
+        # so the in-flight ``goldfive_llm_span`` context manager (e.g.
+        # inside a ``judge_reasoning`` call) can read the marker off
+        # ``asyncio.current_task()`` on its CancelledError path and emit
+        # ``status="cancelled"`` with a benign reason rather than
+        # ``status="failed"`` with a CancelledError traceback. We stamp
+        # upfront — not just on the post-timeout straggler-cancel branch
+        # — because :func:`asyncio.wait_for` itself cancels its inner
+        # awaitable on timeout, and that cancellation can race ahead of
+        # the explicit ``task.cancel()`` below; tagging before the wait
+        # makes the marker race-free. Tasks that complete naturally
+        # within the timeout never observe a CancelledError so the
+        # attribute is harmless on them. The cancel BEHAVIOUR is
+        # unchanged; only the span-status observability is corrected so
+        # live sessions stop showing red judge spans for routine
+        # run-boundary teardowns.
+        from goldfive._llm_span import DRAIN_INITIATED_ATTR
+
+        for task in pending:
+            try:
+                setattr(task, DRAIN_INITIATED_ATTR, True)
+            except (AttributeError, TypeError):  # noqa: PERF203 — defensive
+                # asyncio.Task allows arbitrary attribute writes in
+                # CPython today; the try/except is purely defensive
+                # against future hardening / alternate implementations.
+                pass
         try:
             await asyncio.wait_for(
                 asyncio.gather(*pending, return_exceptions=True),
@@ -1892,7 +1918,9 @@ class DefaultSteerer:
             )
         except TimeoutError:
             # Cancel the stragglers and give them a beat to unwind so
-            # we don't leave "pending task" warnings on loop close.
+            # we don't leave "pending task" warnings on loop close. The
+            # drain-initiated marker is already on each task from the
+            # tagging loop above.
             still_pending = [t for t in pending if not t.done()]
             for task in still_pending:
                 task.cancel()
