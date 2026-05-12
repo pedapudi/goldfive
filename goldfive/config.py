@@ -448,6 +448,40 @@ class ReasoningDriftConfig:
     looping_reasoning_similarity_threshold: float = 0.9
     reasoning_cluster_similarity_threshold: float = 0.75
     looping_reasoning_hash_window: int = 5
+    fallback_to_content_when_no_reasoning: bool = False
+    """Synthesize a reasoning signal from the response body on
+    non-thinking models (goldfive#263).
+
+    Some local models (Gemma 4, Mistral, several base-model
+    deployments) do not emit a separate chain-of-thought stream.
+    :func:`goldfive.adapters._adk_plugin._extract_reasoning` then
+    returns an empty string and the
+    :meth:`~goldfive.steerer.DefaultSteerer.observe_reasoning` path
+    never fires — so the LLM-as-a-judge reasoning detectors
+    (OFF_TOPIC, GOAL_DRIFT, INTENT_DIVERGENCE, LOOPING_REASONING)
+    silently disarm across the entire run. Reproduced live
+    2026-05-11 on Gemma-4 (session ``4a721a07``): zero
+    ``reasoning_judge`` invocations across the run despite agent
+    flows that would have tripped on a thinking-capable model.
+
+    When this flag is True, the ADK plugin's
+    ``after_model_callback`` falls back to feeding the response's
+    ``content`` body (the agent's answer text) into
+    ``observe_reasoning`` if and only if the real reasoning
+    extraction returned empty. The trade-off is intentionally
+    lossy: "what the agent decided" mixes with "what it reasoned
+    about", so OFF_TOPIC / GOAL_DRIFT signals will be noisier than
+    on a thinking model that emits a clean chain-of-thought. The
+    user accepts this — a lossy reasoning signal is strictly
+    better than no signal at all on Gemma-class deployments.
+
+    Default ``False`` so the behaviour change is opt-in. Operators
+    running on non-thinking models flip this to True (typed config
+    or ``GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT=1``). The flag has no
+    effect on responses that DO carry real reasoning content: real
+    reasoning always wins; the fallback only kicks in on a genuine
+    empty.
+    """
 
     @classmethod
     def from_env(cls) -> ReasoningDriftConfig:
@@ -490,6 +524,10 @@ class ReasoningDriftConfig:
             looping_reasoning_hash_window=_read_int_env(
                 "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
                 defaults.looping_reasoning_hash_window,
+            ),
+            fallback_to_content_when_no_reasoning=_read_bool_env(
+                "GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT",
+                defaults.fallback_to_content_when_no_reasoning,
             ),
         )
 

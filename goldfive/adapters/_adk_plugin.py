@@ -1213,6 +1213,42 @@ def _extract_reasoning(llm_response: Any) -> str:
     return ""
 
 
+def _choose_reasoning_text(
+    llm_response: Any,
+    *,
+    fallback_enabled: bool,
+) -> tuple[str, str]:
+    """Pick the text to feed into ``observe_reasoning`` (goldfive#263).
+
+    Returns ``(text, source)`` where ``source`` is one of:
+
+    * ``"reasoning"`` — real chain-of-thought extracted via
+      :func:`_extract_reasoning` (thinking-capable models like Qwen3.5,
+      Claude with extended thinking, Gemini with thought parts).
+    * ``"content_fallback"`` — synthesised from the response body
+      because the real reasoning extraction returned empty AND
+      ``fallback_enabled`` is ``True``. The trade-off and motivation are
+      documented on
+      :attr:`~goldfive.config.ReasoningDriftConfig.fallback_to_content_when_no_reasoning`.
+    * ``""`` — nothing to feed: either real reasoning is empty and the
+      flag is off, or the flag is on but the response has no body either.
+
+    Real reasoning always wins when present, even with the fallback
+    flag enabled: the synthesised content path only kicks in on a
+    genuine empty.
+    """
+    reasoning = _extract_reasoning(llm_response)
+    if reasoning:
+        return reasoning, "reasoning"
+    if not fallback_enabled:
+        return "", ""
+    texts = _extract_text_parts(llm_response)
+    body = " ".join(t for t in texts if t).strip()
+    if body:
+        return body, "content_fallback"
+    return "", ""
+
+
 def _extract_function_calls(llm_response: Any) -> list[dict]:
     content = _safe_attr(llm_response, "content", None)
     if content is None:
@@ -5663,7 +5699,25 @@ def make_adk_plugin(
                 return None
             texts = _extract_text_parts(llm_response)
             calls = _extract_function_calls(llm_response)
-            reasoning = _extract_reasoning(llm_response)
+            # Pick the text to feed into ``observe_reasoning`` (goldfive#263).
+            # On thinking-capable models we get a real chain-of-thought;
+            # on non-thinking models (Gemma 4, Mistral, …) the
+            # ``ReasoningDriftConfig.fallback_to_content_when_no_reasoning``
+            # opt-in synthesises a signal from the response body. The
+            # flag default is False so this branch is byte-identical to
+            # pre-#263 behaviour unless an operator opts in.
+            try:
+                from goldfive.drift.reasoning import (  # noqa: PLC0415 — lazy
+                    _fallback_to_content_when_no_reasoning,
+                )
+
+                _fallback_enabled = _fallback_to_content_when_no_reasoning()
+            except Exception:  # noqa: BLE001 — defensive: never block obs.
+                _fallback_enabled = False
+            reasoning, reasoning_source = _choose_reasoning_text(
+                llm_response,
+                fallback_enabled=_fallback_enabled,
+            )
             finish = _safe_attr(llm_response, "finish_reason", None)
             # Feed the per-invocation counters used by the
             # CONFABULATION_RISK check in after_run_callback. We track:
@@ -5741,6 +5795,7 @@ def make_adk_plugin(
                 "texts": texts,
                 "function_calls": calls,
                 "reasoning": reasoning,
+                "reasoning_source": reasoning_source,
                 "finish_reason": str(finish) if finish is not None else "",
             }
             if metrics:
@@ -5777,6 +5832,20 @@ def make_adk_plugin(
                 else:
                     observe_reasoning = getattr(ctx.steerer, "observe_reasoning", None)
                     if observe_reasoning is not None:
+                        # Tag synthesised-reasoning calls in the log so
+                        # operators can tell content-fallback turns from
+                        # real chain-of-thought turns (goldfive#263).
+                        # The judge prompt itself doesn't know — and
+                        # doesn't need to — but downstream log consumers
+                        # do care.
+                        if reasoning_source == "content_fallback":
+                            log.debug(
+                                "after_model_callback: observe_reasoning fed "
+                                "content_fallback (no real reasoning extracted; "
+                                "fallback_to_content_when_no_reasoning=True) "
+                                "inv_id=%s",
+                                inv_id or "?",
+                            )
                         # Resolve the live agent name so the steerer's
                         # per-(agent, task) reasoning-judge rate-limit
                         # bucket isolates agents (goldfive#252 follow-up).
