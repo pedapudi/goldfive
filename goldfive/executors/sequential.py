@@ -1235,6 +1235,30 @@ class SequentialExecutor(Executor):
                     getattr(control_msg, "payload", None) or {}
                 ) if control_msg is not None else {}
                 pause_reason = str(pause_payload.get("reason", "") or "")
+                # goldfive#264 — observation-only carve-out (defense-
+                # in-depth). The primary gate is at
+                # ``DefaultSteerer._dispatch_goldfive_pause_control``:
+                # under ``observation_only=True`` the channel send is
+                # skipped and the executor never observes this branch.
+                # Custom steerer subclasses or future code paths that
+                # bypass the dispatcher would otherwise drive an
+                # overlay-terminating pause here — exactly the
+                # enforcement ``observation_only`` exists to suppress.
+                # Log and continue the overlay loop without ending the
+                # turn or cancelling the upstream invoke. The
+                # originating ``HUMAN_INTERVENTION_REQUIRED`` drift
+                # the steerer emitted remains the durable signal on
+                # the sink stream.
+                if getattr(steerer, "_observation_only", False):
+                    log.info(
+                        "SequentialExecutor._run_overlay: "
+                        "observation_only=True — would have paused on "
+                        "GOLDFIVE_PAUSE_ESCALATE (reason=%r) but "
+                        "observation_only is in effect; continuing "
+                        "overlay without ending the turn",
+                        pause_reason or "<no reason>",
+                    )
+                    continue
                 log.info(
                     "SequentialExecutor._run_overlay: GOLDFIVE_PAUSE_ESCALATE "
                     "received (reason=%r); ending overlay turn — pre-task "
@@ -1534,6 +1558,30 @@ class SequentialExecutor(Executor):
                 # outcome so the overlay loop can break out and the
                 # executor's pre-task loop blocks for operator
                 # intervention.
+                #
+                # goldfive#264 — observation-only carve-out (defense-
+                # in-depth). The primary gate is at
+                # ``DefaultSteerer._dispatch_goldfive_pause_control``:
+                # under ``observation_only=True`` no
+                # GOLDFIVE_PAUSE_ESCALATE is sent on the channel so
+                # this branch is unreachable via the supported steerer.
+                # A custom steerer or future code path that bypasses
+                # that gate would otherwise cancel the in-flight
+                # invoke here — exactly the enforcement
+                # ``observation_only`` exists to suppress. Drop the
+                # channel message (the originating
+                # ``HUMAN_INTERVENTION_REQUIRED`` drift on the sink
+                # stream remains the durable signal) and keep waiting
+                # on the invoke task / next control message.
+                if getattr(steerer, "_observation_only", False):
+                    log.info(
+                        "SequentialExecutor: observation_only=True — "
+                        "dropping GOLDFIVE_PAUSE_ESCALATE without "
+                        "cancelling in-flight invoke (HUMAN_INTERVENTION_"
+                        "REQUIRED drift on the sink stream remains the "
+                        "durable signal)"
+                    )
+                    continue
                 await self._cancel_invoke_task(invoke_task)
                 return ("goldfive_pause", outcome.goldfive_pause_message)
 
