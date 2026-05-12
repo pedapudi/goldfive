@@ -427,3 +427,274 @@ async def test_after_pin_report_task_started_resolves_bound_task() -> None:
     assert "missing_task_id" not in str(res), (
         f"task_id was not injected from the pin: {res}"
     )
+
+
+# ---------------------------------------------------------------------------
+# goldfive#262 — DelegationObserved emit happens AFTER the pin
+# ---------------------------------------------------------------------------
+
+
+class _SinkingSteerer:
+    """Minimal steerer stub that owns a ``_sinks`` list.
+
+    The plugin's ``_emit_observability`` reads ``steerer._sinks`` to fan
+    sink events out — this stub is just enough to capture
+    ``DelegationObserved`` events the plugin emits from
+    ``before_tool_callback``.
+    """
+
+    def __init__(self, sink: Any) -> None:
+        self._sinks = [sink]
+
+    async def observe(self, *a: Any, **kw: Any) -> None:
+        pass
+
+    async def transition(self, *a: Any, **kw: Any) -> None:
+        pass
+
+    def detect_drift(self, *a: Any, **kw: Any) -> None:
+        return None
+
+    def bind(self, **kw: Any) -> None:
+        pass
+
+
+def _delegation_events(events: list[Any]) -> list[Any]:
+    """Filter ``events`` to ``DelegationObserved`` payloads only."""
+    out: list[Any] = []
+    for e in events:
+        if not hasattr(e, "WhichOneof"):
+            continue
+        if e.WhichOneof("payload") == "delegation_observed":
+            out.append(e.delegation_observed)
+    return out
+
+
+async def test_delegation_observed_event_carries_bound_task_id() -> None:
+    """The ``DelegationObserved`` event's ``task_id`` is the freshly-bound
+    plan-task id (goldfive#262).
+
+    Before #262 the emit ran BEFORE ``_maybe_pin_delegation_task``, so
+    the proto field was empty on the typical orchestration-only
+    coordinator turn (``ctx.task is None``). After the reorder the emit
+    reads ``session.current_task_id`` which the pin just stamped — so
+    the harmonograf ingest can attribute the delegation to the right
+    task and stamp ``tasks.assignee_agent_id``.
+    """
+    from goldfive.sinks.memory import InMemorySink
+
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        Task(id="A", title="Research the topic"),
+        Task(id="B", title="Write the draft"),
+        edges=[TaskEdge(from_task_id="A", to_task_id="B")],
+    )
+    session = _session_with(plan)
+
+    sink = InMemorySink()
+    steerer = _SinkingSteerer(sink)
+
+    # Orchestration-only coordinator turn: ctx.task is None — same
+    # shape as the live coordinator that reproduced the bug
+    # (session 4a721a07).
+    ctx_obj = SessionContext(
+        session=session,
+        steerer=steerer,
+        task=None,
+        tool_handlers={},
+        host_agent_name="coord",
+    )
+    plugin.set_active_context(ctx_obj)
+
+    adk_state: dict[str, Any] = {SESSION_CONTEXT_STATE_KEY: ctx_obj}
+    coord_inv = _FakeInvocationContext(adk_state, "coord")
+    coord_tool_context = _FakeToolContext(coord_inv, function_call_id="fc-1")
+
+    agent_tool = _FakeAgentTool("researcher")
+    await plugin.before_tool_callback(
+        tool=agent_tool,
+        tool_args={"request": "please research the topic"},
+        tool_context=coord_tool_context,
+    )
+
+    # Confirm the pin landed.
+    assert session.current_task_id == "A"
+    a = _find_task(session.plan, "A")
+    assert a is not None and a.assignee_agent_id == "researcher"
+
+    # Exactly one delegation_observed event, carrying the bound task id.
+    delegations = _delegation_events(sink.events)
+    assert len(delegations) == 1, (
+        f"expected one DelegationObserved; got {[type(e).__name__ for e in sink.events]}"
+    )
+    d = delegations[0]
+    assert d.from_agent == "coord"
+    assert d.to_agent == "researcher"
+    assert d.task_id == "A", (
+        f"DelegationObserved.task_id must carry the bound id; got '{d.task_id}'"
+    )
+
+
+async def test_delegation_observed_task_id_empty_when_no_eligible_task() -> None:
+    """When the pin can't bind a task (no eligible PENDING tasks), the
+    emit lands with ``task_id == ""`` (defensive — no fake binding).
+
+    Mirror of the no-eligible-task case from the selection-algorithm
+    tests, but checks the emit side rather than the pin side.
+    """
+    import dataclasses
+
+    from goldfive.sinks.memory import InMemorySink
+
+    plugin = make_adk_plugin(host_agent_name="coord")
+    # Same shape as ``test_no_eligible_task_leaves_session_unpinned``:
+    # A is RUNNING (not PENDING) so it's not eligible; B's predecessor A
+    # is not COMPLETED so B is DAG-blocked. Zero eligible tasks.
+    plan = _plan(
+        Task(id="A", title="Plan the work"),
+        Task(id="B", title="Execute the work"),
+        edges=[TaskEdge(from_task_id="A", to_task_id="B")],
+    )
+    plan = dataclasses.replace(
+        plan,
+        tasks=(
+            dataclasses.replace(plan.tasks[0], status=TaskStatus.RUNNING),
+            plan.tasks[1],
+        ),
+    )
+    session = _session_with(plan)
+
+    sink = InMemorySink()
+    steerer = _SinkingSteerer(sink)
+
+    ctx_obj = SessionContext(
+        session=session,
+        steerer=steerer,
+        task=None,
+        tool_handlers={},
+        host_agent_name="coord",
+    )
+    plugin.set_active_context(ctx_obj)
+
+    adk_state: dict[str, Any] = {SESSION_CONTEXT_STATE_KEY: ctx_obj}
+    coord_inv = _FakeInvocationContext(adk_state, "coord")
+    coord_tool_context = _FakeToolContext(coord_inv, function_call_id="fc-1")
+
+    agent_tool = _FakeAgentTool("worker")
+    await plugin.before_tool_callback(
+        tool=agent_tool,
+        tool_args={"request": "go"},
+        tool_context=coord_tool_context,
+    )
+
+    # Pin did not bind anything.
+    assert session.current_task_id == ""
+
+    # Exactly one delegation_observed event, with empty task_id.
+    delegations = _delegation_events(sink.events)
+    assert len(delegations) == 1
+    d = delegations[0]
+    assert d.from_agent == "coord"
+    assert d.to_agent == "worker"
+    assert d.task_id == "", (
+        f"expected empty task_id when no eligible task; got '{d.task_id}'"
+    )
+
+
+async def test_capability_check_still_resolves_after_reorder() -> None:
+    """After the pin → emit → capability-check reorder, the capability
+    detector still resolves the task via Strategy 1 (assignee, freshly
+    stamped by the pin) — i.e. the reorder didn't break the goldfive#253
+    detector.
+
+    Rule A scenario: the invoked sub-agent has only AgentTool wrappers
+    (no leaf tools) and the bound plan task is a leaf authoring task.
+    The capability detector must fire CAPABILITY_MISMATCH.
+    """
+    from goldfive.types import DriftKind
+
+    class _RecordingSteerer:
+        def __init__(self) -> None:
+            self._sinks: list[Any] = []
+            self.drifts: list[Any] = []
+
+        async def observe(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        async def transition(self, *a: Any, **kw: Any) -> None:
+            pass
+
+        def detect_drift(self, *a: Any, **kw: Any) -> None:
+            return None
+
+        def bind(self, **kw: Any) -> None:
+            pass
+
+        async def _handle_drift(self, drift: Any, session: Any) -> None:  # noqa: ARG002
+            self.drifts.append(drift)
+
+    plugin = make_adk_plugin(host_agent_name="coord")
+    # Single leaf authoring task (PENDING, no assignee) — the pin will
+    # bind it to the invoked underqualified sub-agent.
+    plan = _plan(
+        Task(id="t-draft", title="Draft a presentation about LLM observability"),
+    )
+    session = _session_with(plan)
+
+    steerer = _RecordingSteerer()
+    ctx_obj = SessionContext(
+        session=session,
+        steerer=steerer,
+        task=None,
+        tool_handlers={},
+        host_agent_name="coord",
+    )
+    plugin.set_active_context(ctx_obj)
+
+    # The "underqualified" invoked agent has only an AgentTool wrapper
+    # — Rule A's structural signal. Build a stand-in shape the
+    # capability detector can introspect (it walks ``.tools`` on the
+    # invoked agent).
+    class _AgentToolWrapper:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.agent = _FakeAgent(name)
+
+    class _Underqualified:
+        name = "underqualified"
+        tools = [_AgentToolWrapper("inner")]
+
+    # AgentTool dispatch shape the plugin recognises.
+    class _DispatchAgentTool:
+        def __init__(self, sub: Any) -> None:
+            self.name = sub.name
+            self.agent = sub
+
+    dispatch = _DispatchAgentTool(_Underqualified())
+
+    adk_state: dict[str, Any] = {SESSION_CONTEXT_STATE_KEY: ctx_obj}
+    coord_inv = _FakeInvocationContext(adk_state, "coord")
+    coord_tool_context = _FakeToolContext(coord_inv, function_call_id="fc-1")
+
+    await plugin.before_tool_callback(
+        tool=dispatch,
+        tool_args={"request": "draft the presentation"},
+        tool_context=coord_tool_context,
+    )
+
+    # Pin landed: assignee stamped, current_task_id pinned — Strategy 1
+    # of the capability check resolves on this.
+    t = _find_task(session.plan, "t-draft")
+    assert t is not None and t.assignee_agent_id == "underqualified"
+    assert session.current_task_id == "t-draft"
+
+    # Capability detector fired and the drift reached the steerer.
+    capability_drifts = [
+        d for d in steerer.drifts if d.kind is DriftKind.CAPABILITY_MISMATCH
+    ]
+    assert len(capability_drifts) >= 1, (
+        f"expected CAPABILITY_MISMATCH; got {[d.kind for d in steerer.drifts]}"
+    )
+    drift = capability_drifts[0]
+    assert drift.current_task_id == "t-draft"
+    assert drift.current_agent_id == "underqualified"
