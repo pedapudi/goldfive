@@ -66,10 +66,10 @@ import dataclasses
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
-from goldfive.types import DriftEvent, DriftKind, Goal
+from goldfive.types import DriftKind, Goal
 
 log = logging.getLogger(__name__)
 
@@ -403,8 +403,3 @@ def _ensure_registered() -> None:
     )
 
     _AUTO_REGISTERED = True
-
-
-# Define typed Awaitable alias for documentation only (not exported).
-_DriftEventOr = DriftEvent | None  # noqa: F841 — referenced by docstrings/type hints
-_AsyncClassifier = Callable[..., Awaitable[Any]]  # noqa: F841
