@@ -1,4 +1,4 @@
-"""Reporting-tool specs and handlers.
+"""Async handlers and tool-spec catalog for the canonical reporting tools.
 
 The eight canonical reporting tools — the agent-facing contract for
 driving the plan's task state machine and signalling plan mutations.
@@ -25,7 +25,47 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from goldfive import _state_audit
-from goldfive.types import SupersessionKind, TaskStatus
+from goldfive.reporting._internal import (
+    _ACK,
+    _TERMINAL_STATUSES,
+    _await_plan_stable,
+    _bool,
+    _classify_pin_freshness,
+    _classify_transition,
+    _emit_approval_requested,
+    _emit_task_declaration_received,
+    _emit_task_transition_refused,
+    _find_task_in_session,
+    _float,
+    _int,
+    _read_pin_revision,
+    _read_plan_revision,
+    _reroute_if_superseded,
+    _resolve_task_id_with_source,
+    _rotate_after_terminal,
+    _str,
+)
+from goldfive.reporting.rendering import (
+    _directive_ack,
+    _idempotent_response,
+    _invalid_transition_response,
+    _missing_required_field_response,
+    _missing_task_id_response,
+    _refused_response,
+)
+from goldfive.reporting.schemas import (
+    _SCHEMA_AWAITING_APPROVAL,
+    _SCHEMA_DECLARE_TASK_NOT_NEEDED,
+    _SCHEMA_DECLARE_TASK_SKIPPED,
+    _SCHEMA_NEW_WORK_DISCOVERED,
+    _SCHEMA_PLAN_DIVERGENCE,
+    _SCHEMA_TASK_BLOCKED,
+    _SCHEMA_TASK_COMPLETED,
+    _SCHEMA_TASK_FAILED,
+    _SCHEMA_TASK_PROGRESS,
+    _SCHEMA_TASK_STARTED,
+)
+from goldfive.types import TaskStatus
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
@@ -103,518 +143,8 @@ DECLARATION_KINDS: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Handler shims
+# Stale-pin classification / routing bridge
 # ---------------------------------------------------------------------------
-
-
-_ACK: dict[str, Any] = {"acknowledged": True}
-
-
-# ---------------------------------------------------------------------------
-# Tier 1 / F1 — directive tool responses (loop prevention)
-# ---------------------------------------------------------------------------
-#
-# Every report_task_* handler returns a richer payload than the historical
-# ``{"acknowledged": True}`` ack. The payload anchors the LLM's "what do
-# I do next?" reasoning by embedding the live plan_state, so a coordinator
-# that just completed a task sees the next pending hand-off instead of an
-# information-free ack and looping back onto the just-finished work.
-#
-# Shape:
-#   {
-#     "acknowledged": True,
-#     "task": {"id": <task_id>, "status": <new_status_str>},
-#     "plan_state": {
-#        "completed_task_ids": [...sorted ids of COMPLETED tasks...],
-#        "next_pending": {
-#            "id": ..., "title": ..., "assigned_to": <bare agent name>,
-#            "predecessors_completed": True,
-#        } | None,
-#     },
-#   }
-#
-# Idempotent / invalid / refused responses keep their existing shapes —
-# they signal "do nothing" to the LLM and don't need the directive surface.
-# This is the pre-dispatch loop-source closure pattern (see
-# ``docs/design/`` for the loop-prevention strategy).
-
-
-def _next_pending_with_completed_predecessors(plan: Any) -> Any | None:
-    """Return the first PENDING task whose incoming edges all have terminal predecessors.
-
-    Walks ``plan.tasks`` in declared order (topological-ish — refine
-    preserves the original ordering for unmutated stages) and returns
-    the first ``Task`` whose every incoming-edge predecessor is in a
-    terminal status (``TERMINAL_TASK_STATUSES``). Returns ``None`` when
-    no such task exists.
-
-    Note: a task with NO incoming edges trivially passes the
-    "predecessors_completed" gate and is returned if PENDING.
-    """
-    if plan is None:
-        return None
-    tasks = list(getattr(plan, "tasks", None) or ())
-    if not tasks:
-        return None
-    edges = list(getattr(plan, "edges", None) or ())
-    by_id = {str(getattr(t, "id", "") or ""): t for t in tasks}
-    incoming: dict[str, list[str]] = {tid: [] for tid in by_id}
-    for e in edges:
-        to_id = str(getattr(e, "to_task_id", "") or "")
-        from_id = str(getattr(e, "from_task_id", "") or "")
-        if to_id in incoming and from_id:
-            incoming[to_id].append(from_id)
-    for task in tasks:
-        if getattr(task, "status", None) is not TaskStatus.PENDING:
-            continue
-        tid = str(getattr(task, "id", "") or "")
-        if not tid:
-            continue
-        preds = incoming.get(tid, [])
-        if all(
-            (by_id.get(p) is not None)
-            and (getattr(by_id[p], "status", None) in _TERMINAL_STATUSES)
-            for p in preds
-        ):
-            return task
-    return None
-
-
-def _bare_agent_name(name: str) -> str:
-    """Return the bare agent name (last dot-separated segment).
-
-    Mirrors the normalization used by ``_correction_injection`` —
-    fully-qualified ADK agent paths like ``coordinator.research_agent``
-    collapse to ``research_agent`` so the LLM sees a name it can pass
-    back as the AgentTool target.
-    """
-    s = (name or "").strip()
-    if not s:
-        return ""
-    if "." in s:
-        return s.rsplit(".", 1)[-1]
-    return s
-
-
-def _build_plan_state(plan: Any) -> dict[str, Any]:
-    """Return the F1 ``plan_state`` block for a directive tool response."""
-    if plan is None:
-        return {"completed_task_ids": [], "next_pending": None}
-    tasks = list(getattr(plan, "tasks", None) or ())
-    completed_ids = sorted(
-        str(getattr(t, "id", "") or "")
-        for t in tasks
-        if getattr(t, "status", None) is TaskStatus.COMPLETED
-        and getattr(t, "id", "")
-    )
-    next_pending = _next_pending_with_completed_predecessors(plan)
-    next_pending_payload: dict[str, Any] | None = None
-    if next_pending is not None:
-        next_pending_payload = {
-            "id": str(getattr(next_pending, "id", "") or ""),
-            "title": str(getattr(next_pending, "title", "") or ""),
-            "assigned_to": _bare_agent_name(
-                str(getattr(next_pending, "assignee_agent_id", "") or "")
-            ),
-            # The selector only returns tasks whose every predecessor is
-            # terminal; expose the assertion so the LLM doesn't have to
-            # re-derive it.
-            "predecessors_completed": True,
-        }
-    return {
-        "completed_task_ids": completed_ids,
-        "next_pending": next_pending_payload,
-    }
-
-
-def _directive_ack(
-    *,
-    session: Session,
-    task_id: str,
-    new_status: TaskStatus,
-) -> dict[str, Any]:
-    """Build the F1 directive payload for a report_task_* handler.
-
-    ``new_status`` is the status the call moved (or would move) the task
-    INTO. Idempotent / invalid / refused branches use their own shapes
-    and do not call this helper.
-    """
-    return {
-        "acknowledged": True,
-        "task": {"id": task_id, "status": new_status.value},
-        "plan_state": _build_plan_state(getattr(session, "plan", None)),
-    }
-
-
-def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
-    """Return the task_id to act on, falling back to session state.
-
-    Order of precedence (goldfive#191):
-
-    1. ``args["task_id"]`` — explicit model-provided id always wins.
-    2. ``StateStore.pin_current_task()`` — the id pinned
-       by the adapter's ``before_agent_callback`` when the current
-       sub-agent has exactly one PENDING/RUNNING task assigned to
-       it. Closes the loop where the LLM's tool call omits the
-       arg but the orchestration layer knew the answer.
-
-    Empty string when neither source supplies a value — caller
-    should short-circuit with the canonical ``missing_task_id``
-    error in that case.
-    """
-    return _resolve_task_id_with_source(args, session)[0]
-
-
-def _resolve_task_id_with_source(args: dict[str, Any], session: Session) -> tuple[str, str]:
-    """Resolve ``task_id`` and report whether it came from args or state.
-
-    Returns ``(task_id, source)`` where ``source`` is one of:
-
-    * ``"llm_report"`` — the LLM supplied an explicit non-empty
-      ``task_id`` arg.
-    * ``"handler_default"`` — the arg was absent / empty / None and the
-      handler defaulted to the adapter-stamped pin
-      (:meth:`StateStore.pin_current_task`). This is the
-      goldfive#191 path.
-    * ``""`` — neither source resolved a value (caller short-circuits
-      with the canonical ``missing_task_id`` rejection).
-
-    Used by the goldfive#251 R4 ``TaskTransitioned`` emit sites to
-    distinguish a direct LLM-driven transition from one that piggy-
-    backed on the adapter pin. The tuple-returning variant is
-    additive; existing callers stay on :func:`_resolve_task_id`.
-
-    Phase 2.1 of goldfive#271 — the read funnels through
-    :class:`~goldfive.state_store.StateStore` so the
-    handler is decoupled from goldfive ``Session.state``'s on-disk
-    key strings.
-    """
-    raw = args.get("task_id")
-    if raw is not None:
-        task_id = str(raw).strip()
-        if task_id:
-            return task_id, "llm_report"
-    from goldfive.state_store import StateStore
-
-    store = StateStore.for_session(session)
-    fallback = store.pin_current_task().strip()
-    if fallback:
-        log.debug(
-            "reporting: defaulted task_id=%s from StateStore",
-            fallback,
-        )
-        return fallback, "handler_default"
-    return "", ""
-
-
-# ---------------------------------------------------------------------------
-# Idempotency / invalid-transition machinery (goldfive#201)
-# ---------------------------------------------------------------------------
-#
-# Each task-scoped reporting handler consults the task's current status
-# before driving the steerer. Three outcomes:
-#
-# 1. **Real transition** — current status is a legal source for the
-#    tool's target transition; the handler invokes the steerer and
-#    returns ``{"acknowledged": True}``. Terminal transitions also
-#    rotate ``goldfive.current_task_id`` to the next assigned
-#    PENDING/RUNNING task (or clear it).
-# 2. **Idempotent no-op** — current status already matches what the
-#    call would move the task to (e.g. ``report_task_completed`` on a
-#    COMPLETED task). Handler returns
-#    ``{"acknowledged": True, "idempotent": True, "current_status": ...}``
-#    without mutating state. This is the goldfive#201 fix: retries
-#    from a confused model no longer masquerade as tool-loop spam.
-# 3. **Invalid transition** — current status cannot legally transition
-#    under this tool (e.g. ``report_task_started`` on a COMPLETED
-#    task). Handler returns
-#    ``{"acknowledged": False, "error": "invalid_transition",
-#       "current_status": ..., "attempted": ...}``
-#    as a real "agent is confused about state" signal. Loop-detector
-#    owners can surface this directly; it's distinct from a benign
-#    retry.
-#
-# See ``docs/design/TASK-LIFECYCLE.md`` for the status-machine contract.
-
-
-# Tool-name → the status the call would transition the task INTO
-# (i.e. "what does success look like"). Used to detect idempotent
-# retries: when ``current_status`` already equals the target, the call
-# is an ack-only no-op.
-_TOOL_TARGET_STATUS: dict[str, TaskStatus] = {
-    "report_task_started": TaskStatus.RUNNING,
-    "report_task_progress": TaskStatus.RUNNING,  # progress is a liveness tick on a RUNNING task
-    "report_task_completed": TaskStatus.COMPLETED,
-    "report_task_failed": TaskStatus.FAILED,
-    "report_task_blocked": TaskStatus.BLOCKED,
-    "report_awaiting_approval": TaskStatus.BLOCKED,  # mapped onto BLOCKED by the steerer
-}
-
-# Which source statuses are *legal* starting points for each tool.
-# Anything else is either an idempotent no-op (see above) or an
-# ``invalid_transition``. Built from ``docs/design/TASK-LIFECYCLE.md``
-# §"Status transitions". PENDING/RUNNING bookkeeping statuses are the
-# canonical sources; terminal statuses are never a legal source for a
-# different transition.
-_TOOL_VALID_SOURCES: dict[str, frozenset[TaskStatus]] = {
-    "report_task_started": frozenset({TaskStatus.PENDING, TaskStatus.BLOCKED}),
-    "report_task_progress": frozenset({TaskStatus.RUNNING}),
-    "report_task_completed": frozenset(
-        {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED}
-    ),
-    "report_task_failed": frozenset({TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED}),
-    "report_task_blocked": frozenset({TaskStatus.PENDING, TaskStatus.RUNNING}),
-    "report_awaiting_approval": frozenset(
-        {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.BLOCKED}
-    ),
-}
-
-# Terminal statuses — duplicated here to avoid a runtime import of
-# ``TERMINAL_TASK_STATUSES`` from ``goldfive.types``; the value set is
-# pinned by ``TaskStatus`` and guarded by a test.
-_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
-    {
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-        TaskStatus.NOT_NEEDED,
-    }
-)
-
-
-def _find_task_in_session(session: Session, task_id: str) -> Task | None:
-    """Return the task in ``session.plan`` with ``task_id``, or ``None``."""
-    plan = getattr(session, "plan", None)
-    if plan is None or not task_id:
-        return None
-    for t in getattr(plan, "tasks", ()) or ():
-        if getattr(t, "id", "") == task_id:
-            return t
-    return None
-
-
-def _resolve_effective_task_id(session: Session, task_id: str) -> str:
-    """Follow the plan's ``supersedes`` chain from a terminal task to its live replacement.
-
-    goldfive#237. The scenario: ``planner.refine`` has replaced
-    ``research_solar`` (now FAILED) with ``research_solar_corrected``
-    (supersedes=``research_solar``, PENDING). The agent keeps its
-    previously-pinned ``current_task_id=research_solar`` and calls
-    ``report_task_progress`` with that id. Without this resolver the
-    handler would reject the call as an invalid transition from a
-    terminal status — a direct contradiction of "agent is actively
-    working, report is rejected".
-
-    Rules:
-
-    * If ``task_id`` refers to a task that is NOT terminal, return it
-      unchanged (the pre-#237 behaviour).
-    * If ``task_id`` refers to a terminal task, walk the plan looking
-      for any task whose ``supersedes`` equals ``task_id``. When
-      found, recurse (so A → B → C chains collapse to C), capping the
-      walk at a small depth for loop safety.
-    * If no replacement exists, return ``task_id`` unchanged — the
-      handler's existing terminal-state rejection path takes over,
-      which is still the right signal when the planner didn't produce
-      a replacement.
-
-    Empty / unknown task_id is returned unchanged.
-    """
-    if not task_id:
-        return task_id
-    plan = getattr(session, "plan", None)
-    if plan is None:
-        return task_id
-    tasks = getattr(plan, "tasks", None) or ()
-    # Index once — handlers call this up to five times per tool call.
-    by_id: dict[str, Task] = {str(getattr(t, "id", "") or ""): t for t in tasks}
-    # Build a reverse map supersedes -> new once. goldfive#251: a
-    # ``CORRECT``-kind supersedes link DOES NOT route — the old task's
-    # completion is historical fact (it is a COMPLETED node retained
-    # for DAG history) and a late report on it is an idempotent no-op
-    # on a completed task, not a retroactive write to the correction.
-    # Only ``REPLACE`` / ``UNSPECIFIED`` (legacy) links reroute.
-    replacements: dict[str, str] = {}
-    for t in tasks:
-        sup = str(getattr(t, "supersedes", "") or "").strip()
-        tid = str(getattr(t, "id", "") or "").strip()
-        if not sup or not tid:
-            continue
-        kind = getattr(t, "supersedes_kind", SupersessionKind.UNSPECIFIED)
-        if kind is SupersessionKind.CORRECT:
-            continue
-        replacements[sup] = tid
-    current = task_id
-    visited: set[str] = {current}
-    for _ in range(8):  # hard cap: plan-revision chains don't grow deep
-        task = by_id.get(current)
-        if task is None:
-            return current
-        if task.status not in _TERMINAL_STATUSES:
-            return current
-        nxt = replacements.get(current, "")
-        if not nxt or nxt in visited:
-            return current
-        visited.add(nxt)
-        current = nxt
-    return current
-
-
-def _reroute_if_superseded(session: Session, task_id: str, tool_name: str) -> str:
-    """Resolve ``task_id`` through the plan's supersession chain with logging.
-
-    Thin wrapper over :func:`_resolve_effective_task_id` that adds an
-    INFO-level log record the first time a call is rerouted so
-    operators can see the re-pin happening live in sessions. Idempotent
-    beyond the log line: handlers can safely call it every dispatch.
-    """
-    resolved = _resolve_effective_task_id(session, task_id)
-    if resolved != task_id:
-        log.info(
-            "reporting: %s called with superseded task_id=%s; routing to replacement=%s",
-            tool_name,
-            task_id,
-            resolved,
-        )
-    return resolved
-
-
-# ---------------------------------------------------------------------------
-# Pin freshness classification (goldfive#266 / pin versioning)
-# ---------------------------------------------------------------------------
-
-
-def _read_pin_revision(session: Session) -> int | None:
-    """Return the pin's stamped revision from session state, or ``None``.
-
-    ``None`` indicates "no stamp present" — distinct from a stamp of 0.
-    Custom adapters / legacy sessions / tests that pre-date #266 won't
-    have stamped the key; those callers must keep working unchanged
-    against the legacy ``_reroute_if_superseded`` semantics. Callers
-    that observe ``None`` should treat the pin as fresh (the stamp
-    isn't load-bearing).
-
-    A stamp of ``0`` means "the pin was set under the initial plan
-    revision" and is treated by the classifier as a stale pin against
-    any plan with ``revision_index > 0`` — that's the actual
-    versioning semantics, distinct from "no stamp".
-    """
-    from goldfive import state_store as _ostate
-
-    state = getattr(session, "state", None)
-    if not isinstance(state, dict):
-        return None
-    if _ostate.KEY_CURRENT_TASK_REVISION not in state:
-        return None
-    return _ostate.read_current_task_revision(state)
-
-
-def _read_plan_revision(session: Session) -> int:
-    """Return ``session.plan.revision_index`` as an int, default 0.
-
-    Tolerant of missing / mock plans (test stubs, custom executors).
-    """
-    plan = getattr(session, "plan", None)
-    try:
-        return max(0, int(getattr(plan, "revision_index", 0) or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _supersession_successor(session: Session, task_id: str) -> tuple[str, SupersessionKind]:
-    """Return ``(successor_task_id, kind)`` for ``task_id``.
-
-    Walks the plan looking for a task whose ``supersedes`` equals
-    ``task_id``. Empty successor + ``UNSPECIFIED`` when no successor
-    exists. Used by the report-time pin classifier — ``REPLACE``
-    successors route, ``CORRECT`` successors refuse, no successor also
-    refuses (ambiguity).
-    """
-    plan = getattr(session, "plan", None)
-    if plan is None or not task_id:
-        return "", SupersessionKind.UNSPECIFIED
-    for t in getattr(plan, "tasks", ()) or ():
-        sup = str(getattr(t, "supersedes", "") or "").strip()
-        if sup != task_id:
-            continue
-        successor_id = str(getattr(t, "id", "") or "").strip()
-        kind = getattr(t, "supersedes_kind", SupersessionKind.UNSPECIFIED)
-        return successor_id, kind
-    return "", SupersessionKind.UNSPECIFIED
-
-
-# Outcomes of :func:`_classify_pin_freshness`:
-#
-# * ``"match"`` — pin revision equals (or exceeds — defensive) current
-#   plan revision. Handler proceeds on the pin's task_id.
-# * ``"stale_replace"`` — pin is older than the current plan revision
-#   and the pin's task has a REPLACE-kind supersedes successor. Handler
-#   routes onto the successor (existing pre-#266 behaviour).
-# * ``"stale_correct"`` — pin is older + the pin's task has a
-#   CORRECT-kind supersedes successor. Handler REFUSES + emits a
-#   ``task_transition_refused`` sink event. The old task's terminal
-#   state is historical fact and the correction is a separate work
-#   unit; transitioning the old task out of terminal would either
-#   destroy fact or shadow the correction.
-# * ``"stale_ambiguous"`` — pin is older + the pin's task has no
-#   supersedes successor. Handler REFUSES; an operator must
-#   disambiguate. Same shape as stale_correct.
-_PinFreshness = str
-
-
-def _classify_pin_freshness(
-    session: Session,
-    task_id: str,
-    *,
-    pin_revision: int,
-    current_revision: int,
-) -> tuple[_PinFreshness, str, SupersessionKind]:
-    """Classify the relationship between a pinned task_id and the live plan.
-
-    Returns ``(freshness, successor_task_id, supersedes_kind)``. The
-    successor is empty for ``"match"`` and ``"stale_ambiguous"``.
-    """
-    if pin_revision >= current_revision:
-        # Future revisions (pin_revision > current_revision) shouldn't
-        # happen under a single executor — the writer reads
-        # plan.revision_index that the report-time reader sees later,
-        # and revisions only ever increment. If it does, treat as a
-        # match (trust the pin) rather than refusing.
-        if pin_revision > current_revision:
-            log.debug(
-                "reporting: pin_revision=%d > current=%d for task_id=%s (unexpected; trusting pin)",
-                pin_revision,
-                current_revision,
-                task_id,
-            )
-        return "match", "", SupersessionKind.UNSPECIFIED
-
-    # pin_revision < current_revision — the pin was set under an older
-    # plan. Consult the supersedes graph.
-    successor_id, kind = _supersession_successor(session, task_id)
-    if successor_id and kind is SupersessionKind.REPLACE:
-        return "stale_replace", successor_id, kind
-    if successor_id and kind is SupersessionKind.CORRECT:
-        return "stale_correct", successor_id, kind
-    if successor_id and kind is SupersessionKind.UNSPECIFIED:
-        # Legacy plans pre-#258 didn't carry a supersedes_kind enum.
-        # Preserve the historical "treat unspecified as REPLACE" rerouting
-        # path used by ``_resolve_effective_task_id`` so legacy data
-        # keeps reaching the right handler.
-        return "stale_replace", successor_id, kind
-    return "stale_ambiguous", "", SupersessionKind.UNSPECIFIED
-
-
-def _refused_response() -> dict[str, Any]:
-    """Return the ack-only response for a refused stale-pin transition.
-
-    The LLM still sees ``{"acknowledged": True}`` rather than an error
-    payload — surfacing the refusal as a structured error would create a
-    prompt-injection surface (the LLM might reason against the rejection
-    and bypass the contract). Operators see the refusal via the
-    ``task_transition_refused`` sink event.
-    """
-    return dict(_ACK)
 
 
 async def _classify_and_route_pin(
@@ -726,215 +256,9 @@ async def _classify_and_route_pin(
     return "", _refused_response(), False
 
 
-async def _emit_task_transition_refused(
-    *,
-    session: Session,
-    steerer: Steerer,
-    task_id: str,
-    attempted_from: TaskStatus,
-    attempted_to: TaskStatus,
-    reason: str,
-    pin_revision: int,
-    current_revision: int,
-    agent_name: str = "",
-    invocation_id: str = "",
-) -> None:
-    """Emit a ``TaskTransitionRefused`` proto envelope onto the sink bus.
-
-    Fired when the report-time pin classifier refuses to drive a stale
-    pin's transition because the old task either has a CORRECT-kind
-    supersedes successor (history vs. correction) or no successor at
-    all (ambiguity — operator must decide). The LLM still sees an
-    ``{"acknowledged": True}`` response so it doesn't reason against
-    the refusal; operators consume this event for the audit trail.
-
-    Typed proto envelope — promoted from the dict shape that #266
-    shipped, matching the ``InvocationCancelled`` promotion pattern
-    from #262. The dict-envelope path has been removed (full
-    migration; harmonograf-side ingest migration lands separately).
-    """
-    sinks = getattr(steerer, "_sinks", None) or []
-    if not sinks:
-        return
-    from goldfive.events import emit, task_transition_refused_event
-
-    try:
-        evt = task_transition_refused_event(
-            session.run_id,
-            session.next_sequence(),
-            task_id=task_id,
-            attempted_from=attempted_from.value,
-            attempted_to=attempted_to.value,
-            reason=reason,
-            pin_revision=int(pin_revision),
-            current_revision=int(current_revision),
-            agent_name=agent_name,
-            invocation_id=invocation_id,
-            session_id=session.id,
-        )
-        await emit(sinks, evt)
-    except Exception as exc:  # noqa: BLE001 — observability must never break a report
-        log.debug(
-            "reporting._emit_task_transition_refused: failed to emit: %s",
-            exc,
-        )
-
-
-async def _await_plan_stable(session: Session, steerer: Steerer) -> None:
-    """Block briefly until the steerer's plan mutation region is idle.
-
-    Duck-types ``steerer._wait_plan_stable``: any Steerer implementation
-    that exposes an async ``_wait_plan_stable(session)`` method gets a
-    consistent plan-state read; implementations that don't (custom
-    Steerers, test stubs) silently fall through and observe whatever
-    plan state happens to be installed at call time — the pre-a4
-    behaviour. Atomicity is best-effort (the helper times out after a
-    short interval and proceeds anyway), so this is a soft barrier,
-    not a hard mutex.
-    """
-    waiter = getattr(steerer, "_wait_plan_stable", None)
-    if not callable(waiter):
-        return
-    try:
-        await waiter(session)
-    except Exception as exc:  # noqa: BLE001 — barrier must never break a report
-        log.debug(
-            "reporting._await_plan_stable: %s (proceeding with current plan state)",
-            exc,
-        )
-
-
-def _idempotent_response(
-    current_status: TaskStatus,
-    *,
-    session: Session | None = None,
-    task_id: str = "",
-) -> dict[str, Any]:
-    """Idempotent ack for a re-report on a task already in ``current_status``.
-
-    F1 (loop prevention): when the LLM re-reports a task that's already
-    terminal, the response still carries the live ``plan_state`` so the
-    coordinator sees the next pending hand-off instead of an
-    information-free ack — the same anchor the directive ack provides
-    on real transitions. Without ``session`` the helper degrades to the
-    pre-F1 shape (legacy callers, test stubs).
-    """
-    response: dict[str, Any] = {
-        "acknowledged": True,
-        "idempotent": True,
-        "current_status": current_status.value,
-    }
-    if session is not None:
-        response["task"] = {"id": task_id, "status": current_status.value}
-        response["plan_state"] = _build_plan_state(getattr(session, "plan", None))
-    return response
-
-
-def _invalid_transition_response(
-    *,
-    tool_name: str,
-    current_status: TaskStatus,
-    attempted: TaskStatus,
-    task_id: str,
-) -> dict[str, Any]:
-    return {
-        "acknowledged": False,
-        "error": "invalid_transition",
-        "tool": tool_name,
-        "task_id": task_id,
-        "current_status": current_status.value,
-        "attempted": attempted.value,
-        "message": (
-            f"Cannot {tool_name!r} task {task_id!r} from {current_status.value} "
-            f"to {attempted.value}. The task is already in a terminal or "
-            "otherwise-incompatible state; do not retry."
-        ),
-    }
-
-
-def _classify_transition(
-    *,
-    tool_name: str,
-    current_status: TaskStatus,
-) -> str:
-    """Return ``"idempotent"``, ``"invalid"``, or ``"transition"``.
-
-    * ``"idempotent"`` — the call is a no-op because the task is
-      already in the status this tool would move it to (or, for
-      ``report_task_progress``, the task is already RUNNING and a
-      progress tick is always legal there). Handler returns an
-      idempotent ACK without mutating state.
-    * ``"invalid"`` — the call cannot legally transition from
-      ``current_status``. Handler returns an ``invalid_transition``
-      error.
-    * ``"transition"`` — the call is a legitimate transition; the
-      handler drives the steerer normally.
-    """
-    target = _TOOL_TARGET_STATUS.get(tool_name)
-    if target is not None and current_status == target:
-        # Special case: ``report_task_progress`` on a RUNNING task is
-        # always a no-op (a progress tick has no status mutation, but we
-        # treat it as idempotent so the caller sees the same shape).
-        return "idempotent"
-    valid = _TOOL_VALID_SOURCES.get(tool_name)
-    if valid is not None and current_status in valid:
-        return "transition"
-    # Falls through to invalid — covers terminal statuses under every
-    # tool (except when current == target above) and the degenerate
-    # case of ``report_task_progress`` on PENDING etc.
-    return "invalid"
-
-
-def _rotate_after_terminal(
-    session: Session,
-    completed_task: Task,
-) -> None:
-    """Advance the current-task pin after a terminal transition.
-
-    Delegates to :func:`goldfive.state_store.rotate_current_task_id`.
-    Imported lazily so this module stays ADK-free and dodges the
-    import-cycle risk between :mod:`goldfive.reporting` and
-    :mod:`goldfive.state_store` (both are imported from
-    :mod:`goldfive.steerer`).
-    """
-    from goldfive import state_store as _ostate
-    from goldfive.state_store import StateStore
-
-    state = getattr(session, "state", None)
-    if not isinstance(state, dict):
-        return
-    plan = getattr(session, "plan", None)
-    agent_name = str(getattr(completed_task, "assignee_agent_id", "") or "")
-
-    # Only rotate if the terminal task was the one we'd been pointing
-    # at — otherwise some other caller owns the pin and we'd clobber
-    # theirs.
-    pinned = StateStore.for_session(session).pin_current_task().strip()
-    this_id = str(getattr(completed_task, "id", "") or "")
-    if pinned and pinned != this_id:
-        return
-
-    _ostate.rotate_current_task_id(state, plan, agent_name)
-
-
-def _missing_task_id_response(tool_name: str) -> dict[str, Any]:
-    """Return the canonical ``missing_task_id`` rejection shape.
-
-    Mirrors the shape :mod:`goldfive.adapters._tool_invocation`
-    returns so adapters that call the handler directly (legacy paths,
-    custom adapters) surface the same structured error the
-    ``invoke_tool`` dispatcher would.
-    """
-    return {
-        "acknowledged": False,
-        "error": "missing_task_id",
-        "tool": tool_name,
-        "message": (
-            f"Tool {tool_name!r} requires a task_id; call it with the id "
-            "of the task you're reporting on, or ensure the adapter "
-            "has pinned goldfive.current_task_id on session state."
-        ),
-    }
+# ---------------------------------------------------------------------------
+# Required-field validation
+# ---------------------------------------------------------------------------
 
 
 def _validate_required(
@@ -994,70 +318,9 @@ def _validate_required(
     return None
 
 
-def _missing_required_field_response(
-    *,
-    tool_name: str,
-    field: str,
-    reason: str,
-    schema: dict[str, Any],
-) -> dict[str, Any]:
-    """Canonical rejection shape for a missing/empty required field.
-
-    Mirrors the structure of :func:`_missing_task_id_response` —
-    ``{"acknowledged": False, "error": ..., "tool": ..., "message":
-    ...}`` plus a ``field`` and ``schema`` so the LLM can self-correct
-    on the next turn. The ``schema`` echo is the parameters block the
-    handler is enforcing; tool dispatchers / observability layers can
-    use it to render a hint.
-    """
-    properties = schema.get("properties") or {}
-    expected = properties.get(field) or {}
-    return {
-        "acknowledged": False,
-        "error": "missing_required_field",
-        "tool": tool_name,
-        "field": field,
-        "reason": reason,
-        "expected": expected,
-        "required": list(schema.get("required") or []),
-        "message": (
-            f"Tool {tool_name!r} requires field {field!r} to be a non-empty "
-            f"value; received {reason}. Call the tool again with all "
-            f"required fields populated."
-        ),
-    }
-
-
-def _str(args: dict[str, Any], key: str, default: str = "") -> str:
-    v = args.get(key, default)
-    if v is None:
-        return default
-    return str(v)
-
-
-def _float(args: dict[str, Any], key: str, default: float = 0.0) -> float:
-    v = args.get(key, default)
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def _bool(args: dict[str, Any], key: str, default: bool = True) -> bool:
-    v = args.get(key, default)
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        return v.lower() in {"true", "1", "yes"}
-    return bool(v) if v is not None else default
-
-
-def _int(args: dict[str, Any], key: str, default: int = 0) -> int:
-    v = args.get(key, default)
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
 
 
 async def _handle_task_started(
@@ -1375,59 +638,6 @@ async def _handle_plan_divergence(
     return dict(_ACK)
 
 
-async def _emit_task_declaration_received(
-    *,
-    session: Session,
-    steerer: Steerer,
-    kind: str,
-    task_id: str,
-    reason: str,
-) -> None:
-    """Emit a ``TaskDeclarationReceived`` dict envelope onto the sink bus.
-
-    goldfive#271 Phase 3: structural declarations from the agent
-    (``declare_task_skipped``, ``declare_task_not_needed``) are
-    observability-only — they do NOT mutate plan state. Operators see
-    the declaration on the sink so they can compare it against the
-    imperative ``report_task_*`` surface that follows. The dict
-    envelope is the same low-cost path used for ``RefineAttempted``
-    / ``RefineFailed`` (PR #264) before those are promoted to typed
-    proto. A future cleanup may promote ``TaskDeclarationReceived``
-    to a proper proto message; until then the dict shape with a
-    well-known ``kind`` field is the contract.
-
-    ``source_signal`` is fixed to ``"DECLARATION"`` so downstream
-    consumers can distinguish a self-volunteered declaration from a
-    framework-driven inference (steerer rotation, reconciler
-    NOT_NEEDED stamp).
-    """
-    sinks = getattr(steerer, "_sinks", None) or []
-    if not sinks:
-        return
-    from goldfive.events import emit, make_event
-
-    payload = {
-        "kind": str(kind),
-        "task_id": str(task_id),
-        "reason": str(reason),
-        "source_signal": "DECLARATION",
-    }
-    try:
-        evt = make_event(
-            session.run_id,
-            session.next_sequence(),
-            "task_declaration_received",
-            payload,
-            session_id=session.id,
-        )
-        await emit(sinks, evt)
-    except Exception as exc:  # noqa: BLE001 — observability must never break a tool call
-        log.debug(
-            "reporting._emit_task_declaration_received: failed to emit: %s",
-            exc,
-        )
-
-
 def _record_declaration(session: Session, kind: str, task_id: str, reason: str) -> bool:
     """Record a declaration on session.state; return True if newly recorded.
 
@@ -1617,162 +827,6 @@ async def _handle_awaiting_approval(
     decision = str(meta.get("decision", "")) or "approve"
     detail = str(meta.get("detail", ""))
     return {"acknowledged": True, "decision": decision, "detail": detail}
-
-
-async def _emit_approval_requested(
-    *,
-    session: Session,
-    steerer: Steerer,
-    target_id: str,
-    kind: str,
-    prompt: str,
-    task_id: str,
-    metadata: dict[str, str],
-) -> None:
-    """Emit an ``ApprovalRequested`` through the steerer's bound sinks.
-
-    Falls back to a no-op if the steerer lacks a sinks list (test stubs
-    may drop the ``bind`` attribute). Proto-build errors are logged and
-    swallowed — losing the event is better than failing the tool call.
-    """
-    sinks = getattr(steerer, "_sinks", None) or []
-    if not sinks:
-        return
-    from goldfive.events import approval_requested_event, emit
-
-    try:
-        evt = approval_requested_event(
-            run_id=session.run_id,
-            sequence=session.next_sequence(),
-            target_id=target_id,
-            kind=kind,
-            prompt=prompt,
-            task_id=task_id,
-            metadata=metadata,
-            session_id=session.id,
-        )
-    except Exception as exc:  # noqa: BLE001 — proto stubs may be missing in unit tests
-        log.debug("approval_requested: proto event build failed: %s", exc)
-        return
-    try:
-        await emit(sinks, evt)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("approval_requested: sink emit raised: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Parameter schemas (JSON Schema draft-07 style)
-# ---------------------------------------------------------------------------
-
-
-def _object_schema(*, required: list[str], properties: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": False,
-    }
-
-
-# NOTE: ``task_id`` is intentionally omitted from every schema's
-# ``required`` list (goldfive#191). The adapter stamps
-# ``goldfive.current_task_id`` onto session state at delegation time
-# so the handler can default from state when the model doesn't supply
-# the arg. Handlers still reject with the canonical
-# ``missing_task_id`` shape when neither source resolves a value —
-# so strictness is enforced at the handler layer, not the schema.
-
-_SCHEMA_TASK_STARTED = _object_schema(
-    required=[],
-    properties={
-        "task_id": {"type": "string"},
-        "detail": {"type": "string"},
-    },
-)
-
-_SCHEMA_TASK_PROGRESS = _object_schema(
-    required=[],
-    properties={
-        "task_id": {"type": "string"},
-        "fraction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "detail": {"type": "string"},
-    },
-)
-
-_SCHEMA_TASK_COMPLETED = _object_schema(
-    required=["summary"],
-    properties={
-        "task_id": {"type": "string"},
-        "summary": {"type": "string"},
-        "artifacts": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
-        },
-    },
-)
-
-_SCHEMA_TASK_FAILED = _object_schema(
-    required=["reason"],
-    properties={
-        "task_id": {"type": "string"},
-        "reason": {"type": "string"},
-        "recoverable": {"type": "boolean"},
-    },
-)
-
-_SCHEMA_TASK_BLOCKED = _object_schema(
-    required=["blocker"],
-    properties={
-        "task_id": {"type": "string"},
-        "blocker": {"type": "string"},
-        "needed": {"type": "string"},
-    },
-)
-
-_SCHEMA_NEW_WORK_DISCOVERED = _object_schema(
-    required=["parent_task_id", "title", "description"],
-    properties={
-        "parent_task_id": {"type": "string"},
-        "title": {"type": "string"},
-        "description": {"type": "string"},
-        "assignee": {"type": "string"},
-    },
-)
-
-_SCHEMA_PLAN_DIVERGENCE = _object_schema(
-    required=["note"],
-    properties={
-        "note": {"type": "string"},
-        "suggested_action": {"type": "string"},
-    },
-)
-
-_SCHEMA_AWAITING_APPROVAL = _object_schema(
-    required=["prompt"],
-    properties={
-        "task_id": {"type": "string"},
-        "prompt": {"type": "string"},
-        "timeout_ms": {"type": "integer", "minimum": 0},
-    },
-)
-
-
-_SCHEMA_DECLARE_TASK_SKIPPED = _object_schema(
-    required=["reason"],
-    properties={
-        "task_id": {"type": "string"},
-        "reason": {"type": "string"},
-    },
-)
-
-
-_SCHEMA_DECLARE_TASK_NOT_NEEDED = _object_schema(
-    required=["reason"],
-    properties={
-        "task_id": {"type": "string"},
-        "reason": {"type": "string"},
-    },
-)
 
 
 # ---------------------------------------------------------------------------
@@ -2000,16 +1054,16 @@ def select_reporting_tools(
 
 
 __all__ = [
+    "BUILTIN_REPORTING_TOOLS",
+    "DECLARATION_KINDS",
     "DECLARATION_KIND_NOT_NEEDED",
     "DECLARATION_KIND_SKIPPED",
-    "DECLARATION_KINDS",
     "DECLARATIONS_KEY",
-    "DRIFT_SELF_REPORTING_TOOL_NAMES",
     "DRIFT_SELF_REPORTING_TOOLS",
+    "DRIFT_SELF_REPORTING_TOOL_NAMES",
     "LIFECYCLE_REPORTING_TOOLS",
+    "REPORTING_TOOL_NAMES",
     "ReportingHandler",
     "ReportingToolSpec",
-    "REPORTING_TOOL_NAMES",
-    "BUILTIN_REPORTING_TOOLS",
     "select_reporting_tools",
 ]
