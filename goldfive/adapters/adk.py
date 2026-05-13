@@ -2427,7 +2427,7 @@ class ADKAdapter:
         snapshot_ids = sorted(pending_ids_bucket)
         if session is not None and snapshot_ids:
             try:
-                from goldfive import orchestration_state as _ostate
+                from goldfive import state_store as _ostate
 
                 _ostate.append_cancelled_function_call_ids(session.state, snapshot_ids)
             except Exception as exc:  # noqa: BLE001

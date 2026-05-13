@@ -1,4 +1,4 @@
-"""Tests for the Phase-1 :class:`OrchestrationStore` typed handle.
+"""Tests for the Phase-1 :class:`StateStore` typed handle.
 
 goldfive#271 Phase 1. Pins:
 
@@ -25,14 +25,14 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
-from goldfive import orchestration_state as _ostate  # noqa: E402
-from goldfive.orchestration_store import (  # noqa: E402
+from goldfive import state_store as _ostate  # noqa: E402
+from goldfive.state_store import (  # noqa: E402
     REASONING_BINDINGS_KEY,
     ActiveSteer,
     BindingSource,
     DelegationPin,
-    OrchestrationStore,
     ReasoningBinding,
+    StateStore,
 )
 from goldfive.types import Plan, Session, Task  # noqa: E402
 
@@ -44,7 +44,7 @@ from goldfive.types import Plan, Session, Task  # noqa: E402
 def test_for_session_uses_session_state_dict() -> None:
     """``for_session`` returns a store backed by ``session.state``."""
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     # Empty initially.
     assert store.pin_current_task() == ""
     # Mutating through the store reflects on ``session.state``.
@@ -54,7 +54,7 @@ def test_for_session_uses_session_state_dict() -> None:
 
 def test_for_session_none_yields_empty_view() -> None:
     """``for_session(None)`` is safe — reads default; writes drop silently."""
-    store = OrchestrationStore.for_session(None)
+    store = StateStore.for_session(None)
     assert store.pin_current_task() == ""
     # Write should silently drop — no exception, no side effect.
     store.set_pin_current_task("t1")
@@ -63,14 +63,14 @@ def test_for_session_none_yields_empty_view() -> None:
 def test_for_state_uses_arbitrary_dict() -> None:
     """``for_state`` accepts a plain dict (test scaffolding)."""
     state: dict = {}
-    store = OrchestrationStore.for_state(state)
+    store = StateStore.for_state(state)
     store.set_pin_current_task("tA", source=BindingSource.AGENT_CALLBACK)
     assert state[_ostate.KEY_CURRENT_TASK_ID] == "tA"
 
 
 def test_construction_tolerates_non_mapping() -> None:
     """A non-mapping ``state`` argument degrades to an empty store."""
-    store = OrchestrationStore(state=object())
+    store = StateStore(state=object())
     assert store.pin_current_task() == ""
     # And writes are no-ops, since the underlying dict isn't present.
     store.set_pin_current_task("xx")
@@ -84,7 +84,7 @@ def test_construction_tolerates_non_mapping() -> None:
 def test_pin_round_trip() -> None:
     """``set_pin_current_task`` writes; ``pin_current_task`` reads back."""
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     store.set_pin_current_task(
         "task-42",
         source=BindingSource.AGENT_CALLBACK,
@@ -100,14 +100,14 @@ def test_pin_empty_id_is_noop() -> None:
     """An empty task_id does not clobber the existing pin."""
     session = Session(run_id="r1")
     session.state[_ostate.KEY_CURRENT_TASK_ID] = "existing"
-    OrchestrationStore.for_session(session).set_pin_current_task("")
+    StateStore.for_session(session).set_pin_current_task("")
     assert session.state[_ostate.KEY_CURRENT_TASK_ID] == "existing"
 
 
 def test_pin_clear() -> None:
     """``clear_pin_current_task`` removes id, title, revision."""
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     store.set_pin_current_task("t", title="x", revision=1)
     store.clear_pin_current_task()
     assert _ostate.KEY_CURRENT_TASK_ID not in session.state
@@ -116,7 +116,7 @@ def test_pin_clear() -> None:
 
 def test_pin_revision_default_zero_when_unset() -> None:
     """Reading the revision before any write returns ``0``."""
-    store = OrchestrationStore.for_session(Session(run_id="r1"))
+    store = StateStore.for_session(Session(run_id="r1"))
     assert store.pin_current_task_revision() == 0
 
 
@@ -127,7 +127,7 @@ def test_pin_revision_default_zero_when_unset() -> None:
 
 def test_get_active_steer_returns_none_when_unset() -> None:
     """No body recorded → ``get_active_steer()`` returns ``None``."""
-    store = OrchestrationStore.for_session(Session(run_id="r1"))
+    store = StateStore.for_session(Session(run_id="r1"))
     assert store.get_active_steer() is None
 
 
@@ -141,7 +141,7 @@ def test_get_active_steer_round_trip() -> None:
         author="op@example",
         source="user",
     )
-    active = OrchestrationStore.for_session(session).get_active_steer()
+    active = StateStore.for_session(session).get_active_steer()
     assert isinstance(active, ActiveSteer)
     assert active.body == "focus on X"
     assert active.at_turn == 12
@@ -155,7 +155,7 @@ def test_active_steer_empty_body_returns_none() -> None:
     session = Session(run_id="r1")
     session.state[_ostate.KEY_ACTIVE_STEER_BODY] = ""
     session.state[_ostate.KEY_ACTIVE_STEER_AT_TURN] = 5
-    assert OrchestrationStore.for_session(session).get_active_steer() is None
+    assert StateStore.for_session(session).get_active_steer() is None
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def test_active_steer_empty_body_returns_none() -> None:
 
 
 def test_get_correction_returns_none_when_unset() -> None:
-    store = OrchestrationStore.for_session(Session(run_id="r1"))
+    store = StateStore.for_session(Session(run_id="r1"))
     assert store.get_correction("agent_x", "task_y") is None
     assert not store.has_correction("agent_x", "task_y")
 
@@ -179,7 +179,7 @@ def test_get_correction_round_trip_dict_payload() -> None:
         "revision_number": 2,
     }
     session.state["goldfive.pending_corrections.agent_x.task_y"] = payload
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     assert store.has_correction("agent_x", "task_y")
     assert store.get_correction("agent_x", "task_y") == payload
 
@@ -190,7 +190,7 @@ def test_iter_corrections_for_agent() -> None:
     session.state["goldfive.pending_corrections.agent_x.task_b"] = {"b": 1}
     session.state["goldfive.pending_corrections.other.task_c"] = {"c": 1}
     found = sorted(
-        OrchestrationStore.for_session(session).iter_corrections_for_agent(
+        StateStore.for_session(session).iter_corrections_for_agent(
             "agent_x"
         )
     )
@@ -201,7 +201,7 @@ def test_iter_corrections_strips_compound_agent_form() -> None:
     """Compound ``client42:agent_x`` finds bare ``agent_x`` writes."""
     session = Session(run_id="r1")
     session.state["goldfive.pending_corrections.agent_x.task_a"] = {"a": 1}
-    found = OrchestrationStore.for_session(session).iter_corrections_for_agent(
+    found = StateStore.for_session(session).iter_corrections_for_agent(
         "client42:agent_x"
     )
     assert found == ["task_a"]
@@ -222,7 +222,7 @@ def test_get_pending_delegation_versioned_dict() -> None:
             "tool_args": {"q": "solar"},
         },
     }
-    pin = OrchestrationStore.for_session(session).get_pending_delegation("fc-1")
+    pin = StateStore.for_session(session).get_pending_delegation("fc-1")
     assert isinstance(pin, DelegationPin)
     assert pin.task_id == "tA"
     assert pin.revision == 7
@@ -234,14 +234,14 @@ def test_get_pending_delegation_legacy_string_shape() -> None:
     """The pre-#266 bare-string entry shape still resolves."""
     session = Session(run_id="r1")
     session.state["goldfive.pending_delegations"] = {"fc-1": "tLegacy"}
-    pin = OrchestrationStore.for_session(session).get_pending_delegation("fc-1")
+    pin = StateStore.for_session(session).get_pending_delegation("fc-1")
     assert pin is not None
     assert pin.task_id == "tLegacy"
     assert pin.revision == 0
 
 
 def test_get_pending_delegation_missing_returns_none() -> None:
-    store = OrchestrationStore.for_session(Session(run_id="r1"))
+    store = StateStore.for_session(Session(run_id="r1"))
     assert store.get_pending_delegation("fc-zzz") is None
     assert store.get_pending_delegation("") is None
 
@@ -254,7 +254,7 @@ def test_get_pending_delegation_missing_returns_none() -> None:
 def test_record_reasoning_binding_round_trip() -> None:
     """A recorded binding reads back via ``get_reasoning_extracted_binding``."""
     session = Session(run_id="run-1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     rec = store.record_reasoning_extracted_binding(
         agent_name="agent_x",
         task_id="t1",
@@ -275,7 +275,7 @@ def test_record_reasoning_binding_round_trip() -> None:
 def test_record_reasoning_binding_clamps_confidence() -> None:
     """Confidence outside ``[0, 1]`` is clamped at write time."""
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     rec = store.record_reasoning_extracted_binding(
         agent_name="a", task_id="t", confidence=1.5
     )
@@ -291,7 +291,7 @@ def test_record_reasoning_binding_clamps_confidence() -> None:
 def test_record_reasoning_binding_rejects_empty_inputs() -> None:
     """Empty agent / task name skips the write."""
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     assert store.record_reasoning_extracted_binding(
         agent_name="", task_id="t", confidence=0.9
     ) is None
@@ -304,10 +304,10 @@ def test_record_reasoning_binding_rejects_empty_inputs() -> None:
 def test_get_reasoning_binding_compound_falls_back_to_bare() -> None:
     """A compound ``client42:agent_x`` lookup finds the bare-form binding."""
     session = Session(run_id="r1")
-    OrchestrationStore.for_session(session).record_reasoning_extracted_binding(
+    StateStore.for_session(session).record_reasoning_extracted_binding(
         agent_name="agent_x", task_id="t1", confidence=0.9
     )
-    fetched = OrchestrationStore.for_session(session).get_reasoning_extracted_binding(
+    fetched = StateStore.for_session(session).get_reasoning_extracted_binding(
         "client42:agent_x"
     )
     assert fetched is not None
@@ -316,7 +316,7 @@ def test_get_reasoning_binding_compound_falls_back_to_bare() -> None:
 
 def test_clear_reasoning_binding_drops_entry() -> None:
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     store.record_reasoning_extracted_binding(
         agent_name="agent_x", task_id="t1", confidence=0.9
     )
@@ -327,7 +327,7 @@ def test_clear_reasoning_binding_drops_entry() -> None:
 def test_record_preserves_unrelated_bindings() -> None:
     """Recording for one agent doesn't clobber another agent's binding."""
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     store.record_reasoning_extracted_binding(
         agent_name="alpha", task_id="t_alpha", confidence=0.8
     )
@@ -341,7 +341,7 @@ def test_record_preserves_unrelated_bindings() -> None:
 def test_record_overwrites_same_agent_binding() -> None:
     """A second record for the same agent supersedes the first."""
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     store.record_reasoning_extracted_binding(
         agent_name="a", task_id="t1", confidence=0.5
     )
@@ -390,7 +390,7 @@ def test_store_does_not_write_to_adk_state() -> None:
     Phase-0 violation.
     """
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     store.set_pin_current_task("t1", source=BindingSource.AGENT_CALLBACK, revision=2)
     store.record_reasoning_extracted_binding(
         agent_name="a", task_id="t1", confidence=0.9
@@ -429,7 +429,7 @@ def test_store_reads_match_legacy_state_layout() -> None:
     }
     session.state["goldfive.pending_delegations"] = {"fc-1": "legacy-task"}
 
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     assert store.pin_current_task() == "legacy-task"
     assert store.pin_current_task_title() == "Legacy Title"
     assert store.pin_current_task_revision() == 5
@@ -461,7 +461,7 @@ def test_binding_workflow_with_plan_pin_resolution_signal() -> None:
         summary="",
     )
     session = Session(run_id="r1", plan=plan)
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     store.record_reasoning_extracted_binding(
         agent_name="agent_x",
         task_id="t_beta",

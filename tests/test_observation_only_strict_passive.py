@@ -406,9 +406,9 @@ def test_dynamic_instruction_returns_original_under_observation_only() -> None:
     # Pin the current task so the resolver SHOULD render the augmented
     # block under the non-strict path — proving the gate is the only
     # thing suppressing it.
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
 
-    store = OrchestrationStore.for_session(sess)
+    store = StateStore.for_session(sess)
     store.set_pin_current_task("t1", title="Draft slide")
 
     resolver = make_dynamic_instruction(
@@ -433,7 +433,7 @@ def test_dynamic_instruction_augments_under_observation_disabled() -> None:
     instruction — byte-identical to pre-#271 behaviour.
     """
     from goldfive.adapters._adk_dynainst import make_dynamic_instruction
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
     from goldfive.types import Goal, Plan, TaskStatus
 
     sess = Session(run_id="r-strict-passive-test")
@@ -455,7 +455,7 @@ def test_dynamic_instruction_augments_under_observation_disabled() -> None:
         summary="presentation",
         revision_index=1,
     )
-    store = OrchestrationStore.for_session(sess)
+    store = StateStore.for_session(sess)
     store.set_pin_current_task("t1", title="Draft slide")
 
     resolver = make_dynamic_instruction(

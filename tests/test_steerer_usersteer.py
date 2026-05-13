@@ -481,7 +481,7 @@ async def test_observe_steer_without_author_leaves_author_empty() -> None:
 
 async def test_processed_steer_ids_list_evicts_oldest_when_capped() -> None:
     """The FIFO cap bounds the dedupe list so long sessions stay bounded."""
-    from goldfive import orchestration_state as _ostate
+    from goldfive import state_store as _ostate
 
     steerer, session, _sink, _planner = _bind_fresh()
     cap = _ostate.PROCESSED_STEER_IDS_CAP
@@ -994,7 +994,7 @@ async def test_autonomous_refine_stamps_drift_id_on_plan_revised(
 # the LLM reuses a prior PENDING id, the merge preserves the id and the
 # new title/description/assignee. When the LLM omits a prior PENDING id,
 # it's dropped. This stabilises condition_id keying across cascading
-# refines — see compute_condition_id in orchestration_state.py.
+# refines — see compute_condition_id in state_store.py.
 # ---------------------------------------------------------------------------
 
 

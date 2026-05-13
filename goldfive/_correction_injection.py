@@ -32,7 +32,7 @@ Data flow
 3. The dynamic instruction resolver (Stream B) reads its
    ``(agent_name, current_task_id)``-keyed entry directly off goldfive
    ``Session.state`` via the
-   :class:`~goldfive.orchestration_store.OrchestrationStore`'s
+   :class:`~goldfive.state_store.StateStore`'s
    ``get_correction`` accessor (Phase 2.0 of goldfive#271 — the bridge
    from goldfive ``Session.state`` onto ADK ``session.state`` is gone)
    and — for dict values — formats it via

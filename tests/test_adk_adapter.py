@@ -2481,7 +2481,7 @@ async def test_state_protocol_writes_propagate_through_agent_tool_subtree() -> N
 
     from goldfive.adapters._adk_plugin import session_context_from_invocation
     from goldfive.adapters.adk import ADKAdapter
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
 
     observed_task_ids_in_B: list[str] = []
 
@@ -2549,7 +2549,7 @@ async def test_state_protocol_writes_propagate_through_agent_tool_subtree() -> N
 
     # Agent B — registers a pre-model callback that resolves the
     # goldfive Session via the plugin reference and reads the pin
-    # via the OrchestrationStore. Phase 2.1 of goldfive#271 — the pin
+    # via the StateStore. Phase 2.1 of goldfive#271 — the pin
     # lives on goldfive ``Session.state`` exclusively.
     def _b_before_model(callback_context: Any, llm_request: Any) -> None:  # noqa: ARG001
         inv_ctx = getattr(callback_context, "_invocation_context", None) or getattr(
@@ -2557,7 +2557,7 @@ async def test_state_protocol_writes_propagate_through_agent_tool_subtree() -> N
         )
         ctx = session_context_from_invocation(inv_ctx)
         session = getattr(ctx, "session", None) if ctx is not None else None
-        store = OrchestrationStore.for_session(session)
+        store = StateStore.for_session(session)
         observed_task_ids_in_B.append(store.pin_current_task())
 
     agent_b = Agent(

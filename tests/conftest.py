@@ -105,10 +105,10 @@ def _goldfive_active_steering_default() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def _isolate_orchestration_store_registries() -> Iterator[None]:
-    """Clear OrchestrationStore's per-session registries between tests.
+    """Clear StateStore's per-session registries between tests.
 
     ``_ACTIVE_INVOCATION_TASKS`` and ``_CANCEL_REQUESTED_INVOCATIONS``
-    are module-level dicts in ``goldfive.orchestration_store`` keyed
+    are module-level dicts in ``goldfive.state_store`` keyed
     by ``session.id`` (which is a property aliased to ``run_id``).
     Many tests share ``run_id="r1"``, so a test that calls
     ``request_invocation_cancel`` or ``register_invocation_task``
@@ -126,7 +126,7 @@ def _isolate_orchestration_store_registries() -> Iterator[None]:
     module-level lock) and idempotent.
     """
     try:
-        from goldfive.orchestration_store import (
+        from goldfive.state_store import (
             _ACTIVE_INVOCATION_LOCK,
             _ACTIVE_INVOCATION_TASKS,
             _CANCEL_REQUESTED_INVOCATIONS,

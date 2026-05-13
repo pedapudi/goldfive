@@ -906,9 +906,9 @@ async def test_plugin_injection_via_full_before_model_callback() -> None:
     ``Session.state`` directly via the ``SessionContext`` stash. The
     test pins the current task on goldfive ``Session.state`` (the same
     surface V3's ``before_agent_callback`` writes in production); the
-    planner's injection picks it up via ``OrchestrationStore``.
+    planner's injection picks it up via ``StateStore``.
     """
-    from goldfive import orchestration_state as _ostate
+    from goldfive import state_store as _ostate
 
     plugin = make_adk_plugin(host_agent_name="h")
     agent = _make_llm_agent()
@@ -927,7 +927,7 @@ async def test_plugin_injection_via_full_before_model_callback() -> None:
     )
     # Pin on goldfive Session.state — the surface V3's
     # ``before_agent_callback`` writes in production. The planner
-    # reads pin / title via ``OrchestrationStore.for_session``.
+    # reads pin / title via ``StateStore.for_session``.
     _ostate.set_current_task(session.state, task)
 
     state = {

@@ -116,7 +116,7 @@ def _read_pin_via_before_model(observed: dict[str, Any]):
     shape as :func:`session_context_from_invocation`.
     """
     from goldfive.adapters._adk_plugin import session_context_from_invocation
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
 
     def _before_model(callback_context: Any, llm_request: Any) -> None:  # noqa: ARG001
         inv_ctx = getattr(callback_context, "_invocation_context", None) or getattr(
@@ -126,7 +126,7 @@ def _read_pin_via_before_model(observed: dict[str, Any]):
         session = getattr(ctx, "session", None) if ctx is not None else None
         if observed:
             return None
-        store = OrchestrationStore.for_session(session)
+        store = StateStore.for_session(session)
         observed["pin_current_task"] = store.pin_current_task()
         return None
 
@@ -283,7 +283,7 @@ async def test_top_level_invocation_id_pinned_then_released() -> None:
 # :class:`~goldfive.planners.goldfive_planner.GoldfivePlanner` and
 # :mod:`~goldfive.adapters._adk_dynainst` now read those values from
 # goldfive ``Session.state`` directly via the
-# :class:`~goldfive.orchestration_store.OrchestrationStore` typed
+# :class:`~goldfive.state_store.StateStore` typed
 # accessor — there is no copy onto ADK ``session.state``. This is the
 # fix for goldfive#275 (the stale-session race that broke ADK-web).
 # ---------------------------------------------------------------------------
@@ -292,7 +292,7 @@ async def test_top_level_invocation_id_pinned_then_released() -> None:
 async def test_user_steer_to_planner_instruction_no_bridge() -> None:
     """USER_STEER → DefaultSteerer → goldfive.Session.state →
     GoldfivePlanner.build_planning_instruction (via SessionContext +
-    OrchestrationStore — no ADK-state copy).
+    StateStore — no ADK-state copy).
 
     This is the high-level e2e replacement for the pre-Phase-2.0
     bridge test. The data path used to be:
@@ -306,7 +306,7 @@ async def test_user_steer_to_planner_instruction_no_bridge() -> None:
 
         steerer → goldfive.Session.state
                 → planner reads goldfive Session via SessionContext
-                  + OrchestrationStore
+                  + StateStore
 
     Asserts: no ValueError, no race, the steer body still lands in
     the planner's injected instruction.

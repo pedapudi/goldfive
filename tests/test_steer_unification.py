@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
-from goldfive import orchestration_state as _ostate  # noqa: E402
+from goldfive import state_store as _ostate  # noqa: E402
 from goldfive.control import ControlKind, ControlMessage  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402

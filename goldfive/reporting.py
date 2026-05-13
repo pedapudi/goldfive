@@ -83,7 +83,7 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
 
 
 # State key for the per-Session declarations log. Lives under the
-# ``goldfive.*`` namespace so :func:`goldfive.orchestration_state.write`
+# ``goldfive.*`` namespace so :func:`goldfive.state_store.write`
 # accepts it. Value shape: ``dict[(kind, task_id), {kind, task_id,
 # reason, recorded_at_seq}]`` keyed by ``(declaration_kind, task_id)``
 # so the second declaration of the same kind on the same task is a
@@ -252,7 +252,7 @@ def _resolve_task_id(args: dict[str, Any], session: Session) -> str:
     Order of precedence (goldfive#191):
 
     1. ``args["task_id"]`` — explicit model-provided id always wins.
-    2. ``OrchestrationStore.pin_current_task()`` — the id pinned
+    2. ``StateStore.pin_current_task()`` — the id pinned
        by the adapter's ``before_agent_callback`` when the current
        sub-agent has exactly one PENDING/RUNNING task assigned to
        it. Closes the loop where the LLM's tool call omits the
@@ -274,7 +274,7 @@ def _resolve_task_id_with_source(args: dict[str, Any], session: Session) -> tupl
       ``task_id`` arg.
     * ``"handler_default"`` — the arg was absent / empty / None and the
       handler defaulted to the adapter-stamped pin
-      (:meth:`OrchestrationStore.pin_current_task`). This is the
+      (:meth:`StateStore.pin_current_task`). This is the
       goldfive#191 path.
     * ``""`` — neither source resolved a value (caller short-circuits
       with the canonical ``missing_task_id`` rejection).
@@ -285,7 +285,7 @@ def _resolve_task_id_with_source(args: dict[str, Any], session: Session) -> tupl
     additive; existing callers stay on :func:`_resolve_task_id`.
 
     Phase 2.1 of goldfive#271 — the read funnels through
-    :class:`~goldfive.orchestration_store.OrchestrationStore` so the
+    :class:`~goldfive.state_store.StateStore` so the
     handler is decoupled from goldfive ``Session.state``'s on-disk
     key strings.
     """
@@ -294,13 +294,13 @@ def _resolve_task_id_with_source(args: dict[str, Any], session: Session) -> tupl
         task_id = str(raw).strip()
         if task_id:
             return task_id, "llm_report"
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
 
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     fallback = store.pin_current_task().strip()
     if fallback:
         log.debug(
-            "reporting: defaulted task_id=%s from OrchestrationStore",
+            "reporting: defaulted task_id=%s from StateStore",
             fallback,
         )
         return fallback, "handler_default"
@@ -499,7 +499,7 @@ def _read_pin_revision(session: Session) -> int | None:
     any plan with ``revision_index > 0`` — that's the actual
     versioning semantics, distinct from "no stamp".
     """
-    from goldfive import orchestration_state as _ostate
+    from goldfive import state_store as _ostate
 
     state = getattr(session, "state", None)
     if not isinstance(state, dict):
@@ -891,14 +891,14 @@ def _rotate_after_terminal(
 ) -> None:
     """Advance the current-task pin after a terminal transition.
 
-    Delegates to :func:`goldfive.orchestration_state.rotate_current_task_id`.
+    Delegates to :func:`goldfive.state_store.rotate_current_task_id`.
     Imported lazily so this module stays ADK-free and dodges the
     import-cycle risk between :mod:`goldfive.reporting` and
-    :mod:`goldfive.orchestration_state` (both are imported from
+    :mod:`goldfive.state_store` (both are imported from
     :mod:`goldfive.steerer`).
     """
-    from goldfive import orchestration_state as _ostate
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive import state_store as _ostate
+    from goldfive.state_store import StateStore
 
     state = getattr(session, "state", None)
     if not isinstance(state, dict):
@@ -909,7 +909,7 @@ def _rotate_after_terminal(
     # Only rotate if the terminal task was the one we'd been pointing
     # at — otherwise some other caller owns the pin and we'd clobber
     # theirs.
-    pinned = OrchestrationStore.for_session(session).pin_current_task().strip()
+    pinned = StateStore.for_session(session).pin_current_task().strip()
     this_id = str(getattr(completed_task, "id", "") or "")
     if pinned and pinned != this_id:
         return

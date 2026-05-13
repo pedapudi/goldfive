@@ -61,7 +61,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive import _state_audit
-from goldfive import orchestration_state as _ostate
+from goldfive import state_store as _ostate
 from goldfive.drift import (
     classify_refusal,
     classify_stop_reason,
@@ -590,7 +590,7 @@ class DefaultSteerer:
         self._reasoning_drift_model = reasoning_drift_model
         self._reasoning_drift_rate_limit = max(1, int(reasoning_drift_rate_limit))
         # Phase 1 of goldfive#271 — confidence threshold for recording a
-        # reasoning-extracted binding onto OrchestrationStore. The
+        # reasoning-extracted binding onto StateStore. The
         # judge returns a focus_confidence in [0.0, 1.0]; bindings with
         # confidence >= this threshold are stamped, lower-confidence
         # ones are discarded so the pin-resolution ladder doesn't
@@ -1432,7 +1432,7 @@ class DefaultSteerer:
         (goldfive#171): a delivery retry or UI double-fire of the same
         STEER lands here twice, but cascade-cancel + refine must only
         happen once. The dedupe set lives on ``session.state`` under
-        :data:`orchestration_state.KEY_PROCESSED_STEER_IDS` with FIFO
+        :data:`state_store.KEY_PROCESSED_STEER_IDS` with FIFO
         eviction after :data:`PROCESSED_STEER_IDS_CAP` entries. Content-
         based drifts (LOOPING_REASONING, tool errors, …) are NOT
         deduped — they're heuristic signals, not user actions.
@@ -1720,7 +1720,7 @@ class DefaultSteerer:
         verdict: Any,
         agent_name: str,
     ) -> None:
-        """Stamp a reasoning-extracted binding onto the OrchestrationStore.
+        """Stamp a reasoning-extracted binding onto the StateStore.
 
         Phase 1 of goldfive#271. Called from
         :meth:`_run_judge_background` after the LLM judge returns its
@@ -1753,9 +1753,9 @@ class DefaultSteerer:
             )
             return
         try:
-            from goldfive.orchestration_store import OrchestrationStore
+            from goldfive.state_store import StateStore
 
-            store = OrchestrationStore.for_session(session)
+            store = StateStore.for_session(session)
             recorded = store.record_reasoning_extracted_binding(
                 agent_name=agent_name,
                 task_id=focused,
@@ -4314,7 +4314,7 @@ class DefaultSteerer:
         on the sink (observability preserved); this guard short-circuits
         the dispatch.
 
-        The check uses :class:`OrchestrationStore` as the live registry
+        The check uses :class:`StateStore` as the live registry
         of in-flight invocations (Phase 3.5 component 1, goldfive#271).
         Two conditions count as "late":
 
@@ -4338,9 +4338,9 @@ class DefaultSteerer:
         if (drift.authored_by or "").lower() == "user":
             return False
         try:
-            from goldfive.orchestration_store import OrchestrationStore
+            from goldfive.state_store import StateStore
 
-            store = OrchestrationStore.for_session(session)
+            store = StateStore.for_session(session)
             active = store.active_invocation_ids()
             cancel_pending = store.cancel_requested_invocation_ids()
         except Exception as exc:  # noqa: BLE001 — defensive
@@ -4501,9 +4501,9 @@ class DefaultSteerer:
         # short-circuits.
         if invocation_ids:
             try:
-                from goldfive.orchestration_store import OrchestrationStore
+                from goldfive.state_store import StateStore
 
-                store = OrchestrationStore.for_session(session)
+                store = StateStore.for_session(session)
                 for inv_id in invocation_ids:
                     store.mark_invocation_cancel_requested(inv_id)
             except Exception as exc:  # noqa: BLE001 — defensive
@@ -4804,15 +4804,15 @@ class DefaultSteerer:
         if not self._severity_meets_promotion_threshold(drift.severity):
             return False
         # Consult the active user steer freshness window.
-        # Phase 1 of goldfive#271 — read through OrchestrationStore so
+        # Phase 1 of goldfive#271 — read through StateStore so
         # the active-steer slot reads from a single named accessor; the
         # underlying ``_ostate.read`` calls still funnel through the
         # goldfive Session.state dict, just behind a typed surface.
         window = self._goldfive_steer_suppression_window_turns
         if window > 0:
-            from goldfive.orchestration_store import OrchestrationStore
+            from goldfive.state_store import StateStore
 
-            active = OrchestrationStore.for_session(session).get_active_steer()
+            active = StateStore.for_session(session).get_active_steer()
             if active is not None and active.source.lower() == "user":
                 current_turn = int(getattr(session, "_next_sequence", 0) or 0)
                 age = current_turn - active.at_turn
@@ -6857,7 +6857,7 @@ class DefaultSteerer:
         if trigger_input:
             evt.drift_detected.trigger_input = self._truncate_trigger_input(trigger_input)
         # goldfive#271 PR1 — drift-as-stateful-condition. Route the emit
-        # through the orchestration_state lifecycle helpers so multiple
+        # through the state_store lifecycle helpers so multiple
         # emits for the same logical condition (kind+task+agent within
         # the current turn) collapse onto one ``condition_id`` and the
         # wire carries lifecycle / prev_severity. Additive: legacy
@@ -6972,7 +6972,7 @@ class DefaultSteerer:
         """Stamp ``condition_id`` / ``lifecycle`` / ``prev_severity`` on ``evt``.
 
         Routes the emit through
-        :func:`orchestration_state.open_or_escalate_drift` keyed by
+        :func:`state_store.open_or_escalate_drift` keyed by
         ``(kind, current_task_id, current_agent_id, run_id)``. The first
         emit for a given tuple in a turn opens a new condition and stamps
         ``DRIFT_LIFECYCLE_OPENED``; subsequent emits stamp
@@ -7022,7 +7022,7 @@ class DefaultSteerer:
 
     @staticmethod
     def _drift_lifecycle_pb_value(lifecycle: str, types_pb2: Any) -> int:
-        """Map an :mod:`orchestration_state` lifecycle string to the proto enum."""
+        """Map an :mod:`state_store` lifecycle string to the proto enum."""
         mapping = {
             _ostate.LIFECYCLE_OPENED: "DRIFT_LIFECYCLE_OPENED",
             _ostate.LIFECYCLE_ESCALATING: "DRIFT_LIFECYCLE_ESCALATING",
@@ -7422,14 +7422,14 @@ class DefaultSteerer:
         # 2. goldfive orchestration session.state pin (the reporting-
         # tool fallback's source of truth). Use the canonical state key
         # so tests that inspect the state dict directly see the update.
-        # Phase 1 of goldfive#271 — read through OrchestrationStore;
+        # Phase 1 of goldfive#271 — read through StateStore;
         # the write stays at this call site (Phase 2 migration target
         # per the catalog).
         state = getattr(session, "state", None)
         if isinstance(state, dict):
-            from goldfive.orchestration_store import OrchestrationStore
+            from goldfive.state_store import StateStore
 
-            store = OrchestrationStore.for_state(state)
+            store = StateStore.for_state(state)
             state_pinned_s = store.pin_current_task().strip()
             if state_pinned_s and state_pinned_s in supersession:
                 resolved = _resolve_chain(state_pinned_s)

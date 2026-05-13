@@ -33,7 +33,7 @@ on-task verdict: :func:`classify_reasoning_drift_with_focus` returns
 LLM call. Same prompt, same cost; the prompt is extended to ask the
 judge to name the plan task the reasoning is actually working on. The
 caller (typically :class:`~goldfive.steerer.DefaultSteerer`) writes
-the binding onto :class:`~goldfive.orchestration_store.OrchestrationStore`
+the binding onto :class:`~goldfive.state_store.StateStore`
 when confidence is above a threshold; the pin-resolution ladder reads
 it back as a real signal.
 """

@@ -1,6 +1,6 @@
 """Regression tests for goldfive#242: close the race between
 ``request_invocation_cancel`` (synchronous flag flip) and
-``OrchestrationStore.active_invocation_ids()`` (transitions to empty
+``StateStore.active_invocation_ids()`` (transitions to empty
 only AFTER ADK winds down each cancelled invocation, ~4-8s later).
 
 The bug
@@ -30,7 +30,7 @@ The fix
 -------
 
 A companion per-session set of cancel-pending invocation ids on
-:class:`~goldfive.orchestration_store.OrchestrationStore`, stamped
+:class:`~goldfive.state_store.StateStore`, stamped
 synchronously at the top of ``request_invocation_cancel``. The gate
 now treats "cancel-pending OR not-active" as late.
 """
@@ -49,7 +49,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
-from goldfive.orchestration_store import OrchestrationStore  # noqa: E402
+from goldfive.state_store import StateStore  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     DriftEvent,
@@ -161,14 +161,14 @@ def _drift(
 
 
 # ---------------------------------------------------------------------------
-# OrchestrationStore: cancel-pending registry primitives
+# StateStore: cancel-pending registry primitives
 # ---------------------------------------------------------------------------
 
 
 def test_mark_invocation_cancel_requested_round_trips() -> None:
     """``mark_*`` then ``is_*`` / ``cancel_requested_invocation_ids`` agree."""
     session = _session(run_id="r-prim")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     try:
         assert store.cancel_requested_invocation_ids() == []
         assert not store.is_invocation_cancel_requested("inv-A")
@@ -190,7 +190,7 @@ def test_mark_invocation_cancel_requested_round_trips() -> None:
 def test_clear_active_invocations_drops_cancel_pending_too() -> None:
     """Session teardown wipes both registries in one shot."""
     session = _session(run_id="r-clear")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     store.mark_invocation_cancel_requested("inv-X")
     assert store.cancel_requested_invocation_ids() == ["inv-X"]
 
@@ -210,7 +210,7 @@ async def test_gate_skips_drift_when_cancel_pending_with_active_invocations() ->
     """
     steerer = DefaultSteerer()
     session = _session(run_id="r-race")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
 
     async def _placeholder() -> None:
         await asyncio.sleep(1.0)
@@ -242,7 +242,7 @@ async def test_gate_still_classifies_empty_active_list_as_late() -> None:
     """Pre-existing semantics preserved: empty active list still gates."""
     steerer = DefaultSteerer()
     session = _session(run_id="r-empty")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     try:
         assert store.active_invocation_ids() == []
         assert store.cancel_requested_invocation_ids() == []
@@ -256,7 +256,7 @@ async def test_gate_lets_user_authored_drift_through_even_with_cancel_pending() 
     """User-authored drifts always bypass the gate — preserved."""
     steerer = DefaultSteerer()
     session = _session(run_id="r-user")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     store.mark_invocation_cancel_requested("inv-user")
     try:
         for kind in (
@@ -293,7 +293,7 @@ async def test_request_invocation_cancel_stamps_cancel_pending_synchronously() -
     steerer._adapter = adapter  # type: ignore[assignment]
 
     session = _session(run_id="r-stamp")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
 
     async def _placeholder() -> None:
         await asyncio.sleep(1.0)
