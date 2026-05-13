@@ -435,3 +435,24 @@ def _rule_c_dag_order(
             current_agent_id=invoked_agent_name,
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Registry self-registration
+# ---------------------------------------------------------------------------
+#
+# CAPABILITY_MISMATCH is a purely structural detector — no LLM call, no
+# JSON parsing, no observability truncation. The config is therefore
+# all-default (``uses_llm=False``); we register so callers that
+# discover detectors via the registry can dispatch by kind uniformly.
+
+
+from goldfive.drift.registry import DetectorConfig as _DetectorConfig  # noqa: E402
+from goldfive.drift.registry import register as _register  # noqa: E402
+
+_register(
+    DriftKind.CAPABILITY_MISMATCH,
+    detect_capability_mismatch,
+    _DetectorConfig(uses_llm=False),
+    is_async=False,
+)

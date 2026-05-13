@@ -123,7 +123,7 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
 
 
 # State key for the per-Session declarations log. Lives under the
-# ``goldfive.*`` namespace so :func:`goldfive.orchestration_state.write`
+# ``goldfive.*`` namespace so :func:`goldfive.state_store.write`
 # accepts it. Value shape: ``dict[(kind, task_id), {kind, task_id,
 # reason, recorded_at_seq}]`` keyed by ``(declaration_kind, task_id)``
 # so the second declaration of the same kind on the same task is a

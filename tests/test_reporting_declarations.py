@@ -318,7 +318,7 @@ async def test_declare_task_skipped_defaults_from_pin() -> None:
     declaration tools use the same precedence so an agent that drops
     the explicit arg still gets routed correctly.
     """
-    from goldfive import orchestration_state as _ostate
+    from goldfive import state_store as _ostate
 
     steerer, session, sink = _fresh()
     _ostate.write(session.state, _ostate.KEY_CURRENT_TASK_ID, "t1")

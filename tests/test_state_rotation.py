@@ -9,7 +9,7 @@ Covers the Bug B half of goldfive#201:
   that triggers ``missing_task_id`` rejections.
 
 * The orchestration-state helper
-  :func:`goldfive.orchestration_state.rotate_current_task_id`
+  :func:`goldfive.state_store.rotate_current_task_id`
   encapsulates the rotation rules:
 
   1. Exactly one PENDING / RUNNING task assigned to this agent → pin it.
@@ -33,7 +33,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
-from goldfive import orchestration_state as _ostate  # noqa: E402
+from goldfive import state_store as _ostate  # noqa: E402
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS, ReportingToolSpec  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
@@ -98,7 +98,7 @@ class _StubPlanner:
 
 
 # ---------------------------------------------------------------------------
-# orchestration_state.rotate_current_task_id (pure-helper behaviour)
+# state_store.rotate_current_task_id (pure-helper behaviour)
 # ---------------------------------------------------------------------------
 
 

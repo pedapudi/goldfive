@@ -80,7 +80,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from goldfive import orchestration_state as _ostate
+from goldfive import state_store as _ostate
 from goldfive.types import (
     TERMINAL_TASK_STATUSES,
     Plan,

@@ -50,7 +50,7 @@ from pathlib import Path as _Path
 from typing import TYPE_CHECKING, Any
 
 from goldfive import _state_audit
-from goldfive import orchestration_state as _ostate
+from goldfive import state_store as _ostate
 from goldfive._llm import maybe_close_call_llm
 from goldfive.conversation import Conversation
 from goldfive.events import (
@@ -1072,17 +1072,41 @@ class Runner:
                 # delegate). The wrapping lives at the executor handoff
                 # so absorb_turn / event summaries above still see the
                 # user's actual question.
+                #
+                # goldfive#271 strict-passive carve-out: under
+                # ``observation_only=True`` skip the wrap. The whole
+                # point of strict-passive is to surface the RAW
+                # coordinator behaviour — wrapping mutates the input
+                # the agent's LLM sees verbatim (it's prompt-shaping
+                # masquerading as a user message) and would coach the
+                # coordinator into the "don't delegate" behaviour the
+                # operator is trying to observe. Without the wrap, a
+                # follow-up turn may cause the operator's coordinator
+                # to re-delegate; that's the diagnostic value of
+                # strict-passive.
                 if isinstance(user_input, str):
                     run_sig = inspect.signature(self.executor.run)
                     if "user_input" in run_sig.parameters:
                         executor_user_input = user_input
-                        if (
+                        is_conversational = (
                             getattr(session, "_conversational_turn", False)
-                            and user_input.strip()
-                        ):
+                            and bool(user_input.strip())
+                        )
+                        passive = bool(
+                            getattr(self.steerer, "_observation_only", False)
+                        )
+                        if is_conversational and not passive:
                             executor_user_input = self._wrap_conversational_input(
                                 user_input=user_input,
                                 session=session,
+                            )
+                        elif is_conversational and passive:
+                            log.info(
+                                "Runner.run: observation_only=True — "
+                                "SKIPPING conversational-follow-up wrap "
+                                "(user_input passes through raw); "
+                                "session_id=%s",
+                                (session.id or "")[:16] or "<none>",
                             )
                         executor_kwargs["user_input"] = executor_user_input
                 outcome = await self.executor.run(**executor_kwargs)

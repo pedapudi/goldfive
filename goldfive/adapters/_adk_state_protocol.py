@@ -38,7 +38,7 @@ KEY_CURRENT_TASK_DESCRIPTION = "goldfive.current_task_description"
 KEY_CURRENT_TASK_ASSIGNEE = "goldfive.current_task_assignee"
 # Plan revision in effect at the moment ``current_task_id`` was
 # stamped (goldfive#266 / pin versioning). Mirrors the orchestration-
-# state key in :mod:`goldfive.orchestration_state` so the value
+# state key in :mod:`goldfive.state_store` so the value
 # round-trips between goldfive's session.state and ADK's session.state
 # regardless of which surface the reporting handler reads. Missing /
 # malformed entries are read as 0; report-time classifier treats that
@@ -70,7 +70,7 @@ KEY_PENDING_CORRECTIONS = "goldfive.pending_corrections"
 # ``goldfive.Session.state`` into the live ADK session.state so
 # :class:`~goldfive.planners.goldfive_planner.GoldfivePlanner` sees them
 # on its request-side injection path. Writers live in
-# :mod:`goldfive.orchestration_state`; this module owns the ADK-side key
+# :mod:`goldfive.state_store`; this module owns the ADK-side key
 # names so the adapter's plugin can stamp them without importing the
 # orchestration module for key constants. The string values are
 # intentionally identical to the orchestration-state module's keys —
@@ -239,7 +239,7 @@ def read_divergence_flag(state: Any) -> bool:
 # / ``write_current_task_revision`` / ``clear_current_task`` writers were
 # removed in Phase 2.1 of goldfive#271. The pin lives on goldfive
 # ``Session.state`` exclusively now (see
-# :mod:`goldfive.orchestration_store`); no callback-time write to ADK
+# :mod:`goldfive.state_store`); no callback-time write to ADK
 # ``session.state`` for the pin keys remains. The key constants stay
 # (read-side contract for custom adapters that consult the live ADK
 # session) but the writers are gone.

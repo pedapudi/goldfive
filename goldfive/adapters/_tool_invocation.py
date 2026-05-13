@@ -56,7 +56,7 @@ def find_tool(
 
 # Orchestration-state key the adapter stamps at delegation time
 # (goldfive#191). Duplicated here rather than imported from
-# :mod:`goldfive.orchestration_state` to avoid forcing every adapter
+# :mod:`goldfive.state_store` to avoid forcing every adapter
 # to pull in the orchestration module just to resolve a fallback.
 _STATE_KEY_CURRENT_TASK_ID = "goldfive.current_task_id"
 

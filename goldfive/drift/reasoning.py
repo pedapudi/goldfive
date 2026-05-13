@@ -1001,7 +1001,7 @@ async def _run_judge_with_focus(
 
     Phase 1 of goldfive#271 — returns the full verdict (drift +
     attribution fields) so the steerer can record a reasoning-extracted
-    binding onto :class:`~goldfive.orchestration_store.OrchestrationStore`
+    binding onto :class:`~goldfive.state_store.StateStore`
     when ``focus_confidence`` clears the configured threshold.
 
     Same shape as :func:`_run_judge` for the LLM call itself; the only

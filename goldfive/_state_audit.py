@@ -312,7 +312,7 @@ _KNOWN_CALLERS: frozenset[tuple[str, str]] = frozenset(
         # V3 / V4 — MIGRATED in Phase 2.1 (goldfive#271). The per-agent
         # pin (``_stamp_current_task_id``) and the delegation-site pin
         # (``_pin_delegation_task_id``) now write only to goldfive
-        # ``Session.state`` via :class:`OrchestrationStore`. The
+        # ``Session.state`` via :class:`StateStore`. The
         # readers (the dynamic-instruction resolver, reporting handlers,
         # ``_resolve_pinned_task_id``) consult goldfive Session via the
         # plugin reference (``session_context_from_invocation``) — no
@@ -443,7 +443,7 @@ def _check_caller(*, key: str, surface: str, state_repr: str) -> None:
         f"contract (see docs/design/STATE-OWNERSHIP-CONTRACT.md).\n"
         f"\n"
         f"If this is a NEW write: don't add it. Use "
-        f"goldfive.orchestration_state.write(session.state, ...) "
+        f"goldfive.state_store.write(session.state, ...) "
         f"to update the goldfive-owned dict instead, and let the "
         f"bridge propagate it to ADK.\n"
         f"\n"

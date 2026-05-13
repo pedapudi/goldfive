@@ -30,12 +30,23 @@ parse logic.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from typing import Any
 
+from goldfive.drift.registry import (
+    DetectorConfig,
+    truncate_for_observability,
+)
+from goldfive.drift.registry import (
+    format_goals_block as _format_goals,
+)
+from goldfive.drift.registry import (
+    parse_json_response as _parse_response,
+)
+from goldfive.drift.registry import (
+    register as _register,
+)
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Goal, Plan
 
 log = logging.getLogger(__name__)
@@ -102,47 +113,12 @@ GOAL_DRIFT_USER_PROMPT_TEMPLATE: str = (
 )
 
 
-# Liberal JSON extractor: real LLMs emit markdown code fences and prose
-# even with strong "reply JSON only" instructions. Mirrors the extractor
-# used by the reflective-check path.
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _parse_response(raw: Any) -> dict[str, Any] | None:
-    """Extract the first JSON object from ``raw`` or return ``None``."""
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    stripped = raw.strip()
-    try:
-        decoded = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        match = _JSON_OBJECT_RE.search(stripped)
-        if match is None:
-            return None
-        try:
-            decoded = json.loads(match.group(0))
-        except (json.JSONDecodeError, ValueError):
-            return None
-    if not isinstance(decoded, dict):
-        return None
-    return decoded
-
-
-def _format_goals(goals: Sequence[Goal] | Iterable[Any] | None) -> str:
-    if not goals:
-        return "(no goals recorded)"
-    lines: list[str] = []
-    for i, g in enumerate(goals, start=1):
-        gid = str(getattr(g, "id", "") or "")
-        summary = str(getattr(g, "summary", "") or "")
-        if not summary and isinstance(g, str):
-            summary = g
-        prefix = f"{i}."
-        if gid:
-            lines.append(f"{prefix} [{gid}] {summary}")
-        else:
-            lines.append(f"{prefix} {summary}")
-    return "\n".join(lines) if lines else "(no goals recorded)"
+# Liberal JSON extraction + goals rendering live in
+# :mod:`goldfive.drift.registry` so the goal-drift judge and the
+# per-reasoning judge share one implementation. The aliased imports at
+# the top of this module preserve the historical private names (so
+# external test suites mocking ``goals._parse_response`` continue to
+# work) without re-declaring the function bodies here.
 
 
 def _format_tasks(plan: Plan | Any | None) -> str:
@@ -509,14 +485,40 @@ async def classify_goal_drift(
     )
 
 
+# The trigger-input cap is goal-drift-specific (the activity block is
+# wider than a reasoning-judge prompt), so the *limit* lives here but
+# the truncation itself uses the shared registry helper so the
+# " … [truncated]" suffix stays consistent.
 _GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS: int = 2048
-_GOAL_DRIFT_TRUNCATE_SUFFIX: str = " … [truncated]"
 
 
 def _truncate_trigger_input(text: str) -> str:
     """Cap the observability ``trigger_input`` at a bounded length."""
-    if not isinstance(text, str):
-        return ""
-    if len(text) <= _GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS:
-        return text
-    return text[:_GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS] + _GOAL_DRIFT_TRUNCATE_SUFFIX
+    return truncate_for_observability(text, _GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS)
+
+
+# ---------------------------------------------------------------------------
+# Registry self-registration
+# ---------------------------------------------------------------------------
+#
+# Goal-drift is one of the two LLM-as-a-judge detectors. The config
+# pins the per-callsite output cap (16384, mirrors
+# :data:`GOAL_DRIFT_MAX_OUTPUT_TOKENS`) and the trigger-input cap
+# (2048, mirrors :data:`_GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS`). The
+# judge enters :func:`call_llm_thinking_disabled` for every dispatch.
+
+
+_GOAL_DRIFT_CONFIG: DetectorConfig = DetectorConfig(
+    uses_llm=True,
+    max_input_chars=_GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS,
+    max_output_tokens=GOAL_DRIFT_MAX_OUTPUT_TOKENS,
+    disable_thinking=True,
+)
+
+
+_register(
+    DriftKind.GOAL_DRIFT,
+    classify_goal_drift,
+    _GOAL_DRIFT_CONFIG,
+    is_async=True,
+)

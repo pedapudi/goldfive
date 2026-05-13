@@ -40,7 +40,7 @@ from goldfive.adapters._adk_plugin import (  # noqa: E402
     SessionContext,
     make_adk_plugin,
 )
-from goldfive.orchestration_store import OrchestrationStore  # noqa: E402
+from goldfive.state_store import StateStore  # noqa: E402
 from goldfive.types import (  # noqa: E402
     Plan,
     Session,
@@ -125,7 +125,7 @@ def test_linear_plan_first_delegation_binds_first_task() -> None:
     assert b.assignee_agent_id == ""
     assert c.assignee_agent_id == ""
     assert session.current_task_id == "A"
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     assert store.pin_current_task() == "A"
 
 

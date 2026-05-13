@@ -46,8 +46,8 @@ from goldfive.config import (  # noqa: E402
     _resolve_observation_only_default,
 )
 from goldfive.control import ControlKind  # noqa: E402
-from goldfive.orchestration_store import OrchestrationStore  # noqa: E402
 from goldfive.results import InvocationResult  # noqa: E402
+from goldfive.state_store import StateStore  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     DriftEvent,
@@ -250,7 +250,7 @@ async def test_warning_drift_observation_only_suppresses_all_three_injections(
     4. No ``GOLDFIVE_STEER`` ControlMessage is enqueued on the bound
        control channel.
     5. The plugin's ``request_invocation_cancel`` is NOT invoked, and
-       ``OrchestrationStore.cancel_requested_invocation_ids()`` stays
+       ``StateStore.cancel_requested_invocation_ids()`` stays
        empty.
     """
     cfg = SteeringConfig(observation_only=True)
@@ -269,7 +269,7 @@ async def test_warning_drift_observation_only_suppresses_all_three_injections(
     # target to flag IF the gate were open — without this, the "no
     # cancel" half of the assertion below would pass trivially (no live
     # invocation → nothing to cancel regardless of the gate).
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
 
     async def _placeholder() -> None:
         await asyncio.sleep(0.5)
@@ -331,12 +331,12 @@ async def test_warning_drift_observation_only_suppresses_all_three_injections(
         )
 
         # 5. request_invocation_cancel never reached the plugin AND no
-        # cancel is registered on OrchestrationStore.
+        # cancel is registered on StateStore.
         assert adapter._plugin.calls == [], (
             "observation_only must NOT propagate the cancel to the plugin"
         )
         assert store.cancel_requested_invocation_ids() == [], (
-            "OrchestrationStore must NOT see any cancel-requested "
+            "StateStore must NOT see any cancel-requested "
             "invocations under observation_only"
         )
     finally:
@@ -369,7 +369,7 @@ async def test_warning_drift_active_steering_drives_all_three_injections() -> No
     # returns empty and the plugin is never called — orthogonal to the
     # observation-only gate and would falsely satisfy the "no cancel"
     # half of the test below.
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
 
     async def _placeholder() -> None:
         await asyncio.sleep(0.5)
@@ -543,9 +543,9 @@ async def test_capability_mismatch_under_observation_only_suppresses_injections(
 
     # Plan was NOT mutated.
     assert session.plan is prior_plan
-    # No cancel propagated to the plugin or the OrchestrationStore.
+    # No cancel propagated to the plugin or the StateStore.
     assert adapter._plugin.calls == []
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     assert store.cancel_requested_invocation_ids() == []
     # No GOLDFIVE_STEER ControlMessage on the bound channel.
     assert [
@@ -598,7 +598,7 @@ async def test_info_drift_below_promotion_threshold_unchanged_by_flag() -> None:
         )
         assert session.plan is prior_plan
         assert adapter._plugin.calls == []
-        store = OrchestrationStore.for_session(session)
+        store = StateStore.for_session(session)
         assert store.cancel_requested_invocation_ids() == []
 
 
@@ -645,7 +645,7 @@ async def test_observe_reasoning_warning_verdict_under_observation_only() -> Non
     # Register a fake live invocation so the late-drift guard doesn't
     # short-circuit (the guard would otherwise drop the verdict before
     # it reaches the observation-only gate).
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
 
     async def _placeholder() -> None:
         await asyncio.sleep(0.5)
@@ -675,7 +675,7 @@ async def test_observe_reasoning_warning_verdict_under_observation_only() -> Non
         # session.plan unchanged.
         assert session.plan is prior_plan
 
-        # Adapter plugin saw no cancel; OrchestrationStore has no
+        # Adapter plugin saw no cancel; StateStore has no
         # cancel-pending entry.
         assert adapter._plugin.calls == []
         assert store.cancel_requested_invocation_ids() == []
