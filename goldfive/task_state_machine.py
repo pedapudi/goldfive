@@ -57,7 +57,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from goldfive import orchestration_state as _ostate
 from goldfive.types import (
