@@ -286,6 +286,40 @@ def assert_can_write(
 
 
 # ---------------------------------------------------------------------------
+# Request-side mutation catalog (goldfive#397)
+# ---------------------------------------------------------------------------
+#
+# The ``llm_request.contents`` list reaches the model via ADK's flow
+# AFTER every ``before_model_callback`` has returned. Phase 0/2 of the
+# state-ownership audit covers ADK ``session.state`` writes only —
+# request-side mutation is NOT currently guarded by a runtime tripwire
+# because there is no single funnel (each ADK plugin can mutate
+# ``llm_request.contents`` independently).
+#
+# The :class:`~goldfive.context_editor.ContextEditor` is the ONE goldfive
+# site authorised to mutate ``llm_request.contents``. Every other
+# goldfive code path that touches the field is strictly read-only:
+#
+# * ``goldfive/adapters/_adk_plugin.py::_measure_request_chars``
+#   (line ~1180) — reads ``contents`` to instrument
+#   ``llm.request.chars`` and ``llm.request.messages_count``. Never
+#   writes.
+# * ``goldfive/context_editor.py::_content_bytes`` — same
+#   read-only character measurement, shared so the editor's emitted
+#   ``ContextEdited.bytes_before`` / ``.bytes_after`` are byte-aligned
+#   with the instrumentation line.
+#
+# The catalog entry below is documentation; no runtime check fires.
+# Extending the audit to a runtime list-mutation tripwire is a
+# follow-up (would need to wrap the ``contents`` list in a tracked
+# proxy, which has measurable overhead in the hot path — left to a
+# focused PR if a regression surfaces).
+_REQUEST_CONTENTS_AUTHORISED_SITES: tuple[tuple[str, str], ...] = (
+    ("goldfive/context_editor.py", "ContextEditor.apply"),
+)
+
+
+# ---------------------------------------------------------------------------
 # Catalog of known callers (Phase 0 — pre-existing violations)
 # ---------------------------------------------------------------------------
 

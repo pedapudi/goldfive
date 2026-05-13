@@ -1028,6 +1028,7 @@ class ADKAdapter:
         agent_tool_cap: int | None = None,
         llm_call_timeout_ms: int | None = None,
         agent_max_output_tokens: int | None = None,
+        context_editor: Any = None,
     ) -> None:
         self._user_id = user_id
         # Per-(goldfive session.conversation_id) cached ADK session id
@@ -1099,10 +1100,21 @@ class ADKAdapter:
         # ratcheting entirely (pre-#256 behaviour).
         if agent_max_output_tokens is not None:
             plugin_kwargs["agent_max_output_tokens"] = int(agent_max_output_tokens)
+        # Request-side ContextEditor (goldfive#397). ``None`` (default)
+        # disables the editor entirely — :func:`make_adk_plugin` then
+        # stores ``None`` on the plugin and the ``before_model_callback``
+        # codepath short-circuits with one ``is None`` check.
+        # :func:`goldfive.wrap` threads a
+        # :class:`~goldfive.context_editor.ContextEditor` built from
+        # :class:`~goldfive.config.SteeringConfig.context_editor_rules`
+        # when the operator opts in.
+        if context_editor is not None:
+            plugin_kwargs["context_editor"] = context_editor
         self._plugin = make_adk_plugin(**plugin_kwargs)
         self._agent_tool_cap = cap
         self._llm_call_timeout_ms = llm_call_timeout_ms
         self._agent_max_output_tokens = agent_max_output_tokens
+        self._context_editor = context_editor
 
         # Install the goldfive plugin on the one runner. ADK propagates
         # the plugin manager into any AgentTool-spawned sub-Runner so the
