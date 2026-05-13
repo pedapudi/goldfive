@@ -27,7 +27,7 @@ specific agent invocation via
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 from goldfive.adapters import _adk_state_protocol as _sp
@@ -281,26 +281,6 @@ def _goldfive_session_context_from_readonly_context(readonly_ctx: Any) -> Any:
     return legacy_ctx
 
 
-def _observation_only_active(readonly_ctx: Any) -> bool:
-    """Return True when the steerer reachable through ``readonly_ctx``
-    has ``observation_only=True`` (goldfive#271 strict-passive).
-
-    Used by the dynamic-instruction resolver to skip system-prompt
-    rewriting under strict-passive observation_only — the operator
-    must see the RAW caller-supplied ``instruction`` string, not the
-    goldfive-augmented "Current assigned task:" / pending-correction
-    block. Mirrors the gate :func:`_observation_only_active` in
-    :mod:`goldfive.adapters._adk_plugin`.
-    """
-    ctx = _goldfive_session_context_from_readonly_context(readonly_ctx)
-    if ctx is None:
-        return False
-    steerer = getattr(ctx, "steerer", None)
-    if steerer is None:
-        return False
-    return bool(getattr(steerer, "_observation_only", False))
-
-
 def _task_title_description_from_session(session: Any, task_id: str) -> tuple[str, str]:
     """Look up ``(title, description)`` for ``task_id`` in ``session.plan``.
 
@@ -327,130 +307,6 @@ def _task_title_description_from_session(session: Any, task_id: str) -> tuple[st
             description = str(getattr(task, "description", "") or "")
             return title, description
     return "", ""
-
-
-def make_dynamic_instruction(
-    original_instruction: str,
-    agent_name: str,
-) -> Callable[[Any], str]:
-    """Return a resolver matching ADK's ``InstructionProvider`` signature.
-
-    The returned callable:
-
-    * Reads ``session.state`` off the ``ReadonlyContext`` to reach the
-      :class:`~goldfive.adapters._adk_plugin.SessionContext` stash and
-      from there the goldfive :class:`~goldfive.types.Session`.
-    * Reads the current-task pin via
-      :class:`~goldfive.state_store.StateStore`. If
-      no pin is set, returns the ``original_instruction`` verbatim
-      (pre-plan turns stay unchanged).
-    * Looks up the task in ``Session.plan.tasks`` for ``title`` /
-      ``description`` (the typed :class:`~goldfive.types.Task` is the
-      source of truth — the resolver does not consult de-normalised
-      ADK-state keys).
-    * If a pending correction exists for ``(agent_name, current_task_id)``
-      the block is appended (Stream D writes; the store reads).
-
-    The resolver is pure: given the same Session.state it returns the
-    same string. No side effects, no persistence.
-
-    Phase 2.0 of goldfive#271 — the bridge from goldfive Session.state
-    onto ADK session.state is gone. The resolver reads goldfive
-    Session directly via the SessionContext stash, eliminating the
-    callback-time write to ADK state that raced with ADK's
-    optimistic-concurrency contract (see goldfive#275).
-
-    Legacy fallback: when the SessionContext stash is unreachable (a
-    unit test drives the resolver against a plain state dict without
-    the stash), the resolver reads the pin / title / description /
-    correction directly off ADK state. Production paths always carry
-    the stash.
-    """
-
-    def resolver(readonly_ctx: Any) -> str:
-        try:
-            # goldfive#271 strict-passive carve-out: under
-            # ``observation_only=True`` return the caller's
-            # ``original_instruction`` verbatim. The dynamic resolver's
-            # job is to append a goldfive-shaped "Current assigned task"
-            # / pending-correction block to every wrapped LlmAgent's
-            # system prompt every turn — that's structural prompt-
-            # shaping the operator is trying to observe AROUND under
-            # strict-passive. With this gate, the agent's LLM sees
-            # exactly the ``instruction`` string the caller passed to
-            # the ``LlmAgent`` constructor, nothing more.
-            if _observation_only_active(readonly_ctx):
-                log.info(
-                    "dynamic_instruction resolver: observation_only=True — "
-                    "SKIPPING goldfive prompt augmentation for agent=%r "
-                    "(returning original instruction verbatim)",
-                    agent_name,
-                )
-                return original_instruction
-
-            state = _state_from_readonly_context(readonly_ctx)
-            session = _goldfive_session_from_readonly_context(readonly_ctx)
-
-            if session is not None:
-                from goldfive.state_store import StateStore
-
-                store = StateStore.for_session(session)
-                current_task_id = store.pin_current_task()
-            else:
-                current_task_id = str(state.get(_sp.KEY_CURRENT_TASK_ID, "") or "")
-
-            if not current_task_id:
-                # No pin — pre-plan turn, or an agent that doesn't need
-                # plan-causal augmentation this turn. Return the caller's
-                # instruction verbatim.
-                return original_instruction
-
-            if session is not None:
-                current_task_title, current_task_description = (
-                    _task_title_description_from_session(session, current_task_id)
-                )
-            else:
-                # Legacy ADK-state fallback path.
-                current_task_title = str(
-                    state.get(_sp.KEY_CURRENT_TASK_TITLE, "") or ""
-                )
-                current_task_description = str(
-                    state.get(_sp.KEY_CURRENT_TASK_DESCRIPTION, "") or ""
-                )
-
-            pending_correction = _read_pending_correction(
-                session=session,
-                state=state,
-                agent_name=agent_name,
-                current_task_id=current_task_id,
-            )
-
-            return _compose_instruction(
-                original=original_instruction,
-                task_id=current_task_id,
-                task_title=current_task_title,
-                task_description=current_task_description,
-                pending_correction=pending_correction,
-            )
-        except Exception as exc:  # noqa: BLE001
-            # Instrumentation path — any failure here degrades to the
-            # original instruction so the agent still runs. ADK's own
-            # pipeline would otherwise surface this as an InternalError
-            # mid-turn, which is the worst possible failure mode.
-            log.debug(
-                "dynamic_instruction resolver raised for agent=%r: %s "
-                "(falling back to original instruction)",
-                agent_name,
-                exc,
-            )
-            return original_instruction
-
-    # Stamp provenance on the closure so test code and tree-walk
-    # idempotency checks can recognise it without relying on repr.
-    resolver._goldfive_dynamic_instruction = True  # type: ignore[attr-defined]
-    resolver._goldfive_agent_name = agent_name  # type: ignore[attr-defined]
-    resolver._goldfive_original_instruction = original_instruction  # type: ignore[attr-defined]
-    return resolver
 
 
 def is_dynamic_instruction(value: Any) -> bool:
@@ -540,7 +396,15 @@ def install_dynamic_instructions(root_agent: Any) -> int:
         original = existing if isinstance(existing, str) else ""
 
         agent_name = str(getattr(cur, "name", "") or "")
-        resolver = make_dynamic_instruction(
+        # Wave B1 (refactor/prompt-shaper): the resolver factory lives
+        # on :class:`~goldfive.prompt_shaper.PromptShaper` so the four
+        # prompt-shape injection sites share one ``observation_only``
+        # gate. The closure shape (provenance attrs, ADK
+        # ``InstructionProvider`` signature) is preserved
+        # byte-identically.
+        from goldfive.prompt_shaper import PromptShaper
+
+        resolver = PromptShaper().make_dynamic_instruction(
             original_instruction=original,
             agent_name=agent_name,
         )
@@ -600,6 +464,5 @@ __all__ = [
     "install_dynamic_instructions",
     "is_dynamic_instruction",
     "log_dynamic_instruction_opt_out",
-    "make_dynamic_instruction",
     "pending_correction_key",
 ]

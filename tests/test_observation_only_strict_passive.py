@@ -10,29 +10,35 @@ making the operator's observation be of a goldfive-coached coordinator
 rather than the raw one:
 
 1. **Runner conversational-follow-up wrap**
-   (:meth:`Runner._wrap_conversational_input`, runner.py ~1701).
-   On a follow-up turn the runner rewrote the user's plain input into a
+   (:meth:`goldfive.prompt_shaper.PromptShaper.wrap_conversational_input`,
+   called from :meth:`goldfive.runner.Runner.run`). On a follow-up turn
+   the runner rewrote the user's plain input into a
    ``[CONVERSATIONAL FOLLOW-UP — reuse prior plan, don't delegate]``
    directive. Under strict-passive that wrap is skipped: the executor
    receives the raw ``user_input``.
 
 2. **ADK plugin ``before_model_callback`` ``system_instruction``
-   injections** (:func:`_inject_goldfive_planner_instruction`,
-   :func:`_inject_runtime_tools_hint` in
-   :mod:`goldfive.adapters._adk_plugin`). Both append goldfive-shaped
-   directive blocks to every LLM call's ``system_instruction``. Under
-   strict-passive both are skipped at the callback gate; the
-   coordinator's ``system_instruction`` is whatever ADK / the caller
-   set it to, with no goldfive augmentation.
+   injections**
+   (:meth:`PromptShaper.inject_goldfive_planner_instruction`,
+   :meth:`PromptShaper.inject_runtime_tools_hint`). Both append
+   goldfive-shaped directive blocks to every LLM call's
+   ``system_instruction``. Under strict-passive both are skipped at the
+   shaper's :meth:`should_inject` gate; the coordinator's
+   ``system_instruction`` is whatever ADK / the caller set it to, with
+   no goldfive augmentation.
 
 3. **Dynamic instruction resolver**
-   (:func:`goldfive.adapters._adk_dynainst.make_dynamic_instruction`,
-   installed at :func:`goldfive.wrap` time). The resolver replaces every
-   wrapped ``LlmAgent.instruction`` with a closure that appends
-   "Current assigned task: id/title/description" + any pending-correction
+   (:meth:`PromptShaper.make_dynamic_instruction`, installed at
+   :func:`goldfive.wrap` time). The resolver replaces every wrapped
+   ``LlmAgent.instruction`` with a closure that appends "Current
+   assigned task: id/title/description" + any pending-correction
    block on every turn. Under strict-passive the resolver returns the
    ``original_instruction`` verbatim — the caller-supplied string the
    ``LlmAgent`` was constructed with.
+
+Wave B1 (refactor/prompt-shaper) consolidated the four gate checks
+into :meth:`PromptShaper.should_inject` — the four call sites no
+longer carry duplicated ``observation_only`` predicates.
 
 Live reproduction context: typewriters / kikuchi session
 ``1c3602f8-3810-4158-ad8a-3c8f0b79dfdb`` (2026-05-12) showed the
@@ -260,7 +266,9 @@ async def test_conversational_wrap_log_emitted_under_observation_only(
     """
     import logging
 
-    caplog.set_level(logging.INFO, logger="goldfive.runner")
+    # Wave B1 (refactor/prompt-shaper): the skip log is now emitted by
+    # :mod:`goldfive.prompt_shaper`, not :mod:`goldfive.runner`.
+    caplog.set_level(logging.INFO, logger="goldfive.prompt_shaper")
     runner, _captured = _make_runner(observation_only=True)
     out1 = await runner.run("make a presentation about solar panels")
     assert out1.success
@@ -284,54 +292,64 @@ async def test_conversational_wrap_log_emitted_under_observation_only(
 # Site 2 — ADK plugin ``before_model_callback`` system_instruction injections
 # ---------------------------------------------------------------------------
 #
-# The two injection helpers live in goldfive.adapters._adk_plugin:
-#   * ``_inject_goldfive_planner_instruction`` — appends
+# The two injection methods live on :class:`PromptShaper`:
+#   * ``inject_goldfive_planner_instruction`` — appends
 #     ``GoldfivePlanner.build_planning_instruction`` output
-#   * ``_inject_runtime_tools_hint`` — appends "[GOLDFIVE PLAN-STATE HINT…]"
+#   * ``inject_runtime_tools_hint`` — appends "[GOLDFIVE PLAN-STATE HINT…]"
 #     block listing pending agents
 #
 # Both fire inside ``_GoldfiveADKPlugin.before_model_callback``. The
 # strict-passive gate is a single check on
-# ``ctx.steerer._observation_only`` at the callback entry — the same
-# shape DefaultSteerer._should_inject uses elsewhere. The unit test
-# below drives the gate predicate directly (the full ADK callback
-# requires google-adk + a live LlmRequest; the predicate is the
-# behaviour-defining surface).
+# ``ctx.steerer._observation_only`` via :meth:`PromptShaper.should_inject`
+# — the same shape DefaultSteerer._should_inject uses elsewhere. The
+# unit test below drives the gate predicate directly (the full ADK
+# callback requires google-adk + a live LlmRequest; the predicate is
+# the behaviour-defining surface).
 
 
-def test_observation_only_active_helper_returns_false_when_no_ctx() -> None:
-    """The plugin's ``_observation_only_active`` helper degrades safely
-    when no SessionContext is reachable — the pre-#271 paths (unit-test
-    stubs that never call ``set_active_context``) keep working."""
-    from goldfive.adapters._adk_plugin import _observation_only_active
+def test_should_inject_returns_true_when_no_steerer() -> None:
+    """:meth:`PromptShaper.should_inject` degrades safely to ``True``
+    when no steerer is reachable — pre-#271 paths (unit-test stubs that
+    never call ``set_active_context``) keep working byte-identically."""
+    from goldfive.prompt_shaper import PromptShaper
 
-    assert _observation_only_active(None) is False
-
-
-def test_observation_only_active_helper_true_when_steerer_passive() -> None:
-    """The plugin's ``_observation_only_active`` helper returns True
-    when ``ctx.steerer._observation_only`` is True."""
-    from goldfive.adapters._adk_plugin import _observation_only_active
-
-    class _Ctx:
-        steerer = DefaultSteerer(
-            steering_config=SteeringConfig(observation_only=True)
-        )
-
-    assert _observation_only_active(_Ctx()) is True
+    assert PromptShaper.should_inject(None) is True
 
 
-def test_observation_only_active_helper_false_when_steerer_active() -> None:
-    """The plugin's ``_observation_only_active`` helper returns False
-    when ``ctx.steerer._observation_only`` is False (active steering)."""
-    from goldfive.adapters._adk_plugin import _observation_only_active
+def test_should_inject_returns_false_when_steerer_passive() -> None:
+    """:meth:`PromptShaper.should_inject` returns ``False`` (gate
+    closed → suppress injection) when ``steerer._observation_only`` is
+    ``True``."""
+    from goldfive.prompt_shaper import PromptShaper
 
-    class _Ctx:
-        steerer = DefaultSteerer(
-            steering_config=SteeringConfig(observation_only=False)
-        )
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(observation_only=True)
+    )
+    assert PromptShaper.should_inject(steerer) is False
 
-    assert _observation_only_active(_Ctx()) is False
+
+def test_should_inject_returns_true_when_steerer_active() -> None:
+    """:meth:`PromptShaper.should_inject` returns ``True`` (gate open →
+    run the inject) when ``steerer._observation_only`` is ``False``
+    (active steering)."""
+    from goldfive.prompt_shaper import PromptShaper
+
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(observation_only=False)
+    )
+    assert PromptShaper.should_inject(steerer) is True
+
+
+def test_should_inject_returns_true_when_steerer_lacks_attribute() -> None:
+    """A duck-typed steerer that doesn't carry ``_observation_only``
+    (custom :class:`~goldfive.protocols.Steerer` impls predating #254)
+    returns ``True`` so pre-#254 paths keep working."""
+    from goldfive.prompt_shaper import PromptShaper
+
+    class _LegacySteerer:
+        pass
+
+    assert PromptShaper.should_inject(_LegacySteerer()) is True
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +397,7 @@ def test_dynamic_instruction_returns_original_under_observation_only() -> None:
     ``original_instruction`` verbatim — no "Current assigned task" block,
     no pending-correction block, no goldfive augmentation of any kind.
     """
-    from goldfive.adapters._adk_dynainst import make_dynamic_instruction
+    from goldfive.prompt_shaper import PromptShaper
     from goldfive.types import Goal, Plan, TaskStatus
 
     # Session with a real pinned task, so the non-strict path WOULD
@@ -411,7 +429,7 @@ def test_dynamic_instruction_returns_original_under_observation_only() -> None:
     store = StateStore.for_session(sess)
     store.set_pin_current_task("t1", title="Draft slide")
 
-    resolver = make_dynamic_instruction(
+    resolver = PromptShaper().make_dynamic_instruction(
         original_instruction="You are a friendly slide-drafting agent.",
         agent_name="writer",
     )
@@ -432,7 +450,7 @@ def test_dynamic_instruction_augments_under_observation_disabled() -> None:
     appends the "Current assigned task" block to the original
     instruction — byte-identical to pre-#271 behaviour.
     """
-    from goldfive.adapters._adk_dynainst import make_dynamic_instruction
+    from goldfive.prompt_shaper import PromptShaper
     from goldfive.state_store import StateStore
     from goldfive.types import Goal, Plan, TaskStatus
 
@@ -458,7 +476,7 @@ def test_dynamic_instruction_augments_under_observation_disabled() -> None:
     store = StateStore.for_session(sess)
     store.set_pin_current_task("t1", title="Draft slide")
 
-    resolver = make_dynamic_instruction(
+    resolver = PromptShaper().make_dynamic_instruction(
         original_instruction="You are a friendly slide-drafting agent.",
         agent_name="writer",
     )

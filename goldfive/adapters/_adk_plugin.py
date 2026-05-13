@@ -430,32 +430,6 @@ def _session_context_from_callback(ctx: Any) -> SessionContext | None:
     return None
 
 
-def _observation_only_active(ctx: Any) -> bool:
-    """Return True when the steerer reachable through ``ctx`` has
-    ``observation_only=True`` (goldfive#271 strict-passive).
-
-    Reads ``ctx.steerer._observation_only`` if present. Tolerant of
-    ``ctx is None`` (no live SessionContext — treat as not-passive so
-    pre-#271 behaviour is preserved on paths where the plugin runs
-    without a bound steerer, e.g. unit-test stubs that never call
-    :meth:`_GoldfiveADKPlugin.set_active_context`).
-
-    Used by :meth:`_GoldfiveADKPlugin.before_model_callback` to gate
-    the two ``system_instruction`` injection sites — the
-    GoldfivePlanner request-side instruction and the runtime tool-
-    surface hint. Mirrors the :meth:`DefaultSteerer._should_inject`
-    gate used at every other dispatch site (steerer.py:4004 /
-    :4073 / :4470, executors/sequential.py:703 / :794 / :1252 /
-    :1403 / :1576).
-    """
-    if ctx is None:
-        return False
-    steerer = getattr(ctx, "steerer", None)
-    if steerer is None:
-        return False
-    return bool(getattr(steerer, "_observation_only", False))
-
-
 # --------------------------------------------------------------------------
 # goldfive#191 — Layer 3: task_id arg injection for reporting tools
 # --------------------------------------------------------------------------
@@ -1666,140 +1640,6 @@ def _tool_approval_prompt(tool: Any, tool_name: str, tool_args: Any) -> str:
     return f"Run {tool_name}()?"
 
 
-async def _inject_goldfive_planner_instruction(
-    *,
-    callback_context: Any,
-    llm_request: Any,
-) -> None:
-    """Append :class:`GoldfivePlanner` output to ``llm_request.config.system_instruction``.
-
-    ADK's ``flows/llm_flows/_nl_planning.py`` request-side processor
-    gates instruction injection on ``isinstance(planner,
-    PlanReActPlanner)`` — so a ``BasePlanner`` subclass that is NOT a
-    PlanReAct subclass gets its ``build_planning_instruction`` called
-    on the RESPONSE side (via ``process_planning_response``) but never
-    on the REQUEST side. That's fine for response filtering but it
-    starves the model of goldfive's orchestration context block on
-    the turn that matters.
-
-    This helper is the workaround: it detects when the running
-    agent's ``.planner`` is a :class:`~goldfive.planners.goldfive_planner.GoldfivePlanner`
-    (NOT a ``PlanReActPlanner`` or ``BuiltInPlanner`` — ADK handles
-    those on its own via ``_nl_planning``) and appends the planner's
-    :meth:`build_planning_instruction` output to the request's system
-    instruction using ADK's own ``append_instructions`` method.
-
-    Silent fall-throughs in priority order:
-
-    * ADK not installed or ``BasePlanner`` import fails → skip.
-    * Running agent has no ``planner`` attribute or planner is None
-      → skip (plain ADK LlmAgent with no goldfive attachment).
-    * Planner is a ``PlanReActPlanner`` / ``BuiltInPlanner`` subclass
-      → skip (ADK will handle it natively).
-    * ``build_planning_instruction`` returns ``None`` / empty →
-      skip (planner opted out for this turn).
-    * ``llm_request`` lacks ``append_instructions`` → skip (unit-test
-      request stubs).
-    """
-    try:
-        from goldfive.planners.goldfive_planner import GoldfivePlanner
-    except ImportError:  # pragma: no cover — ADK not installed
-        return
-    try:
-        from google.adk.planners.base_planner import BasePlanner  # type: ignore
-        from google.adk.planners.built_in_planner import BuiltInPlanner  # type: ignore
-        from google.adk.planners.plan_re_act_planner import (  # type: ignore
-            PlanReActPlanner,
-        )
-    except ImportError:  # pragma: no cover — ADK not installed
-        return
-
-    # Find the running agent on the callback_context. ADK exposes it
-    # through the invocation context; tests may supply a context that
-    # carries ``.agent`` directly.
-    inv_ctx = _safe_attr(callback_context, "_invocation_context", None) or _safe_attr(
-        callback_context, "invocation_context", None
-    )
-    agent = _safe_attr(inv_ctx, "agent", None)
-    if agent is None:
-        agent = _safe_attr(callback_context, "agent", None)
-    if agent is None:
-        return
-
-    planner = _safe_attr(agent, "planner", None)
-    if planner is None:
-        return
-    # If ADK itself will inject for this planner type, skip. ``BuiltInPlanner``
-    # never emits a text instruction (it configures thinking on the
-    # request instead), ``PlanReActPlanner`` is the one ADK gates on.
-    if isinstance(planner, (PlanReActPlanner, BuiltInPlanner)):
-        return
-    if not isinstance(planner, BasePlanner):
-        return
-    # Narrow further: the adapter attaches GoldfivePlanner specifically.
-    # A custom BasePlanner subclass that is not GoldfivePlanner should
-    # be respected by ADK's own (response-side) dispatch only, not
-    # re-injected here. This keeps the hook behaviour predictable for
-    # users who subclass BasePlanner themselves.
-    if not isinstance(planner, GoldfivePlanner):
-        return
-
-    # Build the ReadonlyContext ADK expects. When invocation_context
-    # is available we use ADK's real class; otherwise we fall back to
-    # ``callback_context`` itself (test stubs carrying ``.state`` work
-    # through GoldfivePlanner's tolerant _extract_state).
-    readonly = callback_context
-    try:
-        from google.adk.agents.readonly_context import ReadonlyContext  # type: ignore
-
-        if inv_ctx is not None:
-            readonly = ReadonlyContext(inv_ctx)
-    except Exception as exc:  # noqa: BLE001 — use fallback
-        log.debug(
-            "_inject_goldfive_planner_instruction: ReadonlyContext unavailable: %s",
-            exc,
-        )
-
-    instruction = planner.build_planning_instruction(readonly, llm_request)
-    if not instruction:
-        return
-
-    append = getattr(llm_request, "append_instructions", None)
-    if not callable(append):
-        # Best-effort write directly into ``config.system_instruction``
-        # when the test stub doesn't carry the helper. Preserves the
-        # existing value if it's a string.
-        config = getattr(llm_request, "config", None)
-        if config is None:
-            return
-        existing = getattr(config, "system_instruction", None)
-        if not existing:
-            try:
-                config.system_instruction = instruction
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "_inject_goldfive_planner_instruction: could not set system_instruction: %s",
-                    exc,
-                )
-        elif isinstance(existing, str):
-            try:
-                config.system_instruction = existing + "\n\n" + instruction
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "_inject_goldfive_planner_instruction: could not append system_instruction: %s",
-                    exc,
-                )
-        return
-
-    try:
-        append([instruction])
-    except Exception as exc:  # noqa: BLE001
-        log.debug(
-            "_inject_goldfive_planner_instruction: append_instructions raised: %s",
-            exc,
-        )
-
-
 # R3 (F2 alternative) — runtime tool-surface hint.
 #
 # Tier 1's F2 wanted to mutate ``llm_request.config.tools`` mid-callback
@@ -1914,79 +1754,6 @@ def _strip_prior_runtime_tools_hint(existing: str) -> str:
     while "\n\n\n" in cleaned:
         cleaned = cleaned.replace("\n\n\n", "\n\n")
     return cleaned.strip("\n")
-
-
-def _inject_runtime_tools_hint(
-    *,
-    callback_context: Any,
-    llm_request: Any,
-    session: Any,
-) -> None:
-    """Inject (or refresh) the runtime tool-surface hint on ``llm_request``.
-
-    R3 (F2 alternative). Builds the current plan-state hint via
-    :func:`_build_runtime_tools_hint` and writes it to
-    ``llm_request.config.system_instruction``. If a prior goldfive
-    hint is present (detected by :data:`_RUNTIME_TOOLS_HINT_PREFIX`),
-    it is stripped first so we don't accumulate snapshots across calls.
-
-    Best-effort: never raises. A None hint (no plan, or plan with no
-    informative groups) is a no-op so we don't pollute the prompt with
-    empty markers.
-    """
-    hint = _build_runtime_tools_hint(session)
-
-    config = _safe_attr(llm_request, "config", None)
-    if config is None:
-        return
-    existing = getattr(config, "system_instruction", None)
-
-    # Strip any prior hint regardless of whether we'll re-inject. A
-    # None ``hint`` (plan disappeared or all groups empty) should still
-    # remove the stale marker block from the request.
-    if isinstance(existing, str) and _RUNTIME_TOOLS_HINT_PREFIX in existing:
-        try:
-            config.system_instruction = _strip_prior_runtime_tools_hint(existing) or None
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "_inject_runtime_tools_hint: could not strip prior hint: %s",
-                exc,
-            )
-            return
-        existing = getattr(config, "system_instruction", None)
-
-    if not hint:
-        return
-
-    append = getattr(llm_request, "append_instructions", None)
-    if callable(append):
-        try:
-            append([hint])
-            return
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "_inject_runtime_tools_hint: append_instructions raised: %s",
-                exc,
-            )
-            # fall through to direct write
-
-    # Fallback for stubs that lack ``append_instructions`` (unit tests).
-    if not existing:
-        try:
-            config.system_instruction = hint
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "_inject_runtime_tools_hint: could not set system_instruction: %s",
-                exc,
-            )
-    elif isinstance(existing, str):
-        try:
-            config.system_instruction = existing + "\n\n" + hint
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "_inject_runtime_tools_hint: could not append system_instruction: %s",
-                exc,
-            )
 
 
 #: Default per-LLM-call wall-clock budget (milliseconds) enforced by
@@ -2389,6 +2156,19 @@ def make_adk_plugin(
             # Per-invocation pin ensures the pair is exactly-once even
             # when ADK skips ``after_agent_callback`` on cancel.
             self._boundary_entered_invocations: set[str] = set()
+            # Wave B1 (refactor/prompt-shaper): centralised prompt-shape
+            # injection helpers. The plugin reaches the two
+            # ``before_model_callback`` injection sites
+            # (:meth:`PromptShaper.inject_goldfive_planner_instruction`
+            # and :meth:`PromptShaper.inject_runtime_tools_hint`) via
+            # this instance. ``observation_only`` gating lives inside
+            # the shaper so this module no longer needs its own
+            # ``_observation_only_active`` helper. Stateless — owned
+            # per-plugin so future per-runner shaper configuration is
+            # one attribute away.
+            from goldfive.prompt_shaper import PromptShaper
+
+            self._prompt_shaper = PromptShaper()
 
         def set_active_context(self, ctx: SessionContext) -> None:
             """Attach the ``SessionContext`` for the running invocation.
@@ -5304,30 +5084,22 @@ def make_adk_plugin(
             # goldfive Session directly so no callback-time write
             # is required.
             #
-            # goldfive#271 strict-passive carve-out: under
-            # ``observation_only=True`` skip the injection. The
-            # planner's instruction block is goldfive's coaching of
-            # the coordinator's planning behaviour — mutating
-            # ``system_instruction`` to nudge the model toward a
-            # specific orchestration shape is exactly the kind of
-            # silent prompt-shaping strict-passive exists to surface.
-            if _observation_only_active(ctx):
-                log.info(
-                    "before_model_callback: observation_only=True — "
-                    "SKIPPING GoldfivePlanner request-side instruction "
-                    "injection (system_instruction unchanged)"
+            # goldfive#271 strict-passive carve-out + Wave B1: the
+            # injection + ``observation_only`` gate live in
+            # :class:`~goldfive.prompt_shaper.PromptShaper`. The shaper
+            # short-circuits when ``ctx.steerer._observation_only`` is
+            # True; otherwise the byte-identical pre-#271 inject runs.
+            try:
+                await self._prompt_shaper.inject_goldfive_planner_instruction(
+                    callback_context=callback_context,
+                    llm_request=llm_request,
+                    session_context=ctx,
                 )
-            else:
-                try:
-                    await _inject_goldfive_planner_instruction(
-                        callback_context=callback_context,
-                        llm_request=llm_request,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "before_model_callback: goldfive planner injection raised: %s",
-                        exc,
-                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "before_model_callback: goldfive planner injection raised: %s",
+                    exc,
+                )
 
             # Structural ``max_output_tokens`` ceiling for sub-agent
             # LLM calls (goldfive#256). Applied AFTER GoldfivePlanner
@@ -5374,32 +5146,24 @@ def make_adk_plugin(
             # strip the stale block before appending the fresh one
             # (per-call, not accumulated).
             #
-            # goldfive#271 strict-passive carve-out: under
-            # ``observation_only=True`` skip injection. The hint is
-            # directive ("Choose the agent whose tasks are still
-            # PENDING. Do not re-invoke agents whose tasks are
-            # already complete.") — exactly the kind of silent
-            # coaching strict-passive exists to surface. Operators
-            # observe the RAW coordinator's tool-choice behaviour.
-            if _observation_only_active(ctx):
-                log.info(
-                    "before_model_callback: observation_only=True — "
-                    "SKIPPING runtime tool-surface hint injection "
-                    "(system_instruction unchanged)"
-                )
-            else:
-                try:
-                    if ctx is not None and ctx.session is not None:
-                        _inject_runtime_tools_hint(
-                            callback_context=callback_context,
-                            llm_request=llm_request,
-                            session=ctx.session,
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "before_model_callback: runtime tools hint injection raised: %s",
-                        exc,
+            # goldfive#271 strict-passive carve-out + Wave B1: the
+            # hint + ``observation_only`` gate live in
+            # :class:`~goldfive.prompt_shaper.PromptShaper`. The shaper
+            # short-circuits when ``ctx.steerer._observation_only`` is
+            # True; otherwise the byte-identical pre-#271 inject runs.
+            try:
+                if ctx is not None and ctx.session is not None:
+                    self._prompt_shaper.inject_runtime_tools_hint(
+                        callback_context=callback_context,
+                        llm_request=llm_request,
+                        session=ctx.session,
+                        session_context=ctx,
                     )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "before_model_callback: runtime tools hint injection raised: %s",
+                    exc,
+                )
 
             # Per-LLM-call instrumentation (goldfive#172). Measure the
             # request AFTER GoldfivePlanner has appended its

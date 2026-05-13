@@ -315,6 +315,16 @@ class Runner:
         self.executor = executor
         self.goal_deriver: GoalDeriver = goal_deriver or PassthroughGoalDeriver("run")
         self.steerer: Steerer = steerer or DefaultSteerer()
+        # Wave B1 (refactor/prompt-shaper): centralised prompt-shaping
+        # injection sites + ``observation_only`` gate. The Runner only
+        # uses :meth:`PromptShaper.wrap_conversational_input` directly;
+        # the ADK plugin holds its own instance for the three
+        # request-side sites. Stateless — instantiation here keeps the
+        # gate predicate co-located with the runner's other dispatch
+        # helpers.
+        from goldfive.prompt_shaper import PromptShaper
+
+        self._prompt_shaper = PromptShaper()
         # goldfive#143: opt-in gate for the trajectory-level GOAL_DRIFT
         # periodic check. ``True`` (default) is a no-op -- the steerer's
         # own ``goal_drift_call_llm`` wiring governs whether the check
@@ -1073,40 +1083,25 @@ class Runner:
                 # so absorb_turn / event summaries above still see the
                 # user's actual question.
                 #
-                # goldfive#271 strict-passive carve-out: under
-                # ``observation_only=True`` skip the wrap. The whole
-                # point of strict-passive is to surface the RAW
-                # coordinator behaviour — wrapping mutates the input
-                # the agent's LLM sees verbatim (it's prompt-shaping
-                # masquerading as a user message) and would coach the
-                # coordinator into the "don't delegate" behaviour the
-                # operator is trying to observe. Without the wrap, a
-                # follow-up turn may cause the operator's coordinator
-                # to re-delegate; that's the diagnostic value of
-                # strict-passive.
+                # goldfive#271 strict-passive carve-out + Wave B1: the
+                # wrap + ``observation_only`` gate live in
+                # :class:`~goldfive.prompt_shaper.PromptShaper` so the
+                # four prompt-shaping sites share one gate. Under
+                # ``observation_only=True`` ``wrap_conversational_input``
+                # returns the raw input unchanged; otherwise it returns
+                # the composed F6 directive.
                 if isinstance(user_input, str):
                     run_sig = inspect.signature(self.executor.run)
                     if "user_input" in run_sig.parameters:
                         executor_user_input = user_input
-                        is_conversational = (
+                        if (
                             getattr(session, "_conversational_turn", False)
-                            and bool(user_input.strip())
-                        )
-                        passive = bool(
-                            getattr(self.steerer, "_observation_only", False)
-                        )
-                        if is_conversational and not passive:
-                            executor_user_input = self._wrap_conversational_input(
+                            and user_input.strip()
+                        ):
+                            executor_user_input = self._prompt_shaper.wrap_conversational_input(
                                 user_input=user_input,
                                 session=session,
-                            )
-                        elif is_conversational and passive:
-                            log.info(
-                                "Runner.run: observation_only=True — "
-                                "SKIPPING conversational-follow-up wrap "
-                                "(user_input passes through raw); "
-                                "session_id=%s",
-                                (session.id or "")[:16] or "<none>",
+                                steerer=self.steerer,
                             )
                         executor_kwargs["user_input"] = executor_user_input
                 outcome = await self.executor.run(**executor_kwargs)
@@ -1720,58 +1715,6 @@ class Runner:
             )
             return False
         return bool(installed)
-
-    @staticmethod
-    def _wrap_conversational_input(
-        *,
-        user_input: str,
-        session: Session,
-    ) -> str:
-        """Compose a directive that frames the user's input as a
-        conversational follow-up (F6, closes goldfive#277).
-
-        When :meth:`Planner.handle_turn` returns ``None`` on a turn
-        with a real prior plan, the runner reuses ``session.plan``
-        but still drives the executor over the input — without this
-        wrapper the coordinator typically treats the question as a
-        fresh task and re-delegates to sub-agents, wasting an
-        invocation. The wrapper:
-
-        * tags the message as a conversational follow-up,
-        * gives the coordinator the plan summary + completed task
-          context so it can answer from history,
-        * asks it explicitly NOT to delegate.
-
-        Lives in the message body (no system-prompt contract). A
-        parallel layer (the ADK plugin's pre-dispatch interceptor,
-        keyed off ``session._conversational_turn``) tightens the
-        tool surface so the coordinator literally cannot delegate
-        even if it tried; this wrapper is the cooperative half.
-        """
-        from goldfive.types import TaskStatus
-
-        plan = session.plan
-        plan_summary = (plan.summary if plan is not None else "") or "(no summary)"
-        completed_lines: list[str] = []
-        if plan is not None:
-            for t in plan.tasks:
-                if t.status is TaskStatus.COMPLETED:
-                    title = t.title or t.description or t.id
-                    assignee = t.assignee_agent_id or "(no-assignee)"
-                    completed_lines.append(f"  - [{t.id}] {title} (by {assignee})")
-        completed_block = (
-            "\n".join(completed_lines) if completed_lines else "  (none yet)"
-        )
-        return (
-            "[CONVERSATIONAL FOLLOW-UP — reuse prior plan, don't delegate "
-            "to sub-agents]\n\n"
-            "The user is asking a follow-up question about prior work. "
-            "Answer briefly using the conversation history and existing "
-            "artifacts. Do NOT call any AgentTool — answer directly.\n\n"
-            f"Plan summary: {plan_summary}\n"
-            f"Completed tasks:\n{completed_block}\n\n"
-            f"User question: {user_input}"
-        )
 
     async def _resolve_goals(
         self,
