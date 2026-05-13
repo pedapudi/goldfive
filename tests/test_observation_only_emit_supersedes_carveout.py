@@ -56,7 +56,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
-from goldfive import orchestration_state as _ostate  # noqa: E402
+from goldfive import state_store as _ostate  # noqa: E402
 from goldfive._correction_injection import (  # noqa: E402
     is_pending_correction_key,
 )

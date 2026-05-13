@@ -62,10 +62,10 @@ from goldfive.drift.capability_check import (
 from goldfive.drift.capability_check import (
     tokenize_for_matching as _tokenize_for_matching_shared,
 )
-from goldfive.orchestration_store import (
+from goldfive.state_store import (
     PENDING_DELEGATIONS_KEY,
     BindingSource,
-    OrchestrationStore,
+    StateStore,
 )
 
 if TYPE_CHECKING:
@@ -260,13 +260,13 @@ class _InvocationCancelled:
 
 
 class _InvocationTaskRegistryView:
-    """Backwards-compat view over the OrchestrationStore-owned
+    """Backwards-compat view over the StateStore-owned
     invocation-task registry (goldfive#271 Phase 3.5 component 1).
 
     PR #303 placed the per-invocation asyncio.Task registry on the
     plugin instance as ``_invocation_tasks: dict[str, asyncio.Task]``.
     Phase 3.5 relocates the storage to
-    :class:`~goldfive.orchestration_store.OrchestrationStore` per the
+    :class:`~goldfive.state_store.StateStore` per the
     Phase 0 state-ownership contract, but keeps the legacy attribute
     accessible: the steerer's cancel path and tests still index into
     ``plugin._invocation_tasks[inv_id]``.
@@ -295,9 +295,9 @@ class _InvocationTaskRegistryView:
         ctx = getattr(self._plugin, "_active_ctx", None)
         if ctx is None:
             return None
-        from goldfive.orchestration_store import OrchestrationStore
+        from goldfive.state_store import StateStore
 
-        return OrchestrationStore.for_session(ctx.session)
+        return StateStore.for_session(ctx.session)
 
     def __setitem__(self, invocation_id: str, task: asyncio.Task[Any]) -> None:
         store = self._store()
@@ -762,7 +762,7 @@ def _inject_task_id_from_state(
 # Re-export under the legacy module-private name so downstream tests
 # and custom adapters that import :data:`_PENDING_DELEGATIONS_KEY` keep
 # working unchanged. Phase 2.1 (goldfive#271) moved the canonical
-# definition into :mod:`goldfive.orchestration_store`; the value is
+# definition into :mod:`goldfive.state_store`; the value is
 # unchanged.
 _PENDING_DELEGATIONS_KEY = PENDING_DELEGATIONS_KEY
 
@@ -788,9 +788,9 @@ def _resolve_pinned_task_id(*, tool_context: Any) -> str:
     """Return the task_id pinned for this tool invocation, or ``""``.
 
     Consults the delegation-site map first
-    (:meth:`OrchestrationStore.get_pending_delegation` keyed by the
+    (:meth:`StateStore.get_pending_delegation` keyed by the
     current invocation's ``function_call_id``), then falls back to
-    the agent-turn pin (:meth:`OrchestrationStore.pin_current_task`).
+    the agent-turn pin (:meth:`StateStore.pin_current_task`).
     Returns ``""`` when neither path yields a value — the caller
     should then short-circuit with a bare ``{"acknowledged": True}``
     (plus a ``DriftDetected`` sink event for operator visibility on
@@ -807,7 +807,7 @@ def _resolve_pinned_task_id(*, tool_context: Any) -> str:
     pin keys remains.
     """
     session = _goldfive_session_from_tool_context(tool_context)
-    store = OrchestrationStore.for_session(session) if session is not None else None
+    store = StateStore.for_session(session) if session is not None else None
     fc_id = _function_call_id_from_tool_context(tool_context)
     via = ""
     pinned = ""
@@ -2335,21 +2335,21 @@ def make_adk_plugin(
             self._invocation_pinned_task_id: dict[str, str] = {}
             # Per-invocation asyncio.Task registry — MIGRATED in Phase 3.5
             # (goldfive#271 component 1) off this plugin instance and onto
-            # :class:`~goldfive.orchestration_store.OrchestrationStore`.
+            # :class:`~goldfive.state_store.StateStore`.
             # The plugin no longer owns the registry; the store owns it
             # keyed by ``Session.id``.
             #
             # Backwards-compat shim: tests and the steerer's cancel path
             # still touch ``plugin._invocation_tasks``. The
             # :class:`_InvocationTaskRegistryView` exposed below presents
-            # the OrchestrationStore-backed registry through the legacy
+            # the StateStore-backed registry through the legacy
             # ``dict``-shaped attribute so existing call sites continue
-            # to work unchanged. Look up via OrchestrationStore directly
+            # to work unchanged. Look up via StateStore directly
             # for new code (see
-            # :meth:`~goldfive.orchestration_store.OrchestrationStore.get_invocation_task`).
+            # :meth:`~goldfive.state_store.StateStore.get_invocation_task`).
             #
             # Why migrated: per-session orchestration state belongs on
-            # OrchestrationStore — Phase 0 state-ownership contract.
+            # StateStore — Phase 0 state-ownership contract.
             # PR #303 placed the registry on the plugin as a bridge; this
             # phase relocates the storage while preserving the API.
             self._invocation_tasks: _InvocationTaskRegistryView = _InvocationTaskRegistryView(self)
@@ -2394,10 +2394,10 @@ def make_adk_plugin(
             Called from ``ADKAdapter.invoke``'s ``finally`` block. Safe
             to call when no context is active.
             """
-            # Phase 3.5: clear OrchestrationStore-backed registry BEFORE
+            # Phase 3.5: clear StateStore-backed registry BEFORE
             # dropping ``_active_ctx`` so the registry view can still
             # resolve the session to clear. Once ``_active_ctx = None``
-            # the view no-ops and the OrchestrationStore-side bucket
+            # the view no-ops and the StateStore-side bucket
             # would leak across dispatches on the same plugin instance.
             try:
                 self._invocation_tasks.clear()
@@ -2437,7 +2437,7 @@ def make_adk_plugin(
             # goldfive#271 follow-up — invocation-task handle clearing
             # already happened at the top of this method (Phase 3.5
             # restructuring) so the registry view could still resolve
-            # the OrchestrationStore. Nothing to do here.
+            # the StateStore. Nothing to do here.
             # goldfive#271 Phase 3.5 — drop boundary-pair bookkeeping.
             # Anything still in this set means the boundary's exit emit
             # never fired, which only happens when the dispatch was
@@ -3572,7 +3572,7 @@ def make_adk_plugin(
             """Signal 6a — pin to the task named by a reasoning-extracted binding.
 
             Phase 1 of goldfive#271. Consults
-            :class:`~goldfive.orchestration_store.OrchestrationStore`
+            :class:`~goldfive.state_store.StateStore`
             for a binding stamped by the steerer's reasoning-judge
             background path; the binding's
             ``focused_task_id`` is matched against the plan and the
@@ -3588,7 +3588,7 @@ def make_adk_plugin(
             """
             from goldfive.types import TaskStatus
 
-            store = OrchestrationStore.for_session(_safe_attr(ctx, "session", None))
+            store = StateStore.for_session(_safe_attr(ctx, "session", None))
             binding = store.get_reasoning_extracted_binding(agent_name)
             if binding is None or not binding.task_id:
                 return None
@@ -3783,7 +3783,7 @@ def make_adk_plugin(
 
             Phase 2.1 of goldfive#271 — V3 of the audit catalog. The
             pin lands on goldfive's own ``Session.state`` exclusively,
-            via :class:`~goldfive.orchestration_store.OrchestrationStore`.
+            via :class:`~goldfive.state_store.StateStore`.
             The dynamic-instruction resolver and reporting handlers
             both read goldfive Session via the plugin reference
             (:func:`session_context_from_invocation`) — no callback-time
@@ -3800,7 +3800,7 @@ def make_adk_plugin(
                 pin_revision = int(_safe_attr(plan_for_rev, "revision_index", 0) or 0)
             except (TypeError, ValueError):
                 pin_revision = 0
-            store = OrchestrationStore.for_session(ctx.session)
+            store = StateStore.for_session(ctx.session)
             title = ""
             if task is not None:
                 title = str(_safe_attr(task, "title", "") or "")
@@ -3853,7 +3853,7 @@ def make_adk_plugin(
 
             Phase 2.1 of goldfive#271 — V4 of the audit catalog. The
             pin lands on goldfive's ``Session.state`` exclusively,
-            via :meth:`OrchestrationStore.set_pending_delegation`. The
+            via :meth:`StateStore.set_pending_delegation`. The
             sub-invocation's ``before_tool_callback`` reads it back via
             :func:`_resolve_pinned_task_id` (which now consults goldfive
             Session via the plugin reference). Silent on every failure
@@ -3923,7 +3923,7 @@ def make_adk_plugin(
                 pin_revision = int(_safe_attr(plan, "revision_index", 0) or 0)
             except (TypeError, ValueError):
                 pin_revision = 0
-            store = OrchestrationStore.for_session(ctx.session)
+            store = StateStore.for_session(ctx.session)
             store.set_pending_delegation(
                 fc_id,
                 task_id=task_id,
@@ -4358,11 +4358,11 @@ def make_adk_plugin(
                 return
 
             # Pin the chosen task as session.current_task_id via the
-            # OrchestrationStore so the reporting-tool pin lookup
+            # StateStore so the reporting-tool pin lookup
             # (:func:`_resolve_pinned_task_id`) resolves on the
             # delegated sub-invocation's tool calls.
             try:
-                store = OrchestrationStore.for_session(ctx.session)
+                store = StateStore.for_session(ctx.session)
                 live_plan = _safe_attr(ctx.session, "plan", None)
                 try:
                     pin_revision = int(
@@ -4481,14 +4481,14 @@ def make_adk_plugin(
                         _safe_attr(ctx.session, "current_task_id", "") or ""
                     )
                     if not pinned_task_id:
-                        # Fallback to the OrchestrationStore-backed pin
+                        # Fallback to the StateStore-backed pin
                         # (the primary single-writer slot post-#271
                         # Phase 2.1).
-                        from goldfive.orchestration_store import (  # noqa: PLC0415 — lazy
-                            OrchestrationStore,
+                        from goldfive.state_store import (  # noqa: PLC0415 — lazy
+                            StateStore,
                         )
 
-                        store = OrchestrationStore.for_session(ctx.session)
+                        store = StateStore.for_session(ctx.session)
                         pinned_task_id = store.pin_current_task()
                 except Exception as exc:  # noqa: BLE001
                     log.debug(

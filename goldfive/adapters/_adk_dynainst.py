@@ -117,7 +117,7 @@ def _read_pending_correction(
     """Resolve the pending-correction block for ``(agent, task)``.
 
     Phase 2.0 of goldfive#271 — bridge eliminated. The goldfive
-    :class:`~goldfive.orchestration_store.OrchestrationStore` is now
+    :class:`~goldfive.state_store.StateStore` is now
     the read of record. Falls back to reading ADK ``state`` directly
     only when the SessionContext stash is unreachable (legacy unit
     tests / custom adapters that drive the resolver against a plain
@@ -128,9 +128,9 @@ def _read_pending_correction(
     instruction block when non-empty.
     """
     if session is not None:
-        from goldfive.orchestration_store import OrchestrationStore
+        from goldfive.state_store import StateStore
 
-        store = OrchestrationStore.for_session(session)
+        store = StateStore.for_session(session)
         value = store.get_correction(agent_name, current_task_id)
         return _resolve_pending_correction(value)
     # Legacy fallback: no SessionContext reachable. Read directly off
@@ -302,7 +302,7 @@ def make_dynamic_instruction(
       :class:`~goldfive.adapters._adk_plugin.SessionContext` stash and
       from there the goldfive :class:`~goldfive.types.Session`.
     * Reads the current-task pin via
-      :class:`~goldfive.orchestration_store.OrchestrationStore`. If
+      :class:`~goldfive.state_store.StateStore`. If
       no pin is set, returns the ``original_instruction`` verbatim
       (pre-plan turns stay unchanged).
     * Looks up the task in ``Session.plan.tasks`` for ``title`` /
@@ -334,9 +334,9 @@ def make_dynamic_instruction(
             session = _goldfive_session_from_readonly_context(readonly_ctx)
 
             if session is not None:
-                from goldfive.orchestration_store import OrchestrationStore
+                from goldfive.state_store import StateStore
 
-                store = OrchestrationStore.for_session(session)
+                store = StateStore.for_session(session)
                 current_task_id = store.pin_current_task()
             else:
                 current_task_id = str(state.get(_sp.KEY_CURRENT_TASK_ID, "") or "")

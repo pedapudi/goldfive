@@ -167,14 +167,14 @@ async def test_before_run_registers_current_task_under_invocation_id() -> None:
     handle to cancel.
 
     Phase 3.5 (goldfive#271 component 1): the registry now lives on
-    :class:`~goldfive.orchestration_store.OrchestrationStore`, not on
+    :class:`~goldfive.state_store.StateStore`, not on
     the plugin instance. The plugin's ``_invocation_tasks`` attribute
     is a backwards-compat view that delegates to the store. Both the
-    legacy attribute access AND a direct ``OrchestrationStore`` lookup
+    legacy attribute access AND a direct ``StateStore`` lookup
     must return the registered task — pinning that the storage truly
     relocated rather than being duplicated.
     """
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
 
     plugin, session = _bind_plugin()
     inv_ctx = _FakeInvocationContext(
@@ -186,8 +186,8 @@ async def test_before_run_registers_current_task_under_invocation_id() -> None:
     expected = asyncio.current_task()
     # Legacy attribute path — preserved for the steerer + tests.
     assert plugin._invocation_tasks.get("inv-A") is expected
-    # Phase 3.5: registry actually lives on OrchestrationStore.
-    store = OrchestrationStore.for_session(session)
+    # Phase 3.5: registry actually lives on StateStore.
+    store = StateStore.for_session(session)
     assert store.get_invocation_task("inv-A") is expected
     assert "inv-A" in store.active_invocation_ids()
 
@@ -202,10 +202,10 @@ async def test_after_run_drops_registered_task() -> None:
     so an unrelated late cancel doesn't target a finished invocation.
 
     Phase 3.5 (goldfive#271 component 1): the deregister path must
-    reach the OrchestrationStore-backed registry, not just the plugin
+    reach the StateStore-backed registry, not just the plugin
     attribute.
     """
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
 
     plugin, session = _bind_plugin()
     inv_ctx = _FakeInvocationContext(
@@ -215,11 +215,11 @@ async def test_after_run_drops_registered_task() -> None:
     )
     await plugin.before_run_callback(invocation_context=inv_ctx)
     assert "inv-B" in plugin._invocation_tasks
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     assert store.get_invocation_task("inv-B") is not None
     await plugin.after_run_callback(invocation_context=inv_ctx)
     assert "inv-B" not in plugin._invocation_tasks
-    # And the OrchestrationStore-side bucket no longer has the entry.
+    # And the StateStore-side bucket no longer has the entry.
     assert store.get_invocation_task("inv-B") is None
 
 

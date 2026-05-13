@@ -55,7 +55,7 @@ from goldfive import (
     Session,
     Task,
 )
-from goldfive import orchestration_state as _ostate
+from goldfive import state_store as _ostate
 from goldfive.control import ControlKind, ControlMessage
 from goldfive.steerer import DefaultSteerer
 

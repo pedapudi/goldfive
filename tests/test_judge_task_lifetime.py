@@ -231,7 +231,7 @@ async def test_late_judge_verdict_records_drift_but_skips_refine(
     planner = NullPlanner()
     steerer.bind(sinks=[sink], planner=planner)
 
-    # No invocations registered on the OrchestrationStore for this
+    # No invocations registered on the StateStore for this
     # session — the agent has moved on. The fire-and-forget judge
     # treats this as a stale verdict.
     with caplog.at_level(logging.INFO, logger="goldfive.steerer"):
@@ -280,7 +280,7 @@ async def test_judge_verdict_with_live_invocation_proceeds_normally() -> None:
     Confirms the late-drift guard is not over-broad — a WARNING drift
     on a live agent must still reach planner.refine (Level 1 ABSORB).
     """
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
 
     async def call_llm(system: str, user: str, model: str) -> str:  # noqa: ARG001
         return json.dumps(
@@ -303,7 +303,7 @@ async def test_judge_verdict_with_live_invocation_proceeds_normally() -> None:
 
     # Register a fake live invocation. The task itself is irrelevant —
     # only the registry's non-emptiness gates the late-drift guard.
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
 
     async def _placeholder() -> None:
         await asyncio.sleep(0.5)

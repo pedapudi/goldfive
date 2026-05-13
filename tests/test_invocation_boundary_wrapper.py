@@ -5,7 +5,7 @@ agent invocation:
 
 * ``before_agent_callback`` emits ``InvocationBoundaryEntered`` and
   registers ``asyncio.current_task()`` on
-  :class:`~goldfive.orchestration_store.OrchestrationStore`.
+  :class:`~goldfive.state_store.StateStore`.
 * ``after_agent_callback`` emits the paired
   ``InvocationBoundaryExited`` (reason="completed").
 * When ``CancelledError`` propagates out of the ADK runner, the
@@ -19,7 +19,7 @@ agent invocation:
   completion shape.
 
 These tests pin the contract: entry/exit pair on the wire, registry
-relocated to OrchestrationStore (NOT plugin), CancelledError caught
+relocated to StateStore (NOT plugin), CancelledError caught
 once at the boundary.
 """
 
@@ -45,7 +45,7 @@ from goldfive.adapters._adk_plugin import (  # noqa: E402
     _InvocationTaskRegistryView,
     make_adk_plugin,
 )
-from goldfive.orchestration_store import OrchestrationStore  # noqa: E402
+from goldfive.state_store import StateStore  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     Goal,
@@ -338,24 +338,24 @@ async def test_boundary_exits_cancelled_on_cancel_checkpoint() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. Registry storage relocated: lives on OrchestrationStore (NOT plugin)
+# 8. Registry storage relocated: lives on StateStore (NOT plugin)
 # ---------------------------------------------------------------------------
 
 
 def test_invocation_tasks_registry_is_view_not_dict() -> None:
     """The plugin attribute is a backwards-compat view, not the actual
     storage. The Phase 3.5 contract requires the registry to live on
-    OrchestrationStore — verifies the storage truly relocated rather
+    StateStore — verifies the storage truly relocated rather
     than being a duplicate dict."""
     plugin = make_adk_plugin(host_agent_name="coordinator")
     assert isinstance(plugin._invocation_tasks, _InvocationTaskRegistryView)
-    # The view is NOT a dict — it forwards to OrchestrationStore.
+    # The view is NOT a dict — it forwards to StateStore.
     assert not isinstance(plugin._invocation_tasks, dict)
 
 
 async def test_registry_lives_on_orchestration_store() -> None:
     """A task registered through the plugin is visible via the
-    OrchestrationStore lookup; clearing the store-side registry empties
+    StateStore lookup; clearing the store-side registry empties
     the plugin-side view."""
     plugin, session, _sink = _bind_plugin_with_sink()
     # Register a task through the legacy attribute path.
@@ -363,7 +363,7 @@ async def test_registry_lives_on_orchestration_store() -> None:
     try:
         plugin._invocation_tasks["inv-X"] = fake_task
 
-        store = OrchestrationStore.for_session(session)
+        store = StateStore.for_session(session)
         # The store is the source of truth.
         assert store.get_invocation_task("inv-X") is fake_task
         assert "inv-X" in store.active_invocation_ids()

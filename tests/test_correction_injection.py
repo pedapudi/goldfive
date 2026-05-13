@@ -623,7 +623,7 @@ def test_dynamic_resolver_picks_up_correction_dict() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. OrchestrationStore reads pending corrections directly.
+# 10. StateStore reads pending corrections directly.
 # ---------------------------------------------------------------------------
 
 
@@ -633,10 +633,10 @@ def test_orchestration_store_reads_pending_correction_off_goldfive_session() -> 
     Pending corrections live on goldfive ``Session.state`` (written by
     :func:`write_correction`). The dynamic-instruction resolver reads
     them directly via
-    :meth:`goldfive.orchestration_store.OrchestrationStore.get_correction`;
+    :meth:`goldfive.state_store.StateStore.get_correction`;
     no copy onto ADK ``session.state`` is needed.
     """
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
     from goldfive.types import Session
 
     session = Session(run_id="r1")
@@ -653,7 +653,7 @@ def test_orchestration_store_reads_pending_correction_off_goldfive_session() -> 
         "revision_number": 1,
     }
 
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
 
     # Each (agent, task) returns its own correction; no cross-leakage.
     assert store.get_correction("agent_a", "task_1") == session.state[corr_a]

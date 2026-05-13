@@ -561,7 +561,7 @@ async def test_signal6_reasoning_binding_pins_target_task() -> None:
     """A reasoning-extracted binding routes the agent to the named task.
 
     Phase 1 of goldfive#271: when the steerer's reasoning judge has
-    recorded a binding (via OrchestrationStore) and confidence is at
+    recorded a binding (via StateStore) and confidence is at
     the threshold, the pin ladder's signal 6 fires before the
     correction-targeting sub-signal.
 
@@ -576,7 +576,7 @@ async def test_signal6_reasoning_binding_pins_target_task() -> None:
 
     The reasoning binding is the only signal that can disambiguate.
     """
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
 
     plugin = make_adk_plugin(host_agent_name="coord")
     sinks = [_CapturingSink()]
@@ -586,7 +586,7 @@ async def test_signal6_reasoning_binding_pins_target_task() -> None:
             Task(id="t_beta", title="Beta", assignee_agent_id="agent_x"),
         )
     )
-    OrchestrationStore.for_session(session).record_reasoning_extracted_binding(
+    StateStore.for_session(session).record_reasoning_extracted_binding(
         agent_name="agent_x",
         task_id="t_beta",
         confidence=0.9,
@@ -605,7 +605,7 @@ async def test_signal6_reasoning_binding_pins_target_task() -> None:
 
 async def test_signal6_reasoning_binding_falls_through_when_task_terminal() -> None:
     """A binding pointing at a COMPLETED task falls through to other signals."""
-    from goldfive.orchestration_store import OrchestrationStore
+    from goldfive.state_store import StateStore
     from goldfive.types import TaskStatus
 
     plugin = make_adk_plugin(host_agent_name="coord")
@@ -621,7 +621,7 @@ async def test_signal6_reasoning_binding_falls_through_when_task_terminal() -> N
     )
     session = _session_with(plan)
     # Binding still names the completed task.
-    OrchestrationStore.for_session(session).record_reasoning_extracted_binding(
+    StateStore.for_session(session).record_reasoning_extracted_binding(
         agent_name="agent_x",
         task_id="t_alpha",
         confidence=0.95,

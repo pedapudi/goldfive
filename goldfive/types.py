@@ -1543,7 +1543,7 @@ class Session:
     pending_nudges: list[str] = dataclasses.field(default_factory=list)
     # Orchestration-level session state dict (goldfive#152). Goldfive
     # owns keys under the ``goldfive.*`` namespace — see
-    # :mod:`goldfive.orchestration_state` for the documented key names
+    # :mod:`goldfive.state_store` for the documented key names
     # and helpers. This is NOT the same surface as the ADK
     # ``session.state`` dict the ADK adapter writes to for agent-side
     # reads (that lives on the ADK ``Session`` object; see

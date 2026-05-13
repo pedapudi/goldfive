@@ -343,7 +343,7 @@ class GoldfivePlanner(BasePlanner):
         """Return the orchestration context block for this LLM turn.
 
         Reads from goldfive's
-        :class:`~goldfive.orchestration_store.OrchestrationStore` when
+        :class:`~goldfive.state_store.StateStore` when
         the planner can reach the goldfive
         :class:`~goldfive.types.Session` via the
         ``goldfive._session_context`` stash on ADK state. Falls back
@@ -369,9 +369,9 @@ class GoldfivePlanner(BasePlanner):
         gf_session = _goldfive_session_from_context(readonly_context)
 
         if gf_session is not None:
-            from goldfive.orchestration_store import OrchestrationStore
+            from goldfive.state_store import StateStore
 
-            store = OrchestrationStore.for_session(gf_session)
+            store = StateStore.for_session(gf_session)
             pin_id = store.pin_current_task()
             task_id = pin_id or _NONE_MARKER
             # Title comes from the typed ``Session.plan.tasks`` lookup
@@ -498,10 +498,10 @@ class GoldfivePlanner(BasePlanner):
         state = _extract_state(callback_context)
         gf_session = _goldfive_session_from_context(callback_context)
         if gf_session is not None:
-            from goldfive.orchestration_store import OrchestrationStore
+            from goldfive.state_store import StateStore
 
             cancelled_ids = set(
-                OrchestrationStore.for_session(gf_session).cancelled_function_call_ids()
+                StateStore.for_session(gf_session).cancelled_function_call_ids()
             )
         else:
             # Legacy ADK-state fallback: tests that drive the planner

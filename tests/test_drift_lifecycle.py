@@ -2,15 +2,15 @@
 
 Pin the additive surface introduced by the first PR of the refactor:
 
-* ``orchestration_state.compute_condition_id`` — stable for same
+* ``state_store.compute_condition_id`` — stable for same
   kind+task+agent within a turn, distinct across turns.
-* ``orchestration_state.open_or_escalate_drift`` — opens then escalates;
+* ``state_store.open_or_escalate_drift`` — opens then escalates;
   severity bumps are monotonic; ``prev_severity`` carries the prior
   severity on escalation.
-* ``orchestration_state.resolve_drift`` /
+* ``state_store.resolve_drift`` /
   ``escalate_drift_to_human_intervention`` — terminal lifecycle
   transitions; remove the entry from the active set; idempotent.
-* :class:`OrchestrationStore` exposes the same surface as a typed
+* :class:`StateStore` exposes the same surface as a typed
   veneer for callers that prefer the store handle.
 * Wire integration: ``DefaultSteerer._emit_drift_detected`` stamps
   ``condition_id`` / ``lifecycle`` / ``prev_severity`` on
@@ -35,8 +35,8 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
-from goldfive import orchestration_state as _ostate  # noqa: E402
-from goldfive.orchestration_store import OrchestrationStore  # noqa: E402
+from goldfive import state_store as _ostate  # noqa: E402
+from goldfive.state_store import StateStore  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     DriftEvent,
@@ -312,14 +312,14 @@ def test_escalate_to_human_intervention_terminal() -> None:
 
 
 # ---------------------------------------------------------------------------
-# OrchestrationStore — same surface, typed veneer
+# StateStore — same surface, typed veneer
 # ---------------------------------------------------------------------------
 
 
 def test_orchestration_store_open_resolve_round_trip() -> None:
-    """``OrchestrationStore`` exposes the same lifecycle progression."""
+    """``StateStore`` exposes the same lifecycle progression."""
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     opened = store.open_or_escalate_drift(
         kind=DriftKind.PLAN_DIVERGENCE,
         task_id="t1",
@@ -350,7 +350,7 @@ def test_orchestration_store_open_resolve_round_trip() -> None:
 def test_orchestration_store_escalate_to_human() -> None:
     """``escalate_to_human_intervention`` is exposed on the store."""
     session = Session(run_id="r1")
-    store = OrchestrationStore.for_session(session)
+    store = StateStore.for_session(session)
     opened = store.open_or_escalate_drift(
         kind=DriftKind.REFINE_VALIDATION_FAILED,
         task_id="t",
