@@ -41,13 +41,24 @@ it back as a real signal.
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
-import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from typing import Any
 
+from goldfive.drift.registry import (
+    DetectorConfig,
+    truncate_for_observability,
+)
+from goldfive.drift.registry import (
+    format_goals_block as _format_goals,
+)
+from goldfive.drift.registry import (
+    parse_json_response as _parse_response,
+)
+from goldfive.drift.registry import (
+    register as _register,
+)
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Goal, Plan, Task
 
 log = logging.getLogger(__name__)
@@ -86,7 +97,6 @@ __all__ = [
 # sinks (in-memory lists, SQLite rows, gRPC message size caps).
 REASONING_JUDGE_MAX_REASONING_INPUT_CHARS: int = 4096
 REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS: int = 2048
-_TRUNCATE_SUFFIX: str = " … [truncated]"
 
 # Per-callsite ``max_output_tokens`` budget (goldfive#271 follow-up).
 # The judge returns a small JSON verdict ({"on_task": bool, "reason":
@@ -99,18 +109,10 @@ _TRUNCATE_SUFFIX: str = " … [truncated]"
 REASONING_JUDGE_MAX_OUTPUT_TOKENS: int = 16384
 
 
-def truncate_for_observability(text: str, limit: int) -> str:
-    """Cap ``text`` at ``limit`` chars, appending ``"… [truncated]"`` when cut.
-
-    Shared by the observability emission path on every judge call so both
-    the reasoning input and the raw response use the same truncation
-    convention. Callers that need a different limit pass it explicitly.
-    """
-    if not isinstance(text, str):
-        return ""
-    if len(text) <= limit:
-        return text
-    return text[:limit] + _TRUNCATE_SUFFIX
+# ``truncate_for_observability`` lives in :mod:`goldfive.drift.registry`
+# (shared with the goal-drift detector via the same suffix); re-exported
+# here under the historical name so the public ``__all__`` contract and
+# downstream importers continue to work.
 
 
 # Shape matches :mod:`goldfive.drift.goals` / ``LLMPlanner`` so operators
@@ -229,47 +231,12 @@ REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
 )
 
 
-# Liberal JSON extractor. Real LLMs emit markdown code fences and prose
-# even with strong "reply JSON only" instructions. Mirrors the extractor
-# in :mod:`goldfive.drift.goals`.
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _parse_response(raw: Any) -> dict[str, Any] | None:
-    """Extract the first JSON object from ``raw`` or return ``None``."""
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    stripped = raw.strip()
-    try:
-        decoded = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        match = _JSON_OBJECT_RE.search(stripped)
-        if match is None:
-            return None
-        try:
-            decoded = json.loads(match.group(0))
-        except (json.JSONDecodeError, ValueError):
-            return None
-    if not isinstance(decoded, dict):
-        return None
-    return decoded
-
-
-def _format_goals(goals: Sequence[Goal] | Iterable[Any] | None) -> str:
-    if not goals:
-        return "(no goals recorded)"
-    lines: list[str] = []
-    for i, g in enumerate(goals, start=1):
-        gid = str(getattr(g, "id", "") or "")
-        summary = str(getattr(g, "summary", "") or "")
-        if not summary and isinstance(g, str):
-            summary = g
-        prefix = f"{i}."
-        if gid:
-            lines.append(f"{prefix} [{gid}] {summary}")
-        else:
-            lines.append(f"{prefix} {summary}")
-    return "\n".join(lines) if lines else "(no goals recorded)"
+# Liberal JSON extraction + goals rendering live in
+# :mod:`goldfive.drift.registry` so this judge and the goal-drift judge
+# share one implementation. The aliased imports at the top of this
+# module preserve the historical private names (so external test
+# fixtures mocking ``reasoning_judge._parse_response`` continue to work)
+# without re-declaring the function bodies here.
 
 
 def _format_task(task: Task | Any | None) -> str:
@@ -1374,3 +1341,38 @@ async def _emit_judge_invoked(
             "classify_reasoning_drift: sink.emit raised %s; ReasoningJudgeInvoked dropped",
             exc,
         )
+
+
+# ---------------------------------------------------------------------------
+# Registry self-registration
+# ---------------------------------------------------------------------------
+#
+# The reasoning judge emits TWO drift kinds: ``OFF_TOPIC`` (the
+# pre-iter-10 verdict, also the destination for ``erroneous_deviation``
+# classifications) and ``JUSTIFIED_DEVIATION`` (iter-10 PR 3, fired when
+# the judge attributes a deviation to a recent tool observation or
+# user-input signal). Both share the same classifier function, the
+# same config, and the same caller-facing entry point — we register
+# both for completeness so dispatch lookup by kind works for either.
+
+
+_REASONING_JUDGE_CONFIG: DetectorConfig = DetectorConfig(
+    uses_llm=True,
+    max_input_chars=REASONING_JUDGE_MAX_REASONING_INPUT_CHARS,
+    max_output_tokens=REASONING_JUDGE_MAX_OUTPUT_TOKENS,
+    disable_thinking=True,
+)
+
+
+_register(
+    DriftKind.OFF_TOPIC,
+    classify_reasoning_drift,
+    _REASONING_JUDGE_CONFIG,
+    is_async=True,
+)
+_register(
+    DriftKind.JUSTIFIED_DEVIATION,
+    classify_reasoning_drift,
+    _REASONING_JUDGE_CONFIG,
+    is_async=True,
+)
