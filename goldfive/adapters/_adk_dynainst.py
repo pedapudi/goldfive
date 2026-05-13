@@ -240,18 +240,37 @@ def _goldfive_session_from_readonly_context(readonly_ctx: Any) -> Any:
     Returns ``None`` when neither resolves so the resolver can fall
     back to reading from ADK state directly.
     """
+    ctx = _goldfive_session_context_from_readonly_context(readonly_ctx)
+    if ctx is not None:
+        session = getattr(ctx, "session", None)
+        if session is not None:
+            return session
+    # Legacy fallback — the V7 stash on the state dict (already
+    # handled by :func:`_goldfive_session_context_from_readonly_context`
+    # via the ``"goldfive._session_context"`` lookup, but kept here
+    # explicitly so a caller-supplied legacy ctx without a usable
+    # ``session`` attribute still returns ``None`` cleanly).
+    return None
+
+
+def _goldfive_session_context_from_readonly_context(readonly_ctx: Any) -> Any:
+    """Return the goldfive ``SessionContext`` reachable from ``readonly_ctx``.
+
+    Same resolution order as :func:`_goldfive_session_from_readonly_context`
+    but yields the ``SessionContext`` itself so callers can read other
+    fields (notably ``.steerer`` for the goldfive#271 strict-passive
+    observation_only gate). Returns ``None`` when no context is
+    reachable.
+    """
     from goldfive.adapters._adk_plugin import session_context_from_invocation
 
-    # Live-run path: walk the plugin manager.
     inv_ctx = getattr(readonly_ctx, "_invocation_context", None) or getattr(
         readonly_ctx, "invocation_context", None
     )
     if inv_ctx is not None:
         ctx = session_context_from_invocation(inv_ctx)
         if ctx is not None:
-            session = getattr(ctx, "session", None)
-            if session is not None:
-                return session
+            return ctx
     # Legacy fallback — the V7 stash on the state dict.
     state = getattr(readonly_ctx, "state", None)
     if not isinstance(state, Mapping):
@@ -259,7 +278,27 @@ def _goldfive_session_from_readonly_context(readonly_ctx: Any) -> Any:
     legacy_ctx = state.get("goldfive._session_context")
     if legacy_ctx is None:
         return None
-    return getattr(legacy_ctx, "session", None)
+    return legacy_ctx
+
+
+def _observation_only_active(readonly_ctx: Any) -> bool:
+    """Return True when the steerer reachable through ``readonly_ctx``
+    has ``observation_only=True`` (goldfive#271 strict-passive).
+
+    Used by the dynamic-instruction resolver to skip system-prompt
+    rewriting under strict-passive observation_only — the operator
+    must see the RAW caller-supplied ``instruction`` string, not the
+    goldfive-augmented "Current assigned task:" / pending-correction
+    block. Mirrors the gate :func:`_observation_only_active` in
+    :mod:`goldfive.adapters._adk_plugin`.
+    """
+    ctx = _goldfive_session_context_from_readonly_context(readonly_ctx)
+    if ctx is None:
+        return False
+    steerer = getattr(ctx, "steerer", None)
+    if steerer is None:
+        return False
+    return bool(getattr(steerer, "_observation_only", False))
 
 
 def _task_title_description_from_session(session: Any, task_id: str) -> tuple[str, str]:
@@ -330,6 +369,25 @@ def make_dynamic_instruction(
 
     def resolver(readonly_ctx: Any) -> str:
         try:
+            # goldfive#271 strict-passive carve-out: under
+            # ``observation_only=True`` return the caller's
+            # ``original_instruction`` verbatim. The dynamic resolver's
+            # job is to append a goldfive-shaped "Current assigned task"
+            # / pending-correction block to every wrapped LlmAgent's
+            # system prompt every turn — that's structural prompt-
+            # shaping the operator is trying to observe AROUND under
+            # strict-passive. With this gate, the agent's LLM sees
+            # exactly the ``instruction`` string the caller passed to
+            # the ``LlmAgent`` constructor, nothing more.
+            if _observation_only_active(readonly_ctx):
+                log.info(
+                    "dynamic_instruction resolver: observation_only=True — "
+                    "SKIPPING goldfive prompt augmentation for agent=%r "
+                    "(returning original instruction verbatim)",
+                    agent_name,
+                )
+                return original_instruction
+
             state = _state_from_readonly_context(readonly_ctx)
             session = _goldfive_session_from_readonly_context(readonly_ctx)
 

@@ -430,6 +430,32 @@ def _session_context_from_callback(ctx: Any) -> SessionContext | None:
     return None
 
 
+def _observation_only_active(ctx: Any) -> bool:
+    """Return True when the steerer reachable through ``ctx`` has
+    ``observation_only=True`` (goldfive#271 strict-passive).
+
+    Reads ``ctx.steerer._observation_only`` if present. Tolerant of
+    ``ctx is None`` (no live SessionContext — treat as not-passive so
+    pre-#271 behaviour is preserved on paths where the plugin runs
+    without a bound steerer, e.g. unit-test stubs that never call
+    :meth:`_GoldfiveADKPlugin.set_active_context`).
+
+    Used by :meth:`_GoldfiveADKPlugin.before_model_callback` to gate
+    the two ``system_instruction`` injection sites — the
+    GoldfivePlanner request-side instruction and the runtime tool-
+    surface hint. Mirrors the :meth:`DefaultSteerer._should_inject`
+    gate used at every other dispatch site (steerer.py:4004 /
+    :4073 / :4470, executors/sequential.py:703 / :794 / :1252 /
+    :1403 / :1576).
+    """
+    if ctx is None:
+        return False
+    steerer = getattr(ctx, "steerer", None)
+    if steerer is None:
+        return False
+    return bool(getattr(steerer, "_observation_only", False))
+
+
 # --------------------------------------------------------------------------
 # goldfive#191 — Layer 3: task_id arg injection for reporting tools
 # --------------------------------------------------------------------------
@@ -5277,16 +5303,31 @@ def make_adk_plugin(
             # context block" which is safe — the planner reads off
             # goldfive Session directly so no callback-time write
             # is required.
-            try:
-                await _inject_goldfive_planner_instruction(
-                    callback_context=callback_context,
-                    llm_request=llm_request,
+            #
+            # goldfive#271 strict-passive carve-out: under
+            # ``observation_only=True`` skip the injection. The
+            # planner's instruction block is goldfive's coaching of
+            # the coordinator's planning behaviour — mutating
+            # ``system_instruction`` to nudge the model toward a
+            # specific orchestration shape is exactly the kind of
+            # silent prompt-shaping strict-passive exists to surface.
+            if _observation_only_active(ctx):
+                log.info(
+                    "before_model_callback: observation_only=True — "
+                    "SKIPPING GoldfivePlanner request-side instruction "
+                    "injection (system_instruction unchanged)"
                 )
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "before_model_callback: goldfive planner injection raised: %s",
-                    exc,
-                )
+            else:
+                try:
+                    await _inject_goldfive_planner_instruction(
+                        callback_context=callback_context,
+                        llm_request=llm_request,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_model_callback: goldfive planner injection raised: %s",
+                        exc,
+                    )
 
             # Structural ``max_output_tokens`` ceiling for sub-agent
             # LLM calls (goldfive#256). Applied AFTER GoldfivePlanner
@@ -5332,18 +5373,33 @@ def make_adk_plugin(
             # is bracketed with marker tags so subsequent calls can
             # strip the stale block before appending the fresh one
             # (per-call, not accumulated).
-            try:
-                if ctx is not None and ctx.session is not None:
-                    _inject_runtime_tools_hint(
-                        callback_context=callback_context,
-                        llm_request=llm_request,
-                        session=ctx.session,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "before_model_callback: runtime tools hint injection raised: %s",
-                    exc,
+            #
+            # goldfive#271 strict-passive carve-out: under
+            # ``observation_only=True`` skip injection. The hint is
+            # directive ("Choose the agent whose tasks are still
+            # PENDING. Do not re-invoke agents whose tasks are
+            # already complete.") — exactly the kind of silent
+            # coaching strict-passive exists to surface. Operators
+            # observe the RAW coordinator's tool-choice behaviour.
+            if _observation_only_active(ctx):
+                log.info(
+                    "before_model_callback: observation_only=True — "
+                    "SKIPPING runtime tool-surface hint injection "
+                    "(system_instruction unchanged)"
                 )
+            else:
+                try:
+                    if ctx is not None and ctx.session is not None:
+                        _inject_runtime_tools_hint(
+                            callback_context=callback_context,
+                            llm_request=llm_request,
+                            session=ctx.session,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_model_callback: runtime tools hint injection raised: %s",
+                        exc,
+                    )
 
             # Per-LLM-call instrumentation (goldfive#172). Measure the
             # request AFTER GoldfivePlanner has appended its
