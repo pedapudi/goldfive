@@ -43,6 +43,25 @@ from collections.abc import Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive.adapters._tool_invocation import invoke_tool
+
+# goldfive#268 — shared helpers for agent-name stem matching and
+# tokenisation. Lifted out of this module into
+# :mod:`goldfive.drift.capability_check` so the delegation-pin
+# disambiguator (#265 tier 2) and the structural capability detector's
+# Rule C consume one source of truth. Renamed under their historical
+# module-private names so existing in-module references keep working.
+from goldfive.drift.capability_check import (
+    AGENT_NAME_ROLE_SUFFIXES as _AGENT_NAME_ROLE_SUFFIXES_SHARED,
+)
+from goldfive.drift.capability_check import (
+    agent_name_stems as _agent_name_stems_shared,
+)
+from goldfive.drift.capability_check import (
+    stem_token_match as _stem_token_match_shared,
+)
+from goldfive.drift.capability_check import (
+    tokenize_for_matching as _tokenize_for_matching_shared,
+)
 from goldfive.orchestration_store import (
     PENDING_DELEGATIONS_KEY,
     BindingSource,
@@ -918,32 +937,15 @@ def _function_call_id_from_tool_context(tool_context: Any) -> str:
     return ""
 
 
-def _tokenize_for_matching(text: Any) -> set[str]:
-    """Return the set of lowercase alphanumeric tokens of length ≥4.
-
-    Used by :func:`_score_candidates_by_args` to score candidate tasks
-    against AgentTool args. The ≥4 threshold filters out noisy
-    short-word matches ("in", "of", "the") that would otherwise
-    saturate every candidate's score.
-    """
-    if not isinstance(text, str):
-        text = str(text or "")
-    tokens: set[str] = set()
-    buf: list[str] = []
-    for ch in text.lower():
-        if ch.isalnum():
-            buf.append(ch)
-        else:
-            if buf:
-                tok = "".join(buf)
-                if len(tok) >= 4:
-                    tokens.add(tok)
-                buf.clear()
-    if buf:
-        tok = "".join(buf)
-        if len(tok) >= 4:
-            tokens.add(tok)
-    return tokens
+#: Goldfive#268 lifted this helper into
+#: :mod:`goldfive.drift.capability_check` so the structural capability
+#: detector (Rule C) and the delegation-pin disambiguator share one
+#: source of truth. ``_tokenize_for_matching`` remains the
+#: module-private import surface used here (Tier-3 args scorer,
+#: Tier-2 stem match); see
+#: :func:`goldfive.drift.capability_check.tokenize_for_matching` for
+#: the implementation.
+_tokenize_for_matching = _tokenize_for_matching_shared
 
 
 def _score_candidates_by_args(candidates: list[Any], tool_args: Any) -> Any:
@@ -992,55 +994,21 @@ def _score_candidates_by_args(candidates: list[Any], tool_args: Any) -> Any:
     return best
 
 
-#: Trailing role-suffix tokens stripped from an invoked-agent name during
-#: stem extraction for the goldfive#265 tier-2 semantic match. Conservative
-#: by design: only role-marker tokens that almost never carry topic
-#: meaning. Keep small — adding common verbs/nouns here would suppress
-#: legitimate matches (e.g. dropping "researcher" from "researcher_agent"
-#: leaves the empty stem and nothing matches).
-_AGENT_NAME_ROLE_SUFFIXES: frozenset[str] = frozenset(
-    {"agent", "worker", "assistant", "bot", "tool"}
-)
+#: Goldfive#268 lifted this constant into
+#: :mod:`goldfive.drift.capability_check` so the structural capability
+#: detector (Rule C) and the delegation-pin tier-2 disambiguator share
+#: one source of truth. The module-private alias is kept so existing
+#: in-module references and unit tests that patched the symbol on this
+#: module continue to resolve.
+_AGENT_NAME_ROLE_SUFFIXES: frozenset[str] = _AGENT_NAME_ROLE_SUFFIXES_SHARED
 
 
-def _agent_name_stems(agent_name: str) -> tuple[str, ...]:
-    """Return ordered lowercase stem tokens derived from an ADK agent name.
-
-    Goldfive#265 tier-2 semantic match. The invoked agent's display name
-    (e.g. ``reviewer_agent``) is split on underscore/hyphen/space, lower-
-    cased, role-suffix tokens (``agent``, ``worker``, …) trimmed from the
-    tail, and remaining tokens of length >= 4 returned. Length filter
-    matches :func:`_tokenize_for_matching` so the stems are comparable
-    against title/description tokens.
-
-    Examples
-    --------
-    >>> _agent_name_stems("reviewer_agent")
-    ('reviewer',)
-    >>> _agent_name_stems("web_developer_agent")
-    ('developer',)  # 'web' is < 4 chars and filtered out
-    >>> _agent_name_stems("helper_agent")
-    ('helper',)
-    >>> _agent_name_stems("agent")
-    ()
-
-    Deliberately **no regex** — goldfive#166 / #167 retired the regex-
-    based NL classifiers. Pure str ops only.
-    """
-    if not isinstance(agent_name, str) or not agent_name:
-        return ()
-    # Normalise common separators to spaces, then split.
-    norm = agent_name.replace("_", " ").replace("-", " ").lower()
-    raw_tokens = [tok for tok in norm.split() if tok]
-    # Trim role-suffix tokens off the tail (left-to-right) so
-    # ``reviewer_agent`` -> ``reviewer`` and
-    # ``draft_writer_assistant_bot`` -> ``draft writer``.
-    while raw_tokens and raw_tokens[-1] in _AGENT_NAME_ROLE_SUFFIXES:
-        raw_tokens.pop()
-    # Length filter mirrors _tokenize_for_matching's >=4 threshold so
-    # noisy short tokens ("ui", "qa") don't saturate matches.
-    out = tuple(tok for tok in raw_tokens if len(tok) >= 4)
-    return out
+#: Goldfive#268: thin alias over
+#: :func:`goldfive.drift.capability_check.agent_name_stems`. See the
+#: docstring there for behaviour, examples and the rationale for the
+#: role-suffix list. The local symbol stays so call sites in this
+#: module don't need to update import paths.
+_agent_name_stems = _agent_name_stems_shared
 
 
 def _agent_tool_names(invoked_agent: Any) -> tuple[str, ...]:
@@ -1104,30 +1072,11 @@ def _select_by_required_tools(
     return None
 
 
-def _stem_token_match(stem: str, token: str) -> bool:
-    """Return True when ``stem`` and ``token`` share a meaningful root.
-
-    Bi-directional substring match: catches both stem-is-prefix-of-token
-    (``review`` -> ``reviewer``) and token-is-prefix-of-stem
-    (``reviewer`` -> ``review``). This handles the common
-    role-noun/verb pair where the agent name carries the agent-noun
-    form and the task carries the verb form (or vice versa).
-
-    Pure str ops — no regex (goldfive#166 / #167).
-    """
-    if not stem or not token:
-        return False
-    # Short-circuit on exact and direct substring matches; covers the
-    # most common case.
-    if stem == token:
-        return True
-    # Bi-directional containment: ``reviewer`` ⊇ ``review`` AND
-    # ``review`` ⊆ ``reviewer``. Both are length-bounded by the >=4
-    # filter applied upstream so noise like "is" / "of" cannot reach
-    # this check.
-    if stem in token or token in stem:
-        return True
-    return False
+#: Goldfive#268: thin alias over
+#: :func:`goldfive.drift.capability_check.stem_token_match`. See the
+#: docstring there for behaviour (bi-directional substring match
+#: between an agent stem and a task token).
+_stem_token_match = _stem_token_match_shared
 
 
 def _select_by_agent_name_stems(
@@ -4567,11 +4516,32 @@ def make_adk_plugin(
                 return
 
             tool_list = list(_safe_attr(invoked_agent, "tools", None) or [])
+            # goldfive#268 — gather the full PENDING set (DAG-ready and
+            # not) so Rule C can do its cross-task stem lookup. The bound
+            # task may itself be PENDING; the detector's Rule C
+            # excludes it by id. Defensive: never let this introspection
+            # block the detector — fall back to an empty tuple so Rules
+            # A/B still run.
+            pending_tasks: tuple[Any, ...] = ()
+            try:
+                pending_tasks = tuple(
+                    t
+                    for t in tasks
+                    if _safe_attr(t, "status", None) is TaskStatus.PENDING
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_maybe_emit_capability_mismatch: pending-tasks "
+                    "collection raised: %s",
+                    exc,
+                )
+                pending_tasks = ()
             try:
                 drift = detect_capability_mismatch(
                     invoked_agent_name=invoked_agent_name,
                     invoked_agent_tools=tool_list,
                     task=chosen_task,
+                    all_pending_tasks=pending_tasks,
                 )
             except Exception as exc:  # noqa: BLE001 — detector must not block
                 log.debug(

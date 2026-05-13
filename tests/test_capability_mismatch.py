@@ -1,4 +1,4 @@
-"""Structural capability-mismatch detector (goldfive#253).
+"""Structural capability-mismatch detector (goldfive#253, #268).
 
 Covers :func:`goldfive.drift.capability_check.detect_capability_mismatch`
 plus the integration wiring through the ADK adapter's
@@ -12,6 +12,12 @@ Detection rules under test:
   wrappers; bound task uses leaf-task verbs ("draft", "write", ...).
 * Rule B — task ``required_tools`` is non-empty and the invoked agent
   doesn't cover the required names.
+* Rule C (goldfive#268) — out-of-DAG-order delegation: agent role
+  stem is absent from the bound task's title+description AND present
+  in another PENDING task. Mirrors the live evidence from session
+  ``f0630532-…`` where ``reviewer_agent`` got pinned to ``draft_slides``
+  because ``review_presentation`` wasn't DAG-ready yet and only one
+  task was eligible.
 
 Negative cases mirror each positive: the same shapes WITHOUT the
 trigger condition must return ``None``.
@@ -284,6 +290,245 @@ def test_is_agent_tool_duck_type() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Rule C (goldfive#268) — out-of-DAG-order delegation
+# ---------------------------------------------------------------------------
+
+
+def test_rule_c_positive_reviewer_pinned_to_draft() -> None:
+    """Live evidence from session ``f0630532-…``: ``reviewer_agent``
+    pinned to ``draft_slides`` while ``review_presentation`` sits
+    PENDING. The agent's role stem (``reviewer``) is absent from the
+    bound task's text and present in another pending task — Rule C must
+    fire.
+    """
+    bound = Task(
+        id="draft_slides",
+        title="Draft the presentation slides",
+        description="Author the slide content based on the outline.",
+    )
+    pending = [
+        bound,  # the bound task is itself PENDING; detector ignores by id
+        Task(
+            id="review_presentation",
+            title="Review the presentation",
+            description="Read the slides and flag issues.",
+        ),
+        Task(
+            id="outline_presentation",
+            title="Create outline",
+            description="Sketch the section structure.",
+        ),
+    ]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="reviewer_agent",
+        invoked_agent_tools=[_FakeFunctionTool("read_presentation_files")],
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is not None, "Rule C must fire on stem cross-task mismatch"
+    assert drift.kind is DriftKind.CAPABILITY_MISMATCH
+    assert drift.severity is DriftSeverity.CRITICAL
+    assert drift.current_task_id == "draft_slides"
+    assert drift.current_agent_id == "reviewer_agent"
+    # The detail string must point at the structural confusion:
+    # bound id, the stem, and the conflicting PENDING task id.
+    assert "draft_slides" in drift.detail
+    assert "reviewer" in drift.detail
+    assert "review_presentation" in drift.detail
+
+
+def test_rule_c_negative_stem_found_in_bound_task() -> None:
+    """Stem ``reviewer`` is present in the bound task itself
+    ("Review the presentation") — no conflict. Rule C must NOT fire.
+    """
+    bound = Task(
+        id="review_presentation",
+        title="Review the presentation",
+    )
+    pending = [
+        bound,
+        Task(id="draft_slides", title="Draft the presentation slides"),
+    ]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="reviewer_agent",
+        invoked_agent_tools=[_FakeFunctionTool("read_presentation_files")],
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is None, "Rule C must not fire when stem is in the bound task"
+
+
+def test_rule_c_negative_stem_found_nowhere() -> None:
+    """Agent ``helper_agent`` (stem ``helper``) bound to ``draft_slides``
+    with no other ``helper``-shaped task — Rule C has no signal of
+    cross-task confusion and must stay silent.
+    """
+    bound = Task(id="draft_slides", title="Draft the presentation slides")
+    pending = [
+        bound,
+        Task(id="review_presentation", title="Review the presentation"),
+        Task(id="outline_presentation", title="Create outline"),
+    ]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="helper_agent",
+        invoked_agent_tools=[_FakeFunctionTool("noop")],
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is None, "Rule C must not fire when stem isn't anywhere"
+
+
+def test_rule_c_negative_generic_coordinator_agent_name() -> None:
+    """``coordinator_agent`` has the stem ``coordinator`` — which would
+    typically not appear anywhere in a normal pending plan. Rule C
+    must degrade gracefully (not fire) on generic / orchestration-shaped
+    agent names. Use a FunctionTool to defuse Rule A so this case
+    isolates Rule C's behaviour.
+    """
+    bound = Task(id="draft_slides", title="Draft the presentation slides")
+    pending = [
+        bound,
+        Task(id="review_presentation", title="Review the presentation"),
+    ]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="coordinator_agent",
+        invoked_agent_tools=[_FakeFunctionTool("noop")],
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is None, (
+        "Rule C must not fire on generic agent names with no stem match"
+    )
+
+
+def test_rule_c_negative_short_stem_skipped() -> None:
+    """Agent named ``qa_agent`` has stem ``qa`` (length 2) which is
+    below the ≥4 length filter; ``agent_name_stems`` returns an empty
+    tuple and Rule C silently no-ops.
+    """
+    bound = Task(id="draft_slides", title="Draft the presentation slides")
+    pending = [
+        bound,
+        Task(id="review_presentation", title="Review the presentation"),
+    ]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="qa_agent",
+        invoked_agent_tools=[_FakeFunctionTool("noop")],
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is None, "Short stems must skip Rule C cleanly"
+
+
+def test_rule_c_negative_no_all_pending_tasks_passed() -> None:
+    """Legacy callers that don't pass ``all_pending_tasks`` get the
+    pre-#268 behaviour: Rules A/B still run, Rule C is silent.
+    """
+    bound = Task(id="draft_slides", title="Draft the presentation slides")
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="reviewer_agent",
+        invoked_agent_tools=[_FakeFunctionTool("noop")],
+        task=bound,
+        # all_pending_tasks omitted on purpose
+    )
+
+    assert drift is None, "Rule C silent when caller doesn't pass pending set"
+
+
+def test_rule_c_precedence_rule_a_still_wins() -> None:
+    """When Rule A also fires (all AgentTool wrappers + leaf task) AND
+    Rule C would also fire (stem mismatch), Rule A's verdict wins. The
+    detector returns one drift; the detail string identifies Rule A
+    by mentioning "AgentTool".
+    """
+    bound = Task(
+        id="draft_slides",
+        title="Draft the presentation slides",
+    )
+    pending = [
+        bound,
+        Task(id="review_presentation", title="Review the presentation"),
+    ]
+    agent_tools: list[Any] = [_FakeAgentTool("inner")]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="reviewer_agent",
+        invoked_agent_tools=agent_tools,
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is not None
+    assert drift.kind is DriftKind.CAPABILITY_MISMATCH
+    # Rule A's signature wording is in the detail; Rule C's is not.
+    assert "AgentTool" in drift.detail
+    assert "role-stem" not in drift.detail
+
+
+def test_rule_c_precedence_rule_b_still_wins() -> None:
+    """Rule B (required_tools advisory) takes priority over Rule C.
+    Same agent/task confusion shape as the positive case, but the
+    bound task also has an unmet required_tools — Rule B fires first.
+    """
+    bound = Task(
+        id="draft_slides",
+        title="Draft the presentation slides",
+        required_tools=("write_webpage",),
+    )
+    pending = [
+        bound,
+        Task(id="review_presentation", title="Review the presentation"),
+    ]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="reviewer_agent",
+        invoked_agent_tools=[_FakeFunctionTool("read_presentation_files")],
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is not None
+    assert drift.kind is DriftKind.CAPABILITY_MISMATCH
+    assert "write_webpage" in drift.detail
+    # Rule C's signature wording must not appear when Rule B fires.
+    assert "role-stem" not in drift.detail
+
+
+def test_rule_c_excludes_bound_task_by_id() -> None:
+    """Even when the bound task itself appears in ``all_pending_tasks``
+    (the natural shape — every pending task in the plan, including the
+    one we just pinned), Rule C must exclude it from the "other task"
+    sweep so a bound task with stem-matching text doesn't self-trigger.
+    """
+    # Bound task has the stem in its text — but only itself is pending.
+    bound = Task(
+        id="review_presentation",
+        title="Review the presentation",
+    )
+    pending = [bound]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="reviewer_agent",
+        invoked_agent_tools=[_FakeFunctionTool("noop")],
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is None
+
+
+# ---------------------------------------------------------------------------
 # Integration — ADK adapter wires the detector through ``_handle_drift``
 # ---------------------------------------------------------------------------
 
@@ -453,6 +698,102 @@ async def test_integration_capability_mismatch_flows_through_handle_drift() -> N
     assert drift.severity is DriftSeverity.CRITICAL
     assert drift.current_task_id == "t-draft"
     assert drift.current_agent_id == "underqualified"
+
+
+async def test_integration_rule_c_dag_order_mismatch_through_pin() -> None:
+    """End-to-end Rule C (goldfive#268): mirror the live evidence
+    where ``reviewer_agent`` got delegated while only ``draft_slides``
+    was DAG-ready. The delegation pin (#259) binds reviewer_agent ->
+    draft_slides (only eligible), capability_check Rule C catches the
+    stem mismatch against the still-PENDING ``review_presentation``,
+    and the drift lands on the steerer's ``_handle_drift``.
+
+    To isolate Rule C from Rule A, give the reviewer a real
+    FunctionTool — Rule A would otherwise fire first on the
+    AgentTool-only shape.
+    """
+    from google.adk.agents import Agent
+    from google.adk.tools import FunctionTool
+    from google.adk.tools.agent_tool import AgentTool
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.types import Plan, Session, Task, TaskEdge
+
+    def read_presentation_files(path: str) -> dict[str, Any]:  # noqa: ARG001
+        return {"ok": True}
+
+    # The reviewer agent — has a real read tool so Rule A is OUT, and
+    # its name ("reviewer_agent") yields stem "reviewer" for Rule C.
+    reviewer = Agent(
+        name="reviewer_agent",
+        model=_make_quiet_llm()(),
+        instruction="",
+        tools=[FunctionTool(read_presentation_files)],
+    )
+    coord = Agent(
+        name="coord",
+        model=_make_one_shot_delegating_llm("reviewer_agent")(),
+        instruction="",
+        tools=[AgentTool(reviewer)],
+    )
+    adapter = ADKAdapter(coord)
+    steerer = _RecordingSteerer()
+    adapter.bind_steerer(steerer)
+
+    # Plan shape from the live evidence:
+    #   draft_slides (PENDING, DAG-ready) -> review_presentation
+    #   (PENDING, NOT DAG-ready until draft_slides completes).
+    # The pin will see only draft_slides as eligible and bind
+    # reviewer_agent -> draft_slides. Rule C must fire.
+    draft_task = Task(
+        id="draft_slides",
+        title="Draft the presentation slides",
+        description="Author the slide content.",
+    )
+    review_task = Task(
+        id="review_presentation",
+        title="Review the presentation",
+        description="Read the slides and flag issues.",
+    )
+    coord_task = Task(
+        id="t-coord",
+        title="Coordinate the work",
+        assignee_agent_id="coord",
+        status=TaskStatus.RUNNING,
+    )
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=(),
+        tasks=(coord_task, draft_task, review_task),
+        edges=(
+            TaskEdge(
+                from_task_id="draft_slides",
+                to_task_id="review_presentation",
+            ),
+        ),
+    )
+    session = Session(run_id="r1", plan=plan)
+
+    await adapter.invoke(task=coord_task, session=session)
+
+    capability_drifts = [
+        d for d in steerer.drifts if d.kind is DriftKind.CAPABILITY_MISMATCH
+    ]
+    assert len(capability_drifts) >= 1, (
+        f"expected at least one CAPABILITY_MISMATCH drift from Rule C; "
+        f"got {[d.kind for d in steerer.drifts]}"
+    )
+    drift = capability_drifts[0]
+    assert drift.severity is DriftSeverity.CRITICAL
+    # The pin bound reviewer_agent to draft_slides (only eligible).
+    assert drift.current_task_id == "draft_slides"
+    assert drift.current_agent_id == "reviewer_agent"
+    # The detail string identifies Rule C: agent stem + the conflicting
+    # PENDING task id.
+    assert "role-stem" in drift.detail
+    assert "reviewer" in drift.detail
+    assert "review_presentation" in drift.detail
 
 
 async def test_integration_no_capability_mismatch_when_agent_has_leaf_tool() -> None:

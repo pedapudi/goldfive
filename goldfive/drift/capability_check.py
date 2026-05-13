@@ -2,7 +2,7 @@
 
 Fires :class:`~goldfive.types.DriftKind.CAPABILITY_MISMATCH` when the
 agent the coordinator delegated to *structurally* cannot perform the
-bound task. Two narrow rules; false positives are worse than false
+bound task. Three narrow rules; false positives are worse than false
 negatives at this layer because every fire cancels the in-flight
 invocation and triggers a planner refine.
 
@@ -27,7 +27,18 @@ Detection rules (intentionally surgical):
   CRITICAL. Skipped entirely when the advisory is empty (legacy plans
   and planners that don't populate it are a no-op).
 
-Both rules return :class:`~goldfive.types.DriftEvent` carrying the
+* **Rule C — out-of-DAG-order delegation (goldfive#268).** When the
+  invoked agent's *role stem* (the head of its name, with role-suffix
+  tokens like ``agent``/``worker`` trimmed) is absent from the bound
+  task's title+description AND present in some OTHER pending task,
+  the pin has bound the delegation to a structurally-wrong task —
+  typically because the coordinator dispatched a downstream agent
+  before its DAG predecessors completed and the pin had only one
+  eligible candidate to choose from. Fires CRITICAL. Requires the
+  caller to pass ``all_pending_tasks`` so the cross-task lookup can
+  see non-DAG-ready tasks too; otherwise the rule is silent.
+
+All three rules return :class:`~goldfive.types.DriftEvent` carrying the
 agent name + bound task id + the structural gap, suitable for the
 goldfive intervention ladder. The detector is framework-neutral: it
 takes ADK ``Tool`` objects but only reads their attributes (``.agent``
@@ -37,6 +48,7 @@ for AgentTool detection, ``.name`` for the required-tools cover).
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Task
@@ -45,10 +57,124 @@ log = logging.getLogger(__name__)
 
 
 __all__ = [
+    "AGENT_NAME_ROLE_SUFFIXES",
     "DELEGATION_VERB_MARKERS",
+    "agent_name_stems",
     "detect_capability_mismatch",
     "is_agent_tool",
+    "stem_token_match",
+    "tokenize_for_matching",
 ]
+
+
+#: Trailing role-suffix tokens stripped from an invoked-agent name during
+#: stem extraction. Lifted out of :mod:`goldfive.adapters._adk_plugin`
+#: (the goldfive#265 tier-2 disambiguator) so both call sites — the
+#: delegation-pin selector AND the goldfive#268 Rule C detector — share
+#: one definition.
+#:
+#: Conservative by design: only role-marker tokens that almost never
+#: carry topic meaning. Keep small — adding common verbs/nouns here
+#: would suppress legitimate matches (e.g. dropping ``researcher`` from
+#: ``researcher_agent`` leaves the empty stem and nothing matches).
+AGENT_NAME_ROLE_SUFFIXES: frozenset[str] = frozenset(
+    {"agent", "worker", "assistant", "bot", "tool"}
+)
+
+
+def tokenize_for_matching(text: Any) -> set[str]:
+    """Return the set of lowercase alphanumeric tokens of length ≥4.
+
+    Shared with :mod:`goldfive.adapters._adk_plugin` (Tier-3 args
+    scorer + Tier-2 stem match). The ≥4 threshold filters out noisy
+    short-word matches ("in", "of", "the") that would otherwise
+    saturate every comparison. No regex — goldfive#166 / #167.
+    """
+    if not isinstance(text, str):
+        text = str(text or "")
+    tokens: set[str] = set()
+    buf: list[str] = []
+    for ch in text.lower():
+        if ch.isalnum():
+            buf.append(ch)
+        else:
+            if buf:
+                tok = "".join(buf)
+                if len(tok) >= 4:
+                    tokens.add(tok)
+                buf.clear()
+    if buf:
+        tok = "".join(buf)
+        if len(tok) >= 4:
+            tokens.add(tok)
+    return tokens
+
+
+def agent_name_stems(agent_name: str) -> tuple[str, ...]:
+    """Return ordered lowercase stem tokens derived from an ADK agent name.
+
+    Splits on underscore/hyphen/space, lowercases, trims trailing
+    role-suffix tokens (``agent``, ``worker``, …), and keeps tokens of
+    length ≥4. Same surface :mod:`goldfive.adapters._adk_plugin` uses
+    for its goldfive#265 tier-2 disambiguator; lifted here so the #268
+    Rule C detector can share one source of truth.
+
+    Examples
+    --------
+    >>> agent_name_stems("reviewer_agent")
+    ('reviewer',)
+    >>> agent_name_stems("web_developer_agent")
+    ('developer',)
+    >>> agent_name_stems("helper_agent")
+    ('helper',)
+    >>> agent_name_stems("agent")
+    ()
+
+    No regex (goldfive#166 / #167). Pure str ops.
+    """
+    if not isinstance(agent_name, str) or not agent_name:
+        return ()
+    norm = agent_name.replace("_", " ").replace("-", " ").lower()
+    raw_tokens = [tok for tok in norm.split() if tok]
+    while raw_tokens and raw_tokens[-1] in AGENT_NAME_ROLE_SUFFIXES:
+        raw_tokens.pop()
+    return tuple(tok for tok in raw_tokens if len(tok) >= 4)
+
+
+def stem_token_match(stem: str, token: str) -> bool:
+    """Return True when ``stem`` and ``token`` share a meaningful root.
+
+    Bi-directional substring match: ``review`` → ``reviewer`` AND
+    ``reviewer`` → ``review``. Catches the common role-noun/verb pair
+    where the agent name carries the agent-noun form and the task
+    carries the verb form (or vice versa). Pure str ops — no regex
+    (goldfive#166 / #167).
+    """
+    if not stem or not token:
+        return False
+    if stem == token:
+        return True
+    if stem in token or token in stem:
+        return True
+    return False
+
+
+def _task_text_contains_stem(task: Task, stem: str) -> bool:
+    """Return True when ``stem`` appears in task title+description tokens.
+
+    Bi-directional containment via :func:`stem_token_match` against the
+    ≥4-char tokens extracted from the task's title+description, mirror-
+    ing the goldfive#265 Tier-2 selector exactly.
+    """
+    title = str(getattr(task, "title", "") or "")
+    desc = str(getattr(task, "description", "") or "")
+    tokens = tokenize_for_matching(f"{title} {desc}")
+    if not tokens:
+        return False
+    for tok in tokens:
+        if stem_token_match(stem, tok):
+            return True
+    return False
 
 
 #: Phrases that mark a task as *delegation/coordination* shaped rather
@@ -131,6 +257,7 @@ def detect_capability_mismatch(
     invoked_agent_name: str,
     invoked_agent_tools: list[Any],
     task: Task,
+    all_pending_tasks: Sequence[Task] | None = None,
 ) -> DriftEvent | None:
     """Return a CAPABILITY_MISMATCH drift if ``invoked_agent_name`` cannot perform ``task``.
 
@@ -147,14 +274,23 @@ def detect_capability_mismatch(
     task:
         The :class:`~goldfive.types.Task` the coordinator bound to the
         delegation. ``required_tools`` powers Rule B; ``title`` /
-        ``description`` power Rule A's leaf-task heuristic.
+        ``description`` power Rule A's leaf-task heuristic and Rule C's
+        cross-task stem check.
+    all_pending_tasks:
+        Every ``PENDING`` task in the plan (DAG-ready and not). Powers
+        the goldfive#268 Rule C cross-task lookup. ``None`` /empty
+        disables Rule C — legacy callers and tests that don't pass it
+        keep their pre-#268 behaviour exactly.
 
     Returns
     -------
     DriftEvent | None
-        ``None`` when neither rule trips OR when ``invoked_agent_tools``
-        is empty AND ``required_tools`` is empty (no signal). A
-        ``DriftEvent`` with ``severity=CRITICAL`` otherwise.
+        ``None`` when no rule trips OR when ``invoked_agent_tools`` is
+        empty AND ``required_tools`` is empty AND Rule C has no signal.
+        A ``DriftEvent`` with ``severity=CRITICAL`` otherwise. Rules
+        evaluate in order B → A → C; the first to fire wins so the
+        higher-confidence signal (B, then A, then C) takes precedence
+        and the steerer's refine only sees one verdict per delegation.
     """
     if task is None:
         return None
@@ -205,4 +341,97 @@ def detect_capability_mismatch(
                 current_agent_id=invoked_agent_name,
             )
 
+    # Rule C — out-of-DAG-order delegation (goldfive#268). When the
+    # invoked agent's role stem doesn't appear in the bound task but
+    # DOES appear in another PENDING task, the pin has bound the
+    # delegation to a structurally-wrong task. Mirror live evidence:
+    # ``reviewer_agent`` pinned to ``draft_slides`` while
+    # ``review_presentation`` sits PENDING and not-yet-DAG-ready, the
+    # pin's tier-2 stem disambiguator couldn't help because only one
+    # task was eligible. Rule C fires on that exact shape.
+    #
+    # Cross-task signal — needs the full PENDING set (DAG-ready and
+    # not). Silent when the caller didn't pass it, when the agent
+    # name produces no usable stem (generic ``coordinator_agent`` style
+    # names degrade gracefully), or when no other PENDING task
+    # mentions the stem (in which case Rule C has nothing to say — the
+    # pin is just doing its best with a generic agent).
+    drift_c = _rule_c_dag_order(
+        invoked_agent_name=invoked_agent_name,
+        bound_task=task,
+        all_pending_tasks=all_pending_tasks,
+    )
+    if drift_c is not None:
+        return drift_c
+
+    return None
+
+
+def _rule_c_dag_order(
+    *,
+    invoked_agent_name: str,
+    bound_task: Task,
+    all_pending_tasks: Sequence[Task] | None,
+) -> DriftEvent | None:
+    """Rule C: detect out-of-DAG-order delegation (goldfive#268).
+
+    Returns a CAPABILITY_MISMATCH ``DriftEvent`` iff the agent's role
+    stem is *absent* from the bound task's title+description AND
+    *present* in some other PENDING task. Otherwise ``None``.
+
+    Conservative bail-outs (all return ``None``):
+
+    * ``all_pending_tasks`` is ``None`` or empty.
+    * The agent name produces no stem of length ≥4
+      (``coordinator_agent`` → ``coordinator`` is a stem, but a generic
+      ``agent`` / ``worker`` collapses to the empty tuple and we skip).
+    * The stem is already present in the bound task — no conflict, the
+      pin is on the right task.
+    * No other PENDING task mentions the stem either — Rule C has no
+      strong signal of cross-task confusion.
+    """
+    if not all_pending_tasks:
+        return None
+    stems = agent_name_stems(invoked_agent_name)
+    if not stems:
+        return None
+
+    bound_id = str(getattr(bound_task, "id", "") or "")
+
+    # For each stem, check: absent-from-bound AND present-in-other.
+    # Iterate stems so multi-stem names ("draft_writer_agent" -> draft +
+    # writer) get a chance to match. Fire on the first stem that has
+    # the (absent here, present there) shape.
+    for stem in stems:
+        if _task_text_contains_stem(bound_task, stem):
+            # Stem present in bound — no conflict for this stem, try
+            # the next stem before giving up.
+            continue
+        other_match: Task | None = None
+        for other in all_pending_tasks:
+            other_id = str(getattr(other, "id", "") or "")
+            if not other_id or other_id == bound_id:
+                continue
+            if _task_text_contains_stem(other, stem):
+                other_match = other
+                break
+        if other_match is None:
+            continue
+        other_id = str(getattr(other_match, "id", "") or "")
+        other_title = str(getattr(other_match, "title", "") or "")
+        bound_title = str(getattr(bound_task, "title", "") or "")
+        detail = (
+            f"agent {invoked_agent_name!r} bound to task "
+            f"{bound_id!r} ({bound_title[:80]!r}) but agent's role-stem "
+            f"{stem!r} matches PENDING task {other_id!r} "
+            f"({other_title[:80]!r}); the coordinator likely "
+            f"delegated out of DAG order"
+        )
+        return DriftEvent(
+            kind=DriftKind.CAPABILITY_MISMATCH,
+            severity=DriftSeverity.CRITICAL,
+            detail=detail,
+            current_task_id=bound_id,
+            current_agent_id=invoked_agent_name,
+        )
     return None
