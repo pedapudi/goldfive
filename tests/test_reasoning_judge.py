@@ -1707,3 +1707,220 @@ async def test_judge_span_decision_summary_three_state() -> None:
     assert any(
         "justified_deviation (tool_error)" in s for s in decision_summaries
     ), decision_summaries
+
+
+# ---------------------------------------------------------------------------
+# goldfive#270 — justified_deviation/new_information requires user-input grounding
+# ---------------------------------------------------------------------------
+#
+# Regression scaffolding for the walnut-presentation failure (session
+# ``f0630532-7dc3-4008-8faa-ada7edc89806``, 2026-05-12): the research
+# agent's reasoning claimed "based on user instructions" and expanded
+# scope to include raccoons; the judge accepted the claim at face value
+# and emitted ``justified_deviation (new_information)``. The user had
+# only ever asked for a walnuts presentation. The prompt rubric now
+# requires ``new_information`` to be grounded in either (a) the user's
+# actual input verbatim in GOALS, or (b) a recent tool observation; the
+# agent's CLAIM about what the user said is not itself evidence.
+#
+# Tests below pin the prompt-shape contract and the parser-level
+# behaviour for each scenario (under stubbed LLM responses that match
+# what a prompt-compliant judge should now return).
+
+
+def test_prompt_requires_user_input_grounding_for_new_information() -> None:
+    """The user prompt explicitly forbids accepting agent-claimed user direction.
+
+    Pins the goldfive#270 rubric tightening: the new_information
+    provenance must be cross-checkable against GOALS, and "the agent
+    said the user asked for X" is not itself evidence.
+    """
+    rendered = rjudge.REASONING_DRIFT_USER_PROMPT_TEMPLATE.format(
+        plan_tasks_summary="(no plan tasks)",
+        goals_block="(no goals)",
+        task_block="(no task bound)",
+        reasoning_block="thinking",
+        current_agent_id="a1",
+        task_lineage_block="(no task lineage observed)",
+        tool_obs_block="(no recent tool observations)",
+        tool_obs_count=0,
+    )
+    # The rubric now references GOALS as the verifiable surface, and
+    # explicitly names the "agent claimed user said X" failure mode.
+    assert "verbatim in GOALS" in rendered
+    assert "NOT evidence" in rendered or "is NOT evidence" in rendered
+    # The if/then escape hatch back to erroneous_deviation appears.
+    assert "erroneous_deviation" in rendered
+    # The classification block also calls out the cross-check explicitly.
+    assert "Cross-check the agent's" in rendered
+
+
+async def test_walnut_regression_agent_claimed_user_said_raccoons_is_off_topic() -> None:
+    """Verbatim walnut shape: agent claims user instructions but GOALS only
+    mentions walnuts → erroneous_deviation, not justified_deviation.
+
+    Stubs the LLM to return the verdict a prompt-compliant judge would
+    produce under the goldfive#270 rubric: ``erroneous_deviation``
+    because the agent's expansion topic ("raccoons") does not appear
+    in GOALS (which contains only "make me a presentation about
+    walnuts in no more than 10 slides").
+    """
+    goals = [
+        Goal(id="g1", summary="make me a presentation about walnuts in no more than 10 slides"),
+    ]
+    task = Task(
+        id="t_research", title="Research facts about walnuts", description="walnut facts"
+    )
+    # Prompt-compliant verdict under the new rubric: the agent's claim
+    # is unverified against GOALS so the judge must demote to
+    # erroneous_deviation.
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "erroneous_deviation",
+                "severity": "warning",
+                "reason": (
+                    "agent claims 'based on user instructions' but raccoons "
+                    "is not mentioned in GOALS (which only requests walnuts)"
+                ),
+                "provenance": "none",
+            }
+        ]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning=(
+            "I am expanding the research scope to include raccoons based "
+            "on user instructions that were not captured in the explicit "
+            "task description."
+        ),
+        task=task,
+        goals=goals,
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+        current_task_id="t_research",
+        current_agent_id="research_agent",
+    )
+    # The verdict carries an OFF_TOPIC drift, NOT a JUSTIFIED_DEVIATION.
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.OFF_TOPIC
+    assert verdict.classification == "erroneous_deviation"
+    assert verdict.provenance == ""
+    # And the rendered user prompt that went to the LLM actually carries
+    # the user's verbatim input in the GOALS section, so a
+    # prompt-compliant judge has the evidence to cross-check.
+    assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
+    _, user_prompt, _ = call_llm.calls[0]  # type: ignore[attr-defined]
+    # The user's actual input ("walnuts") must be in GOALS section so a
+    # prompt-compliant judge can cross-check the agent's "user said X"
+    # claim. "raccoons" only appears in the REASONING block — never in
+    # GOALS — which is what makes the deviation unjustified.
+    goals_section = user_prompt.split("GOALS:\n", 1)[1].split("\n\n", 1)[0]
+    assert "walnuts" in goals_section
+    assert "raccoons" not in goals_section
+
+
+async def test_legitimate_justified_deviation_when_user_explicitly_expanded_scope() -> None:
+    """Counterpart to the walnut regression: when the user actually DID say
+    "include baking" in GOALS, expanding to baking is justified_deviation.
+
+    Same setup as the regression test, except GOALS contains the
+    expansion topic verbatim, so a prompt-compliant judge can verify
+    the agent's claim and accept the deviation.
+    """
+    goals = [
+        Goal(id="g1", summary="research walnuts AND include their use in baking"),
+    ]
+    task = Task(
+        id="t_research", title="Research facts about walnuts", description="walnut facts"
+    )
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "justified_deviation",
+                "severity": "info",
+                "reason": "user explicitly requested baking applications in GOALS",
+                "provenance": "new_information",
+            }
+        ]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning=(
+            "I am expanding scope to include baking applications because "
+            "the user asked for them."
+        ),
+        task=task,
+        goals=goals,
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+        current_task_id="t_research",
+        current_agent_id="research_agent",
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.JUSTIFIED_DEVIATION
+    assert verdict.classification == "justified_deviation"
+    assert verdict.provenance == "new_information"
+    # The rendered prompt carries the "include baking" GOALS context the
+    # judge needed to cross-check the agent's claim.
+    _, user_prompt, _ = call_llm.calls[0]  # type: ignore[attr-defined]
+    goals_section = user_prompt.split("GOALS:\n", 1)[1].split("\n\n", 1)[0]
+    assert "baking" in goals_section
+
+
+async def test_on_task_baseline_under_tightened_rubric() -> None:
+    """Regression guard: on_task agents stay on_task under the new rubric."""
+    goals = [
+        Goal(id="g1", summary="make me a presentation about walnuts in no more than 10 slides"),
+    ]
+    task = Task(
+        id="t_research", title="Research facts about walnuts", description="walnut facts"
+    )
+    call_llm = _stub_call_llm(
+        [{"classification": "on_task", "reason": "looking up walnut nutrition facts"}]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="I should look up walnut nutrition facts and harvest data.",
+        task=task,
+        goals=goals,
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+        current_task_id="t_research",
+        current_agent_id="research_agent",
+    )
+    assert verdict.drift is None
+    assert verdict.classification == "on_task"
+
+
+async def test_off_topic_baseline_under_tightened_rubric() -> None:
+    """Regression guard: wildly off-scope reasoning with no claimed user
+    direction remains erroneous_deviation under the new rubric."""
+    goals = [
+        Goal(id="g1", summary="make me a presentation about walnuts in no more than 10 slides"),
+    ]
+    task = Task(
+        id="t_research", title="Research facts about walnuts", description="walnut facts"
+    )
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "erroneous_deviation",
+                "severity": "warning",
+                "reason": "drifted entirely to celestial mechanics with no provoking signal",
+            }
+        ]
+    )
+    verdict = await rjudge.classify_reasoning_drift_with_focus(
+        reasoning="Now I should think about Jupiter's moons and their orbital periods.",
+        task=task,
+        goals=goals,
+        plan=None,
+        model="fake",
+        call_llm=call_llm,
+        current_task_id="t_research",
+        current_agent_id="research_agent",
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.OFF_TOPIC
+    assert verdict.classification == "erroneous_deviation"
