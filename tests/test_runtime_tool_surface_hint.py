@@ -1,13 +1,18 @@
 """Tests for the R3 runtime tool-surface hint (Tier 1 F2 alternative).
 
 Covers :func:`goldfive.adapters._adk_plugin._build_runtime_tools_hint`
-and :func:`goldfive.adapters._adk_plugin._inject_runtime_tools_hint`
+and :meth:`goldfive.prompt_shaper.PromptShaper.inject_runtime_tools_hint`
 plus the wiring through ``before_model_callback`` such that the hint
 lands on ``llm_request.config.system_instruction`` without clobbering
 prior instructions and without accumulating across calls.
 
 Runs without ADK installed because the helpers are pure-Python and do
 not import ADK at module load. Wiring tests skip when ADK is missing.
+
+Wave B1 (refactor/prompt-shaper): the inject helper moved off
+:mod:`goldfive.adapters._adk_plugin` and onto :class:`PromptShaper`.
+A thin module-local shim preserves the legacy ``_inject_runtime_tools_hint(...)``
+call shape so the test bodies below read unchanged.
 """
 
 from __future__ import annotations
@@ -20,10 +25,27 @@ from goldfive.adapters._adk_plugin import (
     _RUNTIME_TOOLS_HINT_END,
     _RUNTIME_TOOLS_HINT_PREFIX,
     _build_runtime_tools_hint,
-    _inject_runtime_tools_hint,
     _strip_prior_runtime_tools_hint,
 )
+from goldfive.prompt_shaper import PromptShaper
 from goldfive.types import Plan, Session, Task, TaskStatus
+
+
+def _inject_runtime_tools_hint(
+    *, callback_context: Any, llm_request: Any, session: Any
+) -> None:
+    """Wave B1 shim: forward to :meth:`PromptShaper.inject_runtime_tools_hint`.
+
+    These unit tests drive the helper without a ``SessionContext`` so the
+    gate falls back to "inject" (steerer is None → ``should_inject`` →
+    True) — exactly the pre-refactor behaviour.
+    """
+    PromptShaper().inject_runtime_tools_hint(
+        callback_context=callback_context,
+        llm_request=llm_request,
+        session=session,
+        session_context=None,
+    )
 
 # ---------------------------------------------------------------------------
 # Fakes

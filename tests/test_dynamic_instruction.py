@@ -28,10 +28,23 @@ from goldfive.adapters import _adk_state_protocol as _sp
 from goldfive.adapters._adk_dynainst import (
     install_dynamic_instructions,
     is_dynamic_instruction,
-    make_dynamic_instruction,
     pending_correction_key,
 )
+from goldfive.prompt_shaper import PromptShaper
 from goldfive.types import Plan, Task
+
+
+def make_dynamic_instruction(
+    original_instruction: str,
+    agent_name: str,
+):
+    """Local shim: Wave B1 moved this factory onto
+    :class:`PromptShaper`. Kept as a free function here so the existing
+    test bodies (which pre-date the move) read unchanged."""
+    return PromptShaper().make_dynamic_instruction(
+        original_instruction=original_instruction,
+        agent_name=agent_name,
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers

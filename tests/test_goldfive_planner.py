@@ -17,9 +17,29 @@ pytest.importorskip("google.adk")
 from goldfive.adapters._adk_plugin import (  # noqa: E402
     SESSION_CONTEXT_STATE_KEY,
     SessionContext,
-    _inject_goldfive_planner_instruction,
     make_adk_plugin,
 )
+from goldfive.prompt_shaper import PromptShaper  # noqa: E402
+
+
+async def _inject_goldfive_planner_instruction(
+    *, callback_context: Any, llm_request: Any
+) -> None:
+    """Wave B1 shim: forward to
+    :meth:`PromptShaper.inject_goldfive_planner_instruction`.
+
+    The pre-refactor signature took only ``(callback_context,
+    llm_request)``; the shaper additionally accepts a
+    ``session_context`` to read the steerer. These tests don't exercise
+    the strict-passive gate (they predate it and pass no SessionContext),
+    so we pin ``session_context=None`` — the gate then defaults to
+    "inject" (matches pre-refactor behaviour byte-identically).
+    """
+    await PromptShaper().inject_goldfive_planner_instruction(
+        callback_context=callback_context,
+        llm_request=llm_request,
+        session_context=None,
+    )
 from goldfive.adapters._adk_state_protocol import (  # noqa: E402
     KEY_CURRENT_TASK_ID,
     KEY_CURRENT_TASK_TITLE,

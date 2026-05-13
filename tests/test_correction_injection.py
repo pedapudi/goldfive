@@ -588,9 +588,11 @@ def test_format_correction_block_is_directive_not_diagnostic() -> None:
 
 def test_dynamic_resolver_picks_up_correction_dict() -> None:
     pytest.importorskip("google.adk")
-    from goldfive.adapters._adk_dynainst import make_dynamic_instruction
+    # Wave B1 (refactor/prompt-shaper): the factory moved to
+    # :class:`~goldfive.prompt_shaper.PromptShaper`.
+    from goldfive.prompt_shaper import PromptShaper
 
-    resolver = make_dynamic_instruction(
+    resolver = PromptShaper().make_dynamic_instruction(
         original_instruction="you are the researcher",
         agent_name="research_agent",
     )
