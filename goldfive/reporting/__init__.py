@@ -38,29 +38,13 @@ The public API is unchanged: every name previously importable from
 from __future__ import annotations
 
 # Public surface — the legacy ``from goldfive.reporting import X`` paths.
-from goldfive.reporting.handlers import (
-    BUILTIN_REPORTING_TOOLS,
-    DECLARATION_KIND_NOT_NEEDED,
-    DECLARATION_KIND_SKIPPED,
-    DECLARATION_KINDS,
-    DECLARATIONS_KEY,
-    DRIFT_SELF_REPORTING_TOOL_NAMES,
-    DRIFT_SELF_REPORTING_TOOLS,
-    LIFECYCLE_REPORTING_TOOLS,
-    REPORTING_TOOL_NAMES,
-    ReportingHandler,
-    ReportingToolSpec,
-    select_reporting_tools,
-)
-
-# Private symbols that external callers (tests, doc cross-refs) reach
-# into via ``goldfive.reporting._foo`` or
-# ``from goldfive.reporting import _foo``. Re-exported here so the
-# split doesn't break those callers. New code should NOT import these
-# — they are package-private and may move again.
+# Private symbols (underscore-prefixed) are re-exported here for
+# back-compat with tests / docs that historically reached into the
+# flat ``goldfive.reporting`` module; they appear in ``__all__`` so
+# tools (ruff F401) treat them as intentional re-exports. New code
+# should NOT import these — they are package-private and may move.
 from goldfive.reporting._internal import (
     _ACK,
-    _PinFreshness,
     _TERMINAL_STATUSES,
     _TOOL_TARGET_STATUS,
     _TOOL_VALID_SOURCES,
@@ -74,6 +58,7 @@ from goldfive.reporting._internal import (
     _find_task_in_session,
     _float,
     _int,
+    _PinFreshness,
     _read_pin_revision,
     _read_plan_revision,
     _reroute_if_superseded,
@@ -85,6 +70,17 @@ from goldfive.reporting._internal import (
     _supersession_successor,
 )
 from goldfive.reporting.handlers import (
+    BUILTIN_REPORTING_TOOLS,
+    DECLARATION_KIND_NOT_NEEDED,
+    DECLARATION_KIND_SKIPPED,
+    DECLARATION_KINDS,
+    DECLARATIONS_KEY,
+    DRIFT_SELF_REPORTING_TOOL_NAMES,
+    DRIFT_SELF_REPORTING_TOOLS,
+    LIFECYCLE_REPORTING_TOOLS,
+    REPORTING_TOOL_NAMES,
+    ReportingHandler,
+    ReportingToolSpec,
     _classify_and_route_pin,
     _clear_correction_on_started,
     _handle_awaiting_approval,
@@ -100,6 +96,7 @@ from goldfive.reporting.handlers import (
     _handle_task_started,
     _record_declaration,
     _validate_required,
+    select_reporting_tools,
 )
 from goldfive.reporting.rendering import (
     _bare_agent_name,
@@ -113,7 +110,6 @@ from goldfive.reporting.rendering import (
     _refused_response,
 )
 from goldfive.reporting.schemas import (
-    _object_schema,
     _SCHEMA_AWAITING_APPROVAL,
     _SCHEMA_DECLARE_TASK_NOT_NEEDED,
     _SCHEMA_DECLARE_TASK_SKIPPED,
@@ -124,19 +120,84 @@ from goldfive.reporting.schemas import (
     _SCHEMA_TASK_FAILED,
     _SCHEMA_TASK_PROGRESS,
     _SCHEMA_TASK_STARTED,
+    _object_schema,
 )
 
 __all__ = [
+    # Public API (legacy ``from goldfive.reporting import X``).
+    "BUILTIN_REPORTING_TOOLS",
+    "DECLARATIONS_KEY",
+    "DECLARATION_KINDS",
     "DECLARATION_KIND_NOT_NEEDED",
     "DECLARATION_KIND_SKIPPED",
-    "DECLARATION_KINDS",
-    "DECLARATIONS_KEY",
-    "DRIFT_SELF_REPORTING_TOOL_NAMES",
     "DRIFT_SELF_REPORTING_TOOLS",
+    "DRIFT_SELF_REPORTING_TOOL_NAMES",
     "LIFECYCLE_REPORTING_TOOLS",
+    "REPORTING_TOOL_NAMES",
     "ReportingHandler",
     "ReportingToolSpec",
-    "REPORTING_TOOL_NAMES",
-    "BUILTIN_REPORTING_TOOLS",
     "select_reporting_tools",
+    # Private re-exports — tests and adapters historically reach into
+    # these via ``goldfive.reporting._foo``. Listed here so ruff F401
+    # treats them as intentional, and so ``from goldfive.reporting
+    # import _foo`` keeps working post-split.
+    "_ACK",
+    "_PinFreshness",
+    "_SCHEMA_AWAITING_APPROVAL",
+    "_SCHEMA_DECLARE_TASK_NOT_NEEDED",
+    "_SCHEMA_DECLARE_TASK_SKIPPED",
+    "_SCHEMA_NEW_WORK_DISCOVERED",
+    "_SCHEMA_PLAN_DIVERGENCE",
+    "_SCHEMA_TASK_BLOCKED",
+    "_SCHEMA_TASK_COMPLETED",
+    "_SCHEMA_TASK_FAILED",
+    "_SCHEMA_TASK_PROGRESS",
+    "_SCHEMA_TASK_STARTED",
+    "_TERMINAL_STATUSES",
+    "_TOOL_TARGET_STATUS",
+    "_TOOL_VALID_SOURCES",
+    "_await_plan_stable",
+    "_bare_agent_name",
+    "_bool",
+    "_build_plan_state",
+    "_classify_and_route_pin",
+    "_classify_pin_freshness",
+    "_classify_transition",
+    "_clear_correction_on_started",
+    "_directive_ack",
+    "_emit_approval_requested",
+    "_emit_task_declaration_received",
+    "_emit_task_transition_refused",
+    "_find_task_in_session",
+    "_float",
+    "_handle_awaiting_approval",
+    "_handle_declaration",
+    "_handle_declare_task_not_needed",
+    "_handle_declare_task_skipped",
+    "_handle_new_work_discovered",
+    "_handle_plan_divergence",
+    "_handle_task_blocked",
+    "_handle_task_completed",
+    "_handle_task_failed",
+    "_handle_task_progress",
+    "_handle_task_started",
+    "_idempotent_response",
+    "_int",
+    "_invalid_transition_response",
+    "_missing_required_field_response",
+    "_missing_task_id_response",
+    "_next_pending_with_completed_predecessors",
+    "_object_schema",
+    "_read_pin_revision",
+    "_read_plan_revision",
+    "_record_declaration",
+    "_refused_response",
+    "_reroute_if_superseded",
+    "_resolve_effective_task_id",
+    "_resolve_task_id",
+    "_resolve_task_id_with_source",
+    "_rotate_after_terminal",
+    "_str",
+    "_supersession_successor",
+    "_validate_required",
 ]
