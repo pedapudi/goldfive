@@ -1973,8 +1973,22 @@ class LLMPlanner:
             "MUST appear verbatim in your `tasks` array. Same `id`, "
             "`title`, `assignee_agent_id`, and same terminal `status`. "
             "You MUST NOT drop them, rename them, or regress their status "
-            "back to PENDING/RUNNING/BLOCKED.",
+            "back to PENDING/RUNNING/BLOCKED. NOTE: 'terminal' here means "
+            "task STATUS (COMPLETED/FAILED/CANCELLED), NOT graph position "
+            "— a leaf task whose status is PENDING is NOT terminal. A "
+            "terminal task with no downstream successors is still terminal "
+            "and still MUST be kept. The most common failure mode on "
+            "weaker models is silently dropping a terminal task that "
+            "has no downstream consumers because 'it looks done'; the "
+            "validator rejects this with `terminal task '<id>' missing "
+            "in revision` and the run escalates to human intervention. "
+            "DO NOT do this.",
             f"   Terminal tasks in the current plan: {terminal_json}",
+            "   VALID revision shape (terminal tasks preserved verbatim):",
+            '     "tasks": [..., {"id": "<terminal_id>", "title": "...", '
+            '"status": "COMPLETED", "assignee_agent_id": "..."}, ...]',
+            "   INVALID revision shape (terminal task omitted — REJECTED):",
+            '     "tasks": [<new PENDING tasks only; <terminal_id> missing>]',
             "",
             "2. TERMINAL->TERMINAL EDGES (edges where BOTH endpoints are "
             "terminal tasks) MUST appear verbatim in your `edges` array. "

@@ -2355,3 +2355,63 @@ def test_render_structural_invariants_does_NOT_double_carry_supersession() -> No
     # system prompts. Asserting absence here pins the separation of
     # concerns.
     assert "REUSE-OR-SUPERSEDE" not in rendered
+
+
+def test_render_structural_invariants_disambiguates_terminal_status_vs_graph_leaf() -> None:
+    """Weak-model strengthening: the invariants block explicitly
+    distinguishes status-terminal (COMPLETED/FAILED/CANCELLED) from
+    graph-terminal (leaf with no successors). The 2026-05-13 Gemma 26B
+    failure surfaced as a dropped terminal task; the model treated
+    "no downstream consumers" as license to omit the task. The prompt
+    must now spell out that status is the only criterion.
+    """
+    from goldfive.planner import LLMPlanner
+    from goldfive.types import Plan, Task, TaskEdge, TaskStatus
+    plan = Plan(
+        id="p", run_id="r", goal_ids=[],
+        tasks=[
+            Task(id="research", title="Research", status=TaskStatus.COMPLETED),
+            Task(id="draft_presentation", title="Draft", status=TaskStatus.COMPLETED),
+        ],
+        edges=[TaskEdge(from_task_id="research", to_task_id="draft_presentation")],
+    )
+    planner = LLMPlanner(call_llm=None, model="m")
+    rendered = planner._render_structural_invariants_block(plan)
+    # Disambiguation: status, not graph position.
+    assert "task STATUS" in rendered
+    assert "NOT graph position" in rendered
+    # Explicit naming of the leaf-terminal failure mode.
+    assert "no downstream successors is still terminal" in rendered
+    # Explicit naming of the most common weak-model failure pattern,
+    # including the validator error string operators see in logs.
+    assert "terminal task '<id>' missing in revision" in rendered
+    # VALID + INVALID example labels — structural markup weaker models
+    # tend to follow better than free prose.
+    assert "VALID revision shape" in rendered
+    assert "INVALID revision shape" in rendered
+
+
+async def test_refine_prompt_carries_strengthened_terminal_guidance() -> None:
+    """End-to-end: the strengthened terminal-tasks guidance reaches the
+    LLM via the user prompt on the LOOPING_TOOL_CALL refine path (which
+    routes through _render_structural_invariants_block). Mirrors
+    test_refine_prompt_enumerates_terminal_tasks_and_edges but pins the
+    weak-model disambiguation tokens specifically.
+    """
+    scripted = _ScriptedLLM([_good_looping_revision_json()])
+    planner = LLMPlanner(call_llm=scripted, max_refine_attempts=2)
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="stuck",
+        current_task_id="draft_slides",
+    )
+
+    await planner.refine(plan=_looping_plan(), drift=drift, goals=_goals())
+
+    _system, user_prompt, _model = scripted.calls[0]
+    # The strengthening lands in the prompt the LLM actually sees.
+    assert "task STATUS" in user_prompt
+    assert "no downstream successors is still terminal" in user_prompt
+    assert "VALID revision shape" in user_prompt
+    assert "INVALID revision shape" in user_prompt
