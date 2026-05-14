@@ -169,12 +169,54 @@ today.** It performs its `set_session_plan` swap inside a
 Pin writes race with refine writes; today the race is benign because
 the pin only mutates `assignee_agent_id` (which the validator does not
 re-check) on an existing task id (which always exists across revisions
-the same way per `#247`). The proposal in §5 carefully preserves this
-"pin write is not under the plan lock" property.
+the same way per `#247`). §5 of this proposal **abandons** that
+"pin write is not under the plan lock" property for the descriptive-
+growth write — see §5 for why, and §3.5 for the conceptual framing
+that makes the cost worth paying.
+
+### 3.5 The two entities
+
+The proposal treats **intent** and **record** as conceptually separate
+entities, even though they are physically packaged in one `Plan` data
+structure via `Task.discovered: bool`. This is the load-bearing
+framing for the rest of the doc.
+
+- **Plan-as-intent.** The planner's forecast: what the run is
+  supposed to do. Mutated only by refines — corrective insertions,
+  supersedes topology, USER_STEER-authored adjustments. Tasks with
+  `discovered=False`. Lifecycle owner: `Planner.refine` →
+  `PlanReviser.install_revision_for_drift`.
+- **Plan-as-record.** What actually executed: the DAG of agent
+  invocations the executor witnessed. Grown by
+  `_maybe_pin_delegation_task` falling through to discovery. Tasks
+  with `discovered=True`. Lifecycle owner: the descriptive-growth
+  write helper introduced in §5.
+- **Drift signal.** The continuous diff between intent and record.
+  Today drift detectors fire on individual content checks (OFF_TOPIC,
+  LOOPING_REASONING, CAPABILITY_MISMATCH); after this proposal the
+  structural mismatch — "the executor went somewhere the planner did
+  not forecast" — becomes first-class as a `NEW_WORK_DISCOVERED`
+  revision on the same Plan object.
+
+The two-entity model is what justifies the bool-overlay design choice:
+intent and record share a data structure today because the operations
+on them (validate, render, query) are the same. The proposal does
+**not** invent a new container; it formalises the distinction that
+already exists implicitly when `_maybe_pin_delegation_task` and
+`Planner.refine` both touch `session.plan`.
+
+**Forward-compatibility note.** The overlay can later promote to a
+separate `ExecutionGraph` object beside the `Plan` if the conceptual
+distinction proves to need divergent operations (e.g., the record needs
+sub-second granularity that the intent does not, or sinks want to
+filter without re-reading the `discovered` flag per task). §10.2
+sketches what that move looks like; it is **not** required by this
+proposal. The bool-overlay form is intentionally the smallest viable
+shape that makes the two entities nameable.
 
 ## 4. Proposed design
 
-### 4.1 New `Task` field
+### 4.1 New `Task` fields
 
 ```python
 @dataclasses.dataclass(frozen=True)
@@ -185,12 +227,19 @@ class Task:
     #: or by a planner-authored refine. Default False so legacy plans
     #: and the validator's existing rules are unaffected.
     discovered: bool = False
+    #: Stable hash of (agent_name, args-token-set) at discovery time.
+    #: Used by _maybe_pin_delegation_task to dedup repeated delegations
+    #: to the same agent for the same logical args — see §4.3.0 and
+    #: §11.1. Empty string for forecast tasks. Preserved across
+    #: refines (§4.3.0 "Cross-refine survival"). Opaque to the
+    #: validator.
+    discovery_identity_hash: str = ""
 ```
 
-Plain bool, default `False`. The validator (`Plan.validate`) treats
-`discovered` as opaque metadata — it does not change rule 5 (creation:
-all-PENDING), rule 6 (terminal preservation), rule 7 (no
-absorbing→PENDING edges), or rule 8 (corrective-predecessor topology).
+Both fields are opaque metadata. The validator (`Plan.validate`) does
+not change rule 5 (creation: all-PENDING), rule 6 (terminal
+preservation), rule 7 (no absorbing→PENDING edges), or rule 8
+(corrective-predecessor topology).
 
 ### 4.2 New event kind
 
@@ -219,13 +268,22 @@ to filter without re-reading the full plan.)
 on delegation_observed (before_tool_callback):
     eligible = build_eligible_pending(plan)
     if eligible:
-        chosen = run_tier_1_2_3(eligible, invoked_agent, args)
+        chosen = run_tier_1_2(eligible, invoked_agent, args)
         if chosen has stem match with invoked_agent_name:
             stamp_assignee_and_pin(chosen)        # today's path
             return
 
-    # All tiers missed (zero eligible OR no stem match).
-    # NEW: synthesise a discovered task.
+    # Tier 1/2 missed.
+    # NEW: dedup against prior discovered tasks, then grow if novel.
+    identity_hash = discovery_identity_hash(invoked_agent_name, tool_args)
+    existing = find_discovered_task_by_hash(plan, identity_hash)
+    if existing:
+        # A prior delegation in this run already discovered this
+        # (agent, args-token-set). Pin to it; no plan growth.
+        pin_to_existing(session, existing)
+        return
+
+    # Novel (agent, args-token-set). Synthesise a discovered task.
     title = derive_title(invoked_agent_name, tool_args)
     discovered_task = Task(
         id=mint_id(invoked_agent_name),
@@ -234,17 +292,69 @@ on delegation_observed (before_tool_callback):
         assignee_agent_id=invoked_agent_name,
         status=TaskStatus.PENDING,
         discovered=True,
+        discovery_identity_hash=identity_hash,  # stamped on the task
     )
 
-    # Schedule an async revision adding the discovered task.
-    # See §5 for the async-ordering contract.
-    schedule_discovery_revision(session, discovered_task)
-
-    # Pin the agent to the discovered task id immediately so the
-    # synchronous emit of delegation_observed carries the correct
-    # task_id without waiting for the revision to land.
-    pin_discovered_task(session, discovered_task)
+    # Install the discovered task under the per-session plan lock.
+    # The lock acquisition is the linearisation point against
+    # concurrent refines and concurrent discoveries — see §5 Option D.
+    install_descriptive_growth(session, discovered_task)
 ```
+
+#### 4.3.0 Stable identity hash for dedup
+
+The dedup key collapses (agent, args-token-set) pairs to a stable
+hash so repeated delegations from the same coordinator to the same
+agent for the same logical task re-pin instead of growing the plan.
+
+```python
+def discovery_identity_hash(
+    agent_name: str,
+    tool_args: Mapping[str, Any],
+) -> str:
+    """Stable hash for descriptive-growth dedup.
+
+    Two delegations to the same agent_name with the same
+    args-token-set hash to the same value, regardless of:
+      - whitespace differences in args
+      - capitalization differences in args
+      - arg-key ordering
+      - cosmetic re-orderings of tokens within a single arg value
+
+    The hash is the §6 dedup key: a new delegation whose hash matches
+    an existing discovered task pins to that task; a new hash grows
+    the plan.
+    """
+    tokens = _normalize_args_tokens(tool_args)
+    payload = f"{agent_name}\0" + ",".join(sorted(tokens))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _normalize_args_tokens(tool_args: Mapping[str, Any]) -> frozenset[str]:
+    """Lowercase, strip, tokenise on whitespace + punctuation.
+
+    Trivial whitespace and capitalization variants must map to the
+    same token set so 'Cherry Trees' and 'cherry trees' dedup.
+    """
+    text = " ".join(str(v) for v in tool_args.values())
+    tokens = re.findall(r"\w+", text.lower())
+    # Drop stop-tokens that add no signal.
+    return frozenset(tokens) - _DISCOVERY_STOP_TOKENS
+```
+
+`Task.discovery_identity_hash: str` is a new field on `Task` (default
+empty string for forecast tasks) added in PR 1 alongside
+`discovered: bool`. The validator treats it as opaque metadata.
+
+**Cross-refine survival.** When a planner refine modifies a
+discovered task (§4.5), the hash is preserved. When a refine
+supersedes a discovered task with a non-discovered task, the new
+task inherits the hash so a later delegation to the same
+`(agent, args-token-set)` pins to the now-non-discovered task rather
+than re-growing.
+
+**TTL.** The dedup window is "until the discovered task reaches a
+terminal status" — see §11.1.
 
 #### 4.3.1 Title derivation
 
@@ -325,7 +435,7 @@ Encoding: stamp `drift.authored_by="goldfive"` on the synthesised drift
 opt out of refine for `(kind=NEW_WORK_DISCOVERED, authored_by=goldfive,
 severity=INFO)` triples.
 
-## 5. Async ordering invariants (the tricky part)
+## 5. Install path — lock-acquiring synchronous growth
 
 `_maybe_pin_delegation_task` runs synchronously inside ADK's
 `before_tool_callback`. The synchronous contract: by the time the
@@ -337,7 +447,7 @@ callback returns, the `delegation_observed` event must carry a stable
 re-entrant only via the same task (asyncio's `Lock` is not reentrant —
 attempting to acquire from within a holder deadlocks).
 
-We considered three options for the install path.
+We considered four options for the install path.
 
 ### Option A — `task_id=DISCOVERY_PENDING` sentinel + back-fill
 
@@ -367,73 +477,119 @@ from the racing revision write but does NOT teach them that the task
 is about to appear — they observe the pre-revision plan and treat the
 delegation as belonging to no plan task.
 
-### Option C — synchronous plan growth via a lighter-weight code path *(chosen)*
+### Option C — lock-free synchronous plan growth (REJECTED)
 
-`_maybe_pin_delegation_task` performs the plan swap synchronously
-inside the existing `channel_processor_active()` envelope, the same
-way the assignee-stamp swap does today. The discovery write does NOT
-acquire the per-session plan lock and does NOT route through
-`PlanReviser._emit_plan_revised`'s full mutation pipeline. Instead:
+An earlier draft of this doc proposed performing the plan swap
+synchronously inside `channel_processor_active()` but **without**
+acquiring `_get_plan_lock`, on the theory that the discovery write
+mutates only an additive shape (new task, no supersedes, no
+current_task_id migration) and so cannot tear an existing reader.
+
+**Why we rejected it.** A concurrent refine on the same session can
+be mid-flight inside `Planner.refine` reading `session.plan` to decide
+its revision shape — even in observation mode, where the refine still
+runs and produces a `dry_run=True` revision so the drift dataset is
+complete. The race is exactly the partial-apply window fixed in
+**#403**:
+
+1. Refine A reads `session.plan` at revision N (no discovered task).
+2. Descriptive-growth write B swaps `session.plan` to revision N+1
+   (adds discovered task `T_d`).
+3. Refine A finishes computing its revision against the prior it
+   sampled in step 1, calls `install_revision_for_drift` with
+   `revision_index=N+1`, validation passes against the now-stale
+   prior, and the write lands — **clobbering `T_d`.**
+
+#403's lesson was crisp: **single writer, inside the lock, full stop.**
+The descriptive-growth write is a writer; it MUST acquire the lock.
+The argument that the discovery shape is "additive only" is the same
+shape of argument that almost shipped #403 unfixed — the
+"additive-only" reasoning ignores the read-side races on the prior
+revision_index that lock acquisition exists to serialise.
+
+The "additive only" claim is also wrong on closer inspection: the
+discovery write bumps `revision_index`, and any concurrent refine that
+samples the pre-bump index will validate against a stale prior. The
+clobber risk is identical to #403's partial-apply window.
+
+### Option D — lock-acquiring synchronous plan growth *(chosen)*
+
+`_maybe_pin_delegation_task` performs the discovery write
+synchronously inside the ADK callback, but **acquires the per-session
+plan lock** for the swap window. This is the same contract
+`PlanReviser._emit_plan_revised` honours (post-#403): single writer,
+inside the lock, full stop.
 
 1. Synchronously, inside `_maybe_pin_delegation_task` (still in the
-   ADK callback):
+   ADK callback), acquire `_get_plan_lock(session.id)` for the
+   duration of the swap. Inside the lock:
+   - Re-read `session.plan` (the lock acquisition is the linearisation
+     point — any concurrent refine has either completed before this
+     read or is queued behind it).
+   - Run the dedup check from §6 against the post-lock plan; if a
+     prior discovery write or refine already added the matching
+     `(agent_name, args-token-set)` task, pin to it and skip growth.
    - Build the new `Plan` via `add_tasks(plan, [discovered_task])` +
      `bump_revision(...)`. No edges added (the discovered task is an
      independent sub-DAG root by construction — it has no DAG
      predecessors; rule 7 allows this because the predecessor set is
      empty).
    - Swap the live ref via `set_session_plan(session, new_plan)` inside
-     `channel_processor_active()`.
+     `channel_processor_active()` (the channel-processor envelope is
+     orthogonal to the plan lock; both apply).
    - Stamp `session.current_task_id = discovered.id` and the
      `StateStore` pin.
-2. After the callback returns, schedule a fire-and-forget task that
-   emits the paired `PlanRevised` + `DriftDetected` correlation envelopes
-   via `PlanReviser._emit_plan_revised_correlation` (which does NOT
-   acquire the lock and does NOT re-swap `session.plan` — it is purely
-   the wire-emit half of the pipeline).
+2. Release the lock.
+3. Emit the paired `PlanRevised` + `DriftDetected` envelopes. The
+   emit can be fire-and-forget (off-lock) because the snapshot it
+   carries was captured inside the lock and cannot tear.
 
-Why this is safe:
+Both **steering mode and observation mode** acquire the lock. Refines
+run in observation mode too — they emit `dry_run=True` revisions for
+the drift dataset — so the read-then-write race exists identically in
+both modes.
 
-- **No lock contention.** The discovery write does not contend with
-  refines because refines that land on the same revision_index are
-  rejected by the validator (rule 5/6) and refines that land at N+1
-  see the discovery-augmented plan as their `prior` — they preserve
-  the discovered task via the terminal-preservation rule once it
-  reaches a terminal status, and they may freely modify or supersede
-  it while it is non-terminal.
+Why this is safe (and why the §6 dedup design needs the lock):
+
+- **No clobber by concurrent refine.** A refine cannot complete its
+  install against revision N while the discovery write holds the lock
+  on revision N. The refine either lands first (the discovery write
+  then re-reads inside the lock, dedups or grows against the refined
+  plan) or queues behind (the refine then sees the post-discovery plan
+  as its prior, preserves `T_d` via the immutable-on-supersedes
+  contract, and validates cleanly).
 - **No partial apply visible to `_wait_plan_stable` callers.** The
   swap is atomic at the `ContextVar`-protected `set_session_plan`
-  call. A reader either sees revision N (no discovered task) or
-  revision N+1 (discovered task installed) — never a half-swapped
-  state.
+  call AND serialised behind the lock the read-side barrier
+  acquire-then-releases. A reader either sees revision N (no
+  discovered task) or revision N+1 (discovered task installed) —
+  never a half-swapped state.
+- **Dedup is consistent.** The §6 dedup check needs to read
+  `session.plan.tasks` to find a prior matching discovered task; that
+  read must happen inside the lock to be linearisable against
+  concurrent discoveries (two delegations of the same
+  `(agent, args-token-set)` arriving simultaneously would otherwise
+  each mint a fresh discovered task).
 - **The supersedes-integration / current_task_id repin / pending-
-  corrections sites are not needed.** A freshly-minted PENDING task
-  has no supersedes link, no prior pin to migrate from (the pin moves
-  TO it), and no pending-corrections entries. The skipped pipeline
-  steps are no-ops on a discovery shape by construction.
-- **Idempotency.** A discovery write is keyed by the mint function's
-  output; the mint function uses `uuid4` so two concurrent delegations
-  from the same agent never collide. The pin write itself is
-  idempotent on `current_task_id` (set_pin_current_task no-ops on
-  equality).
+  corrections sites are still no-ops on the discovery shape.** The
+  helper inlines the small slice of `_emit_plan_revised` that applies
+  (validate, swap, watermark, pin) and skips the rest. The lock
+  acquisition is what gives us the same correctness guarantee — not
+  the full pipeline.
 
-What we lose by skipping `_emit_plan_revised`:
+#### 5.0.1 Synchronous-emit budget
 
-- Supersedes-integration runs (no-op).
-- `clear_obsolete_corrections_on_revision` runs (no-op — no corrections
-  reference the new id).
-- `queue_corrections_for_revision` runs (no-op — discovered tasks have
-  no supersedes_kind CORRECT links).
-- `_repin_current_task_on_supersedes` runs (no-op — no supersedes
-  links on the discovered task).
-- Cross-revision diff is computed by the correlation envelope, not the
-  primary envelope. Sinks consuming `PlanRevised.diff` see the discovered
-  task in `added_task_ids` regardless of which emit path it came from.
+Lock acquisition adds latency to the ADK callback. The lock is
+contended only with refines on the same session; in the cherry-tree
+session (§2.1) refines fire on the order of seconds, not milliseconds,
+and the discovery write inside the lock is dominated by the
+`add_tasks` + `bump_revision` allocations (sub-millisecond). The
+post-lock emit is fire-and-forget. Net expected callback cost in the
+common case: <5ms; worst case (lock contended behind a refine):
+<100ms (one refine cycle), still bounded by the refine's own timeout.
 
-The correlation-envelope emit must NOT acquire the plan lock either —
-this is a hard contract. It runs after the in-line swap; if a refine
-fires concurrently it lands at revision_index N+2 and the correlation
-envelope emit at N+1 stays consistent with the snapshot it captured.
+The synchronous-emit cost is what we pay to honour #403. It is worth
+it.
 
 ### 5.1 The new write helper
 
@@ -444,34 +600,51 @@ async def install_descriptive_growth(
     *,
     session: Session,
     new_task: Task,
-) -> bool:
-    """Install a discovered task synchronously.
+    identity_hash: str,
+) -> tuple[Plan, bool]:
+    """Install a discovered task synchronously, under the plan lock.
 
-    Bypasses the full _emit_plan_revised pipeline (supersedes
-    integration, pending-corrections GC, current_task_id repin) which
-    are no-ops on the discovery shape by construction. The plan swap
-    is performed under channel_processor_active() but NOT under the
-    plan lock — see PLAN-DESCRIPTIVE-GROWTH.md §5.
+    Acquires _get_plan_lock(session.id) for the swap window. Inside
+    the lock:
+      1. Re-reads session.plan (linearisation point).
+      2. Runs the §6 dedup check against identity_hash. If a prior
+         discovered task with the same hash exists, returns
+         (existing_plan, False) and the caller pins to the existing
+         task.
+      3. Otherwise builds the new Plan via add_tasks + bump_revision,
+         swaps under channel_processor_active(), stamps the pin, and
+         returns (new_plan, True).
 
-    Schedules the paired PlanRevised + DriftDetected emit as a
-    fire-and-forget task so the caller (the ADK before_tool_callback)
-    can return synchronously.
+    The paired PlanRevised + DriftDetected emit is scheduled
+    off-lock as fire-and-forget; the snapshot it carries is captured
+    inside the lock and cannot tear.
+
+    Lock contract: single writer inside the lock, post-#403. See
+    PLAN-DESCRIPTIVE-GROWTH.md §5 Option D for rationale.
     """
 ```
 
 The helper is called directly from `_maybe_pin_delegation_task`. The
-synchronous-emit decision is encoded by the helper, not the caller.
+lock-acquisition decision is encoded by the helper, not the caller.
 
-### 5.2 Test plan for the async contract
+### 5.2 Test plan for the lock contract
 
 Required tests (impl PR 2):
 
-- Concurrent discovery + refine: a `NEW_WORK_DISCOVERED`-synthesised
+- **Concurrent refine + discovery race test** (analogous to #413's
+  partial-apply window test): a `NEW_WORK_DISCOVERED`-synthesised
   growth racing with a planner-authored refine targeting the same
-  prior revision_index lands one or the other deterministically (the
-  loser observes the winner's plan as `prior` and re-validates).
+  prior revision_index lands one or the other deterministically. The
+  loser observes the winner's plan as `prior` and re-validates.
+  Assert: no torn read of `session.plan`, no clobbered discovery
+  (the discovered task survives to the final plan), no half-revision
+  visible to `_wait_plan_stable` callers (every observed plan has
+  either revision N or N+1 — never an in-between).
 - `_wait_plan_stable` callers crossing a discovery write observe
   either the pre-discovery or post-discovery plan — never a torn read.
+- Dedup under concurrent discoveries: two delegations of the same
+  `(agent, args-token-set)` arriving simultaneously produce one
+  discovered task (the second pins to the first; no duplicate growth).
 - Pin idempotency under multiple deliveries of the same delegation.
 
 ## 6. Steering mode vs observation mode
@@ -585,8 +758,8 @@ refines do not happen.
 
 | PR | Scope | Behind flag |
 |---|---|---|
-| 1 | `Task.discovered: bool` field + `Plan.validate` update (no rule change; just opaque metadata) + state-store migration (proto field + harmonograf-side schema bump) | n/a — additive |
-| 2 | `_maybe_pin_delegation_task` fallback to discovery + `PlanReviser.install_descriptive_growth` helper + the §5.2 test suite | `GOLDFIVE_PLAN_DESCRIPTIVE_GROWTH=1` |
+| 1 | `Task.discovered: bool` + `Task.discovery_identity_hash: str` fields + `Plan.validate` update (no rule change; just opaque metadata) + state-store migration (proto fields + harmonograf-side schema bump). The PR 1 author MUST validate the §11.1.1 cherry-tree dedup numbers before locking in the hash-field schema. | n/a — additive |
+| 2 | `_maybe_pin_delegation_task` fallback to discovery + `PlanReviser.install_descriptive_growth` helper (§5 Option D, lock-acquiring) + §5.2 test plan + **§11.6 regression race test** (mandatory acceptance criterion) + tracking issue cross-link to #413 for the test template | `GOLDFIVE_PLAN_DESCRIPTIVE_GROWTH=1` |
 | 3 | Harmonograf-side rendering of discovered tasks (badge, separate visualisation lane, drift filter) | flag-gated |
 | 4 | Retire `CAPABILITY_MISMATCH` Rule C (4a soft, 4b hard) | flag → default-on |
 | 5 | Docs: update PLAN-LIFECYCLE.md (revision-cascade §4.5 covers discovery), DRIFT.md (Rule C retirement), this design doc (mark Implemented) | n/a |
@@ -636,23 +809,69 @@ gets refine requests it cannot productively answer.
 
 ## 11. Open questions
 
-### 11.1 Granularity: per-delegation vs per-agent-task pair
+### 11.1 Granularity: per-delegation vs per-(agent, args-token-set) — RESOLVED
+
+**Resolution: per-(agent, args-token-set).**
 
 If the coordinator delegates to `debugger_agent` 20 times in one run,
-do we synthesise 20 discovered tasks or 1?
+we synthesise **one** discovered task, not 20. The dedup key is the
+`discovery_identity_hash(agent_name, tool_args)` defined in §4.3.0:
+the first delegation mints the task; subsequent delegations whose
+args-token-set hashes to the same value re-pin to the existing task.
 
-- **Per-delegation (1-to-1).** Conceptually clean — the DAG node count
-  matches the delegation count. Plan grows large on chatty
-  coordinators.
-- **Per-(agent, task-prefix) (deduplicated).** First delegation to
-  `debugger_agent` mints `T1d`; subsequent delegations with similar
-  `tool_args` re-pin to `T1d` instead of growing the plan. Match
-  predicate is the same Tier 2 stem + Tier 3 args-overlap pair.
+**TTL.** The hash entry survives "until the discovered task reaches
+a terminal status" so the plan does not grow unboundedly. Once
+terminal, a fresh delegation with the same hash is a genuinely new
+unit of work and grows the plan again.
 
-Tentative resolution: **per-(agent, args-token-set)** with a TTL of
-"until the discovered task reaches terminal" so the plan does not
-grow unboundedly. Final answer in impl PR 2 after we measure on the
-cherry-tree session.
+**Rationale.**
+
+- **UX.** Per-delegation would have grown the cherry-tree plan (§2.1)
+  to >20 discovered tasks dominated by the debugger's retry storm,
+  which is closer to noise than signal. Per-(agent, args-token-set)
+  collapses to a small constant per behavior — measured on session
+  `2d27ff4a`, the 10 observed delegations dedup to 5 unique
+  `(agent, args-token-set)` tuples (research=1, web_developer=2,
+  reviewer=1, debugger=1 — see the §2.1 validation note).
+- **Drift signal preserved.** Per-call content-divergence drift
+  (OFF_TOPIC, LOOPING_REASONING) still fires per-delegation against
+  the reasoning content of each call; the dedup only collapses the
+  structural growth event, not the observational stream. Operators
+  still see every off-goal call in the drift timeline.
+- **Consistency with refine cascade.** The hash carries across
+  refines (§4.3.0 "Cross-refine survival"), so a planner that
+  consolidates a discovered task into the forecast does not break
+  dedup for subsequent delegations.
+
+The implementation note for PR 2: the dedup check runs inside the
+plan lock (§5 Option D) so two simultaneous delegations of the same
+`(agent, args-token-set)` cannot both grow the plan — the second
+reads the post-lock plan and finds the first's discovered task.
+
+#### 11.1.1 Validation against real data
+
+Before PR 1 locks in the `Task.discovery_identity_hash` schema, the
+PR 1 author MUST validate the dedup decision against the actual
+session `2d27ff4a` delegation arg-sets:
+
+1. Query `goldfive_events` for `delegation_observed` events in the
+   session.
+2. Extract the per-call `(to_agent, args-token-set)` (the
+   `delegation_observed.task_id` field is the post-pin task id and is
+   a reasonable proxy for the args-token-set, since the existing pin
+   already groups by args overlap; for novel discovered tasks PR 2's
+   dedup operates on `tool_args` directly).
+3. Confirm the dedup produces a small constant (target: ≤2 unique
+   tuples per agent in the cherry-tree shape).
+
+The 2026-05-13 validation against session `2d27ff4a` measured 5
+unique tuples across 10 delegations — well within the target. The
+schema is good to lock in.
+
+If a future investigation finds >5 unique tuples per agent on a
+single run (i.e., the dedup is too fine), revisit the
+`_normalize_args_tokens` design — broader normalisation (stemming,
+synonym collapse) is the lever, not a coarser granularity choice.
 
 ### 11.2 Plan-validate invariants: do discovered tasks have predecessor edges?
 
@@ -713,6 +932,38 @@ this — discovered-task delegations count against the same cap. A
 chatty coordinator hitting the cap still triggers the structural
 break-glass.
 
+### 11.6 PR 2 acceptance: regression race test for the lock contract
+
+PR 2 MUST land a regression test analogous to **#413's** partial-apply
+race test. The test asserts the §5 Option D lock contract under
+concurrent refine + discovery pressure:
+
+- **Setup.** Synthesise a session with a planner-authored plan at
+  revision N. Launch two concurrent coroutines:
+  1. A `Planner.refine` call that reads `session.plan`, computes a
+     `CORRECT`-shaped revision, and calls `install_revision_for_drift`.
+  2. A `_maybe_pin_delegation_task` call that misses tier 1/2 and
+     falls through to `install_descriptive_growth`.
+- **Assertions.**
+  - No torn read: every observation of `session.plan` (via a third
+    observer coroutine sampling at a high rate) carries either
+    revision N or revision N+1 or revision N+2 — never an in-between
+    state with a partially-applied diff.
+  - No clobbered discovery: if the discovery write lands first, the
+    refine's prior is the post-discovery plan, the discovered task
+    survives into N+2.
+  - No clobbered refine: if the refine lands first, the discovery
+    write re-reads inside the lock, dedups if applicable, and grows
+    against the refined plan; the refine's tasks survive into N+2.
+  - `_wait_plan_stable` callers crossing either write observe a
+    consistent plan (no half-revision).
+  - Dedup linearisability: two concurrent discoveries with the same
+    `discovery_identity_hash` produce one discovered task, not two.
+
+The test is a hard acceptance criterion for PR 2 — without it, the
+lock-contract claim in §5 is unenforced. Use #413's test fixture as
+the template.
+
 ## 12. References
 
 ### Issues
@@ -733,7 +984,10 @@ break-glass.
 - `#249` — Actor-model channel processor (the single-writer envelope
   `set_session_plan` enforces).
 - `#403` — Partial-apply window in `_emit_plan_revised` (the lock
-  contract §5 carefully does NOT contend with).
+  contract §5 Option D explicitly aligns with: single writer,
+  inside the lock, full stop).
+- `#413` — Concurrent-refine regression test fixture (the template
+  PR 2's §11.6 race test is built from).
 
 ### Sessions
 
