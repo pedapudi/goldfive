@@ -59,7 +59,7 @@ import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from goldfive import orchestration_state as _ostate
+from goldfive import state_store as _ostate
 from goldfive.types import (
     TERMINAL_TASK_STATUSES,
     DriftEvent,
