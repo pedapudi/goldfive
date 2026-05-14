@@ -3,8 +3,9 @@
 iter-10 PR 2. Pins the contract that
 :func:`goldfive.adapters._adk_plugin._GoldfiveADKPlugin.after_tool_callback`
 and :meth:`_GoldfiveADKPlugin.on_tool_error_callback` write into
-``session.recent_tool_observations`` via the steerer's
-``note_tool_observation`` method.
+the ``tool_observed`` subset of ``session.recent_events`` (goldfive#239 —
+the unified buffer that replaced ``recent_tool_observations``) via the
+steerer's ``note_tool_observation`` method.
 
 Three integration cases:
 
@@ -37,7 +38,24 @@ pytestmark = pytest.mark.skipif(
 
 pytest.importorskip("google.adk")
 
-from goldfive.types import DriftEvent, Session, Task  # noqa: E402
+from goldfive.types import (  # noqa: E402
+    RECENT_EVENT_KIND_TOOL_OBSERVED,
+    DriftEvent,
+    Session,
+    Task,
+    filter_recent_events_by_kind,
+)
+
+
+def _tool_obs(session: Session) -> list[dict[str, Any]]:
+    """Pre-merge ``session.recent_tool_observations`` accessor.
+
+    Goldfive#239: the dedicated buffer was merged into ``recent_events``;
+    test assertions filter back to the ``tool_observed`` kind.
+    """
+    return filter_recent_events_by_kind(
+        session.recent_events, RECENT_EVENT_KIND_TOOL_OBSERVED
+    )
 
 # ---------------------------------------------------------------------------
 # Stubs — minimal surface that mirrors what the live ADK runtime gives us.
@@ -150,8 +168,8 @@ async def test_after_tool_callback_records_observation() -> None:
         tool=tool, tool_args=args, tool_context=tool_ctx, result=result
     )
 
-    assert len(session.recent_tool_observations) == 1
-    entry = session.recent_tool_observations[0]
+    assert len(_tool_obs(session)) == 1
+    entry = _tool_obs(session)[0]
     assert entry["tool_name"] == "web_search"
     assert entry["is_error"] is False
     assert entry["error_message"] == ""
@@ -179,8 +197,8 @@ async def test_after_tool_callback_uses_pinned_agent_id_when_set() -> None:
         result={"ok": True},
     )
 
-    assert len(session.recent_tool_observations) == 1
-    entry = session.recent_tool_observations[0]
+    assert len(_tool_obs(session)) == 1
+    entry = _tool_obs(session)[0]
     # Pin wins over the ADK-resolved ``parent`` name.
     assert entry["agent_name"] == "delegated_child"
     # And the task pin from iter-9 wins over ctx.task.id.
@@ -213,8 +231,8 @@ async def test_after_tool_callback_records_error_result() -> None:
         result=err_result,
     )
 
-    assert len(session.recent_tool_observations) == 1
-    entry = session.recent_tool_observations[0]
+    assert len(_tool_obs(session)) == 1
+    entry = _tool_obs(session)[0]
     assert entry["is_error"] is True
     assert entry["error_message"] == "missing_task_id"
     assert entry["tool_name"] == "report_task_started"
@@ -239,8 +257,8 @@ async def test_on_tool_error_callback_records_observation() -> None:
         error=RuntimeError("upstream 500"),
     )
 
-    assert len(session.recent_tool_observations) == 1
-    entry = session.recent_tool_observations[0]
+    assert len(_tool_obs(session)) == 1
+    entry = _tool_obs(session)[0]
     assert entry["is_error"] is True
     assert "upstream 500" in entry["error_message"]
     assert entry["tool_name"] == "web_search"
@@ -266,7 +284,7 @@ async def test_on_tool_error_callback_uses_pinned_agent_id_when_set() -> None:
         error=RuntimeError("boom"),
     )
 
-    entry = session.recent_tool_observations[0]
+    entry = _tool_obs(session)[0]
     assert entry["agent_name"] == "child"
 
 
@@ -298,7 +316,7 @@ async def test_observation_does_not_break_on_buffer_failure_after_tool() -> None
 
     # Buffer is empty (the writer raised before appending) but no
     # exception escaped the callback.
-    assert session.recent_tool_observations == []
+    assert _tool_obs(session) == []
 
 
 async def test_observation_does_not_break_on_buffer_failure_on_error() -> None:
@@ -322,7 +340,7 @@ async def test_observation_does_not_break_on_buffer_failure_on_error() -> None:
         error=RuntimeError("upstream 500"),
     )
 
-    assert session.recent_tool_observations == []
+    assert _tool_obs(session) == []
     # The original ``observe(observation, session)`` path still fires.
     assert len(steerer.observations) == 1
 
@@ -354,7 +372,7 @@ async def test_after_tool_callback_no_observation_when_steerer_lacks_writer() ->
         result={"ok": True},
     )
     # Buffer untouched, no exception.
-    assert session.recent_tool_observations == []
+    assert _tool_obs(session) == []
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +409,7 @@ async def test_after_tool_callback_writes_across_task_boundaries() -> None:
         result={"ok": True},
     )
 
-    task_ids = [e["task_id"] for e in session.recent_tool_observations]
-    tool_names = [e["tool_name"] for e in session.recent_tool_observations]
+    task_ids = [e["task_id"] for e in _tool_obs(session)]
+    tool_names = [e["tool_name"] for e in _tool_obs(session)]
     assert task_ids == ["ta", "tb"]
     assert tool_names == ["tool_a", "tool_b"]

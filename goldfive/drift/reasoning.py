@@ -53,7 +53,13 @@ from goldfive.drift.reasoning_judge import (
     classify_reasoning_drift,  # noqa: F401 — re-export consumed by tests
     classify_reasoning_drift_with_focus,
 )
-from goldfive.types import DriftEvent, DriftKind, DriftSeverity
+from goldfive.types import (
+    RECENT_EVENT_KIND_TOOL_OBSERVED,
+    DriftEvent,
+    DriftKind,
+    DriftSeverity,
+    filter_recent_events_by_kind,
+)
 
 if TYPE_CHECKING:
     from goldfive.config import ReasoningDriftConfig
@@ -1017,10 +1023,21 @@ async def _run_judge_with_focus(
     task = _current_task(session)
     # iter-10 PR 3: surface lineage + recent tool observations to the
     # judge as additional context. ``task_lineage`` was added in iter-9
-    # (#344); ``recent_tool_observations`` was added in iter-10 PR 2
+    # (#344); recent tool observations were added in iter-10 PR 2
     # (#347). Both are passed by attribute lookup so older Session
     # snapshots without the fields still parse cleanly (the helpers
     # treat None as "no data").
+    # Goldfive#239: the dedicated ``recent_tool_observations`` buffer
+    # was merged into :attr:`Session.recent_events`; filter to the
+    # ``tool_observed`` kind here so the judge prompt sees the same
+    # subset it saw pre-merge (the kwarg name is preserved for the
+    # public ``classify_reasoning_drift*`` API).
+    recent_events_attr = getattr(session, "recent_events", None)
+    tool_obs = (
+        filter_recent_events_by_kind(recent_events_attr, RECENT_EVENT_KIND_TOOL_OBSERVED)
+        if recent_events_attr
+        else None
+    )
     return await classify_reasoning_drift_with_focus(
         reasoning=text,
         task=task,
@@ -1035,7 +1052,7 @@ async def _run_judge_with_focus(
         session_id=session.id,
         sequence_fn=session.next_sequence,
         task_lineage=getattr(session, "task_lineage", None),
-        recent_tool_observations=getattr(session, "recent_tool_observations", None),
+        recent_tool_observations=tool_obs,
         available_agents=available_agents,
     )
 

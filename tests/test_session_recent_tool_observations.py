@@ -1,15 +1,21 @@
-"""Unit tests for ``Session.recent_tool_observations`` + steerer writer.
+"""Unit tests for the ``tool_observed`` subset of ``Session.recent_events``
++ the steerer writer.
 
-iter-10 PR 2. The buffer feeds the three-state reasoning judge (PR 3)
-so it can distinguish a provoked deviation (the agent saw a tool error
-or surprising result and pivoted) from an unprovoked one.
+iter-10 PR 2 originally added a dedicated ``recent_tool_observations``
+buffer. Goldfive#239 merged it into the unified ``recent_events``
+buffer; this module pins the same writer contract against the new
+storage. The buffer feeds the three-state reasoning judge (PR 3) so it
+can distinguish a provoked deviation (the agent saw a tool error or
+surprising result and pivoted) from an unprovoked one.
 
 These tests pin the writer contract:
 
-* :meth:`DefaultSteerer.note_tool_observation` appends one entry per
-  call.
-* The buffer is bounded by ``session.recent_tool_observations_max``
-  with trim-on-write — newest wins, oldest dropped.
+* :meth:`DefaultSteerer.note_tool_observation` appends one
+  ``tool_observed`` entry per call to ``session.recent_events``.
+* The ``tool_observed`` subset is bounded by
+  ``session.recent_tool_observations_max`` with trim-on-write — newest
+  wins, oldest dropped. Other kinds in ``recent_events`` are NOT
+  evicted (goldfive#239 per-kind-class trim).
 * The error path is detected from either an explicit ``error=`` kwarg
   (the ``on_tool_error_callback`` shape) or from a ``{"error": ...}``
   dict ``result`` (the acknowledged-failure shape).
@@ -18,7 +24,7 @@ These tests pin the writer contract:
 * Unhashable / unrepresentable args + results are repr-shaped and do
   not raise out of the writer.
 
-PR 3 wires the judge prompt to read from this buffer; this PR ships
+PR 3 wires the judge prompt to read from this buffer; this module ships
 only the population path.
 """
 
@@ -37,11 +43,27 @@ pytestmark = pytest.mark.skipif(
 )
 
 from goldfive.steerer import DefaultSteerer  # noqa: E402
-from goldfive.types import Session  # noqa: E402
+from goldfive.types import (  # noqa: E402
+    RECENT_EVENT_KIND_TOOL_OBSERVED,
+    Session,
+    filter_recent_events_by_kind,
+)
 
 
 def _make_session() -> Session:
     return Session(run_id="r-iter10-pr2")
+
+
+def _tool_obs(session: Session) -> list[dict[str, Any]]:
+    """Return the ``tool_observed`` subset of ``session.recent_events``.
+
+    Goldfive#239: convenience wrapper around the unified buffer's
+    by-kind filter so the assertion shape mirrors the pre-merge
+    ``session.recent_tool_observations`` access pattern.
+    """
+    return filter_recent_events_by_kind(
+        session.recent_events, RECENT_EVENT_KIND_TOOL_OBSERVED
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -63,10 +85,13 @@ def test_note_tool_observation_appends() -> None:
         result={"results": ["fact a", "fact b"]},
     )
 
-    assert len(session.recent_tool_observations) == 1
-    entry = session.recent_tool_observations[0]
-    # Spec-mandated keys.
+    tool_obs = _tool_obs(session)
+    assert len(tool_obs) == 1
+    entry = tool_obs[0]
+    # Spec-mandated keys (goldfive#239 added ``kind`` as the buffer
+    # discriminator).
     assert set(entry.keys()) == {
+        "kind",
         "ts_ms",
         "agent_name",
         "task_id",
@@ -76,6 +101,7 @@ def test_note_tool_observation_appends() -> None:
         "is_error",
         "error_message",
     }
+    assert entry["kind"] == RECENT_EVENT_KIND_TOOL_OBSERVED
     assert isinstance(entry["ts_ms"], int)
     assert entry["agent_name"] == "planner"
     assert entry["task_id"] == "t1"
@@ -101,7 +127,7 @@ def test_note_tool_observation_records_none_result_as_marker() -> None:
         result=None,
     )
 
-    entry = session.recent_tool_observations[0]
+    entry = _tool_obs(session)[0]
     assert entry["result_preview"] == "(none)"
     # No error signal in this path — None is just an absent result.
     assert entry["is_error"] is False
@@ -133,7 +159,7 @@ def test_note_tool_observation_trims_to_max() -> None:
             result={"i": i},
         )
 
-    hist = session.recent_tool_observations
+    hist = _tool_obs(session)
     assert len(hist) == cap
     # Oldest five (a0..a4) dropped; a5..a20 retained, oldest first.
     assert [e["agent_name"] for e in hist] == [f"a{i}" for i in range(5, cap + 5)]
@@ -155,8 +181,9 @@ def test_note_tool_observation_respects_session_local_max_override() -> None:
             result={},
         )
 
-    assert len(session.recent_tool_observations) == 3
-    assert [e["agent_name"] for e in session.recent_tool_observations] == ["a5", "a6", "a7"]
+    hist = _tool_obs(session)
+    assert len(hist) == 3
+    assert [e["agent_name"] for e in hist] == ["a5", "a6", "a7"]
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +206,7 @@ def test_note_tool_observation_records_error_path() -> None:
         error=Exception("boom"),
     )
 
-    entry = session.recent_tool_observations[0]
+    entry = _tool_obs(session)[0]
     assert entry["is_error"] is True
     assert entry["error_message"] == "boom"
 
@@ -198,7 +225,7 @@ def test_note_tool_observation_records_error_dict_result() -> None:
         result={"acknowledged": False, "error": "tool failed: 503"},
     )
 
-    entry = session.recent_tool_observations[0]
+    entry = _tool_obs(session)[0]
     assert entry["is_error"] is True
     assert entry["error_message"] == "tool failed: 503"
 
@@ -218,7 +245,7 @@ def test_note_tool_observation_record_error_string() -> None:
         error="upstream 500",
     )
 
-    entry = session.recent_tool_observations[0]
+    entry = _tool_obs(session)[0]
     assert entry["is_error"] is True
     assert entry["error_message"] == "upstream 500"
 
@@ -239,7 +266,7 @@ def test_note_tool_observation_truncates_long_error_messages() -> None:
         error=long,
     )
 
-    entry = session.recent_tool_observations[0]
+    entry = _tool_obs(session)[0]
     assert len(entry["error_message"]) == 240
 
 
@@ -262,7 +289,7 @@ def test_note_tool_observation_truncates_args_preview() -> None:
         result={"ok": True},
     )
 
-    entry = session.recent_tool_observations[0]
+    entry = _tool_obs(session)[0]
     assert len(entry["args_preview"]) <= 240
 
 
@@ -280,7 +307,7 @@ def test_note_tool_observation_truncates_result_preview() -> None:
         result={"data": "a" * 1000},
     )
 
-    entry = session.recent_tool_observations[0]
+    entry = _tool_obs(session)[0]
     assert len(entry["result_preview"]) <= 480
 
 
@@ -304,8 +331,9 @@ def test_note_tool_observation_handles_unhashable_args() -> None:
         result={"ok": True},
     )
 
-    assert len(session.recent_tool_observations) == 1
-    entry = session.recent_tool_observations[0]
+    tool_obs = _tool_obs(session)
+    assert len(tool_obs) == 1
+    entry = tool_obs[0]
     # repr of object() shape is "<object object at 0x...>" — sanity-check
     # that we ran repr at all.
     assert entry["args_preview"].startswith("{")
@@ -329,8 +357,9 @@ def test_note_tool_observation_handles_repr_failure_in_args() -> None:
         result={"ok": True},
     )
 
-    assert len(session.recent_tool_observations) == 1
-    entry = session.recent_tool_observations[0]
+    tool_obs = _tool_obs(session)
+    assert len(tool_obs) == 1
+    entry = tool_obs[0]
     assert entry["args_preview"] == "(unrepresentable args)"
 
 
@@ -365,7 +394,7 @@ def test_note_tool_observation_swallows_internal_errors() -> None:
         )
 
     # And: the buffer is left untouched (no half-written entry).
-    assert session.recent_tool_observations == []
+    assert _tool_obs(session) == []
 
 
 def test_note_tool_observation_zero_max_clamps_to_one() -> None:
@@ -388,8 +417,9 @@ def test_note_tool_observation_zero_max_clamps_to_one() -> None:
             result={},
         )
 
-    assert len(session.recent_tool_observations) == 1
-    assert session.recent_tool_observations[0]["agent_name"] == "a2"
+    tool_obs = _tool_obs(session)
+    assert len(tool_obs) == 1
+    assert tool_obs[0]["agent_name"] == "a2"
 
 
 # ---------------------------------------------------------------------------
@@ -397,10 +427,10 @@ def test_note_tool_observation_zero_max_clamps_to_one() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_session_default_recent_tool_observations_is_empty_list() -> None:
+def test_session_default_recent_events_is_empty_list() -> None:
     """Bare ``Session(run_id=...)`` constructions get an empty buffer."""
     session = Session(run_id="r")
-    assert session.recent_tool_observations == []
+    assert session.recent_events == []
     assert session.recent_tool_observations_max == 16
 
 
@@ -408,8 +438,8 @@ def test_two_sessions_have_independent_buffers() -> None:
     """The mutable-default-list classic gotcha must not bite us."""
     s1 = Session(run_id="r1")
     s2 = Session(run_id="r2")
-    s1.recent_tool_observations.append({"sentinel": True})
-    assert s2.recent_tool_observations == []
+    s1.recent_events.append({"sentinel": True})
+    assert s2.recent_events == []
 
 
 def test_note_tool_observation_per_task_filter_left_to_reader() -> None:
@@ -440,7 +470,7 @@ def test_note_tool_observation_per_task_filter_left_to_reader() -> None:
         result={},
     )
 
-    task_ids = [e["task_id"] for e in session.recent_tool_observations]
+    task_ids = [e["task_id"] for e in _tool_obs(session)]
     assert task_ids == ["t1", "t2"]
 
 
@@ -464,7 +494,7 @@ def test_note_tool_observation_ts_ms_is_monotonic() -> None:
             result={},
         )
 
-    ts_values: list[int] = [int(e["ts_ms"]) for e in session.recent_tool_observations]
+    ts_values: list[int] = [int(e["ts_ms"]) for e in _tool_obs(session)]
     assert ts_values == sorted(ts_values)
 
 
@@ -485,8 +515,9 @@ def test_note_tool_observation_handles_none_args() -> None:
         args=None,
         result={"ok": True},
     )
-    assert len(session.recent_tool_observations) == 1
-    assert session.recent_tool_observations[0]["args_preview"] == "None"
+    tool_obs = _tool_obs(session)
+    assert len(tool_obs) == 1
+    assert tool_obs[0]["args_preview"] == "None"
 
 
 def test_note_tool_observation_with_string_result() -> None:
@@ -501,7 +532,7 @@ def test_note_tool_observation_with_string_result() -> None:
         args={},
         result="hello world",
     )
-    entry = session.recent_tool_observations[0]
+    entry = _tool_obs(session)[0]
     assert "hello world" in entry["result_preview"]
     assert entry["is_error"] is False
 
@@ -525,4 +556,4 @@ def test_writer_accepts_arbitrary_any_types() -> None:
         args=arbitrary,
         result=arbitrary,
     )
-    assert len(session.recent_tool_observations) == 1
+    assert len(_tool_obs(session)) == 1
