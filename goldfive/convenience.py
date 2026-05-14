@@ -342,7 +342,7 @@ def wrap(
     # meaningful for ADK agents (LlmAgent has the ``instruction``
     # field); the installer is a no-op on other tree shapes.
     if is_adk_agent(agent):
-        from goldfive.adapters._adk_dynainst import (
+        from goldfive.adapters.adk_llm_instrumentation import (
             install_dynamic_instructions,
             log_dynamic_instruction_opt_out,
         )

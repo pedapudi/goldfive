@@ -10,7 +10,8 @@ caller-supplied prompt the coordinator was constructed with.
 Before this module the gate logic was hand-rolled at each of the four
 sites: a ``_observation_only_active`` helper in
 :mod:`goldfive.adapters._adk_plugin`, a near-identical one in
-:mod:`goldfive.adapters._adk_dynainst`, and an inline check in
+:mod:`goldfive.adapters.adk_llm_instrumentation` (then
+``_adk_dynainst``), and an inline check in
 :meth:`goldfive.runner.Runner.run`. The duplication invited drift — a
 future site added without remembering the gate would silently leak the
 shaping under ``observation_only=True``. :class:`PromptShaper`
@@ -526,7 +527,7 @@ class PromptShaper:
                 # steerer + session. The same walk supplies both the
                 # gate's steerer and the resolver's session.
                 from goldfive.adapters import _adk_state_protocol as _sp
-                from goldfive.adapters._adk_dynainst import (
+                from goldfive.adapters.adk_llm_instrumentation import (
                     _compose_instruction,
                     _goldfive_session_context_from_readonly_context,
                     _read_pending_correction,

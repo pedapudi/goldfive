@@ -281,7 +281,7 @@ async def test_top_level_invocation_id_pinned_then_released() -> None:
 # cancelled_function_call_ids onto goldfive ``Session.state`` —
 # framework-agnostic orchestration dict.
 # :class:`~goldfive.planners.goldfive_planner.GoldfivePlanner` and
-# :mod:`~goldfive.adapters._adk_dynainst` now read those values from
+# :mod:`~goldfive.adapters.adk_llm_instrumentation` now read those values from
 # goldfive ``Session.state`` directly via the
 # :class:`~goldfive.state_store.StateStore` typed
 # accessor — there is no copy onto ADK ``session.state``. This is the

@@ -8,7 +8,7 @@ and its integration with:
   superseded by the revision.
 * :mod:`goldfive.reporting` — ``_handle_task_started`` clears the
   correction once the agent acknowledges the new task.
-* :mod:`goldfive.adapters._adk_dynainst` —
+* :mod:`goldfive.adapters.adk_llm_instrumentation` —
   :func:`format_correction_block` renders the dict into directive,
   NOT diagnostic, prompt text; the dynamic resolver picks the rendered
   block up via the ``(agent_name, task_id)``-keyed state entry.
@@ -539,7 +539,7 @@ def test_correction_survives_stream_c_cancellation() -> None:
 
 
 def test_format_correction_block_is_directive_not_diagnostic() -> None:
-    from goldfive.adapters._adk_dynainst import format_correction_block
+    from goldfive.adapters.adk_llm_instrumentation import format_correction_block
 
     block = format_correction_block(
         {

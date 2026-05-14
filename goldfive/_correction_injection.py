@@ -6,9 +6,9 @@ through three streams:
 * Stream A (:mod:`goldfive.types`) — :class:`SupersessionKind` enum +
   the refiner-side topology for CORRECT-kind supersedes (old task stays
   COMPLETED; new task attached as a correction child in the DAG).
-* Stream B (:mod:`goldfive.adapters._adk_dynainst`) — dynamic instruction
-  resolver that appends a ``(agent_name, task_id)``-keyed pending
-  correction onto the agent's system prompt every turn.
+* Stream B (:mod:`goldfive.adapters.adk_llm_instrumentation`) — dynamic
+  instruction resolver that appends a ``(agent_name, task_id)``-keyed
+  pending correction onto the agent's system prompt every turn.
 * Stream C (:mod:`goldfive.adapters._adk_plugin` +
   :mod:`goldfive.adapters._adk_state_protocol`) — cooperative cancel of
   the offending in-flight invocation when the drift is CRITICAL.
@@ -96,8 +96,8 @@ def pending_correction_key(agent_name: str, task_id: str) -> str:
     """Return the full state key a correction is stamped under.
 
     Same formula as
-    :func:`goldfive.adapters._adk_dynainst.pending_correction_key` —
-    re-exported here so the write-side doesn't pull in the ADK adapter
+    :func:`goldfive.adapters.adk_llm_instrumentation.pending_correction_key`
+    — re-exported here so the write-side doesn't pull in the ADK adapter
     module (which has its own dependencies). The string contract is
     shared; either spelling produces the same key.
     """

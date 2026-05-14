@@ -44,6 +44,22 @@ from typing import TYPE_CHECKING, Any
 
 from goldfive.adapters._tool_invocation import invoke_tool
 
+# Wave B2 — request-side ``LlmRequest`` mutation surface lives in
+# :mod:`goldfive.adapters.adk_llm_instrumentation`. Re-imported here so
+# the names resolve as module attributes of ``_adk_plugin`` (the
+# historical surface for the in-module ``before_model_callback``
+# references and external ``from goldfive.adapters._adk_plugin import …``
+# callsites in tests + PromptShaper).
+from goldfive.adapters.adk_llm_instrumentation import (  # noqa: F401
+    _RUNTIME_TOOLS_HINT_END,
+    _RUNTIME_TOOLS_HINT_PREFIX,
+    DEFAULT_AGENT_MAX_OUTPUT_TOKENS,
+    _apply_agent_max_output_tokens_cap,
+    _build_runtime_tools_hint,
+    _measure_request_chars,
+    _strip_prior_runtime_tools_hint,
+)
+
 # goldfive#268 — shared helpers for agent-name stem matching and
 # tokenisation. Lifted out of this module into
 # :mod:`goldfive.drift.capability_check` so the delegation-pin
@@ -1125,81 +1141,12 @@ def _select_by_agent_name_stems(
     return None
 
 
-def _measure_request_chars(llm_request: Any) -> tuple[int, int]:
-    """Return ``(total_chars, messages_count)`` for an ADK ``LlmRequest``.
-
-    Used by the goldfive#172 per-LLM-call instrumentation in
-    :meth:`_GoldfiveADKPlugin.before_model_callback`. We walk
-    ``llm_request.contents`` (a list of ``Content`` whose ``parts`` hold
-    ``text`` / ``function_call`` / ``function_response`` leaves) and
-    sum the character count of each serialised part. The three leaf
-    shapes we care about:
-
-    * ``part.text`` -- plain assistant / user / system text.
-    * ``part.function_call`` -- a model-emitted tool call. We serialise
-      as ``name + json(args)`` because both contribute to the prompt
-      tokens the model pays for.
-    * ``part.function_response`` -- a tool's return payload. Serialised
-      as ``name + json(response)`` for the same reason.
-
-    Unknown part shapes fall through silently (count zero) so a novel
-    ADK part type doesn't break instrumentation. The system instruction
-    on ``llm_request.config.system_instruction`` is counted separately
-    when present, since it's a prompt-prefix the model must process on
-    every call — often the dominant contributor right after a
-    GoldfivePlanner injection.
-
-    Returns ``(0, 0)`` on any failure — instrumentation must never
-    raise into the caller path.
-    """
-    try:
-        contents = _safe_attr(llm_request, "contents", None) or []
-        total_chars = 0
-        messages_count = 0
-        for content in contents:
-            messages_count += 1
-            parts = _safe_attr(content, "parts", None) or []
-            for part in parts:
-                text = _safe_attr(part, "text", "") or ""
-                if text:
-                    total_chars += len(str(text))
-                    continue
-                fc = _safe_attr(part, "function_call", None)
-                if fc is not None:
-                    name = str(_safe_attr(fc, "name", "") or "")
-                    args = _safe_attr(fc, "args", None)
-                    total_chars += len(name)
-                    if args is not None:
-                        try:
-                            total_chars += len(json.dumps(args, default=repr))
-                        except Exception:  # noqa: BLE001
-                            total_chars += len(repr(args))
-                    continue
-                fr = _safe_attr(part, "function_response", None)
-                if fr is not None:
-                    name = str(_safe_attr(fr, "name", "") or "")
-                    resp = _safe_attr(fr, "response", None)
-                    total_chars += len(name)
-                    if resp is not None:
-                        try:
-                            total_chars += len(json.dumps(resp, default=repr))
-                        except Exception:  # noqa: BLE001
-                            total_chars += len(repr(resp))
-                    continue
-        # Include the system instruction — a GoldfivePlanner injection
-        # lands here and typically dominates the prompt prefix.
-        config = _safe_attr(llm_request, "config", None)
-        sys_inst = _safe_attr(config, "system_instruction", "") or ""
-        if isinstance(sys_inst, str):
-            total_chars += len(sys_inst)
-        elif sys_inst is not None:
-            try:
-                total_chars += len(str(sys_inst))
-            except Exception:  # noqa: BLE001
-                pass
-        return total_chars, messages_count
-    except Exception:  # noqa: BLE001 — instrumentation must never raise
-        return 0, 0
+# Per-LLM-call request-side instrumentation (``_measure_request_chars``)
+# was lifted into :mod:`goldfive.adapters.adk_llm_instrumentation` in Wave
+# B2. The name is re-bound at module load below via the top-level import
+# so the in-module ``before_model_callback`` reference and external
+# ``from goldfive.adapters._adk_plugin import _measure_request_chars``
+# callsites keep resolving without change.
 
 
 def _extract_usage_metadata(llm_response: Any) -> dict[str, int]:
@@ -1642,118 +1589,13 @@ def _tool_approval_prompt(tool: Any, tool_name: str, tool_args: Any) -> str:
 
 # R3 (F2 alternative) — runtime tool-surface hint.
 #
-# Tier 1's F2 wanted to mutate ``llm_request.config.tools`` mid-callback
-# to remove agents whose tasks have all completed, but mutating the
-# tool list mid-flight is fragile (ADK caches declarations on
-# ``tools_dict`` and the model API rejects requests where the
-# function declarations don't match the names referenced in
-# ``contents``). R3 takes the non-invasive route: keep all tools
-# available, but pre-emptively tell the LLM — at every model call —
-# which agents still have PENDING work and which agents' work is
-# already DONE. The LLM then has structural guidance to choose the
-# right next action without us having to alter the tool surface.
-#
-# Why a prefix marker: the hint is per-call. Each
-# ``before_model_callback`` invocation must inject the CURRENT plan
-# state, not accumulate prior snapshots. ``system_instruction`` in
-# ADK is a single string, so we detect-and-strip any previous
-# goldfive hint by its ``[GOLDFIVE PLAN-STATE HINT —`` opener before
-# appending the fresh one.
-_RUNTIME_TOOLS_HINT_PREFIX: str = "[GOLDFIVE PLAN-STATE HINT —"
-_RUNTIME_TOOLS_HINT_END: str = "[/GOLDFIVE PLAN-STATE HINT]"
-
-
-def _build_runtime_tools_hint(session: Any) -> str | None:
-    """Compose a 'currently-relevant tools' hint for injection into the LLM context.
-
-    Walks ``session.plan.tasks`` and groups them by ``assignee_agent_id``.
-    For each agent, summarise:
-
-    * tasks already DONE (terminal — COMPLETED / FAILED / CANCELLED / NOT_NEEDED)
-    * tasks PENDING (with their titles, capped at three for brevity)
-    * whether the agent has any remaining work
-
-    Returns a multi-line string suitable for prepending to the LLM
-    request as a system-level guidance message. Returns ``None`` when
-    there's no plan to summarise (turn 1, or pre-plan-install
-    windows), or when the plan groups produce no useful signal.
-
-    The output is bracketed by :data:`_RUNTIME_TOOLS_HINT_PREFIX` and
-    :data:`_RUNTIME_TOOLS_HINT_END` so a follow-up call can detect and
-    strip the previous hint from ``system_instruction`` before
-    appending the fresh one (R3 dedup contract).
-    """
-    plan = _safe_attr(session, "plan", None)
-    if plan is None:
-        return None
-    tasks = _safe_attr(plan, "tasks", None)
-    if not tasks:
-        return None
-
-    try:
-        from goldfive.types import TERMINAL_TASK_STATUSES
-    except ImportError:  # pragma: no cover — should never happen
-        return None
-
-    by_agent: dict[str, dict[str, list[str]]] = {}
-    for t in tasks:
-        agent = _safe_attr(t, "assignee_agent_id", "") or "<unassigned>"
-        bucket = by_agent.setdefault(agent, {"done": [], "remaining": []})
-        status = _safe_attr(t, "status", None)
-        title = _safe_attr(t, "title", "") or _safe_attr(t, "id", "") or "?"
-        if status in TERMINAL_TASK_STATUSES:
-            bucket["done"].append(str(title))
-        else:
-            bucket["remaining"].append(str(title))
-
-    body_lines: list[str] = []
-    for agent in sorted(by_agent):
-        info = by_agent[agent]
-        # Strip any namespace separator so the hint matches what the
-        # LLM sees as the bare tool / sub-agent name.
-        bare = agent.split(":")[-1] if ":" in agent else agent
-        if info["remaining"]:
-            tasks_summary = "; ".join(info["remaining"][:3])
-            body_lines.append(f"  {bare}: PENDING — {tasks_summary}")
-        elif info["done"]:
-            body_lines.append(f"  {bare}: all assigned tasks complete; do NOT re-invoke this agent")
-
-    if not body_lines:
-        return None
-
-    lines: list[str] = [f"{_RUNTIME_TOOLS_HINT_PREFIX} runtime guidance, not user-authored]"]
-    lines.extend(body_lines)
-    lines.append(
-        "Choose the agent whose tasks are still PENDING. Do not re-invoke "
-        "agents whose tasks are already complete."
-    )
-    lines.append(_RUNTIME_TOOLS_HINT_END)
-    return "\n".join(lines)
-
-
-def _strip_prior_runtime_tools_hint(existing: str) -> str:
-    """Remove a previously-injected runtime-tools hint from ``existing``.
-
-    The hint is bracketed by :data:`_RUNTIME_TOOLS_HINT_PREFIX` and
-    :data:`_RUNTIME_TOOLS_HINT_END`. When found, both markers and the
-    text between them are removed; surrounding ``\\n\\n`` separators
-    are normalised so the result has no orphan blank lines.
-
-    Returns the input unchanged when no prior hint marker is present.
-    """
-    if _RUNTIME_TOOLS_HINT_PREFIX not in existing:
-        return existing
-    start = existing.find(_RUNTIME_TOOLS_HINT_PREFIX)
-    end = existing.find(_RUNTIME_TOOLS_HINT_END, start)
-    if end == -1:
-        # Truncated / malformed — drop from prefix to end of string.
-        cleaned = existing[:start]
-    else:
-        cleaned = existing[:start] + existing[end + len(_RUNTIME_TOOLS_HINT_END) :]
-    # Collapse any 3+ consecutive newlines created by the removal.
-    while "\n\n\n" in cleaned:
-        cleaned = cleaned.replace("\n\n\n", "\n\n")
-    return cleaned.strip("\n")
+# The marker constants, hint composition, and the strip helper were
+# lifted into :mod:`goldfive.adapters.adk_llm_instrumentation` in Wave
+# B2. The names are re-bound at module load below via the top-level
+# import so the in-module references and the existing
+# ``from goldfive.adapters._adk_plugin import _build_runtime_tools_hint``
+# callsites (PromptShaper + tests) keep resolving without change. See
+# the dedicated module for the R3 dedup contract rationale.
 
 
 #: Default per-LLM-call wall-clock budget (milliseconds) enforced by
@@ -1773,21 +1615,11 @@ def _strip_prior_runtime_tools_hint(existing: str) -> str:
 DEFAULT_LLM_CALL_TIMEOUT_MS: int = 1_800_000
 
 
-#: Default per-ADK-sub-agent ``max_output_tokens`` ceiling enforced by
-#: :class:`_GoldfiveADKPlugin` (goldfive#256). When a sub-agent's
-#: ``llm_request.config.max_output_tokens`` is unset, OR is greater
-#: than this value, the plugin RATCHETS IT DOWN to this ceiling. When
-#: the sub-agent (or ADK's defaults) already supplied a smaller cap,
-#: the smaller value wins — this is a structural CEILING, not an
-#: override. Set to ``0`` (or any negative int) to disable the
-#: ratcheting entirely (the plugin then leaves ``max_output_tokens``
-#: untouched, which is the pre-#256 behaviour). Default 16384 matches
-#: :attr:`goldfive.planner.LLMPlanner.MAX_OUTPUT_TOKENS` — the same
-#: budget the planner uses for refine-shaped completions. Operators
-#: tune via the typed :class:`~goldfive.config.AgentConfig`
-#: (``RuntimeConfig(agent=AgentConfig(max_output_tokens=...))``) or
-#: the env var ``GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS``.
-DEFAULT_AGENT_MAX_OUTPUT_TOKENS: int = 16384
+# ``DEFAULT_AGENT_MAX_OUTPUT_TOKENS`` (goldfive#256) was lifted into
+# :mod:`goldfive.adapters.adk_llm_instrumentation` in Wave B2. The
+# constant is re-bound at module load below via the top-level import
+# so ``_adk_plugin.DEFAULT_AGENT_MAX_OUTPUT_TOKENS`` attribute access
+# (tests + :func:`make_adk_plugin` default) keeps resolving.
 
 
 def _is_observation_only(ctx: Any) -> bool:
@@ -1816,52 +1648,9 @@ def _is_observation_only(ctx: Any) -> bool:
         return True
 
 
-def _apply_agent_max_output_tokens_cap(llm_request: Any, ceiling: int) -> tuple[int, int]:
-    """Ratchet ``llm_request.config.max_output_tokens`` down to ``ceiling`` (goldfive#256).
-
-    Smaller-wins semantics: when ``config.max_output_tokens`` is already
-    set to a value smaller than ``ceiling`` we leave it alone — the
-    sub-agent / ADK chose a tighter cap and goldfive only ratchets DOWN.
-    When the existing value is missing, zero, negative, or larger than
-    ``ceiling``, we write ``ceiling``.
-
-    ``ceiling <= 0`` is the operator opt-out: the function returns
-    ``(0, 0)`` and leaves ``llm_request`` untouched (the same shape as
-    setting ``GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS`` to a non-positive int).
-
-    Returns ``(previous_value, applied_value)`` where ``previous_value``
-    is what the request carried on entry (``0`` for "missing / unset")
-    and ``applied_value`` is what it carries on exit. Useful for tests
-    and the diagnostic INFO log the caller emits.
-
-    Best-effort: any failure reading or writing ``llm_request.config``
-    is swallowed at DEBUG so a future ADK schema change can't crash the
-    callback. The cap is a structural safety net, not a hard invariant
-    — the watcher and the planner cap still bound runaway calls when
-    this helper short-circuits.
-    """
-    if ceiling <= 0:
-        return (0, 0)
-    config = getattr(llm_request, "config", None)
-    if config is None:
-        return (0, 0)
-    try:
-        existing = getattr(config, "max_output_tokens", None)
-    except Exception:  # noqa: BLE001
-        existing = None
-    previous = int(existing) if isinstance(existing, int) and existing > 0 else 0
-    # Smaller-wins: a sub-agent / ADK that pinned a tighter cap keeps it.
-    if previous > 0 and previous <= ceiling:
-        return (previous, previous)
-    try:
-        config.max_output_tokens = int(ceiling)
-    except Exception as exc:  # noqa: BLE001
-        log.debug(
-            "_apply_agent_max_output_tokens_cap: could not set max_output_tokens: %s",
-            exc,
-        )
-        return (previous, previous)
-    return (previous, int(ceiling))
+# ``_apply_agent_max_output_tokens_cap`` (goldfive#256) was lifted into
+# :mod:`goldfive.adapters.adk_llm_instrumentation` in Wave B2. The
+# function is re-bound at module load below via the top-level import.
 
 
 def _make_cancelled_llm_response() -> Any:

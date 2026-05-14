@@ -66,7 +66,7 @@ from goldfive._correction_injection import (  # noqa: E402
     pending_correction_key,
 )
 from goldfive.adapters import _adk_state_protocol as _sp  # noqa: E402
-from goldfive.adapters._adk_dynainst import (  # noqa: E402
+from goldfive.adapters.adk_llm_instrumentation import (  # noqa: E402
     format_correction_block,
     is_dynamic_instruction,
 )
