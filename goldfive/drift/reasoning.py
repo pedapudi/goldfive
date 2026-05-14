@@ -1050,6 +1050,8 @@ async def analyze_reasoning_with_focus(
     sink: Any = None,
     agent_name: str = "",
     available_agents: list[str] | list[dict[str, Any]] | None = None,
+    embedding_pipeline: Any = None,
+    judge_runner: Any = None,
 ) -> ReasoningJudgeVerdict:
     """Phase-1 sibling of :func:`analyze_reasoning` returning a focused verdict.
 
@@ -1076,15 +1078,27 @@ async def analyze_reasoning_with_focus(
     The legacy :func:`analyze_reasoning` is unchanged — it now
     delegates to this function and returns ``verdict.drift`` for
     back-compat with every existing caller.
+
+    The ``embedding_pipeline`` and ``judge_runner`` parameters are test
+    seams. ``embedding_pipeline`` is a callable
+    ``(text, session) -> DriftEvent | None`` that replaces the default
+    :func:`_embedding_pipeline`; tests use it to script the embedding
+    side without monkeypatching detector symbols. ``judge_runner`` is
+    an async callable with the same signature as
+    :func:`_run_judge_with_focus`; tests use it to short-circuit the
+    judge round-trip. Both default to ``None`` (use the in-module
+    implementations) so production callers see no behaviour change.
     """
+    embed = embedding_pipeline if embedding_pipeline is not None else _embedding_pipeline
+    judge = judge_runner if judge_runner is not None else _run_judge_with_focus
     if not text or mode == "off":
         return ReasoningJudgeVerdict(drift=None)
     if mode == "embedding":
-        return ReasoningJudgeVerdict(drift=_embedding_pipeline(text, session))
+        return ReasoningJudgeVerdict(drift=embed(text, session))
     if mode == "judge":
         if call_llm is None:
             return ReasoningJudgeVerdict(drift=None)
-        return await _run_judge_with_focus(
+        return await judge(
             text,
             session,
             call_llm=call_llm,
@@ -1094,10 +1108,10 @@ async def analyze_reasoning_with_focus(
             available_agents=available_agents,
         )
     if mode == "both":
-        embedding_drift = _embedding_pipeline(text, session)
+        embedding_drift = embed(text, session)
         judge_verdict: ReasoningJudgeVerdict | None = None
         if call_llm is not None:
-            judge_verdict = await _run_judge_with_focus(
+            judge_verdict = await judge(
                 text,
                 session,
                 call_llm=call_llm,
@@ -1136,7 +1150,7 @@ async def analyze_reasoning_with_focus(
         "to 'embedding'",
         mode,
     )
-    return ReasoningJudgeVerdict(drift=_embedding_pipeline(text, session))
+    return ReasoningJudgeVerdict(drift=embed(text, session))
 
 
 async def analyze_reasoning(
@@ -1149,6 +1163,8 @@ async def analyze_reasoning(
     sink: Any = None,
     agent_name: str = "",
     available_agents: list[str] | list[dict[str, Any]] | None = None,
+    embedding_pipeline: Any = None,
+    judge_classifier: Any = None,
 ) -> DriftEvent | None:
     """Run the reasoning-drift pipeline against ``text``.
 
@@ -1191,17 +1207,27 @@ async def analyze_reasoning(
        ``slideshow``), producing noisy CRITICAL drifts on routine
        reasoning. The function is retained as an exported helper for
        backward compatibility with external callers.
+
+    The ``embedding_pipeline`` and ``judge_classifier`` parameters are
+    test seams. ``embedding_pipeline`` is a callable
+    ``(text, session) -> DriftEvent | None`` substituted for
+    :func:`_embedding_pipeline`; ``judge_classifier`` is an async
+    callable with the signature of :func:`_run_judge`. Both default to
+    ``None`` (use the in-module implementations) so production callers
+    see no behaviour change.
     """
+    embed = embedding_pipeline if embedding_pipeline is not None else _embedding_pipeline
+    judge = judge_classifier if judge_classifier is not None else _run_judge
     if not text:
         return None
     if mode == "off":
         return None
     if mode == "embedding":
-        return _embedding_pipeline(text, session)
+        return embed(text, session)
     if mode == "judge":
         if call_llm is None:
             return None
-        return await _run_judge(
+        return await judge(
             text,
             session,
             call_llm=call_llm,
@@ -1211,10 +1237,10 @@ async def analyze_reasoning(
             available_agents=available_agents,
         )
     if mode == "both":
-        embedding_drift = _embedding_pipeline(text, session)
+        embedding_drift = embed(text, session)
         judge_drift: DriftEvent | None = None
         if call_llm is not None:
-            judge_drift = await _run_judge(
+            judge_drift = await judge(
                 text,
                 session,
                 call_llm=call_llm,
@@ -1240,7 +1266,7 @@ async def analyze_reasoning(
         "analyze_reasoning: unknown mode=%r; falling back to 'embedding'",
         mode,
     )
-    return _embedding_pipeline(text, session)
+    return embed(text, session)
 
 
 # Small stopword set used by the intent-divergence token-overlap check.

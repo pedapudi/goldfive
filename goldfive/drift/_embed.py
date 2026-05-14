@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -58,6 +59,19 @@ log = logging.getLogger("goldfive.drift.reasoning.embed")
 _MODEL: Any | None = None
 _MODEL_UNAVAILABLE: bool = False
 _DEFAULT_MODEL_NAME: str = "all-MiniLM-L6-v2"
+
+# Test seam: when non-None, ``_try_load_openai_backend`` delegates to
+# this callable instead of constructing an :class:`_OpenAIEmbeddingBackend`
+# itself. Production code never sets this; the test escape hatch
+# :func:`set_backend_loader` does. Restoring ``None`` returns to the
+# default constructor path.
+_BACKEND_LOADER: Callable[[str], Any | None] | None = None
+
+# Test seam: when non-None, ``_try_load_openai_backend`` builds via this
+# class instead of :class:`_OpenAIEmbeddingBackend`. Lets tests verify
+# the constructor kwargs without reaching into the module to rebind the
+# class symbol. ``set_backend_class(None)`` restores the default.
+_BACKEND_CLASS_OVERRIDE: Any | None = None
 
 # Runtime circuit breaker for the OpenAI-compatible HTTP backend.
 # Previously ``_MODEL_UNAVAILABLE`` flipped only on *import* failures
@@ -96,6 +110,64 @@ def set_model(model: Any | None) -> None:
     _MODEL_UNAVAILABLE = False
     reset_circuit_breaker()
     _reset_cache()
+
+
+def set_backend_loader(loader: Callable[[str], Any | None] | None) -> None:
+    """Test seam: override the OpenAI-backend constructor.
+
+    When ``loader`` is non-None, :func:`_try_load_openai_backend`
+    delegates to it instead of building an
+    :class:`_OpenAIEmbeddingBackend` directly. The loader receives the
+    resolved ``base_url`` and must return an encoder-shaped object
+    exposing ``encode(list[str]) -> list[list[float]]``, or ``None`` to
+    signal "could not build". Pass ``None`` to restore the default
+    constructor path. Tests use this to assert which ``base_url`` the
+    lazy-load path selects without monkeypatching module internals.
+    """
+    global _BACKEND_LOADER
+    _BACKEND_LOADER = loader
+
+
+def set_backend_class(cls: Any | None) -> None:
+    """Test seam: override the backend class used by the default loader.
+
+    When non-None, :func:`_try_load_openai_backend` calls ``cls(**kwargs)``
+    instead of :class:`_OpenAIEmbeddingBackend`. Lets tests assert which
+    constructor kwargs the loader pulls from env / config without
+    monkeypatching the class symbol on this module. Pass ``None`` to
+    restore the default class.
+    """
+    global _BACKEND_CLASS_OVERRIDE
+    _BACKEND_CLASS_OVERRIDE = cls
+
+
+def set_cache_max(n: int) -> None:
+    """Test seam: shrink (or restore) the per-text LRU cache cap.
+
+    Production callers should not touch this — the default 512-entry
+    cap suits all real workloads. Tests use it to verify eviction
+    behaviour without filling 513 entries per case.
+    """
+    global _CACHE_MAX
+    _CACHE_MAX = int(n)
+    # Trim any current entries beyond the new cap so the next encode
+    # sees the freshly-constrained state.
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.popitem(last=False)
+
+
+def force_unavailable() -> None:
+    """Test seam: mark embeddings as unavailable without an HTTP probe.
+
+    Equivalent to ``set_model(None)`` followed by tripping the
+    ``_MODEL_UNAVAILABLE`` flag. Used by graceful-degradation tests
+    that need ``_get_model()`` to return ``None`` regardless of env /
+    config state. :func:`set_model` (with a non-None encoder) or
+    :func:`reset_circuit_breaker` restores the lazy-load path.
+    """
+    global _MODEL, _MODEL_UNAVAILABLE
+    _MODEL = None
+    _MODEL_UNAVAILABLE = True
 
 
 def reset_circuit_breaker() -> None:
@@ -234,6 +306,11 @@ def _try_load_openai_backend(base_url: str) -> Any | None:
     fields fall back to env vars, then to the built-in defaults — the
     same precedence as :func:`_get_model` uses for ``base_url``.
     """
+    # Test seam: when a loader has been installed via
+    # :func:`set_backend_loader`, delegate entirely. The loader is
+    # responsible for returning an encoder-shaped object (or ``None``).
+    if _BACKEND_LOADER is not None:
+        return _BACKEND_LOADER(base_url)
     if _CONFIG is not None:
         model_name = _CONFIG.model
         api_key = _CONFIG.api_key
@@ -245,8 +322,11 @@ def _try_load_openai_backend(base_url: str) -> Any | None:
             timeout_ms = int(os.environ.get("GOLDFIVE_EMBEDDING_TIMEOUT_MS", "10000"))
         except ValueError:
             timeout_ms = 10000
+    # Test seam: override the backend class without rebinding it on the
+    # module. Defaults to the real :class:`_OpenAIEmbeddingBackend`.
+    backend_cls = _BACKEND_CLASS_OVERRIDE or _OpenAIEmbeddingBackend
     try:
-        return _OpenAIEmbeddingBackend(
+        return backend_cls(
             base_url=base_url,
             model=model_name,
             api_key=api_key,

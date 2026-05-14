@@ -161,15 +161,24 @@ class _ScriptedSteerOneAttempt:
         return self.responses.pop(0)
 
 
-def _make_planner() -> LLMPlanner:
+def _make_planner(
+    scripted: _ScriptedSteerOneAttempt | None = None,
+    *,
+    max_refine_attempts: int | None = None,
+) -> LLMPlanner:
     """Construct an ``LLMPlanner`` with a placeholder ``call_llm`` that
-    must never be reached — the tests patch ``_user_steer_one_attempt``
+    must never be reached — the tests inject ``user_steer_one_attempt``
     so the underlying LLM dispatch is bypassed entirely."""
 
     async def _unreachable_call_llm(system: str, user: str, model: str) -> str:
         raise AssertionError("call_llm should not be reached in these tests")
 
-    return LLMPlanner(call_llm=_unreachable_call_llm)
+    kwargs: dict[str, Any] = {"call_llm": _unreachable_call_llm}
+    if scripted is not None:
+        kwargs["user_steer_one_attempt"] = scripted
+    if max_refine_attempts is not None:
+        kwargs["max_refine_attempts"] = max_refine_attempts
+    return LLMPlanner(**kwargs)
 
 
 async def _drive_refine_steer(
@@ -177,9 +186,15 @@ async def _drive_refine_steer(
     monkeypatch: pytest.MonkeyPatch,
     responses: list[tuple[Plan | None, str]],
 ) -> tuple[Plan | None, _ScriptedSteerOneAttempt]:
-    """Patch ``_user_steer_one_attempt`` and call ``planner.refine``."""
+    """Install a scripted ``user_steer_one_attempt`` and call ``planner.refine``.
+
+    The scripted helper is installed via the public injection seam on
+    :class:`LLMPlanner` (constructor kwarg) rather than reaching into
+    the private bound method. We re-thread the planner here so the
+    test body can compose freely while still using the seam.
+    """
     scripted = _ScriptedSteerOneAttempt(responses)
-    monkeypatch.setattr(planner, "_user_steer_one_attempt", scripted, raising=True)
+    planner.set_user_steer_one_attempt(scripted)
     result = await planner.refine(plan=_running_plan(), drift=_user_steer_drift(), goals=_goals())
     return result, scripted
 

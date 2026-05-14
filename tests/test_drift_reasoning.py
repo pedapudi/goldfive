@@ -290,7 +290,7 @@ def test_embedding_based_off_topic_no_fire_when_on_topic() -> None:
 
 
 def test_embedding_based_off_topic_silent_without_model(
-    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     # No model installed; graceful degradation. Force the lazy-load
     # path off so the real sentence-transformers model cannot be
@@ -298,8 +298,8 @@ def test_embedding_based_off_topic_silent_without_model(
     # the scenario under test is explicitly "embedding stack absent."
     from goldfive.drift import _embed as _embed_mod
 
-    set_model(None)
-    monkeypatch.setattr(_embed_mod, "_MODEL_UNAVAILABLE", True, raising=False)
+    _embed_mod.force_unavailable()
+    request.addfinalizer(lambda: _embed_mod.set_model(None))
     session = _session_with_task()
     text = "wildly unrelated reasoning content goes here"
     drift = dreason.detect_off_topic(text, session)
@@ -624,15 +624,15 @@ async def test_reasoning_high_similarity_skips_tightening_fires_loop() -> None:
 
 
 def test_reasoning_cluster_skipped_when_embeddings_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     # Simulate "sentence-transformers not installed" by forcing the
     # embed helper's lazy-load path to short-circuit to None, matching
     # the detector's graceful-degrade contract.
     from goldfive.drift import _embed as embed_mod
 
-    set_model(None)
-    monkeypatch.setattr(embed_mod, "_MODEL_UNAVAILABLE", True, raising=False)
+    embed_mod.force_unavailable()
+    request.addfinalizer(lambda: embed_mod.set_model(None))
 
     session = _cluster_session()
     current = _pad_tokens("shared", 10)

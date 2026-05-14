@@ -288,9 +288,7 @@ def test_default_steerer_get_tool_loop_config_returns_stashed() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_uses_judge_config_over_detected_llm(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_wrap_uses_judge_config_over_detected_llm() -> None:
     """``JudgeConfig.base_url`` wins over the auto-detected tree LLM.
 
     When both an auto-detectable agent LLM AND a :class:`JudgeConfig`
@@ -298,8 +296,6 @@ def test_wrap_uses_judge_config_over_detected_llm(
     JudgeConfig endpoint -- not from ``detect_llm``. Planner +
     goal_deriver still use the detected LLM; only the judges split.
     """
-    import goldfive.convenience as _conv
-
     detected_call_llm = _StubCallable("detected")
     judge_call_llm = _StubCallable("from-judge-config")
 
@@ -310,13 +306,16 @@ def test_wrap_uses_judge_config_over_detected_llm(
         assert cfg.base_url == "http://judge:9000"
         return judge_call_llm, cfg.model
 
-    monkeypatch.setattr(_conv, "detect_llm", _fake_detect)
-    monkeypatch.setattr(_conv, "_build_judge_call_llm", _fake_build)
-
     runtime = RuntimeConfig(
         judge=JudgeConfig(base_url="http://judge:9000", model="judge-model"),
     )
-    runner = goldfive.wrap(_noop_agent, runtime=runtime, sinks=[])
+    runner = goldfive.wrap(
+        _noop_agent,
+        runtime=runtime,
+        sinks=[],
+        llm_detector=_fake_detect,
+        judge_call_llm_builder=_fake_build,
+    )
 
     steerer = runner.steerer
     assert isinstance(steerer, DefaultSteerer)
@@ -327,18 +326,12 @@ def test_wrap_uses_judge_config_over_detected_llm(
     assert steerer._goal_drift_model == "judge-model"
 
 
-def test_wrap_explicit_call_llm_wins_over_judge_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_wrap_explicit_call_llm_wins_over_judge_config() -> None:
     """Explicit ``call_llm=`` trumps both ``JudgeConfig`` and ``detect_llm``."""
-    import goldfive.convenience as _conv
-
     explicit = _StubCallable("explicit")
 
     def _must_not_build(_cfg: Any) -> Any:
         raise AssertionError("JudgeConfig path should be suppressed")
-
-    monkeypatch.setattr(_conv, "_build_judge_call_llm", _must_not_build)
 
     runtime = RuntimeConfig(
         judge=JudgeConfig(base_url="http://should-not-build:9000"),
@@ -349,6 +342,7 @@ def test_wrap_explicit_call_llm_wins_over_judge_config(
         model="explicit-model",
         runtime=runtime,
         sinks=[],
+        judge_call_llm_builder=_must_not_build,
     )
 
     steerer = runner.steerer
@@ -358,12 +352,8 @@ def test_wrap_explicit_call_llm_wins_over_judge_config(
     assert steerer._goal_drift_model == "explicit-model"
 
 
-def test_wrap_falls_back_when_judge_config_build_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_wrap_falls_back_when_judge_config_build_fails() -> None:
     """A ``JudgeConfig`` build failure falls back to the detected LLM."""
-    import goldfive.convenience as _conv
-
     detected = _StubCallable("detected")
 
     def _fake_detect(_agent: Any) -> tuple[Any, str]:
@@ -372,13 +362,16 @@ def test_wrap_falls_back_when_judge_config_build_fails(
     def _fail_build(_cfg: Any) -> None:
         return None  # openai SDK missing / client construction failed
 
-    monkeypatch.setattr(_conv, "detect_llm", _fake_detect)
-    monkeypatch.setattr(_conv, "_build_judge_call_llm", _fail_build)
-
     runtime = RuntimeConfig(
         judge=JudgeConfig(base_url="http://judge:9000"),
     )
-    runner = goldfive.wrap(_noop_agent, runtime=runtime, sinks=[])
+    runner = goldfive.wrap(
+        _noop_agent,
+        runtime=runtime,
+        sinks=[],
+        llm_detector=_fake_detect,
+        judge_call_llm_builder=_fail_build,
+    )
 
     steerer = runner.steerer
     assert isinstance(steerer, DefaultSteerer)
