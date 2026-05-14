@@ -71,7 +71,7 @@ def test_runner_logs_build_identity_on_construction(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """``Runner(...)`` emits one ``goldfive runner starting`` INFO line."""
-    with caplog.at_level(logging.INFO, logger="goldfive.runner"):
+    with caplog.at_level(logging.INFO, logger="goldfive"):
         _make_runner()
 
     matches = [
@@ -109,7 +109,7 @@ def test_runner_build_identity_falls_through_to_unknown(
             clear=False,
         ),
     ):
-        with caplog.at_level(logging.INFO, logger="goldfive.runner"):
+        with caplog.at_level(logging.INFO, logger="goldfive"):
             _make_runner()
 
     matches = [
@@ -127,7 +127,7 @@ async def test_runner_build_identity_logged_once_not_per_run(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Two ``runner.run(...)`` calls must NOT re-emit the startup line."""
-    with caplog.at_level(logging.INFO, logger="goldfive.runner"):
+    with caplog.at_level(logging.INFO, logger="goldfive"):
         runner = _make_runner()
         await runner.run("go")
         await runner.run("go again")

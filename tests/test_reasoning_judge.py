@@ -229,7 +229,7 @@ async def test_malformed_json_returns_none_with_debug_log(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     call_llm = _stub_call_llm(["not json at all"])
-    with caplog.at_level(logging.DEBUG, logger="goldfive.drift.reasoning_judge"):
+    with caplog.at_level(logging.DEBUG, logger="goldfive"):
         drift = await rjudge.classify_reasoning_drift(
             reasoning="thought",
             task=_task(),
@@ -240,7 +240,6 @@ async def test_malformed_json_returns_none_with_debug_log(
     assert drift is None
     assert any(
         "response was not JSON" in r.getMessage()
-        and r.name == "goldfive.drift.reasoning_judge"
         for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
 
@@ -249,7 +248,7 @@ async def test_missing_on_task_key_returns_none_with_debug_log(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     call_llm = _stub_call_llm([{"verdict": "drift"}])
-    with caplog.at_level(logging.DEBUG, logger="goldfive.drift.reasoning_judge"):
+    with caplog.at_level(logging.DEBUG, logger="goldfive"):
         drift = await rjudge.classify_reasoning_drift(
             reasoning="thought",
             task=_task(),
@@ -263,7 +262,6 @@ async def test_missing_on_task_key_returns_none_with_debug_log(
     # bool, since the parser tries both before quiet-failing.
     assert any(
         "lacks both 'classification' and boolean 'on_task'" in r.getMessage()
-        and r.name == "goldfive.drift.reasoning_judge"
         for r in caplog.records
     )
 
@@ -284,7 +282,7 @@ async def test_call_llm_raises_returns_none_with_warning_log(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     call_llm = _raising_call_llm(RuntimeError("boom"))
-    with caplog.at_level(logging.WARNING, logger="goldfive.drift.reasoning_judge"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         drift = await rjudge.classify_reasoning_drift(
             reasoning="thought",
             task=_task(),
@@ -295,8 +293,7 @@ async def test_call_llm_raises_returns_none_with_warning_log(
     assert drift is None
     matching = [
         r for r in caplog.records
-        if r.name == "goldfive.drift.reasoning_judge"
-        and "call_llm raised" in r.getMessage()
+        if "call_llm raised" in r.getMessage()
     ]
     assert len(matching) == 1
     assert matching[0].levelno == logging.WARNING
@@ -306,7 +303,7 @@ async def test_drift_emission_logs_info(caplog: pytest.LogCaptureFixture) -> Non
     call_llm = _stub_call_llm(
         [{"on_task": False, "severity": "critical", "reason": "off"}]
     )
-    with caplog.at_level(logging.INFO, logger="goldfive.drift.reasoning_judge"):
+    with caplog.at_level(logging.INFO, logger="goldfive"):
         drift = await rjudge.classify_reasoning_drift(
             reasoning="thought",
             task=_task(),
@@ -677,7 +674,7 @@ async def test_observe_reasoning_judge_exception_does_not_crash(
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
-    with caplog.at_level(logging.WARNING, logger="goldfive.steerer"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         await steerer.observe_reasoning("some thought", session=session)
         await _wait_for_judges(steerer)
 
@@ -687,12 +684,13 @@ async def test_observe_reasoning_judge_exception_does_not_crash(
     ] == []
     # The set drains cleanly (the raising task resolved).
     assert steerer._background_judges == set()
-    # The raise was swallowed and surfaced as a WARNING on the steerer
-    # logger.
+    # The raise was swallowed and surfaced as a WARNING. Assert on
+    # message content rather than logger name so the test survives the
+    # bucket-3b sibling-logger drop (line now lands on
+    # ``goldfive.drift_observer``).
     steerer_warnings = [
         r for r in caplog.records
-        if r.name == "goldfive.steerer"
-        and r.levelno == logging.WARNING
+        if r.levelno == logging.WARNING
         and "background reasoning-judge raised" in r.getMessage()
     ]
     assert len(steerer_warnings) == 1
@@ -772,7 +770,7 @@ async def test_shutdown_quiet_when_zero_tasks_actually_cancelled(
 
     await steerer.observe_reasoning("a thought", session=session)
 
-    with caplog.at_level(logging.WARNING, logger="goldfive.steerer"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         # timeout=0.0 → wait_for raises TimeoutError immediately even
         # if the gather wins the race in the same instant.
         await steerer.shutdown(timeout=0.0)
@@ -1161,7 +1159,7 @@ async def test_parser_demotes_justified_deviation_with_none_provenance(
             }
         ]
     )
-    with caplog.at_level(logging.INFO, logger="goldfive.drift.reasoning_judge"):
+    with caplog.at_level(logging.INFO, logger="goldfive"):
         verdict = await rjudge.classify_reasoning_drift_with_focus(
             reasoning="thought",
             task=_task(),
@@ -1177,7 +1175,6 @@ async def test_parser_demotes_justified_deviation_with_none_provenance(
     # Demotion is audited at INFO so operators can grep the rate.
     assert any(
         "demoted to erroneous_deviation" in r.getMessage()
-        and r.name == "goldfive.drift.reasoning_judge"
         for r in caplog.records
     )
 

@@ -280,7 +280,7 @@ async def test_warning_drift_observation_only_suppresses_all_three_injections(
         prior_plan = session.plan
 
         drift = _drift_warning(kind=DriftKind.OFF_TOPIC)
-        with caplog.at_level(logging.INFO, logger="goldfive.steerer"):
+        with caplog.at_level(logging.INFO, logger="goldfive"):
             await steerer._handle_drift(drift, session)
 
         # 1. The planner produced a revision exactly once (detection +
@@ -447,7 +447,7 @@ def test_wrap_threads_observation_only_into_steerer() -> None:
 
 
 def test_steering_config_from_env_observation_only(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_steer_env: Any,
 ) -> None:
     """``GOLDFIVE_STEER_OBSERVATION_ONLY`` flips the field via ``from_env``.
 
@@ -460,31 +460,22 @@ def test_steering_config_from_env_observation_only(
       default); a test that suppresses the fixture would see the
       production ``True`` default.
     """
-    monkeypatch.setenv("GOLDFIVE_STEER_OBSERVATION_ONLY", "0")
-    assert SteeringConfig.from_env().observation_only is False
-    monkeypatch.setenv("GOLDFIVE_STEER_OBSERVATION_ONLY", "false")
-    assert SteeringConfig.from_env().observation_only is False
-    monkeypatch.setenv("GOLDFIVE_STEER_OBSERVATION_ONLY", "no")
-    assert SteeringConfig.from_env().observation_only is False
-    monkeypatch.setenv("GOLDFIVE_STEER_OBSERVATION_ONLY", "off")
-    assert SteeringConfig.from_env().observation_only is False
+    for falsey in ("0", "false", "no", "off"):
+        goldfive_steer_env.set(observation_only=falsey)
+        assert SteeringConfig.from_env().observation_only is False
 
-    monkeypatch.setenv("GOLDFIVE_STEER_OBSERVATION_ONLY", "1")
-    assert SteeringConfig.from_env().observation_only is True
-    monkeypatch.setenv("GOLDFIVE_STEER_OBSERVATION_ONLY", "true")
-    assert SteeringConfig.from_env().observation_only is True
-    monkeypatch.setenv("GOLDFIVE_STEER_OBSERVATION_ONLY", "yes")
-    assert SteeringConfig.from_env().observation_only is True
-    monkeypatch.setenv("GOLDFIVE_STEER_OBSERVATION_ONLY", "on")
-    assert SteeringConfig.from_env().observation_only is True
+    for truthy in ("1", "true", "yes", "on"):
+        goldfive_steer_env.set(observation_only=truthy)
+        assert SteeringConfig.from_env().observation_only is True
 
     # Unset: in the suite, the autouse fixture overrides to False.
-    monkeypatch.delenv("GOLDFIVE_STEER_OBSERVATION_ONLY", raising=False)
+    goldfive_steer_env.unset("observation_only")
     assert SteeringConfig.from_env().observation_only is False
 
 
 def test_steering_config_from_env_production_default(
     monkeypatch: pytest.MonkeyPatch,
+    goldfive_steer_env: Any,
 ) -> None:
     """Outside the suite override, the production default is ``True``.
 
@@ -494,7 +485,7 @@ def test_steering_config_from_env_production_default(
     """
     from goldfive import config as _gf_config
 
-    monkeypatch.delenv("GOLDFIVE_STEER_OBSERVATION_ONLY", raising=False)
+    goldfive_steer_env.unset("observation_only")
     prior = _gf_config._OBSERVATION_ONLY_DEFAULT
     _gf_config._OBSERVATION_ONLY_DEFAULT = None
     try:

@@ -289,12 +289,12 @@ async def test_strict_kwarg_aborts_on_revision_rejection() -> None:
 
 
 async def test_strict_env_var_fallback(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_fail_fast_env: Any,
 ) -> None:
     """When the constructor kwarg is omitted (``None``), the env var
     ``GOLDFIVE_FAIL_FAST_REVISION_REJECTION=1`` opts in to strict mode.
     """
-    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_REVISION_REJECTION", "1")
+    goldfive_fail_fast_env.set(revision_rejection="1")
     sink = InMemorySink()
     plans: list[Plan | None] = []
     planner = _ProgrammablePlanner(plans)
@@ -318,13 +318,13 @@ async def test_strict_env_var_fallback(
 
 
 async def test_explicit_kwarg_overrides_env_var(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_fail_fast_env: Any,
 ) -> None:
     """Explicit ``fail_fast_on_revision_rejection=False`` wins over
     ``GOLDFIVE_FAIL_FAST_REVISION_REJECTION=1`` so tests can pin
     behaviour without unsetting the env first.
     """
-    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_REVISION_REJECTION", "1")
+    goldfive_fail_fast_env.set(revision_rejection="1")
     sink = InMemorySink()
     plans: list[Plan | None] = []
     planner = _ProgrammablePlanner(plans)
@@ -416,13 +416,13 @@ async def test_user_steer_install_never_aborts_default_flag() -> None:
 
 
 async def test_user_steer_install_never_aborts_strict_flag(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_fail_fast_env: Any,
 ) -> None:
     """Same contract as the default-flag test, but with the strict env
     var on. The flag governs goldfive-authored installs only; user-
     authored installs go through the L2 type-safe path that has no
     failure mode."""
-    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_REVISION_REJECTION", "1")
+    goldfive_fail_fast_env.set(revision_rejection="1")
     # Same setup as the default test — the steerer call doesn't
     # consult the env var.
     sink = InMemorySink()

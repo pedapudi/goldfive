@@ -371,7 +371,7 @@ async def test_after_model_callback_flag_on_empty_reasoning_feeds_content(
 
     import logging
 
-    with caplog.at_level(logging.DEBUG, logger="goldfive.adapters.adk"):
+    with caplog.at_level(logging.DEBUG, logger="goldfive"):
         await plugin.after_model_callback(
             callback_context=cb_ctx, llm_response=response
         )
@@ -433,20 +433,22 @@ def test_reasoning_drift_config_default_is_false() -> None:
     assert cfg.fallback_to_content_when_no_reasoning is False
 
 
-def test_reasoning_drift_config_env_flip_to_true(monkeypatch: Any) -> None:
+def test_reasoning_drift_config_env_flip_to_true(goldfive_reasoning_drift_env: Any) -> None:
     """``GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT=1`` flips the field to
     ``True`` via :meth:`ReasoningDriftConfig.from_env`.
     """
-    monkeypatch.setenv("GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT", "1")
+    goldfive_reasoning_drift_env.set(fallback_to_content="1")
     cfg = ReasoningDriftConfig.from_env()
     assert cfg.fallback_to_content_when_no_reasoning is True
 
 
-def test_reasoning_drift_config_env_other_truthy_literals(monkeypatch: Any) -> None:
+def test_reasoning_drift_config_env_other_truthy_literals(
+    goldfive_reasoning_drift_env: Any,
+) -> None:
     """``_read_bool_env`` accepts ``true`` / ``yes`` / ``on`` /
     ``y`` / ``t`` too; pick one to anchor the link.
     """
-    monkeypatch.setenv("GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT", "true")
+    goldfive_reasoning_drift_env.set(fallback_to_content="true")
     cfg = ReasoningDriftConfig.from_env()
     assert cfg.fallback_to_content_when_no_reasoning is True
 

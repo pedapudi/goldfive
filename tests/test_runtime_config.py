@@ -16,6 +16,7 @@ Regression suite for goldfive#225. Covers:
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import pytest
 
@@ -43,13 +44,15 @@ def test_embedding_config_defaults() -> None:
 
 
 def test_embedding_config_from_env_all_vars(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_embedding_env: Any,
 ) -> None:
     """All four env vars map to the matching fields."""
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://llm.local:8080")
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_MODEL", "qwen3-embed")
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_API_KEY", "secret-token")
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_TIMEOUT_MS", "2500")
+    goldfive_embedding_env.set(
+        base_url="http://llm.local:8080",
+        model="qwen3-embed",
+        api_key="secret-token",
+        timeout_ms=2500,
+    )
     cfg = EmbeddingConfig.from_env()
     assert cfg.base_url == "http://llm.local:8080"
     assert cfg.model == "qwen3-embed"
@@ -58,17 +61,13 @@ def test_embedding_config_from_env_all_vars(
 
 
 def test_embedding_config_from_env_subset(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_embedding_env: Any,
 ) -> None:
     """A partial env landscape fills in remaining fields with defaults."""
-    for name in (
-        "GOLDFIVE_EMBEDDING_BASE_URL",
-        "GOLDFIVE_EMBEDDING_MODEL",
-        "GOLDFIVE_EMBEDDING_API_KEY",
-        "GOLDFIVE_EMBEDDING_TIMEOUT_MS",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://partial:1234")
+    # ``goldfive_embedding_env`` pre-clears every variable in its setup,
+    # so an explicit ``unset`` round is redundant; setting only the
+    # field we care about leaves the rest at their dataclass defaults.
+    goldfive_embedding_env.set(base_url="http://partial:1234")
     cfg = EmbeddingConfig.from_env()
     assert cfg.base_url == "http://partial:1234"
     # Remaining fields keep the built-in defaults.
@@ -78,21 +77,21 @@ def test_embedding_config_from_env_subset(
 
 
 def test_embedding_config_empty_base_url_is_none(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_embedding_env: Any,
 ) -> None:
     """An explicit empty string is treated as "not set" (maps to ``None``)."""
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "   ")
+    goldfive_embedding_env.set(base_url="   ")
     cfg = EmbeddingConfig.from_env()
     assert cfg.base_url is None
 
 
 def test_embedding_config_invalid_timeout_falls_back(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_embedding_env: Any,
 ) -> None:
     """Non-integer / non-positive timeouts fall back to the default."""
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_TIMEOUT_MS", "abc")
+    goldfive_embedding_env.set(timeout_ms="abc")
     assert EmbeddingConfig.from_env().timeout_ms == 10_000
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_TIMEOUT_MS", "0")
+    goldfive_embedding_env.set(timeout_ms="0")
     assert EmbeddingConfig.from_env().timeout_ms == 10_000
 
 
@@ -111,13 +110,15 @@ def test_tool_loop_config_defaults() -> None:
 
 
 def test_tool_loop_config_from_env_all_vars(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_tool_loop_env: Any,
 ) -> None:
     """All four env vars map to the matching fields."""
-    monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_WINDOW", "12")
-    monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD", "4")
-    monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD", "7")
-    monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD", "6")
+    goldfive_tool_loop_env.set(
+        window=12,
+        exact_threshold=4,
+        name_threshold=7,
+        alternating_threshold=6,
+    )
     cfg = ToolLoopConfig.from_env()
     assert cfg.window == 12
     assert cfg.exact_threshold == 4
@@ -126,17 +127,11 @@ def test_tool_loop_config_from_env_all_vars(
 
 
 def test_tool_loop_config_from_env_subset(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_tool_loop_env: Any,
 ) -> None:
     """Missing vars fall back to the built-in defaults."""
-    for name in (
-        "GOLDFIVE_TOOL_LOOP_WINDOW",
-        "GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD",
-        "GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD",
-        "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_WINDOW", "15")
+    # Fixture pre-clears every tool-loop env var in its setup.
+    goldfive_tool_loop_env.set(window=15)
     cfg = ToolLoopConfig.from_env()
     assert cfg.window == 15
     assert cfg.exact_threshold == 3
@@ -166,30 +161,30 @@ def test_reasoning_drift_config_defaults() -> None:
 
 @pytest.mark.parametrize("mode", ["judge", "embedding", "both", "off"])
 def test_reasoning_drift_config_from_env_mode(
-    monkeypatch: pytest.MonkeyPatch, mode: str
+    goldfive_reasoning_drift_env: Any, mode: str
 ) -> None:
     """`GOLDFIVE_DRIFT_REASONING_MODE` selects the pipeline mode."""
-    monkeypatch.setenv("GOLDFIVE_DRIFT_REASONING_MODE", mode)
+    goldfive_reasoning_drift_env.set(mode=mode)
     cfg = ReasoningDriftConfig.from_env()
     assert cfg.mode == mode
 
 
 def test_reasoning_drift_config_from_env_mode_is_case_insensitive(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_reasoning_drift_env: Any,
 ) -> None:
     """Mode parsing tolerates case variations + surrounding whitespace."""
-    monkeypatch.setenv("GOLDFIVE_DRIFT_REASONING_MODE", "  Embedding  ")
+    goldfive_reasoning_drift_env.set(mode="  Embedding  ")
     cfg = ReasoningDriftConfig.from_env()
     assert cfg.mode == "embedding"
 
 
 def test_reasoning_drift_config_from_env_mode_invalid_warns_and_defaults(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_reasoning_drift_env: Any,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Unknown mode logs a WARNING and falls back to the default."""
-    monkeypatch.setenv("GOLDFIVE_DRIFT_REASONING_MODE", "bogus")
-    with caplog.at_level("WARNING", logger="goldfive.config"):
+    goldfive_reasoning_drift_env.set(mode="bogus")
+    with caplog.at_level("WARNING", logger="goldfive"):
         cfg = ReasoningDriftConfig.from_env()
     assert cfg.mode == "judge"
     warnings = [
@@ -199,16 +194,18 @@ def test_reasoning_drift_config_from_env_mode_invalid_warns_and_defaults(
 
 
 def test_reasoning_drift_config_from_env_all_vars(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_reasoning_drift_env: Any,
 ) -> None:
     """The new ``GOLDFIVE_DRIFT_*`` env vars map to the matching fields."""
-    monkeypatch.setenv("GOLDFIVE_DRIFT_OFF_TOPIC_DISTANCE", "0.55")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_INTENT_HEALTHY_SIMILARITY", "0.7")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_INTENT_MINOR_SIMILARITY", "0.5")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_INTENT_WARNING_SIMILARITY", "0.3")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_LOOPING_SIMILARITY", "0.85")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_CLUSTER_SIMILARITY", "0.7")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW", "8")
+    goldfive_reasoning_drift_env.set(
+        off_topic_distance="0.55",
+        intent_healthy_similarity="0.7",
+        intent_minor_similarity="0.5",
+        intent_warning_similarity="0.3",
+        looping_similarity="0.85",
+        cluster_similarity="0.7",
+        looping_hash_window="8",
+    )
     cfg = ReasoningDriftConfig.from_env()
     assert cfg.off_topic_distance_threshold == 0.55
     assert cfg.intent_divergence_healthy_similarity == 0.7
@@ -220,28 +217,20 @@ def test_reasoning_drift_config_from_env_all_vars(
 
 
 def test_reasoning_drift_config_from_env_missing_falls_back(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_reasoning_drift_env: Any,
 ) -> None:
     """Missing env vars revert to defaults."""
-    for name in (
-        "GOLDFIVE_DRIFT_OFF_TOPIC_DISTANCE",
-        "GOLDFIVE_DRIFT_INTENT_HEALTHY_SIMILARITY",
-        "GOLDFIVE_DRIFT_INTENT_MINOR_SIMILARITY",
-        "GOLDFIVE_DRIFT_INTENT_WARNING_SIMILARITY",
-        "GOLDFIVE_DRIFT_LOOPING_SIMILARITY",
-        "GOLDFIVE_DRIFT_CLUSTER_SIMILARITY",
-        "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    # ``goldfive_reasoning_drift_env`` pre-clears every reasoning-drift
+    # env var in its setup so we don't need an explicit unset round.
     cfg = ReasoningDriftConfig.from_env()
     assert cfg == ReasoningDriftConfig()
 
 
 def test_reasoning_drift_config_from_env_bad_float_falls_back(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_reasoning_drift_env: Any,
 ) -> None:
     """A non-float env var falls back to the default, not a crash."""
-    monkeypatch.setenv("GOLDFIVE_DRIFT_OFF_TOPIC_DISTANCE", "not-a-float")
+    goldfive_reasoning_drift_env.set(off_topic_distance="not-a-float")
     cfg = ReasoningDriftConfig.from_env()
     assert cfg.off_topic_distance_threshold == 0.7
 
@@ -258,21 +247,19 @@ def test_goal_drift_config_defaults() -> None:
 
 
 def test_goal_drift_config_from_env_all_vars(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_goal_drift_env: Any,
 ) -> None:
-    monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL", "8")
-    monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_ACTIVITY_WINDOW", "25")
+    goldfive_goal_drift_env.set(check_interval=8, activity_window=25)
     cfg = GoalDriftConfig.from_env()
     assert cfg.check_interval == 8
     assert cfg.activity_window == 25
 
 
 def test_goal_drift_config_from_env_subset(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_goal_drift_env: Any,
 ) -> None:
-    monkeypatch.delenv("GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL", raising=False)
-    monkeypatch.delenv("GOLDFIVE_GOAL_DRIFT_ACTIVITY_WINDOW", raising=False)
-    monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL", "3")
+    # Fixture pre-clears the goal-drift env surface in its setup.
+    goldfive_goal_drift_env.set(check_interval=3)
     cfg = GoalDriftConfig.from_env()
     assert cfg.check_interval == 3
     assert cfg.activity_window == 10
@@ -292,12 +279,14 @@ def test_judge_config_defaults() -> None:
     assert cfg.timeout_ms == 10_000
 
 
-def test_judge_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_judge_config_from_env(goldfive_judge_env: Any) -> None:
     """All four ``GOLDFIVE_JUDGE_*`` env vars map to fields."""
-    monkeypatch.setenv("GOLDFIVE_JUDGE_BASE_URL", "http://judge.local:9000")
-    monkeypatch.setenv("GOLDFIVE_JUDGE_MODEL", "qwen3-judge")
-    monkeypatch.setenv("GOLDFIVE_JUDGE_API_KEY", "judge-token")
-    monkeypatch.setenv("GOLDFIVE_JUDGE_TIMEOUT_MS", "3500")
+    goldfive_judge_env.set(
+        base_url="http://judge.local:9000",
+        model="qwen3-judge",
+        api_key="judge-token",
+        timeout_ms=3500,
+    )
     cfg = JudgeConfig.from_env()
     assert cfg.base_url == "http://judge.local:9000"
     assert cfg.model == "qwen3-judge"
@@ -305,16 +294,10 @@ def test_judge_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.timeout_ms == 3500
 
 
-def test_judge_config_from_env_subset(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_judge_config_from_env_subset(goldfive_judge_env: Any) -> None:
     """Missing env vars fall back to the built-in defaults."""
-    for name in (
-        "GOLDFIVE_JUDGE_BASE_URL",
-        "GOLDFIVE_JUDGE_MODEL",
-        "GOLDFIVE_JUDGE_API_KEY",
-        "GOLDFIVE_JUDGE_TIMEOUT_MS",
-    ):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("GOLDFIVE_JUDGE_BASE_URL", "http://partial-judge:1234")
+    # Fixture pre-clears the judge env surface in its setup.
+    goldfive_judge_env.set(base_url="http://partial-judge:1234")
     cfg = JudgeConfig.from_env()
     assert cfg.base_url == "http://partial-judge:1234"
     assert cfg.model == ""
@@ -323,10 +306,10 @@ def test_judge_config_from_env_subset(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_judge_config_empty_base_url_is_none(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_judge_env: Any,
 ) -> None:
     """Whitespace-only ``GOLDFIVE_JUDGE_BASE_URL`` is treated as unset."""
-    monkeypatch.setenv("GOLDFIVE_JUDGE_BASE_URL", "   ")
+    goldfive_judge_env.set(base_url="   ")
     cfg = JudgeConfig.from_env()
     assert cfg.base_url is None
 
@@ -358,14 +341,14 @@ def test_runtime_config_includes_judge() -> None:
 
 
 def test_runtime_config_from_env_aggregates_all_four(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_runtime_env: dict,
 ) -> None:
     """Each sub-``from_env`` is called and the results are aggregated."""
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://agg:7000")
-    monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_WINDOW", "14")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW", "9")
-    monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL", "7")
-    monkeypatch.setenv("GOLDFIVE_JUDGE_BASE_URL", "http://judge-agg:9001")
+    goldfive_runtime_env["embedding"].set(base_url="http://agg:7000")
+    goldfive_runtime_env["tool_loop"].set(window=14)
+    goldfive_runtime_env["reasoning_drift"].set(looping_hash_window=9)
+    goldfive_runtime_env["goal_drift"].set(check_interval=7)
+    goldfive_runtime_env["judge"].set(base_url="http://judge-agg:9001")
     cfg = RuntimeConfig.from_env()
     assert cfg.embedding.base_url == "http://agg:7000"
     assert cfg.tool_loops.window == 14

@@ -270,7 +270,7 @@ def test_set_session_plan_inside_contextvar_no_warning(
     """The blessed path: swap inside the contextvar is silent."""
     plan = _plan("t1")
     session = Session(run_id="r1")
-    with caplog.at_level(logging.WARNING, logger="goldfive.types"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         with channel_processor_active():
             set_session_plan(session, plan)
     assert session.plan is plan
@@ -295,7 +295,7 @@ def test_set_session_plan_outside_contextvar_warns_in_non_strict_mode(
     # Force non-strict mode regardless of the test runner's pytest
     # auto-on default.
     with mock.patch.dict(os.environ, {"GOLDFIVE_STRICT_STATE_OWNERSHIP": "0"}):
-        with caplog.at_level(logging.WARNING, logger="goldfive.types"):
+        with caplog.at_level(logging.WARNING, logger="goldfive"):
             set_session_plan(session, plan)
     # Plan still installed — defensive, not blocking.
     assert session.plan is plan

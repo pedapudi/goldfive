@@ -250,13 +250,12 @@ def test_wrap_warns_when_judge_mode_without_call_llm(
     common mis-configuration. Emit a single WARNING so the gap is
     diagnosable from logs.
     """
-    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         goldfive.wrap(_noop_agent, sinks=[])
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.wrap"
-        and "LLM-as-a-judge drift detection is disabled" in r.getMessage()
+        if "LLM-as-a-judge drift detection is disabled" in r.getMessage()
     ]
     assert len(matching) == 1, (
         f"expected exactly one WARNING, got {len(matching)}: "
@@ -270,7 +269,7 @@ def test_wrap_does_not_warn_when_mode_off(
     """No warning when the operator has explicitly disabled judge-mode."""
     from goldfive.config import ReasoningDriftConfig, RuntimeConfig
 
-    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         goldfive.wrap(
             _noop_agent,
             runtime=RuntimeConfig(
@@ -281,8 +280,7 @@ def test_wrap_does_not_warn_when_mode_off(
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.wrap"
-        and "LLM-as-a-judge drift detection is disabled" in r.getMessage()
+        if "LLM-as-a-judge drift detection is disabled" in r.getMessage()
     ]
     assert matching == []
 
@@ -343,14 +341,13 @@ def test_wrap_warns_named_model_on_detection(
     """Auto-detected judge LLM fires the named-model WARNING with model + agent type."""
     _, detector = _make_detect_llm("gpt-4o-mini")
 
-    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         goldfive.wrap(_MyAgent(), sinks=[], llm_detector=detector)
 
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.wrap"
-        and "judge LLM not explicitly configured" in r.getMessage()
+        if "judge LLM not explicitly configured" in r.getMessage()
     ]
     assert len(matching) == 1, (
         f"expected exactly one named-model WARNING, got {len(matching)}: "
@@ -375,14 +372,13 @@ def test_wrap_warns_named_model_prefers_agent_name_over_class_name(
     """
     _, detector = _make_detect_llm("gpt-4o-mini")
 
-    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         goldfive.wrap(_NamedAgent(), sinks=[], llm_detector=detector)
 
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.wrap"
-        and "judge LLM not explicitly configured" in r.getMessage()
+        if "judge LLM not explicitly configured" in r.getMessage()
     ]
     assert len(matching) == 1
     msg = matching[0].getMessage()
@@ -397,7 +393,7 @@ def test_wrap_suppresses_named_model_warning_when_call_llm_explicit(
     _, detector = _make_detect_llm("should-not-appear")
     call_llm = _stub_call_llm([])
 
-    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         goldfive.wrap(
             _noop_agent, call_llm=call_llm, sinks=[], llm_detector=detector
         )
@@ -405,8 +401,7 @@ def test_wrap_suppresses_named_model_warning_when_call_llm_explicit(
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.wrap"
-        and "judge LLM not explicitly configured" in r.getMessage()
+        if "judge LLM not explicitly configured" in r.getMessage()
     ]
     assert matching == []
 
@@ -428,7 +423,7 @@ def test_wrap_suppresses_named_model_warning_when_judge_config_explicit(
         judge=JudgeConfig(base_url="http://judge:9000", model="judge-model"),
     )
 
-    with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         goldfive.wrap(
             _noop_agent,
             runtime=runtime,
@@ -440,8 +435,7 @@ def test_wrap_suppresses_named_model_warning_when_judge_config_explicit(
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.wrap"
-        and "judge LLM not explicitly configured" in r.getMessage()
+        if "judge LLM not explicitly configured" in r.getMessage()
     ]
     assert matching == []
 
@@ -467,7 +461,7 @@ def test_runner_warns_when_goal_drift_enabled_without_call_llm(
             raise AssertionError("not invoked")
 
     steerer = DefaultSteerer()  # no judge callable
-    with caplog.at_level(logging.WARNING, logger="goldfive.runner"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         Runner(
             agent=_NoopAdapter(),
             planner=StubPlanner(),
@@ -477,8 +471,7 @@ def test_runner_warns_when_goal_drift_enabled_without_call_llm(
         )
     matching = [
         r for r in caplog.records
-        if r.name == "goldfive.runner"
-        and "goal-drift judge disabled" in r.getMessage()
+        if "goal-drift judge disabled" in r.getMessage()
     ]
     assert len(matching) == 1, (
         f"expected exactly one warning, got {len(matching)}: "
@@ -503,7 +496,7 @@ def test_runner_does_not_warn_when_call_llm_is_wired(
 
     call_llm = _stub_call_llm([{"progressing": True}])
     steerer = DefaultSteerer(goal_drift_call_llm=call_llm)
-    with caplog.at_level(logging.WARNING, logger="goldfive.runner"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         Runner(
             agent=_NoopAdapter(),
             planner=StubPlanner(),

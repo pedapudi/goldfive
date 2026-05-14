@@ -41,8 +41,6 @@ import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-import pytest
-
 from goldfive.control import (
     ControlChannel,
     ControlKind,
@@ -445,9 +443,9 @@ async def test_overlay_supersede_cancel_aborts_when_fail_fast_kwarg_set() -> Non
 
 
 async def test_overlay_env_var_enables_fail_fast(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_fail_fast_env: Any,
 ) -> None:
-    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL", "1")
+    goldfive_fail_fast_env.set(invoke_cancel="1")
 
     plan = _two_task_plan()
     session = Session(run_id="r1")
@@ -495,9 +493,9 @@ async def test_overlay_env_var_enables_fail_fast(
 
 
 async def test_overlay_kwarg_false_overrides_env_var(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_fail_fast_env: Any,
 ) -> None:
-    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL", "1")
+    goldfive_fail_fast_env.set(invoke_cancel="1")
     executor = SequentialExecutor(
         overlay_mode=True, fail_fast_on_invoke_cancel=False
     )
@@ -510,9 +508,10 @@ async def test_overlay_kwarg_false_overrides_env_var(
 
 
 def test_overlay_default_fail_fast_is_false(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_fail_fast_env: Any,
 ) -> None:
-    monkeypatch.delenv("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL", raising=False)
+    # Fixture pre-clears every fail-fast env var in its setup.
+    _ = goldfive_fail_fast_env
     executor = SequentialExecutor(overlay_mode=True)
     assert executor._fail_fast_on_invoke_cancel is False
 
@@ -713,9 +712,9 @@ async def test_steerer_cancel_inflight_stamps_supersede_flag() -> None:
 
 
 def test_overlay_env_var_zero_is_false(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_fail_fast_env: Any,
 ) -> None:
-    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL", "0")
+    goldfive_fail_fast_env.set(invoke_cancel="0")
     executor = SequentialExecutor(overlay_mode=True)
     assert executor._fail_fast_on_invoke_cancel is False
 
@@ -726,13 +725,13 @@ def test_overlay_env_var_zero_is_false(
 
 
 def test_overlay_env_var_strict_match(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_fail_fast_env: Any,
 ) -> None:
     """The env-var contract is strict: only the literal "1" enables
     fail-fast (mirrors PR #332's ``GOLDFIVE_FAIL_FAST_REVISION_REJECTION``
     parsing). "true" / "yes" / "on" do NOT enable.
     """
-    monkeypatch.setenv("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL", "true")
+    goldfive_fail_fast_env.set(invoke_cancel="true")
     executor = SequentialExecutor(overlay_mode=True)
     assert executor._fail_fast_on_invoke_cancel is False
 

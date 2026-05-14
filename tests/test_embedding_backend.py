@@ -21,24 +21,26 @@ from goldfive.drift import _embed
 
 
 @pytest.fixture(autouse=True)
-def _reset_embed_state(monkeypatch: pytest.MonkeyPatch) -> Any:
+def _reset_embed_state(goldfive_embedding_env: Any) -> Any:
     """Ensure each test starts from a clean slate.
 
     ``set_model(None)`` both clears any installed encoder and resets
-    ``_MODEL_UNAVAILABLE`` so the lazy-load path can run again. We
-    also scrub the env vars so one test leaking a ``setenv`` can't
-    influence another. Under goldfive#225 ``configure(None)`` also
-    clears any :class:`~goldfive.config.EmbeddingConfig` a prior
-    ``goldfive.wrap()`` call may have installed; without this, the
-    env-var behaviour these tests exercise would be short-circuited
-    by a leaked config from another test module.
+    ``_MODEL_UNAVAILABLE`` so the lazy-load path can run again. The
+    ``goldfive_embedding_env`` fixture handles env scrubbing — its
+    ``clear()`` runs in its setup body so the ``GOLDFIVE_EMBEDDING_*``
+    surface is uniformly empty when this fixture yields. Under
+    goldfive#225 ``configure(None)`` also clears any
+    :class:`~goldfive.config.EmbeddingConfig` a prior ``goldfive.wrap()``
+    call may have installed; without this, the env-var behaviour these
+    tests exercise would be short-circuited by a leaked config from
+    another test module.
     """
     _embed.set_model(None)
     _embed.configure(None)
-    monkeypatch.delenv("GOLDFIVE_EMBEDDING_BASE_URL", raising=False)
-    monkeypatch.delenv("GOLDFIVE_EMBEDDING_MODEL", raising=False)
-    monkeypatch.delenv("GOLDFIVE_EMBEDDING_API_KEY", raising=False)
-    monkeypatch.delenv("GOLDFIVE_EMBEDDING_TIMEOUT_MS", raising=False)
+    # ``goldfive_embedding_env`` already pre-cleared the env vars in
+    # its own setup; the parameter here ensures pytest wires it before
+    # this autouse fixture runs.
+    _ = goldfive_embedding_env
     yield
     _embed.set_model(None)
     _embed.configure(None)
@@ -74,10 +76,13 @@ class _FakeBackend:
 # ---------------------------------------------------------------------------
 
 
-def test_openai_backend_env_driven(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_backend_env_driven(
+    monkeypatch: pytest.MonkeyPatch,
+    goldfive_embedding_env: Any,
+) -> None:
     """Setting the env var lights up the HTTP backend, and the encode
     path returns a cosine in ``[-1, 1]``."""
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://fake:9999")
+    goldfive_embedding_env.set(base_url="http://fake:9999")
 
     def fake_build(base_url: str) -> Any:
         assert base_url == "http://fake:9999"
@@ -213,9 +218,10 @@ def test_cached_encode_lru_eviction(request: pytest.FixtureRequest) -> None:
 def test_set_model_overrides_env(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
+    goldfive_embedding_env: Any,
 ) -> None:
     """``set_model(fake)`` wins over ``GOLDFIVE_EMBEDDING_BASE_URL``."""
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://should-not-be-used")
+    goldfive_embedding_env.set(base_url="http://should-not-be-used")
     # If ``_get_model`` ever reaches this, it would hit the real loader
     # and raise; we never want to see it happen when set_model is in
     # effect, so the loader is punitive.
@@ -236,11 +242,12 @@ def test_set_model_overrides_env(
 def test_openai_backend_env_failure_does_not_fall_back_to_st(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
+    goldfive_embedding_env: Any,
 ) -> None:
     """If the user configured an HTTP endpoint but the backend cannot
     build, we prefer "no signal" over silently loading a local
     sentence-transformers model the user did not ask for."""
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://fake:9999")
+    goldfive_embedding_env.set(base_url="http://fake:9999")
     _embed.set_backend_loader(lambda _url: None)
     request.addfinalizer(lambda: _embed.set_backend_loader(None))
 
@@ -250,11 +257,14 @@ def test_openai_backend_env_failure_does_not_fall_back_to_st(
 def test_openai_backend_builder_honours_model_and_timeout(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
+    goldfive_embedding_env: Any,
 ) -> None:
     """``_try_load_openai_backend`` reads every optional env var."""
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_MODEL", "qwen3-embed")
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_API_KEY", "secret")
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_TIMEOUT_MS", "2500")
+    goldfive_embedding_env.set(
+        model="qwen3-embed",
+        api_key="secret",
+        timeout_ms=2500,
+    )
 
     captured: dict[str, Any] = {}
 
@@ -449,17 +459,14 @@ def test_circuit_breaker_warns_once_on_trip(
     _embed.reset_circuit_breaker()
     backend = _make_always_failing_backend()
 
-    with caplog.at_level(
-        logging.WARNING, logger="goldfive.drift.reasoning.embed"
-    ):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         for _ in range(5):
             backend.encode(["x"])
 
     warnings = [
         r
         for r in caplog.records
-        if r.name == "goldfive.drift.reasoning.embed"
-        and "has failed" in r.getMessage()
+        if "has failed" in r.getMessage()
         and "in a row" in r.getMessage()
     ]
     assert len(warnings) == 1, (

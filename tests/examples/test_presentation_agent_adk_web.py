@@ -110,7 +110,10 @@ PLUGIN_REGISTRATIONS_MAX = 5
 
 
 @pytest.fixture
-def presentation_agent_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+def presentation_agent_env(
+    monkeypatch: pytest.MonkeyPatch,
+    goldfive_examples_env: Any,
+) -> Iterator[str]:
     """Stage ``examples/presentation_agent`` under a tmp agents_dir.
 
     Copies the example tree into a temp dir so the ADK ``AgentLoader``
@@ -121,12 +124,13 @@ def presentation_agent_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     Yields the temp agents_dir path. Cleanup is handled by the
     ``TemporaryDirectory`` context manager.
     """
-    # Mock-mode env: no real LLM, no telemetry server.
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("HARMONOGRAF_SERVER", raising=False)
+    # Mock-mode env: no real LLM, no telemetry server. ``clear()`` in
+    # the fixture setup already cleared these; the explicit unsets are
+    # belt-and-braces for readers.
+    goldfive_examples_env.unset("openai_api_key", "harmonograf_server")
     # Pin the topic so plan / goal IDs are stable across reruns. The
     # presentation_agent module reads this at _build_app time.
-    monkeypatch.setenv("GOLDFIVE_EXAMPLE_TOPIC", "solar-panels")
+    goldfive_examples_env.set(topic="solar-panels")
 
     # Reset any cached ``_APP`` so a prior test in the same process
     # doesn't hand back a stale App built under different env vars. The

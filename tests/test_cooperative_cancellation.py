@@ -890,7 +890,7 @@ async def test_observe_reasoning_skipped_after_cancel(caplog: Any) -> None:
 
     import logging
 
-    with caplog.at_level(logging.DEBUG, logger="goldfive.adapters.adk"):
+    with caplog.at_level(logging.DEBUG, logger="goldfive"):
         await plugin.after_model_callback(
             callback_context=cb_ctx,
             llm_response=response,

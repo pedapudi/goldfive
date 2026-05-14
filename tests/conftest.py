@@ -259,3 +259,203 @@ def in_memory_runner() -> Callable[..., Any]:
 def tmp_jsonl_path(tmp_path):
     """Return a pathlib.Path to a .jsonl file inside pytest tmp_path."""
     return tmp_path / "events.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Env-var fixtures (Wave C bucket 3 cleanup)
+# ---------------------------------------------------------------------------
+#
+# Each ``GOLDFIVE_*`` (and the small ``OPENAI_*``) env-var family that the
+# config / from-env tests poke gets a dedicated fixture below. The fixtures
+# are thin wrappers over ``pytest.MonkeyPatch.setenv`` / ``delenv`` — they
+# do NOT touch ``os.environ`` directly, so the standard pytest
+# monkeypatch-teardown still owns the cleanup. The point of the fixture
+# is to (a) eliminate per-test boilerplate, (b) make the env surface a
+# test consumes visible from the fixture name (``goldfive_agent_env``
+# vs ``goldfive_embedding_env`` etc.), and (c) avoid each test inlining
+# the variable-name string.
+#
+# A fixture is named after the **config domain** rather than the env
+# var: callers ask for ``goldfive_steer_env`` and set
+# ``observation_only="1"`` — never the underlying
+# ``GOLDFIVE_STEER_OBSERVATION_ONLY`` string. The mapping is owned by
+# the fixture; callers must not bypass it.
+#
+# Reset semantics: each fixture pre-clears its variables via
+# ``delenv(..., raising=False)`` before yielding so tests start from a
+# guaranteed clean slate. Teardown is automatic via the underlying
+# monkeypatch fixture.
+
+
+class _EnvController:
+    """Thin controller backing the per-domain env-var fixtures.
+
+    Construction takes an explicit allow-list of env-var names: the
+    controller refuses ``set`` / ``unset`` calls for any other name so
+    a fixture's tests cannot accidentally poke a sibling family's
+    variables and confuse the reader of the fixture name.
+    """
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        names: dict[str, str],
+    ) -> None:
+        self._monkeypatch = monkeypatch
+        # ``names`` maps a short kwarg-style key (``base_url``) to the
+        # underlying env-var name (``GOLDFIVE_EMBEDDING_BASE_URL``).
+        self._names = dict(names)
+
+    def _resolve(self, key: str) -> str:
+        if key not in self._names:
+            raise KeyError(
+                f"{key!r} is not a recognised env-var key for this "
+                f"fixture; expected one of {sorted(self._names)}"
+            )
+        return self._names[key]
+
+    def set(self, **kwargs: str) -> None:
+        """Set one or more env vars by short key.
+
+        Values are str-coerced so callers can pass ``1`` / ``True`` /
+        floats without ceremony.
+        """
+        for key, value in kwargs.items():
+            self._monkeypatch.setenv(self._resolve(key), str(value))
+
+    def unset(self, *keys: str) -> None:
+        """Delete one or more env vars (no-op if absent)."""
+        for key in keys:
+            self._monkeypatch.delenv(self._resolve(key), raising=False)
+
+    def clear(self) -> None:
+        """Delete every env var owned by this fixture."""
+        for env_name in self._names.values():
+            self._monkeypatch.delenv(env_name, raising=False)
+
+    def raw_setenv(self, env_name: str, value: str) -> None:
+        """Escape-hatch for tests that need to set a variant string
+        directly (e.g. the case-insensitivity / whitespace tests).
+
+        Only accepts env-var names this controller owns.
+        """
+        if env_name not in self._names.values():
+            raise KeyError(
+                f"{env_name!r} is not owned by this fixture; "
+                f"owned names: {sorted(self._names.values())}"
+            )
+        self._monkeypatch.setenv(env_name, value)
+
+
+_AGENT_ENV: dict[str, str] = {
+    "max_output_tokens": "GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS",
+    "call_timeout_ms": "GOLDFIVE_AGENT_CALL_TIMEOUT_MS",
+}
+
+_EMBEDDING_ENV: dict[str, str] = {
+    "base_url": "GOLDFIVE_EMBEDDING_BASE_URL",
+    "model": "GOLDFIVE_EMBEDDING_MODEL",
+    "api_key": "GOLDFIVE_EMBEDDING_API_KEY",
+    "timeout_ms": "GOLDFIVE_EMBEDDING_TIMEOUT_MS",
+}
+
+_STEER_ENV: dict[str, str] = {
+    "observation_only": "GOLDFIVE_STEER_OBSERVATION_ONLY",
+    "threshold": "GOLDFIVE_STEER_THRESHOLD",
+    "suppression_window_turns": "GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS",
+}
+
+_TOOL_LOOP_ENV: dict[str, str] = {
+    "window": "GOLDFIVE_TOOL_LOOP_WINDOW",
+    "exact_threshold": "GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD",
+    "name_threshold": "GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD",
+    "alternating_threshold": "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD",
+}
+
+_REASONING_DRIFT_ENV: dict[str, str] = {
+    "mode": "GOLDFIVE_DRIFT_REASONING_MODE",
+    "off_topic_distance": "GOLDFIVE_DRIFT_OFF_TOPIC_DISTANCE",
+    "intent_healthy_similarity": "GOLDFIVE_DRIFT_INTENT_HEALTHY_SIMILARITY",
+    "intent_minor_similarity": "GOLDFIVE_DRIFT_INTENT_MINOR_SIMILARITY",
+    "intent_warning_similarity": "GOLDFIVE_DRIFT_INTENT_WARNING_SIMILARITY",
+    "looping_similarity": "GOLDFIVE_DRIFT_LOOPING_SIMILARITY",
+    "cluster_similarity": "GOLDFIVE_DRIFT_CLUSTER_SIMILARITY",
+    "looping_hash_window": "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
+    "fallback_to_content": "GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT",
+}
+
+_GOAL_DRIFT_ENV: dict[str, str] = {
+    "check_interval": "GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL",
+    "activity_window": "GOLDFIVE_GOAL_DRIFT_ACTIVITY_WINDOW",
+}
+
+_JUDGE_ENV: dict[str, str] = {
+    "base_url": "GOLDFIVE_JUDGE_BASE_URL",
+    "model": "GOLDFIVE_JUDGE_MODEL",
+    "api_key": "GOLDFIVE_JUDGE_API_KEY",
+    "timeout_ms": "GOLDFIVE_JUDGE_TIMEOUT_MS",
+}
+
+_FAIL_FAST_ENV: dict[str, str] = {
+    "revision_rejection": "GOLDFIVE_FAIL_FAST_REVISION_REJECTION",
+    "invoke_cancel": "GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL",
+}
+
+_EXAMPLES_ENV: dict[str, str] = {
+    "topic": "GOLDFIVE_EXAMPLE_TOPIC",
+    "openai_api_key": "OPENAI_API_KEY",
+    "harmonograf_server": "HARMONOGRAF_SERVER",
+}
+
+
+def _make_env_fixture(env_map: dict[str, str]) -> Callable[..., Iterator[_EnvController]]:
+    """Build a fixture function that yields an ``_EnvController`` over ``env_map``."""
+
+    @pytest.fixture
+    def _fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[_EnvController]:
+        controller = _EnvController(monkeypatch, env_map)
+        # Start from a clean slate: any of these env vars set in the
+        # ambient environment must not leak into the test.
+        controller.clear()
+        yield controller
+        # No teardown needed — monkeypatch unwinds set/delenv automatically.
+
+    return _fixture
+
+
+goldfive_agent_env = _make_env_fixture(_AGENT_ENV)
+goldfive_embedding_env = _make_env_fixture(_EMBEDDING_ENV)
+goldfive_steer_env = _make_env_fixture(_STEER_ENV)
+goldfive_tool_loop_env = _make_env_fixture(_TOOL_LOOP_ENV)
+goldfive_reasoning_drift_env = _make_env_fixture(_REASONING_DRIFT_ENV)
+goldfive_goal_drift_env = _make_env_fixture(_GOAL_DRIFT_ENV)
+goldfive_judge_env = _make_env_fixture(_JUDGE_ENV)
+goldfive_fail_fast_env = _make_env_fixture(_FAIL_FAST_ENV)
+goldfive_examples_env = _make_env_fixture(_EXAMPLES_ENV)
+
+
+@pytest.fixture
+def goldfive_runtime_env(
+    goldfive_embedding_env: _EnvController,
+    goldfive_tool_loop_env: _EnvController,
+    goldfive_reasoning_drift_env: _EnvController,
+    goldfive_goal_drift_env: _EnvController,
+    goldfive_judge_env: _EnvController,
+    goldfive_steer_env: _EnvController,
+    goldfive_agent_env: _EnvController,
+) -> dict[str, _EnvController]:
+    """Bundle every ``RuntimeConfig`` sub-domain controller for tests
+    that exercise the aggregate ``RuntimeConfig.from_env()`` path.
+
+    Returned as a dict keyed by sub-domain so a single test can poke
+    multiple families without claiming half a dozen named fixtures.
+    """
+    return {
+        "embedding": goldfive_embedding_env,
+        "tool_loop": goldfive_tool_loop_env,
+        "reasoning_drift": goldfive_reasoning_drift_env,
+        "goal_drift": goldfive_goal_drift_env,
+        "judge": goldfive_judge_env,
+        "steer": goldfive_steer_env,
+        "agent": goldfive_agent_env,
+    }

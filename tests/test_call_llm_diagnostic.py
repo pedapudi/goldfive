@@ -66,7 +66,7 @@ async def test_adk_builder_logs_diagnostic_when_all_thoughts_no_answer(caplog):
     call_llm = make_default_adk_call_llm(stub)
     assert call_llm is not None
 
-    with caplog.at_level(logging.INFO, logger="goldfive.llm_detect"):
+    with caplog.at_level(logging.INFO, logger="goldfive"):
         out = await call_llm("system", "user", "stub")
 
     assert out == "", "all-thought response must produce empty answer"
@@ -117,7 +117,7 @@ async def test_adk_builder_no_diagnostic_on_normal_response(caplog):
     call_llm = make_default_adk_call_llm(stub)
     assert call_llm is not None
 
-    with caplog.at_level(logging.INFO, logger="goldfive.llm_detect"):
+    with caplog.at_level(logging.INFO, logger="goldfive"):
         out = await call_llm("system", "user", "stub")
 
     assert out == '{"on_task": true}'

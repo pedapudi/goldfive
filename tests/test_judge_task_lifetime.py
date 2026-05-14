@@ -234,7 +234,7 @@ async def test_late_judge_verdict_records_drift_but_skips_refine(
     # No invocations registered on the StateStore for this
     # session — the agent has moved on. The fire-and-forget judge
     # treats this as a stale verdict.
-    with caplog.at_level(logging.INFO, logger="goldfive.steerer"):
+    with caplog.at_level(logging.INFO, logger="goldfive"):
         await steerer.observe_reasoning(
             "raccoons are nocturnal", session=session
         )
@@ -259,12 +259,13 @@ async def test_late_judge_verdict_records_drift_but_skips_refine(
     )
 
     # The structural log line was emitted at INFO so operators can see
-    # late verdicts in the run log.
+    # late verdicts in the run log. Assert on message content rather
+    # than logger name so the test survives the bucket-3b sibling-
+    # logger drop (the line now lands on ``goldfive.drift_observer``).
     info_records = [
         r
         for r in caplog.records
-        if r.name == "goldfive.steerer"
-        and r.levelno == logging.INFO
+        if r.levelno == logging.INFO
         and "stale judge verdict" in r.getMessage()
     ]
     assert len(info_records) == 1, (

@@ -103,14 +103,13 @@ def test_intent_divergence_logs_cosine(
         description=task_description,
     )
 
-    with caplog.at_level(logging.DEBUG, logger="goldfive.drift.reasoning"):
+    with caplog.at_level(logging.DEBUG, logger="goldfive"):
         dreason.detect_intent_divergence(reasoning_text, session)
 
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.drift.reasoning"
-        and "intent_divergence:" in r.getMessage()
+        if "intent_divergence:" in r.getMessage()
     ]
     assert len(matching) == 1, [r.getMessage() for r in caplog.records]
     msg = matching[0].getMessage()
@@ -139,14 +138,13 @@ def test_off_topic_logs_distance(caplog: pytest.LogCaptureFixture) -> None:
 
     session = _session_basic(title=task_title, description=task_description)
 
-    with caplog.at_level(logging.DEBUG, logger="goldfive.drift.reasoning"):
+    with caplog.at_level(logging.DEBUG, logger="goldfive"):
         dreason.detect_off_topic(reasoning_text, session)
 
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.drift.reasoning"
-        and "off_topic:" in r.getMessage()
+        if "off_topic:" in r.getMessage()
     ]
     assert len(matching) == 1, [r.getMessage() for r in caplog.records]
     msg = matching[0].getMessage()
@@ -173,14 +171,13 @@ def test_looping_reasoning_logs_cosine(caplog: pytest.LogCaptureFixture) -> None
     # Steerer contract: current lives at -1, priors before it.
     session.reasoning_history = [past, current]
 
-    with caplog.at_level(logging.DEBUG, logger="goldfive.drift.reasoning"):
+    with caplog.at_level(logging.DEBUG, logger="goldfive"):
         dreason.detect_looping_reasoning(current, session)
 
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.drift.reasoning"
-        and "looping_reasoning:" in r.getMessage()
+        if "looping_reasoning:" in r.getMessage()
     ]
     assert len(matching) == 1, [r.getMessage() for r in caplog.records]
     msg = matching[0].getMessage()
@@ -210,14 +207,13 @@ def test_cluster_tightening_logs_cosine(
     session = _session_basic()
     session.reasoning_history = [past, current]
 
-    with caplog.at_level(logging.DEBUG, logger="goldfive.drift.reasoning"):
+    with caplog.at_level(logging.DEBUG, logger="goldfive"):
         dreason.detect_reasoning_cluster_tightening(current, session)
 
     matching = [
         r
         for r in caplog.records
-        if r.name == "goldfive.drift.reasoning"
-        and "reasoning_cluster_tightening:" in r.getMessage()
+        if "reasoning_cluster_tightening:" in r.getMessage()
     ]
     assert len(matching) == 1, [r.getMessage() for r in caplog.records]
     msg = matching[0].getMessage()

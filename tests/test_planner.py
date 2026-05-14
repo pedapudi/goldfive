@@ -1606,7 +1606,7 @@ def test_plan_from_json_drops_compound_assignees(
             },
         ],
     }
-    with caplog.at_level("WARNING", logger="goldfive.planner"):
+    with caplog.at_level("WARNING", logger="goldfive"):
         plan = _plan_from_json(payload, run_id="r", goal_ids=[])
     assert plan is not None
     assert [t.assignee_agent_id for t in plan.tasks] == ["", ""]
@@ -1625,7 +1625,7 @@ def test_plan_from_json_drops_bare_assignees(
             {"id": "t2", "title": "draft", "assignee_agent_id": "writer"},
         ],
     }
-    with caplog.at_level("WARNING", logger="goldfive.planner"):
+    with caplog.at_level("WARNING", logger="goldfive"):
         plan = _plan_from_json(payload, run_id="r", goal_ids=[])
     assert plan is not None
     assert [t.assignee_agent_id for t in plan.tasks] == ["", ""]
@@ -1647,7 +1647,7 @@ def test_plan_from_json_drops_mixed_assignees(
             {"id": "t3", "title": "review", "assignee_agent_id": "reviewer"},
         ],
     }
-    with caplog.at_level("WARNING", logger="goldfive.planner"):
+    with caplog.at_level("WARNING", logger="goldfive"):
         plan = _plan_from_json(payload, run_id="r", goal_ids=[])
     assert plan is not None
     assert [t.assignee_agent_id for t in plan.tasks] == ["", "", ""]
@@ -1971,7 +1971,7 @@ async def test_refine_emits_orphan_event_on_legitimate_drop(
         current_task_id="draft_body",
     )
 
-    with caplog.at_level("WARNING", logger="goldfive.planner"):
+    with caplog.at_level("WARNING", logger="goldfive"):
         revised = await planner.refine(plan=prior, drift=drift, goals=_goals())
 
     # Refine applied (validator does not reject — observability only).
