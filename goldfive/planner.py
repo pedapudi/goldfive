@@ -1333,6 +1333,7 @@ class LLMPlanner:
         looping_tool_call_system_prompt: str | None = None,
         plan_divergence_system_prompt: str | None = None,
         max_refine_attempts: int | None = None,
+        user_steer_one_attempt: Callable[..., Awaitable[tuple[Any, str]]] | None = None,
     ) -> None:
         self._call_llm = call_llm
         self._model = model
@@ -1350,6 +1351,14 @@ class LLMPlanner:
             if max_refine_attempts is not None
             else self.DEFAULT_MAX_REFINE_ATTEMPTS
         )
+        # Optional injection for the single-attempt USER_STEER refine
+        # helper. ``None`` (the default) routes through
+        # :meth:`_user_steer_one_attempt` (the in-class implementation).
+        # Tests use this seam to script ``(plan, error)`` tuples
+        # without monkeypatching the private bound method.
+        self._user_steer_one_attempt_override: (
+            Callable[..., Awaitable[tuple[Any, str]]] | None
+        ) = user_steer_one_attempt
         # Optional sink for ``REFINE_VALIDATION_FAILED`` drifts. The
         # ``DefaultSteerer`` wires this in ``bind()`` so the planner can
         # surface a structured signal when its retry budget is spent
@@ -1374,6 +1383,20 @@ class LLMPlanner:
     @property
     def max_refine_attempts(self) -> int:
         return self._max_refine_attempts
+
+    def set_user_steer_one_attempt(
+        self,
+        attempt: Callable[..., Awaitable[tuple[Any, str]]] | None,
+    ) -> None:
+        """Install (or remove) a custom one-attempt callable for refine_user_steer.
+
+        Mirror of the ``user_steer_one_attempt`` constructor kwarg. Tests
+        use this seam to script ``(merged_plan, error)`` tuples through
+        the retry loop without monkeypatching the private bound method
+        on the instance. Pass ``None`` to revert to the in-class
+        :meth:`_user_steer_one_attempt` implementation.
+        """
+        self._user_steer_one_attempt_override = attempt
 
     def set_drift_emitter(self, emitter: Callable[[DriftEvent], Awaitable[None]] | None) -> None:
         """Install (or remove) the async callback used to signal refine
@@ -3489,7 +3512,12 @@ class LLMPlanner:
         last_error = ""
         prior_error_kind: str | None = None
         for attempt in range(1, attempts + 1):
-            merged_plan, error = await self._user_steer_one_attempt(
+            one_attempt = (
+                self._user_steer_one_attempt_override
+                if self._user_steer_one_attempt_override is not None
+                else self._user_steer_one_attempt
+            )
+            merged_plan, error = await one_attempt(
                 plan=plan,
                 goals=goals,
                 drift=drift,

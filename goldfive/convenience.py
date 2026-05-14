@@ -224,6 +224,8 @@ def wrap(
     runtime: RuntimeConfig | None = None,
     dynamic_instruction: bool = True,
     drift_self_reporting: bool | list[str] = False,
+    llm_detector: Any = None,
+    judge_call_llm_builder: Any = None,
     **legacy_kwargs: Any,
 ) -> Runner:
     """Build a :class:`Runner` that drives ``agent`` with goldfive.
@@ -428,8 +430,14 @@ def wrap(
     # the detectors being "on". See ``docs/design/DRIFT.md`` and the
     # live-session evidence in harmonograf session
     # ``1aa68419-00f3-41eb-bf6e-22d0bdff21ed``.
+    # Test seam (goldfive#cleanup-monkeypatch): when a caller passes
+    # ``llm_detector=...`` it replaces :func:`detect_llm` for the
+    # duration of this call. Production code leaves it ``None``;
+    # tests use it to script a ``(call_llm, model_name)`` pair without
+    # rebinding the module-level ``detect_llm`` symbol.
+    detector = llm_detector if llm_detector is not None else detect_llm
     if resolved_call_llm is None:
-        detected = detect_llm(agent)
+        detected = detector(agent)
         if detected is not None:
             resolved_call_llm, detected_model = detected
             _call_llm_from_detect = True
@@ -447,8 +455,16 @@ def wrap(
     judge_call_llm: CallLLM | None = resolved_call_llm
     judge_model: str = resolved_model
     judge_from_config: bool = False
+    # Test seam: ``judge_call_llm_builder`` replaces
+    # :func:`_build_judge_call_llm` for this call. Same pattern as
+    # ``llm_detector`` above — leave ``None`` in production.
+    judge_builder = (
+        judge_call_llm_builder
+        if judge_call_llm_builder is not None
+        else _build_judge_call_llm
+    )
     if call_llm is None and resolved_runtime.judge.base_url:
-        built = _build_judge_call_llm(resolved_runtime.judge)
+        built = judge_builder(resolved_runtime.judge)
         if built is not None:
             judge_call_llm, judge_config_model = built
             if judge_config_model:

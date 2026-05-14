@@ -190,17 +190,16 @@ def test_detail_caps_preview_at_three_keywords() -> None:
 
 
 async def test_pipeline_does_not_fire_keyword_drift_in_embedding_mode(
-    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """With embeddings unavailable and the keyword detector unwired,
     ``analyze_reasoning`` in ``"embedding"`` mode stays quiet on the
     raccoon stimulus the pre-226 code relied on.
     """
     from goldfive.drift import _embed as _embed_mod
-    from goldfive.drift._embed import set_model
 
-    set_model(None)
-    monkeypatch.setattr(_embed_mod, "_MODEL_UNAVAILABLE", True, raising=False)
+    _embed_mod.force_unavailable()
+    request.addfinalizer(lambda: _embed_mod.set_model(None))
     session = _session_with_task()
     text = (
         "The user wants research on solar panels for a presentation. "
@@ -214,17 +213,18 @@ async def test_pipeline_does_not_fire_keyword_drift_in_embedding_mode(
     assert drift is None
 
 
-async def test_pipeline_off_mode_is_silent() -> None:
+async def test_pipeline_off_mode_is_silent(
+    request: pytest.FixtureRequest,
+) -> None:
     """``mode="off"`` skips every mode-selected detector. The always-on
     loop detector lives in the steerer (see
     ``test_drift_reasoning.py::test_observe_reasoning_*``) and is not
     consulted by :func:`analyze_reasoning` itself.
     """
     from goldfive.drift import _embed as _embed_mod
-    from goldfive.drift._embed import set_model
 
-    set_model(None)
-    _embed_mod._MODEL_UNAVAILABLE = True
+    _embed_mod.force_unavailable()
+    request.addfinalizer(lambda: _embed_mod.set_model(None))
     session = _session_with_task()
     text = (
         "Slide 1: solar panels. Slide 2: raccoons habitat species "

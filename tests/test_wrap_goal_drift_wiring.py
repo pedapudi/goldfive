@@ -294,23 +294,21 @@ def test_wrap_does_not_warn_when_mode_off(
 # ---------------------------------------------------------------------------
 
 
-def _patch_detect_llm(monkeypatch: pytest.MonkeyPatch, model_name: str) -> Any:
-    """Force :func:`goldfive._llm_detect.detect_llm` to return a stub pair.
+def _make_detect_llm(model_name: str) -> tuple[Any, Any]:
+    """Build a stubbed LLM detector returning ``(stub_call_llm, model_name)``.
 
     The real ``detect_llm`` requires ADK-shaped input; for the
     named-model WARNING tests we just need it to report "I found a
     callable on model X". Returning a simple tuple keeps the test
-    independent of the ADK optional dep.
+    independent of the ADK optional dep. Callers thread the detector
+    through ``goldfive.wrap(llm_detector=...)``.
     """
     stub_call_llm = _stub_call_llm([])
 
     def _fake_detect(_agent: Any) -> tuple[Any, str]:
         return stub_call_llm, model_name
 
-    import goldfive.convenience as _conv
-
-    monkeypatch.setattr(_conv, "detect_llm", _fake_detect)
-    return stub_call_llm
+    return stub_call_llm, _fake_detect
 
 
 class _MyAgent:
@@ -340,14 +338,13 @@ class _NamedAgent:
 
 
 def test_wrap_warns_named_model_on_detection(
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Auto-detected judge LLM fires the named-model WARNING with model + agent type."""
-    _patch_detect_llm(monkeypatch, "gpt-4o-mini")
+    _, detector = _make_detect_llm("gpt-4o-mini")
 
     with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
-        goldfive.wrap(_MyAgent(), sinks=[])
+        goldfive.wrap(_MyAgent(), sinks=[], llm_detector=detector)
 
     matching = [
         r
@@ -366,7 +363,6 @@ def test_wrap_warns_named_model_on_detection(
 
 
 def test_wrap_warns_named_model_prefers_agent_name_over_class_name(
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """When the agent has a ``.name`` attribute the WARNING uses that.
@@ -377,10 +373,10 @@ def test_wrap_warns_named_model_prefers_agent_name_over_class_name(
     of "agent 'coordinator_agent'", which is what operators actually
     care about.
     """
-    _patch_detect_llm(monkeypatch, "gpt-4o-mini")
+    _, detector = _make_detect_llm("gpt-4o-mini")
 
     with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
-        goldfive.wrap(_NamedAgent(), sinks=[])
+        goldfive.wrap(_NamedAgent(), sinks=[], llm_detector=detector)
 
     matching = [
         r
@@ -395,15 +391,16 @@ def test_wrap_warns_named_model_prefers_agent_name_over_class_name(
 
 
 def test_wrap_suppresses_named_model_warning_when_call_llm_explicit(
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Explicit ``call_llm=`` means the operator already owns the decision."""
-    _patch_detect_llm(monkeypatch, "should-not-appear")
+    _, detector = _make_detect_llm("should-not-appear")
     call_llm = _stub_call_llm([])
 
     with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
-        goldfive.wrap(_noop_agent, call_llm=call_llm, sinks=[])
+        goldfive.wrap(
+            _noop_agent, call_llm=call_llm, sinks=[], llm_detector=detector
+        )
 
     matching = [
         r
@@ -415,29 +412,30 @@ def test_wrap_suppresses_named_model_warning_when_call_llm_explicit(
 
 
 def test_wrap_suppresses_named_model_warning_when_judge_config_explicit(
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An explicit ``JudgeConfig.base_url`` also suppresses the warning."""
     from goldfive.config import JudgeConfig, RuntimeConfig
 
-    _patch_detect_llm(monkeypatch, "should-not-appear")
+    _, detector = _make_detect_llm("should-not-appear")
 
     # Force the judge-llm build to succeed (we don't actually care about
     # the returned callable here, just that JudgeConfig is honoured).
     def _fake_build(_config: Any) -> tuple[Any, str]:
         return _stub_call_llm([]), "judge-model"
 
-    import goldfive.convenience as _conv
-
-    monkeypatch.setattr(_conv, "_build_judge_call_llm", _fake_build)
-
     runtime = RuntimeConfig(
         judge=JudgeConfig(base_url="http://judge:9000", model="judge-model"),
     )
 
     with caplog.at_level(logging.WARNING, logger="goldfive.wrap"):
-        goldfive.wrap(_noop_agent, runtime=runtime, sinks=[])
+        goldfive.wrap(
+            _noop_agent,
+            runtime=runtime,
+            sinks=[],
+            llm_detector=detector,
+            judge_call_llm_builder=_fake_build,
+        )
 
     matching = [
         r

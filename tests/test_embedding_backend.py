@@ -88,13 +88,15 @@ def test_openai_backend_env_driven(monkeypatch: pytest.MonkeyPatch) -> None:
             }
         )
 
-    monkeypatch.setattr(_embed, "_try_load_openai_backend", fake_build)
-
-    assert _embed.available() is True
-    sim = _embed.max_similarity("foo", ["bar"])
-    assert -1.0 <= sim <= 1.0
-    # Orthogonal unit vectors -> cosine == 0.
-    assert abs(sim) < 1e-6
+    _embed.set_backend_loader(fake_build)
+    try:
+        assert _embed.available() is True
+        sim = _embed.max_similarity("foo", ["bar"])
+        assert -1.0 <= sim <= 1.0
+        # Orthogonal unit vectors -> cosine == 0.
+        assert abs(sim) < 1e-6
+    finally:
+        _embed.set_backend_loader(None)
 
 
 def test_openai_backend_response_parsing() -> None:
@@ -174,10 +176,14 @@ def test_cached_encode_hits_on_repeat() -> None:
     assert len(backend.calls) == 1
 
 
-def test_cached_encode_lru_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cached_encode_lru_eviction(request: pytest.FixtureRequest) -> None:
     """Fill the cache past its cap; oldest entry drops first."""
-    # Shrink the cap for the test so we don't need 513 encodes.
-    monkeypatch.setattr(_embed, "_CACHE_MAX", 3)
+    # Shrink the cap for the test so we don't need 513 encodes. Restore
+    # the production cap on teardown so other tests in this session
+    # see the default LRU size.
+    original_cap = _embed._CACHE_MAX
+    _embed.set_cache_max(3)
+    request.addfinalizer(lambda: _embed.set_cache_max(original_cap))
     _embed._reset_cache()
 
     vectors = {
@@ -204,17 +210,19 @@ def test_cached_encode_lru_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(backend.calls) == 5
 
 
-def test_set_model_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_set_model_overrides_env(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
     """``set_model(fake)`` wins over ``GOLDFIVE_EMBEDDING_BASE_URL``."""
     monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://should-not-be-used")
     # If ``_get_model`` ever reaches this, it would hit the real loader
     # and raise; we never want to see it happen when set_model is in
-    # effect, so the mock is punitive.
-    monkeypatch.setattr(
-        _embed,
-        "_try_load_openai_backend",
-        lambda url: (_ for _ in ()).throw(AssertionError("env path used")),
+    # effect, so the loader is punitive.
+    _embed.set_backend_loader(
+        lambda url: (_ for _ in ()).throw(AssertionError("env path used"))
     )
+    request.addfinalizer(lambda: _embed.set_backend_loader(None))
 
     fake = _FakeBackend({"foo": [1.0, 0.0], "bar": [0.0, 1.0]})
     _embed.set_model(fake)
@@ -227,18 +235,21 @@ def test_set_model_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_openai_backend_env_failure_does_not_fall_back_to_st(
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """If the user configured an HTTP endpoint but the backend cannot
     build, we prefer "no signal" over silently loading a local
     sentence-transformers model the user did not ask for."""
     monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://fake:9999")
-    monkeypatch.setattr(_embed, "_try_load_openai_backend", lambda _url: None)
+    _embed.set_backend_loader(lambda _url: None)
+    request.addfinalizer(lambda: _embed.set_backend_loader(None))
 
     assert _embed.available() is False
 
 
 def test_openai_backend_builder_honours_model_and_timeout(
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     """``_try_load_openai_backend`` reads every optional env var."""
     monkeypatch.setenv("GOLDFIVE_EMBEDDING_MODEL", "qwen3-embed")
@@ -251,7 +262,8 @@ def test_openai_backend_builder_honours_model_and_timeout(
         def __init__(self, **kwargs: Any) -> None:
             captured.update(kwargs)
 
-    monkeypatch.setattr(_embed, "_OpenAIEmbeddingBackend", _Spy)
+    _embed.set_backend_class(_Spy)
+    request.addfinalizer(lambda: _embed.set_backend_class(None))
 
     backend = _embed._try_load_openai_backend("http://host:8081/")
     assert backend is not None

@@ -72,39 +72,30 @@ def _stub_judge_call_llm(responses: list[Any]):
 # ---------------------------------------------------------------------------
 
 
-async def test_mode_off_returns_none_regardless_of_input(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_mode_off_returns_none_regardless_of_input() -> None:
     """No embedding detector runs and no judge fires in off-mode."""
-    calls: list[str] = []
+    embed_calls: list[str] = []
 
-    def _track(name):
-        def _f(text, session):
-            calls.append(name)
-            return None
-        return _f
-
-    for fn in (
-        "detect_intent_divergence",
-        "detect_looping_reasoning",
-        "detect_off_topic",
-        "detect_reasoning_cluster_tightening",
-    ):
-        monkeypatch.setattr(dreason, fn, _track(fn))
+    def _embed_pipeline(text, session):
+        embed_calls.append("embedding")
+        return None
 
     judge_calls: list[str] = []
 
-    async def _judge(**kwargs):
+    async def _judge(text, session, **kwargs):
         judge_calls.append("judge")
         return None
 
-    monkeypatch.setattr(dreason, "classify_reasoning_drift", _judge)
-
     drift = await dreason.analyze_reasoning(
-        "arbitrary reasoning", _session(), mode="off", call_llm=_stub_judge_call_llm([])
+        "arbitrary reasoning",
+        _session(),
+        mode="off",
+        call_llm=_stub_judge_call_llm([]),
+        embedding_pipeline=_embed_pipeline,
+        judge_classifier=_judge,
     )
     assert drift is None
-    assert calls == []
+    assert embed_calls == []
     assert judge_calls == []
 
 
@@ -113,46 +104,40 @@ async def test_mode_off_returns_none_regardless_of_input(
 # ---------------------------------------------------------------------------
 
 
-async def test_mode_embedding_runs_embedding_detectors_and_skips_judge(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
+async def test_mode_embedding_runs_embedding_detectors_and_skips_judge() -> None:
+    """``mode="embedding"`` invokes the embedding pipeline and never the
+    judge.
 
-    def _track(name, returns=None):
-        def _f(text, session):
-            calls.append(name)
-            return returns
-        return _f
+    The embedding pipeline contract is "try every embedding detector
+    in worst-signal-wins order"; we model that by handing
+    ``analyze_reasoning`` an embedding pipeline stub that records its
+    own invocation and short-circuits via the real detectors. The
+    detector-level coverage lives in :file:`tests/test_drift_reasoning.py`;
+    here we only care that the dispatch lands on the embedding side
+    and not on the judge side.
+    """
+    embed_calls: list[str] = []
 
-    for fn in (
-        "detect_intent_divergence",
-        "detect_looping_reasoning",
-        "detect_off_topic",
-        "detect_reasoning_cluster_tightening",
-    ):
-        monkeypatch.setattr(dreason, fn, _track(fn))
+    def _embed_pipeline(text, session):
+        embed_calls.append("embedding")
+        return None
 
     judge_calls: list[str] = []
 
-    async def _judge(**kwargs):
+    async def _judge(text, session, **kwargs):
         judge_calls.append("judge")
         return None
 
-    monkeypatch.setattr(dreason, "classify_reasoning_drift", _judge)
-
     drift = await dreason.analyze_reasoning(
-        "text", _session(), mode="embedding",
+        "text",
+        _session(),
+        mode="embedding",
         call_llm=_stub_judge_call_llm([{"on_task": False}]),
+        embedding_pipeline=_embed_pipeline,
+        judge_classifier=_judge,
     )
     assert drift is None
-    # Every embedding detector got a chance (they all returned None).
-    # ``detect_unreferenced_keyword`` is intentionally unwired post #226.
-    assert calls == [
-        "detect_intent_divergence",
-        "detect_looping_reasoning",
-        "detect_off_topic",
-        "detect_reasoning_cluster_tightening",
-    ]
+    assert embed_calls == ["embedding"]
     assert judge_calls == []
 
 
@@ -161,28 +146,21 @@ async def test_mode_embedding_runs_embedding_detectors_and_skips_judge(
 # ---------------------------------------------------------------------------
 
 
-async def test_mode_judge_skips_embedding_and_runs_judge(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_mode_judge_skips_embedding_and_runs_judge() -> None:
     embedding_calls: list[str] = []
-    for fn in (
-        "detect_intent_divergence",
-        "detect_looping_reasoning",
-        "detect_off_topic",
-        "detect_unreferenced_keyword",
-        "detect_reasoning_cluster_tightening",
-    ):
-        def _maker(name):
-            def _f(text, session):
-                embedding_calls.append(name)
-                return None
-            return _f
 
-        monkeypatch.setattr(dreason, fn, _maker(fn))
+    def _embed_pipeline(text, session):
+        embedding_calls.append("embedding")
+        return None
 
     call_llm = _stub_judge_call_llm([{"on_task": True}])
     drift = await dreason.analyze_reasoning(
-        "text", _session(), mode="judge", call_llm=call_llm, model="fake",
+        "text",
+        _session(),
+        mode="judge",
+        call_llm=call_llm,
+        model="fake",
+        embedding_pipeline=_embed_pipeline,
     )
     assert drift is None
     assert embedding_calls == []
@@ -201,9 +179,7 @@ async def test_mode_judge_with_no_call_llm_silently_no_ops() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_mode_both_embedding_wins_tie_on_equal_severity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_mode_both_embedding_wins_tie_on_equal_severity() -> None:
     """When both paths fire with the SAME severity, embedding wins
     (deterministic, synchronous path).
     """
@@ -213,24 +189,22 @@ async def test_mode_both_embedding_wins_tie_on_equal_severity(
         detail="embedding path fired",
         current_task_id="t1",
     )
-    monkeypatch.setattr(
-        dreason,
-        "_embedding_pipeline",
-        lambda text, session: embedding_drift,
-    )
     call_llm = _stub_judge_call_llm(
         [{"on_task": False, "severity": "warning", "reason": "judge path fired"}]
     )
 
     drift = await dreason.analyze_reasoning(
-        "text", _session(), mode="both", call_llm=call_llm, model="fake",
+        "text",
+        _session(),
+        mode="both",
+        call_llm=call_llm,
+        model="fake",
+        embedding_pipeline=lambda text, session: embedding_drift,
     )
     assert drift is embedding_drift
 
 
-async def test_mode_both_judge_wins_higher_severity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_mode_both_judge_wins_higher_severity() -> None:
     """Judge drift at CRITICAL wins over embedding drift at WARNING."""
     embedding_drift = DriftEvent(
         kind=DriftKind.INTENT_DIVERGENCE,
@@ -238,98 +212,93 @@ async def test_mode_both_judge_wins_higher_severity(
         detail="embedding",
         current_task_id="t1",
     )
-    monkeypatch.setattr(
-        dreason,
-        "_embedding_pipeline",
-        lambda text, session: embedding_drift,
-    )
     call_llm = _stub_judge_call_llm(
         [{"on_task": False, "severity": "critical", "reason": "severe drift"}]
     )
 
     drift = await dreason.analyze_reasoning(
-        "text", _session(), mode="both", call_llm=call_llm, model="fake",
+        "text",
+        _session(),
+        mode="both",
+        call_llm=call_llm,
+        model="fake",
+        embedding_pipeline=lambda text, session: embedding_drift,
     )
     assert drift is not None
     assert drift.severity is DriftSeverity.CRITICAL
     assert "severe drift" in drift.detail  # came from judge
 
 
-async def test_mode_both_embedding_wins_higher_severity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_mode_both_embedding_wins_higher_severity() -> None:
     embedding_drift = DriftEvent(
         kind=DriftKind.INTENT_DIVERGENCE,
         severity=DriftSeverity.CRITICAL,
         detail="embedding",
         current_task_id="t1",
     )
-    monkeypatch.setattr(
-        dreason,
-        "_embedding_pipeline",
-        lambda text, session: embedding_drift,
-    )
     call_llm = _stub_judge_call_llm(
         [{"on_task": False, "severity": "info", "reason": "mild"}]
     )
 
     drift = await dreason.analyze_reasoning(
-        "text", _session(), mode="both", call_llm=call_llm, model="fake",
+        "text",
+        _session(),
+        mode="both",
+        call_llm=call_llm,
+        model="fake",
+        embedding_pipeline=lambda text, session: embedding_drift,
     )
     assert drift is embedding_drift
 
 
-async def test_mode_both_judge_alone_when_embedding_silent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(dreason, "_embedding_pipeline", lambda text, session: None)
+async def test_mode_both_judge_alone_when_embedding_silent() -> None:
     call_llm = _stub_judge_call_llm(
         [{"on_task": False, "severity": "warning", "reason": "off"}]
     )
     drift = await dreason.analyze_reasoning(
-        "text", _session(), mode="both", call_llm=call_llm, model="fake",
+        "text",
+        _session(),
+        mode="both",
+        call_llm=call_llm,
+        model="fake",
+        embedding_pipeline=lambda text, session: None,
     )
     assert drift is not None
     assert drift.severity is DriftSeverity.WARNING
 
 
-async def test_mode_both_embedding_alone_when_judge_silent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_mode_both_embedding_alone_when_judge_silent() -> None:
     embedding_drift = DriftEvent(
         kind=DriftKind.INTENT_DIVERGENCE,
         severity=DriftSeverity.WARNING,
         detail="embedding",
         current_task_id="t1",
     )
-    monkeypatch.setattr(
-        dreason,
-        "_embedding_pipeline",
-        lambda text, session: embedding_drift,
-    )
     call_llm = _stub_judge_call_llm([{"on_task": True}])
     drift = await dreason.analyze_reasoning(
-        "text", _session(), mode="both", call_llm=call_llm, model="fake",
+        "text",
+        _session(),
+        mode="both",
+        call_llm=call_llm,
+        model="fake",
+        embedding_pipeline=lambda text, session: embedding_drift,
     )
     assert drift is embedding_drift
 
 
-async def test_mode_both_without_call_llm_degrades_to_embedding(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_mode_both_without_call_llm_degrades_to_embedding() -> None:
     embedding_drift = DriftEvent(
         kind=DriftKind.INTENT_DIVERGENCE,
         severity=DriftSeverity.WARNING,
         detail="embedding",
         current_task_id="t1",
     )
-    monkeypatch.setattr(
-        dreason,
-        "_embedding_pipeline",
-        lambda text, session: embedding_drift,
-    )
     drift = await dreason.analyze_reasoning(
-        "text", _session(), mode="both", call_llm=None,
+        "text",
+        _session(),
+        mode="both",
+        call_llm=None,
+        embedding_pipeline=lambda text, session: embedding_drift,
     )
     assert drift is embedding_drift
 
@@ -339,17 +308,18 @@ async def test_mode_both_without_call_llm_degrades_to_embedding(
 # ---------------------------------------------------------------------------
 
 
-async def test_unknown_mode_falls_back_to_embedding(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_unknown_mode_falls_back_to_embedding() -> None:
     fired: list[str] = []
-    monkeypatch.setattr(
-        dreason,
-        "_embedding_pipeline",
-        lambda text, session: fired.append("embedding") or None,  # type: ignore[func-returns-value]
-    )
+
+    def _embed_pipeline(text, session):
+        fired.append("embedding")
+        return None
+
     drift = await dreason.analyze_reasoning(
-        "text", _session(), mode="bogus",  # type: ignore[arg-type]
+        "text",
+        _session(),
+        mode="bogus",  # type: ignore[arg-type]
+        embedding_pipeline=_embed_pipeline,
     )
     assert drift is None
     assert fired == ["embedding"]
