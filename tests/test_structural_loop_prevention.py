@@ -251,7 +251,7 @@ async def test_progress_stall_escalates_when_task_silent(
     steerer.PROGRESS_STALL_THRESHOLD_SECONDS = 60.0
 
     clock = [1000.0]
-    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("goldfive.drift_observer.time.monotonic", lambda: clock[0])
 
     # Stamp progress at t=1000.
     session.task_last_progress_at["t1"] = 1000.0
@@ -286,7 +286,7 @@ async def test_progress_stall_does_not_fire_when_task_is_iterating(
     steerer.PROGRESS_STALL_THRESHOLD_SECONDS = 60.0
 
     clock = [1000.0]
-    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("goldfive.drift_observer.time.monotonic", lambda: clock[0])
 
     # Stamp progress at t=1000.
     session.task_last_progress_at["t1"] = 1000.0
@@ -322,7 +322,7 @@ async def test_progress_stall_skipped_when_task_has_no_progress_record(
     steerer.PROGRESS_STALL_THRESHOLD_SECONDS = 60.0
 
     clock = [1000.0]
-    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("goldfive.drift_observer.time.monotonic", lambda: clock[0])
 
     # No entry in ``task_last_progress_at`` for "t1".
     assert "t1" not in session.task_last_progress_at
@@ -355,7 +355,7 @@ async def test_user_steer_bypasses_progress_stall_gate(
     steerer.PROGRESS_STALL_THRESHOLD_SECONDS = 60.0
 
     clock = [1000.0]
-    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("goldfive.drift_observer.time.monotonic", lambda: clock[0])
 
     # Stale progress.
     session.task_last_progress_at["t1"] = 1000.0
@@ -431,7 +431,7 @@ async def test_mark_task_running_stamps_progress(
     steerer.bind(sinks=[sink], planner=_GrowingPlanner())
 
     clock = [1234.5]
-    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("goldfive.drift_observer.time.monotonic", lambda: clock[0])
 
     await steerer.mark_task_running("t1", session=session)
 
@@ -449,7 +449,7 @@ async def test_mark_task_progress_refreshes_progress(
     steerer.bind(sinks=[sink], planner=_GrowingPlanner())
 
     clock = [1000.0]
-    monkeypatch.setattr("goldfive.steerer.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("goldfive.drift_observer.time.monotonic", lambda: clock[0])
 
     await steerer.mark_task_running("t1", session=session)
     assert session.task_last_progress_at["t1"] == pytest.approx(1000.0)

@@ -53,7 +53,6 @@ import enum
 import inspect
 import logging
 import re
-import time  # noqa: F401 — re-exported for tests that monkeypatch ``goldfive.steerer.time.monotonic`` / ``.time``
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
