@@ -110,8 +110,10 @@ from goldfive.types import (
     Task,
     TaskEdge,
     TaskStatus,
+    add_tasks,
     bump_revision,
     channel_processor_active,
+    discovery_identity_hash,
     replace_edges,
     set_session_plan,
 )
@@ -688,6 +690,358 @@ class PlanReviser:
         return await self.install_revision_for_drift(
             session=session, drift=drift, revised_plan=revised_plan
         )
+
+    # ------------------------------------------------------------------
+    # Descriptive growth — synchronous, lock-acquiring plan growth at
+    # delegation_observed time (goldfive#423 PR 2).
+    # ------------------------------------------------------------------
+
+    async def install_descriptive_growth(
+        self,
+        session: Session,
+        *,
+        agent_name: str,
+        tool_args_json: str,
+        delegation_event_id: str = "",
+    ) -> Task:
+        """Grow ``session.plan`` with a ``discovered=True`` task and return it.
+
+        The descriptive-growth fallback for unmatched delegations (design
+        doc §4.3 + §5 Option D). Synthesises a new :class:`Task` carrying
+        ``discovered=True`` and a stable
+        :attr:`Task.discovery_identity_hash` computed from
+        ``(agent_name, tool_args_json)`` via the §4.3.0 helper, then
+        installs it onto ``session.plan`` under the per-session plan
+        lock so the swap linearises against concurrent refines.
+
+        Idempotent by ``discovery_identity_hash``. Inside the lock the
+        method re-reads ``session.plan`` (the lock acquisition is the
+        linearisation point — any concurrent refine has either completed
+        before the read or is queued behind it) and checks for an
+        existing task with the same hash. If found, the existing task
+        is returned and the plan is NOT grown. Two delegations of the
+        same ``(agent, args-token-set)`` arriving simultaneously thus
+        produce ONE discovered task, not two (§11.6 dedup
+        linearisability).
+
+        The new task lands as an independent sub-DAG root: no predecessor
+        edges, no supersedes link. Rule 7 of :meth:`Plan.validate` allows
+        this because the predecessor set is empty.
+
+        The ``tool_args_json`` argument MUST come from the observed
+        :class:`~goldfive.types.DelegationObserved` event — i.e., from
+        the agent-authored proto field, NOT from a goldfive-side
+        intercept of agent state at pin time. See §13 for the underlying
+        "adaptive, not predictive" principle. Empty / missing
+        ``tool_args_json`` (legacy events from before PR 1) degrades to
+        a coarser per-``(agent_name, "")`` hash, which is the §9
+        forward-compat fallback PR 2 must tolerate.
+
+        ``delegation_event_id`` is the originating
+        ``DelegationObserved.id`` — threaded into the placeholder
+        :class:`DriftEvent`'s ``id`` so harmonograf's intervention
+        aggregator can correlate the resulting ``PlanRevised`` /
+        ``DriftDetected`` envelopes back to the delegation that
+        triggered the growth. Empty when the caller has no event id on
+        hand; the helper still works.
+
+        Pipeline (under lock):
+
+        1. Compute ``identity_hash`` from ``(agent_name, tool_args_json)``.
+        2. Acquire ``_get_plan_lock(session)``.
+        3. Re-read ``session.plan``. If any task already carries
+           ``discovery_identity_hash == identity_hash``, return it
+           (dedup; no growth).
+        4. Build the new :class:`Task` with ``discovered=True``,
+           ``discovery_identity_hash=identity_hash``,
+           ``status=PENDING``, ``assignee_agent_id=agent_name``, and a
+           title derived from ``agent_name``.
+        5. Synthesise a ``NEW_WORK_DISCOVERED`` :class:`DriftEvent`
+           (INFO severity, ``authored_by="goldfive"``) so the existing
+           :meth:`install_revision_for_drift` carve-out at
+           :meth:`_apply_revision` (the goldfive#258 discovery exemption
+           from the observation-only gate) lets the revision land in
+           both steering AND observation mode.
+        6. Build the revised :class:`Plan` via :func:`add_tasks` and
+           hand it to :meth:`install_revision_for_drift`, which owns the
+           full ``PlanRevised`` + ``DriftDetected`` emit path and is
+           already lock-aware.
+        7. Release the lock; return the new task.
+
+        Returns the discovered :class:`Task` (either the freshly
+        installed one or the deduped pre-existing one). The caller can
+        then re-pin ``session.current_task_id`` onto its id.
+
+        Never raises on validation or install failures; on rejection
+        returns a fresh Task instance representing the would-have-been
+        discovery so callers can still pin observationally. (Production
+        flow always lands — discovered tasks satisfy
+        :meth:`Plan.validate` by construction; rejection means
+        something pathological happened upstream.)
+
+        Design ref: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3,
+        §5 Option D (lock-acquiring), §11.6 (race-test acceptance), §13
+        (adaptive not predictive).
+        """
+        from goldfive.conv import to_pb_plan
+        from goldfive.events import build_plan_revision_diff
+
+        identity_hash = discovery_identity_hash(agent_name, tool_args_json or None)
+        title = self._derive_discovered_task_title(agent_name, tool_args_json)
+        description = self._derive_discovered_task_description(tool_args_json)
+        # Mint a fresh id so two concurrent growths on the same
+        # (agent, args-token-set) cannot collide on plan-task id even
+        # if both miss the dedup check (the lock makes them sequential
+        # — the second will find the first inside the lock — but we
+        # belt-and-braces the id space anyway).
+        new_task_id = f"discovered-{uuid.uuid4().hex[:12]}"
+
+        # The placeholder DriftEvent threads metadata through the
+        # PlanRevised + DriftDetected emit below. INFO severity per
+        # design doc §4.6: framework-synthesised discoveries are
+        # observational, not corrective.
+        drift = DriftEvent(
+            kind=DriftKind.NEW_WORK_DISCOVERED,
+            severity=DriftSeverity.INFO,
+            detail=(
+                f"descriptive growth: agent={agent_name!r} "
+                f"hash={identity_hash} task_id={new_task_id}"
+            ),
+            current_task_id=new_task_id,
+            current_agent_id=agent_name or "",
+            authored_by="goldfive",
+        )
+        if delegation_event_id:
+            try:
+                drift.id = delegation_event_id
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+
+        # Captured-after-lock state used by the OFF-lock PlanRevised
+        # emit. Initialised to "no install" so an early dedup return
+        # cleanly skips the emit.
+        installed_task: Task | None = None
+        revised_plan: Plan | None = None
+        prev_plan: Plan | None = None
+
+        lock = self._get_plan_lock(session)
+        async with lock:
+            # Linearisation point: any concurrent refine has either
+            # completed before this read or is queued behind it. Two
+            # simultaneous descriptive-growth calls also serialise here.
+            current_plan = session.plan
+            if current_plan is not None:
+                for existing in current_plan.tasks:
+                    if (
+                        getattr(existing, "discovery_identity_hash", "") or ""
+                    ) == identity_hash and bool(
+                        getattr(existing, "discovered", False)
+                    ):
+                        # Dedup hit — a prior delegation already grew the
+                        # plan for this (agent, args-token-set). Re-pin
+                        # to the existing task; no growth.
+                        log.info(
+                            "DefaultSteerer.install_descriptive_growth: "
+                            "dedup hit on identity_hash=%s — reusing "
+                            "existing discovered task id=%s for agent=%r",
+                            identity_hash,
+                            existing.id,
+                            agent_name,
+                        )
+                        return existing
+
+            new_task = Task(
+                id=new_task_id,
+                title=title,
+                description=description,
+                assignee_agent_id=agent_name or "",
+                status=TaskStatus.PENDING,
+                discovered=True,
+                discovery_identity_hash=identity_hash,
+            )
+
+            if current_plan is None:
+                # Defensive: no prior plan on the session. The runner
+                # seeds session.plan with Plan.empty() before turn 1
+                # in normal flow, so this branch is unusual — but we
+                # still produce a single-task plan so the discovered
+                # task lands as the seed.
+                revised_plan = Plan(
+                    id=f"discovered-plan-{uuid.uuid4().hex[:12]}",
+                    run_id=session.run_id,
+                    goal_ids=tuple(g.id for g in session.goals),
+                    tasks=(new_task,),
+                    edges=(),
+                    revision_index=1,
+                )
+            else:
+                # Sub-DAG root: no predecessor edges, no supersedes
+                # link. Rule 7 of Plan.validate allows this because the
+                # predecessor set is empty (design doc §4.3 closing
+                # paragraph).
+                grown = add_tasks(current_plan, [new_task])
+                revised_plan = bump_revision(
+                    grown,
+                    revision_index=current_plan.revision_index + 1,
+                    revision_kind=drift.kind.value,
+                    revision_severity=drift.severity.value,
+                    revision_reason=drift.detail,
+                    revision_trigger_event_id=str(getattr(drift, "id", "") or ""),
+                )
+
+            # Validate the revised plan before swapping. A discovered
+            # task that adds no edges is provably valid by construction
+            # (sub-DAG root); the validate is cheap and catches the
+            # pathological case (e.g. a malformed agent_name producing
+            # an empty task id) before mutating session state. On
+            # rejection, log + return the would-have-been Task without
+            # installing — the next delegation's dedup will fail and
+            # re-attempt.
+            try:
+                revised_plan.validate(for_revision=True, prior=current_plan)
+            except ValueError as exc:
+                log.warning(
+                    "DefaultSteerer.install_descriptive_growth: "
+                    "validation failed (%s); skipping install for "
+                    "agent=%r hash=%s",
+                    exc,
+                    agent_name,
+                    identity_hash,
+                )
+                return new_task
+
+            prev_plan = current_plan
+            # SINGLE WRITER under the lock — set_session_plan + the
+            # channel_processor envelope serialise this against any
+            # concurrent refine, and the lock acquisition above ensures
+            # _emit_plan_revised's lock holder cannot interleave. This
+            # is the §5 Option D contract: single writer, inside the
+            # lock, full stop.
+            with channel_processor_active():
+                set_session_plan(session, revised_plan)
+            # Refresh the orchestration-state current plan id so
+            # downstream reads see the revised id. Mirrors the slice of
+            # _emit_plan_revised that owns this stamp post-#403.
+            try:
+                _ostate.set_current_plan(session.state, revised_plan)
+            except Exception as exc:  # noqa: BLE001 — defensive
+                log.debug(
+                    "DefaultSteerer.install_descriptive_growth: "
+                    "set_current_plan raised: %s",
+                    exc,
+                )
+            installed_task = new_task
+
+        # OFF-LOCK: emit PlanRevised + paired DriftDetected. The
+        # snapshot we carry was captured inside the lock and cannot
+        # tear. Fire-and-forget-style — observability cannot block
+        # the delegation. Per design doc §5.1: "The paired PlanRevised
+        # + DriftDetected emit is scheduled off-lock as fire-and-forget;
+        # the snapshot it carries is captured inside the lock and
+        # cannot tear."
+        if installed_task is not None and revised_plan is not None:
+            try:
+                await self._steerer.drift._emit_drift_detected(session, drift)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "DefaultSteerer.install_descriptive_growth: "
+                    "_emit_drift_detected raised: %s",
+                    exc,
+                )
+            try:
+                evt = self._steerer._new_envelope(session)
+                evt.plan_revised.plan.CopyFrom(to_pb_plan(revised_plan))
+                evt.plan_revised.drift_kind = (
+                    self._steerer._drift_kind_pb_value(drift.kind)
+                )
+                evt.plan_revised.severity = (
+                    self._steerer._drift_severity_pb_value(drift.severity)
+                )
+                evt.plan_revised.reason = drift.detail
+                evt.plan_revised.revision_index = revised_plan.revision_index
+                trig_id = str(getattr(drift, "id", "") or "")
+                if trig_id:
+                    evt.plan_revised.trigger_event_id = trig_id
+                evt.plan_revised.diff.CopyFrom(
+                    build_plan_revision_diff(prev_plan, revised_plan)
+                )
+                evt.plan_revised.refine_input_summary = (
+                    self._build_refine_input_summary(drift, prev_plan)
+                )
+                evt.plan_revised.refine_output_summary = (
+                    self._build_refine_output_summary(revised_plan)
+                )
+                evt.plan_revised.target_agent_id = drift.current_agent_id or ""
+                # Discovery growth is observational by construction —
+                # the work is already happening; we are describing it,
+                # not proposing a revision. dry_run=False keeps
+                # harmonograf rendering it as a real revision.
+                evt.plan_revised.dry_run = False
+                await self._steerer._emit(evt)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "DefaultSteerer.install_descriptive_growth: "
+                    "PlanRevised emit raised: %s",
+                    exc,
+                )
+
+        log.info(
+            "DefaultSteerer.install_descriptive_growth: grew plan with "
+            "discovered task id=%s agent=%r hash=%s",
+            new_task_id,
+            agent_name,
+            identity_hash,
+        )
+        return installed_task if installed_task is not None else new_task
+
+    @staticmethod
+    def _derive_discovered_task_title(agent_name: str, tool_args_json: str) -> str:
+        """Render a stable, human-readable title for a discovered task.
+
+        Priority per design doc §4.3.1:
+
+        1. The ``request`` / ``task`` / ``goal`` arg off ``tool_args_json``
+           (the conventional ``AgentTool`` payload key), truncated to 80
+           chars.
+        2. Fallback: ``f"{agent_name}: discovered work"``.
+
+        The §4.3.1 second tier (first reasoning trace via
+        ``Steerer.observe_reasoning``) is left for a follow-up PR — at
+        pin / delegation-observed time we do not yet have a reasoning
+        trace from the discovered sub-agent.
+        """
+        import json as _json
+
+        if tool_args_json:
+            try:
+                parsed = _json.loads(tool_args_json)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                for key in ("request", "task", "goal"):
+                    val = parsed.get(key)
+                    if isinstance(val, str) and val.strip():
+                        snippet = val.strip()
+                        if len(snippet) > 80:
+                            snippet = snippet[:77].rstrip() + "..."
+                        return f"{agent_name}: {snippet}" if agent_name else snippet
+        return f"{agent_name}: discovered work" if agent_name else "discovered work"
+
+    @staticmethod
+    def _derive_discovered_task_description(tool_args_json: str) -> str:
+        """Render a compact description from the observed tool_args.
+
+        Truncated to 256 chars per design doc §4.3 pseudocode.
+        ``tool_args_json`` is the raw JSON payload from the
+        :class:`~goldfive.types.DelegationObserved` proto; we keep it
+        verbatim (with truncation) so operators can see exactly what
+        the agent invoked.
+        """
+        if not tool_args_json:
+            return ""
+        if len(tool_args_json) > 256:
+            return tool_args_json[:253].rstrip() + "..."
+        return tool_args_json
 
     # ------------------------------------------------------------------
     # Per-session plan lock + refine attempt observability

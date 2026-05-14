@@ -657,6 +657,24 @@ class SteeringConfig:
     #: capability. See ``docs/design/CONTEXT-EDITING.md`` for the rule
     #: catalog and the rationale behind drop-only edits.
     context_editor_rules: list[str] | None = None
+    #: Plan-descriptive growth fallback for unmatched delegations
+    #: (goldfive#423 PR 2). When ``True`` and the structural capability
+    #: detector returns a Rule C (out-of-DAG-order) verdict, the steerer
+    #: synthesises a ``discovered=True`` task via
+    #: :meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`
+    #: and re-pins the delegation to it instead of firing the
+    #: CAPABILITY_MISMATCH drift. Rule A and Rule B are unaffected. When
+    #: ``False`` (the default) the existing CAPABILITY_MISMATCH Rule C
+    #: path fires as today, so PR 2 lands behind the flag without
+    #: behaviour change for existing tests/runs. PR 4 flips the default
+    #: after sufficient validation. Env: ``GOLDFIVE_STEER_DESCRIPTIVE_GROWTH``.
+    #:
+    #: Design ref: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3 + §9
+    #: (PR table). The flag gates ONLY the §4.3 fallback; the data-model
+    #: fields shipped in PR 1 (``Task.discovered``,
+    #: ``Task.discovery_identity_hash``, ``DelegationObserved.tool_args_json``)
+    #: are always available regardless of this flag.
+    descriptive_growth_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -697,6 +715,10 @@ class SteeringConfig:
                 defaults.observation_only,
             ),
             context_editor_rules=rules,
+            descriptive_growth_enabled=_read_bool_env(
+                "GOLDFIVE_STEER_DESCRIPTIVE_GROWTH",
+                defaults.descriptive_growth_enabled,
+            ),
         )
 
 

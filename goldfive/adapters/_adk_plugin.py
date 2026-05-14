@@ -1556,6 +1556,170 @@ def _jsonable(v: Any) -> Any:
     return repr(v)
 
 
+def _safe_jsonify_tool_args(tool_args: Any) -> str:
+    """Render ``tool_args`` to a stable JSON string for proto-side carriage.
+
+    Used by the ``DelegationObserved`` emit (goldfive#423 PR 1 proto
+    extension) so descriptive growth (PR 2) and any future adaptive
+    consumer reads tool_args off the observed event the agent itself
+    authored, NOT from a goldfive-side intercept of agent state at pin
+    time. See design doc §13 "adaptive, not predictive".
+
+    Never raises. Returns ``""`` on any serialisation failure (the empty
+    string is what PR 1 documented as the legacy / forward-compat
+    default; PR 2's dedup tolerates it).
+    """
+    if tool_args is None:
+        return ""
+    try:
+        import json as _json  # noqa: PLC0415 — lazy
+
+        return _json.dumps(_jsonable(tool_args), sort_keys=True)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# Rule C detail-string marker emitted by
+# ``goldfive.drift.capability_check._rule_c_dag_order``. Used to
+# distinguish Rule C verdicts from Rule A / Rule B without refactoring
+# the detector's return signature. If the marker drifts, the
+# descriptive-growth fallback simply doesn't fire — Rule C dispatch
+# continues as today — and tests catch the regression.
+_RULE_C_DETAIL_MARKER: str = "delegated out of DAG order"
+
+
+def _is_rule_c_verdict(drift: Any) -> bool:
+    """Return True iff ``drift`` is the CAPABILITY_MISMATCH Rule C verdict.
+
+    Identified by substring match on the detail string emitted by
+    :func:`goldfive.drift.capability_check._rule_c_dag_order`. Rule A
+    and Rule B use distinct detail prefixes ("has only AgentTool" and
+    "is missing required tool", respectively) so this check is
+    unambiguous. See design doc §4.3.2 + §7.
+    """
+    detail = str(getattr(drift, "detail", "") or "")
+    return _RULE_C_DETAIL_MARKER in detail
+
+
+def _descriptive_growth_enabled(steerer: Any) -> bool:
+    """Return True iff ``SteeringConfig.descriptive_growth_enabled`` is on.
+
+    Reads through ``steerer._steering_config.descriptive_growth_enabled``
+    (the post-#225 typed config). Falls back to ``False`` (the
+    documented default) on any read failure so the new path stays
+    opt-in. Honours the goldfive#423 PR 2 feature-flag contract: PR 2
+    lands behind the flag; PR 4 flips the default after validation.
+    """
+    if steerer is None:
+        return False
+    try:
+        cfg = getattr(steerer, "_steering_config", None)
+        if cfg is None:
+            return False
+        return bool(getattr(cfg, "descriptive_growth_enabled", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _attempt_descriptive_growth(
+    *,
+    steerer: Any,
+    session: Any,
+    agent_name: str,
+    tool_args_json: str,
+    delegation_event_id: str,
+) -> Any:
+    """Call :meth:`PlanReviser.install_descriptive_growth` defensively.
+
+    Returns the discovered :class:`~goldfive.types.Task` on success,
+    ``None`` on any failure (helper missing, install raised, etc.) so
+    the caller can fall through to the legacy Rule C drift dispatch.
+
+    Per design doc §4.3 + §5 Option D: the helper acquires the
+    per-session plan lock for the swap window and dedups by
+    ``discovery_identity_hash``, so two simultaneous descriptive-growth
+    calls cannot grow the plan twice for the same
+    ``(agent_name, args-token-set)``.
+    """
+    try:
+        plans = getattr(steerer, "plans", None)
+        if plans is None:
+            return None
+        install = getattr(plans, "install_descriptive_growth", None)
+        if not callable(install):
+            return None
+        return await install(
+            session,
+            agent_name=agent_name,
+            tool_args_json=tool_args_json or "",
+            delegation_event_id=delegation_event_id or "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "_attempt_descriptive_growth: install raised: %s; falling "
+            "back to Rule C dispatch",
+            exc,
+        )
+        return None
+
+
+async def _repin_delegation_to_discovered(
+    *,
+    ctx: Any,
+    discovered_task: Any,
+    invoked_agent_name: str,
+) -> None:
+    """Re-pin ``session.current_task_id`` onto the discovered task.
+
+    Mirrors the pin write at the tail of
+    :meth:`_GoldfiveADKPlugin._maybe_pin_delegation_task` — same
+    :class:`~goldfive.state_store.StateStore` write under
+    :class:`~goldfive.state_store.BindingSource`.DELEGATION_PIN, same
+    soft ``session.current_task_id`` mirror, same swallow-all error
+    handling because observability cannot block the in-flight
+    invocation.
+    """
+    session = getattr(ctx, "session", None)
+    if session is None or discovered_task is None:
+        return
+    chosen_id = str(getattr(discovered_task, "id", "") or "")
+    if not chosen_id:
+        return
+    try:
+        from goldfive.state_store import (  # noqa: PLC0415 — lazy
+            BindingSource,
+            StateStore,
+        )
+
+        store = StateStore.for_session(session)
+        live_plan = getattr(session, "plan", None)
+        try:
+            pin_revision = int(getattr(live_plan, "revision_index", 0) or 0)
+        except (TypeError, ValueError):
+            pin_revision = 0
+        store.set_pin_current_task(
+            chosen_id,
+            source=BindingSource.DELEGATION_PIN,
+            revision=pin_revision,
+            title=str(getattr(discovered_task, "title", "") or ""),
+        )
+        try:
+            session.current_task_id = chosen_id
+        except Exception:  # noqa: BLE001
+            pass
+        log.info(
+            "_repin_delegation_to_discovered: pinned discovered task "
+            "id=%s agent=%r",
+            chosen_id,
+            invoked_agent_name,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "_repin_delegation_to_discovered: pin write raised: %s",
+            exc,
+        )
+
+
 async def _await_tool_approval(
     *,
     tool: Any,
@@ -4095,6 +4259,8 @@ def make_adk_plugin(
             invoked_agent: Any,
             invoked_agent_name: str,
             invocation_id: str,
+            tool_args_json: str = "",
+            delegation_event_id: str = "",
         ) -> None:
             """Run the structural capability-mismatch detector at delegation time (goldfive#253).
 
@@ -4106,6 +4272,19 @@ def make_adk_plugin(
             ``steerer.drift.handle_drift`` so the standard intervention
             ladder fires (cancel + refine), with a direct sink-emission
             fallback when the steerer stub does not expose the helper.
+
+            goldfive#423 PR 2 — descriptive-growth fallback. When the
+            detector returns a Rule C (out-of-DAG-order) verdict AND
+            :class:`~goldfive.config.SteeringConfig.descriptive_growth_enabled`
+            is ``True``, the steerer synthesises a ``discovered=True``
+            task via
+            :meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`
+            and re-pins the delegation to it INSTEAD of dispatching the
+            Rule C drift. Rule A and Rule B unaffected. ``tool_args_json``
+            (the agent-authored args off the
+            :class:`~goldfive.types.DelegationObserved` proto field) and
+            ``delegation_event_id`` thread the observed-fact data needed
+            by the growth helper. See design doc §4.3 + §13.
 
             Silent on every failure mode — observability cannot block
             the in-flight invocation.
@@ -4253,6 +4432,45 @@ def make_adk_plugin(
                 drift.observed_revision_index = _observed_rev
             except Exception:  # noqa: BLE001
                 pass
+
+            # goldfive#423 PR 2 — descriptive-growth fallback. When the
+            # feature flag is on AND the drift is specifically Rule C
+            # (out-of-DAG-order: the pin landed on a task whose role-stem
+            # mismatches the invoked agent, but another PENDING task
+            # carries that stem), bypass the Rule C drift dispatch and
+            # synthesise a discovered=True task instead. The new task
+            # carries the agent's role naturally so the structural
+            # mismatch dissolves at the source rather than being papered
+            # over with a refine that has no clean answer (design doc
+            # §2 + §7). Rule A and Rule B verdicts still dispatch normally
+            # — those are skill-gap signals, not pin-mismatch signals.
+            if _is_rule_c_verdict(drift) and _descriptive_growth_enabled(steerer):
+                grew = await _attempt_descriptive_growth(
+                    steerer=steerer,
+                    session=ctx.session,
+                    agent_name=invoked_agent_name,
+                    tool_args_json=tool_args_json,
+                    delegation_event_id=delegation_event_id,
+                )
+                if grew is not None:
+                    # Successful growth (or dedup hit). Re-pin the
+                    # delegation onto the discovered task and suppress
+                    # the Rule C drift. The pin write must be inside
+                    # ``channel_processor_active()`` per the
+                    # single-writer envelope (#247).
+                    await _repin_delegation_to_discovered(
+                        ctx=ctx,
+                        discovered_task=grew,
+                        invoked_agent_name=invoked_agent_name,
+                    )
+                    log.info(
+                        "_maybe_emit_capability_mismatch: descriptive "
+                        "growth absorbed Rule C verdict — discovered "
+                        "task id=%s agent=%r (Rule C drift SUPPRESSED)",
+                        grew.id,
+                        invoked_agent_name,
+                    )
+                    return
 
             handle = getattr(getattr(steerer, "drift", None), "handle_drift", None)
             if callable(handle):
@@ -5471,12 +5689,22 @@ def make_adk_plugin(
                 if not bound_task_id:
                     bound_task_id = str(_safe_attr(ctx.task, "id", "") or "")
                 task_id = bound_task_id
+                # goldfive#423 PR 1 proto extension: stamp the canonical
+                # tool_args JSON onto DelegationObserved so PR 2's
+                # descriptive-growth dedup hash (and any future
+                # adaptive-consumer) reads the agent-authored args off
+                # the observed event, not a goldfive-side intercept. See
+                # design doc §13 "adaptive, not predictive". Empty
+                # tool_args degrade to "" — PR 2's hash falls back to a
+                # coarser per-(agent, "") key per §9 forward-compat.
+                tool_args_json_text = _safe_jsonify_tool_args(tool_args)
                 await self._emit_observability(
                     "delegation_observed",
                     from_agent=from_agent,
                     to_agent=to_agent,
                     task_id=task_id,
                     invocation_id=inv_id,
+                    tool_args_json=tool_args_json_text,
                 )
                 # Extend the per-task observed-agent lineage with the
                 # delegated child. Idempotent ``set.add`` so repeat
@@ -5521,12 +5749,21 @@ def make_adk_plugin(
                 # CAPABILITY_MISMATCH when the agent has only AgentTool
                 # wrappers but was bound to a leaf authoring task, or
                 # when ``Task.required_tools`` are not covered.
+                #
+                # goldfive#423 PR 2 — thread the observed-fact data
+                # (tool_args_json + delegation_event_id) so when the
+                # detector returns a Rule C verdict, the descriptive-
+                # growth fallback can synthesise a discovered task from
+                # the OBSERVED args (not a pin-time intercept of agent
+                # state). See design doc §13 "adaptive, not predictive".
                 try:
                     await self._maybe_emit_capability_mismatch(
                         ctx=ctx,
                         invoked_agent=nested_agent,
                         invoked_agent_name=to_agent,
                         invocation_id=inv_id,
+                        tool_args_json=tool_args_json_text,
+                        delegation_event_id="",
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.debug(
