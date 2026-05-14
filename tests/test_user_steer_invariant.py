@@ -338,7 +338,7 @@ async def test_install_user_steer_always_returns_valid_plan(
     drift = _drift()
     prior_index = prior.revision_index
 
-    returned = await steerer.install_user_steer(
+    returned = await steerer.plans.install_user_steer(
         drift=drift,
         prior=prior,
         llm_revision=llm_revision,
@@ -452,7 +452,7 @@ async def test_deterministic_minimum_cancels_pending_running_blocked() -> None:
     session = _new_session(prior)
     drift = _drift()
 
-    returned = await steerer.install_user_steer(
+    returned = await steerer.plans.install_user_steer(
         drift=drift,
         prior=prior,
         llm_revision=None,
@@ -484,7 +484,7 @@ async def test_install_user_steer_prefers_valid_llm_revision() -> None:
     session = _new_session(prior)
     drift = _drift()
 
-    returned = await steerer.install_user_steer(
+    returned = await steerer.plans.install_user_steer(
         drift=drift,
         prior=prior,
         llm_revision=llm_revision,
@@ -516,7 +516,7 @@ async def test_install_user_steer_falls_back_on_invalid_llm_revision(
     drift = _drift()
 
     caplog.set_level(logging.WARNING, logger="goldfive.steerer")
-    returned = await steerer.install_user_steer(
+    returned = await steerer.plans.install_user_steer(
         drift=drift,
         prior=prior,
         llm_revision=invalid,
@@ -558,7 +558,7 @@ async def test_install_user_steer_does_not_touch_refine_outcomes() -> None:
     )
 
     drift = _drift()
-    await steerer.install_user_steer(
+    await steerer.plans.install_user_steer(
         drift=drift,
         prior=prior,
         llm_revision=invalid,
@@ -579,7 +579,7 @@ async def test_install_user_steer_swaps_session_plan() -> None:
     session = _new_session(prior)
     drift = _drift()
 
-    returned = await steerer.install_user_steer(
+    returned = await steerer.plans.install_user_steer(
         drift=drift,
         prior=prior,
         llm_revision=None,

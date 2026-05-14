@@ -170,7 +170,7 @@ async def test_span_ctx_provider_isolated_across_concurrent_observe_refine() -> 
     captured: dict[str, str] = {}
 
     async def _refine_for(label: str, session: Session) -> None:
-        async with steerer.observe_refine(session, drift):
+        async with steerer.plans.observe_refine(session, drift):
             # Yield so the other task can enter its own observe_refine
             # and (pre-fix) clobber _active_session.
             await asyncio.sleep(0)
@@ -244,7 +244,7 @@ async def test_planner_drift_emitter_routes_to_calling_task_session() -> None:
     assert sink.proto_drifts() == []
 
     async def _refine_for(session: Session, drift: DriftEvent) -> None:
-        async with steerer.observe_refine(session, _drift()):
+        async with steerer.plans.observe_refine(session, _drift()):
             # Yield to interleave with the other task's bracketed
             # window — pre-fix, this is where _active_session gets
             # overwritten.
@@ -323,7 +323,7 @@ async def test_active_session_resets_to_default_after_block() -> None:
 
     assert planner.provider() is None
 
-    async with steerer.observe_refine(session, drift):
+    async with steerer.plans.observe_refine(session, drift):
         ctx = planner.provider()
         assert ctx is not None
         _sinks_arg, run_id, _session_id, _task_id, _seq_fn = ctx

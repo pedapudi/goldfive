@@ -34,7 +34,7 @@ scenario:
   ``request_invocation_cancel`` path or from upstream cancel propagation
   (adk-web stream close, generator ``aclose()``).
 * The fix preserves PR #320's contract: the judge is still drainable
-  by ``steerer.shutdown()``.
+  by ``steerer.drift.shutdown()``.
 * Both spawn sites — task-boundary (``mark_task_*``) and turn-counter
   (``note_agent_turn``) — are covered.
 """
@@ -149,7 +149,7 @@ async def test_judge_survives_cancel_of_spawning_task_at_task_boundary() -> None
         # spawns the goal-drift judge as a background task; we then
         # cancel ourselves to simulate a sibling cancel landing on
         # this task.
-        await steerer.mark_task_completed(
+        await steerer.tasks.mark_task_completed(
             "t1", session=session, summary="research_panels done"
         )
         # Wait for the judge to have started before we yield to the
@@ -219,7 +219,7 @@ async def test_judge_survives_cancel_of_spawning_task_via_note_agent_turn() -> N
     session = _make_session()
 
     async def host_after_run() -> None:
-        await steerer.note_agent_turn(session)
+        await steerer.drift.note_agent_turn(session)
         await judge_started.wait()
         await asyncio.sleep(1.0)
 
@@ -266,7 +266,7 @@ async def test_two_back_to_back_task_transitions_do_not_clobber_running_judge() 
 
     # First transition spawns the judge, primes the rate-limit
     # timestamp. Second transition rate-limits to no-op (timestamp guard).
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
     # Sanity: spawn happened.
     assert len(steerer._background_judges) == 1
     # Second transition immediately after — within rate-limit window —
@@ -284,7 +284,7 @@ async def test_two_back_to_back_task_transitions_do_not_clobber_running_judge() 
             session,
             add_tasks(plan, [Task(id="t2", title="t2", description="")]),
         )
-    await steerer.mark_task_completed("t2", session=session, summary="also done")
+    await steerer.tasks.mark_task_completed("t2", session=session, summary="also done")
     # First judge still pending.
     assert len(steerer._background_judges) == 1
 
@@ -306,7 +306,7 @@ async def test_two_back_to_back_task_transitions_do_not_clobber_running_judge() 
 
 
 async def test_goal_drift_judge_drainable_at_steerer_shutdown() -> None:
-    """``steerer.shutdown()`` drains a still-running goal-drift judge.
+    """``steerer.drift.shutdown()`` drains a still-running goal-drift judge.
 
     PR #320's contract — judges live for the lifetime of the Runner,
     drained at ``Runner.close()`` — must hold for goal-drift judges
@@ -326,12 +326,12 @@ async def test_goal_drift_judge_drainable_at_steerer_shutdown() -> None:
     steerer.bind(sinks=[ListSink()], planner=StubPlanner())
     session = _make_session()
 
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
     assert len(steerer._background_judges) == 1
 
     # shutdown with a tight timeout — the judge is sleeping 2s, so it
     # will be cancelled by the shutdown path.
-    await steerer.shutdown(timeout=0.1)
+    await steerer.drift.shutdown(timeout=0.1)
     # Yield once so done-callbacks fire.
     await asyncio.sleep(0)
     assert steerer._background_judges == set(), (
@@ -359,7 +359,7 @@ async def test_goal_drift_judge_completes_naturally_when_left_alone() -> None:
     steerer.bind(sinks=[sink], planner=StubPlanner())
     session = _make_session()
 
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
     # Drain.
     pending = list(steerer._background_judges)
     await asyncio.gather(*pending, return_exceptions=True)
@@ -395,7 +395,7 @@ async def test_spawn_helper_is_noop_when_no_judge_is_wired() -> None:
     steerer = DefaultSteerer()  # no goal_drift_call_llm
     steerer.bind(sinks=[ListSink()], planner=StubPlanner())
     session = _make_session()
-    steerer._spawn_goal_drift_judge_background(session)
+    steerer.drift._spawn_goal_drift_judge_background(session)
     assert steerer._background_judges == set(), (
         "spawn helper must not register a task when no judge is wired"
     )
@@ -420,5 +420,5 @@ def test_spawn_helper_is_noop_outside_event_loop() -> None:
     session = _make_session()
 
     # No running loop — helper must return cleanly without scheduling.
-    steerer._spawn_goal_drift_judge_background(session)
+    steerer.drift._spawn_goal_drift_judge_background(session)
     assert steerer._background_judges == set()

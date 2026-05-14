@@ -62,32 +62,15 @@ class _ListSink:
         self.events.append(event_pb)
 
 
-class _StubRouter:
-    """Minimal mock router that satisfies :class:`TaskStateMachine`.
-
-    Records every cross-component call so tests can assert the TSM
-    routes them through the router back-reference (rather than
-    importing the sibling components directly).
+class _StubDrift:
+    """Tiny stub of :class:`DriftObserver` exposing only the methods
+    :class:`TaskStateMachine` reaches for via ``self._steerer.drift``.
     """
 
     def __init__(self) -> None:
-        self._sink = _ListSink()
-        self._sinks = [self._sink]
-        self._adapter: Any = None
-        # Spy state for cross-component routing.
         self.note_agent_activity_calls: list[dict[str, Any]] = []
         self.spawn_drift_calls: list[tuple[DriftEvent, Session]] = []
         self.goal_drift_boundary_calls: int = 0
-
-    def _new_envelope(self, session: Session) -> Any:
-        from goldfive.events import new_event
-
-        return new_event(session.run_id, session.next_sequence(), session_id=session.id)
-
-    async def _emit(self, event_pb: Any) -> None:
-        from goldfive.events import emit
-
-        await emit(self._sinks, event_pb)
 
     def note_agent_activity(
         self,
@@ -114,6 +97,46 @@ class _StubRouter:
 
     async def _maybe_run_goal_drift_on_task_boundary(self, session: Session) -> None:
         self.goal_drift_boundary_calls += 1
+
+
+class _StubRouter:
+    """Minimal mock router that satisfies :class:`TaskStateMachine`.
+
+    Records every cross-component call so tests can assert the TSM
+    routes them through the router back-reference (rather than
+    importing the sibling components directly).
+    """
+
+    def __init__(self) -> None:
+        self._sink = _ListSink()
+        self._sinks = [self._sink]
+        self._adapter: Any = None
+        # Cross-component routing now goes through ``self.drift``;
+        # forward the spy attributes via properties so existing tests
+        # that read ``router.note_agent_activity_calls`` stay readable.
+        self.drift = _StubDrift()
+
+    @property
+    def note_agent_activity_calls(self) -> list[dict[str, Any]]:
+        return self.drift.note_agent_activity_calls
+
+    @property
+    def spawn_drift_calls(self) -> list[tuple[DriftEvent, Session]]:
+        return self.drift.spawn_drift_calls
+
+    @property
+    def goal_drift_boundary_calls(self) -> int:
+        return self.drift.goal_drift_boundary_calls
+
+    def _new_envelope(self, session: Session) -> Any:
+        from goldfive.events import new_event
+
+        return new_event(session.run_id, session.next_sequence(), session_id=session.id)
+
+    async def _emit(self, event_pb: Any) -> None:
+        from goldfive.events import emit
+
+        await emit(self._sinks, event_pb)
 
 
 def _seed_session_with_plan() -> Session:

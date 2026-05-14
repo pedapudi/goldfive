@@ -12,7 +12,7 @@ cascade-cancel + refine.
 These tests exercise the control-channel-driven STEER path end-to-end
 through the overlay loop, asserting:
 
-* ``steerer.observe`` is called with the STEER ``ControlMessage``.
+* ``steerer.drift.observe`` is called with the STEER ``ControlMessage``.
 * The reconciler's task-claim state is reset for the revised plan.
 * ``invoke_passthrough`` is re-invoked with the steer body as user
   input.
@@ -76,8 +76,8 @@ class RecordingSink:
         return kinds
 
 
-class SteerAwareStubSteerer:
-    """Steerer stub that reacts to STEER ControlMessage observations.
+class _SteerAwareDrift:
+    """STEER-aware drift sub-component (goldfive#410).
 
     Captures the full observe stream, and when a STEER arrives: records
     the fact, cascade-cancels every non-terminal task in the current
@@ -89,18 +89,12 @@ class SteerAwareStubSteerer:
     """
 
     def __init__(self, *, refined_plans: list[Plan] | None = None) -> None:
-        self._sinks: list[EventSink] = []
-        self._planner: Any = None
         self.observed: list[Any] = []
         self.drift_events: list[DriftEvent] = []
         self.cascade_cancelled: list[str] = []
         self.planner_refine_calls: list[tuple[Plan, DriftEvent]] = []
         # One refined plan per STEER received, consumed in order.
         self._refined_plans: list[Plan] = list(refined_plans or [])
-
-    def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
-        self._sinks = sinks
-        self._planner = planner
 
     async def observe(self, event: Any, session: Session) -> None:
         self.observed.append(event)
@@ -141,8 +135,40 @@ class SteerAwareStubSteerer:
             with channel_processor_active():
                 set_session_plan(session, self._refined_plans.pop(0))
 
-    async def _handle_drift(self, drift: DriftEvent, session: Session) -> None:  # noqa: ARG002
+    async def handle_drift(self, drift: DriftEvent, session: Session) -> None:  # noqa: ARG002
         self.drift_events.append(drift)
+
+    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:  # noqa: ARG002
+        return None
+
+
+class SteerAwareStubSteerer:
+    """Component-namespaced steerer stub (goldfive#410)."""
+
+    def __init__(self, *, refined_plans: list[Plan] | None = None) -> None:
+        self._sinks: list[EventSink] = []
+        self._planner: Any = None
+        self.drift = _SteerAwareDrift(refined_plans=refined_plans)
+
+    @property
+    def observed(self) -> list[Any]:
+        return self.drift.observed
+
+    @property
+    def drift_events(self) -> list[DriftEvent]:
+        return self.drift.drift_events
+
+    @property
+    def cascade_cancelled(self) -> list[str]:
+        return self.drift.cascade_cancelled
+
+    @property
+    def planner_refine_calls(self) -> list[tuple[Plan, DriftEvent]]:
+        return self.drift.planner_refine_calls
+
+    def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
+        self._sinks = sinks
+        self._planner = planner
 
     async def transition(
         self,
@@ -165,9 +191,6 @@ class SteerAwareStubSteerer:
         )
         with channel_processor_active():
             set_session_plan(session, with_task_status(session.plan, task_id, to))
-
-    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:  # noqa: ARG002
-        return None
 
 
 class StubPlanner:

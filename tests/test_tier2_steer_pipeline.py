@@ -200,50 +200,14 @@ async def test_f5_replaces_prior_false_preserves_plan_id() -> None:
     assert getattr(plan, "_goldfive_pivot", False) is False
 
 
-async def test_f5_pivot_routes_through_install_initial_plan() -> None:
+async def test_f5_pivot_routes_through_install_initial_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """End-to-end: drive turn 1 (initial plan) then turn 2 with a pivot
     input. Assert turn 2 lands a NEW plan_id (Rule 6 NOT applied) by
     checking that ``install_initial_plan`` was called for both turns
     and ``install_revision_for_drift`` was never called.
     """
-    from goldfive.steerer import DefaultSteerer
-
-    initial_calls: list[tuple[str, bool]] = []
-    drift_calls: list[str] = []
-
-    class _SpyingSteerer(DefaultSteerer):
-        """Public-method subclass that records install_* call shapes.
-
-        Replaces the previous instance-level ``monkeypatch.setattr`` spy
-        with a subclass spy: the test owns the steerer class it injects
-        into the runner, so production code never has to learn the
-        pattern.
-        """
-
-        async def install_initial_plan(
-            self,
-            *,
-            session: Session,
-            plan: Plan,
-            is_pivot: bool = False,
-        ) -> bool:
-            initial_calls.append((plan.id, is_pivot))
-            return await super().install_initial_plan(
-                session=session, plan=plan, is_pivot=is_pivot
-            )
-
-        async def install_revision_for_drift(
-            self,
-            *,
-            session: Session,
-            drift: Any,
-            revised_plan: Plan,
-        ) -> bool:
-            drift_calls.append(revised_plan.id)
-            return await super().install_revision_for_drift(
-                session=session, drift=drift, revised_plan=revised_plan
-            )
-
     plan_t1 = _plan_dict(
         plan_id="ignored-by-runner",
         summary="2-slide presentation about solar panels",
@@ -313,8 +277,33 @@ async def test_f5_pivot_routes_through_install_initial_plan() -> None:
         planner=planner,
         executor=SequentialExecutor(),
         goal_deriver=PassthroughGoalDeriver("demo"),
-        steerer=_SpyingSteerer(),
         sinks=[sink],
+    )
+
+    # Spy on the steerer's install paths via ``steerer.plans`` (now
+    # public surface per #410 facade cleanup; previous DefaultSteerer
+    # subclass override is no longer available since the router shims
+    # were removed).
+    initial_calls: list[tuple[str, bool]] = []
+    drift_calls: list[str] = []
+    real_initial = runner.steerer.plans.install_initial_plan
+    real_drift = runner.steerer.plans.install_revision_for_drift
+
+    async def _spy_initial(
+        *, session: Session, plan: Plan, is_pivot: bool = False
+    ) -> bool:
+        initial_calls.append((plan.id, is_pivot))
+        return await real_initial(session=session, plan=plan, is_pivot=is_pivot)
+
+    async def _spy_drift(*, session: Session, drift: Any, revised_plan: Plan) -> bool:
+        drift_calls.append(revised_plan.id)
+        return await real_drift(
+            session=session, drift=drift, revised_plan=revised_plan
+        )
+
+    monkeypatch.setattr(runner.steerer.plans, "install_initial_plan", _spy_initial)
+    monkeypatch.setattr(
+        runner.steerer.plans, "install_revision_for_drift", _spy_drift
     )
 
     out1 = await runner.run("make a 2-slide presentation about solar panels")

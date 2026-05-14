@@ -283,13 +283,13 @@ async def test_apply_revision_no_partial_state_visible_during_cancel_inflight_yi
     # completes (it can still snapshot ``session.plan`` raw, which is
     # either the prior pointer or the fully-integrated revised
     # pointer).
-    original_cancel = steerer._cancel_inflight_for_revision
+    original_cancel = steerer.drift._cancel_inflight_for_revision
 
     async def slow_cancel(d: DriftEvent, s: Session) -> list[str]:
         await asyncio.sleep(0.05)
         return await original_cancel(d, s)
 
-    steerer._cancel_inflight_for_revision = slow_cancel  # type: ignore[method-assign]
+    steerer.drift._cancel_inflight_for_revision = slow_cancel  # type: ignore[method-assign]
 
     partial_snapshots: list[dict[str, Any]] = []
 
@@ -325,7 +325,7 @@ async def test_apply_revision_no_partial_state_visible_during_cancel_inflight_yi
             await asyncio.sleep(0)  # yield to the refine task
 
     async def refine_driver() -> None:
-        await steerer._handle_drift(drift, session)
+        await steerer.drift.handle_drift(drift, session)
 
     await asyncio.gather(refine_driver(), partial_state_poller())
 
@@ -386,7 +386,7 @@ async def test_apply_revision_does_not_mutate_session_before_emit() -> None:
     drift = _drift(kind=DriftKind.OFF_TOPIC, task_id="t1")
 
     steerer = DefaultSteerer()
-    returned, was_installed = steerer._apply_revision(session, revised, drift)
+    returned, was_installed = steerer.plans._apply_revision(session, revised, drift)
 
     # The decision is "install" (no observation-only carve-out fires).
     assert was_installed is True, (

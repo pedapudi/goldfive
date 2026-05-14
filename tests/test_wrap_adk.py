@@ -427,7 +427,7 @@ async def test_per_turn_boundary_does_not_call_steerer_shutdown(
     stub_call_llm: Any,
 ) -> None:
     """``_run_async_impl``'s ``finally`` MUST NOT invoke
-    ``steerer.shutdown`` (goldfive#319).
+    ``steerer.drift.shutdown`` (goldfive#319).
 
     The previous Phase 2.X drain called ``shutdown(timeout=0.5)`` at
     every adk-web outer-turn boundary, which fired ``task.cancel()`` on
@@ -472,7 +472,7 @@ async def test_per_turn_boundary_does_not_call_steerer_shutdown(
     [evt async for evt in wrapped._run_async_impl(ctx)]
 
     assert shutdown_call_count == 0, (
-        "per-turn ``_run_async_impl`` must not call ``steerer.shutdown`` "
+        "per-turn ``_run_async_impl`` must not call ``steerer.drift.shutdown`` "
         "(goldfive#319 regression: that cancels in-flight background "
         f"judges). Got {shutdown_call_count} call(s)."
     )

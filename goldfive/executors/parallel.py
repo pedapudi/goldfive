@@ -426,7 +426,7 @@ class ParallelDAGExecutor:
                                 except Exception as exc:  # noqa: BLE001
                                     log.debug(
                                         "ParallelDAGExecutor: "
-                                        "steerer._emit_plan_revised_correlation raised: %s",
+                                        "steerer.plans._emit_plan_revised_correlation raised: %s",
                                         exc,
                                     )
                         # Falls through to loop top: stages recomputed.
@@ -588,7 +588,9 @@ class ParallelDAGExecutor:
                                 session,
                                 with_task_status(session.plan, task.id, TaskStatus.RUNNING),
                             )
-                    emit_transition = getattr(steerer, "_emit_task_transitioned", None)
+                    emit_transition = getattr(
+                        getattr(steerer, "tasks", None), "_emit_task_transitioned", None
+                    )
                     if callable(emit_transition):
                         # Refresh the task reference so the emit reads
                         # the new status from the swapped plan.
@@ -624,8 +626,8 @@ class ParallelDAGExecutor:
                 try:
                     # Hand the result to the steerer for observation
                     # (sinks + any book-keeping) and drift detection.
-                    await steerer.observe(inv, session)
-                    drift = steerer.detect_drift(inv, session)
+                    await steerer.drift.observe(inv, session)
+                    drift = steerer.drift.detect_drift(inv, session)
                 except asyncio.CancelledError:
                     raise
                 except Exception as detect_exc:  # noqa: BLE001
@@ -638,7 +640,8 @@ class ParallelDAGExecutor:
                     # continues but operators can see the failure in
                     # the event stream. See goldfive#134.
                     log.warning(
-                        "ParallelDAGExecutor: steerer.observe/detect_drift raised for task=%s: %s",
+                        "ParallelDAGExecutor: steerer.drift.observe/detect_drift "
+                        "raised for task=%s: %s",
                         task.id,
                         detect_exc,
                     )
@@ -857,7 +860,11 @@ class ParallelDAGExecutor:
         # If a steerer with observe_refine is bound, route refine
         # attempt+failure emission through it. Otherwise fall back to
         # the legacy direct call (test stubs / custom steerers).
-        observe_refine = getattr(steerer, "observe_refine", None) if steerer is not None else None
+        observe_refine = (
+            getattr(getattr(steerer, "plans", None), "observe_refine", None)
+            if steerer is not None
+            else None
+        )
         attempt_id: str = ""
         if observe_refine is not None and callable(observe_refine):
             cm = observe_refine(session, drift)
@@ -1022,7 +1029,7 @@ class ParallelDAGExecutor:
         # goldfive#199: stamp the trigger_event_id on the plan for every
         # refine so harmonograf can strict-id-merge plan-revision rows
         # regardless of whether the executor refined via the steerer or
-        # inline here. Resolution mirrors steerer._apply_revision: source
+        # inline here. Resolution mirrors steerer.plans._apply_revision: source
         # annotation_id (user-control) → drift.id (autonomous). Preserves
         # any pre-existing stamp from the planner path.
         # goldfive#247: Plan is frozen — derive a new instance via
@@ -1078,7 +1085,7 @@ class ParallelDAGExecutor:
             )
         except Exception as exc:  # noqa: BLE001 — observability must never break the run
             log.debug(
-                "ParallelDAGExecutor: steerer._emit_refine_failed raised: %s",
+                "ParallelDAGExecutor: steerer.plans._emit_refine_failed raised: %s",
                 exc,
             )
 
@@ -1255,9 +1262,9 @@ class ParallelDAGExecutor:
     ) -> None:
         """Feed a STEER :class:`ControlMessage` to the steerer."""
         try:
-            await steerer.observe(message, session)
+            await steerer.drift.observe(message, session)
         except Exception as exc:  # noqa: BLE001
-            log.warning("ParallelDAGExecutor: steerer.observe(STEER) raised: %s", exc)
+            log.warning("ParallelDAGExecutor: steerer.drift.observe(STEER) raised: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1278,7 +1285,7 @@ async def _emit_pipeline_failure_drift(
 ) -> None:
     """Emit an INFO ``CUSTOM`` drift when the drift pipeline itself raised.
 
-    Surfaces plumbing failures in ``steerer.observe`` / ``detect_drift``
+    Surfaces plumbing failures in ``steerer.drift.observe`` / ``detect_drift``
     that would otherwise be swallowed. INFO severity so this is
     record-only and does not trigger another refine. Sinks that care
     can filter on the ``drift_pipeline_failed:`` detail prefix. See

@@ -464,7 +464,7 @@ async def test_install_revision_for_user_steer_emits_user_steer_with_raw() -> No
         summary="post-steer",
     )
     installed = await asyncio.wait_for(
-        steerer.install_revision_for_user_steer(
+        steerer.plans.install_revision_for_user_steer(
             session=session, raw=control, revised_plan=revised
         ),
         timeout=5.0,
@@ -523,7 +523,7 @@ async def test_install_revision_for_user_steer_writes_active_steer() -> None:
         summary="post-steer",
     )
     installed = await asyncio.wait_for(
-        steerer.install_revision_for_user_steer(
+        steerer.plans.install_revision_for_user_steer(
             session=session, raw=control, revised_plan=revised
         ),
         timeout=5.0,
@@ -557,7 +557,7 @@ async def test_install_initial_plan_emits_only_plan_revised() -> None:
         summary="initial",
     )
     installed = await asyncio.wait_for(
-        steerer.install_initial_plan(session=session, plan=plan),
+        steerer.plans.install_initial_plan(session=session, plan=plan),
         timeout=5.0,
     )
     assert installed

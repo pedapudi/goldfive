@@ -86,19 +86,39 @@ class Planner(Protocol):
 
 @runtime_checkable
 class Steerer(Protocol):
-    """Observes execution events, drives task transitions, and detects drift."""
+    """Observes execution events, drives task transitions, and detects drift.
 
-    async def observe(self, event: Any, session: Session) -> None: ...
+    After goldfive#410 (facade cleanup), the Steerer is a thin
+    coordinator with three component sub-objects:
 
-    async def observe_reasoning(
-        self,
-        text: str,
-        *,
-        task: Task | None = None,
-        session: Session,
-        provider: str = "",
-        agent_name: str = "",
-    ) -> None: ...
+    * ``tasks`` — :class:`~goldfive.task_state_machine.TaskStateMachine`,
+      holding ``mark_task_*`` / ``cascade_cancel_downstream`` /
+      ``_emit_task_*``.
+    * ``plans`` — :class:`~goldfive.plan_reviser.PlanReviser`, holding
+      ``install_*`` / ``_apply_revision`` / ``_emit_plan_revised`` /
+      ``_wait_plan_stable``.
+    * ``drift`` — :class:`~goldfive.drift_observer.DriftObserver`,
+      holding ``observe`` / ``observe_reasoning`` / ``detect_drift`` /
+      ``handle_drift`` / ``request_invocation_cancel`` / the reflective
+      and goal-drift checks.
+
+    Callers (Runner, executors, reporting handlers, adapters, planners,
+    tests) reach for ``steerer.tasks.X`` / ``steerer.plans.X`` /
+    ``steerer.drift.X`` directly rather than through router shims. The
+    Steerer itself retains only the cross-component ``transition``
+    helper and the shared ``bind`` / ``bind_adapter`` /
+    ``bind_control_channel`` wiring.
+    """
+
+    # Component sub-objects.  Protocol-level types are kept ``Any`` to
+    # avoid a hard dependency cycle (TaskStateMachine, PlanReviser, and
+    # DriftObserver all hold a back-pointer to a Steerer).  Conforming
+    # implementations should expose attributes of the corresponding
+    # concrete classes; the duck-typed contract is "has the methods the
+    # caller reaches for".
+    tasks: Any
+    plans: Any
+    drift: Any
 
     async def transition(
         self,
@@ -108,39 +128,14 @@ class Steerer(Protocol):
         detail: str = "",
         session: Session,
         cancel_reason: str = "",
-    ) -> None: ...
-
-    async def cascade_cancel_downstream(
-        self,
-        session: Session,
-        cancelled_id: str,
     ) -> None:
-        """BFS-cancel every downstream non-terminal task of ``cancelled_id``.
+        """Generic forward transition.
 
-        Shared cancellation-fanout primitive for both PLAN-LIFECYCLE.md
-        §6.2 (unrecoverable cascade) and §6.3 (cancel cascade). A
-        conforming Steerer MUST:
-
-        - Walk the current plan's forward edges from ``cancelled_id``.
-        - Transition every reachable non-terminal task to CANCELLED.
-        - Emit exactly one ``TaskCancelled`` event per transitioned
-          task, with a reason that identifies ``cancelled_id`` as the
-          cascade source.
-        - Skip tasks already in a terminal status (no re-cancellation,
-          no event re-emission).
-        - De-duplicate diamond-DAG reachability (emit at most one event
-          per downstream task per call).
-
-        The initiator (``cancelled_id``) itself is *not* transitioned
-        or emitted here — callers own that transition before invoking
-        this primitive.
+        Dispatches to the appropriate ``tasks.mark_task_*`` method.
+        Kept as a router-level convenience so callers that don't want
+        to bind to a specific status helper have a uniform entry
+        point.
         """
-
-    def detect_drift(
-        self,
-        event: Any,
-        session: Session,
-    ) -> DriftEvent | None: ...
 
     # Called by executors to wire sinks/planner into the steerer.
     def bind(

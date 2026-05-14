@@ -125,26 +125,22 @@ log = logging.getLogger(__name__)
 class PlanReviser:
     """Plan-install + refine-attempt observability owner.
 
-    Constructed by :class:`DefaultSteerer` and held on
-    ``DefaultSteerer._plan_reviser``. The router delegates every
-    install-* protocol method (and the internal helpers it composes
-    over) to the matching method on this class via thin shims that
-    forward arguments verbatim. Tests that historically poked the
-    bare-attribute names on the steerer (``steerer._apply_revision``,
-    ``steerer._emit_plan_revised``, etc.) keep working through those
-    shims; nothing on the public surface changes.
+    Constructed by :class:`DefaultSteerer` and exposed publicly as
+    ``DefaultSteerer.plans`` (goldfive#410). Callers — the Runner,
+    executors, planners, tests — reach the ``install_*`` family
+    directly as ``steerer.plans.install_X``.
     """
 
     def __init__(self, steerer: DefaultSteerer) -> None:
         # Back-reference to the router. Used to reach the shared
         # event-emission primitives (``_new_envelope`` / ``_emit`` /
         # ``_drift_*_pb_value``) and the cross-component cooperators:
-        # :class:`DriftObserver` for ``_emit_drift_detected`` /
+        # ``steerer.drift`` for ``_emit_drift_detected`` /
         # ``_cancel_inflight_for_revision`` / ``_apply_user_steer_state``
         # / ``_unpack_steer_context`` / ``_resolve_authored_by`` /
-        # ``_drift_annotation_id``, and
-        # :class:`TaskStateMachine` for ``mark_task_failed`` when a
-        # refine-failure cascade fires (REPEATED_FAILURE).
+        # ``_drift_annotation_id``, and ``steerer.tasks`` for
+        # ``_emit_plan_revision_transitions`` when a revision changes
+        # task statuses out-of-band.
         self._steerer = steerer
 
     # ------------------------------------------------------------------
@@ -207,7 +203,7 @@ class PlanReviser:
                 plan = self._fold_runtime_terminal_statuses(plan, session.plan)
                 plan.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
-            await self._steerer._emit_drift_detected(
+            await self._steerer.drift._emit_drift_detected(
                 session,
                 DriftEvent(
                     kind=DriftKind.SCHEMA_VIOLATION,
@@ -290,7 +286,7 @@ class PlanReviser:
                 "operator-pushed STEER ControlMessages."
             )
         if not drift.authored_by:
-            drift.authored_by = self._steerer._resolve_authored_by(drift)
+            drift.authored_by = self._steerer.drift._resolve_authored_by(drift)
         return await self._install_with_drift(
             session=session,
             drift=drift,
@@ -327,7 +323,7 @@ class PlanReviser:
         Returns ``True`` on success, ``False`` on validation failure.
         Never raises.
         """
-        body, author, _dedupe = self._steerer._unpack_steer_context(
+        body, author, _dedupe = self._steerer.drift._unpack_steer_context(
             DriftEvent(
                 kind=DriftKind.USER_STEER,
                 severity=DriftSeverity.WARNING,
@@ -429,8 +425,8 @@ class PlanReviser:
             chosen = self._build_minimal_steer_evolution(prior, drift)
         # Always run the user-steer state bookkeeping — every call to
         # this method represents a genuine operator action.
-        await self._steerer._apply_user_steer_state(drift, session)
-        await self._steerer._emit_drift_detected(session, drift)
+        await self._steerer.drift._apply_user_steer_state(drift, session)
+        await self._steerer.drift._emit_drift_detected(session, drift)
         # No-op short-circuit: the deterministic minimum on a prior with
         # no PENDING/RUNNING/BLOCKED tasks degenerates to a structurally
         # identical plan. Skip the install (avoids a misleading
@@ -451,7 +447,7 @@ class PlanReviser:
         # inside ``_apply_revision`` honours ``drift.authored_by == "user"``)
         # so ``was_installed`` is True even under observation_only.
         chosen, was_installed = self._apply_revision(session, chosen, drift)
-        await self._steerer._cancel_inflight_for_revision(drift, session)
+        await self._steerer.drift._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session,
             chosen,
@@ -561,8 +557,8 @@ class PlanReviser:
         installs do not.
         """
         if apply_user_steer_state:
-            await self._steerer._apply_user_steer_state(drift, session)
-        await self._steerer._emit_drift_detected(session, drift)
+            await self._steerer.drift._apply_user_steer_state(drift, session)
+        await self._steerer.drift._emit_drift_detected(session, drift)
         # I4 fix: fold runtime terminal statuses from the prior plan
         # onto the revised plan BEFORE validation. This is the path
         # that NEW_WORK_DISCOVERED installs (Runner._install_revision)
@@ -574,7 +570,7 @@ class PlanReviser:
         try:
             revised_plan.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
-            await self._steerer._emit_drift_detected(
+            await self._steerer.drift._emit_drift_detected(
                 session,
                 DriftEvent(
                     kind=DriftKind.SCHEMA_VIOLATION,
@@ -615,7 +611,7 @@ class PlanReviser:
         revised_plan, was_installed = self._apply_revision(
             session, revised_plan, drift
         )
-        await self._steerer._cancel_inflight_for_revision(drift, session)
+        await self._steerer.drift._cancel_inflight_for_revision(drift, session)
         await self._emit_plan_revised(
             session,
             revised_plan,
@@ -1479,7 +1475,7 @@ class PlanReviser:
         # attempt's trigger id).
         new_trigger_id = revised.revision_trigger_event_id
         if not new_trigger_id:
-            new_trigger_id = self._steerer._drift_annotation_id(drift) or str(
+            new_trigger_id = self._steerer.drift._drift_annotation_id(drift) or str(
                 getattr(drift, "id", "") or ""
             )
         revised = bump_revision(
@@ -1799,7 +1795,8 @@ class PlanReviser:
             # the revised plan (from ``_apply_revision`` or validator-retry
             # chain) → source annotation_id from the drift → drift.id.
             trig_id = revised.revision_trigger_event_id or (
-                self._steerer._drift_annotation_id(drift) or str(getattr(drift, "id", "") or "")
+                self._steerer.drift._drift_annotation_id(drift)
+                or str(getattr(drift, "id", "") or "")
             )
             if trig_id:
                 evt.plan_revised.trigger_event_id = trig_id
@@ -1887,7 +1884,7 @@ class PlanReviser:
             # consumer that processes events strictly in order sees the
             # plan flip first, then the per-task status changes that flow
             # from it.
-            await self._steerer._emit_plan_revision_transitions(session, prev_plan, revised)
+            await self._steerer.tasks._emit_plan_revision_transitions(session, prev_plan, revised)
             # goldfive a4: paired correlation envelope. The proto
             # ``PlanRevised`` carries no ``attempt_id`` field today; emit
             # a sidecar dict event so consumers can pair this success
@@ -1919,7 +1916,7 @@ class PlanReviser:
         what did the planner see?" at a glance. Truncated via the same
         convention used by ``trigger_input`` to keep event sinks bounded.
         """
-        from goldfive.steerer import DefaultSteerer
+        from goldfive.drift_observer import DriftObserver
 
         parts: list[str] = []
         parts.append(f"drift={drift.kind.value}/{drift.severity.value}")
@@ -1941,12 +1938,12 @@ class PlanReviser:
         else:
             parts.append("prior_plan=none")
         text = " | ".join(parts)
-        return DefaultSteerer._truncate_trigger_input(text)
+        return DriftObserver._truncate_trigger_input(text)
 
     @staticmethod
     def _build_refine_output_summary(revised: Plan) -> str:
         """Render a short summary of the plan the planner returned."""
-        from goldfive.steerer import DefaultSteerer
+        from goldfive.drift_observer import DriftObserver
 
         tasks = getattr(revised, "tasks", None) or []
         parts: list[str] = [
@@ -1960,4 +1957,4 @@ class PlanReviser:
         if titles:
             parts.append("titles=[" + ", ".join(titles) + "]")
         text = " | ".join(parts)
-        return DefaultSteerer._truncate_trigger_input(text)
+        return DriftObserver._truncate_trigger_input(text)

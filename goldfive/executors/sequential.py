@@ -159,14 +159,14 @@ async def _drain_steerer_at_run_boundary(
     it; bounded wait + cancel-stragglers semantics match the existing
     :meth:`shutdown` drain.
     """
-    drain = getattr(steerer, "drain_session_background_tasks", None)
+    drain = getattr(getattr(steerer, "drift", None), "drain_session_background_tasks", None)
     if not callable(drain):
         return
     try:
         await drain(session_id=session.id)
     except Exception as exc:  # noqa: BLE001 — never block run termination
         log.warning(
-            "SequentialExecutor: steerer.drain_session_background_tasks "
+            "SequentialExecutor: steerer.drift.drain_session_background_tasks "
             "raised at run boundary (swallowed): %s",
             exc,
         )
@@ -615,7 +615,7 @@ class SequentialExecutor(Executor):
 
             # If the adapter reported an error on the invocation envelope
             # (but didn't raise), record it; the auto-transition block
-            # below routes that through steerer.mark_task_failed unless
+            # below routes that through steerer.tasks.mark_task_failed unless
             # the agent already transitioned the task itself.
             invocation_error = result is not None and getattr(result, "error", None) is not None
             if invocation_error:
@@ -631,7 +631,7 @@ class SequentialExecutor(Executor):
             # invocation envelope (not only via reporting-tool handlers).
             if result is not None:
                 try:
-                    await steerer.observe(result, session)
+                    await steerer.drift.observe(result, session)
                 except Exception as observe_exc:  # noqa: BLE001
                     # Plumbing failure inside the drift pipeline: surface
                     # it so sinks see a signal, rather than silently
@@ -639,7 +639,7 @@ class SequentialExecutor(Executor):
                     # so the run continues but the failure is durably
                     # recorded. See goldfive#134.
                     log.warning(
-                        "SequentialExecutor: steerer.observe raised for task=%s: %s",
+                        "SequentialExecutor: steerer.drift.observe raised for task=%s: %s",
                         task.id,
                         observe_exc,
                     )
@@ -1014,7 +1014,7 @@ class SequentialExecutor(Executor):
             # branch (e.g. STEER, which calls ``_cancel_invoke_task``
             # directly and routes through the "steer" return) can
             # still trigger the flag-set as a side effect of
-            # ``steerer.observe`` → ``install_user_steer`` →
+            # ``steerer.drift.observe`` → ``install_user_steer`` →
             # ``_cancel_inflight_for_revision``; clearing here
             # prevents that stale flag from misclassifying a genuine
             # external cancel on the NEXT iteration as a supersede.
@@ -1144,7 +1144,7 @@ class SequentialExecutor(Executor):
                 # regression, preserved here post-#163).
                 log.info(
                     "SequentialExecutor._run_overlay: STEER received; "
-                    "feeding steerer.observe for USER_STEER drift + refine",
+                    "feeding steerer.drift.observe for USER_STEER drift + refine",
                 )
                 await self._apply_steer(payload, steerer=steerer, session=session)
                 # goldfive#152: wrap the steer body in a goldfive-authored
@@ -1178,7 +1178,7 @@ class SequentialExecutor(Executor):
                 # job is to compose the framed restart message and
                 # re-invoke. Mirrors the user-STEER branch above but
                 # with ``source="goldfive"`` framing and no
-                # ``steerer.observe`` call (the steerer originated the
+                # ``steerer.drift.observe`` call (the steerer originated the
                 # message; observing again would loop).
                 control_msg = payload
                 payload_dict = (
@@ -1684,7 +1684,7 @@ class SequentialExecutor(Executor):
             # steerer has already swapped ``session.plan`` and queued the
             # corrective body — propagating the message into the resume
             # path lets ``_apply_steer`` feed it back through
-            # ``steerer.observe`` so any downstream observers see the
+            # ``steerer.drift.observe`` so any downstream observers see the
             # message, and the outer loop picks up the swapped plan on
             # the next iteration.
             if outcome.goldfive_steer_message is not None:
@@ -1869,9 +1869,9 @@ class SequentialExecutor(Executor):
     ) -> None:
         """Feed a STEER :class:`ControlMessage` to the steerer."""
         try:
-            await steerer.observe(message, session)
+            await steerer.drift.observe(message, session)
         except Exception as exc:  # noqa: BLE001
-            log.warning("SequentialExecutor: steerer.observe(STEER) raised: %s", exc)
+            log.warning("SequentialExecutor: steerer.drift.observe(STEER) raised: %s", exc)
 
     @staticmethod
     def _compose_nudge_replay_message(nudges: list[str]) -> str:

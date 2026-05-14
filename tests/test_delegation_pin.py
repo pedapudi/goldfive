@@ -875,25 +875,33 @@ async def test_capability_check_still_resolves_after_reorder() -> None:
     """
     from goldfive.types import DriftKind
 
-    class _RecordingSteerer:
+    class _RecordingDrift:
         def __init__(self) -> None:
-            self._sinks: list[Any] = []
             self.drifts: list[Any] = []
 
         async def observe(self, *a: Any, **kw: Any) -> None:
             pass
 
-        async def transition(self, *a: Any, **kw: Any) -> None:
-            pass
-
         def detect_drift(self, *a: Any, **kw: Any) -> None:
             return None
 
-        def bind(self, **kw: Any) -> None:
+        async def handle_drift(self, drift: Any, session: Any) -> None:  # noqa: ARG002
+            self.drifts.append(drift)
+
+    class _RecordingSteerer:
+        def __init__(self) -> None:
+            self._sinks: list[Any] = []
+            self.drift = _RecordingDrift()
+
+        @property
+        def drifts(self) -> list[Any]:
+            return self.drift.drifts
+
+        async def transition(self, *a: Any, **kw: Any) -> None:
             pass
 
-        async def _handle_drift(self, drift: Any, session: Any) -> None:  # noqa: ARG002
-            self.drifts.append(drift)
+        def bind(self, **kw: Any) -> None:
+            pass
 
     plugin = make_adk_plugin(host_agent_name="coord")
     # Single leaf authoring task (PENDING, no assignee) — the pin will

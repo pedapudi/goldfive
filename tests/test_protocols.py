@@ -73,19 +73,17 @@ class _PlannerStub:
 
 
 class _SteererStub:
-    async def observe(self, event: Any, session: Any) -> None:
-        return None
+    """Conforming stub for the post-#410 Steerer protocol.
 
-    async def observe_reasoning(
-        self,
-        text: str,
-        *,
-        task: Any = None,
-        session: Any,
-        provider: str = "",
-        agent_name: str = "",
-    ) -> None:
-        return None
+    The component-namespaced shape: ``tasks`` / ``plans`` / ``drift``
+    sub-objects are accepted as ``Any``-typed attributes by the
+    protocol's structural check, so a bare ``object()`` satisfies them.
+    """
+
+    def __init__(self) -> None:
+        self.tasks: Any = object()
+        self.plans: Any = object()
+        self.drift: Any = object()
 
     async def transition(
         self,
@@ -94,13 +92,8 @@ class _SteererStub:
         *,
         detail: str = "",
         session: Any,
+        cancel_reason: str = "",
     ) -> None:
-        return None
-
-    async def cascade_cancel_downstream(self, session: Any, cancelled_id: str) -> None:
-        return None
-
-    def detect_drift(self, event: Any, session: Any) -> Any | None:
         return None
 
     def bind(self, *, sinks: list[Any], planner: Any) -> None:

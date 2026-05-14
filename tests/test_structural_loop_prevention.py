@@ -193,7 +193,7 @@ async def test_no_op_revision_does_not_bump_revision_index() -> None:
 
     initial_revision = session.plan.revision_index
 
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
+    await steerer.drift.handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
 
     # Refine WAS called (the planner attempted to produce a revision).
     assert len(planner.refine_calls) == 1
@@ -216,7 +216,7 @@ async def test_no_op_revision_escalates_to_human_intervention_after_one_attempt(
     planner = _NoOpPlanner()
     steerer.bind(sinks=[sink], planner=planner)
 
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
+    await steerer.drift.handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
 
     # Exactly ONE refine call (no retry loop).
     assert len(planner.refine_calls) == 1
@@ -259,7 +259,7 @@ async def test_progress_stall_escalates_when_task_silent(
     # Advance past the threshold and fire a drift.
     clock[0] = 1100.0  # 100s elapsed > 60s threshold
 
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
+    await steerer.drift.handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
 
     # Refine was NOT called — the gate fired before refine.
     assert planner.refine_calls == []
@@ -293,7 +293,7 @@ async def test_progress_stall_does_not_fire_when_task_is_iterating(
     # Only 10s elapsed — well within threshold.
     clock[0] = 1010.0
 
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
+    await steerer.drift.handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
 
     # Refine WAS called (the gate did not fire).
     assert len(planner.refine_calls) == 1
@@ -327,7 +327,7 @@ async def test_progress_stall_skipped_when_task_has_no_progress_record(
     # No entry in ``task_last_progress_at`` for "t1".
     assert "t1" not in session.task_last_progress_at
 
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
+    await steerer.drift.handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
 
     # Refine WAS called (no record => no gate).
     assert len(planner.refine_calls) == 1
@@ -361,7 +361,7 @@ async def test_user_steer_bypasses_progress_stall_gate(
     session.task_last_progress_at["t1"] = 1000.0
     clock[0] = 1100.0  # past threshold
 
-    await steerer._handle_drift(
+    await steerer.drift.handle_drift(
         _drift(DriftKind.USER_STEER, task_id="t1", severity=DriftSeverity.WARNING),
         session,
     )
@@ -410,7 +410,7 @@ async def test_refine_exhausted_sentinel_escalates_immediately() -> None:
     planner = _ExhaustedPlanner()
     steerer.bind(sinks=[sink], planner=planner)
 
-    await steerer._handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
+    await steerer.drift.handle_drift(_drift(DriftKind.OFF_TOPIC, task_id="t1"), session)
 
     # Refine was called exactly once (no retry).
     assert len(planner.refine_calls) == 1
@@ -433,7 +433,7 @@ async def test_mark_task_running_stamps_progress(
     clock = [1234.5]
     monkeypatch.setattr("goldfive.drift_observer.time.monotonic", lambda: clock[0])
 
-    await steerer.mark_task_running("t1", session=session)
+    await steerer.tasks.mark_task_running("t1", session=session)
 
     assert session.task_last_progress_at["t1"] == pytest.approx(1234.5)
 
@@ -451,9 +451,9 @@ async def test_mark_task_progress_refreshes_progress(
     clock = [1000.0]
     monkeypatch.setattr("goldfive.drift_observer.time.monotonic", lambda: clock[0])
 
-    await steerer.mark_task_running("t1", session=session)
+    await steerer.tasks.mark_task_running("t1", session=session)
     assert session.task_last_progress_at["t1"] == pytest.approx(1000.0)
 
     clock[0] = 1500.0
-    await steerer.mark_task_progress("t1", session=session, fraction=0.5)
+    await steerer.tasks.mark_task_progress("t1", session=session, fraction=0.5)
     assert session.task_last_progress_at["t1"] == pytest.approx(1500.0)

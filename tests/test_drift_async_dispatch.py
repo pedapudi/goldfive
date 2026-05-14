@@ -147,7 +147,7 @@ async def test_mark_task_completed_appends_synthetic_invocation_completed() -> N
     """
     steerer, session, _sink, _planner = _bind(_NullPlanner())
     # Adapter would normally write this from ``before_run_callback``.
-    steerer.note_agent_activity(
+    steerer.drift.note_agent_activity(
         session,
         kind="agent_invocation_started",
         agent_name="worker",
@@ -155,7 +155,7 @@ async def test_mark_task_completed_appends_synthetic_invocation_completed() -> N
     )
     assert len(session.recent_agent_activity) == 1
 
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
 
     # Paired entry appended.
     completed_entries = [
@@ -173,15 +173,15 @@ async def test_mark_task_failed_appends_synthetic_invocation_completed() -> None
     look like "looping" to the goal-drift judge.
     """
     steerer, session, _sink, _planner = _bind(_NullPlanner())
-    steerer.note_agent_activity(
+    steerer.drift.note_agent_activity(
         session,
         kind="agent_invocation_started",
         agent_name="worker",
         task_id="t1",
     )
 
-    await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
-    await steerer._wait_background_drifts_idle()
+    await steerer.tasks.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
+    await steerer.drift._wait_background_drifts_idle()
 
     completed_entries = [
         e for e in session.recent_agent_activity if e["kind"] == "agent_invocation_completed"
@@ -208,14 +208,14 @@ async def test_mark_task_completed_skips_pairing_when_no_assignee() -> None:
     for t in list(session.plan.tasks):
         force_task_replace(session, t.id, assignee_agent_id="")
     # Pre-existing started entry from a prior agent's run.
-    steerer.note_agent_activity(
+    steerer.drift.note_agent_activity(
         session,
         kind="agent_invocation_started",
         agent_name="worker",
         task_id="t1",
     )
 
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
 
     completed_entries = [
         e for e in session.recent_agent_activity if e["kind"] == "agent_invocation_completed"
@@ -233,8 +233,8 @@ async def test_mark_task_failed_skips_pairing_when_no_assignee() -> None:
     for t in list(session.plan.tasks):
         force_task_replace(session, t.id, assignee_agent_id="")
 
-    await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
-    await steerer._wait_background_drifts_idle()
+    await steerer.tasks.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
+    await steerer.drift._wait_background_drifts_idle()
 
     completed_entries = [
         e for e in session.recent_agent_activity if e["kind"] == "agent_invocation_completed"
@@ -251,16 +251,16 @@ async def test_duplicate_completed_entries_are_harmless() -> None:
     trims naturally on overflow.
     """
     steerer, session, _sink, _planner = _bind(_NullPlanner())
-    steerer.note_agent_activity(
+    steerer.drift.note_agent_activity(
         session,
         kind="agent_invocation_started",
         agent_name="worker",
         task_id="t1",
     )
 
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
     # Simulate the real after_run_callback firing slightly later.
-    steerer.note_agent_activity(
+    steerer.drift.note_agent_activity(
         session,
         kind="agent_invocation_completed",
         agent_name="worker",
@@ -297,7 +297,7 @@ async def test_mark_task_failed_does_not_block_on_refine() -> None:
     steerer, session, _sink, _planner = _bind(slow_planner)
 
     t0 = time.monotonic()
-    await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
+    await steerer.tasks.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
     elapsed = time.monotonic() - t0
 
     # 100ms is generous — the synchronous portion is two event emits +
@@ -325,10 +325,10 @@ async def test_mark_task_failed_refine_runs_eventually() -> None:
     planner = _NullPlanner()
     steerer, session, _sink, _ = _bind(planner)
 
-    await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
+    await steerer.tasks.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
     # No refine call yet — handler is still queued.
     assert planner.refine_calls == []
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     # After the drain refine WAS called.
     assert len(planner.refine_calls) == 1
     assert planner.refine_calls[0]["drift"].kind is DriftKind.TASK_FAILED_RECOVERABLE
@@ -345,7 +345,7 @@ async def test_mark_task_blocked_does_not_block_on_refine() -> None:
     steerer, session, _sink, _planner = _bind(slow_planner)
 
     t0 = time.monotonic()
-    await steerer.mark_task_blocked("t1", session=session, blocker="missing input")
+    await steerer.tasks.mark_task_blocked("t1", session=session, blocker="missing input")
     elapsed = time.monotonic() - t0
 
     assert elapsed < 0.1, (
@@ -368,13 +368,13 @@ async def test_shutdown_drains_background_drifts() -> None:
     slow_planner = _SlowPlanner(delay=30.0)
     steerer, session, _sink, _ = _bind(slow_planner)
 
-    await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
+    await steerer.tasks.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
     # One pending drift task should be tracked.
     assert len(steerer._background_drifts) == 1
 
     t0 = time.monotonic()
     # Bounded timeout — slow_planner.delay (30s) >> shutdown timeout.
-    await steerer.shutdown(timeout=0.2)
+    await steerer.drift.shutdown(timeout=0.2)
     elapsed = time.monotonic() - t0
 
     # Shutdown should land within the timeout window plus the 0.5s
@@ -390,9 +390,9 @@ async def test_shutdown_idempotent_with_no_background_drifts() -> None:
     """``shutdown`` on an empty drift set is a no-op (matches judge drain)."""
     steerer = DefaultSteerer()
     steerer.bind(sinks=[_ListSink()], planner=_NullPlanner())
-    await steerer.shutdown(timeout=5.0)
+    await steerer.drift.shutdown(timeout=5.0)
     # Second call still safe.
-    await steerer.shutdown(timeout=5.0)
+    await steerer.drift.shutdown(timeout=5.0)
 
 
 def test_mark_task_failed_returns_immediately_when_no_loop() -> None:
@@ -418,16 +418,16 @@ def test_mark_task_failed_returns_immediately_when_no_loop() -> None:
     )
     # Direct test: call the spawner WITHOUT a running loop. It should
     # log+return rather than raise.
-    steerer._spawn_drift_handler_background(drift, session)
+    steerer.drift._spawn_drift_handler_background(drift, session)
     assert steerer._background_drifts == set()
     # Sanity: the same call WITH a loop does spawn a task.
     loop = asyncio.new_event_loop()
     try:
 
         async def _spawn() -> None:
-            steerer._spawn_drift_handler_background(drift, session)
+            steerer.drift._spawn_drift_handler_background(drift, session)
             assert len(steerer._background_drifts) == 1
-            await steerer._wait_background_drifts_idle()
+            await steerer.drift._wait_background_drifts_idle()
             assert steerer._background_drifts == set()
 
         loop.run_until_complete(_spawn())
@@ -455,8 +455,8 @@ async def test_background_drift_swallows_handler_exception() -> None:
         raise RuntimeError("simulated handler failure")
 
     # Patch _handle_drift on the instance for this one test.
-    steerer._handle_drift = _raise  # type: ignore[assignment]
-    steerer._spawn_drift_handler_background(drift, session)
+    steerer.drift.handle_drift = _raise  # type: ignore[assignment]
+    steerer.drift._spawn_drift_handler_background(drift, session)
     assert len(steerer._background_drifts) == 1
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     assert steerer._background_drifts == set()

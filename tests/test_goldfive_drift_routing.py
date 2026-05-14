@@ -180,7 +180,7 @@ async def test_goldfive_off_topic_drift_dispatches_goldfive_steer_control() -> N
         authored_by="goldfive",
     )
     session = _make_session()
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # Refine ran (the promotion path called planner.refine_steer).
     assert planner.refine_steer_calls, "refine_steer should have fired"
@@ -224,7 +224,7 @@ async def test_goldfive_intent_divergence_critical_dispatches_pause_escalate() -
         authored_by="goldfive",
     )
     session = _make_session()
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # Level 4 does NOT call refine.
     assert planner.refine_calls == []
@@ -350,7 +350,7 @@ async def test_multiple_goldfive_drifts_queue_in_order_on_channel() -> None:
         for i in (1, 2)
     ]
     for d in drifts:
-        await steerer._handle_drift(d, session)
+        await steerer.drift.handle_drift(d, session)
 
     msgs = [m for m in _drain_channel(channel) if m.kind is ControlKind.GOLDFIVE_STEER]
     assert len(msgs) == 2, f"expected 2 GOLDFIVE_STEER, got {len(msgs)}"
@@ -549,7 +549,7 @@ async def test_no_channel_bound_dispatch_is_noop_not_raise() -> None:
     )
     session = _make_session()
     # Must not raise.
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     # Refine still ran — the dispatch failure does not block the
     # promotion path.
     assert planner.refine_steer_calls, (

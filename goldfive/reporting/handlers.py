@@ -377,7 +377,7 @@ async def _handle_task_started(
         "reporting._handle_task_started.mark_task_running"
     ):
         try:
-            await steerer.mark_task_running(
+            await steerer.tasks.mark_task_running(
                 task_id, session=session, detail=detail, source=source
             )
         finally:
@@ -459,7 +459,9 @@ async def _handle_task_progress(
                 attempted=TaskStatus.RUNNING,
                 task_id=task_id,
             )
-    await steerer.mark_task_progress(task_id, session=session, fraction=fraction, detail=detail)
+    await steerer.tasks.mark_task_progress(
+        task_id, session=session, fraction=fraction, detail=detail
+    )
     return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.RUNNING)
 
 
@@ -505,7 +507,7 @@ async def _handle_task_completed(
                 attempted=TaskStatus.COMPLETED,
                 task_id=task_id,
             )
-    await steerer.mark_task_completed(
+    await steerer.tasks.mark_task_completed(
         task_id, session=session, summary=summary, artifacts=artifacts, source=source
     )
     # Rotate the current-task pin now that this one has landed terminal.
@@ -549,7 +551,7 @@ async def _handle_task_failed(
                 attempted=TaskStatus.FAILED,
                 task_id=task_id,
             )
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         task_id,
         session=session,
         reason=reason,
@@ -596,7 +598,7 @@ async def _handle_task_blocked(
                 attempted=TaskStatus.BLOCKED,
                 task_id=task_id,
             )
-    await steerer.mark_task_blocked(
+    await steerer.tasks.mark_task_blocked(
         task_id, session=session, blocker=blocker, needed=needed, source=source
     )
     return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.BLOCKED)
@@ -612,7 +614,7 @@ async def _handle_new_work_discovered(
     title = _str(args, "title")
     description = _str(args, "description")
     assignee = _str(args, "assignee")
-    await steerer.report_new_work_discovered(
+    await steerer.drift.report_new_work_discovered(
         session=session,
         parent_task_id=parent_task_id,
         title=title,
@@ -630,7 +632,7 @@ async def _handle_plan_divergence(
         return err
     note = _str(args, "note")
     suggested_action = _str(args, "suggested_action")
-    await steerer.report_plan_divergence(
+    await steerer.drift.report_plan_divergence(
         session=session,
         note=note,
         suggested_action=suggested_action,
@@ -795,7 +797,7 @@ async def _handle_awaiting_approval(
     # ``decision`` and ``detail`` so this is safe.
     meta["prompt"] = prompt
 
-    await steerer.mark_task_blocked(
+    await steerer.tasks.mark_task_blocked(
         task_id,
         session=session,
         blocker="awaiting_approval",

@@ -222,7 +222,7 @@ async def test_successful_refine_emits_attempted_and_correlation_with_same_attem
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
 
     attempted = sink.by_kind("refine_attempted")
     failed = sink.by_kind("refine_failed")
@@ -263,7 +263,7 @@ async def test_planner_exception_emits_attempted_and_failed_no_plan_revised() ->
     session = _make_session()
     initial_revision = session.plan.revision_index
 
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
 
     attempted = sink.by_kind("refine_attempted")
     failed = sink.by_kind("refine_failed")
@@ -292,7 +292,7 @@ async def test_planner_returns_none_emits_failed_with_parse_error_kind() -> None
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
 
     failed = sink.by_kind("refine_failed")
     assert len(failed) == 1
@@ -321,7 +321,7 @@ async def test_validator_rejection_emits_failed_with_validator_kind() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
 
     failed = sink.by_kind("refine_failed")
     assert len(failed) == 1
@@ -339,11 +339,11 @@ async def test_attempt_id_is_unique_per_attempt() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
-    await steerer._handle_drift(_drift(kind=DriftKind.TOOL_ERROR), session)
+    await steerer.drift.handle_drift(_drift(kind=DriftKind.TOOL_ERROR), session)
     # Use a different drift kind so the outcome gate (goldfive#215 P2,
     # keyed on (kind, task)) doesn't fold the second attempt onto the
     # first's "succeeded" outcome and short-circuit it.
-    await steerer._handle_drift(_drift(kind=DriftKind.LOOPING_REASONING), session)
+    await steerer.drift.handle_drift(_drift(kind=DriftKind.LOOPING_REASONING), session)
 
     attempted = sink.by_kind("refine_attempted")
     assert len(attempted) == 2
@@ -368,7 +368,7 @@ async def test_refine_attempted_carries_drift_kind_and_severity() -> None:
         kind=DriftKind.LOOPING_REASONING,
         severity=DriftSeverity.WARNING,
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     attempted = sink.by_kind("refine_attempted")
     assert len(attempted) == 1
@@ -391,7 +391,7 @@ async def test_wait_plan_stable_returns_immediately_when_unlocked() -> None:
     session = _make_session()
 
     # Fast-path: lock not even instantiated yet.
-    ok = await steerer._wait_plan_stable(session, timeout=0.5)
+    ok = await steerer.plans._wait_plan_stable(session, timeout=0.5)
     assert ok is True
 
 
@@ -410,13 +410,13 @@ async def test_wait_plan_stable_blocks_until_emit_plan_revised_completes() -> No
     session = _make_session()
 
     # Hold the per-session lock manually to simulate an in-flight mutation.
-    lock = steerer._get_plan_lock(session)
+    lock = steerer.plans._get_plan_lock(session)
     initial_revision = session.plan.revision_index
     barrier_observed: list[int] = []
 
     async def reader() -> None:
         # Wait for stability, then snapshot what the read sees.
-        await steerer._wait_plan_stable(session, timeout=2.0)
+        await steerer.plans._wait_plan_stable(session, timeout=2.0)
         assert session.plan is not None
         barrier_observed.append(session.plan.revision_index)
 
@@ -489,7 +489,7 @@ async def test_concurrent_emit_plan_revised_and_report_observe_consistent_state(
     async def reporter() -> None:
         # Slight delay so the refine path enters the lock first.
         await asyncio.sleep(0.001)
-        await steerer._wait_plan_stable(session, timeout=2.0)
+        await steerer.plans._wait_plan_stable(session, timeout=2.0)
         # Snapshot plan revision_index + current_task_id together. By
         # contract these must agree: pre-revision (0, "t1") or
         # post-revision (1, "t1_corr").
@@ -497,7 +497,7 @@ async def test_concurrent_emit_plan_revised_and_report_observe_consistent_state(
         snapshots.append((session.plan.revision_index, session.current_task_id))
 
     async def refiner() -> None:
-        await steerer._handle_drift(drift, session)
+        await steerer.drift.handle_drift(drift, session)
 
     await asyncio.gather(refiner(), reporter())
 
@@ -525,10 +525,10 @@ async def test_wait_plan_stable_times_out_gracefully_when_lock_held() -> None:
     steerer.bind(sinks=[sink], planner=StubPlanner())
     session = _make_session()
 
-    lock = steerer._get_plan_lock(session)
+    lock = steerer.plans._get_plan_lock(session)
     async with lock:
         # The waiter has a tight timeout; we never release before it.
-        ok = await steerer._wait_plan_stable(session, timeout=0.05)
+        ok = await steerer.plans._wait_plan_stable(session, timeout=0.05)
     assert ok is False
 
 
@@ -561,13 +561,13 @@ async def test_report_handler_invokes_wait_plan_stable() -> None:
 
     # Spy on _wait_plan_stable.
     call_log: list[str] = []
-    original = steerer._wait_plan_stable
+    original = steerer.plans._wait_plan_stable
 
     async def _spy(session_arg: Any, *, timeout: Any = 1.0) -> bool:
         call_log.append("called")
         return await original(session_arg, timeout=timeout)
 
-    steerer._wait_plan_stable = _spy  # type: ignore[method-assign]
+    steerer.plans._wait_plan_stable = _spy  # type: ignore[method-assign]
 
     handler = next(
         t.handler for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_completed"
@@ -586,14 +586,24 @@ async def test_report_handler_tolerates_steerer_without_wait_plan_stable() -> No
     """
     from goldfive.reporting import BUILTIN_REPORTING_TOOLS
 
-    class MinimalSteerer:
-        """Bare-minimum Steerer stub without a4's helper."""
-
+    class _MinimalTasks:
         async def mark_task_completed(self, *args: Any, **kwargs: Any) -> None:
             pass
 
         async def mark_task_running(self, *args: Any, **kwargs: Any) -> None:
             pass
+
+    class MinimalSteerer:
+        """Bare-minimum Steerer stub without a4's helper.
+
+        Exposes ``tasks`` (goldfive#410) so the reporting-handler call
+        path resolves, but intentionally does NOT expose ``plans``
+        (which is what holds ``_wait_plan_stable`` after the facade
+        cleanup).  The handler must tolerate the missing helper.
+        """
+
+        def __init__(self) -> None:
+            self.tasks = _MinimalTasks()
 
     session = _make_session()
     # goldfive#247: Plan + Task are frozen — derive via helper.
@@ -630,7 +640,7 @@ async def test_proto_plan_revised_event_unchanged_on_success() -> None:
     session = _make_session()
 
     drift = _drift(kind=DriftKind.TOOL_ERROR)
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     proto_pr = [
         e for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised"
@@ -674,7 +684,7 @@ async def test_plan_revised_event_populates_refine_summaries() -> None:
         current_task_id="t1",
         current_agent_id="researcher",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     events = _plan_revised_events(sink)
     assert len(events) == 1
@@ -710,7 +720,7 @@ async def test_plan_revised_event_stamps_target_agent_id() -> None:
         current_task_id="t1",
         current_agent_id="researcher",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     pr = _plan_revised_events(sink)[0].plan_revised
     assert pr.target_agent_id == "researcher"
@@ -732,7 +742,7 @@ async def test_plan_revised_event_target_agent_id_empty_for_trajectory_drift() -
         current_task_id="t1",
         current_agent_id="",  # no agent bound — trajectory-level
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     pr = _plan_revised_events(sink)[0].plan_revised
     assert pr.target_agent_id == ""
@@ -755,7 +765,7 @@ async def test_plan_revised_refine_input_summary_truncates_when_long() -> None:
         current_task_id="t1",
         current_agent_id="researcher",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     pr = _plan_revised_events(sink)[0].plan_revised
     assert pr.refine_input_summary.endswith(" … [truncated]")

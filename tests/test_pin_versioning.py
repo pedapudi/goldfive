@@ -112,6 +112,58 @@ class _CapturingSink:
         pass
 
 
+class _StubTasks:
+    """No-op transitions so the report handlers can drive through.
+
+    Mirrors the surface of :class:`TaskStateMachine` that reporting
+    handlers reach for via ``steerer.tasks``.
+    """
+
+    async def mark_task_running(self, *a: Any, **kw: Any) -> None:
+        pass
+
+    async def mark_task_progress(self, *a: Any, **kw: Any) -> None:
+        pass
+
+    async def mark_task_completed(self, *a: Any, **kw: Any) -> None:
+        pass
+
+    async def mark_task_failed(self, *a: Any, **kw: Any) -> None:
+        pass
+
+    async def mark_task_blocked(self, *a: Any, **kw: Any) -> None:
+        pass
+
+
+class _StubDriftObs:
+    async def observe(self, *a: Any, **kw: Any) -> None:  # pragma: no cover
+        pass
+
+
+class _StubPlans:
+    """No-op plan reviser; the ``_wait_plan_stable`` spy lives here
+    so reporting-handler tests can assert the call.
+    """
+
+    def __init__(
+        self,
+        *,
+        wait_plan_stable_delay: float = 0.0,
+        on_wait: Any = None,
+    ) -> None:
+        self._wait_calls = 0
+        self._wait_delay = wait_plan_stable_delay
+        self._on_wait = on_wait
+
+    async def _wait_plan_stable(self, session: Any, *, timeout: float = 1.0) -> bool:
+        self._wait_calls += 1
+        if self._on_wait is not None:
+            await self._on_wait(session)
+        if self._wait_delay > 0:
+            await asyncio.sleep(self._wait_delay)
+        return True
+
+
 class _SinkingSteerer:
     """Steerer stub that exposes ``_sinks`` so the plugin emits events.
 
@@ -128,36 +180,16 @@ class _SinkingSteerer:
         on_wait: Any = None,
     ) -> None:
         self._sinks = list(sinks)
-        self._wait_calls = 0
-        self._wait_delay = wait_plan_stable_delay
-        self._on_wait = on_wait
+        self.tasks = _StubTasks()
+        self.drift = _StubDriftObs()
+        self.plans = _StubPlans(
+            wait_plan_stable_delay=wait_plan_stable_delay,
+            on_wait=on_wait,
+        )
 
-    async def observe(self, *a: Any, **kw: Any) -> None:  # pragma: no cover
-        pass
-
-    async def _wait_plan_stable(self, session: Any, *, timeout: float = 1.0) -> bool:
-        self._wait_calls += 1
-        if self._on_wait is not None:
-            await self._on_wait(session)
-        if self._wait_delay > 0:
-            await asyncio.sleep(self._wait_delay)
-        return True
-
-    # No-op transitions so the report handlers can drive through.
-    async def mark_task_running(self, *a: Any, **kw: Any) -> None:
-        pass
-
-    async def mark_task_progress(self, *a: Any, **kw: Any) -> None:
-        pass
-
-    async def mark_task_completed(self, *a: Any, **kw: Any) -> None:
-        pass
-
-    async def mark_task_failed(self, *a: Any, **kw: Any) -> None:
-        pass
-
-    async def mark_task_blocked(self, *a: Any, **kw: Any) -> None:
-        pass
+    @property
+    def _wait_calls(self) -> int:
+        return self.plans._wait_calls
 
 
 def _plan_with(
@@ -368,7 +400,7 @@ async def test_handler_stale_replace_routes_to_successor() -> None:
     async def _capture(task_id: str, **kw: Any) -> None:
         seen["task_id"] = task_id
 
-    steerer.mark_task_running = _capture  # type: ignore[assignment]
+    steerer.tasks.mark_task_running = _capture  # type: ignore[assignment]
 
     result = await _tool("report_task_started").handler(
         {"task_id": "research_solar"},
@@ -426,7 +458,7 @@ async def test_handler_stale_correct_refuses_and_emits_event() -> None:
     async def _capture(task_id: str, **kw: Any) -> None:
         seen_steerer_task_ids.append(task_id)
 
-    steerer.mark_task_completed = _capture  # type: ignore[assignment]
+    steerer.tasks.mark_task_completed = _capture  # type: ignore[assignment]
 
     result = await _tool("report_task_completed").handler(
         {"task_id": "research_solar", "summary": "done"},
@@ -479,7 +511,7 @@ async def test_handler_stale_no_supersedes_refuses() -> None:
     async def _capture(task_id: str, **kw: Any) -> None:
         seen_steerer_task_ids.append(task_id)
 
-    steerer.mark_task_progress = _capture  # type: ignore[assignment]
+    steerer.tasks.mark_task_progress = _capture  # type: ignore[assignment]
 
     result = await _tool("report_task_progress").handler(
         {"task_id": "orphan", "fraction": 0.5},
@@ -558,7 +590,7 @@ def test_pending_delegations_back_compat_string_shape() -> None:
 
 
 async def test_handler_waits_for_plan_stable_during_concurrent_refine() -> None:
-    """The handler invokes ``steerer._wait_plan_stable`` before classifying.
+    """The handler invokes ``steerer.plans._wait_plan_stable`` before classifying.
 
     Simulates a refine in flight: the steerer's barrier delays the
     handler until the refine has bumped ``revision_index``. Without
@@ -648,7 +680,7 @@ async def test_handler_fresh_pin_routes_through_replace_chain() -> None:
     async def _capture(task_id: str, **kw: Any) -> None:
         seen["task_id"] = task_id
 
-    steerer.mark_task_running = _capture  # type: ignore[assignment]
+    steerer.tasks.mark_task_running = _capture  # type: ignore[assignment]
 
     result = await _tool("report_task_started").handler(
         {"task_id": "t_old"},

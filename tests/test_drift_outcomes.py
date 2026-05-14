@@ -191,7 +191,7 @@ async def test_first_drift_attempts_refine() -> None:
     key = (DriftKind.TOOL_ERROR.value, "t1")
     assert session.refine_outcomes.get(key) is None
 
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
 
     assert len(planner.refine_calls) == 1
     outcome = session.refine_outcomes[key]
@@ -219,7 +219,7 @@ async def test_second_drift_after_success_skipped() -> None:
     key = (DriftKind.TOOL_ERROR.value, "t1")
     session.refine_outcomes[key] = RefineOutcome(state="succeeded", fail_count=0)
 
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
 
     # Refine NOT called: the gate short-circuited at the top.
     assert planner.refine_calls == []
@@ -245,7 +245,7 @@ async def test_failure_increments_count() -> None:
     key = (DriftKind.TOOL_ERROR.value, "t1")
 
     # First emit -> refine raises -> outcome=(failed, 1).
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
     assert session.refine_outcomes[key].state == "failed"
     assert session.refine_outcomes[key].fail_count == 1
 
@@ -253,7 +253,7 @@ async def test_failure_increments_count() -> None:
     # threshold so the gate lets refine run again -> raises -> outcome
     # transitions to (failed, 2). The dict has ONE entry (same key
     # overwritten), not two.
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
     assert session.refine_outcomes[key].state == "failed"
     assert session.refine_outcomes[key].fail_count == 2
     # The ONLY non-cascade entries on the outcome table are
@@ -285,8 +285,8 @@ async def test_threshold_reached_marks_task_failed_and_emits_repeated_failure() 
     session = _make_session()
 
     # Two consecutive same-key failures cross the threshold.
-    await steerer._handle_drift(_drift(), session)
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
 
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -353,7 +353,7 @@ async def test_user_steer_bypasses_outcome_check() -> None:
         detail="please pivot",
         current_task_id="t1",
     )
-    await steerer._handle_drift(user_drift, session)
+    await steerer.drift.handle_drift(user_drift, session)
 
     # Refine ran (USER_STEER bypassed the gate).
     assert len(planner.refine_calls) == 1
@@ -382,7 +382,7 @@ def test_run_started_resets_outcomes() -> None:
     )
     assert len(session.refine_outcomes) == 2
 
-    steerer.reset_for_turn(session)
+    steerer.drift.reset_for_turn(session)
 
     assert session.refine_outcomes == {}
 
@@ -413,10 +413,10 @@ async def test_v30_repro() -> None:
 
     key = (DriftKind.TOOL_ERROR.value, "t1")
 
-    await steerer._handle_drift(_drift(agent_id="agent-a"), session)
+    await steerer.drift.handle_drift(_drift(agent_id="agent-a"), session)
     assert session.refine_outcomes[key].fail_count == 1
 
-    await steerer._handle_drift(_drift(agent_id="agent-b"), session)
+    await steerer.drift.handle_drift(_drift(agent_id="agent-b"), session)
     # Threshold tripped on the SECOND emit despite distinct agent_ids.
     assert session.refine_outcomes[key].fail_count == 2
     assert _task_status(session, "t1") is TaskStatus.FAILED
@@ -456,8 +456,8 @@ async def test_repeated_failure_does_not_recurse_into_handle_drift() -> None:
     session = _make_session()
 
     # Drive two failures to cross the threshold.
-    await steerer._handle_drift(_drift(), session)
-    await steerer._handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
+    await steerer.drift.handle_drift(_drift(), session)
 
     # The threshold-crossed REPEATED_FAILURE is in the event stream.
     from goldfive.pb.goldfive.v1 import types_pb2  # noqa: PLC0415
@@ -521,7 +521,7 @@ async def test_goal_drift_bypasses_outcome_gate() -> None:
     session.refine_outcomes[key] = RefineOutcome(state="failed", fail_count=99)
 
     drift = _drift(kind=DriftKind.GOAL_DRIFT, severity=DriftSeverity.CRITICAL)
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # GOAL_DRIFT bypassed the gate and reached refine.
     assert len(planner.refine_calls) == 1, (
@@ -555,7 +555,7 @@ async def test_promote_to_steer_writes_outcome_on_failure() -> None:
     drift = _drift(severity=DriftSeverity.CRITICAL)
     # Direct invocation of the promote path's refine driver — the
     # public surface that _handle_drift's CRITICAL fall-through uses.
-    await steerer._promote_drift_to_steer(drift, session)
+    await steerer.drift._promote_drift_to_steer(drift, session)
 
     key = (DriftKind.TOOL_ERROR.value, "t1")
     outcome = session.refine_outcomes.get(key)

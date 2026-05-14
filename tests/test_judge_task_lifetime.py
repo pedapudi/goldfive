@@ -4,7 +4,7 @@ must not be cancelled at the per-turn boundary.
 The fire-and-forget reasoning judge (goldfive#251) runs off the critical
 path so the adapter's model-response callback can return before the
 slow LLM judge completes. Pre-fix, ``GoldfiveADKAgent._run_async_impl``
-called ``steerer.shutdown(timeout=0.5)`` in its per-turn ``finally``
+called ``steerer.drift.shutdown(timeout=0.5)`` in its per-turn ``finally``
 block, which fired ``task.cancel()`` on every still-running judge — the
 verdict was dropped on the floor whenever the LLM was slower than 0.5s,
 even when the same Runner had many more turns ahead of it.
@@ -137,7 +137,7 @@ async def test_slow_judge_completes_when_per_turn_drain_is_removed() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
-    await steerer.observe_reasoning(
+    await steerer.drift.observe_reasoning(
         "raccoons are nocturnal", session=session
     )
     assert len(steerer._background_judges) == 1, (
@@ -176,7 +176,7 @@ async def test_done_callback_removes_from_background_judges() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
-    await steerer.observe_reasoning("clean reasoning", session=session)
+    await steerer.drift.observe_reasoning("clean reasoning", session=session)
     assert len(steerer._background_judges) == 1
 
     # Drain the task; the done_callback fires synchronously when the
@@ -235,7 +235,7 @@ async def test_late_judge_verdict_records_drift_but_skips_refine(
     # session — the agent has moved on. The fire-and-forget judge
     # treats this as a stale verdict.
     with caplog.at_level(logging.INFO, logger="goldfive"):
-        await steerer.observe_reasoning(
+        await steerer.drift.observe_reasoning(
             "raccoons are nocturnal", session=session
         )
         pending = list(steerer._background_judges)
@@ -312,7 +312,7 @@ async def test_judge_verdict_with_live_invocation_proceeds_normally() -> None:
     fake_task = asyncio.create_task(_placeholder())
     store.register_invocation_task("inv-live", fake_task)
     try:
-        await steerer.observe_reasoning(
+        await steerer.drift.observe_reasoning(
             "raccoons are nocturnal", session=session
         )
         pending = list(steerer._background_judges)
@@ -349,7 +349,7 @@ async def test_synchronous_tool_flow_unaffected_by_late_drift_guard() -> None:
     # Drive a tool-flow drift (mark_task_failed -> TASK_FAILED_RECOVERABLE
     # -> Level 1 ABSORB) without any registered invocation. The guard
     # must not fire because this isn't the background-judge path.
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session, reason="boom", recoverable=True
     )
 
@@ -358,7 +358,7 @@ async def test_synchronous_tool_flow_unaffected_by_late_drift_guard() -> None:
     # asserting on planner.refine. The late-drift guard rationale
     # below still applies — what changed is the dispatch mechanism,
     # not the guard scope.
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     # planner.refine WAS called: synchronous tool-flow drifts route
     # through ``_handle_drift`` directly and are not gated.
     assert len(planner.refine_calls) >= 1, (

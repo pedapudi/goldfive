@@ -174,7 +174,7 @@ async def test_user_steer_writes_active_steer_state() -> None:
         kind=ControlKind.STEER,
         payload={"note": "focus on the writing instead"},
     )
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     body = _ostate.read(session.state, _ostate.KEY_ACTIVE_STEER_BODY, "")
     assert body == "focus on the writing instead"
@@ -341,11 +341,11 @@ async def test_mark_task_running_stamps_orchestration_state() -> None:
     steerer = DefaultSteerer()
     steerer.bind(sinks=[_ListSink()], planner=_StubPlanner())
 
-    await steerer.mark_task_running("t1", session=session, detail="starting")
+    await steerer.tasks.mark_task_running("t1", session=session, detail="starting")
     assert _ostate.read(session.state, _ostate.KEY_CURRENT_TASK_ID) == "t1"
     assert _ostate.read(session.state, _ostate.KEY_CURRENT_TASK_TITLE) == "First"
 
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
     assert _ostate.read(session.state, _ostate.KEY_CURRENT_TASK_ID, "") == ""
 
 

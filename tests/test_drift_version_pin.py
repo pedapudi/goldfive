@@ -182,7 +182,7 @@ async def test_drift_stamped_with_current_revision_is_dispatched() -> None:
     session = _session(revision_index=3)
     drift = _drift(observed_revision_index=3)
 
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # DriftDetected should be on the wire (the first one is OUR drift;
     # the steerer may emit follow-up escalation drifts because the
@@ -222,7 +222,7 @@ async def test_redundant_same_kind_same_target_drift_is_rejected() -> None:
     ] = 4
     drift = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
 
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # DriftDetected fires for observability.
     assert _emitted_drift_kinds(sink), "redundant drift must still emit DriftDetected"
@@ -273,7 +273,7 @@ async def test_orthogonal_kind_drift_dispatches_after_unrelated_revision() -> No
         task="t-other",
     )
 
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # DriftDetected fires AND the dispatch runs (planner.refine called).
     assert _emitted_drift_kinds(sink), "orthogonal drift must emit DriftDetected"
@@ -306,7 +306,7 @@ async def test_same_kind_different_target_drift_dispatches() -> None:
         task="t-other",
     )
 
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     assert planner.refine_calls, (
         "same-kind-different-target drift must dispatch; got 0 refine calls"
@@ -334,7 +334,7 @@ async def test_unstamped_drift_bypasses_the_gate() -> None:
     drift = _drift(observed_revision_index=0)
     assert drift.observed_revision_index == 0
 
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # DriftDetected fires (back-compat).
     payloads = _drift_detected_payloads(sink)
@@ -370,7 +370,7 @@ async def test_user_authored_drift_bypasses_the_gate() -> None:
             authored_by="user",
             observed_revision_index=2,  # very stale
         )
-        await steerer._handle_drift(drift, session)
+        await steerer.drift.handle_drift(drift, session)
         # User drift made it past the gate — at minimum DriftDetected
         # was emitted. (The cancel + refine machinery is the steerer's
         # downstream business; we only assert the gate did not skip
@@ -588,7 +588,7 @@ async def test_end_to_end_redundant_drift_emits_but_does_not_refine() -> None:
         (DriftKind.OFF_TOPIC.value, "t-draft")
     ] = 3
 
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # Drift on the wire (observability preserved) ...
     assert _emitted_drift_kinds(sink), "DriftDetected must still be emitted"
@@ -634,8 +634,8 @@ async def test_apply_revision_stamps_per_key_watermark() -> None:
     # session-mutation triad (set_session_plan + watermark stamp +
     # orchestration-state pointer) atomically under the lock.
     steerer = DefaultSteerer()
-    revised, _ = steerer._apply_revision(session, revised, drift)
-    await steerer._emit_plan_revised(session, revised, drift, prev_plan=session.plan)
+    revised, _ = steerer.plans._apply_revision(session, revised, drift)
+    await steerer.plans._emit_plan_revised(session, revised, drift, prev_plan=session.plan)
 
     key = (DriftKind.OFF_TOPIC.value, "t-draft")
     assert key in session.last_addressed_revision_by_drift_key, (
@@ -675,8 +675,8 @@ async def test_apply_revision_does_not_stamp_for_user_authored_drifts() -> None:
     # the post-install state — the watermark stamp moved into
     # _emit_plan_revised.
     steerer = DefaultSteerer()
-    revised, _ = steerer._apply_revision(session, revised, drift)
-    await steerer._emit_plan_revised(session, revised, drift, prev_plan=session.plan)
+    revised, _ = steerer.plans._apply_revision(session, revised, drift)
+    await steerer.plans._emit_plan_revised(session, revised, drift, prev_plan=session.plan)
 
     key = (DriftKind.USER_STEER.value, "t-draft")
     assert key not in session.last_addressed_revision_by_drift_key, (

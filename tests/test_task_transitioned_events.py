@@ -334,8 +334,8 @@ async def test_refine_replace_supersedes_emits_plan_revision_transition() -> Non
     # emits the proto + per-transition envelopes.
     # goldfive#247: rebind to the stamped instance.
     # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
-    revised, _was_installed = steerer._apply_revision(session, revised, drift)
-    await steerer._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
+    revised, _was_installed = steerer.plans._apply_revision(session, revised, drift)
+    await steerer.plans._emit_plan_revised(session, revised, drift, prev_plan=prev_plan)
 
     transitions = _transition_events(sink)
     # Exactly one transition: t1 RUNNING -> CANCELLED. The brand-new
@@ -382,7 +382,7 @@ async def test_cooperative_cancellation_emits_cancellation_source() -> None:
     sink = ListSink()
     steerer = _bound_steerer(sink)
 
-    await steerer.mark_task_cancelled(
+    await steerer.tasks.mark_task_cancelled(
         "t1",
         session=session,
         reason="adk_cancellation:invoc-1",

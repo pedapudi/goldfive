@@ -67,20 +67,32 @@ def state_ctx_cls():
     return _Ctx
 
 
-class _RecordingSteerer:
-    """Minimal async-capable steerer stub for plugin observation tests."""
-
+class _RecordingDrift:
     def __init__(self) -> None:
         self.events: list[Any] = []
 
     async def observe(self, event: Any, session: Any) -> None:
         self.events.append(event)
 
-    async def transition(self, *a: Any, **kw: Any) -> None:
-        pass
-
     def detect_drift(self, event: Any, session: Any) -> None:
         return None
+
+
+class _RecordingSteerer:
+    """Minimal async-capable steerer stub for plugin observation tests.
+
+    Component-namespaced per goldfive#410.
+    """
+
+    def __init__(self) -> None:
+        self.drift = _RecordingDrift()
+
+    @property
+    def events(self) -> list[Any]:
+        return self.drift.events
+
+    async def transition(self, *a: Any, **kw: Any) -> None:
+        pass
 
     def bind(self, **kw: Any) -> None:
         pass
@@ -260,15 +272,26 @@ async def test_after_run_emits_confabulation_risk_on_zero_tools(state_ctx_cls) -
 
     plugin = make_adk_plugin(host_agent_name="research_agent")
 
-    class _ConfabulationAwareSteerer(_RecordingSteerer):
-        """Steerer stub that records drift emitted via _handle_drift."""
+    class _ConfabulationDrift(_RecordingDrift):
+        """DriftObserver stub that also records drift via handle_drift."""
 
         def __init__(self) -> None:
             super().__init__()
             self.drifts: list[DriftEvent] = []
 
-        async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+        async def handle_drift(self, drift: DriftEvent, session: Any) -> None:
             self.drifts.append(drift)
+
+    class _ConfabulationAwareSteerer(_RecordingSteerer):
+        """Steerer stub that records drift emitted via drift.handle_drift."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.drift = _ConfabulationDrift()
+
+        @property
+        def drifts(self) -> list[DriftEvent]:
+            return self.drift.drifts
 
     steerer = _ConfabulationAwareSteerer()
     session = Session(run_id="run-confab")
@@ -1809,7 +1832,7 @@ async def test_reporting_tool_duplicate_returns_idempotent_ack(state_ctx_cls) ->
     from goldfive.reporting import BUILTIN_REPORTING_TOOLS
     from goldfive.types import Plan, TaskEdge, TaskStatus
 
-    class _Steerer:
+    class _Tasks:
         def __init__(self) -> None:
             self.running_calls: int = 0
 
@@ -1817,7 +1840,7 @@ async def test_reporting_tool_duplicate_returns_idempotent_ack(state_ctx_cls) ->
             self.running_calls += 1
             # goldfive#247: Plan + Task are frozen — derive a new plan
             # via with_task_status. This stub mimics what the real
-            # DefaultSteerer.mark_task_running does.
+            # DefaultSteerer.tasks.mark_task_running does.
             from goldfive.types import (
                 channel_processor_active,
                 set_session_plan,
@@ -1832,6 +1855,14 @@ async def test_reporting_tool_duplicate_returns_idempotent_ack(state_ctx_cls) ->
                     session,
                     with_task_status(session.plan, task_id, TaskStatus.RUNNING),
                 )
+
+    class _Steerer:
+        def __init__(self) -> None:
+            self.tasks = _Tasks()
+
+        @property
+        def running_calls(self) -> int:
+            return self.tasks.running_calls
 
     spec = next(t for t in BUILTIN_REPORTING_TOOLS if t.name == "report_task_started")
 
@@ -2183,7 +2214,7 @@ async def test_reporting_tool_guards_fire_across_back_to_back_invocations() -> N
 
     # Simulate the STEER-driven plan revision: swap the plan on the
     # session to rev 1 with a new task, which is exactly what
-    # ``steerer._apply_revision`` does mid-run.
+    # ``steerer.plans._apply_revision`` does mid-run.
     t_raccoon = Task(id="raccoon_research", title="raccoons")
     plan_rev1 = Plan(
         id="p1",

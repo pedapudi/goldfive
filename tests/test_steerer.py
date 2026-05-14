@@ -182,7 +182,7 @@ def _task(session: Session, task_id: str) -> Task:
 
 async def test_mark_task_running_transitions_and_emits() -> None:
     steerer, session, sink, _ = _fresh()
-    await steerer.mark_task_running("t1", session=session, detail="kicking off")
+    await steerer.tasks.mark_task_running("t1", session=session, detail="kicking off")
     assert _task(session, "t1").status is TaskStatus.RUNNING
     assert session.current_task_id == "t1"
     assert session.agent_notes["t1"] == "kicking off"
@@ -206,20 +206,20 @@ async def test_mark_task_running_no_op_on_terminal() -> None:
         set_session_plan(
             session, with_task_status(session.plan, "t1", TaskStatus.COMPLETED)
         )
-    await steerer.mark_task_running("t1", session=session)
+    await steerer.tasks.mark_task_running("t1", session=session)
     assert _task(session, "t1").status is TaskStatus.COMPLETED
     assert sink.events == []
 
 
 async def test_mark_task_running_unknown_task_is_noop() -> None:
     steerer, session, sink, _ = _fresh()
-    await steerer.mark_task_running("bogus", session=session)
+    await steerer.tasks.mark_task_running("bogus", session=session)
     assert sink.events == []
 
 
 async def test_mark_task_progress_records_and_emits() -> None:
     steerer, session, sink, _ = _fresh()
-    await steerer.mark_task_progress("t1", session=session, fraction=0.42, detail="halfway")
+    await steerer.tasks.mark_task_progress("t1", session=session, fraction=0.42, detail="halfway")
     assert session.task_progress["t1"] == pytest.approx(0.42)
     assert session.agent_notes["t1"] == "halfway"
     # Status is untouched by progress updates.
@@ -235,15 +235,15 @@ async def test_mark_task_progress_records_and_emits() -> None:
 
 async def test_mark_task_progress_clamps_fraction() -> None:
     steerer, session, _sink, _ = _fresh()
-    await steerer.mark_task_progress("t1", session=session, fraction=-1.0)
+    await steerer.tasks.mark_task_progress("t1", session=session, fraction=-1.0)
     assert session.task_progress["t1"] == 0.0
-    await steerer.mark_task_progress("t1", session=session, fraction=9.0)
+    await steerer.tasks.mark_task_progress("t1", session=session, fraction=9.0)
     assert session.task_progress["t1"] == 1.0
 
 
 async def test_mark_task_completed_transitions_and_emits() -> None:
     steerer, session, sink, _ = _fresh()
-    await steerer.mark_task_completed(
+    await steerer.tasks.mark_task_completed(
         "t1",
         session=session,
         summary="done-zo",
@@ -263,11 +263,11 @@ async def test_mark_task_completed_transitions_and_emits() -> None:
 
 async def test_mark_task_failed_recoverable_fires_drift() -> None:
     steerer, session, sink, planner = _fresh()
-    await steerer.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
+    await steerer.tasks.mark_task_failed("t1", session=session, reason="boom", recoverable=True)
     assert _task(session, "t1").status is TaskStatus.FAILED
     # iter-11A: drift cascade is fire-and-forget; drain before
     # asserting on its observable side effects.
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # TaskFailed + DriftDetected + refine-failure DriftDetected (planner
     # returns None so no PlanRevised; the follow-up drift surfaces that).
@@ -286,10 +286,12 @@ async def test_mark_task_failed_recoverable_fires_drift() -> None:
 
 async def test_mark_task_failed_fatal_fires_critical_drift() -> None:
     steerer, session, sink, _planner = _fresh()
-    await steerer.mark_task_failed("t1", session=session, reason="unrecoverable", recoverable=False)
+    await steerer.tasks.mark_task_failed(
+        "t1", session=session, reason="unrecoverable", recoverable=False
+    )
     # iter-11A: drift cascade is fire-and-forget; drain before
     # asserting on its observable side effects.
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     # Event order: TaskFailed(t1) → TaskCancelled(t2, cascade) → DriftDetected(TASK_FAILED_FATAL) →
     # refine-failure DriftDetected (stub planner returns None). The
     # cascade fires before the fatal drift so planner.refine (if it ran)
@@ -312,13 +314,13 @@ async def test_mark_task_failed_fatal_fires_critical_drift() -> None:
 
 async def test_mark_task_blocked_transitions_and_emits_drift() -> None:
     steerer, session, sink, planner = _fresh()
-    await steerer.mark_task_blocked(
+    await steerer.tasks.mark_task_blocked(
         "t1", session=session, blocker="need API key", needed="credentials.json"
     )
     assert _task(session, "t1").status is TaskStatus.BLOCKED
     # iter-11A: drift cascade is fire-and-forget; drain before
     # asserting on its observable side effects.
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # TaskBlocked + DriftDetected + refine-failure DriftDetected (stub
     # planner returns None; the follow-up drift surfaces that).
@@ -336,7 +338,7 @@ async def test_mark_task_cancelled_transitions() -> None:
     # TaskCancelled for t2 as well. Verify both the primary transition
     # and the cascaded one; detailed cascade behaviour is exercised in
     # the dedicated cascade tests below.
-    await steerer.mark_task_cancelled("t1", session=session, reason="user cancelled")
+    await steerer.tasks.mark_task_cancelled("t1", session=session, reason="user cancelled")
     assert _task(session, "t1").status is TaskStatus.CANCELLED
     assert _task(session, "t2").status is TaskStatus.CANCELLED
     cancelled = [
@@ -504,19 +506,22 @@ def test_detect_drift_prefers_tool_error_then_refusal_then_stop_reason() -> None
     sess = _make_session()
     # Tool-error dict wins even if it also contains refusal text.
     combo = {"error": "nope", "text": "I cannot"}
-    assert s.detect_drift(combo, sess).kind is DriftKind.TOOL_ERROR
+    assert s.drift.detect_drift(combo, sess).kind is DriftKind.TOOL_ERROR
     # Refusal wins over stop_reason alone.
     assert (
-        s.detect_drift(
+        s.drift.detect_drift(
             {"text": "I can't help with that", "stop_reason": "MAX_TOKENS"},
             sess,
         ).kind
         is DriftKind.AGENT_REFUSAL
     )
     # Pure stop_reason goes to CONTEXT_PRESSURE.
-    assert s.detect_drift({"stop_reason": "MAX_TOKENS"}, sess).kind is DriftKind.CONTEXT_PRESSURE
+    assert (
+        s.drift.detect_drift({"stop_reason": "MAX_TOKENS"}, sess).kind
+        is DriftKind.CONTEXT_PRESSURE
+    )
     # Nothing → None.
-    assert s.detect_drift({"text": "all good"}, sess) is None
+    assert s.drift.detect_drift({"text": "all good"}, sess) is None
 
 
 async def test_observe_emits_drift_and_refines() -> None:
@@ -533,7 +538,7 @@ async def test_observe_emits_drift_and_refines() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
-    await steerer.observe({"error": "oh no"}, session)
+    await steerer.drift.observe({"error": "oh no"}, session)
 
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "plan_revised"]
@@ -552,28 +557,28 @@ async def test_observe_emits_drift_and_refines() -> None:
 
 async def test_observe_skips_refine_when_no_drift() -> None:
     steerer, session, sink, planner = _fresh()
-    await steerer.observe({"text": "nothing interesting"}, session)
+    await steerer.drift.observe({"text": "nothing interesting"}, session)
     assert sink.events == []
     assert planner.refine_calls == []
 
 
 async def test_observe_skips_refine_on_info_severity() -> None:
     # Craft a direct DriftEvent at INFO severity via a custom detector.
-    class InfoSteerer(DefaultSteerer):
-        def detect_drift(self, event, session):  # type: ignore[override]
-            return DriftEvent(
-                kind=DriftKind.CUSTOM,
-                severity=DriftSeverity.INFO,
-                detail="just a note",
-            )
-
+    # goldfive#410: the facade no longer dispatches subclass-overridden
+    # ``detect_drift`` through a router shim; custom detection now lives
+    # on the :class:`DriftObserver` component, which we patch in place.
     planner = StubPlanner()
     sink = ListSink()
-    steerer = InfoSteerer()
+    steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=planner)
+    steerer.drift.detect_drift = lambda event, session: DriftEvent(  # type: ignore[method-assign]
+        kind=DriftKind.CUSTOM,
+        severity=DriftSeverity.INFO,
+        detail="just a note",
+    )
     session = _make_session()
 
-    await steerer.observe({}, session)
+    await steerer.drift.observe({}, session)
     assert len(sink.events) == 1
     assert sink.events[0].WhichOneof("payload") == "drift_detected"
     # INFO is below the WARNING threshold — no refine.
@@ -588,7 +593,7 @@ async def test_observe_swallows_planner_exceptions() -> None:
     session = _make_session()
 
     # Must not raise even though refine() blows up.
-    await steerer.observe({"error": "x"}, session)
+    await steerer.drift.observe({"error": "x"}, session)
     # First failure: emit original drift + refine-failure visibility
     # drift. Counter bumps to 1 (below the threshold), so we stay in
     # visibility-only mode — no REPEATED_FAILURE, no mark_task_failed.
@@ -618,7 +623,7 @@ async def test_observe_surfaces_refine_none_return() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
-    await steerer.observe({"error": "x"}, session)
+    await steerer.drift.observe({"error": "x"}, session)
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "drift_detected"]
     from goldfive.pb.goldfive.v1 import types_pb2
@@ -688,13 +693,13 @@ async def test_refine_failure_counter_increments_on_exception() -> None:
     # Outcome gate keys only on (kind, task) so back-to-back drifts
     # of the same TOOL_ERROR on t1 are now legitimately tracked on a
     # single counter — no agent_id dance required.
-    await steerer._handle_drift(_tool_error_drift(), session)
+    await steerer.drift.handle_drift(_tool_error_drift(), session)
     outcome_after_1 = session.refine_outcomes[key]
     assert outcome_after_1.state == "failed"
     assert outcome_after_1.fail_count == 1
     assert len(planner.refine_calls) == 1
 
-    await steerer._handle_drift(_tool_error_drift(), session)
+    await steerer.drift.handle_drift(_tool_error_drift(), session)
     # Second failure hits the threshold: _record_refine_outcome calls
     # mark_task_failed, which fires a TASK_FAILED_FATAL drift that routes
     # through _handle_drift and triggers one more refine attempt (keyed
@@ -703,7 +708,7 @@ async def test_refine_failure_counter_increments_on_exception() -> None:
     # iter-11A: the TASK_FAILED_FATAL refine attempt now lands
     # asynchronously via mark_task_failed's spawned cascade — drain
     # before asserting on the fatal-key outcome.
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     outcome_after_2 = session.refine_outcomes[key]
     assert outcome_after_2.state == "failed"
     assert outcome_after_2.fail_count == 2
@@ -725,19 +730,19 @@ async def test_refine_failure_counter_increments_on_none_return() -> None:
     key = (DriftKind.TOOL_ERROR.value, "t1")
     assert session.refine_outcomes.get(key) is None
 
-    await steerer._handle_drift(_tool_error_drift(), session)
+    await steerer.drift.handle_drift(_tool_error_drift(), session)
     outcome_after_1 = session.refine_outcomes[key]
     assert outcome_after_1.state == "failed"
     assert outcome_after_1.fail_count == 1
     assert len(planner.refine_calls) == 1
 
-    await steerer._handle_drift(_tool_error_drift(), session)
+    await steerer.drift.handle_drift(_tool_error_drift(), session)
     # Same cascade as the exception case: the TOOL_ERROR counter is
     # clamped at the threshold (2), the cascaded TASK_FAILED_FATAL drift
     # kicks off its own independent counter at 1.
     # iter-11A: drain the spawned mark_task_failed cascade before
     # asserting on the fatal-key outcome.
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     outcome_after_2 = session.refine_outcomes[key]
     assert outcome_after_2.state == "failed"
     assert outcome_after_2.fail_count == 2
@@ -755,12 +760,12 @@ async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
     session = _make_session()
 
     # First failure: visibility-only, task stays PENDING.
-    await steerer._handle_drift(_tool_error_drift(), session)
+    await steerer.drift.handle_drift(_tool_error_drift(), session)
     assert _task(session, "t1").status is TaskStatus.PENDING
 
     # Second failure: backoff trips — task marked FAILED, REPEATED_FAILURE
     # drift emitted.
-    await steerer._handle_drift(_tool_error_drift(), session)
+    await steerer.drift.handle_drift(_tool_error_drift(), session)
     assert _task(session, "t1").status is TaskStatus.FAILED
 
     from goldfive.pb.goldfive.v1 import types_pb2
@@ -796,7 +801,7 @@ async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
     # short-circuit without calling refine again — the outcome gate
     # prevents the loop that §7.3 targets.
     calls_before = len(planner.refine_calls)
-    await steerer._handle_drift(_tool_error_drift(), session)
+    await steerer.drift.handle_drift(_tool_error_drift(), session)
     assert len(planner.refine_calls) == calls_before
 
 
@@ -811,7 +816,7 @@ async def test_successful_refine_resets_failure_counter() -> None:
 
     key = (DriftKind.TOOL_ERROR.value, "t1")
 
-    await steerer._handle_drift(_tool_error_drift(), session)
+    await steerer.drift.handle_drift(_tool_error_drift(), session)
     assert session.refine_outcomes[key].state == "failed"
     assert session.refine_outcomes[key].fail_count == 1
 
@@ -822,7 +827,7 @@ async def test_successful_refine_resets_failure_counter() -> None:
     # outcome with state="succeeded", fail_count=0.
     planner.raise_exc = None
     planner.revised = revised
-    await steerer._handle_drift(_tool_error_drift(), session)
+    await steerer.drift.handle_drift(_tool_error_drift(), session)
     assert session.refine_outcomes[key].state == "succeeded"
     assert session.refine_outcomes[key].fail_count == 0
     # And the plan actually got revised on the success.
@@ -874,7 +879,7 @@ def test_every_drift_kind_has_a_known_origin() -> None:
 
 async def test_report_new_work_discovered_fires_drift() -> None:
     steerer, session, sink, planner = _fresh()
-    await steerer.report_new_work_discovered(
+    await steerer.drift.report_new_work_discovered(
         session=session,
         parent_task_id="t1",
         title="follow-up",
@@ -901,7 +906,7 @@ async def test_report_plan_divergence_sets_flag_only() -> None:
     CAPABILITY_MISMATCH in #253).
     """
     steerer, session, sink, planner = _fresh()
-    await steerer.report_plan_divergence(
+    await steerer.drift.report_plan_divergence(
         session=session,
         note="agent is doing something different",
         suggested_action="replan from here",
@@ -919,9 +924,9 @@ async def test_report_plan_divergence_sets_flag_only() -> None:
 
 async def test_event_sequence_is_monotonic_and_run_id_stamped() -> None:
     steerer, session, sink, _ = _fresh()
-    await steerer.mark_task_running("t1", session=session)
-    await steerer.mark_task_progress("t1", session=session, fraction=0.5)
-    await steerer.mark_task_completed("t1", session=session, summary="ok")
+    await steerer.tasks.mark_task_running("t1", session=session)
+    await steerer.tasks.mark_task_progress("t1", session=session, fraction=0.5)
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="ok")
     # mark_task_running and mark_task_completed each emit a per-status
     # envelope plus a goldfive#251 R4 task_transitioned envelope; progress
     # is a liveness tick (no transition). 5 envelopes total, monotonic.
@@ -965,7 +970,7 @@ async def test_observe_rejects_invalid_revised_plan() -> None:
     session = _make_session()
     original_plan = session.plan
 
-    await steerer.observe({"error": "trigger refine"}, session)
+    await steerer.drift.observe({"error": "trigger refine"}, session)
 
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # Three drift_detected events:
@@ -1018,7 +1023,7 @@ async def test_observe_rejects_revised_plan_with_cycle() -> None:
     session = _make_session()
     original_plan = session.plan
 
-    await steerer.observe({"error": "trigger refine"}, session)
+    await steerer.drift.observe({"error": "trigger refine"}, session)
 
     assert session.plan is original_plan
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
@@ -1058,7 +1063,7 @@ async def test_observe_rejects_revised_plan_with_unknown_edge() -> None:
     session = _make_session()
     original_plan = session.plan
 
-    await steerer.observe({"error": "trigger refine"}, session)
+    await steerer.drift.observe({"error": "trigger refine"}, session)
 
     assert session.plan is original_plan
     second = sink.proto_events[1].drift_detected
@@ -1131,7 +1136,7 @@ async def test_apply_revision_silently_folds_terminal_regression(
     # the fold-emission site (no stray INFOs from other ``goldfive.*``
     # modules can satisfy the substring match by luck).
     with caplog.at_level(logging.INFO, logger="goldfive.plan_reviser"):
-        await steerer.observe({"error": "trigger refine"}, session)
+        await steerer.drift.observe({"error": "trigger refine"}, session)
 
     # Plan was installed (revision_index advanced) and t1 is still
     # COMPLETED — the fold corrected the regression. goldfive#247: the
@@ -1210,7 +1215,7 @@ async def test_apply_revision_emits_schema_violation_on_missing_terminal_edge() 
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session(plan=prior)
 
-    await steerer.observe({"error": "trigger refine"}, session)
+    await steerer.drift.observe({"error": "trigger refine"}, session)
 
     assert session.plan is prior
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
@@ -1270,7 +1275,7 @@ async def test_plan_revised_carries_diff() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session(old)
 
-    await steerer.observe({"error": "trigger refine"}, session)
+    await steerer.drift.observe({"error": "trigger refine"}, session)
 
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "plan_revised"]
@@ -1313,7 +1318,7 @@ async def test_no_op_revision_is_rejected_and_escalates() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session(old)
 
-    await steerer.observe({"error": "trigger refine"}, session)
+    await steerer.drift.observe({"error": "trigger refine"}, session)
 
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     # No plan_revised emitted — handler exhausted instead.
@@ -1367,7 +1372,7 @@ async def test_refine_returns_none_escalates_to_pause() -> None:
         detail="off-topic reasoning on t1",
         current_task_id="t1",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # Refine was called exactly once.
     assert len(planner.refine_calls) == 1
@@ -1448,7 +1453,7 @@ async def test_refine_validator_rejected_escalates_to_pause() -> None:
         detail="trigger refine",
         current_task_id="t1",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # Refine was called exactly once.
     assert len(planner.refine_calls) == 1
@@ -1510,7 +1515,7 @@ async def test_refine_returns_none_does_not_cascade_further_drifts() -> None:
         detail="reviewer reported BLOCKED",
         current_task_id="t1",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # Refine called exactly once — no cascade-driven retry.
     assert len(planner.refine_calls) == 1
@@ -1569,7 +1574,7 @@ async def test_refine_exhausted_path_unchanged() -> None:
         detail="off-topic",
         current_task_id="t1",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     assert len(planner.refine_calls) == 1
     # Phase 2 (path-duality fix): pause is now signalled by a
@@ -1609,7 +1614,7 @@ async def test_no_op_revision_path_unchanged() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session(old)
 
-    await steerer.observe({"error": "trigger refine"}, session)
+    await steerer.drift.observe({"error": "trigger refine"}, session)
 
     # Phase 2 (path-duality fix): pause is now signalled by a
     # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
@@ -1645,7 +1650,7 @@ async def test_promote_drift_to_steer_refine_none_escalates_to_pause() -> None:
         detail="trigger goldfive-steer",
         current_task_id="t1",
     )
-    await steerer._promote_drift_to_steer(drift, session)
+    await steerer.drift._promote_drift_to_steer(drift, session)
 
     assert len(planner.refine_calls) == 1
     # Phase 2 (path-duality fix): pause is now signalled by a
@@ -1701,7 +1706,7 @@ async def test_promote_drift_to_steer_validator_rejected_escalates_to_pause() ->
         detail="trigger goldfive-steer",
         current_task_id="t1",
     )
-    await steerer._promote_drift_to_steer(drift, session)
+    await steerer.drift._promote_drift_to_steer(drift, session)
 
     # Phase 2 (path-duality fix): pause is now signalled by a
     # GOLDFIVE_PAUSE_ESCALATE ControlMessage on the bound channel,
@@ -1733,7 +1738,7 @@ async def test_bind_replaces_sinks() -> None:
     steerer.bind(sinks=[sink_a], planner=planner)
     steerer.bind(sinks=[sink_b], planner=planner)
     session = _make_session()
-    await steerer.mark_task_running("t1", session=session)
+    await steerer.tasks.mark_task_running("t1", session=session)
     assert sink_a.events == []
     # task_started + R4 task_transitioned.
     assert len(sink_b.events) == 2
@@ -1760,7 +1765,7 @@ async def test_mark_task_cancelled_cascades_to_downstream_pending() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=StubPlanner())
 
-    await steerer.mark_task_cancelled("t1", session=session, reason="user cancelled")
+    await steerer.tasks.mark_task_cancelled("t1", session=session, reason="user cancelled")
 
     # All three tasks end up CANCELLED.
     assert _task(session, "t1").status is TaskStatus.CANCELLED
@@ -1805,7 +1810,7 @@ async def test_mark_task_cancelled_does_not_cascade_to_completed() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=StubPlanner())
 
-    await steerer.mark_task_cancelled("t1", session=session, reason="steer")
+    await steerer.tasks.mark_task_cancelled("t1", session=session, reason="steer")
 
     assert _task(session, "t1").status is TaskStatus.CANCELLED
     assert _task(session, "t2").status is TaskStatus.COMPLETED
@@ -1838,7 +1843,7 @@ async def test_mark_task_cancelled_multiple_downstream_paths() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=StubPlanner())
 
-    await steerer.mark_task_cancelled("t1", session=session, reason="steer")
+    await steerer.tasks.mark_task_cancelled("t1", session=session, reason="steer")
 
     for tid in ("t1", "t2", "t3", "t4"):
         assert _task(session, tid).status is TaskStatus.CANCELLED, tid
@@ -1871,14 +1876,14 @@ async def test_mark_task_cancelled_does_not_re_cancel() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=StubPlanner())
 
-    await steerer.mark_task_cancelled("t1", session=session, reason="first")
+    await steerer.tasks.mark_task_cancelled("t1", session=session, reason="first")
     first_event_count = len(sink.events)
     # t1 task_cancelled + R4 task_transitioned + cascaded t2 task_cancelled
     # + R4 task_transitioned = 4 envelopes.
     assert first_event_count == 4
 
     # Second call on the same already-terminal task: no new events.
-    await steerer.mark_task_cancelled("t1", session=session, reason="again")
+    await steerer.tasks.mark_task_cancelled("t1", session=session, reason="again")
     assert len(sink.events) == first_event_count
     assert _task(session, "t1").status is TaskStatus.CANCELLED
     assert _task(session, "t2").status is TaskStatus.CANCELLED
@@ -1924,7 +1929,7 @@ async def test_cascade_primitive_shared_between_recoverable_and_unrecoverable_pa
 
     # --- Recoverable path: mark_task_cancelled("t1") -------------------
     rec_steerer, rec_session, rec_sink = _build()
-    await rec_steerer.mark_task_cancelled("t1", session=rec_session, reason="steer")
+    await rec_steerer.tasks.mark_task_cancelled("t1", session=rec_session, reason="steer")
     rec_cancelled = [
         e.task_cancelled
         for e in rec_sink.proto_events
@@ -1938,7 +1943,9 @@ async def test_cascade_primitive_shared_between_recoverable_and_unrecoverable_pa
 
     # --- Unrecoverable path: mark_task_failed("t1", recoverable=False) -
     fat_steerer, fat_session, fat_sink = _build()
-    await fat_steerer.mark_task_failed("t1", session=fat_session, reason="fatal", recoverable=False)
+    await fat_steerer.tasks.mark_task_failed(
+        "t1", session=fat_session, reason="fatal", recoverable=False
+    )
     fat_cancelled = [
         e.task_cancelled
         for e in fat_sink.proto_events

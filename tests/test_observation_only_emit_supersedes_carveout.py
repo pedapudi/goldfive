@@ -273,8 +273,8 @@ async def _drive_emit(
     drift = _drift_looping()
 
     # goldfive#247: _apply_revision returns ``(revised, was_installed)``.
-    chosen, was_installed = steerer._apply_revision(session, revised_plan, drift)
-    await steerer._emit_plan_revised(
+    chosen, was_installed = steerer.plans._apply_revision(session, revised_plan, drift)
+    await steerer.plans._emit_plan_revised(
         session,
         chosen,
         drift,

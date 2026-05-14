@@ -298,12 +298,12 @@ def test_drift_event_explicit_authored_by_preserved() -> None:
 def test_user_control_drifts_are_authored_by_user() -> None:
     """``_drift_from_control`` stamps user-sourced drifts as 'user'."""
     from goldfive.control import ControlKind, ControlMessage
-    from goldfive.steerer import DefaultSteerer
+    from goldfive.drift_observer import DriftObserver
     from goldfive.types import Session
 
     session = Session(run_id="r", current_task_id="t1")
 
-    steer_drift = DefaultSteerer._drift_from_control(
+    steer_drift = DriftObserver._drift_from_control(
         ControlMessage(
             kind=ControlKind.STEER,
             id="ctl-1",
@@ -314,7 +314,7 @@ def test_user_control_drifts_are_authored_by_user() -> None:
     assert steer_drift is not None
     assert steer_drift.authored_by == "user"
 
-    cancel_drift = DefaultSteerer._drift_from_control(
+    cancel_drift = DriftObserver._drift_from_control(
         ControlMessage(
             kind=ControlKind.CANCEL,
             id="ctl-2",
@@ -325,7 +325,7 @@ def test_user_control_drifts_are_authored_by_user() -> None:
     assert cancel_drift is not None
     assert cancel_drift.authored_by == "user"
 
-    pause_drift = DefaultSteerer._drift_from_control(
+    pause_drift = DriftObserver._drift_from_control(
         ControlMessage(kind=ControlKind.PAUSE, id="ctl-3", payload={}),
         session,
     )
@@ -335,7 +335,7 @@ def test_user_control_drifts_are_authored_by_user() -> None:
 
 def test_goldfive_detector_drifts_resolve_to_goldfive() -> None:
     """``_resolve_authored_by`` infers 'goldfive' for detector-sourced drifts."""
-    from goldfive.steerer import DefaultSteerer
+    from goldfive.drift_observer import DriftObserver
 
     # Built without an explicit authored_by (e.g. a detector that
     # predates the unification).
@@ -344,7 +344,7 @@ def test_goldfive_detector_drifts_resolve_to_goldfive() -> None:
         severity=DriftSeverity.WARNING,
         detail="loop",
     )
-    assert DefaultSteerer._resolve_authored_by(drift) == "goldfive"
+    assert DriftObserver._resolve_authored_by(drift) == "goldfive"
 
 
 # ---------------------------------------------------------------------------
@@ -352,19 +352,32 @@ def test_goldfive_detector_drifts_resolve_to_goldfive() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _RecordingToolLoopSteerer:
-    """Steerer stub that captures every drift routed via ``_handle_drift``."""
-
+class _ToolLoopDrift:
     def __init__(self) -> None:
         self.drifts: list[DriftEvent] = []
         self.observations: list[Any] = []
-        self._sinks: list[Any] = []
 
     async def observe(self, event: Any, session: Any) -> None:
         self.observations.append(event)
 
-    async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+    async def handle_drift(self, drift: DriftEvent, session: Any) -> None:
         self.drifts.append(drift)
+
+
+class _RecordingToolLoopSteerer:
+    """Steerer stub that captures every drift routed via ``drift.handle_drift``."""
+
+    def __init__(self) -> None:
+        self.drift = _ToolLoopDrift()
+        self._sinks: list[Any] = []
+
+    @property
+    def drifts(self) -> list[DriftEvent]:
+        return self.drift.drifts
+
+    @property
+    def observations(self) -> list[Any]:
+        return self.drift.observations
 
 
 def _plugin_with_tool_loop_ctx(task: Task, session: Session, steerer: Any):

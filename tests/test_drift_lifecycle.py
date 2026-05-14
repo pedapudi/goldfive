@@ -430,7 +430,7 @@ async def test_emit_drift_detected_stamps_lifecycle_opened() -> None:
         current_task_id="t1",
         current_agent_id="a1",
     )
-    await steerer._emit_drift_detected(session, drift)
+    await steerer.drift._emit_drift_detected(session, drift)
 
     assert len(sink.events) == 1
     evt = sink.events[0]
@@ -470,8 +470,8 @@ async def test_emit_drift_detected_escalates_within_turn() -> None:
         current_task_id="t1",
         current_agent_id="a1",
     )
-    await steerer._emit_drift_detected(session, drift_a)
-    await steerer._emit_drift_detected(session, drift_b)
+    await steerer.drift._emit_drift_detected(session, drift_a)
+    await steerer.drift._emit_drift_detected(session, drift_b)
 
     first, second = sink.events
     # Same condition_id across both emits.
@@ -496,8 +496,8 @@ async def test_emit_drift_detected_distinct_turns_are_distinct_conditions() -> N
         current_task_id="t1",
         current_agent_id="a1",
     )
-    await steerer._emit_drift_detected(s1, drift)
-    await steerer._emit_drift_detected(s2, drift)
+    await steerer.drift._emit_drift_detected(s1, drift)
+    await steerer.drift._emit_drift_detected(s2, drift)
     assert len(sink.events) == 2
     cid1 = sink.events[0].drift_detected.condition_id
     cid2 = sink.events[1].drift_detected.condition_id
@@ -519,7 +519,7 @@ async def test_emit_drift_detected_preserves_legacy_fields() -> None:
         current_task_id="t1",
         current_agent_id="a1",
     )
-    await steerer._emit_drift_detected(session, drift)
+    await steerer.drift._emit_drift_detected(session, drift)
     payload = sink.events[0].drift_detected
     # Existing fields branch on these — none should be perturbed.
     assert payload.detail == "overlay diverged"

@@ -363,7 +363,7 @@ async def test_dispatch_pause_control_observation_only_skips_channel_send(
 
     drift = _drift(kind=DriftKind.OFF_TOPIC)
     with caplog.at_level(logging.INFO, logger="goldfive"):
-        landed = await steerer._dispatch_goldfive_pause_control(
+        landed = await steerer.drift._dispatch_goldfive_pause_control(
             drift, session, reason="test exhaustion"
         )
 
@@ -402,7 +402,7 @@ async def test_dispatch_pause_control_active_steering_sends_channel_message() ->
     steerer.bind_control_channel(channel)
 
     drift = _drift(kind=DriftKind.OFF_TOPIC)
-    landed = await steerer._dispatch_goldfive_pause_control(
+    landed = await steerer.drift._dispatch_goldfive_pause_control(
         drift, session, reason="test exhaustion"
     )
 
@@ -451,7 +451,7 @@ async def test_observation_only_no_op_refine_does_not_dispatch_pause_but_emits_d
     steerer.bind_control_channel(channel)
 
     drift = _drift(kind=DriftKind.OFF_TOPIC)
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # Refine ran (detection + planner unaffected by the gate). OFF_TOPIC
     # + WARNING is on the goldfive-steer promotion path so it lands on
@@ -496,7 +496,7 @@ async def test_observation_only_refine_returns_none_does_not_dispatch_pause() ->
     steerer.bind_control_channel(channel)
 
     drift = _drift(kind=DriftKind.OFF_TOPIC)
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     pause_msgs = _pause_escalate_messages(channel)
     assert pause_msgs == [], (
@@ -525,7 +525,7 @@ async def test_active_steering_no_op_refine_dispatches_pause_escalate() -> None:
     steerer.bind_control_channel(channel)
 
     drift = _drift(kind=DriftKind.OFF_TOPIC)
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     pause_msgs = _pause_escalate_messages(channel)
     assert len(pause_msgs) == 1, (

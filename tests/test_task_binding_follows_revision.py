@@ -33,6 +33,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from goldfive import state_store as _ostate  # noqa: E402
+from goldfive.plan_reviser import PlanReviser  # noqa: E402
 from goldfive.reporting import (  # noqa: E402
     BUILTIN_REPORTING_TOOLS,
     _resolve_effective_task_id,
@@ -170,8 +171,8 @@ async def test_current_task_id_repins_on_revision() -> None:
     steerer.bind(sinks=[ListSink()], planner=planner)
     # goldfive#247: rebind to the stamped instance.
     # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
-    revised, _was_installed = steerer._apply_revision(session, revised, _drift())
-    await steerer._emit_plan_revised(session, revised, _drift(), prev_plan=None)
+    revised, _was_installed = steerer.plans._apply_revision(session, revised, _drift())
+    await steerer.plans._emit_plan_revised(session, revised, _drift(), prev_plan=None)
 
     assert session.current_task_id == "research_solar_corrected"
 
@@ -286,7 +287,7 @@ async def test_multiple_supersessions_all_repin() -> None:
 
     steerer = DefaultSteerer()
     steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
-    steerer._repin_current_task_on_supersedes(session, plan)
+    steerer.plans._repin_current_task_on_supersedes(session, plan)
 
     assert session.current_task_id == "a2"
     assert session.state[_ostate.KEY_CURRENT_TASK_ID] == "b2"
@@ -315,7 +316,7 @@ async def test_no_supersedes_field_no_change() -> None:
 
     steerer = DefaultSteerer()
     steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
-    steerer._repin_current_task_on_supersedes(session, plan)
+    steerer.plans._repin_current_task_on_supersedes(session, plan)
 
     assert session.current_task_id == "t1"
     assert session.state[_ostate.KEY_CURRENT_TASK_ID] == "t1"
@@ -438,7 +439,7 @@ async def test_integrate_correction_supersedes_keeps_old_task() -> None:
         revision_index=1,
     )
 
-    revised = DefaultSteerer._integrate_correction_supersedes(revised)
+    revised = PlanReviser._integrate_correction_supersedes(revised)
 
     by_id = {t.id: t for t in revised.tasks}
     # Old task preserved with its COMPLETED status intact.
@@ -463,7 +464,7 @@ async def test_integrate_correction_supersedes_replace_kind_no_dag_rewrite() -> 
     """
     revised = _revised_with_replacement()
     original_edges = [(e.from_task_id, e.to_task_id) for e in revised.edges]
-    revised = DefaultSteerer._integrate_correction_supersedes(revised)
+    revised = PlanReviser._integrate_correction_supersedes(revised)
     # No edge mutations.
     assert [(e.from_task_id, e.to_task_id) for e in revised.edges] == original_edges
 
@@ -641,7 +642,7 @@ async def test_downstream_edge_rewrite_on_correct_chain() -> None:
         revision_index=1,
     )
 
-    revised = DefaultSteerer._integrate_correction_supersedes(revised)
+    revised = PlanReviser._integrate_correction_supersedes(revised)
 
     edges_set = {(e.from_task_id, e.to_task_id) for e in revised.edges}
     # Chain is now a -> a_prime -> b -> c.
@@ -823,8 +824,8 @@ async def test_correct_integration_via_emit_plan_revised_end_to_end() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     # goldfive#247: rebind to the stamped instance.
     # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
-    revised, _was_installed = steerer._apply_revision(session, revised, _drift())
-    await steerer._emit_plan_revised(session, revised, _drift(), prev_plan=None)
+    revised, _was_installed = steerer.plans._apply_revision(session, revised, _drift())
+    await steerer.plans._emit_plan_revised(session, revised, _drift(), prev_plan=None)
 
     # Session plan now has the corrected topology.
     edges_set = {(e.from_task_id, e.to_task_id) for e in session.plan.edges}

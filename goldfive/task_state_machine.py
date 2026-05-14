@@ -88,18 +88,16 @@ _TERMINAL_TASK_STATUSES = TERMINAL_TASK_STATUSES
 class TaskStateMachine:
     """Per-task status transitions + cascade + transition-event emission.
 
-    Constructed by :class:`DefaultSteerer` and held on
-    ``DefaultSteerer._task_state_machine``. The router delegates every
-    ``mark_task_*`` protocol method to the matching method on this
-    class. Tests that historically poked the bare-attribute names
-    (``steerer.mark_task_running``, ``steerer._emit_task_started``,
-    etc.) still find them via the router's ``__getattr__`` forwarder.
+    Constructed by :class:`DefaultSteerer` and exposed publicly as
+    ``DefaultSteerer.tasks`` (goldfive#410). Callers — the Runner,
+    executors, reporting handlers, planners, tests — reach the
+    ``mark_task_*`` family directly as ``steerer.tasks.mark_task_X``.
     """
 
     def __init__(self, steerer: DefaultSteerer) -> None:
         # Back-reference to the router. Used to reach the shared event-
         # emission primitives (``_new_envelope``, ``_emit``) and the
-        # other two components (``_drift_observer``, ``_plan_reviser``)
+        # other two components (``steerer.drift``, ``steerer.plans``)
         # when a transition path needs to cross a boundary
         # (e.g. mark_task_failed spawns a drift cascade owned by the
         # observer; cascade emits a TaskTransitioned which needs the
@@ -254,7 +252,7 @@ class TaskStateMachine:
         # actually returns; duplicate completed entries are harmless
         # (each is benign and the ring buffer trims naturally).
         if task.assignee_agent_id:
-            self._steerer.note_agent_activity(
+            self._steerer.drift.note_agent_activity(
                 session,
                 kind="agent_invocation_completed",
                 agent_name=task.assignee_agent_id,
@@ -269,7 +267,7 @@ class TaskStateMachine:
             source=source,
         )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
-        await self._steerer._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
 
     async def mark_task_failed(
         self,
@@ -319,7 +317,7 @@ class TaskStateMachine:
         # task-FAILED shape and false-positive on "looping".  See the
         # matching write in :meth:`mark_task_completed` for rationale.
         if task.assignee_agent_id:
-            self._steerer.note_agent_activity(
+            self._steerer.drift.note_agent_activity(
                 session,
                 kind="agent_invocation_completed",
                 agent_name=task.assignee_agent_id,
@@ -334,7 +332,7 @@ class TaskStateMachine:
             source=source,
         )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
-        await self._steerer._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
         # Fatal failures cascade downstream via the same primitive used
         # by mark_task_cancelled, so both §6.2 and §6.3 produce the
         # same TaskCancelled event stream and share rejection guards.
@@ -358,7 +356,7 @@ class TaskStateMachine:
         # (refine → supersedes → cancellation) lands asynchronously;
         # tests that need the post-cascade plan state await
         # :meth:`_wait_background_drifts_idle`.
-        self._steerer._spawn_drift_handler_background(drift, session)
+        self._steerer.drift._spawn_drift_handler_background(drift, session)
 
     async def mark_task_blocked(
         self,
@@ -410,7 +408,7 @@ class TaskStateMachine:
         # reporting tool that triggered us (``report_task_blocked``)
         # can return immediately. See :meth:`mark_task_failed` for
         # the matching call-site comment.
-        self._steerer._spawn_drift_handler_background(drift, session)
+        self._steerer.drift._spawn_drift_handler_background(drift, session)
 
     async def mark_task_cancelled(
         self,
@@ -462,7 +460,7 @@ class TaskStateMachine:
         # cascade-cancel downstream tasks share the same rate-limit bucket
         # and will no-op as subsequent boundary fires fall within the
         # 10s guard.
-        await self._steerer._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
         await self.cascade_cancel_downstream(session, task_id, source="cancellation")
 
     async def mark_task_not_needed(
@@ -521,7 +519,7 @@ class TaskStateMachine:
             source=source,
         )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
-        await self._steerer._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
 
     async def cascade_cancel_downstream(
         self,

@@ -369,25 +369,25 @@ async def test_rate_limit_fires_first_call_then_every_N(
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
     # 1st turn -> judge fires (count=0 starts the task).
-    await steerer.observe_reasoning("turn 1", session=session)
+    await steerer.drift.observe_reasoning("turn 1", session=session)
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
     # 2nd / 3rd turn -> skip (count=1,2).
-    await steerer.observe_reasoning("turn 2", session=session)
-    await steerer.observe_reasoning("turn 3", session=session)
+    await steerer.drift.observe_reasoning("turn 2", session=session)
+    await steerer.drift.observe_reasoning("turn 3", session=session)
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
     # 4th turn -> fire again (count=3 = 3 % 3 == 0).
-    await steerer.observe_reasoning("turn 4", session=session)
+    await steerer.drift.observe_reasoning("turn 4", session=session)
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
     # 5th-6th -> skip.
-    await steerer.observe_reasoning("turn 5", session=session)
-    await steerer.observe_reasoning("turn 6", session=session)
+    await steerer.drift.observe_reasoning("turn 5", session=session)
+    await steerer.drift.observe_reasoning("turn 6", session=session)
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
     # 7th -> fire.
-    await steerer.observe_reasoning("turn 7", session=session)
+    await steerer.drift.observe_reasoning("turn 7", session=session)
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 3  # type: ignore[attr-defined]
 
@@ -411,10 +411,10 @@ async def test_rate_limit_resets_on_task_transition() -> None:
     # them as a near-duplicate cluster (which would short-circuit
     # ``observe_reasoning`` before the judge dispatches and break this
     # test under any venv that has sentence-transformers installed).
-    await steerer.observe_reasoning(
+    await steerer.drift.observe_reasoning(
         "investigating solar panel efficiency curves", session=session
     )
-    await steerer.observe_reasoning(
+    await steerer.drift.observe_reasoning(
         "comparing inverter topologies for residential rooftops",
         session=session,
     )
@@ -437,7 +437,7 @@ async def test_rate_limit_resets_on_task_transition() -> None:
     # First reasoning on t2 -> fresh judge call (the counter for t2 is 0).
     # Use a topic that's semantically far from the two t1 strings above
     # so the looping detector does not flag this as a continuation.
-    await steerer.observe_reasoning(
+    await steerer.drift.observe_reasoning(
         "examining hydroponic tomato yield variance under LED grow lights",
         session=session,
     )
@@ -455,7 +455,7 @@ async def test_judge_disabled_when_call_llm_is_none() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
-    await steerer.observe_reasoning("any thought", session=session)
+    await steerer.drift.observe_reasoning("any thought", session=session)
     await _wait_for_judges(steerer)
     # Only the looping always-on detector ran, and it does not fire
     # on a single clean-text thinking message with no history.
@@ -506,10 +506,10 @@ async def test_judge_rate_limit_buckets_per_agent_not_globally() -> None:
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
     # Round 1: both agents fire on their first unpinned block.
-    await steerer.observe_reasoning("A turn 1", session=session, agent_name="agent_a")
+    await steerer.drift.observe_reasoning("A turn 1", session=session, agent_name="agent_a")
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
-    await steerer.observe_reasoning("B turn 1", session=session, agent_name="agent_b")
+    await steerer.drift.observe_reasoning("B turn 1", session=session, agent_name="agent_b")
     await _wait_for_judges(steerer)
     # The bug reproduces here: pre-fix this would stay at 1 because
     # agent A's turn had already incremented the shared ``""`` bucket.
@@ -520,23 +520,23 @@ async def test_judge_rate_limit_buckets_per_agent_not_globally() -> None:
     )
 
     # Round 2: both skip (count=1 for each agent's bucket).
-    await steerer.observe_reasoning("A turn 2", session=session, agent_name="agent_a")
-    await steerer.observe_reasoning("B turn 2", session=session, agent_name="agent_b")
+    await steerer.drift.observe_reasoning("A turn 2", session=session, agent_name="agent_a")
+    await steerer.drift.observe_reasoning("B turn 2", session=session, agent_name="agent_b")
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
 
     # Round 3: both skip again (count=2).
-    await steerer.observe_reasoning("A turn 3", session=session, agent_name="agent_a")
-    await steerer.observe_reasoning("B turn 3", session=session, agent_name="agent_b")
+    await steerer.drift.observe_reasoning("A turn 3", session=session, agent_name="agent_a")
+    await steerer.drift.observe_reasoning("B turn 3", session=session, agent_name="agent_b")
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
 
     # Round 4: both fire (count=3 % 3 == 0). Confirms the per-agent
     # counters advance independently and are NOT a shared global bucket.
-    await steerer.observe_reasoning("A turn 4", session=session, agent_name="agent_a")
+    await steerer.drift.observe_reasoning("A turn 4", session=session, agent_name="agent_a")
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 3  # type: ignore[attr-defined]
-    await steerer.observe_reasoning("B turn 4", session=session, agent_name="agent_b")
+    await steerer.drift.observe_reasoning("B turn 4", session=session, agent_name="agent_b")
     await _wait_for_judges(steerer)
     assert len(call_llm.calls) == 4  # type: ignore[attr-defined]
 
@@ -578,7 +578,7 @@ async def test_observe_reasoning_returns_fast_when_judge_is_slow() -> None:
 
     loop = asyncio.get_event_loop()
     t0 = loop.time()
-    await steerer.observe_reasoning("clean on-task reasoning", session=session)
+    await steerer.drift.observe_reasoning("clean on-task reasoning", session=session)
     elapsed = loop.time() - t0
     try:
         assert elapsed < 0.1, (
@@ -618,7 +618,7 @@ async def test_observe_reasoning_judge_still_fires_in_background() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
-    await steerer.observe_reasoning("raccoons are nocturnal", session=session)
+    await steerer.drift.observe_reasoning("raccoons are nocturnal", session=session)
     # Judge hasn't run yet -> no drift emitted.
     drift_events_pre = [
         e for e in sink.events if e.WhichOneof("payload") == "drift_detected"
@@ -675,7 +675,7 @@ async def test_observe_reasoning_judge_exception_does_not_crash(
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
     with caplog.at_level(logging.WARNING, logger="goldfive"):
-        await steerer.observe_reasoning("some thought", session=session)
+        await steerer.drift.observe_reasoning("some thought", session=session)
         await _wait_for_judges(steerer)
 
     # No drift was emitted (analyze_reasoning never returned a verdict).
@@ -717,12 +717,12 @@ async def test_shutdown_bounded_timeout_does_not_wait_for_slow_judge() -> None:
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
     # Schedule a judge that will be running when shutdown fires.
-    await steerer.observe_reasoning("slow-path thought", session=session)
+    await steerer.drift.observe_reasoning("slow-path thought", session=session)
     assert len(steerer._background_judges) == 1
 
     loop = asyncio.get_event_loop()
     t0 = loop.time()
-    await steerer.shutdown(timeout=0.5)
+    await steerer.drift.shutdown(timeout=0.5)
     elapsed = loop.time() - t0
     # 0.5 timeout + 0.5 cancel-drain budget = ~1.0s ceiling; we want
     # well under the judge's 10s. Allow a little jitter for slow CI.
@@ -737,7 +737,7 @@ async def test_shutdown_is_noop_when_no_background_judges() -> None:
     steerer.bind(sinks=[ListSink()], planner=NullPlanner())
     # No observe_reasoning call -> empty set.
     assert steerer._background_judges == set()
-    await steerer.shutdown(timeout=5.0)
+    await steerer.drift.shutdown(timeout=5.0)
 
 
 async def test_shutdown_quiet_when_zero_tasks_actually_cancelled(
@@ -768,12 +768,12 @@ async def test_shutdown_quiet_when_zero_tasks_actually_cancelled(
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=NullPlanner())
 
-    await steerer.observe_reasoning("a thought", session=session)
+    await steerer.drift.observe_reasoning("a thought", session=session)
 
     with caplog.at_level(logging.WARNING, logger="goldfive"):
         # timeout=0.0 → wait_for raises TimeoutError immediately even
         # if the gather wins the race in the same instant.
-        await steerer.shutdown(timeout=0.0)
+        await steerer.drift.shutdown(timeout=0.0)
 
     warnings = [
         r for r in caplog.records

@@ -523,16 +523,17 @@ def _rotate_after_terminal(
 async def _await_plan_stable(session: Session, steerer: Steerer) -> None:
     """Block briefly until the steerer's plan mutation region is idle.
 
-    Duck-types ``steerer._wait_plan_stable``: any Steerer implementation
-    that exposes an async ``_wait_plan_stable(session)`` method gets a
-    consistent plan-state read; implementations that don't (custom
-    Steerers, test stubs) silently fall through and observe whatever
-    plan state happens to be installed at call time — the pre-a4
-    behaviour. Atomicity is best-effort (the helper times out after a
-    short interval and proceeds anyway), so this is a soft barrier,
-    not a hard mutex.
+    Duck-types ``steerer.plans._wait_plan_stable``: any Steerer
+    implementation that exposes a ``plans`` component with an async
+    ``_wait_plan_stable(session)`` method gets a consistent plan-state
+    read; implementations that don't (custom Steerers, test stubs)
+    silently fall through and observe whatever plan state happens to
+    be installed at call time — the pre-a4 behaviour. Atomicity is
+    best-effort (the helper times out after a short interval and
+    proceeds anyway), so this is a soft barrier, not a hard mutex.
     """
-    waiter = getattr(steerer, "_wait_plan_stable", None)
+    plans = getattr(steerer, "plans", None)
+    waiter = getattr(plans, "_wait_plan_stable", None) if plans is not None else None
     if not callable(waiter):
         return
     try:

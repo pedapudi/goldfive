@@ -3,8 +3,23 @@
 Every task in a goldfive plan moves through a strict state machine. The
 machine is **monotonic**: once a task reaches a terminal state, it
 cannot leave. It is **owned by the Steerer**: every transition runs
-through `Steerer.transition(task_id, to, *, session)` and emits an
-event to every sink.
+through `Steerer.transition(task_id, to, *, session)` (which dispatches
+to the matching `Steerer.tasks.mark_task_*` helper) and emits an event
+to every sink.
+
+The post-#410 facade exposes three components as public properties on
+`DefaultSteerer`:
+
+* `steerer.tasks` — :class:`~goldfive.task_state_machine.TaskStateMachine`,
+  owner of every `mark_task_*` transition + `cascade_cancel_downstream`
+  + per-status `_emit_task_*` emission.
+* `steerer.plans` — :class:`~goldfive.plan_reviser.PlanReviser`, owner
+  of every `install_*` plan-install entry point + `_apply_revision` +
+  `_emit_plan_revised` + the refine-attempt observability helpers.
+* `steerer.drift` — :class:`~goldfive.drift_observer.DriftObserver`,
+  owner of `observe` / `observe_reasoning` / `detect_drift` /
+  `handle_drift` / `request_invocation_cancel` + the reflective and
+  goal-drift judge orchestration.
 
 Related: [DRIFT.md](DRIFT.md), [PROTOCOLS.md](PROTOCOLS.md#steerer),
 [EVENT-MODEL.md](EVENT-MODEL.md),
@@ -215,9 +230,10 @@ downstream task without re-checking its history.
 
 The same cascade rule applies when **any single task** is
 transitioned to `CANCELLED` — not only as part of the unrecoverable
-FAILED cascade above. `DefaultSteerer.mark_task_cancelled` BFS-walks
-forward from the cancelled task through `Plan.edges` and transitions
-every reachable non-terminal task (PENDING / RUNNING / BLOCKED) to
+FAILED cascade above. `TaskStateMachine.mark_task_cancelled`
+(reachable as `steerer.tasks.mark_task_cancelled`) BFS-walks forward
+from the cancelled task through `Plan.edges` and transitions every
+reachable non-terminal task (PENDING / RUNNING / BLOCKED) to
 `CANCELLED` with reason `"cascade from <task_id>"`. This closes the
 soundness gap where a `USER_STEER` whose refine produces no new plan
 would cancel the current task but leave downstream PENDING tasks
@@ -229,10 +245,11 @@ predecessors COMPLETED" check). See
 
 Both cascades (the unrecoverable case above and the cancel-cascade
 below) fan out to downstream tasks through **one shared primitive**:
-`Steerer.cascade_cancel_downstream(session, cancelled_id)` on
-`goldfive/protocols.py` (reference impl on
-`DefaultSteerer.cascade_cancel_downstream` in
-`goldfive/steerer.py`). The primitive:
+`Steerer.cascade_cancel_downstream(session, cancelled_id)` declared
+on `goldfive/protocols.py` and implemented on
+`TaskStateMachine.cascade_cancel_downstream` in
+`goldfive/task_state_machine.py` (callers reach it as
+`steerer.tasks.cascade_cancel_downstream`). The primitive:
 
 - walks `session.plan.edges` forward from the initiator,
 - transitions every reachable non-terminal task to `CANCELLED`,
@@ -252,8 +269,19 @@ invalidated.
 ## Implementation notes
 
 The reference implementation is `DefaultSteerer` in
-`goldfive/steerer.py`. It ports harmonograf's `_AdkState` to a
-framework-agnostic form.
+`goldfive/steerer.py`, a thin router that exposes three components as
+public properties:
+
+* `goldfive/task_state_machine.py::TaskStateMachine` — task transitions
+  + cascade + per-status event emission (`steerer.tasks`).
+* `goldfive/plan_reviser.py::PlanReviser` — plan-install, refine
+  attempt observability, and revision application (`steerer.plans`).
+* `goldfive/drift_observer.py::DriftObserver` — drift detection,
+  intervention ladder, judge orchestration, and refine-outcome
+  bookkeeping (`steerer.drift`).
+
+Together they port harmonograf's `_AdkState` to a framework-agnostic
+form.
 
 - **State storage.** The canonical state lives on `Task.status` in the
   plan, not in a separate dict. `Session.plan` is the single source of

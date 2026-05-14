@@ -150,7 +150,7 @@ async def test_c4_observe_refine_emits_refine_failed_on_cancellederror_and_rerai
 
     captured_attempt_id: str = ""
     with pytest.raises(asyncio.CancelledError):
-        async with steerer.observe_refine(session, drift) as attempt_id:
+        async with steerer.plans.observe_refine(session, drift) as attempt_id:
             captured_attempt_id = attempt_id
             raise asyncio.CancelledError()
 
@@ -182,7 +182,7 @@ async def test_c4_observe_refine_aclose_mid_refine_emits_failed() -> None:
     captured: dict[str, str] = {}
 
     async def _refine_user() -> None:
-        async with steerer.observe_refine(session, drift) as attempt_id:
+        async with steerer.plans.observe_refine(session, drift) as attempt_id:
             captured["id"] = attempt_id
             started.set()
             # Simulate a long-running refine the canceller will interrupt.
@@ -235,7 +235,7 @@ async def test_c4_handle_drift_emits_refine_failed_when_refine_cancelled() -> No
     drift = _drift()
 
     with pytest.raises(asyncio.CancelledError):
-        await steerer._handle_drift(drift, session)
+        await steerer.drift.handle_drift(drift, session)
 
     failed = sink.by_kind("refine_failed")
     assert len(failed) >= 1, (
@@ -356,15 +356,12 @@ async def test_c2_parallel_refine_cancelled_emits_critical_mirror_legacy_path() 
 
 # ---------------------------------------------------------------------------
 # C5 — _handle_task_started: correction GC must run even if
-# ``await steerer.mark_task_running`` is cancelled mid-flight.
+# ``await steerer.tasks.mark_task_running`` is cancelled mid-flight.
 # ---------------------------------------------------------------------------
 
 
-class _CancellingSteererForTaskStarted:
-    """Steerer stub whose ``mark_task_running`` raises CancelledError."""
-
+class _CancellingTasks:
     def __init__(self) -> None:
-        self._sinks: list[Any] = []
         self.calls: list[str] = []
 
     async def mark_task_running(
@@ -378,17 +375,32 @@ class _CancellingSteererForTaskStarted:
         self.calls.append(task_id)
         raise asyncio.CancelledError()
 
-    # Optional protocol surface used by the reporting handler:
-    async def transition(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
-        pass
 
+class _NoopPlans:
     async def _wait_plan_stable(self, _session: Session) -> None:
         return None
 
 
+class _CancellingSteererForTaskStarted:
+    """Steerer stub whose ``tasks.mark_task_running`` raises CancelledError."""
+
+    def __init__(self) -> None:
+        self._sinks: list[Any] = []
+        self.tasks = _CancellingTasks()
+        self.plans = _NoopPlans()
+
+    @property
+    def calls(self) -> list[str]:
+        return self.tasks.calls
+
+    # Optional protocol surface used by the reporting handler:
+    async def transition(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
+        pass
+
+
 async def test_c5_clear_correction_runs_when_mark_running_cancelled() -> None:
     """Phase 3.5 §C5: ``_handle_task_started`` calls
-    ``await steerer.mark_task_running`` and then synchronously
+    ``await steerer.tasks.mark_task_running`` and then synchronously
     ``_clear_correction_on_started``. Pre-fix the post-await clear was
     skipped on CancelledError, leaving the pending correction wedged
     on session state for a task the agent had just acknowledged.

@@ -271,7 +271,7 @@ async def test_delegated_subagent_reasoning_dispatched_to_judge() -> None:
         "write a detailed section about raccoons — their masks, "
         "nocturnal behaviour, and dexterous paws."
     )
-    await steerer.observe_reasoning(
+    await steerer.drift.observe_reasoning(
         raccoon_reasoning,
         session=session,
         agent_name="research_agent",
@@ -368,14 +368,14 @@ async def test_coordinator_and_subagent_reasoning_both_judged_and_attributed() -
     session = _coordinator_session()
 
     # Coordinator turn first.
-    await steerer.observe_reasoning(
+    await steerer.drift.observe_reasoning(
         "I'll delegate research to research_agent then build slides.",
         session=session,
         agent_name="coordinator",
     )
     await _drain_judges(steerer)
     # Research_agent turn second — same session, same current_task_id.
-    await steerer.observe_reasoning(
+    await steerer.drift.observe_reasoning(
         "Let me write about raccoons in addition to solar panels.",
         session=session,
         agent_name="research_agent",

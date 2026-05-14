@@ -572,7 +572,7 @@ async def test_reasoning_cluster_tightening_is_one_shot_per_task() -> None:
         current = (
             _pad_tokens("shared", 8) + f" uniqueturn{turn:02d}00 uniqueturn{turn:02d}01"
         )
-        await steerer.observe_reasoning(current, session=session)
+        await steerer.drift.observe_reasoning(current, session=session)
     # The embedding pipeline is now fire-and-forget (goldfive#251);
     # drain before inspecting the sink.
     await _wait_for_judges(steerer)
@@ -690,7 +690,7 @@ async def test_observe_reasoning_appends_to_history_and_caps() -> None:
     steerer.bind(sinks=[sink], planner=planner)
 
     for i in range(5):
-        await steerer.observe_reasoning(f"thought {i}", session=session)
+        await steerer.drift.observe_reasoning(f"thought {i}", session=session)
 
     assert session.reasoning_history == ["thought 2", "thought 3", "thought 4"]
 
@@ -705,7 +705,7 @@ async def test_observe_reasoning_emits_looping_drift_and_refines() -> None:
     repeated = "I should re-check the slides for typos"
     # Prime the history so the next observation repeats.
     session.reasoning_history = [repeated, repeated, repeated]
-    await steerer.observe_reasoning(repeated, session=session)
+    await steerer.drift.observe_reasoning(repeated, session=session)
 
     assert len(planner.refine_calls) == 1
     drift = planner.refine_calls[0]["drift"]
@@ -719,7 +719,7 @@ async def test_observe_reasoning_noops_on_empty_text() -> None:
     planner = NullPlanner()
     steerer.bind(sinks=[sink], planner=planner)
 
-    await steerer.observe_reasoning("", session=session)
+    await steerer.drift.observe_reasoning("", session=session)
     assert session.reasoning_history == []
     assert sink.events == []
 
@@ -841,7 +841,7 @@ async def test_observe_reasoning_populates_drift_trigger_input() -> None:
     # Prime the history so the next observation repeats and the loop
     # detector fires.
     session.reasoning_history = [text, text, text]
-    await steerer.observe_reasoning(text, session=session)
+    await steerer.drift.observe_reasoning(text, session=session)
 
     # LOOPING_REASONING is WARNING, so the steerer attempts refine. With
     # NullPlanner the refine returns None and the steerer escalates,
@@ -868,7 +868,7 @@ async def test_observe_reasoning_truncates_long_trigger_input() -> None:
     ) * 60
     # Prime the history so the loop detector fires on the same text.
     session.reasoning_history = [huge, huge, huge]
-    await steerer.observe_reasoning(huge, session=session)
+    await steerer.drift.observe_reasoning(huge, session=session)
 
     # See note in test_observe_reasoning_populates_drift_trigger_input:
     # WARNING-severity drift + NullPlanner refine triggers an

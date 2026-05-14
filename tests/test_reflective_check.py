@@ -143,15 +143,15 @@ async def test_reflective_check_fires_at_interval() -> None:
 
     session = _make_session_with_task()
     for _ in range(14):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     assert len(calls) == 0, "check should not fire before the 15th call"
-    await steerer.note_llm_call(session)
+    await steerer.drift.note_llm_call(session)
     assert len(calls) == 1, "check should fire on the 15th call"
     # Counter resets after a check; another 14 should not re-fire.
     for _ in range(14):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     assert len(calls) == 1
-    await steerer.note_llm_call(session)
+    await steerer.drift.note_llm_call(session)
     assert len(calls) == 2
 
 
@@ -169,7 +169,7 @@ async def test_reflective_check_making_progress_emits_no_drift() -> None:
 
     session = _make_session_with_task()
     for _ in range(3):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     # No drift_detected events emitted (high-confidence yes).
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert "drift_detected" not in kinds
@@ -191,7 +191,7 @@ async def test_reflective_check_low_confidence_emits_uncertain() -> None:
 
     session = _make_session_with_task()
     for _ in range(2):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     assert len(drifts) == 1
     from goldfive.pb.goldfive.v1 import types_pb2
@@ -223,7 +223,7 @@ async def test_reflective_check_stuck_emits_warning() -> None:
 
     session = _make_session_with_task()
     for _ in range(2):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     # The WARNING drift flows through _handle_drift, which also emits a
     # follow-up drift_detected when planner.refine returns None (refine
@@ -253,7 +253,7 @@ async def test_reflective_check_malformed_response_is_graceful() -> None:
     steerer.bind(sinks=[sink], planner=planner)
 
     session = _make_session_with_task()
-    await steerer.note_llm_call(session)
+    await steerer.drift.note_llm_call(session)
     drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     assert len(drifts) == 1
     from goldfive.pb.goldfive.v1 import types_pb2
@@ -274,7 +274,7 @@ async def test_reflective_check_raised_exception_is_graceful() -> None:
     steerer.bind(sinks=[sink], planner=planner)
 
     session = _make_session_with_task()
-    await steerer.note_llm_call(session)  # should not raise
+    await steerer.drift.note_llm_call(session)  # should not raise
     drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     assert len(drifts) == 1
     from goldfive.pb.goldfive.v1 import types_pb2
@@ -293,12 +293,12 @@ async def test_reflective_check_disabled_by_default() -> None:
 
     session = _make_session_with_task()
     for _ in range(100):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     # Counter never incremented (feature is off), and no drift emitted.
     assert session._llm_calls_since_check == 0
     assert [e.WhichOneof("payload") for e in sink.proto_events] == []
     # Even calling maybe_run_reflective_check directly is a no-op.
-    await steerer.maybe_run_reflective_check(session)
+    await steerer.drift.maybe_run_reflective_check(session)
     assert [e.WhichOneof("payload") for e in sink.proto_events] == []
 
 
@@ -321,15 +321,15 @@ async def test_reflective_check_configurable_interval() -> None:
 
     session = _make_session_with_task()
     for _ in range(5):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     assert call_count == 1
     for _ in range(5):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     assert call_count == 2
     for _ in range(4):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     assert call_count == 2  # 14 total → still 2 checks
-    await steerer.note_llm_call(session)
+    await steerer.drift.note_llm_call(session)
     assert call_count == 3  # 15 total → 3 checks
 
 
@@ -350,11 +350,11 @@ async def test_reflective_check_resets_counter_on_task_transition() -> None:
     session = _make_session_with_task()
     # First 3 calls on t1.
     for _ in range(3):
-        await steerer.note_llm_call(session)
+        await steerer.drift.note_llm_call(session)
     assert session._llm_calls_since_check == 3
     # Simulate task transition -- executor updates current_task_id.
     session.current_task_id = "t2"
-    await steerer.note_llm_call(session)
+    await steerer.drift.note_llm_call(session)
     # Counter resets to 1 (one new call on t2) -- we did not carry
     # over from t1.
     assert session._llm_calls_since_check == 1
@@ -377,7 +377,7 @@ async def test_reflective_check_tolerates_fenced_markdown() -> None:
     steerer.bind(sinks=[sink], planner=planner)
 
     session = _make_session_with_task()
-    await steerer.note_llm_call(session)
+    await steerer.drift.note_llm_call(session)
     drifts = [e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"]
     from goldfive.pb.goldfive.v1 import types_pb2
 
@@ -402,7 +402,7 @@ async def test_reflective_check_no_current_task_is_noop() -> None:
 
     session = _make_session_with_task()
     session.current_task_id = ""  # no active task
-    await steerer.note_llm_call(session)
+    await steerer.drift.note_llm_call(session)
     # The counter incremented (feature enabled), but the check found no
     # task and bailed cleanly without calling call_llm.
     assert calls == []

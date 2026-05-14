@@ -26,20 +26,36 @@ adk_plugin = pytest.importorskip("goldfive.adapters._adk_plugin")
 pytest.importorskip("google.adk")
 
 
-class _CapturingSteerer:
-    """Minimal steerer stub — captures every observation seen + every
-    drift emitted via the conventional ``_emit_drift_detected`` path."""
+class _CapturingDrift:
+    """Captures every observation seen + drift emitted (post #410)."""
 
     def __init__(self) -> None:
         self.observations: list[Any] = []
         self.emitted_drifts: list[Any] = []
-        self._sinks: list[Any] = []
 
     async def observe(self, observation: Any, session: Any) -> None:
         self.observations.append(observation)
 
     async def _emit_drift_detected(self, session: Any, drift: Any) -> None:
         self.emitted_drifts.append(drift)
+
+
+class _CapturingSteerer:
+    """Minimal steerer stub — exposes a ``drift`` sub-component that
+    captures every observation seen + every drift emitted via the
+    conventional ``_emit_drift_detected`` path."""
+
+    def __init__(self) -> None:
+        self.drift = _CapturingDrift()
+        self._sinks: list[Any] = []
+
+    @property
+    def observations(self) -> list[Any]:
+        return self.drift.observations
+
+    @property
+    def emitted_drifts(self) -> list[Any]:
+        return self.drift.emitted_drifts
 
 
 def _make_session_context(steerer: Any) -> Any:

@@ -210,16 +210,13 @@ response, see `goldfive/planner.py` or
 # ``goldfive/protocols.py``.
 @runtime_checkable
 class Steerer(Protocol):
-    async def observe(self, event: Any, session: Session) -> None: ...
-
-    async def observe_reasoning(
-        self,
-        text: str,
-        *,
-        task: Task | None = None,
-        session: Session,
-        provider: str = "",
-    ) -> None: ...
+    # Three component sub-objects expose the bulk of the surface.
+    # See ``TaskStateMachine`` / ``PlanReviser`` / ``DriftObserver``
+    # for the per-component contracts.
+    tasks: Any   # TaskStateMachine — mark_task_*, cascade_cancel_downstream
+    plans: Any   # PlanReviser     — install_*, _apply_revision, _emit_plan_revised
+    drift: Any   # DriftObserver   — observe, observe_reasoning, detect_drift,
+                 #                   handle_drift, request_invocation_cancel
 
     async def transition(
         self,
@@ -228,15 +225,8 @@ class Steerer(Protocol):
         *,
         detail: str = "",
         session: Session,
+        cancel_reason: str = "",
     ) -> None: ...
-
-    async def cascade_cancel_downstream(
-        self,
-        session: Session,
-        cancelled_id: str,
-    ) -> None: ...
-
-    def detect_drift(self, event: Any, session: Session) -> Optional[DriftEvent]: ...
 
     def bind(
         self,
@@ -248,32 +238,37 @@ class Steerer(Protocol):
 
 ### Contract
 
-- `observe(event, session)` — the adapter streams raw framework
-  events (LLM text, tool calls, stream chunks) here. The steerer may
-  classify drift, update per-task progress, or no-op. Must not mutate
-  `event`.
-- `observe_reasoning(text, *, task=, session, provider="")` — called
-  once per LLM response that carries chain-of-thought (OpenAI
+After goldfive#410 (post-Wave-C facade cleanup), the Steerer is a
+**thin coordinator** with three component sub-objects. Callers reach
+the right component directly rather than through router shims:
+
+- `steerer.tasks.mark_task_*` / `steerer.tasks.cascade_cancel_downstream`
+  — the canonical task-state-machine surface. Every transition
+  emits exactly one event; terminal states absorb.
+- `steerer.plans.install_*` / `steerer.plans._apply_revision` /
+  `steerer.plans._emit_plan_revised` — the plan-install + revision +
+  refine-attempt observability surface.
+- `steerer.drift.observe(event, session)` — adapter streams raw
+  framework events here. The DriftObserver may classify drift, update
+  per-task progress, or no-op. Must not mutate `event`.
+- `steerer.drift.observe_reasoning(text, *, task=, session, ...)` —
+  called once per LLM response that carries chain-of-thought (OpenAI
   `reasoning_content`, Anthropic `thinking`, Google thought parts).
   Feeds `Session.reasoning_history` and the reasoning-drift pipeline
-  (`LOOPING_REASONING`, `OFF_TOPIC`, `INTENT_DIVERGENCE`).
-  Adapters that cannot surface reasoning simply never call this.
-- `transition(task_id, to, session)` — the single source-of-truth
-  state-mutating method. Enforces monotonicity (see
+  (`LOOPING_REASONING`, `OFF_TOPIC`, `INTENT_DIVERGENCE`). Adapters
+  that cannot surface reasoning simply never call this.
+- `steerer.drift.detect_drift(event, session)` — pure classifier.
+  Returns a `DriftEvent` or `None`. No state mutation, no event
+  emission.
+- `steerer.drift.handle_drift(drift, session)` — the central drift
+  router that walks the intervention ladder (see DRIFT.md §
+  "Intervention ladder").
+- `steerer.transition(task_id, to, session, ...)` — the
+  router-level dispatch helper that fans out to the matching
+  `tasks.mark_task_*`. Enforces monotonicity (see
   [STATE-MACHINE.md](STATE-MACHINE.md)) and emits one event per
-  successful transition.
-- `cascade_cancel_downstream(session, cancelled_id)` — shared
-  cancellation-fanout primitive. BFS-walks `session.plan.edges`
-  forward from `cancelled_id`, transitions every reachable
-  non-terminal task to CANCELLED, and emits exactly one
-  `TaskCancelled` per transitioned task. De-duplicates diamond-DAG
-  reachability and skips already-terminal downstream tasks. Used by
-  both the unrecoverable-failure cascade
-  (`mark_task_failed(recoverable=False)`) and the
-  cancellation-cascade path. The initiator itself is *not*
-  transitioned by this method; callers own that.
-- `detect_drift(event, session)` — pure classifier. Returns a
-  `DriftEvent` or `None`. No state mutation, no event emission.
+  successful transition. Kept on the router so callers that don't
+  want to bind to a specific status helper have a uniform entry point.
 - `bind(sinks, planner)` — called once by the executor before the
   first `observe`. Wires the steerer to its downstream dependencies.
 
@@ -299,20 +294,56 @@ from goldfive.protocols import EventSink, Planner
 _TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
 
-class MinimalSteerer:
-    """Minimal but compliant Steerer. No drift detection."""
+class _MinimalTasks:
+    """Component owner of mark_task_* transitions."""
 
-    def __init__(self) -> None:
-        self._sinks: list[EventSink] = []
-        self._planner: Optional[Planner] = None
+    async def mark_task_running(self, task_id: str, *, session: Session, **_: Any) -> None:
+        _transition(session, task_id, TaskStatus.RUNNING)
 
-    def bind(self, *, sinks: list[EventSink], planner: Planner) -> None:
-        self._sinks = sinks
-        self._planner = planner
+    async def mark_task_completed(self, task_id: str, *, session: Session, **_: Any) -> None:
+        _transition(session, task_id, TaskStatus.COMPLETED)
+
+    # (other mark_task_* + cascade_cancel_downstream + _emit_task_* elided
+    # for brevity — see TaskStateMachine for the full surface)
+
+
+class _MinimalDrift:
+    """Component owner of observe / detect_drift."""
 
     async def observe(self, event: Any, session: Session) -> None:
         # no-op
         return
+
+    def detect_drift(self, event: Any, session: Session) -> Optional[DriftEvent]:
+        return None
+
+
+def _transition(session: Session, task_id: str, to: TaskStatus) -> None:
+    assert session.plan is not None
+    task = next(t for t in session.plan.tasks if t.id == task_id)
+    if task.status in _TERMINAL:
+        return
+    task.status = to
+    # (skip event emission for brevity — see DefaultSteerer)
+
+
+class MinimalSteerer:
+    """Minimal but compliant Steerer. No drift detection.
+
+    Component-namespaced per goldfive#410: the surface lives on
+    ``tasks`` / ``plans`` / ``drift`` sub-objects.
+    """
+
+    def __init__(self) -> None:
+        self._sinks: list[EventSink] = []
+        self._planner: Optional[Planner] = None
+        self.tasks = _MinimalTasks()
+        self.plans = object()  # plan-install surface omitted in this minimal example
+        self.drift = _MinimalDrift()
+
+    def bind(self, *, sinks: list[EventSink], planner: Planner) -> None:
+        self._sinks = sinks
+        self._planner = planner
 
     async def transition(
         self,
@@ -321,16 +352,13 @@ class MinimalSteerer:
         *,
         detail: str = "",
         session: Session,
+        cancel_reason: str = "",
     ) -> None:
-        assert session.plan is not None
-        task = next(t for t in session.plan.tasks if t.id == task_id)
-        if task.status in _TERMINAL:
-            return
-        task.status = to
-        # (skip event emission for brevity — see DefaultSteerer)
-
-    def detect_drift(self, event: Any, session: Session) -> Optional[DriftEvent]:
-        return None
+        if to is TaskStatus.RUNNING:
+            await self.tasks.mark_task_running(task_id, session=session)
+        elif to is TaskStatus.COMPLETED:
+            await self.tasks.mark_task_completed(task_id, session=session)
+        # ... fan out to the remaining mark_task_* helpers.
 ```
 
 The production `DefaultSteerer` in `goldfive/steerer.py` adds the full

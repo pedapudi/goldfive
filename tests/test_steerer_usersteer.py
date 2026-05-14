@@ -155,7 +155,7 @@ async def test_observe_steer_triggers_user_steer_drift_and_refine() -> None:
         payload={"note": "focus on clarity"},
     )
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     # Planner.refine was called with a USER_STEER drift carrying the note.
     assert len(planner.refine_calls) == 1
@@ -186,7 +186,7 @@ async def test_observe_cancel_triggers_critical_user_cancel_drift() -> None:
         kind=ControlKind.CANCEL,
         payload={"reason": "operator abort"},
     )
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     assert len(planner.refine_calls) == 1
     drift: DriftEvent = planner.refine_calls[0]["drift"]
@@ -205,7 +205,7 @@ async def test_observe_pause_emits_drift_but_does_not_refine() -> None:
     steerer, session, sink, planner = _bind_fresh()
     msg = ControlMessage(kind=ControlKind.PAUSE, payload={"note": "coffee"})
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     # INFO severity → refine must NOT be called.
     assert planner.refine_calls == []
@@ -223,7 +223,7 @@ async def test_observe_non_control_event_still_uses_classifier() -> None:
     steerer, session, sink, planner = _bind_fresh()
 
     # A tool-error shape — detect_drift should still classify this.
-    await steerer.observe({"error": "boom"}, session)
+    await steerer.drift.observe({"error": "boom"}, session)
 
     # Should have produced a tool_error drift (classify_tool_error path).
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
@@ -254,8 +254,8 @@ async def test_observe_steer_dedupes_by_annotation_id() -> None:
         id="ctl-retry-2",
         payload={"note": "pivot", "annotation_id": "ann_abc"},
     )
-    await steerer.observe(first, session)
-    await steerer.observe(second, session)
+    await steerer.drift.observe(first, session)
+    await steerer.drift.observe(second, session)
 
     assert len(planner.refine_calls) == 1
     assert session.state.get("goldfive.processed_steer_ids") == ["ann_abc"]
@@ -270,9 +270,9 @@ async def test_observe_steer_dedupes_by_control_id_when_annotation_id_absent() -
         payload={"note": "pivot"},
     )
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
     # Same id, deliberately re-delivered.
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     assert len(planner.refine_calls) == 1
     assert session.state.get("goldfive.processed_steer_ids") == ["ctl-noid-1"]
@@ -292,8 +292,8 @@ async def test_observe_steer_distinct_ids_each_trigger_refine() -> None:
         payload={"note": "two", "annotation_id": "ann_2"},
     )
 
-    await steerer.observe(first, session)
-    await steerer.observe(second, session)
+    await steerer.drift.observe(first, session)
+    await steerer.drift.observe(second, session)
 
     assert len(planner.refine_calls) == 2
     assert session.state.get("goldfive.processed_steer_ids") == ["ann_1", "ann_2"]
@@ -325,12 +325,12 @@ async def test_observe_dedupe_does_not_affect_heuristic_drifts() -> None:
         id="ctl-s",
         payload={"note": "go", "annotation_id": "ann_s"},
     )
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
     # Two tool-error events on DIFFERENT pinned tasks — each is its own
     # drift condition (per-condition gate is keyed on kind+task+agent
     # within a turn) and therefore gets its own refine.
-    await steerer.observe({"error": "boom", "task_id": "t1"}, session)
-    await steerer.observe({"error": "boom", "task_id": "t2"}, session)
+    await steerer.drift.observe({"error": "boom", "task_id": "t1"}, session)
+    await steerer.drift.observe({"error": "boom", "task_id": "t2"}, session)
 
     # planner.refine: 1 steer + 2 tool_error observations across distinct tasks.
     assert len(planner.refine_calls) == 3
@@ -356,7 +356,7 @@ async def test_observe_steer_stamps_annotation_id_on_drift_detected(
         },
     )
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     drift_events = [
         e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"
@@ -381,7 +381,7 @@ async def test_observe_steer_without_annotation_id_leaves_drift_annotation_id_em
         payload={"note": "focus"},
     )
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     drift_events = [
         e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"
@@ -404,7 +404,7 @@ async def test_observe_cancel_stamps_annotation_id_on_drift_detected(
         payload={"reason": "operator abort", "annotation_id": "ann_cxl"},
     )
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     drift_events = [
         e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"
@@ -428,7 +428,7 @@ async def test_autonomous_drift_has_empty_annotation_id() -> None:
     steerer, session, sink, _planner = _bind_fresh()
     # Use a tool-error event — classify_tool_error mints a drift directly
     # from an untyped event (no ControlMessage.raw).
-    await steerer.observe({"error": "boom"}, session)
+    await steerer.drift.observe({"error": "boom"}, session)
 
     drift_events = [
         e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"
@@ -451,7 +451,7 @@ async def test_observe_steer_propagates_author_into_state_and_detail() -> None:
         },
     )
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     assert session.state.get("goldfive.active_steer.author") == "alice"
     # Raw body — not the "by alice: ..." rewrite — lands on body.
@@ -470,7 +470,7 @@ async def test_observe_steer_without_author_leaves_author_empty() -> None:
         payload={"note": "quiet nudge", "annotation_id": "ann_na"},
     )
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     assert session.state.get("goldfive.active_steer.author") == ""
     assert session.state.get("goldfive.active_steer.body") == "quiet nudge"
@@ -493,7 +493,7 @@ async def test_processed_steer_ids_list_evicts_oldest_when_capped() -> None:
             id=f"ctl-{i}",
             payload={"note": f"n{i}", "annotation_id": f"ann_{i}"},
         )
-        await steerer.observe(msg, session)
+        await steerer.drift.observe(msg, session)
 
     ids = session.state.get("goldfive.processed_steer_ids") or []
     assert len(ids) == cap
@@ -521,7 +521,7 @@ async def test_direct_user_steer_drift_event_without_raw_still_writes_state() ->
         current_task_id="t2",
     )
 
-    await steerer._apply_user_steer_state(drift, session)
+    await steerer.drift._apply_user_steer_state(drift, session)
 
     assert session.state.get("goldfive.active_steer.body") == "direct call"
     assert session.state.get("goldfive.active_steer.author") == "bob"
@@ -566,7 +566,7 @@ async def test_steerer_sets_adapter_next_cancel_reason_on_user_steer() -> None:
         kind=ControlKind.STEER,
         payload={"note": "pivot to security posture"},
     )
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     assert adapter._next_cancel_reason == "user_steer"
 
@@ -584,11 +584,11 @@ async def test_steerer_does_not_tag_adapter_on_non_user_steer_drift() -> None:
 
     # PAUSE → USER_PAUSE drift (INFO severity, no refine).
     pause_msg = ControlMessage(kind=ControlKind.PAUSE, payload={"note": "wait"})
-    await steerer.observe(pause_msg, session)
+    await steerer.drift.observe(pause_msg, session)
     assert adapter._next_cancel_reason == ""
 
     # A raw tool-error event also should not tag the adapter.
-    await steerer.observe({"error": "boom"}, session)
+    await steerer.drift.observe({"error": "boom"}, session)
     assert adapter._next_cancel_reason == ""
 
 
@@ -608,7 +608,7 @@ async def test_steerer_bind_adapter_tolerates_adapter_without_attr() -> None:
 
     msg = ControlMessage(kind=ControlKind.STEER, payload={"note": "x"})
     # Must not raise.
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
     # Refine still ran.
     assert len(planner.refine_calls) == 1
 
@@ -808,7 +808,7 @@ async def test_plan_revised_stamps_annotation_id_from_user_steer(
         },
     )
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     revised_events = [
         e for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised"
@@ -836,7 +836,7 @@ async def test_plan_revised_without_annotation_id_falls_back_to_drift_id(
         payload={"note": "pivot"},
     )
 
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
 
     revised_events = [
         e for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised"
@@ -857,7 +857,7 @@ async def test_apply_revision_stamps_trigger_event_id_from_annotation(
     drifts via the raw ControlMessage payload. Rescope keeps that
     behaviour but the field is now the unified ``trigger_event_id``.
     """
-    from goldfive.steerer import DefaultSteerer
+    from goldfive.drift_observer import DriftObserver
 
     session = _make_session()
     msg = ControlMessage(
@@ -865,7 +865,7 @@ async def test_apply_revision_stamps_trigger_event_id_from_annotation(
         id="ctl-ar",
         payload={"note": "refocus", "annotation_id": "ann_ar_77"},
     )
-    drift = DefaultSteerer._drift_from_control(msg, session)
+    drift = DriftObserver._drift_from_control(msg, session)
     assert drift is not None
 
     revised = Plan(
@@ -884,7 +884,7 @@ async def test_apply_revision_stamps_trigger_event_id_from_annotation(
     # in observation-only mode); the test-suite fixture flips the
     # default to active-steering so the install lands.
     # goldfive#255: returns ``(revised, was_installed)``.
-    revised, _was_installed = DefaultSteerer()._apply_revision(session, revised, drift)
+    revised, _was_installed = DefaultSteerer().plans._apply_revision(session, revised, drift)
 
     assert session.plan is not None and session.plan.id == revised.id
     assert revised.revision_trigger_event_id == "ann_ar_77"
@@ -920,7 +920,7 @@ async def test_apply_revision_stamps_drift_id_on_autonomous_drift(
     # goldfive#247: _apply_revision returns the stamped Plan; the input
     # stays unchanged (frozen). goldfive#254: instance method now.
     # goldfive#255: returns ``(revised, was_installed)``.
-    revised, _was_installed = DefaultSteerer()._apply_revision(session, revised, drift)
+    revised, _was_installed = DefaultSteerer().plans._apply_revision(session, revised, drift)
     assert revised.revision_trigger_event_id == drift.id
 
 
@@ -931,7 +931,7 @@ async def test_apply_revision_preserves_prestamped_trigger_event_id() -> None:
     retry attempt's plan with the original trigger id, re-applying the
     revision must not clobber it.
     """
-    from goldfive.steerer import DefaultSteerer
+    from goldfive.drift_observer import DriftObserver
 
     session = _make_session()
     msg = ControlMessage(
@@ -939,7 +939,7 @@ async def test_apply_revision_preserves_prestamped_trigger_event_id() -> None:
         id="ctl-ar2",
         payload={"note": "refocus", "annotation_id": "ann_from_drift"},
     )
-    drift = DefaultSteerer._drift_from_control(msg, session)
+    drift = DriftObserver._drift_from_control(msg, session)
     assert drift is not None
 
     revised = Plan(
@@ -951,7 +951,7 @@ async def test_apply_revision_preserves_prestamped_trigger_event_id() -> None:
         revision_trigger_event_id="ann_prestamped",
     )
     # goldfive#254: instance method now.
-    DefaultSteerer()._apply_revision(session, revised, drift)
+    DefaultSteerer().plans._apply_revision(session, revised, drift)
     assert revised.revision_trigger_event_id == "ann_prestamped"
 
 
@@ -966,7 +966,7 @@ async def test_autonomous_refine_stamps_drift_id_on_plan_revised(
     """
     steerer, session, sink, _planner = _bind_fresh()
     # Feed an untyped event — classify_tool_error path, no ControlMessage.
-    await steerer.observe({"error": "boom"}, session)
+    await steerer.drift.observe({"error": "boom"}, session)
     revised_events = [
         e for e in sink.proto_events if e.WhichOneof("payload") == "plan_revised"
     ]

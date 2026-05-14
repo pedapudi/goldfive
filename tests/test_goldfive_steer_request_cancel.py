@@ -201,7 +201,7 @@ async def test_goldfive_steer_request_cancel_fires() -> None:
         detail="agent wandered",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     assert adapter.request_cancel_calls == []  # reverted: deferred-cancel only
     # The same reason is on the cancel-tag so the adapter's healing
     # path picks it up when CancelledError flows.
@@ -218,7 +218,7 @@ async def test_goldfive_steer_request_cancel_supports_sync_hook() -> None:
         detail="agent abandoned the goal",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     assert adapter.request_cancel_calls == []  # reverted: deferred-cancel only
 
 
@@ -233,7 +233,7 @@ async def test_goldfive_steer_tolerates_adapter_without_request_cancel() -> None
         detail="minor wander",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     # Cancel-tag still stamped.
     assert adapter._next_cancel_reason == "goldfive_off_topic"
     # Refine still ran — the promotion path is intact.
@@ -251,7 +251,7 @@ async def test_goldfive_steer_swallows_request_cancel_raise() -> None:
         current_task_id="t2",
     )
     # Must not raise out.
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     assert adapter.request_cancel_calls == []  # reverted: deferred-cancel only
     assert planner.refine_steer_calls, "refine should still have fired"
 
@@ -270,7 +270,7 @@ async def test_user_steer_does_not_call_request_cancel() -> None:
         detail="operator note",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     assert adapter.request_cancel_calls == []
 
 

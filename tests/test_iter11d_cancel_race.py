@@ -220,7 +220,7 @@ async def test_gate_skips_drift_when_cancel_pending_with_active_invocations() ->
     try:
         # Sanity: pre-cancel, gate does NOT classify the drift as late.
         drift = _drift()
-        assert steerer._is_late_drift_for_terminated_invocation(drift, session) is False
+        assert steerer.drift._is_late_drift_for_terminated_invocation(drift, session) is False
 
         # Synchronous cancel-pending stamp (the part
         # request_invocation_cancel does at its top).
@@ -230,7 +230,7 @@ async def test_gate_skips_drift_when_cancel_pending_with_active_invocations() ->
         # this is the 4-8s window the bug lived in. The gate must
         # nonetheless treat the drift as late.
         assert store.active_invocation_ids() == ["inv-live"]
-        assert steerer._is_late_drift_for_terminated_invocation(drift, session) is True
+        assert steerer.drift._is_late_drift_for_terminated_invocation(drift, session) is True
     finally:
         store.deregister_invocation_task("inv-live")
         store.clear_active_invocations()
@@ -247,7 +247,7 @@ async def test_gate_still_classifies_empty_active_list_as_late() -> None:
         assert store.active_invocation_ids() == []
         assert store.cancel_requested_invocation_ids() == []
         drift = _drift()
-        assert steerer._is_late_drift_for_terminated_invocation(drift, session) is True
+        assert steerer.drift._is_late_drift_for_terminated_invocation(drift, session) is True
     finally:
         store.clear_active_invocations()
 
@@ -266,7 +266,7 @@ async def test_gate_lets_user_authored_drift_through_even_with_cancel_pending() 
         ):
             drift = _drift(kind=kind, authored_by="user")
             assert (
-                steerer._is_late_drift_for_terminated_invocation(drift, session)
+                steerer.drift._is_late_drift_for_terminated_invocation(drift, session)
                 is False
             ), (
                 f"user-authored drift kind={kind!r} must bypass the late-drift "
@@ -311,7 +311,7 @@ async def test_request_invocation_cancel_stamps_cancel_pending_synchronously() -
             kind=DriftKind.GOAL_DRIFT,
             severity=DriftSeverity.CRITICAL,
         )
-        flagged = await steerer.request_invocation_cancel(
+        flagged = await steerer.drift.request_invocation_cancel(
             drift=cancel_drift, session=session
         )
         assert flagged == ["inv-A"]
@@ -329,7 +329,7 @@ async def test_request_invocation_cancel_stamps_cancel_pending_synchronously() -
         # A goldfive-authored drift firing immediately after is gated.
         late_drift = _drift(kind=DriftKind.JUSTIFIED_DEVIATION)
         assert (
-            steerer._is_late_drift_for_terminated_invocation(late_drift, session)
+            steerer.drift._is_late_drift_for_terminated_invocation(late_drift, session)
             is True
         )
     finally:

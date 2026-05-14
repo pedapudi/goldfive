@@ -399,7 +399,7 @@ async def test_user_steer_install_never_aborts_default_flag() -> None:
         detail="pivot",
         authored_by="user",
     )
-    returned = await steerer.install_user_steer(
+    returned = await steerer.plans.install_user_steer(
         drift=drift, prior=prior, llm_revision=invalid, session=session
     )
     # The fallback fired — pending was cancelled, done preserved.
@@ -455,7 +455,7 @@ async def test_user_steer_install_never_aborts_strict_flag(
         detail="pivot",
         authored_by="user",
     )
-    await steerer.install_user_steer(
+    await steerer.plans.install_user_steer(
         drift=drift, prior=prior, llm_revision=invalid, session=session
     )
     payload_kinds = _payload_kinds(sink)

@@ -278,7 +278,7 @@ def test_ladder_mapping(
     expected: InterventionLevel,
 ) -> None:
     steerer = DefaultSteerer()
-    level = steerer._ladder_level_for(kind, severity, occurrence)
+    level = steerer.drift._ladder_level_for(kind, severity, occurrence)
     assert level is expected, (
         f"ladder({kind.value}, {severity.value}, occ={occurrence}) "
         f"= {level.name}, expected {expected.name}"
@@ -311,18 +311,18 @@ def test_ladder_covers_goal_drift() -> None:
     steerer = DefaultSteerer()
     # WARNING -> NUDGE (corrective message; no plan change needed).
     assert (
-        steerer._ladder_level_for(DriftKind.GOAL_DRIFT, DriftSeverity.WARNING, 0)
+        steerer.drift._ladder_level_for(DriftKind.GOAL_DRIFT, DriftSeverity.WARNING, 0)
         is InterventionLevel.NUDGE
     )
     # CRITICAL first occurrence -> NUDGE.
     assert (
-        steerer._ladder_level_for(DriftKind.GOAL_DRIFT, DriftSeverity.CRITICAL, 0)
+        steerer.drift._ladder_level_for(DriftKind.GOAL_DRIFT, DriftSeverity.CRITICAL, 0)
         is InterventionLevel.NUDGE
     )
     # CRITICAL repeat -> CANCEL_REINVOKE (cancel + restart with the
     # corrective body as the new user input).
     assert (
-        steerer._ladder_level_for(
+        steerer.drift._ladder_level_for(
             DriftKind.GOAL_DRIFT,
             DriftSeverity.CRITICAL,
             DefaultSteerer.REFINE_FAILURE_THRESHOLD,
@@ -342,27 +342,27 @@ def test_justified_deviation_routes_to_absorb_at_all_severities() -> None:
     """
     steerer = DefaultSteerer()
     assert (
-        steerer._ladder_level_for(
+        steerer.drift._ladder_level_for(
             DriftKind.JUSTIFIED_DEVIATION, DriftSeverity.INFO, 0
         )
         is InterventionLevel.OBSERVE
     )
     assert (
-        steerer._ladder_level_for(
+        steerer.drift._ladder_level_for(
             DriftKind.JUSTIFIED_DEVIATION, DriftSeverity.WARNING, 0
         )
         is InterventionLevel.ABSORB
     )
     # CRITICAL first occurrence — ABSORB, NOT cancel-reinvoke.
     assert (
-        steerer._ladder_level_for(
+        steerer.drift._ladder_level_for(
             DriftKind.JUSTIFIED_DEVIATION, DriftSeverity.CRITICAL, 0
         )
         is InterventionLevel.ABSORB
     )
     # CRITICAL repeat — STILL ABSORB. Specifically NOT pause_escalate.
     assert (
-        steerer._ladder_level_for(
+        steerer.drift._ladder_level_for(
             DriftKind.JUSTIFIED_DEVIATION,
             DriftSeverity.CRITICAL,
             DefaultSteerer.REFINE_FAILURE_THRESHOLD,
@@ -371,7 +371,7 @@ def test_justified_deviation_routes_to_absorb_at_all_severities() -> None:
     )
     # And way past the repeat threshold for paranoia.
     assert (
-        steerer._ladder_level_for(
+        steerer.drift._ladder_level_for(
             DriftKind.JUSTIFIED_DEVIATION, DriftSeverity.CRITICAL, 99
         )
         is InterventionLevel.ABSORB
@@ -386,21 +386,21 @@ def test_off_topic_unchanged_by_justified_deviation_addition() -> None:
     """
     steerer = DefaultSteerer()
     assert (
-        steerer._ladder_level_for(DriftKind.OFF_TOPIC, DriftSeverity.INFO, 0)
+        steerer.drift._ladder_level_for(DriftKind.OFF_TOPIC, DriftSeverity.INFO, 0)
         is InterventionLevel.OBSERVE
     )
     assert (
-        steerer._ladder_level_for(DriftKind.OFF_TOPIC, DriftSeverity.WARNING, 0)
+        steerer.drift._ladder_level_for(DriftKind.OFF_TOPIC, DriftSeverity.WARNING, 0)
         is InterventionLevel.ABSORB
     )
     assert (
-        steerer._ladder_level_for(
+        steerer.drift._ladder_level_for(
             DriftKind.OFF_TOPIC, DriftSeverity.CRITICAL, 0
         )
         is InterventionLevel.CANCEL_REINVOKE
     )
     assert (
-        steerer._ladder_level_for(
+        steerer.drift._ladder_level_for(
             DriftKind.OFF_TOPIC,
             DriftSeverity.CRITICAL,
             DefaultSteerer.REFINE_FAILURE_THRESHOLD,

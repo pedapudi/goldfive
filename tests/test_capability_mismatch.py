@@ -536,31 +536,40 @@ def test_rule_c_excludes_bound_task_by_id() -> None:
 pytest.importorskip("google.adk")
 
 
-class _RecordingSteerer:
-    """Test stub matching ``test_runaway_delegation_cap``: records every
-    drift routed through ``_handle_drift`` so the test can assert on
-    CAPABILITY_MISMATCH emission without spinning up a full
-    DefaultSteerer.
-    """
-
+class _RecordingDrift:
     def __init__(self) -> None:
-        self._sinks: list[Any] = []
         self.drifts: list[Any] = []
 
     async def observe(self, *a: Any, **kw: Any) -> None:
         pass
 
-    async def transition(self, *a: Any, **kw: Any) -> None:
-        pass
-
     def detect_drift(self, *a: Any, **kw: Any) -> None:
         return None
 
-    def bind(self, **kw: Any) -> None:
+    async def handle_drift(self, drift: Any, session: Any) -> None:  # noqa: ARG002
+        self.drifts.append(drift)
+
+
+class _RecordingSteerer:
+    """Test stub matching ``test_runaway_delegation_cap``: records every
+    drift routed through ``drift.handle_drift`` so the test can assert
+    on CAPABILITY_MISMATCH emission without spinning up a full
+    DefaultSteerer.  Component-namespaced per goldfive#410.
+    """
+
+    def __init__(self) -> None:
+        self._sinks: list[Any] = []
+        self.drift = _RecordingDrift()
+
+    @property
+    def drifts(self) -> list[Any]:
+        return self.drift.drifts
+
+    async def transition(self, *a: Any, **kw: Any) -> None:
         pass
 
-    async def _handle_drift(self, drift: Any, session: Any) -> None:  # noqa: ARG002
-        self.drifts.append(drift)
+    def bind(self, **kw: Any) -> None:
+        pass
 
 
 def _make_one_shot_delegating_llm(tool_name: str) -> Any:

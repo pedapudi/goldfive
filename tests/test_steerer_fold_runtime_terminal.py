@@ -39,6 +39,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.plan_reviser import PlanReviser  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     DriftEvent,
@@ -62,7 +63,7 @@ def _fold_ids(revised: Plan, prior: Plan | None) -> tuple[list[str], Plan]:
     folded-id list by diffing input vs output so the existing test
     assertions ``folded == [...]`` keep working.
     """
-    folded_plan = DefaultSteerer._fold_runtime_terminal_statuses(revised, prior)
+    folded_plan = PlanReviser._fold_runtime_terminal_statuses(revised, prior)
     if folded_plan is revised:
         return [], folded_plan
     before = {t.id: t.status for t in revised.tasks}
@@ -395,7 +396,7 @@ async def test_install_with_drift_folds_runtime_not_needed_into_snapshot() -> No
         authored_by="goldfive",
     )
 
-    installed = await steerer.install_revision_for_drift(
+    installed = await steerer.plans.install_revision_for_drift(
         session=session,
         drift=drift,
         revised_plan=revised,
@@ -472,7 +473,7 @@ async def test_install_with_drift_genuine_terminal_regression_still_rejected() -
         authored_by="goldfive",
     )
 
-    installed = await steerer.install_revision_for_drift(
+    installed = await steerer.plans.install_revision_for_drift(
         session=session,
         drift=drift,
         revised_plan=revised,
@@ -545,7 +546,7 @@ async def test_install_user_steer_folds_before_validating_llm_revision() -> None
         authored_by="user",
     )
 
-    returned = await steerer.install_user_steer(
+    returned = await steerer.plans.install_user_steer(
         drift=drift,
         prior=prior,
         llm_revision=llm_revision,
@@ -605,7 +606,7 @@ async def test_handle_drift_refine_path_folds_before_validation() -> None:
 
     # Trigger an autonomous refine via observe (any error context fires
     # the drift -> refine -> apply pipeline).
-    await steerer.observe({"error": "trigger refine"}, session)
+    await steerer.drift.observe({"error": "trigger refine"}, session)
 
     # Plan was installed; t_reaped landed as NOT_NEEDED (folded), not
     # PENDING.
@@ -669,7 +670,7 @@ async def test_apply_revision_defensive_fold_idempotent_when_caller_already_fold
     # RETURNED plan to verify the defensive fold is idempotent — the
     # session.plan pointer is unchanged at this point, which is the
     # whole point of the fix.
-    revised, _was_installed = DefaultSteerer()._apply_revision(session, revised, drift)
+    revised, _was_installed = DefaultSteerer().plans._apply_revision(session, revised, drift)
 
     # goldfive#403: session.plan is still the PRIOR plan (install
     # deferred to _emit_plan_revised). The defensive-fold invariant

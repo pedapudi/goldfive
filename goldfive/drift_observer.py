@@ -183,21 +183,22 @@ log = logging.getLogger(__name__)
 class DriftObserver:
     """Drift event observability + classification + dispatch helpers.
 
-    Constructed by :class:`DefaultSteerer` and held on
-    ``DefaultSteerer._drift_observer``. The router delegates the
-    drift-emit / detection / attribution / dispatch surface to the
-    matching method on this class via thin shims that forward
-    arguments verbatim. Tests that historically poked the
-    bare-attribute names on the steerer
-    (``steerer._emit_drift_detected``, ``steerer._handle_drift``,
-    ``steerer._promote_drift_to_steer``,
-    ``steerer.request_invocation_cancel``, etc.) keep working through
-    those shims; nothing on the public surface changes.
+    Constructed by :class:`DefaultSteerer` and exposed publicly as
+    ``DefaultSteerer.drift`` (goldfive#410). Callers — executors,
+    adapters, the runner, planners, tests — reach the drift-emit /
+    detection / attribution / dispatch surface directly as
+    ``steerer.drift.X``.
 
-    This is the post-**bucket 3c** state of the steerer split: bucket
-    3a (observability primitives), 3b (observation entry points +
-    judge orchestration), and 3c (dispatch + ladder + promotion +
-    refine-outcome bookkeeping) all live here.
+    Buckets retained from the original steerer-split:
+
+    * bucket 3a — observability primitives (``_emit_drift_detected``,
+      lifecycle stamping, ``_close_open_boundaries_for_terminal_drift``,
+      attribution helpers);
+    * bucket 3b — observation entry points + judge orchestration
+      (``observe`` / ``observe_reasoning`` / ``maybe_run_*_check``);
+    * bucket 3c — dispatch + ladder + promotion + refine-outcome
+      bookkeeping (``handle_drift`` / ``_ladder_level_for`` /
+      ``_promote_drift_to_steer`` / ``_record_refine_outcome``).
     """
 
     # ------------------------------------------------------------------
@@ -1080,12 +1081,11 @@ class DriftObserver:
             return
         drift = self._drift_from_control(event, session)
         if drift is None:
-            # Route through the router so subclasses overriding
-            # :meth:`DefaultSteerer.detect_drift` are still consulted
-            # (legacy extension surface; the router's shim forwards
-            # back into :meth:`DriftObserver.detect_drift` when the
-            # subclass does not override).
-            drift = self._steerer.detect_drift(event, session)
+            # Subclasses that need custom detection can subclass
+            # :class:`DriftObserver` and override
+            # :meth:`detect_drift`. The router-level shim that used
+            # to dispatch back here was retired in goldfive#410.
+            drift = self.detect_drift(event, session)
         if drift is None:
             return
         await self.handle_drift(drift, session)
@@ -2816,8 +2816,8 @@ class DriftObserver:
         _active_session_token = self._steerer._active_session_var.set(session)
         # goldfive a4: mint a refine-attempt id for correlation across
         # ``refine_attempted`` and the paired success/failure event.
-        attempt_id = self._steerer._new_attempt_id()
-        await self._steerer._emit_refine_attempted(session, drift, attempt_id=attempt_id)
+        attempt_id = self._steerer.plans._new_attempt_id()
+        await self._steerer.plans._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         try:
             # Thread the adapter's available_agents_tree (goldfive#151)
             # through refine so the LLM is constrained to pick real
@@ -2873,7 +2873,7 @@ class DriftObserver:
                         drift.current_task_id,
                         exc,
                     )
-                    await self._steerer._emit_refine_failed(
+                    await self._steerer.plans._emit_refine_failed(
                         session,
                         drift,
                         attempt_id=attempt_id,
@@ -2896,7 +2896,7 @@ class DriftObserver:
                         drift.kind.value,
                         exc,
                     )
-                    await self._steerer._emit_refine_failed(
+                    await self._steerer.plans._emit_refine_failed(
                         session,
                         drift,
                         attempt_id=attempt_id,
@@ -2919,7 +2919,7 @@ class DriftObserver:
                     # ``_active_session_var``; we only own the paired-event
                     # stash here. Re-raise so cancellation continues to
                     # propagate per the asyncio contract.
-                    await self._steerer._emit_refine_failed(
+                    await self._steerer.plans._emit_refine_failed(
                         session,
                         drift,
                         attempt_id=attempt_id,
@@ -2946,7 +2946,7 @@ class DriftObserver:
                 "plan unchanged — escalating to HUMAN_INTERVENTION_REQUIRED",
                 drift.kind.value,
             )
-            await self._steerer._emit_refine_failed(
+            await self._steerer.plans._emit_refine_failed(
                 session,
                 drift,
                 attempt_id=attempt_id,
@@ -2965,7 +2965,7 @@ class DriftObserver:
         # carry that status into the persisted snapshot, even when the
         # LLM's view of the prior plan was stale.
         # goldfive#247: fold returns a NEW Plan (Plan is frozen).
-        revised = self._steerer._fold_runtime_terminal_statuses(revised, session.plan)
+        revised = self._steerer.plans._fold_runtime_terminal_statuses(revised, session.plan)
         try:
             revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
@@ -2986,7 +2986,7 @@ class DriftObserver:
             # PLAN-LIFECYCLE.md §3.1 (terminal task preservation) and
             # §3.2 (terminal->terminal edge preservation) on top of the
             # usual structural checks.
-            await self._steerer._emit_refine_failed(
+            await self._steerer.plans._emit_refine_failed(
                 session,
                 drift,
                 attempt_id=attempt_id,
@@ -3014,14 +3014,14 @@ class DriftObserver:
         # HUMAN_INTERVENTION_REQUIRED rather than bumping the revision
         # index for a no-op, which would otherwise loop forever on a
         # judge that keeps re-firing on a corrected task.
-        if self._steerer._plans_structurally_identical(session.plan, revised):
+        if self._steerer.plans._plans_structurally_identical(session.plan, revised):
             log.info(
                 "no-op revision skipped (kind=%s task=%r); escalating to "
                 "HUMAN_INTERVENTION_REQUIRED",
                 drift.kind.value,
                 drift.current_task_id,
             )
-            await self._steerer._emit_refine_failed(
+            await self._steerer.plans._emit_refine_failed(
                 session,
                 drift,
                 attempt_id=attempt_id,
@@ -3043,7 +3043,7 @@ class DriftObserver:
         # goldfive#255: _apply_revision returns ``(revised, was_installed)``
         # so the caller can thread the install outcome into PlanRevised's
         # ``dry_run`` marker.
-        revised, was_installed = self._steerer._apply_revision(session, revised, drift)
+        revised, was_installed = self._steerer.plans._apply_revision(session, revised, drift)
         # Cancel the in-flight coordinator invocation now that the plan
         # it was reasoning against has been superseded (goldfive#271
         # follow-up — v15 concurrent-invocation bug). Order: cancel
@@ -3052,7 +3052,7 @@ class DriftObserver:
         # and operators can correlate the two. Best-effort, never
         # raises — a no-op cancel still leaves the new plan installed.
         await self._cancel_inflight_for_revision(drift, session)
-        await self._steerer._emit_plan_revised(
+        await self._steerer.plans._emit_plan_revised(
             session,
             revised,
             drift,
@@ -4155,8 +4155,8 @@ class DriftObserver:
         _active_session_token = self._steerer._active_session_var.set(session)
         # goldfive a4: same attempt-id correlation contract as
         # ``_handle_drift``.
-        attempt_id = self._steerer._new_attempt_id()
-        await self._steerer._emit_refine_attempted(session, drift, attempt_id=attempt_id)
+        attempt_id = self._steerer.plans._new_attempt_id()
+        await self._steerer.plans._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         # Resolve the registry constraint (goldfive#151) the same way
         # ``_handle_drift`` does so the goldfive steer refine honours it.
         planner = self._steerer._planner
@@ -4211,7 +4211,7 @@ class DriftObserver:
                     drift.current_task_id,
                     exc,
                 )
-                await self._steerer._emit_refine_failed(
+                await self._steerer.plans._emit_refine_failed(
                     session,
                     drift,
                     attempt_id=attempt_id,
@@ -4226,7 +4226,7 @@ class DriftObserver:
                     "DefaultSteerer._promote_drift_to_steer: refine raised %s; plan unchanged",
                     exc,
                 )
-                await self._steerer._emit_refine_failed(
+                await self._steerer.plans._emit_refine_failed(
                     session,
                     drift,
                     attempt_id=attempt_id,
@@ -4245,7 +4245,7 @@ class DriftObserver:
                 # paired ``refine_failed`` so cancelled goldfive-steer refines
                 # do not leave sinks with an unmatched ``refine_attempted``.
                 # Re-raise to preserve asyncio cancellation propagation.
-                await self._steerer._emit_refine_failed(
+                await self._steerer.plans._emit_refine_failed(
                     session,
                     drift,
                     attempt_id=attempt_id,
@@ -4269,7 +4269,7 @@ class DriftObserver:
                 "DefaultSteerer._promote_drift_to_steer: refine returned None; "
                 "plan unchanged — escalating to HUMAN_INTERVENTION_REQUIRED"
             )
-            await self._steerer._emit_refine_failed(
+            await self._steerer.plans._emit_refine_failed(
                 session,
                 drift,
                 attempt_id=attempt_id,
@@ -4283,7 +4283,7 @@ class DriftObserver:
         # I4 fix: fold runtime terminal statuses from the prior plan
         # onto the revised plan BEFORE validation (see _handle_drift
         # for the full rationale). goldfive#247: returns a NEW Plan.
-        revised = self._steerer._fold_runtime_terminal_statuses(revised, session.plan)
+        revised = self._steerer.plans._fold_runtime_terminal_statuses(revised, session.plan)
         try:
             revised.validate(for_revision=True, prior=session.plan)
         except ValueError as exc:
@@ -4294,7 +4294,7 @@ class DriftObserver:
             # HUMAN_INTERVENTION_REQUIRED. The actionable signal is
             # the paired ``refine_failed(validator_rejected)`` envelope
             # plus the escalation drift.
-            await self._steerer._emit_refine_failed(
+            await self._steerer.plans._emit_refine_failed(
                 session,
                 drift,
                 attempt_id=attempt_id,
@@ -4319,14 +4319,14 @@ class DriftObserver:
         # exhaustion semantics as ``_handle_drift`` — a structurally
         # identical plan means the planner cannot make progress on this
         # drift; escalate to HUMAN_INTERVENTION_REQUIRED.
-        if self._steerer._plans_structurally_identical(session.plan, revised):
+        if self._steerer.plans._plans_structurally_identical(session.plan, revised):
             log.info(
                 "no-op refine_steer revision skipped (kind=%s task=%r); "
                 "escalating to HUMAN_INTERVENTION_REQUIRED",
                 drift.kind.value,
                 drift.current_task_id,
             )
-            await self._steerer._emit_refine_failed(
+            await self._steerer.plans._emit_refine_failed(
                 session,
                 drift,
                 attempt_id=attempt_id,
@@ -4340,7 +4340,7 @@ class DriftObserver:
         prev_plan = session.plan
         # goldfive#247: rebind to the stamped instance.
         # goldfive#255: thread ``was_installed`` into PlanRevised.dry_run.
-        revised, was_installed = self._steerer._apply_revision(session, revised, drift)
+        revised, was_installed = self._steerer.plans._apply_revision(session, revised, drift)
         # Cancel the in-flight coordinator invocation now that
         # ``refine_steer`` produced a superseding plan (goldfive#271
         # follow-up — v15 concurrent-invocation bug). This is the
@@ -4357,7 +4357,7 @@ class DriftObserver:
         # revision and operators can correlate the two on the
         # gantt timeline.
         await self._cancel_inflight_for_revision(drift, session)
-        await self._steerer._emit_plan_revised(
+        await self._steerer.plans._emit_plan_revised(
             session,
             revised,
             drift,
@@ -4522,7 +4522,7 @@ class DriftObserver:
         task_id = drift.current_task_id
         reason = f"refine repeatedly failed for {drift.kind.value}"
         if task_id:
-            await self._steerer.mark_task_failed(
+            await self._steerer.tasks.mark_task_failed(
                 task_id,
                 reason=reason,
                 recoverable=False,

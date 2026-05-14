@@ -358,18 +358,18 @@ async def test_steerer_counter_fires_at_interval() -> None:
     steerer.bind(sinks=[ListSink()], planner=StubPlanner())
     session = _make_session()
     for _ in range(4):
-        await steerer.note_agent_turn(session)
+        await steerer.drift.note_agent_turn(session)
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 0, "should not fire before the 5th turn"  # type: ignore[attr-defined]
-    await steerer.note_agent_turn(session)
+    await steerer.drift.note_agent_turn(session)
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 1, "should fire on the 5th turn"  # type: ignore[attr-defined]
     # Counter resets after check; next 4 should not re-fire.
     for _ in range(4):
-        await steerer.note_agent_turn(session)
+        await steerer.drift.note_agent_turn(session)
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
-    await steerer.note_agent_turn(session)
+    await steerer.drift.note_agent_turn(session)
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
 
@@ -396,7 +396,7 @@ async def test_steerer_off_track_emits_critical_drift_and_nudges() -> None:
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
     for _ in range(2):
-        await steerer.note_agent_turn(session)
+        await steerer.drift.note_agent_turn(session)
     await _drain_background_judges(steerer)
 
     drifts = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
@@ -429,7 +429,7 @@ async def test_steerer_disabled_by_default_no_check_ever_fires() -> None:
     steerer.bind(sinks=[ListSink()], planner=StubPlanner())
     session = _make_session()
     for _ in range(100):
-        await steerer.note_agent_turn(session)
+        await steerer.drift.note_agent_turn(session)
     # Disabled steerer never spawns; nothing to drain. The counter
     # check below is the same end-state assertion the inline path
     # carried.
@@ -447,7 +447,7 @@ async def test_steerer_malformed_response_does_not_crash_run() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
-    await steerer.note_agent_turn(session)
+    await steerer.drift.note_agent_turn(session)
     await _drain_background_judges(steerer)
     drifts = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
     assert drifts == []
@@ -459,7 +459,7 @@ async def test_steerer_activity_window_bounded() -> None:
     steerer = DefaultSteerer(goal_drift_activity_window=3)
     session = _make_session()
     for i in range(10):
-        steerer.note_agent_activity(
+        steerer.drift.note_agent_activity(
             session,
             kind="agent_invocation_started",
             agent_name=f"a{i}",
@@ -480,11 +480,11 @@ async def test_steerer_counter_is_not_task_scoped() -> None:
     steerer.bind(sinks=[ListSink()], planner=StubPlanner())
     session = _make_session()
     session.current_task_id = "t1"
-    await steerer.note_agent_turn(session)
+    await steerer.drift.note_agent_turn(session)
     # Task transition.
     session.current_task_id = "t2"
-    await steerer.note_agent_turn(session)
-    await steerer.note_agent_turn(session)
+    await steerer.drift.note_agent_turn(session)
+    await steerer.drift.note_agent_turn(session)
     await _drain_background_judges(steerer)
     # Third call should fire the check, not be held back by transition.
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
@@ -501,7 +501,7 @@ async def test_steerer_maybe_run_goal_drift_check_is_public() -> None:
     sink = ListSink()
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
-    await steerer.maybe_run_goal_drift_check(session)
+    await steerer.drift.maybe_run_goal_drift_check(session)
     # Counter NOT advanced by direct call.
     assert session._agent_turns_since_goal_check == 0
     # But drift was emitted.
@@ -547,7 +547,7 @@ async def test_runner_goal_drift_enabled_false_detaches_callable() -> None:
     # Steerer's callable is detached — no LLM call can fire now.
     assert steerer._goal_drift_call_llm is None
     session = _make_session()
-    await steerer.note_agent_turn(session)
+    await steerer.drift.note_agent_turn(session)
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 0  # type: ignore[attr-defined]
 
@@ -603,7 +603,7 @@ async def test_task_boundary_fires_goal_drift_check_on_mark_task_completed() -> 
     steerer.bind(sinks=[sink], planner=StubPlanner())
     session = _make_session()
 
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
     # Turn counter is reset on task-boundary fire so we don't double-pay.
@@ -625,13 +625,13 @@ async def test_task_boundary_fires_on_mark_task_failed_and_cancelled() -> None:
     steerer.bind(sinks=[ListSink()], planner=StubPlanner())
     session = _make_session()
 
-    await steerer.mark_task_failed("t1", session=session, reason="boom")
+    await steerer.tasks.mark_task_failed("t1", session=session, reason="boom")
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
 
     # Rewind the rate-limit clock so the next boundary fires.
     session._last_goal_drift_check_ts = 0.0
-    await steerer.mark_task_cancelled("t2", session=session, reason="no longer needed")
+    await steerer.tasks.mark_task_cancelled("t2", session=session, reason="no longer needed")
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 2  # type: ignore[attr-defined]
 
@@ -647,7 +647,7 @@ async def test_task_boundary_fires_independent_of_turn_counter() -> None:
     session = _make_session()
     assert session._agent_turns_since_goal_check == 0
 
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
 
@@ -663,7 +663,7 @@ async def test_task_boundary_rate_limited_within_ten_seconds() -> None:
     session = _make_session()
 
     # First transition primes the timestamp.
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
     first_ts = session._last_goal_drift_check_ts
@@ -673,7 +673,7 @@ async def test_task_boundary_rate_limited_within_ten_seconds() -> None:
     # The rate-limit gate fires synchronously before any spawn so no
     # drain is needed to observe the no-fire state, but call it anyway
     # to be defensive (no-op when the set is empty).
-    await steerer.mark_task_completed("t2", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t2", session=session, summary="done")
     await _drain_background_judges(steerer)
     assert len(call_llm.calls) == 1  # type: ignore[attr-defined]
     # Timestamp must NOT advance on a suppressed call.
@@ -689,7 +689,7 @@ async def test_task_boundary_noop_when_goal_drift_not_wired() -> None:
     steerer = DefaultSteerer(goal_drift_call_llm=None)
     steerer.bind(sinks=[ListSink()], planner=StubPlanner())
     session = _make_session()
-    await steerer.mark_task_completed("t1", session=session, summary="done")
+    await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
     assert session._last_goal_drift_check_ts == 0.0
 
 

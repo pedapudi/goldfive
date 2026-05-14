@@ -1826,7 +1826,7 @@ class ADKAdapter:
         steerer = self._steerer
         if steerer is None or not text:
             return
-        observe = getattr(steerer, "observe_reasoning", None)
+        observe = getattr(getattr(steerer, "drift", None), "observe_reasoning", None)
         if observe is None:
             return
         try:

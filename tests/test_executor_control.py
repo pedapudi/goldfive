@@ -69,33 +69,20 @@ class RecordingSink:
         return out
 
 
-class StubSteerer:
-    """Steerer stub that applies transitions directly and records observations.
+class _StubDrift:
+    """Drift sub-component (goldfive#410).
 
-    When ``refine_result`` is set, ``observe(msg)`` calls it on
-    ``ControlMessage`` and swaps session.plan with the result. This
-    emulates the real DefaultSteerer's USER_STEER behavior.
+    Emulates DefaultSteerer steering: when observing a STEER
+    ControlMessage, swap the plan on the session via the configured
+    ``refine_result``.
     """
 
     def __init__(self, *, refine_result: Plan | None = None) -> None:
-        self._sinks: list[EventSink] = []
-        self._planner: Any = None
         self.observed: list[Any] = []
         self.refine_result = refine_result
-        self.last_cancel_reason: str = ""
-        # goldfive#247: per-transition record for tests that need to
-        # verify cancellation happened even when the refine swap
-        # produces a plan that doesn't include the cancelled task id.
-        self.transitions: list[tuple[str, TaskStatus, str]] = []
-
-    def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
-        self._sinks = sinks
-        self._planner = planner
 
     async def observe(self, event: Any, session: Session) -> None:
         self.observed.append(event)
-        # Emulate DefaultSteerer steering: when observing a STEER
-        # ControlMessage, swap the plan on the session.
         kind = getattr(event, "kind", None)
         if (
             self.refine_result is not None
@@ -109,6 +96,42 @@ class StubSteerer:
             )
             with channel_processor_active():
                 set_session_plan(session, self.refine_result)
+
+    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
+        return None
+
+
+class StubSteerer:
+    """Steerer stub that applies transitions directly and records observations.
+
+    Component-namespaced per goldfive#410.
+    """
+
+    def __init__(self, *, refine_result: Plan | None = None) -> None:
+        self._sinks: list[EventSink] = []
+        self._planner: Any = None
+        self.drift = _StubDrift(refine_result=refine_result)
+        self.last_cancel_reason: str = ""
+        # goldfive#247: per-transition record for tests that need to
+        # verify cancellation happened even when the refine swap
+        # produces a plan that doesn't include the cancelled task id.
+        self.transitions: list[tuple[str, TaskStatus, str]] = []
+
+    @property
+    def observed(self) -> list[Any]:
+        return self.drift.observed
+
+    @property
+    def refine_result(self) -> Plan | None:
+        return self.drift.refine_result
+
+    @refine_result.setter
+    def refine_result(self, value: Plan | None) -> None:
+        self.drift.refine_result = value
+
+    def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
+        self._sinks = sinks
+        self._planner = planner
 
     async def transition(
         self,
@@ -140,9 +163,6 @@ class StubSteerer:
             session.completed_results[task_id] = detail
         if to == TaskStatus.CANCELLED:
             self.last_cancel_reason = cancel_reason or detail
-
-    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
-        return None
 
 
 class StubPlanner:
@@ -548,7 +568,7 @@ async def test_sequential_pause_loop_unwinds_on_goldfive_steer() -> None:
             with channel_processor_active():
                 set_session_plan(sess, refined)
 
-    steerer.observe = _observe_goldfive_steer  # type: ignore[method-assign]
+    steerer.drift.observe = _observe_goldfive_steer  # type: ignore[method-assign]
 
     await channel.send(
         ControlMessage(

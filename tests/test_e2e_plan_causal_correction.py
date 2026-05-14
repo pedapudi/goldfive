@@ -347,8 +347,8 @@ async def _drive_refine_cycle(
     prev = session.plan
     # goldfive#247: rebind to the stamped instance.
     # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
-    revised, _was_installed = steerer._apply_revision(session, revised, drift)
-    await steerer._emit_plan_revised(session, revised, drift, prev_plan=prev)
+    revised, _was_installed = steerer.plans._apply_revision(session, revised, drift)
+    await steerer.plans._emit_plan_revised(session, revised, drift, prev_plan=prev)
     return steerer, planner, sink
 
 
@@ -646,7 +646,7 @@ async def test_critical_drift_composes_cancel_with_correction() -> None:
     # _handle_drift takes on CRITICAL severity). Stream C's own unit
     # test covers the _handle_drift dispatch; here we just pin that
     # the API writes a request through the adapter's plugin.
-    flagged = await steerer.request_invocation_cancel(drift=drift, session=session)
+    flagged = await steerer.drift.request_invocation_cancel(drift=drift, session=session)
     assert "inv-research-1" in flagged, (
         "[Stream C regression] CRITICAL severity did not flag the active "
         "invocation for cancel. The in-flight turn would proceed and "
@@ -668,8 +668,8 @@ async def test_critical_drift_composes_cancel_with_correction() -> None:
     revised = _revised_with_correct_supersedes()
     # goldfive#247: rebind to the stamped instance.
     # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
-    revised, _was_installed = steerer._apply_revision(session, revised, drift)
-    await steerer._emit_plan_revised(
+    revised, _was_installed = steerer.plans._apply_revision(session, revised, drift)
+    await steerer.plans._emit_plan_revised(
         session, revised, drift, prev_plan=_presentation_style_plan()
     )
     corr_key = pending_correction_key("research_agent", "research_solar_corrected")

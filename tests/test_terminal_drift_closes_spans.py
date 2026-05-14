@@ -210,7 +210,7 @@ async def test_human_intervention_required_closes_open_boundaries() -> None:
         current_task_id="t1",
         current_agent_id="coordinator",
     )
-    await steerer._emit_drift_detected(session, drift)
+    await steerer.drift._emit_drift_detected(session, drift)
 
     exited = _events_of_kind(sink, "invocation_boundary_exited")
     assert len(exited) == 2, (
@@ -250,7 +250,7 @@ async def test_looping_reasoning_escalation_closes_open_boundaries() -> None:
     # Step 1: LOOPING_REASONING fires -- by itself it does NOT close
     # boundaries because the run might still recover through the
     # nudge / refine ladder.
-    await steerer._emit_drift_detected(session, looping)
+    await steerer.drift._emit_drift_detected(session, looping)
     assert _events_of_kind(sink, "invocation_boundary_exited") == [], (
         "LOOPING_REASONING alone must not close boundaries — CRITICAL-first is recoverable"
     )
@@ -264,7 +264,7 @@ async def test_looping_reasoning_escalation_closes_open_boundaries() -> None:
         current_task_id="t1",
         current_agent_id="coordinator",
     )
-    await steerer._emit_drift_detected(session, escalation)
+    await steerer.drift._emit_drift_detected(session, escalation)
 
     exited = _events_of_kind(sink, "invocation_boundary_exited")
     assert len(exited) == 2, (
@@ -295,7 +295,7 @@ async def test_repeated_failure_closes_open_boundaries() -> None:
         current_task_id="t1",
         current_agent_id="coordinator",
     )
-    await steerer._emit_drift_detected(session, drift)
+    await steerer.drift._emit_drift_detected(session, drift)
 
     exited = _events_of_kind(sink, "invocation_boundary_exited")
     assert len(exited) == 1
@@ -327,7 +327,7 @@ async def test_looping_reasoning_alone_does_not_close_boundaries() -> None:
             current_task_id="t1",
             current_agent_id="coordinator",
         )
-        await steerer._emit_drift_detected(session, drift)
+        await steerer.drift._emit_drift_detected(session, drift)
 
         exited = _events_of_kind(sink, "invocation_boundary_exited")
         assert exited == [], (
@@ -356,7 +356,7 @@ async def test_non_terminal_drift_does_not_close_boundaries() -> None:
         current_task_id="t1",
         current_agent_id="coordinator",
     )
-    await steerer._emit_drift_detected(session, drift)
+    await steerer.drift._emit_drift_detected(session, drift)
 
     exited = _events_of_kind(sink, "invocation_boundary_exited")
     assert exited == []
@@ -392,7 +392,7 @@ async def test_terminal_drift_with_no_open_boundaries_is_noop() -> None:
         current_task_id="t1",
         current_agent_id="coordinator",
     )
-    await steerer._emit_drift_detected(session, drift)
+    await steerer.drift._emit_drift_detected(session, drift)
 
     exited = _events_of_kind(sink, "invocation_boundary_exited")
     # No additional Exited event — cleanup walks an empty registry.
@@ -421,7 +421,7 @@ async def test_terminal_drift_without_adapter_does_not_raise() -> None:
         current_agent_id="coordinator",
     )
     # Must not raise.
-    await steerer._emit_drift_detected(session, drift)
+    await steerer.drift._emit_drift_detected(session, drift)
     # DriftDetected still landed on the wire.
     assert _events_of_kind(sink, "drift_detected"), (
         "the drift itself must still be emitted even without an adapter"
@@ -456,5 +456,5 @@ async def test_terminal_drift_with_legacy_plugin_does_not_raise() -> None:
         current_agent_id="coordinator",
     )
     # Must not raise.
-    await steerer._emit_drift_detected(session, drift)
+    await steerer.drift._emit_drift_detected(session, drift)
     assert _events_of_kind(sink, "drift_detected")

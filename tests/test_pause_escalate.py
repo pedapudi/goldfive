@@ -147,7 +147,7 @@ async def test_pause_escalate_dispatches_control_and_emits_drift() -> None:
         detail="critical intent drift",
         current_task_id="t1",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     pause_msgs = _drain_goldfive_pause(channel)
     assert len(pause_msgs) == 1
@@ -176,7 +176,7 @@ async def test_pause_escalate_does_not_double_emit_human_intervention() -> None:
         detail="stuck",
         current_task_id="t1",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     assert _drain_goldfive_pause(channel)  # at least one dispatched
     human_intervention_events = [
@@ -196,7 +196,7 @@ async def test_refine_validation_failed_pauses_without_refining() -> None:
         detail="planner retry budget spent",
         current_task_id="t1",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     assert _drain_goldfive_pause(channel)
     assert planner.refine_calls == []
     # HUMAN_INTERVENTION_REQUIRED escalation is on the sink.
@@ -215,12 +215,12 @@ async def test_ladder_level_for_pause_escalate_on_repeat() -> None:
     """
     steerer = DefaultSteerer()
     assert (
-        steerer._ladder_level_for(DriftKind.PLAN_DIVERGENCE, DriftSeverity.CRITICAL, 0)
+        steerer.drift._ladder_level_for(DriftKind.PLAN_DIVERGENCE, DriftSeverity.CRITICAL, 0)
         is InterventionLevel.CANCEL_REINVOKE
     )
     # Threshold is 2 in DefaultSteerer.REFINE_FAILURE_THRESHOLD.
     assert (
-        steerer._ladder_level_for(
+        steerer.drift._ladder_level_for(
             DriftKind.PLAN_DIVERGENCE,
             DriftSeverity.CRITICAL,
             DefaultSteerer.REFINE_FAILURE_THRESHOLD,
@@ -365,7 +365,7 @@ async def test_nudge_queues_message_on_session() -> None:
         detail="agent reported no progress",
         current_task_id="t1",
     )
-    await steerer._dispatch_nudge(drift, session)
+    await steerer.drift._dispatch_nudge(drift, session)
     assert len(session.pending_nudges) == 1
     assert "t1" in session.pending_nudges[0]
 
@@ -417,7 +417,7 @@ async def test_cancel_reinvoke_dispatches_goldfive_steer_control() -> None:
         detail="tool error",
         current_task_id="t1",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     steer_msgs = _drain_goldfive_steer(channel)
     assert len(steer_msgs) == 1
     payload = steer_msgs[0].payload
