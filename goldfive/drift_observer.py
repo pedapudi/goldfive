@@ -111,17 +111,17 @@ The module DOES NOT own
   callers that import it as ``from goldfive.steerer import
   InterventionLevel``.
 
-Audit issue #402 — dispatch-before-plan-swap (preserved, not fixed)
--------------------------------------------------------------------
+Audit issue #402 — dispatch-before-plan-swap (fixed)
+----------------------------------------------------
 
 :meth:`_promote_drift_to_steer` dispatches the ``GOLDFIVE_STEER``
-ControlMessage **before** calling ``planner.refine_steer`` and
-installing the resulting plan. The dispatch payload therefore carries
-the *prior* plan's task ids in ``superseded_task_ids`` /
-``replacement_task_ids`` (audit issue #402 — the executor sees stale
-ids in the channel message). Bucket 3c preserves this ordering
-verbatim; the fix lives in a separate queued PR so the refactor diff
-and the bug fix stay reviewable.
+ControlMessage **after** ``planner.refine_steer`` has produced a
+revised plan and :meth:`_emit_plan_revised` has swapped it onto the
+session. Pre-fix the dispatch fired BEFORE refine, so the payload's
+``replacement_task_ids`` carried the prior plan's task ids and the
+executor's overlay loop re-invoked against ids the imminent revision
+was about to remove / cancel. Ordering now mirrors
+:meth:`_handle_drift`'s CANCEL_REINVOKE branch.
 
 All cross-component calls go through the router back-reference passed
 to :meth:`DriftObserver.__init__` (``self._steerer``). This keeps the
@@ -4035,13 +4035,16 @@ class DriftObserver:
         restart message reaches the LLM on the next turn — cancel
         semantics identical to USER_STEER.
 
-        Audit issue #402 (preserved, not fixed): the dispatch order
-        below sends the ``GOLDFIVE_STEER`` ControlMessage BEFORE the
-        refine + plan install, so the dispatch payload carries the
-        prior plan's task ids in ``superseded_task_ids`` /
-        ``replacement_task_ids``. The fix for that ordering lives in a
-        separate queued PR; the refactor must not alter the ordering
-        or the bug surface changes between PRs.
+        Audit issue #402 (fixed): the ``GOLDFIVE_STEER`` ControlMessage
+        dispatch fires AFTER :meth:`_emit_plan_revised` has swapped the
+        plan to the revised version. Pre-fix the dispatch fired BEFORE
+        refine, so the payload's ``replacement_task_ids`` were derived
+        from the prior plan — the executor's overlay loop would
+        re-invoke against tasks that the imminent revision was about to
+        remove / cancel. Ordering now matches :meth:`_handle_drift`'s
+        CANCEL_REINVOKE branch (dispatch follows
+        ``_apply_revision`` / ``_cancel_inflight_for_revision`` /
+        ``_emit_plan_revised``).
         """
         from goldfive.steerer import (
             RefineExhausted,
@@ -4088,23 +4091,19 @@ class DriftObserver:
                 "DefaultSteerer._promote_drift_to_steer: set_active_steer raised: %s",
                 exc,
             )
-        # Phase 2 of the path-duality fix: dispatch a
-        # ``GOLDFIVE_STEER`` ControlMessage on the bound channel so
-        # the executor's invoke loop cancels the in-flight invocation
-        # and restarts the passthrough with a ``[GOLDFIVE STEERING
-        # CONTROL …]`` framed corrective. The body, drift kind, and
-        # superseded task ids ride the message payload; the executor
-        # composes the restart text from those fields. Pre-Phase-2
-        # this wrote ``session.pending_corrective_message`` — a
-        # write-only slot that left the coordinator blind to the plan
-        # swap.
+        # NOTE: the ``GOLDFIVE_STEER`` ControlMessage dispatch used to
+        # fire HERE, BEFORE the refine + plan install below. That left
+        # the payload carrying the PRIOR plan's task ids in
+        # ``superseded_task_ids`` / ``replacement_task_ids`` — the
+        # executor's overlay loop would re-invoke against ids that the
+        # imminent revision was about to remove / cancel (audit #402,
+        # HIGH). The dispatch has been moved to AFTER
+        # :meth:`_emit_plan_revised` so the payload reads the NEW
+        # plan's task ids. This mirrors :meth:`_handle_drift`'s
+        # CANCEL_REINVOKE branch, which already orders dispatch after
+        # ``_apply_revision`` / ``_cancel_inflight_for_revision`` /
+        # ``_emit_plan_revised`` (the canonical pattern).
         #
-        # AUDIT #402: this dispatch happens BEFORE the refine + plan
-        # install below — the payload carries the prior plan's task
-        # ids. Preserved as-is.
-        await self._dispatch_goldfive_steer_control(
-            drift, session, body_override=body
-        )
         # 3. Record the drift id in processed_steer_ids so a redelivery
         # (same drift id) doesn't re-cancel / re-refine.
         drift_id = str(getattr(drift, "id", "") or "")
@@ -4365,6 +4364,18 @@ class DriftObserver:
             prev_plan=prev_plan,
             attempt_id=attempt_id,
             dry_run=not was_installed,
+        )
+        # Audit #402 fix: dispatch the ``GOLDFIVE_STEER`` ControlMessage
+        # AFTER ``_emit_plan_revised`` has swapped ``session.plan`` to
+        # the revised version. ``_dispatch_goldfive_steer_control``
+        # re-reads ``session.plan`` to derive ``replacement_task_ids``,
+        # so dispatching here ensures the payload points the
+        # executor's restart at the NEW plan's PENDING tasks rather
+        # than the prior plan's (which may have been removed /
+        # cancelled by the just-installed revision). Mirrors the
+        # ordering in :meth:`_handle_drift`'s CANCEL_REINVOKE branch.
+        await self._dispatch_goldfive_steer_control(
+            drift, session, body_override=body
         )
 
     @staticmethod
