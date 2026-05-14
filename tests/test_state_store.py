@@ -260,6 +260,111 @@ def test_for_state_cancel_requested_round_trip() -> None:
     assert store.is_invocation_cancel_requested("inv-1") is False
 
 
+# ---------------------------------------------------------------------------
+# Issue #405 LOW #7 — per-invocation supersede-pending registry
+# ---------------------------------------------------------------------------
+
+
+def test_405_low7_supersede_pending_round_trip() -> None:
+    """Issue #405 LOW #7 — basic stamp/check/clear round trip.
+
+    Mirrors the cancel-requested registry's shape: stamp, read, clear.
+    """
+    store = StateStore.for_state({}, session_id="sess-1")
+    assert store.is_supersede_pending("inv-1") is False
+    assert store.has_any_supersede_pending() is False
+    store.mark_supersede_pending("inv-1")
+    assert store.is_supersede_pending("inv-1") is True
+    assert store.has_any_supersede_pending() is True
+    assert "inv-1" in store.supersede_pending_invocation_ids()
+    store.clear_supersede_pending("inv-1")
+    assert store.is_supersede_pending("inv-1") is False
+    assert store.has_any_supersede_pending() is False
+
+
+def test_405_low7_supersede_pending_isolated_per_invocation() -> None:
+    """Issue #405 LOW #7 regression — per-invocation isolation.
+
+    The pre-fix shape (a session-scoped bool) couldn't distinguish two
+    concurrent supersede operations on the same session. The per-
+    invocation registry isolates them: clearing one invocation's
+    entry leaves the other intact.
+
+    Pre-fix behaviour (bool path): one ``session._supersede_pending =
+    False`` clear wiped the signal for ALL pending supersedes, masking
+    the second one. Post-fix: each invocation's marker is independent.
+    """
+    store = StateStore.for_state({}, session_id="sess-1")
+    store.mark_supersede_pending("inv-a")
+    store.mark_supersede_pending("inv-b")
+    # Both flagged.
+    assert store.is_supersede_pending("inv-a") is True
+    assert store.is_supersede_pending("inv-b") is True
+    assert set(store.supersede_pending_invocation_ids()) == {"inv-a", "inv-b"}
+    # Clear one — the other survives. This is the isolation the audit
+    # asked for; the legacy bool would have flipped False for both.
+    store.clear_supersede_pending("inv-a")
+    assert store.is_supersede_pending("inv-a") is False
+    assert store.is_supersede_pending("inv-b") is True, (
+        "Clearing inv-a's supersede entry must NOT drop inv-b's signal "
+        "(LOW #7: per-invocation isolation)"
+    )
+    assert store.has_any_supersede_pending() is True
+
+
+def test_405_low7_supersede_pending_isolated_per_session() -> None:
+    """Issue #405 LOW #7 — cross-session isolation.
+
+    Two stores on different session_ids: a supersede stamp on one
+    session does not surface in the other. Mirrors the locking
+    discipline of the cancel-requested registry.
+    """
+    store_a = StateStore.for_state({}, session_id="sess-a")
+    store_b = StateStore.for_state({}, session_id="sess-b")
+    store_a.mark_supersede_pending("inv-1")
+    assert store_a.is_supersede_pending("inv-1") is True
+    assert store_b.is_supersede_pending("inv-1") is False
+    assert store_b.has_any_supersede_pending() is False
+    # Teardown of session-a doesn't touch session-b.
+    store_a.clear_active_invocations()
+    assert store_a.has_any_supersede_pending() is False
+    # Sanity: session-b is unaffected.
+    store_b.mark_supersede_pending("inv-2")
+    assert store_b.is_supersede_pending("inv-2") is True
+
+
+def test_405_low7_supersede_pending_no_session_id_is_noop() -> None:
+    """Issue #405 LOW #7 — store without ``session_id`` silently no-ops.
+
+    Mirrors the cancel-requested registry's defensive behaviour: a
+    bare-state store (no session id) cannot drive the registry but
+    must not raise.
+    """
+    store = StateStore.for_state({})  # no session_id
+    store.mark_supersede_pending("inv-1")  # silent no-op
+    assert store.is_supersede_pending("inv-1") is False
+    assert store.supersede_pending_invocation_ids() == []
+    assert store.has_any_supersede_pending() is False
+    store.clear_supersede_pending("inv-1")  # idempotent no-op
+    store.clear_all_supersede_pending()
+
+
+def test_405_low7_clear_active_invocations_wipes_supersede_set() -> None:
+    """Issue #405 LOW #7 — session teardown clears the supersede registry.
+
+    ``clear_active_invocations`` wipes the supersede-pending set in
+    lockstep with the active-task and cancel-requested registries so
+    a session reuse starts clean.
+    """
+    store = StateStore.for_state({}, session_id="sess-1")
+    store.mark_supersede_pending("inv-1")
+    store.mark_supersede_pending("inv-2")
+    assert store.has_any_supersede_pending() is True
+    store.clear_active_invocations()
+    assert store.has_any_supersede_pending() is False
+    assert store.supersede_pending_invocation_ids() == []
+
+
 def test_for_state_goals_summary_default_empty_string() -> None:
     """``goals_summary`` reads ``""`` when the slot is unset."""
     assert StateStore.for_state({}).goals_summary() == ""

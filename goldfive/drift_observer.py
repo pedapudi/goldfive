@@ -3895,6 +3895,25 @@ class DriftObserver:
                 "could not stamp supersede flag on session: %s",
                 exc,
             )
+        # Issue #405 LOW #7: also stamp the per-invocation supersede
+        # registry on the StateStore. Each active invocation that's
+        # about to be cancelled by ``request_invocation_cancel`` gets
+        # its own entry, so a concurrent overlay iteration's defensive
+        # ``_supersede_pending = False`` clear cannot drop the signal
+        # for an unrelated invocation. Best-effort; failure is harmless
+        # because the legacy bool above is still set.
+        try:
+            from goldfive.state_store import StateStore  # noqa: PLC0415 — lazy
+
+            store = StateStore.for_session(session)
+            for inv_id in self._resolve_active_invocation_ids(drift, session):
+                store.mark_supersede_pending(inv_id)
+        except Exception as exc:  # noqa: BLE001 — registry is best-effort
+            log.debug(
+                "DefaultSteerer._cancel_inflight_for_revision: "
+                "could not stamp per-invocation supersede registry: %s",
+                exc,
+            )
         try:
             return await self.request_invocation_cancel(
                 drift=drift,
