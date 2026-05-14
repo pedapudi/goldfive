@@ -18,6 +18,10 @@ Responsibilities
     :class:`~goldfive.control.ControlMessage` STEER deliveries.
   - :meth:`install_user_steer` — the always-lands user-steer path with
     a deterministic minimum-evolution fallback (PLAN-LIFECYCLE.md §4.2.1).
+  - :meth:`install_descriptive_growth` — reactive plan growth at
+    delegation-observation time for unmatched delegations (goldfive#423
+    PR 2). See ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3 + §5
+    Option D for the lock-acquiring synchronous growth contract.
   - :meth:`apply_user_steer_with_plan` — deprecated back-compat shim.
 
 * The shared install pipeline :meth:`_install_with_drift`:

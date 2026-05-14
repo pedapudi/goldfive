@@ -2,10 +2,16 @@
 
 ## 1. Status
 
-**Proposal — not yet implemented.** Filed for tracking; ships behind a feature
-flag (`GOLDFIVE_PLAN_DESCRIPTIVE_GROWTH=1`) if accepted. No production code
-in this PR. A separate implementation PR (with the 5-PR sequence in §9)
-follows after design review.
+**Phase 1 shipped (PRs 1-3 of 5).** `Task.discovered` data model +
+`DelegationObserved.tool_args_json` proto extension landed in #431
+(merged at `498320e`). Descriptive growth fallback in
+`_maybe_pin_delegation_task` landed in #433 (merged at `1abee69`)
+behind `SteeringConfig.descriptive_growth_enabled` (default OFF, env
+`GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`). Harmonograf rendering landed
+in `pedapudi/harmonograf#291` (merged at `d2b3921`). **PR 4 (flag
+flip + Rule C retirement) and PR 5 (this docs sync) close out the
+phase.** PR 4 is deferred until live validation is possible
+(kossel.lan offline at the time of writing).
 
 Related: [PLAN-LIFECYCLE.md](PLAN-LIFECYCLE.md) (the contract this proposal
 extends), [DRIFT.md](DRIFT.md) (the `CAPABILITY_MISMATCH` Rule C retirement
@@ -771,17 +777,17 @@ refines do not happen.
 
 ## 9. Implementation plan
 
-| PR | Scope | Behind flag |
-|---|---|---|
-| 1 | `Task.discovered: bool` + `Task.discovery_identity_hash: str` fields + `Plan.validate` update (no rule change; just opaque metadata) + **`DelegationObserved.tool_args` proto extension** (canonical args representation on `goldfive.v1`, so PR 2's dedup hash is computed from observed-fact data, not a pin-time intercept — see §13) + state-store migration (proto regen + harmonograf-side ingestion of the new field + schema bump). Forward-compat: old events without `tool_args` default-empty; PR 2's dedup must tolerate `tool_args=None` and fall back to per-`(agent, task_id)` granularity as a coarser-but-still-useful dedup. | n/a — additive |
-| 2 | `_maybe_pin_delegation_task` fallback to discovery + `PlanReviser.install_descriptive_growth` helper (§5 Option D, lock-acquiring) + §5.2 test plan + **§11.6 regression race test** (mandatory acceptance criterion) + tracking issue cross-link to #413 for the test template | `GOLDFIVE_PLAN_DESCRIPTIVE_GROWTH=1` |
-| 3 | Harmonograf-side rendering of discovered tasks (badge, separate visualisation lane, drift filter) | flag-gated |
-| 4 | Retire `CAPABILITY_MISMATCH` Rule C (4a soft, 4b hard) | flag → default-on |
-| 5 | Docs: update PLAN-LIFECYCLE.md (revision-cascade §4.5 covers discovery), DRIFT.md (Rule C retirement), this design doc (mark Implemented) | n/a |
+| PR | Scope | Behind flag | Status |
+|---|---|---|---|
+| 1 | `Task.discovered: bool` + `Task.discovery_identity_hash: str` fields + `Plan.validate` update (no rule change; just opaque metadata) + **`DelegationObserved.tool_args_json` proto extension** (canonical args representation on `goldfive.v1`, so PR 2's dedup hash is computed from observed-fact data, not a pin-time intercept — see §13) + state-store migration (proto regen + harmonograf-side ingestion of the new field + schema bump). Forward-compat: old events without `tool_args_json` default-empty; PR 2's dedup must tolerate `tool_args=None` and fall back to per-`(agent, task_id)` granularity as a coarser-but-still-useful dedup. | n/a — additive | **Shipped** (#431, `498320e`) |
+| 2 | `_maybe_pin_delegation_task` fallback to discovery + `PlanReviser.install_descriptive_growth` helper (§5 Option D, lock-acquiring) + §5.2 test plan + **§11.6 regression race test** (mandatory acceptance criterion) + tracking issue cross-link to #413 for the test template | `SteeringConfig.descriptive_growth_enabled` (env `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`), default OFF | **Shipped** (#433, `1abee69`) |
+| 3 | Harmonograf-side rendering of discovered tasks (badge, separate visualisation lane, drift filter) | flag-gated | **Shipped** (`pedapudi/harmonograf#291`, `d2b3921`) |
+| 4 | Retire `CAPABILITY_MISMATCH` Rule C (4a soft, 4b hard) — flip `descriptive_growth_enabled` default to True; bypass Rule C when flag is on | flag → default-on | **Deferred** — requires live validation (kossel.lan offline at time of writing) |
+| 5 | Docs: update PLAN-LIFECYCLE.md (Phase 1 discovery section), DRIFT.md (Rule C status under flag), this design doc (mark Phase 1 shipped) | n/a | **This PR** |
 
 Each PR is independently merge-able. PR 2 ships behind the flag so
-production traffic stays on the old path until PR 3 lands the UI
-support.
+production traffic stays on the old path until PR 4 flips the
+default.
 
 ## 10. Alternatives considered
 

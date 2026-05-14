@@ -779,3 +779,56 @@ is non-trivial, and the model's self-assessment can itself be wrong
 their workload justifies it, not as a default. See
 [DRIFT.md §"Reflective self-progress category"](DRIFT.md#reflective-self-progress-category--the-agent-assessing-itself)
 for the full taxonomy and failure-mode handling.
+
+---
+
+## 9. Plan-descriptive growth (Phase 1)
+
+Phase 1 of [goldfive#423](https://github.com/pedapudi/goldfive/issues/423)
+extends the plan-lifecycle contract to cover one new write path:
+**reactive growth at delegation-observation time** when a coordinator
+delegates to an agent the planner did not forecast.
+
+When `_maybe_pin_delegation_task` cannot match an observed delegation
+to an existing PENDING task via the tier-1 / tier-2 / tier-3 disambiguation
+ladder, the steerer synthesises a `Task(discovered=True, ...)`, installs
+it onto `session.plan` via `PlanReviser.install_descriptive_growth`, and
+re-pins `session.current_task_id` onto the new task. The revision is
+emitted as a `NEW_WORK_DISCOVERED` drift (INFO severity, framework-
+authored) and lands in both steering and observation modes (the
+`_apply_revision` discovery carve-out from goldfive#258).
+
+**Feature flag.** Gated on `SteeringConfig.descriptive_growth_enabled`
+(env `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`, default OFF). When the flag
+is off, `_maybe_pin_delegation_task` retains the pre-#423 fallback
+behaviour and `CAPABILITY_MISMATCH` Rule C fires as today. PR 4 of
+#423 (deferred pending live validation) flips the default.
+
+**Dedup.** Repeated delegations to the same `(agent_name,
+args-token-set)` re-pin to the existing discovered task rather than
+growing the plan. The key is `Task.discovery_identity_hash`, a
+stable SHA-256 prefix computed from the observed
+`DelegationObserved.tool_args_json` payload (NOT a goldfive-side
+intercept of args at pin time — see PLAN-DESCRIPTIVE-GROWTH.md §13
+"adaptive, not predictive").
+
+**Write path.** `install_descriptive_growth` acquires the per-session
+plan lock (`_get_plan_lock(session)`) for the swap window, re-reads
+`session.plan` inside the lock as the linearisation point against
+concurrent refines and concurrent discoveries, runs the dedup check,
+and only then builds the revised plan via `add_tasks` + `bump_revision`
+and swaps via `set_session_plan`. This is the lock-acquiring synchronous
+growth path (Option D from the design doc) — single writer, inside the
+lock, full stop. The race contract is identical to goldfive#403's
+partial-apply window fix.
+
+**Topology.** Discovered tasks land as independent sub-DAG roots: no
+predecessor edges, no supersedes link. Rule 7 of `Plan.validate`
+allows this because the predecessor set is empty. A subsequent
+planner-authored refine may supersede a discovered task with a
+`SupersessionKind.REPLACE` / `CORRECT` link if the planner decides to
+consolidate the discovered work into its forecast.
+
+See [PLAN-DESCRIPTIVE-GROWTH.md](PLAN-DESCRIPTIVE-GROWTH.md) for the
+full design rationale, the dedup hash function, the refine-cascade
+semantics, and the §11.6 race-test contract.
