@@ -307,6 +307,14 @@ The dedup key collapses (agent, args-token-set) pairs to a stable
 hash so repeated delegations from the same coordinator to the same
 agent for the same logical task re-pin instead of growing the plan.
 
+**Input source.** `tool_args` is read from the
+`DelegationObserved` proto field added in PR 1 (§9) — i.e., from
+the observed event the agent itself authored, not from a
+goldfive-side intercept of agent state at pin time. The
+normalisation below (lowercase, whitespace-strip, drop stop-tokens)
+is computed on the OBSERVED args. See §13 for the underlying
+"adaptive, not predictive" principle.
+
 ```python
 def discovery_identity_hash(
     agent_name: str,
@@ -604,6 +612,13 @@ async def install_descriptive_growth(
 ) -> tuple[Plan, bool]:
     """Install a discovered task synchronously, under the plan lock.
 
+    `identity_hash` is computed by the caller from the observed
+    `DelegationObserved.tool_args` payload (PR 1 proto extension —
+    see §9, §13) — i.e., from the agent-authored args carried on
+    the event, NOT from a goldfive-side state intercept at
+    pin/dispatch time. The helper takes the hash as an input rather
+    than recomputing it so the lock window stays minimal.
+
     Acquires _get_plan_lock(session.id) for the swap window. Inside
     the lock:
       1. Re-reads session.plan (linearisation point).
@@ -758,7 +773,7 @@ refines do not happen.
 
 | PR | Scope | Behind flag |
 |---|---|---|
-| 1 | `Task.discovered: bool` + `Task.discovery_identity_hash: str` fields + `Plan.validate` update (no rule change; just opaque metadata) + state-store migration (proto fields + harmonograf-side schema bump). The PR 1 author MUST validate the §11.1.1 cherry-tree dedup numbers before locking in the hash-field schema. | n/a — additive |
+| 1 | `Task.discovered: bool` + `Task.discovery_identity_hash: str` fields + `Plan.validate` update (no rule change; just opaque metadata) + **`DelegationObserved.tool_args` proto extension** (canonical args representation on `goldfive.v1`, so PR 2's dedup hash is computed from observed-fact data, not a pin-time intercept — see §13) + state-store migration (proto regen + harmonograf-side ingestion of the new field + schema bump). Forward-compat: old events without `tool_args` default-empty; PR 2's dedup must tolerate `tool_args=None` and fall back to per-`(agent, task_id)` granularity as a coarser-but-still-useful dedup. | n/a — additive |
 | 2 | `_maybe_pin_delegation_task` fallback to discovery + `PlanReviser.install_descriptive_growth` helper (§5 Option D, lock-acquiring) + §5.2 test plan + **§11.6 regression race test** (mandatory acceptance criterion) + tracking issue cross-link to #413 for the test template | `GOLDFIVE_PLAN_DESCRIPTIVE_GROWTH=1` |
 | 3 | Harmonograf-side rendering of discovered tasks (badge, separate visualisation lane, drift filter) | flag-gated |
 | 4 | Retire `CAPABILITY_MISMATCH` Rule C (4a soft, 4b hard) | flag → default-on |
@@ -850,23 +865,19 @@ reads the post-lock plan and finds the first's discovered task.
 
 #### 11.1.1 Validation against real data
 
-Before PR 1 locks in the `Task.discovery_identity_hash` schema, the
-PR 1 author MUST validate the dedup decision against the actual
-session `2d27ff4a` delegation arg-sets:
-
-1. Query `goldfive_events` for `delegation_observed` events in the
-   session.
-2. Extract the per-call `(to_agent, args-token-set)` (the
-   `delegation_observed.task_id` field is the post-pin task id and is
-   a reasonable proxy for the args-token-set, since the existing pin
-   already groups by args overlap; for novel discovered tasks PR 2's
-   dedup operates on `tool_args` directly).
-3. Confirm the dedup produces a small constant (target: ≤2 unique
-   tuples per agent in the cherry-tree shape).
+The dedup identity hash is computed from the `tool_args` carried on
+the `DelegationObserved` proto — i.e., from observed-fact data the
+agent itself authored — not from a goldfive-side intercept of agent
+state at pin time. The PR 1 proto extension (§9) adds the
+`tool_args` field to `DelegationObserved` so PR 2 can compute the
+hash off the observed event rather than a captured snapshot. See
+§13 for the underlying principle ("adaptive, not predictive") that
+makes this the only correct choice.
 
 The 2026-05-13 validation against session `2d27ff4a` measured 5
-unique tuples across 10 delegations — well within the target. The
-schema is good to lock in.
+unique `(agent_name, args-token-set)` tuples across 10 delegations
+— well within the small-constant target §11.1 calls for. The
+`_normalize_args_tokens` design (§4.3.0) is good to lock in.
 
 If a future investigation finds >5 unique tuples per agent on a
 single run (i.e., the dedup is too fine), revisit the
@@ -1004,3 +1015,61 @@ the template.
   write-discipline §5 honours.
 - [CONTROL-CHANNEL.md](CONTROL-CHANNEL.md) — the actor-model context
   inside which the new write path lives.
+
+## 13. Design principle: adaptive, not predictive
+
+This proposal is one instance of a broader rule that constrains every
+goldfive primitive that depends on an agent-derived value. Stated by
+the maintainer during design review:
+
+> "you cannot pin the args. generally, any design that tries to
+> predict the agent behavior will be flawed because agents have
+> agency, so anything predictive must be adaptive as well (or just
+> adaptive). in this case, extend the proto."
+
+**Goldfive observes; agents decide.** Any goldfive primitive that
+depends on an agent-derived value — tool args, output shape,
+delegation target, reasoning content — MUST source that value from
+an observed event (proto-carried, span attribute, or session-state
+write the agent itself authored), NOT from a goldfive interception
+of agent state at pin / dispatch / wrap time. Predictive snapshots
+are stale by construction under model nondeterminism: the agent may
+revise the value between the snapshot and the dispatch, and the
+goldfive primitive then operates on an obsolete copy. Predictive
+must be adaptive (or just adaptive).
+
+Concretely for this proposal: the dedup hash (§4.3.0) is computed
+from `DelegationObserved.tool_args` carried on the observed event
+(PR 1 proto extension, §9), not from a goldfive-side intercept of
+`tool_args` at `_maybe_pin_delegation_task` entry. The agent
+authored the event; goldfive reads it.
+
+### 13.1 Precedents in goldfive
+
+The principle is not new — it codifies a discipline already
+visible elsewhere in the codebase:
+
+- **`observed_revision_index` re-read on apply (#245).** The
+  planner samples `session.plan.revision_index` at refine-decision
+  time, but `install_revision_for_drift` re-reads the live
+  `revision_index` inside the plan lock at apply time. The
+  apply-time read is authoritative; the decision-time sample is
+  advisory. A concurrent refine that landed first does not get
+  clobbered by a stale predictive snapshot.
+- **`_apply_revision` → `_emit_plan_revised` lock contract (#403
+  / PR #413).** The partial-apply window was closed by moving the
+  `set_session_plan` swap inside the plan lock, so readers
+  observe either the pre- or post-revision plan but never a
+  predicted-but-not-yet-installed shape. Same lesson: the
+  authoritative state is what's been observed to land, not what
+  was predicted to land.
+- **`DelegationObserved` itself (#249 actor-model channel
+  processor).** The event is named `Observed` deliberately —
+  goldfive emits it from what ADK delivered, not from what
+  goldfive predicted ADK would deliver.
+
+These precedents demonstrate the rule works: every time goldfive
+has been bitten by a state-correctness bug at scale, the fix has
+been to read the agent's observed output instead of the
+goldfive-side prediction. The proto extension in PR 1 is the
+specific application of the rule to descriptive growth.
