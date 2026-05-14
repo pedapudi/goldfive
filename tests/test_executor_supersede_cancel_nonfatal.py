@@ -747,3 +747,151 @@ def test_env_var_isolation() -> None:
     """
     # If a previous test leaked the env var, this would fail.
     assert os.environ.get("GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL") in (None, "0")
+
+
+# ---------------------------------------------------------------------------
+# 11. Issue #405 LOW #7 — per-invocation supersede registry surfaces in
+#     the executor's cancelled branch.
+# ---------------------------------------------------------------------------
+
+
+async def test_405_low7_executor_consumes_registry_supersede_signal() -> None:
+    """Issue #405 LOW #7 — executor's cancelled branch reads the
+    per-invocation supersede registry as a union-of-signals with the
+    legacy bool.
+
+    Pre-fix: only the bool signalled supersede; a sibling concurrent
+    iteration's defensive ``session._supersede_pending = False`` clear
+    could mask a true supersede. Post-fix: the StateStore-backed
+    per-invocation set is consulted alongside the bool, so even when
+    the bool is unset (e.g. cleared by a concurrent iteration's
+    defensive top-of-loop wipe), the registry entry still signals the
+    supersede and the executor restarts instead of aborting.
+
+    This test wires the registry signal ONLY (bool stays False) and
+    proves the executor restarts. Mirrors the bool-signal test
+    ``test_overlay_supersede_cancel_restarts_loop_by_default`` shape.
+    """
+    plan = _two_task_plan()
+    # Session.id aliases run_id; using a distinct run_id keeps the
+    # supersede registry scoped to this test (no cross-test leakage
+    # via the module-level _SUPERSEDE_PENDING_INVOCATIONS dict).
+    session = Session(run_id="r1-low7")
+    from tests._immutable_plan_helpers import force_plan as _fp_helper
+    _fp_helper(session, plan)
+    # _revised_plan hard-codes run_id="r1"; reconstruct with matching
+    # run_id so the planner-side wiring is consistent.
+    import dataclasses as _dc
+    refined = _dc.replace(_revised_plan(), run_id="r1-low7")
+    steerer = _MinimalStubSteerer()
+    sink = RecordingSink()
+    channel = ControlChannel()
+
+    async def _passthrough(
+        user_message: str,  # noqa: ARG001
+        session: Session,
+        reconciler: Any,
+    ) -> InvocationResult | None:
+        if len(adapter.passthrough_calls) == 1:
+            from tests._immutable_plan_helpers import force_plan as _fp_helper2
+            _fp_helper2(session, refined)
+            # Signal supersede via the registry ONLY — leave the bool
+            # explicitly False (the pre-fix executor would treat this
+            # as an external cancel and abort).
+            from goldfive.state_store import StateStore as _SS
+            _SS.for_session(session).mark_supersede_pending("inv-1")
+            session._supersede_pending = False  # type: ignore[attr-defined]
+            raise asyncio.CancelledError()
+        # Second invocation: complete the revised plan.
+        if session.plan is not None:
+            for t in list(session.plan.tasks):
+                await reconciler.on_before_agent(
+                    agent_name=t.assignee_agent_id, invocation_id=f"inv_{t.id}"
+                )
+                await reconciler.on_after_agent(
+                    agent_name=t.assignee_agent_id, invocation_id=f"inv_{t.id}"
+                )
+        return InvocationResult(task_id="", text="revised plan done")
+
+    adapter = _OverlayStubAdapter(passthrough_effect=_passthrough)
+    executor = SequentialExecutor(overlay_mode=True)
+
+    outcome = await asyncio.wait_for(
+        executor.run(
+            plan=plan,
+            session=session,
+            adapter=adapter,
+            steerer=steerer,
+            planner=_StubPlanner(),
+            sinks=[sink],
+            control=channel,
+            user_input="go",
+        ),
+        timeout=5.0,
+    )
+
+    # Registry-only signal: executor restarted, did NOT abort.
+    assert outcome.success is True, (
+        f"expected restart on registry-only supersede signal; got "
+        f"success={outcome.success!r} reason={outcome.reason!r}"
+    )
+    assert "run_aborted" not in sink.payload_kinds(), (
+        f"unexpected run_aborted with registry supersede signal: "
+        f"{sink.payload_kinds()}"
+    )
+    assert len(adapter.passthrough_calls) == 2
+    # Registry was cleared on consumption.
+    from goldfive.state_store import StateStore as _SS
+    assert _SS.for_session(session).has_any_supersede_pending() is False, (
+        "executor must clear the supersede registry after consuming it"
+    )
+
+
+async def test_405_low7_steerer_stamps_per_invocation_registry() -> None:
+    """Issue #405 LOW #7 — ``_cancel_inflight_for_revision`` populates
+    the per-invocation supersede registry in addition to the legacy
+    bool.
+
+    Sanity check: the steerer's supersede-cancel path stamps the
+    registry for every active invocation it cancels. Without this,
+    the executor's union-of-signals read can't observe the supersede
+    via the registry. Patches the resolver to return a known
+    invocation id so the test does not depend on the reconciler /
+    plugin internals the resolver reads.
+    """
+    from goldfive.state_store import StateStore as _SS
+
+    steerer = DefaultSteerer()
+    # Distinct run_id keeps this test's registry isolated.
+    session = Session(run_id="r1-low7-steerer")
+    store = _SS.for_session(session)
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="off topic",
+    )
+
+    # Patch the resolver to return our known invocation id. The
+    # registry write under test reuses this same resolver via the
+    # ``_cancel_inflight_for_revision`` implementation, so a stable
+    # input lets us assert the write happened against the right id.
+    original_resolver = steerer.drift._resolve_active_invocation_ids
+    steerer.drift._resolve_active_invocation_ids = (  # type: ignore[method-assign]
+        lambda d, s: ["inv-supersede-1"]
+    )
+    try:
+        await steerer.drift._cancel_inflight_for_revision(drift, session)
+    finally:
+        steerer.drift._resolve_active_invocation_ids = original_resolver  # type: ignore[method-assign]
+
+    # Legacy bool still stamped (back-compat with the 8 pre-#405
+    # tests above).
+    assert getattr(session, "_supersede_pending", False) is True
+    # NEW: the per-invocation registry also has the entry.
+    assert store.is_supersede_pending("inv-supersede-1") is True, (
+        "LOW #7: _cancel_inflight_for_revision must stamp the "
+        "per-invocation supersede registry alongside the bool"
+    )
+    # Cleanup
+    store.clear_active_invocations()

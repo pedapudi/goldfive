@@ -1018,9 +1018,22 @@ class SequentialExecutor(Executor):
             # ``_cancel_inflight_for_revision``; clearing here
             # prevents that stale flag from misclassifying a genuine
             # external cancel on the NEXT iteration as a supersede.
+            #
+            # Issue #405 LOW #7: also wipe the per-invocation supersede
+            # registry. The registry is the more defensive backstop
+            # (each invocation_id is unique, so it can't be clobbered
+            # cross-invocation) but at the top of a fresh iteration we
+            # are starting clean — any unconsumed entry from a prior
+            # iteration would only confuse the cancelled branch below.
             try:
                 session._supersede_pending = False  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001
+                pass
+            try:
+                from goldfive.state_store import StateStore  # noqa: PLC0415 — lazy
+
+                StateStore.for_session(session).clear_all_supersede_pending()
+            except Exception:  # noqa: BLE001 — registry is best-effort
                 pass
             # ContextVars snapshot at ``asyncio.create_task`` time
             # (which happens inside _invoke_passthrough_with_control),
@@ -1070,11 +1083,38 @@ class SequentialExecutor(Executor):
                 # from the caller) ALWAYS abort regardless of the flag —
                 # they never set the supersede marker. See PR #332 for
                 # the principle this aligns with.
-                supersede_pending = bool(
+                # Issue #405 LOW #7: union-of-signals read. The legacy
+                # ``session._supersede_pending`` bool is the primary
+                # signal (all existing supersede-cancel tests in
+                # ``tests/test_executor_supersede_cancel_nonfatal.py``
+                # exercise it directly), and the per-invocation set is
+                # the defensive backstop that survives concurrent
+                # overlay iterations. Either fires this branch. The
+                # dual read is transitional; see issue #430 for the
+                # follow-up to retire the bool.
+                supersede_bool = bool(
                     getattr(session, "_supersede_pending", False)
                 )
+                supersede_registry = False
+                try:
+                    from goldfive.state_store import StateStore  # noqa: PLC0415
+
+                    supersede_registry = (
+                        StateStore.for_session(session).has_any_supersede_pending()
+                    )
+                except Exception:  # noqa: BLE001 — registry is best-effort
+                    pass
+                supersede_pending = supersede_bool or supersede_registry
                 if supersede_pending and not self._fail_fast_on_invoke_cancel:
                     session._supersede_pending = False
+                    try:
+                        from goldfive.state_store import StateStore  # noqa: PLC0415
+
+                        StateStore.for_session(
+                            session
+                        ).clear_all_supersede_pending()
+                    except Exception:  # noqa: BLE001
+                        pass
                     log.info(
                         "SequentialExecutor._run_overlay: goldfive-internal "
                         "supersede cancel observed (revision_index=%d); "
@@ -1100,6 +1140,14 @@ class SequentialExecutor(Executor):
                 # the same Session does not inherit it.
                 if supersede_pending:
                     session._supersede_pending = False
+                    try:
+                        from goldfive.state_store import StateStore  # noqa: PLC0415
+
+                        StateStore.for_session(
+                            session
+                        ).clear_all_supersede_pending()
+                    except Exception:  # noqa: BLE001
+                        pass
                 # goldfive#205: overlay path doesn't have a single
                 # "current task" to stamp — the orphan sweep below
                 # handles PENDING tasks. Clear the transient prefix so

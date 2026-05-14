@@ -2415,6 +2415,25 @@ class ADKAdapter:
         falls back to the legacy bucket so existing tests keep
         working. The session-keyed path always wins when present,
         so the cross-session leak the refactor closes is unaffected.
+
+        Issue #405 LOW #8 — interleave note. This method writes to
+        the ``goldfive.cancelled_function_call_ids`` state key from
+        the adapter's cancel / exception paths. It can interleave
+        with :meth:`PlanReviser._repin_current_task_on_supersedes`,
+        which runs from a background drift handler under the
+        steerer's lock and writes to a *disjoint* state key
+        (``goldfive.current_task_id``). No functional overlap today:
+        the heal writes append-only to the cancelled-ids list while
+        the repin writes the pinned task id; both target distinct
+        keys on the same state dict and Python's dict mutation is
+        thread-safe at the per-key level. Future maintainers: if a
+        change introduces a write to ``goldfive.current_task_id``
+        (or any other key the repin touches) from this method, add
+        the steerer's lock around that write or migrate the writes
+        through the StateStore's channel-processor envelope so the
+        ordering is explicit. See issue #405 audit finding LOW #8
+        for the disjoint-key analysis that keeps today's interleave
+        benign.
         """
         gf_session_id = getattr(session, "id", "") or "" if session is not None else ""
         pending_ids_bucket = self._pending_ids_for(gf_session_id)
