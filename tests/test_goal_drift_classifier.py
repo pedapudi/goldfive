@@ -41,6 +41,7 @@ pytestmark = pytest.mark.skipif(
 from goldfive.drift import classify_goal_drift  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
+    RECENT_EVENT_AGENT_ACTIVITY_KINDS,
     DriftEvent,
     DriftKind,
     DriftSeverity,
@@ -50,6 +51,7 @@ from goldfive.types import (  # noqa: E402
     Task,
     TaskEdge,
     TaskStatus,
+    filter_recent_events_by_kind,
 )
 
 # ---------------------------------------------------------------------------
@@ -455,7 +457,13 @@ async def test_steerer_malformed_response_does_not_crash_run() -> None:
 
 
 async def test_steerer_activity_window_bounded() -> None:
-    """note_agent_activity trims to goal_drift_activity_window."""
+    """note_agent_activity trims the agent-activity subset of recent_events.
+
+    Goldfive#239: the unified ``recent_events`` buffer is bounded
+    per-kind-class, so ``goal_drift_activity_window=3`` caps the
+    agent-activity subset at 3 regardless of what other kinds are
+    interleaved.
+    """
     steerer = DefaultSteerer(goal_drift_activity_window=3)
     session = _make_session()
     for i in range(10):
@@ -465,9 +473,12 @@ async def test_steerer_activity_window_bounded() -> None:
             agent_name=f"a{i}",
             task_id=f"t{i}",
         )
-    assert len(session.recent_agent_activity) == 3
+    activity = filter_recent_events_by_kind(
+        session.recent_events, RECENT_EVENT_AGENT_ACTIVITY_KINDS
+    )
+    assert len(activity) == 3
     # Newest three retained (ring buffer drops oldest).
-    assert [e["agent_name"] for e in session.recent_agent_activity] == ["a7", "a8", "a9"]
+    assert [e["agent_name"] for e in activity] == ["a7", "a8", "a9"]
 
 
 async def test_steerer_counter_is_not_task_scoped() -> None:

@@ -17,7 +17,8 @@ cascade fire-and-forget on
 
 Iter-11B: ``mark_task_completed`` / ``mark_task_failed`` now write a
 synthetic ``agent_invocation_completed`` entry to
-:attr:`Session.recent_agent_activity` so the GOAL_DRIFT judge does not
+:attr:`Session.recent_events` (goldfive#239 — the unified buffer that
+replaced ``recent_agent_activity``) so the GOAL_DRIFT judge does not
 read an orphan-start + task-COMPLETED shape and false-positive on
 "looping". The real ``after_run_callback`` will append another
 ``agent_invocation_completed`` slightly later — duplicate completed
@@ -42,6 +43,7 @@ pytestmark = pytest.mark.skipif(
 
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
+    RECENT_EVENT_AGENT_ACTIVITY_KINDS,
     DriftEvent,
     DriftKind,
     DriftSeverity,
@@ -50,7 +52,19 @@ from goldfive.types import (  # noqa: E402
     Session,
     Task,
     TaskEdge,
+    filter_recent_events_by_kind,
 )
+
+
+def _agent_activity(session: Session) -> list[dict[str, Any]]:
+    """Pre-merge ``_agent_activity(session)`` accessor.
+
+    Goldfive#239 merged the dedicated buffer into ``recent_events``;
+    test assertions filter back to the agent-activity kinds.
+    """
+    return filter_recent_events_by_kind(
+        session.recent_events, RECENT_EVENT_AGENT_ACTIVITY_KINDS
+    )
 
 # ---------------------------------------------------------------------------
 # Stubs (intentionally local to this file — keep the spec self-contained).
@@ -153,13 +167,13 @@ async def test_mark_task_completed_appends_synthetic_invocation_completed() -> N
         agent_name="worker",
         task_id="t1",
     )
-    assert len(session.recent_agent_activity) == 1
+    assert len(_agent_activity(session)) == 1
 
     await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
 
     # Paired entry appended.
     completed_entries = [
-        e for e in session.recent_agent_activity if e["kind"] == "agent_invocation_completed"
+        e for e in _agent_activity(session) if e["kind"] == "agent_invocation_completed"
     ]
     assert len(completed_entries) == 1
     assert completed_entries[0]["agent_name"] == "worker"
@@ -184,7 +198,7 @@ async def test_mark_task_failed_appends_synthetic_invocation_completed() -> None
     await steerer.drift._wait_background_drifts_idle()
 
     completed_entries = [
-        e for e in session.recent_agent_activity if e["kind"] == "agent_invocation_completed"
+        e for e in _agent_activity(session) if e["kind"] == "agent_invocation_completed"
     ]
     assert len(completed_entries) == 1
     assert completed_entries[0]["agent_name"] == "worker"
@@ -218,7 +232,7 @@ async def test_mark_task_completed_skips_pairing_when_no_assignee() -> None:
     await steerer.tasks.mark_task_completed("t1", session=session, summary="done")
 
     completed_entries = [
-        e for e in session.recent_agent_activity if e["kind"] == "agent_invocation_completed"
+        e for e in _agent_activity(session) if e["kind"] == "agent_invocation_completed"
     ]
     assert completed_entries == []
 
@@ -237,7 +251,7 @@ async def test_mark_task_failed_skips_pairing_when_no_assignee() -> None:
     await steerer.drift._wait_background_drifts_idle()
 
     completed_entries = [
-        e for e in session.recent_agent_activity if e["kind"] == "agent_invocation_completed"
+        e for e in _agent_activity(session) if e["kind"] == "agent_invocation_completed"
     ]
     assert completed_entries == []
 
@@ -268,7 +282,7 @@ async def test_duplicate_completed_entries_are_harmless() -> None:
     )
 
     completed_entries = [
-        e for e in session.recent_agent_activity if e["kind"] == "agent_invocation_completed"
+        e for e in _agent_activity(session) if e["kind"] == "agent_invocation_completed"
     ]
     assert len(completed_entries) == 2
     # Each entry carries the canonical keys; the goal-drift prompt

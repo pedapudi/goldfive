@@ -1362,6 +1362,62 @@ class RefineOutcome:
     fail_count: int = 0
 
 
+# ---------------------------------------------------------------------------
+# Recent-events buffer (goldfive#239)
+# ---------------------------------------------------------------------------
+#
+# Constants + filtering helper for :attr:`Session.recent_events`. The buffer
+# unifies the historical ``recent_agent_activity`` (fed to the GOAL_DRIFT
+# judge) and ``recent_tool_observations`` (fed to the reasoning judge); each
+# entry is discriminated by its ``kind`` field.
+
+#: Recent-events kind: agent invocation started (was ``recent_agent_activity``).
+RECENT_EVENT_KIND_AGENT_STARTED: str = "agent_invocation_started"
+
+#: Recent-events kind: agent invocation completed (was ``recent_agent_activity``).
+RECENT_EVENT_KIND_AGENT_COMPLETED: str = "agent_invocation_completed"
+
+#: Recent-events kind: tool observation (was ``recent_tool_observations``).
+RECENT_EVENT_KIND_TOOL_OBSERVED: str = "tool_observed"
+
+#: Subset of kinds that the legacy ``recent_agent_activity`` buffer carried.
+#: Used by the goal-drift judge snapshot path (writers trim this group as a
+#: unit so the legacy ``goal_drift_activity_window`` semantics are preserved).
+RECENT_EVENT_AGENT_ACTIVITY_KINDS: frozenset[str] = frozenset(
+    {RECENT_EVENT_KIND_AGENT_STARTED, RECENT_EVENT_KIND_AGENT_COMPLETED}
+)
+
+
+def filter_recent_events_by_kind(
+    events: list[dict[str, Any]] | None,
+    kinds: str | frozenset[str] | set[str] | tuple[str, ...] | list[str],
+) -> list[dict[str, Any]]:
+    """Return the subset of ``events`` whose ``kind`` is in ``kinds``.
+
+    Preserves insertion order so callers get a stable snapshot. Tolerates
+    ``None`` / non-dict entries (returns an empty list / skips them) so
+    readers operating on a partially-initialised :class:`Session` cannot
+    raise. The returned list is a fresh copy — mutating it does NOT affect
+    the underlying buffer.
+
+    The accepted ``kinds`` shape mirrors common filter idioms: a single
+    string ``"tool_observed"`` for one-kind filters, or a collection of
+    strings (e.g. :data:`RECENT_EVENT_AGENT_ACTIVITY_KINDS`) for the
+    multi-kind case.
+    """
+    if not events:
+        return []
+    if isinstance(kinds, str):
+        accepted: frozenset[str] = frozenset({kinds})
+    else:
+        accepted = frozenset(kinds)
+    return [
+        e
+        for e in events
+        if isinstance(e, dict) and e.get("kind") in accepted
+    ]
+
+
 @dataclasses.dataclass
 class Session:
     """Live state for one Runner.run() invocation.
@@ -1492,14 +1548,22 @@ class Session:
     # No task-id scoping: GOAL_DRIFT is a trajectory-level signal, so the
     # counter persists across task transitions.
     _agent_turns_since_goal_check: int = 0
-    # Ring buffer of recent agent activity summaries fed to the
-    # :func:`goldfive.drift.classify_goal_drift` judge. Adapters push
-    # entries via ``DefaultSteerer.note_agent_activity``; the steerer
-    # trims to ``goal_drift_activity_window`` entries to bound the
-    # prompt. Each entry is a small dict (``kind``, ``agent_name``,
-    # ``task_id``, ``detail``) rather than a full event proto to keep
-    # this framework-neutral.
-    recent_agent_activity: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # Unified ring buffer of recent session events (goldfive#239). Holds
+    # entries previously split across ``recent_agent_activity`` (fed to
+    # the :func:`goldfive.drift.classify_goal_drift` judge) and
+    # ``recent_tool_observations`` (fed to the three-state reasoning
+    # judge). Each entry is a small framework-neutral ``dict`` with a
+    # ``kind`` discriminator — current kinds are
+    # ``agent_invocation_started`` / ``agent_invocation_completed``
+    # (the old agent-activity entries) and ``tool_observed`` (the old
+    # tool-observation entries). Adapters push entries via
+    # :meth:`DriftObserver.note_agent_activity` and
+    # :meth:`DriftObserver.note_tool_observation`; the writers trim
+    # **per kind-class** so a flood of tool observations cannot evict
+    # agent-activity entries (and vice versa). Readers filter by
+    # ``kind`` to recover the equivalent of the old buffers — see
+    # :func:`goldfive.types.filter_recent_events_by_kind`.
+    recent_events: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     # Monotonic-ish timestamp (``time.time()``, seconds since epoch) of the
     # last GOAL_DRIFT judge call fired via the task-boundary trigger
     # (goldfive#219). Prevents two task transitions <10s apart from paying
@@ -1573,27 +1637,15 @@ class Session:
     # the reasoning judge) can use this to distinguish "child of a
     # delegation chain rooted at the assignee" from "off-plan agent".
     task_lineage: dict[str, set[str]] = dataclasses.field(default_factory=dict)
-    # Ring buffer of recent tool-call observations consumed by the
-    # iter-10 three-state reasoning judge so it can distinguish a
-    # provoked deviation (the agent saw a tool error / surprising
-    # result and pivoted) from an unprovoked one. Adapters push
-    # entries via ``DefaultSteerer.note_tool_observation`` from their
-    # ``after_tool_callback`` / ``on_tool_error_callback`` hooks; the
-    # steerer trims to ``recent_tool_observations_max`` so the prompt
-    # stays bounded regardless of run length. Each entry is a small
-    # dict (``ts_ms``, ``agent_name``, ``task_id``, ``tool_name``,
-    # ``args_preview``, ``result_preview``, ``is_error``,
-    # ``error_message``) — framework-neutral, no protos, so sinks /
-    # tests can introspect cheaply. Per-task scoping is applied at
-    # READ time by the judge's prompt renderer (PR 3): writers store
-    # everything so a deviation rooted in an earlier task's artefact
-    # remains visible.
-    recent_tool_observations: list[dict[str, Any]] = dataclasses.field(default_factory=list)
-    # Cap for ``recent_tool_observations``. Default 16 covers a couple
-    # of agent invocations on typical traces while keeping the prompt
-    # block under ~1.5KB even before the per-entry truncation. Tunable
-    # via the ``Steerer`` config so operators on tight context budgets
-    # can drop it.
+    # Per-kind cap for ``tool_observed`` entries in ``recent_events``
+    # (goldfive#239 — merged from the legacy ``recent_tool_observations_max``).
+    # Default 16 covers a couple of agent invocations on typical
+    # traces while keeping the prompt block under ~1.5KB even before
+    # the per-entry truncation. Tunable via the ``Steerer`` config so
+    # operators on tight context budgets can drop it. The legacy name
+    # was preserved for env/config compatibility — see
+    # :class:`goldfive.config.ReasoningJudgeConfig` (TODO when
+    # surfacing operator knob).
     recent_tool_observations_max: int = 16
     # Monotonic event sequence counter for sinks. When this Session was
     # built by :meth:`Conversation.next_turn_session`, the seed value is
