@@ -452,6 +452,135 @@ async def test_sequential_pause_blocks_next_task_until_resume() -> None:
 
 
 # ---------------------------------------------------------------------------
+# goldfive#404 — legacy pause-loop honours GOLDFIVE_STEER ControlOutcome
+# ---------------------------------------------------------------------------
+
+
+async def test_sequential_pause_loop_unwinds_on_goldfive_steer() -> None:
+    """goldfive#404: a ``GOLDFIVE_STEER`` ControlMessage delivered while
+    the legacy executor is parked in its pre-task pause loop must
+    unblock the wait (the same way an operator ``STEER`` does) and feed
+    the message into ``_apply_steer`` on the way out.
+
+    Pre-fix behaviour: ``_apply_pre_task_controls``'s pause loop only
+    checked ``outcome.steer_message`` (and ``request_resume`` /
+    ``cancel_run`` / ``rewind_task_id``), so a
+    ``ControlOutcome(goldfive_steer_message=msg)`` was silently dropped
+    and the executor stayed paused indefinitely. The fix mirrors the
+    overlay invoke loop's ``goldfive_steer`` branch — propagating the
+    message into the same resume path.
+    """
+    plan = _linear_plan(["t0", "t1"])
+    session = _fresh_session()
+
+    # When the steerer observes the GOLDFIVE_STEER message it would
+    # normally have already swapped session.plan; provide a refined
+    # plan and route the swap through the StubSteerer's observe() so
+    # the outer loop picks it up on the next iteration. Use a STEER-
+    # kinded payload so the stub's existing branch swaps the plan
+    # (the stub only knows the STEER kind; the production steerer
+    # would route GOLDFIVE_STEER similarly).
+    refined = Plan(
+        id="p1",
+        run_id=session.run_id,
+        goal_ids=[],
+        tasks=[Task(id="t0b", title="New Task 0")],
+        edges=[],
+        revision_reason="goldfive steer",
+        revision_kind=DriftKind.LOOPING_REASONING.value,
+        revision_severity=DriftSeverity.WARNING.value,
+        revision_index=1,
+    )
+    steerer = StubSteerer(refine_result=refined)
+    planner = StubPlanner()
+    sink = RecordingSink()
+    channel = ControlChannel()
+
+    async def _handler(task: Task, session: Session) -> InvocationResult:
+        from tests._immutable_plan_helpers import force_task_status
+
+        force_task_status(session, task.id, TaskStatus.COMPLETED)
+        return InvocationResult(task_id=task.id, text=f"done:{task.id}")
+
+    adapter = StubAdapter(on_invoke=_handler)
+
+    # PAUSE before the run starts; pre-task drain enters the pause
+    # loop on the very first iteration.
+    await channel.send(ControlMessage(kind=ControlKind.PAUSE))
+
+    executor = SequentialExecutor(max_task_invocations=8)
+    runner_task = asyncio.create_task(
+        executor.run(
+            plan=plan,
+            session=session,
+            adapter=adapter,
+            steerer=steerer,
+            planner=planner,
+            sinks=[sink],
+            control=channel,
+        )
+    )
+
+    # Let the executor settle into the paused wait.
+    await asyncio.sleep(0.1)
+    assert not runner_task.done(), "executor should be parked in pause loop"
+    assert adapter.invocations == [], "no task may run while paused"
+
+    # Send GOLDFIVE_STEER (no RESUME). The pre-fix executor drops this
+    # and wedges; the fixed executor unwinds the pause loop, applies
+    # the steer, and proceeds with the refined plan.
+    #
+    # We also re-shape the StubSteerer so it swaps session.plan in
+    # response to a GOLDFIVE_STEER observation — the production
+    # DefaultSteerer would have already done the swap before
+    # dispatching, but we need the stub to react to the test message.
+    async def _observe_goldfive_steer(event: Any, sess: Session) -> None:
+        steerer.observed.append(event)
+        kind_str = str(
+            getattr(getattr(event, "kind", None), "value", "")
+        ).upper()
+        if kind_str == "GOLDFIVE_STEER":
+            from goldfive.types import (
+                channel_processor_active,
+                set_session_plan,
+            )
+
+            with channel_processor_active():
+                set_session_plan(sess, refined)
+
+    steerer.observe = _observe_goldfive_steer  # type: ignore[method-assign]
+
+    await channel.send(
+        ControlMessage(
+            kind=ControlKind.GOLDFIVE_STEER,
+            payload={"body": "goldfive-authored corrective"},
+        )
+    )
+
+    outcome = await asyncio.wait_for(runner_task, timeout=3.0)
+
+    # The run completed (no indefinite wedge — the regression).
+    assert outcome.success is True
+    # The refined plan's task ran.
+    assert "t0b" in adapter.invocations
+    # The steerer observed the GOLDFIVE_STEER ControlMessage — confirms
+    # the pause loop fed it through ``_apply_steer`` instead of
+    # dropping it.
+    goldfive_steer_obs = [
+        o for o in steerer.observed
+        if str(
+            getattr(getattr(o, "kind", None), "value", "")
+        ).upper() == "GOLDFIVE_STEER"
+    ]
+    assert len(goldfive_steer_obs) == 1
+    # Two acks: PAUSE + GOLDFIVE_STEER (the STEER ack also
+    # transparently unblocks the pause — no separate RESUME needed).
+    acks = await _drain_acks(channel, count=2, timeout=1.0)
+    assert len(acks) == 2
+    assert all(a.result == AckResult.SUCCESS for a in acks)
+
+
+# ---------------------------------------------------------------------------
 # Sequential executor: REWIND_TO resets downstream tasks
 # ---------------------------------------------------------------------------
 
