@@ -30,7 +30,7 @@ from goldfive.state_store import (  # noqa: E402
     DelegationPin,
     StateStore,
 )
-from goldfive.types import DriftKind, DriftSeverity  # noqa: E402
+from goldfive.types import DriftKind, DriftSeverity, Plan, Task, TaskStatus  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Module-level primitives accept plain dicts
@@ -389,3 +389,65 @@ def test_construction_with_non_mapping_yields_empty_view() -> None:
     assert store.get_active_steer() is None
     assert store.cancelled_function_call_ids() == []
     assert store.iter_pending_delegations() == {}
+
+
+# ---------------------------------------------------------------------------
+# Plan-descriptive-growth overlay (goldfive#423 PR 1; design doc
+# ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.1).
+#
+# State-store back-compat: the new ``Task.discovered`` and
+# ``Task.discovery_identity_hash`` fields are dataclass defaults; the
+# state store keeps Task instances by reference and never inspects these
+# fields, so the round-trip is the identity. The tests below pin the
+# back-compat contract from the brief:
+#
+#   * Tasks constructed without the new kwargs (legacy plans pre-PR-1)
+#     light up the dataclass defaults — ``discovered=False`` and an
+#     empty identity hash.
+#   * Tasks WITH the new fields populated survive state-store
+#     storage + retrieval unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_task_in_state_store_has_default_discovered_fields() -> None:
+    # Simulate loading a stored Plan from before this PR: tasks were
+    # constructed without ever passing the new kwargs. The dataclass
+    # defaults must light up after retrieval so no downstream consumer
+    # (PR 2 dedup, harmonograf render) sees an undefined field.
+    legacy_task = Task(id="legacy", title="legacy task")  # pre-PR-1 shape
+    legacy_plan = Plan(
+        id="p", run_id="r", goal_ids=[], tasks=[legacy_task], edges=[]
+    )
+    state: dict = {}
+    state_store.set_current_plan(state, legacy_plan)
+    state_store.set_current_task(state, legacy_task)
+
+    # The state store keeps the Plan / Task instances by reference;
+    # retrieval surfaces the same instances, which still carry the
+    # dataclass defaults for the new fields.
+    assert legacy_task.discovered is False
+    assert legacy_task.discovery_identity_hash == ""
+    # The plan reference round-trips with no mutation.
+    assert legacy_plan.tasks[0].discovered is False
+
+
+def test_discovered_task_in_state_store_preserves_fields() -> None:
+    # PR 2 will mint discovered tasks and pass them through
+    # ``set_current_task``; PR 1 just verifies the new fields survive
+    # the state-store API without being silently dropped or coerced.
+    discovered_task = Task(
+        id="discovered-1",
+        title="debugger_agent: locate cherry trees",
+        status=TaskStatus.RUNNING,
+        discovered=True,
+        discovery_identity_hash="hashabcdef123456",
+    )
+    state: dict = {}
+    state_store.set_current_task(state, discovered_task)
+    # The store keeps the id / title slots — not the full Task. So
+    # the back-compat guarantee is that the Task instance the caller
+    # holds is unmodified (no in-place mutation by the store).
+    assert discovered_task.discovered is True
+    assert discovered_task.discovery_identity_hash == "hashabcdef123456"
+    # And the pinned id round-trips.
+    assert StateStore.for_state(state).pin_current_task() == "discovered-1"

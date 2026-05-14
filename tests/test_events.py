@@ -22,6 +22,7 @@ pytestmark = pytest.mark.skipif(
 from goldfive.control import ControlKind, ControlMessage  # noqa: E402
 from goldfive.events import (  # noqa: E402
     build_plan_revision_diff,
+    delegation_observed_event,
     invocation_cancelled_event,
     plan_revised_event,
 )
@@ -447,3 +448,92 @@ def test_invocation_cancelled_event_round_trips_through_wire() -> None:
     assert payload.drift_kind == "agent_refusal"
     assert payload.detail == "loopy"
     assert payload.tool_name == "lookup"
+
+
+# ---------------------------------------------------------------------------
+# Plan-descriptive-growth proto extension (goldfive#423 PR 1; design doc
+# ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3.0, §9, §13).
+#
+# The ``DelegationObserved.tool_args_json`` field is the canonical
+# observed-fact carrier PR 2's dedup hash reads from. PR 1 just verifies
+# the field flows through the event builder + survives the wire +
+# defaults to empty when the producer does not pass it.
+# ---------------------------------------------------------------------------
+
+
+def test_delegation_observed_event_default_tool_args_json_is_empty() -> None:
+    """Producers that do not pass ``tool_args_json`` produce the same
+    wire shape as pre-PR-1 — empty string default, no field on the wire.
+    """
+    evt = delegation_observed_event(
+        run_id="r",
+        sequence=1,
+        from_agent="coordinator",
+        to_agent="researcher",
+    )
+    assert evt.delegation_observed.tool_args_json == ""
+
+
+def test_delegation_observed_event_carries_tool_args_json() -> None:
+    """The new kwarg is stamped onto the proto payload when provided."""
+    payload = '{"topic": "cherry trees"}'
+    evt = delegation_observed_event(
+        run_id="r",
+        sequence=1,
+        from_agent="coordinator",
+        to_agent="researcher",
+        tool_args_json=payload,
+    )
+    assert evt.delegation_observed.tool_args_json == payload
+
+
+def test_delegation_observed_event_round_trips_tool_args_json_through_wire() -> None:
+    """Serialise + parse — the JSON payload survives the wire format."""
+    from goldfive.pb.goldfive.v1 import events_pb2
+
+    payload = '{"request": "locate cherry tree files", "format": "json"}'
+    evt = delegation_observed_event(
+        run_id="r-rt",
+        sequence=5,
+        from_agent="coordinator",
+        to_agent="debugger_agent",
+        task_id="t1",
+        invocation_id="inv-1",
+        tool_args_json=payload,
+    )
+    encoded = evt.SerializeToString()
+    decoded = events_pb2.Event()
+    decoded.ParseFromString(encoded)
+    assert decoded.WhichOneof("payload") == "delegation_observed"
+    assert decoded.delegation_observed.tool_args_json == payload
+
+
+def test_delegation_observed_old_wire_format_parses_with_default_tool_args() -> None:
+    """Old serialised events (no ``tool_args_json`` field) deserialize.
+
+    Critical UI-safety guarantee: harmonograf builds that ingested old
+    events MUST still be loadable post-PR-1. We simulate the pre-PR-1
+    wire shape by serialising a fresh DelegationObserved without ever
+    setting the new field, then parsing through the current schema.
+    The default empty string lights up — never a missing-field error.
+    """
+    from goldfive.pb.goldfive.v1 import events_pb2
+
+    # Construct without touching tool_args_json (matches the pre-PR-1
+    # producer that did not know about the field).
+    msg = events_pb2.DelegationObserved(
+        from_agent="coordinator",
+        to_agent="debugger_agent",
+        task_id="t1",
+        invocation_id="inv-1",
+    )
+    wire = msg.SerializeToString()
+    parsed = events_pb2.DelegationObserved()
+    parsed.ParseFromString(wire)
+    # The default-empty back-compat default lights up.
+    assert parsed.tool_args_json == ""
+    # And the other fields survive — back-compat is additive only.
+    assert parsed.from_agent == "coordinator"
+    assert parsed.to_agent == "debugger_agent"
+    assert parsed.task_id == "t1"
+    assert parsed.invocation_id == "inv-1"

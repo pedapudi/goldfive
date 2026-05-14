@@ -9,6 +9,7 @@ dataclasses have landed.
 from __future__ import annotations
 
 import importlib.util
+from typing import Any
 
 import pytest
 
@@ -232,3 +233,98 @@ def test_all_task_statuses_round_trip(status: TaskStatus) -> None:
 def test_all_drift_severities_round_trip(severity: DriftSeverity) -> None:
     d = DriftEvent(kind=DriftKind.TOOL_ERROR, severity=severity)
     assert from_pb_drift_event(to_pb_drift_event(d)).severity == severity
+
+
+# ---------------------------------------------------------------------------
+# Plan-descriptive-growth overlay (goldfive#423 PR 1; design doc
+# ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.1, §4.4). Round-trip the
+# new ``Task.discovered`` and ``Task.discovery_identity_hash`` fields
+# through the proto and pin back-compat for the missing-field path.
+# ---------------------------------------------------------------------------
+
+
+def test_task_discovered_field_round_trip() -> None:
+    # The new fields survive the to/from proto path so sinks (PR 3:
+    # harmonograf) can render discovered tasks distinctly without
+    # re-reading the dataclass.
+    t = Task(
+        id="discovered-1",
+        title="debugger_agent: locate files",
+        discovered=True,
+        discovery_identity_hash="abc123def4567890",
+    )
+    recovered = from_pb_task(to_pb_task(t))
+    assert recovered == t
+    assert recovered.discovered is True
+    assert recovered.discovery_identity_hash == "abc123def4567890"
+
+
+def test_task_discovered_default_round_trip() -> None:
+    # A forecast task (discovered=False, hash="") round-trips with the
+    # defaults unchanged. This is the back-compat path: every legacy
+    # call site that builds a Task with no kwargs lands here.
+    t = Task(id="t1", title="forecast")
+    recovered = from_pb_task(to_pb_task(t))
+    assert recovered.discovered is False
+    assert recovered.discovery_identity_hash == ""
+    assert recovered == t
+
+
+def test_task_from_old_proto_without_discovered_field() -> None:
+    """Old serialised events (pre-PR-1 wire format) must deserialize.
+
+    Critical UI-safety guarantee from the brief: old harmonograf builds
+    that produced events without ``discovered`` / ``discovery_identity_hash``
+    must still be readable. We simulate the pre-PR-1 wire format by
+    constructing a proto Task and clearing the new fields, then
+    parsing the bytes back through a fresh Task message and feeding
+    that to ``from_pb_task``.
+    """
+    pb = _pb_module_for_test()
+    # Build a current-shape proto then strip the new fields by
+    # round-tripping through a wire format that omits them — protobuf
+    # default-fills missing scalars on parse.
+    msg = pb.Task(id="t1", title="legacy", status=pb.TASK_STATUS_PENDING)
+    wire = msg.SerializeToString()
+    parsed = pb.Task()
+    parsed.ParseFromString(wire)
+    recovered = from_pb_task(parsed)
+    # The defaults must light up — never accidentally discovered.
+    assert recovered.discovered is False
+    assert recovered.discovery_identity_hash == ""
+
+
+def _pb_module_for_test() -> Any:
+    """Test-local pb accessor — same shape as ``goldfive.conv._pb_module``."""
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    return types_pb2
+
+
+def test_plan_with_discovered_task_round_trip() -> None:
+    # End-to-end: a Plan carrying both forecast and discovered tasks
+    # survives the full envelope path used by PlanRevised emit (the
+    # PR 2 install-path observability story).
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(id="planned", title="forecast task"),
+            Task(
+                id="discovered-1",
+                title="debugger_agent: locate files",
+                discovered=True,
+                discovery_identity_hash="hashabcdef123456",
+            ),
+        ],
+        edges=[],
+    )
+    recovered = from_pb_plan(to_pb_plan(plan))
+    assert recovered == plan
+    discovered_recovered = next(t for t in recovered.tasks if t.id == "discovered-1")
+    assert discovered_recovered.discovered is True
+    assert discovered_recovered.discovery_identity_hash == "hashabcdef123456"
+    planned_recovered = next(t for t in recovered.tasks if t.id == "planned")
+    assert planned_recovered.discovered is False
+    assert planned_recovered.discovery_identity_hash == ""

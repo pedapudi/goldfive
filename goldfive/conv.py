@@ -198,6 +198,13 @@ def to_pb_task(task: Task) -> Any:
         bound_span_id=task.bound_span_id,
         supersedes=task.supersedes,
         supersedes_kind=_supersession_kind_to_pb(task.supersedes_kind),
+        # goldfive#423 PR 1 — plan-descriptive-growth overlay. Stamped
+        # on the proto representation so sinks (PR 3: harmonograf) can
+        # distinguish forecast tasks from discovered ones without
+        # re-reading the dataclass. Defaults are no-op for forecast
+        # tasks (discovered=False, hash="").
+        discovered=task.discovered,
+        discovery_identity_hash=task.discovery_identity_hash,
     )
     return msg
 
@@ -214,6 +221,12 @@ def from_pb_task(msg: Any) -> Task:
         bound_span_id=msg.bound_span_id,
         supersedes=getattr(msg, "supersedes", "") or "",
         supersedes_kind=_supersession_kind_from_pb(getattr(msg, "supersedes_kind", 0) or 0),
+        # goldfive#423 PR 1 — back-compat via ``getattr`` so old
+        # serialised events (pre-PR-1 wire format without these
+        # fields) deserialize cleanly with the dataclass defaults
+        # (``discovered=False``, ``discovery_identity_hash=""``).
+        discovered=bool(getattr(msg, "discovered", False) or False),
+        discovery_identity_hash=getattr(msg, "discovery_identity_hash", "") or "",
     )
 
 

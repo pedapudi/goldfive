@@ -343,6 +343,25 @@ message Task {
   // coerces mismatched values to the correct kind based on the old
   // task's actual status and logs a WARNING.
   SupersessionKind supersedes_kind = 10;
+
+  // Plan-descriptive-growth overlay (goldfive#423 PR 1; design doc
+  // ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.1). When true, this
+  // task was added reactively at delegation observation time (or by
+  // an equivalent observation hook), not by initial planning or by a
+  // planner-authored refine. Default false so legacy plans and the
+  // validator's existing rules are unaffected.
+  //
+  // Forward-compat: old proto-serialised tasks without this field
+  // deserialize to ``discovered=false`` — the back-compat default.
+  bool discovered = 11;
+
+  // Plan-descriptive-growth overlay (goldfive#423 PR 1; design doc
+  // §4.3.0). Stable hash of (agent_name, args-token-set) at discovery
+  // time. PR 2 reads this off the task to dedup repeated delegations
+  // to the same agent for the same logical args. Empty string for
+  // forecast tasks. Opaque metadata — the validator does not inspect
+  // it.
+  string discovery_identity_hash = 12;
 }
 
 // A Plan is a DAG of Tasks with a revision history. The initial plan
