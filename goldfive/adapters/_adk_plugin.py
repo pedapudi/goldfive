@@ -44,6 +44,22 @@ from typing import TYPE_CHECKING, Any
 
 from goldfive.adapters._tool_invocation import invoke_tool
 
+# Wave B2 — request-side ``LlmRequest`` mutation surface lives in
+# :mod:`goldfive.adapters.adk_llm_instrumentation`. Re-imported here so
+# the names resolve as module attributes of ``_adk_plugin`` (the
+# historical surface for the in-module ``before_model_callback``
+# references and external ``from goldfive.adapters._adk_plugin import …``
+# callsites in tests + PromptShaper).
+from goldfive.adapters.adk_llm_instrumentation import (  # noqa: F401
+    _RUNTIME_TOOLS_HINT_END,
+    _RUNTIME_TOOLS_HINT_PREFIX,
+    DEFAULT_AGENT_MAX_OUTPUT_TOKENS,
+    _apply_agent_max_output_tokens_cap,
+    _build_runtime_tools_hint,
+    _measure_request_chars,
+    _strip_prior_runtime_tools_hint,
+)
+
 # goldfive#268 — shared helpers for agent-name stem matching and
 # tokenisation. Lifted out of this module into
 # :mod:`goldfive.drift.capability_check` so the delegation-pin
@@ -66,22 +82,6 @@ from goldfive.state_store import (
     PENDING_DELEGATIONS_KEY,
     BindingSource,
     StateStore,
-)
-
-# Wave B2 — request-side ``LlmRequest`` mutation surface lives in
-# :mod:`goldfive.adapters.adk_llm_instrumentation`. Re-imported here so
-# the names resolve as module attributes of ``_adk_plugin`` (the
-# historical surface for the in-module ``before_model_callback``
-# references and external ``from goldfive.adapters._adk_plugin import …``
-# callsites in tests + PromptShaper).
-from goldfive.adapters.adk_llm_instrumentation import (  # noqa: F401
-    DEFAULT_AGENT_MAX_OUTPUT_TOKENS,
-    _apply_agent_max_output_tokens_cap,
-    _build_runtime_tools_hint,
-    _measure_request_chars,
-    _RUNTIME_TOOLS_HINT_END,
-    _RUNTIME_TOOLS_HINT_PREFIX,
-    _strip_prior_runtime_tools_hint,
 )
 
 if TYPE_CHECKING:
