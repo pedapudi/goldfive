@@ -88,30 +88,40 @@ def _make_quiet_llm() -> Any:
     return _Quiet
 
 
-class _RecordingSteerer:
-    """Steerer stub that records drift events routed through
-    ``_handle_drift`` so tests can assert on the RUNAWAY_DELEGATION
-    emission without spinning up a full ``DefaultSteerer``.
-    """
-
+class _RecordingDrift:
     def __init__(self) -> None:
-        self._sinks: list[Any] = []
         self.drifts: list[Any] = []
 
     async def observe(self, *a: Any, **kw: Any) -> None:
         pass
 
-    async def transition(self, *a: Any, **kw: Any) -> None:
-        pass
-
     def detect_drift(self, *a: Any, **kw: Any) -> None:
         return None
 
-    def bind(self, **kw: Any) -> None:
+    async def handle_drift(self, drift: Any, session: Any) -> None:  # noqa: ARG002
+        self.drifts.append(drift)
+
+
+class _RecordingSteerer:
+    """Steerer stub that records drift events routed through
+    ``drift.handle_drift`` so tests can assert on the
+    RUNAWAY_DELEGATION emission without spinning up a full
+    ``DefaultSteerer``. Component-namespaced per goldfive#410.
+    """
+
+    def __init__(self) -> None:
+        self._sinks: list[Any] = []
+        self.drift = _RecordingDrift()
+
+    @property
+    def drifts(self) -> list[Any]:
+        return self.drift.drifts
+
+    async def transition(self, *a: Any, **kw: Any) -> None:
         pass
 
-    async def _handle_drift(self, drift: Any, session: Any) -> None:  # noqa: ARG002
-        self.drifts.append(drift)
+    def bind(self, **kw: Any) -> None:
+        pass
 
 
 async def test_below_cap_runs_cleanly_with_no_drift() -> None:

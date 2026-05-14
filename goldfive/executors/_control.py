@@ -25,7 +25,7 @@ members and their raw string equivalents — ``ControlKind`` is a
 
 * ``PAUSE`` / ``RESUME`` — pause / unpause the run loop between tasks.
 * ``CANCEL`` — abort the run; executor emits ``RunAborted``.
-* ``STEER`` — feed the message to ``steerer.observe`` so the planner
+* ``STEER`` — feed the message to ``steerer.drift.observe`` so the planner
   can produce a fresh plan on the ``USER_STEER`` drift.
 * ``REWIND_TO`` — mark a task and every downstream task ``PENDING``
   so the executor re-walks them.
@@ -263,7 +263,7 @@ async def dispatch_control(
 
     if kind == "STEER":
         # The steer message is queued for the executor to feed through
-        # ``steerer.observe`` so the planner can produce a USER_STEER-
+        # ``steerer.drift.observe`` so the planner can produce a USER_STEER-
         # driven plan revision. Phase 2 of the path-duality fix: a
         # STEER also acts as a RESUME for any goldfive-initiated pause
         # — the executor honours that by treating ``steer_message`` as
@@ -333,7 +333,7 @@ async def dispatch_control(
         # (custom Steerers may not implement it); failures are
         # swallowed at debug — observability MUST NOT break the
         # control path.
-        emit_transition = getattr(steerer, "_emit_task_transitioned", None)
+        emit_transition = getattr(getattr(steerer, "tasks", None), "_emit_task_transitioned", None)
         if callable(emit_transition):
             for task, prev_status in transitions:
                 try:

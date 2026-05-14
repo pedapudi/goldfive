@@ -698,7 +698,7 @@ async def test_steerer_cancel_inflight_stamps_supersede_flag() -> None:
 
     # No adapter bound → request_invocation_cancel returns []. The
     # supersede stamp must STILL fire (it's set before the delegation).
-    flagged = await steerer._cancel_inflight_for_revision(drift, session)
+    flagged = await steerer.drift._cancel_inflight_for_revision(drift, session)
     assert flagged == []
     assert getattr(session, "_supersede_pending", False) is True, (
         "DefaultSteerer._cancel_inflight_for_revision must stamp "

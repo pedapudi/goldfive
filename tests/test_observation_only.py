@@ -281,7 +281,7 @@ async def test_warning_drift_observation_only_suppresses_all_three_injections(
 
         drift = _drift_warning(kind=DriftKind.OFF_TOPIC)
         with caplog.at_level(logging.INFO, logger="goldfive"):
-            await steerer._handle_drift(drift, session)
+            await steerer.drift.handle_drift(drift, session)
 
         # 1. The planner produced a revision exactly once (detection +
         # planner LLM unaffected by the gate). OFF_TOPIC + WARNING is on
@@ -379,7 +379,7 @@ async def test_warning_drift_active_steering_drives_all_three_injections() -> No
     try:
         prior_plan = session.plan
         drift = _drift_warning(kind=DriftKind.OFF_TOPIC)
-        await steerer._handle_drift(drift, session)
+        await steerer.drift.handle_drift(drift, session)
 
         refine_total = len(planner.refine_calls) + len(
             planner.refine_steer_calls
@@ -508,7 +508,7 @@ async def test_capability_mismatch_under_observation_only_suppresses_injections(
     same gated ``_handle_drift`` path: no cancel, no plan mutation.
 
     The ADK adapter's ``_maybe_emit_capability_mismatch`` builds a
-    DriftEvent and calls ``steerer._handle_drift(drift, session)``
+    DriftEvent and calls ``steerer.drift.handle_drift(drift, session)``
     directly (see ``goldfive/adapters/_adk_plugin.py``). We exercise the
     steerer side of that contract with a hand-built drift so the test
     is independent of the ADK adapter and runs without the ``google.adk``
@@ -530,7 +530,7 @@ async def test_capability_mismatch_under_observation_only_suppresses_injections(
         kind=DriftKind.CAPABILITY_MISMATCH,
         severity=DriftSeverity.CRITICAL,
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # Plan was NOT mutated.
     assert session.plan is prior_plan
@@ -577,7 +577,7 @@ async def test_info_drift_below_promotion_threshold_unchanged_by_flag() -> None:
             kind=DriftKind.CONFABULATION_RISK,
             severity=DriftSeverity.INFO,
         )
-        await steerer._handle_drift(drift, session)
+        await steerer.drift.handle_drift(drift, session)
 
         # OBSERVE: no refine, no plan revision, no cancel, no steer.
         assert planner.refine_calls == [], (
@@ -645,7 +645,7 @@ async def test_observe_reasoning_warning_verdict_under_observation_only() -> Non
     store.register_invocation_task("inv-live", fake_task)
     try:
         prior_plan = session.plan
-        await steerer.observe_reasoning("raccoons are nocturnal", session=session)
+        await steerer.drift.observe_reasoning("raccoons are nocturnal", session=session)
         pending = list(steerer._background_judges)
         await asyncio.gather(*pending, return_exceptions=True)
 
@@ -738,7 +738,7 @@ async def test_bootstrap_install_lands_under_observation_only() -> None:
     steerer.bind(sinks=[sink], planner=planner)
 
     initial = _initial_plan()
-    installed = await steerer.install_initial_plan(session=session, plan=initial)
+    installed = await steerer.plans.install_initial_plan(session=session, plan=initial)
     assert installed is True, "bootstrap must succeed"
 
     # session.plan was set (non-None) post-install.
@@ -798,7 +798,7 @@ async def test_user_authored_revision_lands_under_observation_only() -> None:
     # Drive the canonical user-authored install path. ``raw=None`` is
     # accepted: ``_unpack_steer_context`` falls back to drift.detail
     # when raw is absent.
-    installed = await steerer.install_revision_for_user_steer(
+    installed = await steerer.plans.install_revision_for_user_steer(
         session=session,
         raw=None,
         revised_plan=revised,
@@ -849,7 +849,7 @@ async def test_goldfive_corrective_drift_is_gated_under_observation_only() -> No
         kind=DriftKind.OFF_TOPIC,
         authored_by="goldfive",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # session.plan unchanged — gate held.
     assert session.plan is prior_plan, (
@@ -896,7 +896,7 @@ async def test_goldfive_corrective_drift_lands_with_observation_only_false() -> 
         kind=DriftKind.OFF_TOPIC,
         authored_by="goldfive",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # session.plan mutated to the revised plan.
     assert session.plan is not prior_plan, (
@@ -955,7 +955,7 @@ async def test_discovery_revision_lands_under_observation_only() -> None:
         authored_by="goldfive",
     )
 
-    installed = await steerer.install_revision_for_drift(
+    installed = await steerer.plans.install_revision_for_drift(
         session=session,
         drift=drift,
         revised_plan=revised,
@@ -1038,7 +1038,7 @@ async def test_discovery_revision_lands_under_observation_only_initial_plan_seed
         tasks=[Task(id="t1", title="Research solar panels")],
         edges=[],
     )
-    installed = await steerer.install_initial_plan(session=session, plan=initial)
+    installed = await steerer.plans.install_initial_plan(session=session, plan=initial)
     assert installed is True, "initial plan install must succeed"
 
     # session.plan was swapped from the empty seed onto the real plan.
@@ -1090,7 +1090,7 @@ async def test_discovery_via_install_revision_for_drift_under_observation_only()
         detail="the user asked a follow-up that surfaced new work",
         authored_by="goldfive",
     )
-    installed = await steerer.install_revision_for_drift(
+    installed = await steerer.plans.install_revision_for_drift(
         session=session,
         drift=drift,
         revised_plan=revised,

@@ -202,25 +202,37 @@ def test_cap_skips_when_request_has_no_config() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _CapturingSteerer:
-    """Capture every observation + drift the watcher emits.
-
-    Shape mirrors the live :class:`DefaultSteerer` interface enough for
-    the watcher's emission path: ``observe(obs, session)`` and
-    ``_emit_drift_detected(session, drift)``. The watcher writes to both;
-    we expose both for assertions.
-    """
-
+class _CapturingDrift:
     def __init__(self) -> None:
         self.observations: list[Any] = []
         self.emitted_drifts: list[Any] = []
-        self._sinks: list[Any] = []
 
     async def observe(self, observation: Any, session: Any) -> None:
         self.observations.append(observation)
 
     async def _emit_drift_detected(self, session: Any, drift: Any) -> None:
         self.emitted_drifts.append(drift)
+
+
+class _CapturingSteerer:
+    """Capture every observation + drift the watcher emits.
+
+    Shape mirrors the live :class:`DefaultSteerer` interface for the
+    watcher's emission path after goldfive#410: the watcher reaches
+    for ``steerer.drift.observe`` and ``steerer.drift._emit_drift_detected``.
+    """
+
+    def __init__(self) -> None:
+        self.drift = _CapturingDrift()
+        self._sinks: list[Any] = []
+
+    @property
+    def observations(self) -> list[Any]:
+        return self.drift.observations
+
+    @property
+    def emitted_drifts(self) -> list[Any]:
+        return self.drift.emitted_drifts
 
 
 def _make_session_context(steerer: Any) -> Any:

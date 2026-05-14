@@ -116,9 +116,9 @@ def test_reasoning_judge_cap_is_16384():
 
 
 def test_reflective_check_cap_is_16384():
-    from goldfive.steerer import DefaultSteerer
+    from goldfive.drift_observer import DriftObserver
 
-    assert DefaultSteerer.REFLECTIVE_MAX_OUTPUT_TOKENS == 16384
+    assert DriftObserver.REFLECTIVE_MAX_OUTPUT_TOKENS == 16384
 
 
 # ---------------------------------------------------------------------------

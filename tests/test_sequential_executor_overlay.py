@@ -62,25 +62,39 @@ class RecordingSink:
         return kinds
 
 
+class _OverlayDrift:
+    """Drift sub-component exposing ``observe`` / ``handle_drift``."""
+
+    def __init__(self) -> None:
+        self.observed: list[Any] = []
+
+    async def observe(self, event: Any, session: Session) -> None:  # noqa: ARG002
+        self.observed.append(event)
+
+    async def handle_drift(self, drift: DriftEvent, session: Session) -> None:  # noqa: ARG002
+        self.observed.append(drift)
+
+    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:  # noqa: ARG002
+        return None
+
+
 class StubSteerer:
     def __init__(self) -> None:
         self._sinks: list[EventSink] = []
         self._planner: Any = None
-        self.observed: list[Any] = []
+        self.drift = _OverlayDrift()
         self.transitions: list[tuple[str, TaskStatus]] = []
         # Full call record including detail/cancel_reason so tests can
         # assert on the structured reason strings the executor emits.
         self.transition_details: list[tuple[str, TaskStatus, str, str]] = []
 
+    @property
+    def observed(self) -> list[Any]:
+        return self.drift.observed
+
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks
         self._planner = planner
-
-    async def observe(self, event: Any, session: Session) -> None:  # noqa: ARG002
-        self.observed.append(event)
-
-    async def _handle_drift(self, drift: DriftEvent, session: Session) -> None:  # noqa: ARG002
-        self.observed.append(drift)
 
     async def transition(
         self,
@@ -105,9 +119,6 @@ class StubSteerer:
         )
         with channel_processor_active():
             set_session_plan(session, with_task_status(session.plan, task_id, to))
-
-    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:  # noqa: ARG002
-        return None
 
 
 class StubPlanner:
@@ -808,7 +819,7 @@ async def test_overlay_steer_restart_still_works() -> None:
     control-channel integration is covered in
     ``tests/test_overlay_steer.py``; this test is a belt-and-
     suspenders check that the restart loop in ``_run_overlay``
-    still routes STEERs to ``steerer.observe`` and re-invokes
+    still routes STEERs to ``steerer.drift.observe`` and re-invokes
     passthrough.
     """
     # We exercise the STEER branch through the real
@@ -881,7 +892,7 @@ async def test_overlay_steer_restart_still_works() -> None:
     assert any(
         str(getattr(getattr(o, "kind", None), "value", "")).upper() == "STEER"
         for o in steerer.observed
-    ), "steerer.observe was not called with the STEER message"
+    ), "steerer.drift.observe was not called with the STEER message"
     # No follow-up dispatch (even though we had a steer in the middle).
     assert adapter.follow_up_calls == []
 

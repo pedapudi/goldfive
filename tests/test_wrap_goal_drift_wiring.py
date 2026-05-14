@@ -537,7 +537,7 @@ async def test_goal_drift_judge_fires_when_wired() -> None:
 
     # Below interval -- no judge call yet.
     for _ in range(2):
-        await steerer.note_agent_turn(session)
+        await steerer.drift.note_agent_turn(session)
     # Drain any spawned judges (none expected below interval) so the
     # call-llm count assertion is post-judge.
     pending = list(steerer._background_judges)
@@ -546,7 +546,7 @@ async def test_goal_drift_judge_fires_when_wired() -> None:
     assert len(call_llm.calls) == 0  # type: ignore[attr-defined]
 
     # Third turn crosses the interval -> judge fires, drift is emitted.
-    await steerer.note_agent_turn(session)
+    await steerer.drift.note_agent_turn(session)
     pending = list(steerer._background_judges)
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)

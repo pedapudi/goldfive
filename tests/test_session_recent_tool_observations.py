@@ -54,7 +54,7 @@ def test_note_tool_observation_appends() -> None:
     steerer = DefaultSteerer()
     session = _make_session()
 
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="planner",
         task_id="t1",
@@ -92,7 +92,7 @@ def test_note_tool_observation_records_none_result_as_marker() -> None:
     steerer = DefaultSteerer()
     session = _make_session()
 
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="planner",
         task_id="t1",
@@ -124,7 +124,7 @@ def test_note_tool_observation_trims_to_max() -> None:
     assert cap == 16  # default per §3.1
 
     for i in range(cap + 5):
-        steerer.note_tool_observation(
+        steerer.drift.note_tool_observation(
             session,
             agent_name=f"a{i}",
             task_id="t1",
@@ -146,7 +146,7 @@ def test_note_tool_observation_respects_session_local_max_override() -> None:
     session.recent_tool_observations_max = 3
 
     for i in range(8):
-        steerer.note_tool_observation(
+        steerer.drift.note_tool_observation(
             session,
             agent_name=f"a{i}",
             task_id="t1",
@@ -169,7 +169,7 @@ def test_note_tool_observation_records_error_path() -> None:
     steerer = DefaultSteerer()
     session = _make_session()
 
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="worker",
         task_id="t2",
@@ -189,7 +189,7 @@ def test_note_tool_observation_records_error_dict_result() -> None:
     steerer = DefaultSteerer()
     session = _make_session()
 
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="worker",
         task_id="t3",
@@ -208,7 +208,7 @@ def test_note_tool_observation_record_error_string() -> None:
     steerer = DefaultSteerer()
     session = _make_session()
 
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="worker",
         task_id="t",
@@ -229,7 +229,7 @@ def test_note_tool_observation_truncates_long_error_messages() -> None:
     session = _make_session()
     long = "x" * 1000
 
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t",
@@ -253,7 +253,7 @@ def test_note_tool_observation_truncates_args_preview() -> None:
     steerer = DefaultSteerer()
     session = _make_session()
 
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t",
@@ -271,7 +271,7 @@ def test_note_tool_observation_truncates_result_preview() -> None:
     steerer = DefaultSteerer()
     session = _make_session()
 
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t",
@@ -295,7 +295,7 @@ def test_note_tool_observation_handles_unhashable_args() -> None:
     session = _make_session()
 
     # ``{"x": object()}`` is unhashable but ``repr`` works.
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t",
@@ -320,7 +320,7 @@ def test_note_tool_observation_handles_repr_failure_in_args() -> None:
 
     steerer = DefaultSteerer()
     session = _make_session()
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t",
@@ -355,7 +355,7 @@ def test_note_tool_observation_swallows_internal_errors() -> None:
         side_effect=RuntimeError("clock dead"),
     ):
         # Must not raise.
-        steerer.note_tool_observation(
+        steerer.drift.note_tool_observation(
             session,
             agent_name="w",
             task_id="t",
@@ -379,7 +379,7 @@ def test_note_tool_observation_zero_max_clamps_to_one() -> None:
     session.recent_tool_observations_max = 0
 
     for i in range(3):
-        steerer.note_tool_observation(
+        steerer.drift.note_tool_observation(
             session,
             agent_name=f"a{i}",
             task_id="t",
@@ -423,7 +423,7 @@ def test_note_tool_observation_per_task_filter_left_to_reader() -> None:
     steerer = DefaultSteerer()
     session = _make_session()
 
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t1",
@@ -431,7 +431,7 @@ def test_note_tool_observation_per_task_filter_left_to_reader() -> None:
         args={},
         result={},
     )
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t2",
@@ -455,7 +455,7 @@ def test_note_tool_observation_ts_ms_is_monotonic() -> None:
     session = _make_session()
 
     for i in range(5):
-        steerer.note_tool_observation(
+        steerer.drift.note_tool_observation(
             session,
             agent_name=f"a{i}",
             task_id="t",
@@ -477,7 +477,7 @@ def test_note_tool_observation_handles_none_args() -> None:
     """``args=None`` (some adapter edge cases) -> repr-shaped, no raise."""
     steerer = DefaultSteerer()
     session = _make_session()
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t",
@@ -493,7 +493,7 @@ def test_note_tool_observation_with_string_result() -> None:
     """Bare string ``result`` is repr-encoded, not flagged as error."""
     steerer = DefaultSteerer()
     session = _make_session()
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t",
@@ -517,7 +517,7 @@ def test_writer_accepts_arbitrary_any_types() -> None:
     arbitrary: Any = object()
     steerer = DefaultSteerer()
     session = _make_session()
-    steerer.note_tool_observation(
+    steerer.drift.note_tool_observation(
         session,
         agent_name="w",
         task_id="t",

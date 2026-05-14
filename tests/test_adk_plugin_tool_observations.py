@@ -44,10 +44,10 @@ from goldfive.types import DriftEvent, Session, Task  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-class _RecordingSteerer:
-    """Async-capable steerer stub that captures every drift + every observation entry.
+class _RecordingDrift:
+    """Drift sub-component capturing every observation + drift (post #410).
 
-    Holds a real ``DefaultSteerer.note_tool_observation`` so the
+    Holds a real ``DriftObserver.note_tool_observation`` so the
     integration test exercises the steerer's writer end-to-end. Tests
     that want to override the writer (e.g. to assert dispatch survives
     a writer failure) can monkeypatch ``note_tool_observation`` after
@@ -66,12 +66,27 @@ class _RecordingSteerer:
     async def observe(self, event: Any, session: Any) -> None:
         self.observations.append(event)
 
-    async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+    async def handle_drift(self, drift: DriftEvent, session: Any) -> None:
         self.drifts.append(drift)
 
     def note_tool_observation(self, *args: Any, **kwargs: Any) -> None:
         # Delegate to the real implementation under test.
-        self._real_steerer.note_tool_observation(*args, **kwargs)
+        self._real_steerer.drift.note_tool_observation(*args, **kwargs)
+
+
+class _RecordingSteerer:
+    """Async-capable steerer stub that captures every drift + every observation entry."""
+
+    def __init__(self) -> None:
+        self.drift = _RecordingDrift()
+
+    @property
+    def observations(self) -> list[Any]:
+        return self.drift.observations
+
+    @property
+    def drifts(self) -> list[DriftEvent]:
+        return self.drift.drifts
 
 
 def _plugin_with_ctx(task: Task, session: Session, steerer: Any):
@@ -231,7 +246,7 @@ async def test_on_tool_error_callback_records_observation() -> None:
     assert entry["tool_name"] == "web_search"
     # ``on_tool_error`` doesn't get a result -- writer marks it as none.
     assert entry["result_preview"] == "(none)"
-    # The existing one-shot ``Observation`` for steerer.observe still
+    # The existing one-shot ``Observation`` for steerer.drift.observe still
     # fires alongside the new buffer write.
     assert len(steerer.observations) == 1
 
@@ -267,7 +282,7 @@ async def test_observation_does_not_break_on_buffer_failure_after_tool() -> None
     def _raise(*_a: Any, **_kw: Any) -> None:
         raise RuntimeError("buffer broken")
 
-    steerer.note_tool_observation = _raise  # type: ignore[assignment]
+    steerer.drift.note_tool_observation = _raise  # type: ignore[assignment]
 
     session = Session(run_id="run-iter10-pr2-broken")
     task = Task(id="t1", title="Task", assignee_agent_id="worker")
@@ -293,7 +308,7 @@ async def test_observation_does_not_break_on_buffer_failure_on_error() -> None:
     def _raise(*_a: Any, **_kw: Any) -> None:
         raise RuntimeError("buffer broken")
 
-    steerer.note_tool_observation = _raise  # type: ignore[assignment]
+    steerer.drift.note_tool_observation = _raise  # type: ignore[assignment]
 
     session = Session(run_id="run-iter10-pr2-broken-on-err")
     task = Task(id="t1", title="Task", assignee_agent_id="worker")

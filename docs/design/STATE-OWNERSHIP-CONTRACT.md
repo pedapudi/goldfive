@@ -161,7 +161,7 @@ The following writes touch `goldfive.types.Session.state` (the goldfive-owned di
 | `goldfive/orchestration_state.py:185` | `state.pop(key, None)` | Same as above. |
 | `goldfive/_correction_injection.py:217` | `state[key] = dict(correction)` | Caller is `write_correction`, takes a `goldfive.Session`; key is `goldfive.pending_corrections.*`. The bridge V2 mirrors to ADK. |
 | `goldfive/_correction_injection.py:352, :394` | `state.pop(key, None)` | Same. |
-| `goldfive/steerer.py:4602` | `state[_ostate.KEY_CURRENT_TASK_ID] = resolved` | Inside `_emit_plan_revised`'s supersession-rewrite path; `state` is the goldfive `Session.state`. |
+| `goldfive/plan_reviser.py:1322` | `state[_ostate.KEY_CURRENT_TASK_ID] = resolved` | Inside `PlanReviser._emit_plan_revised`'s supersession-rewrite path; `state` is the goldfive `Session.state`. (Moved from `goldfive/steerer.py` in #410 facade-cleanup.) |
 | `goldfive/adapters/_adk_state_protocol.py:159` etc. | `state[key] = value` inside the protocol module's `_set` and the `set_*_on_adk_state` helpers. | These are the *helpers* that target the ADK side. The violations are at the **call sites** (V1-V5), not in the helper itself. The tripwire flags the call sites (which run inside callbacks) and lets the helpers themselves run uninstrumented. |
 
 ## 6. Edge cases the contract explicitly addresses

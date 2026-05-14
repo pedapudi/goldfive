@@ -190,7 +190,7 @@ async def test_goldfive_steer_promotes_at_warning_severity() -> None:
         detail="agent wandered into raccoons",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # refine_steer was called (not the generic refine path).
     assert len(planner.refine_steer_calls) == 1
@@ -218,7 +218,7 @@ async def test_goldfive_steer_does_not_promote_at_info_severity() -> None:
         detail="minor wander",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # INFO drift -> ladder OBSERVE. No refine of either flavour runs.
     assert planner.refine_steer_calls == []
@@ -253,7 +253,7 @@ async def test_goldfive_steer_suppressed_when_user_steer_active() -> None:
         id="ctl-user",
         payload={"note": "focus on X", "annotation_id": "ann_user"},
     )
-    await steerer.observe(user_msg, session)
+    await steerer.drift.observe(user_msg, session)
     user_at_turn = session.state[_ostate.KEY_ACTIVE_STEER_AT_TURN]
     user_body = session.state[_ostate.KEY_ACTIVE_STEER_BODY]
     user_refine_steer_calls = len(planner.refine_steer_calls)
@@ -267,7 +267,7 @@ async def test_goldfive_steer_suppressed_when_user_steer_active() -> None:
         detail="agent drifting",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # No new refine_steer call (the user steer's refine already ran via
     # planner.refine, but the goldfive promotion must NOT have called
@@ -302,7 +302,7 @@ async def test_goldfive_steer_fires_when_user_steer_stale() -> None:
         id="ctl-stale",
         payload={"note": "initial", "annotation_id": "ann_stale"},
     )
-    await steerer.observe(user_msg, session)
+    await steerer.drift.observe(user_msg, session)
     # Advance sequence beyond the window.
     session._next_sequence += 10
 
@@ -312,7 +312,7 @@ async def test_goldfive_steer_fires_when_user_steer_stale() -> None:
         detail="fresh detector fire",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # refine_steer fired now (stale user steer shouldn't block).
     assert len(planner.refine_steer_calls) == 1
@@ -334,7 +334,7 @@ async def test_goldfive_steer_cancel_reason_off_topic() -> None:
         detail="wander",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     assert adapter._next_cancel_reason == "goldfive_off_topic"
 
 
@@ -346,7 +346,7 @@ async def test_goldfive_steer_cancel_reason_intent_divergence_critical() -> None
         detail="diverged",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     assert adapter._next_cancel_reason == "goldfive_intent_divergence"
 
 
@@ -364,7 +364,7 @@ async def test_goldfive_steer_body_from_drift_detail() -> None:
         detail="agent acknowledged discrepancy but chose to adopt expanded topic",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     assert (
         session.state[_ostate.KEY_ACTIVE_STEER_BODY]
         == "agent acknowledged discrepancy but chose to adopt expanded topic"
@@ -380,7 +380,7 @@ async def test_goldfive_steer_body_fallback_when_detail_empty() -> None:
         detail="",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     body = session.state[_ostate.KEY_ACTIVE_STEER_BODY]
     assert "Goldfive detected" in body
     assert "OFF_TOPIC" in body
@@ -402,7 +402,7 @@ async def test_goldfive_steer_threshold_off_disables_promotion() -> None:
         detail="even critical stays legacy",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # No refine_steer call (promotion disabled).
     assert planner.refine_steer_calls == []
@@ -430,7 +430,7 @@ async def test_goldfive_steer_threshold_critical_skips_warning() -> None:
         detail="warning-only",
         current_task_id="t2",
     )
-    await steerer._handle_drift(warn, session)
+    await steerer.drift.handle_drift(warn, session)
     assert planner.refine_steer_calls == []
 
     # CRITICAL -> promoted (distinct task so the outcome gate doesn't gate it).
@@ -440,7 +440,7 @@ async def test_goldfive_steer_threshold_critical_skips_warning() -> None:
         detail="critical-promoted",
         current_task_id="t1",
     )
-    await steerer._handle_drift(crit, session)
+    await steerer.drift.handle_drift(crit, session)
     assert len(planner.refine_steer_calls) == 1
 
 
@@ -459,7 +459,7 @@ async def test_processed_steer_ids_records_goldfive_drift_id() -> None:
         current_task_id="t2",
     )
     drift_id = drift.id
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     processed = session.state.get(_ostate.KEY_PROCESSED_STEER_IDS, [])
     assert drift_id in processed
 
@@ -477,7 +477,7 @@ async def test_user_steer_drift_event_authored_by_user() -> None:
         id="ctl-user",
         payload={"note": "focus", "annotation_id": "ann_1"},
     )
-    await steerer.observe(msg, session)
+    await steerer.drift.observe(msg, session)
     steer_drifts = [
         e
         for e in _drift_detected_events(sink)
@@ -498,7 +498,7 @@ async def test_goldfive_drift_event_authored_by_goldfive_when_unset() -> None:
         detail="boom",
         current_task_id="t2",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     evts = _drift_detected_events(sink)
     assert evts
     assert all(e.drift_detected.authored_by == "goldfive" for e in evts)
@@ -513,7 +513,7 @@ async def test_suppressed_drift_event_wire_flag() -> None:
     """DriftDetected carries suppressed_by_user_steer=True on suppression."""
     steerer, session, sink, planner, _adapter = _bind(window=5)
     # User steer first.
-    await steerer.observe(
+    await steerer.drift.observe(
         ControlMessage(
             kind=ControlKind.STEER,
             id="ctl-user-sup",
@@ -529,7 +529,7 @@ async def test_suppressed_drift_event_wire_flag() -> None:
         current_task_id="t2",
     )
     refine_steer_before = len(planner.refine_steer_calls)
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     assert len(planner.refine_steer_calls) == refine_steer_before
     matching = [

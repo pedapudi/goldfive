@@ -370,7 +370,7 @@ def test_f3_allows_dispatch_when_next_pending_is_same_agent() -> None:
 def test_f4_goal_drift_warning_routes_to_nudge() -> None:
     """F4: WARNING-severity GOAL_DRIFT -> NUDGE (queue corrective msg)."""
     steerer = DefaultSteerer()
-    level = steerer._ladder_level_for(
+    level = steerer.drift._ladder_level_for(
         DriftKind.GOAL_DRIFT, DriftSeverity.WARNING, occurrence_count=0
     )
     assert level is InterventionLevel.NUDGE
@@ -383,7 +383,7 @@ def test_f4_goal_drift_critical_first_routes_to_nudge() -> None:
     NUDGE first so the corrective user message re-anchors the LLM
     without refining a plan that's already correct."""
     steerer = DefaultSteerer()
-    level = steerer._ladder_level_for(
+    level = steerer.drift._ladder_level_for(
         DriftKind.GOAL_DRIFT, DriftSeverity.CRITICAL, occurrence_count=0
     )
     assert level is InterventionLevel.NUDGE
@@ -395,7 +395,7 @@ def test_f4_goal_drift_critical_repeat_routes_to_cancel_reinvoke() -> None:
     PAUSE_ESCALATE is the last-resort fallback the default ladder
     surfaces only after CANCEL_REINVOKE also fails to break the loop."""
     steerer = DefaultSteerer()
-    level = steerer._ladder_level_for(
+    level = steerer.drift._ladder_level_for(
         DriftKind.GOAL_DRIFT,
         DriftSeverity.CRITICAL,
         occurrence_count=DefaultSteerer.REFINE_FAILURE_THRESHOLD,

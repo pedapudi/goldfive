@@ -95,21 +95,45 @@ class NoopSink:
         return None
 
 
-class RecordingSteerer:
-    """Steerer fake that surfaces any drift the adapter attached to
-    ``InvocationResult.raw['_drift_to_surface']`` and records observed
-    events.
+class _RecordingDrift:
+    """Drift sub-component for :class:`RecordingSteerer`.
+
+    Implements only the surface the parallel executor reaches for:
+    ``observe`` and ``detect_drift``. Surfaces an attached drift from
+    ``InvocationResult.raw['_drift_to_surface']`` so tests can stage
+    arbitrary drift shapes without driving real detection.
     """
 
     def __init__(self) -> None:
         self.observed: list[Any] = []
-        self.bound_sinks: list | None = None
-
-    def bind(self, *, sinks: list, planner: Any) -> None:
-        self.bound_sinks = sinks
 
     async def observe(self, event: Any, session: Session) -> None:
         self.observed.append(event)
+
+    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
+        if isinstance(event, InvocationResult):
+            raw = event.raw or {}
+            if isinstance(raw, dict):
+                return raw.get("_drift_to_surface")
+        return None
+
+
+class RecordingSteerer:
+    """Steerer fake that surfaces any drift the adapter attached to
+    ``InvocationResult.raw['_drift_to_surface']`` and records observed
+    events.  Component-namespaced shape per goldfive#410.
+    """
+
+    def __init__(self) -> None:
+        self.drift = _RecordingDrift()
+        self.bound_sinks: list | None = None
+
+    @property
+    def observed(self) -> list[Any]:
+        return self.drift.observed
+
+    def bind(self, *, sinks: list, planner: Any) -> None:
+        self.bound_sinks = sinks
 
     async def transition(  # pragma: no cover - not exercised here
         self,
@@ -120,13 +144,6 @@ class RecordingSteerer:
         session: Session,
         cancel_reason: str = "",
     ) -> None:
-        return None
-
-    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
-        if isinstance(event, InvocationResult):
-            raw = event.raw or {}
-            if isinstance(raw, dict):
-                return raw.get("_drift_to_surface")
         return None
 
 
@@ -898,7 +915,7 @@ async def test_repeated_refine_failure_aborts_run() -> None:
 
 @pytest.mark.asyncio
 async def test_observer_exception_emits_pipeline_failure_drift() -> None:
-    """``steerer.observe`` raising must emit an INFO ``CUSTOM`` drift.
+    """``steerer.drift.observe`` raising must emit an INFO ``CUSTOM`` drift.
 
     Previously the executor would ``log.debug`` and set ``drift = None``,
     leaving sinks unaware the drift pipeline had silently failed for
@@ -907,12 +924,17 @@ async def test_observer_exception_emits_pipeline_failure_drift() -> None:
     plumbing failure is durably visible.
     """
 
-    class RaisingSteerer(RecordingSteerer):
+    class _RaisingDrift(_RecordingDrift):
         async def observe(self, event: Any, session: Session) -> None:
             raise RuntimeError("classifier exploded")
 
         def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
             return None  # pragma: no cover - never reached; observe raises
+
+    class RaisingSteerer(RecordingSteerer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.drift = _RaisingDrift()
 
     adapter = TracingAdapter(delay=0.005)
     sink = NoopSink()
@@ -937,7 +959,7 @@ async def test_observer_exception_emits_pipeline_failure_drift() -> None:
     ]
     assert pipeline_failures, (
         "expected at least one INFO CUSTOM drift with "
-        "'drift_pipeline_failed:' prefix after steerer.observe raised"
+        "'drift_pipeline_failed:' prefix after steerer.drift.observe raised"
     )
     assert (
         pipeline_failures[0].drift_detected.severity

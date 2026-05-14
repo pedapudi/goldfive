@@ -182,7 +182,7 @@ async def test_drain_cancels_in_flight_drift_at_run_boundary() -> None:
 
     # Mid-run: a reporting tool fires mark_task_failed which dispatches
     # the cascade fire-and-forget on _background_drifts.
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session, reason="boom", recoverable=True
     )
     assert len(steerer._background_drifts) == 1
@@ -191,7 +191,7 @@ async def test_drain_cancels_in_flight_drift_at_run_boundary() -> None:
     await asyncio.wait_for(slow_planner.refine_started.wait(), timeout=2.0)
 
     t0 = time.monotonic()
-    await steerer.drain_session_background_tasks(
+    await steerer.drift.drain_session_background_tasks(
         session_id="s-leak", timeout=0.5
     )
     elapsed = time.monotonic() - t0
@@ -217,17 +217,17 @@ async def test_drain_is_idempotent() -> None:
     steerer.bind(sinks=[_ListSink()], planner=slow_planner)
     session = _make_session(session_id="s-idem")
 
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session, reason="boom", recoverable=True
     )
     await asyncio.wait_for(slow_planner.refine_started.wait(), timeout=2.0)
 
-    await steerer.drain_session_background_tasks(
+    await steerer.drift.drain_session_background_tasks(
         session_id="s-idem", timeout=0.5
     )
     assert steerer._background_drifts == set()
     # Second call: empty set, must be a no-op (and must NOT raise).
-    await steerer.drain_session_background_tasks(
+    await steerer.drift.drain_session_background_tasks(
         session_id="s-idem", timeout=0.5
     )
     assert steerer._background_drifts == set()
@@ -248,16 +248,16 @@ async def test_drain_is_session_scoped() -> None:
     session_a = _make_session(session_id="s-A")
     session_b = _make_session(session_id="s-B")
 
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session_a, reason="boom", recoverable=True
     )
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session_b, reason="boom", recoverable=True
     )
     assert len(steerer._background_drifts) == 2
 
     # Drain only session A. Session B's task must survive.
-    await steerer.drain_session_background_tasks(
+    await steerer.drift.drain_session_background_tasks(
         session_id="s-A", timeout=0.5
     )
     surviving = list(steerer._background_drifts)
@@ -304,7 +304,7 @@ async def test_drain_post_abort_no_drift_detected_emitted() -> None:
     steerer.bind(sinks=[sink], planner=slow_planner)
     session = _make_session(session_id="s-post-abort")
 
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session, reason="boom", recoverable=True
     )
     await asyncio.wait_for(slow_planner.refine_started.wait(), timeout=2.0)
@@ -313,7 +313,7 @@ async def test_drain_post_abort_no_drift_detected_emitted() -> None:
         1 for e in sink.events if _payload_kind(e) == "drift_detected"
     )
 
-    await steerer.drain_session_background_tasks(
+    await steerer.drift.drain_session_background_tasks(
         session_id="s-post-abort", timeout=0.5
     )
     # The drain returned. Give the loop a couple of yields to let any
@@ -369,14 +369,14 @@ async def test_drain_does_not_touch_user_steer_drifts() -> None:
     # Direct path: _handle_drift is the route observe() takes for
     # user-authored drifts. The fact that it does NOT spawn anything
     # onto _background_drifts is the structural guarantee we want.
-    await steerer._handle_drift(user_drift, session)
+    await steerer.drift.handle_drift(user_drift, session)
 
     # No background tasks were created — the USER_STEER cascade ran
     # synchronously inline.
     assert steerer._background_drifts == set()
     # Therefore the drain has nothing to do for this session — it
     # cannot accidentally cancel operator-authored intent.
-    await steerer.drain_session_background_tasks(
+    await steerer.drift.drain_session_background_tasks(
         session_id="s-user", timeout=0.5
     )
 
@@ -397,12 +397,12 @@ async def test_drain_runs_at_every_run_boundary_not_just_last() -> None:
 
     # Turn 1 — fresh session.
     session_turn_1 = _make_session(session_id="s-turn-1")
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session_turn_1, reason="boom", recoverable=True
     )
     assert len(steerer._background_drifts) == 1
     await asyncio.wait_for(slow_planner.refine_started.wait(), timeout=2.0)
-    await steerer.drain_session_background_tasks(
+    await steerer.drift.drain_session_background_tasks(
         session_id="s-turn-1", timeout=0.5
     )
     assert steerer._background_drifts == set()
@@ -415,12 +415,12 @@ async def test_drain_runs_at_every_run_boundary_not_just_last() -> None:
     # steerer's spawn path: a new drift dispatched here lands on the
     # set and is cancellable by turn 2's drain.
     session_turn_2 = _make_session(session_id="s-turn-2")
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session_turn_2, reason="boom again", recoverable=True
     )
     assert len(steerer._background_drifts) == 1
     await asyncio.wait_for(slow_planner.refine_started.wait(), timeout=2.0)
-    await steerer.drain_session_background_tasks(
+    await steerer.drift.drain_session_background_tasks(
         session_id="s-turn-2", timeout=0.5
     )
     assert steerer._background_drifts == set()
@@ -438,13 +438,13 @@ async def test_drain_empty_session_id_warns_and_no_ops() -> None:
     steerer.bind(sinks=[_ListSink()], planner=slow_planner)
     session = _make_session(session_id="s-empty-guard")
 
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session, reason="boom", recoverable=True
     )
     assert len(steerer._background_drifts) == 1
 
     # Empty session_id: must NOT cancel the in-flight task.
-    await steerer.drain_session_background_tasks(session_id="", timeout=0.5)
+    await steerer.drift.drain_session_background_tasks(session_id="", timeout=0.5)
     assert len(steerer._background_drifts) == 1
 
     # Cleanup.
@@ -548,7 +548,7 @@ async def test_executor_run_aborted_drains_in_flight_drift_end_to_end() -> None:
         # Mid-invocation: a reporting tool would call mark_task_failed,
         # which spawns the fire-and-forget refine cascade on the slow
         # planner. fail_fast=True will then abort the run.
-        await steerer.mark_task_failed(
+        await steerer.tasks.mark_task_failed(
             task.id, session=session, reason="boom", recoverable=False
         )
         # Give the spawned task a yield to actually start the refine.

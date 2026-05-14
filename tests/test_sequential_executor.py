@@ -61,23 +61,37 @@ class RecordingSink:
         return kinds
 
 
+class _StubDrift:
+    """Drift sub-component for :class:`StubSteerer` (goldfive#410)."""
+
+    def __init__(self) -> None:
+        self.observed: list[Any] = []
+
+    async def observe(self, event: Any, session: Session) -> None:
+        self.observed.append(event)
+
+    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
+        return None
+
+
 class StubSteerer:
     """Minimal Steerer stub that just forwards reporting-tool calls into
     plan.Task.status mutations. Acts as the central authority over task state
-    the way a real Steerer would.
+    the way a real Steerer would.  Component-namespaced per goldfive#410.
     """
 
     def __init__(self) -> None:
         self._sinks: list[EventSink] = []
         self._planner: Any = None
-        self.observed: list[Any] = []
+        self.drift = _StubDrift()
+
+    @property
+    def observed(self) -> list[Any]:
+        return self.drift.observed
 
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks
         self._planner = planner
-
-    async def observe(self, event: Any, session: Session) -> None:
-        self.observed.append(event)
 
     async def transition(
         self,
@@ -100,9 +114,6 @@ class StubSteerer:
         )
         with channel_processor_active():
             set_session_plan(session, with_task_status(session.plan, task_id, to))
-
-    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
-        return None
 
 
 class StubPlanner:
@@ -1250,7 +1261,7 @@ async def test_max_task_invocations_explicit_cap_honored() -> None:
 
 
 async def test_observer_exception_emits_pipeline_failure_drift() -> None:
-    """``steerer.observe`` raising must emit an INFO ``CUSTOM`` drift.
+    """``steerer.drift.observe`` raising must emit an INFO ``CUSTOM`` drift.
 
     goldfive#134: a bug in the drift pipeline used to be swallowed at
     ``log.debug`` level. The run now surfaces an INFO ``CUSTOM`` drift
@@ -1263,9 +1274,14 @@ async def test_observer_exception_emits_pipeline_failure_drift() -> None:
     planner = StubPlanner()
     sink = RecordingSink()
 
-    class RaisingSteerer(StubSteerer):
+    class _RaisingDrift(_StubDrift):
         async def observe(self, event: Any, session: Session) -> None:
             raise RuntimeError("classifier exploded")
+
+    class RaisingSteerer(StubSteerer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.drift = _RaisingDrift()
 
     steerer = RaisingSteerer()
 
@@ -1304,7 +1320,7 @@ async def test_observer_exception_emits_pipeline_failure_drift() -> None:
     ]
     assert pipeline_failures, (
         "expected an INFO CUSTOM 'drift_pipeline_failed' drift after "
-        "steerer.observe raised"
+        "steerer.drift.observe raised"
     )
     assert (
         pipeline_failures[0].drift_detected.severity

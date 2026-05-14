@@ -274,7 +274,7 @@ class GoldfivePlanner(BasePlanner):
         via log.debug).
     session:
         Optional :class:`~goldfive.types.Session` passed to
-        ``steerer._handle_drift``. Same binding contract as
+        ``steerer.drift.handle_drift``. Same binding contract as
         ``steerer`` — set by the adapter when it auto-attaches.
     """
 
@@ -614,7 +614,7 @@ class GoldfivePlanner(BasePlanner):
         return None
 
     # ------------------------------------------------------------------
-    # Drift emission — plumbed through steerer._handle_drift to hit
+    # Drift emission — plumbed through steerer.drift.handle_drift to hit
     # the same pipeline PlanReconciler / RUNAWAY_DELEGATION use.
     # ------------------------------------------------------------------
 
@@ -626,7 +626,7 @@ class GoldfivePlanner(BasePlanner):
         kind_name: str,
         detail: str,
     ) -> None:
-        """Emit a structural tool-call drift via ``steerer._handle_drift``.
+        """Emit a structural tool-call drift via ``steerer.drift.handle_drift``.
 
         ``kind_name`` selects which :class:`DriftKind` member to fire
         — one of ``"PLAN_DIVERGENCE"`` (cross-layer delegation) or
@@ -639,7 +639,7 @@ class GoldfivePlanner(BasePlanner):
         whether to escalate via the intervention ladder (#142) or let
         it ride.
 
-        Routed through ``steerer._handle_drift`` (pre-built
+        Routed through ``steerer.drift.handle_drift`` (pre-built
         :class:`DriftEvent` path) matching the reconciler's
         convention — :meth:`observe` would round-trip the event back
         through classification and drop it.
@@ -693,10 +693,10 @@ class GoldfivePlanner(BasePlanner):
             current_agent_id=function_call_name,
             observed_revision_index=_observed_rev,
         )
-        handle = getattr(steerer, "_handle_drift", None)
+        handle = getattr(getattr(steerer, "drift", None), "handle_drift", None)
         if not callable(handle):
             log.debug(
-                "GoldfivePlanner: steerer has no _handle_drift; %s signal dropped",
+                "GoldfivePlanner: steerer.drift has no handle_drift; %s signal dropped",
                 kind_name,
             )
             return

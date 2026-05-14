@@ -568,7 +568,7 @@ async def test_steerer_observe_reasoning_threads_available_agents() -> None:
     steerer.bind(sinks=[sink], planner=NullPlanner())
     steerer.bind_adapter(_StubAdapterWithTree())
     session = _brussels_sprouts_session()
-    await steerer.observe_reasoning(
+    await steerer.drift.observe_reasoning(
         (
             "draft_slides is assigned to me. I'll delegate to "
             "web_developer_agent to build the actual slide content."
@@ -618,7 +618,7 @@ async def test_steerer_observe_reasoning_no_adapter_keeps_default_prompt() -> No
     # return None and the judge prompt should look pre-#244.
     steerer.bind(sinks=[sink], planner=NullPlanner())
     session = _brussels_sprouts_session()
-    await steerer.observe_reasoning(
+    await steerer.drift.observe_reasoning(
         "Drafting slides for the deck.",
         session=session,
         agent_name="coordinator_agent",

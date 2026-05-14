@@ -890,7 +890,9 @@ class Runner:
                     authored_by="goldfive",
                 )
                 emit_helper = getattr(
-                    self.steerer, "_emit_drift_detected", None
+                    getattr(self.steerer, "drift", None),
+                    "_emit_drift_detected",
+                    None,
                 )
                 if callable(emit_helper):
                     try:
@@ -1477,7 +1479,7 @@ class Runner:
             try:
                 await steerer_shutdown()
             except Exception as exc:  # noqa: BLE001
-                log.warning("steerer.shutdown() raised: %s", exc)
+                log.warning("steerer.drift.shutdown() raised: %s", exc)
         for sink in self.sinks:
             try:
                 await sink.close()
@@ -1681,7 +1683,7 @@ class Runner:
                         if session.plan is not None
                         else "<none>",
                     )
-                installed = await self.steerer.install_initial_plan(
+                installed = await self.steerer.plans.install_initial_plan(
                     session=session, plan=revised_plan, is_pivot=is_pivot
                 )
             else:
@@ -1703,7 +1705,7 @@ class Runner:
                     detail=user_text,
                     authored_by="goldfive",
                 )
-                installed = await self.steerer.install_revision_for_drift(
+                installed = await self.steerer.plans.install_revision_for_drift(
                     session=session,
                     drift=drift,
                     revised_plan=revised_plan,

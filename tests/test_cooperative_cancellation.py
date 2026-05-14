@@ -549,7 +549,7 @@ async def test_info_drift_does_not_request_cancel() -> None:
         current_task_id="t1",
         current_agent_id="sub_agent",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     # No cancel was flagged for any invocation.
     assert plugin.peek_cancel_for_invocation("inv-A") is None
 
@@ -573,7 +573,7 @@ async def test_critical_drift_requests_cancel() -> None:
         current_task_id="t1",
         current_agent_id="sub_agent",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
     # Cancel was flagged for the resolved invocation id.
     req = plugin.peek_cancel_for_invocation("inv-A")
     assert req is not None
@@ -600,7 +600,7 @@ async def test_cancel_noop_when_no_active_invocation() -> None:
         # No current_agent_id / current_task_id either.
     )
     # Does not raise.
-    flagged = await steerer.request_invocation_cancel(drift=drift, session=session)
+    flagged = await steerer.drift.request_invocation_cancel(drift=drift, session=session)
     assert flagged == []
 
 
@@ -718,7 +718,7 @@ async def test_user_steer_drift_bypasses_severity_gate() -> None:
     # The user-authored drift goes through _handle_drift's promotion
     # path before cancel is considered; ensure the directly-reachable
     # cancel API honours the bypass.
-    flagged = await steerer.request_invocation_cancel(drift=drift, session=session)
+    flagged = await steerer.drift.request_invocation_cancel(drift=drift, session=session)
     assert "inv-A" in flagged
 
 
@@ -784,7 +784,7 @@ class _ReasoningLlmResponse:
     """LlmResponse-shaped stub carrying both a regular text part and a
     thought part. ``_extract_reasoning`` picks up the thought; the
     after_model_callback path also runs ``_extract_text_parts`` which
-    reads the non-thought text for the regular ``steerer.observe``
+    reads the non-thought text for the regular ``steerer.drift.observe``
     fan-out.
     """
 
@@ -798,11 +798,8 @@ class _ReasoningLlmResponse:
         self.finish_reason = None
 
 
-class _SteererSpy:
-    """Wraps a real :class:`DefaultSteerer` so a test can assert which
-    of ``observe`` / ``observe_reasoning`` / ``note_llm_call`` ran on
-    a given ``after_model_callback`` invocation.
-    """
+class _DriftSpy:
+    """Spying drift sub-component (post #410)."""
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
@@ -820,13 +817,40 @@ class _SteererSpy:
 
     async def note_llm_call(self, session: Any) -> None:
         self.note_llm_calls += 1
-        # Forward to inner so the counter on the real steerer advances
-        # only when we actually delegate (no-op anyway when the inner
-        # steerer wasn't given a reflective_call_llm).
         await self._inner.note_llm_call(session)
 
-    # Plugin reads other attrs (e.g. ``request_invocation_cancel``,
-    # ``_background_judges``) directly off the steerer; forward those.
+    # Plugin reads other attrs (e.g. ``request_invocation_cancel``)
+    # directly off the drift component; forward them.
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _SteererSpy:
+    """Wraps a real :class:`DefaultSteerer` so a test can assert which
+    of ``observe`` / ``observe_reasoning`` / ``note_llm_call`` ran on
+    a given ``after_model_callback`` invocation.  Component-namespaced
+    per goldfive#410.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        # Wrap the inner steerer's drift sub-component with a spy.
+        self.drift = _DriftSpy(inner.drift)
+
+    @property
+    def observe_calls(self) -> int:
+        return self.drift.observe_calls
+
+    @property
+    def observe_reasoning_calls(self) -> int:
+        return self.drift.observe_reasoning_calls
+
+    @property
+    def note_llm_calls(self) -> int:
+        return self.drift.note_llm_calls
+
+    # Plugin reads other attrs (e.g. ``_background_judges``) directly
+    # off the steerer; forward those.
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
@@ -861,14 +885,14 @@ async def test_observe_reasoning_skipped_after_cancel(caplog: Any) -> None:
     """When the invocation is flagged cancelled, the
     after_model_callback path:
 
-    * Does NOT call ``steerer.observe_reasoning`` (the reasoning judge
+    * Does NOT call ``steerer.drift.observe_reasoning`` (the reasoning judge
       / pattern detectors don't run on zombie reasoning).
     * Does NOT spawn a background judge task — ``_background_judges``
       is unchanged.
     * Does NOT bump the reflective-check counter via ``note_llm_call``.
     * Logs the "skipping observe_reasoning for cancelled invocation"
       debug line.
-    * Still runs the regular ``steerer.observe`` LLM-response fan-out
+    * Still runs the regular ``steerer.drift.observe`` LLM-response fan-out
       (operators need the cancelled turn's text observable; the gate
       is local to reasoning).
     """
@@ -949,7 +973,7 @@ async def test_observe_reasoning_runs_when_not_cancelled() -> None:
 
 async def test_observe_reasoning_skip_does_not_break_other_observation() -> None:
     """The cancel gate must be local to the reasoning + reflective
-    paths. The plain ``steerer.observe`` LLM-response fan-out (kind=
+    paths. The plain ``steerer.drift.observe`` LLM-response fan-out (kind=
     'llm_response') should fire even on cancelled invocations so
     operators retain visibility into the cancelled turn's text.
     """
@@ -967,14 +991,15 @@ async def test_observe_reasoning_skip_does_not_break_other_observation() -> None
 
     # Capture observations the steerer received via the regular
     # observation path so we can confirm it was the llm_response fan-out.
+    # goldfive#410: ``observe`` now lives on the drift sub-component.
     observed: list[Any] = []
-    real_observe = spy._inner.observe  # noqa: SLF001
+    real_observe = spy._inner.drift.observe  # noqa: SLF001
 
     async def _capturing_observe(observation: Any, session: Any) -> None:
         observed.append(observation)
         await real_observe(observation, session)
 
-    spy._inner.observe = _capturing_observe  # type: ignore[method-assign] # noqa: SLF001
+    spy._inner.drift.observe = _capturing_observe  # type: ignore[method-assign] # noqa: SLF001
 
     await plugin.after_model_callback(
         callback_context=cb_ctx,

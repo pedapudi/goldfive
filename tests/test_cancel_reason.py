@@ -100,7 +100,7 @@ async def test_upstream_failure_stamps_reason() -> None:
     sink = _ListSink()
     steerer.bind(sinks=[sink], planner=_StubPlanner())
 
-    await steerer.mark_task_failed(
+    await steerer.tasks.mark_task_failed(
         "t1", session=session, reason="boom", recoverable=False
     )
 
@@ -120,7 +120,7 @@ async def test_cancel_cascade_stamps_upstream_failed() -> None:
     sink = _ListSink()
     steerer.bind(sinks=[sink], planner=_StubPlanner())
 
-    await steerer.mark_task_cancelled(
+    await steerer.tasks.mark_task_cancelled(
         "t1", session=session, reason="user cancelled"
     )
 

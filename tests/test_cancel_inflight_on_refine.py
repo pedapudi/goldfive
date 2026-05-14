@@ -409,7 +409,7 @@ async def test_install_initial_plan_does_not_cancel_inflight() -> None:
         edges=[],
         summary="initial",
     )
-    installed = await steerer.install_initial_plan(session=session, plan=plan)
+    installed = await steerer.plans.install_initial_plan(session=session, plan=plan)
     assert installed
     # The plugin's cancel must NOT have been called: there is no
     # in-flight invocation on a fresh-session install.
@@ -446,7 +446,7 @@ async def test_cancel_inflight_for_revision_fires_for_real_drift() -> None:
         current_task_id="t1",
         current_agent_id="coordinator",
     )
-    flagged = await steerer._cancel_inflight_for_revision(drift, _make_session())
+    flagged = await steerer.drift._cancel_inflight_for_revision(drift, _make_session())
     assert flagged == ["inv-X"]
     assert len(adapter._plugin.calls) == 1
     assert adapter._plugin.calls[0]["cancel_inflight_task"] is True
@@ -560,7 +560,7 @@ async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> Non
         current_task_id="t1",
         current_agent_id="coordinator",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     try:
         await asyncio.wait_for(coord_task, timeout=1.0)

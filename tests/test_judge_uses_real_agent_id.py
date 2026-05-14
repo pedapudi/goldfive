@@ -123,7 +123,7 @@ async def test_reflective_drift_uses_session_current_agent_id_when_set() -> None
         current_agent_id="research_agent",
     )
 
-    await steerer.maybe_run_reflective_check(session)
+    await steerer.drift.maybe_run_reflective_check(session)
 
     drifts = await _capture_drifts(steerer, sink)
     # ``_handle_drift`` may emit a lifecycle follow-up (ESCALATING) on top
@@ -157,7 +157,7 @@ async def test_reflective_drift_falls_back_to_assignee_when_pin_empty() -> None:
         current_agent_id="",  # empty pin
     )
 
-    await steerer.maybe_run_reflective_check(session)
+    await steerer.drift.maybe_run_reflective_check(session)
 
     drifts = await _capture_drifts(steerer, sink)
     assert drifts, "reflective check should have emitted at least one drift"
@@ -186,7 +186,7 @@ async def test_uncertain_progress_drift_also_uses_session_pin() -> None:
         current_agent_id="research_agent",
     )
 
-    await steerer.maybe_run_reflective_check(session)
+    await steerer.drift.maybe_run_reflective_check(session)
 
     drifts = await _capture_drifts(steerer, sink)
     assert drifts, "reflective check should have emitted at least one drift"

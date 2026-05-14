@@ -93,7 +93,7 @@ async def test_lineage_initialises_on_task_running() -> None:
     steerer, session, task = _build_session_with_running_task(assignee="coordinator")
     assert task.id not in session.task_lineage  # pre-condition
 
-    await steerer.mark_task_running(task.id, session=session)
+    await steerer.tasks.mark_task_running(task.id, session=session)
 
     assert session.task_lineage[task.id] == {"coordinator"}
 
@@ -107,7 +107,7 @@ async def test_lineage_initialises_empty_set_when_no_assignee() -> None:
     have we observed".
     """
     steerer, session, task = _build_session_with_running_task(assignee="")
-    await steerer.mark_task_running(task.id, session=session)
+    await steerer.tasks.mark_task_running(task.id, session=session)
     assert session.task_lineage[task.id] == set()
 
 
@@ -120,7 +120,7 @@ async def test_delegation_observed_extends_lineage_on_pinned_task() -> None:
     framework-neutral.
     """
     steerer, session, task = _build_session_with_running_task(assignee="coordinator")
-    await steerer.mark_task_running(task.id, session=session)
+    await steerer.tasks.mark_task_running(task.id, session=session)
     assert session.current_task_id == task.id
 
     # Simulate the plugin's idempotent set.add on a delegated child.
@@ -131,7 +131,7 @@ async def test_delegation_observed_extends_lineage_on_pinned_task() -> None:
 async def test_lineage_accumulates_multiple_delegations() -> None:
     """Two delegations under the same task end up in one set."""
     steerer, session, task = _build_session_with_running_task(assignee="coordinator")
-    await steerer.mark_task_running(task.id, session=session)
+    await steerer.tasks.mark_task_running(task.id, session=session)
 
     session.task_lineage[task.id].add("research_agent")
     session.task_lineage[task.id].add("writer_agent")
@@ -147,34 +147,34 @@ async def test_lineage_accumulates_multiple_delegations() -> None:
 
 async def test_lineage_clears_on_completed() -> None:
     steerer, session, task = _build_session_with_running_task()
-    await steerer.mark_task_running(task.id, session=session)
+    await steerer.tasks.mark_task_running(task.id, session=session)
     assert task.id in session.task_lineage
 
-    await steerer.mark_task_completed(task.id, session=session)
+    await steerer.tasks.mark_task_completed(task.id, session=session)
     assert task.id not in session.task_lineage
 
 
 async def test_lineage_clears_on_failed_recoverable() -> None:
     steerer, session, task = _build_session_with_running_task()
-    await steerer.mark_task_running(task.id, session=session)
+    await steerer.tasks.mark_task_running(task.id, session=session)
 
-    await steerer.mark_task_failed(task.id, session=session, recoverable=True)
+    await steerer.tasks.mark_task_failed(task.id, session=session, recoverable=True)
     assert task.id not in session.task_lineage
 
 
 async def test_lineage_clears_on_failed_fatal() -> None:
     steerer, session, task = _build_session_with_running_task()
-    await steerer.mark_task_running(task.id, session=session)
+    await steerer.tasks.mark_task_running(task.id, session=session)
 
-    await steerer.mark_task_failed(task.id, session=session, recoverable=False)
+    await steerer.tasks.mark_task_failed(task.id, session=session, recoverable=False)
     assert task.id not in session.task_lineage
 
 
 async def test_lineage_clears_on_cancelled() -> None:
     steerer, session, task = _build_session_with_running_task()
-    await steerer.mark_task_running(task.id, session=session)
+    await steerer.tasks.mark_task_running(task.id, session=session)
 
-    await steerer.mark_task_cancelled(task.id, session=session)
+    await steerer.tasks.mark_task_cancelled(task.id, session=session)
     assert task.id not in session.task_lineage
 
 
@@ -186,9 +186,9 @@ async def test_lineage_clears_on_not_needed() -> None:
     other terminal transition.
     """
     steerer, session, task = _build_session_with_running_task()
-    await steerer.mark_task_running(task.id, session=session)
+    await steerer.tasks.mark_task_running(task.id, session=session)
 
-    await steerer.mark_task_not_needed(task.id, session=session)
+    await steerer.tasks.mark_task_not_needed(task.id, session=session)
     assert task.id not in session.task_lineage
 
 
@@ -221,14 +221,14 @@ async def test_lineage_clears_on_cascade_cancel_downstream() -> None:
     steerer = DefaultSteerer()
     steerer.bind(sinks=[_ListSink()], planner=_NullPlanner())
 
-    await steerer.mark_task_running("u", session=session)
-    await steerer.mark_task_running("d", session=session)
+    await steerer.tasks.mark_task_running("u", session=session)
+    await steerer.tasks.mark_task_running("d", session=session)
     assert "u" in session.task_lineage
     assert "d" in session.task_lineage
 
     # Fatal failure on upstream cascades cancellation to downstream;
     # both lineage entries should be cleared.
-    await steerer.mark_task_failed("u", session=session, recoverable=False)
+    await steerer.tasks.mark_task_failed("u", session=session, recoverable=False)
     assert "u" not in session.task_lineage
     assert "d" not in session.task_lineage
     # goldfive#247: read live status from session.plan; the local

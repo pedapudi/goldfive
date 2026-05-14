@@ -680,7 +680,7 @@ async def test_reflective_check_stamps_decision_context() -> None:
     )
     # Call the reflective check directly (bypasses the interval gate
     # so we don't have to reason about LLM-call accounting state).
-    await steerer.maybe_run_reflective_check(session)
+    await steerer.drift.maybe_run_reflective_check(session)
     events = _span_events(sink)
     assert events, "expected at least one span pair"
     start = _start(events[0])

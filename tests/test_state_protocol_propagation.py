@@ -354,7 +354,7 @@ async def test_user_steer_to_planner_instruction_no_bridge() -> None:
 
     # USER_STEER via the steerer — same path a control-channel STEER
     # takes in production. Writes active_steer onto goldfive.Session.state.
-    await steerer.observe(
+    await steerer.drift.observe(
         ControlMessage(
             kind=ControlKind.STEER,
             payload={"note": "pivot toward reliability"},
@@ -505,7 +505,7 @@ async def test_user_steer_between_invocations_no_stale_session_valueerror() -> N
     # exercises. The control-channel STEER drives DefaultSteerer's
     # _apply_user_steer_state which writes the active_steer keys onto
     # goldfive Session.state.
-    await steerer.observe(
+    await steerer.drift.observe(
         ControlMessage(
             kind=ControlKind.STEER,
             payload={"note": "pivot to reliability"},
@@ -609,7 +609,7 @@ async def test_phase_0_tripwire_stays_green_through_user_steer_flow() -> None:
 
     # No ValueError, no StateOwnershipViolation:
     await adapter.invoke(task=task, session=session)
-    await steerer.observe(
+    await steerer.drift.observe(
         ControlMessage(
             kind=ControlKind.STEER,
             payload={"note": "stay reliable"},

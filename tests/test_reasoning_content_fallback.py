@@ -4,7 +4,7 @@ Background — reproduced live 2026-05-11 on Gemma-4 (session
 ``4a721a07``). Gemma's responses carry ``reasoning: null`` end-to-end,
 so :func:`goldfive.adapters._adk_plugin._extract_reasoning` returns an
 empty string and the plugin's ``after_model_callback`` never invokes
-``steerer.observe_reasoning``. Result: zero ``reasoning_judge``
+``steerer.drift.observe_reasoning``. Result: zero ``reasoning_judge``
 invocations across the entire run, zero OFF_TOPIC / GOAL_DRIFT
 detection from the reasoning surface, even on agent flows that would
 have tripped on a thinking-capable model (Qwen3.5, Claude with
@@ -30,7 +30,7 @@ These tests pin five invariants:
 3. **Flag on, empty reasoning + content body** — the synthesised path
    fires and ``observe_reasoning`` gets the CONTENT text. The
    ``raw["reasoning_source"]`` annotation on the
-   ``steerer.observe(llm_response)`` payload reads
+   ``steerer.drift.observe(llm_response)`` payload reads
    ``"content_fallback"`` so downstream consumers can tell synthesised
    from real reasoning.
 4. **Flag on, both empty** — defensive: ``observe_reasoning`` is NOT
@@ -161,11 +161,8 @@ class _FakeCallbackContext:
         self.state = invocation_context.session.state
 
 
-class _SteererSpy:
-    """Records every call into ``observe`` / ``observe_reasoning`` /
-    ``note_llm_call`` so a test can assert which path the plugin took
-    and inspect the text it forwarded.
-    """
+class _DriftSpy:
+    """Records every call into the drift sub-component (post #410)."""
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
@@ -184,6 +181,34 @@ class _SteererSpy:
     async def note_llm_call(self, session: Any) -> None:
         self.note_llm_calls += 1
         await self._inner.note_llm_call(session)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _SteererSpy:
+    """Wraps a real steerer with a spying drift sub-component so a test
+    can assert which observe/observe_reasoning/note_llm_call path the
+    plugin took.  Component-namespaced per goldfive#410.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        # Replace the inner steerer's drift with a spying wrapper so
+        # the plugin's ``steerer.drift.X`` calls land on the spy.
+        self.drift = _DriftSpy(inner.drift)
+
+    @property
+    def observe_calls(self) -> list[Any]:
+        return self.drift.observe_calls
+
+    @property
+    def observe_reasoning_calls(self) -> list[tuple[str, dict[str, Any]]]:
+        return self.drift.observe_reasoning_calls
+
+    @property
+    def note_llm_calls(self) -> int:
+        return self.drift.note_llm_calls
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

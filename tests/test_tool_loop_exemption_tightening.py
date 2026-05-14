@@ -53,19 +53,34 @@ from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Session, Task
 # ---------------------------------------------------------------------------
 
 
-class _RecordingToolLoopSteerer:
-    """Steerer stub that captures every drift routed via ``_handle_drift``."""
+class _ToolLoopDrift:
+    """Drift sub-component capturing observations + ``handle_drift`` calls."""
 
     def __init__(self) -> None:
         self.drifts: list[DriftEvent] = []
         self.observations: list[Any] = []
-        self._sinks: list[Any] = []
 
     async def observe(self, event: Any, session: Any) -> None:
         self.observations.append(event)
 
-    async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+    async def handle_drift(self, drift: DriftEvent, session: Any) -> None:
         self.drifts.append(drift)
+
+
+class _RecordingToolLoopSteerer:
+    """Steerer stub that captures every drift routed via ``drift.handle_drift``."""
+
+    def __init__(self) -> None:
+        self.drift = _ToolLoopDrift()
+        self._sinks: list[Any] = []
+
+    @property
+    def drifts(self) -> list[DriftEvent]:
+        return self.drift.drifts
+
+    @property
+    def observations(self) -> list[Any]:
+        return self.drift.observations
 
 
 def _plugin_with_tool_loop_ctx(task: Task, session: Session, steerer: Any):

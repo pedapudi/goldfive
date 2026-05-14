@@ -191,7 +191,7 @@ async def test_report_task_failed_transitions_and_refines() -> None:
     # iter-11A: drift cascade is fire-and-forget so the reporting tool
     # ack is no longer gated on planner.refine; drain before asserting
     # on the refine side effects.
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     # Sequence: TaskFailed, DriftDetected. Planner.refine invoked once.
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert "task_failed" in kinds and "drift_detected" in kinds
@@ -213,7 +213,7 @@ async def test_report_task_blocked_transitions_and_refines() -> None:
     assert session.plan.tasks[0].status is TaskStatus.BLOCKED
     # iter-11A: drift cascade is fire-and-forget; drain before
     # asserting on planner.refine side effects.
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     assert len(planner.refine_calls) == 1
     assert planner.refine_calls[0]["drift"].kind is DriftKind.BLOCKED
 
@@ -285,7 +285,7 @@ async def test_handler_recoverable_accepts_string_bool() -> None:
     )
     # iter-11A: drift cascade is fire-and-forget; drain before
     # asserting on planner.refine side effects.
-    await steerer._wait_background_drifts_idle()
+    await steerer.drift._wait_background_drifts_idle()
     # "false" string → recoverable=False → TASK_FAILED_FATAL
     assert planner.refine_calls[0]["drift"].kind is DriftKind.TASK_FAILED_FATAL
 

@@ -203,7 +203,7 @@ class ClaudeAgentSDKAdapter:
         steerer = getattr(self, "_steerer", None)
         if steerer is None or not text:
             return
-        observe = getattr(steerer, "observe_reasoning", None)
+        observe = getattr(getattr(steerer, "drift", None), "observe_reasoning", None)
         if observe is None:
             return
         try:
@@ -451,7 +451,7 @@ class ClaudeAgentSDKAdapter:
 
 
 class _ToolCallObservation:
-    """Lightweight record passed to ``steerer.observe`` for tool_use.
+    """Lightweight record passed to ``steerer.drift.observe`` for tool_use.
 
     Using a plain object (instead of an SDK type) keeps the steerer
     framework-agnostic — it only needs ``name`` and ``arguments``.
@@ -544,11 +544,12 @@ def _strip_mcp_prefix(name: str) -> str:
 
 
 async def _safe_observe(steerer: SteererLike | None, event: Any, session: Session) -> None:
-    """Call ``steerer.observe`` without letting exceptions escape."""
+    """Call ``steerer.drift.observe`` without letting exceptions escape."""
 
     if steerer is None:
         return
-    observe = getattr(steerer, "observe", None)
+    drift_obs = getattr(steerer, "drift", None)
+    observe = getattr(drift_obs, "observe", None) if drift_obs is not None else None
     if observe is None:
         return
     try:

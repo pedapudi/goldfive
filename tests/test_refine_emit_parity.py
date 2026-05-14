@@ -135,7 +135,7 @@ async def test_observe_refine_emits_attempted_on_enter() -> None:
         current_task_id="t1",
     )
 
-    async with steerer.observe_refine(session, drift) as attempt_id:
+    async with steerer.plans.observe_refine(session, drift) as attempt_id:
         # Inside the context the planner's span-ctx provider resolves
         # to a non-None tuple, so the planner-side _emit_refine_orphaned_tasks
         # would route to the bound sinks.
@@ -186,7 +186,7 @@ async def test_observe_refine_emits_failed_on_exception_and_reraises() -> None:
 
     captured_attempt_id: str = ""
     with pytest.raises(RuntimeError, match="boom"):
-        async with steerer.observe_refine(session, drift) as attempt_id:
+        async with steerer.plans.observe_refine(session, drift) as attempt_id:
             captured_attempt_id = attempt_id
             raise RuntimeError("boom")
 
@@ -282,7 +282,7 @@ async def test_planner_orphan_emit_fires_when_steerer_observes_refine() -> None:
         current_task_id="draft_body",
     )
 
-    async with steerer.observe_refine(session, drift) as _attempt_id:
+    async with steerer.plans.observe_refine(session, drift) as _attempt_id:
         revised = await planner.refine(plan=prior, drift=drift, goals=list(session.goals))
 
     assert revised is not None
@@ -355,7 +355,7 @@ async def test_planner_no_orphan_emit_when_coverage_complete() -> None:
         current_task_id="draft",
     )
 
-    async with steerer.observe_refine(session, drift) as _attempt_id:
+    async with steerer.plans.observe_refine(session, drift) as _attempt_id:
         revised = await planner.refine(plan=prior, drift=drift, goals=list(session.goals))
 
     assert revised is not None
@@ -451,16 +451,26 @@ class _FixedDriftSteerer(DefaultSteerer):
     the classifier heuristics. All other behaviour (the
     :meth:`observe_refine` plumbing under test) is inherited from the
     real DefaultSteerer.
+
+    goldfive#410: ``detect_drift`` now lives on the DriftObserver
+    component.  The override patches the bound DriftObserver in
+    place by wrapping its ``detect_drift`` method.
     """
 
-    def detect_drift(self, event: Any, session: Session) -> DriftEvent | None:
-        if isinstance(event, InvocationResult):
-            raw = event.raw or {}
-            if isinstance(raw, dict):
-                drift = raw.get("_drift_to_surface")
-                if isinstance(drift, DriftEvent):
-                    return drift
-        return super().detect_drift(event, session)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        base_detect = self.drift.detect_drift
+
+        def _detect(event: Any, session: Session) -> DriftEvent | None:
+            if isinstance(event, InvocationResult):
+                raw = event.raw or {}
+                if isinstance(raw, dict):
+                    drift = raw.get("_drift_to_surface")
+                    if isinstance(drift, DriftEvent):
+                        return drift
+            return base_detect(event, session)
+
+        self.drift.detect_drift = _detect  # type: ignore[method-assign]
 
 
 class _ScriptedRefinePlanner:
@@ -710,7 +720,7 @@ async def test_refine_attempted_emitted_from_both_steerer_and_executor_paths() -
             edges=[TaskEdge("t1", "t2")],
         ),
     )
-    await steerer_st._handle_drift(_drift(task_id="t1"), session_st)
+    await steerer_st.drift.handle_drift(_drift(task_id="t1"), session_st)
     assert sink_st.by_kind("refine_attempted"), (
         "steerer-driven refine emits refine_attempted"
     )

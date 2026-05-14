@@ -104,18 +104,29 @@ class _FakePart:
         self.text = text
 
 
-class _RecordingSteerer:
-    """Async-capable steerer stub that records _handle_drift calls."""
+class _RecordingDrift:
+    """Records ``handle_drift`` / ``observe`` calls (post #410)."""
 
     def __init__(self) -> None:
         self.drifts: list[DriftEvent] = []
-        self._sinks: list = []
 
-    async def _handle_drift(self, drift: DriftEvent, session: Any) -> None:
+    async def handle_drift(self, drift: DriftEvent, session: Any) -> None:
         self.drifts.append(drift)
 
     async def observe(self, event: Any, session: Any) -> None:
         pass
+
+
+class _RecordingSteerer:
+    """Async-capable steerer stub that records ``drift.handle_drift`` calls."""
+
+    def __init__(self) -> None:
+        self.drift = _RecordingDrift()
+        self._sinks: list = []
+
+    @property
+    def drifts(self) -> list[DriftEvent]:
+        return self.drift.drifts
 
 
 class _RecordingUserPlanner:

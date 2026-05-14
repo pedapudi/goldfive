@@ -687,7 +687,7 @@ async def test_absorb_on_looping_reasoning_queues_nudge() -> None:
         detail="tool-loop detector fired",
         current_task_id="define_structure",
     )
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # Refine applied (plan swapped in). goldfive#247: _apply_revision
     # builds a NEW Plan via bump_revision; identity is no longer the

@@ -47,12 +47,10 @@ levels. See goldfive#142 for the full table.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import contextvars
 import enum
 import inspect
 import logging
-import re
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
@@ -670,13 +668,19 @@ class DefaultSteerer:
         # cannot reference one constructed later inside its own
         # ``__init__`` — none of them do today; every cross-call lands
         # at runtime.
+        #
+        # Components are exposed as public properties (``steerer.tasks``,
+        # ``steerer.plans``, ``steerer.drift``) so callers — executors,
+        # the runner, reporting handlers, planners, tests — can address
+        # the right component directly rather than going through a
+        # router shim. See goldfive#410.
         from goldfive.drift_observer import DriftObserver
         from goldfive.plan_reviser import PlanReviser
         from goldfive.task_state_machine import TaskStateMachine
 
-        self._task_state_machine: TaskStateMachine = TaskStateMachine(self)
-        self._plan_reviser: PlanReviser = PlanReviser(self)
-        self._drift_observer: DriftObserver = DriftObserver(self)
+        self.tasks: TaskStateMachine = TaskStateMachine(self)
+        self.plans: PlanReviser = PlanReviser(self)
+        self.drift: DriftObserver = DriftObserver(self)
 
     # ------------------------------------------------------------------
     # Protocol-required: wiring
@@ -828,7 +832,7 @@ class DefaultSteerer:
                 drift.kind.value,
             )
             return
-        await self._emit_drift_detected(session, drift)
+        await self.drift._emit_drift_detected(session, drift)
 
     # ------------------------------------------------------------------
     # Protocol-required: transition (generic)
@@ -873,683 +877,53 @@ class DefaultSteerer:
         FAILED.
         """
         if to is TaskStatus.RUNNING:
-            await self.mark_task_running(task_id, session=session, detail=detail, source=source)
+            await self.tasks.mark_task_running(
+                task_id, session=session, detail=detail, source=source
+            )
         elif to is TaskStatus.COMPLETED:
-            await self.mark_task_completed(task_id, summary=detail, session=session, source=source)
+            await self.tasks.mark_task_completed(
+                task_id, summary=detail, session=session, source=source
+            )
         elif to is TaskStatus.FAILED:
             reason = cancel_reason or detail
-            await self.mark_task_failed(task_id, reason=reason, session=session, source=source)
+            await self.tasks.mark_task_failed(
+                task_id, reason=reason, session=session, source=source
+            )
         elif to is TaskStatus.BLOCKED:
-            await self.mark_task_blocked(task_id, blocker=detail, session=session, source=source)
+            await self.tasks.mark_task_blocked(
+                task_id, blocker=detail, session=session, source=source
+            )
         elif to is TaskStatus.CANCELLED:
             reason = cancel_reason or detail
-            await self.mark_task_cancelled(task_id, reason=reason, session=session, source=source)
+            await self.tasks.mark_task_cancelled(
+                task_id, reason=reason, session=session, source=source
+            )
         elif to is TaskStatus.NOT_NEEDED:
-            await self.mark_task_not_needed(task_id, reason=detail, session=session, source=source)
+            await self.tasks.mark_task_not_needed(
+                task_id, reason=detail, session=session, source=source
+            )
         # PENDING and UNSPECIFIED are intentionally not reachable from
         # here; transitions are always forward in the lifecycle.
 
-    # ------------------------------------------------------------------
-    # Task state machine — delegated to :class:`TaskStateMachine`.
-    #
-    # See :mod:`goldfive.task_state_machine` for the implementation.
-    # These thin shims preserve the historical public surface
-    # (``DefaultSteerer.mark_task_*``) so executors / reporting handlers
-    # / tests that bind to the router don't have to change.
-    # ------------------------------------------------------------------
-
-    async def mark_task_running(
-        self,
-        task_id: str,
-        *,
-        session: Session,
-        detail: str = "",
-        source: str = "other",
-    ) -> None:
-        await self._task_state_machine.mark_task_running(
-            task_id, session=session, detail=detail, source=source
-        )
-
-    async def mark_task_progress(
-        self,
-        task_id: str,
-        *,
-        session: Session,
-        fraction: float = 0.0,
-        detail: str = "",
-    ) -> None:
-        await self._task_state_machine.mark_task_progress(
-            task_id, session=session, fraction=fraction, detail=detail
-        )
-
-    async def mark_task_completed(
-        self,
-        task_id: str,
-        *,
-        session: Session,
-        summary: str = "",
-        artifacts: dict[str, str] | None = None,
-        source: str = "other",
-    ) -> None:
-        await self._task_state_machine.mark_task_completed(
-            task_id,
-            session=session,
-            summary=summary,
-            artifacts=artifacts,
-            source=source,
-        )
-
-    async def mark_task_failed(
-        self,
-        task_id: str,
-        *,
-        session: Session,
-        reason: str = "",
-        recoverable: bool = True,
-        source: str = "other",
-    ) -> None:
-        await self._task_state_machine.mark_task_failed(
-            task_id,
-            session=session,
-            reason=reason,
-            recoverable=recoverable,
-            source=source,
-        )
-
-    async def mark_task_blocked(
-        self,
-        task_id: str,
-        *,
-        session: Session,
-        blocker: str = "",
-        needed: str = "",
-        source: str = "other",
-    ) -> None:
-        await self._task_state_machine.mark_task_blocked(
-            task_id,
-            session=session,
-            blocker=blocker,
-            needed=needed,
-            source=source,
-        )
-
-    async def mark_task_cancelled(
-        self,
-        task_id: str,
-        *,
-        session: Session,
-        reason: str = "",
-        source: str = "other",
-    ) -> None:
-        await self._task_state_machine.mark_task_cancelled(
-            task_id, session=session, reason=reason, source=source
-        )
-
-    async def mark_task_not_needed(
-        self,
-        task_id: str,
-        *,
-        session: Session,
-        reason: str = "",
-        source: str = "other",
-    ) -> None:
-        await self._task_state_machine.mark_task_not_needed(
-            task_id, session=session, reason=reason, source=source
-        )
-
-    async def cascade_cancel_downstream(
-        self,
-        session: Session,
-        cancelled_id: str,
-        *,
-        source: str = "cancellation",
-    ) -> None:
-        await self._task_state_machine.cascade_cancel_downstream(
-            session, cancelled_id, source=source
-        )
-
-    # ------------------------------------------------------------------
-    # Observer: drift detection + refine
-    # ------------------------------------------------------------------
-
-    async def observe(self, event: Any, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver.observe`."""
-        await self._drift_observer.observe(event, session)
-
-    async def observe_reasoning(
-        self,
-        text: str,
-        *,
-        task: Task | None = None,
-        session: Session,
-        provider: str = "",
-        agent_name: str = "",
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver.observe_reasoning`."""
-        await self._drift_observer.observe_reasoning(
-            text,
-            task=task,
-            session=session,
-            provider=provider,
-            agent_name=agent_name,
-        )
-
-    async def _run_judge_background(
-        self,
-        *,
-        text: str,
-        session: Session,
-        call_llm: ReflectiveCallLLM | None,
-        judge_sink: Any,
-        history_length: int,
-        agent_name: str = "",
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._run_judge_background`."""
-        await self._drift_observer._run_judge_background(
-            text=text,
-            session=session,
-            call_llm=call_llm,
-            judge_sink=judge_sink,
-            history_length=history_length,
-            agent_name=agent_name,
-        )
-
-    def _maybe_record_reasoning_binding(
-        self,
-        *,
-        session: Session,
-        verdict: Any,
-        agent_name: str,
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._maybe_record_reasoning_binding`."""
-        self._drift_observer._maybe_record_reasoning_binding(
-            session=session, verdict=verdict, agent_name=agent_name
-        )
-
-    async def shutdown(self, *, timeout: float = 5.0) -> None:
-        """Shim — delegate to :meth:`DriftObserver.shutdown`."""
-        await self._drift_observer.shutdown(timeout=timeout)
-
-    async def drain_session_background_tasks(
-        self, *, session_id: str, timeout: float = 2.0
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver.drain_session_background_tasks`."""
-        await self._drift_observer.drain_session_background_tasks(
-            session_id=session_id, timeout=timeout
-        )
-
-    async def _drain_background_set(
-        self,
-        bg_set: set[asyncio.Task[Any]],
-        *,
-        label: str,
-        timeout: float,
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._drain_background_set`."""
-        await self._drift_observer._drain_background_set(
-            bg_set, label=label, timeout=timeout
-        )
-
-    @staticmethod
-    def _truncate_trigger_input(text: str, limit: int = 2048) -> str:
-        """Shim — delegate to :meth:`DriftObserver._truncate_trigger_input`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._truncate_trigger_input(text, limit=limit)
-
-    def _resolve_available_agents(self) -> list[str] | list[dict[str, Any]] | None:
-        """Shim — delegate to :meth:`DriftObserver._resolve_available_agents`."""
-        return self._drift_observer._resolve_available_agents()
-
-    def _maybe_take_reasoning_judge_slot(
-        self,
-        session: Session,
-        *,
-        agent_name: str = "",
-    ) -> ReflectiveCallLLM | None:
-        """Shim — delegate to :meth:`DriftObserver._maybe_take_reasoning_judge_slot`."""
-        return self._drift_observer._maybe_take_reasoning_judge_slot(
-            session, agent_name=agent_name
-        )
-
-    # ------------------------------------------------------------------
-    # Reflective check — prompt + budget constants re-exported
-    # ------------------------------------------------------------------
-    #
-    # Re-exported as class attributes so callers / subclasses / tests
-    # that read ``DefaultSteerer.REFLECTIVE_*`` directly keep working.
-    # The canonical definitions live on :class:`DriftObserver`.
-
-    REFLECTIVE_SYSTEM_PROMPT: str = (
-        "You are assessing your own progress on a task. Answer truthfully. "
-        "Reply with a single JSON object and nothing else."
-    )
-
-    REFLECTIVE_USER_PROMPT_TEMPLATE: str = (
-        "You are assessing your own progress on a task.\n\n"
-        "CURRENT TASK:\n"
-        "id: {task_id}\n"
-        "title: {task_title}\n"
-        "description: {task_description}\n\n"
-        "WHAT YOU HAVE DONE IN THE LAST {window} LLM TURNS (summarized):\n"
-        "- recent tool calls: {tool_call_summary}\n"
-        "- recent reasoning (last 3 blocks): {reasoning_summary}\n\n"
-        "Q: Are you making forward progress on the task? Reply with a "
-        "single JSON object:\n"
-        '{{"making_progress": true|false, "confidence": 0.0-1.0, '
-        '"reason": "one-sentence explanation"}}'
-    )
-
-    REFLECTIVE_MAX_OUTPUT_TOKENS: int = 16384
-
-    async def note_llm_call(self, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver.note_llm_call`."""
-        await self._drift_observer.note_llm_call(session)
-
-    async def maybe_run_reflective_check(self, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver.maybe_run_reflective_check`."""
-        await self._drift_observer.maybe_run_reflective_check(session)
-
-    def note_agent_activity(
-        self,
-        session: Session,
-        *,
-        kind: str,
-        agent_name: str = "",
-        task_id: str = "",
-        detail: str = "",
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver.note_agent_activity`."""
-        self._drift_observer.note_agent_activity(
-            session,
-            kind=kind,
-            agent_name=agent_name,
-            task_id=task_id,
-            detail=detail,
-        )
-
-    def note_tool_observation(
-        self,
-        session: Session,
-        *,
-        agent_name: str,
-        task_id: str,
-        tool_name: str,
-        args: Any,
-        result: Any,
-        error: Exception | str | None = None,
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver.note_tool_observation`."""
-        self._drift_observer.note_tool_observation(
-            session,
-            agent_name=agent_name,
-            task_id=task_id,
-            tool_name=tool_name,
-            args=args,
-            result=result,
-            error=error,
-        )
-
-    async def note_agent_turn(self, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver.note_agent_turn`."""
-        await self._drift_observer.note_agent_turn(session)
-
-    # Minimum spacing between two task-boundary-triggered GOAL_DRIFT
-    # judge calls (seconds). Re-exported here as a class attribute so
-    # tests / subclasses that read ``DefaultSteerer._GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S``
-    # keep working. The canonical definition lives on :class:`DriftObserver`.
-    _GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S: float = 10.0
-
-    async def _maybe_run_goal_drift_on_task_boundary(self, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver._maybe_run_goal_drift_on_task_boundary`."""
-        await self._drift_observer._maybe_run_goal_drift_on_task_boundary(session)
-
-    async def maybe_run_goal_drift_check(self, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver.maybe_run_goal_drift_check`."""
-        await self._drift_observer.maybe_run_goal_drift_check(session)
-
-    def _spawn_goal_drift_judge_background(self, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver._spawn_goal_drift_judge_background`."""
-        self._drift_observer._spawn_goal_drift_judge_background(session)
-
-    async def _run_goal_drift_judge_background(self, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver._run_goal_drift_judge_background`."""
-        await self._drift_observer._run_goal_drift_judge_background(session)
-
-    def _spawn_drift_handler_background(
-        self, drift: DriftEvent, session: Session
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._spawn_drift_handler_background`."""
-        self._drift_observer._spawn_drift_handler_background(drift, session)
-
-    async def _run_drift_handler_background(
-        self, drift: DriftEvent, session: Session
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._run_drift_handler_background`."""
-        await self._drift_observer._run_drift_handler_background(drift, session)
-
-    async def _wait_background_drifts_idle(self) -> None:
-        """Shim — delegate to :meth:`DriftObserver._wait_background_drifts_idle`."""
-        await self._drift_observer._wait_background_drifts_idle()
-
-    async def _emit_reflective_failure(
-        self, session: Session, *, task_id: str, reason: str
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._emit_reflective_failure`."""
-        await self._drift_observer._emit_reflective_failure(
-            session, task_id=task_id, reason=reason
-        )
-
-    # --- Reflective prompt helpers -----------------------------------
-
-    # Liberal JSON extractor: tolerates markdown code fences and leading /
-    # trailing prose around the object. Re-exported here for any
-    # subclass / test that pokes the bare-attribute name; the canonical
-    # definition lives on :class:`DriftObserver`.
-    _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-    @classmethod
-    def _parse_reflective_response(cls, raw: Any) -> dict[str, Any] | None:
-        """Shim — delegate to :meth:`DriftObserver._parse_reflective_response`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._parse_reflective_response(raw)
-
-    @staticmethod
-    def _summarize_recent_tool_calls(session: Session, *, limit: int = 10) -> str:
-        """Shim — delegate to :meth:`DriftObserver._summarize_recent_tool_calls`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._summarize_recent_tool_calls(session, limit=limit)
-
-    @staticmethod
-    def _summarize_recent_reasoning(session: Session, *, limit: int = 3) -> str:
-        """Shim — delegate to :meth:`DriftObserver._summarize_recent_reasoning`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._summarize_recent_reasoning(session, limit=limit)
-
-    @staticmethod
-    def _steer_dedupe_id(event: Any) -> str:
-        """Shim — delegate to :meth:`DriftObserver._steer_dedupe_id`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._steer_dedupe_id(event)
-
-    @staticmethod
-    def _unpack_steer_context(drift: DriftEvent) -> tuple[str, str, str]:
-        """Shim — delegate to :meth:`DriftObserver._unpack_steer_context`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._unpack_steer_context(drift)
-
-    @classmethod
-    def _is_duplicate_steer(cls, event: Any, session: Session) -> bool:
-        """Shim — delegate to :meth:`DriftObserver._is_duplicate_steer`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._is_duplicate_steer(event, session)
-
-    @staticmethod
-    def _drift_from_control(event: Any, session: Session) -> DriftEvent | None:
-        """Shim — delegate to :meth:`DriftObserver._drift_from_control`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._drift_from_control(event, session)
-
-    def detect_drift(
-        self,
-        event: Any,
-        session: Session,
-    ) -> DriftEvent | None:
-        """Shim — delegate to :meth:`DriftObserver.detect_drift`."""
-        return self._drift_observer.detect_drift(event, session)
-
-    # ------------------------------------------------------------------
-    # Plan-mutation drift hooks (invoked by reporting-tool handlers)
-    # ------------------------------------------------------------------
-
-    async def report_new_work_discovered(
-        self,
-        *,
-        session: Session,
-        parent_task_id: str,
-        title: str,
-        description: str,
-        assignee: str = "",
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver.report_new_work_discovered`."""
-        await self._drift_observer.report_new_work_discovered(
-            session=session,
-            parent_task_id=parent_task_id,
-            title=title,
-            description=description,
-            assignee=assignee,
-        )
-
-    async def report_plan_divergence(
-        self,
-        *,
-        session: Session,
-        note: str,
-        suggested_action: str = "",
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver.report_plan_divergence`."""
-        await self._drift_observer.report_plan_divergence(
-            session=session,
-            note=note,
-            suggested_action=suggested_action,
-        )
-
     # ==================================================================
-    # Internals
+    # Internals (router-level, not delegated to a component)
     # ==================================================================
 
     # --- Plan lookup --------------------------------------------------
 
     @staticmethod
     def _find_task(session: Session, task_id: str) -> Task | None:
-        # Identity helper — kept as a router-level staticmethod so the
-        # historical call surface (``DefaultSteerer._find_task``) keeps
-        # working unchanged. Mirrors
-        # :meth:`goldfive.task_state_machine.TaskStateMachine._find_task`.
+        # Identity helper. Mirrors
+        # :meth:`goldfive.task_state_machine.TaskStateMachine._find_task`
+        # and remains here as a router-level staticmethod for callers
+        # (the reflective-check path on :class:`DriftObserver`, tests)
+        # that look up tasks without holding a component reference.
         if not task_id or session.plan is None:
             return None
         for t in session.plan.tasks:
             if t.id == task_id:
                 return t
         return None
-
-    # ------------------------------------------------------------------
-    # Drift dispatch + intervention ladder + promotion — thin shims to
-    # :class:`DriftObserver`. The real implementations live on
-    # ``self._drift_observer`` (bucket 3c of the steerer split). The
-    # router keeps these shims so the wide collection of tests, the
-    # planner's structural-drift hook, and any third-party subclasses
-    # that historically poked the bare-attribute names on
-    # :class:`DefaultSteerer` keep working byte-equivalently.
-    # ------------------------------------------------------------------
-
-    async def _handle_drift(self, drift: DriftEvent, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver.handle_drift`.
-
-        The central drift-routing entry point. See
-        :meth:`DriftObserver.handle_drift` for the contract.
-        """
-        await self._drift_observer.handle_drift(drift, session)
-
-    def _ladder_level_for(
-        self,
-        kind: DriftKind,
-        severity: DriftSeverity,
-        occurrence_count: int,
-    ) -> InterventionLevel:
-        """Shim — delegate to :meth:`DriftObserver._ladder_level_for`."""
-        return self._drift_observer._ladder_level_for(kind, severity, occurrence_count)
-
-    async def _dispatch_nudge(self, drift: DriftEvent, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver._dispatch_nudge`."""
-        await self._drift_observer._dispatch_nudge(drift, session)
-
-    async def _dispatch_goldfive_steer_control(
-        self,
-        drift: DriftEvent,
-        session: Session,
-        *,
-        body_override: str = "",
-    ) -> bool:
-        """Shim — delegate to :meth:`DriftObserver._dispatch_goldfive_steer_control`."""
-        return await self._drift_observer._dispatch_goldfive_steer_control(
-            drift, session, body_override=body_override
-        )
-
-    async def _dispatch_goldfive_pause_control(
-        self,
-        drift: DriftEvent,
-        session: Session,
-        *,
-        reason: str,
-    ) -> bool:
-        """Shim — delegate to :meth:`DriftObserver._dispatch_goldfive_pause_control`."""
-        return await self._drift_observer._dispatch_goldfive_pause_control(
-            drift, session, reason=reason
-        )
-
-    async def _dispatch_pause_escalate(
-        self,
-        drift: DriftEvent,
-        session: Session,
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._dispatch_pause_escalate`."""
-        await self._drift_observer._dispatch_pause_escalate(drift, session)
-
-    def _tag_adapter_cancel_reason(
-        self, drift: DriftEvent, *, session: Session | None = None
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._tag_adapter_cancel_reason`."""
-        self._drift_observer._tag_adapter_cancel_reason(drift, session=session)
-
-    def _tag_adapter_cancel_reason_for_promotion(
-        self, drift: DriftEvent, *, session: Session | None = None
-    ) -> str:
-        """Shim — delegate to :meth:`DriftObserver._tag_adapter_cancel_reason_for_promotion`."""
-        return self._drift_observer._tag_adapter_cancel_reason_for_promotion(
-            drift, session=session
-        )
-
-    async def _request_adapter_cancel(self, reason: str) -> None:
-        """Shim — delegate to :meth:`DriftObserver._request_adapter_cancel`."""
-        await self._drift_observer._request_adapter_cancel(reason)
-
-    def _is_late_drift_for_terminated_invocation(
-        self, drift: DriftEvent, session: Session
-    ) -> bool:
-        """Shim — delegate to :meth:`DriftObserver._is_late_drift_for_terminated_invocation`."""
-        return self._drift_observer._is_late_drift_for_terminated_invocation(drift, session)
-
-    def _resolve_active_invocation_ids(
-        self, drift: DriftEvent, session: Session
-    ) -> list[str]:
-        """Shim — delegate to :meth:`DriftObserver._resolve_active_invocation_ids`."""
-        return self._drift_observer._resolve_active_invocation_ids(drift, session)
-
-    async def request_invocation_cancel(
-        self,
-        *,
-        drift: DriftEvent,
-        session: Session,
-        cancel_inflight_task: bool = False,
-    ) -> list[str]:
-        """Shim — delegate to :meth:`DriftObserver.request_invocation_cancel`."""
-        return await self._drift_observer.request_invocation_cancel(
-            drift=drift,
-            session=session,
-            cancel_inflight_task=cancel_inflight_task,
-        )
-
-    @staticmethod
-    def _should_request_cancel_for_drift(drift: DriftEvent) -> bool:
-        """Shim — delegate to :meth:`DriftObserver._should_request_cancel_for_drift`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._should_request_cancel_for_drift(drift)
-
-    @staticmethod
-    def _cancel_reason_for_drift(drift: DriftEvent) -> str:
-        """Shim — delegate to :meth:`DriftObserver._cancel_reason_for_drift`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._cancel_reason_for_drift(drift)
-
-    async def _cancel_inflight_for_revision(
-        self, drift: DriftEvent, session: Session
-    ) -> list[str]:
-        """Shim — delegate to :meth:`DriftObserver._cancel_inflight_for_revision`."""
-        return await self._drift_observer._cancel_inflight_for_revision(drift, session)
-
-    def _severity_meets_promotion_threshold(self, severity: DriftSeverity) -> bool:
-        """Shim — delegate to :meth:`DriftObserver._severity_meets_promotion_threshold`."""
-        return self._drift_observer._severity_meets_promotion_threshold(severity)
-
-    def _should_promote_to_steer(self, drift: DriftEvent, session: Session) -> bool:
-        """Shim — delegate to :meth:`DriftObserver._should_promote_to_steer`."""
-        return self._drift_observer._should_promote_to_steer(drift, session)
-
-    async def _promote_drift_to_steer(self, drift: DriftEvent, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver._promote_drift_to_steer`.
-
-        Audit issue #402 (dispatch-before-plan-swap) is preserved on
-        the DriftObserver side; the shim simply forwards.
-        """
-        await self._drift_observer._promote_drift_to_steer(drift, session)
-
-    @staticmethod
-    def _compose_goldfive_steer_body(drift: DriftEvent) -> str:
-        """Shim — delegate to :meth:`DriftObserver._compose_goldfive_steer_body`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._compose_goldfive_steer_body(drift)
-
-    async def _apply_user_steer_state(
-        self,
-        drift: DriftEvent,
-        session: Session,
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._apply_user_steer_state`."""
-        await self._drift_observer._apply_user_steer_state(drift, session)
-
-    async def _record_refine_outcome(
-        self,
-        session: Session,
-        drift: DriftEvent,
-        *,
-        succeeded: bool,
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._record_refine_outcome`."""
-        await self._drift_observer._record_refine_outcome(
-            session, drift, succeeded=succeeded
-        )
-
-    def reset_for_turn(self, session: Session) -> None:
-        """Shim — delegate to :meth:`DriftObserver.reset_for_turn`.
-
-        Wired from :meth:`Runner.run` immediately after the
-        ``run_started`` event so each turn starts with an empty
-        outcome table.
-        """
-        self._drift_observer.reset_for_turn(session)
-
-    def _occurrence_count_for_ladder(self, session: Session, drift: DriftEvent) -> int:
-        """Shim — delegate to :meth:`DriftObserver._occurrence_count_for_ladder`."""
-        return self._drift_observer._occurrence_count_for_ladder(session, drift)
-
-    async def _escalate_refine_failure_as_critical_drift(
-        self, session: Session, source: DriftEvent, *, reason: str
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._escalate_refine_failure_as_critical_drift`."""
-        await self._drift_observer._escalate_refine_failure_as_critical_drift(
-            session, source, reason=reason
-        )
 
     # ------------------------------------------------------------------
     # ``observation_only`` gate — stays on the router because it reads
@@ -1563,12 +937,12 @@ class DefaultSteerer:
         Single named gate for the three steering injection points
         (goldfive#254):
 
-        * plan mutation in :meth:`_apply_revision`
+        * plan mutation in :meth:`PlanReviser._apply_revision`
           (``set_session_plan`` + ``last_addressed_revision_by_drift_key``);
         * ``GOLDFIVE_STEER`` ControlMessage enqueue in
-          :meth:`_dispatch_goldfive_steer_control`;
+          :meth:`DriftObserver._dispatch_goldfive_steer_control`;
         * the plugin ``request_invocation_cancel`` flag in
-          :meth:`request_invocation_cancel`.
+          :meth:`DriftObserver.request_invocation_cancel`.
 
         ``False`` when :class:`~goldfive.config.SteeringConfig.observation_only`
         is in effect — detection still runs, ``planner.refine_steer``
@@ -1580,99 +954,11 @@ class DefaultSteerer:
         """
         return not self._observation_only
 
-    # ------------------------------------------------------------------
-    # Plan install entry points — thin shims to :class:`PlanReviser`
-    # ------------------------------------------------------------------
-
-    async def install_initial_plan(
-        self,
-        *,
-        session: Session,
-        plan: Plan,
-        is_pivot: bool = False,
-    ) -> bool:
-        """Shim — delegate to :meth:`PlanReviser.install_initial_plan`."""
-        return await self._plan_reviser.install_initial_plan(
-            session=session, plan=plan, is_pivot=is_pivot
-        )
-
-    async def install_revision_for_drift(
-        self,
-        *,
-        session: Session,
-        drift: DriftEvent,
-        revised_plan: Plan,
-    ) -> bool:
-        """Shim — delegate to :meth:`PlanReviser.install_revision_for_drift`."""
-        return await self._plan_reviser.install_revision_for_drift(
-            session=session, drift=drift, revised_plan=revised_plan
-        )
-
-    async def install_revision_for_user_steer(
-        self,
-        *,
-        session: Session,
-        raw: Any,
-        revised_plan: Plan,
-    ) -> bool:
-        """Shim — delegate to :meth:`PlanReviser.install_revision_for_user_steer`."""
-        return await self._plan_reviser.install_revision_for_user_steer(
-            session=session, raw=raw, revised_plan=revised_plan
-        )
-
-    async def install_user_steer(
-        self,
-        *,
-        drift: DriftEvent,
-        prior: Plan,
-        llm_revision: Plan | None,
-        session: Session,
-    ) -> Plan:
-        """Shim — delegate to :meth:`PlanReviser.install_user_steer`."""
-        return await self._plan_reviser.install_user_steer(
-            drift=drift,
-            prior=prior,
-            llm_revision=llm_revision,
-            session=session,
-        )
-
-    def _build_minimal_steer_evolution(
-        self, prior: Plan, drift: DriftEvent
-    ) -> Plan:
-        """Shim — delegate to :meth:`PlanReviser._build_minimal_steer_evolution`."""
-        return self._plan_reviser._build_minimal_steer_evolution(prior, drift)
-
-    async def _install_with_drift(
-        self,
-        *,
-        session: Session,
-        drift: DriftEvent,
-        revised_plan: Plan,
-        apply_user_steer_state: bool,
-    ) -> bool:
-        """Shim — delegate to :meth:`PlanReviser._install_with_drift`."""
-        return await self._plan_reviser._install_with_drift(
-            session=session,
-            drift=drift,
-            revised_plan=revised_plan,
-            apply_user_steer_state=apply_user_steer_state,
-        )
-
-    async def apply_user_steer_with_plan(
-        self,
-        *,
-        drift: DriftEvent,
-        session: Session,
-        revised_plan: Plan,
-    ) -> bool:
-        """Shim — delegate to :meth:`PlanReviser.apply_user_steer_with_plan`."""
-        return await self._plan_reviser.apply_user_steer_with_plan(
-            drift=drift, session=session, revised_plan=revised_plan
-        )
-
     # Consecutive refine failures tolerated per (drift_kind, task_id)
     # before we give up and mark the task FAILED. Class attribute so
     # subclasses / tests can tune it without poking at instance state.
+    # Canonical definition; :class:`DriftObserver` and :class:`PlanReviser`
+    # both read it as ``self._steerer.REFINE_FAILURE_THRESHOLD``.
     REFINE_FAILURE_THRESHOLD: int = 2
 
     # Wall-clock seconds of task silence before a drift escalates to
@@ -1687,103 +973,9 @@ class DefaultSteerer:
     # work (model reasoning, multi-step research) is not interrupted,
     # tight enough that a Qwen judge re-firing on a wedged task does
     # not loop forever. ``0`` disables the gate (useful for tests).
+    # Canonical definition; :class:`DriftObserver` reads it as
+    # ``self._steerer.PROGRESS_STALL_THRESHOLD_SECONDS``.
     PROGRESS_STALL_THRESHOLD_SECONDS: float = 600.0
-
-
-    # --- Refine atomicity + observability (goldfive a4) --------------
-
-    def _get_plan_lock(self, session: Session) -> asyncio.Lock:
-        """Shim — delegate to :meth:`PlanReviser._get_plan_lock`."""
-        return self._plan_reviser._get_plan_lock(session)
-
-    async def _wait_plan_stable(
-        self,
-        session: Session,
-        *,
-        timeout: float | None = 1.0,
-    ) -> bool:
-        """Shim — delegate to :meth:`PlanReviser._wait_plan_stable`."""
-        return await self._plan_reviser._wait_plan_stable(session, timeout=timeout)
-
-    @staticmethod
-    def _new_attempt_id() -> str:
-        """Shim — delegate to :meth:`PlanReviser._new_attempt_id`."""
-        from goldfive.plan_reviser import PlanReviser
-
-        return PlanReviser._new_attempt_id()
-
-    async def _emit_refine_attempted(
-        self,
-        session: Session,
-        drift: DriftEvent,
-        *,
-        attempt_id: str,
-    ) -> None:
-        """Shim — delegate to :meth:`PlanReviser._emit_refine_attempted`."""
-        await self._plan_reviser._emit_refine_attempted(
-            session, drift, attempt_id=attempt_id
-        )
-
-    async def _emit_refine_failed(
-        self,
-        session: Session,
-        drift: DriftEvent,
-        *,
-        attempt_id: str,
-        failure_kind: str,
-        reason: str,
-        detail: str = "",
-    ) -> None:
-        """Shim — delegate to :meth:`PlanReviser._emit_refine_failed`."""
-        await self._plan_reviser._emit_refine_failed(
-            session,
-            drift,
-            attempt_id=attempt_id,
-            failure_kind=failure_kind,
-            reason=reason,
-            detail=detail,
-        )
-
-    def observe_refine(
-        self,
-        session: Session,
-        drift: DriftEvent,
-    ) -> contextlib.AbstractAsyncContextManager[str]:
-        """Shim — delegate to :meth:`PlanReviser.observe_refine`.
-
-        Note: this returns the underlying async context manager directly
-        rather than wrapping it in another ``@asynccontextmanager`` so
-        ``async with steerer.observe_refine(...)`` resolves to the same
-        ``_AsyncGeneratorContextManager`` instance that ``async with
-        steerer._plan_reviser.observe_refine(...)`` would resolve to.
-        """
-        return self._plan_reviser.observe_refine(session, drift)
-
-    async def _emit_plan_revised_correlation(
-        self,
-        session: Session,
-        revised: Plan,
-        drift: DriftEvent,
-        *,
-        attempt_id: str,
-    ) -> None:
-        """Shim — delegate to :meth:`PlanReviser._emit_plan_revised_correlation`."""
-        await self._plan_reviser._emit_plan_revised_correlation(
-            session, revised, drift, attempt_id=attempt_id
-        )
-
-    @staticmethod
-    def _fold_runtime_terminal_statuses(revised: Plan, prior: Plan | None) -> Plan:
-        """Shim — delegate to :meth:`PlanReviser._fold_runtime_terminal_statuses`."""
-        from goldfive.plan_reviser import PlanReviser
-
-        return PlanReviser._fold_runtime_terminal_statuses(revised, prior)
-
-    def _apply_revision(
-        self, session: Session, revised: Plan, drift: DriftEvent
-    ) -> tuple[Plan, bool]:
-        """Shim — delegate to :meth:`PlanReviser._apply_revision`."""
-        return self._plan_reviser._apply_revision(session, revised, drift)
 
     # --- Event construction ------------------------------------------
 
@@ -1812,234 +1004,3 @@ class DefaultSteerer:
         name = f"DRIFT_SEVERITY_{severity.name}"
         return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_SEVERITY_UNSPECIFIED", 0))
 
-    # --- Concrete emitters -------------------------------------------
-    #
-    # Per-status proto emit helpers — delegated to
-    # :class:`~goldfive.task_state_machine.TaskStateMachine`. Thin shims
-    # so test fixtures that mock ``DefaultSteerer._emit_task_*`` keep
-    # intercepting at the router level and so other components inside
-    # this module can keep calling ``self._emit_task_*`` unchanged.
-
-    async def _emit_task_started(self, session: Session, task_id: str, detail: str) -> None:
-        await self._task_state_machine._emit_task_started(session, task_id, detail)
-
-    async def _emit_task_progress(
-        self, session: Session, task_id: str, fraction: float, detail: str
-    ) -> None:
-        await self._task_state_machine._emit_task_progress(session, task_id, fraction, detail)
-
-    async def _emit_task_completed(
-        self,
-        session: Session,
-        task_id: str,
-        summary: str,
-        artifacts: dict[str, str],
-    ) -> None:
-        await self._task_state_machine._emit_task_completed(
-            session, task_id, summary, artifacts
-        )
-
-    async def _emit_task_failed(
-        self, session: Session, task_id: str, reason: str, recoverable: bool
-    ) -> None:
-        await self._task_state_machine._emit_task_failed(
-            session, task_id, reason, recoverable
-        )
-
-    async def _emit_task_blocked(
-        self, session: Session, task_id: str, blocker: str, needed: str
-    ) -> None:
-        await self._task_state_machine._emit_task_blocked(
-            session, task_id, blocker, needed
-        )
-
-    async def _emit_task_cancelled(self, session: Session, task_id: str, reason: str) -> None:
-        await self._task_state_machine._emit_task_cancelled(session, task_id, reason)
-
-    async def _emit_task_transitioned(
-        self,
-        session: Session,
-        task: Task,
-        *,
-        from_status: TaskStatus,
-        to_status: TaskStatus,
-        source: str,
-    ) -> None:
-        await self._task_state_machine._emit_task_transitioned(
-            session,
-            task,
-            from_status=from_status,
-            to_status=to_status,
-            source=source,
-        )
-
-    async def _emit_plan_revision_transitions(
-        self,
-        session: Session,
-        prev_plan: Plan | None,
-        revised: Plan,
-    ) -> None:
-        await self._task_state_machine._emit_plan_revision_transitions(
-            session, prev_plan, revised
-        )
-
-    def _resolve_invocation_id_for_agent(self, agent_name: str) -> str:
-        return self._task_state_machine._resolve_invocation_id_for_agent(agent_name)
-
-    # ------------------------------------------------------------------
-    # DriftObserver shims — drift-event emission + lifecycle stamping +
-    # source attribution + structural escalation primitives. The real
-    # implementations live on :class:`goldfive.drift_observer.DriftObserver`
-    # held on ``self._drift_observer``; these are byte-equivalent shims
-    # for callers that historically poked the bare-attribute names on
-    # :class:`DefaultSteerer`.
-    # ------------------------------------------------------------------
-
-    # Class-level constants re-exported for callers (and methods still
-    # on this router) that read ``self._TERMINAL_DRIFT_KINDS`` /
-    # ``self._USER_AUTHORED_DRIFT_KINDS`` /
-    # ``self._USER_OR_TRAJECTORY_DRIFT_KINDS``. The canonical
-    # definitions live on :class:`DriftObserver`; aliasing them here
-    # keeps subclasses + tests that re-read these sets working.
-    _TERMINAL_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
-        {
-            DriftKind.HUMAN_INTERVENTION_REQUIRED,
-            DriftKind.REPEATED_FAILURE,
-        }
-    )
-
-    _USER_AUTHORED_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
-        {
-            DriftKind.USER_STEER,
-            DriftKind.USER_CANCEL,
-            DriftKind.USER_PAUSE,
-        }
-    )
-
-    _USER_OR_TRAJECTORY_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
-        {
-            DriftKind.USER_STEER,
-            DriftKind.USER_CANCEL,
-            DriftKind.GOAL_DRIFT,
-        }
-    )
-
-    async def _emit_drift_detected(self, session: Session, drift: DriftEvent) -> None:
-        """Shim — delegate to :meth:`DriftObserver._emit_drift_detected`."""
-        await self._drift_observer._emit_drift_detected(session, drift)
-
-    @classmethod
-    def _is_terminal_drift(cls, drift: DriftEvent) -> bool:
-        """Shim — delegate to :meth:`DriftObserver._is_terminal_drift`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._is_terminal_drift(drift)
-
-    async def _close_open_boundaries_for_terminal_drift(self, drift: DriftEvent) -> None:
-        """Shim — delegate to :meth:`DriftObserver._close_open_boundaries_for_terminal_drift`."""
-        await self._drift_observer._close_open_boundaries_for_terminal_drift(drift)
-
-    def _stamp_drift_lifecycle(
-        self,
-        session: Session,
-        drift: DriftEvent,
-        evt: Any,
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._stamp_drift_lifecycle`."""
-        self._drift_observer._stamp_drift_lifecycle(session, drift, evt)
-
-    @staticmethod
-    def _drift_lifecycle_pb_value(lifecycle: str, types_pb2: Any) -> int:
-        """Shim — delegate to :meth:`DriftObserver._drift_lifecycle_pb_value`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._drift_lifecycle_pb_value(lifecycle, types_pb2)
-
-    @classmethod
-    def _resolve_authored_by(cls, drift: DriftEvent) -> str:
-        """Shim — delegate to :meth:`DriftObserver._resolve_authored_by`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._resolve_authored_by(drift)
-
-    @staticmethod
-    def _drift_annotation_id(drift: DriftEvent) -> str:
-        """Shim — delegate to :meth:`DriftObserver._drift_annotation_id`."""
-        from goldfive.drift_observer import DriftObserver
-
-        return DriftObserver._drift_annotation_id(drift)
-
-    def _is_task_progress_stalled(self, drift: DriftEvent, session: Session) -> bool:
-        """Shim — delegate to :meth:`DriftObserver._is_task_progress_stalled`."""
-        return self._drift_observer._is_task_progress_stalled(drift, session)
-
-    async def _emit_progress_stalled_escalation(
-        self, drift: DriftEvent, session: Session
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._emit_progress_stalled_escalation`."""
-        await self._drift_observer._emit_progress_stalled_escalation(drift, session)
-
-    async def _emit_handler_exhausted_escalation(
-        self, drift: DriftEvent, session: Session
-    ) -> None:
-        """Shim — delegate to :meth:`DriftObserver._emit_handler_exhausted_escalation`."""
-        await self._drift_observer._emit_handler_exhausted_escalation(drift, session)
-
-    @staticmethod
-    def _plans_structurally_identical(prior: Plan | None, revised: Plan) -> bool:
-        """Shim — delegate to :meth:`PlanReviser._plans_structurally_identical`."""
-        from goldfive.plan_reviser import PlanReviser
-
-        return PlanReviser._plans_structurally_identical(prior, revised)
-
-    @staticmethod
-    def _integrate_correction_supersedes(revised: Plan) -> Plan:
-        """Shim — delegate to :meth:`PlanReviser._integrate_correction_supersedes`."""
-        from goldfive.plan_reviser import PlanReviser
-
-        return PlanReviser._integrate_correction_supersedes(revised)
-
-    def _repin_current_task_on_supersedes(
-        self,
-        session: Session,
-        revised: Plan,
-    ) -> None:
-        """Shim — delegate to :meth:`PlanReviser._repin_current_task_on_supersedes`."""
-        self._plan_reviser._repin_current_task_on_supersedes(session, revised)
-
-    async def _emit_plan_revised(
-        self,
-        session: Session,
-        revised: Plan,
-        drift: DriftEvent,
-        *,
-        prev_plan: Plan | None = None,
-        attempt_id: str | None = None,
-        dry_run: bool | None = None,
-    ) -> None:
-        """Shim — delegate to :meth:`PlanReviser._emit_plan_revised`."""
-        await self._plan_reviser._emit_plan_revised(
-            session,
-            revised,
-            drift,
-            prev_plan=prev_plan,
-            attempt_id=attempt_id,
-            dry_run=dry_run,
-        )
-
-    @staticmethod
-    def _build_refine_input_summary(
-        drift: DriftEvent,
-        prev_plan: Plan | None,
-    ) -> str:
-        """Shim — delegate to :meth:`PlanReviser._build_refine_input_summary`."""
-        from goldfive.plan_reviser import PlanReviser
-
-        return PlanReviser._build_refine_input_summary(drift, prev_plan)
-
-    @staticmethod
-    def _build_refine_output_summary(revised: Plan) -> str:
-        """Shim — delegate to :meth:`PlanReviser._build_refine_output_summary`."""
-        from goldfive.plan_reviser import PlanReviser
-
-        return PlanReviser._build_refine_output_summary(revised)

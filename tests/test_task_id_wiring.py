@@ -67,12 +67,11 @@ class _Agent:
         self.name = name
 
 
-class _RecordingSteerer:
-    """Steerer stub that records transitions + drifts for assertions."""
+class _RecordingTasks:
+    """Tasks sub-component: records every transition the handler routes."""
 
     def __init__(self) -> None:
         self.transitions: list[tuple[str, Any, str]] = []
-        self.drifts: list[Any] = []
 
     async def mark_task_running(
         self, task_id: str, *, session: Any, detail: str = "", **_: Any
@@ -123,20 +122,43 @@ class _RecordingSteerer:
     ) -> None:
         self.transitions.append((task_id, "BLOCKED", blocker))
 
+
+class _RecordingDrift:
+    """Drift sub-component: records observed events + plan-mutation hooks."""
+
+    def __init__(self) -> None:
+        self.drifts: list[Any] = []
+
+    async def observe(self, event: Any, session: Any) -> None:
+        self.drifts.append(event)
+
     async def report_new_work_discovered(self, **kwargs: Any) -> None:
         pass
 
     async def report_plan_divergence(self, **kwargs: Any) -> None:
         pass
 
-    async def observe(self, event: Any, session: Any) -> None:
-        self.drifts.append(event)
+    def detect_drift(self, event: Any, session: Any) -> Any:
+        return None
+
+
+class _RecordingSteerer:
+    """Steerer stub that records transitions + drifts for assertions."""
+
+    def __init__(self) -> None:
+        self.tasks = _RecordingTasks()
+        self.drift = _RecordingDrift()
+
+    @property
+    def transitions(self) -> list[tuple[str, Any, str]]:
+        return self.tasks.transitions
+
+    @property
+    def drifts(self) -> list[Any]:
+        return self.drift.drifts
 
     async def transition(self, *a: Any, **kw: Any) -> None:
         pass
-
-    def detect_drift(self, event: Any, session: Any) -> Any:
-        return None
 
     def bind(self, **kw: Any) -> None:
         pass

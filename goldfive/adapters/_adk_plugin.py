@@ -23,7 +23,7 @@ goldfive's :class:`~goldfive.protocols.Steerer`. It does four jobs:
 4. **Drift observation** — ``after_model_callback``,
    ``on_event_callback`` (transfer/escalation), and
    ``on_tool_error_callback`` feed raw signals into
-   ``steerer.observe(...)`` so the steerer can classify drift.
+   ``steerer.drift.observe(...)`` so the steerer can classify drift.
 
 The plugin never imports ``google.adk`` at module load. It imports the
 ADK ``BasePlugin`` base class lazily inside :func:`make_adk_plugin`,
@@ -1356,7 +1356,7 @@ def _as_observation(
     task: Any = None,
     agent_id: str = "",
 ) -> dict[str, Any]:
-    """Build the lightweight observation dict handed to ``steerer.observe``.
+    """Build the lightweight observation dict handed to ``steerer.drift.observe``.
 
     The steerer is responsible for classifying this into a
     :class:`~goldfive.types.DriftEvent` via ``detect_drift``. This
@@ -2425,7 +2425,9 @@ def make_adk_plugin(
             # steerers without ``note_agent_activity`` fall through to
             # a no-op. Always safe — the recorder does not itself
             # trigger an LLM call.
-            note_activity = getattr(ctx.steerer, "note_agent_activity", None)
+            note_activity = getattr(
+                getattr(ctx.steerer, "drift", None), "note_agent_activity", None
+            )
             if note_activity is not None:
                 try:
                     note_activity(
@@ -3710,7 +3712,9 @@ def make_adk_plugin(
             # these hooks fall through cleanly. The counter is
             # trajectory-level and persists across task transitions.
             if ctx.steerer is not None:
-                note_activity = getattr(ctx.steerer, "note_agent_activity", None)
+                note_activity = getattr(
+                    getattr(ctx.steerer, "drift", None), "note_agent_activity", None
+                )
                 if note_activity is not None:
                     try:
                         note_activity(
@@ -3724,7 +3728,9 @@ def make_adk_plugin(
                             "after_run_callback: note_agent_activity raised: %s",
                             exc,
                         )
-                note_agent_turn = getattr(ctx.steerer, "note_agent_turn", None)
+                note_agent_turn = getattr(
+                    getattr(ctx.steerer, "drift", None), "note_agent_turn", None
+                )
                 if note_agent_turn is not None:
                     try:
                         await note_agent_turn(ctx.session)
@@ -3795,13 +3801,13 @@ def make_adk_plugin(
                 task=task,
                 agent_id=finishing_agent_name or self._host_agent_name,
             )
-            # Route through steerer.observe so the drift hits the same
+            # Route through steerer.drift.observe so the drift hits the same
             # pipeline AGENT_REFUSAL uses (DriftDetected sink event,
             # severity-based refine decision). We pre-classified above
             # so the steerer's classify_* cascade will no-op on the
             # observation dict — we still fire it explicitly by calling
             # _handle_drift directly when the steerer exposes it.
-            handle = getattr(ctx.steerer, "_handle_drift", None)
+            handle = getattr(getattr(ctx.steerer, "drift", None), "handle_drift", None)
             if handle is not None:
                 try:
                     await handle(drift, ctx.session)
@@ -3815,10 +3821,10 @@ def make_adk_plugin(
             # observation through observe() so custom steerers still
             # see the signal.
             try:
-                await ctx.steerer.observe(observation, ctx.session)
+                await ctx.steerer.drift.observe(observation, ctx.session)
             except Exception as exc:  # noqa: BLE001
                 log.debug(
-                    "_maybe_emit_confabulation_risk: steerer.observe raised: %s",
+                    "_maybe_emit_confabulation_risk: steerer.drift.observe raised: %s",
                     exc,
                 )
 
@@ -4045,7 +4051,7 @@ def make_adk_plugin(
             list off the ADK ``invoked_agent`` to
             :func:`goldfive.drift.capability_check.detect_capability_mismatch`.
             When the detector returns a drift, route it through
-            ``steerer._handle_drift`` so the standard intervention
+            ``steerer.drift.handle_drift`` so the standard intervention
             ladder fires (cancel + refine), with a direct sink-emission
             fallback when the steerer stub does not expose the helper.
 
@@ -4196,7 +4202,7 @@ def make_adk_plugin(
             except Exception:  # noqa: BLE001
                 pass
 
-            handle = getattr(steerer, "_handle_drift", None)
+            handle = getattr(getattr(steerer, "drift", None), "handle_drift", None)
             if callable(handle):
                 try:
                     await handle(drift, ctx.session)
@@ -4243,9 +4249,9 @@ def make_adk_plugin(
             """Emit a ``RUNAWAY_DELEGATION`` drift at CRITICAL severity.
 
             Built and dispatched directly (not through
-            ``steerer.observe`` → ``detect_drift``) because the cap is
+            ``steerer.drift.observe`` → ``detect_drift``) because the cap is
             an observed invariant violation, not a heuristic. Routes
-            through ``steerer._handle_drift`` when available so the
+            through ``steerer.drift.handle_drift`` when available so the
             planner gets a refine hook; falls back to a direct
             ``_emit_drift_detected`` if the steerer doesn't expose
             ``_handle_drift``. Failures swallowed — observability
@@ -4294,7 +4300,7 @@ def make_adk_plugin(
                 observed_revision_index=_observed_rev,
             )
             # Prefer _handle_drift so the full refine/emit path fires.
-            handle = getattr(steerer, "_handle_drift", None)
+            handle = getattr(getattr(steerer, "drift", None), "handle_drift", None)
             if callable(handle):
                 try:
                     await handle(drift, ctx.session)
@@ -4791,11 +4797,17 @@ def make_adk_plugin(
                         task=getattr(ctx, "task", None),
                         agent_id=self._host_agent_name,
                     )
-                    await steerer.observe(observation, session)
+                    await steerer.drift.observe(observation, session)
                     # Also surface as a structured DriftDetected so
                     # sinks see the drift even if the steerer's
-                    # observe() routes elsewhere.
-                    emit_drift = getattr(steerer, "_emit_drift_detected", None)
+                    # observe() routes elsewhere. After goldfive#410
+                    # the helper lives on the drift sub-component.
+                    drift_obs = getattr(steerer, "drift", None)
+                    emit_drift = (
+                        getattr(drift_obs, "_emit_drift_detected", None)
+                        if drift_obs is not None
+                        else None
+                    )
                     if emit_drift is not None:
                         try:
                             await emit_drift(session, drift)
@@ -5688,9 +5700,9 @@ def make_adk_plugin(
                 agent_id=self._host_agent_name,
             )
             try:
-                await ctx.steerer.observe(observation, ctx.session)
+                await ctx.steerer.drift.observe(observation, ctx.session)
             except Exception as exc:  # noqa: BLE001
-                log.debug("after_model_callback: steerer.observe raised: %s", exc)
+                log.debug("after_model_callback: steerer.drift.observe raised: %s", exc)
             if reasoning:
                 # Cooperative-cancel gate (iter-11D, goldfive#251 follow-up).
                 # Skip reasoning observation for cancelled invocations:
@@ -5710,7 +5722,9 @@ def make_adk_plugin(
                         inv_id,
                     )
                 else:
-                    observe_reasoning = getattr(ctx.steerer, "observe_reasoning", None)
+                    observe_reasoning = getattr(
+                        getattr(ctx.steerer, "drift", None), "observe_reasoning", None
+                    )
                     if observe_reasoning is not None:
                         # Tag synthesised-reasoning calls in the log so
                         # operators can tell content-fallback turns from
@@ -5791,7 +5805,7 @@ def make_adk_plugin(
                     inv_id,
                 )
             else:
-                note_llm_call = getattr(ctx.steerer, "note_llm_call", None)
+                note_llm_call = getattr(getattr(ctx.steerer, "drift", None), "note_llm_call", None)
                 if note_llm_call is not None:
                     try:
                         await note_llm_call(ctx.session)
@@ -5819,9 +5833,9 @@ def make_adk_plugin(
                 agent_id=self._host_agent_name,
             )
             try:
-                await ctx.steerer.observe(observation, ctx.session)
+                await ctx.steerer.drift.observe(observation, ctx.session)
             except Exception as exc:  # noqa: BLE001
-                log.debug("on_event_callback: steerer.observe raised: %s", exc)
+                log.debug("on_event_callback: steerer.drift.observe raised: %s", exc)
             return None
 
         async def on_tool_error_callback(
@@ -5844,9 +5858,9 @@ def make_adk_plugin(
                 agent_id=self._host_agent_name,
             )
             try:
-                await ctx.steerer.observe(observation, ctx.session)
+                await ctx.steerer.drift.observe(observation, ctx.session)
             except Exception as exc:  # noqa: BLE001
-                log.debug("on_tool_error_callback: steerer.observe raised: %s", exc)
+                log.debug("on_tool_error_callback: steerer.drift.observe raised: %s", exc)
             # Iter-10 PR 2: also record the raised-error path on
             # ``session.recent_tool_observations`` so the three-state
             # reasoning judge (PR 3) can recognise a provoked
@@ -5855,7 +5869,9 @@ def make_adk_plugin(
             # (e.g. ``classify_tool_error``) but never persisted on
             # the session.
             try:
-                note_obs = getattr(ctx.steerer, "note_tool_observation", None)
+                note_obs = getattr(
+                    getattr(ctx.steerer, "drift", None), "note_tool_observation", None
+                )
                 if note_obs is not None:
                     gf_session = ctx.session
                     pinned_agent = (
@@ -5915,9 +5931,9 @@ def make_adk_plugin(
             The detector is deterministic and O(1) per call modulo the
             tracker's ``window`` length; any failure is swallowed so a
             buggy classifier never breaks tool dispatch. Drifts are
-            routed through ``steerer._handle_drift`` when available so
+            routed through ``steerer.drift.handle_drift`` when available so
             the intervention ladder sees them; falls back to
-            ``steerer.observe`` for stubs that don't expose
+            ``steerer.drift.observe`` for stubs that don't expose
             ``_handle_drift``.
             """
             ctx = self._resolve_ctx(tool_context)
@@ -5995,7 +6011,9 @@ def make_adk_plugin(
             # the authoritative source — fall back to the ADK-resolved
             # agent_name and the ctx-task id when those are empty.
             try:
-                note_obs = getattr(ctx.steerer, "note_tool_observation", None)
+                note_obs = getattr(
+                    getattr(ctx.steerer, "drift", None), "note_tool_observation", None
+                )
                 if note_obs is not None:
                     gf_session = ctx.session
                     pinned_agent = (
@@ -6046,7 +6064,7 @@ def make_adk_plugin(
 
             # Prefer ``_handle_drift`` so the intervention ladder
             # sees the signal. Fall back to ``observe`` for stubs.
-            handle = getattr(ctx.steerer, "_handle_drift", None)
+            handle = getattr(getattr(ctx.steerer, "drift", None), "handle_drift", None)
             for drift in drifts:
                 if handle is not None:
                     try:
@@ -6067,10 +6085,10 @@ def make_adk_plugin(
                     agent_id=agent_name or self._host_agent_name,
                 )
                 try:
-                    await ctx.steerer.observe(observation, ctx.session)
+                    await ctx.steerer.drift.observe(observation, ctx.session)
                 except Exception as exc:  # noqa: BLE001
                     log.debug(
-                        "after_tool_callback: steerer.observe raised: %s",
+                        "after_tool_callback: steerer.drift.observe raised: %s",
                         exc,
                     )
             return None

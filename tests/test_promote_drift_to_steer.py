@@ -208,7 +208,7 @@ async def test_promote_drift_dispatches_after_plan_swap_audit_402() -> None:
         f"t_old_pending, got {prior_pendings}"
     )
 
-    await steerer._handle_drift(drift, session)
+    await steerer.drift.handle_drift(drift, session)
 
     # refine_steer ran — promotion path was exercised.
     assert planner.refine_steer_calls, (

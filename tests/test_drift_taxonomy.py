@@ -108,7 +108,7 @@ def test_classifier_fires_for_every_drift_kind(kind_value: str) -> None:
     steerer = Steerer()
     session = types.Session(run_id="drift-classifier", current_task_id="t1")
     raw = _raw_event_for(kind_value)
-    drift = steerer.detect_drift(raw, session)
+    drift = steerer.drift.detect_drift(raw, session)
 
     if drift is None:
         pytest.skip(
@@ -132,5 +132,5 @@ def test_unknown_event_does_not_fire_drift() -> None:
     steerer = Steerer()
     session = types.Session(run_id="no-drift")
     # A benign progress event should not fire drift.
-    drift = steerer.detect_drift({"kind": "progress", "task_id": "t1"}, session)
+    drift = steerer.drift.detect_drift({"kind": "progress", "task_id": "t1"}, session)
     assert drift is None

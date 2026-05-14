@@ -86,7 +86,7 @@ class CallableAdapter:
         steerer = getattr(self, "_steerer", None)
         if steerer is None:
             return
-        observe = getattr(steerer, "observe_reasoning", None)
+        observe = getattr(getattr(steerer, "drift", None), "observe_reasoning", None)
         if observe is None:
             return
         try:
