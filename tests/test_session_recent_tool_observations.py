@@ -342,14 +342,18 @@ def test_note_tool_observation_handles_repr_failure_in_args() -> None:
 def test_note_tool_observation_swallows_internal_errors() -> None:
     """A broken clock must not propagate out of the writer.
 
-    Patches ``time.monotonic_ns`` (read inside the steerer module) to
-    raise. The writer's broad try/except is the contract — observability
-    code must never break tool dispatch.
+    Patches ``time.monotonic_ns`` (read inside the drift_observer module
+    where ``note_tool_observation`` now lives — see bucket-3b of the
+    steerer split) to raise. The writer's broad try/except is the
+    contract — observability code must never break tool dispatch.
     """
     steerer = DefaultSteerer()
     session = _make_session()
 
-    with mock.patch("goldfive.steerer.time.monotonic_ns", side_effect=RuntimeError("clock dead")):
+    with mock.patch(
+        "goldfive.drift_observer.time.monotonic_ns",
+        side_effect=RuntimeError("clock dead"),
+    ):
         # Must not raise.
         steerer.note_tool_observation(
             session,
