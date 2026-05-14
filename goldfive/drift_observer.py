@@ -2094,7 +2094,11 @@ class DriftObserver:
         if cap <= 0:
             return
         # Indices in order of insertion. Need only the leading overflow.
-        indices = [i for i, e in enumerate(events) if isinstance(e, dict) and e.get("kind") in kinds]
+        indices = [
+            i
+            for i, e in enumerate(events)
+            if isinstance(e, dict) and e.get("kind") in kinds
+        ]
         overflow = len(indices) - cap
         if overflow <= 0:
             return
