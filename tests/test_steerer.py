@@ -1125,7 +1125,12 @@ async def test_apply_revision_silently_folds_terminal_regression(
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session(plan=prior)
 
-    with caplog.at_level(logging.INFO, logger="goldfive.steerer"):
+    # Wave C bucket 2: the fold helper lives on
+    # :mod:`goldfive.plan_reviser` now; narrow the capture to that
+    # submodule's logger so the assertion below is keyed precisely on
+    # the fold-emission site (no stray INFOs from other ``goldfive.*``
+    # modules can satisfy the substring match by luck).
+    with caplog.at_level(logging.INFO, logger="goldfive.plan_reviser"):
         await steerer.observe({"error": "trigger refine"}, session)
 
     # Plan was installed (revision_index advanced) and t1 is still
