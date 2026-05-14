@@ -409,10 +409,13 @@ class DefaultSteerer:
         goal_drift_model:
             Model name forwarded to ``goal_drift_call_llm``.
         goal_drift_activity_window:
-            Number of recent-activity entries retained on
-            ``session.recent_agent_activity`` and passed to the
+            Number of agent-activity entries retained in the
+            ``recent_events`` buffer (goldfive#239) and passed to the
             judge. Bounds the prompt size; defaults to ``10`` when
-            ``goal_drift_config`` is also ``None``.
+            ``goal_drift_config`` is also ``None``. The ``tool_observed``
+            subset of the same buffer is bounded independently by
+            ``session.recent_tool_observations_max`` so a flood of one
+            kind cannot evict the other.
         goal_drift_config:
             Optional :class:`~goldfive.config.GoalDriftConfig` (see
             goldfive#225). When provided, its fields supply fallback

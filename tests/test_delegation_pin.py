@@ -525,6 +525,186 @@ def test_tier1_wins_over_tier2_on_conflict() -> None:
     assert review.assignee_agent_id == ""
 
 
+# ---------------------------------------------------------------------------
+# Issue #405 MEDIUM #5 — Tier-2 stem-match Rule A cross-check
+# ---------------------------------------------------------------------------
+#
+# Audit finding: ``_stem_token_match`` is bi-directionally permissive.
+# ``reviewer`` substring-matches ``reviewing`` / ``previewer`` /
+# ``reviews``. When capability_check Rule A is suppressed by
+# ``_looks_like_delegation_task`` (delegation-shaped tasks), the
+# Tier-2 stem matcher could pin a delegation-only ``reviewer_agent``
+# onto a task whose title contains ``previewer`` (or another
+# substring-only collision) even though Rule A would otherwise fire
+# at detector time. Fix: post-Tier-2, run the Rule A predicate
+# against the chosen task; fall through to Tier-3 if it would fire.
+
+
+def test_405_medium5_tier2_falls_through_when_rule_a_would_fire() -> None:
+    """Issue #405 MEDIUM #5 regression.
+
+    The invoked agent is a delegation-only coordinator (all tools are
+    AgentTool wrappers) named ``reviewer_agent``. Two PENDING tasks:
+
+    * ``preview_export``: title contains ``previewer`` — stem-matches
+      ``reviewer`` bi-directionally (``review`` is in ``previewer``)
+      AND reads as a leaf task (no delegation verbs).
+    * ``other_task``: title has no stem overlap with ``reviewer``.
+
+    Pre-fix: Tier-2 picks ``preview_export`` because ``reviewer``
+    substring-matches a ``previewer`` token; Rule A would then fire
+    at delegation_observed time and force a costly cancel+refine.
+    Post-fix: Tier-2's Rule A cross-check rejects the pick (delegation-
+    only agent + leaf task), falls through to Tier-3, which picks the
+    first eligible by plan order. The delegation-only agent never gets
+    bound to a structurally-wrong leaf task.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        # ``other_task`` first so the topo-order fallback picks it.
+        Task(id="other_task", title="Compose the executive summary"),
+        Task(id="preview_export", title="Generate the previewer export"),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    # Delegation-only agent: every tool is an AgentTool wrapper.
+    invoked_agent = _FakeInvokedAgent(
+        name="reviewer_agent",
+        tools=[_FakeAgentTool("sub_a"), _FakeAgentTool("sub_b")],
+    )
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="reviewer_agent",
+        tool_args={"x": "go"},
+        invoked_agent=invoked_agent,
+    )
+
+    other = _find_task(session.plan, "other_task")
+    preview = _find_task(session.plan, "preview_export")
+    assert other is not None and preview is not None
+    # Tier-2's Rule A cross-check rejected the ``previewer`` false
+    # positive; Tier-3 picked ``other_task`` (first by plan order).
+    assert preview.assignee_agent_id == "", (
+        f"Tier-2 must not pin a delegation-only agent onto a leaf "
+        f"task that would trigger Rule A; got "
+        f"preview_export.assignee={preview.assignee_agent_id!r}"
+    )
+    assert other.assignee_agent_id == "reviewer_agent"
+    assert session.current_task_id == "other_task"
+
+
+def test_405_medium5_tier2_still_picks_delegation_task() -> None:
+    """Issue #405 MEDIUM #5 — Rule A is correctly suppressed by
+    ``_looks_like_delegation_task`` for orchestrational task titles.
+
+    Same fixture as the regression case but the candidate's title
+    explicitly reads as delegation (``"Coordinate the reviewer
+    review"``). The Tier-2 Rule A cross-check honours the delegation-
+    task carve-out and lets the stem match stand. Pin lands.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        Task(id="other_task", title="Compose the executive summary"),
+        Task(
+            id="review_round",
+            title="Coordinate the reviewer review round",
+        ),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    invoked_agent = _FakeInvokedAgent(
+        name="reviewer_agent",
+        tools=[_FakeAgentTool("sub_a")],
+    )
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="reviewer_agent",
+        tool_args={"x": "go"},
+        invoked_agent=invoked_agent,
+    )
+
+    review = _find_task(session.plan, "review_round")
+    assert review is not None
+    assert review.assignee_agent_id == "reviewer_agent", (
+        "delegation-shaped chosen task must NOT trigger the Rule A "
+        "cross-check; Tier-2 should still pin"
+    )
+    assert session.current_task_id == "review_round"
+
+
+def test_405_medium5_tier2_unaffected_when_agent_has_leaf_tools() -> None:
+    """Issue #405 MEDIUM #5 — Rule A doesn't fire when the agent has
+    any leaf tool, so Tier-2 picks normally even on a leaf task.
+
+    Reproduces the ``review_presentation`` happy path from
+    ``test_tier2_agent_name_match_picks_reviewer_task`` but with the
+    agent carrying a FunctionTool. Rule A wouldn't fire at detector
+    time and Tier-2's cross-check matches that — pin proceeds.
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        Task(id="outline_presentation", title="Outline the presentation"),
+        Task(id="draft_presentation", title="Draft the presentation"),
+        Task(id="review_presentation", title="Review the presentation"),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    invoked_agent = _FakeInvokedAgent(
+        name="reviewer_agent",
+        tools=[_FakeFunctionTool("scan_pdf")],  # leaf tool
+    )
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="reviewer_agent",
+        tool_args={"request": "please proceed"},
+        invoked_agent=invoked_agent,
+    )
+
+    review = _find_task(session.plan, "review_presentation")
+    assert review is not None
+    assert review.assignee_agent_id == "reviewer_agent"
+    assert session.current_task_id == "review_presentation"
+
+
+def test_405_medium5_legacy_callers_without_invoked_agent_unaffected() -> None:
+    """Issue #405 MEDIUM #5 — callers that don't pass ``invoked_agent``
+    keep the pre-#405 behaviour exactly.
+
+    The Rule A cross-check is opt-in on the presence of
+    ``invoked_agent``. Without it the Tier-2 match wins even on the
+    substring-only collision (the detector still has the final say at
+    delegation_observed time via the real ``detect_capability_mismatch``
+    Rule A — this is a defence-in-depth, not the primary gate).
+    """
+    plugin = make_adk_plugin(host_agent_name="coord")
+    plan = _plan(
+        Task(id="other_task", title="Compose the executive summary"),
+        Task(id="preview_export", title="Generate the previewer export"),
+    )
+    session = _session_with(plan)
+    ctx = _ctx(session)
+
+    plugin._maybe_pin_delegation_task(
+        ctx=ctx,
+        invoked_agent_name="reviewer_agent",
+        tool_args={"x": "go"},
+        # No ``invoked_agent`` — legacy code path.
+    )
+
+    preview = _find_task(session.plan, "preview_export")
+    assert preview is not None
+    # Substring match wins on the legacy path (Rule A cross-check
+    # didn't run because ``invoked_agent`` wasn't supplied).
+    assert preview.assignee_agent_id == "reviewer_agent"
+    assert session.current_task_id == "preview_export"
+
+
 def test_idempotent_on_already_assigned_task() -> None:
     """Re-running the pin with the same agent on the same eligible task
     is a no-op (assignee already matches, no spurious plan swap)."""

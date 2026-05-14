@@ -537,10 +537,11 @@ class GoalDriftConfig:
     """Scheduling for the trajectory-level GOAL_DRIFT judge (#143).
 
     ``check_interval`` is the number of agent-invocation turns between
-    judge calls; ``activity_window`` bounds
-    ``session.recent_agent_activity`` and hence the prompt size. Both
-    were previously ``DefaultSteerer`` kwargs with no env or
-    ``wrap()``-level override; this config surfaces them.
+    judge calls; ``activity_window`` bounds the agent-activity subset of
+    ``session.recent_events`` (goldfive#239 — the unified buffer that
+    replaced the historical ``recent_agent_activity``) and hence the
+    prompt size. Both were previously ``DefaultSteerer`` kwargs with no
+    env or ``wrap()``-level override; this config surfaces them.
     """
 
     check_interval: int = 5

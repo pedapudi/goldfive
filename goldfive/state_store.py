@@ -976,6 +976,30 @@ _ACTIVE_INVOCATION_LOCK = threading.Lock()
 # wipes both registries in one shot.
 _CANCEL_REQUESTED_INVOCATIONS: dict[str, set[str]] = {}
 
+# Companion registry: per-session set of invocation ids for which a
+# goldfive-internal supersede-cancel is in flight (issue #405 LOW #7).
+# Stamped by the steerer's
+# :meth:`~goldfive.steerer.DefaultSteerer._cancel_inflight_for_revision`
+# before delegating to ``request_invocation_cancel`` and consumed by
+# :meth:`SequentialExecutor._run_overlay`'s cancelled branch to
+# distinguish an internal supersede from an external cancel.
+#
+# Co-exists with the legacy ``session._supersede_pending`` bool: that
+# bool is still set/cleared for back-compat with the existing 8 tests
+# in ``test_executor_supersede_cancel_nonfatal.py`` plus the
+# empty-resolver fallback in :meth:`DriftObserver._cancel_inflight_for_revision`
+# (no invocation id to anchor a registry entry, so the bool acts as
+# a session-scope sentinel). The per-invocation set provides the
+# defensive isolation under concurrent overlay iterations the audit
+# called for. Same locking discipline as the cancel-requested
+# registry; cleared by :meth:`StateStore.clear_active_invocations`
+# so a session teardown wipes all three registries in one shot.
+#
+# The dual-signal design is transitional — see issue #430 for the
+# follow-up to retire the bool entirely in favour of a sentinel-id
+# registry stamp.
+_SUPERSEDE_PENDING_INVOCATIONS: dict[str, set[str]] = {}
+
 
 # ---------------------------------------------------------------------------
 # Typed result objects
@@ -1647,6 +1671,7 @@ class StateStore:
         with _ACTIVE_INVOCATION_LOCK:
             _ACTIVE_INVOCATION_TASKS.pop(self._session_id, None)
             _CANCEL_REQUESTED_INVOCATIONS.pop(self._session_id, None)
+            _SUPERSEDE_PENDING_INVOCATIONS.pop(self._session_id, None)
 
     # -- Cancel-requested registry (goldfive#242) -----------------------
     #
@@ -1699,6 +1724,123 @@ class StateStore:
         if bucket is None:
             return []
         return list(bucket)
+
+    # -- Supersede-pending registry (issue #405 LOW #7) -----------------
+    #
+    # Per-invocation isolation for the goldfive-internal supersede
+    # marker. The legacy ``session._supersede_pending`` bool is a
+    # session-scoped flip that the executor clears at the top of every
+    # overlay iteration as a defensive workaround (see the comment at
+    # ``SequentialExecutor._run_overlay`` lines ~1009-1022). Under
+    # concurrent overlay iterations from different invocations on the
+    # same session, that global clear could mask a true supersede from
+    # another invocation. The per-invocation set below mirrors the
+    # ``_CANCEL_REQUESTED_INVOCATIONS`` shape so each invocation's
+    # supersede state is isolated and cannot be cleared out-of-band by
+    # an unrelated iteration's defensive wipe.
+    #
+    # Both registries are populated/consumed; the bool is kept for
+    # back-compat with the existing supersede-cancel tests and the
+    # empty-resolver fallback in
+    # :meth:`DriftObserver._cancel_inflight_for_revision` (no
+    # invocation id to anchor a registry entry, so the bool acts as
+    # a session-scope sentinel). Readers should prefer the set when
+    # they have an invocation_id and fall back to the bool otherwise.
+    # The dual-signal design is transitional; see issue #430 for the
+    # follow-up to retire the bool entirely.
+
+    def mark_supersede_pending(self, invocation_id: str) -> None:
+        """Stamp ``invocation_id`` as part of an in-flight supersede cancel.
+
+        Called from
+        :meth:`~goldfive.steerer.DefaultSteerer._cancel_inflight_for_revision`
+        (via :meth:`request_invocation_cancel`) right before the cancel
+        lands on the registered asyncio.Task. Idempotent; multiple
+        supersede requests for the same id collapse to one entry.
+
+        No-op when ``invocation_id`` is empty or the store has no
+        session id.
+        """
+        if not invocation_id or not self._session_id:
+            return
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _SUPERSEDE_PENDING_INVOCATIONS.setdefault(self._session_id, set())
+            bucket.add(str(invocation_id))
+
+    def clear_supersede_pending(self, invocation_id: str) -> None:
+        """Drop ``invocation_id`` from the supersede-pending set.
+
+        Called by the executor's cancelled branch after consuming the
+        supersede signal (treating the cancel as a restart trigger
+        instead of an abort). Idempotent — clearing an absent id is
+        silent.
+        """
+        if not invocation_id or not self._session_id:
+            return
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _SUPERSEDE_PENDING_INVOCATIONS.get(self._session_id)
+            if bucket is None:
+                return
+            bucket.discard(str(invocation_id))
+            if not bucket:
+                _SUPERSEDE_PENDING_INVOCATIONS.pop(self._session_id, None)
+
+    def is_supersede_pending(self, invocation_id: str) -> bool:
+        """Return True iff a supersede cancel was stamped for ``invocation_id``.
+
+        Per-invocation read; does not consult the legacy session-scoped
+        ``_supersede_pending`` bool. Callers that need union-of-signals
+        semantics should also check the bool.
+        """
+        if not invocation_id or not self._session_id:
+            return False
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _SUPERSEDE_PENDING_INVOCATIONS.get(self._session_id)
+        if bucket is None:
+            return False
+        return str(invocation_id) in bucket
+
+    def supersede_pending_invocation_ids(self) -> list[str]:
+        """Return the ids of every invocation with a pending supersede.
+
+        Empty list when no session id or no pending supersedes.
+        """
+        if not self._session_id:
+            return []
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _SUPERSEDE_PENDING_INVOCATIONS.get(self._session_id)
+        if bucket is None:
+            return []
+        return list(bucket)
+
+    def has_any_supersede_pending(self) -> bool:
+        """Return True iff any invocation on this session is supersede-pending.
+
+        Convenience for callers (the executor overlay loop) that don't
+        track a specific invocation_id but want to know "did the steerer
+        stamp a supersede for *something* on this session" — used to
+        disambiguate a cancelled invocation as internal-supersede vs.
+        external. See :meth:`supersede_pending_invocation_ids`.
+        """
+        if not self._session_id:
+            return False
+        with _ACTIVE_INVOCATION_LOCK:
+            bucket = _SUPERSEDE_PENDING_INVOCATIONS.get(self._session_id)
+        return bool(bucket)
+
+    def clear_all_supersede_pending(self) -> None:
+        """Drop every supersede-pending entry for this session. Idempotent.
+
+        Used by the executor's cancelled branch when it has consumed
+        the supersede (treating the cancel as a restart) but doesn't
+        know which specific invocation_id was the supersede target.
+        Mirrors the legacy ``session._supersede_pending = False`` clear
+        but scoped per-session via the registry.
+        """
+        if not self._session_id:
+            return
+        with _ACTIVE_INVOCATION_LOCK:
+            _SUPERSEDE_PENDING_INVOCATIONS.pop(self._session_id, None)
 
     # -- Active drift conditions (goldfive#271 PR1) ---------------------
 

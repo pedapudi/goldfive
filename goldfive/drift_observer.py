@@ -149,6 +149,8 @@ from goldfive.drift import (
     classify_tool_error,
 )
 from goldfive.types import (
+    RECENT_EVENT_AGENT_ACTIVITY_KINDS,
+    RECENT_EVENT_KIND_TOOL_OBSERVED,
     CancellationRequest,
     DriftEvent,
     DriftKind,
@@ -157,6 +159,7 @@ from goldfive.types import (
     Session,
     Task,
     TaskStatus,
+    filter_recent_events_by_kind,
 )
 
 if TYPE_CHECKING:
@@ -825,7 +828,8 @@ class DriftObserver:
     def _summarize_recent_tool_calls(session: Session, *, limit: int = 10) -> str:
         """Build a short human-readable summary of the last N tool calls.
 
-        Reads from ``session.recent_tool_observations`` (populated by
+        Reads from ``session.recent_events`` filtered to
+        ``tool_observed`` kinds (populated by
         :meth:`note_tool_observation` from the adapter's
         ``after_tool_callback`` / ``on_tool_error_callback`` hooks).
         Falls back to "(no recent tool calls)" when the buffer is empty.
@@ -839,7 +843,8 @@ class DriftObserver:
 
         Adapters that want richer summaries can subclass and override.
         """
-        hist = getattr(session, "recent_tool_observations", None) or []
+        events = getattr(session, "recent_events", None) or []
+        hist = filter_recent_events_by_kind(events, RECENT_EVENT_KIND_TOOL_OBSERVED)
         if not hist:
             return "(no recent tool calls)"
         # Take the tail (most recent ``limit`` entries) oldest-first.
@@ -1977,9 +1982,15 @@ class DriftObserver:
 
         Push-only: adapters (or executors) call this once per
         ``AgentInvocationStarted`` / ``AgentInvocationCompleted`` so the
-        GOAL_DRIFT judge has a rolling view of the trajectory. The ring
-        buffer is trimmed to ``goal_drift_activity_window`` so the
-        prompt stays bounded regardless of run length.
+        GOAL_DRIFT judge has a rolling view of the trajectory.
+
+        Goldfive#239: writes into the unified
+        :attr:`Session.recent_events` buffer with the supplied ``kind``
+        (one of :data:`RECENT_EVENT_AGENT_ACTIVITY_KINDS`). Trimming is
+        per-kind-class: the agent-activity subset is trimmed to
+        ``goal_drift_activity_window`` so a flood of ``tool_observed``
+        entries cannot evict legitimate agent activity (and vice
+        versa) — preserves the pre-merge semantics exactly.
 
         Always safe to call (feature-gate is enforced at check time, not
         at record time) -- unlike :meth:`note_agent_turn`, this method
@@ -1998,11 +2009,13 @@ class DriftObserver:
             # Keep individual entries bounded so a pathological detail
             # cannot blow up the prompt even before trimming.
             entry["detail"] = detail[:500]
-        hist = session.recent_agent_activity
-        hist.append(entry)
-        overflow = len(hist) - self._steerer._goal_drift_activity_window
-        if overflow > 0:
-            del hist[:overflow]
+        events = session.recent_events
+        events.append(entry)
+        self._trim_recent_events_kind_class(
+            events,
+            RECENT_EVENT_AGENT_ACTIVITY_KINDS,
+            max(1, int(self._steerer._goal_drift_activity_window)),
+        )
 
     def note_tool_observation(
         self,
@@ -2015,7 +2028,7 @@ class DriftObserver:
         result: Any,
         error: Exception | str | None = None,
     ) -> None:
-        """Append a bounded tool-observation entry to ``session.recent_tool_observations``.
+        """Append a bounded tool-observation entry to ``session.recent_events``.
 
         Iter-10 PR 2. Population path for the three-state reasoning
         judge (PR 3 reads this buffer to distinguish a provoked
@@ -2024,10 +2037,13 @@ class DriftObserver:
         and ``on_tool_error_callback`` hooks.
 
         Push-only and trim-on-write — mirrors
-        :meth:`note_agent_activity`. The buffer is bounded by
-        ``session.recent_tool_observations_max`` (default 16) so the
-        prompt the judge eventually reads stays small regardless of
-        run length. Per-task filtering happens at READ time in the
+        :meth:`note_agent_activity`. Goldfive#239 merged the
+        previously-separate ``recent_tool_observations`` buffer into
+        :attr:`Session.recent_events`; entries are stamped with
+        ``kind="tool_observed"`` and the ``tool_observed`` subset is
+        trimmed to ``session.recent_tool_observations_max`` (default 16)
+        so the prompt the judge eventually reads stays small regardless
+        of run length. Per-task filtering happens at READ time in the
         judge's prompt renderer; this writer captures every call.
 
         Always swallow internal errors. Observability must never break
@@ -2068,6 +2084,7 @@ class DriftObserver:
                 except Exception:  # noqa: BLE001
                     error_message = "(unrepresentable error)"
             entry: dict[str, Any] = {
+                "kind": RECENT_EVENT_KIND_TOOL_OBSERVED,
                 "ts_ms": ts_ms,
                 "agent_name": agent_name,
                 "task_id": task_id,
@@ -2077,8 +2094,8 @@ class DriftObserver:
                 "is_error": is_error,
                 "error_message": error_message,
             }
-            hist = session.recent_tool_observations
-            hist.append(entry)
+            events = session.recent_events
+            events.append(entry)
             # Cap defaults to 16 (§3.1) but honour any session-local
             # override; clamp to >=1 so a pathological 0 / negative
             # value doesn't disable the buffer entirely (we always
@@ -2088,15 +2105,50 @@ class DriftObserver:
             except (TypeError, ValueError):
                 cap_raw = 16
             cap = max(1, cap_raw)
-            overflow = len(hist) - cap
-            if overflow > 0:
-                # Slice-delete is amortized O(1) on average for the
-                # bounded ``overflow == 1`` case (the steady state once
-                # the buffer is full), and is the same pattern
-                # ``note_agent_activity`` uses.
-                del hist[:overflow]
+            self._trim_recent_events_kind_class(
+                events, frozenset({RECENT_EVENT_KIND_TOOL_OBSERVED}), cap
+            )
         except Exception as exc:  # noqa: BLE001
             log.debug("note_tool_observation: swallowed: %s", exc)
+
+    @staticmethod
+    def _trim_recent_events_kind_class(
+        events: list[dict[str, Any]],
+        kinds: frozenset[str],
+        cap: int,
+    ) -> None:
+        """In-place trim entries of the given kind-class to ``cap``.
+
+        Goldfive#239: the unified :attr:`Session.recent_events` buffer
+        holds multiple event kinds (agent activity + tool observations).
+        Each kind-class is bounded by its own cap so a flood of one
+        kind cannot evict another. This helper finds the
+        oldest-first indices of entries whose ``kind`` is in ``kinds``
+        and drops the leading overflow.
+
+        ``cap`` must be ``>= 1`` — callers floor user-supplied values
+        before calling.
+
+        O(n) in the buffer length; both kind-classes have bounded caps
+        (10 / 16) so the buffer length is always small and the walk
+        is cheap.
+        """
+        if cap <= 0:
+            return
+        # Indices in order of insertion. Need only the leading overflow.
+        indices = [
+            i
+            for i, e in enumerate(events)
+            if isinstance(e, dict) and e.get("kind") in kinds
+        ]
+        overflow = len(indices) - cap
+        if overflow <= 0:
+            return
+        # Drop the ``overflow`` oldest entries of this kind-class. We
+        # iterate from the highest index down so popping doesn't shift
+        # the indices we still need to drop.
+        for idx in sorted(indices[:overflow], reverse=True):
+            del events[idx]
 
     async def note_agent_turn(self, session: Session) -> None:
         """Record one agent invocation against ``session``.
@@ -2216,8 +2268,15 @@ class DriftObserver:
         from goldfive.drift.goals import classify_goal_drift
 
         # Snapshot activity so subsequent appends during the await do
-        # not perturb the prompt the judge saw.
-        activity = list(session.recent_agent_activity)
+        # not perturb the prompt the judge saw. Goldfive#239: read from
+        # the unified ``recent_events`` buffer, filtered to the
+        # agent-activity kinds the goal-drift judge expects (the
+        # legacy ``recent_agent_activity`` buffer carried exactly
+        # these kinds, so the snapshot is byte-identical to the
+        # pre-merge path).
+        activity = filter_recent_events_by_kind(
+            session.recent_events, RECENT_EVENT_AGENT_ACTIVITY_KINDS
+        )
         drift = await classify_goal_drift(
             goals=session.goals,
             plan=session.plan,
@@ -4037,6 +4096,9 @@ class DriftObserver:
         # the first flag's channel-message restart. The supersede
         # marker above is still stamped (cheap, idempotent) so an
         # overlay reading it sees the same internal-cancel signal.
+        # Done BEFORE the per-invocation registry stamp (#405 LOW #7)
+        # so we don't pollute the registry with entries for cancels
+        # we're about to short-circuit.
         drift_id = str(getattr(drift, "id", "") or "")
         if drift_id and drift_id in self._cancelled_drift_ids:
             log.debug(
@@ -4052,6 +4114,25 @@ class DriftObserver:
             # set stays bounded by in-flight handler depth.
             self._cancelled_drift_ids.discard(drift_id)
             return []
+        # Issue #405 LOW #7: also stamp the per-invocation supersede
+        # registry on the StateStore. Each active invocation that's
+        # about to be cancelled by ``request_invocation_cancel`` gets
+        # its own entry, so a concurrent overlay iteration's defensive
+        # ``_supersede_pending = False`` clear cannot drop the signal
+        # for an unrelated invocation. Best-effort; failure is harmless
+        # because the legacy bool above is still set.
+        try:
+            from goldfive.state_store import StateStore  # noqa: PLC0415 — lazy
+
+            store = StateStore.for_session(session)
+            for inv_id in self._resolve_active_invocation_ids(drift, session):
+                store.mark_supersede_pending(inv_id)
+        except Exception as exc:  # noqa: BLE001 — registry is best-effort
+            log.debug(
+                "DefaultSteerer._cancel_inflight_for_revision: "
+                "could not stamp per-invocation supersede registry: %s",
+                exc,
+            )
         try:
             return await self.request_invocation_cancel(
                 drift=drift,

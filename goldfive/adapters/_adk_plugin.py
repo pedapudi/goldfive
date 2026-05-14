@@ -1098,6 +1098,7 @@ _stem_token_match = _stem_token_match_shared
 def _select_by_agent_name_stems(
     candidates: list[Any],
     agent_name: str,
+    invoked_agent: Any = None,
 ) -> Any:
     """Tier-2 selector for goldfive#265: agent-name semantic match.
 
@@ -1115,6 +1116,21 @@ def _select_by_agent_name_stems(
     (goldfive#166 / #167), no LLM call, no embedding — this is a
     pure structural disambiguation step that runs before the weaker
     topic-args scorer.
+
+    Issue #405 MEDIUM #5 — Rule A capability cross-check. Bi-directional
+    substring is permissive: ``reviewer`` matches ``reviewing`` /
+    ``previewer`` / ``reviews`` indiscriminately. To suppress false-
+    positive picks where the chosen task is a *leaf* task that the
+    invoked agent (a delegation-only coordinator) structurally cannot
+    perform, we run the same capability_check Rule A predicate against
+    the chosen task. If Rule A would fire on the pick, we return
+    ``None`` so the caller falls through to Tier-3 instead of binding
+    a structurally-wrong task. Mirrors the conservative gating in
+    :func:`goldfive.drift.capability_check.detect_capability_mismatch`
+    so the pin and the detector agree on which leaf-vs-delegation
+    shapes are acceptable. Only fires when ``invoked_agent`` is
+    supplied; legacy callers without an agent object retain the
+    pre-#405 behaviour exactly.
     """
     stems = _agent_name_stems(agent_name)
     if not stems or not candidates:
@@ -1136,8 +1152,44 @@ def _select_by_agent_name_stems(
                 break
         if hit:
             matched.append(cand)
-    if len(matched) == 1:
-        return matched[0]
+    if len(matched) != 1:
+        return None
+    chosen = matched[0]
+
+    # Issue #405 MEDIUM #5: post-Tier-2 Rule A guard. If the invoked
+    # agent has only AgentTool wrappers (delegation-only capability)
+    # AND the chosen task does not read as a delegation/coordination
+    # task, treat the stem match as a false positive and fall through
+    # to Tier-3. Skip when ``invoked_agent`` was not supplied (legacy
+    # path) or when the agent's tool surface cannot be introspected.
+    if invoked_agent is None:
+        return chosen
+    try:
+        from goldfive.drift.capability_check import (  # noqa: PLC0415 — lazy
+            _looks_like_delegation_task,
+            is_agent_tool,
+        )
+    except Exception:  # noqa: BLE001 — capability_check not importable
+        return chosen
+    tools = tuple(_safe_attr(invoked_agent, "tools", None) or ())
+    if not tools:
+        # Empty tool list: cannot distinguish "no leaf capability" from
+        # "test stub / introspection failure", so don't second-guess
+        # the Tier-2 pick — Rule A itself bails out on this shape.
+        return chosen
+    if not all(is_agent_tool(t) for t in tools):
+        # Agent has at least one leaf tool — Rule A would not fire,
+        # so the pick is fine.
+        return chosen
+    if _looks_like_delegation_task(chosen):
+        # Chosen task reads as orchestrational — Rule A would be
+        # suppressed by the same predicate at detector time, so the
+        # pin and the detector agree this is a valid delegation→
+        # delegation match.
+        return chosen
+    # Rule A would fire on the chosen task. The Tier-2 stem match is
+    # a false positive (e.g. ``reviewer`` matched ``previewer`` /
+    # ``reviewing`` substring-only). Fall through to Tier-3.
     return None
 
 
@@ -3966,7 +4018,7 @@ def make_adk_plugin(
                     )
                 if chosen is None:
                     chosen = _select_by_agent_name_stems(
-                        eligible, invoked_agent_name
+                        eligible, invoked_agent_name, invoked_agent
                     )
                 if chosen is None:
                     scored = _score_candidates_by_args(eligible, tool_args)
