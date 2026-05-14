@@ -582,6 +582,136 @@ async def test_critical_drift_requests_cancel() -> None:
 
 
 # ---------------------------------------------------------------------------
+# goldfive#405 MEDIUM #6 — double-cancel dedup
+# ---------------------------------------------------------------------------
+
+
+async def test_cancel_inflight_for_revision_skips_when_precancel_already_fired() -> None:
+    """goldfive#405 MEDIUM #6 regression: a drift whose top-level
+    flag-only cancel already fired must not be hard-cancelled a second
+    time by :meth:`_cancel_inflight_for_revision`.
+
+    Without the dedup, a CRITICAL promote-eligible drift fires both
+    cancels: the flag-only one writes the cancel-state flag the
+    executor consumes (driving a channel-message restart), then the
+    post-refine ``_cancel_inflight_for_revision`` hard-cancels — by
+    which point the executor may have restarted, landing the second
+    cancel on a fresh invocation and producing two restarts for one
+    drift.
+
+    Direct test: pre-stamp the drift id on the observer's
+    ``_cancelled_drift_ids`` set (the synchronous bookkeeping the
+    top-level cancel does), then call
+    ``_cancel_inflight_for_revision`` and assert the underlying
+    plugin's ``request_invocation_cancel`` was NOT invoked.
+    """
+    plugin, _sink, session = _make_plugin()
+    adapter = _StubAdapter(plugin)
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[], planner=None)
+    steerer.bind_adapter(adapter)
+    plugin._top_invocation_id = "inv-A"
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.CRITICAL,
+        current_task_id="t1",
+        current_agent_id="sub_agent",
+    )
+    # Simulate the top-level pre-cancel having already fired by
+    # stamping the drift id on the dedup set directly.
+    steerer.drift._cancelled_drift_ids.add(drift.id)
+
+    flagged = await steerer.drift._cancel_inflight_for_revision(drift, session)
+    # Result is an empty list because the dedup short-circuit returned
+    # before calling the plugin.
+    assert flagged == []
+    # The supersede flag is still stamped (idempotent best-effort);
+    # the cancel itself did not fire.
+    assert getattr(session, "_supersede_pending", False) is True
+    # And the dedup set is cleared so a different drift on the same
+    # session isn't accidentally suppressed.
+    assert drift.id not in steerer.drift._cancelled_drift_ids
+
+
+async def test_cancel_inflight_for_revision_still_fires_without_precancel() -> None:
+    """When NO pre-cancel ran for the drift (e.g. WARNING severity
+    promote-eligible kind), :meth:`_cancel_inflight_for_revision`
+    must still fire — the dedup only kicks in for same-drift repeats.
+    """
+    plugin, _sink, session = _make_plugin()
+    adapter = _StubAdapter(plugin)
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[], planner=None)
+    steerer.bind_adapter(adapter)
+    plugin._top_invocation_id = "inv-A"
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        current_task_id="t1",
+        current_agent_id="sub_agent",
+    )
+    # No pre-cancel stamp — dedup must not engage.
+    assert drift.id not in steerer.drift._cancelled_drift_ids
+
+    flagged = await steerer.drift._cancel_inflight_for_revision(drift, session)
+    # Cancel fired against the resolved invocation.
+    assert flagged != [], (
+        "without a prior pre-cancel, _cancel_inflight_for_revision must "
+        "still drive the hard cancel"
+    )
+    req = plugin.peek_cancel_for_invocation("inv-A")
+    assert req is not None
+
+
+async def test_handle_drift_dispatch_records_drift_id_in_cancelled_set() -> None:
+    """The top-level flag-only cancel stamps the drift id so the dedup
+    in :meth:`_cancel_inflight_for_revision` engages.
+
+    Asserts the bookkeeping primitive that bug #6's fix relies on.
+    """
+    plugin, _sink, session = _make_plugin()
+    adapter = _StubAdapter(plugin)
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[], planner=None)
+    steerer.bind_adapter(adapter)
+    plugin._top_invocation_id = "inv-A"
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.CRITICAL,
+        current_task_id="t1",
+        current_agent_id="sub_agent",
+    )
+
+    # Use a probe to catch the moment between the pre-cancel and the
+    # finally-clear: peek at the cancelled set immediately after the
+    # cancel fires by monkey-patching ``request_invocation_cancel``.
+    original = steerer.drift.request_invocation_cancel
+    seen_after_precancel: list[bool] = []
+
+    async def _probing_cancel(*args: Any, **kwargs: Any) -> Any:
+        result = await original(*args, **kwargs)
+        # Look at the dedup set immediately after the pre-cancel fires.
+        seen_after_precancel.append(drift.id in steerer.drift._cancelled_drift_ids)
+        return result
+
+    steerer.drift.request_invocation_cancel = _probing_cancel  # type: ignore[method-assign]
+
+    await steerer.drift.handle_drift(drift, session)
+    # At least one cancel invocation; the pre-cancel slot was stamped
+    # before the planner ran (planner is None so dispatch returns
+    # early — the finally still ran and cleared it).
+    assert seen_after_precancel and seen_after_precancel[0] is True, (
+        f"goldfive#405 #6: pre-cancel must stamp drift.id on the "
+        f"dedup set; observations={seen_after_precancel}"
+    )
+    # After dispatch completes, the finally cleared the entry.
+    assert drift.id not in steerer.drift._cancelled_drift_ids
+
+
+# ---------------------------------------------------------------------------
 # 8. Empty invocation-id guard
 # ---------------------------------------------------------------------------
 

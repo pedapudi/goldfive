@@ -333,6 +333,180 @@ def test_cross_invocation_isolation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# goldfive#420 — run-scoped buckets accumulate across re-invocations
+# ---------------------------------------------------------------------------
+
+
+def test_run_scoped_bucket_accumulates_across_reinvocations() -> None:
+    """goldfive#420 regression: re-invocations of the same agent within
+    one run share a bucket when ``session_run_id`` is threaded.
+
+    Reproduces the cherry-tree e2e (session ``2d27ff4a``, 2026-05-13)
+    failure mode where ``debugger_agent`` was re-invoked 11+ times,
+    each time calling ``find_presentation_files`` with varying args.
+    Pre-#420 the per-(invocation_id, agent_name) bucket gave every
+    re-invocation a fresh 2-entry window — never tripping the 7-call
+    CRITICAL name-tier. With ``session_run_id`` threaded, the calls
+    accumulate into one bucket and CRITICAL fires once the cumulative
+    name-tier threshold is met.
+    """
+    tracker = ToolLoopTracker()
+    # 11 re-invocations of the same agent, each emitting one
+    # find_presentation_files call with varying args. After 7 cumulative
+    # calls on the (run-id, agent) bucket the WORK name-tier CRITICAL
+    # (count >= 7) fires.
+    drifts_per_call: list[list[Any]] = []
+    for i in range(11):
+        result = tracker.observe_tool_call(
+            invocation_id=f"adk-inv-{i}",  # ADK mints a fresh id each re-invocation
+            agent_name="debugger_agent",
+            tool_name="find_presentation_files",
+            args={"topic": f"q{i}"},  # varying args -> name-tier path
+            task_id="t-debug",
+            session_run_id="run-cherry-tree",
+        )
+        drifts_per_call.append(result)
+    # By call 5: name count = 5 -> WARNING (work name warning=5).
+    assert drifts_per_call[4], "expected WARNING at cumulative call 5"
+    assert drifts_per_call[4][0].severity is DriftSeverity.WARNING
+    # By call 7: name count = 7 -> CRITICAL.
+    seventh = drifts_per_call[6]
+    assert len(seventh) == 1, (
+        f"goldfive#420: cumulative same-name calls across re-invocations "
+        f"should trip CRITICAL at 7, got {seventh}"
+    )
+    drift = seventh[0]
+    assert drift.severity is DriftSeverity.CRITICAL
+    assert drift.kind is DriftKind.LOOPING_REASONING
+    assert drift.raw is not None
+    assert drift.raw.get("category") == "work"
+    assert drift.raw.get("tier") == "critical"
+    assert drift.raw.get("mode") == "name"
+    # The drift event records the actual ADK invocation id (so the
+    # cancel target is right), not the run-scoped bucket key.
+    assert drift.raw.get("invocation_id") == "adk-inv-6"
+
+
+def test_run_scoped_bucket_isolates_parallel_agents() -> None:
+    """Same run, different agent names -> independent buckets.
+
+    Even under run-scoping, parallel sub-agents within one run still
+    must be isolated by agent_name so a researcher's read_file loop
+    doesn't poison the writer's bucket. Mirrors the legacy cross-
+    agent-isolation contract under the new scope key.
+    """
+    tracker = ToolLoopTracker()
+    for agent in ("coord", "researcher", "writer"):
+        for _ in range(2):
+            tracker.observe_tool_call(
+                invocation_id="inv-1",
+                agent_name=agent,
+                tool_name="read_file",
+                args={"path": "x"},
+                task_id="t1",
+                session_run_id="run-1",
+            )
+    # 2 calls per agent, each in its own (run-id, agent) bucket.
+    assert (
+        tracker.buffer_size(
+            invocation_id="inv-1", agent_name="coord", session_run_id="run-1"
+        )
+        == 2
+    )
+    assert (
+        tracker.buffer_size(
+            invocation_id="inv-1",
+            agent_name="researcher",
+            session_run_id="run-1",
+        )
+        == 2
+    )
+    assert (
+        tracker.buffer_size(
+            invocation_id="inv-1", agent_name="writer", session_run_id="run-1"
+        )
+        == 2
+    )
+
+
+def test_run_scoped_isolation_across_distinct_runs() -> None:
+    """Calls in different runs do NOT share a bucket even at same agent name.
+
+    Run-scoped accumulation must not bleed across runs. Two separate
+    runs of the same agent calling the same tool stay isolated.
+    """
+    tracker = ToolLoopTracker()
+    for run_id in ("run-a", "run-b"):
+        for i in range(3):
+            tracker.observe_tool_call(
+                invocation_id=f"{run_id}-inv-{i}",
+                agent_name="debugger_agent",
+                tool_name="find_presentation_files",
+                args={"topic": f"q{i}"},
+                task_id="t1",
+                session_run_id=run_id,
+            )
+    # Three calls in each run, isolated buckets.
+    assert (
+        tracker.buffer_size(
+            invocation_id="run-a-inv-0",
+            agent_name="debugger_agent",
+            session_run_id="run-a",
+        )
+        == 3
+    )
+    assert (
+        tracker.buffer_size(
+            invocation_id="run-b-inv-0",
+            agent_name="debugger_agent",
+            session_run_id="run-b",
+        )
+        == 3
+    )
+
+
+def test_run_scoped_progress_reset_clears_accumulated_bucket() -> None:
+    """on_task_progress with a session_run_id clears the run-scoped bucket.
+
+    The progress-reset gate must clear the SAME bucket that
+    observe_tool_call populates, otherwise a successful
+    report_task_completed would leave the run-scoped window unflushed
+    and a benign next call would still trip the loop detector.
+    """
+    tracker = ToolLoopTracker()
+    for i in range(3):
+        tracker.observe_tool_call(
+            invocation_id=f"inv-{i}",
+            agent_name="debugger_agent",
+            tool_name="find_presentation_files",
+            args={"topic": f"q{i}"},
+            task_id="t1",
+            session_run_id="run-1",
+        )
+    assert (
+        tracker.buffer_size(
+            invocation_id="inv-0",
+            agent_name="debugger_agent",
+            session_run_id="run-1",
+        )
+        == 3
+    )
+    tracker.on_task_progress(
+        invocation_id="inv-final",
+        agent_name="debugger_agent",
+        session_run_id="run-1",
+    )
+    assert (
+        tracker.buffer_size(
+            invocation_id="inv-0",
+            agent_name="debugger_agent",
+            session_run_id="run-1",
+        )
+        == 0
+    )
+
+
+# ---------------------------------------------------------------------------
 # Cross-agent isolation
 # ---------------------------------------------------------------------------
 

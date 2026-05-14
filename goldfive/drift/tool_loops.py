@@ -103,12 +103,23 @@ flagged when each call completes its step.
    window unconditionally when called directly (tests and any
    future direct callers).
 
-Isolation: trackers are keyed on ``(invocation_id, agent_name)`` so
-each ADK invocation gets its own window, and parallel sub-agents
-within the same invocation (via AgentTool) are also isolated. State
-is intentionally held in a single :class:`ToolLoopTracker` instance
-on the plugin -- we don't need per-session persistence, the whole
-window is ephemeral to one run.
+Isolation: trackers are keyed on ``(scope_key, agent_name)`` where
+``scope_key`` is the ``session_run_id`` when the caller supplies one
+(the ADK plugin does, threading ``session.run_id`` through), and the
+ADK ``invocation_id`` otherwise (legacy callers / tests). Scoping on
+``session.run_id`` is the goldfive#420 fix: when a coordinator
+re-invokes the same sub-agent multiple times within a session (the
+debugger_agent / re-delegation pattern empirically observed on the
+cherry-tree e2e), each re-invocation got a fresh ``invocation_id`` —
+so 20 tool calls spread across 11 invocations only saw ~2 calls per
+bucket, never tripping the configured CRITICAL threshold (7 same-name
+calls). Re-keying on ``(session.run_id, agent_name)`` lets the
+detector see the cumulative window across re-invocations of the same
+agent within the same run. Parallel sub-agents within the same run
+remain isolated via ``agent_name``. State is intentionally held in a
+single :class:`ToolLoopTracker` instance on the plugin -- we don't
+need per-session persistence, the whole window is ephemeral to one
+run.
 
 Configuration
 -------------
@@ -511,6 +522,7 @@ class ToolLoopTracker:
         args: Any,
         task_id: str = "",
         observed_revision_index: int = 0,
+        session_run_id: str = "",
     ) -> list[DriftEvent]:
         """Record one tool call; return any drift observations it triggers.
 
@@ -526,12 +538,33 @@ class ToolLoopTracker:
         observed revision is older than the live plan's. Defaults to
         ``0`` (the "unset / pre-#245" sentinel) for legacy callers and
         unit tests that don't thread the session's plan revision.
+
+        ``session_run_id`` (goldfive#420) is the scope key used to
+        accumulate tool calls across re-invocations of the same agent
+        within one run. When supplied (the ADK plugin threads
+        ``session.run_id`` here), the bucket key is
+        ``(session_run_id, agent_name)`` — so 11 re-invocations of
+        ``debugger_agent`` calling ``find_presentation_files`` 2x each
+        accumulate into one 22-entry window instead of 11 isolated
+        2-entry windows. When empty (legacy callers, unit tests that
+        haven't been updated, third-party adapters), the bucket key
+        falls back to ``(invocation_id, agent_name)`` — preserving the
+        pre-#420 isolation semantics. ``invocation_id`` is still
+        recorded on the produced :class:`DriftEvent` so the dispatch-
+        time helpers (active-invocation lookup, cancel) get the right
+        target.
         """
-        key = (invocation_id or "", agent_name or "")
+        # goldfive#420: prefer the run-scoped key when the caller
+        # supplied one. Falls back to invocation-scoped for legacy
+        # callers (tests, third-party adapters) so the pre-#420
+        # contract is preserved when no session id is plumbed.
+        scope_key = session_run_id or invocation_id or ""
+        key = (scope_key, agent_name or "")
         signature = (tool_name or "", args_hash(args))
         self._buffers[key].append(signature)
         return self._classify(
             key,
+            invocation_id=invocation_id or "",
             current_task_id=task_id,
             observed_revision_index=observed_revision_index,
         )
@@ -541,8 +574,9 @@ class ToolLoopTracker:
         *,
         invocation_id: str,
         agent_name: str,
+        session_run_id: str = "",
     ) -> None:
-        """Reset the per-(invocation, agent) buffer after task progress.
+        """Reset the per-(scope, agent) buffer after task progress.
 
         Called whenever a task transitions to a progress state so
         mode 2's "no task progress in window" gate starts from a clean
@@ -550,6 +584,11 @@ class ToolLoopTracker:
         ``read_file read_file read_file`` that COMPLETES the task is
         not flagged because the next observation starts from an empty
         window.
+
+        ``session_run_id`` (goldfive#420) must match the value the
+        caller threads through :meth:`observe_tool_call` so the reset
+        targets the same bucket. Empty / unset falls back to
+        ``invocation_id`` for pre-#420 callers.
 
         .. note::
 
@@ -564,7 +603,8 @@ class ToolLoopTracker:
            whenever they have out-of-band knowledge that genuine
            task progress occurred.
         """
-        key = (invocation_id or "", agent_name or "")
+        scope_key = session_run_id or invocation_id or ""
+        key = (scope_key, agent_name or "")
         buf = self._buffers.get(key)
         if buf is not None:
             buf.clear()
@@ -578,9 +618,20 @@ class ToolLoopTracker:
         """
         self._buffers.clear()
 
-    def buffer_size(self, *, invocation_id: str, agent_name: str) -> int:
-        """Current entry count for the given key (test introspection helper)."""
-        key = (invocation_id or "", agent_name or "")
+    def buffer_size(
+        self,
+        *,
+        invocation_id: str,
+        agent_name: str,
+        session_run_id: str = "",
+    ) -> int:
+        """Current entry count for the given key (test introspection helper).
+
+        ``session_run_id`` (goldfive#420) selects the run-scoped key
+        when present; falls back to ``invocation_id`` otherwise.
+        """
+        scope_key = session_run_id or invocation_id or ""
+        key = (scope_key, agent_name or "")
         buf = self._buffers.get(key)
         return 0 if buf is None else len(buf)
 
@@ -598,6 +649,7 @@ class ToolLoopTracker:
         *,
         current_task_id: str,
         observed_revision_index: int = 0,
+        invocation_id: str = "",
     ) -> list[DriftEvent]:
         """Return zero or more drift observations for the current window.
 
@@ -607,10 +659,20 @@ class ToolLoopTracker:
         Alternating is suppressed when an exact/name drift already
         fired -- same rationale as pre-#204 (the weaker signal would
         be noise on top of the stronger).
+
+        ``invocation_id`` (goldfive#420) is stamped onto the emitted
+        :class:`DriftEvent`'s ``raw.invocation_id`` so the dispatch-
+        time cancel helper can target the actual in-flight invocation
+        even when the bucket key scoped on ``session_run_id``. Falls
+        back to the bucket scope when not supplied (legacy callers).
         """
         buf = list(self._buffers[key])
         observations: list[DriftEvent] = []
-        invocation_id, agent_name = key
+        scope_key, agent_name = key
+        # Prefer the explicitly-provided invocation id (goldfive#420);
+        # fall back to the bucket scope when callers didn't thread one
+        # through (legacy in-tree callers, third-party adapters).
+        emit_invocation_id = invocation_id or scope_key
 
         # Pre-compute per-signature and per-name counts in the window.
         exact_counts: dict[tuple[str, str], int] = {}
@@ -672,7 +734,7 @@ class ToolLoopTracker:
                         "args_hash": sig[1],
                         "count": exact_for_name,
                         "window_len": len(buf),
-                        "invocation_id": invocation_id,
+                        "invocation_id": emit_invocation_id,
                         "category": _classify_tool_category(name),
                         "tier": tier_key,
                     }
@@ -686,7 +748,7 @@ class ToolLoopTracker:
                         "tool_name": name,
                         "count": name_total,
                         "window_len": len(buf),
-                        "invocation_id": invocation_id,
+                        "invocation_id": emit_invocation_id,
                         "category": _classify_tool_category(name),
                         "tier": tier_key,
                     }
@@ -749,7 +811,7 @@ class ToolLoopTracker:
                                 "mode": "alternating",
                                 "tools": [a_name, b_name],
                                 "window_len": len(tail),
-                                "invocation_id": invocation_id,
+                                "invocation_id": emit_invocation_id,
                             },
                             trigger_input=(
                                 f"tool_loop alternating ({len(tail)} calls): "

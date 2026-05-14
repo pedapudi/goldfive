@@ -285,6 +285,48 @@ class DriftObserver:
         # ``REFINE_FAILURE_THRESHOLD`` / ``PROGRESS_STALL_THRESHOLD_SECONDS``
         # class constants).
         self._steerer = steerer
+        # goldfive#405 MEDIUM #4: in-flight refine registry. Closes the
+        # race where two concurrent judges observing the SAME
+        # ``(kind, current_task_id)`` at the same
+        # ``observed_revision_index`` both read
+        # ``session.last_addressed_revision_by_drift_key.get(key, 0) == 0``
+        # before either ``_apply_revision`` has stamped a new
+        # watermark — so both pass the freshness gate and both
+        # dispatch a redundant refine. The watermark write is gated by
+        # the per-session plan lock inside :meth:`PlanReviser._emit_plan_revised`,
+        # but that lock isn't acquired until well AFTER refine completes
+        # (the lock spans only the install + emit, not the multi-second
+        # LLM round trip). Holding the plan lock around refine would
+        # serialise unrelated drift refines on the same session, so we
+        # take the lighter-weight approach: stamp ``(session_id, kind,
+        # current_task_id)`` synchronously at the freshness-gate check
+        # site; a subsequent same-key judge sees the in-flight entry,
+        # emits ``DriftDetected`` for observability, and short-circuits
+        # the dispatch. The entry is cleared in a ``finally`` at the
+        # end of dispatch (success, exception, or cancel) so a single
+        # crash can never wedge a key permanently.
+        #
+        # Keyed by ``(session.id, kind.value, current_task_id)`` because
+        # the freshness watermark itself is keyed by
+        # ``(kind, current_task_id)`` and the steerer is shared across
+        # sessions (multi-runner processes). Per-session dict scope.
+        self._inflight_refine_keys: set[tuple[str, str, str]] = set()
+        # goldfive#405 MEDIUM #6 — double-cancel dedup. Stamped by
+        # :meth:`_handle_drift_dispatch` when its top-level
+        # ``request_invocation_cancel`` (flag-only) fires for a
+        # CRITICAL drift; consulted by
+        # :meth:`_cancel_inflight_for_revision` so a second
+        # post-refine hard cancel for the SAME drift short-circuits.
+        # Without this dedup, a CRITICAL promote-eligible drift fires
+        # two cancels: the flag-only one writes the cancel-state flag
+        # the executor consumes (driving the channel-message restart),
+        # then ``_cancel_inflight_for_revision`` hard-cancels after
+        # refine — by which point the executor may already have
+        # restarted, so the hard cancel lands on a fresh invocation.
+        # Keyed by ``drift.id`` (unique per dispatch) so repeat-drift
+        # firings (separate dispatch instances at higher occurrence
+        # counts) each get their own slot.
+        self._cancelled_drift_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Drift event emission + lifecycle stamping
@@ -2571,14 +2613,15 @@ class DriftObserver:
         :meth:`_emit_plan_revised`). See the original docstring in
         :class:`DefaultSteerer` for the long-form contract; the body
         and behaviour are unchanged here.
+
+        goldfive#405 MEDIUM #4 refactor: the dispatch body now lives in
+        :meth:`_handle_drift_dispatch` so this method can wrap it in a
+        try/finally that clears an in-flight-refine entry. The entry
+        guards (PLAN_DIVERGENCE drop, authored_by normalisation,
+        verdict-freshness watermark check) and the in-flight stamp
+        remain inline; everything from "tag the bound adapter's next
+        cancel reason" onward moved.
         """
-        from goldfive.steerer import (
-            _ABSORB_NUDGE_KINDS,
-            InterventionLevel,
-            RefineExhausted,
-            _planner_refine_accepts_available_agents,
-            compose_corrective_user_message,
-        )
 
         # goldfive#252: PLAN_DIVERGENCE replaced by CAPABILITY_MISMATCH
         # (#253) — disabled here. Guard at the very top so any external
@@ -2617,6 +2660,13 @@ class DriftObserver:
         #     operator directive must be honoured regardless of the
         #     framework's plan-state cursor (preserves the iter-11D /
         #     #242 contract).
+        # goldfive#405 MEDIUM #4 — in-flight-refine registry key. Stamped
+        # synchronously below (alongside the freshness-gate watermark
+        # check) and cleared in this method's ``finally`` so a second
+        # concurrent judge observing the SAME ``(kind, current_task_id)``
+        # short-circuits before duplicating the refine. ``None`` outside
+        # the goldfive-authored / observation-stamped guard.
+        inflight_key: tuple[str, str, str] | None = None
         if drift.observed_revision_index and (drift.authored_by or "").lower() != "user":
             # Per-(kind, target) addressed-watermark check — narrower
             # than naive ``observed < live_revision`` gating so parallel
@@ -2650,6 +2700,75 @@ class DriftObserver:
                 # ran; do NOT cancel / refine on a redundant view.
                 await self._emit_drift_detected(session, drift)
                 return
+            # goldfive#405 MEDIUM #4 — concurrent-refine race close. The
+            # watermark above stamps AT THE END of a successful refine
+            # (inside :meth:`PlanReviser._emit_plan_revised`'s lock), so
+            # two concurrent judges that observed the same
+            # ``(kind, current_task_id)`` at the same revision both read
+            # ``last_addressed == 0`` here, both pass the watermark
+            # check, and both proceed to dispatch — running two refines
+            # for one drift. The plan lock isn't held across
+            # ``planner.refine`` (multi-second LLM round-trip) by design,
+            # so widening it would serialise unrelated drift handling on
+            # the same session. Instead, stamp an in-flight key
+            # synchronously here. A second same-key judge sees the entry,
+            # emits ``DriftDetected`` for observability, and skips the
+            # cancel+refine machinery; cleared in the ``finally`` at the
+            # end of this method so a single dispatch crash can't wedge
+            # a key permanently.
+            inflight_key = (
+                str(session.id or session.run_id or ""),
+                drift.kind.value,
+                drift.current_task_id or "",
+            )
+            if inflight_key in self._inflight_refine_keys:
+                log.info(
+                    "DefaultSteerer._handle_drift: concurrent refine — "
+                    "drift kind=%s target=%r already in-flight at "
+                    "observed revision %d; skipping dispatch",
+                    drift.kind.value,
+                    drift.current_task_id or "<trajectory>",
+                    drift.observed_revision_index,
+                )
+                await self._emit_drift_detected(session, drift)
+                return
+            self._inflight_refine_keys.add(inflight_key)
+        try:
+            await self._handle_drift_dispatch(drift, session)
+        finally:
+            if inflight_key is not None:
+                self._inflight_refine_keys.discard(inflight_key)
+            # goldfive#405 MEDIUM #6 — release the cancelled-drift slot
+            # at the end of dispatch. Safe to discard unconditionally:
+            # if the drift never made it to the pre-cancel branch the
+            # set has no entry and discard is a no-op; if it did and
+            # ``_cancel_inflight_for_revision`` already consumed the
+            # entry, discard is still a no-op. Bounds the set to the
+            # active dispatch depth so it can't grow indefinitely
+            # across the steerer's lifetime.
+            drift_id = str(getattr(drift, "id", "") or "")
+            if drift_id:
+                self._cancelled_drift_ids.discard(drift_id)
+
+    async def _handle_drift_dispatch(self, drift: DriftEvent, session: Session) -> None:
+        """Dispatch the drift through cancel + ladder (goldfive#405 MEDIUM #4).
+
+        Extracted from :meth:`handle_drift` so the freshness gate can
+        wrap dispatch in a try/finally that clears the in-flight refine
+        entry. The body is unchanged from the pre-#405 inline version —
+        every comment / log line / control-flow contract preserved.
+        Callers must ensure :meth:`handle_drift`'s entry guards
+        (USER_STEER side effects, freshness-watermark check) have
+        already run; this method jumps straight into cancel + refine.
+        """
+        from goldfive.steerer import (
+            _ABSORB_NUDGE_KINDS,
+            InterventionLevel,
+            RefineExhausted,
+            _planner_refine_accepts_available_agents,
+            compose_corrective_user_message,
+        )
+
         # Tag the bound adapter's next cancel with a symbolic reason so
         # the synthetic function_response the adapter appends on cancel
         # carries LLM-actionable content. Done BEFORE the drift event
@@ -2715,7 +2834,20 @@ class DriftObserver:
         # Whether to re-dispatch after the cancel is the parent
         # agent's decision, informed by plan-causal prompting from
         # Stream B — the framework itself does NOT auto-reinvoke.
+        #
         if self._should_request_cancel_for_drift(drift):
+            # goldfive#405 MEDIUM #6 — record the drift id BEFORE the
+            # cancel fires so the post-refine
+            # :meth:`_cancel_inflight_for_revision` short-circuits the
+            # second cancel for the SAME drift. Stamping before rather
+            # than after the await ensures the dedup engages even if
+            # the cancel call yields the event loop and a same-task
+            # background tries to fire its own ``_cancel_inflight_for_revision``
+            # before this branch returns. See the docstring on
+            # :attr:`_cancelled_drift_ids` for the full rationale.
+            drift_id = str(getattr(drift, "id", "") or "")
+            if drift_id:
+                self._cancelled_drift_ids.add(drift_id)
             try:
                 await self.request_invocation_cancel(drift=drift, session=session)
             except Exception as exc:  # noqa: BLE001 — cancel is best-effort
@@ -3895,6 +4027,31 @@ class DriftObserver:
                 "could not stamp supersede flag on session: %s",
                 exc,
             )
+        # goldfive#405 MEDIUM #6 — short-circuit when the same drift
+        # already had a flag-only cancel fired at the top of
+        # :meth:`_handle_drift_dispatch`. The flag write the executor
+        # consumes is idempotent; firing a SECOND cancel here would
+        # add no value but could land on a different invocation than
+        # the first cancel targeted — between the two cancels the
+        # executor may have restarted the invocation in response to
+        # the first flag's channel-message restart. The supersede
+        # marker above is still stamped (cheap, idempotent) so an
+        # overlay reading it sees the same internal-cancel signal.
+        drift_id = str(getattr(drift, "id", "") or "")
+        if drift_id and drift_id in self._cancelled_drift_ids:
+            log.debug(
+                "DefaultSteerer._cancel_inflight_for_revision: "
+                "drift id=%s already had a pre-refine cancel — "
+                "skipping post-refine cancel to avoid double-cancel "
+                "against a freshly-restarted invocation",
+                drift_id,
+            )
+            # Drop the entry so the slot is GC'd once the dispatch
+            # completes. Subsequent ``_cancel_inflight_for_revision``
+            # invocations for OTHER drifts won't see this id and the
+            # set stays bounded by in-flight handler depth.
+            self._cancelled_drift_ids.discard(drift_id)
+            return []
         try:
             return await self.request_invocation_cancel(
                 drift=drift,
