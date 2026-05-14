@@ -537,3 +537,85 @@ def test_delegation_observed_old_wire_format_parses_with_default_tool_args() -> 
     assert parsed.to_agent == "debugger_agent"
     assert parsed.task_id == "t1"
     assert parsed.invocation_id == "inv-1"
+
+
+def test_delegation_observed_event_wire_bytes_identical_to_pre_pr1_when_no_tool_args() -> None:
+    """Canonical UI-safety regression guard: a caller that does NOT pass
+    ``tool_args_json`` MUST produce byte-identical wire to the pre-PR-1
+    producer that did not know about the field.
+
+    This is the load-bearing claim from PR 1's brief:
+    *conditional emission means byte-identical old wire*. Proto3 omits
+    default-valued scalars from the wire, but the helper applies
+    ``if tool_args_json:`` defensively even for the empty-string default
+    — this test pins that contract so any future regression (e.g. a
+    refactor that drops the conditional and assigns unconditionally)
+    fails loudly.
+
+    We compare the current helper's output against a "pre-PR-1 shape"
+    proto built without ever touching ``tool_args_json``.
+    """
+    from goldfive.pb.goldfive.v1 import events_pb2
+
+    # New-code path: helper called without tool_args_json kwarg.
+    evt_new = delegation_observed_event(
+        run_id="r-bc",
+        sequence=7,
+        from_agent="coordinator",
+        to_agent="researcher",
+        task_id="t1",
+        invocation_id="inv-1",
+        event_id="e1",
+        observed_at=events_pb2.DelegationObserved().observed_at.__class__(seconds=42),
+    )
+    new_wire = evt_new.SerializeToString()
+
+    # Pre-PR-1 shape: build the same DelegationObserved without ever
+    # touching tool_args_json. (Schema knows about the field, but the
+    # producer doesn't set it — same wire-output condition as a build
+    # that pre-dates the field.)
+    pre_inner = events_pb2.DelegationObserved(
+        from_agent="coordinator",
+        to_agent="researcher",
+        task_id="t1",
+        invocation_id="inv-1",
+    )
+    pre_inner.observed_at.CopyFrom(evt_new.delegation_observed.observed_at)
+    pre_evt = events_pb2.Event(
+        event_id="e1",
+        run_id="r-bc",
+        sequence=7,
+        delegation_observed=pre_inner,
+    )
+    pre_evt.emitted_at.CopyFrom(evt_new.emitted_at)
+    pre_wire = pre_evt.SerializeToString()
+
+    assert new_wire == pre_wire, (
+        "Byte-identity contract broken: new event helper without "
+        "tool_args_json must serialise to the same bytes as a pre-PR-1 "
+        "producer that did not know about the field."
+    )
+
+
+def test_delegation_observed_event_wire_bytes_change_only_when_tool_args_passed() -> None:
+    """Companion to the byte-identity guard: when ``tool_args_json`` IS
+    provided, the wire MUST differ (otherwise the field would be a
+    no-op and PR 2's dedup would silently fail).
+    """
+    common = dict(
+        run_id="r-bc2",
+        sequence=8,
+        from_agent="coordinator",
+        to_agent="researcher",
+        task_id="t1",
+        invocation_id="inv-1",
+        event_id="e2",
+    )
+    evt_empty = delegation_observed_event(**common)
+    evt_with_args = delegation_observed_event(**common, tool_args_json='{"x":"y"}')
+    # Align observed_at + emitted_at so only tool_args_json differs.
+    evt_with_args.delegation_observed.observed_at.CopyFrom(
+        evt_empty.delegation_observed.observed_at
+    )
+    evt_with_args.emitted_at.CopyFrom(evt_empty.emitted_at)
+    assert evt_empty.SerializeToString() != evt_with_args.SerializeToString()
