@@ -169,15 +169,15 @@ if TYPE_CHECKING:
 ReflectiveCallLLM = Callable[[str, str, str], Awaitable[str]]
 
 log = logging.getLogger(__name__)
-# Tests + harmonograf consumers grep for ``"DefaultSteerer."`` prefixes
-# and the ``goldfive.steerer`` logger name across log records the
-# observation + judge surface emits. Keep emitting under that logger
-# name so the contract survives the bucket-3b extraction byte-for-byte
-# (cf. the structural ``"stale judge verdict"`` INFO line asserted by
-# :file:`tests/test_judge_task_lifetime.py`). The module's other logs
-# stay on the ``goldfive.drift_observer`` logger so log-routing /
-# filtering scoped to this component still works.
-_steerer_log = logging.getLogger("goldfive.steerer")
+# Wave C bucket 3b/3c post-cleanup: the module previously kept a
+# sibling ``_steerer_log = logging.getLogger("goldfive.steerer")``
+# because the test corpus asserted on ``record.name == "goldfive.steerer"``.
+# Those assertions have been widened to message-content predicates so
+# we no longer need the sibling — every log line on this module now
+# lands on the natural ``goldfive.drift_observer`` logger (``log``).
+# Operators / harmonograf consumers should grep on message content
+# (``"DefaultSteerer."`` prefixes, ``"stale judge verdict"``, etc.)
+# or on the parent ``goldfive`` logger.
 
 
 class DriftObserver:
@@ -1076,7 +1076,7 @@ class DriftObserver:
         """
         if self._is_duplicate_steer(event, session):
             steer_id = self._steer_dedupe_id(event)
-            _steerer_log.debug("DefaultSteerer.observe: dropping duplicate STEER id=%s", steer_id)
+            log.debug("DefaultSteerer.observe: dropping duplicate STEER id=%s", steer_id)
             return
         drift = self._drift_from_control(event, session)
         if drift is None:
@@ -1331,7 +1331,7 @@ class DriftObserver:
             # synchronous detectors run inline on the model-response
             # callback and always see a live invocation.
             if self._is_late_drift_for_terminated_invocation(drift, session):
-                _steerer_log.info(
+                log.info(
                     "DefaultSteerer: stale judge verdict; invocation for "
                     "agent=%r task=%r already terminated; drift kind=%s "
                     "recorded but refine skipped",
@@ -1350,7 +1350,7 @@ class DriftObserver:
             # the WARNING log below muddying the signal.
             raise
         except Exception as exc:  # noqa: BLE001 — background task
-            _steerer_log.warning(
+            log.warning(
                 "DefaultSteerer: background reasoning-judge raised (swallowed): %s",
                 exc,
             )
@@ -1386,7 +1386,7 @@ class DriftObserver:
         confidence = float(getattr(verdict, "focus_confidence", 0.0) or 0.0)
         threshold = self._steerer._reasoning_binding_confidence_threshold
         if confidence < threshold:
-            _steerer_log.debug(
+            log.debug(
                 "DefaultSteerer: reasoning binding for agent=%r "
                 "task=%r dropped (confidence=%.2f < threshold=%.2f)",
                 agent_name,
@@ -1408,7 +1408,7 @@ class DriftObserver:
                 session_id=session.id,
             )
             if recorded is not None:
-                _steerer_log.info(
+                log.info(
                     "DefaultSteerer: recorded reasoning-extracted binding "
                     "agent=%r task=%r confidence=%.2f",
                     agent_name,
@@ -1416,7 +1416,7 @@ class DriftObserver:
                     confidence,
                 )
         except Exception as exc:  # noqa: BLE001 — never break the run
-            _steerer_log.warning(
+            log.warning(
                 "DefaultSteerer: record_reasoning_extracted_binding raised (swallowed): %s",
                 exc,
             )
@@ -1492,7 +1492,7 @@ class DriftObserver:
         drain — operator intent survives across turns by construction.
         """
         if not session_id:
-            _steerer_log.warning(
+            log.warning(
                 "DefaultSteerer.drain_session_background_tasks: empty "
                 "session_id; refusing to drain (would otherwise match "
                 "every pending background task)",
@@ -1586,7 +1586,7 @@ class DriftObserver:
             # / WARNING reserved for the real "we cancelled work"
             # signal.
             if still_pending:
-                _steerer_log.warning(
+                log.warning(
                     "DefaultSteerer.shutdown: %d background %s task(s) "
                     "exceeded %.2fs timeout; cancelled",
                     len(still_pending),
@@ -1594,7 +1594,7 @@ class DriftObserver:
                     float(timeout),
                 )
             else:
-                _steerer_log.debug(
+                log.debug(
                     "DefaultSteerer.shutdown: %.2fs timeout expired but "
                     "all %s tasks completed in the same instant; nothing "
                     "to cancel",
@@ -1830,7 +1830,7 @@ class DriftObserver:
                         verdict_str = "malformed"
                     span.decision_summary = f"reflective check on {task.id}: {verdict_str}"
         except Exception as exc:  # noqa: BLE001 - never break the run
-            _steerer_log.warning(
+            log.warning(
                 "DefaultSteerer.maybe_run_reflective_check: call_llm raised %s", exc
             )
             await self._emit_reflective_failure(
@@ -2054,7 +2054,7 @@ class DriftObserver:
                 # ``note_agent_activity`` uses.
                 del hist[:overflow]
         except Exception as exc:  # noqa: BLE001
-            _steerer_log.debug("note_tool_observation: swallowed: %s", exc)
+            log.debug("note_tool_observation: swallowed: %s", exc)
 
     async def note_agent_turn(self, session: Session) -> None:
         """Record one agent invocation against ``session``.
@@ -2277,7 +2277,7 @@ class DriftObserver:
             # against the still-pending tally without warning.
             raise
         except Exception as exc:  # noqa: BLE001 — background task
-            _steerer_log.warning(
+            log.warning(
                 "DefaultSteerer: background goal-drift judge raised "
                 "(swallowed): %s",
                 exc,
@@ -2322,7 +2322,7 @@ class DriftObserver:
         except RuntimeError:
             # No loop — fall through silently. Same defensive pattern
             # as :meth:`_spawn_goal_drift_judge_background`.
-            _steerer_log.debug(
+            log.debug(
                 "DefaultSteerer._spawn_drift_handler_background: no running "
                 "loop; skipping spawn for kind=%s",
                 drift.kind.value,
@@ -2355,7 +2355,7 @@ class DriftObserver:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — background task
-            _steerer_log.warning(
+            log.warning(
                 "DefaultSteerer: background drift handler raised "
                 "(swallowed): kind=%s exc=%s",
                 drift.kind.value,
@@ -2636,7 +2636,7 @@ class DriftObserver:
                 session.last_addressed_revision_by_drift_key.get(key, 0)
             )
             if last_addressed and drift.observed_revision_index < last_addressed:
-                _steerer_log.info(
+                log.info(
                     "DefaultSteerer._handle_drift: redundant verdict — "
                     "drift kind=%s target=%r observed revision %d but "
                     "same (kind, target) was already addressed at "
@@ -2866,7 +2866,7 @@ class DriftObserver:
                     # produce a meaningful change. Same escalation path
                     # as the structural no-op detector — pause for
                     # human intervention rather than retrying.
-                    _steerer_log.info(
+                    log.info(
                         "DefaultSteerer._handle_drift: planner.refine raised "
                         "RefineExhausted for kind=%s task=%r: %s",
                         drift.kind.value,
@@ -2890,7 +2890,7 @@ class DriftObserver:
                     # LLM JSON after a mid-invocation cancel poisons the session)
                     # leaves session.plan unchanged and the executor re-enters
                     # the same state on the next tick.
-                    _steerer_log.warning(
+                    log.warning(
                         "DefaultSteerer._handle_drift: planner.refine(kind=%s) raised "
                         "%s; plan unchanged",
                         drift.kind.value,
@@ -2941,7 +2941,7 @@ class DriftObserver:
             # recurse through ``_handle_drift`` and eventually abort the
             # run. Mirrors the ``RefineExhausted`` and no-op-revision
             # escalation paths.
-            _steerer_log.warning(
+            log.warning(
                 "DefaultSteerer._handle_drift: planner.refine(kind=%s) returned None; "
                 "plan unchanged — escalating to HUMAN_INTERVENTION_REQUIRED",
                 drift.kind.value,
@@ -3015,7 +3015,7 @@ class DriftObserver:
         # index for a no-op, which would otherwise loop forever on a
         # judge that keeps re-firing on a corrected task.
         if self._steerer._plans_structurally_identical(session.plan, revised):
-            _steerer_log.info(
+            log.info(
                 "no-op revision skipped (kind=%s task=%r); escalating to "
                 "HUMAN_INTERVENTION_REQUIRED",
                 drift.kind.value,
@@ -3193,7 +3193,7 @@ class DriftObserver:
         # No cancel-and-restart fires on the executor; the live invocation
         # continues against the prior plan.
         if not self._steerer._should_inject():
-            _steerer_log.info(
+            log.info(
                 "DefaultSteerer._dispatch_goldfive_steer_control: "
                 "observation_only=True — SKIPPING GOLDFIVE_STEER enqueue. "
                 "would_have_dispatched kind=%s task=%s drift_id=%s "
@@ -3262,7 +3262,7 @@ class DriftObserver:
         from goldfive.control import ControlKind, ControlMessage
 
         if not self._steerer._should_inject():
-            _steerer_log.info(
+            log.info(
                 "DefaultSteerer._dispatch_goldfive_pause_control: "
                 "observation_only=True — SKIPPING GOLDFIVE_PAUSE_ESCALATE "
                 "dispatch. would_have_dispatched kind=%s task=%s "
@@ -3663,7 +3663,7 @@ class DriftObserver:
         live invocation.
         """
         if not self._steerer._should_inject():
-            _steerer_log.info(
+            log.info(
                 "DefaultSteerer.request_invocation_cancel: "
                 "observation_only=True — SKIPPING cancel for "
                 "drift kind=%s severity=%s agent=%s task=%s",
@@ -3771,7 +3771,7 @@ class DriftObserver:
             else:
                 flagged.append(inv_id)
         if flagged:
-            _steerer_log.info(
+            log.info(
                 "DefaultSteerer.request_invocation_cancel: flagged "
                 "invocations=%s for drift kind=%s severity=%s",
                 flagged,
@@ -3990,7 +3990,7 @@ class DriftObserver:
                 age = current_turn - active.at_turn
                 if 0 <= age < window:
                     drift.suppressed_by_user_steer = True
-                    _steerer_log.info(
+                    log.info(
                         "goldfive steer suppressed: user steer %r is active "
                         "(age=%d turns, window=%d)",
                         active.body,
@@ -4204,7 +4204,7 @@ class DriftObserver:
             except RefineExhausted as exc:
                 # goldfive#271: planner explicitly signalled handler
                 # exhaustion. Pause for human intervention.
-                _steerer_log.info(
+                log.info(
                     "DefaultSteerer._promote_drift_to_steer: refine raised "
                     "RefineExhausted for kind=%s task=%r: %s",
                     drift.kind.value,
@@ -4222,7 +4222,7 @@ class DriftObserver:
                 await self._emit_handler_exhausted_escalation(drift, session)
                 return
             except Exception as exc:  # noqa: BLE001
-                _steerer_log.warning(
+                log.warning(
                     "DefaultSteerer._promote_drift_to_steer: refine raised %s; plan unchanged",
                     exc,
                 )
@@ -4265,7 +4265,7 @@ class DriftObserver:
             # HUMAN_INTERVENTION_REQUIRED rather than emitting a
             # recursing CRITICAL follow-up drift that would eventually
             # abort the run.
-            _steerer_log.warning(
+            log.warning(
                 "DefaultSteerer._promote_drift_to_steer: refine returned None; "
                 "plan unchanged — escalating to HUMAN_INTERVENTION_REQUIRED"
             )
@@ -4320,7 +4320,7 @@ class DriftObserver:
         # identical plan means the planner cannot make progress on this
         # drift; escalate to HUMAN_INTERVENTION_REQUIRED.
         if self._steerer._plans_structurally_identical(session.plan, revised):
-            _steerer_log.info(
+            log.info(
                 "no-op refine_steer revision skipped (kind=%s task=%r); "
                 "escalating to HUMAN_INTERVENTION_REQUIRED",
                 drift.kind.value,

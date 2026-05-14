@@ -44,32 +44,22 @@ from goldfive.steerer import DefaultSteerer  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _scrub_module_state(monkeypatch: pytest.MonkeyPatch) -> Any:
+def _scrub_module_state(goldfive_runtime_env: dict) -> Any:
     """Clear every module-level config slot and env var before each test.
 
     Tests that install a config via ``wrap()`` must leave the process
     in a clean state for downstream tests — otherwise the reasoning-
     drift detectors run against last-test thresholds.
+
+    The ``goldfive_runtime_env`` fixture handles env-var scrubbing by
+    pre-clearing every ``RuntimeConfig`` sub-domain in its setup; we
+    only need to handle the module-level config slots here.
     """
     _embed.set_model(None)
     _embed.configure(None)
     _reasoning.configure(None)
     _tool_loops.configure(None)
-    for name in (
-        "GOLDFIVE_EMBEDDING_BASE_URL",
-        "GOLDFIVE_EMBEDDING_MODEL",
-        "GOLDFIVE_EMBEDDING_API_KEY",
-        "GOLDFIVE_EMBEDDING_TIMEOUT_MS",
-        "GOLDFIVE_TOOL_LOOP_WINDOW",
-        "GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD",
-        "GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD",
-        "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD",
-        "GOLDFIVE_DRIFT_OFF_TOPIC_DISTANCE",
-        "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
-        "GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL",
-        "GOLDFIVE_GOAL_DRIFT_ACTIVITY_WINDOW",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    _ = goldfive_runtime_env  # parameter forces fixture ordering.
     yield
     _embed.set_model(None)
     _embed.configure(None)
@@ -147,10 +137,10 @@ def test_wrap_threads_reasoning_drift_mode_from_config() -> None:
 
 
 def test_wrap_threads_reasoning_drift_mode_from_env(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_reasoning_drift_env: Any,
 ) -> None:
     """`GOLDFIVE_DRIFT_REASONING_MODE=both make demo` end-to-end."""
-    monkeypatch.setenv("GOLDFIVE_DRIFT_REASONING_MODE", "both")
+    goldfive_reasoning_drift_env.set(mode="both")
     runner = goldfive.wrap(_noop_agent, sinks=[])
     steerer = runner.steerer
     assert isinstance(steerer, DefaultSteerer)
@@ -158,14 +148,13 @@ def test_wrap_threads_reasoning_drift_mode_from_env(
 
 
 def test_wrap_falls_back_to_from_env_when_runtime_none(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_runtime_env: dict,
 ) -> None:
     """With ``runtime=None`` (the default) env vars drive the effective config."""
-    monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_CHECK_INTERVAL", "11")
-    monkeypatch.setenv("GOLDFIVE_GOAL_DRIFT_ACTIVITY_WINDOW", "30")
-    monkeypatch.setenv("GOLDFIVE_TOOL_LOOP_WINDOW", "13")
-    monkeypatch.setenv("GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW", "11")
-    monkeypatch.setenv("GOLDFIVE_EMBEDDING_BASE_URL", "http://envfall:1234")
+    goldfive_runtime_env["goal_drift"].set(check_interval=11, activity_window=30)
+    goldfive_runtime_env["tool_loop"].set(window=13)
+    goldfive_runtime_env["reasoning_drift"].set(looping_hash_window=11)
+    goldfive_runtime_env["embedding"].set(base_url="http://envfall:1234")
 
     runner = goldfive.wrap(_noop_agent, sinks=[])
 
@@ -244,11 +233,10 @@ def test_wrap_threads_steering_config() -> None:
 
 
 def test_wrap_threads_steering_config_from_env(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_steer_env: Any,
 ) -> None:
     """GOLDFIVE_STEER_THRESHOLD env var threads through wrap()."""
-    monkeypatch.setenv("GOLDFIVE_STEER_THRESHOLD", "off")
-    monkeypatch.setenv("GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS", "11")
+    goldfive_steer_env.set(threshold="off", suppression_window_turns=11)
     runner = goldfive.wrap(_noop_agent, sinks=[])
     steerer = runner.steerer
     assert isinstance(steerer, DefaultSteerer)

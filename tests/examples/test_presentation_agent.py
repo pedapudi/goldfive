@@ -82,11 +82,13 @@ def test_mock_run_completes_successfully() -> None:
     assert task_ids == {"research", "build", "review", "debug"}
 
 
-def test_app_is_valid_adk_app(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_app_is_valid_adk_app(goldfive_examples_env) -> None:
     """``app`` must load offline and present a ``BaseAgent`` root."""
     # Force mock-mode App construction — no OPENAI_API_KEY, no harmonograf.
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("HARMONOGRAF_SERVER", raising=False)
+    # The fixture's ``clear()`` pre-step already unset both variables in
+    # the calling environment, so the explicit unsets below are belt-
+    # and-braces for readers; either is sufficient.
+    goldfive_examples_env.unset("openai_api_key", "harmonograf_server")
 
     # Reset the cached app so we build a fresh one under the scrubbed env.
     from examples.presentation_agent import agent as agent_mod

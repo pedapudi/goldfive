@@ -59,27 +59,26 @@ def test_agent_config_defaults() -> None:
     assert cfg.call_timeout_ms == 120_000
 
 
-def test_agent_config_from_env_max_output_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_agent_config_from_env_max_output_tokens(goldfive_agent_env: Any) -> None:
     """``GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS`` overrides the field default."""
-    monkeypatch.setenv("GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS", "1024")
+    goldfive_agent_env.set(max_output_tokens=1024)
     cfg = AgentConfig.from_env()
     assert cfg.max_output_tokens == 1024
     # Other field unaffected.
     assert cfg.call_timeout_ms == 120_000
 
 
-def test_agent_config_from_env_call_timeout_ms(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_agent_config_from_env_call_timeout_ms(goldfive_agent_env: Any) -> None:
     """``GOLDFIVE_AGENT_CALL_TIMEOUT_MS`` overrides the field default."""
-    monkeypatch.setenv("GOLDFIVE_AGENT_CALL_TIMEOUT_MS", "30000")
+    goldfive_agent_env.set(call_timeout_ms=30000)
     cfg = AgentConfig.from_env()
     assert cfg.call_timeout_ms == 30_000
     assert cfg.max_output_tokens == 16384
 
 
-def test_agent_config_from_env_ignores_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_agent_config_from_env_ignores_invalid(goldfive_agent_env: Any) -> None:
     """Non-integer / non-positive env values fall back to the field default."""
-    monkeypatch.setenv("GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS", "not-an-int")
-    monkeypatch.setenv("GOLDFIVE_AGENT_CALL_TIMEOUT_MS", "0")
+    goldfive_agent_env.set(max_output_tokens="not-an-int", call_timeout_ms="0")
     cfg = AgentConfig.from_env()
     assert cfg.max_output_tokens == 16384
     assert cfg.call_timeout_ms == 120_000
@@ -93,10 +92,9 @@ def test_runtime_config_carries_agent_subconfig() -> None:
     assert runtime.agent.max_output_tokens == 16384
 
 
-def test_runtime_config_from_env_threads_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_runtime_config_from_env_threads_agent(goldfive_agent_env: Any) -> None:
     """``RuntimeConfig.from_env()`` calls :meth:`AgentConfig.from_env`."""
-    monkeypatch.setenv("GOLDFIVE_AGENT_MAX_OUTPUT_TOKENS", "2048")
-    monkeypatch.setenv("GOLDFIVE_AGENT_CALL_TIMEOUT_MS", "90000")
+    goldfive_agent_env.set(max_output_tokens=2048, call_timeout_ms=90000)
     runtime = RuntimeConfig.from_env()
     assert runtime.agent.max_output_tokens == 2048
     assert runtime.agent.call_timeout_ms == 90_000

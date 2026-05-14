@@ -362,7 +362,7 @@ async def test_dispatch_pause_control_observation_only_skips_channel_send(
     steerer.bind_control_channel(channel)
 
     drift = _drift(kind=DriftKind.OFF_TOPIC)
-    with caplog.at_level(logging.INFO, logger="goldfive.steerer"):
+    with caplog.at_level(logging.INFO, logger="goldfive"):
         landed = await steerer._dispatch_goldfive_pause_control(
             drift, session, reason="test exhaustion"
         )
@@ -680,7 +680,7 @@ async def test_overlay_observation_only_drops_leaked_pause_escalate(
     adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
     executor = SequentialExecutor(overlay_mode=True, fail_fast=True)
 
-    with caplog.at_level(logging.INFO, logger="goldfive.executors.sequential"):
+    with caplog.at_level(logging.INFO, logger="goldfive"):
         outcome = await executor.run(
             plan=plan,
             session=session,

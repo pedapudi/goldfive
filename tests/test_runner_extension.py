@@ -133,7 +133,7 @@ async def test_close_hook_exception_is_logged_and_does_not_block_others(
     runner.add_close_hook(hook_b)
     runner.add_close_hook(hook_c)
 
-    with caplog.at_level(logging.WARNING, logger="goldfive.runner"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         await runner.close()
 
     assert calls == ["a", "b", "c"]

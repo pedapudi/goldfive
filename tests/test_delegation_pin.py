@@ -245,7 +245,7 @@ def test_no_eligible_task_leaves_session_unpinned(
     session = _session_with(plan)
     ctx = _ctx(session)
 
-    with caplog.at_level(logging.DEBUG, logger="goldfive.adapters.adk"):
+    with caplog.at_level(logging.DEBUG, logger="goldfive"):
         plugin._maybe_pin_delegation_task(
             ctx=ctx,
             invoked_agent_name="Z",

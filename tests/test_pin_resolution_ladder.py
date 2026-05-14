@@ -468,7 +468,7 @@ async def test_signal4_dag_relaxed_pins_with_warning(
     )
     state, ctx = _ctx_for(session, "coord", sinks=sinks)
 
-    with caplog.at_level(logging.WARNING, logger="goldfive.adapters.adk"):
+    with caplog.at_level(logging.WARNING, logger="goldfive"):
         await plugin.before_agent_callback(
             agent=_Agent("researcher"),
             callback_context=ctx,

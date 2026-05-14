@@ -586,34 +586,33 @@ def test_runtime_config_threads_steering_threshold() -> None:
     assert steerer._goldfive_steer_suppression_window_turns == 7
 
 
-def test_steering_config_from_env_accepts_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_steering_config_from_env_accepts_defaults(goldfive_steer_env: Any) -> None:
     from goldfive.config import SteeringConfig
 
-    monkeypatch.delenv("GOLDFIVE_STEER_THRESHOLD", raising=False)
-    monkeypatch.delenv("GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS", raising=False)
+    # Fixture pre-clears the steering env vars in setup.
+    _ = goldfive_steer_env
     cfg = SteeringConfig.from_env()
     assert cfg.threshold == "warning"
     assert cfg.suppression_window_turns == 3
 
 
 def test_steering_config_from_env_reads_threshold(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_steer_env: Any,
 ) -> None:
     from goldfive.config import SteeringConfig
 
-    monkeypatch.setenv("GOLDFIVE_STEER_THRESHOLD", "critical")
-    monkeypatch.setenv("GOLDFIVE_STEER_SUPPRESSION_WINDOW_TURNS", "9")
+    goldfive_steer_env.set(threshold="critical", suppression_window_turns=9)
     cfg = SteeringConfig.from_env()
     assert cfg.threshold == "critical"
     assert cfg.suppression_window_turns == 9
 
 
 def test_steering_config_from_env_rejects_unknown_threshold(
-    monkeypatch: pytest.MonkeyPatch,
+    goldfive_steer_env: Any,
 ) -> None:
     from goldfive.config import SteeringConfig
 
-    monkeypatch.setenv("GOLDFIVE_STEER_THRESHOLD", "nonsense")
+    goldfive_steer_env.set(threshold="nonsense")
     cfg = SteeringConfig.from_env()
     # Falls back to default
     assert cfg.threshold == "warning"

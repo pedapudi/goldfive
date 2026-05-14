@@ -701,7 +701,7 @@ async def test_task_boundary_noop_when_goal_drift_not_wired() -> None:
 async def test_classifier_logs_on_track_at_debug(caplog: pytest.LogCaptureFixture) -> None:
     """progressing=true → DEBUG log with 'on-track' so operators can diagnose."""
     call_llm = _stub_call_llm([{"progressing": True, "reason": "writing in progress"}])
-    with caplog.at_level("DEBUG", logger="goldfive.drift.goals"):
+    with caplog.at_level("DEBUG", logger="goldfive"):
         drift = await classify_goal_drift(
             goals=[Goal(id="g1", summary="ship memo")],
             plan=None,
@@ -721,7 +721,7 @@ async def test_classifier_logs_drift_detected_at_info(caplog: pytest.LogCaptureF
     without having to crank logging to DEBUG."""
     reason = "researching raccoons instead of solar panels"
     call_llm = _stub_call_llm([{"progressing": False, "reason": reason}])
-    with caplog.at_level("INFO", logger="goldfive.drift.goals"):
+    with caplog.at_level("INFO", logger="goldfive"):
         drift = await classify_goal_drift(
             goals=[Goal(id="g1", summary="ship memo")],
             plan=None,
@@ -739,7 +739,7 @@ async def test_classifier_logs_malformed_json_at_debug(
 ) -> None:
     """Malformed response → DEBUG log including the raw text snippet."""
     call_llm = _stub_call_llm(["this is not JSON at all -- raccoons everywhere"])
-    with caplog.at_level("DEBUG", logger="goldfive.drift.goals"):
+    with caplog.at_level("DEBUG", logger="goldfive"):
         drift = await classify_goal_drift(
             goals=[Goal(id="g1", summary="ship memo")],
             plan=None,
@@ -759,7 +759,7 @@ async def test_classifier_logs_missing_progressing_key_at_debug(
 ) -> None:
     """Dict without 'progressing' key → DEBUG log with 'lacks boolean'."""
     call_llm = _stub_call_llm([{"reason": "no key"}])
-    with caplog.at_level("DEBUG", logger="goldfive.drift.goals"):
+    with caplog.at_level("DEBUG", logger="goldfive"):
         drift = await classify_goal_drift(
             goals=[Goal(id="g1", summary="ship memo")],
             plan=None,
