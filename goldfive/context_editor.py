@@ -136,7 +136,7 @@ class ContextEditRule(Protocol):
     guarantee that two callbacks at the same revision produce the same
     edit. Rules that need stateful information (e.g. cancelled
     function_call ids) read it off ``ctx.session.state`` via the
-    relevant ``orchestration_state`` helper — that state is
+    relevant ``state_store`` helper — that state is
     monotonically growing and revision-stamped, so deterministic per
     call.
 
@@ -181,7 +181,7 @@ class ContextEditContext:
     :meth:`ContextEditor.apply`.
 
     Rules use ``session`` to read orchestration state
-    (e.g. ``orchestration_state.read_cancelled_function_call_ids``) and
+    (e.g. ``state_store.read_cancelled_function_call_ids``) and
     ``observed_revision_index`` to stamp idempotence keys. The session
     handle is the goldfive Session (NOT the ADK session) — same handle
     every other steering surface reads from.
@@ -754,7 +754,7 @@ class PruneCancelledReasoningRule:
     ``goldfive.cancelled_function_call_ids`` on ``session.state``
     (written by :meth:`ADKAdapter._heal_pending_tool_calls` after every
     cancel — see
-    :func:`goldfive.orchestration_state.append_cancelled_function_call_ids`).
+    :func:`goldfive.state_store.append_cancelled_function_call_ids`).
     Every ``function_call`` part whose ``id`` appears in that list is
     eligible for pruning, alongside its paired ``function_response``.
     The list is append-only and de-duplicated, so the rule's decision
@@ -762,13 +762,16 @@ class PruneCancelledReasoningRule:
 
     Pairing safety
     --------------
-    The rule prunes **both halves of a pair** atomically — never one
-    side. A ``function_call`` whose id is cancelled is dropped IFF the
-    matching ``function_response`` is also present in ``contents`` (or
-    vice versa). When one side is missing, the rule leaves the
-    surviving half alone — the pairing invariant in the editor would
-    reject a one-sided drop anyway, and emitting a deliberate revert
-    is more honest than a defensive over-strip.
+    The rule prunes every Content whose parts touch a cancelled
+    ``function_call_id`` — whether the cancelled half is a
+    ``function_call`` or its paired ``function_response``. Since calls
+    and responses share the same id and are usually packaged together,
+    a healthy pair drops as a unit and the editor's pairing invariant
+    (Invariant 2) holds trivially. If pre-rule ``contents`` already
+    contained an orphan half (e.g. cancel-mid-tool already dropped one
+    side), this rule drops the surviving orphan too — which fixes
+    rather than introduces a pairing violation. The editor's pairing
+    invariant catches any residual asymmetry as a safety net.
 
     Empty-contents safety
     ---------------------
@@ -827,12 +830,12 @@ class PruneCancelledReasoningRule:
 def _read_cancelled_ids(session: Any) -> set[str]:
     """Read ``goldfive.cancelled_function_call_ids`` off the session as a set.
 
-    Goes through :func:`goldfive.orchestration_state.read_cancelled_function_call_ids`
+    Goes through :func:`goldfive.state_store.read_cancelled_function_call_ids`
     (the canonical reader) so the rule stays in sync with the writer's
     schema. Returns an empty set on any failure.
     """
     try:
-        from goldfive import orchestration_state as _ostate  # noqa: PLC0415
+        from goldfive import state_store as _ostate  # noqa: PLC0415
 
         state = _safe_attr(session, "state", None)
         if state is None:

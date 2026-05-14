@@ -97,7 +97,7 @@ class FakeSession:
     ``state`` is a plain dict; the
     :class:`~goldfive.context_editor.PruneCancelledReasoningRule` reads
     ``goldfive.cancelled_function_call_ids`` off it via
-    :func:`goldfive.orchestration_state.read_cancelled_function_call_ids`.
+    :func:`goldfive.state_store.read_cancelled_function_call_ids`.
     """
 
     def __init__(
@@ -328,7 +328,7 @@ async def test_prune_cancelled_reasoning_smoke() -> None:
     its paired function_response) and leave the live pair + any text
     intact.
     """
-    from goldfive import orchestration_state as _ostate
+    from goldfive import state_store as _ostate
 
     session = FakeSession()
     # Stamp one cancelled function_call_id on goldfive Session state
