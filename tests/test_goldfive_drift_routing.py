@@ -302,8 +302,42 @@ async def test_multiple_goldfive_drifts_queue_in_order_on_channel() -> None:
     time (the first triggers cancel-and-restart; the second waits in
     the inbox for the next pre-task drain). This pins behaviour
     against the alternative "coalesce / dedupe at dispatch time" — we
-    rely on the channel to serialise."""
-    steerer, _planner, channel, _sink = _bound_steerer()
+    rely on the channel to serialise.
+
+    Audit #402: dispatch fires AFTER ``_emit_plan_revised``, so the
+    second drift must produce a STRUCTURALLY DIFFERENT revised plan
+    or the no-op-revision short-circuit (goldfive#271) will fire
+    before dispatch. We give each refine a unique replacement task
+    id so the second revision is genuinely distinct from the first.
+    """
+    # Custom planner that returns a fresh revised plan per refine call,
+    # each with a distinct replacement task id so the no-op-revision
+    # short-circuit (#271) does NOT fire between drifts.
+    class _DistinctRevisedPlanner:
+        def __init__(self) -> None:
+            self.refine_steer_calls: list[dict[str, Any]] = []
+
+        async def generate(self, **_kw: Any) -> Plan | None:  # pragma: no cover
+            return None
+
+        async def refine(self, **kwargs: Any) -> Plan | None:
+            return await self.refine_steer(**kwargs)
+
+        async def refine_steer(self, **kwargs: Any) -> Plan | None:
+            idx = len(self.refine_steer_calls) + 1
+            self.refine_steer_calls.append(kwargs)
+            return _make_revised_plan(replacement_id=f"t2_rev{idx}")
+
+    steerer = DefaultSteerer(
+        goldfive_steer_threshold="warning",
+        goldfive_steer_suppression_window_turns=3,
+    )
+    planner = _DistinctRevisedPlanner()
+    sink = _ListSink()
+    channel = ControlChannel()
+    steerer.bind(sinks=[sink], planner=planner)
+    steerer.bind_control_channel(channel)
+
     session = _make_session()
     drifts = [
         DriftEvent(
