@@ -641,6 +641,21 @@ class SteeringConfig:
     observation_only: bool = dataclasses.field(
         default_factory=_resolve_observation_only_default
     )
+    #: Names of :class:`~goldfive.context_editor.ContextEditRule` rules to
+    #: register on the ADK plugin's :class:`~goldfive.context_editor.ContextEditor`
+    #: (goldfive#397). ``None`` (the default) AND an empty list both leave
+    #: the editor unwired — the plugin's ``before_model_callback`` never
+    #: even instantiates the editor and the codepath is zero-overhead.
+    #:
+    #: Set to a list of rule names (e.g. ``["prune_cancelled_reasoning"]``)
+    #: to opt in. Unknown rule names are logged and ignored at registration
+    #: time; an empty list after filtering also keeps the editor unwired.
+    #:
+    #: Per-rule (rather than a single master switch) so e2e regressions
+    #: from a single rule can be bisected without disabling the whole
+    #: capability. See ``docs/design/CONTEXT-EDITING.md`` for the rule
+    #: catalog and the rationale behind drop-only edits.
+    context_editor_rules: list[str] | None = None
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -657,8 +672,17 @@ class SteeringConfig:
           built-in default (``True`` in production, flipped to
           ``False`` for the goldfive test suite via the autouse
           ``_goldfive_active_steering_default`` fixture).
+        * ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES`` — comma-separated rule
+          names (goldfive#397). Empty / unset → ``None`` (editor unwired).
+          Example: ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES=prune_cancelled_reasoning``.
         """
         defaults = cls()
+        raw_rules = os.environ.get("GOLDFIVE_STEER_CONTEXT_EDITOR_RULES", "").strip()
+        rules: list[str] | None
+        if not raw_rules:
+            rules = defaults.context_editor_rules
+        else:
+            rules = [r.strip() for r in raw_rules.split(",") if r.strip()] or None
         return cls(
             threshold=_read_steer_threshold_env(
                 "GOLDFIVE_STEER_THRESHOLD", defaults.threshold
@@ -671,6 +695,7 @@ class SteeringConfig:
                 "GOLDFIVE_STEER_OBSERVATION_ONLY",
                 defaults.observation_only,
             ),
+            context_editor_rules=rules,
         )
 
 

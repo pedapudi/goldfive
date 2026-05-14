@@ -1790,6 +1790,32 @@ DEFAULT_LLM_CALL_TIMEOUT_MS: int = 1_800_000
 DEFAULT_AGENT_MAX_OUTPUT_TOKENS: int = 16384
 
 
+def _is_observation_only(ctx: Any) -> bool:
+    """Return True iff the steerer behind ``ctx`` is in observation-only mode.
+
+    Read by the request-side :class:`~goldfive.context_editor.ContextEditor`
+    (goldfive#397) — every steering surface MUST be a complete no-op
+    under :class:`~goldfive.config.SteeringConfig.observation_only=True`
+    (the strict-passive pattern established by goldfive#271).
+
+    The steerer exposes ``_observation_only`` as its public-ish field
+    (set from ``SteeringConfig.observation_only`` at construction). We
+    treat any failure to read it as "observation_only" — the safer
+    default for a surface whose whole purpose is to NOT fire when the
+    operator has opted into passive observation.
+    """
+    try:
+        steerer = _safe_attr(ctx, "steerer", None)
+        if steerer is None:
+            return True
+        flag = _safe_attr(steerer, "_observation_only", None)
+        if flag is None:
+            return True
+        return bool(flag)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _apply_agent_max_output_tokens_cap(llm_request: Any, ceiling: int) -> tuple[int, int]:
     """Ratchet ``llm_request.config.max_output_tokens`` down to ``ceiling`` (goldfive#256).
 
@@ -1883,6 +1909,7 @@ def make_adk_plugin(
     agent_tool_cap: int = 16,
     llm_call_timeout_ms: int = DEFAULT_LLM_CALL_TIMEOUT_MS,
     agent_max_output_tokens: int = DEFAULT_AGENT_MAX_OUTPUT_TOKENS,
+    context_editor: Any = None,
 ) -> Any:
     """Build the ADK plugin class bound to goldfive's protocol.
 
@@ -1968,6 +1995,19 @@ def make_adk_plugin(
             # ``make_adk_plugin``'s docstring for the smaller-wins
             # semantics.
             self._agent_max_output_tokens = int(agent_max_output_tokens)
+            # Request-side ContextEditor (goldfive#397). ``None`` when
+            # :class:`~goldfive.config.SteeringConfig.context_editor_rules`
+            # is unset / empty — the ``before_model_callback`` codepath
+            # short-circuits on this being ``None`` so the
+            # feature-flag-off path has zero overhead (one ``is None``
+            # check). When non-None, the editor is invoked AFTER the
+            # PromptShaper-equivalent injections (today:
+            # ``_inject_goldfive_planner_instruction`` +
+            # ``_inject_runtime_tools_hint``) and BEFORE the per-LLM-call
+            # instrumentation that measures the final request. See
+            # ``goldfive/context_editor.py`` for the rule chain
+            # semantics + invariants.
+            self._context_editor: Any = context_editor
             # Active :class:`SessionContext` for the invocation that is
             # currently driving this plugin's runner. Set by
             # :meth:`ADKAdapter.invoke` before ``run_async`` and cleared
@@ -5164,6 +5204,38 @@ def make_adk_plugin(
                     "before_model_callback: runtime tools hint injection raised: %s",
                     exc,
                 )
+
+            # Request-side ContextEditor (goldfive#397). Runs AFTER all
+            # additive prompt-shaping (planner + runtime tools hint
+            # above; will become PromptShaper after Wave B1 lands) and
+            # BEFORE the per-LLM-call instrumentation below — so the
+            # measured ``chars`` reflect what the model actually sees
+            # AFTER any edits applied.
+            #
+            # The codepath is short-circuited when the editor wasn't
+            # constructed (no rules configured) so the
+            # feature-flag-off path costs one ``is None`` check.
+            # Observation-only is a hard gate inside ``apply()`` — the
+            # editor is a complete no-op under
+            # ``SteeringConfig.observation_only=True``.
+            #
+            # Best-effort: never raises into the callback path. An
+            # editor crash logs at DEBUG and the LLM dispatch proceeds
+            # with the un-edited ``contents``.
+            if self._context_editor is not None and ctx is not None and ctx.session is not None:
+                try:
+                    observation_only = _is_observation_only(ctx)
+                    await self._context_editor.apply(
+                        llm_request,
+                        session=ctx.session,
+                        host_agent_name=self._host_agent_name,
+                        observation_only=observation_only,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "before_model_callback: ContextEditor.apply raised: %s",
+                        exc,
+                    )
 
             # Per-LLM-call instrumentation (goldfive#172). Measure the
             # request AFTER GoldfivePlanner has appended its

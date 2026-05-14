@@ -374,16 +374,37 @@ def wrap(
     _reasoning_module.configure(resolved_runtime.reasoning_drift)
     _tool_loops_module.configure(resolved_runtime.tool_loops)
 
+    # Resolve sinks first so the ContextEditor (built next) can emit
+    # ``context_edited`` / ``context_edit_rejected`` events onto the
+    # same fan-out the rest of the runtime uses. Default to
+    # ``[LoggingSink()]`` mirroring the historical behaviour.
+    resolved_sinks: list[EventSink] = list(sinks) if sinks is not None else [LoggingSink()]
+
+    # Request-side ContextEditor (goldfive#397). Built ONLY when the
+    # operator opted in via ``SteeringConfig.context_editor_rules``;
+    # otherwise stays ``None`` and the ADK plugin's
+    # ``before_model_callback`` short-circuits with one ``is None``
+    # check (zero overhead for non-users — the contract goldfive#397
+    # demands).
+    from goldfive.context_editor import build_editor_from_config  # noqa: PLC0415
+
+    context_editor = build_editor_from_config(
+        resolved_runtime.steering.context_editor_rules,
+        sinks=resolved_sinks,
+    )
+
     # Thread :class:`AgentConfig` (goldfive#256) into the ADK adapter so
     # the plugin's structural ``max_output_tokens`` ceiling AND the
     # per-LLM-call wall-clock budget reflect the runtime config. Both
     # kwargs are ignored for non-ADK adapter shapes (the typed config
     # has no analogous surface on Claude / callable adapters today).
+    # ``context_editor`` is forwarded too; non-ADK adapters ignore it.
     adapter = auto_adapter(
         agent,
         plugins=plugins,
         llm_call_timeout_ms=resolved_runtime.agent.call_timeout_ms,
         agent_max_output_tokens=resolved_runtime.agent.max_output_tokens,
+        context_editor=context_editor,
     )
 
     resolved_call_llm: CallLLM | None = call_llm
@@ -571,8 +592,6 @@ def wrap(
                 "use an ADK agent detect_llm() can introspect.",
                 mode,
             )
-    resolved_sinks: list[EventSink] = list(sinks) if sinks is not None else [LoggingSink()]
-
     runner = Runner(
         agent=adapter,
         planner=resolved_planner,

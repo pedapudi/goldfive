@@ -120,6 +120,7 @@ def auto_adapter(
     plugins: list[Any] | None = None,
     llm_call_timeout_ms: int | None = None,
     agent_max_output_tokens: int | None = None,
+    context_editor: Any = None,
 ) -> AgentAdapter:
     """Return a concrete :class:`AgentAdapter` for ``agent``.
 
@@ -160,6 +161,8 @@ def auto_adapter(
             adk_kwargs["llm_call_timeout_ms"] = int(llm_call_timeout_ms)
         if agent_max_output_tokens is not None:
             adk_kwargs["agent_max_output_tokens"] = int(agent_max_output_tokens)
+        if context_editor is not None:
+            adk_kwargs["context_editor"] = context_editor
         return ADKAdapter(agent, **adk_kwargs)
 
     if _looks_like_claude_client_factory(agent):
