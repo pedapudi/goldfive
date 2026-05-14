@@ -59,7 +59,8 @@ KEY_DIVERGENCE_FLAG = "goldfive.divergence_flag"
 
 # Dynamic instruction (goldfive#251). Prefix key for correction-injection
 # bodies written by Stream D's correction-injection path and read by the
-# dynamic instruction resolver in :mod:`goldfive.adapters._adk_dynainst`.
+# dynamic instruction resolver in
+# :mod:`goldfive.adapters.adk_llm_instrumentation`.
 # The full key is ``{prefix}.{agent_name}.{task_id}`` so a correction is
 # scoped to the exact agent+task pair it was authored for and does not
 # leak into sibling agents or later tasks. Reader-only in this module;

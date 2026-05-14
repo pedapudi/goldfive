@@ -300,10 +300,10 @@ def assert_can_write(
 # site authorised to mutate ``llm_request.contents``. Every other
 # goldfive code path that touches the field is strictly read-only:
 #
-# * ``goldfive/adapters/_adk_plugin.py::_measure_request_chars``
-#   (line ~1180) — reads ``contents`` to instrument
-#   ``llm.request.chars`` and ``llm.request.messages_count``. Never
-#   writes.
+# * ``goldfive/adapters/adk_llm_instrumentation.py::_measure_request_chars``
+#   — reads ``contents`` to instrument ``llm.request.chars`` and
+#   ``llm.request.messages_count``. Never writes. Re-exported from
+#   :mod:`goldfive.adapters._adk_plugin` for backwards compatibility.
 # * ``goldfive/context_editor.py::_content_bytes`` — same
 #   read-only character measurement, shared so the editor's emitted
 #   ``ContextEdited.bytes_before`` / ``.bytes_after`` are byte-aligned

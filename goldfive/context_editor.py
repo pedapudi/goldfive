@@ -226,7 +226,7 @@ def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
 def _content_bytes(contents: list[Any]) -> int:
     """Sum the serialised byte cost of every part in ``contents``.
 
-    Mirrors :func:`goldfive.adapters._adk_plugin._measure_request_chars`
+    Mirrors :func:`goldfive.adapters.adk_llm_instrumentation._measure_request_chars`
     semantics (text + name + json(args) for function_call; name +
     json(response) for function_response) so the byte delta on the
     ``ContextEdited`` event is directly comparable with the

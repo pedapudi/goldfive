@@ -25,7 +25,7 @@ pytest.importorskip("google.adk")
 import goldfive
 from goldfive import InMemorySink, StaticPlanner
 from goldfive.adapters import _adk_state_protocol as _sp
-from goldfive.adapters._adk_dynainst import (
+from goldfive.adapters.adk_llm_instrumentation import (
     install_dynamic_instructions,
     is_dynamic_instruction,
     pending_correction_key,

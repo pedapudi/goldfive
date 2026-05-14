@@ -1310,7 +1310,7 @@ class StateStore:
         :mod:`goldfive._correction_injection` writes — typically a
         :class:`Mapping` with ``superseded_task_id`` /
         ``revision_number`` / etc. (rendered via
-        :func:`goldfive.adapters._adk_dynainst.format_correction_block`)
+        :func:`goldfive.adapters.adk_llm_instrumentation.format_correction_block`)
         but tests / external callers may have written a pre-rendered
         string. ``None`` means no pending correction.
         """
@@ -1318,9 +1318,9 @@ class StateStore:
             return None
         # Local import to avoid a hard import cycle: the adapter module
         # imports back from this module.
-        from goldfive.adapters import _adk_dynainst as _dynainst  # noqa: PLC0415
+        from goldfive.adapters import adk_llm_instrumentation as _instr  # noqa: PLC0415
 
-        key = _dynainst.pending_correction_key(agent_name, task_id)
+        key = _instr.pending_correction_key(agent_name, task_id)
         return self._get(key, None)
 
     def has_correction(self, agent_name: str, task_id: str) -> bool:
