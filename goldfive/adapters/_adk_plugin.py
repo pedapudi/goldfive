@@ -6035,6 +6035,18 @@ def make_adk_plugin(
                     if _gf_plan is not None
                     else 0
                 )
+                # goldfive#420: thread ``session.run_id`` so the tracker
+                # buckets accumulate across re-invocations of the same
+                # agent in one run. Pre-#420 the bucket keyed on
+                # ``invocation_id`` only, so a coordinator re-delegating
+                # to (e.g.) ``debugger_agent`` 11 times saw 11 fresh
+                # 2-entry windows and never tripped the 7-call CRITICAL
+                # name-tier on a same-tool/varying-args loop. Empty /
+                # missing ``run_id`` falls back to ``invocation_id`` for
+                # compatibility (test stubs, third-party adapters).
+                _session_run_id = str(
+                    _safe_attr(_gf_session, "run_id", "") or ""
+                )
                 drifts = self._tool_loop_tracker.observe_tool_call(
                     invocation_id=inv_id,
                     agent_name=agent_name,
@@ -6042,6 +6054,7 @@ def make_adk_plugin(
                     args=dict(args_payload),
                     task_id=task_id,
                     observed_revision_index=_observed_rev,
+                    session_run_id=_session_run_id,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.debug(
@@ -6101,9 +6114,13 @@ def make_adk_plugin(
             if tool_name in self._progress_reporting_tools:
                 if _is_progress_report_success(result):
                     try:
+                        # goldfive#420: mirror the run-scoped key the
+                        # observe_tool_call call used so the reset
+                        # targets the same accumulating bucket.
                         self._tool_loop_tracker.on_task_progress(
                             invocation_id=inv_id,
                             agent_name=agent_name,
+                            session_run_id=_session_run_id,
                         )
                     except Exception as exc:  # noqa: BLE001
                         log.debug(

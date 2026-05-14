@@ -646,6 +646,223 @@ async def test_apply_revision_stamps_per_key_watermark() -> None:
     )
 
 
+async def _verify_pre_fix_bug_reproduces() -> None:
+    """Companion verifier: without the in-flight registry, both refines
+    do fire — proving the bug reproduces without the fix.
+
+    Implemented as a fixture-style helper so the canonical regression
+    test below stays clean; this helper just confirms that monkey-
+    patching out the registry restores the buggy behaviour.
+    """
+    import asyncio
+
+    class _SlowPlanner:
+        def __init__(self) -> None:
+            self.refine_calls: list[dict[str, Any]] = []
+            self.gate = asyncio.Event()
+
+        async def generate(self, **kwargs: Any) -> Plan | None:
+            return None
+
+        async def refine(self, **kwargs: Any) -> Plan | None:
+            self.refine_calls.append(kwargs)
+            await self.gate.wait()
+            return None
+
+    sink = _ListSink()
+    planner = _SlowPlanner()
+    steerer = _build_steerer(sinks=[sink], planner=planner)
+    session = _session(revision_index=3)
+
+    # Disable the registry by giving it a no-op set so the bug
+    # reproduces.
+    class _NoOpSet(set):
+        def __contains__(self, item: Any) -> bool:
+            return False
+
+        def add(self, item: Any) -> None:
+            return None
+
+    steerer.drift._inflight_refine_keys = _NoOpSet()
+
+    drift_a = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
+    drift_b = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
+    task_a = asyncio.create_task(steerer.drift.handle_drift(drift_a, session))
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if planner.refine_calls:
+            break
+    # Without the registry, drift_b's handle_drift will also block in
+    # the planner. Dispatch as a task so we can release the gate.
+    task_b = asyncio.create_task(steerer.drift.handle_drift(drift_b, session))
+    # Yield until B has also entered the planner.
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if len(planner.refine_calls) >= 2:
+            break
+    planner.gate.set()
+    await asyncio.gather(task_a, task_b)
+    # Both judges fire refine; a follow-up escalation drift (raised by
+    # the handler-exhaustion path) MAY also drive a refine, so we
+    # assert at-least-two — the post-fix path is at-most-one.
+    assert len(planner.refine_calls) >= 2, (
+        f"pre-fix demonstrator: both concurrent judges should drive refine "
+        f"when the registry is disabled; got {len(planner.refine_calls)}"
+    )
+
+
+async def test_pre_fix_bug_reproducible_when_registry_disabled() -> None:
+    """Companion sanity test: the bug reproduces when the registry is bypassed.
+
+    Belt-and-braces for the regression below — confirms the test
+    methodology is sound (we're not testing a no-op).
+    """
+    await _verify_pre_fix_bug_reproduces()
+
+
+async def test_concurrent_judges_same_key_only_one_refine_fires() -> None:
+    """goldfive#405 MEDIUM #4: parallel judges observing the SAME
+    ``(kind, current_task_id)`` at the same revision must only dispatch
+    ONE refine.
+
+    Pre-fix: both judges read
+    ``session.last_addressed_revision_by_drift_key.get(key, 0) == 0``
+    before either's ``_apply_revision`` stamped the watermark — so
+    both passed the freshness gate and both ran refine.
+
+    Post-fix: an in-flight-refine registry stamped synchronously at
+    the gate site short-circuits the second arrival. Both judges still
+    emit ``DriftDetected`` for observability, but only one drives
+    ``planner.refine``.
+
+    Race construction: spin a slow planner (asyncio.sleep before
+    returning) so the first refine sits in-flight while we start the
+    second handle_drift in parallel. With the registry in place the
+    second observes the in-flight entry and short-circuits; without it,
+    both would land on the planner.
+    """
+    import asyncio
+
+    class _SlowPlanner:
+        def __init__(self) -> None:
+            self.refine_calls: list[dict[str, Any]] = []
+            self.gate = asyncio.Event()
+
+        async def generate(self, **kwargs: Any) -> Plan | None:
+            return None
+
+        async def refine(self, **kwargs: Any) -> Plan | None:
+            self.refine_calls.append(kwargs)
+            # Block until released so the second handle_drift starts
+            # while the first refine is still in-flight.
+            await self.gate.wait()
+            return None  # _NullPlanner-equivalent: forces handler-exhaustion path
+
+    sink = _ListSink()
+    planner = _SlowPlanner()
+    steerer = _build_steerer(sinks=[sink], planner=planner)
+    session = _session(revision_index=3)
+    drift_a = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
+    drift_b = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
+
+    # Start the first dispatch; it'll await the planner gate.
+    task_a = asyncio.create_task(steerer.drift.handle_drift(drift_a, session))
+    # Yield until A is sitting inside refine — at most a handful of
+    # event-loop iterations after the in-flight key has been stamped.
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if planner.refine_calls:
+            break
+    assert planner.refine_calls, "drift A should have reached planner.refine"
+
+    # Now dispatch B. A is still in-flight; B must short-circuit on
+    # the in-flight key check.
+    await steerer.drift.handle_drift(drift_b, session)
+
+    # Release A.
+    planner.gate.set()
+    await task_a
+
+    assert len(planner.refine_calls) == 1, (
+        f"goldfive#405 MEDIUM #4: only one refine must fire for two "
+        f"concurrent same-(kind, target) judges; got "
+        f"{len(planner.refine_calls)}"
+    )
+    # Both judges emit DriftDetected (observability preserved).
+    detected = _drift_detected_payloads(sink)
+    of_topic_emits = [p for p in detected if int(p.kind) == int(detected[0].kind)]
+    assert len(of_topic_emits) >= 2, (
+        "both judges must emit DriftDetected even when the second "
+        "short-circuits on the in-flight registry"
+    )
+
+
+async def test_inflight_key_cleared_after_dispatch_completes() -> None:
+    """The in-flight key is cleared in a finally so subsequent same-key
+    drifts (after the first completes) can dispatch normally.
+
+    Closes the failure mode where a crash / cancel mid-dispatch would
+    permanently wedge the key, silently suppressing every future
+    same-(kind, target) drift on the session.
+    """
+    sink = _ListSink()
+    planner = _NullPlanner()
+    steerer = _build_steerer(sinks=[sink], planner=planner)
+    session = _session(revision_index=3)
+    drift_first = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
+    await steerer.drift.handle_drift(drift_first, session)
+
+    # First call recorded a refine attempt (planner is the null one;
+    # the path runs through to None-return and the entry is freed).
+    assert planner.refine_calls, "first drift must have dispatched"
+    # Inflight set should be empty post-dispatch.
+    assert steerer.drift._inflight_refine_keys == set(), (
+        "inflight key must be cleared after dispatch completes"
+    )
+
+    # A second same-(kind, target) drift dispatches normally (its
+    # observed revision is still 3 -- _NullPlanner doesn't install a
+    # new plan so the watermark isn't bumped). Confirms the entry
+    # didn't permanently suppress this key.
+    drift_second = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
+    await steerer.drift.handle_drift(drift_second, session)
+    assert len(planner.refine_calls) == 2, (
+        "second drift must dispatch -- the registry entry was cleared"
+    )
+
+
+async def test_inflight_key_cleared_on_dispatch_exception() -> None:
+    """The in-flight key is cleared even if dispatch raises.
+
+    The ``finally`` clause guarantees no permanent wedge — a planner
+    that raises during refine still releases the key so the next
+    same-(kind, target) verdict can land.
+    """
+    class _RaisingPlanner:
+        def __init__(self) -> None:
+            self.refine_calls: list[dict[str, Any]] = []
+
+        async def generate(self, **kwargs: Any) -> Plan | None:
+            return None
+
+        async def refine(self, **kwargs: Any) -> Plan | None:
+            self.refine_calls.append(kwargs)
+            raise RuntimeError("simulated refine failure")
+
+    sink = _ListSink()
+    planner = _RaisingPlanner()
+    steerer = _build_steerer(sinks=[sink], planner=planner)
+    session = _session(revision_index=3)
+    drift = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
+
+    # handle_drift catches refine exceptions internally; should not raise.
+    await steerer.drift.handle_drift(drift, session)
+    # Key released even though refine raised.
+    assert steerer.drift._inflight_refine_keys == set(), (
+        "inflight key must be cleared in finally even when dispatch raises"
+    )
+
+
 async def test_apply_revision_does_not_stamp_for_user_authored_drifts() -> None:
     """User-authored drifts bypass the gate AND don't stamp the watermark.
 
