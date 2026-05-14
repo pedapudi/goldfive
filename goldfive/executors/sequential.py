@@ -1674,6 +1674,29 @@ class SequentialExecutor(Executor):
             if outcome.steer_message is not None:
                 steer_msg = outcome.steer_message
                 paused = False
+            # goldfive#404: GOLDFIVE_STEER must unwind the pause loop the
+            # same way a user STEER does. The overlay invoke loop at
+            # ``_invoke_passthrough_with_control`` (lines 1543-1552)
+            # already treats ``goldfive_steer_message`` as a cancel-and-
+            # restart trigger; mirror that here so a goldfive-authored
+            # drift produced while the executor is paused isn't silently
+            # dropped (which would wedge the run indefinitely). The
+            # steerer has already swapped ``session.plan`` and queued the
+            # corrective body — propagating the message into the resume
+            # path lets ``_apply_steer`` feed it back through
+            # ``steerer.observe`` so any downstream observers see the
+            # message, and the outer loop picks up the swapped plan on
+            # the next iteration.
+            if outcome.goldfive_steer_message is not None:
+                steer_msg = outcome.goldfive_steer_message
+                paused = False
+            # goldfive#404: GOLDFIVE_PAUSE_ESCALATE while already paused
+            # is a no-op — re-entering a pause state we're already in
+            # would only re-arm the same wait. The ack has already been
+            # published; keep blocking on the channel for a real
+            # RESUME / CANCEL / STEER. (The overlay path's
+            # ``goldfive_pause`` branch cancels the in-flight invoke and
+            # returns; here there is no in-flight invoke to cancel.)
             if outcome.rewind_task_id:
                 paused = False
 
