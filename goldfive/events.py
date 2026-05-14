@@ -705,12 +705,22 @@ def delegation_observed_event(
     observed_at: Any | None = None,
     session_id: str = "",
     event_id: str = "",
+    tool_args_json: str = "",
 ) -> Any:
     """Build a ``DelegationObserved`` envelope.
 
     Emitted from the plugin's ``before_tool_callback`` when the tool is
     an ADK ``AgentTool`` — the host agent is about to delegate to the
     wrapped sub-agent. Observability only; the tool still runs.
+
+    ``tool_args_json`` is the optional plan-descriptive-growth proto
+    field added in goldfive#423 PR 1 (design doc
+    ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3.0, §13). Producers
+    serialise the AgentTool args dict as JSON and pass the string
+    here; PR 2's dedup path reads it off the event to compute a stable
+    identity hash. Default empty string keeps the field omissible on
+    the wire (old goldfive callers that do not pass the kwarg produce
+    the same wire shape as pre-PR-1).
     """
     evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
     evt.delegation_observed.from_agent = from_agent
@@ -718,6 +728,8 @@ def delegation_observed_event(
     evt.delegation_observed.task_id = task_id
     evt.delegation_observed.invocation_id = invocation_id
     evt.delegation_observed.observed_at.CopyFrom(observed_at or now_ts())
+    if tool_args_json:
+        evt.delegation_observed.tool_args_json = tool_args_json
     return evt
 
 

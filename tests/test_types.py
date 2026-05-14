@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from goldfive.types import (
@@ -11,9 +13,12 @@ from goldfive.types import (
     Goal,
     Plan,
     Session,
+    SupersessionKind,
     Task,
     TaskEdge,
     TaskStatus,
+    _normalize_args_tokens,
+    discovery_identity_hash,
     task_upstream_ready,
 )
 
@@ -31,6 +36,31 @@ class TestTaskDefaults:
         assert t.predicted_start_ms == 0
         assert t.predicted_duration_ms == 0
         assert t.bound_span_id == ""
+
+    def test_task_discovered_default_false(self) -> None:
+        # goldfive#423 PR 1 — plan-descriptive-growth overlay defaults.
+        # Existing call sites that construct a Task without the new
+        # kwargs must keep working with discovered=False and an empty
+        # identity hash. This is the load-bearing back-compat guarantee:
+        # legacy state (in-memory plans, persistence-restored sessions,
+        # old proto wire formats that deserialize through the dataclass
+        # defaults) reads as "forecast task" — never accidentally
+        # discovered.
+        t = Task(id="a", title="A")
+        assert t.discovered is False
+        assert t.discovery_identity_hash == ""
+
+    def test_task_discovered_can_be_set(self) -> None:
+        # PR 2 will mint discovered tasks; PR 1 just verifies the
+        # dataclass slot accepts the value.
+        t = Task(
+            id="d",
+            title="discovered: locate cherry trees",
+            discovered=True,
+            discovery_identity_hash="abc123def4567890",
+        )
+        assert t.discovered is True
+        assert t.discovery_identity_hash == "abc123def4567890"
 
     def test_task_edge_fields(self) -> None:
         e = TaskEdge(from_task_id="a", to_task_id="b")
@@ -663,6 +693,274 @@ class TestPlanValidate:
         )
         revision.validate(for_revision=True)
         revision.validate(for_revision=False)
+
+    # ------------------------------------------------------------------
+    # Plan-descriptive-growth overlay (goldfive#423 PR 1; design doc
+    # ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.1, §4.5).
+    #
+    # The ``discovered`` marker is opaque to the validator's structural
+    # rules — it does not change the rule-set, it just documents the
+    # invariants the dataclass slot must honour.
+    # ------------------------------------------------------------------
+
+    def test_validate_accepts_discovered_task_as_subdag_root(self) -> None:
+        # A discovered task with no predecessor edges validates cleanly
+        # at both creation and revision time. This is the §4.3
+        # "independent sub-DAG root" shape PR 2's install path uses.
+        plan = _mk_plan(
+            [
+                Task(id="planned", title="planned"),
+                Task(
+                    id="discovered-1",
+                    title="debugger_agent: locate files",
+                    discovered=True,
+                    discovery_identity_hash="abc123def4567890",
+                ),
+            ],
+            [],
+        )
+        plan.validate()
+        plan.validate(for_revision=True)
+
+    def test_validate_accepts_discovered_task_alongside_pending_dag(self) -> None:
+        # Realistic shape from the cherry-tree §2.1 motivating example:
+        # planner-authored DAG (T1 -> T2 -> T3) PLUS an independent
+        # discovered task minted at delegation time. The discovered
+        # task is root-eligible without any upstream edge.
+        plan = _mk_plan(
+            [
+                Task(id="T1", title="find_presentation_files"),
+                Task(id="T2", title="read_presentation"),
+                Task(id="T3", title="summarise_presentation"),
+                Task(
+                    id="T1d",
+                    title="debugger_agent: locate cherry tree files",
+                    discovered=True,
+                    discovery_identity_hash="hash16chars12345",
+                ),
+            ],
+            [TaskEdge("T1", "T2"), TaskEdge("T2", "T3")],
+        )
+        plan.validate()
+        plan.validate(for_revision=True)
+
+    def test_validate_accepts_discovered_task_with_supersedes(self) -> None:
+        # §4.5: a discovered task MAY carry a supersedes link — e.g. a
+        # refine consolidates discovered work into the forecast. Here:
+        # planned "find_files" task is COMPLETED in the prior, and the
+        # revision adds a CORRECT-shaped discovered correction task.
+        prior = _mk_plan(
+            [
+                Task(id="find_files", title="find files", status=TaskStatus.COMPLETED),
+            ],
+            [],
+        )
+        revision = _mk_plan(
+            [
+                Task(id="find_files", title="find files", status=TaskStatus.COMPLETED),
+                Task(
+                    id="find_files_v2",
+                    title="discovered: re-locate files",
+                    discovered=True,
+                    discovery_identity_hash="hashabcdef123456",
+                    supersedes="find_files",
+                    supersedes_kind=SupersessionKind.CORRECT,
+                ),
+            ],
+            [],
+        )
+        # Does not raise — supersedes-of-terminal is governed by §3.5
+        # REPLACE/CORRECT and is orthogonal to the discovered marker.
+        revision.validate(for_revision=True, prior=prior)
+
+    def test_validate_protects_discovered_task_from_terminal_drop(self) -> None:
+        # §4.5: a discovered task that has reached a terminal status is
+        # protected by rule 6 just like any other task. Dropping it in
+        # a refine raises. This is the same back-compat behaviour as
+        # forecast tasks — discovered is opaque metadata to rule 6.
+        prior = _mk_plan(
+            [
+                Task(
+                    id="discovered-1",
+                    title="discovered: foo",
+                    status=TaskStatus.COMPLETED,
+                    discovered=True,
+                ),
+            ],
+            [],
+        )
+        revision_dropping_discovered = _mk_plan([], [])
+        with pytest.raises(ValueError, match="terminal task .* missing in revision"):
+            revision_dropping_discovered.validate(for_revision=True, prior=prior)
+
+    def test_validate_unchanged_on_plans_with_no_discovered_tasks(self) -> None:
+        # Back-compat seal: a plan whose tasks ALL have discovered=False
+        # validates identically to pre-PR-1 behaviour. We exercise both
+        # the happy path and an existing rule (cycle rejection) to
+        # confirm no rule churn.
+        ok = _mk_plan(
+            [
+                Task(id="a", title="A"),
+                Task(id="b", title="B"),
+            ],
+            [TaskEdge("a", "b")],
+        )
+        ok.validate()
+        ok.validate(for_revision=True)
+
+        cycle = _mk_plan(
+            [Task(id="a", title="A"), Task(id="b", title="B")],
+            [TaskEdge("a", "b"), TaskEdge("b", "a")],
+        )
+        with pytest.raises(ValueError, match="cycle"):
+            cycle.validate()
+
+
+# ---------------------------------------------------------------------------
+# Plan-descriptive-growth identity helpers (goldfive#423 PR 1; design doc
+# §4.3.0). PR 2 wires the consumer (``_maybe_pin_delegation_task`` dedup);
+# PR 1 just ships the helpers + verifies the determinism contract.
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoveryIdentityHash:
+    def test_hash_is_deterministic(self) -> None:
+        # Same inputs always produce the same hash — required so a
+        # discovered task minted in one process and replayed from a
+        # sink in another dedups consistently.
+        h1 = discovery_identity_hash("debugger_agent", {"request": "locate files"})
+        h2 = discovery_identity_hash("debugger_agent", {"request": "locate files"})
+        assert h1 == h2
+        assert len(h1) == 16  # 16 hex chars (first 8 bytes of sha256)
+
+    def test_hash_normalises_capitalization(self) -> None:
+        # §4.3.0: 'Cherry Trees' and 'cherry trees' must dedup so the
+        # cherry-tree §2.1 motivating example produces ONE discovered
+        # task across the coordinator's capitalisation drift.
+        h_caps = discovery_identity_hash(
+            "debugger_agent", {"topic": "Cherry Trees"}
+        )
+        h_lower = discovery_identity_hash(
+            "debugger_agent", {"topic": "cherry trees"}
+        )
+        assert h_caps == h_lower
+
+    def test_hash_normalises_whitespace_and_punctuation(self) -> None:
+        # §4.3.0: trivial whitespace / punctuation differences dedup.
+        h_a = discovery_identity_hash(
+            "research_agent", {"topic": "topic one"}
+        )
+        h_b = discovery_identity_hash(
+            "research_agent", {"topic": "  topic   one  "}
+        )
+        h_c = discovery_identity_hash(
+            "research_agent", {"topic": "topic, one!"}
+        )
+        assert h_a == h_b == h_c
+
+    def test_hash_normalises_key_order(self) -> None:
+        # Mapping iteration order should not affect the hash because
+        # the token-set comparison drops keys and only inspects values.
+        h_ab = discovery_identity_hash(
+            "agent", {"a": "alpha", "b": "beta"}
+        )
+        h_ba = discovery_identity_hash(
+            "agent", {"b": "beta", "a": "alpha"}
+        )
+        assert h_ab == h_ba
+
+    def test_hash_distinguishes_agents(self) -> None:
+        # Different agents must hash differently even with identical
+        # args — the dedup key is (agent, args), not args alone. PR 2
+        # uses this to keep distinct sub-agent discoveries separate
+        # when the coordinator happens to pass the same request.
+        h_a = discovery_identity_hash("debugger_agent", {"x": "foo"})
+        h_b = discovery_identity_hash("reviewer_agent", {"x": "foo"})
+        assert h_a != h_b
+
+    def test_hash_distinguishes_different_args(self) -> None:
+        # Different args must hash differently so genuinely new
+        # discovered work grows the plan rather than collapsing onto
+        # a prior discovered task.
+        h_a = discovery_identity_hash("agent", {"x": "topic one"})
+        h_b = discovery_identity_hash("agent", {"x": "topic two"})
+        assert h_a != h_b
+
+    def test_hash_handles_empty_args(self) -> None:
+        # §4.3.0 edge case: empty args still produces a valid hash so
+        # PR 2 can install a discovered task without a dedup partner;
+        # the hash is the agent-name-only component.
+        h_empty_dict = discovery_identity_hash("agent", {})
+        h_none = discovery_identity_hash("agent", None)
+        h_empty_str = discovery_identity_hash("agent", "")
+        # All valid and consistent — three different "no-args" forms
+        # must produce the SAME hash so call sites that pass any of
+        # the three dedup correctly.
+        assert len(h_empty_dict) == 16
+        assert h_empty_dict == h_none
+        assert h_empty_dict == h_empty_str
+        # Different agent with empty args still distinguishes.
+        assert h_empty_dict != discovery_identity_hash("other", {})
+
+    def test_hash_accepts_json_string_form(self) -> None:
+        # The PR 2 call site reads ``DelegationObserved.tool_args_json``
+        # off the event proto; the helper accepts the JSON string
+        # directly and produces the same hash as the equivalent dict.
+        args = {"topic": "Cherry Trees"}
+        h_dict = discovery_identity_hash("agent", args)
+        h_json = discovery_identity_hash("agent", json.dumps(args))
+        assert h_dict == h_json
+
+    def test_hash_accepts_malformed_json_gracefully(self) -> None:
+        # Defensive: a malformed JSON payload (broken serialiser, old
+        # event with placeholder text) must not raise — the helper
+        # falls back to treating the raw string as a text blob so
+        # dedup degrades gracefully rather than crashing the pin path.
+        h = discovery_identity_hash("agent", "not valid json {{{")
+        assert len(h) == 16
+
+    def test_hash_stop_tokens_dropped(self) -> None:
+        # §4.3.0: stop-tokens (the, a, an) are dropped so filler-word
+        # differences do not differentiate semantically-identical
+        # requests.
+        h_a = discovery_identity_hash("agent", {"topic": "find the cherry trees"})
+        h_b = discovery_identity_hash("agent", {"topic": "find cherry trees"})
+        assert h_a == h_b
+
+    def test_normalize_args_tokens_matches_design_spec(self) -> None:
+        # Direct test on the helper used in §4.3.0's example:
+        # ``_normalize_args_tokens({"topic": "Cherry Trees"})`` matches
+        # ``_normalize_args_tokens({"topic": "cherry trees"})``.
+        a = _normalize_args_tokens({"topic": "Cherry Trees"})
+        b = _normalize_args_tokens({"topic": "cherry trees"})
+        assert a == b
+        # And the resulting tokens are lowercased, frozenset-typed.
+        assert isinstance(a, frozenset)
+        assert a == frozenset({"cherry", "trees"})
+
+    def test_normalize_args_tokens_handles_none(self) -> None:
+        # None input — produces empty token set (PR 2 forward-compat:
+        # old events with no tool_args_json reach the helper as None).
+        assert _normalize_args_tokens(None) == frozenset()
+
+    def test_normalize_args_tokens_handles_json_string(self) -> None:
+        # The proto-carried form lands as a string; normalisation
+        # parses it as JSON when possible.
+        tokens = _normalize_args_tokens('{"topic": "cherry trees"}')
+        assert tokens == frozenset({"cherry", "trees"})
+
+    def test_normalize_only_skips_token_normalisation(self) -> None:
+        # ``normalize=False`` skips the §4.3.0 lowercasing /
+        # tokenisation so test fixtures can verify normalisation is
+        # what causes superficially-different args to dedup.
+        h_norm = discovery_identity_hash("agent", {"x": "Foo Bar"})
+        h_raw = discovery_identity_hash(
+            "agent", {"x": "Foo Bar"}, normalize=False
+        )
+        # Same args, same agent — but the raw hash treats
+        # capitalization as significant while the normalised one does
+        # not. They should differ.
+        assert h_raw != h_norm
 
 
 # ---------------------------------------------------------------------------

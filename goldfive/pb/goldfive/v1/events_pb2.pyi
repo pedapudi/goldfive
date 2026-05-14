@@ -361,18 +361,20 @@ class InvocationBoundaryExited(_message.Message):
     def __init__(self, invocation_id: _Optional[str] = ..., agent_name: _Optional[str] = ..., task_id: _Optional[str] = ..., reason: _Optional[str] = ..., exited_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
 
 class DelegationObserved(_message.Message):
-    __slots__ = ("from_agent", "to_agent", "task_id", "invocation_id", "observed_at")
+    __slots__ = ("from_agent", "to_agent", "task_id", "invocation_id", "observed_at", "tool_args_json")
     FROM_AGENT_FIELD_NUMBER: _ClassVar[int]
     TO_AGENT_FIELD_NUMBER: _ClassVar[int]
     TASK_ID_FIELD_NUMBER: _ClassVar[int]
     INVOCATION_ID_FIELD_NUMBER: _ClassVar[int]
     OBSERVED_AT_FIELD_NUMBER: _ClassVar[int]
+    TOOL_ARGS_JSON_FIELD_NUMBER: _ClassVar[int]
     from_agent: str
     to_agent: str
     task_id: str
     invocation_id: str
     observed_at: _timestamp_pb2.Timestamp
-    def __init__(self, from_agent: _Optional[str] = ..., to_agent: _Optional[str] = ..., task_id: _Optional[str] = ..., invocation_id: _Optional[str] = ..., observed_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...) -> None: ...
+    tool_args_json: str
+    def __init__(self, from_agent: _Optional[str] = ..., to_agent: _Optional[str] = ..., task_id: _Optional[str] = ..., invocation_id: _Optional[str] = ..., observed_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., tool_args_json: _Optional[str] = ...) -> None: ...
 
 class ReasoningJudgeInvoked(_message.Message):
     __slots__ = ("run_id", "task_id", "subject_agent_id", "model", "elapsed_ms", "reasoning_input", "raw_response", "on_task", "severity", "reason", "classification")

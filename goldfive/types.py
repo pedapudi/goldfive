@@ -34,11 +34,14 @@ import asyncio
 import contextlib
 import contextvars
 import dataclasses
+import hashlib
+import json
 import logging
 import os
+import re
 import sys
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -433,6 +436,178 @@ class Task:
     #: of the detector skips out). Tuple (not list) so the dataclass
     #: stays hashable and shareable across the frozen-Plan invariant.
     required_tools: tuple[str, ...] = ()
+    #: goldfive#423 PR 1 — plan-descriptive-growth overlay (design doc
+    #: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.1). When ``True``,
+    #: this task was added reactively at delegation-observation time
+    #: (or by an equivalent observation hook), not by initial planning
+    #: or by a planner-authored refine. Default ``False`` so legacy
+    #: plans, the validator's existing creation-time / preservation
+    #: rules, and every existing call site that constructs a ``Task``
+    #: without this kwarg are unaffected.
+    #:
+    #: PR 1 is pure data scaffolding: the marker is opaque metadata
+    #: at validate time except for two carve-outs (see
+    #: :meth:`Plan.validate`):
+    #:
+    #: 1. A discovered task is always a valid sub-DAG root (rule 7's
+    #:    "no absorbing→PENDING" check still applies, but discovered
+    #:    tasks have no upstream predecessors by construction).
+    #: 2. A discovered task is protected from terminal-drop by a refine
+    #:    once it has reached a terminal status — the existing rule 6
+    #:    preservation already covers this, listed here for symmetry.
+    #:
+    #: PR 2 wires the write helper that mints discovered tasks at
+    #: delegation time; this field is the dataclass slot it stamps.
+    discovered: bool = False
+    #: goldfive#423 PR 1 — plan-descriptive-growth overlay (design doc
+    #: §4.3.0). Stable hash of (agent_name, args-token-set) computed at
+    #: discovery time by
+    #: :func:`discovery_identity_hash` from the observed
+    #: ``DelegationObserved.tool_args_json`` proto field. Empty string
+    #: for forecast tasks. The validator treats it as opaque metadata;
+    #: PR 2's dedup path reads it off the task to short-circuit
+    #: repeated delegations from the same coordinator to the same agent
+    #: with the same logical args.
+    #:
+    #: Preserved across refines (§4.3.0 "Cross-refine survival"). PR 1
+    #: only carries the slot — PR 2 wires the consumer.
+    discovery_identity_hash: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Plan-descriptive-growth identity helpers (goldfive#423 PR 1)
+# ---------------------------------------------------------------------------
+#
+# These helpers exist so PR 2's ``_maybe_pin_delegation_task`` dedup path
+# can compute a stable hash from the ``DelegationObserved.tool_args_json``
+# proto field added in PR 1, then store the hash on
+# ``Task.discovery_identity_hash`` for re-pin lookups across subsequent
+# delegations. PR 1 ships the data-model slots + the hash function; PR 2
+# wires the consumer.
+#
+# Design ref: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3.0 and §13
+# ("adaptive, not predictive": the hash is computed from observed
+# tool_args carried on the event the agent itself authored, NOT from a
+# goldfive-side intercept of agent state at pin / dispatch time).
+
+#: Stop-tokens dropped from the normalised args-token-set before hashing
+#: so trivial filler words ("the cherry trees" vs "cherry trees") dedup.
+#: Start small — empty or near-empty per design §4.3.0. Operators can
+#: widen later if real-run dedup proves too fine.
+_DISCOVERY_STOP_TOKENS: frozenset[str] = frozenset({"the", "a", "an"})
+
+#: Regex used to tokenise args text — Unicode word characters only, so
+#: punctuation, whitespace, and quoting differences across model outputs
+#: collapse before the token-set comparison.
+_DISCOVERY_TOKEN_RE: re.Pattern[str] = re.compile(r"\w+", re.UNICODE)
+
+
+def _normalize_args_tokens(
+    tool_args: Mapping[str, Any] | str | None,
+) -> frozenset[str]:
+    """Normalise tool args into a stable token set for dedup hashing.
+
+    Accepts the args in one of three shapes so PR 2 callers and tests
+    can pass whichever they have on hand:
+
+    * ``Mapping[str, Any]`` — the in-memory args dict the coordinator
+      invoked the AgentTool with. Values are stringified and concatenated
+      before tokenisation.
+    * ``str`` — the JSON-serialised form carried on the
+      ``DelegationObserved.tool_args_json`` proto field. Parsed as JSON
+      when possible; falls back to treating the raw string as a single
+      text blob when JSON parsing fails (so empty / malformed payloads
+      degrade to a coarser-but-still-useful token set).
+    * ``None`` — produces an empty token set (legacy events with no
+      ``tool_args_json`` field; PR 2's dedup then falls back to per-
+      ``(agent, task_id)`` granularity per design §9 forward-compat).
+
+    Normalisation steps:
+
+    1. Stringify every value, joined on whitespace.
+    2. Lowercase the result so capitalisation variants ("Cherry Trees"
+       vs "cherry trees") dedup.
+    3. Tokenise on ``\\w+`` so punctuation / whitespace / quoting
+       differences collapse.
+    4. Drop :data:`_DISCOVERY_STOP_TOKENS` so filler words do not
+       differentiate otherwise-identical requests.
+    5. Return as a :class:`frozenset` so the token-set is hashable +
+       order-independent (same tokens in different positions hash the
+       same).
+
+    The result is the §4.3.0 input to :func:`discovery_identity_hash`.
+    """
+    if tool_args is None:
+        return frozenset()
+
+    if isinstance(tool_args, str):
+        # Try to parse the JSON shape carried on the proto. If parsing
+        # fails (empty / malformed), treat the raw string as a single
+        # text blob — coarser dedup is still better than no dedup.
+        try:
+            parsed = json.loads(tool_args) if tool_args else None
+        except (ValueError, TypeError):
+            parsed = tool_args
+        if isinstance(parsed, Mapping):
+            text = " ".join(str(v) for v in parsed.values())
+        elif parsed is None:
+            text = ""
+        else:
+            text = str(parsed)
+    elif isinstance(tool_args, Mapping):
+        text = " ".join(str(v) for v in tool_args.values())
+    else:
+        # Defensive: anything else (list / tuple / scalar) gets
+        # stringified whole.
+        text = str(tool_args)
+
+    tokens = _DISCOVERY_TOKEN_RE.findall(text.lower())
+    return frozenset(tokens) - _DISCOVERY_STOP_TOKENS
+
+
+def discovery_identity_hash(
+    agent_id: str,
+    tool_args: Mapping[str, Any] | str | None,
+    *,
+    normalize: bool = True,
+) -> str:
+    """Return a stable dedup hash for ``(agent_id, normalized_args)``.
+
+    Two delegations to the same ``agent_id`` with semantically-identical
+    ``tool_args`` hash to the same 16-hex-char value, regardless of:
+
+    * whitespace differences in args
+    * capitalization differences in args
+    * arg-key ordering
+    * stop-token differences in the values
+
+    The hash is deterministic across processes (uses ``hashlib.sha256``,
+    no salt / no random nonce) so a discovered task minted in one
+    process and replayed from a sink in another dedups consistently.
+
+    ``normalize=False`` skips the §4.3.0 token normalisation and hashes
+    the raw stringified args — used by tests that want to verify the
+    normalisation IS what makes two superficially-different args dedup.
+    Production call sites should always leave ``normalize=True``.
+
+    Empty / missing args produce a valid (non-empty) hash so PR 2 can
+    still install a discovered task without a dedup partner; the hash
+    is just the agent name's hash component.
+
+    Design ref: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3.0.
+    """
+    if normalize:
+        tokens = _normalize_args_tokens(tool_args)
+        payload = f"{agent_id}\0" + ",".join(sorted(tokens))
+    else:
+        if tool_args is None:
+            raw = ""
+        elif isinstance(tool_args, str):
+            raw = tool_args
+        else:
+            raw = str(tool_args)
+        payload = f"{agent_id}\0{raw}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -563,6 +738,28 @@ class Plan:
            safe). ``COMPLETED`` predecessors are *allowed* because
            that is the natural in-flight DAG shape: a finished stage
            feeding into a still-PENDING next stage.
+
+        Plan-descriptive-growth overlay (goldfive#423 PR 1; design doc
+        ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.1, §4.5):
+
+        * A task with ``discovered=True`` is always a valid sub-DAG
+          root — the discovery write installs it without upstream
+          predecessor edges by construction. Rule 7 (no
+          absorbing→PENDING) still applies but is trivially satisfied
+          for a root task with no predecessors.
+        * A discovered task MAY carry a ``supersedes`` reference (e.g.
+          a refine consolidating discovered work into the forecast)
+          but is NOT required to. The existing supersedes machinery
+          (rule 8) governs unchanged when the reference is non-empty.
+        * A discovered task MAY NOT be terminal-dropped by a refine
+          once it has reached a terminal status — rule 6 already
+          enforces this for every task regardless of the discovered
+          marker.
+
+        The ``discovered`` and ``discovery_identity_hash`` fields are
+        otherwise opaque metadata at validate time. Plans containing
+        only ``discovered=False`` tasks behave exactly as before this
+        PR — full back-compat.
 
         8. **Corrective-predecessor topology (PLAN-LIFECYCLE.md §3.6,
            goldfive#248).** When a revised task ``X`` declares

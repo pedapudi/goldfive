@@ -175,7 +175,7 @@ class TaskEdge(_message.Message):
     def __init__(self, from_task_id: _Optional[str] = ..., to_task_id: _Optional[str] = ...) -> None: ...
 
 class Task(_message.Message):
-    __slots__ = ("id", "title", "description", "assignee_agent_id", "status", "predicted_start_ms", "predicted_duration_ms", "bound_span_id", "supersedes", "supersedes_kind")
+    __slots__ = ("id", "title", "description", "assignee_agent_id", "status", "predicted_start_ms", "predicted_duration_ms", "bound_span_id", "supersedes", "supersedes_kind", "discovered", "discovery_identity_hash")
     ID_FIELD_NUMBER: _ClassVar[int]
     TITLE_FIELD_NUMBER: _ClassVar[int]
     DESCRIPTION_FIELD_NUMBER: _ClassVar[int]
@@ -186,6 +186,8 @@ class Task(_message.Message):
     BOUND_SPAN_ID_FIELD_NUMBER: _ClassVar[int]
     SUPERSEDES_FIELD_NUMBER: _ClassVar[int]
     SUPERSEDES_KIND_FIELD_NUMBER: _ClassVar[int]
+    DISCOVERED_FIELD_NUMBER: _ClassVar[int]
+    DISCOVERY_IDENTITY_HASH_FIELD_NUMBER: _ClassVar[int]
     id: str
     title: str
     description: str
@@ -196,7 +198,9 @@ class Task(_message.Message):
     bound_span_id: str
     supersedes: str
     supersedes_kind: SupersessionKind
-    def __init__(self, id: _Optional[str] = ..., title: _Optional[str] = ..., description: _Optional[str] = ..., assignee_agent_id: _Optional[str] = ..., status: _Optional[_Union[TaskStatus, str]] = ..., predicted_start_ms: _Optional[int] = ..., predicted_duration_ms: _Optional[int] = ..., bound_span_id: _Optional[str] = ..., supersedes: _Optional[str] = ..., supersedes_kind: _Optional[_Union[SupersessionKind, str]] = ...) -> None: ...
+    discovered: bool
+    discovery_identity_hash: str
+    def __init__(self, id: _Optional[str] = ..., title: _Optional[str] = ..., description: _Optional[str] = ..., assignee_agent_id: _Optional[str] = ..., status: _Optional[_Union[TaskStatus, str]] = ..., predicted_start_ms: _Optional[int] = ..., predicted_duration_ms: _Optional[int] = ..., bound_span_id: _Optional[str] = ..., supersedes: _Optional[str] = ..., supersedes_kind: _Optional[_Union[SupersessionKind, str]] = ..., discovered: bool = ..., discovery_identity_hash: _Optional[str] = ...) -> None: ...
 
 class Plan(_message.Message):
     __slots__ = ("id", "run_id", "goal_ids", "summary", "tasks", "edges", "revision_reason", "revision_kind", "revision_severity", "revision_index", "created_at", "revision_trigger_event_id")

@@ -543,6 +543,26 @@ message DelegationObserved {
   string task_id = 3;
   string invocation_id = 4;
   google.protobuf.Timestamp observed_at = 5;
+
+  // Optional. JSON serialisation of the AgentTool args dict the
+  // coordinator invoked the sub-agent with, captured at observation
+  // time. Used by the plan-descriptive-growth dedup path (see
+  // ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3.0 and §13) to
+  // compute a stable identity hash from observed-fact data rather
+  // than a goldfive-side intercept at pin / dispatch time.
+  //
+  // Forward-compat: old events without this field deserialize to
+  // an empty string. PR 2's dedup falls back to per-(agent, task_id)
+  // granularity when this field is empty (see §9 PR 1 row in the
+  // design doc).
+  //
+  // JSON keeps the payload agent-agnostic and easy to hash on the
+  // observer side without needing to re-serialise typed args. Producers
+  // SHOULD use ``json.dumps(args, sort_keys=True)`` so equivalent
+  // arg-dicts produce identical strings on the wire — the
+  // normalisation in :func:`_normalize_args_tokens` is tolerant either
+  // way but stable serialisation aids debug diffing.
+  string tool_args_json = 6;
 }
 
 // ---------------------------------------------------------------------------
