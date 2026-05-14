@@ -986,12 +986,18 @@ _CANCEL_REQUESTED_INVOCATIONS: dict[str, set[str]] = {}
 #
 # Co-exists with the legacy ``session._supersede_pending`` bool: that
 # bool is still set/cleared for back-compat with the existing 8 tests
-# in ``test_executor_supersede_cancel_nonfatal.py`` plus a STEER-branch
-# side-effect carve-out, while the per-invocation set provides the
+# in ``test_executor_supersede_cancel_nonfatal.py`` plus the
+# empty-resolver fallback in :meth:`DriftObserver._cancel_inflight_for_revision`
+# (no invocation id to anchor a registry entry, so the bool acts as
+# a session-scope sentinel). The per-invocation set provides the
 # defensive isolation under concurrent overlay iterations the audit
 # called for. Same locking discipline as the cancel-requested
 # registry; cleared by :meth:`StateStore.clear_active_invocations`
 # so a session teardown wipes all three registries in one shot.
+#
+# The dual-signal design is transitional — see issue #430 for the
+# follow-up to retire the bool entirely in favour of a sentinel-id
+# registry stamp.
 _SUPERSEDE_PENDING_INVOCATIONS: dict[str, set[str]] = {}
 
 
@@ -1735,9 +1741,13 @@ class StateStore:
     #
     # Both registries are populated/consumed; the bool is kept for
     # back-compat with the existing supersede-cancel tests and the
-    # STEER-branch side-effect path. Readers should prefer the set
-    # when they have an invocation_id and fall back to the bool
-    # otherwise.
+    # empty-resolver fallback in
+    # :meth:`DriftObserver._cancel_inflight_for_revision` (no
+    # invocation id to anchor a registry entry, so the bool acts as
+    # a session-scope sentinel). Readers should prefer the set when
+    # they have an invocation_id and fall back to the bool otherwise.
+    # The dual-signal design is transitional; see issue #430 for the
+    # follow-up to retire the bool entirely.
 
     def mark_supersede_pending(self, invocation_id: str) -> None:
         """Stamp ``invocation_id`` as part of an in-flight supersede cancel.

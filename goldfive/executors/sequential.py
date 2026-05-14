@@ -1089,7 +1089,9 @@ class SequentialExecutor(Executor):
                 # ``tests/test_executor_supersede_cancel_nonfatal.py``
                 # exercise it directly), and the per-invocation set is
                 # the defensive backstop that survives concurrent
-                # overlay iterations. Either fires this branch.
+                # overlay iterations. Either fires this branch. The
+                # dual read is transitional; see issue #430 for the
+                # follow-up to retire the bool.
                 supersede_bool = bool(
                     getattr(session, "_supersede_pending", False)
                 )
