@@ -59,7 +59,7 @@ try:
     from google.adk.models.base_llm import BaseLlm
     from google.adk.models.llm_request import LlmRequest
     from google.adk.models.llm_response import LlmResponse
-    from google.adk.tools import AgentTool, FunctionTool
+    from google.adk.tools import AgentTool, FunctionTool, ToolContext
     from google.genai import types as genai_types
 except ImportError as _adk_err:  # pragma: no cover
     raise SystemExit("install goldfive[adk] to run this example") from _adk_err
@@ -75,16 +75,56 @@ log = logging.getLogger(__name__)
 # Tools — write / read / patch the generated presentation files.
 # Output resolves under this module's directory to match harmonograf's
 # reference tree so the two stay byte-compatible.
+#
+# Each tool scopes its filesystem effects under
+# ``output/<session_id>/`` (see ``_session_output_dir``). The session id
+# comes from the ADK ``ToolContext`` so concurrent runs never see each
+# other's artifacts and ``find_presentation_files`` never lists stale
+# directories from prior runs (which the LLM was treating as actionable
+# "candidate topics" — see #416 / #417).
 # ---------------------------------------------------------------------------
 
 
+def _session_output_dir(tool_context: ToolContext | None) -> str:
+    """Resolve ``output/<session_id>/`` for the current run.
+
+    ``tool_context`` is the ADK ``ToolContext`` (FunctionTool injects it
+    when a parameter named ``tool_context`` is present). When the context
+    is unavailable — e.g. the tool is unit-tested without an ADK runner —
+    we fall back to ``output/_default/`` so calls remain deterministic
+    and don't pollute the bare ``output/`` root.
+    """
+    session_id = "_default"
+    if tool_context is not None:
+        try:
+            sid = tool_context.session.id  # type: ignore[union-attr]
+            if sid:
+                session_id = str(sid)
+        except AttributeError:
+            # ``ToolContext`` shape varies across ADK versions; treat any
+            # missing attribute as "no session" and fall through to the
+            # default bucket.
+            pass
+    # Sanitise — session ids are arbitrary strings and we're using them
+    # as a path component.
+    safe = session_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+    return os.path.realpath(
+        os.path.join(os.path.dirname(__file__), "output", safe)
+    )
+
+
 def write_webpage(
-    topic: str, html_content: str, css_content: str, js_content: str
+    topic: str,
+    html_content: str,
+    css_content: str,
+    js_content: str,
+    tool_context: ToolContext | None = None,
 ) -> str:
-    """Write an interactive webpage (HTML, CSS, JS) under ``output/``."""
+    """Write an interactive webpage (HTML, CSS, JS) under ``output/<session>/``."""
     try:
         topic_filename = topic.lower().replace(" ", "_").replace("/", "_")
-        output_dir = os.path.join(os.path.dirname(__file__), "output", topic_filename)
+        base_dir = _session_output_dir(tool_context)
+        output_dir = os.path.join(base_dir, topic_filename)
         os.makedirs(output_dir, exist_ok=True)
 
         with open(os.path.join(output_dir, "index.html"), "w") as f:
@@ -99,10 +139,13 @@ def write_webpage(
         return f"Error writing file: {e}"
 
 
-def read_presentation_files(topic: str) -> dict[str, str]:
+def read_presentation_files(
+    topic: str, tool_context: ToolContext | None = None
+) -> dict[str, str]:
     """Read the generated presentation files and return name → contents."""
     topic_filename = topic.lower().replace(" ", "_").replace("/", "_")
-    output_dir = os.path.join(os.path.dirname(__file__), "output", topic_filename)
+    base_dir = _session_output_dir(tool_context)
+    output_dir = os.path.join(base_dir, topic_filename)
     files: dict[str, str] = {}
     for name in ("index.html", "styles.css", "script.js"):
         path = os.path.join(output_dir, name)
@@ -114,22 +157,35 @@ def read_presentation_files(topic: str) -> dict[str, str]:
     return files
 
 
-def find_presentation_files(topic: str) -> dict[str, Any]:
+def find_presentation_files(
+    topic: str, tool_context: ToolContext | None = None
+) -> dict[str, Any]:
     """Locate the generated presentation directory by fuzzy-matching ``topic``.
 
     The web developer often slugifies an embellished topic (e.g.
     ``"NAND Flash Memory Presentation"`` → ``nand_flash_memory_presentation``)
     while the reviewer asks for the bare slug (``nand_flash_memory``). This
-    tool searches ``output/`` for a directory whose name either contains the
-    bare slug or, after stripping the common ``_presentation`` /
-    ``_interactive_presentation`` / ``_slideshow`` suffixes, equals it. On a
-    match it reads the three presentation files and returns their contents.
+    tool searches ``output/<session_id>/`` for a directory whose name
+    either contains the bare slug or, after stripping the common
+    ``_presentation`` / ``_interactive_presentation`` / ``_slideshow``
+    suffixes, equals it. On a match it reads the three presentation
+    files and returns their contents.
+
+    On a miss it returns ``{"found": False}`` with **no** ``candidates``
+    list. Prior to #416 we returned ``candidates=<all session subdirs>``
+    and the LLM treated that list as actionable alternative topics, which
+    caused multi-call cascades on cherry-tree sessions when stale
+    directories from older runs were visible. Per-session scoping (#417)
+    plus dropping ``candidates`` (#416) together close that footgun.
+    Operators who want a directory listing can call the separate
+    ``list_presentation_directory`` helper below; it is intentionally NOT
+    registered to the debugger.
     """
     topic_slug = topic.lower().replace(" ", "_").replace("/", "_")
-    base_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "output"))
+    base_dir = _session_output_dir(tool_context)
 
     if not os.path.isdir(base_dir):
-        return {"found": False, "candidates": []}
+        return {"found": False}
 
     suffixes = ("_interactive_presentation", "_presentation", "_slideshow")
     entries = sorted(
@@ -150,7 +206,7 @@ def find_presentation_files(topic: str) -> dict[str, Any]:
             break
 
     if match is None:
-        return {"found": False, "candidates": entries}
+        return {"found": False}
 
     candidate_dir = os.path.realpath(os.path.join(base_dir, match))
     # Defence in depth: refuse anything that escaped the sandbox via symlink.
@@ -158,7 +214,7 @@ def find_presentation_files(topic: str) -> dict[str, Any]:
         candidate_dir == base_dir
         or candidate_dir.startswith(base_dir + os.sep)
     ):
-        return {"found": False, "candidates": entries}
+        return {"found": False}
 
     files: dict[str, str] = {}
     for fname in ("index.html", "styles.css", "script.js"):
@@ -172,15 +228,38 @@ def find_presentation_files(topic: str) -> dict[str, Any]:
     return {"found": True, "directory": candidate_dir, "files": files}
 
 
-def patch_file(path: str, new_content: str) -> str:
+def list_presentation_directory(
+    tool_context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Operator-only: list the subdirectories of ``output/<session_id>/``.
+
+    Deliberately NOT registered to ``debugger_agent`` — exposing this to
+    the model recreates the #416 footgun (the LLM treats raw directory
+    names as actionable alternative topics). Useful for offline scripts
+    that want to inventory a session's artifacts.
+    """
+    base_dir = _session_output_dir(tool_context)
+    if not os.path.isdir(base_dir):
+        return {"directory": base_dir, "entries": []}
+    entries = sorted(
+        name
+        for name in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, name))
+    )
+    return {"directory": base_dir, "entries": entries}
+
+
+def patch_file(
+    path: str, new_content: str, tool_context: ToolContext | None = None
+) -> str:
     """Overwrite ``path`` with ``new_content`` in place.
 
-    Relative paths resolve against ``output/`` so the debugger cannot
-    scribble outside the sandbox.
+    Relative paths resolve against ``output/<session_id>/`` so the
+    debugger cannot scribble outside the per-session sandbox.
     """
     try:
         if not os.path.isabs(path):
-            path = os.path.join(os.path.dirname(__file__), "output", path)
+            path = os.path.join(_session_output_dir(tool_context), path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             f.write(new_content)
@@ -327,11 +406,13 @@ def _build_agent_tree(model: Any) -> Agent:
             "``find_presentation_files`` tool with the topic the reviewer "
             "tried. If it returns ``found=True``, report the discovered "
             "absolute directory and the file contents back to the "
-            "coordinator so the review can proceed at that path. If it "
-            "returns ``found=False``, report the candidate directory list "
-            "back to the coordinator so it can re-dispatch the developer "
-            "with the correct topic — do not attempt to patch files you "
-            "have not located."
+            "coordinator so the review can proceed at that path. If "
+            "``find_presentation_files`` returns ``found=False``, do NOT "
+            "call it again with a guessed or alternative topic — that will "
+            "only loop. Report the failure (and the exact ``topic`` string "
+            "you tried) back to the coordinator immediately so it can "
+            "re-dispatch the developer with the correct topic. Do not "
+            "attempt to patch files you have not located."
         ),
         description=(
             "A debugger agent that either patches generated presentation "
