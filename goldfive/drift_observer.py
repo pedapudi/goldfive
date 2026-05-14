@@ -1,4 +1,4 @@
-"""Drift event lifecycle + classification + observation + dispatch helpers for :class:`DefaultSteerer`.
+"""Drift event lifecycle, classification, observation, and dispatch helpers.
 
 Extracted from :mod:`goldfive.steerer` in Wave C of the steerer split.
 Buckets **3a** (observability primitives), **3b** (observation entry
@@ -153,7 +153,6 @@ from goldfive.types import (
     DriftEvent,
     DriftKind,
     DriftSeverity,
-    Plan,
     RefineOutcome,
     Session,
     Task,
@@ -2412,9 +2411,9 @@ class DriftObserver:
     _LADDER: dict[
         DriftKind,
         tuple[
-            "InterventionLevel | None",
-            "InterventionLevel | None",
-            tuple["InterventionLevel", "InterventionLevel"],
+            InterventionLevel | None,
+            InterventionLevel | None,
+            tuple[InterventionLevel, InterventionLevel],
         ],
     ] = {}  # populated lazily in :meth:`_load_ladder_tables` to avoid an
     # import-cycle with :mod:`goldfive.steerer` (which defines the
@@ -2423,9 +2422,9 @@ class DriftObserver:
     _LADDER_BY_VALUE: dict[
         str,
         tuple[
-            "InterventionLevel | None",
-            "InterventionLevel | None",
-            tuple["InterventionLevel", "InterventionLevel"],
+            InterventionLevel | None,
+            InterventionLevel | None,
+            tuple[InterventionLevel, InterventionLevel],
         ],
     ] = {}
 
@@ -2533,7 +2532,7 @@ class DriftObserver:
         kind: DriftKind,
         severity: DriftSeverity,
         occurrence_count: int,
-    ) -> "InterventionLevel":
+    ) -> InterventionLevel:
         """Return the intervention level for ``(kind, severity, count)``.
 
         See :meth:`goldfive.steerer.DefaultSteerer._ladder_level_for` —
@@ -2574,9 +2573,9 @@ class DriftObserver:
         and behaviour are unchanged here.
         """
         from goldfive.steerer import (
+            _ABSORB_NUDGE_KINDS,
             InterventionLevel,
             RefineExhausted,
-            _ABSORB_NUDGE_KINDS,
             _planner_refine_accepts_available_agents,
             compose_corrective_user_message,
         )

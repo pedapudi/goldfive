@@ -316,7 +316,6 @@ def _planner_refine_accepts_available_agents(planner: Any) -> bool:
     argument``. Planners declared with ``**kwargs`` are assumed to
     accept (the kwarg passes through).
     """
-    import inspect
 
     refine = getattr(planner, "refine", None)
     if refine is None:
