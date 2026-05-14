@@ -664,10 +664,20 @@ async def test_apply_revision_defensive_fold_idempotent_when_caller_already_fold
     )
     # goldfive#254: instance method now.
     # goldfive#255: _apply_revision returns ``(revised, was_installed)``.
+    # goldfive#403: _apply_revision no longer mutates session.plan
+    # (the install moved into _emit_plan_revised's lock). Inspect the
+    # RETURNED plan to verify the defensive fold is idempotent — the
+    # session.plan pointer is unchanged at this point, which is the
+    # whole point of the fix.
     revised, _was_installed = DefaultSteerer()._apply_revision(session, revised, drift)
 
-    # goldfive#247: identity check replaced with id check (Plan is frozen)
-    assert session.plan is not None and session.plan.id == revised.id
-    new_by_id = {t.id: t for t in session.plan.tasks}
+    # goldfive#403: session.plan is still the PRIOR plan (install
+    # deferred to _emit_plan_revised). The defensive-fold invariant
+    # lives on ``revised`` (the returned stamped Plan).
+    assert session.plan is prior, (
+        "goldfive#403: _apply_revision must NOT install the plan; "
+        "the swap is now performed inside _emit_plan_revised's lock"
+    )
+    new_by_id = {t.id: t for t in revised.tasks}
     assert new_by_id["t1"].status is TaskStatus.NOT_NEEDED
     assert new_by_id["t2"].status is TaskStatus.PENDING

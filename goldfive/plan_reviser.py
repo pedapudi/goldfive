@@ -1350,13 +1350,32 @@ class PlanReviser:
     def _apply_revision(
         self, session: Session, revised: Plan, drift: DriftEvent
     ) -> tuple[Plan, bool]:
-        """Stamp revision metadata and install ``revised`` on the session.
+        """Stamp revision metadata and decide whether ``revised`` should install.
 
         Returns ``(revised, was_installed)``: ``was_installed`` is
-        ``True`` iff the revision was actually swapped onto
+        ``True`` iff the revision **should be** swapped onto
         ``session.plan`` (so the caller — and downstream
         :meth:`_emit_plan_revised` — can stamp ``dry_run`` on the
         emitted ``PlanRevised`` faithfully).
+
+        goldfive#403: this method NO LONGER mutates session state. Pre-
+        #403 it called :func:`set_session_plan`, stamped
+        ``session.last_addressed_revision_by_drift_key``, and pushed
+        ``_ostate.set_current_plan`` here. All three sites were
+        OUTSIDE the per-session plan lock — the caller then awaited
+        :meth:`_cancel_inflight_for_revision` (which yields the event
+        loop) before :meth:`_emit_plan_revised` acquired the lock,
+        leaving a partial-apply window where ``_wait_plan_stable``
+        readers observed a bumped ``revision_index`` with the
+        un-rewired (pre-supersedes) edge DAG. All three mutations now
+        run inside :meth:`_emit_plan_revised`'s lock, gated on the
+        ``was_installed`` decision encoded by this method's return
+        value. The contract for direct callers (none in production —
+        every caller of this method also routes to
+        :meth:`_emit_plan_revised`) is now "compute, don't install";
+        tests that previously asserted post-call ``session.plan``
+        identity must also invoke :meth:`_emit_plan_revised` to
+        observe the install.
 
         Preserves the existing ``revision_index`` monotonicity: the new
         plan's index is at least ``old.revision_index + 1``.
@@ -1519,27 +1538,34 @@ class PlanReviser:
             return revised, False
         log.info(
             "DefaultSteerer._apply_revision: prior_plan_id=%s "
-            "revised_plan_id=%s revision_index=%d drift_kind=%s",
+            "revised_plan_id=%s revision_index=%d drift_kind=%s "
+            "(decision=install; session.plan swap deferred to "
+            "_emit_plan_revised under lock — goldfive#403)",
             prior_id[:16] or "<none>",
             (revised.id or "")[:16] or "<empty>",
             int(revised.revision_index),
             drift.kind.value,
         )
-        with channel_processor_active():
-            set_session_plan(session, revised)
-        # goldfive#245 follow-up — stamp the per-(kind, target) addressed
-        # watermark so the verdict-freshness gate in :meth:`_handle_drift`
-        # can drop subsequent same-(kind, target) verdicts observed at
-        # older revisions as redundant. User-authored drifts bypass the
-        # gate entirely so they don't stamp here.
-        if (drift.authored_by or "").lower() != "user":
-            key = (drift.kind.value, drift.current_task_id or "")
-            session.last_addressed_revision_by_drift_key[key] = int(
-                revised.revision_index
-            )
-        # goldfive#152: refresh the orchestration-state current plan id
-        # so downstream reads see the revised id, not the stale one.
-        _ostate.set_current_plan(session.state, revised)
+        # goldfive#403: do NOT mutate ``session.plan``,
+        # ``session.last_addressed_revision_by_drift_key``, or
+        # ``session.state`` here. Pre-#403 this method called
+        # :func:`set_session_plan` immediately, stamped the per-(kind,
+        # target) watermark, and pushed the orchestration-state pointer
+        # — all OUTSIDE the per-session plan lock. The caller then
+        # awaited :meth:`_cancel_inflight_for_revision` (which yields
+        # the event loop) before :meth:`_emit_plan_revised` acquired
+        # the lock, leaving a window where readers calling
+        # :meth:`_wait_plan_stable` saw the bumped ``revision_index``
+        # and stamped watermark but with the un-rewired (pre-supersedes)
+        # edge DAG and the un-repinned ``current_task_id``. The
+        # docstring on :meth:`_emit_plan_revised` promises that
+        # ``_wait_plan_stable`` callers see pre- or post-revision state
+        # but never a partial apply; the only way to honour that is to
+        # defer every session-mutation site into the lock-protected
+        # region of :meth:`_emit_plan_revised`. This method now returns
+        # the stamped Plan plus the install decision; the caller is
+        # responsible for routing it to :meth:`_emit_plan_revised`,
+        # which performs the actual install atomically.
         return revised, True
 
     async def _emit_plan_revised(
@@ -1559,16 +1585,26 @@ class PlanReviser:
         from goldfive.conv import to_pb_plan
         from goldfive.events import build_plan_revision_diff
 
-        # goldfive a4: serialise the consistency-critical region of plan
-        # mutation. Held only across the in-memory mutations + the
-        # PlanRevised emit — NOT across ``planner.refine`` itself, which
-        # the caller owns. Reports calling :meth:`_wait_plan_stable`
-        # observe either the pre- or post-revision state, never a
-        # partial apply (e.g. supersedes integrated but pin not yet
-        # repinned, or revision_index bumped but PlanRevised not yet
-        # emitted). Fixes the race between fire-and-forget
-        # judge-triggered refines (#254) and imperative report_task_*
-        # handlers.
+        # goldfive a4 / goldfive#403: serialise the consistency-critical
+        # region of plan mutation. Held across EVERY session-mutation
+        # site (``session.plan`` swap, watermark stamp,
+        # orchestration-state pointer, supersedes-integration re-swap,
+        # current_task_id repin, pending-corrections GC + queue) plus
+        # the PlanRevised emit — NOT across ``planner.refine`` itself,
+        # which the caller owns. Pre-#403 the first ``set_session_plan``
+        # call lived in :meth:`_apply_revision` (OUTSIDE this lock) and
+        # the caller's ``await _cancel_inflight_for_revision`` yielded
+        # the event loop before this method ran, leaving a partial-
+        # apply window where ``_wait_plan_stable`` callers observed a
+        # bumped ``revision_index`` with the un-rewired edge DAG.
+        # Reports calling :meth:`_wait_plan_stable` now observe either
+        # the pre- or post-revision state, never a partial apply (e.g.
+        # supersedes integrated but pin not yet repinned, or
+        # revision_index bumped but PlanRevised not yet emitted). Fixes
+        # the race between fire-and-forget judge-triggered refines
+        # (#254) and imperative report_task_* handlers (goldfive a4)
+        # and closes the partial-apply window opened by the two-phase
+        # plan swap that goldfive#403 audited as HIGH severity.
         lock = self._get_plan_lock(session)
         async with lock:
             # goldfive#267: resolve the effective dry_run for THIS emit so
@@ -1605,39 +1641,75 @@ class PlanReviser:
             # the old task are rewritten so work flows through the
             # correction. No-op for REPLACE-kind (existing behaviour is
             # preserved) and for plans without supersedes.
-            # goldfive#247: returns a NEW Plan (Plan is frozen). The
-            # pre-frozen code mutated ``revised`` in place; with frozen
-            # types, we swap the new variant onto ``session.plan`` so
-            # the live pointer matches the rewired DAG that's about to
-            # be emitted as PlanRevised.
+            # goldfive#247: returns a NEW Plan (Plan is frozen). With
+            # frozen types, the integrated variant replaces ``revised``
+            # so the wire payload and the session pointer agree on the
+            # rewired DAG.
             #
-            # goldfive#267: under ``dry_run=True`` we still compute the
+            # goldfive#267 / goldfive#403: we ALWAYS compute the
             # integrated plan (the PlanRevised emit payload needs the
             # rewired DAG so operators can preview what the corrective
-            # refine WOULD have installed), but we MUST NOT call
-            # ``set_session_plan`` — doing so end-runs the gate at
-            # :meth:`_apply_revision`, which returned ``(revised, False)``
-            # specifically so the live ``session.plan`` would NOT be
-            # swapped. The local ``revised`` variable still gets rebound
-            # to the integrated variant so the rest of this method emits
-            # the rewired shape on the wire.
-            integrated = self._integrate_correction_supersedes(revised)
-            if integrated is not revised:
-                revised = integrated
-                if effective_dry_run:
-                    log.info(
-                        "DefaultSteerer._emit_plan_revised: dry_run=True — "
-                        "SKIPPING supersedes-integration set_session_plan. "
-                        "prior_plan_id=%s would_have_installed_plan_id=%s "
-                        "revision_index=%d drift_kind=%s",
-                        prior_plan_id_short,
-                        would_be_plan_id_short,
-                        int(revised.revision_index),
-                        drift.kind.value,
+            # refine WOULD have installed under ``dry_run=True``, and
+            # the live install path needs it so the FIRST and ONLY
+            # ``set_session_plan`` call below lands the rewired shape).
+            # Rebinding ``revised`` is unconditional; the actual session
+            # mutation is gated below on ``effective_dry_run``.
+            revised = self._integrate_correction_supersedes(revised)
+
+            # goldfive#403: single, atomic install site for the
+            # session-mutation triad — ``session.plan`` swap, per-(kind,
+            # target) addressed watermark, and orchestration-state
+            # current-plan pointer — all performed under the lock with
+            # the integrated (supersedes-rewired) DAG. Pre-#403 the
+            # first two of these lived in :meth:`_apply_revision`
+            # (outside the lock) and ran BEFORE the caller's
+            # ``await _cancel_inflight_for_revision``, leaving the
+            # bumped ``revision_index`` + stamped watermark visible on
+            # ``session.plan`` with the un-rewired edge DAG and
+            # un-repinned ``current_task_id`` until this method's lock
+            # acquisition. The supersedes-integration ``set_session_plan``
+            # is now folded into this single call (was a second swap
+            # below). Under ``effective_dry_run`` every site is
+            # suppressed exactly as before — the would-have-applied
+            # revision never end-runs ``_apply_revision``'s gate via
+            # the emit path. The PlanRevised wire event still fires —
+            # dry_run is observability, not silence.
+            if effective_dry_run:
+                log.info(
+                    "DefaultSteerer._emit_plan_revised: dry_run=True — "
+                    "SKIPPING session.plan install + watermark stamp + "
+                    "orchestration-state pointer. prior_plan_id=%s "
+                    "would_have_installed_plan_id=%s revision_index=%d "
+                    "drift_kind=%s",
+                    prior_plan_id_short,
+                    would_be_plan_id_short,
+                    int(revised.revision_index),
+                    drift.kind.value,
+                )
+            else:
+                with channel_processor_active():
+                    set_session_plan(session, revised)
+                # goldfive#245 follow-up / goldfive#403: stamp the
+                # per-(kind, target) addressed watermark so the
+                # verdict-freshness gate in :meth:`_handle_drift` can
+                # drop subsequent same-(kind, target) verdicts observed
+                # at older revisions as redundant. User-authored drifts
+                # bypass the gate entirely so they don't stamp here.
+                # Moved from :meth:`_apply_revision` into the lock so
+                # the watermark is never visible without the matching
+                # ``session.plan`` swap.
+                if (drift.authored_by or "").lower() != "user":
+                    key = (drift.kind.value, drift.current_task_id or "")
+                    session.last_addressed_revision_by_drift_key[key] = int(
+                        revised.revision_index
                     )
-                else:
-                    with channel_processor_active():
-                        set_session_plan(session, revised)
+                # goldfive#152 / goldfive#403: refresh the
+                # orchestration-state current plan id so downstream
+                # reads see the revised id, not the stale one. Moved
+                # from :meth:`_apply_revision` into the lock so the
+                # orchestration-state pointer is never visible without
+                # the matching ``session.plan`` swap.
+                _ostate.set_current_plan(session.state, revised)
 
             # goldfive#251 Stream D: GC corrections for tasks superseded by
             # this revision BEFORE queuing new ones. A task whose correction

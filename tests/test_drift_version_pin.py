@@ -600,12 +600,18 @@ async def test_end_to_end_redundant_drift_emits_but_does_not_refine() -> None:
 
 
 async def test_apply_revision_stamps_per_key_watermark() -> None:
-    """``_apply_revision`` stamps ``last_addressed_revision_by_drift_key``.
+    """The refine-install pipeline stamps ``last_addressed_revision_by_drift_key``.
 
     This is the producer side of the gate: every successful goldfive-
     authored refine that lands a new plan must stamp the watermark so
     subsequent same-(kind, target) verdicts observed at older revisions
     are correctly identified as redundant.
+
+    goldfive#403: the watermark stamp moved out of ``_apply_revision``
+    (which previously mutated session state outside the per-session
+    plan lock) into ``_emit_plan_revised`` (which holds the lock around
+    every session-mutation site). Exercise both methods together to
+    observe the stamp — the post-#403 install pipeline contract.
     """
     session = _session(revision_index=2)
     drift = _drift(
@@ -623,11 +629,17 @@ async def test_apply_revision_stamps_per_key_watermark() -> None:
     )
 
     # goldfive#254: instance method.
-    DefaultSteerer()._apply_revision(session, revised, drift)
+    # goldfive#403: _apply_revision stamps the returned Plan but does
+    # NOT mutate session state; _emit_plan_revised performs the
+    # session-mutation triad (set_session_plan + watermark stamp +
+    # orchestration-state pointer) atomically under the lock.
+    steerer = DefaultSteerer()
+    revised, _ = steerer._apply_revision(session, revised, drift)
+    await steerer._emit_plan_revised(session, revised, drift, prev_plan=session.plan)
 
     key = (DriftKind.OFF_TOPIC.value, "t-draft")
     assert key in session.last_addressed_revision_by_drift_key, (
-        "_apply_revision must stamp the per-(kind, target) watermark"
+        "the refine-install pipeline must stamp the per-(kind, target) watermark"
     )
     assert session.last_addressed_revision_by_drift_key[key] == 3, (
         "watermark must equal the new revision_index"
@@ -659,7 +671,12 @@ async def test_apply_revision_does_not_stamp_for_user_authored_drifts() -> None:
     )
 
     # goldfive#254: instance method.
-    DefaultSteerer()._apply_revision(session, revised, drift)
+    # goldfive#403: exercise the full install pipeline so we observe
+    # the post-install state — the watermark stamp moved into
+    # _emit_plan_revised.
+    steerer = DefaultSteerer()
+    revised, _ = steerer._apply_revision(session, revised, drift)
+    await steerer._emit_plan_revised(session, revised, drift, prev_plan=session.plan)
 
     key = (DriftKind.USER_STEER.value, "t-draft")
     assert key not in session.last_addressed_revision_by_drift_key, (
