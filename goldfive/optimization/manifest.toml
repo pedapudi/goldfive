@@ -384,3 +384,355 @@ type = "int"
 range = [1, 64]
 default = 8
 tags = ["threshold", "reasoning", "prompt_budget"]
+
+# ---------------------------------------------------------------------------
+# Expansion: plan-template fragments (manifest-and-decision-telemetry)
+# ---------------------------------------------------------------------------
+#
+# The two supersession fragments are embedded verbatim into every refine
+# system prompt (refine / user_steer / looping_tool_call / plan_divergence)
+# via string concatenation. They shape the JSON output template the
+# planner is constrained to emit -- tuning here moves the precision /
+# recall of supersession detection without touching any drift-specific
+# prompt body.
+
+[[mutation]]
+id = "plan_template_supersession_invariant"
+kind = "prompt"
+source = "goldfive/optimization/prompts/plan_template_supersession_invariant.md"
+python_attr = "goldfive.planner:_SUPERSESSION_INVARIANT"
+description = "Reuse-or-supersede invariant embedded in every refine system prompt."
+required_placeholders = []
+tags = ["planner", "template", "supersession"]
+
+[[mutation]]
+id = "plan_template_supersession_examples"
+kind = "prompt"
+source = "goldfive/optimization/prompts/plan_template_supersession_examples.md"
+python_attr = "goldfive.planner:_SUPERSESSION_EXAMPLES"
+description = "Few-shot REPLACE/EVOLUTION examples anchoring the supersession invariant."
+required_placeholders = []
+tags = ["planner", "template", "supersession"]
+
+[[mutation]]
+id = "plan_template_refinement_guidance"
+kind = "prompt"
+source = "goldfive/optimization/prompts/plan_template_refinement_guidance.md"
+python_attr = "goldfive.planner:_REFINEMENT_GUIDANCE_BLOCK"
+description = "Default-pattern refinement guidance ('small drift -> swap drifted task with supersedes; reshape only when needed') embedded in the refine prompts."
+required_placeholders = []
+tags = ["planner", "template", "refine"]
+
+# ---------------------------------------------------------------------------
+# Expansion: planner retry budgets + LLM caps (manifest-and-decision-telemetry)
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "planner_default_max_refine_attempts"
+kind = "numeric"
+source = "goldfive/planner.py:LLMPlanner.DEFAULT_MAX_REFINE_ATTEMPTS"
+python_attr = "goldfive.planner:LLMPlanner.DEFAULT_MAX_REFINE_ATTEMPTS"
+description = "Class-default refine retry budget when no per-instance override is supplied. Drives the RetryBudgetSpent attempt counter."
+type = "int"
+range = [1, 10]
+default = 2
+tags = ["planner", "retry_budget"]
+
+[[mutation]]
+id = "planner_max_output_tokens"
+kind = "numeric"
+source = "goldfive/planner.py:LLMPlanner.MAX_OUTPUT_TOKENS"
+python_attr = "goldfive.planner:LLMPlanner.MAX_OUTPUT_TOKENS"
+description = "Per-call output token cap on planner LLM dispatches (generate / refine / refine_steer / refine_user_steer)."
+type = "int"
+range = [512, 65536]
+default = 16384
+tags = ["planner", "prompt_budget"]
+
+[[mutation]]
+id = "goal_deriver_max_output_tokens"
+kind = "numeric"
+source = "goldfive/goal_deriver.py:LLMGoalDeriver.MAX_OUTPUT_TOKENS"
+python_attr = "goldfive.goal_deriver:LLMGoalDeriver.MAX_OUTPUT_TOKENS"
+description = "Per-call output token cap on LLMGoalDeriver.derive LLM dispatches."
+type = "int"
+range = [512, 32768]
+default = 8192
+tags = ["goal_deriver", "prompt_budget"]
+
+[[mutation]]
+id = "default_max_output_tokens"
+kind = "numeric"
+source = "goldfive/_llm.py:DEFAULT_MAX_OUTPUT_TOKENS"
+python_attr = "goldfive._llm:DEFAULT_MAX_OUTPUT_TOKENS"
+description = "Process-default output-token cap used by call_llm when no per-callsite cap is in scope."
+type = "int"
+range = [256, 32768]
+default = 4096
+tags = ["llm", "prompt_budget"]
+
+# ---------------------------------------------------------------------------
+# Expansion: steerer ladder policy + cooldowns (manifest-and-decision-telemetry)
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "refine_failure_threshold"
+kind = "numeric"
+source = "goldfive/steerer.py:DefaultSteerer.REFINE_FAILURE_THRESHOLD"
+python_attr = "goldfive.steerer:DefaultSteerer.REFINE_FAILURE_THRESHOLD"
+description = "Consecutive same-(kind, task) refine failures before the steerer suppresses further refines and emits PolicyApplied(refine_failure_threshold)."
+type = "int"
+range = [1, 10]
+default = 2
+tags = ["steerer", "policy", "retry_budget"]
+
+[[mutation]]
+id = "progress_stall_threshold_seconds"
+kind = "numeric"
+source = "goldfive/steerer.py:DefaultSteerer.PROGRESS_STALL_THRESHOLD_SECONDS"
+python_attr = "goldfive.steerer:DefaultSteerer.PROGRESS_STALL_THRESHOLD_SECONDS"
+description = "Wall-clock idle seconds after which a refine-eligible task escalates to HUMAN_INTERVENTION_REQUIRED instead of looping the planner."
+type = "float"
+range = [10.0, 7200.0]
+default = 600.0
+tags = ["steerer", "policy", "cooldown"]
+
+[[mutation]]
+id = "executor_max_nudge_replays"
+kind = "numeric"
+source = "goldfive/executors/sequential.py:_DEFAULT_MAX_NUDGE_REPLAYS"
+python_attr = "goldfive.executors.sequential:_DEFAULT_MAX_NUDGE_REPLAYS"
+description = "Per-task cap on consecutive NUDGE-driven re-invocations before the executor declares the nudge cycle exhausted."
+type = "int"
+range = [1, 20]
+default = 3
+tags = ["executor", "retry_budget", "nudge"]
+
+# ---------------------------------------------------------------------------
+# Expansion: reasoning judge LLM dispatch caps (manifest-and-decision-telemetry)
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "reasoning_judge_max_reasoning_input_chars"
+kind = "numeric"
+source = "goldfive/drift/reasoning_judge.py:REASONING_JUDGE_MAX_REASONING_INPUT_CHARS"
+python_attr = "goldfive.drift.reasoning_judge:REASONING_JUDGE_MAX_REASONING_INPUT_CHARS"
+description = "Hard cap on the reasoning_input field of ReasoningJudgeInvoked. Truncation budget when the reasoning block is logged for observability."
+type = "int"
+range = [256, 16384]
+default = 4096
+tags = ["reasoning", "judge", "prompt_budget"]
+
+[[mutation]]
+id = "reasoning_judge_max_raw_response_chars"
+kind = "numeric"
+source = "goldfive/drift/reasoning_judge.py:REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS"
+python_attr = "goldfive.drift.reasoning_judge:REASONING_JUDGE_MAX_RAW_RESPONSE_CHARS"
+description = "Hard cap on the raw_response field of ReasoningJudgeInvoked."
+type = "int"
+range = [256, 16384]
+default = 2048
+tags = ["reasoning", "judge", "prompt_budget"]
+
+[[mutation]]
+id = "reasoning_judge_max_output_tokens"
+kind = "numeric"
+source = "goldfive/drift/reasoning_judge.py:REASONING_JUDGE_MAX_OUTPUT_TOKENS"
+python_attr = "goldfive.drift.reasoning_judge:REASONING_JUDGE_MAX_OUTPUT_TOKENS"
+description = "Per-call output-token cap on the reasoning-judge LLM dispatch."
+type = "int"
+range = [512, 65536]
+default = 16384
+tags = ["reasoning", "judge", "prompt_budget"]
+
+[[mutation]]
+id = "reasoning_judge_plan_tasks_summary_max_chars"
+kind = "numeric"
+source = "goldfive/drift/reasoning_judge.py:PLAN_TASKS_SUMMARY_MAX_CHARS"
+python_attr = "goldfive.drift.reasoning_judge:PLAN_TASKS_SUMMARY_MAX_CHARS"
+description = "Truncation budget for the {plan_tasks_summary} block inside the reasoning-judge user prompt."
+type = "int"
+range = [200, 16384]
+default = 2000
+tags = ["reasoning", "judge", "prompt_budget"]
+
+[[mutation]]
+id = "reasoning_judge_agent_tree_block_max_chars"
+kind = "numeric"
+source = "goldfive/drift/reasoning_judge.py:AGENT_TREE_BLOCK_MAX_CHARS"
+python_attr = "goldfive.drift.reasoning_judge:AGENT_TREE_BLOCK_MAX_CHARS"
+description = "Truncation budget for the agent-tree suffix block appended to the reasoning-judge prompt when the host supplies tree context."
+type = "int"
+range = [200, 8192]
+default = 1200
+tags = ["reasoning", "judge", "prompt_budget"]
+
+# ---------------------------------------------------------------------------
+# Expansion: trajectory-level goal-drift judge caps (manifest-and-decision-telemetry)
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "goal_drift_max_output_tokens"
+kind = "numeric"
+source = "goldfive/drift/goals.py:GOAL_DRIFT_MAX_OUTPUT_TOKENS"
+python_attr = "goldfive.drift.goals:GOAL_DRIFT_MAX_OUTPUT_TOKENS"
+description = "Per-call output-token cap on the trajectory-level GOAL_DRIFT judge LLM dispatch."
+type = "int"
+range = [512, 65536]
+default = 16384
+tags = ["goal_drift", "judge", "prompt_budget"]
+
+[[mutation]]
+id = "goal_drift_trigger_input_max_chars"
+kind = "numeric"
+source = "goldfive/drift/goals.py:_GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS"
+python_attr = "goldfive.drift.goals:_GOAL_DRIFT_TRIGGER_INPUT_MAX_CHARS"
+description = "Truncation budget for the trigger_input field on a goal_drift DriftDetected event."
+type = "int"
+range = [256, 16384]
+default = 2048
+tags = ["goal_drift", "judge", "prompt_budget"]
+
+# ---------------------------------------------------------------------------
+# Expansion: detector internal knobs (manifest-and-decision-telemetry)
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "reasoning_sentence_min_length"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:_SENTENCE_MIN_LENGTH"
+python_attr = "goldfive.drift.reasoning:_SENTENCE_MIN_LENGTH"
+description = "Minimum character length for a sentence-level candidate inside detect_off_topic's per-sentence sub-pass. Fragments shorter than this can't carry enough lexical content for cosine to be meaningful."
+type = "int"
+range = [1, 200]
+default = 10
+tags = ["threshold", "reasoning", "off_topic"]
+
+[[mutation]]
+id = "embed_runtime_failure_threshold"
+kind = "numeric"
+source = "goldfive/drift/_embed.py:_RUNTIME_FAILURE_THRESHOLD"
+python_attr = "goldfive.drift._embed:_RUNTIME_FAILURE_THRESHOLD"
+description = "Consecutive embedding-backend failures before the circuit-breaker trips and the detectors degrade to no-signal."
+type = "int"
+range = [1, 50]
+default = 3
+tags = ["threshold", "embed", "circuit_breaker"]
+
+[[mutation]]
+id = "embed_cache_max"
+kind = "numeric"
+source = "goldfive/drift/_embed.py:_CACHE_MAX"
+python_attr = "goldfive.drift._embed:_CACHE_MAX"
+description = "LRU cache size (entries) for per-text encoded vectors. Lower cuts memory, higher cuts redundant encoding cost."
+type = "int"
+range = [16, 16384]
+default = 512
+tags = ["embed", "cache"]
+
+[[mutation]]
+id = "processed_steer_ids_cap"
+kind = "numeric"
+source = "goldfive/state_store.py:PROCESSED_STEER_IDS_CAP"
+python_attr = "goldfive.state_store:PROCESSED_STEER_IDS_CAP"
+description = "FIFO cap on the per-session processed-STEER annotation_id dedup set. Above the cap the oldest ids are evicted."
+type = "int"
+range = [16, 16384]
+default = 256
+tags = ["state_store", "dedup", "cap"]
+
+# ---------------------------------------------------------------------------
+# Expansion: adapter LLM-call watcher knobs (manifest-and-decision-telemetry)
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "default_llm_call_timeout_ms"
+kind = "numeric"
+source = "goldfive/adapters/_adk_plugin.py:DEFAULT_LLM_CALL_TIMEOUT_MS"
+python_attr = "goldfive.adapters._adk_plugin:DEFAULT_LLM_CALL_TIMEOUT_MS"
+description = "Wall-clock budget (ms) before the ADK plugin's LLM-call watcher emits an LLM_CALL_TIMEOUT drift and flags the invocation for cancel. 0 disables the watcher."
+type = "int"
+range = [0, 7200000]
+default = 1800000
+tags = ["adapter", "cooldown", "timeout"]
+
+[[mutation]]
+id = "default_agent_max_output_tokens"
+kind = "numeric"
+source = "goldfive/adapters/adk_llm_instrumentation.py:DEFAULT_AGENT_MAX_OUTPUT_TOKENS"
+python_attr = "goldfive.adapters.adk_llm_instrumentation:DEFAULT_AGENT_MAX_OUTPUT_TOKENS"
+description = "Default per-agent output-token cap installed on the ADK plugin's LLM-call shim when AgentConfig does not override."
+type = "int"
+range = [256, 131072]
+default = 16384
+tags = ["adapter", "prompt_budget"]
+
+# ---------------------------------------------------------------------------
+# Expansion: detector / dedup TTLs (manifest-and-decision-telemetry)
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "reflective_max_output_tokens"
+kind = "numeric"
+source = "goldfive/drift_observer.py:DriftObserver.REFLECTIVE_MAX_OUTPUT_TOKENS"
+python_attr = "goldfive.drift_observer:DriftObserver.REFLECTIVE_MAX_OUTPUT_TOKENS"
+description = "Per-call output-token cap on the reflective self-progress check LLM dispatch."
+type = "int"
+range = [512, 65536]
+default = 16384
+tags = ["reflective", "judge", "prompt_budget"]
+
+[[mutation]]
+id = "goal_drift_task_boundary_min_interval_seconds"
+kind = "numeric"
+source = "goldfive/drift_observer.py:DriftObserver._GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S"
+python_attr = "goldfive.drift_observer:DriftObserver._GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S"
+description = "Minimum spacing (seconds) between two task-boundary-triggered GOAL_DRIFT judge calls. Cooldown to amortise LLM cost on back-to-back transitions."
+type = "float"
+range = [0.0, 600.0]
+default = 10.0
+tags = ["goal_drift", "cooldown"]
+
+[[mutation]]
+id = "parallel_executor_refine_failure_threshold"
+kind = "numeric"
+source = "goldfive/executors/parallel.py:ParallelDAGExecutor.REFINE_FAILURE_THRESHOLD"
+python_attr = "goldfive.executors.parallel:ParallelDAGExecutor.REFINE_FAILURE_THRESHOLD"
+description = "ParallelDAGExecutor's stage-level refine-failure threshold. Mirror of the steerer-side knob but scoped to the parallel-executor branch."
+type = "int"
+range = [1, 10]
+default = 2
+tags = ["executor", "parallel", "retry_budget"]
+
+[[mutation]]
+id = "embedding_default_timeout_ms"
+kind = "numeric"
+source = "goldfive/config.py:EmbeddingConfig.timeout_ms"
+python_attr = "goldfive.config:EmbeddingConfig.timeout_ms"
+description = "Dataclass-default HTTP timeout for embedding-backend calls (ms). Overrides per-Runner via the EmbeddingConfig instance; this is the class-default operators see when no override is supplied."
+type = "int"
+range = [500, 600000]
+default = 10000
+tags = ["config", "embed", "timeout"]
+
+[[mutation]]
+id = "judge_default_timeout_ms"
+kind = "numeric"
+source = "goldfive/config.py:JudgeConfig.timeout_ms"
+python_attr = "goldfive.config:JudgeConfig.timeout_ms"
+description = "Dataclass-default HTTP timeout for judge-LLM dispatches (ms). Class-default operators see when no per-Runner JudgeConfig override is supplied."
+type = "int"
+range = [500, 600000]
+default = 10000
+tags = ["config", "judge", "timeout"]
+
+[[mutation]]
+id = "agent_call_timeout_ms_default"
+kind = "numeric"
+source = "goldfive/config.py:AgentConfig.call_timeout_ms"
+python_attr = "goldfive.config:AgentConfig.call_timeout_ms"
+description = "Dataclass-default per-agent LLM call timeout (ms). Operator-facing tunable for the per-invocation wall-clock budget; LLM_CALL_TIMEOUT drift fires when exceeded."
+type = "int"
+range = [1000, 7200000]
+default = 120000
+tags = ["config", "agent", "timeout"]
