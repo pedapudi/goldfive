@@ -64,13 +64,23 @@ class ListSink:
         zicato-optimization-surface: ``steering_decision_made`` is an
         observability-only paired event; filter it here so existing
         order assertions keep their pre-#zicato semantics.
+        manifest-and-decision-telemetry: the same applies to the new
+        ``ladder_transition_decided`` / ``detector_dispatch_ordered``
+        / ``policy_applied`` / ``retry_budget_spent`` envelopes.
         """
+        skip = {
+            "steering_decision_made",
+            "ladder_transition_decided",
+            "detector_dispatch_ordered",
+            "policy_applied",
+            "retry_budget_spent",
+        }
         out: list[Any] = []
         for e in self.events:
             if not hasattr(e, "WhichOneof"):
                 continue
             try:
-                if e.WhichOneof("payload") == "steering_decision_made":
+                if e.WhichOneof("payload") in skip:
                     continue
             except Exception:
                 pass
@@ -228,7 +238,7 @@ async def test_observe_pause_emits_drift_but_does_not_refine() -> None:
     # DriftDetected was still emitted.
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected"]
-    drift_pb = sink.events[0].drift_detected
+    drift_pb = sink.proto_events[0].drift_detected
     # Detail carries the note.
     assert drift_pb.detail == "coffee"
 

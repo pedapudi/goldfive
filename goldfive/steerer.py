@@ -701,6 +701,14 @@ class DefaultSteerer:
         setter = getattr(planner, "set_drift_emitter", None)
         if callable(setter):
             setter(self._emit_planner_refine_validation_failed)
+        # Wire the per-attempt retry-budget telemetry callback
+        # (manifest-and-decision-telemetry). Each refine attempt emits
+        # a ``RetryBudgetSpent`` row through the normal sink pipeline
+        # so downstream optimizers can correlate planner attempt counts
+        # against drift outcomes. Duck-typed on purpose.
+        budget_setter = getattr(planner, "set_retry_budget_emitter", None)
+        if callable(budget_setter):
+            budget_setter(self._emit_planner_retry_budget)
         # Wire the span-context provider so every planner-internal
         # ``call_llm`` site emits ``GoldfiveLLMCallStart/End`` pairs onto
         # the sink bus and shows up as a proper span on harmonograf's
@@ -836,6 +844,48 @@ class DefaultSteerer:
             )
             return
         await self.drift._emit_drift_detected(session, drift)
+
+    async def _emit_planner_retry_budget(
+        self,
+        operation: str,
+        attempt: int,
+        budget_remaining: int,
+        reason: str,
+    ) -> None:
+        """Forward a per-attempt retry-budget telemetry row to sinks.
+
+        Wired in :meth:`bind` via
+        :meth:`~goldfive.planner.LLMPlanner.set_retry_budget_emitter`.
+        Routes through the same ``_active_session_var`` ContextVar the
+        drift emitter uses so concurrent runs sharing one steerer
+        instance still attribute rows to the right session. Best-effort:
+        emission failure must never break the refine retry loop.
+        """
+        session = self._active_session_var.get()
+        if session is None:
+            # No active session — the planner is being exercised
+            # standalone (tests). Drop the row; no caller depends on
+            # it.
+            return
+        try:
+            from goldfive.events import retry_budget_spent_event
+        except ModuleNotFoundError:  # pragma: no cover -- proto-less env
+            return
+        try:
+            seq, event_id = session.next_sequence_and_event_id()
+            evt = retry_budget_spent_event(
+                session.run_id,
+                seq,
+                operation=operation,
+                attempt=attempt,
+                budget_remaining=budget_remaining,
+                reason=reason,
+                session_id=session.id,
+                event_id=event_id,
+            )
+            await self._emit(evt)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("retry_budget_spent emit failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Protocol-required: transition (generic)

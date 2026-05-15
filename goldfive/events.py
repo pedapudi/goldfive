@@ -1058,6 +1058,131 @@ def steering_decision_made_event(
     return evt
 
 
+def ladder_transition_decided_event(
+    run_id: str,
+    sequence: int,
+    *,
+    from_level: str = "",
+    to_level: str,
+    reason: str = "",
+    drift_kind: str = "",
+    drift_id: str = "",
+    severity: str = "",
+    session_id: str = "",
+    event_id: str = "",
+) -> Any:
+    """Build a ``LadderTransitionDecided`` envelope.
+
+    Emitted every time the intervention ladder picks a level for a
+    drift. ``from_level`` is the prior ladder pick for the same
+    ``(kind, task)`` pair when one exists; ``""`` on a fresh
+    condition. ``to_level`` is the chosen ``InterventionLevel`` as a
+    bare lowercase string (``"observe"`` / ``"nudge"`` /
+    ``"cancel_reinvoke"`` / ``"pause_escalate"`` / ``"absorb"`` /
+    ``"terminate"``).
+
+    Decision-telemetry contract: emission failure must NOT propagate
+    to callers; the caller wraps this in try/except as best-effort.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
+    payload = evt.ladder_transition_decided
+    payload.from_level = str(from_level or "")
+    payload.to_level = str(to_level or "")
+    payload.reason = str(reason or "")
+    payload.drift_kind = str(drift_kind or "")
+    payload.drift_id = str(drift_id or "")
+    payload.severity = str(severity or "")
+    return evt
+
+
+def detector_dispatch_ordered_event(
+    run_id: str,
+    sequence: int,
+    *,
+    dispatch_order: Any,
+    reason: str = "",
+    session_id: str = "",
+    event_id: str = "",
+) -> Any:
+    """Build a ``DetectorDispatchOrdered`` envelope.
+
+    Emitted once per session (or per dispatch-order recomputation)
+    snapshotting which detectors will run and in what order. The
+    ordering is deterministic in goldfive today but the contract
+    reserves the freedom to reorder / skip detectors based on runtime
+    config — an optimizer that wants to learn "what runs when" needs
+    the snapshot rather than infer from fire patterns.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
+    payload = evt.detector_dispatch_ordered
+    for name in dispatch_order or ():
+        payload.dispatch_order.append(str(name))
+    payload.reason = str(reason or "")
+    return evt
+
+
+def policy_applied_event(
+    run_id: str,
+    sequence: int,
+    *,
+    policy_name: str,
+    outcome: str,
+    reason: str = "",
+    detail: str = "",
+    session_id: str = "",
+    event_id: str = "",
+) -> Any:
+    """Build a ``PolicyApplied`` envelope.
+
+    Generic decision-telemetry event for steerer policies that don't
+    fit ``SteeringDecisionMade`` (which is per-detector) or
+    ``LadderTransitionDecided`` (which is per-drift). Use for
+    observation-only gating, refine-failure-threshold trips,
+    supersession-integration paths, etc.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
+    payload = evt.policy_applied
+    payload.policy_name = str(policy_name or "")
+    payload.outcome = str(outcome or "")
+    payload.reason = str(reason or "")
+    payload.detail = str(detail or "")
+    return evt
+
+
+def retry_budget_spent_event(
+    run_id: str,
+    sequence: int,
+    *,
+    operation: str,
+    attempt: int,
+    budget_remaining: int,
+    reason: str = "",
+    session_id: str = "",
+    event_id: str = "",
+) -> Any:
+    """Build a ``RetryBudgetSpent`` envelope.
+
+    Emitted on each refine attempt — both success and failure —
+    recording the per-call retry budget. ``attempt`` is 1-indexed (1
+    = first try). ``budget_remaining`` is the number of further
+    attempts the operation is still allowed to make; ``0`` means this
+    attempt exhausted the budget.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
+    payload = evt.retry_budget_spent
+    payload.operation = str(operation or "")
+    try:
+        payload.attempt = max(0, int(attempt))
+    except (TypeError, ValueError):
+        payload.attempt = 0
+    try:
+        payload.budget_remaining = max(0, int(budget_remaining))
+    except (TypeError, ValueError):
+        payload.budget_remaining = 0
+    payload.reason = str(reason or "")
+    return evt
+
+
 def drift_detected_event(
     run_id: str,
     sequence: int,

@@ -1366,6 +1366,14 @@ class LLMPlanner:
         # When left as ``None`` (e.g. the planner is used standalone in
         # tests) the fallback still happens -- it is just not emitted.
         self._drift_emitter: Callable[[DriftEvent], Awaitable[None]] | None = None
+        # Optional sink for per-attempt ``RetryBudgetSpent`` telemetry
+        # (manifest-and-decision-telemetry). Wired up by
+        # ``DefaultSteerer.bind`` so each refine attempt emits a
+        # decision-telemetry row without the planner depending on a
+        # sink list. ``None`` in standalone use (tests).
+        self._retry_budget_emitter: (
+            Callable[[str, int, int, str], Awaitable[None]] | None
+        ) = None
         # Optional context provider for ``GoldfiveLLMCallStart/End``
         # spans (goldfive internal-llm-spans). The steerer wires this
         # up in :meth:`bind` so every planner-internal ``call_llm``
@@ -1408,6 +1416,46 @@ class LLMPlanner:
         event pipeline without the planner owning a sink list itself.
         """
         self._drift_emitter = emitter
+
+    def set_retry_budget_emitter(
+        self,
+        emitter: Callable[[str, int, int, str], Awaitable[None]] | None,
+    ) -> None:
+        """Install (or remove) the per-attempt retry-budget telemetry hook.
+
+        The emitter is called once per refine attempt (success or
+        failure) with ``(operation, attempt, budget_remaining, reason)``
+        positional arguments — the same fields the
+        ``RetryBudgetSpent`` proto event carries. The steerer wires
+        this in :meth:`bind` so each planner attempt produces a
+        decision-telemetry row without the planner owning a sink list.
+
+        When ``None`` (e.g. standalone planner in tests), retry budget
+        emission is a no-op; the refine retry loop is unchanged.
+        """
+        self._retry_budget_emitter = emitter
+
+    async def _emit_retry_budget(
+        self,
+        *,
+        operation: str,
+        attempt: int,
+        budget_remaining: int,
+        reason: str,
+    ) -> None:
+        """Fire the per-attempt retry-budget telemetry callback when bound.
+
+        Best-effort: a missing or raising emitter must not break the
+        refine retry loop.
+        """
+        emitter = getattr(self, "_retry_budget_emitter", None)
+        if emitter is None:
+            return
+        try:
+            await emitter(operation, attempt, budget_remaining, reason)
+        except Exception:  # noqa: BLE001 -- telemetry best-effort
+            # Telemetry must never compromise refine correctness.
+            log.debug("retry_budget_emitter raised; dropping", exc_info=True)
 
     def set_span_context_provider(self, provider: Callable[[], Any] | None) -> None:
         """Install (or remove) the callable that supplies span-emission context.
@@ -2491,6 +2539,12 @@ class LLMPlanner:
         user_prompt = base_user_prompt
         last_error = ""
         attempts = max(1, self._max_refine_attempts)
+        # Decision-telemetry operation name. ``log_prefix`` typically
+        # carries the call-site label (``"LLMPlanner.refine"``,
+        # ``"LLMPlanner.refine_user_steer"``, etc); strip the class
+        # qualifier so RetryBudgetSpent.operation matches the proto
+        # docstring contract ("refine" / "refine_user_steer" / ...).
+        operation_name = log_prefix.split(".")[-1] if log_prefix else "refine"
         for attempt in range(1, attempts + 1):
             # Per-attempt span. decision_summary / output_preview is
             # stamped inside the with-block; the outer retry loop's
@@ -2715,7 +2769,24 @@ class LLMPlanner:
                     ", ".join(f"{t.id!r} ({t.title!r})" for t in orphans),
                 )
                 await self._emit_refine_orphaned_tasks(prior_plan, revised, orphans)
+            # Decision-telemetry: success on attempt N leaves
+            # (attempts - N) budget unused. Emit the row so an
+            # optimizer can see which attempt the planner converged on.
+            await self._emit_retry_budget(
+                operation=operation_name,
+                attempt=attempt,
+                budget_remaining=max(0, attempts - attempt),
+                reason="validated",
+            )
             return revised, "", False
+        # Loop exhausted (or terminated early by the empty-response
+        # break). The final attempt left no remaining budget.
+        await self._emit_retry_budget(
+            operation=operation_name,
+            attempt=attempts,
+            budget_remaining=0,
+            reason=last_error or "budget_exhausted",
+        )
         return None, last_error, False
 
     def _build_refine_prompt(

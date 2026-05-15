@@ -568,6 +568,129 @@ class DriftObserver:
             invocation_id=invocation_id,
         )
 
+    # ------------------------------------------------------------------
+    # Decision-telemetry emission (manifest-and-decision-telemetry)
+    # ------------------------------------------------------------------
+
+    async def _emit_ladder_transition(
+        self,
+        *,
+        session: Session,
+        from_level: str,
+        to_level: str,
+        reason: str,
+        drift: DriftEvent,
+    ) -> None:
+        """Emit a ``LadderTransitionDecided`` envelope.
+
+        Best-effort: silently swallows proto-stubs-missing
+        ``ModuleNotFoundError`` (the legacy environment that runs
+        import-only smoke tests without the ``proto`` extra) and any
+        emit-side exception so the ladder routing keeps working when
+        telemetry sinks are unavailable.
+        """
+        try:
+            from goldfive.events import ladder_transition_decided_event
+        except ModuleNotFoundError:  # pragma: no cover -- proto-less env
+            return
+        try:
+            seq, event_id = session.next_sequence_and_event_id()
+            evt = ladder_transition_decided_event(
+                session.run_id,
+                seq,
+                from_level=from_level,
+                to_level=to_level,
+                reason=reason,
+                drift_kind=str(drift.kind),
+                drift_id=str(getattr(drift, "id", "") or ""),
+                severity=str(drift.severity),
+                session_id=session.id,
+                event_id=event_id,
+            )
+            await self._steerer._emit(evt)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("ladder_transition_decided emit failed: %s", exc)
+
+    async def _emit_detector_dispatch_ordered(
+        self,
+        *,
+        session: Session,
+        dispatch_order: tuple[str, ...],
+        reason: str = "default",
+    ) -> None:
+        """Emit a ``DetectorDispatchOrdered`` envelope.
+
+        Emitted at most once per session — guarded by a flag set on
+        the session itself so repeat dispatches against the same
+        session don't re-fire. Best-effort like the ladder emit.
+        """
+        # Idempotency guard: stamp the session so multiple observe
+        # calls within one session emit only one snapshot.
+        already_emitted = bool(getattr(session, "_detector_dispatch_emitted", False))
+        if already_emitted:
+            return
+        try:
+            from goldfive.events import detector_dispatch_ordered_event
+        except ModuleNotFoundError:  # pragma: no cover -- proto-less env
+            return
+        try:
+            seq, event_id = session.next_sequence_and_event_id()
+            evt = detector_dispatch_ordered_event(
+                session.run_id,
+                seq,
+                dispatch_order=dispatch_order,
+                reason=reason,
+                session_id=session.id,
+                event_id=event_id,
+            )
+            await self._steerer._emit(evt)
+            # Stamp post-emit so a failure on the wire leaves the
+            # idempotency window open for a retry.
+            try:
+                object.__setattr__(session, "_detector_dispatch_emitted", True)
+            except (AttributeError, TypeError):
+                # ``Session`` may be frozen / slotted in some configs;
+                # the worst case is a duplicate emission, which is
+                # harmless.
+                pass
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("detector_dispatch_ordered emit failed: %s", exc)
+
+    async def _emit_policy_applied(
+        self,
+        *,
+        session: Session,
+        policy_name: str,
+        outcome: str,
+        reason: str = "",
+        detail: str = "",
+    ) -> None:
+        """Emit a ``PolicyApplied`` envelope.
+
+        Best-effort; any failure (missing proto stubs, sink exception)
+        is logged at DEBUG and dropped so the policy decision keeps
+        going.
+        """
+        try:
+            from goldfive.events import policy_applied_event
+        except ModuleNotFoundError:  # pragma: no cover -- proto-less env
+            return
+        try:
+            seq, event_id = session.next_sequence_and_event_id()
+            evt = policy_applied_event(
+                session.run_id,
+                seq,
+                policy_name=policy_name,
+                outcome=outcome,
+                reason=reason,
+                detail=detail,
+                session_id=session.id,
+                event_id=event_id,
+            )
+            await self._steerer._emit(evt)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("policy_applied emit failed: %s", exc)
+
     @classmethod
     def _is_terminal_drift(cls, drift: DriftEvent) -> bool:
         """Return True iff ``drift`` should trigger boundary cleanup.
@@ -1284,6 +1407,11 @@ class DriftObserver:
         based drifts (LOOPING_REASONING, tool errors, …) are NOT
         deduped — they're heuristic signals, not user actions.
         """
+        # First observe call on a session snapshots the detector
+        # dispatch order so an optimizer can see WHICH detectors were
+        # in play independent of which ones fired. Idempotent (the
+        # helper short-circuits on second call).
+        await self._maybe_emit_dispatch_snapshot(session)
         if self._is_duplicate_steer(event, session):
             steer_id = self._steer_dedupe_id(event)
             log.debug("DefaultSteerer.observe: dropping duplicate STEER id=%s", steer_id)
@@ -1298,6 +1426,31 @@ class DriftObserver:
         if drift is None:
             return
         await self.handle_drift(drift, session)
+
+    async def _maybe_emit_dispatch_snapshot(self, session: Session) -> None:
+        """Emit a one-shot ``DetectorDispatchOrdered`` for this session.
+
+        Snapshots the symbolic detector names registered with the
+        drift registry (insertion-order, which is the dispatch order
+        callers see when they iterate ``list_registered``). Idempotent
+        per session via the flag stamped in
+        :meth:`_emit_detector_dispatch_ordered`.
+        """
+        try:
+            from goldfive.drift.registry import _ensure_registered, list_registered
+            _ensure_registered()
+            kinds = list_registered()
+            dispatch_order = tuple(str(k.value if hasattr(k, "value") else k) for k in kinds)
+        except Exception as exc:  # noqa: BLE001 -- registry best-effort
+            log.debug("dispatch snapshot: registry list failed: %s", exc)
+            return
+        if not dispatch_order:
+            return
+        await self._emit_detector_dispatch_ordered(
+            session=session,
+            dispatch_order=dispatch_order,
+            reason="default",
+        )
 
     async def observe_reasoning(
         self,
@@ -3133,6 +3286,23 @@ class DriftObserver:
             occurrence_count,
             level.name,
         )
+        # Decision telemetry: stamp the ladder pick. ``from_level``
+        # is empty here because the ladder is stateless per call —
+        # consumers wanting to reconstruct true transitions join on
+        # ``(drift_kind, task_id)`` ordered by ``sequence``. The
+        # reason field distinguishes first-occurrence from repeat.
+        ladder_reason = (
+            "first occurrence"
+            if occurrence_count == 0
+            else f"repeat (count={occurrence_count})"
+        )
+        await self._emit_ladder_transition(
+            session=session,
+            from_level="",
+            to_level=level.name.lower(),
+            reason=ladder_reason,
+            drift=drift,
+        )
         if level is InterventionLevel.OBSERVE:
             return
         if level is InterventionLevel.NUDGE:
@@ -3180,6 +3350,16 @@ class DriftObserver:
                         drift.kind.value,
                         drift.current_task_id,
                     )
+                    await self._emit_policy_applied(
+                        session=session,
+                        policy_name="refine_outcome_succeeded_skip",
+                        outcome="skipped",
+                        reason="prior_succeeded_same_turn",
+                        detail=(
+                            f"kind={drift.kind.value} "
+                            f"task_id={drift.current_task_id or ''}"
+                        ),
+                    )
                     return
                 if outcome.fail_count >= self._steerer.REFINE_FAILURE_THRESHOLD:
                     log.debug(
@@ -3187,6 +3367,17 @@ class DriftObserver:
                         drift.kind.value,
                         drift.current_task_id,
                         outcome.fail_count,
+                    )
+                    await self._emit_policy_applied(
+                        session=session,
+                        policy_name="refine_failure_threshold",
+                        outcome="suppressed",
+                        reason="threshold_reached",
+                        detail=(
+                            f"kind={drift.kind.value} "
+                            f"task_id={drift.current_task_id or ''} "
+                            f"count={outcome.fail_count}"
+                        ),
                     )
                     return
         # Progress-based escalation (goldfive#271). Orthogonal to the
@@ -3594,6 +3785,18 @@ class DriftObserver:
                 superseded_ids,
                 replacement_ids,
                 body[:200],
+            )
+            # Decision telemetry: stamp the observation-only gate so
+            # an optimizer can count would-have-dispatched events.
+            await self._emit_policy_applied(
+                session=session,
+                policy_name="observation_only_gate",
+                outcome="suppressed",
+                reason="observation_only=True",
+                detail=(
+                    f"kind={drift.kind.value} "
+                    f"task_id={drift.current_task_id or ''}"
+                ),
             )
             return False
         landed = await self._steerer._dispatch_goldfive_control(msg)
