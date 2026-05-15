@@ -432,8 +432,9 @@ async def test_emit_drift_detected_stamps_lifecycle_opened() -> None:
     )
     await steerer.drift._emit_drift_detected(session, drift)
 
-    assert len(sink.events) == 1
-    evt = sink.events[0]
+    drift_events = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
+    assert len(drift_events) == 1
+    evt = drift_events[0]
     assert evt.HasField("drift_detected")
     payload = evt.drift_detected
     # Existing fields unchanged (back-compat regression).
@@ -473,7 +474,8 @@ async def test_emit_drift_detected_escalates_within_turn() -> None:
     await steerer.drift._emit_drift_detected(session, drift_a)
     await steerer.drift._emit_drift_detected(session, drift_b)
 
-    first, second = sink.events
+    drift_events = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
+    first, second = drift_events
     # Same condition_id across both emits.
     assert first.drift_detected.condition_id == second.drift_detected.condition_id
     assert second.drift_detected.lifecycle == types_pb2.DRIFT_LIFECYCLE_ESCALATING
@@ -498,9 +500,10 @@ async def test_emit_drift_detected_distinct_turns_are_distinct_conditions() -> N
     )
     await steerer.drift._emit_drift_detected(s1, drift)
     await steerer.drift._emit_drift_detected(s2, drift)
-    assert len(sink.events) == 2
-    cid1 = sink.events[0].drift_detected.condition_id
-    cid2 = sink.events[1].drift_detected.condition_id
+    drift_events = [e for e in sink.events if e.WhichOneof("payload") == "drift_detected"]
+    assert len(drift_events) == 2
+    cid1 = drift_events[0].drift_detected.condition_id
+    cid2 = drift_events[1].drift_detected.condition_id
     assert cid1 != cid2
 
 

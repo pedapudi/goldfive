@@ -78,6 +78,7 @@ message Event {
     TaskTransitionRefused task_transition_refused = 36;
     InvocationBoundaryEntered invocation_boundary_entered = 37;
     InvocationBoundaryExited invocation_boundary_exited = 38;
+    SteeringDecisionMade steering_decision_made = 39;
   }
 }
 
@@ -955,4 +956,93 @@ message TaskTransitionRefused {
   // from, when resolvable. Empty when the pin lacks invocation
   // attribution. Best-effort.
   string invocation_id = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Steering-decision observability (zicato-optimization-surface)
+// ---------------------------------------------------------------------------
+
+// Emitted on every detector evaluation regardless of outcome. Pairs
+// with ``DriftDetected``: when a detector decides to fire, both events
+// emit (the ``DriftDetected.id`` matches ``SteeringDecisionMade.drift_id``);
+// when a detector decides NOT to fire, only ``SteeringDecisionMade``
+// emits.
+//
+// Downstream optimizers consume the silent-path emissions to learn
+// what goldfive considered before deciding to stay quiet — without it,
+// the only training signal for tuning detector thresholds is the
+// positive class (drifts that fired). The negative class
+// (``outcome="no_drift"``) closes the loop.
+//
+// ``considered_*`` fields capture what the detector evaluated; the
+// ``chosen_*`` fields record what the steerer eventually applied (post
+// observation-only gating, suppression-window dedup, intervention
+// ladder routing). On a no-fire path the ``chosen_*`` fields echo the
+// considered values when the detector's own score crossed a threshold
+// but the steerer chose not to act; they are empty when the detector
+// itself decided no drift was present.
+message SteeringDecisionMade {
+  // Symbolic name of the detector that produced this decision —
+  // ``"reasoning_judge"``, ``"goal_drift"``, ``"tool_loops"``,
+  // ``"capability_check"``, ``"confabulation_risk"``,
+  // ``"reflective_check"``, etc. Free-form string; consumers MUST
+  // tolerate unknown values.
+  string detector_name = 1;
+  // ``"no_drift"``         — detector ran, decided not to fire.
+  // ``"drift_emitted"``    — detector fired AND the steerer dispatched
+  //                          the drift (paired ``DriftDetected`` is on
+  //                          the wire with matching ``drift_id``).
+  // ``"drift_suppressed"`` — detector fired but the steerer suppressed
+  //                          the dispatch (observation-only mode, a
+  //                          fresher user-steer was active, the
+  //                          drift was a stale verdict against an
+  //                          already-revised plan, etc.). The paired
+  //                          ``DriftDetected`` event is still emitted
+  //                          for observability with the relevant
+  //                          ``suppressed_*`` flag set.
+  string outcome = 2;
+  // One-line human-readable reason for the outcome — e.g.
+  // ``"cosine 0.42 below 0.6 healthy bound"``, ``"observation_only=true"``,
+  // ``"stale verdict against revision 7 (live=8)"``. Optional; empty
+  // when no specific reason applies.
+  string reason = 3;
+  // Detector-specific scalar score that drove the decision (e.g.
+  // cosine similarity for reasoning detectors, repeat-count for
+  // tool-loops normalised to ``count / threshold``). 0.0 when no
+  // single score summarises the decision (e.g. categorical detectors).
+  float score = 4;
+  // The severity the detector considered — ``"info"`` / ``"warning"``
+  // / ``"critical"``, or ``""`` when no drift would have fired.
+  string considered_severity = 5;
+  // The severity the steerer actually applied (may differ when the
+  // intervention ladder demotes / promotes the level). Empty on
+  // ``no_drift`` outcomes.
+  string chosen_severity = 6;
+  // The intervention level the detector / steerer considered. Bare
+  // lowercase string of the ``InterventionLevel`` enum
+  // (``"observe"`` / ``"absorb"`` / ``"nudge"`` / ``"cancel_reinvoke"``
+  // / ``"pause_escalate"`` / ``"terminate"``), or ``""`` when no
+  // level was considered.
+  string considered_intervention_level = 7;
+  // The intervention level actually applied. Empty when no
+  // intervention fired (``outcome != "drift_emitted"``).
+  string chosen_intervention_level = 8;
+  // Cross-reference to the paired ``DriftDetected.id`` when
+  // ``outcome != "no_drift"``. Empty on the silent path.
+  string drift_id = 9;
+  // Wall-clock time at which the decision was finalised. Advisory; use
+  // the Event envelope's ``sequence`` for ordering.
+  google.protobuf.Timestamp decided_at = 10;
+  // ADK invocation_id of the dispatch the decision concerns, when
+  // resolvable. Empty for trajectory-level decisions (e.g. the
+  // periodic goal-drift judge) and for decisions made before an
+  // invocation_id is available.
+  string invocation_id = 11;
+  // Task the decision is attributed to, when bound. Empty when the
+  // detector is trajectory-level.
+  string task_id = 12;
+  // Agent the decision is attributed to (the reasoning subject for
+  // judge detectors; the dispatch target for tool detectors). Empty
+  // when no agent is bound.
+  string agent_name = 13;
 }

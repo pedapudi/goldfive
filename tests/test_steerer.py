@@ -65,18 +65,21 @@ class ListSink:
         ``refine_failed`` / correlation ``plan_revised``) on the same
         sink fan-out. goldfive#251 R4 added ``task_transitioned`` proto
         envelopes — observability-only, attached after every per-status
-        envelope. Tests that assert on proto event order can use
-        this filter to ignore both the dict sidecars and the R4
-        observability events while still exercising
-        the production emit path.
+        envelope. zicato-optimization-surface added
+        ``steering_decision_made`` envelopes — observability-only,
+        paired with every ``drift_detected`` (and emitted on the silent
+        no-fire path). Tests that assert on proto event order use this
+        filter to ignore the dict sidecars and the two observability-
+        only kinds while still exercising the production emit path.
         """
+        skip = {"task_transitioned", "steering_decision_made"}
         out: list[Any] = []
         for e in self.events:
             which = getattr(e, "WhichOneof", None)
             if which is None:
                 continue
             try:
-                if which("payload") == "task_transitioned":
+                if which("payload") in skip:
                     continue
             except Exception:
                 pass
@@ -579,8 +582,12 @@ async def test_observe_skips_refine_on_info_severity() -> None:
     session = _make_session()
 
     await steerer.drift.observe({}, session)
-    assert len(sink.events) == 1
-    assert sink.events[0].WhichOneof("payload") == "drift_detected"
+    # zicato-optimization-surface: each DriftDetected is paired with a
+    # SteeringDecisionMade observability event; the production-relevant
+    # sequence is captured via ``proto_events`` (which filters the
+    # paired event out).
+    assert len(sink.proto_events) == 1
+    assert sink.proto_events[0].WhichOneof("payload") == "drift_detected"
     # INFO is below the WARNING threshold — no refine.
     assert planner.refine_calls == []
 
@@ -767,6 +774,10 @@ async def test_two_consecutive_refine_failures_marks_task_failed() -> None:
     # drift emitted.
     await steerer.drift.handle_drift(_tool_error_drift(), session)
     assert _task(session, "t1").status is TaskStatus.FAILED
+    # Drain the cascade-spawned TASK_FAILED_FATAL drift handler so the
+    # event stream below sees the full sequence (and so fixture
+    # teardown doesn't cancel the background mid-emit).
+    await steerer.drift._wait_background_drifts_idle()
 
     from goldfive.pb.goldfive.v1 import types_pb2
 

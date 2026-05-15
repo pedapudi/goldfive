@@ -510,8 +510,17 @@ async def test_goldfive_drift_event_authored_by_goldfive_when_unset() -> None:
 
 
 async def test_suppressed_drift_event_wire_flag() -> None:
-    """DriftDetected carries suppressed_by_user_steer=True on suppression."""
-    steerer, session, sink, planner, _adapter = _bind(window=5)
+    """DriftDetected carries suppressed_by_user_steer=True on suppression.
+
+    ``window`` is measured against the session's monotonic event-
+    sequence counter, which now includes the paired
+    ``SteeringDecisionMade`` observability events introduced by
+    zicato-optimization-surface (one per ``DriftDetected``). The
+    suppression intent here is "fire-immediately-after-steer is
+    suppressed" — a generous window keeps the test honest while the
+    counter-vs-logical-turn semantic mismatch is in flight.
+    """
+    steerer, session, sink, planner, _adapter = _bind(window=50)
     # User steer first.
     await steerer.drift.observe(
         ControlMessage(

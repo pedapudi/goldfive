@@ -139,7 +139,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from goldfive import _state_audit
 from goldfive import state_store as _ostate
@@ -393,6 +393,30 @@ class DriftObserver:
         # row per emit and renders it identically.
         self._stamp_drift_lifecycle(session, drift, evt)
         await self._steerer._emit(evt)
+        # zicato-optimization-surface: pair every DriftDetected with a
+        # SteeringDecisionMade so the optimizer's training set gets a
+        # full record of the detector decision and the steerer outcome.
+        # ``suppressed_by_user_steer`` is the only suppression bit we
+        # know at this emit site; the broader observation-only /
+        # stale-verdict suppression paths are stamped from the
+        # dispatch-time call sites that gate them.
+        outcome = "drift_suppressed" if drift.suppressed_by_user_steer else "drift_emitted"
+        reason = (
+            "suppressed by recent user steer"
+            if drift.suppressed_by_user_steer
+            else (drift.detail or "")
+        )
+        await self._emit_steering_decision(
+            session=session,
+            detector_name=self._detector_name_for_drift(drift),
+            outcome=outcome,
+            reason=reason,
+            considered_severity=str(drift.severity),
+            chosen_severity=("" if drift.suppressed_by_user_steer else str(drift.severity)),
+            drift_id=str(getattr(drift, "id", "") or ""),
+            task_id=drift.current_task_id,
+            agent_name=drift.current_agent_id,
+        )
         # goldfive#271 follow-up: when a terminal drift fires the run
         # cannot recover on its own — any boundary still open at this
         # point belongs to an invocation that will not get a paired
@@ -405,6 +429,132 @@ class DriftObserver:
         # ``dur=(open)``.
         if self._is_terminal_drift(drift):
             await self._close_open_boundaries_for_terminal_drift(drift)
+
+    # ------------------------------------------------------------------
+    # SteeringDecisionMade emission (zicato-optimization-surface)
+    # ------------------------------------------------------------------
+
+    #: Map from :class:`DriftKind` to the symbolic detector name carried
+    #: on ``SteeringDecisionMade.detector_name``. Used by
+    #: :meth:`_detector_name_for_drift` for positive-fire pairing and by
+    #: the silent-path emit helpers below.
+    _DETECTOR_NAME_BY_KIND: ClassVar[dict[DriftKind, str]] = {
+        DriftKind.LOOPING_REASONING: "reasoning_loop_embedding",
+        DriftKind.REASONING_CLUSTER_TIGHTENING: "reasoning_cluster_embedding",
+        DriftKind.OFF_TOPIC: "reasoning_judge",
+        DriftKind.JUSTIFIED_DEVIATION: "reasoning_judge",
+        DriftKind.INTENT_DIVERGENCE: "intent_divergence_embedding",
+        DriftKind.GOAL_DRIFT: "goal_drift_judge",
+        DriftKind.LOOPING_TOOL_CALL: "tool_loops",
+        DriftKind.CAPABILITY_MISMATCH: "capability_check",
+        DriftKind.CONFABULATION_RISK: "confabulation_risk",
+        DriftKind.HUMAN_INTERVENTION_REQUIRED: "human_intervention",
+        DriftKind.PLAN_DIVERGENCE: "plan_reconciler",
+        DriftKind.USER_STEER: "user_control",
+        DriftKind.USER_CANCEL: "user_control",
+        DriftKind.USER_PAUSE: "user_control",
+        DriftKind.UNCERTAIN_PROGRESS: "reflective_check",
+        DriftKind.SELF_REPORTED_STUCK: "reflective_check",
+    }
+
+    @classmethod
+    def _detector_name_for_drift(cls, drift: DriftEvent) -> str:
+        """Return the symbolic detector name for a drift's kind.
+
+        Falls back to the bare lowercase kind value for kinds not in
+        :data:`_DETECTOR_NAME_BY_KIND` so unfamiliar kinds still produce
+        a meaningful field rather than ``""``.
+        """
+        return cls._DETECTOR_NAME_BY_KIND.get(drift.kind, str(drift.kind))
+
+    async def _emit_steering_decision(
+        self,
+        *,
+        session: Session,
+        detector_name: str,
+        outcome: str,
+        reason: str = "",
+        score: float = 0.0,
+        considered_severity: str = "",
+        chosen_severity: str = "",
+        considered_intervention_level: str = "",
+        chosen_intervention_level: str = "",
+        drift_id: str = "",
+        task_id: str = "",
+        agent_name: str = "",
+        invocation_id: str = "",
+    ) -> None:
+        """Emit a ``SteeringDecisionMade`` envelope onto every sink.
+
+        The full positive-path / suppression-path / silent-path tri-state
+        is collapsed into the ``outcome`` argument: callers stamp
+        ``"drift_emitted"``, ``"drift_suppressed"``, or ``"no_drift"``
+        and the routing is identical otherwise.
+
+        Best-effort: if the proto stubs are unavailable (the legacy
+        environment that runs the import-only smoke tests without the
+        ``proto`` extra) the call falls through silently so the detector
+        path keeps working.
+        """
+        try:
+            from goldfive.events import steering_decision_made_event
+        except ModuleNotFoundError:  # pragma: no cover -- proto-less env
+            return
+        seq, event_id = session.next_sequence_and_event_id()
+        evt = steering_decision_made_event(
+            session.run_id,
+            seq,
+            detector_name=detector_name,
+            outcome=outcome,
+            reason=reason,
+            score=float(score),
+            considered_severity=considered_severity,
+            chosen_severity=chosen_severity,
+            considered_intervention_level=considered_intervention_level,
+            chosen_intervention_level=chosen_intervention_level,
+            drift_id=drift_id,
+            invocation_id=invocation_id,
+            task_id=task_id,
+            agent_name=agent_name,
+            session_id=session.id,
+            event_id=event_id,
+        )
+        await self._steerer._emit(evt)
+
+    async def emit_no_drift_decision(
+        self,
+        *,
+        session: Session,
+        detector_name: str,
+        reason: str = "",
+        score: float = 0.0,
+        task_id: str = "",
+        agent_name: str = "",
+        invocation_id: str = "",
+    ) -> None:
+        """Public hook for detectors that ran and decided not to fire.
+
+        The silent path: a detector evaluated its inputs and decided no
+        drift is warranted. Without this hook there is no on-the-wire
+        record that the detector ran at all — only firing detectors
+        produce ``DriftDetected``. Downstream optimizers need both
+        classes to tune thresholds.
+
+        Use from detectors at the "decided not to fire" decision point.
+        Always pair with a follow-up ``_emit_drift_detected`` call if
+        the decision flips (e.g. a follow-up severity bump): the
+        resulting wire trace shows both decisions in order.
+        """
+        await self._emit_steering_decision(
+            session=session,
+            detector_name=detector_name,
+            outcome="no_drift",
+            reason=reason,
+            score=float(score),
+            task_id=task_id,
+            agent_name=agent_name,
+            invocation_id=invocation_id,
+        )
 
     @classmethod
     def _is_terminal_drift(cls, drift: DriftEvent) -> bool:
@@ -1359,6 +1509,20 @@ class DriftObserver:
 
             drift = verdict.drift
             if drift is None:
+                # zicato-optimization-surface: emit the silent-path
+                # decision so the optimizer sees that the judge ran
+                # and decided the reasoning was on-task. Without this
+                # the only training signal for tuning the judge is
+                # the firing path (the negative class is "absence of
+                # DriftDetected", which is ambiguous between "judge
+                # quiet" and "judge never ran").
+                await self.emit_no_drift_decision(
+                    session=session,
+                    detector_name="reasoning_judge",
+                    reason="judge verdict: on_task",
+                    task_id=session.current_task_id,
+                    agent_name=agent_name,
+                )
                 return
             if not drift.trigger_input:
                 drift.trigger_input = self._truncate_trigger_input(text)
@@ -1943,6 +2107,19 @@ class DriftObserver:
             await self.handle_drift(drift, session)
             return
         # making_progress=true, confidence >= 0.5 -- no drift.
+        # zicato-optimization-surface: emit the silent-path decision so
+        # the wire trace shows the reflective check ran and the agent
+        # self-reported healthy progress with sufficient confidence.
+        await self.emit_no_drift_decision(
+            session=session,
+            detector_name="reflective_check",
+            reason=(
+                f"agent self-reported making_progress=true (confidence={conf_val:.2f})"
+            ),
+            score=float(conf_val),
+            task_id=task.id,
+            agent_name=agent_id_for_drift,
+        )
         return
 
     async def _emit_reflective_failure(
@@ -2295,6 +2472,16 @@ class DriftObserver:
             session=session,
         )
         if drift is None:
+            # zicato-optimization-surface: the judge ran and decided
+            # the trajectory is on-track. Surface that decision on the
+            # wire so threshold-tuning optimizers see the negative
+            # class, not just the firing-detector positive class.
+            await self.emit_no_drift_decision(
+                session=session,
+                detector_name="goal_drift_judge",
+                reason="judge verdict: progressing",
+                task_id=session.current_task_id,
+            )
             return
         await self.handle_drift(drift, session)
 
