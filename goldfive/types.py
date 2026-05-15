@@ -49,6 +49,20 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
+def _uuid_hex() -> str:
+    """Return a hex UUID4 string, deterministic when ``goldfive.runtime``
+    has installed a seed.
+
+    Indirection so :class:`DriftEvent.id` / :meth:`Session.next_event_id`
+    can route through :func:`goldfive.runtime.seeded_uuid4` without
+    incurring an import cycle: the module-level import of
+    :mod:`goldfive.runtime` is deferred to call time.
+    """
+    from goldfive.runtime import seeded_uuid4
+
+    return seeded_uuid4().hex
+
+
 class TaskStatus(StrEnum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -1081,7 +1095,7 @@ class Plan:
         only one install path post-Phase-4.
         """
         return cls(
-            id=uuid.uuid4().hex,
+            id=_uuid_hex(),
             run_id=run_id,
             goal_ids=(),
             tasks=(),
@@ -1432,7 +1446,7 @@ class DriftEvent:
     # ``trigger_event_id`` for a ``PlanRevised`` that the drift produced
     # when the drift was not minted from a user annotation. See
     # goldfive#199 / harmonograf#95 (rescope).
-    id: str = dataclasses.field(default_factory=lambda: uuid.uuid4().hex)
+    id: str = dataclasses.field(default_factory=_uuid_hex)
     # Short rendering of the data goldfive fed into the detector that
     # produced this drift — e.g. the reasoning block the LLM judge saw,
     # the activity summary shown to the goal-drift classifier, the tool
@@ -1899,7 +1913,7 @@ class Session:
         """
         if sequence is None:
             sequence = self.next_sequence()
-        suffix = uuid.uuid4().hex[:8]
+        suffix = _uuid_hex()[:8]
         return f"{self.run_id}:{sequence}:{suffix}"
 
     @property

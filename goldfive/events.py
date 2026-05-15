@@ -86,8 +86,16 @@ def new_event(
     # supplied value (minted via Session.next_event_id); fall back to a
     # locally-minted ``{run_id}:{sequence}:{uuid4_short}`` so the field
     # is always non-empty AND globally unique on the wire even for
-    # out-of-band emitters that don't have a Session in scope.
-    evt.event_id = event_id or f"{run_id}:{sequence}:{uuid.uuid4().hex[:8]}"
+    # out-of-band emitters that don't have a Session in scope. The
+    # uuid4 here routes through ``goldfive.runtime.seeded_uuid4`` so
+    # determinism harnesses ({set_seed -> identical event streams})
+    # see byte-identical fallback ids.
+    if event_id:
+        evt.event_id = event_id
+    else:
+        from goldfive.runtime import seeded_uuid4
+
+        evt.event_id = f"{run_id}:{sequence}:{seeded_uuid4().hex[:8]}"
     return evt
 
 
@@ -130,9 +138,11 @@ def make_event(
     """
     import time
 
+    from goldfive.runtime import seeded_uuid4
+
     t = time.time_ns()
     return {
-        "event_id": event_id or f"{run_id}:{sequence}:{uuid.uuid4().hex[:8]}",
+        "event_id": event_id or f"{run_id}:{sequence}:{seeded_uuid4().hex[:8]}",
         "run_id": run_id,
         "sequence": sequence,
         "session_id": session_id,
