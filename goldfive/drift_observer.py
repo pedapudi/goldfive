@@ -336,6 +336,18 @@ class DriftObserver:
     # ------------------------------------------------------------------
 
     async def _emit_drift_detected(self, session: Session, drift: DriftEvent) -> None:
+        # zicato-optimization-surface: record the drift on the session's
+        # aggregate list BEFORE the wire emit so the in-memory
+        # ``Session.drift_summary`` view stays consistent with the
+        # event stream even when a sink raises (the emit below catches
+        # via :func:`goldfive.events.emit`'s gather, so a sink crash
+        # cannot suppress the summary entry). Idempotent for callers
+        # that already populated the list themselves — same drift id
+        # never appended twice.
+        session_drift_ids = {str(getattr(d, "id", "") or "") for d in session.drift_events}
+        drift_id = str(getattr(drift, "id", "") or "")
+        if not drift_id or drift_id not in session_drift_ids:
+            session.drift_events.append(drift)
         evt = self._steerer._new_envelope(session)
         evt.drift_detected.kind = self._steerer._drift_kind_pb_value(drift.kind)
         evt.drift_detected.severity = self._steerer._drift_severity_pb_value(drift.severity)

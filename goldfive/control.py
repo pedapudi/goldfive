@@ -14,7 +14,6 @@ imported by adapters and bridges without dragging in protobuf or grpc.
 from __future__ import annotations
 
 import asyncio
-import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import StrEnum

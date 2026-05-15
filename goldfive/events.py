@@ -13,7 +13,6 @@ optional-dependency group.
 from __future__ import annotations
 
 import asyncio
-import uuid
 from typing import Any
 
 # NOTE: EventSink is a protocol with an async ``emit(event_pb)`` method.
