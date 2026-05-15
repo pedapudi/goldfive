@@ -464,6 +464,15 @@ class DriftObserver:
             task_id=drift.current_task_id,
             agent_name=drift.current_agent_id,
         )
+        # goldfive#437 — paired :class:`JudgementEmitted` envelope so
+        # downstream consumers of the new judge-centric event surface
+        # see every drift verdict alongside the rubric / boolean /
+        # numeric verdicts from operator-supplied judges. Emits
+        # ``verdict_kind = "drift"`` keyed on a synthetic judge_name
+        # derived from the drift kind (e.g. ``"reasoning_drift"`` for
+        # ``REASONING_DRIFT``). Back-compat preserved: the
+        # ``DriftDetected`` envelope above is unchanged.
+        await self._emit_judgement_from_drift(session, drift)
         # goldfive#271 follow-up: when a terminal drift fires the run
         # cannot recover on its own — any boundary still open at this
         # point belongs to an invocation that will not get a paired
@@ -731,6 +740,77 @@ class DriftObserver:
             await self._steerer._emit(evt)
         except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
             log.debug("policy_applied emit failed: %s", exc)
+
+    async def _emit_judgement_from_drift(
+        self, session: Session, drift: DriftEvent
+    ) -> None:
+        """Emit a :class:`JudgementEmitted` paired with a ``DriftDetected``.
+
+        Built-in drift detectors fire BOTH events (goldfive#437) when
+        the pluggable-judges surface is in use: ``DriftDetected``
+        preserves the pre-judges wire contract; ``JudgementEmitted``
+        exposes the same verdict on the new judge-centric event
+        surface keyed by ``judge_name`` so downstream optimizers can
+        join on a single field across drift / rubric / boolean /
+        numeric verdicts.
+
+        The paired emission is gated on the steerer having a
+        non-empty installed judges list — :func:`goldfive.wrap`
+        installs :func:`builtin_judges.default_judges` by default,
+        so callers using the wrap surface always get both events.
+        Bare ``DefaultSteerer()`` constructions (older tests, custom
+        embedders) ship with no judges and stay on the legacy single-
+        event behaviour, preserving the test corpus's existing
+        ``len(sink.events) == 1`` assertions on drift emit.
+
+        ``judge_name`` defaults to the drift kind's bare lowercase
+        string (e.g. ``"reasoning_drift"``, ``"goal_drift"``). Errors
+        are absorbed at WARNING — a broken sink or missing pb stubs
+        must not crash the run.
+        """
+        # Gate on installed judges so bare ``DefaultSteerer()`` tests
+        # (which never call :meth:`set_judges`) preserve the legacy
+        # single-emit contract. See class docstring for the rationale.
+        if not getattr(self._steerer, "_judges", None):
+            return
+        try:
+            from goldfive.events import emit, new_event
+            from goldfive.pb.goldfive.v1 import events_pb2 as _pb
+        except Exception as exc:  # noqa: BLE001 — pb stubs missing
+            log.debug(
+                "DriftObserver._emit_judgement_from_drift: pb stubs unavailable "
+                "(%s); judgement paired with drift kind=%s not emitted",
+                exc,
+                drift.kind,
+            )
+            return
+        sinks = list(self._steerer._sinks)
+        if not sinks:
+            return
+        sess_id = str(getattr(session, "id", "") or "")
+        run_id = str(getattr(session, "run_id", "") or "")
+        try:
+            seq, event_id = session.next_sequence_and_event_id()
+        except Exception:  # noqa: BLE001 — older Session shapes
+            seq, event_id = 0, ""
+        evt = new_event(run_id, seq, sess_id, event_id=event_id)
+        payload = _pb.JudgementEmitted()
+        payload.judge_name = str(drift.kind.value)
+        payload.verdict_kind = "drift"
+        payload.drift_kind = str(drift.kind.value)
+        payload.severity = str(drift.severity.value)
+        payload.detail = str(drift.detail or "")
+        evt.judgement_emitted.CopyFrom(payload)
+        try:
+            await emit(sinks, evt)
+        except Exception as exc:  # noqa: BLE001 — broken sink must not crash run
+            log.warning(
+                "DriftObserver._emit_judgement_from_drift: emit raised %s (%s) "
+                "for drift kind=%s; swallowed",
+                type(exc).__name__,
+                exc,
+                drift.kind,
+            )
 
     @classmethod
     def _is_terminal_drift(cls, drift: DriftEvent) -> bool:

@@ -226,6 +226,7 @@ def wrap(
     drift_self_reporting: bool | list[str] = False,
     llm_detector: Any = None,
     judge_call_llm_builder: Any = None,
+    judges: list[Any] | None = None,
     **legacy_kwargs: Any,
 ) -> Runner:
     """Build a :class:`Runner` that drives ``agent`` with goldfive.
@@ -307,6 +308,33 @@ def wrap(
         :class:`DefaultSteerer` via its config kwargs. An explicit
         ``steerer=`` kwarg wins — the caller keeps full control
         over the steerer they build themselves.
+    judges:
+        Optional list of :class:`~goldfive.judges.Judge` instances
+        (goldfive#437). When provided, the steerer iterates this list
+        at every observation point and emits a
+        :class:`JudgementEmitted` envelope for each populated verdict
+        (drift / rubric / boolean / numeric). Drift-flavoured verdicts
+        ALSO fire :class:`DriftDetected` exactly as the pre-judges code
+        path did, so existing sinks see no behavioural change.
+
+        Defaults to :func:`goldfive.builtin_judges.default_judges` —
+        the built-in detector set wrapped as :class:`Judge` instances.
+        Pass an explicit empty list (``judges=[]``) to opt out of the
+        new event surface entirely (the legacy hardcoded detector
+        path still runs but emits no
+        :class:`JudgementEmitted` envelopes). Pass a custom mix to
+        register agent-specific quality signals alongside (or in
+        place of) the built-ins::
+
+            runner = goldfive.wrap(
+                agent,
+                judges=[
+                    goldfive.builtin_judges.reasoning_drift(),
+                    MyCustomLengthJudge(),
+                    MyRubricJudge(rubric="..."),
+                ],
+            )
+
     drift_self_reporting:
         Forwarded to :class:`Runner`. Default ``False`` (goldfive#196):
         only the lifecycle reporting tools (``report_task_started`` /
@@ -608,6 +636,26 @@ def wrap(
                 "use an ADK agent detect_llm() can introspect.",
                 mode,
             )
+    # Pluggable-judges installation (goldfive#437). Operators pass a
+    # custom judge list via ``goldfive.wrap(judges=[...])``. When the
+    # caller does not supply one, the goldfive default judge set is
+    # installed so the new :class:`JudgementEmitted` envelope is
+    # populated for every default-detector verdict alongside the
+    # legacy :class:`DriftDetected` emit (back-compat preserved).
+    # Passing an explicit empty list (``judges=[]``) is the opt-out
+    # token — the steerer's hardcoded detector path still runs but no
+    # ``JudgementEmitted`` envelopes ride the sink stream.
+    resolved_judges: list[Any]
+    if judges is not None:
+        resolved_judges = list(judges)
+    else:
+        from goldfive.builtin_judges import default_judges as _default_judges
+
+        resolved_judges = _default_judges()
+    set_judges = getattr(resolved_steerer, "set_judges", None)
+    if callable(set_judges):
+        set_judges(resolved_judges)
+
     runner = Runner(
         agent=adapter,
         planner=resolved_planner,

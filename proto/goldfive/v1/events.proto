@@ -83,6 +83,7 @@ message Event {
     DetectorDispatchOrdered detector_dispatch_ordered = 41;
     PolicyApplied policy_applied = 42;
     RetryBudgetSpent retry_budget_spent = 43;
+    JudgementEmitted judgement_emitted = 44;
   }
 }
 
@@ -1166,4 +1167,73 @@ message RetryBudgetSpent {
   // retry, ``"validated"`` on success, ``"budget_exhausted"`` after
   // the final attempt.
   string reason = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Pluggable judges — non-drift verdict observability (goldfive#437)
+// ---------------------------------------------------------------------------
+
+// Emitted on every :class:`Judge.evaluate` call that produced a
+// populated verdict (an empty-default verdict is treated as "no
+// signal" and skipped — see :mod:`goldfive.judges.base`).
+//
+// ``verdict_kind`` selects which of the verdict-flavour fields the
+// consumer should read. The runtime picks the first populated
+// flavour in the order: drift, rubric, boolean, numeric. When a
+// drift-flavoured verdict fires the runtime ALSO emits the legacy
+// :class:`DriftDetected` envelope so pre-judges consumers keep
+// working — :class:`JudgementEmitted` is additive, not a
+// replacement.
+//
+// Fields not relevant to the selected ``verdict_kind`` retain their
+// proto-default zero values (empty string / 0.0 / false / empty
+// map). Consumers MUST switch on ``verdict_kind`` rather than
+// inferring the flavour from field-population heuristics so a judge
+// that opts to populate ``detail`` on a numeric verdict doesn't
+// confuse downstream readers.
+message JudgementEmitted {
+  // Stable identifier for the judge that produced this verdict —
+  // the value the judge implementation sets on its ``name`` class
+  // attribute. Used as the join key for per-judge time series in
+  // downstream consumers. Always non-empty on emitted events.
+  string judge_name = 1;
+  // One of ``"drift"`` / ``"rubric"`` / ``"boolean"`` / ``"numeric"``.
+  // Free-form string for forward-compat — readers MUST tolerate
+  // unknown values and SHOULD surface them as-is rather than
+  // dropping the event.
+  string verdict_kind = 2;
+  // Drift kind as the bare lowercase string (e.g. ``"off_topic"``,
+  // ``"goal_drift"``). Populated when ``verdict_kind == "drift"``;
+  // empty otherwise.
+  string drift_kind = 3;
+  // Severity as the bare lowercase string (``"info"`` /
+  // ``"warning"`` / ``"critical"``). Populated for drift verdicts;
+  // empty otherwise.
+  string severity = 4;
+  // Aggregate rubric score. Domain-defined range; goldfive does not
+  // interpret the value. Populated when ``verdict_kind == "rubric"``;
+  // 0.0 otherwise (the proto-default — consumers MUST gate reads on
+  // ``verdict_kind``).
+  float rubric_score = 5;
+  // Per-dimension rubric sub-scores keyed on dimension name (e.g.
+  // ``"format"``, ``"evidence_quality"``). Populated when
+  // ``verdict_kind == "rubric"``; empty map otherwise.
+  map<string, float> rubric_dimensions = 6;
+  // Boolean pass / fail result. Populated when
+  // ``verdict_kind == "boolean"``; ``false`` (the proto-default)
+  // otherwise.
+  bool boolean_result = 7;
+  // Single numeric metric value. Populated when
+  // ``verdict_kind == "numeric"``; 0.0 otherwise.
+  float numeric_value = 8;
+  // Name of the metric carried by ``numeric_value`` (e.g.
+  // ``"cost_usd"``, ``"latency_ms"``, ``"tokens_out"``). Populated
+  // when ``verdict_kind == "numeric"``; empty otherwise.
+  string metric_name = 9;
+  // One-line human-readable explanation. Populated on any flavour
+  // when the judge has a short rationale to surface to operators
+  // (Gantt tooltip / log line). Up to 512 chars on the wire;
+  // producers SHOULD truncate longer rationales with the
+  // " … [truncated]" convention used elsewhere in this file.
+  string detail = 10;
 }
