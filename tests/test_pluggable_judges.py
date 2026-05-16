@@ -418,6 +418,47 @@ async def test_evaluate_judges_drift_flavour_accepts_enum_typed_verdict() -> Non
     assert captured_drifts[0].severity is DriftSeverity.WARNING
 
 
+async def test_evaluate_judges_drift_flavour_with_unrecognised_kind_emits_only_judgement() -> None:
+    """A drift verdict whose ``drift_kind`` is an unrecognised custom
+    string (not a :class:`DriftKind` member) still emits a
+    ``JudgementEmitted`` envelope but forwards NO ``DriftEvent``.
+
+    ``__post_init__`` leaves an unrecognised string untouched (a
+    forward-compatible / domain-specific judge is not broken), so the
+    steerer's ``_drift_from_judge_verdict`` cannot project it onto a
+    :class:`DriftKind`. It returns ``None`` — the legacy refine
+    machinery is skipped, but the typed judge signal still reaches the
+    wire via ``JudgementEmitted``.
+    """
+    sink = ListSink()
+    steerer = goldfive.DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_NullPlanner())  # type: ignore[arg-type]
+    drift_verdict = JudgeVerdict(
+        drift_emitted=True,
+        drift_kind="domain_specific_signal",  # not a DriftKind member
+        severity="critical",
+        detail="custom judge with a bespoke drift kind",
+    )
+    # The unrecognised string is left as-is — not coerced to an enum.
+    assert drift_verdict.drift_kind == "domain_specific_signal"
+    assert not isinstance(drift_verdict.drift_kind, DriftKind)
+    captured_drifts: list[DriftEvent] = []
+
+    async def _capture(drift: DriftEvent, session: Session) -> None:  # noqa: ARG001
+        captured_drifts.append(drift)
+
+    steerer.drift.handle_drift = _capture  # type: ignore[method-assign]
+    steerer.set_judges([_StubJudge("bespoke_j", drift_verdict)])
+    await steerer.evaluate_judges(JudgeContext(), session=_make_session())
+    # JudgementEmitted still reaches the wire, carrying the raw string.
+    judgements = _judgement_events(sink)
+    assert len(judgements) == 1
+    assert judgements[0].verdict_kind == "drift"
+    assert judgements[0].drift_kind == "domain_specific_signal"
+    # ...but no DriftEvent is projected from the unrecognised kind.
+    assert captured_drifts == []
+
+
 async def test_custom_drift_judge_emits_exactly_one_judgement() -> None:
     """A custom drift-flavoured judge produces exactly ONE
     ``JudgementEmitted`` — keyed on the judge's real ``name``.

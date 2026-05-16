@@ -22,7 +22,7 @@ steerer between emission and dispatch.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 from goldfive.types import DriftKind, DriftSeverity
 
@@ -30,39 +30,29 @@ if TYPE_CHECKING:
     from goldfive.types import Plan, Session
 
 
-def _normalize_drift_kind(value: DriftKind | str) -> DriftKind | str:
-    """Coerce a verdict ``drift_kind`` to :class:`DriftKind` when possible.
+_DriftEnum = TypeVar("_DriftEnum", DriftKind, DriftSeverity)
 
-    Accepts either a :class:`DriftKind` enum member (the preferred,
-    typed form) or the legacy lowercase string. A string that matches a
-    known :class:`DriftKind` value is upgraded to the enum so consumers
-    get a real enum off ``JudgeVerdict.drift_kind``; an empty string or
-    an unrecognised custom string is returned unchanged so a forward-
-    compatible / domain-specific judge is not broken. :class:`DriftKind`
-    is a :class:`~enum.StrEnum`, so the upgraded value still compares
-    equal to the original lowercase string — back-compat is preserved.
+
+def _normalize_drift_field(
+    value: _DriftEnum | str, enum_cls: type[_DriftEnum]
+) -> _DriftEnum | str:
+    """Coerce a verdict drift field to its enum when the value matches a member.
+
+    Used by :meth:`JudgeVerdict.__post_init__` to normalise the
+    ``drift_kind`` / ``severity`` fields. Accepts either an ``enum_cls``
+    member — :class:`DriftKind` or :class:`DriftSeverity`, the preferred
+    typed form — or the legacy lowercase string. A string matching a
+    known ``enum_cls`` value is upgraded to the enum so consumers get a
+    real enum off ``JudgeVerdict``; an empty string (no drift) or an
+    unrecognised custom string is returned unchanged so a forward-
+    compatible / domain-specific judge is not broken. Both enums are
+    :class:`~enum.StrEnum`, so the upgraded value still compares equal to
+    the original lowercase string — back-compat is preserved.
     """
-    if isinstance(value, DriftKind) or not value:
+    if isinstance(value, enum_cls) or not value:
         return value
     try:
-        return DriftKind(str(value))
-    except ValueError:
-        return value
-
-
-def _normalize_drift_severity(value: DriftSeverity | str) -> DriftSeverity | str:
-    """Coerce a verdict ``severity`` to :class:`DriftSeverity` when possible.
-
-    Mirrors :func:`_normalize_drift_kind`: a :class:`DriftSeverity` enum
-    member passes through, a recognised legacy lowercase string is
-    upgraded to the enum, and an empty / unrecognised string is returned
-    unchanged. :class:`DriftSeverity` is a :class:`~enum.StrEnum`, so the
-    upgrade is transparent to existing string-equality consumers.
-    """
-    if isinstance(value, DriftSeverity) or not value:
-        return value
-    try:
-        return DriftSeverity(str(value))
+        return enum_cls(str(value))
     except ValueError:
         return value
 
@@ -172,12 +162,12 @@ class JudgeVerdict:
         # construction. Normalising here (rather than at every read
         # site) means every consumer — the steerer, sinks, external
         # callers — sees the typed enum without each having to coerce.
-        normalized_kind = _normalize_drift_kind(self.drift_kind)
-        if normalized_kind is not self.drift_kind:
-            object.__setattr__(self, "drift_kind", normalized_kind)
-        normalized_severity = _normalize_drift_severity(self.severity)
-        if normalized_severity is not self.severity:
-            object.__setattr__(self, "severity", normalized_severity)
+        object.__setattr__(
+            self, "drift_kind", _normalize_drift_field(self.drift_kind, DriftKind)
+        )
+        object.__setattr__(
+            self, "severity", _normalize_drift_field(self.severity, DriftSeverity)
+        )
 
 
 @runtime_checkable
