@@ -1945,11 +1945,33 @@ class Session:
     # remain at 0 so single-Session callers (tests, programmatic use)
     # see no behaviour change.
     _next_sequence: int = 0
+    # Monotonic *logical-turn* counter — one increment per reasoning
+    # observation (:meth:`DriftObserver.observe_reasoning`, i.e. one
+    # model response fed through the drift pipeline). Deliberately
+    # distinct from ``_next_sequence``, which counts every emitted
+    # event: the user-steer suppression window in
+    # :meth:`DriftObserver._should_promote_to_steer` measures steer
+    # freshness in *logical turns* and must not be inflated by
+    # observability-event volume (goldfive#441 — the decision-telemetry
+    # events added in #436/#440 emit several events per turn). Per-
+    # Session, starts at 0; a steer stamped against a prior Session's
+    # counter reads as stale once a fresh Session resets to 0, which is
+    # the desired cross-turn behaviour.
+    _reasoning_turn: int = 0
 
     def next_sequence(self) -> int:
         s = self._next_sequence
         self._next_sequence = s + 1
         return s
+
+    def mark_reasoning_turn(self) -> int:
+        """Advance the logical-turn counter and return the new value.
+
+        Called once per reasoning observation by
+        :meth:`DriftObserver.observe_reasoning`. See ``_reasoning_turn``.
+        """
+        self._reasoning_turn += 1
+        return self._reasoning_turn
 
     def next_sequence_and_event_id(self) -> tuple[int, str]:
         """Atomic pair: increment sequence, mint matching event_id.
