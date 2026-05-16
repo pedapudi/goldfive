@@ -427,3 +427,104 @@ async def test_retry_budget_emitter_fires_on_exhaustion() -> None:
     assert attempt == 2
     assert remaining == 0
     assert "JSON parse failed" in reason
+
+
+async def test_retry_budget_emitter_fires_on_reject_sentinel() -> None:
+    """The reject-sentinel terminal outcome emits a RetryBudgetSpent row.
+
+    The reject sentinel returns early from the attempt loop; without an
+    explicit emit the optimizer would silently miss reject outcomes
+    even though the planner did converge on a verdict.
+    """
+    from goldfive.planner import LLMPlanner
+    from goldfive.types import Goal, Plan, Task, TaskStatus
+
+    emitted: list[tuple[str, int, int, str]] = []
+
+    async def collect(
+        operation: str, attempt: int, budget_remaining: int, reason: str
+    ) -> None:
+        emitted.append((operation, attempt, budget_remaining, reason))
+
+    async def reject_llm(system: str, user: str, model: str) -> str:
+        return '{"reject": true, "reason": "request is unsatisfiable"}'
+
+    planner = LLMPlanner(call_llm=reject_llm, model="test", max_refine_attempts=2)
+    planner.set_retry_budget_emitter(collect)
+
+    prior = Plan(
+        id="p1",
+        run_id="r1",
+        summary="prior",
+        tasks=(Task(id="t1", title="x", description="y", status=TaskStatus.PENDING),),
+        edges=(),
+        goal_ids=("g1",),
+    )
+    goals = [Goal(id="g1", summary="ship")]
+    result, reason_out, rejected = await planner._call_and_validate_refine(
+        system_prompt="sys",
+        base_user_prompt="user",
+        prior_plan=prior,
+        goals=goals,
+        log_prefix="LLMPlanner.refine",
+        allow_reject=True,
+    )
+    assert result is None
+    assert rejected
+    assert "unsatisfiable" in reason_out
+    # Exactly one row, stamped on the first attempt with reason=rejected.
+    assert len(emitted) == 1
+    op, attempt, remaining, reason = emitted[0]
+    assert op == "refine"
+    assert attempt == 1
+    assert remaining == 1
+    assert reason == "rejected"
+
+
+async def test_retry_budget_emitter_attempt_number_on_empty_response() -> None:
+    """An empty LLM response breaks the loop early; the emitted attempt
+    number must reflect the attempt that actually ran, not the budget.
+    """
+    from goldfive.planner import LLMPlanner
+    from goldfive.types import Goal, Plan, Task, TaskStatus
+
+    emitted: list[tuple[str, int, int, str]] = []
+
+    async def collect(
+        operation: str, attempt: int, budget_remaining: int, reason: str
+    ) -> None:
+        emitted.append((operation, attempt, budget_remaining, reason))
+
+    async def empty_llm(system: str, user: str, model: str) -> str:
+        # Small-model artefact: no final answer. The loop treats this as
+        # terminal and breaks on the FIRST attempt without retrying.
+        return ""
+
+    planner = LLMPlanner(call_llm=empty_llm, model="test", max_refine_attempts=3)
+    planner.set_retry_budget_emitter(collect)
+
+    prior = Plan(
+        id="p1",
+        run_id="r1",
+        summary="prior",
+        tasks=(Task(id="t1", title="x", description="y", status=TaskStatus.PENDING),),
+        edges=(),
+        goal_ids=("g1",),
+    )
+    goals = [Goal(id="g1", summary="ship")]
+    result, err, rejected = await planner._call_and_validate_refine(
+        system_prompt="sys",
+        base_user_prompt="user",
+        prior_plan=prior,
+        goals=goals,
+        log_prefix="LLMPlanner.refine",
+    )
+    assert result is None
+    assert not rejected
+    # Budget is 3 but the empty-response branch broke on attempt 1 — the
+    # emitted attempt must be 1, not the full budget of 3.
+    assert len(emitted) == 1
+    op, attempt, remaining, reason = emitted[0]
+    assert op == "refine"
+    assert attempt == 1
+    assert remaining == 0

@@ -2646,6 +2646,17 @@ class LLMPlanner:
                     log_prefix,
                     reason,
                 )
+                # Decision-telemetry: the reject sentinel is a terminal
+                # outcome of this attempt -- the planner converged on a
+                # "cannot refine" verdict rather than running the budget
+                # out. Emit the row so an optimizer counting attempts
+                # does not silently miss reject outcomes.
+                await self._emit_retry_budget(
+                    operation=operation_name,
+                    attempt=attempt,
+                    budget_remaining=max(0, attempts - attempt),
+                    reason="rejected",
+                )
                 return None, reason, True
             revised = _plan_from_json(
                 parsed,
@@ -2780,10 +2791,14 @@ class LLMPlanner:
             )
             return revised, "", False
         # Loop exhausted (or terminated early by the empty-response
-        # break). The final attempt left no remaining budget.
+        # break). ``attempt`` holds the actual attempt the loop stopped
+        # on -- ``attempts`` on natural exhaustion, but lower when the
+        # empty-response branch broke out early. Report the real number
+        # so RetryBudgetSpent.attempt matches the proto contract
+        # ("1-indexed attempt number") rather than over-counting.
         await self._emit_retry_budget(
             operation=operation_name,
-            attempt=attempts,
+            attempt=attempt,
             budget_remaining=0,
             reason=last_error or "budget_exhausted",
         )
