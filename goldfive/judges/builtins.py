@@ -32,8 +32,8 @@ multiple runners without state-bleed.
 
 from __future__ import annotations
 
-import enum
 from collections.abc import Iterable
+from enum import StrEnum
 from typing import Any
 
 from goldfive.drift import (
@@ -202,7 +202,7 @@ class LoopingToolJudge:
 # ---------------------------------------------------------------------------
 
 
-class BuiltinJudge(enum.StrEnum):
+class BuiltinJudge(StrEnum):
     """Typed identifier for each judge in the goldfive default set.
 
     Each member's value is the judge's wire ``name`` — the same token

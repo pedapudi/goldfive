@@ -92,6 +92,8 @@ def wrap(
     runtime: RuntimeConfig | None = None,
     dynamic_instruction: bool = True,
     drift_self_reporting: bool | list[str] = False,
+    llm_detector: Any = None,
+    judge_call_llm_builder: Any = None,
     judges: list[Judge] | None = None,
     disable_judges: Iterable[BuiltinJudge | str] | None = None,
 ) -> Runner: ...
