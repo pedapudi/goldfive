@@ -464,6 +464,25 @@ class DriftObserver:
             task_id=drift.current_task_id,
             agent_name=drift.current_agent_id,
         )
+        # goldfive#437 — paired :class:`JudgementEmitted` envelope so
+        # downstream consumers of the new judge-centric event surface
+        # see every drift verdict alongside the rubric / boolean /
+        # numeric verdicts from operator-supplied judges. Emits
+        # ``verdict_kind = "drift"`` keyed on a synthetic judge_name
+        # derived from the drift kind (e.g. ``"reasoning_drift"`` for
+        # ``REASONING_DRIFT``). Back-compat preserved: the
+        # ``DriftDetected`` envelope above is unchanged.
+        #
+        # Skipped when the drift originated from a custom Judge that
+        # already emitted its own ``JudgementEmitted`` keyed on the
+        # judge's real ``name`` (see
+        # :meth:`DefaultSteerer.evaluate_judges`). Without this guard a
+        # custom drift-flavoured judge would land TWO ``JudgementEmitted``
+        # events for one signal — one keyed on ``judge_name``, one on the
+        # drift kind — and break the "join on judge_name" telemetry
+        # contract downstream consumers (zicato) rely on.
+        if not getattr(drift, "_judge_emitted_judgement", False):
+            await self._emit_judgement_from_drift(session, drift)
         # goldfive#271 follow-up: when a terminal drift fires the run
         # cannot recover on its own — any boundary still open at this
         # point belongs to an invocation that will not get a paired
@@ -731,6 +750,77 @@ class DriftObserver:
             await self._steerer._emit(evt)
         except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
             log.debug("policy_applied emit failed: %s", exc)
+
+    async def _emit_judgement_from_drift(
+        self, session: Session, drift: DriftEvent
+    ) -> None:
+        """Emit a :class:`JudgementEmitted` paired with a ``DriftDetected``.
+
+        Built-in drift detectors fire BOTH events (goldfive#437) when
+        the pluggable-judges surface is in use: ``DriftDetected``
+        preserves the pre-judges wire contract; ``JudgementEmitted``
+        exposes the same verdict on the new judge-centric event
+        surface keyed by ``judge_name`` so downstream optimizers can
+        join on a single field across drift / rubric / boolean /
+        numeric verdicts.
+
+        The paired emission is gated on the steerer having a
+        non-empty installed judges list — :func:`goldfive.wrap`
+        installs :func:`builtin_judges.default_judges` by default,
+        so callers using the wrap surface always get both events.
+        Bare ``DefaultSteerer()`` constructions (older tests, custom
+        embedders) ship with no judges and stay on the legacy single-
+        event behaviour, preserving the test corpus's existing
+        ``len(sink.events) == 1`` assertions on drift emit.
+
+        ``judge_name`` defaults to the drift kind's bare lowercase
+        string (e.g. ``"reasoning_drift"``, ``"goal_drift"``). Errors
+        are absorbed at WARNING — a broken sink or missing pb stubs
+        must not crash the run.
+        """
+        # Gate on installed judges so bare ``DefaultSteerer()`` tests
+        # (which never call :meth:`set_judges`) preserve the legacy
+        # single-emit contract. See class docstring for the rationale.
+        if not getattr(self._steerer, "_judges", None):
+            return
+        try:
+            from goldfive.events import emit, new_event
+            from goldfive.pb.goldfive.v1 import events_pb2 as _pb
+        except Exception as exc:  # noqa: BLE001 — pb stubs missing
+            log.debug(
+                "DriftObserver._emit_judgement_from_drift: pb stubs unavailable "
+                "(%s); judgement paired with drift kind=%s not emitted",
+                exc,
+                drift.kind,
+            )
+            return
+        sinks = list(self._steerer._sinks)
+        if not sinks:
+            return
+        sess_id = str(getattr(session, "id", "") or "")
+        run_id = str(getattr(session, "run_id", "") or "")
+        try:
+            seq, event_id = session.next_sequence_and_event_id()
+        except Exception:  # noqa: BLE001 — older Session shapes
+            seq, event_id = 0, ""
+        evt = new_event(run_id, seq, sess_id, event_id=event_id)
+        payload = _pb.JudgementEmitted()
+        payload.judge_name = str(drift.kind.value)
+        payload.verdict_kind = "drift"
+        payload.drift_kind = str(drift.kind.value)
+        payload.severity = str(drift.severity.value)
+        payload.detail = str(drift.detail or "")
+        evt.judgement_emitted.CopyFrom(payload)
+        try:
+            await emit(sinks, evt)
+        except Exception as exc:  # noqa: BLE001 — broken sink must not crash run
+            log.warning(
+                "DriftObserver._emit_judgement_from_drift: emit raised %s (%s) "
+                "for drift kind=%s; swallowed",
+                type(exc).__name__,
+                exc,
+                drift.kind,
+            )
 
     @classmethod
     def _is_terminal_drift(cls, drift: DriftEvent) -> bool:
@@ -1553,6 +1643,16 @@ class DriftObserver:
             del history[:overflow]
         from goldfive.drift.reasoning import detect_looping_reasoning
 
+        # goldfive#437 — operator-supplied custom judges. Dispatched
+        # here so every reasoning observation reaches the pluggable
+        # surface regardless of how the built-in detector pipeline
+        # below resolves (a loop-detector fire short-circuits with an
+        # early ``return``). Fire-and-forget — a custom rubric / cost
+        # judge MUST NOT serialise the model-response callback behind
+        # an LLM round-trip; the per-judge timeout in
+        # :meth:`DefaultSteerer.evaluate_judges` bounds a hung judge.
+        self._dispatch_custom_judges(text=text, session=session, agent_name=agent_name)
+
         # Always-on loop detector. A fire short-circuits before the
         # mode-selected pipeline so it remains the canonical signal
         # for "repetitive" reasoning regardless of mode. Cheap, and
@@ -1616,6 +1716,74 @@ class DriftObserver:
         )
         self._steerer._background_judges.add(bg_task)
         bg_task.add_done_callback(self._steerer._background_judges.discard)
+
+    def _dispatch_custom_judges(
+        self, *, text: str, session: Session, agent_name: str = ""
+    ) -> None:
+        """Fire-and-forget the operator-supplied custom judges (goldfive#437).
+
+        Builds a :class:`~goldfive.judges.JudgeContext` snapshot from
+        the current reasoning observation and schedules
+        :meth:`DefaultSteerer.evaluate_judges` against the *custom*
+        judges only — judges whose ``name`` is not in
+        :data:`~goldfive.judges.builtins.BUILTIN_JUDGE_NAMES`.
+
+        Built-ins are excluded on purpose: their drift verdicts
+        already ride the wire via the legacy detector path and its
+        paired :meth:`_emit_judgement_from_drift` emission. Re-running
+        the built-in wrappers here would double-fire ``DriftDetected``
+        for the same logical signal.
+
+        Scheduled via :func:`asyncio.create_task` (tracked on
+        ``_background_drifts`` so :meth:`shutdown` drains it) so a slow
+        custom judge cannot serialise the model-response callback. A
+        no-op when no custom judges are installed.
+        """
+        judges = getattr(self._steerer, "_judges", None) or []
+        if not judges:
+            return
+        try:
+            from goldfive.judges.builtins import BUILTIN_JUDGE_NAMES
+        except Exception:  # noqa: BLE001 — judges package optional / partial
+            return
+        custom = [
+            j
+            for j in judges
+            if str(getattr(j, "name", "") or "") not in BUILTIN_JUDGE_NAMES
+        ]
+        if not custom:
+            return
+        try:
+            from goldfive.judges.base import JudgeContext
+        except Exception:  # noqa: BLE001
+            return
+        ctx = JudgeContext(
+            reasoning_text=text,
+            plan=getattr(session, "plan", None),
+            transcript=tuple(getattr(session, "reasoning_history", []) or ()),
+            session_state=session,
+            current_task_id=str(getattr(session, "current_task_id", "") or ""),
+            current_agent_id=agent_name,
+        )
+
+        async def _run() -> None:
+            try:
+                await self._steerer.evaluate_judges(
+                    ctx, session=session, judges=custom
+                )
+            except Exception as exc:  # noqa: BLE001 — judges must not crash run
+                log.warning(
+                    "DriftObserver._dispatch_custom_judges: evaluate_judges "
+                    "raised %s (%s); swallowed",
+                    type(exc).__name__,
+                    exc,
+                )
+
+        bg_task = asyncio.create_task(
+            _run(), name=f"goldfive-custom-judge:{session.id}"
+        )
+        self._steerer._background_drifts.add(bg_task)
+        bg_task.add_done_callback(self._steerer._background_drifts.discard)
 
     async def _run_judge_background(
         self,

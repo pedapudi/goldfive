@@ -367,6 +367,7 @@ class DefaultSteerer:
         steering_config: SteeringConfig | None = None,
         goldfive_steer_threshold: str | None = None,
         goldfive_steer_suppression_window_turns: int | None = None,
+        judges: list[Any] | None = None,
     ) -> None:
         """Build a steerer.
 
@@ -653,6 +654,17 @@ class DefaultSteerer:
         # mirroring :attr:`_background_judges`. ``shutdown`` drains
         # both sets symmetrically.
         self._background_drifts: set[asyncio.Task[None]] = set()
+        # Pluggable-judges surface (goldfive#437). Operators register a
+        # list of :class:`~goldfive.judges.Judge` instances via
+        # :func:`goldfive.wrap(judges=[...])`; the runtime calls
+        # :meth:`evaluate_judges` at observation points and emits
+        # ``JudgementEmitted`` for every populated verdict (plus the
+        # legacy ``DriftDetected`` envelope when a judge returns a
+        # drift-flavoured verdict). ``None`` from the constructor
+        # defers default-set installation until :func:`goldfive.wrap`
+        # decides — see :meth:`set_judges`. Empty list is an explicit
+        # operator opt-out (no judges run).
+        self._judges: list[Any] = list(judges) if judges is not None else []
         # Per-session plan-state mutation lock. Held only across the
         # consistency-critical region of ``_emit_plan_revised`` (revision
         # index bump + supersedes integration + correction GC + repin +
@@ -776,6 +788,252 @@ class DefaultSteerer:
             )
             return False
         return True
+
+    def set_judges(self, judges: list[Any]) -> None:
+        """Install the pluggable-judges list (goldfive#437).
+
+        Operator entry point — :func:`goldfive.wrap` forwards its
+        ``judges=`` kwarg here so the steerer's built-in detector
+        emit path can additionally publish :class:`JudgementEmitted`
+        for every populated verdict. The legacy
+        :class:`DriftDetected` envelope is unchanged: drift-flavoured
+        verdicts still fire both events for back-compat.
+
+        Replaces any previously-installed judge list; pass an empty
+        list to disable the surface entirely (no judges run, only
+        the legacy hardcoded detector path remains active).
+        """
+        self._judges = list(judges)
+
+    def get_judges(self) -> list[Any]:
+        """Return the currently-installed judge list (goldfive#437)."""
+        return list(self._judges)
+
+    #: Wall-clock budget, in seconds, for a single ``Judge.evaluate``
+    #: call inside :meth:`evaluate_judges`. A custom judge that hangs
+    #: (network rubric grader with no client-side timeout, a deadlocked
+    #: lock) MUST NOT stall the run — the auto-wired observation path
+    #: dispatches :meth:`evaluate_judges` from the model-response
+    #: critical path. A judge that overruns the budget is cancelled,
+    #: logged at WARNING, and treated as "no signal" (goldfive#437).
+    JUDGE_EVALUATE_TIMEOUT_S: float = 30.0
+
+    async def evaluate_judges(
+        self,
+        ctx: Any,
+        *,
+        session: Session | None = None,
+        run_id: str = "",
+        judges: list[Any] | None = None,
+    ) -> list[Any]:
+        """Evaluate every installed judge against ``ctx`` and emit results.
+
+        For every judge in :attr:`_judges`:
+
+        * call ``judge.evaluate(ctx)`` and await the
+          :class:`~goldfive.judges.JudgeVerdict`, bounded by
+          :attr:`JUDGE_EVALUATE_TIMEOUT_S` — a judge that overruns
+          the budget is cancelled and treated as "no signal";
+        * pick ``verdict_kind`` from the first populated flavour
+          (drift / rubric / boolean / numeric);
+        * skip emission entirely when no flavour is populated (judges
+          that have nothing to say stay silent on the wire);
+        * emit a :class:`JudgementEmitted` envelope onto the bound
+          sinks for every populated verdict;
+        * forward drift-flavoured verdicts back to the legacy
+          :meth:`drift.handle_drift` path so ``DriftDetected`` still
+          fires and the refine machinery still runs (back-compat
+          contract).
+
+        Errors raised by a judge — and timeouts — are caught and
+        logged at WARNING; a misbehaving judge MUST NOT break the run
+        or suppress other judges' verdicts. Returns the list of
+        verdicts collected so callers can inspect them in tests.
+
+        ``session`` is forwarded onto the emitted event envelope (for
+        ``session_id``) and used as the back-channel for drift-
+        flavoured verdicts that need to route through
+        :meth:`drift.handle_drift`. ``run_id`` is the active run's
+        identifier — falls back to ``session.run_id`` when omitted.
+        ``judges`` overrides the installed list for this call only —
+        the auto-wired observation path passes the operator-supplied
+        custom judges (built-ins excluded; their drift verdicts ride
+        the legacy detector path's paired emission instead).
+        """
+        verdicts: list[Any] = []
+        active = list(self._judges) if judges is None else list(judges)
+        for judge in active:
+            judge_name = str(getattr(judge, "name", "") or type(judge).__name__)
+            try:
+                verdict = await asyncio.wait_for(
+                    judge.evaluate(ctx), timeout=self.JUDGE_EVALUATE_TIMEOUT_S
+                )
+            except TimeoutError:
+                log.warning(
+                    "DefaultSteerer.evaluate_judges: judge %r exceeded the "
+                    "%.1fs evaluate budget; cancelled and treated as no signal",
+                    judge_name,
+                    self.JUDGE_EVALUATE_TIMEOUT_S,
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 — judges must not crash the run
+                log.warning(
+                    "DefaultSteerer.evaluate_judges: judge %r raised %s (%s); "
+                    "swallowed",
+                    judge_name,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            if verdict is None:
+                continue
+            verdicts.append(verdict)
+            await self._emit_judgement(
+                verdict, judge_name=judge_name, session=session, run_id=run_id
+            )
+            # Drift-flavoured verdicts ALSO fire the legacy
+            # ``DriftDetected`` envelope via the existing handle_drift
+            # path so pre-judges consumers see no behavioural change.
+            if getattr(verdict, "drift_emitted", False) and session is not None:
+                drift = self._drift_from_judge_verdict(verdict, judge_name=judge_name)
+                if drift is not None:
+                    # Mark the drift so the ``_emit_drift_detected``
+                    # paired-emission path does NOT emit a second
+                    # ``JudgementEmitted`` — ``_emit_judgement`` above
+                    # already published one keyed on the judge's real
+                    # ``name``. A non-wire runtime attribute (the proto
+                    # ``DriftDetected`` envelope is unaffected).
+                    drift._judge_emitted_judgement = True  # type: ignore[attr-defined]
+                    try:
+                        await self.drift.handle_drift(drift, session)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "DefaultSteerer.evaluate_judges: handle_drift raised "
+                            "%s (%s) for judge %r; swallowed",
+                            type(exc).__name__,
+                            exc,
+                            judge_name,
+                        )
+        return verdicts
+
+    def _drift_from_judge_verdict(
+        self, verdict: Any, *, judge_name: str
+    ) -> DriftEvent | None:
+        """Project a drift-flavoured verdict back onto a :class:`DriftEvent`.
+
+        Used by :meth:`evaluate_judges` so drift-flavoured verdicts
+        still flow through the legacy refine machinery. Returns
+        ``None`` when the verdict does not carry a recognisable
+        :class:`DriftKind` so a malformed judge can't crash the
+        handler — the :class:`JudgementEmitted` envelope is still
+        emitted in that case.
+        """
+        try:
+            kind = DriftKind(str(verdict.drift_kind))
+        except (ValueError, AttributeError):
+            log.debug(
+                "DefaultSteerer._drift_from_judge_verdict: judge %r returned "
+                "unrecognised drift_kind=%r; emitting JudgementEmitted only",
+                judge_name,
+                getattr(verdict, "drift_kind", ""),
+            )
+            return None
+        try:
+            severity = DriftSeverity(str(verdict.severity))
+        except (ValueError, AttributeError):
+            severity = DriftSeverity.INFO
+        return DriftEvent(
+            kind=kind,
+            severity=severity,
+            detail=str(getattr(verdict, "detail", "") or ""),
+        )
+
+    async def _emit_judgement(
+        self,
+        verdict: Any,
+        *,
+        judge_name: str,
+        session: Session | None,
+        run_id: str,
+    ) -> None:
+        """Emit a :class:`JudgementEmitted` envelope for ``verdict``.
+
+        Picks ``verdict_kind`` from the first populated flavour:
+        drift, then rubric, then boolean, then numeric. An empty-
+        default verdict produces no event (the judge had nothing to
+        say). Errors raised by the sink are absorbed at WARNING so
+        a broken sink can't crash the run.
+        """
+        verdict_kind = ""
+        if getattr(verdict, "drift_emitted", False):
+            verdict_kind = "drift"
+        elif getattr(verdict, "rubric_score", None) is not None or getattr(
+            verdict, "rubric_dimensions", None
+        ):
+            verdict_kind = "rubric"
+        elif getattr(verdict, "boolean_result", None) is not None:
+            verdict_kind = "boolean"
+        elif getattr(verdict, "numeric_value", None) is not None or getattr(
+            verdict, "metric_name", ""
+        ):
+            verdict_kind = "numeric"
+        if not verdict_kind:
+            # Empty-default verdict — judge had nothing to say.
+            return
+        if not self._sinks:
+            return
+        try:
+            from goldfive.events import emit, new_event
+            from goldfive.pb.goldfive.v1 import events_pb2 as _pb
+        except Exception as exc:  # noqa: BLE001 — pb stubs missing
+            log.debug(
+                "DefaultSteerer._emit_judgement: pb stubs unavailable (%s); "
+                "judge %r verdict not emitted",
+                exc,
+                judge_name,
+            )
+            return
+        active_session = session if session is not None else self._active_session_var.get()
+        sess_id = str(getattr(active_session, "id", "") or "")
+        resolved_run_id = run_id or str(getattr(active_session, "run_id", "") or "")
+        try:
+            if active_session is not None:
+                seq, event_id = active_session.next_sequence_and_event_id()
+            else:
+                seq, event_id = 0, ""
+        except Exception:  # noqa: BLE001 — older Session shapes lack the helpers
+            seq, event_id = 0, ""
+        evt = new_event(resolved_run_id, seq, sess_id, event_id=event_id)
+        payload = _pb.JudgementEmitted()
+        payload.judge_name = judge_name
+        payload.verdict_kind = verdict_kind
+        payload.drift_kind = str(getattr(verdict, "drift_kind", "") or "")
+        payload.severity = str(getattr(verdict, "severity", "") or "")
+        rubric_score = getattr(verdict, "rubric_score", None)
+        if rubric_score is not None:
+            payload.rubric_score = float(rubric_score)
+        rubric_dimensions = getattr(verdict, "rubric_dimensions", None) or {}
+        for dim_name, dim_score in rubric_dimensions.items():
+            payload.rubric_dimensions[str(dim_name)] = float(dim_score)
+        boolean_result = getattr(verdict, "boolean_result", None)
+        if boolean_result is not None:
+            payload.boolean_result = bool(boolean_result)
+        numeric_value = getattr(verdict, "numeric_value", None)
+        if numeric_value is not None:
+            payload.numeric_value = float(numeric_value)
+        payload.metric_name = str(getattr(verdict, "metric_name", "") or "")
+        payload.detail = str(getattr(verdict, "detail", "") or "")
+        evt.judgement_emitted.CopyFrom(payload)
+        try:
+            await emit(list(self._sinks), evt)
+        except Exception as exc:  # noqa: BLE001 — broken sink must not crash run
+            log.warning(
+                "DefaultSteerer._emit_judgement: emit raised %s (%s) for judge %r; "
+                "swallowed",
+                type(exc).__name__,
+                exc,
+                judge_name,
+            )
 
     def get_tool_loop_config(self) -> ToolLoopConfig | None:
         """Return the :class:`~goldfive.config.ToolLoopConfig` stashed at init, if any.

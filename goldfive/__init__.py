@@ -4,6 +4,7 @@ from __future__ import annotations
 
 __version__ = "0.1.0"
 
+from goldfive import builtin_judges
 from goldfive.adapters.callable import CallableAdapter
 from goldfive.config import (
     EmbeddingConfig,
@@ -29,6 +30,7 @@ from goldfive.goal_deriver import (
     LLMGoalDeriver,
     PassthroughGoalDeriver,
 )
+from goldfive.judges import Judge, JudgeContext, JudgeVerdict
 from goldfive.planner import LLMPlanner, PassthroughPlanner, StaticPlanner
 from goldfive.protocols import (
     AgentAdapter,
@@ -77,6 +79,7 @@ __all__ = [
     "AgentAdapter",
     "BUILTIN_REPORTING_TOOLS",
     "CallableAdapter",
+    "builtin_judges",
     "DRIFT_SELF_REPORTING_TOOLS",
     "DRIFT_SELF_REPORTING_TOOL_NAMES",
     "LIFECYCLE_REPORTING_TOOLS",
@@ -102,6 +105,9 @@ __all__ = [
     "InMemorySink",
     "InvocationResult",
     "JSONLPersistenceSink",
+    "Judge",
+    "JudgeContext",
+    "JudgeVerdict",
     "LLMGoalDeriver",
     "LLMPlanner",
     "LiteralGoalDeriver",
