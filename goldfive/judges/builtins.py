@@ -49,13 +49,18 @@ def _verdict_from_drift(drift: DriftEvent | None) -> JudgeVerdict:
     Returns an empty-default :class:`JudgeVerdict` when ``drift`` is
     ``None`` — the steerer skips :class:`JudgementEmitted` emission
     for empty verdicts (no signal == no event).
+
+    ``DriftEvent.kind`` / ``severity`` are already the typed
+    :class:`~goldfive.types.DriftKind` / :class:`~goldfive.types.DriftSeverity`
+    enums; they are passed through to :class:`JudgeVerdict` directly
+    (the preferred, enum-typed form — no string round-trip).
     """
     if drift is None:
         return JudgeVerdict()
     return JudgeVerdict(
         drift_emitted=True,
-        drift_kind=str(drift.kind),
-        severity=str(drift.severity),
+        drift_kind=drift.kind,
+        severity=drift.severity,
         detail=drift.detail or "",
     )
 

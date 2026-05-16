@@ -4,6 +4,26 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ## Unreleased — 2026-05-11
 
+### Judges
+
+- **`JudgeVerdict.drift_kind` / `severity` are now enum-typed.** The two
+  drift-flavoured fields were bare lowercase `str`s documented as
+  "matching `DriftKind` / `DriftSeverity`" — every caller building or
+  consuming a verdict had to hand-write the magic string. They now
+  accept the real `DriftKind` / `DriftSeverity` enums (the preferred,
+  typed form). The legacy lowercase-string form is still accepted for
+  back-compat: a string matching a known enum value is normalised to
+  the enum at construction (`JudgeVerdict.__post_init__`), so a verdict
+  built either way exposes a real enum on `verdict.drift_kind` /
+  `verdict.severity`. Because both enums are `StrEnum`, the normalised
+  value still compares equal to its lowercase string — existing
+  string-equality consumers see no behavioural change. An empty string
+  (no drift) or an unrecognised custom string is left untouched. The
+  built-in judge wrappers (`goldfive.builtin_judges`) now pass the
+  `DriftEvent` enums straight through with no string round-trip, and
+  the steerer's verdict-consuming path (`_drift_from_judge_verdict`,
+  `_emit_judgement`) handles both shapes.
+
 ### Delegation pin
 
 - **[#265](https://github.com/pedapudi/goldfive/issues/265) — agent-name

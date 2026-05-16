@@ -282,6 +282,22 @@ def _next_pending_task_agent(plan: Plan | None) -> str:
     return ""
 
 
+def _enum_or_str_value(value: Any) -> str:
+    """Project a ``DriftKind``/``DriftSeverity``-or-string onto its string value.
+
+    :class:`~goldfive.judges.JudgeVerdict` accepts either the typed
+    :class:`DriftKind` / :class:`DriftSeverity` enum (preferred) or a
+    legacy lowercase string for its ``drift_kind`` / ``severity``
+    fields. Proto envelopes carry plain strings, so the emit path needs
+    one place that flattens either shape: an enum member yields its
+    ``.value``, anything else is ``str()``-coerced. ``None`` / empty
+    yields the empty string.
+    """
+    if isinstance(value, enum.Enum):
+        return str(value.value)
+    return str(value or "")
+
+
 # Task statuses that are terminal (no further transitions allowed).
 # Re-exported from :mod:`goldfive.types` — the canonical definition —
 # under the historical private name so existing imports in this module
@@ -927,9 +943,15 @@ class DefaultSteerer:
         :class:`DriftKind` so a malformed judge can't crash the
         handler — the :class:`JudgementEmitted` envelope is still
         emitted in that case.
+
+        ``JudgeVerdict.drift_kind`` / ``severity`` may be a typed
+        :class:`DriftKind` / :class:`DriftSeverity` enum (the preferred
+        form) or a legacy lowercase string; ``DriftKind(...)`` /
+        ``DriftSeverity(...)`` accept both an enum member and a string,
+        so this handles either shape.
         """
         try:
-            kind = DriftKind(str(verdict.drift_kind))
+            kind = DriftKind(verdict.drift_kind)
         except (ValueError, AttributeError):
             log.debug(
                 "DefaultSteerer._drift_from_judge_verdict: judge %r returned "
@@ -939,7 +961,7 @@ class DefaultSteerer:
             )
             return None
         try:
-            severity = DriftSeverity(str(verdict.severity))
+            severity = DriftSeverity(verdict.severity)
         except (ValueError, AttributeError):
             severity = DriftSeverity.INFO
         return DriftEvent(
@@ -1007,8 +1029,13 @@ class DefaultSteerer:
         payload = _pb.JudgementEmitted()
         payload.judge_name = judge_name
         payload.verdict_kind = verdict_kind
-        payload.drift_kind = str(getattr(verdict, "drift_kind", "") or "")
-        payload.severity = str(getattr(verdict, "severity", "") or "")
+        # ``drift_kind`` / ``severity`` on a :class:`JudgeVerdict` may be
+        # a typed :class:`DriftKind` / :class:`DriftSeverity` enum or a
+        # legacy lowercase string. The proto field is a plain string;
+        # ``_enum_or_str_value`` projects either shape onto its string
+        # value so the wire form is identical regardless.
+        payload.drift_kind = _enum_or_str_value(getattr(verdict, "drift_kind", ""))
+        payload.severity = _enum_or_str_value(getattr(verdict, "severity", ""))
         rubric_score = getattr(verdict, "rubric_score", None)
         if rubric_score is not None:
             payload.rubric_score = float(rubric_score)

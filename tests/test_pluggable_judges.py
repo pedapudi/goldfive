@@ -138,6 +138,63 @@ def dataclasses_error() -> type[Exception]:
     return _dc.FrozenInstanceError
 
 
+def test_judge_verdict_accepts_drift_enums() -> None:
+    """``JudgeVerdict`` accepts the typed ``DriftKind`` / ``DriftSeverity``
+    enums (the preferred form) and stores them as enum members."""
+    v = JudgeVerdict(
+        drift_emitted=True,
+        drift_kind=DriftKind.TOOL_ERROR,
+        severity=DriftSeverity.CRITICAL,
+    )
+    assert v.drift_kind is DriftKind.TOOL_ERROR
+    assert v.severity is DriftSeverity.CRITICAL
+    assert isinstance(v.drift_kind, DriftKind)
+    assert isinstance(v.severity, DriftSeverity)
+
+
+def test_judge_verdict_normalizes_legacy_string_form() -> None:
+    """A legacy lowercase-string ``drift_kind`` / ``severity`` is
+    normalised to the matching enum at construction, so consumers always
+    read a real enum — yet string equality still holds (StrEnum)."""
+    v = JudgeVerdict(
+        drift_emitted=True,
+        drift_kind="tool_error",
+        severity="critical",
+    )
+    # Normalised to the enum.
+    assert v.drift_kind is DriftKind.TOOL_ERROR
+    assert v.severity is DriftSeverity.CRITICAL
+    # Back-compat: still compares equal to the legacy lowercase string.
+    assert v.drift_kind == "tool_error"
+    assert v.severity == "critical"
+    assert str(v.drift_kind) == "tool_error"
+    assert str(v.severity) == "critical"
+
+
+def test_judge_verdict_empty_default_leaves_drift_fields_blank() -> None:
+    """The empty-default verdict keeps ``drift_kind`` / ``severity`` as
+    empty strings — no spurious enum coercion of the no-drift sentinel."""
+    v = JudgeVerdict()
+    assert v.drift_kind == ""
+    assert v.severity == ""
+    assert not isinstance(v.drift_kind, DriftKind)
+    assert not isinstance(v.severity, DriftSeverity)
+
+
+def test_judge_verdict_unrecognised_string_passes_through() -> None:
+    """An unrecognised custom ``drift_kind`` / ``severity`` string is
+    left untouched so a forward-compatible / domain-specific judge is
+    not broken by normalisation."""
+    v = JudgeVerdict(
+        drift_emitted=True,
+        drift_kind="some_future_kind",
+        severity="unusual",
+    )
+    assert v.drift_kind == "some_future_kind"
+    assert v.severity == "unusual"
+    assert not isinstance(v.drift_kind, DriftKind)
+
+
 def test_judge_protocol_accepts_duck_typed_implementation() -> None:
     class _MyJudge:
         name = "my_judge"
@@ -316,6 +373,46 @@ async def test_evaluate_judges_drift_flavour_emits_judgement_with_kind() -> None
     assert judgements[0].drift_kind == str(DriftKind.AGENT_REFUSAL)
     # And the verdict was forwarded to the legacy handler for the
     # DriftDetected back-compat fan-out.
+    assert len(captured_drifts) == 1
+    assert captured_drifts[0].kind is DriftKind.AGENT_REFUSAL
+    assert captured_drifts[0].severity is DriftSeverity.WARNING
+
+
+async def test_evaluate_judges_drift_flavour_accepts_enum_typed_verdict() -> None:
+    """A drift-flavoured verdict built with the typed ``DriftKind`` /
+    ``DriftSeverity`` enums (rather than legacy strings) is consumed
+    correctly: the ``JudgementEmitted`` envelope carries the string
+    value and the forwarded ``DriftEvent`` carries the real enums.
+
+    Pins the steerer-side half of the enum-typed judge API — the
+    consumer that reads ``JudgeVerdict`` and fires ``DriftDetected``
+    handles both the enum form and the legacy-string form.
+    """
+    sink = ListSink()
+    steerer = goldfive.DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_NullPlanner())  # type: ignore[arg-type]
+    # Built entirely from enums — no magic strings.
+    drift_verdict = JudgeVerdict(
+        drift_emitted=True,
+        drift_kind=DriftKind.AGENT_REFUSAL,
+        severity=DriftSeverity.WARNING,
+        detail="enum-typed refusal verdict",
+    )
+    captured_drifts: list[DriftEvent] = []
+
+    async def _capture(drift: DriftEvent, session: Session) -> None:  # noqa: ARG001
+        captured_drifts.append(drift)
+
+    steerer.drift.handle_drift = _capture  # type: ignore[method-assign]
+    steerer.set_judges([_StubJudge("enum_refusal_j", drift_verdict)])
+    await steerer.evaluate_judges(JudgeContext(), session=_make_session())
+    judgements = _judgement_events(sink)
+    assert len(judgements) == 1
+    assert judgements[0].verdict_kind == "drift"
+    # Proto carries the plain string value regardless of input shape.
+    assert judgements[0].drift_kind == str(DriftKind.AGENT_REFUSAL)
+    assert judgements[0].severity == str(DriftSeverity.WARNING)
+    # The forwarded DriftEvent carries the real enum members.
     assert len(captured_drifts) == 1
     assert captured_drifts[0].kind is DriftKind.AGENT_REFUSAL
     assert captured_drifts[0].severity is DriftSeverity.WARNING
