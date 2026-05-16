@@ -79,6 +79,10 @@ message Event {
     InvocationBoundaryEntered invocation_boundary_entered = 37;
     InvocationBoundaryExited invocation_boundary_exited = 38;
     SteeringDecisionMade steering_decision_made = 39;
+    LadderTransitionDecided ladder_transition_decided = 40;
+    DetectorDispatchOrdered detector_dispatch_ordered = 41;
+    PolicyApplied policy_applied = 42;
+    RetryBudgetSpent retry_budget_spent = 43;
   }
 }
 
@@ -1045,4 +1049,121 @@ message SteeringDecisionMade {
   // judge detectors; the dispatch target for tool detectors). Empty
   // when no agent is bound.
   string agent_name = 13;
+}
+
+// ---------------------------------------------------------------------------
+// Decision-telemetry events (manifest-and-decision-telemetry)
+//
+// SteeringDecisionMade (39) records per-detector outcomes. The four
+// events below record orthogonal *internal* steerer decisions that
+// don't fit the per-detector frame: which intervention-ladder level
+// fires for a given drift, the order detectors run in for a session,
+// per-policy outcomes that have no single ``DriftKind`` to attribute,
+// and per-attempt refine budget accounting. Downstream optimizers
+// (zicato) consume them as features for LLM-driven analysis of
+// goldfive's silent decision paths.
+//
+// All four events are purely additive — emission failure must NOT
+// affect any caller's control flow. Sinks ignorant of the new payloads
+// fall through unchanged.
+// ---------------------------------------------------------------------------
+
+// Emitted whenever the steerer's intervention ladder picks a level
+// for a freshly-emitted drift. The ladder maps
+// ``(DriftKind, DriftSeverity, occurrence_count)`` to an
+// :class:`InterventionLevel`; this event records the input + chosen
+// level so an optimizer can reconstruct the ladder table from
+// telemetry alone.
+//
+// ``from_level`` is RESERVED and currently always emitted as ``""``.
+// The intervention ladder is stateless per call (it derives the level
+// purely from ``(kind, severity, occurrence_count)``), so the steerer
+// does not carry a prior-level slot. Consumers that want true level
+// transitions reconstruct them by joining LadderTransitionDecided rows
+// on ``(drift_kind, current task)`` ordered by ``sequence`` — the
+// ``reason`` field already distinguishes first-occurrence from repeat.
+// The field is kept on the wire so a future stateful ladder can
+// populate it without a proto change.
+message LadderTransitionDecided {
+  // RESERVED — always ``""`` today. See the message-level comment:
+  // the ladder is stateless, so there is no prior-level slot to
+  // stamp. Reconstruct transitions consumer-side via the join on
+  // ``(drift_kind, task)`` ordered by ``sequence``.
+  string from_level = 1;
+  // Bare lowercase ``InterventionLevel`` enum name the ladder picked.
+  // One of ``observe`` / ``absorb`` / ``nudge`` / ``cancel_reinvoke``
+  // / ``pause_escalate`` / ``terminate``.
+  string to_level = 2;
+  // One-line human-readable explanation — typically
+  // ``"first occurrence"`` / ``"repeat (count=N)"`` /
+  // ``"severity=critical short-circuits"``.
+  string reason = 3;
+  // ``DriftKind`` value as ``DRIFT_KIND_*`` string (matching the
+  // proto enum name so consumers can parse with ``DriftKind.Value``).
+  string drift_kind = 4;
+  // Cross-reference to ``DriftDetected.id`` for the drift that
+  // triggered the ladder lookup.
+  string drift_id = 5;
+  // ``DriftSeverity`` value as ``DRIFT_SEVERITY_*`` string.
+  string severity = 6;
+}
+
+// Emitted once per session (or each time the steerer recomputes the
+// dispatch order — typically just at first observation) recording the
+// detector dispatch ordering. The ordering is deterministic in
+// goldfive today but the contract reserves the freedom to reorder /
+// skip detectors based on runtime config (e.g. ``reasoning_drift_mode``
+// disables embedding detectors), and an optimizer that wants to learn
+// "what runs when" needs to see the snapshot rather than infer from
+// fire patterns.
+message DetectorDispatchOrdered {
+  // Symbolic detector names in dispatch order. Names mirror those used
+  // by ``SteeringDecisionMade.detector_name``.
+  repeated string dispatch_order = 1;
+  // One-line description of why the order is what it is — typically
+  // ``"default"`` / ``"reasoning_drift_mode=disabled excludes embedding detectors"``
+  // etc.
+  string reason = 2;
+}
+
+// Generic policy-decision event for any steerer ``else-if`` branch
+// that isn't a ``DriftDetected``. Examples: observation-only mode
+// gating an emit, the same-turn dedup skipping a re-fire, the
+// supersedes-integration set_session_plan path, a user-steer
+// cooldown suppressing a follow-up drift. Each is a steerer policy
+// that an optimizer should be able to count, not a detector-level
+// signal.
+message PolicyApplied {
+  // Stable symbolic name of the policy — e.g.
+  // ``"observation_only_gate"`` / ``"supersession_integration"`` /
+  // ``"user_steer_cooldown"`` / ``"same_turn_dedup"`` /
+  // ``"refine_failure_threshold"``.
+  string policy_name = 1;
+  // What the policy did — typically ``"applied"`` / ``"skipped"`` /
+  // ``"suppressed"``. Free-form; consumers MUST tolerate unknown values.
+  string outcome = 2;
+  // Brief explanation for the outcome.
+  string reason = 3;
+  // Optional structured detail (e.g. ``"task_id=t1 count=3"``);
+  // empty when no per-call detail applies.
+  string detail = 4;
+}
+
+// Emitted on each refine attempt (success or failure) recording the
+// per-call retry-budget state. The budget is
+// ``LLMPlanner._max_refine_attempts`` (default 2); each event records
+// the attempt number and how many attempts remain.
+message RetryBudgetSpent {
+  // Symbolic operation name — ``"refine"`` / ``"refine_user_steer"``
+  // / ``"generate"`` / ``"plan_template_validate"``.
+  string operation = 1;
+  // 1-indexed attempt number (1 = first try).
+  uint32 attempt = 2;
+  // How many further attempts are allowed before the operation gives
+  // up. ``0`` when this attempt exhausted the budget.
+  uint32 budget_remaining = 3;
+  // One-line reason / outcome — e.g. ``"call_llm raised: ..."`` on a
+  // retry, ``"validated"`` on success, ``"budget_exhausted"`` after
+  // the final attempt.
+  string reason = 4;
 }

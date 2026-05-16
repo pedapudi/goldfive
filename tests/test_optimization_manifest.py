@@ -80,6 +80,46 @@ def test_manifest_covers_required_mutation_kinds() -> None:
     assert not missing, f"manifest missing required entries: {sorted(missing)}"
 
 
+def test_manifest_covers_expansion_entries() -> None:
+    """manifest-and-decision-telemetry expansion targets must be present."""
+    manifest = Manifest.load()
+    required_ids = {
+        # Plan-template fragments extracted in the expansion.
+        "plan_template_supersession_invariant",
+        "plan_template_supersession_examples",
+        "plan_template_refinement_guidance",
+        # Planner retry budgets / caps.
+        "planner_default_max_refine_attempts",
+        "planner_max_output_tokens",
+        "goal_deriver_max_output_tokens",
+        # Steerer ladder policy knobs.
+        "refine_failure_threshold",
+        "progress_stall_threshold_seconds",
+        "executor_max_nudge_replays",
+        # Reasoning-judge LLM dispatch caps.
+        "reasoning_judge_max_reasoning_input_chars",
+        "reasoning_judge_max_raw_response_chars",
+        "reasoning_judge_max_output_tokens",
+        # Trajectory-level goal-drift caps.
+        "goal_drift_max_output_tokens",
+        "goal_drift_trigger_input_max_chars",
+        # Adapter watcher knobs.
+        "default_llm_call_timeout_ms",
+    }
+    missing = required_ids - set(manifest.ids())
+    assert not missing, f"expansion entries missing: {sorted(missing)}"
+
+
+def test_manifest_size_target() -> None:
+    """manifest-and-decision-telemetry expansion brings the total to 60+."""
+    manifest = Manifest.load()
+    assert len(manifest) >= 60, (
+        f"manifest has {len(manifest)} entries; expected >= 60 per the "
+        "expansion target (was ~31 before the manifest-and-decision-"
+        "telemetry expansion)."
+    )
+
+
 def test_manifest_filter_by_tag() -> None:
     manifest = Manifest.load()
     judge = manifest.filter_by_tag("judge")

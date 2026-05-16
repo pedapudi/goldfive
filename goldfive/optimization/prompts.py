@@ -89,6 +89,13 @@ _PROMPT_NAMES: Final[frozenset[str]] = frozenset(
         "user_steer_system",
         "plan_divergence_system",
         "refine_system",
+        # manifest-and-decision-telemetry: plan-template fragments
+        # embedded in the four refine prompts above. Tuning here moves
+        # supersession precision / recall without touching drift-
+        # specific prompts.
+        "plan_template_supersession_invariant",
+        "plan_template_supersession_examples",
+        "plan_template_refinement_guidance",
     }
 )
 

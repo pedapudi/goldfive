@@ -244,8 +244,13 @@ async def test_goldfive_steer_suppressed_when_user_steer_active() -> None:
     more sequence positions than before. The window is widened from 3
     to 6 to keep the suppression invariant honoured under the new
     emit count. (See the PR's "ordering invariant weakened" note.)
+    manifest-and-decision-telemetry: the new decision-telemetry events
+    (DetectorDispatchOrdered once per session, LadderTransitionDecided
+    + RetryBudgetSpent per drift handling) advance ``_next_sequence``
+    further; window widened to 20 so the suppression invariant
+    survives the extra emission overhead.
     """
-    steerer, session, sink, planner, adapter = _bind(window=6)
+    steerer, session, sink, planner, adapter = _bind(window=20)
 
     # Apply a user steer first.
     user_msg = ControlMessage(

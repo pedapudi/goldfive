@@ -68,11 +68,23 @@ class ListSink:
         envelope. zicato-optimization-surface added
         ``steering_decision_made`` envelopes — observability-only,
         paired with every ``drift_detected`` (and emitted on the silent
-        no-fire path). Tests that assert on proto event order use this
-        filter to ignore the dict sidecars and the two observability-
-        only kinds while still exercising the production emit path.
+        no-fire path). manifest-and-decision-telemetry added
+        ``ladder_transition_decided`` / ``detector_dispatch_ordered`` /
+        ``policy_applied`` / ``retry_budget_spent`` envelopes — also
+        observability-only, recording the internal steerer decisions
+        that drove a fire / suppression. Tests that assert on proto
+        event order use this filter to ignore the dict sidecars and
+        the observability-only kinds while still exercising the
+        production emit path.
         """
-        skip = {"task_transitioned", "steering_decision_made"}
+        skip = {
+            "task_transitioned",
+            "steering_decision_made",
+            "ladder_transition_decided",
+            "detector_dispatch_ordered",
+            "policy_applied",
+            "retry_budget_spent",
+        }
         out: list[Any] = []
         for e in self.events:
             which = getattr(e, "WhichOneof", None)
@@ -545,7 +557,7 @@ async def test_observe_emits_drift_and_refines() -> None:
 
     kinds = [e.WhichOneof("payload") for e in sink.proto_events]
     assert kinds == ["drift_detected", "plan_revised"]
-    assert sink.events[0].drift_detected.kind == types_pb2.DRIFT_KIND_TOOL_ERROR
+    assert sink.proto_events[0].drift_detected.kind == types_pb2.DRIFT_KIND_TOOL_ERROR
     assert len(planner.refine_calls) == 1
     # goldfive#247: Plan is frozen — _apply_revision builds a NEW Plan
     # via bump_revision; identity is no longer the assertion. Verify
@@ -561,7 +573,11 @@ async def test_observe_emits_drift_and_refines() -> None:
 async def test_observe_skips_refine_when_no_drift() -> None:
     steerer, session, sink, planner = _fresh()
     await steerer.drift.observe({"text": "nothing interesting"}, session)
-    assert sink.events == []
+    # manifest-and-decision-telemetry: a first observe call emits a
+    # one-shot DetectorDispatchOrdered envelope before drift evaluation.
+    # The proto_events filter strips it; the production-relevant
+    # assertion is "no drift, no refine".
+    assert sink.proto_events == []
     assert planner.refine_calls == []
 
 
