@@ -36,6 +36,7 @@ from goldfive.events import (  # noqa: E402
     retry_budget_spent_event,
 )
 from goldfive.pb.goldfive.v1 import events_pb2 as pb  # noqa: E402
+from goldfive.pb.goldfive.v1 import types_pb2  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     DriftEvent,
@@ -213,9 +214,19 @@ async def test_ladder_transition_decided_emitted_on_tool_error() -> None:
     assert len(rows) == 1
     payload = rows[0].ladder_transition_decided
     assert payload.to_level  # some non-empty level
-    assert payload.drift_kind  # stamped
     assert payload.drift_id == drift.id
-    assert payload.severity == "warning"
+    # The proto contract is the symbolic ``DRIFT_KIND_*`` /
+    # ``DRIFT_SEVERITY_*`` form so consumers can round-trip via
+    # ``DriftKind.Value`` — not the lowercase StrEnum value.
+    assert payload.drift_kind == "DRIFT_KIND_TOOL_ERROR"
+    assert payload.severity == "DRIFT_SEVERITY_WARNING"
+    # Round-trips through the proto enum reverse-lookup.
+    assert types_pb2.DriftKind.Value(payload.drift_kind) == (
+        types_pb2.DRIFT_KIND_TOOL_ERROR
+    )
+    assert types_pb2.DriftSeverity.Value(payload.severity) == (
+        types_pb2.DRIFT_SEVERITY_WARNING
+    )
 
 
 async def test_ladder_transition_first_vs_repeat_reason() -> None:

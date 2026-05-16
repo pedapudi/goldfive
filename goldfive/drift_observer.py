@@ -183,6 +183,41 @@ log = logging.getLogger(__name__)
 # or on the parent ``goldfive`` logger.
 
 
+def _drift_kind_symbol(kind: object) -> str:
+    """Return the ``DRIFT_KIND_*`` symbolic name for a drift kind.
+
+    ``DriftKind`` is a ``StrEnum`` whose ``str()`` is the lowercase
+    *value* (``"looping_reasoning"``); the decision-telemetry proto
+    contract wants the symbolic enum name (``DRIFT_KIND_LOOPING_REASONING``)
+    so consumers can round-trip through ``DriftKind.Value``. Defensive
+    against a bare string (returns it upper-cased + prefixed) and an
+    empty value (returns ``""``).
+    """
+    name = getattr(kind, "name", None)
+    if not name:
+        text = str(kind or "").strip()
+        if not text:
+            return ""
+        name = text
+    name = name.upper()
+    return name if name.startswith("DRIFT_KIND_") else f"DRIFT_KIND_{name}"
+
+
+def _drift_severity_symbol(severity: object) -> str:
+    """Return the ``DRIFT_SEVERITY_*`` symbolic name for a drift severity.
+
+    Mirrors :func:`_drift_kind_symbol` for ``DriftSeverity``.
+    """
+    name = getattr(severity, "name", None)
+    if not name:
+        text = str(severity or "").strip()
+        if not text:
+            return ""
+        name = text
+    name = name.upper()
+    return name if name.startswith("DRIFT_SEVERITY_") else f"DRIFT_SEVERITY_{name}"
+
+
 class DriftObserver:
     """Drift event observability + classification + dispatch helpers.
 
@@ -601,9 +636,15 @@ class DriftObserver:
                 from_level=from_level,
                 to_level=to_level,
                 reason=reason,
-                drift_kind=str(drift.kind),
+                # The proto docstring promises the ``DRIFT_KIND_*`` /
+                # ``DRIFT_SEVERITY_*`` symbolic enum name so a consumer
+                # can parse with ``DriftKind.Value``. ``str(DriftKind.X)``
+                # yields the lowercase *value* (``"looping_reasoning"``),
+                # which ``DriftKind.Value`` would reject -- emit the
+                # symbolic name instead.
+                drift_kind=_drift_kind_symbol(drift.kind),
                 drift_id=str(getattr(drift, "id", "") or ""),
-                severity=str(drift.severity),
+                severity=_drift_severity_symbol(drift.severity),
                 session_id=session.id,
                 event_id=event_id,
             )
