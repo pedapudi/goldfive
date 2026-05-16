@@ -45,6 +45,22 @@ def test_load_parses_bundled_manifest() -> None:
     assert len(set(manifest.ids())) == len(manifest)
 
 
+def test_package_reexports_public_exception_types() -> None:
+    """The exceptions the public API raises are importable from the package.
+
+    ``Manifest.load`` raises :class:`ManifestLoadError` and
+    ``load_prompt`` raises :class:`PromptNotFound`; a caller that imports
+    ``Manifest`` / ``load_prompt`` from the package must be able to catch
+    those without reaching into a submodule.
+    """
+    import goldfive.optimization as opt
+
+    assert opt.ManifestLoadError is ManifestLoadError
+    assert opt.PromptNotFound is PromptNotFound
+    assert "ManifestLoadError" in opt.__all__
+    assert "PromptNotFound" in opt.__all__
+
+
 def test_manifest_covers_required_mutation_kinds() -> None:
     """Manifest must include the prompts + thresholds the brief calls out."""
     manifest = Manifest.load()

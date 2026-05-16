@@ -26,10 +26,12 @@ from __future__ import annotations
 
 from goldfive.optimization.manifest import (
     Manifest,
+    ManifestLoadError,
     Mutation,
     ValidationError,
 )
 from goldfive.optimization.prompts import (
+    PromptNotFound,
     available_prompts,
 )
 from goldfive.optimization.prompts import (
@@ -44,7 +46,9 @@ from goldfive.optimization.prompts import (
 
 __all__ = [
     "Manifest",
+    "ManifestLoadError",
     "Mutation",
+    "PromptNotFound",
     "ValidationError",
     "available_prompts",
     "bind_prompt",
