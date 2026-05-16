@@ -254,7 +254,30 @@ def default_judges() -> list[Judge]:
     ]
 
 
+#: Names of the built-in judges. The runtime's auto-wired observation
+#: path (``DriftObserver.observe_reasoning``) skips judges in this set:
+#: their drift verdicts already ride the wire via the legacy detector
+#: path + its paired ``JudgementEmitted`` emission
+#: (``DriftObserver._emit_judgement_from_drift``). Re-running the
+#: built-in wrappers from ``evaluate_judges`` would double-fire
+#: ``DriftDetected`` for the same logical signal. Operator-supplied
+#: custom judges (any name not in this set) run on every reasoning
+#: observation. See goldfive#437.
+BUILTIN_JUDGE_NAMES: frozenset[str] = frozenset(
+    {
+        "reasoning_drift",
+        "looping_reasoning",
+        "goal_drift",
+        "refusal",
+        "tool_error",
+        "stop_reason",
+        "looping_tool",
+    }
+)
+
+
 __all__ = [
+    "BUILTIN_JUDGE_NAMES",
     "GoalDriftJudge",
     "LoopingReasoningJudge",
     "LoopingToolJudge",

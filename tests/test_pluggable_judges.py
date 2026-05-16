@@ -26,6 +26,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -454,3 +455,99 @@ async def test_wrap_judges_empty_list_disables_judges() -> None:
     steerer = runner.steerer  # type: ignore[attr-defined]
     assert steerer.get_judges() == []
     await runner.close()
+
+
+# ---------------------------------------------------------------------------
+# observe_reasoning auto-wires custom judges (goldfive#437)
+# ---------------------------------------------------------------------------
+
+
+async def _drain_background(steerer: Any) -> None:
+    """Await background custom-judge tasks scheduled by observe_reasoning."""
+    pending = list(getattr(steerer, "_background_drifts", set())) + list(
+        getattr(steerer, "_background_judges", set())
+    )
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def test_observe_reasoning_runs_custom_judge() -> None:
+    """A custom (non-built-in) judge is invoked on every reasoning
+    observation and its verdict reaches the sink as ``JudgementEmitted``.
+
+    Pins the headline goldfive#437 contract: ``goldfive.wrap(judges=[
+    MyRubricJudge()])`` actually runs the judge during a run rather
+    than leaving ``evaluate_judges`` as dead code.
+    """
+    sink = ListSink()
+    steerer = goldfive.DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_NullPlanner())  # type: ignore[arg-type]
+    custom = _StubJudge("my_rubric", JudgeVerdict(rubric_score=0.7))
+    steerer.set_judges([custom])
+    session = _make_session()
+    await steerer.drift.observe_reasoning("a thought", session=session)
+    await _drain_background(steerer)
+    hits = _judgement_events(sink)
+    assert len(hits) == 1
+    assert hits[0].judge_name == "my_rubric"
+    assert hits[0].verdict_kind == "rubric"
+    assert custom.calls, "custom judge must have been invoked"
+    # The JudgeContext carried the reasoning text.
+    assert custom.calls[0].reasoning_text == "a thought"
+
+
+async def test_observe_reasoning_skips_builtin_judges() -> None:
+    """Built-in judges are NOT re-run by the observe_reasoning auto-wire
+    path — their drift verdicts ride the legacy detector path's paired
+    emission, so re-running them here would double-fire.
+
+    Installs the full default set; a benign reasoning block produces
+    no ``JudgementEmitted`` from the custom-judge path (all installed
+    judges are built-ins).
+    """
+    sink = ListSink()
+    steerer = goldfive.DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_NullPlanner())  # type: ignore[arg-type]
+    steerer.set_judges(builtin_judges.default_judges())
+    session = _make_session()
+    await steerer.drift.observe_reasoning("a benign thought", session=session)
+    await _drain_background(steerer)
+    assert _judgement_events(sink) == []
+
+
+async def test_observe_reasoning_custom_judge_exception_does_not_crash() -> None:
+    """A custom judge that raises is swallowed; observe_reasoning still
+    returns normally and the reasoning history is still appended."""
+    sink = ListSink()
+    steerer = goldfive.DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_NullPlanner())  # type: ignore[arg-type]
+    steerer.set_judges([_RaisingJudge()])
+    session = _make_session()
+    await steerer.drift.observe_reasoning("a thought", session=session)
+    await _drain_background(steerer)
+    assert _judgement_events(sink) == []
+    assert session.reasoning_history == ["a thought"]
+
+
+async def test_evaluate_judges_times_out_slow_judge() -> None:
+    """A judge whose ``evaluate`` hangs past the budget is cancelled and
+    treated as no signal; other judges still run."""
+
+    class _SlowJudge:
+        name = "slow"
+
+        async def evaluate(self, ctx: JudgeContext) -> JudgeVerdict:  # noqa: ARG002
+            await asyncio.sleep(3600)
+            return JudgeVerdict(boolean_result=True)
+
+    sink = ListSink()
+    steerer = goldfive.DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_NullPlanner())  # type: ignore[arg-type]
+    steerer.JUDGE_EVALUATE_TIMEOUT_S = 0.05  # type: ignore[misc]
+    good = _StubJudge("good", JudgeVerdict(boolean_result=False))
+    steerer.set_judges([_SlowJudge(), good])
+    await steerer.evaluate_judges(JudgeContext(), session=_make_session())
+    hits = _judgement_events(sink)
+    assert len(hits) == 1
+    assert hits[0].judge_name == "good"
+    assert good.calls, "good judge must run after the slow one is cancelled"

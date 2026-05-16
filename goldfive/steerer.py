@@ -809,19 +809,31 @@ class DefaultSteerer:
         """Return the currently-installed judge list (goldfive#437)."""
         return list(self._judges)
 
+    #: Wall-clock budget, in seconds, for a single ``Judge.evaluate``
+    #: call inside :meth:`evaluate_judges`. A custom judge that hangs
+    #: (network rubric grader with no client-side timeout, a deadlocked
+    #: lock) MUST NOT stall the run — the auto-wired observation path
+    #: dispatches :meth:`evaluate_judges` from the model-response
+    #: critical path. A judge that overruns the budget is cancelled,
+    #: logged at WARNING, and treated as "no signal" (goldfive#437).
+    JUDGE_EVALUATE_TIMEOUT_S: float = 30.0
+
     async def evaluate_judges(
         self,
         ctx: Any,
         *,
         session: Session | None = None,
         run_id: str = "",
+        judges: list[Any] | None = None,
     ) -> list[Any]:
         """Evaluate every installed judge against ``ctx`` and emit results.
 
         For every judge in :attr:`_judges`:
 
         * call ``judge.evaluate(ctx)`` and await the
-          :class:`~goldfive.judges.JudgeVerdict`;
+          :class:`~goldfive.judges.JudgeVerdict`, bounded by
+          :attr:`JUDGE_EVALUATE_TIMEOUT_S` — a judge that overruns
+          the budget is cancelled and treated as "no signal";
         * pick ``verdict_kind`` from the first populated flavour
           (drift / rubric / boolean / numeric);
         * skip emission entirely when no flavour is populated (judges
@@ -833,22 +845,37 @@ class DefaultSteerer:
           fires and the refine machinery still runs (back-compat
           contract).
 
-        Errors raised by a judge are caught and logged at WARNING;
-        a misbehaving judge MUST NOT break the run or suppress other
-        judges' verdicts. Returns the list of verdicts collected so
-        callers can inspect them in tests.
+        Errors raised by a judge — and timeouts — are caught and
+        logged at WARNING; a misbehaving judge MUST NOT break the run
+        or suppress other judges' verdicts. Returns the list of
+        verdicts collected so callers can inspect them in tests.
 
         ``session`` is forwarded onto the emitted event envelope (for
         ``session_id``) and used as the back-channel for drift-
         flavoured verdicts that need to route through
         :meth:`drift.handle_drift`. ``run_id`` is the active run's
         identifier — falls back to ``session.run_id`` when omitted.
+        ``judges`` overrides the installed list for this call only —
+        the auto-wired observation path passes the operator-supplied
+        custom judges (built-ins excluded; their drift verdicts ride
+        the legacy detector path's paired emission instead).
         """
         verdicts: list[Any] = []
-        for judge in list(self._judges):
+        active = list(self._judges) if judges is None else list(judges)
+        for judge in active:
             judge_name = str(getattr(judge, "name", "") or type(judge).__name__)
             try:
-                verdict = await judge.evaluate(ctx)
+                verdict = await asyncio.wait_for(
+                    judge.evaluate(ctx), timeout=self.JUDGE_EVALUATE_TIMEOUT_S
+                )
+            except TimeoutError:
+                log.warning(
+                    "DefaultSteerer.evaluate_judges: judge %r exceeded the "
+                    "%.1fs evaluate budget; cancelled and treated as no signal",
+                    judge_name,
+                    self.JUDGE_EVALUATE_TIMEOUT_S,
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 — judges must not crash the run
                 log.warning(
                     "DefaultSteerer.evaluate_judges: judge %r raised %s (%s); "

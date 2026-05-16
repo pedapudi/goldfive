@@ -1633,6 +1633,16 @@ class DriftObserver:
             del history[:overflow]
         from goldfive.drift.reasoning import detect_looping_reasoning
 
+        # goldfive#437 — operator-supplied custom judges. Dispatched
+        # here so every reasoning observation reaches the pluggable
+        # surface regardless of how the built-in detector pipeline
+        # below resolves (a loop-detector fire short-circuits with an
+        # early ``return``). Fire-and-forget — a custom rubric / cost
+        # judge MUST NOT serialise the model-response callback behind
+        # an LLM round-trip; the per-judge timeout in
+        # :meth:`DefaultSteerer.evaluate_judges` bounds a hung judge.
+        self._dispatch_custom_judges(text=text, session=session, agent_name=agent_name)
+
         # Always-on loop detector. A fire short-circuits before the
         # mode-selected pipeline so it remains the canonical signal
         # for "repetitive" reasoning regardless of mode. Cheap, and
@@ -1696,6 +1706,74 @@ class DriftObserver:
         )
         self._steerer._background_judges.add(bg_task)
         bg_task.add_done_callback(self._steerer._background_judges.discard)
+
+    def _dispatch_custom_judges(
+        self, *, text: str, session: Session, agent_name: str = ""
+    ) -> None:
+        """Fire-and-forget the operator-supplied custom judges (goldfive#437).
+
+        Builds a :class:`~goldfive.judges.JudgeContext` snapshot from
+        the current reasoning observation and schedules
+        :meth:`DefaultSteerer.evaluate_judges` against the *custom*
+        judges only — judges whose ``name`` is not in
+        :data:`~goldfive.judges.builtins.BUILTIN_JUDGE_NAMES`.
+
+        Built-ins are excluded on purpose: their drift verdicts
+        already ride the wire via the legacy detector path and its
+        paired :meth:`_emit_judgement_from_drift` emission. Re-running
+        the built-in wrappers here would double-fire ``DriftDetected``
+        for the same logical signal.
+
+        Scheduled via :func:`asyncio.create_task` (tracked on
+        ``_background_drifts`` so :meth:`shutdown` drains it) so a slow
+        custom judge cannot serialise the model-response callback. A
+        no-op when no custom judges are installed.
+        """
+        judges = getattr(self._steerer, "_judges", None) or []
+        if not judges:
+            return
+        try:
+            from goldfive.judges.builtins import BUILTIN_JUDGE_NAMES
+        except Exception:  # noqa: BLE001 — judges package optional / partial
+            return
+        custom = [
+            j
+            for j in judges
+            if str(getattr(j, "name", "") or "") not in BUILTIN_JUDGE_NAMES
+        ]
+        if not custom:
+            return
+        try:
+            from goldfive.judges.base import JudgeContext
+        except Exception:  # noqa: BLE001
+            return
+        ctx = JudgeContext(
+            reasoning_text=text,
+            plan=getattr(session, "plan", None),
+            transcript=tuple(getattr(session, "reasoning_history", []) or ()),
+            session_state=session,
+            current_task_id=str(getattr(session, "current_task_id", "") or ""),
+            current_agent_id=agent_name,
+        )
+
+        async def _run() -> None:
+            try:
+                await self._steerer.evaluate_judges(
+                    ctx, session=session, judges=custom
+                )
+            except Exception as exc:  # noqa: BLE001 — judges must not crash run
+                log.warning(
+                    "DriftObserver._dispatch_custom_judges: evaluate_judges "
+                    "raised %s (%s); swallowed",
+                    type(exc).__name__,
+                    exc,
+                )
+
+        bg_task = asyncio.create_task(
+            _run(), name=f"goldfive-custom-judge:{session.id}"
+        )
+        self._steerer._background_drifts.add(bg_task)
+        bg_task.add_done_callback(self._steerer._background_drifts.discard)
 
     async def _run_judge_background(
         self,
