@@ -148,6 +148,22 @@ class TestSessionSequence:
         # b starts fresh regardless of a's state.
         assert b.next_sequence() == 0
 
+    def test_mark_reasoning_turn_is_monotonic_and_independent(self) -> None:
+        """goldfive#441: the logical-turn counter is separate from _next_sequence."""
+        s = Session(run_id="r1")
+        assert s._reasoning_turn == 0
+        assert s.mark_reasoning_turn() == 1
+        assert s.mark_reasoning_turn() == 2
+        # Advancing the per-event counter must NOT move the turn counter.
+        s.next_sequence()
+        s.next_sequence()
+        assert s._reasoning_turn == 2
+        # ...and vice versa.
+        before = s._next_sequence
+        s.mark_reasoning_turn()
+        assert s._next_sequence == before
+        assert s._reasoning_turn == 3
+
 
 # ---------------------------------------------------------------------------
 # Goal predicate is a live callable

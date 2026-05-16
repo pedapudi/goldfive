@@ -717,7 +717,7 @@ Keys:
 | `goldfive.current_plan_id` | `Runner` on plan submit, `DefaultSteerer._apply_revision` on revision | Set when a plan is installed; persists across the run |
 | `goldfive.current_task_id`, `goldfive.current_task_title` | `PlanReconciler` on before/after_agent; `DefaultSteerer.mark_task_*` on legacy transitions | Set on RUNNING; cleared on terminal transition of the same task and at run end |
 | `goldfive.goals_summary` | `Runner` after goal derivation; `DefaultSteerer._apply_user_steer_state` after USER_STEER | Formatted `"- [id] summary\n..."` block; refreshed whenever `session.goals` changes |
-| `goldfive.active_steer.body`, `goldfive.active_steer.at_turn` | `DefaultSteerer._apply_user_steer_state` on USER_STEER drift | `body` is the raw steer text; `at_turn` is the session sequence value at fire time. Cleared at run end |
+| `goldfive.active_steer.body`, `goldfive.active_steer.at_turn` | `DefaultSteerer._apply_user_steer_state` on USER_STEER drift | `body` is the raw steer text; `at_turn` is the logical-turn counter (`Session._reasoning_turn`) value at fire time — see goldfive#441. Cleared at run end |
 | `goldfive.cancelled_function_call_ids` | `ADKAdapter._heal_pending_tool_calls` | Append-only list of function_call ids that were healed mid-invocation. De-duplicated within the run |
 
 Ownership rules:

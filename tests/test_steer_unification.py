@@ -236,21 +236,14 @@ async def test_goldfive_steer_does_not_promote_at_info_severity() -> None:
 async def test_goldfive_steer_suppressed_when_user_steer_active() -> None:
     """Fresh user steer within the freshness window blocks a goldfive steer.
 
-    goldfive a4: each refine now emits two extra dict-envelope sidecars
-    (``refine_attempted`` + correlation ``plan_revised``) which advance
-    ``session._next_sequence`` alongside the canonical proto events.
-    ``_should_promote_to_steer`` reads ``_next_sequence`` as the "current
-    turn" surrogate, so the user-steer's promotion path now consumes
-    more sequence positions than before. The window is widened from 3
-    to 6 to keep the suppression invariant honoured under the new
-    emit count. (See the PR's "ordering invariant weakened" note.)
-    manifest-and-decision-telemetry: the new decision-telemetry events
-    (DetectorDispatchOrdered once per session, LadderTransitionDecided
-    + RetryBudgetSpent per drift handling) advance ``_next_sequence``
-    further; window widened to 20 so the suppression invariant
-    survives the extra emission overhead.
+    goldfive#441: freshness is measured in *logical turns*
+    (``Session._reasoning_turn``), not raw event sequence. No reasoning
+    observation elapses between the user steer and the goldfive drift
+    here, so the steer is age-0 and suppresses the drift at the default
+    window (3) — no test-only widening needed regardless of how many
+    decision-telemetry events the promotion path emits.
     """
-    steerer, session, sink, planner, adapter = _bind(window=20)
+    steerer, session, sink, planner, adapter = _bind()
 
     # Apply a user steer first.
     user_msg = ControlMessage(
@@ -300,16 +293,16 @@ async def test_goldfive_steer_fires_when_user_steer_stale() -> None:
     """User steer outside the freshness window no longer blocks promotion."""
     steerer, session, _sink, planner, _adapter = _bind(window=1)
 
-    # Apply a user steer then synthetically advance the session sequence
-    # beyond the window.
+    # Apply a user steer then advance the logical-turn counter
+    # (goldfive#441) beyond the window.
     user_msg = ControlMessage(
         kind=ControlKind.STEER,
         id="ctl-stale",
         payload={"note": "initial", "annotation_id": "ann_stale"},
     )
     await steerer.drift.observe(user_msg, session)
-    # Advance sequence beyond the window.
-    session._next_sequence += 10
+    # Advance the reasoning-turn counter beyond the window.
+    session._reasoning_turn += 10
 
     drift = DriftEvent(
         kind=DriftKind.OFF_TOPIC,
@@ -324,6 +317,111 @@ async def test_goldfive_steer_fires_when_user_steer_stale() -> None:
     # active_steer now carries the goldfive body.
     assert session.state[_ostate.KEY_ACTIVE_STEER_SOURCE] == "goldfive"
     assert session.state[_ostate.KEY_ACTIVE_STEER_BODY] == "fresh detector fire"
+
+
+async def test_suppression_window_unaffected_by_event_volume() -> None:
+    """goldfive#441 regression: telemetry-event volume cannot shrink the window.
+
+    The freshness window is keyed on the logical-turn counter
+    (``Session._reasoning_turn``), not the per-event ``_next_sequence``.
+    Emitting a large volume of observability events between the user
+    steer and the competing goldfive drift advances ``_next_sequence``
+    but NOT ``_reasoning_turn`` — so the steer stays age-0 and the
+    drift is still suppressed at the default window.
+    """
+    steerer, session, sink, planner, _adapter = _bind()  # default window=3
+
+    await steerer.drift.observe(
+        ControlMessage(
+            kind=ControlKind.STEER,
+            id="ctl-vol",
+            payload={"note": "stay on task", "annotation_id": "ann_vol"},
+        ),
+        session,
+    )
+    refine_steer_before = len(planner.refine_steer_calls)
+    # Simulate a heavy decision-telemetry stream (#436/#440 emit several
+    # events per turn): bump the per-event counter far past the window
+    # WITHOUT advancing the logical-turn counter.
+    session._next_sequence += 500
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="goldfive-signal-vol",
+        current_task_id="t2",
+    )
+    await steerer.drift.handle_drift(drift, session)
+
+    # Still suppressed — event volume did not consume the window.
+    assert len(planner.refine_steer_calls) == refine_steer_before
+    assert session.state[_ostate.KEY_ACTIVE_STEER_SOURCE] == "user"
+    matching = [
+        e
+        for e in _drift_detected_events(sink)
+        if e.drift_detected.detail == "goldfive-signal-vol"
+    ]
+    assert matching
+    assert matching[-1].drift_detected.suppressed_by_user_steer is True
+
+
+async def test_suppression_window_counts_logical_turns() -> None:
+    """goldfive#441: the window counts down once per reasoning turn.
+
+    A user steer is suppressing at age 0; after ``window`` logical
+    turns elapse (``_reasoning_turn`` advanced) it is stale and the
+    competing goldfive drift promotes.
+    """
+    steerer, session, _sink, planner, _adapter = _bind()  # default window=3
+
+    await steerer.drift.observe(
+        ControlMessage(
+            kind=ControlKind.STEER,
+            id="ctl-turns",
+            payload={"note": "initial", "annotation_id": "ann_turns"},
+        ),
+        session,
+    )
+    # Two logical turns elapse — still inside the window of 3.
+    session.mark_reasoning_turn()
+    session.mark_reasoning_turn()
+    drift_inside = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="inside-window",
+        current_task_id="t2",
+    )
+    await steerer.drift.handle_drift(drift_inside, session)
+    assert planner.refine_steer_calls == []  # suppressed
+    assert session.state[_ostate.KEY_ACTIVE_STEER_SOURCE] == "user"
+
+    # A third logical turn pushes the steer to age 3 == window -> stale.
+    session.mark_reasoning_turn()
+    drift_outside = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="outside-window",
+        current_task_id="t2",
+    )
+    await steerer.drift.handle_drift(drift_outside, session)
+    assert len(planner.refine_steer_calls) == 1  # promoted
+    assert session.state[_ostate.KEY_ACTIVE_STEER_SOURCE] == "goldfive"
+
+
+async def test_observe_reasoning_advances_logical_turn_counter() -> None:
+    """``observe_reasoning`` ticks ``Session._reasoning_turn`` once per call."""
+    steerer = DefaultSteerer(reasoning_drift_mode="off")
+    steerer.bind(sinks=[ListSink()], planner=_StubPlanner(revised=_make_plan()))
+    session = _make_session()
+
+    assert session._reasoning_turn == 0
+    await steerer.drift.observe_reasoning("a reasoning block", session=session)
+    assert session._reasoning_turn == 1
+    await steerer.drift.observe_reasoning("another reasoning block", session=session)
+    assert session._reasoning_turn == 2
+    # Empty reasoning is a no-op and does not advance the counter.
+    await steerer.drift.observe_reasoning("", session=session)
+    assert session._reasoning_turn == 2
 
 
 # ---------------------------------------------------------------------------
@@ -517,15 +615,13 @@ async def test_goldfive_drift_event_authored_by_goldfive_when_unset() -> None:
 async def test_suppressed_drift_event_wire_flag() -> None:
     """DriftDetected carries suppressed_by_user_steer=True on suppression.
 
-    ``window`` is measured against the session's monotonic event-
-    sequence counter, which now includes the paired
-    ``SteeringDecisionMade`` observability events introduced by
-    zicato-optimization-surface (one per ``DriftDetected``). The
-    suppression intent here is "fire-immediately-after-steer is
-    suppressed" — a generous window keeps the test honest while the
-    counter-vs-logical-turn semantic mismatch is in flight.
+    goldfive#441: the window is measured in logical turns
+    (``Session._reasoning_turn``). The goldfive drift fires immediately
+    after the steer with no reasoning observation in between, so it is
+    age-0 and suppressed at the default window — observability-event
+    volume no longer affects the outcome.
     """
-    steerer, session, sink, planner, _adapter = _bind(window=50)
+    steerer, session, sink, planner, _adapter = _bind()
     # User steer first.
     await steerer.drift.observe(
         ControlMessage(

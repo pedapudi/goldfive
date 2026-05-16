@@ -1635,6 +1635,12 @@ class DriftObserver:
         """
         if not text:
             return
+        # goldfive#441 — advance the logical-turn counter once per
+        # reasoning observation. The user-steer suppression window
+        # (:meth:`_should_promote_to_steer`) measures freshness against
+        # this counter, NOT ``_next_sequence`` (which counts every
+        # emitted event and is inflated by decision-telemetry volume).
+        session.mark_reasoning_turn()
         history = session.reasoning_history
         history.append(text)
         cap = getattr(session, "reasoning_history_max", 20) or 20
@@ -4812,8 +4818,9 @@ class DriftObserver:
            their legacy ladder mapping.
         3. The severity must clear the configured ``threshold``.
         4. If a user-authored steer is within the freshness window
-           (``suppression_window_turns`` turns), stamp the suppression
-           flag and return ``False``. Otherwise return ``True``.
+           (``suppression_window_turns`` *logical turns* — see
+           ``Session._reasoning_turn``), stamp the suppression flag and
+           return ``False``. Otherwise return ``True``.
         """
         if drift.kind in self._USER_AUTHORED_DRIFT_KINDS:
             return False
@@ -4835,7 +4842,11 @@ class DriftObserver:
 
             active = StateStore.for_session(session).get_active_steer()
             if active is not None and active.source.lower() == "user":
-                current_turn = int(getattr(session, "_next_sequence", 0) or 0)
+                # goldfive#441 — freshness is measured in *logical
+                # turns* (``_reasoning_turn``: one tick per reasoning
+                # observation), NOT ``_next_sequence`` (per-event, and
+                # inflated by decision-telemetry volume from #436/#440).
+                current_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
                 age = current_turn - active.at_turn
                 if 0 <= age < window:
                     drift.suppressed_by_user_steer = True
@@ -4925,7 +4936,9 @@ class DriftObserver:
         # only, or catch ``CancelledError`` at the goldfive-steer
         # boundary and continue.
         # 2. Stamp active-steer state + compose the restart body.
-        at_turn = int(getattr(session, "_next_sequence", 0) or 0)
+        # ``at_turn`` is the logical-turn counter (goldfive#441), the
+        # same surface the user-steer freshness window reads.
+        at_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
         body = self._compose_goldfive_steer_body(drift)
         try:
             _ostate.set_active_steer(
@@ -5288,11 +5301,12 @@ class DriftObserver:
         raw_body, author, steer_id = self._unpack_steer_context(drift)
         body = raw_body.strip()
         # Stamp the active_steer keys regardless so readers see "a
-        # steer is active as of turn N". ``at_turn`` uses the
-        # session's monotonic sequence counter which increments on
-        # every emitted event — a cheap, always-available "turn"
-        # proxy.
-        at_turn = getattr(session, "_next_sequence", 0) or 0
+        # steer is active as of turn N". ``at_turn`` is the logical-turn
+        # counter (``_reasoning_turn``: one tick per reasoning
+        # observation) so the freshness window in
+        # :meth:`_should_promote_to_steer` measures real agent turns,
+        # not raw event volume (goldfive#441).
+        at_turn = getattr(session, "_reasoning_turn", 0) or 0
         try:
             _ostate.set_active_steer(
                 session.state,

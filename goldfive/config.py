@@ -585,13 +585,17 @@ class SteeringConfig:
       promoted. Useful for high-noise trees where the WARNING judge
       fires too aggressively.
 
-    ``suppression_window_turns`` is the number of session-sequence
-    "turns" (monotonic ``_next_sequence`` increments) within which a
-    fresh user-authored steer suppresses any goldfive-authored steer
-    promotion. The goldfive drift still surfaces as a ``DriftDetected``
-    event with ``suppressed_by_user_steer=true``; no cancel or refine
-    fires. Default ``3`` keeps a live operator override dominant
-    across a few detector ticks.
+    ``suppression_window_turns`` is the number of *logical turns*
+    within which a fresh user-authored steer suppresses any
+    goldfive-authored steer promotion. A logical turn is one reasoning
+    observation (``Session._reasoning_turn`` — one tick per model
+    response fed through the drift pipeline), NOT a raw event-sequence
+    increment: keying on the per-event ``_next_sequence`` let
+    observability-event volume shrink the effective window
+    (goldfive#441). The goldfive drift still surfaces as a
+    ``DriftDetected`` event with ``suppressed_by_user_steer=true``; no
+    cancel or refine fires. Default ``3`` keeps a live operator
+    override dominant across a few agent turns.
 
     ``observation_only`` (goldfive#254) gates the three actual steering
     injection points on :class:`~goldfive.steerer.DefaultSteerer`:

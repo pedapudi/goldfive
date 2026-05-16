@@ -77,7 +77,8 @@ Active steer (set by DefaultSteerer on USER_STEER drift):
 * ``goldfive.active_steer.body`` — the steer body as authored by the
   operator (post-``_compose_steer_restart_message`` UNWRAPPING; i.e.
   the raw steer text, not the framed restart message).
-* ``goldfive.active_steer.at_turn`` — monotonic sequence value
+* ``goldfive.active_steer.at_turn`` — logical-turn counter value
+  (``Session._reasoning_turn``: one tick per reasoning observation)
   captured at steer-fire time. Lets downstream refines know "was this
   steer before or after the observation I'm looking at?".
 * ``goldfive.active_steer.author`` — operator identity from the
@@ -117,7 +118,8 @@ Design notes
   active — so ``goldfive.active_steer.*`` is just a durable read-back
   of the most recent USER_STEER, not a cooldown window. Consumers
   that want "has the steer expired?" compare the recorded ``at_turn``
-  against the current session sequence themselves.
+  against the current logical-turn counter (``Session._reasoning_turn``)
+  themselves.
 * **Tree-agnostic.** No presentation-specific or domain keys. The
   namespace is pure orchestration state.
 * **Writers only under the prefix.** :func:`write` refuses non-goldfive
