@@ -23,6 +23,21 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
   `DriftEvent` enums straight through with no string round-trip, and
   the steerer's verdict-consuming path (`_drift_from_judge_verdict`,
   `_emit_judgement`) handles both shapes.
+- **Typed opt-out for the built-in judges: `goldfive.wrap(disable_judges=...)`.**
+  External callers could already supply a custom judge list via
+  `wrap(judges=[...])`, but the only way to keep the default detector
+  set *minus* a subset was to re-list every wanted built-in by hand —
+  and the built-ins were keyed by magic string. New `BuiltinJudge`
+  enum (`goldfive.builtin_judges.BuiltinJudge`) gives each built-in a
+  typed identifier (a `StrEnum`, so it interoperates with the existing
+  string-keyed surfaces). `default_judges(disable=[BuiltinJudge...])`
+  and `wrap(disable_judges=[BuiltinJudge...])` drop the named built-ins
+  from the default set; an unrecognised entry is ignored
+  (forward-compatible). Passing both `judges=` and `disable_judges=`
+  raises `TypeError`. `BUILTIN_JUDGE_NAMES` is now derived from
+  `BuiltinJudge` (still a `frozenset[str]` — back-compat preserved).
+  `docs/reference/api.md` gains a Judges section and a refreshed `wrap`
+  signature.
 
 ### Delegation pin
 

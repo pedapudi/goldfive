@@ -229,6 +229,67 @@ def test_factories_return_fresh_instances() -> None:
     assert a is not b
 
 
+def test_builtin_judge_enum_values_match_judge_names() -> None:
+    """Every :class:`BuiltinJudge` member's value equals the wire ``name``
+    of the judge its factory builds — the enum is a typed alias for the
+    historical magic-string judge names."""
+    from goldfive.builtin_judges import BuiltinJudge
+
+    enum_values = {str(j) for j in BuiltinJudge}
+    factory_names = {j.name for j in builtin_judges.default_judges()}
+    assert enum_values == factory_names
+    # StrEnum: a member compares equal to its wire name.
+    assert BuiltinJudge.TOOL_ERROR == "tool_error"
+
+
+def test_builtin_judge_names_derives_from_enum() -> None:
+    """``BUILTIN_JUDGE_NAMES`` stays a ``frozenset[str]`` (back-compat)
+    and is exactly the set of :class:`BuiltinJudge` values."""
+    from goldfive.builtin_judges import BuiltinJudge
+    from goldfive.judges.builtins import BUILTIN_JUDGE_NAMES
+
+    assert BUILTIN_JUDGE_NAMES == {str(j) for j in BuiltinJudge}
+    # Membership works with either a plain string or a BuiltinJudge.
+    assert "reasoning_drift" in BUILTIN_JUDGE_NAMES
+    assert BuiltinJudge.REFUSAL in BUILTIN_JUDGE_NAMES
+
+
+def test_default_judges_disable_by_enum() -> None:
+    """``default_judges(disable=[BuiltinJudge...])`` drops exactly the
+    named built-ins and keeps the rest."""
+    from goldfive.builtin_judges import BuiltinJudge
+
+    full = builtin_judges.default_judges()
+    filtered = builtin_judges.default_judges(
+        disable=[BuiltinJudge.TOOL_ERROR, BuiltinJudge.GOAL_DRIFT]
+    )
+    names = {j.name for j in filtered}
+    assert "tool_error" not in names
+    assert "goal_drift" not in names
+    assert "reasoning_drift" in names
+    assert len(filtered) == len(full) - 2
+
+
+def test_default_judges_disable_accepts_legacy_strings() -> None:
+    """``disable=`` also accepts the legacy wire-name strings."""
+    filtered = builtin_judges.default_judges(disable=["refusal"])
+    assert "refusal" not in {j.name for j in filtered}
+
+
+def test_default_judges_disable_ignores_unknown_entries() -> None:
+    """An unrecognised ``disable=`` entry is ignored (forward-compatible)."""
+    full = builtin_judges.default_judges()
+    filtered = builtin_judges.default_judges(disable=["not_a_real_judge"])
+    assert len(filtered) == len(full)
+
+
+def test_default_judges_no_disable_returns_full_set() -> None:
+    """``default_judges()`` / ``default_judges(disable=None)`` return the
+    full set unchanged — back-compat with the no-arg call."""
+    assert len(builtin_judges.default_judges()) == 7
+    assert len(builtin_judges.default_judges(disable=None)) == 7
+
+
 async def test_refusal_judge_emits_drift_verdict_on_match() -> None:
     judge = builtin_judges.refusal()
     ctx = JudgeContext(reasoning_text="I cannot help with that request")
@@ -633,6 +694,46 @@ async def test_wrap_judges_empty_list_disables_judges() -> None:
     steerer = runner.steerer  # type: ignore[attr-defined]
     assert steerer.get_judges() == []
     await runner.close()
+
+
+async def test_wrap_disable_judges_drops_named_builtins() -> None:
+    """``goldfive.wrap(disable_judges=[BuiltinJudge...])`` installs the
+    default set minus the named built-ins."""
+    from goldfive.builtin_judges import BuiltinJudge
+
+    async def _agent(task: Any, session: Any, tools: Any) -> Any:  # noqa: ARG001
+        from goldfive.results import InvocationResult
+
+        return InvocationResult(output="ok")
+
+    runner = goldfive.wrap(
+        _agent, sinks=[], disable_judges=[BuiltinJudge.TOOL_ERROR]
+    )
+    steerer = runner.steerer  # type: ignore[attr-defined]
+    names = {j.name for j in steerer.get_judges()}
+    assert "tool_error" not in names
+    assert "reasoning_drift" in names
+    assert len(names) == 6
+    await runner.close()
+
+
+async def test_wrap_disable_judges_rejects_combination_with_judges() -> None:
+    """Passing both ``judges=`` and ``disable_judges=`` is a ``TypeError``
+    — an explicit ``judges=`` list already names the exact set."""
+    from goldfive.builtin_judges import BuiltinJudge
+
+    async def _agent(task: Any, session: Any, tools: Any) -> Any:  # noqa: ARG001
+        from goldfive.results import InvocationResult
+
+        return InvocationResult(output="ok")
+
+    with pytest.raises(TypeError, match="disable_judges"):
+        goldfive.wrap(
+            _agent,
+            sinks=[],
+            judges=[],
+            disable_judges=[BuiltinJudge.REFUSAL],
+        )
 
 
 # ---------------------------------------------------------------------------

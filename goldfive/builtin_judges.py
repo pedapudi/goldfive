@@ -10,6 +10,7 @@ matches the issue-time contract.
 from __future__ import annotations
 
 from goldfive.judges.builtins import (
+    BuiltinJudge,
     default_judges,
     goal_drift,
     looping_reasoning,
@@ -21,6 +22,7 @@ from goldfive.judges.builtins import (
 )
 
 __all__ = [
+    "BuiltinJudge",
     "default_judges",
     "goal_drift",
     "looping_reasoning",
