@@ -1074,9 +1074,10 @@ def ladder_transition_decided_event(
     """Build a ``LadderTransitionDecided`` envelope.
 
     Emitted every time the intervention ladder picks a level for a
-    drift. ``from_level`` is the prior ladder pick for the same
-    ``(kind, task)`` pair when one exists; ``""`` on a fresh
-    condition. ``to_level`` is the chosen ``InterventionLevel`` as a
+    drift. ``from_level`` is RESERVED — the ladder is stateless per
+    call, so the emit site always passes ``""``; consumers reconstruct
+    transitions by joining rows on ``(drift_kind, task)`` ordered by
+    ``sequence``. ``to_level`` is the chosen ``InterventionLevel`` as a
     bare lowercase string (``"observe"`` / ``"nudge"`` /
     ``"cancel_reinvoke"`` / ``"pause_escalate"`` / ``"absorb"`` /
     ``"terminate"``).

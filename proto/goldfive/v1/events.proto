@@ -1075,15 +1075,20 @@ message SteeringDecisionMade {
 // level so an optimizer can reconstruct the ladder table from
 // telemetry alone.
 //
-// ``from_level`` is the prior level for the same ``(kind, task)`` pair
-// when the steerer has already routed a drift in this session;
-// ``""`` otherwise (the first ladder pick on a fresh condition). Use
-// the pair (from_level, to_level) to identify true level transitions
-// vs steady-state repeats.
+// ``from_level`` is RESERVED and currently always emitted as ``""``.
+// The intervention ladder is stateless per call (it derives the level
+// purely from ``(kind, severity, occurrence_count)``), so the steerer
+// does not carry a prior-level slot. Consumers that want true level
+// transitions reconstruct them by joining LadderTransitionDecided rows
+// on ``(drift_kind, current task)`` ordered by ``sequence`` — the
+// ``reason`` field already distinguishes first-occurrence from repeat.
+// The field is kept on the wire so a future stateful ladder can
+// populate it without a proto change.
 message LadderTransitionDecided {
-  // Bare lowercase ``InterventionLevel`` enum name for the prior
-  // routing of the same ``(kind, task)`` pair, or ``""`` when this is
-  // the first ladder pick on this condition.
+  // RESERVED — always ``""`` today. See the message-level comment:
+  // the ladder is stateless, so there is no prior-level slot to
+  // stamp. Reconstruct transitions consumer-side via the join on
+  // ``(drift_kind, task)`` ordered by ``sequence``.
   string from_level = 1;
   // Bare lowercase ``InterventionLevel`` enum name the ladder picked.
   // One of ``observe`` / ``absorb`` / ``nudge`` / ``cancel_reinvoke``
