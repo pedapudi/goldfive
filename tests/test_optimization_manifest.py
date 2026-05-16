@@ -72,6 +72,30 @@ def test_manifest_filter_by_tag() -> None:
         assert "judge" in mut.tags
 
 
+def test_manifest_prompt_entries_and_shipped_prompts_are_a_bijection() -> None:
+    """Every shipped prompt has exactly one manifest entry and vice versa.
+
+    ``test_prompt_mutations_match_live_python_attrs`` already catches a
+    manifest entry pointing at a missing prompt (``load_prompt`` raises).
+    The reverse direction is the gap this test closes: a markdown file
+    added to :func:`goldfive.optimization.prompts.available_prompts`
+    without a paired manifest entry would otherwise go unnoticed — the
+    optimizer would see a prompt it cannot resolve a ``python_attr`` for.
+    """
+    manifest = Manifest.load()
+    manifest_prompt_names = {
+        mut.source.rsplit("/", 1)[1].removesuffix(".md")
+        for mut in manifest
+        if mut.kind == "prompt"
+    }
+    shipped = set(available_prompts())
+    assert manifest_prompt_names == shipped, (
+        "manifest prompt entries and shipped prompts diverged — "
+        f"shipped-only: {sorted(shipped - manifest_prompt_names)}, "
+        f"manifest-only: {sorted(manifest_prompt_names - shipped)}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Manifest reflects live code values
 # ---------------------------------------------------------------------------
