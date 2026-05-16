@@ -22,10 +22,39 @@ steerer between emission and dispatch.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
+
+from goldfive.types import DriftKind, DriftSeverity
 
 if TYPE_CHECKING:
     from goldfive.types import Plan, Session
+
+
+_DriftEnum = TypeVar("_DriftEnum", DriftKind, DriftSeverity)
+
+
+def _normalize_drift_field(
+    value: _DriftEnum | str, enum_cls: type[_DriftEnum]
+) -> _DriftEnum | str:
+    """Coerce a verdict drift field to its enum when the value matches a member.
+
+    Used by :meth:`JudgeVerdict.__post_init__` to normalise the
+    ``drift_kind`` / ``severity`` fields. Accepts either an ``enum_cls``
+    member — :class:`DriftKind` or :class:`DriftSeverity`, the preferred
+    typed form — or the legacy lowercase string. A string matching a
+    known ``enum_cls`` value is upgraded to the enum so consumers get a
+    real enum off ``JudgeVerdict``; an empty string (no drift) or an
+    unrecognised custom string is returned unchanged so a forward-
+    compatible / domain-specific judge is not broken. Both enums are
+    :class:`~enum.StrEnum`, so the upgraded value still compares equal to
+    the original lowercase string — back-compat is preserved.
+    """
+    if isinstance(value, enum_cls) or not value:
+        return value
+    try:
+        return enum_cls(str(value))
+    except ValueError:
+        return value
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,10 +112,20 @@ class JudgeVerdict:
     flavour in the order: drift, rubric, boolean, numeric):
 
     * **drift** — set ``drift_emitted = True`` and populate
-      ``drift_kind`` + ``severity`` (lowercase strings matching
+      ``drift_kind`` + ``severity``. Both fields accept the typed
       :class:`~goldfive.types.DriftKind` /
-      :class:`~goldfive.types.DriftSeverity`). The steerer fires both
-      :class:`DriftDetected` (back-compat) and :class:`JudgementEmitted`.
+      :class:`~goldfive.types.DriftSeverity` enums (the preferred
+      form). The legacy lowercase-string form (``"tool_error"``,
+      ``"critical"``, ...) is still accepted for back-compat: a string
+      matching a known enum value is normalised to the enum at
+      construction, so a verdict built either way exposes a real enum
+      on ``verdict.drift_kind`` / ``verdict.severity``. Because both
+      enums are :class:`~enum.StrEnum`, the normalised value still
+      compares equal to its lowercase string — existing
+      string-equality consumers see no change. An empty string (no
+      drift) or an unrecognised custom string is left untouched. The
+      steerer fires both :class:`DriftDetected` (back-compat) and
+      :class:`JudgementEmitted`.
     * **rubric** — set ``rubric_score`` (an aggregate in [0, 1] or any
       domain-defined range) and optionally ``rubric_dimensions`` with
       per-dimension sub-scores.
@@ -100,10 +139,13 @@ class JudgeVerdict:
     :class:`JudgementEmitted.detail` for the UI.
     """
 
-    # drift-flavored (back-compat with existing detectors)
+    # drift-flavored (back-compat with existing detectors). ``drift_kind``
+    # / ``severity`` accept either the typed enum (preferred) or the
+    # legacy lowercase string; ``__post_init__`` normalises a recognised
+    # string to its enum so consumers always get a real enum value back.
     drift_emitted: bool = False
-    drift_kind: str = ""
-    severity: str = ""
+    drift_kind: DriftKind | str = ""
+    severity: DriftSeverity | str = ""
     # rubric-flavored
     rubric_score: float | None = None
     rubric_dimensions: dict[str, float] = dataclasses.field(default_factory=dict)
@@ -113,6 +155,19 @@ class JudgeVerdict:
     numeric_value: float | None = None
     metric_name: str = ""
     detail: str = ""
+
+    def __post_init__(self) -> None:
+        # The dataclass is ``frozen``; ``object.__setattr__`` is the
+        # sanctioned way to write a derived/normalised value during
+        # construction. Normalising here (rather than at every read
+        # site) means every consumer — the steerer, sinks, external
+        # callers — sees the typed enum without each having to coerce.
+        object.__setattr__(
+            self, "drift_kind", _normalize_drift_field(self.drift_kind, DriftKind)
+        )
+        object.__setattr__(
+            self, "severity", _normalize_drift_field(self.severity, DriftSeverity)
+        )
 
 
 @runtime_checkable
