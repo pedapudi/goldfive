@@ -32,6 +32,8 @@ multiple runners without state-bleed.
 
 from __future__ import annotations
 
+import enum
+from collections.abc import Iterable
 from typing import Any
 
 from goldfive.drift import (
@@ -196,6 +198,37 @@ class LoopingToolJudge:
 
 
 # ---------------------------------------------------------------------------
+# Typed selector for the built-in judges
+# ---------------------------------------------------------------------------
+
+
+class BuiltinJudge(enum.StrEnum):
+    """Typed identifier for each judge in the goldfive default set.
+
+    Each member's value is the judge's wire ``name`` — the same token
+    used as the :class:`~goldfive.judges.JudgementEmitted.judge_name`
+    key and the historical opt-in / opt-out string. ``BuiltinJudge``
+    exists so external callers select / disable built-ins **by enum**
+    rather than by hand-written magic string:
+
+        goldfive.wrap(agent, disable_judges=[BuiltinJudge.TOOL_ERROR])
+
+    Because :class:`BuiltinJudge` is a :class:`~enum.StrEnum`, a member
+    compares equal to its wire name, so it interoperates with the
+    string-keyed APIs (``judge.name``, :data:`BUILTIN_JUDGE_NAMES`)
+    without any coercion at the call site.
+    """
+
+    REASONING_DRIFT = "reasoning_drift"
+    LOOPING_REASONING = "looping_reasoning"
+    GOAL_DRIFT = "goal_drift"
+    REFUSAL = "refusal"
+    TOOL_ERROR = "tool_error"
+    STOP_REASON = "stop_reason"
+    LOOPING_TOOL = "looping_tool"
+
+
+# ---------------------------------------------------------------------------
 # Factory functions (the public opt-in surface)
 # ---------------------------------------------------------------------------
 #
@@ -241,21 +274,48 @@ def looping_tool() -> Judge:
     return LoopingToolJudge()
 
 
-def default_judges() -> list[Judge]:
+#: Maps every :class:`BuiltinJudge` to its factory. Single source of
+#: truth for the default set, :data:`BUILTIN_JUDGE_NAMES`, and the
+#: :func:`default_judges` ``disable=`` filter — adding a built-in judge
+#: means adding one row here and one :class:`BuiltinJudge` member.
+_BUILTIN_JUDGE_FACTORIES: dict[BuiltinJudge, Any] = {
+    BuiltinJudge.REASONING_DRIFT: reasoning_drift,
+    BuiltinJudge.LOOPING_REASONING: looping_reasoning,
+    BuiltinJudge.GOAL_DRIFT: goal_drift,
+    BuiltinJudge.REFUSAL: refusal,
+    BuiltinJudge.TOOL_ERROR: tool_error,
+    BuiltinJudge.STOP_REASON: stop_reason,
+    BuiltinJudge.LOOPING_TOOL: looping_tool,
+}
+
+
+def default_judges(
+    disable: Iterable[BuiltinJudge | str] | None = None,
+) -> list[Judge]:
     """Return the goldfive default judge set.
 
     Mirrors the detectors the pre-judges code path armed by default.
     :func:`goldfive.wrap` installs this set when the caller does not
     supply an explicit ``judges=`` list.
+
+    Parameters
+    ----------
+    disable:
+        Optional iterable of :class:`BuiltinJudge` members (preferred)
+        or their wire-name strings. Built-ins named here are omitted
+        from the returned list — the typed way to keep the default set
+        but drop a subset (e.g. an agent that legitimately makes no
+        tool calls disabling :attr:`BuiltinJudge.TOOL_ERROR`). An
+        unrecognised entry is ignored (forward-compatible). ``None`` /
+        empty returns the full set.
     """
+    disabled: frozenset[str] = (
+        frozenset(str(d) for d in disable) if disable is not None else frozenset()
+    )
     return [
-        reasoning_drift(),
-        looping_reasoning(),
-        goal_drift(),
-        refusal(),
-        tool_error(),
-        stop_reason(),
-        looping_tool(),
+        factory()
+        for judge, factory in _BUILTIN_JUDGE_FACTORIES.items()
+        if str(judge) not in disabled
     ]
 
 
@@ -268,21 +328,17 @@ def default_judges() -> list[Judge]:
 #: ``DriftDetected`` for the same logical signal. Operator-supplied
 #: custom judges (any name not in this set) run on every reasoning
 #: observation. See goldfive#437.
-BUILTIN_JUDGE_NAMES: frozenset[str] = frozenset(
-    {
-        "reasoning_drift",
-        "looping_reasoning",
-        "goal_drift",
-        "refusal",
-        "tool_error",
-        "stop_reason",
-        "looping_tool",
-    }
-)
+#:
+#: Derived from :class:`BuiltinJudge` so the enum stays the single
+#: source of truth; remains a ``frozenset[str]`` for back-compat with
+#: existing ``name in BUILTIN_JUDGE_NAMES`` callers (a ``BuiltinJudge``
+#: member is a ``str``, so membership tests work with either form).
+BUILTIN_JUDGE_NAMES: frozenset[str] = frozenset(str(j) for j in BuiltinJudge)
 
 
 __all__ = [
     "BUILTIN_JUDGE_NAMES",
+    "BuiltinJudge",
     "GoalDriftJudge",
     "LoopingReasoningJudge",
     "LoopingToolJudge",

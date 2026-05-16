@@ -89,6 +89,11 @@ def wrap(
     model: str | None = None,
     max_task_invocations: int | None = None,
     plugins: list[Any] | None = None,
+    runtime: RuntimeConfig | None = None,
+    dynamic_instruction: bool = True,
+    drift_self_reporting: bool | list[str] = False,
+    judges: list[Judge] | None = None,
+    disable_judges: Iterable[BuiltinJudge | str] | None = None,
 ) -> Runner: ...
 
 
@@ -126,6 +131,56 @@ the one runner. ADK propagates the plugin manager into any
 `AgentTool`-spawned sub-Runner so delegation inherits the same plugin
 surface. Duplicate plugin instances (same `plugin.name`) are
 silently deduped (#166/#169).
+
+### Judges (`judges=` / `disable_judges=`)
+
+A `Judge` is the pluggable verdict-producing extension point (#437):
+an object with a stable `name: str` and an async
+`evaluate(JudgeContext) -> JudgeVerdict`. The steerer runs every
+installed judge at each observation point and emits a
+`JudgementEmitted` envelope per populated verdict. Judges produce one
+of four verdict flavours: **drift** (`drift_kind` + `severity`),
+**rubric** (`rubric_score` + per-dimension scores), **boolean**
+(pass/fail), **numeric** (a named metric). `JudgeVerdict.drift_kind` /
+`severity` accept the typed `DriftKind` / `DriftSeverity` enums.
+
+`wrap` installs `goldfive.builtin_judges.default_judges()` — the
+built-in detector set (`reasoning_drift`, `looping_reasoning`,
+`goal_drift`, `refusal`, `tool_error`, `stop_reason`, `looping_tool`) —
+unless the caller controls the set explicitly:
+
+- **`judges=[...]`** — the explicit list. Replaces the default set
+  entirely. Pass `judges=[]` to disable the `JudgementEmitted` surface.
+  Mix built-in factories with custom judges:
+
+  ```python
+  runner = goldfive.wrap(
+      agent,
+      judges=[
+          goldfive.builtin_judges.reasoning_drift(),
+          MyRubricJudge(rubric="..."),
+      ],
+  )
+  ```
+
+- **`disable_judges=[...]`** — keep the default set minus the named
+  built-ins. Members are `goldfive.builtin_judges.BuiltinJudge` enum
+  values (a `StrEnum`; legacy wire-name strings also accepted). The
+  typed, surgical opt-out — no need to re-list the rest:
+
+  ```python
+  from goldfive.builtin_judges import BuiltinJudge
+
+  # Full default set minus the tool-error judge.
+  runner = goldfive.wrap(agent, disable_judges=[BuiltinJudge.TOOL_ERROR])
+  ```
+
+  Passing both `judges=` and `disable_judges=` raises `TypeError` — an
+  explicit `judges=` list already specifies the exact set.
+
+Drift-flavoured verdicts (from built-in **or** custom judges) also fire
+the legacy `DriftDetected` envelope, so existing sinks see no
+behavioural change.
 
 When the wrap target is an ADK `BaseAgent`, the returned object is a
 `GoldfiveADKAgent` — a `BaseAgent` subclass that *also* exposes the

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from goldfive._llm_detect import CallLLM, detect_llm
@@ -47,6 +47,7 @@ from goldfive.types import Goal
 
 if TYPE_CHECKING:
     from goldfive.control import ControlChannel
+    from goldfive.judges.builtins import BuiltinJudge
 
 log = logging.getLogger("goldfive.wrap")
 
@@ -227,6 +228,7 @@ def wrap(
     llm_detector: Any = None,
     judge_call_llm_builder: Any = None,
     judges: list[Any] | None = None,
+    disable_judges: Iterable[BuiltinJudge | str] | None = None,
     **legacy_kwargs: Any,
 ) -> Runner:
     """Build a :class:`Runner` that drives ``agent`` with goldfive.
@@ -334,6 +336,27 @@ def wrap(
                     MyRubricJudge(rubric="..."),
                 ],
             )
+
+    disable_judges:
+        Optional iterable of
+        :class:`~goldfive.builtin_judges.BuiltinJudge` members (or their
+        wire-name strings) to drop from the **default** judge set. The
+        typed, surgical opt-out: keep every built-in detector except the
+        ones named here, without having to re-list the rest via
+        ``judges=``. Mutually exclusive with an explicit ``judges=``
+        list — when ``judges=`` is supplied the caller is already
+        specifying the exact set, so ``disable_judges`` is rejected with
+        a :class:`TypeError` rather than silently ignored::
+
+            # Keep the full default set minus the tool-error judge —
+            # e.g. an agent that legitimately makes no tool calls.
+            runner = goldfive.wrap(
+                agent,
+                disable_judges=[goldfive.builtin_judges.BuiltinJudge.TOOL_ERROR],
+            )
+
+        An unrecognised entry is ignored (forward-compatible). ``None``
+        (the default) keeps the full default set.
 
     drift_self_reporting:
         Forwarded to :class:`Runner`. Default ``False`` (goldfive#196):
@@ -645,13 +668,24 @@ def wrap(
     # Passing an explicit empty list (``judges=[]``) is the opt-out
     # token — the steerer's hardcoded detector path still runs but no
     # ``JudgementEmitted`` envelopes ride the sink stream.
+    #
+    # ``disable_judges=`` drops named built-ins from the *default* set.
+    # It is meaningless alongside an explicit ``judges=`` (which already
+    # spells out the exact set), so the combination is rejected loudly
+    # rather than silently ignoring one of the two.
+    if judges is not None and disable_judges is not None:
+        raise TypeError(
+            "goldfive.wrap: pass either judges= (the explicit judge list) "
+            "or disable_judges= (drop built-ins from the default set), not "
+            "both — an explicit judges= list already specifies the exact set."
+        )
     resolved_judges: list[Any]
     if judges is not None:
         resolved_judges = list(judges)
     else:
         from goldfive.builtin_judges import default_judges as _default_judges
 
-        resolved_judges = _default_judges()
+        resolved_judges = _default_judges(disable=disable_judges)
     set_judges = getattr(resolved_steerer, "set_judges", None)
     if callable(set_judges):
         set_judges(resolved_judges)
