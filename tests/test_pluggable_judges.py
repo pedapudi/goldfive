@@ -321,6 +321,46 @@ async def test_evaluate_judges_drift_flavour_emits_judgement_with_kind() -> None
     assert captured_drifts[0].severity is DriftSeverity.WARNING
 
 
+async def test_custom_drift_judge_emits_exactly_one_judgement() -> None:
+    """A custom drift-flavoured judge produces exactly ONE
+    ``JudgementEmitted`` — keyed on the judge's real ``name``.
+
+    The drift verdict also routes through ``_emit_drift_detected``
+    (the back-compat ``DriftDetected`` fan-out). That path has its own
+    paired ``JudgementEmitted`` emission for legacy detectors; it MUST
+    be suppressed here so the custom judge does not land two events
+    (one keyed on ``judge_name``, one on the drift kind) and break the
+    "join on judge_name" telemetry contract.
+    """
+    sink = ListSink()
+    steerer = goldfive.DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=_NullPlanner())  # type: ignore[arg-type]
+    steerer.set_judges(builtin_judges.default_judges())  # paired-emit armed
+    drift_verdict = JudgeVerdict(
+        drift_emitted=True,
+        drift_kind=str(DriftKind.AGENT_REFUSAL),
+        severity=str(DriftSeverity.WARNING),
+        detail="custom refusal grader matched",
+    )
+
+    # Route handle_drift straight to the real _emit_drift_detected so
+    # the paired-emission path runs without the full ladder machinery.
+    async def _emit_only(drift: DriftEvent, session: Session) -> None:
+        await steerer.drift._emit_drift_detected(session, drift)
+
+    steerer.drift.handle_drift = _emit_only  # type: ignore[method-assign]
+    custom = _StubJudge("my_grader", drift_verdict)
+    await steerer.evaluate_judges(
+        JudgeContext(), session=_make_session(), judges=[custom]
+    )
+    judgements = _judgement_events(sink)
+    assert len(judgements) == 1, "exactly one JudgementEmitted for the drift judge"
+    assert judgements[0].judge_name == "my_grader"
+    assert judgements[0].verdict_kind == "drift"
+    # The legacy DriftDetected envelope still fires (back-compat).
+    assert len(_drift_events(sink)) == 1
+
+
 async def test_evaluate_judges_swallows_judge_exception() -> None:
     sink = ListSink()
     steerer = goldfive.DefaultSteerer()

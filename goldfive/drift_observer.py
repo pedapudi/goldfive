@@ -472,7 +472,17 @@ class DriftObserver:
         # derived from the drift kind (e.g. ``"reasoning_drift"`` for
         # ``REASONING_DRIFT``). Back-compat preserved: the
         # ``DriftDetected`` envelope above is unchanged.
-        await self._emit_judgement_from_drift(session, drift)
+        #
+        # Skipped when the drift originated from a custom Judge that
+        # already emitted its own ``JudgementEmitted`` keyed on the
+        # judge's real ``name`` (see
+        # :meth:`DefaultSteerer.evaluate_judges`). Without this guard a
+        # custom drift-flavoured judge would land TWO ``JudgementEmitted``
+        # events for one signal — one keyed on ``judge_name``, one on the
+        # drift kind — and break the "join on judge_name" telemetry
+        # contract downstream consumers (zicato) rely on.
+        if not getattr(drift, "_judge_emitted_judgement", False):
+            await self._emit_judgement_from_drift(session, drift)
         # goldfive#271 follow-up: when a terminal drift fires the run
         # cannot recover on its own — any boundary still open at this
         # point belongs to an invocation that will not get a paired

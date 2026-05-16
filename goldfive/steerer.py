@@ -897,6 +897,13 @@ class DefaultSteerer:
             if getattr(verdict, "drift_emitted", False) and session is not None:
                 drift = self._drift_from_judge_verdict(verdict, judge_name=judge_name)
                 if drift is not None:
+                    # Mark the drift so the ``_emit_drift_detected``
+                    # paired-emission path does NOT emit a second
+                    # ``JudgementEmitted`` — ``_emit_judgement`` above
+                    # already published one keyed on the judge's real
+                    # ``name``. A non-wire runtime attribute (the proto
+                    # ``DriftDetected`` envelope is unaffected).
+                    drift._judge_emitted_judgement = True  # type: ignore[attr-defined]
                     try:
                         await self.drift.handle_drift(drift, session)
                     except Exception as exc:  # noqa: BLE001
