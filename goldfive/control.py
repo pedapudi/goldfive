@@ -14,7 +14,6 @@ imported by adapters and bridges without dragging in protobuf or grpc.
 from __future__ import annotations
 
 import asyncio
-import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -68,7 +67,11 @@ class AckResult(StrEnum):
 @dataclass
 class ControlMessage:
     kind: ControlKind
-    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    id: str = field(
+        default_factory=lambda: __import__(
+            "goldfive.runtime", fromlist=["seeded_uuid4"]
+        ).seeded_uuid4().hex
+    )
     payload: dict[str, Any] = field(default_factory=dict)
     issued_at_ms: int = 0
 

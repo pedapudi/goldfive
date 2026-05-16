@@ -40,13 +40,26 @@ import logging
 import os
 import re
 import sys
-import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+def _uuid_hex() -> str:
+    """Return a hex UUID4 string, deterministic when ``goldfive.runtime``
+    has installed a seed.
+
+    Indirection so :class:`DriftEvent.id` / :meth:`Session.next_event_id`
+    can route through :func:`goldfive.runtime.seeded_uuid4` without
+    incurring an import cycle: the module-level import of
+    :mod:`goldfive.runtime` is deferred to call time.
+    """
+    from goldfive.runtime import seeded_uuid4
+
+    return seeded_uuid4().hex
 
 
 class TaskStatus(StrEnum):
@@ -1081,7 +1094,7 @@ class Plan:
         only one install path post-Phase-4.
         """
         return cls(
-            id=uuid.uuid4().hex,
+            id=_uuid_hex(),
             run_id=run_id,
             goal_ids=(),
             tasks=(),
@@ -1432,7 +1445,7 @@ class DriftEvent:
     # ``trigger_event_id`` for a ``PlanRevised`` that the drift produced
     # when the drift was not minted from a user annotation. See
     # goldfive#199 / harmonograf#95 (rescope).
-    id: str = dataclasses.field(default_factory=lambda: uuid.uuid4().hex)
+    id: str = dataclasses.field(default_factory=_uuid_hex)
     # Short rendering of the data goldfive fed into the detector that
     # produced this drift — e.g. the reasoning block the LLM judge saw,
     # the activity summary shown to the goal-drift classifier, the tool
@@ -1615,6 +1628,77 @@ def filter_recent_events_by_kind(
     ]
 
 
+# Drift severity weights consumed by :attr:`Session.drift_summary`.
+# Values mirror the rank used by :func:`severity_rank` (INFO=0,
+# WARNING=1, CRITICAL=2) but bumped onto a 1/3/10 cost scale so a
+# single CRITICAL clearly dominates a noisy stream of INFOs in the
+# aggregate. Documented on :class:`DriftSummary` for callers that
+# want to substitute their own weights.
+_DRIFT_SEVERITY_WEIGHTS: dict[DriftSeverity, float] = {
+    DriftSeverity.INFO: 1.0,
+    DriftSeverity.WARNING: 3.0,
+    DriftSeverity.CRITICAL: 10.0,
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class DriftSummary:
+    """Aggregated view of every drift emitted on a :class:`Session`.
+
+    Built lazily by :attr:`Session.drift_summary` from the session's
+    ``drift_events`` list. Downstream optimizers consume this as a
+    cheap one-shot read of "what happened on this run" without
+    re-walking the event stream.
+
+    Severity weights default to ``{INFO: 1, WARNING: 3, CRITICAL: 10}``
+    — the same 1/3/10 cost scale already used informally in the
+    steerer's intervention ladder. ``total_severity_weight`` is the sum
+    of weights across :attr:`events`, useful as a scalar "how broken
+    was this run" metric for ranking trials in a tuning sweep.
+
+    Fields:
+
+    * :attr:`by_kind` — ``{DriftKind: count}`` per drift kind observed.
+      Missing kinds are absent (not 0); use ``.get(kind, 0)`` for a
+      safe lookup.
+    * :attr:`by_severity` — ``{DriftSeverity: count}`` per severity
+      observed.
+    * :attr:`events` — tuple of every :class:`DriftEvent` in emission
+      order (frozen reference to the underlying list at the time the
+      summary was built).
+    * :attr:`total_severity_weight` — sum of per-event weights.
+    """
+
+    by_kind: dict[DriftKind, int]
+    by_severity: dict[DriftSeverity, int]
+    events: tuple[DriftEvent, ...]
+    total_severity_weight: float
+
+    def __len__(self) -> int:
+        """Return the total number of drifts in the summary."""
+        return len(self.events)
+
+    def __bool__(self) -> bool:
+        """``True`` when at least one drift was observed."""
+        return bool(self.events)
+
+
+def _build_drift_summary(events: Sequence[DriftEvent]) -> DriftSummary:
+    by_kind: dict[DriftKind, int] = {}
+    by_severity: dict[DriftSeverity, int] = {}
+    total: float = 0.0
+    for drift in events:
+        by_kind[drift.kind] = by_kind.get(drift.kind, 0) + 1
+        by_severity[drift.severity] = by_severity.get(drift.severity, 0) + 1
+        total += _DRIFT_SEVERITY_WEIGHTS.get(drift.severity, 0.0)
+    return DriftSummary(
+        by_kind=by_kind,
+        by_severity=by_severity,
+        events=tuple(events),
+        total_severity_weight=total,
+    )
+
+
 @dataclasses.dataclass
 class Session:
     """Live state for one Runner.run() invocation.
@@ -1761,6 +1845,15 @@ class Session:
     # ``kind`` to recover the equivalent of the old buffers — see
     # :func:`goldfive.types.filter_recent_events_by_kind`.
     recent_events: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # Every ``DriftEvent`` emitted on this session (zicato-optimization-surface).
+    # Appended to by :meth:`~goldfive.drift_observer.DriftObserver._emit_drift_detected`
+    # just before the wire fan-out so the aggregate :attr:`Session.drift_summary`
+    # below sees every drift the session produced, in order. Unbounded by
+    # design — sessions are short-lived and the aggregate consumer
+    # (optimization harnesses, harmonograf-style summarisers) wants every
+    # entry, not a sliding window. Tests / long-running embedded callers
+    # who care about memory clear the list manually between turns.
+    drift_events: list[DriftEvent] = dataclasses.field(default_factory=list)
     # Monotonic-ish timestamp (``time.time()``, seconds since epoch) of the
     # last GOAL_DRIFT judge call fired via the task-boundary trigger
     # (goldfive#219). Prevents two task transitions <10s apart from paying
@@ -1899,7 +1992,7 @@ class Session:
         """
         if sequence is None:
             sequence = self.next_sequence()
-        suffix = uuid.uuid4().hex[:8]
+        suffix = _uuid_hex()[:8]
         return f"{self.run_id}:{sequence}:{suffix}"
 
     @property
@@ -1913,3 +2006,23 @@ class Session:
         a single stream carries events from multiple Sessions.
         """
         return self.run_id
+
+    @property
+    def drift_summary(self) -> DriftSummary:
+        """Aggregate every drift emitted on this session into one summary.
+
+        Snapshot of :attr:`drift_events` at call time — subsequent
+        emits do NOT update the returned summary in place; callers
+        re-read the property to see new drifts. The
+        :class:`DriftSummary` itself is frozen.
+
+        Severity weights are the 1/3/10 INFO/WARNING/CRITICAL scale
+        documented on :class:`DriftSummary`. A run that produced no
+        drifts returns an empty summary (``bool(summary) is False``);
+        callers can short-circuit on that.
+
+        Cost: O(N) where N is ``len(drift_events)``. Sessions usually
+        carry tens of drifts at most; if the caller anticipates many
+        repeated reads they can cache the return value themselves.
+        """
+        return _build_drift_summary(self.drift_events)

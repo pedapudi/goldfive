@@ -13,7 +13,6 @@ optional-dependency group.
 from __future__ import annotations
 
 import asyncio
-import uuid
 from typing import Any
 
 # NOTE: EventSink is a protocol with an async ``emit(event_pb)`` method.
@@ -86,8 +85,16 @@ def new_event(
     # supplied value (minted via Session.next_event_id); fall back to a
     # locally-minted ``{run_id}:{sequence}:{uuid4_short}`` so the field
     # is always non-empty AND globally unique on the wire even for
-    # out-of-band emitters that don't have a Session in scope.
-    evt.event_id = event_id or f"{run_id}:{sequence}:{uuid.uuid4().hex[:8]}"
+    # out-of-band emitters that don't have a Session in scope. The
+    # uuid4 here routes through ``goldfive.runtime.seeded_uuid4`` so
+    # determinism harnesses ({set_seed -> identical event streams})
+    # see byte-identical fallback ids.
+    if event_id:
+        evt.event_id = event_id
+    else:
+        from goldfive.runtime import seeded_uuid4
+
+        evt.event_id = f"{run_id}:{sequence}:{seeded_uuid4().hex[:8]}"
     return evt
 
 
@@ -130,9 +137,11 @@ def make_event(
     """
     import time
 
+    from goldfive.runtime import seeded_uuid4
+
     t = time.time_ns()
     return {
-        "event_id": event_id or f"{run_id}:{sequence}:{uuid.uuid4().hex[:8]}",
+        "event_id": event_id or f"{run_id}:{sequence}:{seeded_uuid4().hex[:8]}",
         "run_id": run_id,
         "sequence": sequence,
         "session_id": session_id,
@@ -986,6 +995,66 @@ def task_transition_refused_event(
         evt.task_transition_refused.current_revision = 0
     evt.task_transition_refused.agent_name = str(agent_name or "")
     evt.task_transition_refused.invocation_id = str(invocation_id or "")
+    return evt
+
+
+def steering_decision_made_event(
+    run_id: str,
+    sequence: int,
+    *,
+    detector_name: str,
+    outcome: str,
+    reason: str = "",
+    score: float = 0.0,
+    considered_severity: str = "",
+    chosen_severity: str = "",
+    considered_intervention_level: str = "",
+    chosen_intervention_level: str = "",
+    drift_id: str = "",
+    invocation_id: str = "",
+    task_id: str = "",
+    agent_name: str = "",
+    session_id: str = "",
+    event_id: str = "",
+) -> Any:
+    """Build a ``SteeringDecisionMade`` envelope (zicato-optimization-surface).
+
+    Emitted on every detector evaluation regardless of outcome, so
+    downstream optimizers get a training signal for BOTH the
+    positive-fire path (``outcome="drift_emitted"``) and the silent
+    path (``outcome="no_drift"``). Without this event there is no
+    on-the-wire record that a detector ran and chose NOT to act, so a
+    threshold-tuning optimizer is forced to infer non-fires from the
+    absence of a ``DriftDetected`` — which conflates "detector quiet"
+    with "detector never ran".
+
+    Field semantics mirror the proto message comment. ``decided_at`` is
+    stamped here from :func:`now_ts`; the caller supplies every other
+    field.
+
+    Sink contract: paired with ``DriftDetected`` when
+    ``outcome != "no_drift"``. The ``drift_id`` field cross-references
+    the paired ``DriftDetected.id`` so harmonograf-class consumers can
+    join the two rows. On the no-fire path ``drift_id`` is empty.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
+    payload = evt.steering_decision_made
+    payload.detector_name = str(detector_name or "")
+    payload.outcome = str(outcome or "")
+    payload.reason = str(reason or "")
+    try:
+        payload.score = float(score)
+    except (TypeError, ValueError):
+        payload.score = 0.0
+    payload.considered_severity = str(considered_severity or "")
+    payload.chosen_severity = str(chosen_severity or "")
+    payload.considered_intervention_level = str(considered_intervention_level or "")
+    payload.chosen_intervention_level = str(chosen_intervention_level or "")
+    payload.drift_id = str(drift_id or "")
+    payload.invocation_id = str(invocation_id or "")
+    payload.task_id = str(task_id or "")
+    payload.agent_name = str(agent_name or "")
+    payload.decided_at.CopyFrom(now_ts())
     return evt
 
 

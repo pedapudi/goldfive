@@ -59,8 +59,23 @@ class ListSink:
 
     @property
     def proto_events(self) -> list[Any]:
-        """goldfive a4: filter dict-envelope sidecars."""
-        return [e for e in self.events if hasattr(e, "WhichOneof")]
+        """goldfive a4: filter dict-envelope sidecars.
+
+        zicato-optimization-surface: ``steering_decision_made`` is an
+        observability-only paired event; filter it here so existing
+        order assertions keep their pre-#zicato semantics.
+        """
+        out: list[Any] = []
+        for e in self.events:
+            if not hasattr(e, "WhichOneof"):
+                continue
+            try:
+                if e.WhichOneof("payload") == "steering_decision_made":
+                    continue
+            except Exception:
+                pass
+            out.append(e)
+        return out
 
 
 class RecordingPlanner:

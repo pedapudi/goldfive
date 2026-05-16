@@ -96,7 +96,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -342,7 +341,9 @@ async def goldfive_llm_span(
     in-flight judge calls as red error spans. Cancel BEHAVIOUR is
     unchanged; this is an observability-only refinement.
     """
-    span_id = uuid.uuid4().hex
+    from goldfive.runtime import seeded_uuid4
+
+    span_id = seeded_uuid4().hex
     start_ns = time.time_ns()
     handle = GoldfiveLLMSpanHandle()
 

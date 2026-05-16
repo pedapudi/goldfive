@@ -826,7 +826,15 @@ async def test_inflight_key_cleared_after_dispatch_completes() -> None:
     # didn't permanently suppress this key.
     drift_second = _drift(observed_revision_index=3, severity=DriftSeverity.WARNING)
     await steerer.drift.handle_drift(drift_second, session)
-    assert len(planner.refine_calls) == 2, (
+    # Two same-(kind, target) WARNING drifts cross the
+    # ``REFINE_FAILURE_THRESHOLD`` and the second handler spawns a
+    # cascade-cancel TASK_FAILED_FATAL drift on a background task. That
+    # background task may or may not have run by the time control
+    # returns here depending on how many ``await`` points the dispatch
+    # chain crossed; assert >= 2 so this test stays honest about its
+    # invariant (a second drift dispatched, the inflight key was
+    # cleared) without coupling to the cascade's run-order.
+    assert len(planner.refine_calls) >= 2, (
         "second drift must dispatch -- the registry entry was cleared"
     )
 

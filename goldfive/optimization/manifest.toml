@@ -1,0 +1,386 @@
+# Goldfive steering-optimization manifest.
+#
+# This file is the source-of-truth inventory of every knob downstream
+# optimizers (e.g. pedapudi/zicato) are allowed to mutate on goldfive's
+# steering path. Each entry describes ONE mutation target — a prompt
+# body or a numeric threshold — with enough metadata for the optimizer
+# to:
+#
+#   * resolve the live current value (via ``source``);
+#   * validate a proposed new value against per-entry constraints;
+#   * group related entries (via ``tags``) when sweeping.
+#
+# Source paths
+# ------------
+# ``source`` carries one of two shapes:
+#
+#   * ``goldfive/optimization/prompts/<name>.md`` — points at the
+#     markdown copy of the prompt. The live runtime value is the
+#     Python attribute named in ``python_attr``; the markdown file is
+#     the optimizer-facing canonical text.
+#   * ``goldfive/<module>.py:<ATTR>`` — points at a module-level Python
+#     attribute that the optimizer mutates with ``setattr``.
+#
+# Numeric ``range`` is ``[low, high]`` inclusive. Defaults track the
+# repo's current value at manifest authorship time and are kept in
+# sync by tests in ``tests/test_optimization_manifest.py`` so a code-
+# side bump does not silently drift the manifest's notion of default.
+#
+# Adding a knob: append an entry here and add the corresponding
+# coverage row in ``tests/test_optimization_manifest.py``.
+
+# ---------------------------------------------------------------------------
+# Prompt knobs
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "reasoning_judge_system_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/reasoning_judge_system.md"
+python_attr = "goldfive.drift.reasoning_judge:REASONING_DRIFT_SYSTEM_PROMPT"
+description = "System half of the per-thinking-message reasoning-drift judge."
+required_placeholders = []
+tags = ["judge", "reasoning"]
+
+[[mutation]]
+id = "reasoning_judge_user_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/reasoning_judge_user.md"
+python_attr = "goldfive.drift.reasoning_judge:REASONING_DRIFT_USER_PROMPT_TEMPLATE"
+description = "User half of the per-thinking-message reasoning-drift judge. Rendered with .format(...)."
+required_placeholders = [
+    "{plan_tasks_summary}",
+    "{task_block}",
+    "{current_agent_id}",
+    "{task_lineage_block}",
+    "{goals_block}",
+    "{tool_obs_count}",
+    "{tool_obs_block}",
+    "{reasoning_block}",
+]
+tags = ["judge", "reasoning"]
+
+[[mutation]]
+id = "reasoning_judge_agent_tree_suffix"
+kind = "prompt"
+source = "goldfive/optimization/prompts/reasoning_judge_agent_tree_suffix.md"
+python_attr = "goldfive.drift.reasoning_judge:AGENT_TREE_SYSTEM_PROMPT_SUFFIX"
+description = "Optional system-prompt suffix appended when the reasoning judge is given an agent tree."
+required_placeholders = []
+tags = ["judge", "reasoning"]
+
+[[mutation]]
+id = "goal_drift_system_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/goal_drift_system.md"
+python_attr = "goldfive.drift.goals:GOAL_DRIFT_SYSTEM_PROMPT"
+description = "System half of the trajectory-level GOAL_DRIFT judge."
+required_placeholders = []
+tags = ["judge", "goal_drift"]
+
+[[mutation]]
+id = "goal_drift_user_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/goal_drift_user.md"
+python_attr = "goldfive.drift.goals:GOAL_DRIFT_USER_PROMPT_TEMPLATE"
+description = "User half of the trajectory-level GOAL_DRIFT judge. Rendered with .format(...)."
+required_placeholders = [
+    "{goals_block}",
+    "{tasks_block}",
+    "{activity_count}",
+    "{activity_block}",
+]
+tags = ["judge", "goal_drift"]
+
+[[mutation]]
+id = "reflective_check_system_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/reflective_check_system.md"
+python_attr = "goldfive.drift_observer:DriftObserver.REFLECTIVE_SYSTEM_PROMPT"
+description = "System half of the opt-in reflective self-progress check."
+required_placeholders = []
+tags = ["judge", "reflective"]
+
+[[mutation]]
+id = "reflective_check_user_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/reflective_check_user.md"
+python_attr = "goldfive.drift_observer:DriftObserver.REFLECTIVE_USER_PROMPT_TEMPLATE"
+description = "User half of the opt-in reflective self-progress check. Rendered with .format(...)."
+required_placeholders = [
+    "{task_id}",
+    "{task_title}",
+    "{task_description}",
+    "{window}",
+    "{tool_call_summary}",
+    "{reasoning_summary}",
+]
+tags = ["judge", "reflective"]
+
+[[mutation]]
+id = "refine_system_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/refine_system.md"
+python_attr = "goldfive.planner:_REFINE_SYSTEM_PROMPT"
+description = "System half of LLMPlanner.refine — applies on autonomous drifts (tool error, off-topic, looping, etc.)."
+required_placeholders = []
+tags = ["planner", "refine"]
+
+[[mutation]]
+id = "user_steer_system_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/user_steer_system.md"
+python_attr = "goldfive.planner:_USER_STEER_SYSTEM_PROMPT"
+description = "System half of LLMPlanner.refine when the trigger is a human USER_STEER directive."
+required_placeholders = []
+tags = ["planner", "refine", "user_steer"]
+
+[[mutation]]
+id = "looping_tool_call_system_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/looping_tool_call_system.md"
+python_attr = "goldfive.planner:_LOOPING_TOOL_CALL_SYSTEM_PROMPT"
+description = "System half of LLMPlanner.refine when the loop detector flagged a stuck tool-call pattern."
+required_placeholders = []
+tags = ["planner", "refine", "looping"]
+
+[[mutation]]
+id = "plan_divergence_system_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/plan_divergence_system.md"
+python_attr = "goldfive.planner:_PLAN_DIVERGENCE_SYSTEM_PROMPT"
+description = "System half of LLMPlanner.refine for PLAN_DIVERGENCE drifts (observed activity vs. planned dispatch)."
+required_placeholders = []
+tags = ["planner", "refine", "divergence"]
+
+[[mutation]]
+id = "plan_generate_system_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/plan_generate_system.md"
+python_attr = "goldfive.planner:_DEFAULT_SYSTEM_PROMPT"
+description = "System half of LLMPlanner.generate — produces the initial plan for a fresh run."
+required_placeholders = []
+tags = ["planner", "generate"]
+
+[[mutation]]
+id = "goal_derive_system_prompt"
+kind = "prompt"
+source = "goldfive/optimization/prompts/goal_derive_system.md"
+python_attr = "goldfive.goal_deriver:DEFAULT_SYSTEM_PROMPT"
+description = "System half of LLMGoalDeriver.derive — extracts goals from raw user input."
+required_placeholders = []
+tags = ["goal_deriver"]
+
+# ---------------------------------------------------------------------------
+# Reasoning-drift numeric thresholds
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "off_topic_distance_threshold"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:OFF_TOPIC_DISTANCE_THRESHOLD"
+python_attr = "goldfive.drift.reasoning:OFF_TOPIC_DISTANCE_THRESHOLD"
+description = "Cosine-distance threshold above which a reasoning block is flagged OFF_TOPIC."
+type = "float"
+range = [0.0, 1.0]
+default = 0.7
+tags = ["threshold", "reasoning", "off_topic"]
+
+[[mutation]]
+id = "looping_reasoning_similarity_threshold"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:LOOPING_REASONING_SIMILARITY_THRESHOLD"
+python_attr = "goldfive.drift.reasoning:LOOPING_REASONING_SIMILARITY_THRESHOLD"
+description = "Cosine-similarity threshold above which a reasoning block is flagged LOOPING_REASONING."
+type = "float"
+range = [0.5, 0.999]
+default = 0.9
+tags = ["threshold", "reasoning", "looping"]
+
+[[mutation]]
+id = "reasoning_cluster_similarity_threshold"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:REASONING_CLUSTER_SIMILARITY_THRESHOLD"
+python_attr = "goldfive.drift.reasoning:REASONING_CLUSTER_SIMILARITY_THRESHOLD"
+description = "Lower-tier cosine-similarity threshold for the REASONING_CLUSTER_TIGHTENING early-warning signal."
+type = "float"
+range = [0.4, 0.95]
+default = 0.75
+tags = ["threshold", "reasoning", "cluster"]
+
+[[mutation]]
+id = "looping_reasoning_hash_window"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:LOOPING_REASONING_HASH_WINDOW"
+python_attr = "goldfive.drift.reasoning:LOOPING_REASONING_HASH_WINDOW"
+description = "Number of prior reasoning blocks to compare against when checking for loops."
+type = "int"
+range = [2, 50]
+default = 5
+tags = ["threshold", "reasoning", "looping"]
+
+[[mutation]]
+id = "intent_divergence_healthy_similarity"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:INTENT_DIVERGENCE_HEALTHY_SIMILARITY"
+python_attr = "goldfive.drift.reasoning:INTENT_DIVERGENCE_HEALTHY_SIMILARITY"
+description = "Cosine-similarity above which reasoning vs. goals/task is considered healthy (no INTENT_DIVERGENCE drift)."
+type = "float"
+range = [0.0, 1.0]
+default = 0.6
+tags = ["threshold", "reasoning", "intent_divergence"]
+
+[[mutation]]
+id = "intent_divergence_minor_similarity"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:INTENT_DIVERGENCE_MINOR_SIMILARITY"
+python_attr = "goldfive.drift.reasoning:INTENT_DIVERGENCE_MINOR_SIMILARITY"
+description = "Lower bound for INFO-tier INTENT_DIVERGENCE. Below this and above WARNING bound, WARNING fires."
+type = "float"
+range = [0.0, 1.0]
+default = 0.4
+tags = ["threshold", "reasoning", "intent_divergence"]
+
+[[mutation]]
+id = "intent_divergence_warning_similarity"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:INTENT_DIVERGENCE_WARNING_SIMILARITY"
+python_attr = "goldfive.drift.reasoning:INTENT_DIVERGENCE_WARNING_SIMILARITY"
+description = "Lower bound for WARNING-tier INTENT_DIVERGENCE. Below this, CRITICAL fires."
+type = "float"
+range = [0.0, 1.0]
+default = 0.2
+tags = ["threshold", "reasoning", "intent_divergence"]
+
+[[mutation]]
+id = "sentence_level_min_block_length"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:SENTENCE_LEVEL_MIN_BLOCK_LENGTH"
+python_attr = "goldfive.drift.reasoning:SENTENCE_LEVEL_MIN_BLOCK_LENGTH"
+description = "Minimum character length for OFF_TOPIC's per-sentence sub-pass to engage."
+type = "int"
+range = [50, 4000]
+default = 200
+tags = ["threshold", "reasoning", "off_topic"]
+
+[[mutation]]
+id = "sentence_level_max_sentences"
+kind = "numeric"
+source = "goldfive/drift/reasoning.py:SENTENCE_LEVEL_MAX_SENTENCES"
+python_attr = "goldfive.drift.reasoning:SENTENCE_LEVEL_MAX_SENTENCES"
+description = "Upper bound on how many sentences OFF_TOPIC's per-sentence path checks per call."
+type = "int"
+range = [1, 100]
+default = 10
+tags = ["threshold", "reasoning", "off_topic"]
+
+# ---------------------------------------------------------------------------
+# Tool-loop numeric thresholds
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "tool_loop_window"
+kind = "numeric"
+source = "goldfive/drift/tool_loops.py:DEFAULT_WINDOW"
+python_attr = "goldfive.drift.tool_loops:DEFAULT_WINDOW"
+description = "Ring-buffer size for recent tool calls per (invocation_id, agent_name)."
+type = "int"
+range = [3, 100]
+default = 10
+tags = ["threshold", "tool_loops"]
+
+[[mutation]]
+id = "tool_loop_exact_threshold"
+kind = "numeric"
+source = "goldfive/drift/tool_loops.py:DEFAULT_EXACT_THRESHOLD"
+python_attr = "goldfive.drift.tool_loops:DEFAULT_EXACT_THRESHOLD"
+description = "Work-category WARNING exact-repeat threshold (same tool + same args)."
+type = "int"
+range = [2, 20]
+default = 3
+tags = ["threshold", "tool_loops"]
+
+[[mutation]]
+id = "tool_loop_name_threshold"
+kind = "numeric"
+source = "goldfive/drift/tool_loops.py:DEFAULT_NAME_THRESHOLD"
+python_attr = "goldfive.drift.tool_loops:DEFAULT_NAME_THRESHOLD"
+description = "Work-category WARNING name-repeat threshold (same tool, any args)."
+type = "int"
+range = [2, 20]
+default = 5
+tags = ["threshold", "tool_loops"]
+
+[[mutation]]
+id = "tool_loop_alternating_threshold"
+kind = "numeric"
+source = "goldfive/drift/tool_loops.py:DEFAULT_ALTERNATING_THRESHOLD"
+python_attr = "goldfive.drift.tool_loops:DEFAULT_ALTERNATING_THRESHOLD"
+description = "Alternating-pattern length threshold (A,B,A,B,A counts as a loop at 5)."
+type = "int"
+range = [3, 21]
+default = 5
+tags = ["threshold", "tool_loops"]
+
+# ---------------------------------------------------------------------------
+# Goal-drift scheduling
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "goal_drift_check_interval"
+kind = "numeric"
+source = "goldfive/drift/goals.py:GOAL_DRIFT_CHECK_INTERVAL"
+python_attr = "goldfive.drift.goals:GOAL_DRIFT_CHECK_INTERVAL"
+description = "Number of agent-invocation turns between trajectory-level GOAL_DRIFT judge calls."
+type = "int"
+range = [1, 100]
+default = 5
+tags = ["threshold", "goal_drift"]
+
+[[mutation]]
+id = "goal_drift_idle_seconds"
+kind = "numeric"
+source = "goldfive/drift/goals.py:GOAL_DRIFT_IDLE_SECONDS"
+python_attr = "goldfive.drift.goals:GOAL_DRIFT_IDLE_SECONDS"
+description = "Wall-clock idle threshold (seconds) above which the trajectory-level GOAL_DRIFT judge fires."
+type = "int"
+range = [10, 3600]
+default = 300
+tags = ["threshold", "goal_drift"]
+
+# ---------------------------------------------------------------------------
+# Reasoning-judge prompt size budgets
+# ---------------------------------------------------------------------------
+
+[[mutation]]
+id = "reasoning_drift_max_reasoning_chars"
+kind = "numeric"
+source = "goldfive/drift/reasoning_judge.py:REASONING_DRIFT_MAX_REASONING_CHARS"
+python_attr = "goldfive.drift.reasoning_judge:REASONING_DRIFT_MAX_REASONING_CHARS"
+description = "Truncation budget (chars) for the REASONING block inside the reasoning-judge prompt."
+type = "int"
+range = [200, 32768]
+default = 1500
+tags = ["threshold", "reasoning", "prompt_budget"]
+
+[[mutation]]
+id = "reasoning_drift_tool_obs_max_chars"
+kind = "numeric"
+source = "goldfive/drift/reasoning_judge.py:REASONING_DRIFT_TOOL_OBS_MAX_CHARS"
+python_attr = "goldfive.drift.reasoning_judge:REASONING_DRIFT_TOOL_OBS_MAX_CHARS"
+description = "Truncation budget (chars) for the RECENT TOOL OBSERVATIONS block in the reasoning-judge prompt."
+type = "int"
+range = [200, 32768]
+default = 1500
+tags = ["threshold", "reasoning", "prompt_budget"]
+
+[[mutation]]
+id = "reasoning_drift_tool_obs_max_entries"
+kind = "numeric"
+source = "goldfive/drift/reasoning_judge.py:REASONING_DRIFT_TOOL_OBS_MAX_ENTRIES"
+python_attr = "goldfive.drift.reasoning_judge:REASONING_DRIFT_TOOL_OBS_MAX_ENTRIES"
+description = "Maximum number of recent tool observations shown to the reasoning judge."
+type = "int"
+range = [1, 64]
+default = 8
+tags = ["threshold", "reasoning", "prompt_budget"]
