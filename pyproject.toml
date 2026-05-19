@@ -31,6 +31,17 @@ adk = [
 claude = [
     "anthropic>=0.39.0",
 ]
+# claude-agent-sdk integration (``goldfive.integrations.claude_sdk``).
+# Min version 0.1.80 is the first that ships the documented
+# ``permissionDecision="defer"`` + ``ResultMessage.deferred_tool_use``
+# contract the ``ClaudeAgentSDKLlm`` BaseLlm adapter relies on
+# (claude_agent_sdk/types.py:415 for the literal; types.py:1131 for
+# ``DeferredToolUse``). Earlier 0.1.x versions silently ignored
+# unknown ``permissionDecision`` values, which would surface as
+# "tool stuck pending permission" instead of the clean defer path.
+claude_sdk = [
+    "claude-agent-sdk>=0.1.80",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

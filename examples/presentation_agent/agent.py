@@ -795,7 +795,15 @@ async def _run(*, topic: str, mock: bool) -> Any:
         # ``GOOGLE_API_KEY``). That way an operator can keep planner/judges
         # on Max while running subagents on a cheaper / less rate-limited
         # model.
-        agent_model_name = os.environ.get("GOLDFIVE_EXAMPLE_MODEL", "claude-sonnet-4-6")
+        # Default to Haiku: it's the model this PR validated end-to-end
+        # (real research + real ``write_webpage`` tool calls + slide
+        # files land in ``output/``) once the parallel-function-call and
+        # AgentTool schema fixes shipped together with the adapter. Run
+        # with ``GOLDFIVE_EXAMPLE_MODEL=claude-sonnet-4-6`` for stronger
+        # delegation quality on harder topics — that path uses the same
+        # adapter and works identically, it just bills more Max usage
+        # per turn.
+        agent_model_name = os.environ.get("GOLDFIVE_EXAMPLE_MODEL", "claude-haiku-4-5")
         if agent_model_name.startswith("claude-"):
             agent_model = ClaudeAgentSDKLlm(model=agent_model_name)
         else:

@@ -261,9 +261,19 @@ def _genai_schema_to_json_schema(schema: Any) -> dict[str, Any]:
 
     Used to translate ADK's ``FunctionDeclaration.parameters`` (a Schema
     proto) into the dict shape claude-agent-sdk's ``@tool`` decorator
-    accepts. Handles the subset of Schema fields ADK tools actually
-    populate: ``type``, ``properties``, ``items``, ``required``,
-    ``description``, ``enum``. Unknown fields are dropped.
+    accepts. Pass-through fields:
+
+    * ``type``, ``properties``, ``items``, ``required``,
+      ``description``, ``enum`` — the structural backbone.
+    * ``nullable``, ``format``, ``default``, ``pattern`` —
+      constraint hints that downstream consumers (Claude when
+      constructing tool calls, ADK when validating returns) actually
+      use. Dropping these produces malformed tool calls that ADK then
+      rejects, triggering a retry loop noisy in logs and chewing into
+      the per-call ``max_turns`` budget. Pass them through.
+
+    Other Schema fields are dropped (intentional — we only translate
+    the surface ADK tools populate today).
     """
     if schema is None:
         return {"type": "object", "properties": {}, "required": []}
@@ -293,6 +303,12 @@ def _genai_schema_to_json_schema(schema: Any) -> dict[str, Any]:
     required = getattr(schema, "required", None)
     if required:
         out["required"] = list(required)
+
+    # Constraint hints — pass through when ADK populated them.
+    for attr in ("nullable", "format", "default", "pattern"):
+        val = getattr(schema, attr, None)
+        if val is not None:
+            out[attr] = val
 
     if "type" not in out:
         out["type"] = "object"
@@ -352,6 +368,15 @@ def _extract_input_schema_from_adk_tool(adk_tool: Any) -> dict[str, Any]:
     if declaration is None:
         declaration = getattr(adk_tool, "declaration", None)
     if declaration is not None:
+        # Check ``parameters_json_schema`` first. ADK gates which field
+        # is populated via ``FeatureName.JSON_SCHEMA_FOR_FUNC_DECL``;
+        # today ``parameters`` is the populated one, but if that flag
+        # flips in a future ADK upgrade and we don't read both, this
+        # extractor silently returns ``{"type": "object", "properties": {}}``
+        # — the same failure mode the PR's ``AgentTool`` fix addresses.
+        parameters_json = getattr(declaration, "parameters_json_schema", None)
+        if parameters_json:
+            return dict(parameters_json)
         parameters = getattr(declaration, "parameters", None)
         if parameters is not None:
             return _genai_schema_to_json_schema(parameters)
@@ -454,12 +479,34 @@ def make_claude_agent_sdk_llm_class() -> type:
         ``ClaudeSDKClient``, render the entire prior ADK conversation as
         a descriptive text transcript prepended to the user prompt, and
         register the ADK tool schemas via the SDK's MCP transport. A
-        ``PreToolUse`` hook returns ``defer`` so Claude's first tool
-        request is *captured* (not executed) and surfaced back to ADK as
-        a ``function_call`` ``Part``. ADK then runs the tool through its
-        normal pipeline (goldfive plugin observes), and the next ADK
-        invocation re-enters this method with the ``function_response``
-        appended to ``contents``.
+        ``PreToolUse`` hook returns ``defer`` so each tool request is
+        *captured* (not executed) and surfaced back to ADK as one
+        ``function_call`` ``Part`` per call (parallel tool_use blocks
+        from Claude are preserved as parallel ``function_call`` parts —
+        matching ADK's native Gemini path). ADK then runs each tool
+        through its normal pipeline (goldfive plugin observes), and the
+        next ADK invocation re-enters this method with the
+        ``function_response``\\ s appended to ``contents``.
+
+        The ``defer`` mechanism is SDK-supported as of
+        ``claude-agent-sdk>=0.1.80`` — see ``claude_agent_sdk/types.py``:
+
+        * ``PreToolUseHookSpecificOutput.permissionDecision``: the
+          literal includes ``"defer"`` (alongside ``allow``, ``deny``,
+          ``ask``);
+        * ``DeferredToolUse`` dataclass: docstring reads *"Tool use
+          that was deferred by a PreToolUse hook returning ``defer``.
+          The run stops and the result message carries the deferred
+          tool call here so the caller can inspect it and decide
+          whether to resume."*;
+        * ``ResultMessage.deferred_tool_use`` field + ``stop_reason ==
+          "tool_deferred"`` on the terminating message.
+
+        We rely on the ``stop_reason`` + the hook-captured calls, not
+        on ``ResultMessage.deferred_tool_use`` itself, because the hook
+        sees the call earlier in the stream (before SDK synthesises the
+        deferred-tool envelope on the closing ``ResultMessage``). Pin
+        is enforced via the ``goldfive[claude_sdk]`` extra.
 
         Why text replay instead of stateful client reuse: the SDK has
         no clean API for "given this transcript + tool history, give me
@@ -516,7 +563,14 @@ def make_claude_agent_sdk_llm_class() -> type:
                     f"{_MCP_TOOL_PREFIX}{name}" for name in adk_tools_dict.keys()
                 ]
 
-            captured_tool_call: dict[str, Any] = {}
+            # Capture *all* deferred tool calls (not just the first).
+            # ADK's ``BaseLlm`` contract permits multiple ``function_call``
+            # parts per ``LlmResponse`` and dispatches them in parallel —
+            # matching the native ADK + Gemini path. The earlier
+            # "first call wins" shape silently dropped parallel tool_use
+            # blocks (e.g. ``[get_weather(Tokyo), get_weather(NYC)]``)
+            # which diverged from the Gemini behaviour.
+            captured_tool_calls: list[dict[str, Any]] = []
             valid_tool_names = set(mcp_tool_names)
 
             async def _defer_hook(
@@ -546,15 +600,13 @@ def make_claude_agent_sdk_llm_class() -> type:
                             ),
                         }
                     }
-                # Capture first ADK tool defer; ignore any subsequent
-                # calls in the same run (we'll only return the first to
-                # ADK and let it loop back for the next one).
-                if not captured_tool_call:
-                    captured_tool_call.update(
-                        name=name,
-                        args=input_data.get("tool_input", {}) or {},
-                        tool_use_id=tool_use_id or "",
-                    )
+                captured_tool_calls.append(
+                    {
+                        "name": name,
+                        "args": input_data.get("tool_input", {}) or {},
+                        "tool_use_id": tool_use_id or "",
+                    }
+                )
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
@@ -577,56 +629,78 @@ def make_claude_agent_sdk_llm_class() -> type:
                 hooks={"PreToolUse": [HookMatcher(hooks=[_defer_hook])]},
             )
 
-            text_chunks: list[str] = []
+            # Text bookkeeping: we keep the *preamble* (text emitted
+            # before any ``tool_use`` block) as a real ``Part`` because
+            # it's Claude's "let me check the weather first" framing.
+            # Text emitted *after* the first ``tool_use`` is the SDK's
+            # synthetic apology / "tool was deferred" artifact — discard.
+            preamble_chunks: list[str] = []
+            saw_tool_use_inline = False
+            last_usage: dict[str, Any] | None = None
             async with ClaudeSDKClient(options=opts) as client:
                 await client.query(user_prompt or "Please continue.")
                 async for msg in client.receive_response():
-                    # Pull plain text content; track tool_use via the
-                    # hook (captured_tool_call) rather than mid-stream
-                    # so we don't double-handle.
+                    # Surface usage from whichever ``AssistantMessage``
+                    # most recently reported it (per
+                    # ``claude_agent_sdk.types.AssistantMessage.usage``).
+                    msg_usage = getattr(msg, "usage", None)
+                    if msg_usage:
+                        last_usage = msg_usage
                     for block in getattr(msg, "content", []) or []:
                         btype = type(block).__name__
-                        if btype == "TextBlock":
+                        if btype == "TextBlock" and not saw_tool_use_inline:
                             text = getattr(block, "text", None)
                             if text:
-                                text_chunks.append(text)
-                    # Stop iterating once Claude has acknowledged the
-                    # deferred call (stop_reason=tool_deferred) — the
-                    # rest of the stream is the SDK winding down and
-                    # may include Claude's pre-defer apology text we
-                    # want to discard.
-                    stop_reason = getattr(msg, "stop_reason", None)
-                    if stop_reason == "tool_deferred":
+                                preamble_chunks.append(text)
+                        elif btype == "ToolUseBlock":
+                            # Flip the gate so subsequent text in *this*
+                            # stream goes to the discard bucket.
+                            saw_tool_use_inline = True
+                    if getattr(msg, "stop_reason", None) == "tool_deferred":
                         break
 
             parts: list[Any] = []
-            # When we defer a tool, Claude often emits an apology text
-            # block before the defer registers (e.g. "I apologize, the
-            # tool was unavailable…"). That's an artifact of the defer
-            # mechanism — discard it and surface only the function_call.
-            if not captured_tool_call:
-                joined = "".join(text_chunks).strip()
-                if joined:
-                    parts.append(genai_types.Part(text=joined))
-            else:
+            preamble = "".join(preamble_chunks).strip()
+            if preamble:
+                parts.append(genai_types.Part(text=preamble))
+            for call in captured_tool_calls:
                 parts.append(
                     genai_types.Part(
                         function_call=genai_types.FunctionCall(
-                            name=captured_tool_call["name"].removeprefix(
-                                _MCP_TOOL_PREFIX
-                            ),
-                            args=captured_tool_call["args"],
+                            name=call["name"].removeprefix(_MCP_TOOL_PREFIX),
+                            args=call["args"],
                         )
                     )
                 )
-
             if not parts:
+                # Always emit at least one part so ADK has something to
+                # walk. Empty-text ``Part`` keeps the response shape
+                # well-formed.
                 parts.append(genai_types.Part(text=""))
+
+            # Translate the SDK's ``usage`` (Anthropic's
+            # ``{input_tokens, output_tokens, ...}`` dict) into ADK's
+            # ``GenerateContentResponseUsageMetadata`` so the
+            # ``goldfive#172`` per-call instrumentation can log
+            # ``llm.usage.*`` instead of ``?``. Operators on Max care
+            # about this metric — without it, quota burn per goldfive
+            # run is invisible until the invoice arrives.
+            usage_metadata: Any = None
+            if last_usage:
+                input_tokens = last_usage.get("input_tokens")
+                output_tokens = last_usage.get("output_tokens")
+                total = (input_tokens or 0) + (output_tokens or 0)
+                usage_metadata = genai_types.GenerateContentResponseUsageMetadata(
+                    prompt_token_count=input_tokens,
+                    candidates_token_count=output_tokens,
+                    total_token_count=total or None,
+                )
 
             yield LlmResponse(
                 content=genai_types.Content(role="model", parts=parts),
                 partial=False,
                 turn_complete=True,
+                usage_metadata=usage_metadata,
             )
 
     return ClaudeAgentSDKLlm
@@ -635,6 +709,21 @@ def make_claude_agent_sdk_llm_class() -> type:
 # Module-level alias for convenience: ``ClaudeAgentSDKLlm = ...``. Built
 # lazily on first attribute access so that ``import
 # goldfive.integrations.claude_sdk`` stays cheap and dependency-light.
+#
+# Error contract:
+#
+# * Unknown attribute names → :class:`AttributeError` (standard
+#   Python protocol; lets ``hasattr`` answer ``False`` cleanly).
+# * Attribute is ``"ClaudeAgentSDKLlm"`` but ``claude-agent-sdk`` (or
+#   ``google-adk``) is not importable → the underlying
+#   :class:`ImportError` propagates with the install hint baked in by
+#   :func:`make_claude_agent_sdk_llm_class`. Surfacing the more
+#   informative ImportError is intentional: a generic
+#   ``AttributeError`` would point the caller at the *symbol* when the
+#   actual problem is a *missing dependency*. The trade-off is that
+#   ``hasattr(module, "ClaudeAgentSDKLlm")`` raises rather than
+#   returning ``False`` when the SDK is uninstalled — callers who need
+#   the soft-check semantics should catch ``ImportError`` explicitly.
 def __getattr__(name: str) -> Any:
     if name == "ClaudeAgentSDKLlm":
         cls = make_claude_agent_sdk_llm_class()
