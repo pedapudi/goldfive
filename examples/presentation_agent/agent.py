@@ -766,16 +766,30 @@ async def _run(*, topic: str, mock: bool) -> Any:
     """
     use_claude_sdk = bool(os.environ.get("GOLDFIVE_USE_CLAUDE_SDK"))
     judge_fallback_call_llm: Any | None = None
+    # Hoist the annotation so all branches share the union type — keeps
+    # mypy / pyright from narrowing to ``_MockLlm`` (the value type on
+    # the ``elif mock`` branch) which would lose the ``str`` arm.
+    agent_model: str | BaseLlm
     if use_claude_sdk:
         from goldfive.integrations.claude_sdk import make_call_llm
 
+        if mock:
+            # The Claude SDK branch supersedes ``--mock`` when both are
+            # set. Surface this in logs so a developer who left
+            # ``GOLDFIVE_USE_CLAUDE_SDK=1`` in their shell isn't
+            # confused by ``--mock`` being silently ignored.
+            log.info(
+                "presentation_agent: GOLDFIVE_USE_CLAUDE_SDK=1 set; "
+                "ignoring --mock and routing planner/goal-deriver/judges "
+                "through claude-agent-sdk."
+            )
         # Planner + goal-deriver + judges go through claude-agent-sdk →
         # Max billing. Subagent model uses ``GOLDFIVE_EXAMPLE_MODEL`` and
         # must be one ADK natively routes (litellm string like
         # ``openai/gpt-4o-mini`` or bare Google Gemini name with
         # ``GOOGLE_API_KEY``). A Claude ``BaseLlm`` adapter for subagents
         # is in development — see the PR thread for status.
-        agent_model: str | BaseLlm = os.environ.get(
+        agent_model = os.environ.get(
             "GOLDFIVE_EXAMPLE_MODEL", "gemini-2.5-flash-lite"
         )
         planner_call_llm = make_call_llm("claude-haiku-4-5")
