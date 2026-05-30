@@ -441,6 +441,71 @@ _TRANSCRIPT_EPILOGUE = (
 )
 
 
+def _defer_in_permission_decision(sdk_types: Any) -> bool | None:
+    """Whether ``"defer"`` is a permitted ``permissionDecision`` value.
+
+    Returns ``True``/``False`` when the ``permissionDecision`` ``Literal``
+    can be located and inspected on any TypedDict in
+    ``claude_agent_sdk.types``; returns ``None`` when the field or its
+    ``Literal`` can't be found/parsed (caller treats ``None`` as
+    "cannot verify — don't fail", to avoid false alarms on SDK layout
+    changes that don't actually drop the feature).
+    """
+    import typing
+
+    for obj in vars(sdk_types).values():
+        ann = getattr(obj, "__annotations__", None)
+        if not isinstance(ann, dict) or "permissionDecision" not in ann:
+            continue
+        # Walk the (possibly ``NotRequired[...]``-wrapped) hint looking
+        # for a nested ``Literal[...]`` and collect its string members.
+        found_literal = False
+        seen: set[str] = set()
+        stack = [ann["permissionDecision"]]
+        while stack:
+            cur = stack.pop()
+            if typing.get_origin(cur) is typing.Literal:
+                found_literal = True
+                seen.update(a for a in typing.get_args(cur) if isinstance(a, str))
+            else:
+                stack.extend(typing.get_args(cur))
+        return "defer" in seen if found_literal else None
+    return None
+
+
+def _verify_defer_contract() -> None:
+    """Fail loudly at the seam if the installed ``claude-agent-sdk`` no
+    longer exposes the ``defer`` PreToolUse contract this adapter is
+    built on.
+
+    The adapter pins ``claude-agent-sdk>=0.1.80`` with no upper bound and
+    keys its runtime behaviour on two SDK affordances that aren't visible
+    to the test suite (the SDK isn't a test dependency): the
+    ``permissionDecision="defer"`` value and the ``DeferredToolUse`` /
+    ``ResultMessage.deferred_tool_use`` envelope (``stop_reason ==
+    "tool_deferred"``). A future release that renames or drops these
+    would otherwise turn into a silent mid-run hang. This check converts
+    that into a clear error at class-build time.
+    """
+    from claude_agent_sdk import types as sdk_types
+
+    missing: list[str] = []
+    if not hasattr(sdk_types, "DeferredToolUse"):
+        missing.append("the DeferredToolUse type")
+    if _defer_in_permission_decision(sdk_types) is False:
+        missing.append('"defer" in the PreToolUse permissionDecision literal')
+    if missing:
+        raise RuntimeError(
+            "Installed claude-agent-sdk no longer exposes the defer "
+            "contract ClaudeAgentSDKLlm depends on (missing: "
+            + "; ".join(missing)
+            + "). The adapter pins claude-agent-sdk>=0.1.80 with no "
+            "upper bound; a newer release appears to have changed the "
+            "PreToolUse defer API. Pin a compatible version or update "
+            "the adapter."
+        )
+
+
 def make_claude_agent_sdk_llm_class() -> type:
     """Build the ADK ``BaseLlm`` subclass on demand.
 
@@ -460,6 +525,9 @@ def make_claude_agent_sdk_llm_class() -> type:
             "goldfive.integrations.claude_sdk requires `claude-agent-sdk`. "
             "Install it with: uv pip install claude-agent-sdk"
         ) from e
+    # Fail loudly now (not mid-run) if the installed SDK dropped the
+    # defer contract this adapter keys on.
+    _verify_defer_contract()
     try:
         from google.adk.models.base_llm import BaseLlm
         from google.adk.models.llm_request import LlmRequest
@@ -480,13 +548,30 @@ def make_claude_agent_sdk_llm_class() -> type:
         a descriptive text transcript prepended to the user prompt, and
         register the ADK tool schemas via the SDK's MCP transport. A
         ``PreToolUse`` hook returns ``defer`` so each tool request is
-        *captured* (not executed) and surfaced back to ADK as one
-        ``function_call`` ``Part`` per call (parallel tool_use blocks
-        from Claude are preserved as parallel ``function_call`` parts —
-        matching ADK's native Gemini path). ADK then runs each tool
-        through its normal pipeline (goldfive plugin observes), and the
-        next ADK invocation re-enters this method with the
-        ``function_response``\\ s appended to ``contents``.
+        *captured* (not executed) and surfaced back to ADK as a
+        ``function_call`` ``Part``. ADK then runs the tool through its
+        normal pipeline (goldfive plugin observes), and the next ADK
+        invocation re-enters this method with the
+        ``function_response`` appended to ``contents``.
+
+        One tool call per turn (parallel fan-out is serialised). Per the
+        ``DeferredToolUse`` contract below, returning ``defer`` *stops
+        the run* and the terminating ``ResultMessage`` carries a single
+        deferred tool call, so even when Claude emits several
+        ``tool_use`` blocks in one assistant message the SDK halts at
+        the first defer and the hook captures only one call before
+        ``generate_content_async`` breaks. The capture is kept as a
+        ``list`` so that *if* a future SDK fires several ``PreToolUse``
+        hooks before halting we surface them all (one ``function_call``
+        ``Part`` each; append-order == emission-order is best-effort),
+        but we do **not** claim that happens on ``>=0.1.80`` — it does
+        not, and a live two-tools-in-one-turn trace proving simultaneous
+        N-capture was not reproduced. When the model attempts to fan out
+        (more ADK ``tool_use`` blocks observed in the stream than were
+        captured) we ``log.warning`` so the serialisation is visible
+        rather than silent; ADK loops back and Claude re-issues the
+        remaining call(s) next turn, so the end state matches the native
+        Gemini path even though intra-turn parallelism is flattened.
 
         The ``defer`` mechanism is SDK-supported as of
         ``claude-agent-sdk>=0.1.80`` — see ``claude_agent_sdk/types.py``:
@@ -563,14 +648,17 @@ def make_claude_agent_sdk_llm_class() -> type:
                     f"{_MCP_TOOL_PREFIX}{name}" for name in adk_tools_dict.keys()
                 ]
 
-            # Capture *all* deferred tool calls (not just the first).
-            # ADK's ``BaseLlm`` contract permits multiple ``function_call``
-            # parts per ``LlmResponse`` and dispatches them in parallel —
-            # matching the native ADK + Gemini path. The earlier
-            # "first call wins" shape silently dropped parallel tool_use
-            # blocks (e.g. ``[get_weather(Tokyo), get_weather(NYC)]``)
-            # which diverged from the Gemini behaviour.
+            # Append (don't overwrite) each deferred ADK tool call. The
+            # SDK halts the run on the *first* ``defer`` (see the class
+            # docstring + the ``DeferredToolUse`` contract), so in
+            # practice this holds at most one entry per turn; the list
+            # shape is forward-compatible if a future SDK fires several
+            # ``PreToolUse`` hooks before halting. ``attempted_adk_calls``
+            # counts ADK ``tool_use`` blocks seen in the stream so we can
+            # warn when the model tried to fan out but only one call was
+            # captured (the rest serialise across ADK turns).
             captured_tool_calls: list[dict[str, Any]] = []
+            attempted_adk_calls = 0
             valid_tool_names = set(mcp_tool_names)
 
             async def _defer_hook(
@@ -618,6 +706,19 @@ def make_claude_agent_sdk_llm_class() -> type:
                     }
                 }
 
+            # ``tools`` and ``allowed_tools`` are intentionally *both*
+            # the ADK allowlist, and they do different jobs:
+            #   * ``tools`` is the visibility allowlist — only our
+            #     MCP-prefixed ADK tools are shown to the model, which
+            #     strips Claude Code's built-ins (TodoWrite/Task/…) so
+            #     the internal agent loop stays dormant.
+            #   * ``allowed_tools`` suppresses the interactive permission
+            #     ``ask`` the SDK would otherwise raise on each ADK tool
+            #     before our ``PreToolUse`` hook gets to ``defer`` it.
+            # ``setting_sources=[]`` is the SDK isolation knob (no
+            # CLAUDE.md / settings discovery). ``max_turns`` reuses the
+            # module constant so this path can't drift from
+            # ``make_call_llm``.
             opts = ClaudeAgentOptions(
                 system_prompt=system or None,
                 model=llm_request.model or self.model,
@@ -625,7 +726,7 @@ def make_claude_agent_sdk_llm_class() -> type:
                 mcp_servers=mcp_servers,
                 allowed_tools=mcp_tool_names,
                 setting_sources=[],
-                max_turns=5,
+                max_turns=_DEFAULT_MAX_TURNS,
                 hooks={"PreToolUse": [HookMatcher(hooks=[_defer_hook])]},
             )
 
@@ -637,6 +738,7 @@ def make_claude_agent_sdk_llm_class() -> type:
             preamble_chunks: list[str] = []
             saw_tool_use_inline = False
             last_usage: dict[str, Any] | None = None
+            last_stop_reason: Any = None
             async with ClaudeSDKClient(options=opts) as client:
                 await client.query(user_prompt or "Please continue.")
                 async for msg in client.receive_response():
@@ -646,6 +748,9 @@ def make_claude_agent_sdk_llm_class() -> type:
                     msg_usage = getattr(msg, "usage", None)
                     if msg_usage:
                         last_usage = msg_usage
+                    stop_reason = getattr(msg, "stop_reason", None)
+                    if stop_reason is not None:
+                        last_stop_reason = stop_reason
                     for block in getattr(msg, "content", []) or []:
                         btype = type(block).__name__
                         if btype == "TextBlock" and not saw_tool_use_inline:
@@ -656,8 +761,31 @@ def make_claude_agent_sdk_llm_class() -> type:
                             # Flip the gate so subsequent text in *this*
                             # stream goes to the discard bucket.
                             saw_tool_use_inline = True
-                    if getattr(msg, "stop_reason", None) == "tool_deferred":
+                            # Count ADK tool_use blocks the model emitted
+                            # so we can detect attempted fan-out the SDK
+                            # serialised by halting on the first defer.
+                            if getattr(block, "name", None) in valid_tool_names:
+                                attempted_adk_calls += 1
+                    if stop_reason == "tool_deferred":
                         break
+
+            # The model emitted more ADK tool calls than the SDK let us
+            # capture before halting on the first defer. ADK will loop
+            # back and Claude re-issues the rest next turn, but flag the
+            # serialisation so it's not a silent divergence from the
+            # native (parallel) Gemini path.
+            if attempted_adk_calls > len(captured_tool_calls):
+                log.warning(
+                    "goldfive.integrations.claude_sdk.ClaudeAgentSDKLlm: "
+                    "model emitted %d ADK tool calls in one turn but the "
+                    "SDK deferred only %d before halting (model=%s); the "
+                    "remaining %d will be re-issued on subsequent ADK "
+                    "turns (intra-turn parallelism is serialised)",
+                    attempted_adk_calls,
+                    len(captured_tool_calls),
+                    llm_request.model or self.model,
+                    attempted_adk_calls - len(captured_tool_calls),
+                )
 
             parts: list[Any] = []
             preamble = "".join(preamble_chunks).strip()
@@ -673,9 +801,22 @@ def make_claude_agent_sdk_llm_class() -> type:
                     )
                 )
             if not parts:
-                # Always emit at least one part so ADK has something to
-                # walk. Empty-text ``Part`` keeps the response shape
-                # well-formed.
+                # Neither preamble text nor a captured tool call — a bare
+                # empty model turn. To ADK this is indistinguishable from
+                # a legitimately empty response and is a prime suspect
+                # when a subagent stalls, so log loudly (mirrors the
+                # zero-output WARNING in ``make_call_llm``). We still
+                # emit one empty-text ``Part`` so the response shape
+                # stays well-formed for ADK to walk.
+                log.warning(
+                    "goldfive.integrations.claude_sdk.ClaudeAgentSDKLlm: "
+                    "claude-agent-sdk produced no text and no tool call "
+                    "(model=%s, stop_reason=%s, max_turns=%d); ADK will "
+                    "see an empty model turn",
+                    llm_request.model or self.model,
+                    last_stop_reason,
+                    _DEFAULT_MAX_TURNS,
+                )
                 parts.append(genai_types.Part(text=""))
 
             # Translate the SDK's ``usage`` (Anthropic's
