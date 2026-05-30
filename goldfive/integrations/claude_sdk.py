@@ -625,6 +625,24 @@ def make_claude_agent_sdk_llm_class() -> type:
         async def generate_content_async(
             self, llm_request: LlmRequest, stream: bool = False
         ) -> AsyncGenerator[LlmResponse, None]:
+            # Surface the text-replay cost curve once per adapter instance
+            # so operators see it in logs before the Anthropic invoice
+            # does. Each turn re-sends the full prior transcript, so input
+            # tokens grow linearly with turn count and cumulative spend is
+            # O(N^2) over an N-turn subagent run (the docstring explains
+            # why we accept this trade-off). Pair with the per-call
+            # ``usage_metadata`` now plumbed onto every ``LlmResponse`` to
+            # watch the curve climb.
+            if not getattr(self, "_warned_token_cost", False):
+                self._warned_token_cost = True
+                log.info(
+                    "goldfive.integrations.claude_sdk.ClaudeAgentSDKLlm: "
+                    "text-replay transport re-sends the full transcript "
+                    "each turn (model=%s); input tokens grow linearly and "
+                    "cumulative cost is ~O(N^2) over an N-turn subagent "
+                    "run. Watch per-call usage_metadata to track spend.",
+                    llm_request.model or self.model,
+                )
             system = _extract_system_instruction(llm_request.config)
             transcript = _render_contents_as_transcript(llm_request.contents)
             user_prompt = (

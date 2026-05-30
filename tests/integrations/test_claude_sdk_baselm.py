@@ -1013,6 +1013,39 @@ class TestGenerateContentAsync:
         assert [p.text for p in parts if p.text] == ["the answer is 42"]
         assert all(p.function_call is None for p in parts)
 
+    @pytest.mark.asyncio
+    async def test_token_cost_info_logged_once_per_instance(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The O(N^2) text-replay cost is surfaced via a one-shot INFO log
+        on the first call, and not repeated on subsequent calls of the
+        same adapter instance."""
+        from goldfive.integrations.claude_sdk import (
+            make_claude_agent_sdk_llm_class,
+        )
+
+        env = _install_baselm_env(
+            monkeypatch,
+            messages=[
+                _SdkMessage(content=[TextBlock("ok")], stop_reason="end_turn")
+            ],
+        )
+        cls = make_claude_agent_sdk_llm_class()
+        llm = cls(model="claude-haiku-4-5")
+        with caplog.at_level(
+            logging.INFO, logger="goldfive.integrations.claude_sdk"
+        ):
+            async for _ in llm.generate_content_async(_FakeLlmReq(tools_dict={})):
+                pass
+            async for _ in llm.generate_content_async(_FakeLlmReq(tools_dict={})):
+                pass
+        cost_logs = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.INFO and "O(N^2)" in r.getMessage()
+        ]
+        assert len(cost_logs) == 1, [r.getMessage() for r in caplog.records]
+
 
 # Module-level fixture: a clean import slate per test, like the
 # companion ``test_claude_sdk_call_llm.py`` file.
