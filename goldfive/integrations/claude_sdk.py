@@ -70,9 +70,74 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
-# Module-level so the test suite can assert on it without reaching
-# into ``_call``'s closure.
+# Module-level so the test suite can assert on it without reaching into
+# ``_call``'s closure, and so the BaseLlm adapter (``ClaudeAgentSDKLlm``)
+# can reuse the same turn budget instead of hardcoding its own.
 _DEFAULT_MAX_TURNS = 5
+
+
+def _import_sdk() -> tuple[Any, Any]:
+    """Lazily import the optional ``claude-agent-sdk``.
+
+    Returns ``(ClaudeAgentOptions, query)``. Raises :class:`ImportError`
+    with an install hint when the package is absent — the single owner of
+    that hint so every call site reports it identically. Imported lazily
+    so merely importing this module does not require the SDK.
+    """
+    try:
+        from claude_agent_sdk import ClaudeAgentOptions, query
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "goldfive.integrations.claude_sdk requires `claude-agent-sdk`. "
+            "Install it with: uv pip install claude-agent-sdk"
+        ) from e
+    return ClaudeAgentOptions, query
+
+
+def _build_agent_options(
+    *,
+    system: str | None,
+    model: str,
+    tools: list[Any],
+    max_turns: int = _DEFAULT_MAX_TURNS,
+    **extra: Any,
+) -> Any:
+    """Single source of truth for the ``ClaudeAgentOptions`` knobs shared
+    by every goldfive call site — ``make_call_llm`` here and the
+    ``ClaudeAgentSDKLlm`` BaseLlm adapter. Centralising them keeps the two
+    call sites from silently drifting on the SDK-isolation settings.
+
+    Fixed here and not overridable by callers:
+
+    * ``setting_sources=[]`` — disables the SDK's default discovery chain
+      (``~/.claude/settings.json``, project ``.claude/settings.json``,
+      project ``CLAUDE.md``). Without it, operator-local Claude config
+      leaks into every planner / judge prompt — e.g. a personal
+      ``CLAUDE.md`` ("respond in YAML", "be terse") would silently
+      corrupt the structured-JSON output goldfive parsers expect,
+      surfacing downstream as "unparseable verdict" with no obvious cause.
+
+    What legitimately varies between call sites is passed in:
+
+    * ``tools`` — ``make_call_llm`` passes ``[]`` to strip Claude Code's
+      built-in tools (TodoWrite, Task, Read, Bash, …) so the internal
+      agent loop stays dormant for short structured prompts. The BaseLlm
+      adapter passes its MCP-prefixed ADK tool allowlist instead.
+      ``allowed_tools=[]`` is NOT the isolation knob: it only suppresses
+      permission prompts; the tools stay visible to the model. Callers
+      needing an ``allowed_tools`` allowlist (plus ``mcp_servers`` /
+      ``hooks``) pass them through ``**extra``.
+    * ``max_turns`` — defaults to :data:`_DEFAULT_MAX_TURNS`.
+    """
+    ClaudeAgentOptions, _ = _import_sdk()
+    return ClaudeAgentOptions(
+        system_prompt=system or None,
+        model=model,
+        tools=tools,
+        setting_sources=[],
+        max_turns=max_turns,
+        **extra,
+    )
 
 
 def make_call_llm(
@@ -91,38 +156,21 @@ def make_call_llm(
     ``claude_agent_sdk`` is not importable. We import lazily so simply
     importing this module does not require the SDK to be installed.
     """
-    try:
-        from claude_agent_sdk import ClaudeAgentOptions, query
-    except ImportError as e:  # pragma: no cover
-        raise ImportError(
-            "goldfive.integrations.claude_sdk requires `claude-agent-sdk`. "
-            "Install it with: uv pip install claude-agent-sdk"
-        ) from e
+    # Validate the optional dependency eagerly so misconfiguration
+    # surfaces at wiring time, not on the first planner / judge call.
+    # ``query`` is captured for the closure below.
+    _, query = _import_sdk()
 
     async def _call(system: str, prompt: str, model: str) -> str:
-        # Two SDK-isolation knobs (must agree with the BaseLlm adapter
-        # in a follow-up PR):
-        #
-        # * ``setting_sources=[]`` — disables the SDK's default
-        #   discovery chain (``~/.claude/settings.json``, project
-        #   ``.claude/settings.json``, project ``CLAUDE.md``). Without
-        #   it, operator-local Claude config leaks into every
-        #   planner / judge prompt — e.g. a personal CLAUDE.md
-        #   ("respond in YAML", "be terse") would silently corrupt the
-        #   structured-JSON output goldfive parsers expect, surfacing
-        #   downstream as "unparseable verdict" with no obvious cause.
-        # * ``tools=[]`` — strips Claude Code's built-in tools
-        #   (TodoWrite, Task, Read, Bash, …) from Claude's view, which
-        #   keeps the internal agent loop dormant for these short
-        #   structured prompts. ``allowed_tools=[]`` is NOT the right
-        #   knob here: it only suppresses permission prompts; the tools
-        #   stay visible to the model.
-        opts = ClaudeAgentOptions(
-            system_prompt=system or None,
+        # ``tools=[]`` gives this call site full isolation — no tools at
+        # all — so the SDK's agent loop stays dormant for short
+        # structured prompts. The isolation knobs (``setting_sources=[]``,
+        # ``max_turns``) live in ``_build_agent_options`` so this call
+        # site and the BaseLlm adapter can't drift.
+        opts = _build_agent_options(
+            system=system,
             model=model or default_model,
             tools=[],
-            setting_sources=[],
-            max_turns=_DEFAULT_MAX_TURNS,
         )
         chunks: list[str] = []
         last_stop_reason: Any = None
