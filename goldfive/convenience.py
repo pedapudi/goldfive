@@ -31,7 +31,7 @@ from goldfive.adapters.auto import auto_adapter, is_adk_agent
 from goldfive.config import JudgeConfig, RuntimeConfig
 from goldfive.executors.sequential import SequentialExecutor
 from goldfive.goal_deriver import LiteralGoalDeriver, LLMGoalDeriver
-from goldfive.planner import LLMPlanner, PassthroughPlanner
+from goldfive.planner import LLMPlanner, PassthroughPlanner, StaticPlanner
 from goldfive.protocols import (
     EventSink,
     Executor,
@@ -43,13 +43,67 @@ from goldfive.results import ExecutionOutcome
 from goldfive.runner import Runner
 from goldfive.sinks import LoggingSink
 from goldfive.steerer import DefaultSteerer
-from goldfive.types import Goal
+from goldfive.types import Goal, Plan, Task
 
 if TYPE_CHECKING:
     from goldfive.control import ControlChannel
     from goldfive.judges.builtins import BuiltinJudge
 
 log = logging.getLogger("goldfive.wrap")
+
+
+#: Stable task id for the synthetic single-task plan that judge-only mode
+#: installs. Kept distinct so operators can recognise it in transcripts /
+#: telemetry as the framing task the native run executed under.
+_JUDGE_ONLY_TASK_ID = "judge_only_native_run"
+
+
+def _build_judge_only_planner() -> StaticPlanner:
+    """Return the planner that drives a NATIVE, un-steered agent run.
+
+    Judge-only mode runs the wrapped agent natively while keeping the
+    drift judges armed, and issues ZERO planning / steering LLM calls.
+    The recipe (validated downstream): a :class:`StaticPlanner` carrying
+    a single task.
+
+    Why a one-task :class:`StaticPlanner` rather than
+    :class:`PassthroughPlanner`:
+
+    * :class:`PassthroughPlanner` returns ``None`` from ``generate`` /
+      ``handle_turn``, so the Runner has no plan to execute and the run
+      aborts with an EMPTY transcript — nothing for the judges to score.
+    * :class:`StaticPlanner` returns a baked single-task plan. Under the
+      overlay executor (``SequentialExecutor(overlay_mode=True)``, the
+      ``wrap()`` default) that drives ONE ``invoke_passthrough`` of the
+      native agent tree against the user's input — a real transcript is
+      produced — and ``refine`` returns ``None`` so no refine / steer
+      planning call ever fires.
+
+    The single task's ``assignee_agent_id`` is intentionally left empty:
+    overlay dispatch runs the native tree regardless of assignee, and
+    the framework populates assignment observationally (goldfive#252).
+    The task is pure framing so the Gantt / transcript has a node to
+    hang native activity under.
+    """
+    return StaticPlanner(
+        Plan(
+            id="",
+            run_id="",
+            goal_ids=(),
+            tasks=(
+                Task(
+                    id=_JUDGE_ONLY_TASK_ID,
+                    title="Native agent run (judge-only)",
+                    description=(
+                        "Run the wrapped agent natively with no planning or "
+                        "steering overlay; drift judges stay armed."
+                    ),
+                ),
+            ),
+            edges=(),
+            summary="Native agent run (judge-only mode)",
+        )
+    )
 
 
 def _build_judge_call_llm(config: JudgeConfig) -> tuple[CallLLM, str] | None:
@@ -225,6 +279,7 @@ def wrap(
     runtime: RuntimeConfig | None = None,
     dynamic_instruction: bool = True,
     drift_self_reporting: bool | list[str] = False,
+    judge_only: bool = False,
     llm_detector: Any = None,
     judge_call_llm_builder: Any = None,
     judges: list[Any] | None = None,
@@ -372,6 +427,42 @@ def wrap(
         steerer's refine machinery) remain the canonical detectors.
         Pass ``True`` to restore the full pre-#196 set, or a list of
         drift tool names to enable a subset.
+    judge_only:
+        First-class JUDGE-ONLY mode. Default ``False`` — behaviour is
+        byte-identical to today (the full planning overlay runs:
+        goal-derivation, per-turn planning, refine, and drift-reactive
+        steering).
+
+        When ``True`` the wrapped agent runs NATIVELY while the drift
+        judges stay armed, and NO planning / steering LLM call is ever
+        issued (no goal-derive, no plan / refine, no drift-reactive
+        steering). This is the mode an evaluation / benchmarking harness
+        wants: judge an agent's own NATIVE behaviour without goldfive
+        steering it.
+
+        It is a convenience that sets the defaults for ``planner`` and
+        ``goal_deriver``; it does NOT touch the judges (they remain wired
+        from ``call_llm`` / the detected tree LLM / ``JudgeConfig`` exactly
+        as in full mode). Concretely, when the caller did not supply them:
+
+        * ``planner`` defaults to a :class:`StaticPlanner` carrying a
+          single framing task. Under the overlay executor that drives ONE
+          native ``invoke_passthrough`` of the agent tree — a real
+          transcript is produced — and its ``refine`` returns ``None`` so
+          no refine / steer planning call fires. (A
+          :class:`PassthroughPlanner` would instead return ``None`` from
+          ``generate`` and ABORT the run with an empty transcript — the
+          trap this mode exists to avoid.)
+        * ``goal_deriver`` defaults to :class:`LiteralGoalDeriver`, which
+          wraps the user input as a single goal WITHOUT an LLM call (vs
+          the goal-derive LLM call :class:`LLMGoalDeriver` would make).
+
+        An explicit ``planner=`` / ``goal_deriver=`` / ``steerer=`` still
+        wins — ``judge_only`` only supplies the defaults. Note that
+        ``SteeringConfig.observation_only`` does NOT achieve this: it
+        gates only the three drift-reactive INJECTION points, while the
+        planner's goal-derivation / per-turn planning / refine still run
+        and burn LLM calls.
 
     Returns
     -------
@@ -510,9 +601,7 @@ def wrap(
     # :func:`_build_judge_call_llm` for this call. Same pattern as
     # ``llm_detector`` above — leave ``None`` in production.
     judge_builder = (
-        judge_call_llm_builder
-        if judge_call_llm_builder is not None
-        else _build_judge_call_llm
+        judge_call_llm_builder if judge_call_llm_builder is not None else _build_judge_call_llm
     )
     if call_llm is None and resolved_runtime.judge.base_url:
         built = judge_builder(resolved_runtime.judge)
@@ -557,6 +646,13 @@ def wrap(
     resolved_planner: Planner
     if planner is not None:
         resolved_planner = planner
+    elif judge_only:
+        # Judge-only mode: a one-task StaticPlanner drives a native
+        # overlay run (real transcript) while issuing zero planning
+        # LLM calls — no generate-time plan synthesis, and refine
+        # returns None so no refine / steer call fires. See the
+        # ``judge_only`` docstring and :func:`_build_judge_only_planner`.
+        resolved_planner = _build_judge_only_planner()
     elif resolved_call_llm is not None:
         resolved_planner = LLMPlanner(call_llm=resolved_call_llm, model=resolved_model)
     else:
@@ -570,6 +666,10 @@ def wrap(
     resolved_goal_deriver: GoalDeriver
     if goal_deriver is not None:
         resolved_goal_deriver = goal_deriver
+    elif judge_only:
+        # Judge-only mode: wrap the user input as a single goal without
+        # an LLM call (LLMGoalDeriver would issue a goal-derive call).
+        resolved_goal_deriver = LiteralGoalDeriver()
     elif resolved_call_llm is not None:
         resolved_goal_deriver = LLMGoalDeriver(
             call_llm=resolved_call_llm,
