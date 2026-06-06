@@ -650,6 +650,21 @@ class SequentialExecutor(Executor):
                         reason=f"drift_pipeline_failed: {observe_exc}",
                     )
 
+            # zicato#12 mechanism 1: record the agent's COMPLETE actual output
+            # as the canonical gradeable artifact, INDEPENDENT of whether the
+            # agent self-reported via ``report_task_completed``. When the agent
+            # self-reports, the task is already terminal by the time the
+            # auto-transition below runs, so the ``detail=summary`` write path
+            # is skipped and ``completed_results`` would keep only the
+            # self-authored summary. ``completed_outputs`` always carries the
+            # full assistant text so a grader can match the real output. The
+            # self-reported summary remains in ``completed_results`` as
+            # separate metadata — it never shadows the real output here.
+            if result is not None and getattr(result, "error", None) is None:
+                full_output = getattr(result, "full_text", "") or getattr(result, "text", "") or ""
+                if full_output:
+                    session.completed_outputs[task.id] = full_output
+
             # Re-read the task's tracked status after the invocation.
             tracked = _find_task(session.plan or current_plan, task.id)
             tracked_status = tracked.status if tracked is not None else TaskStatus.PENDING

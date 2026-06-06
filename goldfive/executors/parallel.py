@@ -345,6 +345,13 @@ class ParallelDAGExecutor:
                             )
                         if inv is not None:
                             session.completed_results[task.id] = inv.text
+                            # zicato#12 mechanism 1: full-fidelity actual
+                            # output (every turn), recorded as the canonical
+                            # gradeable artifact alongside the legacy
+                            # last-turn ``completed_results`` write.
+                            full_output = inv.full_text or inv.text or ""
+                            if full_output:
+                                session.completed_outputs[task.id] = full_output
                     completed_stage_ids.add(task.id)
 
                 # If a STEER arrived mid-stage, apply it now (stage was

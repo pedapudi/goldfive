@@ -1329,6 +1329,123 @@ async def test_observer_exception_emits_pipeline_failure_drift() -> None:
     assert "classifier exploded" in pipeline_failures[0].drift_detected.detail
 
 
+async def test_completed_outputs_records_full_output_on_self_report() -> None:
+    """zicato#12 mechanism 1: when the agent self-reports completion (task is
+    already terminal by the time the executor's auto-transition runs), the
+    full actual output must still land in ``completed_outputs`` — independent
+    of the lossy self-authored ``completed_results`` summary.
+    """
+    plan = _linear_plan(1)
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    real_answer = "row id KEYWORD_____ID_x_y_V2 = 17 (full table dump follows)…"
+
+    async def _self_report(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        # Emulate report_task_completed: the task is ALREADY terminal and
+        # completed_results holds only the agent-authored summary line.
+        await steerer.transition(task.id, TaskStatus.COMPLETED, session=session)
+        session.completed_results[task.id] = "Found the KEYWORD table."
+        # The invocation envelope carries the agent's REAL output across turns.
+        return InvocationResult(
+            task_id=task.id,
+            text="Done — anything else?",
+            text_turns=[real_answer, "Done — anything else?"],
+        )
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_self_report)
+    executor = SequentialExecutor(max_task_invocations=1)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    assert outcome.success is True
+    # Self-report summary is preserved as metadata (unchanged behavior).
+    assert session.completed_results["t0"] == "Found the KEYWORD table."
+    # Full actual output is the canonical gradeable artifact and carries the
+    # exact id a grader needs.
+    assert "KEYWORD_____ID_x_y_V2" in session.completed_outputs["t0"]
+    assert real_answer in session.completed_outputs["t0"]
+
+
+async def test_completed_outputs_on_clean_return_without_self_report() -> None:
+    """When the agent returns cleanly WITHOUT self-reporting, the executor
+    auto-transitions to COMPLETED and ``completed_outputs`` still captures the
+    full output (here, multi-turn)."""
+    plan = _linear_plan(1)
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _clean_return(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        # No transition, no completed_results write — clean return only.
+        return InvocationResult(
+            task_id=task.id,
+            text="wrap up",
+            text_turns=["substantive answer with TOKEN_42", "wrap up"],
+        )
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_clean_return)
+    executor = SequentialExecutor(max_task_invocations=1)
+    outcome = await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+
+    assert outcome.success is True
+    # The full output is captured for graders even on a clean auto-transition
+    # (the executor records completed_outputs directly off the invocation
+    # envelope, independent of whether the task self-reported).
+    assert "TOKEN_42" in session.completed_outputs["t0"]
+    assert session.completed_outputs["t0"].endswith("wrap up")
+
+
+async def test_completed_outputs_not_recorded_on_error() -> None:
+    """An invocation that carried an error records no gradeable output."""
+    plan = _linear_plan(1)
+    session = _fresh_session()
+    steerer = StubSteerer()
+    planner = StubPlanner()
+    sink = RecordingSink()
+
+    async def _errored(
+        task: Task, session: Session, steerer: StubSteerer, planner: StubPlanner
+    ) -> InvocationResult:
+        return InvocationResult(
+            task_id=task.id,
+            text="partial",
+            error=RuntimeError("boom"),
+        )
+
+    adapter = StubAdapter(steerer=steerer, planner=planner, on_invoke=_errored)
+    executor = SequentialExecutor(max_task_invocations=1, fail_fast=False)
+    await executor.run(
+        plan=plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=planner,
+        sinks=[sink],
+    )
+    assert "t0" not in session.completed_outputs
+
+
 def test_deprecation_warning_fires_for_old_kwarg() -> None:
     """Passing ``max_plan_reinvocations=`` emits a :class:`DeprecationWarning`
     and maps to the new attribute name.

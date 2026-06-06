@@ -101,6 +101,12 @@ class Conversation:
     started_at_ms: int
     goals: list[Goal] = dataclasses.field(default_factory=list)
     completed_results: dict[str, str] = dataclasses.field(default_factory=dict)
+    # zicato#12: merged ``task_id -> full actual output`` map across turns,
+    # the cross-turn mirror of :attr:`goldfive.types.Session.completed_outputs`.
+    # Carried alongside ``completed_results`` (the self-reported summary) so a
+    # later turn / planner / grader sees prior turns' real output, not only the
+    # summary.
+    completed_outputs: dict[str, str] = dataclasses.field(default_factory=dict)
     turns: list[TurnRecord] = dataclasses.field(default_factory=list)
     # Conversation-level wire sequence cursor (goldfive#271 Gap 2).
     # Each turn's :class:`Session` seeds its private ``_next_sequence``
@@ -173,6 +179,7 @@ class Conversation:
             started_at_ms=_now_ms(),
             goals=list(self.goals),
             completed_results=dict(self.completed_results),
+            completed_outputs=dict(self.completed_outputs),
             _next_sequence=self._next_sequence,
         )
 
@@ -290,6 +297,9 @@ class Conversation:
         # that a revised result on a follow-up turn is visible to the
         # turn after it.
         self.completed_results.update(session.completed_results)
+        # zicato#12: carry the full actual output forward with the same
+        # later-turns-win merge semantics as ``completed_results``.
+        self.completed_outputs.update(session.completed_outputs)
 
         # goldfive#271 Gap 2: lift the turn's high-water sequence back to
         # the Conversation cursor so the next ``next_turn_session()``

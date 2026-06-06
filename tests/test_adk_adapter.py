@@ -1326,6 +1326,49 @@ async def test_heal_is_noop_when_no_pending_calls() -> None:
     assert runner_empty.session_service.appended == []
 
 
+async def test_invoke_captures_all_text_turns_full_text() -> None:
+    """zicato#12 mechanism 2: every non-empty assistant text turn is captured.
+
+    The substantive turn (with the exact id a grader needs) lands in
+    ``full_text`` / ``text_turns``, while ``text`` keeps only the LAST turn for
+    backward compatibility.
+    """
+    from google.adk.events.event import Event  # type: ignore
+    from google.genai import types  # type: ignore
+
+    from goldfive.adapters.adk import ADKAdapter
+    from goldfive.results import TURN_SEPARATOR
+    from goldfive.types import Session, Task
+
+    agent = _make_agent()
+    substantive = "Result rows: KEYWORD_____ID_x_y_V2, KEYWORD_____ID_a_b_V1"
+    wrapup = "Done — let me know if you need anything else."
+
+    def _text_event(text: str):
+        return Event(
+            invocation_id="inv-mt",
+            author="test_agent",
+            content=types.Content(role="model", parts=[types.Part(text=text)]),
+        )
+
+    async def _run():
+        yield _text_event(substantive)
+        yield _text_event(wrapup)
+
+    runner = _FakeRunner(_run, agent)
+    adapter = ADKAdapter(runner, session_id="sess-mt")
+    result = await adapter.invoke(Task(id="t1", title="x"), Session(run_id="r"))
+
+    # Legacy field: last turn only.
+    assert result.text == wrapup
+    # Full-fidelity channel: both turns, in order.
+    assert result.text_turns == [substantive, wrapup]
+    assert result.full_text == TURN_SEPARATOR.join([substantive, wrapup])
+    # The id the grader needs survives in full_text but NOT in text.
+    assert "KEYWORD_____ID_x_y_V2" in result.full_text
+    assert "KEYWORD_____ID_x_y_V2" not in result.text
+
+
 # ---------------------------------------------------------------------------
 # goldfive#139 — reason-differentiated synthetic response content +
 # USER_STEER user-role primer event. The prior generic content shape
