@@ -4,6 +4,39 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 
 ## Unreleased — 2026-05-11
 
+### Evaluation / output capture
+
+- **The agent's complete actual output is now the canonical gradeable
+  artifact, captured independent of the self-report
+  ([zicato#12](https://github.com/pedapudi/zicato/issues/12)).**
+  Evaluation previously keyed off either the agent-authored
+  `report_task_completed(summary=…)` status line (`session.completed_results`)
+  or `InvocationResult.text` — the LAST assistant turn only. Both are
+  lossy: graders ended up scoring *how the agent narrated what it did*
+  rather than *what it did*, injecting verdict noise that is especially
+  damaging in optimization loops. This change is **purely additive and
+  backward-compatible**:
+  - `InvocationResult` gains `text_turns` (every non-empty assistant
+    text turn, in order) and `full_text` (the turns joined by
+    `goldfive.results.TURN_SEPARATOR`). `text` is unchanged — still the
+    final turn — so existing consumers see no behavioural change.
+    `full_text` falls back to `text` when an adapter does not track
+    per-turn text. The ADK adapter now accumulates all turns.
+  - `Session` gains `completed_outputs: dict[str, str]`, the full actual
+    output per task, recorded by the sequential and parallel executors
+    **regardless of whether the agent self-reported**.
+    `completed_results` (the summary) is retained unchanged as separate
+    metadata and never shadows the real output. The map carries across
+    conversation turns alongside `completed_results` (later-turns-win)
+    and is cleared in lockstep when a task is reset to PENDING.
+  - Existing consumers of `completed_results` / `InvocationResult.text`
+    (`adk_wrap`, the Claude adapter, persistence reconstruction, planner
+    context) are untouched — they keep their current semantics.
+  - New evaluator-author contract doc: `docs/guides/evaluation.md`
+    (read `completed_outputs` / `full_text`, not the summary / last
+    turn; previews are previews; `report_task_completed(artifacts=…)` is
+    the exact-match-friendly structured channel). `api.md` updated.
+
 ### Judges
 
 - **`JudgeVerdict.drift_kind` / `severity` are now enum-typed.** The two

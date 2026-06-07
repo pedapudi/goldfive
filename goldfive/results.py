@@ -10,13 +10,38 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+#: Separator placed between successive assistant text turns when an adapter
+#: joins them into :attr:`InvocationResult.full_text`. A blank line keeps the
+#: turns visually distinct without inventing markup a grader might trip over.
+TURN_SEPARATOR = "\n\n"
+
+
 @dataclasses.dataclass
 class InvocationResult:
     """Result returned by ``AgentAdapter.invoke`` for a single task.
 
-    ``text`` is the final assistant text, ``stop_reason`` is adapter-specific,
-    ``error`` is populated if the invocation raised, and ``raw`` carries the
-    adapter's native result object for debugging or downstream inspection.
+    ``text`` is the **final** assistant text turn, ``stop_reason`` is
+    adapter-specific, ``error`` is populated if the invocation raised, and
+    ``raw`` carries the adapter's native result object for debugging or
+    downstream inspection.
+
+    Full-fidelity output (zicato#12)
+    --------------------------------
+    Agents routinely emit their substantive answer (a list, a table of ids,
+    a detailed value) in one turn and a terse wrap-up ("Done — let me know if
+    you need anything else") in a later turn. ``text`` keeps only the last
+    non-empty turn, which silently drops the substantive turn. Graders that
+    need to match against the agent's *actual* output must read:
+
+    * ``text_turns`` — every non-empty assistant text turn, in order. The
+      lossless record of what the agent produced.
+    * ``full_text`` — the same turns joined by :data:`TURN_SEPARATOR`; the
+      canonical, full-fidelity gradeable artifact.
+
+    ``text`` is retained unchanged for backward compatibility (existing
+    consumers that only ever wanted the final turn keep their semantics).
+    Adapters that cannot distinguish turns may leave ``text_turns`` empty;
+    :attr:`full_text` then falls back to ``text`` (see ``__post_init__``).
     """
 
     task_id: str
@@ -24,6 +49,24 @@ class InvocationResult:
     stop_reason: str = ""
     error: Exception | None = None
     raw: Any = None
+    #: Every non-empty assistant text turn of this invocation, in emission
+    #: order. Empty for adapters that do not track per-turn text; in that
+    #: case ``full_text`` falls back to ``text``.
+    text_turns: list[str] = dataclasses.field(default_factory=list)
+    #: All assistant text turns joined by :data:`TURN_SEPARATOR`. The
+    #: full-fidelity gradeable artifact. Defaults to the joined ``text_turns``
+    #: when set; otherwise falls back to ``text``.
+    full_text: str = ""
+
+    def __post_init__(self) -> None:
+        # full_text is derived, not separately authored: prefer the joined
+        # turns, fall back to the single ``text`` so callers that construct an
+        # InvocationResult with only ``text=`` still get a sensible full_text.
+        if not self.full_text:
+            if self.text_turns:
+                self.full_text = TURN_SEPARATOR.join(self.text_turns)
+            else:
+                self.full_text = self.text
 
 
 @dataclasses.dataclass

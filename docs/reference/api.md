@@ -473,7 +473,12 @@ class Session:
     goals: list[Goal] = field(default_factory=list)
     plan: Plan | None = None
     current_task_id: str = ""
+    # Agent-authored SUMMARY per task (lossy status-line metadata).
     completed_results: dict[str, str] = field(default_factory=dict)
+    # Agent's COMPLETE ACTUAL OUTPUT per task — the canonical, gradeable
+    # artifact. Recorded independent of self-reporting. Prefer this over
+    # ``completed_results`` for grading. See ../guides/evaluation.md.
+    completed_outputs: dict[str, str] = field(default_factory=dict)
     task_progress: dict[str, float] = field(default_factory=dict)
     agent_notes: dict[str, str] = field(default_factory=dict)
     divergence_flag: bool = False
@@ -531,11 +536,19 @@ Returned by `AgentAdapter.invoke()`.
 @dataclass
 class InvocationResult:
     task_id: str
-    text: str = ""
+    text: str = ""              # the LAST assistant text turn (legacy)
     stop_reason: str = ""
     error: Optional[Exception] = None
     raw: Any = None
+    text_turns: list[str] = field(default_factory=list)  # every text turn, in order
+    full_text: str = ""         # text_turns joined by TURN_SEPARATOR; falls back to text
 ```
+
+`text` is the **final** assistant turn only — kept for backward
+compatibility. For grading, read `full_text` (or `text_turns`): an
+agent often emits its substantive answer in one turn and a terse
+wrap-up in a later turn, and `text` keeps only the latter. See
+[../guides/evaluation.md](../guides/evaluation.md).
 
 ### `ExecutionOutcome`
 

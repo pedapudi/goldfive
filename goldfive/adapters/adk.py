@@ -2024,6 +2024,11 @@ class ADKAdapter:
             log.debug("ADKAdapter.invoke: could not stash session context")
 
         final_text = ""
+        # zicato#12 mechanism 2: keep EVERY non-empty assistant text turn,
+        # not just the last. ``final_text`` stays the last turn (backward
+        # compatibility for InvocationResult.text); ``text_turns`` is the
+        # lossless record fed into InvocationResult.full_text for graders.
+        text_turns: list[str] = []
         stop_reason = "completed"
         err: Exception | None = None
         last_event: Any = None
@@ -2086,6 +2091,7 @@ class ADKAdapter:
                 text = _extract_text_from_event(event)
                 if text:
                     final_text = text
+                    text_turns.append(text)
                 if _is_final_event(event):
                     stop_reason = "final_response"
                 # Early termination when the agent has reported this
@@ -2232,6 +2238,7 @@ class ADKAdapter:
             stop_reason=stop_reason,
             error=err,
             raw=last_event,
+            text_turns=text_turns,
         )
 
     # ------------------------------------------------------------------

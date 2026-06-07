@@ -1715,6 +1715,15 @@ class Session:
     plan: Plan | None = None
     current_task_id: str = ""
     completed_results: dict[str, str] = dataclasses.field(default_factory=dict)
+    # zicato#12: the agent's COMPLETE actual output per task, recorded
+    # independently of whether the agent self-reported via
+    # ``report_task_completed``. ``completed_results`` holds the agent-authored
+    # *summary* (a status line, lossy metadata); ``completed_outputs`` holds
+    # the full-fidelity assistant text (every turn, joined) — the canonical,
+    # gradeable artifact. Evaluators and exact-match graders should read
+    # ``completed_outputs`` (falling back to ``completed_results`` only when an
+    # entry is absent, e.g. legacy adapters). See docs/guides/evaluation.md.
+    completed_outputs: dict[str, str] = dataclasses.field(default_factory=dict)
     # task_id -> progress fraction 0-1
     task_progress: dict[str, float] = dataclasses.field(default_factory=dict)
     # task_id -> last agent note

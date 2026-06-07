@@ -153,6 +153,34 @@ def test_conversation_absorb_turn_merges_goals_and_results() -> None:
     assert len(conv.turns) == 1
 
 
+def test_conversation_carries_completed_outputs_across_turns() -> None:
+    """zicato#12: the full actual output is carried across turns alongside the
+    self-reported summary, with later-turns-win merge semantics."""
+    from goldfive.results import ExecutionOutcome
+
+    conv = Conversation.new()
+    conv.completed_results = {"t_prior": "summary line"}
+    conv.completed_outputs = {"t_prior": "the full prior output with ID_99"}
+
+    # A fresh turn session inherits BOTH maps as copies.
+    s = conv.next_turn_session()
+    assert s.completed_results == {"t_prior": "summary line"}
+    assert s.completed_outputs == {"t_prior": "the full prior output with ID_99"}
+    assert s.completed_outputs is not conv.completed_outputs
+
+    # This turn produces its own (summary, full-output) pair.
+    s.completed_results["t1"] = "Found the table."
+    s.completed_outputs["t1"] = "row ID_x_y_V2 = 42 full dump"
+
+    outcome = ExecutionOutcome(success=True, session=s)
+    conv.absorb_turn(outcome, user_input_summary="q")
+
+    assert conv.completed_outputs["t_prior"] == "the full prior output with ID_99"
+    assert "ID_x_y_V2" in conv.completed_outputs["t1"]
+    # Summary map remains the lossy metadata, unchanged in shape.
+    assert conv.completed_results["t1"] == "Found the table."
+
+
 def test_conversation_absorb_turn_deduplicates_goal_ids() -> None:
     from goldfive.results import ExecutionOutcome
 

@@ -581,6 +581,7 @@ def _rewind_plan(
         prev = prev_task.status
         if prev is TaskStatus.PENDING:
             session.completed_results.pop(tid, None)
+            session.completed_outputs.pop(tid, None)  # zicato#12
             session.task_progress.pop(tid, None)
             continue
         new_plan = with_task_status(new_plan, tid, TaskStatus.PENDING)
@@ -590,6 +591,7 @@ def _rewind_plan(
         new_task = next((t for t in new_plan.tasks if t.id == tid), prev_task)
         transitions.append((new_task, prev))
         session.completed_results.pop(tid, None)
+        session.completed_outputs.pop(tid, None)  # zicato#12
         session.task_progress.pop(tid, None)
     if new_plan is not plan:
         with channel_processor_active():
