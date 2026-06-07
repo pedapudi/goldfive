@@ -1722,7 +1722,7 @@ class Session:
     # the full-fidelity assistant text (every turn, joined) — the canonical,
     # gradeable artifact. Evaluators and exact-match graders should read
     # ``completed_outputs`` (falling back to ``completed_results`` only when an
-    # entry is absent, e.g. legacy adapters). See docs/reference/EVALUATION.md.
+    # entry is absent, e.g. legacy adapters). See docs/guides/evaluation.md.
     completed_outputs: dict[str, str] = dataclasses.field(default_factory=dict)
     # task_id -> progress fraction 0-1
     task_progress: dict[str, float] = dataclasses.field(default_factory=dict)

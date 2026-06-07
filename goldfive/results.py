@@ -25,8 +25,8 @@ class InvocationResult:
     ``raw`` carries the adapter's native result object for debugging or
     downstream inspection.
 
-    Full-fidelity output (goldfive#... / zicato#12)
-    ----------------------------------------------
+    Full-fidelity output (zicato#12)
+    --------------------------------
     Agents routinely emit their substantive answer (a list, a table of ids,
     a detailed value) in one turn and a terse wrap-up ("Done — let me know if
     you need anything else") in a later turn. ``text`` keeps only the last
