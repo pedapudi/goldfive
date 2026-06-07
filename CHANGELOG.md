@@ -37,6 +37,26 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
     turn; previews are previews; `report_task_completed(artifacts=…)` is
     the exact-match-friendly structured channel). `api.md` updated.
 
+### Convenience
+
+- **First-class judge-only mode: `goldfive.wrap(agent, judge_only=True)`
+  (and `goldfive.run`, via `**wrap_kwargs`) — closes #445.** Runs the
+  wrapped agent NATIVELY while keeping the drift judges armed, issuing
+  ZERO planning / steering LLM calls (no goal-derivation, no
+  plan / refine, no drift-reactive steering). Default `judge_only=False`
+  is byte-identical to today — the full `LLMPlanner` / `LLMGoalDeriver`
+  overlay still runs. It is a convenience that supplies the defaults for
+  `planner` (a one-task `StaticPlanner` that drives a single native
+  overlay run — a real transcript, unlike `PassthroughPlanner`, which
+  returns `None` and aborts empty) and `goal_deriver`
+  (`LiteralGoalDeriver`, no goal-derive call); an explicit `planner=` /
+  `goal_deriver=` / `steerer=` still wins. The judges are untouched —
+  still wired off `call_llm` / the detected tree LLM / `JudgeConfig`
+  exactly as in full mode. Note `SteeringConfig.observation_only` does
+  NOT achieve this: it gates only the three drift-reactive injection
+  points while the planner's goal-derivation / per-turn planning /
+  refine still run and burn LLM calls.
+
 ### Judges
 
 - **`JudgeVerdict.drift_kind` / `severity` are now enum-typed.** The two
