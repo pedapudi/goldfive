@@ -345,7 +345,12 @@ async def test_truncates_long_reasoning_in_prompt() -> None:
     # The user prompt carries the truncation marker, not the full text.
     _system, user, _model = call_llm.calls[0]  # type: ignore[attr-defined]
     assert "[truncated]" in user
-    assert len(user) < len(big) + 2000  # prompt framing but not full 3500 chars
+    # Framing margin re-pointed by AGENCY-PRESERVATION.md PR 4: the
+    # template grew the "4. NOTE" / note_to_agent instructions (~700
+    # chars of framing). The assertion's purpose is unchanged — the
+    # truncated reasoning, not the full 3500+ chars, lands in the
+    # prompt — so the margin covers framing only.
+    assert len(user) < len(big) + 3000  # prompt framing but not full 3500 chars
 
 
 # ---------------------------------------------------------------------------
@@ -1510,11 +1515,15 @@ def test_prompt_lineage_block_when_agent_not_in_set() -> None:
 
 
 def test_prompt_renders_three_state_decision_section() -> None:
-    """The user prompt template carries the iter-10 'Decide THREE things' block.
+    """The user prompt template carries the decision block.
 
     Snapshot-style contains-check: pins the literal markers so a
-    well-meaning prompt edit that drops one of the three decisions
-    fails this test.
+    well-meaning prompt edit that drops one of the decisions fails
+    this test. Re-pointed by AGENCY-PRESERVATION.md PR 4: the iter-10
+    'Decide THREE things' block grew a fourth decision — the
+    judge-authored ``note_to_agent`` observation — so the header now
+    reads FOUR and the NOTE marker is pinned alongside the original
+    three.
     """
     rendered = rjudge.REASONING_DRIFT_USER_PROMPT_TEMPLATE.format(
         plan_tasks_summary="(no plan tasks)",
@@ -1526,11 +1535,15 @@ def test_prompt_renders_three_state_decision_section() -> None:
         tool_obs_block="(no recent tool observations)",
         tool_obs_count=0,
     )
-    assert "Decide THREE things:" in rendered
-    # The three decisions are listed.
+    assert "Decide FOUR things:" in rendered
+    # The four decisions are listed.
     assert "1. CLASSIFICATION." in rendered
     assert "2. ATTRIBUTION." in rendered
     assert "3. PROVENANCE." in rendered
+    assert "4. NOTE." in rendered
+    # The note's JSON key + content rules appear verbatim.
+    assert "note_to_agent" in rendered
+    assert "no commands" in rendered
     # Provenance enum literals appear verbatim (the LLM's output must
     # match these strings; the parser strip+lowercases before
     # comparison but the prompt asks for the canonical names).

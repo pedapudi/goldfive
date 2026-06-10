@@ -158,128 +158,33 @@ _ABSORB_NUDGE_KINDS: frozenset[DriftKind] = frozenset(
 )
 
 
-# Default drift messages per kind, used by
-# :func:`compose_corrective_user_message` when the drift carries no
-# kind-specific override. Keep SHORT, action-focused; no goldfive jargon
-# ("synthetic", "healed", "orphan", "drift") in user-facing copy.
-_CORRECTIVE_TEMPLATES: dict[DriftKind, str] = {
-    DriftKind.LOOPING_REASONING: (
-        "The prior attempt looped on {current_task_id}. "
-        "Refined plan: {next_task_title}. Please try a different approach."
-    ),
-    DriftKind.LOOPING_TOOL_CALL: (
-        "The prior attempt kept retrying the same tool call on "
-        "{current_task_id} without progress. Refined plan: "
-        "{next_task_title}. Please try a different approach."
-    ),
-    DriftKind.PLAN_DIVERGENCE: (
-        "The tree's prior activity diverged from the plan. "
-        "Refined plan: proceed with {next_task_title}."
-    ),
-    DriftKind.AGENT_REFUSAL: (
-        "The prior attempt could not complete {current_task_id}. "
-        "Refined plan: try {next_task_title}."
-    ),
-    DriftKind.MODEL_REFUSAL: (
-        "The model declined to proceed on {current_task_id}. Refined plan: try {next_task_title}."
-    ),
-    DriftKind.INTENT_DIVERGENCE: (
-        "The prior attempt strayed from the stated intent for "
-        "{current_task_id}. Refined plan: proceed with "
-        "{next_task_title}."
-    ),
-    DriftKind.TOOL_ERROR: (
-        "The prior attempt hit a tool error on {current_task_id}. "
-        "Refined plan: proceed with {next_task_title}."
-    ),
-    DriftKind.RUNAWAY_DELEGATION: (
-        "The prior attempt kept delegating without finishing "
-        "{current_task_id}. Refined plan: proceed with "
-        "{next_task_title} directly."
-    ),
-    DriftKind.SELF_REPORTED_STUCK: (
-        "The prior attempt reported being stuck on {current_task_id}. "
-        "Refined plan: try {next_task_title}."
-    ),
-    DriftKind.CONFABULATION_RISK: (
-        "The prior attempt may have produced {current_task_id} "
-        "without consulting external data. Refined plan: "
-        "{next_task_title}."
-    ),
-    # Tier 1 / F4 — GOAL_DRIFT corrective. The judge's signal is "agent
-    # is grinding on completed work / not advancing the goal". The plan
-    # itself is fine; the agent just needs a pointer at the next hand-
-    # off. Includes ``{next_task_agent}`` so the coordinator can route
-    # to the assignee directly rather than re-invoking the stuck agent.
-    DriftKind.GOAL_DRIFT: (
-        "Task '{current_task_id}' is already complete. "
-        "Please proceed to '{next_task_title}' via {next_task_agent}."
-    ),
-}
-
-
 def compose_corrective_user_message(
     *,
     drift: DriftEvent,
     refined_plan: Plan | None,
 ) -> str:
-    """Build a short directive user message for Level 3 re-invoke.
+    """DEPRECATED shim — delegates to :mod:`goldfive.observer_notes`.
 
-    Shape varies by drift kind (see :data:`_CORRECTIVE_TEMPLATES`). The
-    message is deliberately short, action-focused, and avoids goldfive
-    jargon -- the consumer is the agent's LLM, which should read a
-    natural instruction rather than a framework postmortem.
+    AGENCY-PRESERVATION.md PR 4 retired the ``_CORRECTIVE_TEMPLATES``
+    command templates this function used to render ("proceed to
+    '{next_task_title}' via {next_task_agent}", "do NOT retry", …):
+    goldfive owns goals / budgets / observability, the wrapped agent
+    owns MEANS (decomposition, delegation, ordering, retries), so the
+    agent-facing message is now an observation+goal advisory note, not
+    a directive about which task or agent comes next.
+
+    Kept as a thin delegating shim because the name is in the public
+    ``__all__`` and external callers / tests import it. In-tree call
+    sites (``goldfive.drift_observer``) call
+    :func:`goldfive.observer_notes.compose_note_for_drift` directly —
+    it accepts the ``session`` so the note carries the user's goals;
+    this shim cannot (signature compatibility), so notes it renders
+    carry the "(no goals recorded for this run)" placeholder. New code
+    should not call this.
     """
-    current = drift.current_task_id or "the current task"
-    next_title = _next_pending_task_title(refined_plan) or "the next planned step"
-    next_agent = _next_pending_task_agent(refined_plan) or "the next assigned agent"
-    template = _CORRECTIVE_TEMPLATES.get(drift.kind)
-    if template is None:
-        # Generic fallback for drift kinds that didn't get a
-        # custom shape. Keep it tight and action-focused.
-        template = (
-            "The prior attempt on {current_task_id} did not complete "
-            "successfully. Refined plan: proceed with {next_task_title}."
-        )
-    return template.format(
-        current_task_id=current,
-        next_task_title=next_title,
-        next_task_agent=next_agent,
-    )
+    from goldfive.observer_notes import compose_note_for_drift
 
-
-def _next_pending_task_title(plan: Plan | None) -> str:
-    """Return the title of the next PENDING task in topological order.
-
-    Falls back to the task id if no title is set. Returns an empty
-    string when there is no eligible task.
-    """
-    if plan is None:
-        return ""
-    for t in plan.tasks:
-        if t.status is TaskStatus.PENDING:
-            return (t.title or t.id or "").strip()
-    return ""
-
-
-def _next_pending_task_agent(plan: Plan | None) -> str:
-    """Return the bare agent name assigned to the next PENDING task.
-
-    Tier 1 / F4 — used by the GOAL_DRIFT corrective template, which
-    redirects the LLM's next action to a different agent. Returns the
-    last dot-separated segment of ``assignee_agent_id`` so the LLM sees
-    a name it can pass back as the AgentTool target. Empty string when
-    no eligible task exists or the task has no assignee.
-    """
-    if plan is None:
-        return ""
-    for t in plan.tasks:
-        if t.status is TaskStatus.PENDING:
-            assignee = (getattr(t, "assignee_agent_id", "") or "").strip()
-            if "." in assignee:
-                return assignee.rsplit(".", 1)[-1]
-            return assignee
-    return ""
+    return compose_note_for_drift(drift=drift, plan=refined_plan)
 
 
 def _enum_or_str_value(value: Any) -> str:
@@ -968,6 +873,12 @@ class DefaultSteerer:
             kind=kind,
             severity=severity,
             detail=str(getattr(verdict, "detail", "") or ""),
+            # AGENCY-PRESERVATION.md PR 4 — thread the judge-authored
+            # agent-facing observation onto the drift so
+            # ``goldfive.observer_notes`` can prefer it over ``detail``
+            # when composing notes. ``getattr`` keeps pre-PR-4 verdict
+            # shapes (no field) degrading to the empty string.
+            note_to_agent=str(getattr(verdict, "note_to_agent", "") or ""),
         )
 
     async def _emit_judgement(

@@ -3387,12 +3387,12 @@ class DriftObserver:
         (USER_STEER side effects, freshness-watermark check) have
         already run; this method jumps straight into cancel + refine.
         """
+        from goldfive.observer_notes import compose_note_for_drift
         from goldfive.steerer import (
             _ABSORB_NUDGE_KINDS,
             InterventionLevel,
             RefineExhausted,
             _planner_refine_accepts_available_agents,
-            compose_corrective_user_message,
         )
 
         # Tag the bound adapter's next cancel with a symbolic reason so
@@ -3885,10 +3885,11 @@ class DriftObserver:
         # rescue — their corrective path fires at the next task
         # boundary or via Level 3 CANCEL_REINVOKE.
         if level is InterventionLevel.ABSORB and drift.kind in _ABSORB_NUDGE_KINDS:
-            nudge_msg = compose_corrective_user_message(
-                drift=drift,
-                refined_plan=session.plan,
-            )
+            # AGENCY-PRESERVATION.md PR 4: the nudge body is an
+            # observation+goal advisory note, not a directive about
+            # which task / agent comes next. Same queue, same overlay
+            # replay path — content only.
+            nudge_msg = compose_note_for_drift(drift=drift, session=session)
             session.pending_nudges.append(nudge_msg)
             log.debug(
                 "DefaultSteerer._handle_drift: queued post-ABSORB nudge for kind=%s task=%s: %s",
@@ -3908,13 +3909,14 @@ class DriftObserver:
         nudge at the next invocation boundary and sends it as a gentle
         corrective user message. Until #141 lands, the queue is
         observable but inert; nothing consumes it.
-        """
-        from goldfive.steerer import compose_corrective_user_message
 
-        msg = compose_corrective_user_message(
-            drift=drift,
-            refined_plan=session.plan,
-        )
+        Body content (AGENCY-PRESERVATION.md PR 4): an observation+goal
+        advisory note from :mod:`goldfive.observer_notes` — no
+        next-task / next-agent directives.
+        """
+        from goldfive.observer_notes import compose_note_for_drift
+
+        msg = compose_note_for_drift(drift=drift, session=session)
         session.pending_nudges.append(msg)
         log.debug(
             "DefaultSteerer: queued nudge for kind=%s task=%s: %s",
@@ -3942,23 +3944,21 @@ class DriftObserver:
         body. The promotion path passes its already-composed
         :meth:`_compose_goldfive_steer_body` output; the Level 3
         CANCEL_REINVOKE path leaves it empty and falls back to
-        :func:`compose_corrective_user_message` against the freshly
-        revised plan.
+        :func:`goldfive.observer_notes.compose_note_for_drift` against
+        the freshly revised plan (AGENCY-PRESERVATION.md PR 4 —
+        observation+goal note, not a next-task directive).
 
         Returns ``True`` on successful dispatch, ``False`` on no
         bound channel / send failure (best-effort — see
         :meth:`DefaultSteerer._dispatch_goldfive_control`).
         """
         from goldfive.control import ControlKind, ControlMessage
-        from goldfive.steerer import compose_corrective_user_message
+        from goldfive.observer_notes import compose_note_for_drift
 
         if body_override:
             body = body_override
         else:
-            body = compose_corrective_user_message(
-                drift=drift,
-                refined_plan=session.plan,
-            )
+            body = compose_note_for_drift(drift=drift, session=session)
         superseded_ids = (
             [str(drift.current_task_id)] if drift.current_task_id else []
         )
@@ -4939,7 +4939,7 @@ class DriftObserver:
         # ``at_turn`` is the logical-turn counter (goldfive#441), the
         # same surface the user-steer freshness window reads.
         at_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
-        body = self._compose_goldfive_steer_body(drift)
+        body = self._compose_goldfive_steer_body(drift, session)
         try:
             _ostate.set_active_steer(
                 session.state,
@@ -5241,26 +5241,31 @@ class DriftObserver:
         )
 
     @staticmethod
-    def _compose_goldfive_steer_body(drift: DriftEvent) -> str:
+    def _compose_goldfive_steer_body(drift: DriftEvent, session: Session) -> str:
         """Derive the steer body for a goldfive-promoted drift.
 
-        Prefers ``drift.detail`` verbatim — the reasoning judge and
-        other LLM-as-a-judge paths already emit human-readable reasons
-        like "agent acknowledged discrepancy but chose to adopt
-        expanded topic" that are directly usable as a corrective. When
-        ``detail`` is empty, synthesise a generic template from the
-        drift's kind / severity / task context.
+        AGENCY-PRESERVATION.md PR 4: renders the full observation+goal
+        advisory note via :mod:`goldfive.observer_notes`. The
+        observation-sourcing chain is formalised there
+        (:func:`~goldfive.observer_notes.observation_for_drift`):
+
+        1. ``drift.note_to_agent`` verbatim — the judge authored the
+           agent-facing observation in the same call that produced the
+           verdict;
+        2. structured detector facts (tool-loop counts / fingerprints
+           on ``drift.raw``);
+        3. ``drift.detail`` verbatim — the pre-PR-4 preference, kept as
+           the fallback for judges that don't author notes;
+        4. a per-kind neutral fallback template (replaces the retired
+           "Goldfive detected {KIND} drift … proceed with the
+           corrective plan" command text).
+
+        ``session`` supplies the goals line and the bookkeeping Status
+        snapshot.
         """
-        detail = str(getattr(drift, "detail", "") or "").strip()
-        if detail:
-            return detail
-        task_id = drift.current_task_id or "the current task"
-        return (
-            f"Goldfive detected {drift.kind.name} drift "
-            f"(severity={drift.severity.name}). The preceding agent "
-            f"output did not match the task: {task_id}. Discard prior "
-            "work on this task and proceed with the corrective plan."
-        )
+        from goldfive.observer_notes import compose_note_for_drift
+
+        return compose_note_for_drift(drift=drift, session=session)
 
     # ------------------------------------------------------------------
     # USER_STEER state handler (goldfive#152)

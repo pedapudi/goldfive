@@ -1500,6 +1500,22 @@ class DriftEvent:
     # round-trip cannot move the cursor between observation and emit
     # without the gate noticing.
     observed_revision_index: int = 0
+    # AGENCY-PRESERVATION.md PR 4 — judge-authored observation addressed
+    # to the wrapped agent. Populated by the LLM judges
+    # (:mod:`goldfive.drift.reasoning_judge`, :mod:`goldfive.drift.goals`,
+    # and drift-flavoured :class:`~goldfive.judges.JudgeVerdict`s via
+    # ``DefaultSteerer._drift_from_judge_verdict``) in the SAME call
+    # that produced the verdict: one or two neutral, factual sentences —
+    # no commands, no fault language; question form when the judge is
+    # unsure. ``goldfive.observer_notes.observation_for_drift`` prefers
+    # this verbatim over ``detail`` when composing the agent-facing
+    # note; ``detail`` remains the operator/observability rendering.
+    # In-process only in this PR — NOT mirrored onto the ``DriftDetected``
+    # / ``JudgementEmitted`` proto envelopes (that would require a proto
+    # regen; the PR 5 telemetry pass owns the wire surface). Old-style
+    # judge responses that omit the field leave this empty and the
+    # composer falls through to ``detail`` (graceful degradation).
+    note_to_agent: str = ""
 
 
 @dataclasses.dataclass

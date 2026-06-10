@@ -137,6 +137,21 @@ class JudgeVerdict:
     ``detail`` is a free-form one-line human-readable explanation that
     every flavour can populate. Surfaced on
     :class:`JudgementEmitted.detail` for the UI.
+
+    ``note_to_agent`` (AGENCY-PRESERVATION.md PR 4) is an optional
+    observation addressed to the *wrapped agent*, authored by the judge
+    in the same evaluation that produced the verdict: one or two
+    neutral, factual sentences stating what was observed relative to
+    the user's goal — no commands, no fault language; question form
+    when the judge's confidence is low. Drift-flavoured verdicts thread
+    it onto :attr:`~goldfive.types.DriftEvent.note_to_agent` (see
+    ``DefaultSteerer._drift_from_judge_verdict``) where
+    :mod:`goldfive.observer_notes` prefers it verbatim over ``detail``
+    when composing agent-facing notes. Optional and additive: judges
+    that never populate it (including every pre-PR-4 judge) degrade
+    gracefully to the ``detail`` fallback. Not emitted on the
+    ``JudgementEmitted`` proto envelope in this PR (no proto regen;
+    the wire surface belongs to the PR 5 telemetry pass).
     """
 
     # drift-flavored (back-compat with existing detectors). ``drift_kind``
@@ -155,6 +170,11 @@ class JudgeVerdict:
     numeric_value: float | None = None
     metric_name: str = ""
     detail: str = ""
+    # AGENCY-PRESERVATION.md PR 4 — judge-authored agent-facing
+    # observation (see class docstring). Follows the additive-field
+    # pattern the enum-typed drift fields established: optional,
+    # default-empty, back-compat with every existing constructor call.
+    note_to_agent: str = ""
 
     def __post_init__(self) -> None:
         # The dataclass is ``frozen``; ``object.__setattr__`` is the
