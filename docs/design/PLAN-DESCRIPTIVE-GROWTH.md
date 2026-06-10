@@ -2,16 +2,39 @@
 
 ## 1. Status
 
-**Phase 1 shipped (PRs 1-3 of 5).** `Task.discovered` data model +
+**COMPLETE (all 5 PRs shipped).** `Task.discovered` data model +
 `DelegationObserved.tool_args_json` proto extension landed in #431
-(merged at `498320e`). Descriptive growth fallback in
-`_maybe_pin_delegation_task` landed in #433 (merged at `1abee69`)
-behind `SteeringConfig.descriptive_growth_enabled` (default OFF, env
-`GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`). Harmonograf rendering landed
-in `pedapudi/harmonograf#291` (merged at `d2b3921`). **PR 4 (flag
-flip + Rule C retirement) and PR 5 (this docs sync) close out the
-phase.** PR 4 is deferred until live validation is possible
-(kossel.lan offline at the time of writing).
+(merged at `498320e`). The Phase-1 growth fallback landed in #433
+(merged at `1abee69`) wired to the CAPABILITY_MISMATCH Rule-C verdict
+path behind `SteeringConfig.descriptive_growth_enabled` (then default
+OFF). Harmonograf rendering landed in `pedapudi/harmonograf#291`
+(merged at `d2b3921`).
+
+**PR 4 (flag flip + Rule C soft retirement) shipped as
+AGENCY-PRESERVATION.md Stage 1 PR 2**, which also corrected the
+Phase-1 trigger placement: #433 had wired growth to the Rule-C
+*verdict* path only, leaving the tier-3 scorer's misattribution and
+the Rule-A-bypass gap (the 2d27ff4a cherry-tree storm) in place. The
+completing PR moved the trigger to the §4.3 tier-3 *fallback* position
+in `_maybe_pin_delegation_task` (tier-1/2 miss → dedup-hash lookup →
+`install_descriptive_growth` → pin; growth now happens BEFORE any
+capability rule runs), flipped `descriptive_growth_enabled` to default
+ON, soft-retired Rule C behind `GOLDFIVE_CAPABILITY_RULE_C` (§7.1 step
+1; default OFF), skipped the capability rules on discovered bound
+tasks (§11.4 resolution (a)), enforced the §11.1 dedup TTL
+(terminal discovered tasks no longer absorb fresh same-hash
+delegations), and added the same dedup-hash → grow → claim flow to
+`PlanReconciler.on_before_agent`'s unmatched-agent branch so
+`transfer_to_agent`-style trees grow the ledger via the degraded
+per-`(agent_name, "")` hash (§9 forward compat — `before_agent`
+observations carry no tool args).
+
+Still legacy-reachable, scheduled for hard deletion in
+AGENCY-PRESERVATION.md PR 13: the tier-3 topic-args scorer inside
+`_maybe_pin_delegation_task` (only under
+`descriptive_growth_enabled=False`) and `_rule_c_dag_order` + the
+`all_pending_tasks` parameter (only under
+`GOLDFIVE_CAPABILITY_RULE_C=1`; §7.1 step 2).
 
 Related: [PLAN-LIFECYCLE.md](PLAN-LIFECYCLE.md) (the contract this proposal
 extends), [DRIFT.md](DRIFT.md) (the `CAPABILITY_MISMATCH` Rule C retirement
@@ -782,8 +805,8 @@ refines do not happen.
 | 1 | `Task.discovered: bool` + `Task.discovery_identity_hash: str` fields + `Plan.validate` update (no rule change; just opaque metadata) + **`DelegationObserved.tool_args_json` proto extension** (canonical args representation on `goldfive.v1`, so PR 2's dedup hash is computed from observed-fact data, not a pin-time intercept — see §13) + state-store migration (proto regen + harmonograf-side ingestion of the new field + schema bump). Forward-compat: old events without `tool_args_json` default-empty; PR 2's dedup must tolerate `tool_args=None` and fall back to per-`(agent, task_id)` granularity as a coarser-but-still-useful dedup. | n/a — additive | **Shipped** (#431, `498320e`) |
 | 2 | `_maybe_pin_delegation_task` fallback to discovery + `PlanReviser.install_descriptive_growth` helper (§5 Option D, lock-acquiring) + §5.2 test plan + **§11.6 regression race test** (mandatory acceptance criterion) + tracking issue cross-link to #413 for the test template | `SteeringConfig.descriptive_growth_enabled` (env `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`), default OFF | **Shipped** (#433, `1abee69`) |
 | 3 | Harmonograf-side rendering of discovered tasks (badge, separate visualisation lane, drift filter) | flag-gated | **Shipped** (`pedapudi/harmonograf#291`, `d2b3921`) |
-| 4 | Retire `CAPABILITY_MISMATCH` Rule C (4a soft, 4b hard) — flip `descriptive_growth_enabled` default to True; bypass Rule C when flag is on | flag → default-on | **Deferred** — requires live validation (kossel.lan offline at time of writing) |
-| 5 | Docs: update PLAN-LIFECYCLE.md (Phase 1 discovery section), DRIFT.md (Rule C status under flag), this design doc (mark Phase 1 shipped) | n/a | **This PR** |
+| 4 | Retire `CAPABILITY_MISMATCH` Rule C (4a soft, 4b hard) — flip `descriptive_growth_enabled` default to True; move the growth trigger from the Rule-C verdict path to the §4.3 tier-3 fallback position (also closes the Rule-A-bypass gap); reconciler-side growth for transfer-style trees | flag → default-on; Rule C behind `GOLDFIVE_CAPABILITY_RULE_C` (default OFF) | **Shipped** (4a soft — AGENCY-PRESERVATION.md Stage 1 PR 2; 4b hard deletion deferred to AGENCY-PRESERVATION.md PR 13) |
+| 5 | Docs: update PLAN-LIFECYCLE.md (Phase 1 discovery section), DRIFT.md (Rule C status under flag), this design doc (mark Phase 1 shipped; status sync'd again by the PR-4 completion) | n/a | **Shipped** |
 
 Each PR is independently merge-able. PR 2 ships behind the flag so
 production traffic stays on the old path until PR 4 flips the

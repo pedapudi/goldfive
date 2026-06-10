@@ -687,24 +687,36 @@ class SteeringConfig:
     #: capability. See ``docs/design/CONTEXT-EDITING.md`` for the rule
     #: catalog and the rationale behind drop-only edits.
     context_editor_rules: list[str] | None = None
-    #: Plan-descriptive growth fallback for unmatched delegations
-    #: (goldfive#423 PR 2). When ``True`` and the structural capability
-    #: detector returns a Rule C (out-of-DAG-order) verdict, the steerer
-    #: synthesises a ``discovered=True`` task via
+    #: Plan-descriptive growth for unmatched delegations (goldfive#423,
+    #: completed by AGENCY-PRESERVATION.md Stage 1 PR 2). When ``True``
+    #: (the default) the growth trigger lives at PIN time: when the
+    #: delegation pin's tier 1 (required-tools cover) and tier 2
+    #: (agent-name stem) both miss in
+    #: ``_maybe_pin_delegation_task``, the plugin synthesises a
+    #: ``discovered=True`` task via
     #: :meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`
-    #: and re-pins the delegation to it instead of firing the
-    #: CAPABILITY_MISMATCH drift. Rule A and Rule B are unaffected. When
-    #: ``False`` (the default) the existing CAPABILITY_MISMATCH Rule C
-    #: path fires as today, so PR 2 lands behind the flag without
-    #: behaviour change for existing tests/runs. PR 4 flips the default
-    #: after sufficient validation. Env: ``GOLDFIVE_STEER_DESCRIPTIVE_GROWTH``.
+    #: and pins the delegation to it — the tier-3 topic-args scorer is
+    #: bypassed and no CAPABILITY_MISMATCH rule ever sees a mispinned
+    #: task (this closes the Rule-A-bypass gap from the cherry-tree
+    #: failure, e2e session ``2d27ff4a``). The
+    #: :class:`~goldfive.reconciler.PlanReconciler` applies the same
+    #: dedup-hash → grow → claim flow to unmatched ``before_agent``
+    #: observations so ``transfer_to_agent``-style trees grow the
+    #: ledger too.
+    #:
+    #: When ``False`` the legacy pre-#423 pin behaviour is restored
+    #: (tier-3 topic-args scorer + topo-order fallback; mispins are
+    #: caught downstream by the CAPABILITY_MISMATCH rules). The tier-3
+    #: scorer survives only for this legacy path and is scheduled for
+    #: deletion (AGENCY-PRESERVATION.md PR 13).
+    #: Env: ``GOLDFIVE_STEER_DESCRIPTIVE_GROWTH``.
     #:
     #: Design ref: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3 + §9
-    #: (PR table). The flag gates ONLY the §4.3 fallback; the data-model
-    #: fields shipped in PR 1 (``Task.discovered``,
+    #: (PR table). The flag gates ONLY the §4.3 growth flow; the
+    #: data-model fields shipped in PR 1 (``Task.discovered``,
     #: ``Task.discovery_identity_hash``, ``DelegationObserved.tool_args_json``)
     #: are always available regardless of this flag.
-    descriptive_growth_enabled: bool = False
+    descriptive_growth_enabled: bool = True
     #: Authority scope for cancelling the wrapped agent's IN-FLIGHT
     #: invocation on a drift-driven plan install (AGENCY-PRESERVATION.md
     #: PR 1; goldfive#449/#452).

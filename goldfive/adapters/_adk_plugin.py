@@ -1579,36 +1579,16 @@ def _safe_jsonify_tool_args(tool_args: Any) -> str:
         return ""
 
 
-# Rule C detail-string marker emitted by
-# ``goldfive.drift.capability_check._rule_c_dag_order``. Used to
-# distinguish Rule C verdicts from Rule A / Rule B without refactoring
-# the detector's return signature. If the marker drifts, the
-# descriptive-growth fallback simply doesn't fire — Rule C dispatch
-# continues as today — and tests catch the regression.
-_RULE_C_DETAIL_MARKER: str = "delegated out of DAG order"
-
-
-def _is_rule_c_verdict(drift: Any) -> bool:
-    """Return True iff ``drift`` is the CAPABILITY_MISMATCH Rule C verdict.
-
-    Identified by substring match on the detail string emitted by
-    :func:`goldfive.drift.capability_check._rule_c_dag_order`. Rule A
-    and Rule B use distinct detail prefixes ("has only AgentTool" and
-    "is missing required tool", respectively) so this check is
-    unambiguous. See design doc §4.3.2 + §7.
-    """
-    detail = str(getattr(drift, "detail", "") or "")
-    return _RULE_C_DETAIL_MARKER in detail
-
-
 def _descriptive_growth_enabled(steerer: Any) -> bool:
     """Return True iff ``SteeringConfig.descriptive_growth_enabled`` is on.
 
     Reads through ``steerer._steering_config.descriptive_growth_enabled``
-    (the post-#225 typed config). Falls back to ``False`` (the
-    documented default) on any read failure so the new path stays
-    opt-in. Honours the goldfive#423 PR 2 feature-flag contract: PR 2
-    lands behind the flag; PR 4 flips the default after validation.
+    (the post-#225 typed config). Falls back to ``False`` on any read
+    failure — a steerer that doesn't carry a typed steering config
+    (custom Steerer implementations, lightweight test stubs) keeps the
+    legacy pin behaviour, since it cannot expose the growth machinery
+    the new flow needs. The field default is ``True`` as of
+    goldfive#423 / AGENCY-PRESERVATION.md Stage 1 PR 2.
     """
     if steerer is None:
         return False
@@ -1617,6 +1597,28 @@ def _descriptive_growth_enabled(steerer: Any) -> bool:
         if cfg is None:
             return False
         return bool(getattr(cfg, "descriptive_growth_enabled", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _growth_at_pin_enabled(steerer: Any) -> bool:
+    """Return True iff the pin-time descriptive-growth flow can run.
+
+    Two conditions (goldfive#423 / AGENCY-PRESERVATION.md PR 2):
+
+    1. The feature flag is on (:func:`_descriptive_growth_enabled`).
+    2. The steerer actually exposes
+       ``plans.install_descriptive_growth`` — without the helper the
+       "tier 1/2 miss → grow" signal would strand the delegation
+       unpinned, which is strictly worse than the legacy tier-3
+       fallback. Custom steerers without the helper keep legacy
+       behaviour even with the flag on.
+    """
+    if not _descriptive_growth_enabled(steerer):
+        return False
+    try:
+        plans = getattr(steerer, "plans", None)
+        return callable(getattr(plans, "install_descriptive_growth", None))
     except Exception:  # noqa: BLE001
         return False
 
@@ -1633,7 +1635,8 @@ async def _attempt_descriptive_growth(
 
     Returns the discovered :class:`~goldfive.types.Task` on success,
     ``None`` on any failure (helper missing, install raised, etc.) so
-    the caller can fall through to the legacy Rule C drift dispatch.
+    the caller degrades to a no-pin delegation — the same silent
+    failure contract every other branch of the pin honours.
 
     Per design doc §4.3 + §5 Option D: the helper acquires the
     per-session plan lock for the swap window and dedups by
@@ -1656,8 +1659,8 @@ async def _attempt_descriptive_growth(
         )
     except Exception as exc:  # noqa: BLE001
         log.debug(
-            "_attempt_descriptive_growth: install raised: %s; falling "
-            "back to Rule C dispatch",
+            "_attempt_descriptive_growth: install raised: %s; leaving "
+            "the delegation unpinned",
             exc,
         )
         return None
@@ -4051,9 +4054,11 @@ def make_adk_plugin(
             invoked_agent_name: str,
             tool_args: Any,
             invoked_agent: Any = None,
-        ) -> None:
+            tool_args_json: str = "",
+        ) -> bool:
             """Observationally bind a plan task to ``invoked_agent_name`` at
-            delegation_observed time (goldfive#259, refined by #265).
+            delegation_observed time (goldfive#259, refined by #265; growth
+            flow by goldfive#423 / AGENCY-PRESERVATION.md Stage 1 PR 2).
 
             #252 zeroed ``Task.assignee_agent_id`` at plan-parse time so the
             LLM cannot pre-declare which sub-agent will pick up a task; the
@@ -4066,10 +4071,40 @@ def make_adk_plugin(
             :func:`_resolve_pinned_task_id` finds the task without needing a
             pre-declared assignee.
 
-            Selection algorithm (multi-eligible disambiguation tiers):
+            Selection algorithm with descriptive growth ON (the default —
+            :attr:`SteeringConfig.descriptive_growth_enabled`; design doc
+            ``PLAN-DESCRIPTIVE-GROWTH.md`` §4.3):
 
+            0. **Dedup-hash re-pin.** If any non-terminal plan task carries
+               the §4.3.0 ``discovery_identity_hash`` of
+               ``(invoked_agent_name, tool_args_json)``, pin to it — a
+               prior delegation in this run already discovered this
+               logical unit of work (§11.1 per-(agent, args-token-set)
+               granularity; the §11.1 TTL excludes terminal tasks).
             1. Eligible set = PENDING tasks whose every upstream-edge
                predecessor is COMPLETED (DAG-ready).
+            2. **Tier 1 — required-tools cover** and **Tier 2 —
+               agent-name stem match** run over the *forecast*
+               (non-discovered) candidates, even when only one candidate
+               is eligible — the single-eligible shortcut is what
+               mispinned the cherry-tree run (e2e ``2d27ff4a``, §8): the
+               only eligible task is not necessarily the work this
+               delegation enacts.
+            3. Tier 1/2 miss -> return ``True`` so the (async) caller
+               grows the plan via
+               :meth:`PlanReviser.install_descriptive_growth` and pins
+               the discovered task. The tier-3 topic-args scorer is
+               deliberately NOT run — it is the misattribution path this
+               flow retires.
+
+            Selection algorithm with descriptive growth OFF (legacy,
+            pre-#423 — kept verbatim for the
+            ``descriptive_growth_enabled=False`` escape hatch and for
+            steerers that don't expose the growth helper; the tier-3
+            scorer below is scheduled for deletion in
+            AGENCY-PRESERVATION.md PR 13 once the legacy path goes):
+
+            1. Eligible set as above.
             2. If exactly one eligible -> bind it.
             3. Multi-eligible disambiguation, short-circuiting on first
                unique pick (goldfive#265):
@@ -4093,32 +4128,53 @@ def make_adk_plugin(
                  wins; tie or zero overlap -> first eligible by plan
                  order.
 
-            4. If zero eligible -> log DEBUG and return.
+            4. If zero eligible -> log DEBUG and return (growth mode
+               instead returns ``True``: the delegation is observed work
+               and the §4.3 contract is that observed work lands in the
+               ledger).
 
             Tier 1 wins on conflict with Tier 2 by construction: it runs
             first and short-circuits. ``invoked_agent`` is optional so
             legacy callers (and tests that don't carry an ADK agent
             object) still get the tier-2 + tier-3 path.
 
+            ``tool_args_json`` is the canonical serialisation of
+            ``tool_args`` — the exact string stamped onto the
+            ``DelegationObserved`` proto by the caller — so the dedup
+            hash is computed from the agent-authored observed-fact data,
+            not a divergent goldfive-side re-serialisation (design doc
+            §13 "adaptive, not predictive").
+
             The stamp is a real mutation, not a dry run. Assignee
             repopulation is observational in the same sense that
             ``NEW_WORK_DISCOVERED`` is — describing observed reality, not a
             revision — so it does NOT emit ``PlanRevised``.
 
+            Returns ``True`` iff the caller must run the descriptive-growth
+            fallback (tier 1/2 missed under growth mode); ``False`` in
+            every other case (pinned, or silently gave up). The growth
+            install is async (it acquires the per-session plan lock) and
+            this method runs synchronously inside ADK's
+            ``before_tool_callback`` machinery, hence the signal-the-caller
+            split rather than growing inline.
+
             Silent on every failure mode.
             """
             if not invoked_agent_name:
-                return
+                return False
             plan = _safe_attr(ctx.session, "plan", None)
             if plan is None:
-                return
+                return False
             tasks = tuple(_safe_attr(plan, "tasks", None) or ())
-            if not tasks:
-                return
+            growth_mode = _growth_at_pin_enabled(ctx.steerer)
+            if not tasks and not growth_mode:
+                return False
             try:
                 from goldfive.types import (  # noqa: PLC0415 — lazy
+                    TERMINAL_TASK_STATUSES,
                     TaskStatus,
                     channel_processor_active,
+                    discovery_identity_hash,
                     replace_task,
                     set_session_plan,
                 )
@@ -4127,7 +4183,32 @@ def make_adk_plugin(
                     "_maybe_pin_delegation_task: cannot import deps: %s",
                     exc,
                 )
-                return
+                return False
+
+            chosen: Any = None
+            if growth_mode:
+                # Step 0 — dedup-hash re-pin (§4.3.0 / §11.1). Scans ALL
+                # non-terminal tasks (not just the DAG-ready eligible
+                # set) because the previously-discovered task is
+                # typically RUNNING by the time the coordinator
+                # re-delegates. The hash survives refines (§4.3.0
+                # "cross-refine survival") so we match on the hash
+                # field alone, not on ``discovered``.
+                identity_hash = discovery_identity_hash(
+                    invoked_agent_name, tool_args_json or None
+                )
+                for task in tasks:
+                    if (
+                        str(
+                            _safe_attr(task, "discovery_identity_hash", "")
+                            or ""
+                        )
+                        == identity_hash
+                        and _safe_attr(task, "status", None)
+                        not in TERMINAL_TASK_STATUSES
+                    ):
+                        chosen = task
+                        break
 
             edges = tuple(_safe_attr(plan, "edges", None) or ())
             completed_ids: set[str] = set()
@@ -4156,41 +4237,88 @@ def make_adk_plugin(
                     continue
                 eligible.append(task)
 
-            if not eligible:
-                log.debug(
-                    "_maybe_pin_delegation_task: no eligible PENDING task "
-                    "to bind for delegation to %s; leaving unpinned",
-                    invoked_agent_name,
-                )
-                return
-
-            chosen: Any
-            if len(eligible) == 1:
-                chosen = eligible[0]
-            else:
-                # goldfive#265 — structural disambiguation tiers run
-                # BEFORE the topic-args scorer + plan-order fallback.
-                # Order: tier 1 (required-tools cover) -> tier 2
-                # (agent-name semantic match) -> tier 3 (existing
-                # scorer + topo-order). Each tier short-circuits on a
-                # unique pick; ambiguous tiers fall through.
-                chosen = None
+            if chosen is None and growth_mode:
+                # goldfive#423 / AGENCY-PRESERVATION.md PR 2 — growth
+                # flow (design doc §4.3). Tiers 1/2 run over the
+                # FORECAST (non-discovered) candidates only, and they
+                # run even when a single candidate is eligible: the
+                # pre-#423 single-eligible shortcut is exactly what
+                # mispinned the cherry-tree run (e2e 2d27ff4a — sole
+                # eligible ``find_presentation_files``, delegation to
+                # ``debugger_agent``). Discovered tasks are matched by
+                # identity hash in step 0; a stem match against an old
+                # discovered task here would wrongly block growth for a
+                # NEW (agent, args-token-set) pair (§11.1 granularity).
+                forecast = [
+                    t
+                    for t in eligible
+                    if not bool(_safe_attr(t, "discovered", False))
+                ]
                 tier1_agent_tool_names = _agent_tool_names(invoked_agent)
-                if tier1_agent_tool_names:
+                if forecast and tier1_agent_tool_names:
                     chosen = _select_by_required_tools(
-                        eligible, tier1_agent_tool_names
+                        forecast, tier1_agent_tool_names
                     )
-                if chosen is None:
+                if chosen is None and forecast:
                     chosen = _select_by_agent_name_stems(
-                        eligible, invoked_agent_name, invoked_agent
+                        forecast, invoked_agent_name, invoked_agent
                     )
                 if chosen is None:
-                    scored = _score_candidates_by_args(eligible, tool_args)
-                    chosen = scored if scored is not None else eligible[0]
+                    # Tier 1/2 missed (or nothing was eligible) →
+                    # descriptive growth. The tier-3 topic-args scorer
+                    # (:func:`_score_candidates_by_args`) is deliberately
+                    # NOT consulted — it is the misattribution path this
+                    # flow retires (it survives below only for the
+                    # descriptive_growth_enabled=False escape hatch and
+                    # gets deleted in AGENCY-PRESERVATION.md PR 13).
+                    # Growth happens at pin time, BEFORE any
+                    # CAPABILITY_MISMATCH rule runs, which is what closes
+                    # the Rule-A-bypass gap.
+                    log.info(
+                        "_maybe_pin_delegation_task: tier 1/2 miss for "
+                        "delegation to %s (eligible=%d) — requesting "
+                        "descriptive growth",
+                        invoked_agent_name,
+                        len(eligible),
+                    )
+                    return True
+            elif chosen is None:
+                # Legacy (descriptive_growth_enabled=False) selection —
+                # pre-#423 behaviour, kept verbatim. Scheduled for
+                # deletion together with the tier-3 scorer
+                # (AGENCY-PRESERVATION.md PR 13).
+                if not eligible:
+                    log.debug(
+                        "_maybe_pin_delegation_task: no eligible PENDING task "
+                        "to bind for delegation to %s; leaving unpinned",
+                        invoked_agent_name,
+                    )
+                    return False
+                if len(eligible) == 1:
+                    chosen = eligible[0]
+                else:
+                    # goldfive#265 — structural disambiguation tiers run
+                    # BEFORE the topic-args scorer + plan-order fallback.
+                    # Order: tier 1 (required-tools cover) -> tier 2
+                    # (agent-name semantic match) -> tier 3 (existing
+                    # scorer + topo-order). Each tier short-circuits on a
+                    # unique pick; ambiguous tiers fall through.
+                    tier1_agent_tool_names = _agent_tool_names(invoked_agent)
+                    if tier1_agent_tool_names:
+                        chosen = _select_by_required_tools(
+                            eligible, tier1_agent_tool_names
+                        )
+                    if chosen is None:
+                        chosen = _select_by_agent_name_stems(
+                            eligible, invoked_agent_name, invoked_agent
+                        )
+                    if chosen is None:
+                        scored = _score_candidates_by_args(eligible, tool_args)
+                        chosen = scored if scored is not None else eligible[0]
 
             chosen_id = str(_safe_attr(chosen, "id", "") or "")
             if not chosen_id:
-                return
+                return False
 
             # Stamp assignee onto the chosen task by deriving a new Plan
             # under the channel-processor envelope. Skip when the assignee
@@ -4212,7 +4340,7 @@ def make_adk_plugin(
                     "_maybe_pin_delegation_task: assignee stamp raised: %s",
                     exc,
                 )
-                return
+                return False
 
             # Pin the chosen task as session.current_task_id via the
             # StateStore so the reporting-tool pin lookup
@@ -4242,7 +4370,7 @@ def make_adk_plugin(
                     "_maybe_pin_delegation_task: current_task pin raised: %s",
                     exc,
                 )
-                return
+                return False
 
             log.info(
                 "goldfive.delegation.assignee_observed: task_id=%s "
@@ -4251,6 +4379,7 @@ def make_adk_plugin(
                 invoked_agent_name,
                 len(eligible),
             )
+            return False
 
         async def _maybe_emit_capability_mismatch(
             self,
@@ -4259,8 +4388,6 @@ def make_adk_plugin(
             invoked_agent: Any,
             invoked_agent_name: str,
             invocation_id: str,
-            tool_args_json: str = "",
-            delegation_event_id: str = "",
         ) -> None:
             """Run the structural capability-mismatch detector at delegation time (goldfive#253).
 
@@ -4273,18 +4400,22 @@ def make_adk_plugin(
             ladder fires (cancel + refine), with a direct sink-emission
             fallback when the steerer stub does not expose the helper.
 
-            goldfive#423 PR 2 — descriptive-growth fallback. When the
-            detector returns a Rule C (out-of-DAG-order) verdict AND
-            :class:`~goldfive.config.SteeringConfig.descriptive_growth_enabled`
-            is ``True``, the steerer synthesises a ``discovered=True``
-            task via
-            :meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`
-            and re-pins the delegation to it INSTEAD of dispatching the
-            Rule C drift. Rule A and Rule B unaffected. ``tool_args_json``
-            (the agent-authored args off the
-            :class:`~goldfive.types.DelegationObserved` proto field) and
-            ``delegation_event_id`` thread the observed-fact data needed
-            by the growth helper. See design doc §4.3 + §13.
+            goldfive#423 / AGENCY-PRESERVATION.md PR 2 — descriptive
+            growth no longer lives here. The original #423 Phase 1
+            wired a Rule C → growth fallback into this verdict path;
+            that trigger moved to pin time
+            (:meth:`_maybe_pin_delegation_task` tier-1/2 miss →
+            :meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`),
+            which runs BEFORE this detector — so by the time we get
+            here the bound task already reflects observed reality.
+            Discovered tasks are skipped outright per design doc §11.4
+            resolution (a): the auto-derived ``agent_name: request``
+            title reads leaf-shaped to Rule A's heuristic and would
+            re-fire on every delegation to a delegation-only agent
+            (the cherry-tree Rule-A storm, e2e 2d27ff4a); Rule B is
+            vacuous on discovered tasks (empty ``required_tools``);
+            Rule C is soft-retired behind ``GOLDFIVE_CAPABILITY_RULE_C``.
+            AGENCY-PRESERVATION.md PR 3 revisits Rule A wholesale.
 
             Silent on every failure mode — observability cannot block
             the in-flight invocation.
@@ -4386,6 +4517,22 @@ def make_adk_plugin(
                 # Pin missing or pinned task not live in the plan. The
                 # detector cannot decide capability without a task.
                 return
+            if bool(_safe_attr(chosen_task, "discovered", False)):
+                # goldfive#423 / AGENCY-PRESERVATION.md PR 2 — design
+                # doc §11.4 resolution (a): skip the capability rules
+                # entirely on discovered tasks. The task IS the observed
+                # delegation (synthesised from it at pin time), so
+                # "can this agent perform this task" is true by
+                # construction; Rule A's leaf-title heuristic would
+                # misread the auto-derived title and re-fire the
+                # 2d27ff4a refine storm the growth flow exists to stop.
+                log.debug(
+                    "_maybe_emit_capability_mismatch: bound task %s is "
+                    "discovered=True — capability rules skipped "
+                    "(design doc §11.4(a))",
+                    str(_safe_attr(chosen_task, "id", "") or ""),
+                )
+                return
 
             tool_list = list(_safe_attr(invoked_agent, "tools", None) or [])
             # goldfive#268 — gather the full PENDING set (DAG-ready and
@@ -4433,45 +4580,13 @@ def make_adk_plugin(
             except Exception:  # noqa: BLE001
                 pass
 
-            # goldfive#423 PR 2 — descriptive-growth fallback. When the
-            # feature flag is on AND the drift is specifically Rule C
-            # (out-of-DAG-order: the pin landed on a task whose role-stem
-            # mismatches the invoked agent, but another PENDING task
-            # carries that stem), bypass the Rule C drift dispatch and
-            # synthesise a discovered=True task instead. The new task
-            # carries the agent's role naturally so the structural
-            # mismatch dissolves at the source rather than being papered
-            # over with a refine that has no clean answer (design doc
-            # §2 + §7). Rule A and Rule B verdicts still dispatch normally
-            # — those are skill-gap signals, not pin-mismatch signals.
-            if _is_rule_c_verdict(drift) and _descriptive_growth_enabled(steerer):
-                grew = await _attempt_descriptive_growth(
-                    steerer=steerer,
-                    session=ctx.session,
-                    agent_name=invoked_agent_name,
-                    tool_args_json=tool_args_json,
-                    delegation_event_id=delegation_event_id,
-                )
-                if grew is not None:
-                    # Successful growth (or dedup hit). Re-pin the
-                    # delegation onto the discovered task and suppress
-                    # the Rule C drift. The pin write must be inside
-                    # ``channel_processor_active()`` per the
-                    # single-writer envelope (#247).
-                    await _repin_delegation_to_discovered(
-                        ctx=ctx,
-                        discovered_task=grew,
-                        invoked_agent_name=invoked_agent_name,
-                    )
-                    log.info(
-                        "_maybe_emit_capability_mismatch: descriptive "
-                        "growth absorbed Rule C verdict — discovered "
-                        "task id=%s agent=%r (Rule C drift SUPPRESSED)",
-                        grew.id,
-                        invoked_agent_name,
-                    )
-                    return
-
+            # NOTE (goldfive#423 / AGENCY-PRESERVATION.md PR 2): the
+            # Rule C → descriptive-growth fallback that used to live
+            # here moved to pin time (_maybe_pin_delegation_task / the
+            # before_tool_callback growth branch). Any verdict reaching
+            # this point — including a Rule C verdict under the
+            # GOLDFIVE_CAPABILITY_RULE_C=1 escape hatch — dispatches
+            # through the standard drift path below.
             handle = getattr(getattr(steerer, "drift", None), "handle_drift", None)
             if callable(handle):
                 try:
@@ -5655,8 +5770,22 @@ def make_adk_plugin(
                 # MUST run before the emit so ``task_id`` below is
                 # non-empty for the typical orchestration-only
                 # coordinator turn (``ctx.task is None``).
+                #
+                # goldfive#423 PR 1 proto extension: the canonical
+                # tool_args JSON is stamped onto DelegationObserved (the
+                # emit below) so the descriptive-growth dedup hash (and
+                # any future adaptive consumer) reads the agent-authored
+                # args off the observed event, not a goldfive-side
+                # intercept. See design doc §13 "adaptive, not
+                # predictive". Computed BEFORE the pin so the pin's
+                # step-0 hash lookup and the growth install hash the
+                # exact same string the event will carry. Empty
+                # tool_args degrade to "" — the hash falls back to a
+                # coarser per-(agent, "") key per §9 forward-compat.
+                tool_args_json_text = _safe_jsonify_tool_args(tool_args)
+                needs_growth = False
                 try:
-                    self._maybe_pin_delegation_task(
+                    needs_growth = self._maybe_pin_delegation_task(
                         ctx=ctx,
                         invoked_agent_name=to_agent,
                         tool_args=tool_args,
@@ -5665,12 +5794,49 @@ def make_adk_plugin(
                         # ``agent.tools``. Optional; falls through to the
                         # tier-2/3 paths when absent (legacy callers).
                         invoked_agent=nested_agent,
+                        tool_args_json=tool_args_json_text,
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.debug(
                         "before_tool_callback: delegation_pin hook raised: %s",
                         exc,
                     )
+                if needs_growth:
+                    # goldfive#423 / AGENCY-PRESERVATION.md PR 2 —
+                    # descriptive growth at PIN time (design doc §4.3).
+                    # Tier 1/2 missed: no forecast task structurally
+                    # matches this delegation, so the plan grows a
+                    # discovered=True task and the pin lands on it.
+                    # Runs BEFORE the DelegationObserved emit (so the
+                    # event carries the discovered task id) and BEFORE
+                    # _maybe_emit_capability_mismatch (so no capability
+                    # rule ever grades the delegation against a
+                    # mispinned forecast task — the Rule-A-bypass gap
+                    # from e2e 2d27ff4a). install_descriptive_growth
+                    # acquires the per-session plan lock and dedups by
+                    # identity hash (§5 Option D / §11.6); it lands in
+                    # observation mode too via the goldfive#258
+                    # NEW_WORK_DISCOVERED carve-out.
+                    try:
+                        grew = await _attempt_descriptive_growth(
+                            steerer=ctx.steerer,
+                            session=ctx.session,
+                            agent_name=to_agent,
+                            tool_args_json=tool_args_json_text,
+                            delegation_event_id="",
+                        )
+                        if grew is not None:
+                            await _repin_delegation_to_discovered(
+                                ctx=ctx,
+                                discovered_task=grew,
+                                invoked_agent_name=to_agent,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "before_tool_callback: descriptive growth "
+                            "raised: %s",
+                            exc,
+                        )
 
                 # Resolve task_id for the emit AFTER the pin has run.
                 # Prefer the freshly-pinned ``session.current_task_id``
@@ -5689,15 +5855,6 @@ def make_adk_plugin(
                 if not bound_task_id:
                     bound_task_id = str(_safe_attr(ctx.task, "id", "") or "")
                 task_id = bound_task_id
-                # goldfive#423 PR 1 proto extension: stamp the canonical
-                # tool_args JSON onto DelegationObserved so PR 2's
-                # descriptive-growth dedup hash (and any future
-                # adaptive-consumer) reads the agent-authored args off
-                # the observed event, not a goldfive-side intercept. See
-                # design doc §13 "adaptive, not predictive". Empty
-                # tool_args degrade to "" — PR 2's hash falls back to a
-                # coarser per-(agent, "") key per §9 forward-compat.
-                tool_args_json_text = _safe_jsonify_tool_args(tool_args)
                 await self._emit_observability(
                     "delegation_observed",
                     from_agent=from_agent,
@@ -5748,22 +5905,17 @@ def make_adk_plugin(
                 # truth check on the invoked agent's tool surface. Fires
                 # CAPABILITY_MISMATCH when the agent has only AgentTool
                 # wrappers but was bound to a leaf authoring task, or
-                # when ``Task.required_tools`` are not covered.
-                #
-                # goldfive#423 PR 2 — thread the observed-fact data
-                # (tool_args_json + delegation_event_id) so when the
-                # detector returns a Rule C verdict, the descriptive-
-                # growth fallback can synthesise a discovered task from
-                # the OBSERVED args (not a pin-time intercept of agent
-                # state). See design doc §13 "adaptive, not predictive".
+                # when ``Task.required_tools`` are not covered. Runs
+                # AFTER the pin/growth above, so under descriptive
+                # growth (the default) the bound task already reflects
+                # observed reality and discovered tasks are skipped
+                # inside the helper (design doc §11.4(a)).
                 try:
                     await self._maybe_emit_capability_mismatch(
                         ctx=ctx,
                         invoked_agent=nested_agent,
                         invoked_agent_name=to_agent,
                         invocation_id=inv_id,
-                        tool_args_json=tool_args_json_text,
-                        delegation_event_id="",
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.debug(

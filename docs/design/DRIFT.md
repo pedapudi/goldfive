@@ -103,18 +103,23 @@ kinds group naturally into six categories.
 | `BLOCKED` | `report_task_blocked(task_id, blocker)` with a structural blocker. | `warning` | sometimes |
 | `CAPABILITY_MISMATCH` | Structural capability gap at `delegation_observed` time: Rule A (coordinator-style leaf-assignment, #253), Rule B (required-tools cover, #253), Rule C (out-of-DAG-order delegation, #268). See `goldfive/drift/capability_check.py`. | `critical` | yes (refine) |
 
-**Rule C status under plan-descriptive growth (goldfive#423).** Rule A
-and Rule B still fire normally. **Rule C** is active until PR 4 of
-#423 lands. When `SteeringConfig.descriptive_growth_enabled=True`
-(env `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH=1`), the steerer bypasses
-Rule C in favour of synthesising a `discovered=True` task via
-`PlanReviser.install_descriptive_growth` — the plan grows to match
-reality rather than firing a structural drift. When the flag is
-False (the default until PR 4), Rule C fires as before. The data-
-model carriers (`Task.discovered`,
-`DelegationObserved.tool_args_json`) ship regardless of the flag.
-See [PLAN-DESCRIPTIVE-GROWTH.md](PLAN-DESCRIPTIVE-GROWTH.md) §7 for
-the full Rule A/B/C table under the new model.
+**Rule C status under plan-descriptive growth (goldfive#423 /
+AGENCY-PRESERVATION.md PR 2).** Rule A and Rule B still fire normally
+for non-discovered bound tasks; both are skipped when the bound task
+is `discovered=True` (PLAN-DESCRIPTIVE-GROWTH.md §11.4(a)). **Rule C
+is soft-retired**: it no longer runs unless the operator explicitly
+sets `GOLDFIVE_CAPABILITY_RULE_C=1`. With
+`SteeringConfig.descriptive_growth_enabled=True` (the default; env
+`GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`), the delegation pin grows a
+`discovered=True` task via `PlanReviser.install_descriptive_growth`
+whenever tier 1/2 matching misses — the plan grows to match reality
+BEFORE any capability rule runs, so the mispin shape Rule C detected
+no longer occurs. Hard deletion of Rule C follows in
+AGENCY-PRESERVATION.md PR 13. The data-model carriers
+(`Task.discovered`, `DelegationObserved.tool_args_json`) ship
+regardless of the flag. See
+[PLAN-DESCRIPTIVE-GROWTH.md](PLAN-DESCRIPTIVE-GROWTH.md) §7 for the
+full Rule A/B/C table under the new model.
 
 ### Discovery category — new work that was not in the plan
 

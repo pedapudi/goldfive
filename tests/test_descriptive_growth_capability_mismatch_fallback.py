@@ -1,20 +1,42 @@
-"""Integration tests for the CAPABILITY_MISMATCH → descriptive-growth fallback.
+"""CAPABILITY_MISMATCH verdict path after the descriptive-growth move.
 
-Per goldfive#423 PR 2: when ``SteeringConfig.descriptive_growth_enabled``
-is ``True`` and the structural capability detector returns a Rule C
-verdict (out-of-DAG-order delegation — invoked agent's role stem
-absent from the bound task but present in another PENDING task), the
-ADK plugin's ``_maybe_emit_capability_mismatch`` synthesises a
-``discovered=True`` task via
-:meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`
-and re-pins the delegation to it INSTEAD of dispatching the Rule C
-drift. With the flag off (the default) the legacy Rule C dispatch
-fires as today.
+History: goldfive#423 Phase 1 wired a Rule C → descriptive-growth
+fallback INTO ``_maybe_emit_capability_mismatch`` (this file originally
+pinned that behaviour). goldfive#423 / AGENCY-PRESERVATION.md Stage 1
+PR 2 moved the growth trigger to PIN time
+(``_maybe_pin_delegation_task`` tier-1/2 miss →
+:meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`),
+which runs BEFORE any capability rule, and soft-retired Rule C behind
+``GOLDFIVE_CAPABILITY_RULE_C``.
 
-Rule A and Rule B verdicts dispatch normally regardless of the flag —
-those are skill-gap signals, not pin-mismatch signals.
+This file now pins the VERDICT-path side of that contract:
 
-Design ref: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3, §7.
+* the verdict path never grows the plan (growth lives at pin time —
+  see ``tests/test_descriptive_growth_pin_time.py``);
+* Rule C is silent by default and dispatches as a plain drift under
+  the explicit escape hatch (no growth absorption);
+* Rule A still dispatches normally for non-discovered bound tasks;
+* discovered bound tasks skip the capability rules entirely
+  (design doc §11.4 resolution (a)).
+
+Test migration map (every original assertion re-pointed, none deleted
+silently — see the PR body for the one-line justifications):
+
+* ``test_flag_off_dispatches_rule_c_drift_as_today`` →
+  ``test_rule_c_dispatches_under_escape_hatch_without_growth``.
+* ``test_flag_on_grows_discovered_task_and_suppresses_rule_c`` →
+  ``test_verdict_path_no_longer_grows`` (inverted: the growth the old
+  test asserted here now happens at pin time; the pin-time positive
+  lives in ``test_descriptive_growth_pin_time.py``).
+* ``test_flag_on_rule_a_still_fires`` → kept (signature updated: the
+  growth-threading kwargs were removed from
+  ``_maybe_emit_capability_mismatch``).
+* ``test_flag_on_dedups_repeated_unmatched_delegations`` → migrated to
+  ``test_descriptive_growth_pin_time.py::test_2d27ff4a_repeated_delegations_one_task_no_drift``
+  (the dedup now exercises the pin-time path, which is where the 20×
+  cherry-tree delegations actually arrive).
+
+Design ref: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3, §7, §11.4.
 """
 
 from __future__ import annotations
@@ -98,16 +120,10 @@ class _NullPlanner:
 def _rule_c_plan() -> Plan:
     """Build the canonical Rule C shape from design doc §2.1.
 
-    Coordinator delegates to ``debugger_agent`` but pin lands on
-    ``find_presentation_files`` (the first eligible). The agent's role
-    stem ``debugger`` is absent from the bound task and not present
-    in any other PENDING task — actually that means Rule C WON'T
-    fire on a generic find-files plan. We need a shape where the
-    invoked agent's stem matches a different PENDING task.
-
-    Better fixture: bind ``reviewer_agent`` to a ``draft`` task while
-    a separate ``review`` task is also PENDING. The stem ``reviewer``
-    → ``review`` is absent from ``draft`` and present in ``review``.
+    Bind ``reviewer_agent`` to a ``draft`` task while a separate
+    ``review`` task is also PENDING. The stem ``reviewer`` → ``review``
+    is absent from ``draft`` and present in ``review`` — the Rule C
+    trigger shape.
     """
     return Plan(
         id="p-rulec",
@@ -136,7 +152,7 @@ def _rule_c_plan() -> Plan:
 def _make_session(plan: Plan | None = None) -> Session:
     return Session(
         run_id="r-rulec",
-        goals=[Goal(id="g-rulec", summary="exercise rule c fallback")],
+        goals=[Goal(id="g-rulec", summary="exercise rule c retirement")],
         plan=plan if plan is not None else _rule_c_plan(),
     )
 
@@ -171,7 +187,7 @@ def _build_ctx_and_plugin(session: Session, steerer: Any):
 
 
 class _AgentToolStub:
-    """Minimal AgentTool surface (a leaf-only tool list)."""
+    """Minimal leaf-tool surface (just a ``.name``)."""
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -183,17 +199,27 @@ class _InvokedAgentStub:
     def __init__(self, name: str) -> None:
         self.name = name
         # Some leaf tools so Rule A doesn't fire (we want to exercise
-        # specifically Rule C).
+        # specifically the Rule C shape).
         self.tools = [_AgentToolStub("search_web"), _AgentToolStub("read_file")]
 
 
-async def test_flag_off_dispatches_rule_c_drift_as_today() -> None:
-    """With the feature flag OFF, the Rule C CAPABILITY_MISMATCH dispatches as today."""
+async def test_rule_c_dispatches_under_escape_hatch_without_growth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With growth OFF and ``GOLDFIVE_CAPABILITY_RULE_C=1``, the Rule C
+    CAPABILITY_MISMATCH dispatches as a plain drift — the verdict-path
+    growth absorption was removed (growth lives at pin time now).
+
+    Migrated from ``test_flag_off_dispatches_rule_c_drift_as_today``:
+    Rule C is soft-retired by default, so reaching the legacy dispatch
+    now additionally requires the explicit env escape hatch.
+    """
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_C", "1")
     sink = _ListSink()
     steerer = DefaultSteerer(
         steering_config=SteeringConfig(
             observation_only=False,
-            descriptive_growth_enabled=False,  # FLAG OFF
+            descriptive_growth_enabled=False,  # legacy escape hatch
         )
     )
     steerer.bind(sinks=[sink], planner=_NullPlanner())
@@ -211,8 +237,6 @@ async def test_flag_off_dispatches_rule_c_drift_as_today() -> None:
         invoked_agent=_InvokedAgentStub("reviewer_agent"),
         invoked_agent_name="reviewer_agent",
         invocation_id="inv-test-1",
-        tool_args_json='{"request": "review the draft"}',
-        delegation_event_id="evt-1",
     )
 
     # Rule C drift was dispatched.
@@ -223,21 +247,67 @@ async def test_flag_off_dispatches_rule_c_drift_as_today() -> None:
     ]
     assert (
         len(rule_c) == 1
-    ), f"with flag OFF, expected 1 Rule C drift; got {len(rule_c)}"
-    # No discovered task synthesised.
+    ), f"under the escape hatch, expected 1 Rule C drift; got {len(rule_c)}"
+    # No discovered task synthesised — the verdict-path fallback is gone.
     discovered = [t for t in session.plan.tasks if getattr(t, "discovered", False)]
     assert (
         discovered == []
-    ), f"flag OFF must not grow discovered tasks; got {[t.id for t in discovered]}"
+    ), f"verdict path must not grow discovered tasks; got {[t.id for t in discovered]}"
 
 
-async def test_flag_on_grows_discovered_task_and_suppresses_rule_c() -> None:
-    """With the feature flag ON, Rule C is replaced by descriptive growth."""
+async def test_rule_c_silent_by_default_on_verdict_path() -> None:
+    """Same Rule C shape, no env flag: nothing fires and nothing grows.
+
+    New default pinned by goldfive#423 / AGENCY-PRESERVATION.md PR 2
+    (correctness requirement (c)): Rule C is soft-retired, and the
+    verdict path no longer owns any growth, so the canonical Rule C
+    fixture produces zero drift dispatches and zero plan mutations.
+    """
     sink = _ListSink()
     steerer = DefaultSteerer(
         steering_config=SteeringConfig(
             observation_only=False,
-            descriptive_growth_enabled=True,  # FLAG ON
+            descriptive_growth_enabled=False,
+        )
+    )
+    steerer.bind(sinks=[sink], planner=_NullPlanner())
+    recorder = _RecordingDriftSteerer(steerer)
+
+    session = _make_session()
+    session.current_task_id = "draft_slides"
+    plugin, _state = _build_ctx_and_plugin(session, steerer)
+
+    ctx = plugin._active_ctx
+    await plugin._maybe_emit_capability_mismatch(
+        ctx=ctx,
+        invoked_agent=_InvokedAgentStub("reviewer_agent"),
+        invoked_agent_name="reviewer_agent",
+        invocation_id="inv-test-default",
+    )
+
+    assert recorder.handled_drifts == [], (
+        f"Rule C must be silent by default; got "
+        f"{[d.detail for d in recorder.handled_drifts]}"
+    )
+    discovered = [t for t in session.plan.tasks if getattr(t, "discovered", False)]
+    assert discovered == []
+
+
+async def test_verdict_path_no_longer_grows() -> None:
+    """With growth ON, the verdict path neither grows nor dispatches Rule C.
+
+    Migrated from ``test_flag_on_grows_discovered_task_and_suppresses_rule_c``
+    with the polarity inverted: the growth that test asserted HERE now
+    happens at pin time (positive coverage in
+    ``test_descriptive_growth_pin_time.py``); the verdict path is a
+    pure detector again, and Rule C's retirement means the old fixture
+    produces no verdict at all.
+    """
+    sink = _ListSink()
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(
+            observation_only=False,
+            descriptive_growth_enabled=True,
         )
     )
     steerer.bind(sinks=[sink], planner=_NullPlanner())
@@ -249,49 +319,35 @@ async def test_flag_on_grows_discovered_task_and_suppresses_rule_c() -> None:
 
     ctx = plugin._active_ctx
     prior_task_count = len(session.plan.tasks)
+    prior_revision = session.plan.revision_index
 
     await plugin._maybe_emit_capability_mismatch(
         ctx=ctx,
         invoked_agent=_InvokedAgentStub("reviewer_agent"),
         invoked_agent_name="reviewer_agent",
         invocation_id="inv-test-2",
-        tool_args_json='{"request": "review the draft"}',
-        delegation_event_id="evt-2",
     )
 
-    # Rule C drift was SUPPRESSED.
-    rule_c = [
-        d
-        for d in recorder.handled_drifts
-        if d.kind is DriftKind.CAPABILITY_MISMATCH
-    ]
-    assert (
-        rule_c == []
-    ), f"flag ON must suppress Rule C drift; got {[d.detail for d in rule_c]}"
-
-    # Discovered task was synthesised.
+    # No drift dispatched (Rule C retired; Rules A/B don't apply here).
+    assert recorder.handled_drifts == []
+    # No growth from the verdict path — the plan is untouched.
     assert session.plan is not None
-    assert len(session.plan.tasks) == prior_task_count + 1
-    discovered = [
-        t for t in session.plan.tasks if getattr(t, "discovered", False)
-    ]
-    assert len(discovered) == 1, (
-        f"flag ON must synthesise 1 discovered task; got {len(discovered)}"
-    )
-    new_task = discovered[0]
-    assert new_task.assignee_agent_id == "reviewer_agent"
-    assert new_task.discovery_identity_hash != ""
-
-    # Pin moved to the new discovered task.
-    assert session.current_task_id == new_task.id
+    assert len(session.plan.tasks) == prior_task_count
+    assert session.plan.revision_index == prior_revision
+    discovered = [t for t in session.plan.tasks if getattr(t, "discovered", False)]
+    assert discovered == []
+    # The pin was not moved.
+    assert session.current_task_id == "draft_slides"
 
 
 async def test_flag_on_rule_a_still_fires() -> None:
     """Rule A (leaf-task with AgentTool-only agent) is unaffected by the flag.
 
-    The descriptive-growth fallback gates ONLY on Rule C detail
-    substring. Rule A — coordinator-style leaf-assignment — has a
-    different detail prefix and still dispatches normally.
+    Rule A — coordinator-style leaf-assignment — still dispatches
+    normally for NON-discovered bound tasks (Rule A is
+    AGENCY-PRESERVATION.md PR 3's business, untouched by PR 2). Kept
+    from the original suite; only the removed growth-threading kwargs
+    changed.
     """
 
     class _AgentToolWrapper:
@@ -368,12 +424,9 @@ async def test_flag_on_rule_a_still_fires() -> None:
         invoked_agent=_OnlyAgentToolsAgent(),
         invoked_agent_name="coordinator_b",
         invocation_id="inv-test-rulea",
-        tool_args_json='{"request": "go write the report"}',
-        delegation_event_id="evt-rulea",
     )
 
-    # Rule A drift was dispatched normally (NOT suppressed by the
-    # descriptive-growth gate).
+    # Rule A drift was dispatched normally.
     cap_drifts = [
         d
         for d in recorder.handled_drifts
@@ -393,12 +446,51 @@ async def test_flag_on_rule_a_still_fires() -> None:
     )
 
 
-async def test_flag_on_dedups_repeated_unmatched_delegations() -> None:
-    """Repeated same-args delegations grow the plan once, then re-pin.
+async def test_discovered_bound_task_skips_capability_rules() -> None:
+    """A ``discovered=True`` bound task short-circuits the detector.
 
-    Cherry-tree run from design doc §2.1 motivating evidence: 20+
-    debugger_agent delegations dedup to a single discovered task.
+    Design doc §11.4 resolution (a): the auto-derived
+    ``agent_name: request`` title reads leaf-shaped, so without the
+    skip an AgentTool-only agent pinned to its own discovered task
+    would re-fire Rule A on every delegation — the exact 2d27ff4a
+    storm descriptive growth exists to stop.
     """
+
+    class _AgentToolWrapper:
+        def __init__(self, name: str, agent_name: str) -> None:
+            self.name = name
+            self.agent = type("_A", (), {"name": agent_name})()
+
+    class _OnlyAgentToolsAgent:
+        def __init__(self) -> None:
+            self.name = "debugger_agent"
+            self.tools = [_AgentToolWrapper("delegate_x", "agent_x")]
+
+    plan = Plan(
+        id="p-disc",
+        run_id="r-disc",
+        goal_ids=["g-disc"],
+        tasks=[
+            Task(
+                id="discovered-abc123",
+                title="debugger_agent: locate cherry tree files",
+                description='{"request": "locate cherry tree files"}',
+                assignee_agent_id="debugger_agent",
+                status=TaskStatus.PENDING,
+                discovered=True,
+                discovery_identity_hash="hash1234abcd5678",
+            ),
+        ],
+        edges=[],
+        revision_index=2,
+    )
+    session = Session(
+        run_id="r-disc",
+        goals=[Goal(id="g-disc", summary="discovered tasks skip rules")],
+        plan=plan,
+    )
+    session.current_task_id = "discovered-abc123"
+
     sink = _ListSink()
     steerer = DefaultSteerer(
         steering_config=SteeringConfig(
@@ -406,31 +498,34 @@ async def test_flag_on_dedups_repeated_unmatched_delegations() -> None:
         )
     )
     steerer.bind(sinks=[sink], planner=_NullPlanner())
-    _RecordingDriftSteerer(steerer)  # silence drift dispatch
+    recorder = _RecordingDriftSteerer(steerer)
 
-    session = _make_session()
-    session.current_task_id = "draft_slides"
-    plugin, _state = _build_ctx_and_plugin(session, steerer)
+    from goldfive.adapters._adk_plugin import (
+        SessionContext,
+        make_adk_plugin,
+    )
+
+    plugin = make_adk_plugin(host_agent_name="coordinator")
+    plugin.set_active_context(
+        SessionContext(
+            session=session,
+            steerer=steerer,
+            task=plan.tasks[0],
+            tool_handlers={},
+            host_agent_name="coordinator",
+        )
+    )
 
     ctx = plugin._active_ctx
-
-    # Fire 10 delegations to the same (agent, tool_args).
-    for i in range(10):
-        await plugin._maybe_emit_capability_mismatch(
-            ctx=ctx,
-            invoked_agent=_InvokedAgentStub("reviewer_agent"),
-            invoked_agent_name="reviewer_agent",
-            invocation_id=f"inv-{i}",
-            tool_args_json='{"request": "review the draft"}',
-            delegation_event_id=f"evt-{i}",
-        )
-
-    # Only one discovered task.
-    assert session.plan is not None
-    discovered = [t for t in session.plan.tasks if getattr(t, "discovered", False)]
-    assert len(discovered) == 1, (
-        f"10 same-args delegations must dedup to 1 discovered task; "
-        f"got {len(discovered)}"
+    await plugin._maybe_emit_capability_mismatch(
+        ctx=ctx,
+        invoked_agent=_OnlyAgentToolsAgent(),
+        invoked_agent_name="debugger_agent",
+        invocation_id="inv-test-disc",
     )
-    # current_task_id pinned to that one discovered task.
-    assert session.current_task_id == discovered[0].id
+
+    assert recorder.handled_drifts == [], (
+        f"capability rules must be skipped on discovered tasks "
+        f"(design doc §11.4(a)); got "
+        f"{[d.detail for d in recorder.handled_drifts]}"
+    )
