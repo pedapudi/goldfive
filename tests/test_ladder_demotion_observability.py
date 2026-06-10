@@ -128,6 +128,62 @@ async def test_demoted_critical_kind_observes_without_refine_or_outcome(
     assert dict(session.refine_outcomes) == {}
 
 
+async def test_demoted_kind_still_records_signal_ledger_fire_at_observe() -> None:
+    """PR #456's SignalLedger fire-recording survives the PR-3 demotion.
+
+    The fire-recording hook (``_note_signal_drift_fire``) lives at the
+    END of ``_emit_drift_detected`` — the single DriftDetected
+    chokepoint, which runs in the dispatch BEFORE the ladder routing.
+    So a CAPABILITY_MISMATCH routed to OBSERVE still records a fire on
+    the ledger: the demotion removes the ladder *action* (no signal
+    delivered), not the observability telemetry. This guards the lead's
+    binding concern that demotions "must not silently stop telemetry for
+    demoted kinds (DriftDetected + fire-recording still happen at
+    OBSERVE)".
+    """
+    from goldfive.config import SteeringConfig
+    from goldfive.signal_ledger import SignalLedger
+
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(observation_only=False, signal_telemetry=True)
+    )
+    sink = _ListSink()
+    planner = _RecordingPlanner()
+    steerer.bind(sinks=[sink], planner=planner)
+    session = Session(
+        run_id="r1",
+        goals=[Goal(id="g1", summary="ship it")],
+        plan=Plan(
+            id="p1",
+            run_id="r1",
+            goal_ids=["g1"],
+            tasks=[Task(id="t1", title="A")],
+            edges=[],
+        ),
+    )
+    session.current_task_id = "t1"
+    drift = DriftEvent(
+        kind=DriftKind.CAPABILITY_MISMATCH,
+        severity=DriftSeverity.CRITICAL,
+        detail="demoted",
+        current_task_id="t1",
+    )
+    await steerer.drift.handle_drift(drift, session)
+    await steerer.drift._wait_background_drifts_idle()
+
+    # OBSERVE: no signal delivered, no refine.
+    assert planner.refine_calls == []
+    assert len(_drift_detected(sink)) == 1
+    # PR #456 fire-recording preserved: the ledger saw the fire, but no
+    # delivery (OBSERVE delivers no signal).
+    entry = SignalLedger.for_session(session).entry(
+        DriftKind.CAPABILITY_MISMATCH.value, "t1"
+    )
+    assert entry is not None
+    assert entry.fire_count >= 1
+    assert not entry.has_delivery
+
+
 async def test_plan_divergence_dropped_in_handle_drift_no_outcome() -> None:
     """PLAN_DIVERGENCE is dropped at the top of ``handle_drift`` (#252):
     no DriftDetected via this path, no refine, no ``refine_outcomes``
