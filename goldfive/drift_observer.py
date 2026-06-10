@@ -3540,8 +3540,22 @@ class DriftObserver:
             # ABSORB so Rule B — user-declared ``required_tools``, genuine
             # prescriptive intent — keeps steering via refine, capped at the
             # WARNING rung ("WARNING-max": Rule B now emits WARNING, never
-            # CRITICAL, so it cannot escalate to cancel/pause). PR 13 hard-
-            # deletes Rule A/C and revisits this row.
+            # CRITICAL, so it cannot escalate to cancel/pause).
+            #
+            # Trajectory-safety synergy with #453: an ABSORB-driven refine
+            # is goldfive-authored, and post-#453 goldfive-authored drift
+            # never cancels the in-flight invocation (CAPABILITY_MISMATCH
+            # is not in ``_HARD_SAFETY_DRIFT_KINDS``). So Rule B's retained
+            # steering refines the ledger plan WITHOUT preempting the
+            # running agent — the demotion and the cancel-authority gate
+            # compose into "advise, don't grab the wheel".
+            #
+            # In the DEFAULT config the CRITICAL cells are unreachable
+            # belt-and-suspenders: Rule A and Rule C are both gated off,
+            # and the only live emitter (Rule B) emits WARNING. The
+            # CRITICAL→OBSERVE mapping bites only if an operator re-enables
+            # Rule A/C via the escape-hatch env flags. PR 13 hard-deletes
+            # Rule A/C and revisits this row.
             DriftKind.CAPABILITY_MISMATCH: (
                 _IL.OBSERVE,
                 _IL.ABSORB,

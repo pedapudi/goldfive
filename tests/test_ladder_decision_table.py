@@ -86,7 +86,12 @@ def render_ladder_surface(steerer: DefaultSteerer) -> str:
 #   * plan_divergence     WARNING ABSORB→OBSERVE, CRITICAL
 #                         [CANCEL_REINVOKE|PAUSE_ESCALATE]→[OBSERVE|OBSERVE]
 #   * capability_mismatch CRITICAL [ABSORB|PAUSE_ESCALATE]→[OBSERVE|OBSERVE]
-#                         (WARNING stays ABSORB: Rule B / "WARNING-max")
+#                         (WARNING stays ABSORB: Rule B / "WARNING-max").
+#                         The CRITICAL→OBSERVE cells are unreachable in the
+#                         DEFAULT config — Rule A and Rule C are both env-
+#                         gated OFF and the only live emitter (Rule B) emits
+#                         WARNING; the cells bite only under the Rule A/C
+#                         escape hatches (belt-and-suspenders).
 #   * new_work_discovered WARNING ABSORB→OBSERVE, CRITICAL
 #                         [ABSORB|PAUSE_ESCALATE]→[OBSERVE|OBSERVE]
 # wrong_agent is unchanged here: it is deprecated with no _LADDER row and
