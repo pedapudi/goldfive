@@ -1,18 +1,58 @@
-# Agency Preservation: from controller-in-disguise to true overlay
+# Agency Preservation: from always-on controller to dormant supervisor
 
 Status: ROADMAP (not yet implemented)
 
+## 0. What goldfive is
+
+goldfive is neither an overlay nor a controller. The "overlay, not
+controller" slogan (goldfive#141) describes a *mechanism* — wrap the tree,
+observe via callbacks, don't drive per-task — and says nothing about
+purpose. goldfive's purpose is to provide **steering and guardrails if
+things drift**: a *dormant supervisor*. Lane-keep assist, not autopilot
+and not a dashcam.
+
+That identity decomposes into three behaviors with different contracts:
+
+- **Dormant (the steady state)**: while the wrapped agent is making
+  progress toward the user's goal, goldfive has ZERO trajectory footprint —
+  no per-turn prompt injection, no grading of delegations against a
+  forecast, no preemption. Observation and event emission only.
+- **Guardrails (always armed)**: hard limits on *observed facts* — tool
+  loops, reasoning loops, stalls, budgets, runaway delegation, refusals.
+  These need no plan and no judgment call; they are cheap, low
+  false-positive, and legitimately always on. Their job is to *stop*
+  runaway behavior, not to redirect it.
+- **Steering (engaged only on drift)**: corrective influence when the
+  trajectory diverges from the *user's goal*. This requires a reference
+  and an LLM judge; it is expensive and fallible, so it engages
+  conditionally, proportionally, and honestly attributed.
+
+The dichotomy matters because guardrails and steering are different
+products with different trigger conditions and different authority — and
+the current implementation runs both through one machine (one drift
+taxonomy, one ladder, one refine path), which is how a planning artifact
+like CAPABILITY_MISMATCH ended up with the same enforcement machinery as
+a genuine loop detector.
+
 ## 1. Problem statement
 
-goldfive's stated execution model is *overlay, not controller* (goldfive#141):
-wrap any agent tree, hand it the caller's request verbatim once, observe via
-callbacks, and intervene structurally only when the trajectory genuinely
-drifts. In practice the implementation still behaves like a controller in
-four load-bearing places, which measurably damages the wrapped agent's
-trajectory and undermines its agency. The fact that
-`SteeringConfig.observation_only=True` had to become the production default
-(goldfive#254) is the symptom: the active half of the product is currently
-too disruptive to leave on.
+Measured against the dormant-supervisor identity, the implementation
+fails on both sides of the "if things drift" condition:
+
+- **When nothing is drifting, goldfive is not dormant.** Prompt shaping
+  injects every turn; the reconciler grades every delegation against a
+  forecast plan, *manufacturing* the drift signal that justifies
+  engagement; plan bookkeeping writes preempt in-flight work. The system
+  has a per-turn tax and a hair trigger.
+- **When something is drifting, the response is not proportional
+  steering — it is a wheel grab.** "Steer" today means: swap the plan,
+  kill the in-flight invocation, restart the tree with goldfive's text as
+  a synthetic user turn prescribing which task and which agent comes next.
+
+This measurably damages the wrapped agent's trajectory and undermines its
+agency. The fact that `SteeringConfig.observation_only=True` had to become
+the production default (goldfive#254) is the symptom: the active half of
+the product is currently too disruptive to leave on.
 
 The four defects, verified in code:
 
@@ -67,19 +107,35 @@ GOLDFIVE_STEER dispatch + deferred cancel) under the default threshold
 
 ## 2. Design principle: an explicit authority split
 
+The dormant-supervisor identity (§0) is operationalized as an authority
+split:
+
 - **goldfive owns**: GOALS (what the user wants), BUDGETS/SAFETY (loops,
-  stalls, refusals, runaway delegation, timeouts), OBSERVABILITY (sinks →
-  harmonograf/zicato), and USER-authority relay (USER_STEER / USER_CANCEL /
-  USER_PAUSE remain absolute).
+  stalls, refusals, runaway delegation, timeouts — the guardrails),
+  OBSERVABILITY (sinks → harmonograf/zicato), and USER-authority relay
+  (USER_STEER / USER_CANCEL / USER_PAUSE remain absolute).
 - **The wrapped agent owns**: MEANS — decomposition, delegation, ordering,
   retries.
 - **The Plan becomes a ledger**: goal-anchored OUTCOME tasks (what success
   looks like) plus a descriptively-grown record of what the agent actually
-  did — not a forecast the agent is graded against.
+  did — not a forecast the agent is graded against. This is what makes
+  "if things drift" measurable correctly: drift is divergence from the
+  user's goal given the agent's own observed trajectory, not divergence
+  from goldfive's upfront guess at how the agent would decompose the work.
 - **Interventions become advisory observer notes**: honestly attributed,
   observation+goal content, delivered without destroying in-flight context.
   Control (cancel/pause/terminate) stays on the control channel and never
   depends on agent cooperation — the no-prompt-contract rule is preserved.
+- **Guardrails and steering separate**: guardrail kinds keep hard ladder
+  rows (always armed, observed facts, stop-not-redirect); steering kinds
+  engage only on goal-referenced drift, through the note channel, with
+  grace-window pacing.
+
+The roadmap's three stages map onto the three behaviors: Stage 1 + the
+prompt-shaping diet restore *dormancy* (zero steady-state footprint);
+the drift triage keeps *guardrails* armed while demoting forecast-mismatch
+kinds to observability; the observer-note channel and ledger plan mode
+rebuild *steering* as conditional, proportional, goal-referenced influence.
 
 End state: `observation_only=False` becomes the default again only when the
 new regime is measurably non-inferior to no-steering (judge-only
