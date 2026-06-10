@@ -210,18 +210,20 @@ async def test_refine_validation_failed_pauses_without_refining() -> None:
 async def test_ladder_level_for_pause_escalate_on_repeat() -> None:
     """Threshold-crossing occurrence drives CRITICAL to Level 4.
 
-    Uses PLAN_DIVERGENCE: first CRITICAL = CANCEL_REINVOKE, repeat =
-    PAUSE_ESCALATE.
+    Uses TOOL_ERROR: first CRITICAL = CANCEL_REINVOKE, repeat =
+    PAUSE_ESCALATE. (Was PLAN_DIVERGENCE, demoted to OBSERVE at all
+    severities in AGENCY-PRESERVATION.md PR 3 — re-pointed to a kind
+    that still exhibits the first→repeat escalation this test pins.)
     """
     steerer = DefaultSteerer()
     assert (
-        steerer.drift._ladder_level_for(DriftKind.PLAN_DIVERGENCE, DriftSeverity.CRITICAL, 0)
+        steerer.drift._ladder_level_for(DriftKind.TOOL_ERROR, DriftSeverity.CRITICAL, 0)
         is InterventionLevel.CANCEL_REINVOKE
     )
     # Threshold is 2 in DefaultSteerer.REFINE_FAILURE_THRESHOLD.
     assert (
         steerer.drift._ladder_level_for(
-            DriftKind.PLAN_DIVERGENCE,
+            DriftKind.TOOL_ERROR,
             DriftSeverity.CRITICAL,
             DefaultSteerer.REFINE_FAILURE_THRESHOLD,
         )

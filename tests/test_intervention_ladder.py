@@ -91,19 +91,22 @@ _CASES: list[tuple[DriftKind, DriftSeverity, int, InterventionLevel]] = [
         0,
         InterventionLevel.OBSERVE,
     ),
-    # PLAN_DIVERGENCE.
-    (DriftKind.PLAN_DIVERGENCE, DriftSeverity.WARNING, 0, InterventionLevel.ABSORB),
+    # PLAN_DIVERGENCE — DEMOTED to OBSERVE at all severities
+    # (AGENCY-PRESERVATION.md PR 3: forecast-mismatch, not goal drift;
+    # also already dropped at the top of handle_drift per #252). Was
+    # WARNING→ABSORB, CRITICAL→CANCEL_REINVOKE/PAUSE_ESCALATE.
+    (DriftKind.PLAN_DIVERGENCE, DriftSeverity.WARNING, 0, InterventionLevel.OBSERVE),
     (
         DriftKind.PLAN_DIVERGENCE,
         DriftSeverity.CRITICAL,
         0,
-        InterventionLevel.CANCEL_REINVOKE,
+        InterventionLevel.OBSERVE,
     ),
     (
         DriftKind.PLAN_DIVERGENCE,
         DriftSeverity.CRITICAL,
         2,
-        InterventionLevel.PAUSE_ESCALATE,
+        InterventionLevel.OBSERVE,
     ),
     # OFF_TOPIC: plan-context drift from the reasoning judge. Ladder
     # mirrors PLAN_DIVERGENCE so the ABSORB path can route to the
@@ -246,22 +249,29 @@ _CASES: list[tuple[DriftKind, DriftSeverity, int, InterventionLevel]] = [
         0,
         InterventionLevel.ABSORB,
     ),
-    # Default fallback: a drift kind with no table entry. NEW_WORK_DISCOVERED
-    # is WARNING severity by default -> ABSORB.
+    # NEW_WORK_DISCOVERED — DEMOTED to OBSERVE at all severities
+    # (AGENCY-PRESERVATION.md PR 3). The agent-authored reporting tool
+    # reroutes to descriptive growth instead of refine, and the explicit
+    # _LADDER row makes "non-steering at every severity" the documented
+    # mapping. Was the default-fallback ABSORB / PAUSE_ESCALATE below.
     (
         DriftKind.NEW_WORK_DISCOVERED,
         DriftSeverity.WARNING,
         0,
-        InterventionLevel.ABSORB,
+        InterventionLevel.OBSERVE,
     ),
-    # Default fallback, CRITICAL repeat -> PAUSE_ESCALATE.
     (
         DriftKind.NEW_WORK_DISCOVERED,
         DriftSeverity.CRITICAL,
         2,
-        InterventionLevel.PAUSE_ESCALATE,
+        InterventionLevel.OBSERVE,
     ),
-    # INFO on a kind without a table entry -> OBSERVE.
+    # Default fallback: a drift kind with NO _LADDER entry. CUSTOM is the
+    # representative (NEW_WORK_DISCOVERED gained an explicit row in PR 3,
+    # so it no longer exercises this path). WARNING -> ABSORB; CRITICAL
+    # repeat -> PAUSE_ESCALATE; INFO -> OBSERVE.
+    (DriftKind.CUSTOM, DriftSeverity.WARNING, 0, InterventionLevel.ABSORB),
+    (DriftKind.CUSTOM, DriftSeverity.CRITICAL, 2, InterventionLevel.PAUSE_ESCALATE),
     (DriftKind.CUSTOM, DriftSeverity.INFO, 0, InterventionLevel.OBSERVE),
 ]
 

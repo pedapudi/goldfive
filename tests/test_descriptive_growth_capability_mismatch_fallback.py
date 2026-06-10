@@ -340,15 +340,17 @@ async def test_verdict_path_no_longer_grows() -> None:
     assert session.current_task_id == "draft_slides"
 
 
-async def test_flag_on_rule_a_still_fires() -> None:
-    """Rule A (leaf-task with AgentTool-only agent) is unaffected by the flag.
+async def test_flag_on_rule_a_still_fires(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rule A (leaf-task with AgentTool-only agent) still dispatches when re-enabled.
 
-    Rule A — coordinator-style leaf-assignment — still dispatches
-    normally for NON-discovered bound tasks (Rule A is
-    AGENCY-PRESERVATION.md PR 3's business, untouched by PR 2). Kept
-    from the original suite; only the removed growth-threading kwargs
-    changed.
+    Rule A — coordinator-style leaf-assignment — is now soft-retired and
+    default OFF (AGENCY-PRESERVATION.md PR 3), so this test opts in via
+    ``GOLDFIVE_CAPABILITY_RULE_A=1``. With the flag on it dispatches
+    normally for NON-discovered bound tasks (the discovered-task skip is
+    tested separately). The verdict is still CRITICAL at the detector;
+    the ladder, not the detector, demotes the CRITICAL cells to OBSERVE.
     """
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_A", "1")
 
     class _AgentToolWrapper:
         """An AgentTool wrapper as detected by ``is_agent_tool``."""

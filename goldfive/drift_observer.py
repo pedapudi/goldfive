@@ -1478,18 +1478,90 @@ class DriftObserver:
         description: str,
         assignee: str = "",
     ) -> None:
-        """Fire a ``NEW_WORK_DISCOVERED`` drift event → triggers refine."""
+        """Absorb agent-reported new work as descriptive growth (no refine).
+
+        AGENCY-PRESERVATION.md PR 3: the agent-authored
+        ``report_new_work_discovered`` reporting tool used to fire a
+        WARNING ``NEW_WORK_DISCOVERED`` drift through
+        :meth:`handle_drift`, which routed to ``planner.refine`` — i.e.
+        goldfive re-forecast the plan because the agent found work its
+        upfront forecast missed. That is exactly the "Plan is a forecast
+        the agent is graded against" defect (§1.2) and violates
+        PLAN-DESCRIPTIVE-GROWTH.md §13 ("adaptive, not predictive").
+
+        The reroute absorbs the report as a ``discovered=True`` ledger
+        task via
+        :meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`
+        instead — the same absorb-as-growth machinery the pin-time and
+        reconciler paths use (goldfive#423 / PR 2). Observability is
+        preserved: ``install_descriptive_growth`` emits the
+        ``PlanRevised`` + ``DriftDetected`` pair (the drift is INFO —
+        "observational, not corrective", design doc §4.6 — a deliberate
+        severity drop from the old WARNING, since absorbed new work is
+        not a steering signal).
+
+        The agent's verbatim ``title`` / ``description`` are passed
+        through as overrides so the ledger task keeps the reported text.
+        ``tool_args_json`` encodes ``(parent_task_id, title,
+        description)`` purely to seed the dedup identity hash: a repeated
+        identical report is idempotent (dedup hit, no second task) while
+        two genuinely different reports under the same assignee stay
+        distinct.
+
+        The discovered task lands as an independent sub-DAG root (no edge
+        back to ``parent_task_id``); the forecast-DAG parent link the old
+        refine path could draw is intentionally not reconstructed — the
+        ledger records *what happened*, not a predicted decomposition.
+
+        Defensive fallback: when the bound steerer is a stub without
+        ``plans.install_descriptive_growth`` (some unit-test doubles),
+        emit a ``DriftDetected`` directly so the observability signal is
+        never silently dropped. Never routes back through
+        ``planner.refine``.
+        """
         detail = f"new work under {parent_task_id}: {title}: {description}" + (
             f" (assignee={assignee})" if assignee else ""
         )
+        plans = getattr(self._steerer, "plans", None)
+        install = getattr(plans, "install_descriptive_growth", None)
+        if callable(install):
+            # Seed the dedup identity from the full report so distinct
+            # reports don't collide and identical re-reports dedup.
+            tool_args_json = json.dumps(
+                {
+                    "parent_task_id": parent_task_id,
+                    "title": title,
+                    "description": description,
+                },
+                sort_keys=True,
+            )
+            try:
+                await install(
+                    session,
+                    agent_name=assignee or "",
+                    tool_args_json=tool_args_json,
+                    title=title,
+                    description=description,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 — growth is best-effort
+                log.debug(
+                    "DefaultSteerer.report_new_work_discovered: "
+                    "install_descriptive_growth raised: %s; falling back "
+                    "to direct DriftDetected emit",
+                    exc,
+                )
+        # Fallback (stub steerer / growth unavailable): preserve the
+        # observability signal without any refine/steer side effect.
         drift = DriftEvent(
             kind=DriftKind.NEW_WORK_DISCOVERED,
-            severity=DriftSeverity.WARNING,
+            severity=DriftSeverity.INFO,
             detail=detail,
             current_task_id=parent_task_id,
             current_agent_id=assignee,
+            authored_by="goldfive",
         )
-        await self.handle_drift(drift, session)
+        await self._emit_drift_detected(session, drift)
 
     async def report_plan_divergence(
         self,
@@ -3434,11 +3506,70 @@ class DriftObserver:
                 None,
                 (_IL.OBSERVE, _IL.OBSERVE),
             ),
+            # AGENCY-PRESERVATION.md PR 3 — forecast-mismatch demotions.
+            # These kinds are divergence from goldfive's *forecast* of how
+            # the agent would decompose the work, not divergence from the
+            # user's goal (§0/§1.2). They become observability-only:
+            # DriftDetected still emits, but the ladder takes no
+            # refine/steer/cancel action at any severity. Because OBSERVE
+            # short-circuits the dispatch before the refine path
+            # (:meth:`_handle_drift_dispatch`), a demoted kind also stops
+            # writing ``refine_outcomes`` — verified by the §5.3
+            # side-effect check (no other gate depended on those writes).
+            #
+            # PLAN_DIVERGENCE: belt-and-braces. The kind is ALSO dropped at
+            # the top of :meth:`handle_drift` (#252, reconciler emitter
+            # dead), so this row is normally unreachable; pinning it OBSERVE
+            # keeps the table honest and demotes any future / external
+            # producer that bypasses the #252 guard. The live observability
+            # signal comes from the executor reachability-audit emitter
+            # (``sequential._plan_divergence_drift_event``), which emits
+            # DriftDetected directly and is unchanged.
             DriftKind.PLAN_DIVERGENCE: (
                 _IL.OBSERVE,
-                _IL.ABSORB,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                _IL.OBSERVE,
+                (_IL.OBSERVE, _IL.OBSERVE),
             ),
+            # CAPABILITY_MISMATCH: Rule A (coordinator-style leaf-assignment)
+            # is stem/keyword NL classification — the #166/#167 anti-pattern
+            # — and is additionally gated OFF by default behind
+            # ``GOLDFIVE_CAPABILITY_RULE_A`` (see
+            # :mod:`goldfive.drift.capability_check`). The CRITICAL cells
+            # (where Rule A / the soft-retired Rule C fire) are demoted to
+            # OBSERVE so even a re-enabled rule only observes. WARNING stays
+            # ABSORB so Rule B — user-declared ``required_tools``, genuine
+            # prescriptive intent — keeps steering via refine, capped at the
+            # WARNING rung ("WARNING-max": Rule B now emits WARNING, never
+            # CRITICAL, so it cannot escalate to cancel/pause). PR 13 hard-
+            # deletes Rule A/C and revisits this row.
+            DriftKind.CAPABILITY_MISMATCH: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.OBSERVE, _IL.OBSERVE),
+            ),
+            # NEW_WORK_DISCOVERED: explicit observability-only row. The
+            # agent-authored reporting-tool path
+            # (:meth:`report_new_work_discovered`) no longer reaches the
+            # ladder at all — it reroutes to descriptive growth
+            # (``install_descriptive_growth``, absorb-as-growth) instead of
+            # ``planner.refine`` (§1.2 / PLAN-DESCRIPTIVE-GROWTH.md §13:
+            # adaptive, not predictive). Framework-synthesised discoveries
+            # are INFO and were already non-steering via the default
+            # fallthrough; this row makes "non-steering at every severity"
+            # explicit so the table self-documents the demotion.
+            DriftKind.NEW_WORK_DISCOVERED: (
+                _IL.OBSERVE,
+                _IL.OBSERVE,
+                (_IL.OBSERVE, _IL.OBSERVE),
+            ),
+            # WRONG_AGENT is deliberately absent (deprecated; no production
+            # emitter — grep ``DriftKind.WRONG_AGENT`` finds only the enum
+            # def, proto/pb stubs, and docs, never a ``DriftEvent(kind=…)``
+            # construction). Its enum value stays reserved (see the
+            # deprecation note in :mod:`goldfive.types`), but it gets no
+            # ladder row: there is no live dispatch to map. Mirrors the
+            # JUSTIFIED_DEVIATION "lack of a _LADDER row is intentional"
+            # precedent. AGENCY-PRESERVATION.md PR 3.
             DriftKind.OFF_TOPIC: (
                 _IL.OBSERVE,
                 _IL.ABSORB,

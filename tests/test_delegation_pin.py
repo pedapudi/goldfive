@@ -1043,7 +1043,9 @@ async def test_delegation_observed_task_id_empty_when_no_eligible_task() -> None
     )
 
 
-async def test_capability_check_still_resolves_after_reorder() -> None:
+async def test_capability_check_still_resolves_after_reorder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """After the pin → emit → capability-check reorder, the capability
     detector still resolves the task via Strategy 1 (assignee, freshly
     stamped by the pin) — i.e. the reorder didn't break the goldfive#253
@@ -1051,8 +1053,12 @@ async def test_capability_check_still_resolves_after_reorder() -> None:
 
     Rule A scenario: the invoked sub-agent has only AgentTool wrappers
     (no leaf tools) and the bound plan task is a leaf authoring task.
-    The capability detector must fire CAPABILITY_MISMATCH.
+    The capability detector must fire CAPABILITY_MISMATCH. Rule A is
+    soft-retired (default OFF, AGENCY-PRESERVATION.md PR 3), so this
+    wiring test opts in via ``GOLDFIVE_CAPABILITY_RULE_A=1`` — it
+    exercises the pin→detector plumbing, which is unchanged.
     """
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_A", "1")
     from goldfive.types import DriftKind
 
     class _RecordingDrift:
