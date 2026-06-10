@@ -84,6 +84,8 @@ message Event {
     PolicyApplied policy_applied = 42;
     RetryBudgetSpent retry_budget_spent = 43;
     JudgementEmitted judgement_emitted = 44;
+    SignalDelivered signal_delivered = 45;
+    SignalOutcome signal_outcome = 46;
   }
 }
 
@@ -1236,4 +1238,91 @@ message JudgementEmitted {
   // producers SHOULD truncate longer rationales with the
   // " … [truncated]" convention used elsewhere in this file.
   string detail = 10;
+}
+
+// ---------------------------------------------------------------------------
+// Signal telemetry — observe-only (AGENCY-PRESERVATION.md PR 5)
+// ---------------------------------------------------------------------------
+
+// Emitted at each goldfive-authored dispatch decision point the instant a
+// corrective signal is — or, under ``observation_only``, *would have been* —
+// delivered to the wrapped agent. The observe-only substrate for the §5.4
+// shadow/differential validation: it diffs "what the legacy regime would have
+// done" against "what the new regime would do" on the same real runs. Gates
+// nothing.
+//
+// Additive (tag 45 in Event.payload); no existing field renumbered. New
+// message rather than a dict envelope because signal events ride the hot
+// dispatch path that ~all unit tests iterate via ``Event.WhichOneof`` — a
+// dict envelope would break the "existing suites pass unmodified" invariant
+// (AGENCY-PRESERVATION.md §5.1). The off-by-default ``ContextEdited`` dict
+// precedent (goldfive#397) is fine only because it never lands on that path.
+message SignalDelivered {
+  // The goldfive-minted drift id (``DriftEvent.id``) that triggered the
+  // signal. Strict join key against the paired ``DriftDetected.id``.
+  string drift_id = 1;
+  // Drift kind as the bare value string (e.g. ``"looping_tool_call"``).
+  string kind = 2;
+  // Drift severity as the bare value string (``"info"`` / ``"warning"`` /
+  // ``"critical"``).
+  string severity = 3;
+  // The dispatch decision point the signal rode: ``"nudge_replay"`` /
+  // ``"steer_control"`` / ``"pause_control"`` / ``"promotion"``. Readers MUST
+  // tolerate unknown values for forward-compat.
+  string channel = 4;
+  // Logical-turn stamp on the goldfive#441 ``Session._reasoning_turn`` clock
+  // at delivery time. The clock PR 8's grace window is measured on.
+  int32 turn = 5;
+  // The observation+goal advisory note (PR 4 ``observer_notes``) the agent
+  // would read. The agent-facing wire surface ``types.py`` defers to "the PR 5
+  // telemetry pass".
+  string note_text = 6;
+  // True when the steering injection gate was shut
+  // (``DefaultSteerer._should_inject() == not observation_only``) — i.e. the
+  // signal carried no production authority. The §5.4 shadow-mode flag: an
+  // ``observation_only`` run records every signal ``dry_run=true``,
+  // establishing the agent self-correction base rate before behavior changes.
+  bool dry_run = 7;
+  // Bound goldfive task id (``Task.id``) — stable, never LLM-minted.
+  string task_id = 8;
+  // Bound agent id (``DriftEvent.current_agent_id``).
+  string agent_id = 9;
+  // The differential-validation payload: a JSON object string carrying what
+  // the dispatch path already computed — ``ladder_level``,
+  // ``occurrence_count``, ``promotion``, ``observation_only``,
+  // ``would_cancel_inflight`` (PR 1's cancel-authority verdict),
+  // ``channel_action`` (the mechanical "queued"/"dispatched"/"suppressed"
+  // truth), and channel-specific extras (plan-swap ``superseded_task_ids`` /
+  // ``replacement_task_ids`` the legacy regime would have steered toward).
+  // A string (not a nested message) so the field set can iterate against real
+  // traffic without a proto regen per added key; consumers ``json.loads`` it.
+  string decision_json = 10;
+}
+
+// Emitted once — and only once — per ``(drift_kind, task_id)`` SignalLedger
+// key that carried at least one delivered signal, when the key reaches a
+// terminal observation. The companion to ``SignalDelivered``: together they
+// let the §5.4 report estimate the self-correction base rate and the
+// post-signal drift re-fire rate. Gates nothing. Additive (tag 46).
+message SignalOutcome {
+  // Drift kind as the bare value string.
+  string drift_kind = 1;
+  // Bound goldfive task id.
+  string task_id = 2;
+  // One of ``"self_corrected_unaided"`` (task resolved; key carried only
+  // dry-run deliveries — the base-rate case), ``"self_corrected_after_signal"``
+  // (task resolved; >=1 real delivery), ``"escalated"`` (key escalated to a
+  // pause), ``"user_intervened"`` (USER_STEER/CANCEL arrived while open), or
+  // ``"invocation_ended"`` (run ended with the key still open — the
+  // conservative catch-all). Readers MUST tolerate unknown values.
+  string outcome = 3;
+  // Logical turns from first observation to resolution on the
+  // ``Session._reasoning_turn`` clock (clamped >= 0).
+  int32 turns_to_resolution = 4;
+  // Number of deliveries recorded on the key (dry-run + real).
+  int32 delivery_count = 5;
+  // True when at least one non-dry-run signal was delivered on the key.
+  bool had_real_delivery = 6;
+  // Optional one-line human-readable detail.
+  string detail = 7;
 }

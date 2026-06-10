@@ -152,6 +152,186 @@ def make_event(
 
 
 # ---------------------------------------------------------------------------
+# Signal telemetry (AGENCY-PRESERVATION.md PR 5 — "Telemetry first").
+#
+# ``SignalDelivered`` / ``SignalOutcome`` are the observe-only substrate for
+# the §5.4 shadow/differential validation: under ``observation_only`` the new
+# steering decision logic runs dry against real traffic and these events
+# record what WOULD have been delivered (``dry_run=True``) with a decision
+# payload rich enough to diff "what the legacy regime would have done" against
+# "what the new regime would do" on the same run. They gate nothing.
+#
+# Route choice — ADDITIVE PROTO MESSAGES (Event.payload tags 45/46), NOT dict
+# envelopes. The repo's lighter-weight precedent for net-new events is the
+# dict envelope (``ContextEdited`` / ``ContextEditRejected`` #397,
+# ``pin_resolved``), which avoids a proto regen. That precedent works ONLY
+# because those events never land on the hot dispatch path: ``ContextEdited``
+# is off by default, ``pin_resolved`` is ADK-plugin-only. SignalDelivered
+# rides EVERY goldfive-authored dispatch — and ~all of the steering unit tests
+# iterate ``sink.events`` calling ``Event.WhichOneof("payload")``, which a
+# plain dict lacks. A dict envelope here would break those suites and violate
+# the binding "existing suites pass UNMODIFIED" invariant
+# (AGENCY-PRESERVATION.md §5.1). So PR 5 takes the additive-proto route: two
+# new messages, two new ``oneof payload`` tags, zero field renumbered — and
+# every existing ``WhichOneof`` reader keeps working. The rich, still-evolving
+# decision payload rides a single ``decision_json`` string field so the field
+# set can iterate against real traffic without a proto regen per key.
+# ``DriftEvent.note_to_agent`` reaching the wire as ``SignalDelivered.note_text``
+# is the agent-facing surface ``types.py`` defers to "the PR 5 telemetry pass".
+# ---------------------------------------------------------------------------
+
+#: ``SignalDelivered.channel`` vocabulary — the dispatch decision point the
+#: signal rode. Mirrors the four goldfive-authored dispatch sites in
+#: :mod:`goldfive.drift_observer`.
+SIGNAL_CHANNEL_NUDGE_REPLAY = "nudge_replay"
+SIGNAL_CHANNEL_STEER_CONTROL = "steer_control"
+SIGNAL_CHANNEL_PAUSE_CONTROL = "pause_control"
+SIGNAL_CHANNEL_PROMOTION = "promotion"
+
+SIGNAL_CHANNELS: tuple[str, ...] = (
+    SIGNAL_CHANNEL_NUDGE_REPLAY,
+    SIGNAL_CHANNEL_STEER_CONTROL,
+    SIGNAL_CHANNEL_PAUSE_CONTROL,
+    SIGNAL_CHANNEL_PROMOTION,
+)
+
+#: ``SignalOutcome.outcome`` vocabulary (AGENCY-PRESERVATION.md PR 5).
+SIGNAL_OUTCOME_SELF_CORRECTED_UNAIDED = "self_corrected_unaided"
+SIGNAL_OUTCOME_SELF_CORRECTED_AFTER_SIGNAL = "self_corrected_after_signal"
+SIGNAL_OUTCOME_ESCALATED = "escalated"
+SIGNAL_OUTCOME_USER_INTERVENED = "user_intervened"
+SIGNAL_OUTCOME_INVOCATION_ENDED = "invocation_ended"
+
+SIGNAL_OUTCOMES: tuple[str, ...] = (
+    SIGNAL_OUTCOME_SELF_CORRECTED_UNAIDED,
+    SIGNAL_OUTCOME_SELF_CORRECTED_AFTER_SIGNAL,
+    SIGNAL_OUTCOME_ESCALATED,
+    SIGNAL_OUTCOME_USER_INTERVENED,
+    SIGNAL_OUTCOME_INVOCATION_ENDED,
+)
+
+
+def signal_delivered_event(
+    run_id: str,
+    sequence: int,
+    *,
+    drift_id: str,
+    kind: str,
+    severity: str = "",
+    channel: str,
+    turn: int = 0,
+    note_text: str = "",
+    dry_run: bool = False,
+    task_id: str = "",
+    agent_id: str = "",
+    decision: dict[str, Any] | None = None,
+    session_id: str = "",
+    event_id: str = "",
+) -> Any:
+    """Build a ``SignalDelivered`` envelope (AGENCY-PRESERVATION.md PR 5).
+
+    Emitted at each goldfive-authored dispatch decision point
+    (:data:`SIGNAL_CHANNELS`) the instant a corrective signal is — or, under
+    ``observation_only``, *would have been* — delivered to the wrapped agent.
+
+    ``dry_run`` is ``True`` whenever the steering injection gate
+    (``DefaultSteerer._should_inject()`` == ``not observation_only``) is shut,
+    i.e. the new decision logic ran without production authority. This is the
+    shadow-mode flag §5.4 diffs on: an ``observation_only`` run records every
+    signal as ``dry_run=True``, establishing the agent self-correction base
+    rate before any behavior change. (The legacy nudge-replay channel still
+    *physically* queues a message even under ``observation_only`` — a known
+    pre-PR-6 quirk; ``decision["channel_action"]`` records that mechanical
+    truth so the flag and the mechanism never silently disagree.)
+
+    ``decision`` is the differential-validation payload: ladder level chosen,
+    occurrence count, promotion verdict, the suppression / cancel-authority
+    gate flags the dispatch path already computed, and the plan-swap target
+    ids the legacy regime would have steered toward. Err toward more — §5.4
+    makes this the exit-criterion substrate. It is JSON-serialised onto the
+    single ``decision_json`` wire field so the key set can grow without a
+    proto regen; consumers ``json.loads`` it back.
+
+    ``note_text`` is the observation+goal advisory composed via
+    :mod:`goldfive.observer_notes` (PR 4) — the text the agent would read.
+    """
+    import json
+
+    evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
+    payload = evt.signal_delivered
+    payload.drift_id = str(drift_id or "")
+    payload.kind = str(kind or "")
+    payload.severity = str(severity or "")
+    payload.channel = str(channel or "")
+    try:
+        payload.turn = int(turn or 0)
+    except (TypeError, ValueError):
+        payload.turn = 0
+    payload.note_text = str(note_text or "")
+    payload.dry_run = bool(dry_run)
+    payload.task_id = str(task_id or "")
+    payload.agent_id = str(agent_id or "")
+    if decision:
+        try:
+            payload.decision_json = json.dumps(decision, sort_keys=True, default=str)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            payload.decision_json = "{}"
+    return evt
+
+
+def signal_outcome_event(
+    run_id: str,
+    sequence: int,
+    *,
+    drift_kind: str,
+    task_id: str = "",
+    outcome: str,
+    turns_to_resolution: int = 0,
+    delivery_count: int = 0,
+    had_real_delivery: bool = False,
+    detail: str = "",
+    session_id: str = "",
+    event_id: str = "",
+) -> Any:
+    """Build a ``SignalOutcome`` envelope (AGENCY-PRESERVATION.md PR 5).
+
+    Emitted once — and only once — per ``(drift_kind, task_id)`` ledger key
+    that carried at least one delivered signal, when the key reaches a
+    terminal observation. ``outcome`` is one of :data:`SIGNAL_OUTCOMES`:
+
+    * ``self_corrected_unaided`` — the bound task resolved and the key carried
+      ONLY dry-run deliveries (no production-authority signal ever reached the
+      agent). This is the §2 base-rate metric under ``observation_only``.
+    * ``self_corrected_after_signal`` — the bound task resolved and the key
+      carried at least one real (``dry_run=False``) delivery.
+    * ``escalated`` — the key escalated to a pause (``pause_control``).
+    * ``user_intervened`` — a USER_STEER / USER_CANCEL arrived while the key
+      was open.
+    * ``invocation_ended`` — the run ended with the key still open
+      (conservative catch-all; resolution unknown).
+
+    ``turns_to_resolution`` is measured on the goldfive#441 logical-turn clock
+    (``Session._reasoning_turn``): resolution turn minus first-fire turn.
+    """
+    evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
+    payload = evt.signal_outcome
+    payload.drift_kind = str(drift_kind or "")
+    payload.task_id = str(task_id or "")
+    payload.outcome = str(outcome or "")
+    try:
+        payload.turns_to_resolution = int(turns_to_resolution or 0)
+    except (TypeError, ValueError):
+        payload.turns_to_resolution = 0
+    try:
+        payload.delivery_count = int(delivery_count or 0)
+    except (TypeError, ValueError):
+        payload.delivery_count = 0
+    payload.had_real_delivery = bool(had_real_delivery)
+    payload.detail = str(detail or "")
+    return evt
+
+
+# ---------------------------------------------------------------------------
 # Typed event factories (proto path). Each returns a populated Event envelope
 # with the appropriate oneof payload set. Callers produce one Event per call
 # and pass it to :func:`emit` or a sink's ``emit`` directly.

@@ -717,6 +717,21 @@ class SteeringConfig:
     #: ``Task.discovery_identity_hash``, ``DelegationObserved.tool_args_json``)
     #: are always available regardless of this flag.
     descriptive_growth_enabled: bool = True
+    #: AGENCY-PRESERVATION.md PR 5 (#449/#452) — signal telemetry.
+    #: When ``True`` the drift observer emits ``SignalDelivered`` /
+    #: ``SignalOutcome`` events and maintains the StateStore-backed
+    #: ``SignalLedger`` (deliveries, drift re-fires, resolution outcomes).
+    #: When ``False`` (the default) the signal-telemetry helpers early-return
+    #: before touching the ledger or the wire, so PR 5 is a true no-op: the
+    #: event stream is byte-for-byte identical to pre-PR-5 and every existing
+    #: suite passes unmodified (§5.1 "no-op by default"). This GATES NOTHING in
+    #: the steering control-flow — it only turns the observe-only bookkeeping +
+    #: emission on. Operators running the §5.4 shadow/differential-validation
+    #: campaign (and PR 8's grace-window pacing, which reads the ledger) enable
+    #: it. Best left ON together with ``observation_only=True`` to record the
+    #: agent self-correction base rate before any behavior PR.
+    #: Env: ``GOLDFIVE_STEER_SIGNAL_TELEMETRY``.
+    signal_telemetry: bool = False
     #: Authority scope for cancelling the wrapped agent's IN-FLIGHT
     #: invocation on a drift-driven plan install (AGENCY-PRESERVATION.md
     #: PR 1; goldfive#449/#452).
@@ -790,6 +805,10 @@ class SteeringConfig:
             descriptive_growth_enabled=_read_bool_env(
                 "GOLDFIVE_STEER_DESCRIPTIVE_GROWTH",
                 defaults.descriptive_growth_enabled,
+            ),
+            signal_telemetry=_read_bool_env(
+                "GOLDFIVE_STEER_SIGNAL_TELEMETRY",
+                defaults.signal_telemetry,
             ),
             cancel_inflight_scope=_read_cancel_inflight_scope_env(
                 "GOLDFIVE_CANCEL_INFLIGHT_SCOPE",

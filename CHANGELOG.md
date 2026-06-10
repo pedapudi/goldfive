@@ -149,6 +149,33 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
   `cancel_inflight_scope="all"` (env
   `GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`) restores the legacy
   cancel-on-every-install behaviour exactly.
+- **[#449](https://github.com/pedapudi/goldfive/issues/449)/[#452](https://github.com/pedapudi/goldfive/issues/452)
+  (AGENCY-PRESERVATION.md PR 5) — signal telemetry: `SignalDelivered` /
+  `SignalOutcome` events + an observe-only `SignalLedger`.** New, additive
+  and **off by default** (`SteeringConfig.signal_telemetry`, env
+  `GOLDFIVE_STEER_SIGNAL_TELEMETRY`). When enabled, the drift observer emits
+  a `SignalDelivered` event at each goldfive-authored dispatch decision point
+  (`nudge_replay` / `steer_control` / `pause_control` / `promotion`) and a
+  `SignalOutcome` event when a delivered-signal key resolves
+  (`self_corrected_unaided` | `self_corrected_after_signal` | `escalated` |
+  `user_intervened` | `invocation_ended`). `SignalDelivered.dry_run` is the
+  `observation_only` shadow-mode flag, and `decision_json` carries the
+  differential payload (ladder level, occurrence count, promotion verdict,
+  cancel-authority verdict, plan-swap targets) the §5.4 shadow/differential
+  report diffs over real traffic to establish the agent self-correction base
+  rate **before** any behavior change. The events are additive proto messages
+  (`Event.payload` tags 45/46 — no field renumbered) so every existing
+  `WhichOneof` reader and the JSONL sink keep working unchanged. A new
+  StateStore-backed `goldfive.signal_ledger.SignalLedger` (keyed
+  `(drift_kind, task_id)` — stable goldfive-minted task ids, never LLM-minted)
+  records deliveries, drift re-fires, and resolution outcomes turn-stamped on
+  the goldfive#441 `Session._reasoning_turn` clock. **It gates nothing** —
+  the grace-window bookkeeping is recorded for PR 8's pacing to consume;
+  pacing is PR 8. With the flag off (the default) every signal helper
+  early-returns, so the event stream and all existing suites are byte-for-byte
+  unchanged (§5.1 no-op-by-default). Hypothesis interleaving tests pin the
+  ledger invariants (no double-count per `drift_id`, monotone turn stamps,
+  exactly one terminal outcome per delivered key, always-parseable state).
 - **BREAKING:
   [#254](https://github.com/pedapudi/goldfive/issues/254) —
   observation-only is the new default on `goldfive.wrap()`.**

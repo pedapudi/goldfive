@@ -159,7 +159,23 @@ async def _drain_steerer_at_run_boundary(
     it; bounded wait + cancel-stragglers semantics match the existing
     :meth:`shutdown` drain.
     """
-    drain = getattr(getattr(steerer, "drift", None), "drain_session_background_tasks", None)
+    drift_observer = getattr(steerer, "drift", None)
+    # AGENCY-PRESERVATION.md PR 5 (observe-only): finalize the SignalLedger at
+    # the run boundary — every still-open, delivered key resolves to
+    # ``invocation_ended`` (the conservative catch-all). Done here because this
+    # helper is the documented run-boundary chokepoint with the ``session`` in
+    # scope; best-effort and gates nothing.
+    finalize = getattr(drift_observer, "finalize_signal_ledger", None)
+    if callable(finalize):
+        try:
+            await finalize(session)
+        except Exception as exc:  # noqa: BLE001 — never block run termination
+            log.warning(
+                "SequentialExecutor: steerer.drift.finalize_signal_ledger "
+                "raised at run boundary (swallowed): %s",
+                exc,
+            )
+    drain = getattr(drift_observer, "drain_session_background_tasks", None)
     if not callable(drain):
         return
     try:

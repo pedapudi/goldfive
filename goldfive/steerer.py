@@ -580,6 +580,18 @@ class DefaultSteerer:
             from goldfive.config import _resolve_observation_only_default
 
             self._observation_only = _resolve_observation_only_default()
+        # AGENCY-PRESERVATION.md PR 5 (#449/#452): signal telemetry —
+        # SignalDelivered / SignalOutcome events + the SignalLedger
+        # bookkeeping. Default OFF so PR 5 is a true no-op (§5.1
+        # "no-op by default"): with the flag off the drift-observer's signal
+        # helpers early-return before touching the ledger or the wire, so the
+        # event stream every existing suite asserts on is byte-for-byte
+        # unchanged. The shadow/differential-validation campaign (§5.4) and
+        # PR 8's grace-window pacing enable it explicitly via
+        # ``SteeringConfig(signal_telemetry=True)``. Gates nothing either way.
+        self._signal_telemetry_enabled: bool = bool(
+            getattr(steering_config, "signal_telemetry", False)
+        )
         # Background reasoning-judge tasks (goldfive#251). The LLM-judge
         # path in :meth:`observe_reasoning` is fire-and-forget so the
         # adapter's model-response callback can return immediately and
