@@ -198,8 +198,14 @@ async def test_new_work_discovered_rejects_null_description() -> None:
 
 
 async def test_new_work_discovered_accepts_valid_payload() -> None:
-    """Sanity: the happy path still drives the steerer."""
+    """Sanity: the happy path still drives the steerer.
+
+    AGENCY-PRESERVATION.md PR 3: the valid payload now drives
+    descriptive growth (a discovered ledger task) rather than
+    ``planner.refine`` (absorb-as-growth). Was ``len(refine_calls) == 1``.
+    """
     steerer, session, _sink, planner = _fresh()
+    before = len(session.plan.tasks)
     out = await _tool("report_new_work_discovered").handler(
         {
             "parent_task_id": "t1",
@@ -212,7 +218,9 @@ async def test_new_work_discovered_accepts_valid_payload() -> None:
     )
     # F1: directive ack on a real transition / accepted call.
     assert out["acknowledged"] is True
-    assert len(planner.refine_calls) == 1
+    # Absorbed as growth: no refine, plan grew by one discovered task.
+    assert planner.refine_calls == []
+    assert len(session.plan.tasks) == before + 1
 
 
 # ---------------------------------------------------------------------------

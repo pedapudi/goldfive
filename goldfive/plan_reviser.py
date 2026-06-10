@@ -713,6 +713,8 @@ class PlanReviser:
         agent_name: str,
         tool_args_json: str,
         delegation_event_id: str = "",
+        title: str | None = None,
+        description: str | None = None,
     ) -> Task:
         """Grow ``session.plan`` with a ``discovered=True`` task and return it.
 
@@ -758,6 +760,14 @@ class PlanReviser:
         triggered the growth. Empty when the caller has no event id on
         hand; the helper still works.
 
+        ``title`` / ``description`` are optional verbatim overrides
+        (AGENCY-PRESERVATION.md PR 3). ``None`` (the default) derives
+        both from ``tool_args_json`` exactly as before — pin-time and
+        reconciler growth are unaffected. The agent-authored
+        ``report_new_work_discovered`` reroute passes the agent's own
+        title/description so absorb-as-growth keeps the reported text
+        instead of an auto-derived ``agent: request`` label.
+
         Pipeline (under lock):
 
         1. Compute ``identity_hash`` from ``(agent_name, tool_args_json)``.
@@ -800,8 +810,25 @@ class PlanReviser:
         from goldfive.events import build_plan_revision_diff
 
         identity_hash = discovery_identity_hash(agent_name, tool_args_json or None)
-        title = self._derive_discovered_task_title(agent_name, tool_args_json)
-        description = self._derive_discovered_task_description(tool_args_json)
+        # Explicit ``title`` / ``description`` overrides (None → derive
+        # from the observed ``tool_args_json`` as before) let the
+        # agent-authored ``report_new_work_discovered`` reroute
+        # (AGENCY-PRESERVATION.md PR 3) preserve the agent's own verbatim
+        # title/description while still landing as a discovered ledger
+        # task. The identity hash still keys on ``(agent_name,
+        # tool_args_json)``, so callers wanting per-report dedup encode
+        # the distinguishing fields into ``tool_args_json``. Pin-time and
+        # reconciler callers pass neither and keep the derived titles.
+        title = (
+            title
+            if title is not None
+            else self._derive_discovered_task_title(agent_name, tool_args_json)
+        )
+        description = (
+            description
+            if description is not None
+            else self._derive_discovered_task_description(tool_args_json)
+        )
         # Mint a fresh id so two concurrent growths on the same
         # (agent, args-token-set) cannot collide on plan-task id even
         # if both miss the dedup check (the lock makes them sequential

@@ -79,13 +79,26 @@ def render_ladder_surface(steerer: DefaultSteerer) -> str:
 # every changed line. NEVER overwrite blindly: a diff here is either an
 # intended ladder demotion (update + justify in the PR body) or a
 # regression (fix the code, not the golden).
+#
+# AGENCY-PRESERVATION.md PR 3 demoted exactly three rows from this table
+# (the forecast-mismatch family); every other row is byte-for-byte the
+# Commit-1 baseline:
+#   * plan_divergence     WARNING ABSORB→OBSERVE, CRITICAL
+#                         [CANCEL_REINVOKE|PAUSE_ESCALATE]→[OBSERVE|OBSERVE]
+#   * capability_mismatch CRITICAL [ABSORB|PAUSE_ESCALATE]→[OBSERVE|OBSERVE]
+#                         (WARNING stays ABSORB: Rule B / "WARNING-max")
+#   * new_work_discovered WARNING ABSORB→OBSERVE, CRITICAL
+#                         [ABSORB|PAUSE_ESCALATE]→[OBSERVE|OBSERVE]
+# wrong_agent is unchanged here: it is deprecated with no _LADDER row and
+# no emitter, so its dead default-fallthrough line is moot (see the
+# types.py deprecation note + the _load_ladder_tables comment).
 # ---------------------------------------------------------------------------
 EXPECTED_LADDER_SURFACE = """\
 agent_refusal                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 agent_transfer               INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 ambiguous_intent             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 blocked                      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-capability_mismatch          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+capability_mismatch          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[OBSERVE|OBSERVE]
 confabulation_risk           INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 context_pressure             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 custom                       INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
@@ -99,9 +112,9 @@ llm_call_timeout             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE
 looping_reasoning            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[NUDGE|PAUSE_ESCALATE]
 looping_tool_call            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 model_refusal                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
-new_work_discovered          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+new_work_discovered          INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
 off_topic                    INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
-plan_divergence              INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
+plan_divergence              INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
 reasoning_cluster_tightening INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
 refine_validation_failed     INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 repeated_failure             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]

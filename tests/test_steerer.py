@@ -904,8 +904,19 @@ def test_every_drift_kind_has_a_known_origin() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_report_new_work_discovered_fires_drift() -> None:
+async def test_report_new_work_discovered_grows_plan_not_refine() -> None:
+    """AGENCY-PRESERVATION.md PR 3: agent-authored
+    ``report_new_work_discovered`` absorbs the report as descriptive
+    growth (a ``discovered=True`` ledger task) instead of firing
+    ``planner.refine``. Was ``test_report_new_work_discovered_fires_drift``
+    (asserted a refine call + the original WARNING drift).
+
+    Observability is preserved: the growth path still emits a
+    NEW_WORK_DISCOVERED ``DriftDetected`` (now INFO — "observational,
+    not corrective"), plus a ``PlanRevised``. No refine.
+    """
     steerer, session, sink, planner = _fresh()
+    before = len(session.plan.tasks)
     await steerer.drift.report_new_work_discovered(
         session=session,
         parent_task_id="t1",
@@ -913,15 +924,25 @@ async def test_report_new_work_discovered_fires_drift() -> None:
         description="double-check the numbers",
         assignee="analyst",
     )
-    # Original drift + refine-failure drift (stub planner returns None).
-    # goldfive a4: also a refine_attempted + refine_failed dict envelope
-    # — filter to proto events for the count assertion.
-    assert len(sink.proto_events) == 2
-    assert sink.proto_events[0].WhichOneof("payload") == "drift_detected"
+    # Absorbed as growth, never re-forecast.
+    assert planner.refine_calls == []
+    # Plan grew by exactly one discovered task with the verbatim title.
+    assert len(session.plan.tasks) == before + 1
+    discovered = [t for t in session.plan.tasks if getattr(t, "discovered", False)]
+    assert len(discovered) == 1
+    assert discovered[0].title == "follow-up"
+    assert discovered[0].assignee_agent_id == "analyst"
+    # Observability preserved: DriftDetected (NEW_WORK_DISCOVERED) still
+    # emits for the demoted kind, via the growth path.
     from goldfive.pb.goldfive.v1 import types_pb2
 
-    assert sink.proto_events[0].drift_detected.kind == types_pb2.DRIFT_KIND_NEW_WORK_DISCOVERED
-    assert planner.refine_calls[0]["drift"].kind is DriftKind.NEW_WORK_DISCOVERED
+    drift_events = [
+        e for e in sink.proto_events if e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert len(drift_events) == 1
+    assert (
+        drift_events[0].drift_detected.kind == types_pb2.DRIFT_KIND_NEW_WORK_DISCOVERED
+    )
 
 
 async def test_report_plan_divergence_sets_flag_only() -> None:

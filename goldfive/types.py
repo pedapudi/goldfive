@@ -120,6 +120,19 @@ class DriftKind(StrEnum):
     TASK_FAILED_FATAL = "task_failed_fatal"
     CONTEXT_PRESSURE = "context_pressure"
     BLOCKED = "blocked"
+    # WRONG_AGENT is DEPRECATED (AGENCY-PRESERVATION.md PR 3). No
+    # production code path ever constructs it — grep
+    # ``DriftKind.WRONG_AGENT`` finds only this enum def, the proto/pb
+    # stubs, and docs, never a ``DriftEvent(kind=DriftKind.WRONG_AGENT)``
+    # emission. The "reporting tool call arrived from an agent that is
+    # not ``task.assignee_agent_id``" signal it was meant to carry is
+    # subsumed by the structural CAPABILITY_MISMATCH detector (#253) and
+    # the goldfive#252 move off assignee-grading. The enum value stays
+    # reserved (wire/proto compat, same as the retired CONFUSION value
+    # below) and carries NO intervention-ladder row — there is no live
+    # dispatch to map. Do NOT add an emitter or a ladder row back; if a
+    # wrong-assignee signal is wanted, extend CAPABILITY_MISMATCH. Hard
+    # removal of any remaining references tracked for a later PR.
     WRONG_AGENT = "wrong_agent"
     AGENT_TRANSFER = "agent_transfer"
     MODEL_REFUSAL = "model_refusal"
