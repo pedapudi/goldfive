@@ -27,16 +27,27 @@ Detection rules (intentionally surgical):
   CRITICAL. Skipped entirely when the advisory is empty (legacy plans
   and planners that don't populate it are a no-op).
 
-* **Rule C — out-of-DAG-order delegation (goldfive#268).** When the
-  invoked agent's *role stem* (the head of its name, with role-suffix
-  tokens like ``agent``/``worker`` trimmed) is absent from the bound
-  task's title+description AND present in some OTHER pending task,
-  the pin has bound the delegation to a structurally-wrong task —
+* **Rule C — out-of-DAG-order delegation (goldfive#268). SOFT-RETIRED
+  (goldfive#423 / AGENCY-PRESERVATION.md PR 2): OFF by default.** When
+  the invoked agent's *role stem* (the head of its name, with
+  role-suffix tokens like ``agent``/``worker`` trimmed) is absent from
+  the bound task's title+description AND present in some OTHER pending
+  task, the pin has bound the delegation to a structurally-wrong task —
   typically because the coordinator dispatched a downstream agent
   before its DAG predecessors completed and the pin had only one
   eligible candidate to choose from. Fires CRITICAL. Requires the
   caller to pass ``all_pending_tasks`` so the cross-task lookup can
   see non-DAG-ready tasks too; otherwise the rule is silent.
+
+  With descriptive growth at pin time
+  (``SteeringConfig.descriptive_growth_enabled``, default ON) the
+  "no right task existed" cause Rule C papered over is fixed at the
+  source — the plan grows a ``discovered=True`` task carrying the
+  agent's role stem, so Rule C's trigger shape no longer occurs
+  (design doc §7). The rule is therefore disabled unless the operator
+  explicitly re-enables it via ``GOLDFIVE_CAPABILITY_RULE_C=1``
+  (per design doc §7.1 soft retirement; hard deletion follows in
+  AGENCY-PRESERVATION.md PR 13).
 
 All three rules return :class:`~goldfive.types.DriftEvent` carrying the
 agent name + bound task id + the structural gap, suitable for the
@@ -48,12 +59,39 @@ for AgentTool detection, ``.name`` for the required-tools cover).
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from typing import Any
 
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Task
 
 log = logging.getLogger(__name__)
+
+
+#: Env flag that re-enables the soft-retired Rule C (goldfive#423 /
+#: AGENCY-PRESERVATION.md PR 2; retirement plan in design doc §7.1).
+#: Named so re-enabling is an explicit operator act:
+#: ``GOLDFIVE_CAPABILITY_RULE_C=1``. Read per call (not cached at
+#: import) so tests and operators can flip it without re-importing.
+_RULE_C_ENV_VAR = "GOLDFIVE_CAPABILITY_RULE_C"
+
+#: Truthy spellings accepted for :data:`_RULE_C_ENV_VAR` — same
+#: vocabulary as :func:`goldfive.config._read_bool_env` so the env
+#: surface stays consistent across the project. (No falsy/typo
+#: handling needed: anything that is not an explicit truthy spelling
+#: leaves the rule retired, which is the safe default.)
+_RULE_C_TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
+
+
+def _rule_c_enabled() -> bool:
+    """Return True iff the operator explicitly re-enabled Rule C.
+
+    Rule C is soft-retired (default OFF) because descriptive growth at
+    pin time removes the trigger shape it existed to catch — see the
+    module docstring and ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §7.
+    """
+    raw = os.environ.get(_RULE_C_ENV_VAR, "").strip().lower()
+    return raw in _RULE_C_TRUTHY
 
 
 __all__ = [
@@ -280,7 +318,10 @@ def detect_capability_mismatch(
         Every ``PENDING`` task in the plan (DAG-ready and not). Powers
         the goldfive#268 Rule C cross-task lookup. ``None`` /empty
         disables Rule C — legacy callers and tests that don't pass it
-        keep their pre-#268 behaviour exactly.
+        keep their pre-#268 behaviour exactly. Note Rule C is
+        soft-retired and additionally requires
+        ``GOLDFIVE_CAPABILITY_RULE_C=1`` to run at all (goldfive#423 /
+        AGENCY-PRESERVATION.md PR 2).
 
     Returns
     -------
@@ -350,19 +391,29 @@ def detect_capability_mismatch(
     # pin's tier-2 stem disambiguator couldn't help because only one
     # task was eligible. Rule C fires on that exact shape.
     #
+    # SOFT-RETIRED (goldfive#423 / AGENCY-PRESERVATION.md PR 2): the
+    # rule no longer runs unless the operator explicitly re-enables it
+    # via ``GOLDFIVE_CAPABILITY_RULE_C=1``. Descriptive growth at pin
+    # time grows the plan when no structurally-right task exists, so
+    # the mispin shape Rule C detected no longer occurs (design doc
+    # §7). Hard deletion of ``_rule_c_dag_order`` + the
+    # ``all_pending_tasks`` parameter follows in AGENCY-PRESERVATION.md
+    # PR 13 (§7.1 step 2).
+    #
     # Cross-task signal — needs the full PENDING set (DAG-ready and
     # not). Silent when the caller didn't pass it, when the agent
     # name produces no usable stem (generic ``coordinator_agent`` style
     # names degrade gracefully), or when no other PENDING task
     # mentions the stem (in which case Rule C has nothing to say — the
     # pin is just doing its best with a generic agent).
-    drift_c = _rule_c_dag_order(
-        invoked_agent_name=invoked_agent_name,
-        bound_task=task,
-        all_pending_tasks=all_pending_tasks,
-    )
-    if drift_c is not None:
-        return drift_c
+    if _rule_c_enabled():
+        drift_c = _rule_c_dag_order(
+            invoked_agent_name=invoked_agent_name,
+            bound_task=task,
+            all_pending_tasks=all_pending_tasks,
+        )
+        if drift_c is not None:
+            return drift_c
 
     return None
 

@@ -728,11 +728,14 @@ class PlanReviser:
         method re-reads ``session.plan`` (the lock acquisition is the
         linearisation point — any concurrent refine has either completed
         before the read or is queued behind it) and checks for an
-        existing task with the same hash. If found, the existing task
-        is returned and the plan is NOT grown. Two delegations of the
-        same ``(agent, args-token-set)`` arriving simultaneously thus
-        produce ONE discovered task, not two (§11.6 dedup
-        linearisability).
+        existing NON-TERMINAL task with the same hash. If found, the
+        existing task is returned and the plan is NOT grown. Two
+        delegations of the same ``(agent, args-token-set)`` arriving
+        simultaneously thus produce ONE discovered task, not two
+        (§11.6 dedup linearisability). The dedup window follows the
+        §11.1 TTL: once the discovered task reaches a terminal status,
+        a fresh delegation with the same hash is a genuinely new unit
+        of work and grows the plan again.
 
         The new task lands as an independent sub-DAG root: no predecessor
         edges, no supersedes link. Rule 7 of :meth:`Plan.validate` allows
@@ -759,9 +762,9 @@ class PlanReviser:
 
         1. Compute ``identity_hash`` from ``(agent_name, tool_args_json)``.
         2. Acquire ``_get_plan_lock(session)``.
-        3. Re-read ``session.plan``. If any task already carries
-           ``discovery_identity_hash == identity_hash``, return it
-           (dedup; no growth).
+        3. Re-read ``session.plan``. If any NON-TERMINAL task already
+           carries ``discovery_identity_hash == identity_hash``,
+           return it (dedup; no growth — §11.1 TTL).
         4. Build the new :class:`Task` with ``discovered=True``,
            ``discovery_identity_hash=identity_hash``,
            ``status=PENDING``, ``assignee_agent_id=agent_name``, and a
@@ -847,6 +850,16 @@ class PlanReviser:
                     ) == identity_hash and bool(
                         getattr(existing, "discovered", False)
                     ):
+                        # Dedup TTL (design doc §11.1): the window is
+                        # "until the discovered task reaches a terminal
+                        # status". A fresh delegation matching a TERMINAL
+                        # discovered task is a genuinely new unit of work
+                        # and grows the plan again.
+                        if (
+                            getattr(existing, "status", None)
+                            in TERMINAL_TASK_STATUSES
+                        ):
+                            continue
                         # Dedup hit — a prior delegation already grew the
                         # plan for this (agent, args-token-set). Re-pin
                         # to the existing task; no growth.

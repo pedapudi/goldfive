@@ -17,7 +17,10 @@ Detection rules under test:
   in another PENDING task. Mirrors the live evidence from session
   ``f0630532-…`` where ``reviewer_agent`` got pinned to ``draft_slides``
   because ``review_presentation`` wasn't DAG-ready yet and only one
-  task was eligible.
+  task was eligible. SOFT-RETIRED by goldfive#423 /
+  AGENCY-PRESERVATION.md PR 2 — silent unless
+  ``GOLDFIVE_CAPABILITY_RULE_C=1`` (the rule-mechanics tests opt in
+  via the ``_rule_c_escape_hatch`` fixture).
 
 Negative cases mirror each positive: the same shapes WITHOUT the
 trigger condition must return ``None``.
@@ -291,9 +294,58 @@ def test_is_agent_tool_duck_type() -> None:
 
 # ---------------------------------------------------------------------------
 # Rule C (goldfive#268) — out-of-DAG-order delegation
+#
+# SOFT-RETIRED by goldfive#423 / AGENCY-PRESERVATION.md PR 2: Rule C no
+# longer runs unless the operator explicitly sets
+# ``GOLDFIVE_CAPABILITY_RULE_C=1`` (descriptive growth at pin time fixes
+# the mispin shape Rule C detected — design doc §7/§7.1). The
+# rule-mechanics tests below opt in via the ``_rule_c_escape_hatch``
+# fixture so the retired-but-re-enableable implementation stays pinned
+# until its hard deletion (AGENCY-PRESERVATION.md PR 13);
+# ``test_rule_c_soft_retired_silent_by_default`` pins the new default.
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def _rule_c_escape_hatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-enable the soft-retired Rule C for rule-mechanics tests."""
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_C", "1")
+
+
+def test_rule_c_soft_retired_silent_by_default() -> None:
+    """goldfive#423 / AGENCY-PRESERVATION.md PR 2: the canonical Rule C
+    positive shape (stem absent from bound task, present in another
+    PENDING task) returns ``None`` unless ``GOLDFIVE_CAPABILITY_RULE_C``
+    is explicitly set — Rule C is soft-retired.
+    """
+    bound = Task(
+        id="draft_slides",
+        title="Draft the presentation slides",
+        description="Author the slide content based on the outline.",
+    )
+    pending = [
+        bound,
+        Task(
+            id="review_presentation",
+            title="Review the presentation",
+            description="Read the slides and flag issues.",
+        ),
+    ]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="reviewer_agent",
+        invoked_agent_tools=[_FakeFunctionTool("read_presentation_files")],
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is None, (
+        "Rule C is soft-retired (goldfive#423 PR 2) and must be silent "
+        "without GOLDFIVE_CAPABILITY_RULE_C=1"
+    )
+
+
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_positive_reviewer_pinned_to_draft() -> None:
     """Live evidence from session ``f0630532-…``: ``reviewer_agent``
     pinned to ``draft_slides`` while ``review_presentation`` sits
@@ -339,6 +391,7 @@ def test_rule_c_positive_reviewer_pinned_to_draft() -> None:
     assert "review_presentation" in drift.detail
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_stem_found_in_bound_task() -> None:
     """Stem ``reviewer`` is present in the bound task itself
     ("Review the presentation") — no conflict. Rule C must NOT fire.
@@ -362,6 +415,7 @@ def test_rule_c_negative_stem_found_in_bound_task() -> None:
     assert drift is None, "Rule C must not fire when stem is in the bound task"
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_stem_found_nowhere() -> None:
     """Agent ``helper_agent`` (stem ``helper``) bound to ``draft_slides``
     with no other ``helper``-shaped task — Rule C has no signal of
@@ -384,6 +438,7 @@ def test_rule_c_negative_stem_found_nowhere() -> None:
     assert drift is None, "Rule C must not fire when stem isn't anywhere"
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_generic_coordinator_agent_name() -> None:
     """``coordinator_agent`` has the stem ``coordinator`` — which would
     typically not appear anywhere in a normal pending plan. Rule C
@@ -409,6 +464,7 @@ def test_rule_c_negative_generic_coordinator_agent_name() -> None:
     )
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_short_stem_skipped() -> None:
     """Agent named ``qa_agent`` has stem ``qa`` (length 2) which is
     below the ≥4 length filter; ``agent_name_stems`` returns an empty
@@ -430,6 +486,7 @@ def test_rule_c_negative_short_stem_skipped() -> None:
     assert drift is None, "Short stems must skip Rule C cleanly"
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_no_all_pending_tasks_passed() -> None:
     """Legacy callers that don't pass ``all_pending_tasks`` get the
     pre-#268 behaviour: Rules A/B still run, Rule C is silent.
@@ -446,6 +503,7 @@ def test_rule_c_negative_no_all_pending_tasks_passed() -> None:
     assert drift is None, "Rule C silent when caller doesn't pass pending set"
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_precedence_rule_a_still_wins() -> None:
     """When Rule A also fires (all AgentTool wrappers + leaf task) AND
     Rule C would also fire (stem mismatch), Rule A's verdict wins. The
@@ -476,6 +534,7 @@ def test_rule_c_precedence_rule_a_still_wins() -> None:
     assert "role-stem" not in drift.detail
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_precedence_rule_b_still_wins() -> None:
     """Rule B (required_tools advisory) takes priority over Rule C.
     Same agent/task confusion shape as the positive case, but the
@@ -505,6 +564,7 @@ def test_rule_c_precedence_rule_b_still_wins() -> None:
     assert "role-stem" not in drift.detail
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_excludes_bound_task_by_id() -> None:
     """Even when the bound task itself appears in ``all_pending_tasks``
     (the natural shape — every pending task in the plan, including the
@@ -709,6 +769,7 @@ async def test_integration_capability_mismatch_flows_through_handle_drift() -> N
     assert drift.current_agent_id == "underqualified"
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 async def test_integration_rule_c_dag_order_mismatch_through_pin() -> None:
     """End-to-end Rule C (goldfive#268): mirror the live evidence
     where ``reviewer_agent`` got delegated while only ``draft_slides``
