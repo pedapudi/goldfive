@@ -105,7 +105,13 @@ GOAL_DRIFT_USER_PROMPT_TEMPLATE: str = (
     "STRICTLY in one of these two JSON shapes:\n"
     '{{"progressing": true}}\n'
     "OR\n"
-    '{{"progressing": false, "reason": "one-sentence explanation"}}\n\n'
+    '{{"progressing": false, "reason": "one-sentence explanation", '
+    '"note_to_agent": "one or two sentences addressed to the agent '
+    "itself: state only what you observed and how it relates to the "
+    "goals. Neutral and factual — no commands, no instructions about "
+    "which task, tool, or agent to use next, and no fault language. "
+    "If your confidence is low, phrase the note as a question (e.g. "
+    "'Does the current approach still serve the goal of X?')\"}}\n\n"
     "Progressing = agents are doing work that plausibly contributes to "
     "the goal.\n"
     "Not progressing = agents are looping, refusing, off-topic, or "
@@ -474,6 +480,12 @@ async def classify_goal_drift(
     # goldfive decide this is off-goal?" on the timeline without
     # re-fetching the per-invocation activity log.
     trigger_input = _truncate_trigger_input(activity_block)
+    # AGENCY-PRESERVATION.md PR 4 — the judge authors the agent-facing
+    # observation in the same call that produced the verdict. Old-style
+    # responses (key absent / non-string) degrade to "" and the
+    # observer-note composer falls back to ``detail``.
+    note_raw = parsed.get("note_to_agent", "")
+    note_to_agent = note_raw.strip() if isinstance(note_raw, str) else ""
     return DriftEvent(
         kind=DriftKind.GOAL_DRIFT,
         severity=DriftSeverity.CRITICAL,
@@ -482,6 +494,7 @@ async def classify_goal_drift(
         current_agent_id=current_agent_id,
         trigger_input=trigger_input,
         observed_revision_index=observed_revision_index,
+        note_to_agent=note_to_agent,
     )
 
 

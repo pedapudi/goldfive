@@ -423,4 +423,14 @@ async def test_cancel_reinvoke_dispatches_goldfive_steer_control() -> None:
     payload = steer_msgs[0].payload
     assert payload["drift_kind"] == DriftKind.TOOL_ERROR.value
     assert "t1" in payload["body"]
-    assert "Try a different approach" in payload["body"]
+    # Re-pointed by AGENCY-PRESERVATION.md PR 4: the body used to
+    # interpolate the next PENDING task's title ("Try a different
+    # approach") as a directive. The body is now an observation+goal
+    # advisory note — the next-task pointer is gone by design (the
+    # agent owns means); the task ids still ride the payload's
+    # superseded/replacement lists for observability.
+    from goldfive.observer_notes import ADVISORY_FOOTER
+
+    assert "Try a different approach" not in payload["body"]
+    assert ADVISORY_FOOTER in payload["body"]
+    assert payload["replacement_task_ids"] == ["t1"]

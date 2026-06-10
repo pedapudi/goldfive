@@ -37,7 +37,7 @@ RECENT TOOL OBSERVATIONS (last {tool_obs_count}, oldest first):
 REASONING (the agent's most recent chain-of-thought block):
 {reasoning_block}
 
-Decide THREE things:
+Decide FOUR things:
 1. CLASSIFICATION. Which best describes the reasoning?
    - on_task: it advances the BOUND TASK or the GOALS.
    - justified_deviation: it departs from the BOUND TASK, but a recent
@@ -60,6 +60,14 @@ Decide THREE things:
      tool_error | surprising_result | discovered_dependency | new_information
    When classification is on_task or erroneous_deviation, set
    provenance to "none".
+4. NOTE. ONLY when classification is NOT on_task, write note_to_agent:
+   one or two sentences addressed to the agent itself, stating only what
+   you observed and how it relates to the GOALS. Neutral and factual —
+   no commands, no instructions about which task, tool, or agent to use
+   next, and no fault language (avoid words like 'failed', 'wrong',
+   'broken'). If your confidence in this verdict is low, phrase the note
+   as a question (e.g. "Does the current approach still serve the goal
+   of X?"). When classification is on_task, set note_to_agent to "".
 
 Reply with a single JSON object and nothing else, in this shape:
 {{
@@ -69,7 +77,8 @@ Reply with a single JSON object and nothing else, in this shape:
   "provenance": "tool_error" | "surprising_result" | "discovered_dependency" | "new_information" | "none",
   "focused_task_id": "<id from PLAN TASKS, or '' if off-plan>",
   "focus_confidence": 0.0-1.0,
-  "stated_intent": "one-sentence summary of what the agent says it is doing"
+  "stated_intent": "one-sentence summary of what the agent says it is doing",
+  "note_to_agent": "one-or-two-sentence neutral observation for the agent, or '' when on_task"
 }}
 
 GUIDANCE:

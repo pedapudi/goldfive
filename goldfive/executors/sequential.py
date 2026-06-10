@@ -1943,37 +1943,36 @@ class SequentialExecutor(Executor):
         Mirrors :meth:`_compose_steer_restart_message` but for the
         autonomous-nudge path (goldfive#202). The LLM sees:
 
-        * A header distinguishing this from a fresh user turn: the
-          operator did not intervene; goldfive detected drift (e.g.
-          repeated ``report_task_completed`` calls), revised the plan,
-          and is directing the coordinator to the new next task.
-        * Each queued nudge verbatim (short, action-focused strings
-          composed by :func:`compose_corrective_user_message`).
-        * A brief instruction to continue with the revised plan.
+        * A header distinguishing this from a fresh user turn (the
+          ``[GOLDFIVE PLAN REVISION`` attribution marker is preserved
+          for plugins / sinks / prompt templates that match on it).
+        * Each queued nudge verbatim — full observation+goal advisory
+          notes composed by
+          :func:`goldfive.observer_notes.compose_note_for_drift`
+          (AGENCY-PRESERVATION.md PR 4: the pre-PR-4 body commanded
+          means — "Proceed with the replacement; do NOT retry the
+          prior task" — which overrode the agent's own judgment about
+          decomposition and retries; the note body now carries neutral
+          facts, the user's goal, and the advisory footer instead).
 
         The scoped replay path is the carefully-narrowed successor to
         the blanket follow-up loop that goldfive#163 removed. #163's
         removal was correct when every PENDING task triggered a
         follow-up; this path only fires when the STEERER explicitly
         queued a nudge in response to a tracked drift + plan
-        revision — not on every PENDING-at-invocation-end.
+        revision — not on every PENDING-at-invocation-end. Delivery
+        mechanics (queue, replay cap, reconciler reset, re-entry
+        kind) are unchanged by PR 4 — content only.
         """
-        body = "\n".join(f"- {n}" for n in nudges if n)
+        body = "\n\n".join(n for n in nudges if n)
         return (
-            "[GOLDFIVE PLAN REVISION — replace superseded task(s)]\n"
+            "[GOLDFIVE PLAN REVISION — observer note]\n"
             "\n"
-            "Goldfive detected drift during the prior turn and revised "
-            "the active plan. The task you were last working on has "
-            "been superseded by a replacement. Proceed with the "
-            "replacement; do NOT retry the prior task.\n"
+            "goldfive — an external monitoring layer, not the user — "
+            "revised its plan bookkeeping during the prior turn. The "
+            "note(s) below describe what it observed.\n"
             "\n"
-            f"{body}\n"
-            "\n"
-            "Notes:\n"
-            "- Continue the run with the revised plan. Resume with the "
-            "next unfinished task — the replacement mentioned above, "
-            "or any other PENDING task your tree still owns.\n"
-            "- Do not re-invoke reporting tools for the superseded task."
+            f"{body}"
         )
 
     @staticmethod
@@ -2001,14 +2000,21 @@ class SequentialExecutor(Executor):
 
         * ``"user"`` (default) — ``[USER STEERING CONTROL — supersedes
           prior task context]`` header: this is an operator override,
-          not a fresh user turn.
+          not a fresh user turn. **Byte-identical to the pre-PR-4
+          rendering** — AGENCY-PRESERVATION.md PR 4 changes only
+          goldfive-authored content; user-authority relay text is
+          untouched (and pinned by test).
         * ``"goldfive"`` — ``[GOLDFIVE STEERING CONTROL — supersedes
-          prior task context]`` header: goldfive's drift ladder
-          promoted a detector signal into a steer and is directing the
-          coordinator away from contaminated work. When the optional
+          prior task context]`` header (the attribution marker is
+          preserved so plugins / sinks can discriminate authors). The
+          body is the observation+goal advisory note the steerer
+          composed via :mod:`goldfive.observer_notes`. The optional
           ``superseded_task_ids`` / ``replacement_task_ids`` lists are
-          provided, a task-id block is appended so the LLM knows
-          precisely which ids are void and what replaced them.
+          rendered as a *bookkeeping* line — goldfive's ledger facts,
+          not instructions (the pre-PR-4 "do NOT resume these" /
+          "pick these up instead" command block is retired; the ids
+          also remain on the ControlMessage payload for
+          observability).
 
         Falls back to ``fallback`` when the extracted text is empty,
         then wraps that fallback in the same header so the re-invocation
@@ -2026,32 +2032,28 @@ class SequentialExecutor(Executor):
         source_norm = (source or "user").strip().lower()
         if source_norm == "goldfive":
             header = "[GOLDFIVE STEERING CONTROL — supersedes prior task context]"
-            extra_notes: list[str] = []
+            bookkeeping_bits: list[str] = []
             sup = [str(t) for t in (superseded_task_ids or []) if t]
             rep = [str(t) for t in (replacement_task_ids or []) if t]
             if sup:
-                extra_notes.append(
-                    "- Superseded task ids (do NOT resume these): "
+                bookkeeping_bits.append(
+                    "goldfive's plan tracking records task id(s) "
                     + ", ".join(sup)
+                    + " as superseded by this revision"
                 )
             if rep:
-                extra_notes.append(
-                    "- Replacement task ids (pick these up instead): "
-                    + ", ".join(rep)
+                bookkeeping_bits.append(
+                    "its ledger contains replacement entrie(s): " + ", ".join(rep)
                 )
-            extra_block = ("\n" + "\n".join(extra_notes)) if extra_notes else ""
+            extra_block = (
+                ("\n\ngoldfive bookkeeping (for reference): " + "; ".join(bookkeeping_bits) + ".")
+                if bookkeeping_bits
+                else ""
+            )
             return (
                 f"{header}\n"
                 "\n"
-                f"{effective}\n"
-                "\n"
-                "Notes:\n"
-                "- Goldfive detected drift in the prior turn's activity. "
-                "Prior research, partial work, or planned tasks from the "
-                "contaminated step are superseded unless this message "
-                "explicitly references them.\n"
-                "- Proceed with the corrective direction above. Do not "
-                "retry the superseded task."
+                f"{effective}"
                 f"{extra_block}"
             )
         return (

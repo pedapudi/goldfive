@@ -163,7 +163,7 @@ REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     "{tool_obs_block}\n\n"
     "REASONING (the agent's most recent chain-of-thought block):\n"
     "{reasoning_block}\n\n"
-    "Decide THREE things:\n"
+    "Decide FOUR things:\n"
     "1. CLASSIFICATION. Which best describes the reasoning?\n"
     "   - on_task: it advances the BOUND TASK or the GOALS.\n"
     "   - justified_deviation: it departs from the BOUND TASK, but a recent\n"
@@ -185,7 +185,15 @@ REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     "   signal that justifies the deviation. Pick exactly one of:\n"
     "     tool_error | surprising_result | discovered_dependency | new_information\n"
     "   When classification is on_task or erroneous_deviation, set\n"
-    '   provenance to "none".\n\n'
+    '   provenance to "none".\n'
+    "4. NOTE. ONLY when classification is NOT on_task, write note_to_agent:\n"
+    "   one or two sentences addressed to the agent itself, stating only what\n"
+    "   you observed and how it relates to the GOALS. Neutral and factual —\n"
+    "   no commands, no instructions about which task, tool, or agent to use\n"
+    "   next, and no fault language (avoid words like 'failed', 'wrong',\n"
+    "   'broken'). If your confidence in this verdict is low, phrase the note\n"
+    '   as a question (e.g. "Does the current approach still serve the goal\n'
+    '   of X?"). When classification is on_task, set note_to_agent to "".\n\n'
     "Reply with a single JSON object and nothing else, in this shape:\n"
     "{{\n"
     '  "classification": "on_task" | "justified_deviation" | "erroneous_deviation",\n'
@@ -196,7 +204,9 @@ REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     '  "focused_task_id": "<id from PLAN TASKS, or \'\' if off-plan>",\n'
     '  "focus_confidence": 0.0-1.0,\n'
     '  "stated_intent": "one-sentence summary of what the agent says it '
-    'is doing"\n'
+    'is doing",\n'
+    '  "note_to_agent": "one-or-two-sentence neutral observation for the '
+    "agent, or '' when on_task\"\n"
     "}}\n\n"
     "GUIDANCE:\n"
     "- on_task includes clarifying sub-steps, exploring tradeoffs, and\n"
@@ -656,6 +666,16 @@ class ReasoningJudgeVerdict:
     # change ships in PR 3 (parser) + PR 4 (routing).
     classification: str = ""
     provenance: str = ""
+    # AGENCY-PRESERVATION.md PR 4 — the judge's agent-facing
+    # observation, authored in the same call that produced the verdict
+    # (prompt decision 4). Neutral facts relative to the goals; question
+    # form when the judge is unsure. Mirrored onto
+    # ``DriftEvent.note_to_agent`` for non-on_task verdicts so the
+    # observer-note composers prefer it over ``detail``. Empty string
+    # for on_task verdicts, quiet-failure paths, and old-style
+    # responses that omit the field (graceful degradation: the
+    # composer falls back to ``detail``).
+    note_to_agent: str = ""
 
 
 # Map the judge's ``severity`` string to a :class:`DriftSeverity`. Missing
@@ -932,6 +952,10 @@ async def classify_reasoning_drift_with_focus(
     # below populates these post-call.
     classification_parsed: str = ""
     provenance_parsed: str = ""
+    # AGENCY-PRESERVATION.md PR 4 — judge-authored agent-facing
+    # observation. Empty for on_task verdicts, quiet-failures, and
+    # old-style responses missing the field.
+    note_to_agent_parsed: str = ""
     try:
         async with goldfive_llm_span(
             sinks=span_sinks,
@@ -1048,6 +1072,15 @@ async def classify_reasoning_drift_with_focus(
                 intent_raw = parsed.get("stated_intent", "")
                 if isinstance(intent_raw, str):
                     stated_intent_parsed = intent_raw.strip()
+                # AGENCY-PRESERVATION.md PR 4 — the agent-facing note.
+                # Only honoured on non-on_task verdicts (the prompt
+                # asks for "" on on_task; a chatty model that fills it
+                # anyway is ignored so healthy turns stay note-free).
+                # Old-style responses (key absent) degrade to "".
+                if classification_parsed and classification_parsed != "on_task":
+                    note_raw = parsed.get("note_to_agent", "")
+                    if isinstance(note_raw, str):
+                        note_to_agent_parsed = note_raw.strip()
             # Build the span's output / decision strings from the parsed
             # verdict so harmonograf can render "judged agent/task:
             # on-task" inline.
@@ -1179,6 +1212,7 @@ async def classify_reasoning_drift_with_focus(
                     reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
                 ),
                 observed_revision_index=observed_revision_index,
+                note_to_agent=note_to_agent_parsed,
             )
         else:
             # erroneous_deviation — same wire shape as the pre-iter-10
@@ -1236,6 +1270,7 @@ async def classify_reasoning_drift_with_focus(
                     reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
                 ),
                 observed_revision_index=observed_revision_index,
+                note_to_agent=note_to_agent_parsed,
             )
     # Emit ReasoningJudgeInvoked on every invocation, regardless of
     # verdict. Done after the drift decision so the event carries the
@@ -1276,6 +1311,7 @@ async def classify_reasoning_drift_with_focus(
         stated_intent=stated_intent_parsed,
         classification=classification_parsed,
         provenance=provenance_parsed,
+        note_to_agent=note_to_agent_parsed,
     )
 
 
