@@ -130,12 +130,24 @@ split:
   rows (always armed, observed facts, stop-not-redirect); steering kinds
   engage only on goal-referenced drift, through the note channel, with
   grace-window pacing.
+- **Interventions prefer the least-invasive surface.** A supervisor at
+  the callback layer has five surfaces, ordered from most to least
+  trajectory-preserving: (1) **shape the choice set** — select among the
+  agent's own candidate actions before commitment; (2) **edit
+  perception** — subtract poisoned context so the model stops
+  re-anchoring on it; (3) **speak** — attributed advisory notes;
+  (4) **constrain structurally** — tools, budgets, decoding;
+  (5) **stop** — pause / cancel / terminate. Historically goldfive used
+  only (3)-as-command and (5). Stages 1–3 repair (3) and (5); Stage 4
+  builds (1), (2), and (4).
 
-The roadmap's three stages map onto the three behaviors: Stage 1 + the
-prompt-shaping diet restore *dormancy* (zero steady-state footprint);
-the drift triage keeps *guardrails* armed while demoting forecast-mismatch
-kinds to observability; the observer-note channel and ledger plan mode
-rebuild *steering* as conditional, proportional, goal-referenced influence.
+The roadmap's stages map onto the identity: Stage 1 + the prompt-shaping
+diet restore *dormancy* (zero steady-state footprint); the drift triage
+keeps *guardrails* armed while demoting forecast-mismatch kinds to
+observability; the observer-note channel and ledger plan mode rebuild
+*steering* as conditional, proportional, goal-referenced influence; Stage 4
+is the ambition layer — the techniques that make an active goldfive beat a
+disabled one, which is exactly the bar the PR-13 counterfactual bench sets.
 
 End state: `observation_only=False` becomes the default again only when the
 new regime is measurably non-inferior to no-steering (judge-only
@@ -191,7 +203,11 @@ author the observation in the same call that produced the verdict (add
 `drift/goals.py`); deterministic detectors render facts they already hold.
 Preserve the neutral-framing lesson from `_correction_injection.py`; add
 adversarial tests asserting rendered notes contain no imperative
-means-verbs.
+means-verbs. When judge confidence is low, prefer *question-form* notes
+("Does the current approach still serve the goal of X?") over statements —
+self-generated corrections integrate into a trajectory better than
+external ones, and a question is the lowest-footprint speech act
+available. Statement form stays for hard observed facts.
 
 ### Stage 2 — Observer-note channel, cancel policy, pacing
 
@@ -217,6 +233,13 @@ rendered block per LLM request). Delivery points, in preference order:
    `pending_nudges`.
 3. claude-agent-sdk adapter: system-prompt section + PostToolUse hook
    `additionalContext`.
+4. Tool-result annotation for loop-shaped drift: an append-only,
+   attributed reminder on the tool result itself —
+   `[goldfive observer: this is the 5th identical call; the result has
+   not changed]` — landing adjacent to the evidence at the moment of
+   maximal relevance (the battle-tested system-reminder pattern). Append
+   only, never modify the real result: the line between annotation and
+   corruption is attribution plus preservation.
 
 Rendered block shape:
 
@@ -232,6 +255,26 @@ instructions remain authoritative.
 
 Config `signal_channel: "request_context" | "legacy_user_message"`, default
 legacy in this PR.
+
+**PR 6b — Context-editing rules (finish goldfive#397): steering by
+subtraction.**
+PR 1 stops cancelling in-flight work, which means failed reasoning trails
+*stay* in context — and models re-anchor on their own failed attempts;
+that is largely what looping *is*. Context editing is the cancel gate's
+natural complement: prune the poison instead of killing the invocation.
+The `ContextEditor` skeleton shipped in #397 Phase 1 (drop-only invariant,
+`PruneCancelledReasoningRule` registered); land the designed follow-up
+rules — `PruneTransientErrorRule` (redact 429/parse-blip
+function_responses), `PruneStaleSteerRule`, `CompactPriorReasoningRule`
+(collapse N identical failed tool calls into one summarized entry). The
+compaction rule requires relaxing Phase 1's drop-only invariant to a
+*byte-monotonic replace* rule class (output ≤ input bytes and content
+count, but summarize-in-place permitted); keep the `ContextEdited` /
+`ContextEditRejected` event contract. Rules fire only on tripped
+guardrail counters or drift verdicts — never on healthy turns
+(dormancy). Files: `goldfive/context_editor.py`, `config.py`
+(`context_editor_rules`), `_state_audit.py` authorised-sites constant,
+CONTEXT-EDITING.md.
 
 **PR 7 — Cancel policy + ladder restructure.**
 Rename NUDGE → SIGNAL; replace every CANCEL_REINVOKE cell in
@@ -324,6 +367,69 @@ the observed-actions refine path, and the legacy ladder/channel values.
 Update PLAN-LIFECYCLE.md, PLAN-DESCRIPTIVE-GROWTH.md, DRIFT.md,
 CONTROL-CHANNEL.md, RATIONALE.md alongside.
 
+### Stage 4 — Beyond repair: the ambition layer (exploratory)
+
+Stages 1–3 are the *repair* layer: they stop goldfive from harming
+trajectories and fix the drift reference. Stage 4 is what makes an active
+goldfive measurably better than a disabled one. Each item ships
+individually flagged, default-off, and must beat the judge-only baseline
+on the PR-13 three-arm bench before its flag flips. No fixed PR numbers —
+sequence by what Stage 1–3 telemetry shows is the binding constraint.
+
+**4a — Fork-and-judge selection at commitment points** (surface 1:
+shape the choice set). At a high-stakes juncture — the first model call
+after a drift verdict, an irreversible tool call, a major delegation —
+`before_model_callback` samples K candidate completions *from the agent's
+own distribution* (re-issue the request at temperature), a judge selects
+the goal-aligned candidate, and the synthesized-`LlmResponse`
+short-circuit (already available in the ADK plugin surface; see
+CONTEXT-EDITING.md "ADK surface") returns it. Not one goldfive-authored
+token enters the context; every candidate is the agent's own intention;
+the agent never knows. This converts steering from post-hoc correction to
+pre-commitment selection — test-time compute scaling applied at the
+orchestration layer. Cost is K× on only the calls where it triggers;
+cheap on a self-hosted serving stack. The only Stage-4 technique with
+literally zero context footprint.
+
+**4b — Intent-self-reference drift** (the strongest legitimate
+reference). The ledger records observed *actions*; the goldfive#271
+machinery already captures stated *intent*. Combine them: treat the
+agent's own emitted commitments as a co-equal drift reference and detect
+*self-inconsistency* — "the agent said it would verify before deleting;
+it is deleting without verifying." Lower false-positive rate than
+goal-judges (no interpretation gap), and maximally agency-respecting:
+the note quotes the agent back to itself. Feeds the reasoning judge as a
+third grounding alongside goals and the ledger.
+
+**4c — Structural guardrails on the tool surface** (surface 4). When a
+loop detector trips on tool T with identical args — an observed fact —
+`before_model` drops T from `config.tools` for one call, or forces a
+text-only "exhale" turn (no tools) so the model must articulate state
+before acting again. Honest, structural, zero cooperation required.
+Discipline: fires ONLY on tripped guardrail counters; narrowing the tool
+surface on healthy turns is the "do NOT delegate" mistake Stage 1
+deletes. Same family: generalize the existing `_ratchet_max_tokens`
+mechanism into graduated per-task budgets (tool-call and token) that
+tighten as guardrail counters accumulate — a ramp instead of the binary
+pause.
+
+**4d — Decision-theoretic gate → learned intervention policy.** The
+grace window (PR 8) is a fixed-delay heuristic. The principled gate:
+intervene iff `P(real drift) × cost(unchecked drift) >
+expected(intervention damage)` — and PR-5 `SignalOutcome` telemetry
+estimates *both* sides empirically (self-corrected_unaided rate ≈ how
+often intervention was unnecessary; post-signal re-fire rate ≈ how often
+it didn't help). Long-term this is zicato's job: a contextual bandit
+over {wait, signal, escalate}, learned offline per tree shape and model,
+closing the loop the telemetry opens.
+
+**Considered and rejected:** activation steering / representation
+engineering (self-hosted-only, research-grade fragile) and logit-biasing
+a looping tool's name tokens (brittle under tokenization and paraphrase).
+Worth taking from the decoding layer: guided/constrained decoding for the
+*judges'* structured outputs on self-hosted stacks — cheaper,
+schema-reliable verdicts, which matters once judges gate interventions.
+
 ## 4. Verification
 
 - Per PR: unit tests; forecast mode stays default through Stage 2 so
@@ -341,4 +447,6 @@ CONTROL-CHANNEL.md, RATIONALE.md alongside.
   task per unique (agent, args) pair.
 - Counterfactual gate: the PR-13 three-arm bench is the only authority for
   default flips; PR-5 telemetry must show the self-correction base rate
-  before any signal regime is enabled by default.
+  before any signal regime is enabled by default. Stage-4 items are held
+  to the same bar individually: each flag flips only when its arm beats
+  the judge-only baseline.
