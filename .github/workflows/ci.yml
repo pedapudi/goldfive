@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, agency-preservation]
   pull_request:
-    branches: [main]
+    branches: [main, agency-preservation]
 
 jobs:
   lint-and-test:
