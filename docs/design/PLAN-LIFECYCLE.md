@@ -790,19 +790,28 @@ extends the plan-lifecycle contract to cover one new write path:
 delegates to an agent the planner did not forecast.
 
 When `_maybe_pin_delegation_task` cannot match an observed delegation
-to an existing PENDING task via the tier-1 / tier-2 / tier-3 disambiguation
-ladder, the steerer synthesises a `Task(discovered=True, ...)`, installs
-it onto `session.plan` via `PlanReviser.install_descriptive_growth`, and
-re-pins `session.current_task_id` onto the new task. The revision is
-emitted as a `NEW_WORK_DISCOVERED` drift (INFO severity, framework-
-authored) and lands in both steering and observation modes (the
-`_apply_revision` discovery carve-out from goldfive#258).
+to an existing forecast PENDING task via tier 1 (required-tools cover)
+or tier 2 (agent-name stem) — the tier-3 topic-args scorer is bypassed
+in the growth flow (goldfive#423 / AGENCY-PRESERVATION.md PR 2) — the
+steerer synthesises a `Task(discovered=True, ...)`, installs it onto
+`session.plan` via `PlanReviser.install_descriptive_growth`, and pins
+`session.current_task_id` onto the new task BEFORE the
+`DelegationObserved` emit and before any capability rule runs. The
+revision is emitted as a `NEW_WORK_DISCOVERED` drift (INFO severity,
+framework-authored) and lands in both steering and observation modes
+(the `_apply_revision` discovery carve-out from goldfive#258).
+`PlanReconciler.on_before_agent` applies the same dedup-hash → grow →
+claim flow to unmatched agents in `transfer_to_agent`-style trees,
+using the degraded per-`(agent_name, "")` hash (no tool args at that
+hook).
 
 **Feature flag.** Gated on `SteeringConfig.descriptive_growth_enabled`
-(env `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`, default OFF). When the flag
-is off, `_maybe_pin_delegation_task` retains the pre-#423 fallback
-behaviour and `CAPABILITY_MISMATCH` Rule C fires as today. PR 4 of
-#423 (deferred pending live validation) flips the default.
+(env `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`, **default ON** since
+goldfive#423 / AGENCY-PRESERVATION.md PR 2). When the flag is off,
+`_maybe_pin_delegation_task` retains the pre-#423 tier-1/2/3 fallback
+behaviour (scheduled for deletion in AGENCY-PRESERVATION.md PR 13) and
+`CAPABILITY_MISMATCH` Rule C can fire — though Rule C is itself
+soft-retired behind `GOLDFIVE_CAPABILITY_RULE_C=1`.
 
 **Dedup.** Repeated delegations to the same `(agent_name,
 args-token-set)` re-pin to the existing discovered task rather than
