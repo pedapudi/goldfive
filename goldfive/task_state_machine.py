@@ -733,6 +733,30 @@ class TaskStateMachine:
         task_id_for_progress = str(getattr(task, "id", "") or "")
         if task_id_for_progress:
             session.task_last_progress_at[task_id_for_progress] = time.monotonic()
+        # AGENCY-PRESERVATION.md PR 5 (observe-only): when a task reaches a
+        # terminal status, resolve any open, delivered SignalLedger keys bound
+        # to it — ``self_corrected_after_signal`` if a real signal was
+        # delivered, ``self_corrected_unaided`` if only dry-run (the
+        # ``observation_only`` base rate). Terminal-only is the conservative
+        # "resolved" detection (never over-claims self-correction). Run before
+        # the sink guard so ledger state stays consistent even without sinks
+        # (mirrors the progress-liveness rationale above); the emit inside is
+        # a no-op when no sink is bound. Best-effort; gates nothing.
+        if task_id_for_progress and to_status in _TERMINAL_TASK_STATUSES:
+            recorder = getattr(
+                getattr(self._steerer, "drift", None),
+                "record_signal_outcomes_for_task",
+                None,
+            )
+            if callable(recorder):
+                try:
+                    await recorder(session, task_id_for_progress)
+                except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+                    log.debug(
+                        "TaskStateMachine._emit_task_transitioned: signal-outcome "
+                        "resolution raised (swallowed): %s",
+                        exc,
+                    )
         sinks = self._steerer._sinks
         if not sinks:
             return

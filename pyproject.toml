@@ -38,6 +38,7 @@ dev = [
     "mypy>=1.10",
     "protobuf>=4.25",
     "grpcio-tools>=1.60",
+    "hypothesis>=6.0",
 ]
 embedding = [
     "sentence-transformers>=3.0",

@@ -555,6 +555,13 @@ class DriftObserver:
         if self._is_terminal_drift(drift):
             await self._close_open_boundaries_for_terminal_drift(drift)
 
+        # AGENCY-PRESERVATION.md PR 5 (observe-only): record this fire on the
+        # SignalLedger. The single ``DriftDetected`` chokepoint sees every
+        # fire and re-fire exactly once per ``drift_id``; a USER_* fire
+        # resolves open delivered keys as ``user_intervened`` instead. Last,
+        # after the emit, and fully best-effort — gates nothing.
+        await self._note_signal_drift_fire(session, drift)
+
     # ------------------------------------------------------------------
     # SteeringDecisionMade emission (zicato-optimization-surface)
     # ------------------------------------------------------------------
@@ -809,6 +816,232 @@ class DriftObserver:
             await self._steerer._emit(evt)
         except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
             log.debug("policy_applied emit failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Signal telemetry (AGENCY-PRESERVATION.md PR 5 — observe-only)
+    # ------------------------------------------------------------------
+    #
+    # These helpers are the ONLY new behavior PR 5 adds: each records a
+    # SignalLedger fact (gating nothing — §5.1) and emits a SignalDelivered /
+    # SignalOutcome event. They are wired into the real dispatch path (the four
+    # goldfive-authored dispatch decision points + the drift-emit chokepoint +
+    # the task-transition + run-end boundaries) so there is no dead middleware
+    # (§5.6). Every body is best-effort: a ledger or emit failure is logged at
+    # DEBUG and swallowed so dispatch is byte-for-byte unchanged.
+    #
+    # ALL of them short-circuit when ``SteeringConfig.signal_telemetry`` is
+    # off (the default) via :meth:`_signal_telemetry_on`, so with the flag off
+    # PR 5 is a true no-op: no ledger write, no wire event, no observable
+    # change to the event stream every existing suite asserts on (§5.1).
+
+    def _signal_telemetry_on(self) -> bool:
+        """True when ``SteeringConfig.signal_telemetry`` is enabled.
+
+        Default OFF. Gates the observe-only signal-telemetry helpers below so
+        PR 5 ships dark; the §5.4 validation campaign and PR 8 turn it on.
+        """
+        return bool(getattr(self._steerer, "_signal_telemetry_enabled", False))
+
+    async def _emit_signal_delivered(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        *,
+        channel: str,
+        note_text: str,
+        ladder_level: str = "",
+        extra_decision: dict[str, Any] | None = None,
+    ) -> None:
+        """Record + emit a ``SignalDelivered`` for a dispatch decision point.
+
+        ``dry_run`` is ``not _should_inject()`` (== ``observation_only``): the
+        §5.4 shadow-mode flag. The decision payload captures what the dispatch
+        path already computed — ladder level, occurrence count, the
+        cancel-authority verdict (PR 1's gate), promotion flag, and whatever
+        channel-specific ``extra_decision`` the caller passes (plan-swap
+        target ids, the mechanical ``channel_action``) — so the differential
+        report can diff legacy-would-do vs. new-would-do on the same run.
+        """
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.events import SIGNAL_CHANNEL_PROMOTION, signal_delivered_event
+
+            dry_run = not self._steerer._should_inject()
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            kind = drift.kind.value
+            task_id = drift.current_task_id or ""
+            severity = drift.severity.value
+            decision: dict[str, Any] = {
+                "ladder_level": str(ladder_level or ""),
+                "occurrence_count": self._occurrence_count_for_ladder(session, drift),
+                "observation_only": dry_run,
+                "would_cancel_inflight": self._should_request_cancel_for_drift(drift),
+                "authored_by": str(getattr(drift, "authored_by", "") or ""),
+                "suppressed_by_user_steer": bool(
+                    getattr(drift, "suppressed_by_user_steer", False)
+                ),
+                "promotion": channel == SIGNAL_CHANNEL_PROMOTION,
+            }
+            if extra_decision:
+                decision.update(extra_decision)
+            # Ledger first (gates nothing); the ledger's dedup is the
+            # authority — only emit a wire event when the delivery was newly
+            # recorded, so a redelivery of the same drift on the same channel
+            # never produces a duplicate SignalDelivered. ``recorded`` stays
+            # True if the ledger is unavailable (emit for observability).
+            recorded = True
+            try:
+                from goldfive.signal_ledger import SignalLedger
+
+                _, recorded = SignalLedger.for_session(session).record_delivery(
+                    drift_kind=kind,
+                    task_id=task_id,
+                    drift_id=str(getattr(drift, "id", "") or ""),
+                    channel=channel,
+                    turn=turn,
+                    dry_run=dry_run,
+                    severity=severity,
+                    ladder_level=str(ladder_level or ""),
+                    note_text=note_text,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("signal ledger record_delivery failed: %s", exc)
+                recorded = True
+            if not recorded:
+                return
+            seq, event_id = session.next_sequence_and_event_id()
+            evt = signal_delivered_event(
+                session.run_id,
+                seq,
+                drift_id=str(getattr(drift, "id", "") or ""),
+                kind=kind,
+                severity=severity,
+                channel=channel,
+                turn=turn,
+                note_text=note_text,
+                dry_run=dry_run,
+                task_id=task_id,
+                agent_id=drift.current_agent_id or "",
+                decision=decision,
+                session_id=session.id,
+                event_id=event_id,
+            )
+            await self._steerer._emit(evt)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal_delivered emit failed: %s", exc)
+
+    async def _emit_signal_outcome(self, session: Session, entry: Any) -> None:
+        """Emit a ``SignalOutcome`` for a freshly-resolved ledger entry."""
+        try:
+            from goldfive.events import signal_outcome_event
+
+            seq, event_id = session.next_sequence_and_event_id()
+            evt = signal_outcome_event(
+                session.run_id,
+                seq,
+                drift_kind=entry.drift_kind,
+                task_id=entry.task_id,
+                outcome=entry.outcome,
+                turns_to_resolution=entry.turns_to_resolution(),
+                delivery_count=len(entry.deliveries),
+                had_real_delivery=entry.has_real_delivery,
+                session_id=session.id,
+                event_id=event_id,
+            )
+            await self._steerer._emit(evt)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal_outcome emit failed: %s", exc)
+
+    async def _note_signal_drift_fire(self, session: Session, drift: DriftEvent) -> None:
+        """Record a drift fire on the ledger (or a user-intervention outcome).
+
+        Wired into :meth:`_emit_drift_detected` — the single chokepoint every
+        ``DriftDetected`` flows through — so the ledger sees every fire and
+        re-fire exactly once per ``drift_id``. A USER_STEER / USER_CANCEL fire
+        is NOT a goldfive signal key: it resolves every open, delivered key as
+        ``user_intervened`` instead of opening a ``(USER_*, task)`` entry.
+        """
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.signal_ledger import SignalLedger
+
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            ledger = SignalLedger.for_session(session)
+            authored_by = str(getattr(drift, "authored_by", "") or "").lower()
+            if authored_by == "user" or drift.kind in self._USER_AUTHORED_DRIFT_KINDS:
+                for entry in ledger.resolve_user_intervened(turn=turn):
+                    await self._emit_signal_outcome(session, entry)
+                return
+            ledger.record_fire(
+                drift_kind=drift.kind.value,
+                task_id=drift.current_task_id or "",
+                turn=turn,
+                drift_id=str(getattr(drift, "id", "") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal ledger fire note failed: %s", exc)
+
+    async def _record_signal_outcome_escalated(
+        self, session: Session, drift: DriftEvent
+    ) -> None:
+        """Resolve the drift's ledger key as ``escalated`` (pause dispatch)."""
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.signal_ledger import SignalLedger
+
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            entry = SignalLedger.for_session(session).resolve_escalated(
+                drift_kind=drift.kind.value,
+                task_id=drift.current_task_id or "",
+                turn=turn,
+            )
+            if entry is not None:
+                await self._emit_signal_outcome(session, entry)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal ledger escalation note failed: %s", exc)
+
+    async def record_signal_outcomes_for_task(
+        self, session: Session, task_id: str
+    ) -> None:
+        """Resolve open, delivered keys bound to a now-terminal ``task_id``.
+
+        Public so :class:`~goldfive.task_state_machine.TaskStateMachine` can
+        call it from its task-transition emit chokepoint
+        (``self._steerer.drift.record_signal_outcomes_for_task``). Conservative
+        "resolved" detection: terminal task state only (never over-claims).
+        """
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.signal_ledger import SignalLedger
+
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            for entry in SignalLedger.for_session(session).resolve_task(
+                task_id=str(task_id or ""), turn=turn
+            ):
+                await self._emit_signal_outcome(session, entry)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal ledger task-resolution note failed: %s", exc)
+
+    async def finalize_signal_ledger(self, session: Session) -> None:
+        """Resolve every still-open, delivered key as ``invocation_ended``.
+
+        Wired into the executor's run-boundary drain so it fires once per run
+        end. Idempotent (a second call finds nothing open).
+        """
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.signal_ledger import SignalLedger
+
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            for entry in SignalLedger.for_session(session).finalize_open(turn=turn):
+                await self._emit_signal_outcome(session, entry)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal ledger finalize failed: %s", exc)
 
     async def _emit_judgement_from_drift(
         self, session: Session, drift: DriftEvent
@@ -3969,6 +4202,20 @@ class DriftObserver:
                 drift.current_task_id or "-",
                 nudge_msg,
             )
+            # AGENCY-PRESERVATION.md PR 5 (observe-only): the post-ABSORB
+            # nudge is a second nudge_replay delivery site (distinct from
+            # Level-2 ``_dispatch_nudge``). ``ladder_level="absorb"`` lets the
+            # divergence report tell the two apart.
+            from goldfive.events import SIGNAL_CHANNEL_NUDGE_REPLAY
+
+            await self._emit_signal_delivered(
+                session,
+                drift,
+                channel=SIGNAL_CHANNEL_NUDGE_REPLAY,
+                note_text=nudge_msg,
+                ladder_level="absorb",
+                extra_decision={"channel_action": "queued"},
+            )
 
     # ------------------------------------------------------------------
     # Level dispatch (#142) — nudge / steer / pause
@@ -3995,6 +4242,24 @@ class DriftObserver:
             drift.kind.value,
             drift.current_task_id or "-",
             msg,
+        )
+        # AGENCY-PRESERVATION.md PR 5 (observe-only): record the nudge_replay
+        # delivery. The legacy nudge queue is NOT gated by ``observation_only``
+        # (only the steer / pause / cancel write-paths are — see
+        # SteeringConfig.observation_only) so the message physically queues in
+        # both modes; ``channel_action="queued"`` records that mechanical
+        # truth, while the event's ``dry_run`` flag still tracks shadow-mode
+        # for the §5.4 divergence report. PR 6 routes this through the gated
+        # observer-note channel and the asymmetry goes away.
+        from goldfive.events import SIGNAL_CHANNEL_NUDGE_REPLAY
+
+        await self._emit_signal_delivered(
+            session,
+            drift,
+            channel=SIGNAL_CHANNEL_NUDGE_REPLAY,
+            note_text=msg,
+            ladder_level="nudge",
+            extra_decision={"channel_action": "queued"},
         )
 
     async def _dispatch_goldfive_steer_control(
@@ -4053,6 +4318,32 @@ class DriftObserver:
                 "body": body,
                 "superseded_task_ids": superseded_ids,
                 "replacement_task_ids": replacement_ids,
+            },
+        )
+        # AGENCY-PRESERVATION.md PR 5 (observe-only): record the steer-control
+        # delivery decision BEFORE the observation_only gate so the suppressed
+        # (dry_run) path — the §5.4 base-rate substrate — is captured too. A
+        # ``body_override`` means this is the promote-to-steer path
+        # (:meth:`_promote_drift_to_steer`), so the signal rides the
+        # ``promotion`` channel; otherwise it is the Level-3 CANCEL_REINVOKE
+        # ``steer_control`` channel. The plan-swap target ids are exactly what
+        # the legacy regime would have steered toward — prime divergence
+        # substrate.
+        from goldfive.events import SIGNAL_CHANNEL_PROMOTION, SIGNAL_CHANNEL_STEER_CONTROL
+
+        _will_inject = self._steerer._should_inject()
+        await self._emit_signal_delivered(
+            session,
+            drift,
+            channel=(
+                SIGNAL_CHANNEL_PROMOTION if body_override else SIGNAL_CHANNEL_STEER_CONTROL
+            ),
+            note_text=body,
+            ladder_level="promotion" if body_override else "cancel_reinvoke",
+            extra_decision={
+                "superseded_task_ids": superseded_ids,
+                "replacement_task_ids": replacement_ids,
+                "channel_action": "dispatched" if _will_inject else "suppressed",
             },
         )
         # goldfive#254 — observation-only: skip the actual ControlMessage
@@ -4140,6 +4431,29 @@ class DriftObserver:
         the in-flight invoke. The carve-out below stops that chain.
         """
         from goldfive.control import ControlKind, ControlMessage
+
+        # AGENCY-PRESERVATION.md PR 5 (observe-only): record the pause-control
+        # delivery and resolve the key as ``escalated``. Emitted before the
+        # observation_only gate so the suppressed (dry_run) escalation decision
+        # is captured. Escalation is terminal for the key in BOTH modes — the
+        # *decision* to pause happened even when the pause channel send is
+        # suppressed under observation_only.
+        from goldfive.events import SIGNAL_CHANNEL_PAUSE_CONTROL
+
+        await self._emit_signal_delivered(
+            session,
+            drift,
+            channel=SIGNAL_CHANNEL_PAUSE_CONTROL,
+            note_text=reason,
+            ladder_level="pause_escalate",
+            extra_decision={
+                "reason": reason,
+                "channel_action": (
+                    "dispatched" if self._steerer._should_inject() else "suppressed"
+                ),
+            },
+        )
+        await self._record_signal_outcome_escalated(session, drift)
 
         if not self._steerer._should_inject():
             log.info(
