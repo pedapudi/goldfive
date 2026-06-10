@@ -168,6 +168,14 @@ depended on (a long refine overlapping a still-generating coordinator).
 Until PR 6 lands, the verdict-freshness gate (goldfive#245) and
 no-op-revision rejection bound the loop risk; ship with an env
 kill-switch.
+*Correctness requirements (§5.2):* this PR ships with (a) an explicit
+inventory of every guarantee the unconditional cancel currently provides
+— loop-break for the v15 scenario, plan coherence for reporting, the
+restart boundary that nudge delivery relied on, supersede-flag
+consumption in the executor's cancelled branch — plus a test per item
+demonstrating what supplies that guarantee in the new regime; and (b) a
+pinned v15 regression test: slow refine + still-generating coordinator
+must not loop the refine.
 
 **PR 2 — Finish goldfive#423.**
 Flip `descriptive_growth_enabled` default ON (`config.py`); move the growth
@@ -189,6 +197,14 @@ transfer-style trees grow the ledger too.
 | NEW_WORK_DISCOVERED (agent-authored, `drift_observer.py:1180`) | reroute to `install_descriptive_growth` instead of refine |
 | WRONG_AGENT | deprecate (no production emitter exists) |
 | budget/safety set (LOOPING_*, TIMEOUT, REFUSAL, TOO_MANY_STEPS, …) | keep ladder rows |
+
+*Correctness requirements (§5.3):* before any cell changes, land a
+decision-table snapshot test over the full
+`(kind, severity, occurrence, config) → action` surface so this PR's
+review shows every cell change as an explicit table diff — no silent
+collateral edits to unrelated rows. Verify demoted kinds that no longer
+refine also no longer write `refine_outcomes` entries that other gates
+read.
 
 **PR 4 — Intervention content rewrite** (no control-flow change).
 Replace `_CORRECTIVE_TEMPLATES` / `compose_corrective_user_message`
@@ -218,6 +234,14 @@ user_intervened) + a `SignalLedger` keyed `(kind, task)` recording
 grace-window bookkeeping without gating anything. Dry-run note emission
 under observation_only establishes the agent self-correction base rate
 *before* behavior changes. Additive protos only.
+*Correctness requirements (§5.4, §5.5):* the dry-run events must carry
+enough payload to diff "what the legacy regime would have done" against
+"what the new regime would do" on the same real runs; the exit criterion
+for enabling any later behavior PR is a reviewed divergence report over
+real traffic. `SignalLedger` keys use goldfive-minted stable task ids,
+never LLM-minted identifiers (churning keys make lifecycle gates never
+engage); ship hypothesis-based interleaving tests for the ledger
+(concurrent judge verdicts, late drifts, user steers).
 
 **PR 6 — The observer-note channel.**
 `ObserverNoteQueue` (StateStore-backed) with per-request coalescing (≤1
@@ -255,6 +279,12 @@ instructions remain authoritative.
 
 Config `signal_channel: "request_context" | "legacy_user_message"`, default
 legacy in this PR.
+*Correctness requirements (§5.2):* an exactly-once delivery contract test
+across all delivery points — a note enqueued while an invocation is
+mid-flight and ALSO present at the next boundary must render once, not
+twice (the classic two-mode double-delivery bug); marker strip-and-refresh
+idempotency tests (two consecutive `before_model` calls never stack
+blocks).
 
 **PR 6b — Context-editing rules (finish goldfive#397): steering by
 subtraction.**
@@ -286,6 +316,12 @@ safety. Strip steering side-effects from `_promote_drift_to_steer`
 dispatch, no `active_steer(source="goldfive")` stamp; keep refine_steer +
 PlanRevised + note enqueue. `GOLDFIVE_STEER_LEGACY_LADDER=1` escape hatch
 for one release.
+*Correctness requirements (§5.3):* the PR-3 decision-table snapshot is
+re-baselined here with the full diff in the PR description; the deep test
+coverage on the executor's supersede/cancel branches
+(`sequential.py:1023-1110`) is migrated deliberately — each deleted
+assertion is either re-pointed at the new behavior or justified in the
+PR, never dropped silently.
 
 **PR 8 — Pacing (minimum-intervention).**
 Grace window: after a note for `(kind, task)` is delivered, that key cannot
@@ -450,3 +486,104 @@ schema-reliable verdicts, which matters once judges gate interventions.
   before any signal regime is enabled by default. Stage-4 items are held
   to the same bar individually: each flag flips only when its arm beats
   the judge-only baseline.
+
+## 5. Correctness strategy
+
+This roadmap touches the most entangled code in the repo —
+`drift_observer.py`'s dispatch path is ~2,000 lines of interacting gates
+(verdict freshness #245, in-flight refine registry #405, outcome gates
+#215, suppression #441, late-drift tolerance #319) — and PR 1 removes a
+behavior that is *load-bearing* (the unconditional cancel was the v15
+concurrent-invocation fix and feeds the executor's supersede contract).
+The risk concentrates in three places: PR 1/7 (dispatch + cancel
+semantics), PR 3/7 (ladder cell changes silently altering what other
+gates read), and the Stage 2–3 two-mode period (legacy/new forks doubling
+branch surface; double-delivery is the classic bug shape). Defense in
+depth, eight layers:
+
+### 5.1 No-op by default; one-line revertible flips
+
+Every behavior change lands behind a flag whose default preserves legacy
+behavior (`signal_channel` legacy in PR 6, `plan_mode=forecast` through
+Stage 2, `GOLDFIVE_STEER_LEGACY_LADDER`, the PR-1 env kill-switch).
+Default flips are separate one-line PRs. Existing test suites (~195
+files) must keep passing UNMODIFIED until the cutover PR — a refactor
+that breaks one is signal, not churn to be fixed up in place.
+
+### 5.2 Invariant contract tests written before the code changes
+
+The guarantees currently *implicit* in the cancel-everything design are
+written down and tested so they hold in both regimes:
+
+- every installed plan revision is eventually observed by the executor;
+- no queued nudge/note is dropped, and none is delivered twice across
+  channels;
+- `session._supersede_pending` is always consumed or provably harmless;
+- USER_STEER is honored within N logical turns regardless of regime;
+- run termination still occurs without agent cooperation (no
+  prompt-contract regression).
+
+PR 1 additionally ships the cancel-guarantee inventory and the pinned
+v15 regression test (see its entry). PR 6 ships the exactly-once
+delivery contract.
+
+### 5.3 Decision-table snapshot tests
+
+`_ladder_level_for` is a pure function
+`(kind, severity, occurrence, config) → action`. The full table is
+snapshotted in both regimes so PRs 3 and 7 surface every cell change as
+a reviewable diff — no silent collateral edits. Side-effect coupling is
+checked alongside: demoted kinds must not leave stale `refine_outcomes`
+writes that other gates consume.
+
+### 5.4 Shadow / differential validation before authority
+
+The reason PR 5 (telemetry) precedes every behavior change: under
+`observation_only`, the NEW decision logic runs dry against real traffic,
+emitting `SignalDelivered(dry_run=true)` with full decision payloads.
+We diff legacy-would-do vs. new-would-do on the same real runs and
+review divergences before either regime is enabled. The new code path
+accumulates production mileage with zero production authority — the same
+trick this roadmap applies to goldfive itself (observe before steering).
+
+### 5.5 Golden traces and property-based interleaving tests
+
+The JSONL sink already records full event sequences; recorded traces
+from real sessions — including the 2d27ff4a refine-storm shape — become
+deterministic dispatch-level regression fixtures. New concurrent state
+(`SignalLedger`, `ObserverNoteQueue`) gets hypothesis-based interleaving
+tests (concurrent judge verdicts, late drifts, user steers, restarts) —
+this codebase's race history (#405 dedup registry, the per-session plan
+lock, growth dedup linearisability) says concurrency is where its bugs
+live.
+
+### 5.6 Integration disciplines (project scar tissue, applied per PR)
+
+- Grep call sites for every new gate/helper — unit tests pass on dead
+  middleware that no dispatch path calls.
+- Verify callback state handoffs are read-readable on the ADK side
+  (`session.state` shallow-copy trap).
+- Lifecycle-gate keys (SignalLedger, note dedup) use goldfive-minted
+  stable ids, never LLM-minted identifiers — churning keys make gates
+  never engage.
+- Verify the running build (process start time vs. merge time) before
+  interpreting any e2e result.
+
+### 5.7 Layered e2e with functional pass criteria
+
+Narrow regression checks are not accepted as validation (harnesses have
+PASSED on functionally broken runs). Every stage gets the six-layer
+pass — sanity → drive a real coordinator+AgentTool tree → DB → UI →
+health → output — with *functional completion* and *steer-honoured* as
+explicit criteria. The pinned 2d27ff4a replay asserts: zero
+goldfive-authored in-flight cancels, no refine storms, exactly one
+discovered task per unique (agent, args) pair.
+
+### 5.8 Bench-gated flips and the residual risk
+
+Arm (c) of the PR-13 bench keeps the legacy regime alive precisely so
+regressions are measurable rather than argued about; flips being
+one-line PRs makes rollback a 60-second operation. The honest residual
+risk is emergent behavior in the two-mode period that no test
+anticipates — that is what §5.4 and §5.5 exist for: shadow mileage on
+real workloads before any new path gets authority.
