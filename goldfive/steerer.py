@@ -383,6 +383,7 @@ class DefaultSteerer:
         steering_config: SteeringConfig | None = None,
         goldfive_steer_threshold: str | None = None,
         goldfive_steer_suppression_window_turns: int | None = None,
+        cancel_inflight_scope: str | None = None,
         judges: list[Any] | None = None,
     ) -> None:
         """Build a steerer.
@@ -625,6 +626,30 @@ class DefaultSteerer:
         else:
             _window = 3
         self._goldfive_steer_suppression_window_turns = max(0, _window)
+        # AGENCY-PRESERVATION.md PR 1 (goldfive#449/#452): authority
+        # scope for cancelling the wrapped agent's in-flight invocation
+        # on a drift-driven plan install. Precedence mirrors the other
+        # goldfive#225 knobs: explicit kwarg > ``SteeringConfig`` >
+        # built-in default (``"user_and_safety"``). Consumed by
+        # :meth:`DriftObserver._drift_authorizes_inflight_cancel`;
+        # ``"all"`` is the §5.1 kill-switch restoring the legacy
+        # cancel-on-every-install behaviour (env:
+        # ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`` via
+        # :meth:`SteeringConfig.from_env`).
+        if cancel_inflight_scope is not None:
+            _cancel_scope = str(cancel_inflight_scope).strip().lower()
+        elif steering_config is not None:
+            _cancel_scope = str(steering_config.cancel_inflight_scope).strip().lower()
+        else:
+            _cancel_scope = "user_and_safety"
+        if _cancel_scope not in {"user_and_safety", "all"}:
+            log.warning(
+                "DefaultSteerer: unknown cancel_inflight_scope=%r; "
+                "falling back to 'user_and_safety'",
+                _cancel_scope,
+            )
+            _cancel_scope = "user_and_safety"
+        self._cancel_inflight_scope: str = _cancel_scope
         self._steering_config: SteeringConfig | None = steering_config
         # goldfive#254: observation-only mode. Detection still runs in
         # full and ``planner.refine_steer`` still runs (operators see the

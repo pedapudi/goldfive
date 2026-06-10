@@ -287,6 +287,65 @@ class DriftObserver:
         }
     )
 
+    # AGENCY-PRESERVATION.md PR 1 (goldfive#449/#452): hard-safety drift
+    # kinds — the GUARDRAIL half of the §0 authority split. Together
+    # with :attr:`_USER_AUTHORED_DRIFT_KINDS` these are the ONLY drift
+    # authorities permitted to cancel the wrapped agent's in-flight
+    # invocation under the default ``cancel_inflight_scope=
+    # "user_and_safety"`` policy (see
+    # :meth:`_drift_authorizes_inflight_cancel`).
+    #
+    # Inclusion rationale — a kind belongs here iff it represents
+    # budget/resource protection or run termination, i.e. its job is to
+    # *stop* runaway behaviour (observed fact, no judgment call), not to
+    # redirect a trajectory:
+    #
+    # * ``RESOURCE_EXHAUSTED`` — budget exhaustion. Named explicitly in
+    #   the roadmap's PR-1 entry ("budget exhaustion"). No goldfive-core
+    #   emitter today, but external producers / adapters use the kind;
+    #   a budget trip must retain stop authority wherever it comes from.
+    # * ``RUNAWAY_DELEGATION`` — the AgentTool-per-invoke cap
+    #   (goldfive#130). The backstop for coordinator prompts that
+    #   delegate forever; CRITICAL by construction and named explicitly
+    #   in the roadmap ("runaway delegation").
+    # * ``TOO_MANY_STEPS`` — step-budget trip. Same observed-fact budget
+    #   family as RESOURCE_EXHAUSTED.
+    # * ``TASK_TIMEOUT`` — per-task wall-clock budget. Budget family.
+    # * ``LLM_CALL_TIMEOUT`` — per-LLM-call wall-clock budget
+    #   (goldfive#256 / #271 follow-up). Its plugin-side emitter already
+    #   pairs the drift with a cooperative cancel on the invocation;
+    #   excluding it here would leave the dispatch path's cancel policy
+    #   inconsistent with the emitter's own contract.
+    # * ``HUMAN_INTERVENTION_REQUIRED`` — the ONLY kind the ladder's
+    #   TERMINATE cell maps from (the CRITICAL-repeat pair of its
+    #   ``_LADDER`` row is ``(PAUSE_ESCALATE, TERMINATE)``; verified
+    #   against :meth:`_load_ladder_tables`). The run is stopping for an
+    #   operator; preempting in-flight work is stop authority, not
+    #   steering.
+    #
+    # Deliberately EXCLUDED:
+    #
+    # * ``REPEATED_FAILURE`` — terminal for the *task*, but it is
+    #   goldfive's own refine-failure escalation (a steering artifact,
+    #   not an external budget); its emitter already marked the task
+    #   FAILED and the executor will not resume it.
+    # * The loop/judge/forecast kinds (``LOOPING_*``, ``OFF_TOPIC``,
+    #   ``GOAL_DRIFT``, ``CAPABILITY_MISMATCH``, ``NEW_WORK_DISCOVERED``,
+    #   …) — goldfive-authored steering signals. Under the
+    #   dormant-supervisor identity their corrections arrive at the next
+    #   invocation boundary (nudge replay / GOLDFIVE_STEER restart);
+    #   they never preempt in-flight work.
+    _HARD_SAFETY_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
+        {
+            DriftKind.RESOURCE_EXHAUSTED,
+            DriftKind.RUNAWAY_DELEGATION,
+            DriftKind.TOO_MANY_STEPS,
+            DriftKind.TASK_TIMEOUT,
+            DriftKind.LLM_CALL_TIMEOUT,
+            DriftKind.HUMAN_INTERVENTION_REQUIRED,
+        }
+    )
+
     # Drift kinds whose origin is a user intervention (USER_STEER /
     # USER_CANCEL) or a trajectory-level signal that has its own rate
     # limit (GOAL_DRIFT — task-boundary throttle via
@@ -3454,6 +3513,15 @@ class DriftObserver:
         # the severity gate because an operator directive must be
         # honoured even when emitted at a lower severity tier.
         #
+        # AGENCY-PRESERVATION.md PR 1 (goldfive#449/#452): the CRITICAL
+        # arm is additionally authority-gated inside
+        # :meth:`_should_request_cancel_for_drift` — goldfive-authored
+        # steering drift never cancels in-flight work; only
+        # user-authored and hard-safety kinds
+        # (:attr:`_HARD_SAFETY_DRIFT_KINDS`) reach the cancel.
+        # ``cancel_inflight_scope="all"`` restores the legacy
+        # any-CRITICAL-cancels behaviour.
+        #
         # The actual short-circuit happens in the ADK plugin's next
         # ``before_agent_callback`` / ``before_model_callback`` /
         # ``before_tool_callback``; this call just writes the flag.
@@ -3847,6 +3915,10 @@ class DriftObserver:
         # sink event lands adjacent to the revision in the wire log
         # and operators can correlate the two. Best-effort, never
         # raises — a no-op cancel still leaves the new plan installed.
+        # AGENCY-PRESERVATION.md PR 1: the helper itself gates on drift
+        # authority — only user-authored / hard-safety drifts actually
+        # cancel; goldfive-authored steering installs land for
+        # bookkeeping while the invocation runs to completion.
         await self._cancel_inflight_for_revision(drift, session)
         await self._steerer.plans._emit_plan_revised(
             session,
@@ -4588,8 +4660,48 @@ class DriftObserver:
             )
         return flagged
 
-    @staticmethod
-    def _should_request_cancel_for_drift(drift: DriftEvent) -> bool:
+    def _drift_authorizes_inflight_cancel(self, drift: DriftEvent) -> bool:
+        """Authority predicate for cancelling in-flight work (AGENCY-PRESERVATION.md PR 1).
+
+        The single place the goldfive#449/#452 authority split is
+        encoded for the cancel surface: in-flight cancellation is
+        permitted ONLY when the triggering drift is
+
+        * **user-authored** — :attr:`_USER_AUTHORED_DRIFT_KINDS`
+          (USER_STEER / USER_CANCEL / USER_PAUSE). User authority is
+          absolute (§2 of the design doc); behaviour for these kinds is
+          byte-identical to the pre-PR-1 implementation.
+        * **hard safety** — :attr:`_HARD_SAFETY_DRIFT_KINDS` (budget /
+          resource protection and termination; see the constant's
+          rationale comment). Guardrails stop runaway behaviour; that
+          is stop authority, legitimately always armed.
+
+        Everything else — Level-1 ABSORB refines, NEW_WORK_DISCOVERED
+        installs, drift→steer promotions, every judge/forecast kind —
+        is goldfive-authored *steering* and never preempts the wrapped
+        agent's in-flight invocation. Corrections reach the agent at
+        the natural invocation boundary instead (the overlay loop's
+        nudge-replay path, the GOLDFIVE_STEER restart).
+
+        Kill-switch (§5.1): ``cancel_inflight_scope="all"`` (env
+        ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all``) short-circuits to
+        ``True`` for every drift, restoring the legacy
+        cancel-on-every-install behaviour exactly. The scope is read
+        off the router (:class:`DefaultSteerer`) the same way the
+        ``observation_only`` flag is, with a defensive default for
+        duck-typed steerers that predate the knob.
+        """
+        scope = str(
+            getattr(self._steerer, "_cancel_inflight_scope", "user_and_safety")
+            or "user_and_safety"
+        )
+        if scope == "all":
+            return True
+        if drift.kind in self._USER_AUTHORED_DRIFT_KINDS:
+            return True
+        return drift.kind in self._HARD_SAFETY_DRIFT_KINDS
+
+    def _should_request_cancel_for_drift(self, drift: DriftEvent) -> bool:
         """Decide whether a drift warrants a cooperative cancel.
 
         Severity ladder (goldfive#251 design decision):
@@ -4601,7 +4713,8 @@ class DriftObserver:
           route to the existing ABSORB / NUDGE ladder paths; the
           refined plan lands on the next task boundary without
           preempting the in-flight turn.
-        * ``DriftSeverity.CRITICAL`` — cancels. The in-flight turn's
+        * ``DriftSeverity.CRITICAL`` — cancels, *if the drift's
+          authority permits it* (see below). The in-flight turn's
           output is likely to contaminate its parent's transcript
           (stale prompt, wrong scope, broken tool); short-circuit
           cleanly and let the parent see ``{"status": "cancelled"}``.
@@ -4609,14 +4722,26 @@ class DriftObserver:
         User-authored drifts (``USER_STEER`` / ``USER_CANCEL`` /
         ``USER_PAUSE``) bypass the severity gate — an operator
         directive must be honoured even when the ControlMessage-to-
-        DriftEvent coercion landed on a lower severity tier.
+        DriftEvent coercion landed on a lower severity tier. This arm
+        is byte-identical to the pre-PR-1 implementation.
+
+        AGENCY-PRESERVATION.md PR 1 (goldfive#449/#452): the CRITICAL
+        arm is additionally gated on
+        :meth:`_drift_authorizes_inflight_cancel`. Pre-PR-1 ANY
+        CRITICAL goldfive-authored drift (OFF_TOPIC, LOOPING_*, …)
+        could flag the in-flight invocation for cooperative cancel
+        here; under the new policy goldfive-authored *steering* drift
+        never cancels in-flight work — only hard-safety kinds
+        (:attr:`_HARD_SAFETY_DRIFT_KINDS`) keep the CRITICAL cancel.
+        ``cancel_inflight_scope="all"`` restores the legacy behaviour
+        (the predicate returns ``True`` unconditionally, so this
+        method degenerates to the pre-PR-1 ``severity is CRITICAL``
+        check).
         """
-        if drift.kind in (
-            DriftKind.USER_STEER,
-            DriftKind.USER_CANCEL,
-            DriftKind.USER_PAUSE,
-        ):
+        if drift.kind in self._USER_AUTHORED_DRIFT_KINDS:
             return True
+        if not self._drift_authorizes_inflight_cancel(drift):
+            return False
         return drift.severity is DriftSeverity.CRITICAL
 
     @staticmethod
@@ -4691,7 +4816,46 @@ class DriftObserver:
         supersede flag is still stamped in the no-op case — it costs
         nothing and a downstream overlay that DOES observe a cancel
         from a separate path stays correctly classified.
+
+        Authority gate (AGENCY-PRESERVATION.md PR 1; goldfive#449/#452):
+        the unconditional cancel described above fired on EVERY
+        drift-driven install — including Level-1 ABSORB refines and
+        NEW_WORK_DISCOVERED installs — which made it the single
+        largest trajectory destroyer in the system (design doc §1.1).
+        This method now early-returns for drifts that fail
+        :meth:`_drift_authorizes_inflight_cancel` (not user-authored,
+        not hard-safety), BEFORE any side effect: no
+        ``session._supersede_pending`` stamp, no per-invocation
+        supersede-registry entry, no plugin call. Stamping the flag
+        for a cancel that never fires would hand the executor's
+        cancelled branch a supersede signal with no matching cancel —
+        exactly the stranded-flag bug class the v22 Bug-A fix exists
+        to prevent (the executor only consumes the flag inside its
+        ``kind == "cancelled"`` branch, so a flag without a cancel
+        either goes stale or misclassifies a later EXTERNAL cancel as
+        an internal supersede). The revised plan still installs and
+        ``PlanRevised`` still emits; the in-flight invocation runs to
+        completion and picks up the correction at the next invocation
+        boundary. ``cancel_inflight_scope="all"`` restores the
+        unconditional behaviour exactly (§5.1 kill-switch).
         """
+        # AGENCY-PRESERVATION.md PR 1 authority gate — must run BEFORE
+        # the supersede stamp below (see the authority-gate paragraph
+        # in the docstring: a stamped-but-never-consumed supersede flag
+        # is the bug class to avoid).
+        if not self._drift_authorizes_inflight_cancel(drift):
+            log.info(
+                "DefaultSteerer._cancel_inflight_for_revision: drift "
+                "kind=%s severity=%s authored_by=%s is neither "
+                "user-authored nor hard-safety — leaving the in-flight "
+                "invocation running (AGENCY-PRESERVATION PR 1; set "
+                "cancel_inflight_scope='all' to restore the legacy "
+                "cancel-on-every-install behaviour)",
+                drift.kind.value,
+                drift.severity.value,
+                drift.authored_by or "-",
+            )
+            return []
         # Stamp the supersede marker so the overlay loop can
         # distinguish this internal cancel from an external one. See
         # the supersede-contract paragraph in the docstring above.
@@ -5218,6 +5382,16 @@ class DriftObserver:
         # InvocationCancelled sink event lands adjacent to the
         # revision and operators can correlate the two on the
         # gantt timeline.
+        #
+        # AGENCY-PRESERVATION.md PR 1: promotion is goldfive-authored
+        # by construction (``_should_promote_to_steer`` returns False
+        # for user drifts), so under the default
+        # ``cancel_inflight_scope="user_and_safety"`` the helper's
+        # authority gate makes this a no-op — the refined plan installs
+        # for bookkeeping and the corrective reaches the agent via the
+        # GOLDFIVE_STEER restart at the invocation boundary instead of
+        # a mid-flight ``task.cancel()``. ``"all"`` (the §5.1
+        # kill-switch) restores the empirically-motivated v15 cancel.
         await self._cancel_inflight_for_revision(drift, session)
         await self._steerer.plans._emit_plan_revised(
             session,

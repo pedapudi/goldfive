@@ -273,7 +273,11 @@ class PlanReviser:
         * :meth:`_apply_revision` — bump ``revision_index`` + stamp
           metadata
         * :meth:`_cancel_inflight_for_revision` — preempt any
-          in-flight invocation per the drift's severity
+          in-flight invocation, IF the drift's authority permits it
+          (AGENCY-PRESERVATION.md PR 1: user-authored / hard-safety
+          only under the default ``cancel_inflight_scope``; a
+          goldfive-authored install lands for bookkeeping while the
+          invocation runs to completion)
         * :meth:`_emit_plan_revised` — ``PlanRevised`` + the paired
           refine-attempted / -success sidecar envelopes
 
@@ -391,7 +395,9 @@ class PlanReviser:
         * :meth:`_emit_drift_detected` emits the ``USER_STEER`` drift.
         * :meth:`_apply_revision` swaps ``session.plan`` and bumps
           ``revision_index``.
-        * :meth:`_cancel_inflight_for_revision` preempts in-flight work.
+        * :meth:`_cancel_inflight_for_revision` preempts in-flight work
+          (USER_STEER is user-authored, so the AGENCY-PRESERVATION PR-1
+          authority gate always permits this cancel).
         * :meth:`_emit_plan_revised` fires ``PlanRevised``.
 
         The deterministic-fallback branch deliberately does NOT touch
