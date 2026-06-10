@@ -686,14 +686,20 @@ async def test_steerer_cancel_inflight_stamps_supersede_flag() -> None:
     ``session._supersede_pending = True`` before delegating to
     ``request_invocation_cancel``. Without this stamp, the executor's
     cancelled branch can't disambiguate the supersede.
+
+    AGENCY-PRESERVATION.md PR 1: drift kind re-pointed from OFF_TOPIC
+    to RUNAWAY_DELEGATION (hard-safety) so the cancel path under test
+    still passes the new authority gate at the default scope. The
+    inverse — a goldfive-authored steering drift must stamp NOTHING —
+    is pinned in ``tests/test_cancel_authority_gate.py``.
     """
     steerer = DefaultSteerer()
     session = Session(run_id="r1")
 
     drift = DriftEvent(
-        kind=DriftKind.OFF_TOPIC,
+        kind=DriftKind.RUNAWAY_DELEGATION,
         severity=DriftSeverity.WARNING,
-        detail="off topic",
+        detail="delegation cap exceeded",
     )
 
     # No adapter bound → request_invocation_cancel returns []. The
@@ -858,6 +864,10 @@ async def test_405_low7_steerer_stamps_per_invocation_registry() -> None:
     via the registry. Patches the resolver to return a known
     invocation id so the test does not depend on the reconciler /
     plugin internals the resolver reads.
+
+    AGENCY-PRESERVATION.md PR 1: drift kind re-pointed from OFF_TOPIC
+    to RUNAWAY_DELEGATION (hard-safety) so the registry stamp under
+    test still passes the new authority gate at the default scope.
     """
     from goldfive.state_store import StateStore as _SS
 
@@ -867,9 +877,9 @@ async def test_405_low7_steerer_stamps_per_invocation_registry() -> None:
     store = _SS.for_session(session)
 
     drift = DriftEvent(
-        kind=DriftKind.OFF_TOPIC,
+        kind=DriftKind.RUNAWAY_DELEGATION,
         severity=DriftSeverity.WARNING,
-        detail="off topic",
+        detail="delegation cap exceeded",
     )
 
     # Patch the resolver to return our known invocation id. The

@@ -352,8 +352,16 @@ async def test_warning_drift_active_steering_drives_all_three_injections() -> No
     four side effects fire and ``dry_run`` is ``False`` on the emitted
     ``PlanRevised``. Confirms the gate is the only difference — no
     second drift mechanism was disturbed by the refactor.
+
+    AGENCY-PRESERVATION.md PR 1: this positive control pins the
+    *historical* behaviour, which included the in-flight cancel for a
+    goldfive-authored OFF_TOPIC drift. The new orthogonal
+    ``cancel_inflight_scope`` authority gate is pinned to ``"all"``
+    (legacy) here so the observation_only gate remains the ONLY
+    variable under test; the new-default cancel policy has its own
+    coverage in ``tests/test_cancel_authority_gate.py``.
     """
-    cfg = SteeringConfig(observation_only=False)
+    cfg = SteeringConfig(observation_only=False, cancel_inflight_scope="all")
     steerer = DefaultSteerer(steering_config=cfg)
     session = _make_session()
     sink = ListSink()

@@ -118,6 +118,38 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 ### Steering
 
 - **BREAKING:
+  [#449](https://github.com/pedapudi/goldfive/issues/449)/[#452](https://github.com/pedapudi/goldfive/issues/452)
+  (AGENCY-PRESERVATION.md PR 1) — in-flight cancellation is gated on
+  drift authority.** `DriftObserver._cancel_inflight_for_revision`
+  used to fire on EVERY drift-driven plan install — including Level-1
+  ABSORB refines and `NEW_WORK_DISCOVERED` installs — killing the
+  wrapped agent's in-flight invocation within ~one event-loop tick
+  (design doc §1.1). Under the new default
+  (`SteeringConfig.cancel_inflight_scope="user_and_safety"`) only
+  user-authored drifts (`USER_STEER` / `USER_CANCEL` / `USER_PAUSE`)
+  or hard-safety kinds (`RESOURCE_EXHAUSTED`, `RUNAWAY_DELEGATION`,
+  `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`,
+  `HUMAN_INTERVENTION_REQUIRED`) may preempt in-flight work; the same
+  authority gate applies to the pre-refine cooperative-cancel path
+  (`_should_request_cancel_for_drift`), so a CRITICAL
+  goldfive-authored steering drift no longer flags a cancel either.
+  Goldfive-authored revisions still install for bookkeeping (the
+  `PlanRevised` stream is unchanged) and corrections reach the agent
+  at the natural invocation boundary (nudge replay / `GOLDFIVE_STEER`
+  restart). Skipped cancels stamp NOTHING — no
+  `session._supersede_pending`, no per-invocation supersede-registry
+  entry — so the executor's cancelled branch cannot misread a
+  stranded flag. The v15 concurrent-invocation loop the unconditional
+  cancel guarded against stays bounded by the
+  [#245](https://github.com/pedapudi/goldfive/issues/245)
+  verdict-freshness gate, the
+  [#405](https://github.com/pedapudi/goldfive/issues/405) in-flight
+  refine registry, and no-op-revision rejection (pinned in
+  `tests/test_cancel_authority_gate.py`). Kill-switch:
+  `cancel_inflight_scope="all"` (env
+  `GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`) restores the legacy
+  cancel-on-every-install behaviour exactly.
+- **BREAKING:
   [#254](https://github.com/pedapudi/goldfive/issues/254) —
   observation-only is the new default on `goldfive.wrap()`.**
   `SteeringConfig.observation_only` (default `True`) gates the three

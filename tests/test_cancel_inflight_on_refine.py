@@ -417,8 +417,17 @@ async def test_install_initial_plan_does_not_cancel_inflight() -> None:
 
 
 async def test_cancel_inflight_for_revision_fires_for_real_drift() -> None:
-    """A non-synthetic drift (PLAN_DIVERGENCE, real USER_STEER, OFF_TOPIC,
-    …) MUST forward to the plugin with ``cancel_inflight_task=True``."""
+    """A cancel-authorized drift (user-authored or hard-safety) MUST
+    forward to the plugin with ``cancel_inflight_task=True``.
+
+    AGENCY-PRESERVATION.md PR 1: originally exercised with
+    PLAN_DIVERGENCE (goldfive-authored), which no longer cancels under
+    the default ``cancel_inflight_scope="user_and_safety"``. The
+    plugin-forwarding contract under test is authority-agnostic, so
+    the drift is re-pointed to USER_STEER (user-authored — always
+    authorized). The goldfive-authored case under the legacy ``"all"``
+    scope is pinned in ``tests/test_cancel_authority_gate.py``.
+    """
 
     class _CountingAdapter:
         def __init__(self) -> None:
@@ -440,11 +449,12 @@ async def test_cancel_inflight_for_revision_fires_for_real_drift() -> None:
     adapter = _CountingAdapter()
     steerer.bind_adapter(adapter)
     drift = DriftEvent(
-        kind=DriftKind.PLAN_DIVERGENCE,
+        kind=DriftKind.USER_STEER,
         severity=DriftSeverity.WARNING,
-        detail="off-plan agent",
+        detail="operator pivot",
         current_task_id="t1",
         current_agent_id="coordinator",
+        authored_by="user",
     )
     flagged = await steerer.drift._cancel_inflight_for_revision(drift, _make_session())
     assert flagged == ["inv-X"]
@@ -481,6 +491,17 @@ async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> Non
     CAPABILITY_MISMATCH in #253). The cancel-inflight contract is
     independent of which drift kind triggers it, so we exercise the
     same code path with ``OFF_TOPIC`` (also WARNING → ABSORB → refine).
+
+    AGENCY-PRESERVATION.md PR 1: OFF_TOPIC is goldfive-authored
+    steering drift, which under the default
+    ``cancel_inflight_scope="user_and_safety"`` no longer cancels
+    in-flight work — the very behaviour this test pinned is now the
+    *legacy* regime. The steerer is constructed with the ``"all"``
+    kill-switch so the empirically-motivated v15 cancel contract stays
+    pinned for the escape hatch; the new-default counterpart (promotion
+    installs the plan but leaves the coordinator running, with refine
+    looping bounded by the #245/#405 gates) lives in
+    ``tests/test_cancel_authority_gate.py``.
     """
 
     revised = Plan(
@@ -515,6 +536,8 @@ async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> Non
     steerer = DefaultSteerer(
         goldfive_steer_threshold="warning",
         goldfive_steer_suppression_window_turns=3,
+        # AGENCY-PRESERVATION.md PR 1 legacy pin — see docstring.
+        cancel_inflight_scope="all",
     )
     steerer.bind(sinks=[], planner=_StubPlanner())
 

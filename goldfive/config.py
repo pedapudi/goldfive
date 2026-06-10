@@ -80,6 +80,8 @@ __all__ = [
 
 _VALID_STEER_THRESHOLDS: frozenset[str] = frozenset({"off", "warning", "critical"})
 
+_VALID_CANCEL_INFLIGHT_SCOPES: frozenset[str] = frozenset({"user_and_safety", "all"})
+
 
 # Test-only override hook for :class:`SteeringConfig.observation_only`'s
 # default (goldfive#254). Production code path: this stays ``None`` and
@@ -223,6 +225,30 @@ def _read_float_env(name: str, default: float) -> float:
 _VALID_REASONING_DRIFT_MODES: frozenset[str] = frozenset(
     {"judge", "embedding", "both", "off"}
 )
+
+
+def _read_cancel_inflight_scope_env(name: str, default: str) -> str:
+    """Return ``os.environ[name]`` as a cancel-inflight scope literal, or ``default``.
+
+    Accepts ``"user_and_safety"`` / ``"all"`` (case-insensitive).
+    Anything else logs a WARNING and falls back so a typo never
+    silently re-enables (or disables) the in-flight cancel authority
+    gate (AGENCY-PRESERVATION.md PR 1, goldfive#449/#452).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _VALID_CANCEL_INFLIGHT_SCOPES:
+        return value
+    log.warning(
+        "ignoring unknown %s=%r (expected one of %s); using default %r",
+        name,
+        raw,
+        sorted(_VALID_CANCEL_INFLIGHT_SCOPES),
+        default,
+    )
+    return default
 
 
 def _read_reasoning_drift_mode_env(
@@ -679,6 +705,32 @@ class SteeringConfig:
     #: ``Task.discovery_identity_hash``, ``DelegationObserved.tool_args_json``)
     #: are always available regardless of this flag.
     descriptive_growth_enabled: bool = False
+    #: Authority scope for cancelling the wrapped agent's IN-FLIGHT
+    #: invocation on a drift-driven plan install (AGENCY-PRESERVATION.md
+    #: PR 1; goldfive#449/#452).
+    #:
+    #: * ``"user_and_safety"`` (the default) — in-flight cancellation is
+    #:   permitted ONLY when the triggering drift is user-authored
+    #:   (USER_STEER / USER_CANCEL / USER_PAUSE) or a hard-safety kind
+    #:   (budget/resource protection and termination — see
+    #:   :attr:`goldfive.drift_observer.DriftObserver._HARD_SAFETY_DRIFT_KINDS`).
+    #:   Goldfive-authored revisions (Level-1 ABSORB refines,
+    #:   NEW_WORK_DISCOVERED installs, drift→steer promotions) still
+    #:   install for bookkeeping, but the in-flight invocation runs to
+    #:   completion; corrections reach the agent at the natural
+    #:   invocation boundary (nudge replay / GOLDFIVE_STEER restart).
+    #: * ``"all"`` — the legacy behaviour: EVERY drift-driven plan
+    #:   install fires :meth:`DriftObserver._cancel_inflight_for_revision`
+    #:   (the goldfive#271-follow-up v15 concurrent-invocation fix in
+    #:   its original, unconditional form). This is the §5.1 one-line
+    #:   kill-switch for PR 1: setting
+    #:   ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`` restores today's
+    #:   behaviour exactly.
+    #:
+    #: Orthogonal to ``observation_only``: observation-only suppresses
+    #: the plugin cancel call itself; this knob decides which drift
+    #: AUTHORITIES may request it in the first place.
+    cancel_inflight_scope: str = "user_and_safety"
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -698,6 +750,10 @@ class SteeringConfig:
         * ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES`` — comma-separated rule
           names (goldfive#397). Empty / unset → ``None`` (editor unwired).
           Example: ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES=prune_cancelled_reasoning``.
+        * ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE`` — ``user_and_safety`` /
+          ``all`` (case-insensitive). ``all`` is the PR-1 kill-switch
+          that restores the legacy cancel-on-every-install behaviour
+          (AGENCY-PRESERVATION.md §5.1).
         """
         defaults = cls()
         raw_rules = os.environ.get("GOLDFIVE_STEER_CONTEXT_EDITOR_RULES", "").strip()
@@ -722,6 +778,10 @@ class SteeringConfig:
             descriptive_growth_enabled=_read_bool_env(
                 "GOLDFIVE_STEER_DESCRIPTIVE_GROWTH",
                 defaults.descriptive_growth_enabled,
+            ),
+            cancel_inflight_scope=_read_cancel_inflight_scope_env(
+                "GOLDFIVE_CANCEL_INFLIGHT_SCOPE",
+                defaults.cancel_inflight_scope,
             ),
         )
 
