@@ -321,9 +321,10 @@ def test_hard_safety_kinds_stay_armed_at_critical() -> None:
 
     PR 7 closed the latent mismatch this note used to flag: RESOURCE_EXHAUSTED
     / TOO_MANY_STEPS / TASK_TIMEOUT / LLM_CALL_TIMEOUT now map CRITICAL-first to
-    CANCEL_REINVOKE (stop), not ABSORB (redirect) — verified by the snapshot.
-    This test additionally pins that hard-safety kinds never map CRITICAL to
-    ABSORB (the §0 stop-not-redirect guarantee).
+    PAUSE_ESCALATE (stop — restart can't refund a spent budget), not ABSORB
+    (redirect); RUNAWAY_DELEGATION maps to CANCEL_REINVOKE — verified by the
+    snapshot. This test additionally pins that hard-safety kinds never map
+    CRITICAL to ABSORB (the §0 stop-not-redirect guarantee).
     """
     steerer = DefaultSteerer()
     threshold = steerer.REFINE_FAILURE_THRESHOLD

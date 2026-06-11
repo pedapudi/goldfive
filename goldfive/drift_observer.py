@@ -24,7 +24,7 @@ bounded note-buffer family (``note_agent_activity`` /
 machinery: ``handle_drift`` (the central drift-routing method),
 ``_promote_drift_to_steer`` (audit issue #402 — dispatch-before-plan-swap
 ordering is preserved here, not fixed), the intervention ladder
-(``_ladder_level_for`` / ``_LADDER`` / ``_LADDER_BY_VALUE``), ladder
+(``_ladder_level_for`` / ``_LADDER`` / ``_LADDER_LEGACY``), ladder
 dispatch (``_dispatch_nudge`` / ``_dispatch_goldfive_steer_control`` /
 ``_dispatch_goldfive_pause_control`` / ``_dispatch_pause_escalate``),
 adapter cancel tagging, the late-drift gate
@@ -3749,15 +3749,6 @@ class DriftObserver:
     # import-cycle with :mod:`goldfive.steerer` (which defines the
     # :class:`InterventionLevel` enum).
 
-    _LADDER_BY_VALUE: dict[
-        str,
-        tuple[
-            InterventionLevel | None,
-            InterventionLevel | None,
-            tuple[InterventionLevel, InterventionLevel],
-        ],
-    ] = {}
-
     # AGENCY-PRESERVATION.md PR 7 — the pre-PR-7 ladder, used when the
     # ``legacy_ladder`` escape hatch is on. Identical to :attr:`_LADDER`
     # EXCEPT the goldfive-authored rows whose CANCEL_REINVOKE cells PR 7
@@ -3780,7 +3771,7 @@ class DriftObserver:
 
     @classmethod
     def _load_ladder_tables(cls) -> None:
-        """Populate :attr:`_LADDER` / :attr:`_LADDER_BY_VALUE` on first use.
+        """Populate :attr:`_LADDER` / :attr:`_LADDER_LEGACY` on first use.
 
         Lazy load defers the :class:`InterventionLevel` import so this
         module can be imported before :mod:`goldfive.steerer` finishes
@@ -4076,9 +4067,7 @@ class DriftObserver:
             if getattr(self._steerer, "_legacy_ladder", False)
             else self._LADDER
         )
-        entry = self._LADDER_BY_VALUE.get(kind.value)
-        if entry is None:
-            entry = ladder.get(kind)
+        entry = ladder.get(kind)
         is_repeat = occurrence_count >= self._steerer.REFINE_FAILURE_THRESHOLD
         if entry is not None:
             info_level, warning_level, critical_pair = entry
