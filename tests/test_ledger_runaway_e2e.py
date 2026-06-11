@@ -103,11 +103,11 @@ async def test_ledger_runaway_reaches_clean_pause() -> None:
     from goldfive import wrap
     from goldfive.adapters.adk import ADKAdapter
     from goldfive.config import RuntimeConfig, SteeringConfig
-    from goldfive.control import ControlChannel, ControlKind
+    from goldfive.control import ControlChannel
     from goldfive.conv import _drift_kind_to_pb
     from goldfive.planner import StaticPlanner
     from goldfive.sinks import InMemorySink
-    from goldfive.types import DriftKind, Plan, Task, TaskKind
+    from goldfive.types import DriftKind, Plan, Task, TaskKind, TaskStatus
 
     cap = 3
     sub = Agent(name="sub", model=_make_quiet_llm()(), instruction="")
@@ -164,21 +164,29 @@ async def test_ledger_runaway_reaches_clean_pause() -> None:
         "ledger runaway must escalate to a human-intervention pause"
     )
     # ...and the run outcome carries the pause reason (so a plain
-    # completion can never masquerade as the stop).
+    # completion can never masquerade as the stop) — AND that reason names
+    # the RUNAWAY as the cause, binding the PAUSE to this drift specifically
+    # (a forecast-mode run pauses too, but via a different path, so the
+    # cause string is what pins the PR-12 ledger runaway rung).
     assert "goldfive_pause_escalate" in (outcome.reason or ""), (
         f"expected a pause-reason outcome; got reason={outcome.reason!r}"
     )
+    assert "runaway_delegation" in (outcome.reason or ""), (
+        f"the pause must be caused by the runaway; got reason={outcome.reason!r}"
+    )
 
-    # (3) The pause is also observable on the control channel as a
-    #     GOLDFIVE_PAUSE_ESCALATE (the executor's overlay pause-block
-    #     consumed it to end the turn — the integration the unit test
-    #     can't show).
-    drained: list[Any] = []
-    inbox = channel._inbox  # noqa: SLF001 — test inspection
-    while not inbox.empty():
-        drained.append(inbox.get_nowait())
-    assert any(
-        getattr(m, "kind", None) is ControlKind.GOLDFIVE_PAUSE_ESCALATE for m in drained
-    ) or "goldfive_pause_escalate" in (outcome.reason or ""), (
-        "no observable GOLDFIVE_PAUSE_ESCALATE disposition"
+    # (3) The run paused WITHOUT delivering the outcome: the OUTCOME
+    #     deliverable o1 stays non-terminal (PENDING). This discriminates a
+    #     "silent success that completed the deliverable" — a broken stop
+    #     that produced output anyway. (We deliberately do NOT assert
+    #     outcome.success: a clean ledger pause is success=True with the
+    #     deliverable still PENDING — the "don't grade ledger runs on
+    #     run.success alone" caution. The control channel is consumed by
+    #     the executor's pause-block to end the turn, so it is not a
+    #     post-run observable — outcome.reason + the HIR drift + the
+    #     undelivered OUTCOME are the canonical pause observables.)
+    o1 = next(t for t in outcome.session.plan.tasks if t.id == "o1")
+    assert o1.status is TaskStatus.PENDING, (
+        f"the OUTCOME deliverable should be undelivered (PENDING) after the "
+        f"pause; got {o1.status}"
     )
