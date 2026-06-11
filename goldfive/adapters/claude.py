@@ -564,7 +564,9 @@ class ClaudeAgentSDKAdapter:
             log.debug("claude adapter: observer-note mark_delivered raised: %s", exc)
             return None
         if should and newly:
-            return render_block(note)
+            # task #11 cross-surface fold: carry the plan-state Status line
+            # on the claude surface too (identical to before_model).
+            return render_block(note, plan=getattr(session, "plan", None))
         return None
 
 

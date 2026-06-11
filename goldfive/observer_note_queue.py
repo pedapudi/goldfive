@@ -209,7 +209,62 @@ class ObserverNote:
         )
 
 
-def render_block(note: ObserverNote) -> str:
+def _bare_agent(name: Any) -> str:
+    """Return the bare (namespace-stripped, lowercased) agent name.
+
+    Agent ids may be fully qualified (``ns:writer``); the bare segment is
+    what surfaces resolve and what notes are scoped on. Tolerant of
+    ``None`` / non-str.
+    """
+    try:
+        s = str(name or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+    if ":" in s:
+        s = s.split(":")[-1]
+    return s.lower()
+
+
+def plan_state_line(plan: Any) -> str:
+    """Return a factual per-agent open-work line for the note Status fold.
+
+    AGENCY-PRESERVATION.md task #11 (cross-surface plan-state fold) — the
+    content the retired Site-3 hint used to inject per turn now rides the
+    observer note on EVERY block surface (before_model, boundary-replay,
+    claude), composed here so the three surfaces stay identical. Groups
+    ``plan.tasks`` by assignee and reports each agent's open
+    (non-terminal) vs. no-open-tasks state. Bookkeeping only — no "choose
+    the agent" / "do NOT re-invoke" imperative (dropped in PR 9). Returns
+    ``""`` when there is no plan / no tasks. Never raises.
+    """
+    try:
+        tasks = getattr(plan, "tasks", None) if plan is not None else None
+        if not tasks:
+            return ""
+        from goldfive.types import TERMINAL_TASK_STATUSES
+
+        by_agent: dict[str, list[int]] = {}
+        for t in tasks:
+            agent = getattr(t, "assignee_agent_id", "") or "<unassigned>"
+            bucket = by_agent.setdefault(agent, [0, 0])  # [open, done]
+            status = getattr(t, "status", None)
+            if status in TERMINAL_TASK_STATUSES:
+                bucket[1] += 1
+            else:
+                bucket[0] += 1
+        frags: list[str] = []
+        for agent in sorted(by_agent):
+            bare = agent.split(":")[-1] if ":" in agent else agent
+            open_n, _done_n = by_agent[agent]
+            frags.append(f"{bare}: {open_n} open" if open_n else f"{bare}: no open tasks")
+        if not frags:
+            return ""
+        return "Plan state (goldfive bookkeeping): " + "; ".join(frags) + "."
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def render_block(note: ObserverNote, *, plan: Any = None) -> str:
     """Render ``note`` as the marker-bracketed system-prompt / replay block.
 
     Shape (AGENCY-PRESERVATION.md PR 6 "Rendered block shape")::
@@ -219,13 +274,19 @@ def render_block(note: ObserverNote) -> str:
         The user's goal: <...>
         Status: <...>
         This note is advisory. How to proceed is your decision; ...
+        Plan state (goldfive bookkeeping): <...>      (task #11 fold, when ``plan`` given)
         [/GOLDFIVE OBSERVER NOTE]
 
     The body already carries the advisory footer (composed by PR 4); this
-    function only adds the attribution header + closing marker.
+    function adds the attribution header + closing marker, and — when
+    ``plan`` is supplied (task #11 cross-surface fold) — a factual
+    plan-state line INSIDE the block (so strip-and-refresh removes it as
+    one unit). ``plan=None`` keeps the pre-task-#11 shape byte-identical.
     """
     body = (note.body or "").strip()
-    return f"{OBSERVER_NOTE_BLOCK_BEGIN}\n{body}\n{OBSERVER_NOTE_BLOCK_END}"
+    extra = plan_state_line(plan) if plan is not None else ""
+    inner = f"{body}\n{extra}" if extra else body
+    return f"{OBSERVER_NOTE_BLOCK_BEGIN}\n{inner}\n{OBSERVER_NOTE_BLOCK_END}"
 
 
 def render_tool_annotation(note: ObserverNote) -> str:
@@ -321,6 +382,7 @@ class ObserverNoteQueue:
         self,
         *,
         kinds: frozenset[str] | None = None,
+        agent_id: str | None = None,
     ) -> ObserverNote | None:
         """Return the most-severe pending note (per-request coalescing).
 
@@ -334,7 +396,25 @@ class ObserverNoteQueue:
         ``kind`` is in the set — used by the tool-result annotation surface
         (4) to pick only loop-shaped notes, leaving other notes for the
         block surfaces.
+
+        ``agent_id`` (AGENCY-PRESERVATION.md task #11 — agent-scoped
+        delivery) restricts selection so a per-(agent, task) note reaches
+        only the right agent's surfaces:
+
+        * ``None`` (the default) — NO agent filter. Every caller that does
+          not / cannot resolve the current agent keeps the pre-task-#11
+          broadcast behaviour (and every existing test, which passes
+          agentless stubs, is unaffected — §5.1).
+        * ``"<name>"`` — select only notes whose ``agent_id`` is empty
+          (broadcast / coordinator-level) OR matches ``<name>`` by bare
+          name (namespace-stripped). An agent-specific note for a
+          DIFFERENT agent is skipped, so e.g. a correction enqueued for
+          ``writer`` is never rendered onto ``researcher``'s model call.
+          The surface that knows its agent (notably the ADK
+          ``before_model`` surface) passes it; coarse surfaces leave it
+          ``None``.
         """
+        target = _bare_agent(agent_id) if agent_id else None
         best: ObserverNote | None = None
         best_key: tuple[int, int, int] = (-2, -1, -1)
         for n in self.notes():
@@ -342,6 +422,12 @@ class ObserverNoteQueue:
                 continue
             if kinds is not None and n.kind not in kinds:
                 continue
+            if target is not None:
+                note_agent = _bare_agent(n.agent_id)
+                # Empty note_agent = broadcast (reaches any agent); a
+                # non-empty agent-specific note must match the target.
+                if note_agent and note_agent != target:
+                    continue
             key = (_severity_rank(n.severity), int(n.turn), int(n.enqueued_seq))
             if key > best_key:
                 best_key = key
@@ -463,6 +549,7 @@ __all__ = [
     "OBSERVER_NOTE_MARKER_PREFIX",
     "ObserverNote",
     "ObserverNoteQueue",
+    "plan_state_line",
     "render_block",
     "render_tool_annotation",
     "strip_prior_block",

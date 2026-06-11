@@ -5481,10 +5481,22 @@ def make_adk_plugin(
                     and getattr(ctx.steerer, "_signal_channel", "legacy_user_message")
                     == "request_context"
                 ):
+                    # Resolve the agent whose model call this is, so the
+                    # note channel scopes per-(agent,task) notes to their
+                    # own agent (task #11). Falls back to the host agent.
+                    _inv_ctx = _safe_attr(
+                        callback_context, "_invocation_context", None
+                    ) or _safe_attr(callback_context, "invocation_context", None)
+                    _running_agent = _safe_attr(_inv_ctx, "agent", None)
+                    _current_agent_name = (
+                        str(_safe_attr(_running_agent, "name", "") or "")
+                        or self._host_agent_name
+                    )
                     self._prompt_shaper.inject_observer_note(
                         llm_request=llm_request,
                         session=ctx.session,
                         session_context=ctx,
+                        current_agent_name=_current_agent_name,
                     )
             except Exception as exc:  # noqa: BLE001
                 log.debug(
