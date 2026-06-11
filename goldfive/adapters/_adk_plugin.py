@@ -5397,11 +5397,14 @@ def make_adk_plugin(
             # reaching a mid-invocation agent on its next model call. Gated on
             # ``signal_channel == "request_context"`` so the legacy default is
             # byte-identical (the queue is never populated and this whole block
-            # is skipped). The shaper marks the note delivered (the exactly-once
-            # chokepoint) and returns it; we emit exactly one SignalDelivered at
-            # this actual-delivery moment. ``observation_only`` is honoured
-            # inside the shaper (block not appended; note consumed as a dry-run
-            # delivery). Best-effort: never raises into the callback path.
+            # is skipped). The shaper marks the note delivered — the
+            # exactly-once *rendering* chokepoint so the invocation-boundary
+            # replay never re-renders a note this surface showed.
+            # ``SignalDelivered`` is NOT emitted here: it fires once at the
+            # dispatch decision point (``_route_corrective_note``), the PR-5
+            # model the §5.4 shadow diff is built on. ``observation_only`` is
+            # honoured inside the shaper (block not appended; note consumed as
+            # a dry-run delivery). Best-effort: never raises into the callback.
             try:
                 if (
                     ctx is not None
@@ -5409,22 +5412,11 @@ def make_adk_plugin(
                     and getattr(ctx.steerer, "_signal_channel", "legacy_user_message")
                     == "request_context"
                 ):
-                    delivered_note = self._prompt_shaper.inject_observer_note(
+                    self._prompt_shaper.inject_observer_note(
                         llm_request=llm_request,
                         session=ctx.session,
                         session_context=ctx,
                     )
-                    if delivered_note is not None and ctx.steerer is not None:
-                        drift_observer = getattr(ctx.steerer, "drift", None)
-                        emit = getattr(
-                            drift_observer, "_emit_signal_delivered_for_note", None
-                        )
-                        if callable(emit):
-                            await emit(
-                                ctx.session,
-                                delivered_note,
-                                surface="before_model",
-                            )
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "before_model_callback: observer-note injection raised: %s",
@@ -6618,11 +6610,12 @@ def make_adk_plugin(
             ``looping_reasoning``) and appends its compact attributed
             annotation under the reserved ``goldfive_observer_note`` key on a
             shallow copy of the result mapping — append-only, the real result
-            is preserved verbatim. Marks the note delivered (exactly-once) and
-            emits exactly one ``SignalDelivered``. Returns ``None`` (no result
-            replacement) when not in request_context mode, the result is not a
-            mapping, or no loop note is pending — so the legacy path is
-            untouched.
+            is preserved verbatim. Marks the note delivered — the exactly-once
+            *rendering* chokepoint so the block surfaces never re-render it.
+            (``SignalDelivered`` is emitted once at the dispatch point, not
+            here.) Returns ``None`` (no result replacement) when not in
+            request_context mode, the result is not a mapping, or no loop note
+            is pending — so the legacy path is untouched.
             """
             if ctx is None or ctx.steerer is None or ctx.session is None:
                 return None
@@ -6652,17 +6645,6 @@ def make_adk_plugin(
             )
             if not newly:
                 return None
-            drift_observer = getattr(ctx.steerer, "drift", None)
-            emit = getattr(drift_observer, "_emit_signal_delivered_for_note", None)
-            if callable(emit):
-                try:
-                    await emit(ctx.session, note, surface="tool_annotation")
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "after_tool_callback: observer-note SignalDelivered "
-                        "emit raised: %s",
-                        exc,
-                    )
             # Append-only: copy the result and add the reserved annotation key.
             annotated = dict(result)
             annotated["goldfive_observer_note"] = render_tool_annotation(note)

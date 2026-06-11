@@ -700,15 +700,23 @@ substrate so delivery is exactly-once across all of them:
 **Exactly-once + coalescing.** Each note carries a `delivered` flag;
 the first surface to render a note marks it, and every other surface
 only ever looks at *pending* notes (`peek_for_render`), so a note shown
-mid-invocation is never re-delivered at the boundary (the classic
+mid-invocation is never re-rendered at the boundary (the classic
 two-mode double-delivery bug). At most one block leaves the queue per
 request, and the most-severe pending note wins; lower-severity notes
-surface on subsequent requests (none is dropped). The `SignalLedger`'s
-`(drift_id, channel="request_context")` dedup is a second, independent
-exactly-once layer, and `SignalDelivered` is emitted at the moment a
-surface *actually* renders the note (so `dry_run` reflects whether it
-reached the agent — under `observation_only` the note is consumed as a
-dry-run delivery and the block is not injected).
+surface on subsequent requests (none is dropped).
+
+**Telemetry at the dispatch decision point.** `SignalDelivered` is
+emitted once, at the dispatch decision (`_route_corrective_note`) —
+the PR-5 model the §5.4 shadow/differential diff is built on (the
+divergence report compares the *decisions* the legacy and new regimes
+make on the same run, not delivery mechanics). Both channels emit
+there; request_context uses `channel="request_context"`. The four
+surfaces are the exactly-once *rendering* leg only — they mark the
+queue's `delivered` flag but emit no second event. `dry_run`
+(== `observation_only`) records whether the note will actually reach
+the agent, which is consistent with the surface behaviour: under
+`observation_only` the surface skips injection (the strict-passive
+operator sees the raw prompt) and the note is consumed as a dry-run.
 
 **Config (no-op by default).** `SteeringConfig.signal_channel`
 selects the channel:

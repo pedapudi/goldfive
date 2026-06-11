@@ -1383,9 +1383,7 @@ class SequentialExecutor(Executor):
                     and _has_live_pending_or_running(session.plan or plan)
                     and _steerer_should_inject(steerer)
                 ):
-                    replay_msg = await self._consume_observer_note_for_replay(
-                        session, steerer
-                    )
+                    replay_msg = await self._consume_observer_note_for_replay(session)
                 if replay_msg is not None:
                     nudge_replays += 1
                     current_user_input = replay_msg
@@ -2027,17 +2025,16 @@ class SequentialExecutor(Executor):
     async def _consume_observer_note_for_replay(
         self,
         session: Session,
-        steerer: Any,
     ) -> str | None:
         """Consume the most-severe pending observer note for a boundary replay.
 
         Surface 2 of the PR 6 observer-note channel. Selects the most-severe
         pending note (≤1 per replay), marks it delivered — the exactly-once
-        chokepoint, so a note already shown mid-invocation via the
-        ``before_model`` surface is skipped here — emits exactly one
-        ``SignalDelivered`` at this actual-delivery moment, and returns the
-        rendered block to feed as the next user turn. Returns ``None`` when no
-        note is pending (the caller falls through to the end-of-overlay sweep).
+        *rendering* chokepoint, so a note already shown mid-invocation via the
+        ``before_model`` surface is skipped here — and returns the rendered
+        block to feed as the next user turn. (``SignalDelivered`` is emitted
+        once at the dispatch point, not here.) Returns ``None`` when no note is
+        pending (the caller falls through to the end-of-overlay sweep).
         Best-effort: never raises into the overlay loop.
         """
         from goldfive.observer_note_queue import ObserverNoteQueue, render_block
@@ -2063,16 +2060,6 @@ class SequentialExecutor(Executor):
             return None
         if not newly:
             return None
-        drift_observer = getattr(steerer, "drift", None)
-        emit = getattr(drift_observer, "_emit_signal_delivered_for_note", None)
-        if callable(emit):
-            try:
-                await emit(session, note, surface="boundary_replay")
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "SequentialExecutor: observer-note SignalDelivered emit raised: %s",
-                    exc,
-                )
         return render_block(note)
 
     @staticmethod

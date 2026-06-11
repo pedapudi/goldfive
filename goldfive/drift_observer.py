@@ -967,19 +967,28 @@ class DriftObserver:
     ) -> None:
         """Route a composed observer note to the configured delivery channel.
 
-        * ``signal_channel="legacy_user_message"`` (default) — append the note
-          to ``session.pending_nudges`` and emit ``SignalDelivered`` at enqueue
-          (``channel="nudge_replay"``, ``channel_action="queued"``). This is
-          the pre-PR-6 path, byte-identical, so existing suites pass unmodified.
+        Both channels emit ``SignalDelivered`` at the **dispatch decision
+        point** (here) — the PR-5 model the §5.4 shadow/differential diff is
+        built on (the divergence report compares the *decisions* the legacy
+        and new regimes make on the same run, not delivery mechanics). The
+        only difference is *where the note is queued* and *how it is rendered*:
+
+        * ``signal_channel="legacy_user_message"`` (default) — append to
+          ``session.pending_nudges``; the executor's boundary nudge-replay
+          renders it. ``channel="nudge_replay"``. Byte-identical to pre-PR-6,
+          so existing suites pass unmodified (§5.1).
         * ``signal_channel="request_context"`` (PR 6) — enqueue onto the
-          :class:`~goldfive.observer_note_queue.ObserverNoteQueue`. No
-          ``SignalDelivered`` is emitted here: emission happens at the moment a
-          delivery surface actually renders the note (so ``dry_run`` reflects
-          whether the note reached the agent), via
-          :meth:`_emit_signal_delivered_for_note`.
+          :class:`~goldfive.observer_note_queue.ObserverNoteQueue`; the four
+          observer-note surfaces render it, each marking the queue's
+          ``delivered`` flag so the note is *rendered* exactly once across
+          surfaces. ``channel="request_context"``. Whether the note actually
+          reaches the agent is gated on ``observation_only`` at the surface,
+          which is exactly what ``dry_run`` (== ``observation_only``) records
+          on this event — so the event and the mechanism never disagree.
         """
         channel = getattr(self._steerer, "_signal_channel", "legacy_user_message")
         if channel == "request_context":
+            from goldfive.events import SIGNAL_CHANNEL_REQUEST_CONTEXT
             from goldfive.observer_note_queue import ObserverNoteQueue
             from goldfive.observer_notes import observation_for_drift
 
@@ -998,6 +1007,14 @@ class DriftObserver:
                 )
             except Exception as exc:  # noqa: BLE001 -- best-effort enqueue
                 log.debug("observer-note enqueue failed: %s", exc)
+            await self._emit_signal_delivered(
+                session,
+                drift,
+                channel=SIGNAL_CHANNEL_REQUEST_CONTEXT,
+                note_text=note_text,
+                ladder_level=ladder_level,
+                extra_decision={"channel_action": "enqueued"},
+            )
             return
 
         # Legacy channel — the pre-PR-6 behaviour.
@@ -1012,89 +1029,6 @@ class DriftObserver:
             ladder_level=ladder_level,
             extra_decision={"channel_action": "queued"},
         )
-
-    async def _emit_signal_delivered_for_note(
-        self,
-        session: Session,
-        note: Any,
-        *,
-        surface: str,
-    ) -> None:
-        """Emit a ``SignalDelivered`` at the moment an observer note is delivered.
-
-        Called by each request_context delivery surface (the ADK
-        ``before_model`` block, the invocation-boundary replay, the
-        claude-agent-sdk system prompt / ``PostToolUse`` ``additionalContext``,
-        and the append-only tool-result annotation) AFTER it has marked the
-        note delivered on the queue. The queue's ``delivered`` flag guarantees
-        exactly one surface delivers a given note; the SignalLedger's
-        ``(drift_id, channel)`` dedup is the second exactly-once layer.
-        ``dry_run`` tracks ``observation_only`` so a shadow-mode run still
-        records what *would* have been delivered (§5.4). Best-effort: gated on
-        ``signal_telemetry`` and never raises into the delivery path.
-        """
-        if not self._signal_telemetry_on():
-            return
-        try:
-            from goldfive.events import (
-                SIGNAL_CHANNEL_REQUEST_CONTEXT,
-                signal_delivered_event,
-            )
-
-            dry_run = not self._steerer._should_inject()
-            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
-            drift_id = str(getattr(note, "drift_id", "") or "")
-            kind = str(getattr(note, "kind", "") or "")
-            task_id = str(getattr(note, "task_id", "") or "")
-            severity = str(getattr(note, "severity", "") or "")
-            ladder_level = str(getattr(note, "ladder_level", "") or "")
-            note_body = str(getattr(note, "body", "") or "")
-            decision: dict[str, Any] = {
-                "ladder_level": ladder_level,
-                "observation_only": dry_run,
-                "delivery_surface": str(surface or ""),
-                "channel_action": "delivered",
-            }
-            recorded = True
-            try:
-                from goldfive.signal_ledger import SignalLedger
-
-                _, recorded = SignalLedger.for_session(session).record_delivery(
-                    drift_kind=kind,
-                    task_id=task_id,
-                    drift_id=drift_id,
-                    channel=SIGNAL_CHANNEL_REQUEST_CONTEXT,
-                    turn=turn,
-                    dry_run=dry_run,
-                    severity=severity,
-                    ladder_level=ladder_level,
-                    note_text=note_body,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.debug("signal ledger record_delivery (note) failed: %s", exc)
-                recorded = True
-            if not recorded:
-                return
-            seq, event_id = session.next_sequence_and_event_id()
-            evt = signal_delivered_event(
-                session.run_id,
-                seq,
-                drift_id=drift_id,
-                kind=kind,
-                severity=severity,
-                channel=SIGNAL_CHANNEL_REQUEST_CONTEXT,
-                turn=turn,
-                note_text=note_body,
-                dry_run=dry_run,
-                task_id=task_id,
-                agent_id=str(getattr(note, "agent_id", "") or ""),
-                decision=decision,
-                session_id=session.id,
-                event_id=event_id,
-            )
-            await self._steerer._emit(evt)
-        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
-            log.debug("signal_delivered (note) emit failed: %s", exc)
 
     async def _note_signal_drift_fire(self, session: Session, drift: DriftEvent) -> None:
         """Record a drift fire on the ledger (or a user-intervention outcome).

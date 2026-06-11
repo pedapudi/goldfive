@@ -10,7 +10,9 @@ Covers the §5.2 *binding* acceptance criteria for the observer-note channel:
 
 Plus the channel-routing no-op-by-default guarantee (§5.1: legacy default →
 queue never populated, ``pending_nudges`` used as before) and the
-``SignalDelivered``-at-actual-delivery wiring.
+``SignalDelivered``-at-dispatch-point wiring (both channels emit at the
+dispatch decision; the request_context surfaces render exactly-once but emit
+no second event).
 """
 
 from __future__ import annotations
@@ -229,23 +231,22 @@ async def test_exactly_once_before_model_consumes_then_boundary_skips() -> None:
     # Surface 2 (invocation-boundary replay): the SAME note is no longer
     # pending, so the boundary renders NOTHING — never a second delivery.
     executor = SequentialExecutor()
-    replay = await executor._consume_observer_note_for_replay(session, steerer)
+    replay = await executor._consume_observer_note_for_replay(session)
     assert replay is None
     assert ObserverNoteQueue.for_session(session).get("d1").delivered is True
 
 
 async def test_exactly_once_boundary_delivers_when_before_model_did_not() -> None:
-    """The reverse path: if no model call fired, the boundary delivers once."""
-    steerer = _make_steerer(channel="request_context")
+    """The reverse path: if no model call fired, the boundary renders once."""
     session = _make_session()
     _enqueue(session, drift_id="d1")
 
     executor = SequentialExecutor()
-    replay = await executor._consume_observer_note_for_replay(session, steerer)
+    replay = await executor._consume_observer_note_for_replay(session)
     assert replay is not None
     assert replay.count(OBSERVER_NOTE_PREFIX) == 1
     # And a second boundary pass finds nothing — exactly once.
-    again = await executor._consume_observer_note_for_replay(session, steerer)
+    again = await executor._consume_observer_note_for_replay(session)
     assert again is None
 
 
@@ -313,46 +314,47 @@ def test_observation_only_does_not_inject_but_consumes() -> None:
     note = PromptShaper().inject_observer_note(
         llm_request=req, session=session, session_context=ctx
     )
-    # The note is consumed (returned for the dry-run SignalDelivered) but the
-    # block is NOT injected — the strict-passive operator sees the raw prompt.
+    # The note is consumed (marked delivered) but the block is NOT injected —
+    # the strict-passive operator sees the raw prompt.
     assert note is not None
     assert req.config.system_instruction == "base"
     assert ObserverNoteQueue.for_session(session).get("d1").delivered is True
 
 
 # ---------------------------------------------------------------------------
-# SignalDelivered at ACTUAL delivery (channel=request_context)
+# SignalDelivered at the dispatch decision point (channel=request_context)
+#
+# Both channels emit at the dispatch point (the PR-5 model the §5.4 shadow
+# diff is built on); request_context differs only in the channel value and
+# where the note is queued. The delivery surfaces render exactly-once but do
+# NOT emit a second event.
 # ---------------------------------------------------------------------------
 
 
-async def test_signal_delivered_emitted_at_actual_delivery() -> None:
+async def test_signal_delivered_emitted_at_dispatch_for_request_context() -> None:
     sink = _ListSink()
     steerer = _make_steerer(
         channel="request_context", signal_telemetry=True, sink=sink
     )
     session = _make_session()
-    ctx = _Ctx(steerer, session)
-    _enqueue(session, drift_id="d1")
 
-    note = PromptShaper().inject_observer_note(
-        llm_request=_Req(), session=session, session_context=ctx
-    )
-    assert note is not None
-    await steerer.drift._emit_signal_delivered_for_note(
-        session, note, surface="before_model"
-    )
+    # Dispatching the nudge enqueues the note AND emits one SignalDelivered on
+    # the request_context channel — the dispatch decision point.
+    await steerer.drift._dispatch_nudge(_drift(), session)
 
     delivered = _delivered(sink)
     assert len(delivered) == 1
     payload = delivered[0].signal_delivered
     assert payload.channel == SIGNAL_CHANNEL_REQUEST_CONTEXT
-    assert payload.drift_id == "d1"
     assert payload.dry_run is False  # observation_only is False here
 
-    # The SignalLedger recorded one delivery on the request_context channel —
-    # a redelivery (e.g. the boundary surface) dedups, never double-counts.
-    await steerer.drift._emit_signal_delivered_for_note(
-        session, note, surface="boundary_replay"
+    # Rendering the note at a surface does NOT emit a second event — the
+    # surfaces are the exactly-once rendering leg only.
+    note = ObserverNoteQueue.for_session(session).peek_for_render()
+    assert note is not None
+    ctx = _Ctx(steerer, session)
+    PromptShaper().inject_observer_note(
+        llm_request=_Req(), session=session, session_context=ctx
     )
     assert len(_delivered(sink)) == 1
 
@@ -366,13 +368,7 @@ async def test_signal_delivered_dry_run_under_observation_only() -> None:
         sink=sink,
     )
     session = _make_session()
-    note = ObserverNoteQueue.for_session(session).enqueue(
-        body="Observation: x", observation="x", severity="warning",
-        drift_id="d1", kind="looping_tool_call", task_id="t1", turn=0,
-    )
-    await steerer.drift._emit_signal_delivered_for_note(
-        session, note, surface="before_model"
-    )
+    await steerer.drift._dispatch_nudge(_drift(), session)
     delivered = _delivered(sink)
     assert len(delivered) == 1
     assert delivered[0].signal_delivered.dry_run is True

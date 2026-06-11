@@ -641,19 +641,22 @@ class PromptShaper:
         Per-request coalescing: at most ONE block is rendered, the most-severe
         pending note wins
         (:meth:`~goldfive.observer_note_queue.ObserverNoteQueue.peek_for_render`),
-        and that note is marked delivered — the exactly-once chokepoint, so the
-        invocation-boundary replay never re-delivers a note this surface showed.
+        and that note is marked delivered — the exactly-once *rendering*
+        chokepoint, so the invocation-boundary replay never re-renders a note
+        this surface showed.
 
         Under ``observation_only=True`` (:meth:`should_inject` → ``False``) the
         block is NOT appended (the strict-passive operator sees the raw prompt)
-        but the note is still consumed + returned, so a shadow-mode run records
-        ``SignalDelivered(dry_run=True)`` — what *would* have been delivered
-        (§5.4) — and the queue does not re-evaluate it.
+        but the note is still consumed so the queue does not re-evaluate it —
+        the dispatch-point ``SignalDelivered(dry_run=True)`` already recorded
+        what *would* have been delivered (§5.4).
 
-        Returns the :class:`~goldfive.observer_note_queue.ObserverNote` that was
-        delivered (the caller — the ADK plugin — emits exactly one
-        ``SignalDelivered`` for it), or ``None`` when nothing was pending (or on
-        a defensive failure). Best-effort: never raises into
+        ``SignalDelivered`` is emitted once at the dispatch decision point
+        (``DriftObserver._route_corrective_note``), NOT here — this surface is
+        purely the *rendering* leg. Returns the
+        :class:`~goldfive.observer_note_queue.ObserverNote` it rendered (for
+        observability / tests), or ``None`` when nothing was pending (or on a
+        defensive failure). Best-effort: never raises into
         ``before_model_callback``.
 
         ``session`` MUST be the goldfive :class:`~goldfive.types.Session` (the

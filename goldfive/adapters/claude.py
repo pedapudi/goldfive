@@ -520,11 +520,11 @@ class ClaudeAgentSDKAdapter:
 
         Shared by the system-prompt section (3a) and the ``PostToolUse`` hook
         (3b). Gated on ``signal_channel == "request_context"``. Marks the note
-        delivered (the exactly-once chokepoint), emits exactly one
-        ``SignalDelivered`` at this actual-delivery moment, and returns the
-        rendered block to inject — but only when the steerer's ``_should_inject``
+        delivered — the exactly-once *rendering* chokepoint — and returns the
+        rendered block to inject, but only when the steerer's ``_should_inject``
         gate is open (under ``observation_only`` the note is consumed as a
         dry-run delivery and ``None`` is returned so nothing reaches the agent).
+        (``SignalDelivered`` is emitted once at the dispatch point, not here.)
         Returns ``None`` when nothing is pending. Best-effort: never raises.
         """
         steerer = self._steerer
@@ -563,17 +563,6 @@ class ClaudeAgentSDKAdapter:
         except Exception as exc:  # noqa: BLE001
             log.debug("claude adapter: observer-note mark_delivered raised: %s", exc)
             return None
-        if newly:
-            drift_observer = getattr(steerer, "drift", None)
-            emit = getattr(drift_observer, "_emit_signal_delivered_for_note", None)
-            if callable(emit):
-                try:
-                    await emit(session, note, surface=surface)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "claude adapter: observer-note SignalDelivered emit raised: %s",
-                        exc,
-                    )
         if should and newly:
             return render_block(note)
         return None
