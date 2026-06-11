@@ -545,6 +545,20 @@ class Task:
     #: by the planner only in ledger mode, and to
     #: :attr:`TaskKind.DISCOVERED` by the descriptive-growth write path
     #: only in ledger mode. Opaque to :meth:`Plan.validate`.
+    #:
+    #: AUTHORITY: ``kind`` is authoritative ONLY in ledger mode. In
+    #: forecast mode (the default) it is always ``FORECAST`` and the
+    #: :attr:`discovered` bool remains the source of truth for "was this
+    #: task descriptively grown?" — deliberately, so forecast-mode wire
+    #: bytes are unchanged (stamping ``DISCOVERED`` in forecast mode would
+    #: serialise field 13 and break the bit-identical guarantee). The
+    #: ``discovered``-bool ↔ ``kind`` invariant
+    #: (``discovered=True`` ⟺ ``kind is DISCOVERED``) is therefore NOT
+    #: enforced in forecast mode.
+    #: TODO(AGENCY-PRESERVATION PR 13 / cutover): normalise the
+    #: ``discovered`` ↔ ``kind`` invariant when ``plan_mode="ledger"``
+    #: becomes the default — that is the deliberate-wire-change PR where
+    #: forecast-mode events no longer exist to keep byte-identical.
     kind: TaskKind = TaskKind.FORECAST
     #: AGENCY-PRESERVATION.md Stage 3 PR 10 + PR 11. Stable id of the
     #: OUTCOME task (or goal) this task advances. Empty on FORECAST tasks
