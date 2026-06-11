@@ -30,6 +30,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from goldfive.config import SteeringConfig  # noqa: E402
+from goldfive.control import ControlChannel, ControlKind  # noqa: E402
 from goldfive.observer_note_queue import ObserverNoteQueue  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
@@ -193,6 +194,52 @@ async def test_ledger_user_steer_refine_survives() -> None:
     # USER_STEER is one of the three surviving refine authors — it still
     # refines even in ledger mode.
     assert planner.refined, "USER_STEER refine must survive in ledger mode"
+
+
+async def test_ledger_runaway_delegation_pauses_not_note() -> None:
+    """RUNAWAY_DELEGATION (hard-safety) in ledger mode → PAUSE_ESCALATE.
+
+    The forecast CANCEL_REINVOKE follow-on continues via the refine's
+    revised plan (the GOLDFIVE_STEER restart carries replacement_task_ids
+    from the post-refine plan — audit #402). In ledger mode there is no
+    refine to produce that plan, so a note-replay would re-invoke the same
+    coordinator on the same plan and likely re-trip the guardrail.
+    Stop-and-ask is the safe follow-on — and it must be a CLEAN,
+    observable pause (a GOLDFIVE_PAUSE_ESCALATE control + a
+    HUMAN_INTERVENTION_REQUIRED drift), never a hang or a silent death.
+    """
+    steerer, planner = _make_steerer(plan_mode="ledger")
+    channel = ControlChannel()
+    steerer.bind_control_channel(channel)
+    session = _session()
+
+    drift = DriftEvent(
+        kind=DriftKind.RUNAWAY_DELEGATION,
+        severity=DriftSeverity.CRITICAL,
+        detail="coordinator delegated past the cap",
+        current_task_id="d1",
+        authored_by="goldfive",
+    )
+    await steerer.drift.handle_drift(drift, session)
+
+    # No forecast repair of either flavour.
+    assert planner.refine_calls == []
+    assert planner.refine_steer_calls == []
+    # Did NOT force-fail the bound task (that's the looping rung, not the
+    # hard-safety rung) and did NOT degrade to a mere advisory note.
+    d1 = next(t for t in session.plan.tasks if t.id == "d1")
+    assert d1.status is not TaskStatus.FAILED
+    assert not getattr(session, "pending_nudges", None)
+    # A clean, observable stop-and-ask: a GOLDFIVE_PAUSE_ESCALATE control
+    # message was dispatched on the channel.
+    drained: list[Any] = []
+    inbox = channel._inbox  # noqa: SLF001 — test inspection
+    while not inbox.empty():
+        drained.append(inbox.get_nowait())
+    kinds = [getattr(m, "kind", None) for m in drained]
+    assert ControlKind.GOLDFIVE_PAUSE_ESCALATE in kinds, (
+        f"expected a GOLDFIVE_PAUSE_ESCALATE control; got {kinds}"
+    )
 
 
 # ---------------------------------------------------------------------------

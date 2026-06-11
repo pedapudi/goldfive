@@ -3302,6 +3302,21 @@ class DriftObserver:
         or ``refine_steer`` (promotion) instead takes one of the ledger
         rungs:
 
+        * **hard-safety kinds** (:attr:`_HARD_SAFETY_DRIFT_KINDS`, e.g.
+          ``RUNAWAY_DELEGATION`` — the only one that reaches here, the
+          others being PAUSE_ESCALATE-first and returning earlier) →
+          **PAUSE_ESCALATE** (stop-and-ask). Their forecast
+          CANCEL_REINVOKE follow-on depended on the refine's revised plan
+          to route around the offending subtree: the GOLDFIVE_STEER
+          restart carries ``replacement_task_ids`` picked from the
+          POST-refine ``session.plan`` (audit #402). In ledger mode there
+          is no refine to produce that plan, so a note-replay would just
+          re-invoke the same coordinator on the same plan and likely
+          re-trip the guardrail. The hard-safety CANCEL itself already
+          fired earlier in :meth:`_handle_drift_dispatch` (mode-agnostic);
+          this is purely the post-cancel disposition, and stop-and-ask is
+          the safe choice — consistent with PR 7's PAUSE_ESCALATE-first
+          treatment of the other hard-safety kinds.
         * **looping kinds** (:data:`_LEDGER_FORCE_FAIL_DRIFT_KINDS`) with a
           bound task → **force-FAIL** the bound ledger task. ``recoverable``
           is True — a sibling/replacement DISCOVERED task may still cover
@@ -3317,6 +3332,11 @@ class DriftObserver:
         absorption are SEPARATE dispatch paths and keep their refine. Never
         raises into the dispatch.
         """
+        if drift.kind in self._HARD_SAFETY_DRIFT_KINDS:
+            # Hard-safety guardrail whose productive continuation needed the
+            # refine (see docstring). No refine in ledger mode → stop-and-ask.
+            await self._dispatch_pause_escalate(drift, session)
+            return
         task_id = drift.current_task_id or ""
         if drift.kind in self._LEDGER_FORCE_FAIL_DRIFT_KINDS and task_id:
             reason = (
