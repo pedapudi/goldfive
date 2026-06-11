@@ -683,12 +683,18 @@ during, the roadmap as written. They are intentional — not drift.
    `refine_steer` path also needed gating** — it fires *before* the ladder.
    Both refine entry points are now gated on `plan_mode`.
 
-4. **Force-FAIL contract — deterministic detectors only** (#469, PR 12).
-   Ledger-mode force-FAIL is restricted to the **two deterministic looping
-   detectors** (`LOOPING_TOOL_CALL`, `LOOPING_REASONING`). This is the dual
-   of PR 11's "no judge-manufactured terminal state" (deviation 1): no
-   terminal task disposition is ever minted by an LLM judge — only by a
-   deterministic counter or a user/predicate.
+4. **Force-FAIL contract — no terminal from a fallible signal** (#469,
+   PR 12). Ledger-mode force-FAIL is restricted to the **two deterministic
+   looping detectors** (`LOOPING_TOOL_CALL`, `LOOPING_REASONING`). This is
+   the dual of PR 11's outcome-progress contract (deviation 1): no terminal
+   disposition is ever manufactured from a FALLIBLE / UNCERTAIN judge
+   signal. A drift-judge *opinion* (`GOAL_DRIFT`, `OFF_TOPIC`, reasoning
+   verdicts) takes the note rung and never force-FAILs a task in ledger
+   mode; the outcome-progress judge mints OUTCOME terminals only on a
+   CONFIDENT verdict (uncertainty carries forward as PENDING — deviation 1).
+   Terminal dispositions come from a deterministic counter, a confident
+   outcome verdict, or a user / predicate — never from a fallible
+   mid-trajectory drift opinion.
 
 5. **Agent-aware-surfaces principle** (#468). Agent-specific notes (notably
    per-(agent, task) corrections) render **only on agent-aware surfaces**:
@@ -749,14 +755,18 @@ the task tracker):
    and a force-FAILED looping DISCOVERED task can fail the run via the
    fatal gate.
 
-2. **Stage-3 layered e2e must assert "ledger-mode runaway → clean PAUSE"**
-   (#469 review; shipped as the §5.7 runaway e2e). The
-   no-hang/no-silent-death contract is an *integration* property (executor
-   pause-block + ledger plan structure + run-end disposition) that unit
-   tests cannot show — §5.7 scar tissue: narrow criteria pass on broken
-   runs. Shipped standalone as `tests/test_ledger_runaway_e2e.py` (#471);
-   keep standalone per bench's harness ruling — the canonical pause probes
-   are `outcome.reason` + the HIR drift on the sink + OUTCOME-stays-PENDING.
+2. **Stage-3 layered e2e: "ledger-mode runaway → clean PAUSE"** (#469
+   review; SHIPPED + merged as the standalone §5.7 e2e
+   `tests/test_ledger_runaway_e2e.py` — #471). The no-hang/no-silent-death
+   contract is an *integration* property (executor pause-block + ledger
+   plan structure + run-end disposition) that unit tests cannot show —
+   §5.7 scar tissue: narrow criteria pass on broken runs. Drives a real
+   coordinator+AgentTool tree through `wrap()` → `Runner.run()` in
+   `plan_mode=ledger`, trips a runaway, and asserts a clean PAUSE
+   (`outcome.reason` carries the runaway cause + a
+   `HUMAN_INTERVENTION_REQUIRED` drift + the OUTCOME stays PENDING; 30s
+   wall-clock bound). Bench's call: keep it STANDALONE — NOT a 2d27ff4a
+   refold.
 
 3. **The §5.4 shadow campaign must enable `signal_telemetry` explicitly**
    (channel, #462) — it defaults OFF (§6.2).
