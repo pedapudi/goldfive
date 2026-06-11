@@ -187,6 +187,13 @@ merged divergence: a CRITICAL goldfive-authored `OFF_TOPIC` drift cancels
 in-flight work under `cancel_inflight_scope=all` (legacy) but not under
 `user_and_safety` (new) — the PR-1 authority split — so the report reads
 `would_cancel_inflight: legacy=True -> new=False`. Once the behavior PRs
-merge, `ladder_level` and channel divergences appear in the same report.
-The reviewed two-log report is the **exit criterion** for enabling any
-behavior PR (§5.4, §5.8).
+merge, `ladder_level` divergences appear in the same report.
+
+The delivery **transport** — `channel` (`nudge_replay` vs.
+`request_context` since PR 6) and `channel_action` — is per-regime
+identity, not a steering decision, so it is reported *informationally*
+(a `[transport]` line plus a `transport-only` count) but **excluded** from
+the divergence-driving comparison; otherwise every aligned key would
+trivially "diverge" on transport and drown the real decision divergences
+the review exists to surface. The reviewed two-log report is the **exit
+criterion** for enabling any behavior PR (§5.4, §5.8).
