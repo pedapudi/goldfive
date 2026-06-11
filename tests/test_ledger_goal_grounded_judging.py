@@ -27,6 +27,9 @@ from goldfive.drift.goals import (  # noqa: E402
     GOAL_DRIFT_GRADUATED_USER_PROMPT_TEMPLATE,
     classify_goal_drift,
 )
+from goldfive.drift.reasoning_judge import (  # noqa: E402
+    classify_reasoning_drift_with_focus,
+)
 from goldfive.types import (  # noqa: E402
     DriftKind,
     DriftSeverity,
@@ -147,3 +150,92 @@ def test_graduated_template_has_three_bands() -> None:
     assert '"progressing": true' in tmpl
     assert '"band": "uncertain"' in tmpl
     assert '"band": "off_track"' in tmpl
+
+
+# ---------------------------------------------------------------------------
+# (b) Reasoning judge re-grounding (goals primary, bound task as context)
+# ---------------------------------------------------------------------------
+
+
+def _reasoning_task() -> Task:
+    return Task(id="o1", title="Summary delivered", kind=TaskKind.OUTCOME)
+
+
+def _on_task_verdict() -> str:
+    return (
+        '{"classification": "on_task", "severity": "info", "reason": "ok", '
+        '"provenance": "none", "focused_task_id": "o1", '
+        '"focus_confidence": 1.0, "stated_intent": "summarising", '
+        '"note_to_agent": ""}'
+    )
+
+
+def test_reasoning_ledger_grounds_goals_primary_task_as_context() -> None:
+    captured: dict[str, str] = {}
+
+    async def llm(system: str, user: str, model: str) -> str:
+        captured["user"] = user
+        return _on_task_verdict()
+
+    asyncio.run(
+        classify_reasoning_drift_with_focus(
+            reasoning="let me summarise the deck",
+            task=_reasoning_task(),
+            goals=_goals(),
+            plan=_ledger_plan(),
+            model="m",
+            call_llm=llm,
+            ledger=True,
+        )
+    )
+    user = captured["user"]
+    # GOALS lead; the bound task is explicitly framed as context only.
+    assert user.index("GOALS") < user.index("CURRENTLY BOUND TASK")
+    assert "PRIMARY reference" in user
+    assert "CONTEXT ONLY" in user
+    assert "LEDGER" in user
+
+
+def test_reasoning_forecast_mode_unchanged_task_first() -> None:
+    captured: dict[str, str] = {}
+
+    async def llm(system: str, user: str, model: str) -> str:
+        captured["user"] = user
+        return _on_task_verdict()
+
+    asyncio.run(
+        classify_reasoning_drift_with_focus(
+            reasoning="let me summarise the deck",
+            task=_reasoning_task(),
+            goals=_goals(),
+            plan=_ledger_plan(),
+            model="m",
+            call_llm=llm,
+            ledger=False,
+        )
+    )
+    user = captured["user"]
+    # Forecast template (pre-PR-11): bound task precedes goals.
+    assert user.index("CURRENTLY BOUND TASK") < user.index("GOALS")
+    assert "PRIMARY reference" not in user
+
+
+def test_reasoning_ledger_verdict_shape_unchanged() -> None:
+    # The ledger template keeps the IDENTICAL verdict JSON shape, so the
+    # parser still produces an on-task (no drift) verdict.
+    async def llm(system: str, user: str, model: str) -> str:
+        return _on_task_verdict()
+
+    verdict = asyncio.run(
+        classify_reasoning_drift_with_focus(
+            reasoning="summarising",
+            task=_reasoning_task(),
+            goals=_goals(),
+            plan=_ledger_plan(),
+            model="m",
+            call_llm=llm,
+            ledger=True,
+        )
+    )
+    assert verdict.drift is None
+    assert verdict.focused_task_id == "o1"

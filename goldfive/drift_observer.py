@@ -2309,6 +2309,10 @@ class DriftObserver:
                     sink=judge_sink,
                     agent_name=agent_name,
                     available_agents=judge_available_agents,
+                    # AGENCY-PRESERVATION.md PR 11(b) — ledger mode
+                    # re-grounds the judge on goals (primary) with the
+                    # bound task as context.
+                    ledger=self._ledger_mode(),
                 )
             finally:
                 # Restore the live history. Any entries appended by
