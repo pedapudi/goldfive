@@ -1162,6 +1162,18 @@ class DefaultSteerer:
     # Protocol-required: transition (generic)
     # ------------------------------------------------------------------
 
+    async def finalize_outcomes(self, session: Session) -> None:
+        """Judge + finalize ledger OUTCOME deliverables at the run boundary.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 11(c). Delegates to
+        :meth:`DriftObserver.finalize_outcomes` (the judge + transition
+        logic lives drift-side); the executor calls this single method at
+        the overlay run boundary, mirroring the
+        ``_drain_steerer_at_run_boundary`` contract. Ledger-gated and
+        quiet on failure — a no-op in forecast mode.
+        """
+        await self.drift.finalize_outcomes(session)
+
     async def transition(
         self,
         task_id: str,

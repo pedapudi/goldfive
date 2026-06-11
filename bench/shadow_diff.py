@@ -21,8 +21,13 @@ Two modes
   deliveries across the logs by a stable cross-run key
   ``(kind, task_id, occurrence#)`` — drift ids are per-run minted, so they
   are NOT used as the join key (the project's stable-keys discipline) —
-  and reports, per drift, exactly how the two regimes' decisions differ,
-  plus drifts that fired in only one regime.
+  and reports, per drift, exactly how the two regimes' *decisions* differ,
+  plus drifts that fired in only one regime. The delivery ``channel`` /
+  ``channel_action`` are per-regime *transport identity* (since PR 6 the new
+  regime always rides ``request_context`` and the legacy regime
+  ``nudge_replay``), so they are reported informationally but excluded from
+  the divergence-driving comparison — otherwise every aligned key would
+  trivially "diverge" on transport and drown the real decision divergences.
 * **single-log (census)** — one positional ``LOG.jsonl``: a per-event
   legacy-would-do vs. new-would-do derivation from each delivery's own
   ``decision`` payload, plus a census of channels / ladder levels /
@@ -77,16 +82,33 @@ class ShadowDiffError(RuntimeError):
 # defines *what a regime would do* to the agent. Prose (``note_text``) is
 # deliberately excluded from the divergence set — §5.4 diffs decisions, not
 # wording — but is retained on the record for the human-readable detail.
+#
+# ``channel`` / ``channel_action`` are deliberately NOT here: they are
+# per-regime *transport identity*, not a steering decision. Since PR 6 the new
+# regime always rides ``request_context`` and the legacy regime always rides
+# ``nudge_replay`` (``channel_action`` enqueued vs. queued), so EVERY aligned
+# key would trivially differ on them — that noise would swamp the real decision
+# divergences (``would_cancel_inflight``, ``ladder_level``, plan-swap targets)
+# the §5.4 review exists to surface. They live in :data:`_TRANSPORT_FIELDS`
+# instead, shown informationally per key but never counted as a divergence.
 _DECISION_FIELDS: tuple[str, ...] = (
-    "channel",
     "ladder_level",
     "would_cancel_inflight",
-    "channel_action",
     "promotion",
     "superseded_task_ids",
     "replacement_task_ids",
     "dry_run",
 )
+
+#: Per-regime transport identity — which delivery channel carried the signal.
+#: Reported informationally (a transport line on each key) but excluded from
+#: the divergence-driving comparison; a key that differs ONLY here is NOT a
+#: decision divergence (AGENCY-PRESERVATION.md §5.4 diffs decisions).
+_TRANSPORT_FIELDS: tuple[str, ...] = ("channel", "channel_action")
+
+#: All fields surfaced in a record's comparable projection (decision +
+#: transport), so the rendered report can still show channel/channel_action.
+_VIEW_FIELDS: tuple[str, ...] = _DECISION_FIELDS + _TRANSPORT_FIELDS
 
 
 @dataclasses.dataclass
@@ -106,9 +128,9 @@ class SignalRecord:
     decision: dict[str, Any]
 
     def decision_view(self) -> dict[str, Any]:
-        """The comparable (kind-agnostic) projection used for diffing."""
+        """The comparable projection (decision + transport fields) for diffing."""
         view: dict[str, Any] = {}
-        for field in _DECISION_FIELDS:
+        for field in _VIEW_FIELDS:
             if field == "channel":
                 view[field] = self.channel
             elif field == "dry_run":
@@ -131,10 +153,20 @@ class KeyDivergence:
     legacy: dict[str, Any] | None
     new: dict[str, Any] | None
     diverged_fields: list[str]
+    #: Per-regime transport fields (channel / channel_action) that differ.
+    #: Informational only — a key that differs ONLY here is NOT ``diverged``.
+    transport_fields: list[str] = dataclasses.field(default_factory=list)
 
     @property
     def diverged(self) -> bool:
         return self.present_in != "both" or bool(self.diverged_fields)
+
+    @property
+    def transport_only(self) -> bool:
+        """True iff the key differs ONLY in transport (not a decision divergence)."""
+        return self.present_in == "both" and not self.diverged_fields and bool(
+            self.transport_fields
+        )
 
 
 @dataclasses.dataclass
@@ -163,6 +195,11 @@ class DivergenceReport:
     def field_divergences(self) -> list[KeyDivergence]:
         return [k for k in self.keys if k.present_in == "both" and k.diverged_fields]
 
+    @property
+    def transport_only_keys(self) -> list[KeyDivergence]:
+        """Keys that differ ONLY in transport (channel) — informational, not divergences."""
+        return [k for k in self.keys if k.transport_only]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "legacy_path": self.legacy_path,
@@ -174,6 +211,7 @@ class DivergenceReport:
             "legacy_only": len(self.legacy_only),
             "new_only": len(self.new_only),
             "field_divergences": len(self.field_divergences),
+            "transport_only_keys": len(self.transport_only_keys),
             "keys": [dataclasses.asdict(k) for k in self.keys],
         }
 
@@ -291,6 +329,7 @@ def diff_two_logs(
             lview = lrec.decision_view()
             nview = nrec.decision_view()
             diverged = [f for f in _DECISION_FIELDS if lview.get(f) != nview.get(f)]
+            transport = [f for f in _TRANSPORT_FIELDS if lview.get(f) != nview.get(f)]
             keys.append(
                 KeyDivergence(
                     kind=kind,
@@ -300,6 +339,7 @@ def diff_two_logs(
                     legacy=lview,
                     new=nview,
                     diverged_fields=diverged,
+                    transport_fields=transport,
                 )
             )
         elif lrec is not None:
@@ -350,12 +390,17 @@ def render_two_log_text(report: DivergenceReport) -> str:
     lines.append(f"  decision-field diffs:    {len(report.field_divergences)}")
     lines.append(f"  legacy-only (new silent):{len(report.legacy_only)}")
     lines.append(f"  new-only (legacy silent):{len(report.new_only)}")
+    lines.append(
+        f"  transport-only (channel): {len(report.transport_only_keys)}  "
+        "(per-regime transport, not a divergence)"
+    )
     lines.append("-" * 64)
 
     if not report.diverged_keys:
-        lines.append("VERDICT: no divergence — the two regimes' decisions are identical")
-        lines.append("on this traffic. (Expected before the behavior PRs land; once")
-        lines.append("PR 7's ladder restructure merges, ladder_level diffs appear here.)")
+        lines.append("VERDICT: no decision divergence — the two regimes' steering")
+        lines.append("decisions are identical on this traffic (transport channel aside).")
+        lines.append("(Expected before the behavior PRs land; once PR 7's ladder")
+        lines.append("restructure merges, ladder_level diffs appear here.)")
         return "\n".join(lines)
 
     lines.append(f"VERDICT: {len(report.diverged_keys)} drift key(s) diverge — review below.")
@@ -367,6 +412,11 @@ def render_two_log_text(report: DivergenceReport) -> str:
             for field in kd.diverged_fields:
                 lines.append(
                     f"    {field}: legacy={kd.legacy.get(field)!r}  ->  new={kd.new.get(field)!r}"
+                )
+            for field in kd.transport_fields:
+                lines.append(
+                    f"    [transport] {field}: legacy={kd.legacy.get(field)!r}  ->  "
+                    f"new={kd.new.get(field)!r}  (informational)"
                 )
         elif kd.present_in == "legacy_only":
             lines.append(

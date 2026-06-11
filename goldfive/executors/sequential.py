@@ -61,6 +61,7 @@ from goldfive.types import (
     Plan,
     Session,
     Task,
+    TaskKind,
     TaskStatus,
     channel_processor_active,
     set_session_plan,
@@ -186,6 +187,54 @@ async def _drain_steerer_at_run_boundary(
             "raised at run boundary (swallowed): %s",
             exc,
         )
+
+
+async def _finalize_outcomes_at_run_boundary(steerer: Any, session: Session) -> None:
+    """Judge + finalize ledger OUTCOME deliverables at the overlay boundary.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 11(c). In ledger plan mode OUTCOME
+    deliverables are never reported by the agent, so goldfive's
+    outcome-progress judge is what makes "run completion = all outcomes
+    terminal" decidable. Called from :meth:`SequentialExecutor._run_overlay`
+    immediately after the passthrough loop breaks and BEFORE the
+    goldfive#208 end-of-overlay PENDING disposition + the fatal-failure
+    gate, so met deliverables land COMPLETED and CONFIDENTLY-unmet ones
+    flow through the existing fatal-failure path (whose ``observation_only``
+    carve-out is already correct). Uncertain deliverables stay PENDING and
+    carry forward like any #208 reachable-PENDING task.
+
+    Duck-typed + ledger-gated inside the steerer: custom steerers without
+    ``finalize_outcomes`` (or forecast mode) fall through cleanly. Awaited
+    so the transitions are visible to the disposition that follows; never
+    blocks run termination.
+    """
+    finalize = getattr(steerer, "finalize_outcomes", None)
+    if not callable(finalize):
+        return
+    try:
+        await finalize(session)
+    except Exception as exc:  # noqa: BLE001 — never block run termination
+        log.warning(
+            "SequentialExecutor: steerer.finalize_outcomes raised at run "
+            "boundary (swallowed): %s",
+            exc,
+        )
+
+
+def _executor_plan_mode(steerer: Any) -> str:
+    """Read ``SteeringConfig.plan_mode`` off the steerer ("forecast"/"ledger").
+
+    AGENCY-PRESERVATION.md PR 11(c). Defensive: any read failure resolves
+    to ``"forecast"`` so the misconfiguration guard never fires
+    spuriously on a custom steerer without a typed config.
+    """
+    try:
+        cfg = getattr(steerer, "_steering_config", None)
+        if cfg is None:
+            return "forecast"
+        return str(getattr(cfg, "plan_mode", "forecast")).strip().lower()
+    except Exception:  # noqa: BLE001
+        return "forecast"
 
 
 _DEFAULT_MAX_NUDGE_REPLAYS: int = 3
@@ -387,7 +436,28 @@ class SequentialExecutor(Executor):
         # duck-typed so third-party AgentAdapter implementations that
         # predate the overlay refactor still work under ``overlay_mode=False``
         # (the caller's choice).
-        if self.overlay_mode and callable(getattr(adapter, "invoke_passthrough", None)):
+        _uses_overlay = self.overlay_mode and callable(
+            getattr(adapter, "invoke_passthrough", None)
+        )
+        if not _uses_overlay and _executor_plan_mode(steerer) == "ledger":
+            # AGENCY-PRESERVATION.md PR 11(c) misconfiguration guard.
+            # Ledger plan mode expects OVERLAY execution: the coordinator
+            # drives and OUTCOME deliverables are never per-task
+            # dispatched. The legacy per-task loop WOULD try to invoke an
+            # assignee-less OUTCOME root. We deliberately do NOT change the
+            # legacy scheduler (forecast risk for zero benefit); instead we
+            # warn loudly so the misconfiguration is visible.
+            log.warning(
+                "SequentialExecutor.run: plan_mode=ledger but the legacy "
+                "per-task loop was selected (overlay_mode=%s, "
+                "invoke_passthrough=%s). Ledger plan mode expects overlay "
+                "execution; OUTCOME deliverables are not per-task "
+                "dispatchable. Use SequentialExecutor(overlay_mode=True) "
+                "with an adapter exposing invoke_passthrough.",
+                self.overlay_mode,
+                callable(getattr(adapter, "invoke_passthrough", None)),
+            )
+        if _uses_overlay:
             return await self._run_overlay(
                 plan=plan,
                 session=session,
@@ -1430,6 +1500,17 @@ class SequentialExecutor(Executor):
                 continue
             break
 
+        # --- Outcome-progress finalize (AGENCY-PRESERVATION.md PR 11c).
+        #     The passthrough loop has ended; in ledger plan mode, judge
+        #     the OUTCOME deliverables now — BEFORE the #208 PENDING
+        #     disposition and the fatal-failure gate below — so met
+        #     deliverables land COMPLETED, CONFIDENTLY-unmet ones become
+        #     FAILED (flowing through the existing fatal-failure path),
+        #     and uncertain ones stay PENDING to carry forward exactly
+        #     like a #208 reachable-PENDING task. Ledger-gated inside the
+        #     steerer; a no-op in forecast mode.
+        await _finalize_outcomes_at_run_boundary(steerer, session)
+
         # --- End-of-overlay PENDING disposition (goldfive#163, revised
         #     by goldfive#208). The tree finished its natural flow; we
         #     now have to decide what to do with PENDING tasks the tree
@@ -2232,14 +2313,26 @@ def _any_failed(plan: Plan) -> bool:
 
 
 def _has_live_pending_or_running(plan: Plan) -> bool:
-    """Return True if the plan has any PENDING or RUNNING task left.
+    """Return True if the plan has any non-OUTCOME PENDING/RUNNING task.
 
     Used by the overlay's nudge-replay gate (goldfive#202): a queued
     nudge should only trigger a re-invoke when there is actually
     outstanding work for the coordinator to do. Guards against replaying
     against a terminated plan.
+
+    AGENCY-PRESERVATION.md PR 11(c): OUTCOME-kind tasks (ledger
+    deliverables) are EXCLUDED. They stay PENDING for the whole run — the
+    agent never works on them directly — so counting them would make this
+    gate perpetually true and strip its discriminating power (it would
+    replay even when no real agent work remains). Only DISCOVERED /
+    forecast tasks count as "live work justifying a replay". A no-op in
+    forecast mode, where no OUTCOME-kind tasks exist.
     """
-    return any(t.status in (TaskStatus.PENDING, TaskStatus.RUNNING) for t in plan.tasks)
+    return any(
+        t.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+        and getattr(t, "kind", None) is not TaskKind.OUTCOME
+        for t in plan.tasks
+    )
 
 
 def _steerer_should_inject(steerer: Any) -> bool:

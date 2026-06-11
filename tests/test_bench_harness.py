@@ -46,6 +46,7 @@ from bench.harness import (  # noqa: E402
 )
 from bench.shadow_diff import (  # noqa: E402
     ShadowDiffError,
+    SignalRecord,
     diff_two_logs,
     load_signals,
     render_two_log_text,
@@ -160,15 +161,18 @@ async def test_shadow_diff_surfaces_cancel_authority_divergence(tmp_path: Path) 
     assert kd.legacy["would_cancel_inflight"] is True
     assert kd.new["would_cancel_inflight"] is False
 
-    # The looping WARNING key never cancels under either regime, so it does
-    # NOT diverge on the cancel-authority dimension this test pins. (Since
-    # AGENCY-PRESERVATION.md PR 6 it DOES diverge on ``channel`` — the signal
-    # arm rides the new ``request_context`` observer-note channel while the
-    # legacy arm rides ``nudge_replay`` — which is the expected per-regime
-    # transport difference, not a cancel-authority divergence.)
+    # The looping WARNING key never cancels under either regime, so it is NOT
+    # a decision divergence. Since PR 6 it DOES ride a different transport (the
+    # signal arm rides ``request_context``, the legacy arm ``nudge_replay``) —
+    # but channel/channel_action are per-regime transport identity, excluded
+    # from the divergence-driving set, so the key reports as transport-only,
+    # not diverged.
     looping = [k for k in report.keys if k.kind == "looping_tool_call"]
     assert looping
     assert "would_cancel_inflight" not in looping[0].diverged_fields
+    assert not looping[0].diverged
+    assert looping[0].transport_only
+    assert "channel" in looping[0].transport_fields
 
     # The rendered report names the divergence (the reviewed §5.4 artifact).
     text = render_two_log_text(report)
@@ -192,6 +196,67 @@ async def test_single_log_census(tmp_path: Path) -> None:
     # In the legacy log the OFF_TOPIC delivery would cancel in-flight work,
     # so its single-event legacy-vs-new derivation diverges.
     assert any(d["kind"] == "off_topic" for d in census["diverging_events"])
+
+
+# ---------------------------------------------------------------------------
+# 4b. Transport (channel/channel_action) is excluded from decision divergence
+# ---------------------------------------------------------------------------
+
+
+def _rec(seq: int, *, channel: str, channel_action: str, **decision: object) -> SignalRecord:
+    dec = {"channel_action": channel_action, **decision}
+    return SignalRecord(
+        sequence=seq,
+        drift_id=f"d{seq}",
+        kind="off_topic",
+        task_id="t0",
+        channel=channel,
+        severity="warning",
+        turn=1,
+        dry_run=True,
+        ladder_level=str(decision.get("ladder_level", "nudge")),
+        note_text="",
+        decision=dec,
+    )
+
+
+def test_channel_difference_alone_is_transport_not_divergence() -> None:
+    """A key differing ONLY in channel/channel_action is transport-only."""
+    legacy = [
+        _rec(1, channel="nudge_replay", channel_action="queued", would_cancel_inflight=False)
+    ]
+    new = [
+        _rec(1, channel="request_context", channel_action="enqueued", would_cancel_inflight=False)
+    ]
+    report = diff_two_logs(legacy, new)
+    kd = report.keys[0]
+    assert not kd.diverged
+    assert kd.transport_only
+    assert set(kd.transport_fields) == {"channel", "channel_action"}
+    assert report.diverged_keys == []
+    assert len(report.transport_only_keys) == 1
+    # The verdict reflects "no decision divergence" despite the transport swap.
+    text = render_two_log_text(report)
+    assert "no decision divergence" in text
+    assert "transport-only (channel): 1" in text
+
+
+def test_real_decision_divergence_survives_transport_difference() -> None:
+    """A genuine decision diff (would_cancel_inflight) still diverges even when
+    the channel also differs — transport never masks a real divergence."""
+    legacy = [
+        _rec(1, channel="nudge_replay", channel_action="queued", would_cancel_inflight=True)
+    ]
+    new = [
+        _rec(1, channel="request_context", channel_action="enqueued", would_cancel_inflight=False)
+    ]
+    report = diff_two_logs(legacy, new)
+    kd = report.keys[0]
+    assert kd.diverged
+    assert "would_cancel_inflight" in kd.diverged_fields
+    # channel still differs, recorded as informational transport (not masking).
+    assert "channel" in kd.transport_fields
+    assert not kd.transport_only  # it IS a real divergence, not transport-only
 
 
 # ---------------------------------------------------------------------------
