@@ -101,7 +101,7 @@ __all__ = [
     "GOAL_QUESTION",
     "OBSERVER_NOTE_BLOCK_BEGIN",
     "OBSERVER_NOTE_BLOCK_END",
-    "OBSERVER_NOTE_MARKER",
+    "OBSERVER_NOTE_MARKER_PREFIX",
     "compose_note_for_drift",
     "compose_observer_note",
     "compose_status_line",
@@ -125,14 +125,14 @@ ADVISORY_FOOTER: str = (
 #: :class:`~goldfive.context_editor.PruneStaleSteerRule` detects goldfive
 #: notes by matching this substring. Both sides import from here so the
 #: constant can never drift between the writer and the reader.
-OBSERVER_NOTE_MARKER: str = "[GOLDFIVE OBSERVER NOTE"
+OBSERVER_NOTE_MARKER_PREFIX: str = "[GOLDFIVE OBSERVER NOTE"
 
 #: The full opening / closing lines of a rendered observer-note block.
-#: Derived from :data:`OBSERVER_NOTE_MARKER` so the detection prefix is
-#: guaranteed to be a prefix of the rendered opening line. The PR 6
-#: channel wraps each delivered note between these two lines.
+#: Derived from :data:`OBSERVER_NOTE_MARKER_PREFIX` so the detection
+#: prefix is guaranteed to be a prefix of the rendered opening line. The
+#: PR 6 channel wraps each delivered note between these two lines.
 OBSERVER_NOTE_BLOCK_BEGIN: str = (
-    f"{OBSERVER_NOTE_MARKER} — from an external monitoring layer, "
+    f"{OBSERVER_NOTE_MARKER_PREFIX} — from an external monitoring layer, "
     "not from the user]"
 )
 OBSERVER_NOTE_BLOCK_END: str = "[/GOLDFIVE OBSERVER NOTE]"

@@ -849,10 +849,13 @@ async def test_prune_stale_steer_keeps_active_note() -> None:
 async def test_prune_stale_steer_detects_observer_note_marker() -> None:
     """A note bearing the canonical OBSERVER_NOTE block marker (no footer)
     is detected — pins the single-source marker import from observer_notes."""
-    from goldfive.observer_notes import OBSERVER_NOTE_BLOCK_BEGIN, OBSERVER_NOTE_MARKER
+    from goldfive.observer_notes import (
+        OBSERVER_NOTE_BLOCK_BEGIN,
+        OBSERVER_NOTE_MARKER_PREFIX,
+    )
 
     # The detection marker must be a prefix of the rendered block opening.
-    assert OBSERVER_NOTE_BLOCK_BEGIN.startswith(OBSERVER_NOTE_MARKER)
+    assert OBSERVER_NOTE_BLOCK_BEGIN.startswith(OBSERVER_NOTE_MARKER_PREFIX)
 
     sink = InMemorySink()
     editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[sink])
