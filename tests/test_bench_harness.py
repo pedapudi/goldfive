@@ -160,9 +160,15 @@ async def test_shadow_diff_surfaces_cancel_authority_divergence(tmp_path: Path) 
     assert kd.legacy["would_cancel_inflight"] is True
     assert kd.new["would_cancel_inflight"] is False
 
-    # The looping WARNING key never cancels under either regime → no divergence.
+    # The looping WARNING key never cancels under either regime, so it does
+    # NOT diverge on the cancel-authority dimension this test pins. (Since
+    # AGENCY-PRESERVATION.md PR 6 it DOES diverge on ``channel`` — the signal
+    # arm rides the new ``request_context`` observer-note channel while the
+    # legacy arm rides ``nudge_replay`` — which is the expected per-regime
+    # transport difference, not a cancel-authority divergence.)
     looping = [k for k in report.keys if k.kind == "looping_tool_call"]
-    assert looping and not looping[0].diverged
+    assert looping
+    assert "would_cancel_inflight" not in looping[0].diverged_fields
 
     # The rendered report names the divergence (the reviewed §5.4 artifact).
     text = render_two_log_text(report)
