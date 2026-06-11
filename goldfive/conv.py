@@ -21,6 +21,7 @@ from goldfive.types import (
     SupersessionKind,
     Task,
     TaskEdge,
+    TaskKind,
     TaskStatus,
 )
 
@@ -185,6 +186,35 @@ def _supersession_kind_from_pb(value: int) -> SupersessionKind:
     return SupersessionKind.UNSPECIFIED
 
 
+def _task_kind_to_pb(kind: TaskKind) -> int:
+    """Translate a :class:`TaskKind` member to its proto int value.
+
+    Missing / unknown values fall back to ``TASK_KIND_FORECAST`` (the
+    proto3 value-0 default) so a legacy Task with no kind set round-trips
+    as FORECAST and forecast-mode serialisation stays byte-identical
+    (value-0 fields are not written to the wire).
+    """
+    pb = _pb_module()
+    name = f"TASK_KIND_{kind.name}" if isinstance(kind, TaskKind) else ""
+    return getattr(pb, name, getattr(pb, "TASK_KIND_FORECAST", 0))
+
+
+def _task_kind_from_pb(value: int) -> TaskKind:
+    """Translate a proto :class:`TaskKind` int back to the dataclass enum."""
+    pb = _pb_module()
+    try:
+        name = pb.TaskKind.Name(value)
+    except (ValueError, AttributeError):
+        return TaskKind.FORECAST
+    if name.startswith("TASK_KIND_"):
+        member = name[len("TASK_KIND_") :]
+        try:
+            return TaskKind[member]
+        except KeyError:
+            return TaskKind.FORECAST
+    return TaskKind.FORECAST
+
+
 def to_pb_task(task: Task) -> Any:
     pb = _pb_module()
     msg = pb.Task(
@@ -205,6 +235,12 @@ def to_pb_task(task: Task) -> Any:
         # tasks (discovered=False, hash="").
         discovered=task.discovered,
         discovery_identity_hash=task.discovery_identity_hash,
+        # AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode overlay.
+        # FORECAST (the dataclass default) maps to the proto3 value-0
+        # default, so forecast-mode tasks serialise byte-identically to
+        # pre-PR-10. OUTCOME / DISCOVERED only appear in ledger mode.
+        kind=_task_kind_to_pb(task.kind),
+        contributes_to=task.contributes_to,
     )
     return msg
 
@@ -227,6 +263,12 @@ def from_pb_task(msg: Any) -> Task:
         # (``discovered=False``, ``discovery_identity_hash=""``).
         discovered=bool(getattr(msg, "discovered", False) or False),
         discovery_identity_hash=getattr(msg, "discovery_identity_hash", "") or "",
+        # AGENCY-PRESERVATION.md Stage 3 PR 10 — back-compat via
+        # ``getattr`` so old serialised events (pre-PR-10 wire format
+        # without these fields) deserialize cleanly with the dataclass
+        # defaults (``kind=TaskKind.FORECAST``, ``contributes_to=""``).
+        kind=_task_kind_from_pb(getattr(msg, "kind", 0) or 0),
+        contributes_to=getattr(msg, "contributes_to", "") or "",
     )
 
 

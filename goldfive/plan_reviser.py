@@ -113,6 +113,7 @@ from goldfive.types import (
     SupersessionKind,
     Task,
     TaskEdge,
+    TaskKind,
     TaskStatus,
     add_tasks,
     bump_revision,
@@ -148,6 +149,23 @@ class PlanReviser:
         # ``_emit_plan_revision_transitions`` when a revision changes
         # task statuses out-of-band.
         self._steerer = steerer
+
+    def _ledger_mode(self) -> bool:
+        """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 10. Reads through
+        ``steerer._steering_config.plan_mode`` (the typed config), exactly
+        as the pin path reads ``descriptive_growth_enabled``. Defensive:
+        any read failure (custom steerer without a typed config, test
+        stub) resolves to forecast mode, keeping the legacy behaviour.
+        """
+        try:
+            cfg = getattr(self._steerer, "_steering_config", None)
+            if cfg is None:
+                return False
+            return str(getattr(cfg, "plan_mode", "forecast")).strip().lower() == "ledger"
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------
     # Public install entry points (4 + 1 back-compat shim)
@@ -810,6 +828,17 @@ class PlanReviser:
         from goldfive.events import build_plan_revision_diff
 
         identity_hash = discovery_identity_hash(agent_name, tool_args_json or None)
+        # AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode. In
+        # ledger mode the descriptively-grown task is the means-level
+        # DISCOVERED trajectory record; in forecast mode the ledger
+        # taxonomy is unused, so the grown task keeps the FORECAST default
+        # and forecast-mode behaviour stays byte-identical (the
+        # ``discovered=True`` bool is the only overlay it carries, exactly
+        # as before PR 10). Read off the steerer's typed config the same
+        # way the pin path reads ``descriptive_growth_enabled``.
+        discovered_kind = (
+            TaskKind.DISCOVERED if self._ledger_mode() else TaskKind.FORECAST
+        )
         # Explicit ``title`` / ``description`` overrides (None → derive
         # from the observed ``tool_args_json`` as before) let the
         # agent-authored ``report_new_work_discovered`` reroute
@@ -908,6 +937,7 @@ class PlanReviser:
                 status=TaskStatus.PENDING,
                 discovered=True,
                 discovery_identity_hash=identity_hash,
+                kind=discovered_kind,
             )
 
             if current_plan is None:

@@ -469,6 +469,27 @@ class Runner:
     # per-session Conversation lookup
     # ------------------------------------------------------------------
 
+    def _resolve_plan_mode(self) -> str:
+        """Return the steerer's plan mode ("forecast" / "ledger").
+
+        AGENCY-PRESERVATION.md Stage 3 PR 10. The Runner threads
+        ``SteeringConfig.plan_mode`` into the per-turn planner ``context``
+        so :meth:`LLMPlanner.generate` / :meth:`LLMPlanner.handle_turn`
+        can switch to the OUTCOME-deliverable prompts in ledger mode —
+        the planner-side analogue of the pin path reading
+        ``descriptive_growth_enabled`` off the steerer. Defensive: any
+        read failure (custom steerer without a typed config) resolves to
+        ``"forecast"``, the bit-identical default.
+        """
+        try:
+            cfg = getattr(self.steerer, "_steering_config", None)
+            if cfg is None:
+                return "forecast"
+            mode = str(getattr(cfg, "plan_mode", "forecast")).strip().lower()
+            return "ledger" if mode == "ledger" else "forecast"
+        except Exception:  # noqa: BLE001
+            return "forecast"
+
     def _conversation_key(self, session_id: str | None) -> str:
         """Map an optional outer-session-id pin to the lookup key.
 
@@ -809,6 +830,11 @@ class Runner:
             if context:
                 planner_context.update(context)
             planner_context["run_id"] = session.run_id
+            # AGENCY-PRESERVATION.md Stage 3 PR 10 — surface the plan mode
+            # to the planner so ledger mode produces OUTCOME deliverables.
+            # Set last so a caller-supplied context cannot silently
+            # override the steerer-configured mode.
+            planner_context["plan_mode"] = self._resolve_plan_mode()
             try:
                 next_plan = await self.planner.generate(
                     goals=session.goals,
@@ -1590,6 +1616,10 @@ class Runner:
         if context:
             planner_context.update(context)
         planner_context["run_id"] = session.run_id
+        # AGENCY-PRESERVATION.md Stage 3 PR 10 — surface the plan mode to
+        # the planner so ledger mode produces OUTCOME-deliverable
+        # revisions. Set last so caller context cannot override it.
+        planner_context["plan_mode"] = self._resolve_plan_mode()
         return await self.planner.handle_turn(
             user_input=user_input,
             session=session,
