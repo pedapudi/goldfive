@@ -732,6 +732,35 @@ selects the channel:
 
 Env: `GOLDFIVE_STEER_SIGNAL_CHANNEL=request_context`.
 
+**Pacing — minimum-intervention grace windows (AGENCY-PRESERVATION.md
+PR 8).** Under `request_context`, a signal for a `(drift_kind, task)`
+key is gated by three ordered gates before dispatch
+(`DriftObserver._signal_pacing_decision`):
+
+1. **fresh user steer** — a user-authored `active_steer` within the #441
+   `suppression_window_turns` suppresses the goldfive signal (the
+   operator's correction is already in flight);
+2. **same-key grace window** — after a note for the key is *rendered*,
+   that key cannot re-signal or escalate for `grace_window_turns`
+   logical turns (default 3). It keys on **visibility** — the
+   `ObserverNoteQueue.last_rendered_turn` (stamped at render), NOT the
+   SignalLedger's dispatch turn: under request_context dispatch and
+   render can be turns apart, and an enqueued-but-never-rendered note
+   never started a window (the agent has not seen it);
+3. **per-request coalescing** — `peek_for_render` already renders ≤1
+   block per request (most-severe wins).
+
+Past the window the same key re-signals (the 2nd note is re-authored
+quoting the first — a self-reference is lower-footprint than a fresh
+statement); the 3rd occurrence (`>= REFINE_FAILURE_THRESHOLD` prior
+signals) escalates to `PAUSE_ESCALATE`. Resolution attribution is
+likewise **visibility-keyed**: `self_corrected_after_signal` requires
+the agent to have actually *seen* a note (the queue's rendered set); a
+note dispatched but never rendered resolves `self_corrected_unaided`.
+`grace_window_turns=0` disables the window (the pre-PR-8 behaviour); the
+legacy channel has no queue notes so PR 8 is a no-op there (§5.1). Env:
+`GOLDFIVE_STEER_GRACE_WINDOW_TURNS`.
+
 ---
 
 ## §6. References

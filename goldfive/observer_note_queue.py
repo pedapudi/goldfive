@@ -348,6 +348,61 @@ class ObserverNoteQueue:
                 best = n
         return best
 
+    # -- pacing reads (AGENCY-PRESERVATION.md PR 8) -----------------------
+    #
+    # The grace window keys on VISIBILITY — when a note for a ``(kind, task)``
+    # key was actually RENDERED onto a surface (``delivered_turn``, stamped by
+    # :meth:`mark_delivered`) — NOT on when it was dispatched/enqueued. Under
+    # ``request_context`` a dispatch and its render can be turns apart (the
+    # note waits in the queue until a surface peeks it), so the SignalLedger's
+    # dispatch-turn record is the wrong clock for "has the agent had time to
+    # self-correct since it SAW the signal?" (binding requirement, #462
+    # review). PR 8 reads these; PR 6's ``delivered`` flag supplies them.
+
+    def last_rendered_turn(self, kind: str, task_id: str) -> int:
+        """Return the most-recent render turn for a ``(kind, task)`` key.
+
+        The max ``delivered_turn`` over delivered (rendered) notes matching
+        ``(kind, task_id)``; ``-1`` when no note for that key has been
+        rendered yet. This is the grace-window anchor: an enqueued-but-never-
+        rendered note returns ``-1`` (it never started a grace window — the
+        agent has not seen it).
+        """
+        k = str(kind or "")
+        t = str(task_id or "")
+        best = -1
+        for n in self.notes():
+            if n.kind == k and n.task_id == t and n.delivered:
+                best = max(best, int(n.delivered_turn))
+        return best
+
+    def signal_count(self, kind: str, task_id: str) -> int:
+        """Return the number of notes ENQUEUED for a ``(kind, task)`` key.
+
+        Each enqueue is one signal that passed the upstream gates (re-fires
+        suppressed inside a grace window are never enqueued — see the dispatch
+        path), so this is the escalation counter: count ``0`` is the first
+        signal, ``1`` the second (re-authored quoting the first), and
+        ``>= REFINE_FAILURE_THRESHOLD`` escalates to a pause.
+        """
+        k = str(kind or "")
+        t = str(task_id or "")
+        return sum(1 for n in self.notes() if n.kind == k and n.task_id == t)
+
+    def rendered_keys(self) -> set[tuple[str, str]]:
+        """Return every ``(kind, task)`` that has at least one RENDERED note.
+
+        The visibility source of truth for ``self_corrected_after_signal``
+        attribution (binding requirement): a key resolves ``after_signal`` only
+        if the agent actually SAW a note for it; an enqueued-but-never-rendered
+        key resolves ``self_corrected_unaided``.
+        """
+        out: set[tuple[str, str]] = set()
+        for n in self.notes():
+            if n.delivered:
+                out.add((n.kind, n.task_id))
+        return out
+
     # -- mutators --------------------------------------------------------
 
     def enqueue(

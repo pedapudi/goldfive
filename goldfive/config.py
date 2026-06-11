@@ -920,6 +920,25 @@ class SteeringConfig:
     #: then lets them keep the pin if their tree depends on it.
     #: Env: ``GOLDFIVE_STEER_PIN_ASSIGNED_TASK``.
     pin_assigned_task: bool = False
+    #: AGENCY-PRESERVATION.md Stage 2 PR 8 — minimum-intervention pacing for
+    #: the observer-note channel. After a note for a ``(drift_kind, task)`` key
+    #: is RENDERED to the agent, that key cannot re-signal or escalate for this
+    #: many *logical turns* (``Session._reasoning_turn`` — the goldfive#441
+    #: clock; one tick per reasoning observation). The window keys on actual
+    #: VISIBILITY (the ObserverNoteQueue's ``delivered_turn``, stamped at
+    #: render), NOT the dispatch turn — under ``request_context`` dispatch and
+    #: render can be turns apart. Detectors keep running; a key resolving inside
+    #: the window still records ``self_corrected_after_signal``. After the
+    #: window the same key re-signals (the 2nd note re-authored quoting the
+    #: first); the 3rd occurrence escalates to a pause (REFINE_FAILURE_THRESHOLD
+    #: semantics).
+    #:
+    #: Default ``3``. ``0`` disables the grace window (every drift re-signals
+    #: immediately — the pre-PR-8 behaviour). Only takes effect under
+    #: ``signal_channel == "request_context"`` (the queue tracks visibility
+    #: there); the legacy regime has no queue notes, so PR 8 is a no-op there
+    #: (§5.1). Env: ``GOLDFIVE_STEER_GRACE_WINDOW_TURNS``.
+    grace_window_turns: int = 3
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -950,6 +969,11 @@ class SteeringConfig:
         * ``GOLDFIVE_STEER_LEGACY_LADDER`` — boolean. The PR-7 escape hatch
           restoring the pre-PR-7 ladder cells + promotion side-effects
           (AGENCY-PRESERVATION.md PR 7 / §5.8); default ``False``.
+        * ``GOLDFIVE_STEER_GRACE_WINDOW_TURNS`` — positive int. The PR-8
+          minimum-intervention grace window in logical turns
+          (AGENCY-PRESERVATION.md PR 8); default ``3``. (Set ``0`` to disable
+          via the typed config; ``_read_int_env`` rejects non-positive env
+          values, so the env minimum is ``1``.)
         """
         defaults = cls()
         raw_rules = os.environ.get("GOLDFIVE_STEER_CONTEXT_EDITOR_RULES", "").strip()
@@ -998,6 +1022,10 @@ class SteeringConfig:
             pin_assigned_task=_read_bool_env(
                 "GOLDFIVE_STEER_PIN_ASSIGNED_TASK",
                 defaults.pin_assigned_task,
+            ),
+            grace_window_turns=_read_int_env(
+                "GOLDFIVE_STEER_GRACE_WINDOW_TURNS",
+                defaults.grace_window_turns,
             ),
         )
 

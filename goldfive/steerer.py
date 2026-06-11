@@ -634,6 +634,18 @@ class DefaultSteerer:
         self._legacy_ladder: bool = bool(
             getattr(steering_config, "legacy_ladder", False)
         )
+        # AGENCY-PRESERVATION.md PR 8: minimum-intervention grace window. After
+        # a note for a ``(kind, task)`` key is RENDERED, that key can't
+        # re-signal/escalate for this many logical turns (default 3; 0
+        # disables). The drift observer reads this in the signal-pacing gate,
+        # keyed on the ObserverNoteQueue's render-visibility (NOT the ledger's
+        # dispatch turn). Only active under ``signal_channel ==
+        # "request_context"`` (the queue tracks visibility there).
+        try:
+            _grace = int(getattr(steering_config, "grace_window_turns", 3))
+        except (TypeError, ValueError):
+            _grace = 3
+        self._grace_window_turns: int = max(0, _grace)
         # Background reasoning-judge tasks (goldfive#251). The LLM-judge
         # path in :meth:`observe_reasoning` is fire-and-forget so the
         # adapter's model-response callback can return immediately and

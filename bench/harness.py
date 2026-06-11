@@ -124,6 +124,7 @@ KNOWN_STEER_ENV: frozenset[str] = frozenset(
         "GOLDFIVE_STEER_SIGNAL_CHANNEL",  # PR 6 — SteeringConfig.from_env now reads it
         "GOLDFIVE_STEER_LEGACY_LADDER",  # PR 7 — SteeringConfig.from_env now reads it
         "GOLDFIVE_STEER_PIN_ASSIGNED_TASK",  # PR 9 — SteeringConfig.from_env now reads it
+        "GOLDFIVE_STEER_GRACE_WINDOW_TURNS",  # PR 8 — SteeringConfig.from_env now reads it
     }
 )
 
@@ -649,8 +650,32 @@ async def inject_demo_signals(
         authored_by="goldfive",
     )
     await steerer.drift._dispatch_nudge(looping, drift_session)
+    # AGENCY-PRESERVATION.md PR 8: self_corrected_after_signal attribution is
+    # now keyed on VISIBILITY (the ObserverNoteQueue's rendered set), not on
+    # dispatch. Under request_context with active steering the synthetic driver
+    # stands in for a delivery surface (before_model / boundary) actually
+    # SHOWING the queued notes — render them so the resolution attributes
+    # after_signal. Under observation_only (the shadow arms) we deliberately do
+    # NOT render: the note is never really shown, so the key resolves
+    # self_corrected_unaided (the §2 base-rate the shadow campaign measures).
+    if (
+        runtime.steering.signal_channel == "request_context"
+        and not runtime.steering.observation_only
+    ):
+        from goldfive.observer_note_queue import ObserverNoteQueue
+
+        rq = ObserverNoteQueue.for_session(drift_session)
+        render_turn = int(getattr(drift_session, "_reasoning_turn", 0) or 0)
+        for note in rq.pending():
+            rq.mark_delivered(
+                note.note_id,
+                channel="request_context",
+                turn=render_turn,
+                surface="bench_render",
+            )
     # Resolve the bound task → SignalOutcome for both delivered keys
-    # (self_corrected_unaided under observation_only, after_signal otherwise).
+    # (self_corrected_unaided under observation_only / unrendered,
+    # after_signal once rendered).
     await steerer.tasks.mark_task_completed("dt0", session=drift_session, summary="done")
     # Finalize any still-open delivered keys at the run boundary (idempotent).
     await steerer.drift.finalize_signal_ledger(drift_session)
