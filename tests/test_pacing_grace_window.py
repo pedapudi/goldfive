@@ -150,6 +150,35 @@ def test_rendered_keys_only_includes_rendered() -> None:
     assert q.rendered_keys() == {("looping_tool_call", "t1")}
 
 
+def test_pacing_reads_exclude_correction_notes() -> None:
+    """Task-#11 correction notes are not drift signals — excluded from the
+    grace window / escalation / attribution reads (composition with #468)."""
+    from goldfive.observer_note_queue import CORRECTION_DRIFT_ID_PREFIX
+
+    session = _session()
+    q = ObserverNoteQueue.for_session(session)
+    # A RENDERED correction note for (off_topic, t1).
+    cid = f"{CORRECTION_DRIFT_ID_PREFIX}writer:t1:1"
+    q.enqueue(
+        body="b", observation="o", severity="warning", drift_id=cid,
+        kind="off_topic", task_id="t1", agent_id="writer", turn=2,
+    )
+    q.mark_delivered(cid, channel="request_context", turn=2)
+    # The correction does NOT count as a signal render / count / rendered key.
+    assert q.last_rendered_turn("off_topic", "t1") == -1
+    assert q.signal_count("off_topic", "t1") == 0
+    assert ("off_topic", "t1") not in q.rendered_keys()
+    # A genuine drift-signal note for the SAME key IS counted.
+    q.enqueue(
+        body="b", observation="o", severity="warning", drift_id="real-uuid",
+        kind="off_topic", task_id="t1", turn=3,
+    )
+    q.mark_delivered("real-uuid", channel="request_context", turn=3)
+    assert q.last_rendered_turn("off_topic", "t1") == 3
+    assert q.signal_count("off_topic", "t1") == 1
+    assert ("off_topic", "t1") in q.rendered_keys()
+
+
 # ---------------------------------------------------------------------------
 # Ordered gates — _signal_pacing_decision
 # ---------------------------------------------------------------------------

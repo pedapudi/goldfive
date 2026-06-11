@@ -477,47 +477,73 @@ class ObserverNoteQueue:
     # self-correct since it SAW the signal?" (binding requirement, #462
     # review). PR 8 reads these; PR 6's ``delivered`` flag supplies them.
 
-    def last_rendered_turn(self, kind: str, task_id: str) -> int:
-        """Return the most-recent render turn for a ``(kind, task)`` key.
+    @staticmethod
+    def _is_signal_note(n: ObserverNote) -> bool:
+        """True for a drift-signal note, False for a task-#11 correction note.
 
-        The max ``delivered_turn`` over delivered (rendered) notes matching
-        ``(kind, task_id)``; ``-1`` when no note for that key has been
+        The PR-8 pacing reads (grace window / escalation / attribution) gate
+        and attribute goldfive's drift SIGNALS only. A *correction* note
+        (task #11 — drift_id carries :data:`CORRECTION_DRIFT_ID_PREFIX`) is a
+        distinct mechanism (plan-revision notice on the agent-scoped channel),
+        not a drift advisory: it must NOT start a signal grace window, count
+        toward signal escalation, or stand in for "the agent saw the SIGNAL"
+        in ``after_signal`` attribution. Corrections also carry no SignalLedger
+        entry, so excluding them keeps the queue pacing reads aligned with the
+        ledger's signal keys.
+        """
+        return not str(n.drift_id or "").startswith(CORRECTION_DRIFT_ID_PREFIX)
+
+    def last_rendered_turn(self, kind: str, task_id: str) -> int:
+        """Return the most-recent SIGNAL render turn for a ``(kind, task)`` key.
+
+        The max ``delivered_turn`` over delivered (rendered) *signal* notes
+        matching ``(kind, task_id)`` (correction notes excluded — see
+        :meth:`_is_signal_note`); ``-1`` when no signal for that key has been
         rendered yet. This is the grace-window anchor: an enqueued-but-never-
-        rendered note returns ``-1`` (it never started a grace window — the
+        rendered signal returns ``-1`` (it never started a grace window — the
         agent has not seen it).
         """
         k = str(kind or "")
         t = str(task_id or "")
         best = -1
         for n in self.notes():
-            if n.kind == k and n.task_id == t and n.delivered:
+            if n.kind == k and n.task_id == t and n.delivered and self._is_signal_note(n):
                 best = max(best, int(n.delivered_turn))
         return best
 
     def signal_count(self, kind: str, task_id: str) -> int:
-        """Return the number of notes ENQUEUED for a ``(kind, task)`` key.
+        """Return the number of SIGNAL notes ENQUEUED for a ``(kind, task)`` key.
 
         Each enqueue is one signal that passed the upstream gates (re-fires
         suppressed inside a grace window are never enqueued — see the dispatch
         path), so this is the escalation counter: count ``0`` is the first
         signal, ``1`` the second (re-authored quoting the first), and
-        ``>= REFINE_FAILURE_THRESHOLD`` escalates to a pause.
+        ``>= REFINE_FAILURE_THRESHOLD`` escalates to a pause. Correction notes
+        (task #11) are excluded — they are not drift signals and must not
+        trip signal escalation.
         """
         k = str(kind or "")
         t = str(task_id or "")
-        return sum(1 for n in self.notes() if n.kind == k and n.task_id == t)
+        return sum(
+            1
+            for n in self.notes()
+            if n.kind == k and n.task_id == t and self._is_signal_note(n)
+        )
 
     def rendered_keys(self) -> set[tuple[str, str]]:
-        """Return every ``(kind, task)`` that has at least one RENDERED note.
+        """Return every ``(kind, task)`` with at least one RENDERED SIGNAL note.
 
         The visibility source of truth for ``self_corrected_after_signal``
         attribution (binding requirement): a key resolves ``after_signal`` only
-        if the agent actually SAW a note for it; an enqueued-but-never-rendered
-        key resolves ``self_corrected_unaided``.
+        if the agent actually SAW a drift SIGNAL for it; an
+        enqueued-but-never-rendered key resolves ``self_corrected_unaided``.
+        Correction notes (task #11) are excluded — a rendered correction is
+        not "the agent saw the SIGNAL" (and corrections carry no ledger entry
+        to attribute anyway).
         """
         out: set[tuple[str, str]] = set()
         for n in self.notes():
-            if n.delivered:
+            if n.delivered and self._is_signal_note(n):
                 out.add((n.kind, n.task_id))
         return out
 
