@@ -5391,6 +5391,46 @@ def make_adk_plugin(
                     exc,
                 )
 
+            # Observer-note channel surface 1 (AGENCY-PRESERVATION.md PR 6).
+            # The most-severe pending advisory note is rendered as a
+            # marker-bracketed block on the request's system_instruction,
+            # reaching a mid-invocation agent on its next model call. Gated on
+            # ``signal_channel == "request_context"`` so the legacy default is
+            # byte-identical (the queue is never populated and this whole block
+            # is skipped). The shaper marks the note delivered (the exactly-once
+            # chokepoint) and returns it; we emit exactly one SignalDelivered at
+            # this actual-delivery moment. ``observation_only`` is honoured
+            # inside the shaper (block not appended; note consumed as a dry-run
+            # delivery). Best-effort: never raises into the callback path.
+            try:
+                if (
+                    ctx is not None
+                    and ctx.session is not None
+                    and getattr(ctx.steerer, "_signal_channel", "legacy_user_message")
+                    == "request_context"
+                ):
+                    delivered_note = self._prompt_shaper.inject_observer_note(
+                        llm_request=llm_request,
+                        session=ctx.session,
+                        session_context=ctx,
+                    )
+                    if delivered_note is not None and ctx.steerer is not None:
+                        drift_observer = getattr(ctx.steerer, "drift", None)
+                        emit = getattr(
+                            drift_observer, "_emit_signal_delivered_for_note", None
+                        )
+                        if callable(emit):
+                            await emit(
+                                ctx.session,
+                                delivered_note,
+                                surface="before_model",
+                            )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "before_model_callback: observer-note injection raised: %s",
+                    exc,
+                )
+
             # Request-side ContextEditor (goldfive#397). Runs AFTER all
             # additive prompt-shaping (planner + runtime tools hint
             # above; will become PromptShaper after Wave B1 lands) and
@@ -6549,7 +6589,84 @@ def make_adk_plugin(
                         "after_tool_callback: steerer.drift.observe raised: %s",
                         exc,
                     )
+
+            # Observer-note channel surface 4 (AGENCY-PRESERVATION.md PR 6):
+            # append-only, attributed tool-result annotation for loop-shaped
+            # drift. The drift handling above may have enqueued a loop note;
+            # land its factual one-liner adjacent to the repeated tool's
+            # result, at the moment of maximal relevance (the system-reminder
+            # pattern). Append-only — we return a shallow copy of the result
+            # dict with ONE new namespaced key, never touching the real result
+            # keys. Gated on ``signal_channel == "request_context"`` so the
+            # legacy default is byte-identical (returns None as before).
+            try:
+                annotated = await self._maybe_annotate_tool_result(ctx, result)
+                if annotated is not None:
+                    return annotated
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "after_tool_callback: observer-note annotation raised: %s",
+                    exc,
+                )
             return None
+
+        async def _maybe_annotate_tool_result(self, ctx: Any, result: Any) -> Any:
+            """Return an annotated copy of ``result`` for a loop note, or ``None``.
+
+            Surface 4 of the observer-note channel. Consumes the most-severe
+            pending *loop-shaped* note (``looping_tool_call`` /
+            ``looping_reasoning``) and appends its compact attributed
+            annotation under the reserved ``goldfive_observer_note`` key on a
+            shallow copy of the result mapping — append-only, the real result
+            is preserved verbatim. Marks the note delivered (exactly-once) and
+            emits exactly one ``SignalDelivered``. Returns ``None`` (no result
+            replacement) when not in request_context mode, the result is not a
+            mapping, or no loop note is pending — so the legacy path is
+            untouched.
+            """
+            if ctx is None or ctx.steerer is None or ctx.session is None:
+                return None
+            if (
+                getattr(ctx.steerer, "_signal_channel", "legacy_user_message")
+                != "request_context"
+            ):
+                return None
+            if not isinstance(result, Mapping):
+                return None
+            from goldfive.observer_note_queue import (
+                ObserverNoteQueue,
+                render_tool_annotation,
+            )
+
+            _LOOP_KINDS = frozenset({"looping_tool_call", "looping_reasoning"})
+            queue = ObserverNoteQueue.for_session(ctx.session)
+            note = queue.peek_for_render(kinds=_LOOP_KINDS)
+            if note is None:
+                return None
+            turn = int(_safe_attr(ctx.session, "_reasoning_turn", 0) or 0)
+            newly = queue.mark_delivered(
+                note.note_id,
+                channel="request_context",
+                turn=turn,
+                surface="tool_annotation",
+            )
+            if not newly:
+                return None
+            drift_observer = getattr(ctx.steerer, "drift", None)
+            emit = getattr(drift_observer, "_emit_signal_delivered_for_note", None)
+            if callable(emit):
+                try:
+                    await emit(ctx.session, note, surface="tool_annotation")
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "after_tool_callback: observer-note SignalDelivered "
+                        "emit raised: %s",
+                        exc,
+                    )
+            # Append-only: copy the result and add the reserved annotation key.
+            annotated = dict(result)
+            annotated["goldfive_observer_note"] = render_tool_annotation(note)
+            return annotated
 
     # goldfive#271 Phase 0 — wrap each callback in a state-audit
     # bookkeeping context so the runtime tripwire can recognise

@@ -614,6 +614,143 @@ class PromptShaper:
         resolver._goldfive_original_instruction = original_instruction  # type: ignore[attr-defined]
         return resolver
 
+    # ----------------------------------------------------------------
+    # Site 5 — observer-note channel (AGENCY-PRESERVATION.md PR 6)
+    # ----------------------------------------------------------------
+
+    def inject_observer_note(
+        self,
+        *,
+        llm_request: Any,
+        session: Any,
+        session_context: Any = None,
+    ) -> Any:
+        """Render the most-severe pending observer note onto the request.
+
+        Surface 1 of the PR 6 observer-note channel — the preferred surface,
+        reaching a *mid-invocation* agent on its next model call (which removes
+        the only remaining justification for cancel-as-information-delivery).
+        Uses the marker strip-and-refresh pattern (mirrors
+        :meth:`inject_runtime_tools_hint`): any prior observer-note block,
+        bracketed by
+        :data:`~goldfive.observer_note_queue.OBSERVER_NOTE_PREFIX` /
+        ``OBSERVER_NOTE_END``, is stripped from ``system_instruction`` before
+        the current one is appended — so two consecutive ``before_model`` calls
+        never stack blocks (the idempotency half of §5.2).
+
+        Per-request coalescing: at most ONE block is rendered, the most-severe
+        pending note wins
+        (:meth:`~goldfive.observer_note_queue.ObserverNoteQueue.peek_for_render`),
+        and that note is marked delivered — the exactly-once chokepoint, so the
+        invocation-boundary replay never re-delivers a note this surface showed.
+
+        Under ``observation_only=True`` (:meth:`should_inject` → ``False``) the
+        block is NOT appended (the strict-passive operator sees the raw prompt)
+        but the note is still consumed + returned, so a shadow-mode run records
+        ``SignalDelivered(dry_run=True)`` — what *would* have been delivered
+        (§5.4) — and the queue does not re-evaluate it.
+
+        Returns the :class:`~goldfive.observer_note_queue.ObserverNote` that was
+        delivered (the caller — the ADK plugin — emits exactly one
+        ``SignalDelivered`` for it), or ``None`` when nothing was pending (or on
+        a defensive failure). Best-effort: never raises into
+        ``before_model_callback``.
+
+        ``session`` MUST be the goldfive :class:`~goldfive.types.Session` (the
+        queue lives on goldfive ``Session.state``, the same dict the drift
+        observer enqueues onto — NOT ADK ``session.state``, which is
+        shallow-copied across the callback boundary).
+        """
+        try:
+            from goldfive.observer_note_queue import (
+                OBSERVER_NOTE_PREFIX,
+                ObserverNoteQueue,
+                render_block,
+                strip_prior_block,
+            )
+        except Exception:  # pragma: no cover - defensive import
+            return None
+
+        steerer = (
+            getattr(session_context, "steerer", None)
+            if session_context is not None
+            else None
+        )
+
+        config = _safe_attr(llm_request, "config", None)
+        if config is None:
+            return None
+        existing = getattr(config, "system_instruction", None)
+        # Strip any prior observer-note block regardless of whether we
+        # re-inject this call (strip-and-refresh: never stack blocks).
+        if isinstance(existing, str) and OBSERVER_NOTE_PREFIX in existing:
+            try:
+                config.system_instruction = strip_prior_block(existing) or None
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "PromptShaper.inject_observer_note: could not strip prior block: %s",
+                    exc,
+                )
+                return None
+            existing = getattr(config, "system_instruction", None)
+
+        try:
+            queue = ObserverNoteQueue.for_session(session)
+            note = queue.peek_for_render()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("PromptShaper.inject_observer_note: queue read raised: %s", exc)
+            return None
+        if note is None:
+            return None
+
+        if self.should_inject(steerer):
+            block = render_block(note)
+            append = getattr(llm_request, "append_instructions", None)
+            wrote = False
+            if callable(append):
+                try:
+                    append([block])
+                    wrote = True
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "PromptShaper.inject_observer_note: "
+                        "append_instructions raised: %s",
+                        exc,
+                    )
+            if not wrote:
+                # Fallback for stubs / requests without ``append_instructions``.
+                try:
+                    if not existing:
+                        config.system_instruction = block
+                    elif isinstance(existing, str):
+                        config.system_instruction = existing + "\n\n" + block
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "PromptShaper.inject_observer_note: "
+                        "could not write system_instruction: %s",
+                        exc,
+                    )
+        else:
+            log.info(
+                "PromptShaper.inject_observer_note: observation_only=True — "
+                "consuming note %s as a dry-run delivery "
+                "(system_instruction unchanged)",
+                getattr(note, "note_id", "?"),
+            )
+
+        turn = int(_safe_attr(session, "_reasoning_turn", 0) or 0)
+        try:
+            newly = queue.mark_delivered(
+                note.note_id,
+                channel="request_context",
+                turn=turn,
+                surface="before_model",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("PromptShaper.inject_observer_note: mark_delivered raised: %s", exc)
+            return None
+        return note if newly else None
+
 
 def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
     """Local copy of the defensive attribute reader used by the ADK plugin.

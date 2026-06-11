@@ -32,6 +32,7 @@ This module is pinned to the shapes in ``docs/design/PROTOCOLS.md``.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -56,6 +57,9 @@ except ImportError as _sdk_import_err:  # pragma: no cover
     _sdk = None  # type: ignore[assignment]
 else:
     _SDK_IMPORT_ERROR = None
+
+
+log = logging.getLogger("goldfive.adapters.claude")
 
 
 if TYPE_CHECKING:
@@ -282,6 +286,17 @@ class ClaudeAgentSDKAdapter:
             completed=session.completed_results,
         )
 
+        # Observer-note channel surface 3a (AGENCY-PRESERVATION.md PR 6):
+        # system-prompt section. In request_context mode, append the
+        # most-severe pending observer note as a marker-bracketed block. No-op
+        # under the legacy default (the queue is never populated) or
+        # observation_only. Best-effort: never blocks the invocation.
+        note_block = await self._consume_observer_note(
+            session, surface="claude_system_prompt"
+        )
+        if note_block:
+            system_prompt = f"{system_prompt}\n\n{note_block}"
+
         options = self._build_options(sdk=sdk, system_prompt=system_prompt, session=session)
 
         client = self._client_factory()
@@ -359,9 +374,24 @@ class ClaudeAgentSDKAdapter:
             hooks=[self._make_pretooluse_hook(session)],
         )
 
+        hooks: dict[str, Any] = {"PreToolUse": [hook_matcher]}
+        # Observer-note channel surface 3b (AGENCY-PRESERVATION.md PR 6):
+        # a PostToolUse hook surfaces the most-severe pending observer note as
+        # ``additionalContext`` adjacent to the tool use. Only registered in
+        # request_context mode so the legacy default (and every existing test,
+        # which never sets ``signal_channel``) keeps the unchanged single-hook
+        # options object.
+        if (
+            getattr(self._steerer, "_signal_channel", "legacy_user_message")
+            == "request_context"
+        ):
+            hooks["PostToolUse"] = [
+                sdk.HookMatcher(hooks=[self._make_posttooluse_hook(session)])
+            ]
+
         kwargs: dict[str, Any] = {
             "system_prompt": system_prompt,
-            "hooks": {"PreToolUse": [hook_matcher]},
+            "hooks": hooks,
         }
         if self._model is not None:
             kwargs["model"] = self._model
@@ -443,6 +473,110 @@ class ClaudeAgentSDKAdapter:
             }
 
         return _hook
+
+    def _make_posttooluse_hook(
+        self,
+        session: Session,
+    ) -> Callable[..., Awaitable[dict[str, Any]]]:
+        """Build the async ``PostToolUse`` hook (PR 6 observer-note surface 3b).
+
+        After each tool use the hook drains the most-severe pending observer
+        note (if any) and returns it as ``additionalContext`` — the
+        claude-agent-sdk equivalent of the ADK tool-result annotation. Marking
+        the note delivered on the queue keeps delivery exactly-once across
+        surfaces. Returns ``{}`` (no-op) when nothing is pending.
+        """
+
+        async def _hook(
+            _input_data: dict[str, Any],
+            _tool_use_id: str | None,
+            _context: Any,
+        ) -> dict[str, Any]:
+            try:
+                block = await self._consume_observer_note(
+                    session, surface="claude_posttooluse"
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("claude PostToolUse: observer-note consume raised: %s", exc)
+                return {}
+            if not block:
+                return {}
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": block,
+                },
+            }
+
+        return _hook
+
+    async def _consume_observer_note(
+        self,
+        session: Session,
+        *,
+        surface: str,
+    ) -> str | None:
+        """Consume the most-severe pending observer note for a claude surface.
+
+        Shared by the system-prompt section (3a) and the ``PostToolUse`` hook
+        (3b). Gated on ``signal_channel == "request_context"``. Marks the note
+        delivered (the exactly-once chokepoint), emits exactly one
+        ``SignalDelivered`` at this actual-delivery moment, and returns the
+        rendered block to inject — but only when the steerer's ``_should_inject``
+        gate is open (under ``observation_only`` the note is consumed as a
+        dry-run delivery and ``None`` is returned so nothing reaches the agent).
+        Returns ``None`` when nothing is pending. Best-effort: never raises.
+        """
+        steerer = self._steerer
+        if steerer is None:
+            return None
+        if (
+            getattr(steerer, "_signal_channel", "legacy_user_message")
+            != "request_context"
+        ):
+            return None
+        try:
+            from goldfive.observer_note_queue import ObserverNoteQueue, render_block
+
+            queue = ObserverNoteQueue.for_session(session)
+            note = queue.peek_for_render()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("claude adapter: observer-note queue read raised: %s", exc)
+            return None
+        if note is None:
+            return None
+        should = True
+        pred = getattr(steerer, "_should_inject", None)
+        if callable(pred):
+            try:
+                should = bool(pred())
+            except Exception:  # noqa: BLE001
+                should = True
+        turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+        try:
+            newly = queue.mark_delivered(
+                note.note_id,
+                channel="request_context",
+                turn=turn,
+                surface=surface,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("claude adapter: observer-note mark_delivered raised: %s", exc)
+            return None
+        if newly:
+            drift_observer = getattr(steerer, "drift", None)
+            emit = getattr(drift_observer, "_emit_signal_delivered_for_note", None)
+            if callable(emit):
+                try:
+                    await emit(session, note, surface=surface)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "claude adapter: observer-note SignalDelivered emit raised: %s",
+                        exc,
+                    )
+        if should and newly:
+            return render_block(note)
+        return None
 
 
 # --------------------------------------------------------------------------- #

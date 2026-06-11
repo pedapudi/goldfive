@@ -187,12 +187,23 @@ SIGNAL_CHANNEL_NUDGE_REPLAY = "nudge_replay"
 SIGNAL_CHANNEL_STEER_CONTROL = "steer_control"
 SIGNAL_CHANNEL_PAUSE_CONTROL = "pause_control"
 SIGNAL_CHANNEL_PROMOTION = "promotion"
+#: AGENCY-PRESERVATION.md PR 6 — the observer-note channel. A note delivered
+#: through any of the four observer-note surfaces (ADK ``before_model`` block,
+#: invocation-boundary replay, claude-agent-sdk system prompt / ``PostToolUse``,
+#: append-only tool-result annotation) rides this single channel value; the
+#: ``decision["delivery_surface"]`` field records which surface. The
+#: SignalLedger's ``(drift_id, channel)`` dedup therefore collapses the
+#: several surfaces to one delivery per note — the second exactly-once layer
+#: behind :class:`~goldfive.observer_note_queue.ObserverNoteQueue`'s
+#: ``delivered`` flag.
+SIGNAL_CHANNEL_REQUEST_CONTEXT = "request_context"
 
 SIGNAL_CHANNELS: tuple[str, ...] = (
     SIGNAL_CHANNEL_NUDGE_REPLAY,
     SIGNAL_CHANNEL_STEER_CONTROL,
     SIGNAL_CHANNEL_PAUSE_CONTROL,
     SIGNAL_CHANNEL_PROMOTION,
+    SIGNAL_CHANNEL_REQUEST_CONTEXT,
 )
 
 #: ``SignalOutcome.outcome`` vocabulary (AGENCY-PRESERVATION.md PR 5).
