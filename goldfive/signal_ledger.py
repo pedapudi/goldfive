@@ -427,15 +427,29 @@ class SignalLedger:
         *,
         task_id: str,
         turn: int,
+        rendered_keys: set[tuple[str, str]] | None = None,
     ) -> list[LedgerEntry]:
         """Resolve every open, delivered key bound to ``task_id``.
 
         Called when the task reaches a terminal state (the conservative
         "resolved" signal — we do not attempt to detect mid-task "progressing"
-        here; that never over-claims self-correction). A key with at least one
-        real (non-dry-run) delivery resolves ``self_corrected_after_signal``;
-        a key with only dry-run deliveries resolves ``self_corrected_unaided``
-        (the ``observation_only`` base-rate case).
+        here; that never over-claims self-correction).
+
+        Attribution (AGENCY-PRESERVATION.md PR 8, binding requirement from the
+        #462 review): ``after_signal`` requires the agent to have actually SEEN
+        a note, not merely that one was dispatched.
+
+        * ``rendered_keys`` given (the ``request_context`` regime) — a key
+          resolves ``self_corrected_after_signal`` ONLY if ``(drift_kind,
+          task_id)`` is in ``rendered_keys`` (the ObserverNoteQueue's
+          render-visibility set); a note dispatched but never rendered resolves
+          ``self_corrected_unaided``. Dispatch-time ``has_real_delivery`` is the
+          WRONG clock here — under request_context dispatch and render can be
+          turns apart, and an unrendered note never reached the agent.
+        * ``rendered_keys`` is ``None`` (the legacy ``nudge_replay`` regime,
+          where the queued message IS the delivery, and existing
+          observe-only / shadow tests) — fall back to the dispatch-time
+          ``has_real_delivery`` attribution (byte-identical to pre-PR-8).
         """
         store = self._read_all()
         resolved: list[LedgerEntry] = []
@@ -445,9 +459,13 @@ class SignalLedger:
                 continue
             if not entry.is_open or not entry.has_delivery:
                 continue
+            if rendered_keys is not None:
+                seen = (entry.drift_kind, entry.task_id) in rendered_keys
+            else:
+                seen = entry.has_real_delivery
             outcome = (
                 SIGNAL_OUTCOME_SELF_CORRECTED_AFTER_SIGNAL
-                if entry.has_real_delivery
+                if seen
                 else SIGNAL_OUTCOME_SELF_CORRECTED_UNAIDED
             )
             done = self._resolve_in_store(store, entry, outcome=outcome, turn=turn)

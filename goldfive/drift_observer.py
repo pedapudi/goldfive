@@ -962,6 +962,97 @@ class DriftObserver:
     # Observer-note channel (AGENCY-PRESERVATION.md PR 6)
     # ------------------------------------------------------------------
 
+    def _signal_pacing_decision(self, session: Session, drift: DriftEvent) -> str:
+        """Grace-window / escalation gate for a SIGNAL-level or promotion drift.
+
+        AGENCY-PRESERVATION.md PR 8 (minimum-intervention pacing). Returns one
+        of ``"proceed"`` / ``"suppress"`` / ``"escalate"`` for a
+        ``(drift.kind, drift.current_task_id)`` key:
+
+        * ``"suppress"`` — a note for the key was RENDERED within the last
+          ``grace_window_turns`` logical turns; the agent has not yet had a full
+          window to self-correct since it SAW the signal, so do not re-signal or
+          escalate. Keys on the ObserverNoteQueue's render-visibility
+          (``last_rendered_turn``), NOT the SignalLedger dispatch turn (binding
+          requirement: under request_context dispatch and render can be turns
+          apart).
+        * ``"escalate"`` — the key is past its grace window AND has already
+          signalled ``>= REFINE_FAILURE_THRESHOLD`` times (the 3rd-occurrence
+          rule); escalate to a pause rather than signal again.
+        * ``"proceed"`` — signal normally (the 1st note, or the 2nd which
+          ``_route_corrective_note`` re-authors quoting the first).
+
+        Only active under ``signal_channel == "request_context"`` with
+        ``grace_window_turns > 0`` (the queue tracks visibility there). The
+        legacy regime has no queue notes, so this returns ``"proceed"`` and PR 8
+        is a no-op there (§5.1). Best-effort: any failure degrades to
+        ``"proceed"`` so pacing never blocks a legitimate signal.
+        """
+        channel = getattr(self._steerer, "_signal_channel", "legacy_user_message")
+        if channel != "request_context":
+            # Legacy regime: no queue visibility, and the promotion path's #441
+            # gate is unchanged — PR 8 is a no-op here (§5.1).
+            return "proceed"
+        # Ordered gate 1: a fresh user steer suppresses the goldfive signal
+        # (the operator's correction is already in flight). Applies even when
+        # the grace window is disabled.
+        if self._user_steer_is_fresh(session):
+            return "suppress"
+        window = int(getattr(self._steerer, "_grace_window_turns", 0) or 0)
+        if window <= 0:
+            return "proceed"
+        try:
+            from goldfive.observer_note_queue import ObserverNoteQueue
+
+            queue = ObserverNoteQueue.for_session(session)
+            kind = drift.kind.value
+            task = drift.current_task_id or ""
+            current_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            # Ordered gate 2: same-key grace window, keyed on render-VISIBILITY
+            # (the queue's last render turn for the key), not the dispatch turn.
+            last_rendered = queue.last_rendered_turn(kind, task)
+            if last_rendered >= 0 and (current_turn - last_rendered) < window:
+                return "suppress"
+            # Past the window: the 3rd occurrence (>= REFINE_FAILURE_THRESHOLD
+            # prior signals) escalates to a pause. (Ordered gate 3, per-request
+            # coalescing, is enforced at render time by peek_for_render.)
+            if queue.signal_count(kind, task) >= self._steerer.REFINE_FAILURE_THRESHOLD:
+                return "escalate"
+            return "proceed"
+        except Exception as exc:  # noqa: BLE001 -- pacing must never wedge dispatch
+            log.debug("signal pacing decision failed: %s", exc)
+            return "proceed"
+
+    async def _apply_signal_pacing(
+        self, session: Session, drift: DriftEvent, decision: str
+    ) -> bool:
+        """Act on a non-``proceed`` :meth:`_signal_pacing_decision`.
+
+        Returns ``True`` when the caller should STOP (the signal was suppressed
+        or replaced by an escalation), ``False`` when it should proceed to the
+        normal signal dispatch. Centralises the suppress / escalate handling so
+        the promotion path and the ladder SIGNAL branch stay identical.
+        """
+        if decision == "suppress":
+            log.debug(
+                "DefaultSteerer: signal suppressed by grace window (kind=%s task=%s)",
+                drift.kind.value,
+                drift.current_task_id or "-",
+            )
+            return True
+        if decision == "escalate":
+            log.info(
+                "DefaultSteerer: signal escalated to pause — key re-signalled "
+                ">= REFINE_FAILURE_THRESHOLD times past its grace window "
+                "(kind=%s task=%s)",
+                drift.kind.value,
+                drift.current_task_id or "-",
+            )
+            await self._dispatch_pause_escalate(drift, session)
+            await self._record_signal_outcome_escalated(session, drift)
+            return True
+        return False
+
     async def _route_corrective_note(
         self,
         session: Session,
@@ -998,14 +1089,38 @@ class DriftObserver:
             from goldfive.observer_notes import observation_for_drift
 
             try:
+                queue = ObserverNoteQueue.for_session(session)
+                kind = drift.kind.value
+                task = drift.current_task_id or ""
                 observation, _question = observation_for_drift(drift)
-                ObserverNoteQueue.for_session(session).enqueue(
-                    body=note_text,
+                # AGENCY-PRESERVATION.md PR 8: the 2nd signal for a
+                # ``(kind, task)`` key is re-authored quoting the first — a
+                # self-reference is a lower-footprint reminder than a fresh
+                # statement, and it tells the agent goldfive is repeating, not
+                # raising a new concern. (The 1st signal, the grace-window
+                # suppression of in-window re-fires, and the 3rd-occurrence
+                # escalation are all decided in ``_signal_pacing_decision``
+                # before we get here; this only threads the quote into the
+                # body when exactly one prior note for the key exists.)
+                body = note_text
+                priors = [
+                    n for n in queue.notes() if n.kind == kind and n.task_id == task
+                ]
+                if len(priors) == 1:
+                    first_obs = (priors[0].observation or "").strip()
+                    if first_obs:
+                        body = (
+                            f"{note_text}\n\nThis repeats an earlier observer "
+                            f'note for this work, which observed: "{first_obs}". '
+                            f"That situation appears unchanged."
+                        )
+                queue.enqueue(
+                    body=body,
                     observation=observation,
                     severity=drift.severity.value,
                     drift_id=str(getattr(drift, "id", "") or ""),
-                    kind=drift.kind.value,
-                    task_id=drift.current_task_id or "",
+                    kind=kind,
+                    task_id=task,
                     agent_id=drift.current_agent_id or "",
                     turn=int(getattr(session, "_reasoning_turn", 0) or 0),
                     ladder_level=ladder_level,
@@ -1101,8 +1216,23 @@ class DriftObserver:
             from goldfive.signal_ledger import SignalLedger
 
             turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            # AGENCY-PRESERVATION.md PR 8 (binding requirement, #462 review):
+            # attribute ``after_signal`` by VISIBILITY, not dispatch. Under
+            # request_context the queue's render-set is the source of truth — a
+            # note dispatched (recorded in the ledger) but never RENDERED
+            # resolves ``self_corrected_unaided``. In the legacy regime the
+            # queued message IS the delivery, so ``rendered_keys=None`` keeps
+            # the dispatch-time ``has_real_delivery`` attribution.
+            rendered_keys: set[tuple[str, str]] | None = None
+            if (
+                getattr(self._steerer, "_signal_channel", "legacy_user_message")
+                == "request_context"
+            ):
+                from goldfive.observer_note_queue import ObserverNoteQueue
+
+                rendered_keys = ObserverNoteQueue.for_session(session).rendered_keys()
             for entry in SignalLedger.for_session(session).resolve_task(
-                task_id=str(task_id or ""), turn=turn
+                task_id=str(task_id or ""), turn=turn, rendered_keys=rendered_keys
             ):
                 await self._emit_signal_outcome(session, entry)
         except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
@@ -4428,6 +4558,19 @@ class DriftObserver:
                     exc,
                 )
         if promote_to_steer:
+            # AGENCY-PRESERVATION.md PR 8: pace the promotion signal — suppress
+            # a re-signal inside the grace window, escalate to a pause on the
+            # 3rd occurrence. This gate runs BEFORE the PR-12 ledger/forecast
+            # fork below: pacing is a property of the SIGNAL itself (is this
+            # the same advisory firing again too soon?), independent of which
+            # repair channel a "proceed" decision ultimately routes to. So a
+            # ledger-mode promotion paces identically to a forecast-mode one.
+            # ``"proceed"`` falls through to the fork (the note re-authoring
+            # for the 2nd occurrence is in ``_route_corrective_note``).
+            if await self._apply_signal_pacing(
+                session, drift, self._signal_pacing_decision(session, drift)
+            ):
+                return
             # AGENCY-PRESERVATION.md Stage 3 PR 12 — refine retirement in
             # ledger plan mode. Promotion produces a forecast-repair
             # ``refine_steer`` (PR 7 kept it on the promotion path); in
@@ -4483,6 +4626,13 @@ class DriftObserver:
             # were demoted to: proportional, trajectory-preserving influence.
             # The dispatch method keeps its ``_dispatch_nudge`` name (internal;
             # widely referenced) — it enqueues the SIGNAL-level note.
+            #
+            # AGENCY-PRESERVATION.md PR 8: pace it — suppress a re-signal inside
+            # the grace window, escalate to a pause on the 3rd occurrence.
+            if await self._apply_signal_pacing(
+                session, drift, self._signal_pacing_decision(session, drift)
+            ):
+                return
             await self._dispatch_nudge(drift, session)
             return
         if level is InterventionLevel.PAUSE_ESCALATE:
@@ -5977,34 +6127,48 @@ class DriftObserver:
             return False
         if not self._severity_meets_promotion_threshold(drift.severity):
             return False
-        # Consult the active user steer freshness window.
-        # Phase 1 of goldfive#271 — read through StateStore so
-        # the active-steer slot reads from a single named accessor; the
-        # underlying ``_ostate.read`` calls still funnel through the
-        # goldfive Session.state dict, just behind a typed surface.
+        # Ordered-gate #1 (AGENCY-PRESERVATION.md PR 8 unification): a fresh
+        # operator USER_STEER suppresses the goldfive promotion — the operator's
+        # correction is already in flight; running goldfive's on top races it.
+        # ``_user_steer_is_fresh`` is the shared #441 freshness predicate (also
+        # gate 1 of the SIGNAL-level path in ``_signal_pacing_decision``).
+        if self._user_steer_is_fresh(session):
+            drift.suppressed_by_user_steer = True
+            log.info(
+                "goldfive steer suppressed: a fresh user steer is active "
+                "(kind=%s task=%s)",
+                drift.kind.value,
+                drift.current_task_id or "-",
+            )
+            return False
+        return True
+
+    def _user_steer_is_fresh(self, session: Session) -> bool:
+        """True iff an operator USER_STEER is active within the #441 window.
+
+        The shared ordered-gate #1 predicate: a user-authored ``active_steer``
+        whose age (in logical turns — ``Session._reasoning_turn``, goldfive#441,
+        NOT event sequence) is within ``suppression_window_turns``. Consulted by
+        both :meth:`_should_promote_to_steer` (the promotion path, all regimes)
+        and :meth:`_signal_pacing_decision` (the SIGNAL-level path, PR 8). Pure
+        predicate — never mutates the drift; callers stamp
+        ``suppressed_by_user_steer`` themselves where the wire flag is wanted.
+        """
         window = self._steerer._goldfive_steer_suppression_window_turns
-        if window > 0:
+        if window <= 0:
+            return False
+        try:
             from goldfive.state_store import StateStore
 
             active = StateStore.for_session(session).get_active_steer()
-            if active is not None and active.source.lower() == "user":
-                # goldfive#441 — freshness is measured in *logical
-                # turns* (``_reasoning_turn``: one tick per reasoning
-                # observation), NOT ``_next_sequence`` (per-event, and
-                # inflated by decision-telemetry volume from #436/#440).
-                current_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
-                age = current_turn - active.at_turn
-                if 0 <= age < window:
-                    drift.suppressed_by_user_steer = True
-                    log.info(
-                        "goldfive steer suppressed: user steer %r is active "
-                        "(age=%d turns, window=%d)",
-                        active.body,
-                        age,
-                        window,
-                    )
-                    return False
-        return True
+            if active is None or active.source.lower() != "user":
+                return False
+            current_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            age = current_turn - active.at_turn
+            return 0 <= age < window
+        except Exception as exc:  # noqa: BLE001
+            log.debug("user-steer freshness check failed: %s", exc)
+            return False
 
     async def _promote_drift_to_steer(self, drift: DriftEvent, session: Session) -> None:
         """Promote a goldfive-detected drift into a full steer.
