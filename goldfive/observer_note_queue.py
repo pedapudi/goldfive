@@ -98,6 +98,14 @@ if TYPE_CHECKING:  # pragma: no cover - type-check only
 #: ``goldfive.signal_ledger`` / ``goldfive.active_drifts``.
 KEY_OBSERVER_NOTE_QUEUE = "goldfive.observer_note_queue"
 
+#: ``drift_id`` prefix minted for correction-origin notes (task #11). The
+#: SINGLE SOURCE for the prefix: ``_correction_injection`` mints
+#: ``correction:<agent>:<task>:<rev>`` and the queue's structural filters
+#: (``peek_for_render(exclude_correction_notes=True)``) recognise it — so a
+#: correction (agent-targeted) is never surfaced where only loop
+#: observations belong (the tool-result annotation).
+CORRECTION_DRIFT_ID_PREFIX = "correction:"
+
 #: Cap on the retained note list. Delivered notes are kept as tombstones so
 #: ``enqueue`` dedup and the exactly-once flag survive, but a pathologically
 #: long-lived session cannot balloon ``Session.state``: on overflow the
@@ -209,7 +217,62 @@ class ObserverNote:
         )
 
 
-def render_block(note: ObserverNote) -> str:
+def _bare_agent(name: Any) -> str:
+    """Return the bare (namespace-stripped, lowercased) agent name.
+
+    Agent ids may be fully qualified (``ns:writer``); the bare segment is
+    what surfaces resolve and what notes are scoped on. Tolerant of
+    ``None`` / non-str.
+    """
+    try:
+        s = str(name or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+    if ":" in s:
+        s = s.split(":")[-1]
+    return s.lower()
+
+
+def plan_state_line(plan: Any) -> str:
+    """Return a factual per-agent open-work line for the note Status fold.
+
+    AGENCY-PRESERVATION.md task #11 (cross-surface plan-state fold) — the
+    content the retired Site-3 hint used to inject per turn now rides the
+    observer note on EVERY block surface (before_model, boundary-replay,
+    claude), composed here so the three surfaces stay identical. Groups
+    ``plan.tasks`` by assignee and reports each agent's open
+    (non-terminal) vs. no-open-tasks state. Bookkeeping only — no "choose
+    the agent" / "do NOT re-invoke" imperative (dropped in PR 9). Returns
+    ``""`` when there is no plan / no tasks. Never raises.
+    """
+    try:
+        tasks = getattr(plan, "tasks", None) if plan is not None else None
+        if not tasks:
+            return ""
+        from goldfive.types import TERMINAL_TASK_STATUSES
+
+        by_agent: dict[str, list[int]] = {}
+        for t in tasks:
+            agent = getattr(t, "assignee_agent_id", "") or "<unassigned>"
+            bucket = by_agent.setdefault(agent, [0, 0])  # [open, done]
+            status = getattr(t, "status", None)
+            if status in TERMINAL_TASK_STATUSES:
+                bucket[1] += 1
+            else:
+                bucket[0] += 1
+        frags: list[str] = []
+        for agent in sorted(by_agent):
+            bare = agent.split(":")[-1] if ":" in agent else agent
+            open_n, _done_n = by_agent[agent]
+            frags.append(f"{bare}: {open_n} open" if open_n else f"{bare}: no open tasks")
+        if not frags:
+            return ""
+        return "Plan state (goldfive bookkeeping): " + "; ".join(frags) + "."
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def render_block(note: ObserverNote, *, plan: Any = None) -> str:
     """Render ``note`` as the marker-bracketed system-prompt / replay block.
 
     Shape (AGENCY-PRESERVATION.md PR 6 "Rendered block shape")::
@@ -219,13 +282,19 @@ def render_block(note: ObserverNote) -> str:
         The user's goal: <...>
         Status: <...>
         This note is advisory. How to proceed is your decision; ...
+        Plan state (goldfive bookkeeping): <...>      (task #11 fold, when ``plan`` given)
         [/GOLDFIVE OBSERVER NOTE]
 
     The body already carries the advisory footer (composed by PR 4); this
-    function only adds the attribution header + closing marker.
+    function adds the attribution header + closing marker, and — when
+    ``plan`` is supplied (task #11 cross-surface fold) — a factual
+    plan-state line INSIDE the block (so strip-and-refresh removes it as
+    one unit). ``plan=None`` keeps the pre-task-#11 shape byte-identical.
     """
     body = (note.body or "").strip()
-    return f"{OBSERVER_NOTE_BLOCK_BEGIN}\n{body}\n{OBSERVER_NOTE_BLOCK_END}"
+    extra = plan_state_line(plan) if plan is not None else ""
+    inner = f"{body}\n{extra}" if extra else body
+    return f"{OBSERVER_NOTE_BLOCK_BEGIN}\n{inner}\n{OBSERVER_NOTE_BLOCK_END}"
 
 
 def render_tool_annotation(note: ObserverNote) -> str:
@@ -321,6 +390,9 @@ class ObserverNoteQueue:
         self,
         *,
         kinds: frozenset[str] | None = None,
+        agent_id: str | None = None,
+        broadcast_only: bool = False,
+        exclude_correction_notes: bool = False,
     ) -> ObserverNote | None:
         """Return the most-severe pending note (per-request coalescing).
 
@@ -334,7 +406,38 @@ class ObserverNoteQueue:
         ``kind`` is in the set — used by the tool-result annotation surface
         (4) to pick only loop-shaped notes, leaving other notes for the
         block surfaces.
+
+        ``agent_id`` (AGENCY-PRESERVATION.md task #11 — agent-scoped
+        delivery) restricts selection so a per-(agent, task) note reaches
+        only the right agent's surfaces:
+
+        * ``None`` (the default) — NO agent filter. Every caller that does
+          not / cannot resolve the current agent keeps the pre-task-#11
+          broadcast behaviour (and every existing test, which passes
+          agentless stubs, is unaffected — §5.1).
+        * ``"<name>"`` — select only notes whose ``agent_id`` is empty
+          (broadcast / coordinator-level) OR matches ``<name>`` by bare
+          name (namespace-stripped). An agent-specific note for a
+          DIFFERENT agent is skipped, so e.g. a correction enqueued for
+          ``writer`` is never rendered onto ``researcher``'s model call.
+          The surface that knows its agent (notably the ADK
+          ``before_model`` surface) passes it; coarse surfaces leave it
+          ``None``.
+
+        ``broadcast_only`` (task #11 — coarse-surface defense) selects ONLY
+        broadcast (empty ``agent_id``) notes, skipping every agent-specific
+        one. A surface that cannot resolve its agent (the boundary replay,
+        which re-invokes at the coordinator level) sets this so an
+        agent-specific note is never misdelivered there — it stays pending
+        for its own agent's agent-aware surface (better undelivered than
+        misdelivered; §0 dormancy bias). Takes precedence over ``agent_id``.
+
+        ``exclude_correction_notes`` (task #11) skips notes whose
+        ``drift_id`` carries :data:`CORRECTION_DRIFT_ID_PREFIX` — used by the
+        tool-result annotation surface so agent-targeted corrections never
+        ride the loop-observation channel, regardless of their drift kind.
         """
+        target = _bare_agent(agent_id) if agent_id else None
         best: ObserverNote | None = None
         best_key: tuple[int, int, int] = (-2, -1, -1)
         for n in self.notes():
@@ -342,6 +445,21 @@ class ObserverNoteQueue:
                 continue
             if kinds is not None and n.kind not in kinds:
                 continue
+            if exclude_correction_notes and str(n.drift_id or "").startswith(
+                CORRECTION_DRIFT_ID_PREFIX
+            ):
+                continue
+            note_agent = _bare_agent(n.agent_id)
+            if broadcast_only:
+                # Only broadcast notes here; agent-specific notes wait for
+                # their own agent-aware surface.
+                if note_agent:
+                    continue
+            elif target is not None:
+                # Empty note_agent = broadcast (reaches any agent); a
+                # non-empty agent-specific note must match the target.
+                if note_agent and note_agent != target:
+                    continue
             key = (_severity_rank(n.severity), int(n.turn), int(n.enqueued_seq))
             if key > best_key:
                 best_key = key
@@ -510,6 +628,7 @@ class ObserverNoteQueue:
 
 
 __all__ = [
+    "CORRECTION_DRIFT_ID_PREFIX",
     "KEY_OBSERVER_NOTE_QUEUE",
     # Re-exported from goldfive.observer_notes (single source) for callers that
     # import the marker constants alongside the queue API.
@@ -518,6 +637,7 @@ __all__ = [
     "OBSERVER_NOTE_MARKER_PREFIX",
     "ObserverNote",
     "ObserverNoteQueue",
+    "plan_state_line",
     "render_block",
     "render_tool_annotation",
     "strip_prior_block",

@@ -2176,11 +2176,29 @@ class PlanReviser:
                 # dynamic instruction resolver (Stream B) reads this on the next
                 # turn and appends a directive-style correction block to the
                 # agent's system prompt. No-op on refines with no CORRECT links.
+                #
+                # AGENCY-PRESERVATION.md task #11: in the request_context regime
+                # with the Site-4 pin retired, corrections ride the agent-scoped
+                # ObserverNoteQueue instead of that slot (the suppressed resolver
+                # no longer reads it). ``pin_assigned_task`` keeps the pin — and
+                # hence the slot read — so corrections stay on the slot there.
+                # Legacy channel: unchanged.
+                _channel = getattr(
+                    self._steerer, "_signal_channel", "legacy_user_message"
+                )
+                _pin = bool(
+                    getattr(
+                        getattr(self._steerer, "_steering_config", None),
+                        "pin_assigned_task",
+                        False,
+                    )
+                )
                 queue_corrections_for_revision(
                     session=session,
                     revised=revised,
                     prev_plan=prev_plan,
                     drift=drift,
+                    corrections_via_notes=(_channel == "request_context" and not _pin),
                 )
 
             # goldfive#237: re-pin ``current_task_id`` onto any replacement
