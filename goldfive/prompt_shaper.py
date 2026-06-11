@@ -608,9 +608,11 @@ class PromptShaper:
                 from goldfive.adapters import _adk_state_protocol as _sp
                 from goldfive.adapters.adk_llm_instrumentation import (
                     _compose_instruction,
+                    _goals_block_from_session,
                     _goldfive_session_context_from_readonly_context,
                     _read_pending_correction,
                     _state_from_readonly_context,
+                    _task_kind_from_session,
                     _task_title_description_from_session,
                 )
 
@@ -696,12 +698,33 @@ class PromptShaper:
                     current_task_id=current_task_id,
                 )
 
+                # AGENCY-PRESERVATION.md Stage 3 PR 12 — for a DISCOVERED
+                # pin (ledger plan mode), render a [GOALS] block instead of
+                # the task block (the agent owns its own means-work; ground
+                # it on goals, don't re-pin the discovered task as a
+                # prescription). ``_compose_instruction`` falls back to the
+                # task block when the kind is not DISCOVERED or there are no
+                # goals, so forecast / OUTCOME pins are byte-identical. This
+                # branch is reached only where the pin WOULD render — under
+                # the PR 9 request_context+pin-off diet the resolver already
+                # returned above.
+                task_kind = (
+                    _task_kind_from_session(session, current_task_id)
+                    if session is not None
+                    else ""
+                )
+                goals_block = (
+                    _goals_block_from_session(session) if session is not None else ""
+                )
+
                 return _compose_instruction(
                     original=original_instruction,
                     task_id=current_task_id,
                     task_title=current_task_title,
                     task_description=current_task_description,
                     pending_correction=pending_correction,
+                    task_kind=task_kind,
+                    goals_block=goals_block,
                 )
             except Exception as exc:  # noqa: BLE001
                 # Instrumentation path — any failure here degrades to
