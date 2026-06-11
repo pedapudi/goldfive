@@ -450,6 +450,21 @@ class SignalLedger:
           where the queued message IS the delivery, and existing
           observe-only / shadow tests) — fall back to the dispatch-time
           ``has_real_delivery`` attribution (byte-identical to pre-PR-8).
+
+        Bench caveat (read before extracting 13b ``self_corrected`` rates).
+        The two regimes use DIFFERENT clocks, so the per-arm
+        ``self_corrected_after_signal`` base rate is asymmetric by design:
+        arm B (``request_context``) is render-VISIBILITY-keyed (accurate — a
+        dispatched-but-unrendered note resolves ``unaided``), while arm C
+        (legacy) is DISPATCH-keyed (a note dispatched but not actually
+        replayed still resolves ``after_signal``). In real runs both channels
+        deliver, so the rates converge; the asymmetry only bites in the
+        dispatched-but-not-delivered tail, where arm C can slightly
+        OVER-attribute ``after_signal``. This is acceptable because the
+        primary default-flip gate is the A-vs-B comparison (NOT the B-vs-C
+        self-correction rate) and the legacy channel retires in PR 13 — but a
+        B-vs-C self-correction delta must not be over-read for arm C. (Bench
+        annotates the same caveat in its 13b metric extraction.)
         """
         store = self._read_all()
         resolved: list[LedgerEntry] = []

@@ -31,6 +31,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from goldfive.config import SteeringConfig  # noqa: E402
+from goldfive.control import ControlChannel, ControlKind  # noqa: E402
 from goldfive.events import (  # noqa: E402
     SIGNAL_OUTCOME_SELF_CORRECTED_AFTER_SIGNAL,
     SIGNAL_OUTCOME_SELF_CORRECTED_UNAIDED,
@@ -47,6 +48,8 @@ from goldfive.types import (  # noqa: E402
     Plan,
     Session,
     Task,
+    TaskKind,
+    TaskStatus,
 )
 
 # ---------------------------------------------------------------------------
@@ -338,6 +341,179 @@ def test_resolve_task_legacy_falls_back_to_has_real_delivery() -> None:
     # rendered_keys=None (legacy regime) → attribution by has_real_delivery.
     resolved = ledger.resolve_task(task_id="t1", turn=5, rendered_keys=None)
     assert resolved[0].outcome == SIGNAL_OUTCOME_SELF_CORRECTED_AFTER_SIGNAL
+
+
+# ---------------------------------------------------------------------------
+# Composition with #469 (PR 12) — promotion-path pacing gates BEFORE the
+# ledger/forecast fork.
+#
+# A promotion-eligible goldfive drift in ledger + request_context mode now hits
+# BOTH PR 8's pacing gate AND #469's `_ledger_retire_refine` routing at the
+# `if promote_to_steer:` site. Pacing MUST run first: a within-window re-fire
+# must be a no-op (NOT a ledger force-FAIL), and a pacing-escalate must dispatch
+# exactly one pause (NOT also #469's force-FAIL). LOOPING_TOOL_CALL is the probe
+# kind — it is promotion-eligible AND a ledger force-FAIL kind, so a missed
+# short-circuit is observable as a FAILED bound task.
+# ---------------------------------------------------------------------------
+
+
+class _ListSink:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def emit(self, event_pb: Any) -> None:
+        self.events.append(event_pb)
+
+    async def close(self) -> None:
+        pass
+
+
+class _RecordingPlanner:
+    """Records refine / refine_steer calls so 'no refine ran' is assertable."""
+
+    def __init__(self) -> None:
+        self.refine_calls: list[dict[str, Any]] = []
+        self.refine_steer_calls: list[dict[str, Any]] = []
+
+    async def generate(self, *, goals: Any, available_agents: Any, context: Any = None) -> Any:
+        return None
+
+    async def refine(self, **kwargs: Any) -> Plan | None:
+        self.refine_calls.append(kwargs)
+        return kwargs.get("plan")
+
+    async def refine_steer(self, **kwargs: Any) -> Plan | None:
+        self.refine_steer_calls.append(kwargs)
+        return kwargs.get("plan")
+
+    @property
+    def refined(self) -> bool:
+        return bool(self.refine_calls or self.refine_steer_calls)
+
+
+def _ledger_session(turn: int) -> Session:
+    s = Session(
+        run_id="r1",
+        goals=[Goal(id="g1", summary="ship a memo")],
+        plan=Plan(
+            id="p1",
+            run_id="r1",
+            goal_ids=["g1"],
+            tasks=[
+                Task(
+                    id="t1",
+                    title="writer: drafting",
+                    discovered=True,
+                    kind=TaskKind.DISCOVERED,
+                    status=TaskStatus.RUNNING,
+                )
+            ],
+            edges=[],
+        ),
+        current_task_id="t1",
+    )
+    s._reasoning_turn = turn
+    return s
+
+
+def _ledger_steerer(*, grace: int = 3) -> tuple[DefaultSteerer, _RecordingPlanner]:
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(
+            signal_channel="request_context",
+            grace_window_turns=grace,
+            plan_mode="ledger",
+            threshold="warning",
+            observation_only=False,
+        )
+    )
+    planner = _RecordingPlanner()
+    steerer.bind(sinks=[_ListSink()], planner=planner)
+    return steerer, planner
+
+
+def _promotion_drift() -> DriftEvent:
+    # WARNING (clears threshold="warning" without tripping the CRITICAL cancel)
+    # + LOOPING_TOOL_CALL (promotion-eligible AND ledger force-FAIL kind).
+    return DriftEvent(
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        severity=DriftSeverity.WARNING,
+        detail="search_web looped",
+        current_task_id="t1",
+        current_agent_id="agent",
+        authored_by="goldfive",
+    )
+
+
+def _t1(session: Session) -> Task:
+    return next(t for t in session.plan.tasks if t.id == "t1")
+
+
+async def test_promotion_suppress_does_not_force_fail_in_ledger_mode() -> None:
+    """Within-window promotion re-fire → suppressed BEFORE #469's ledger fork.
+
+    If pacing did not gate first, the looping kind would force-FAIL the bound
+    task; the grace window exists precisely to give the agent room to
+    self-correct after it saw the prior note, so a suppressed re-fire must be a
+    no-op.
+    """
+    steerer, planner = _ledger_steerer(grace=3)
+    session = _ledger_session(turn=6)
+    _enqueue(session, drift_id="d1", turn=5)
+    ObserverNoteQueue.for_session(session).mark_delivered(
+        "d1", channel="request_context", turn=5
+    )
+    await steerer.drift.handle_drift(_promotion_drift(), session)
+    assert _t1(session).status is not TaskStatus.FAILED
+    assert not planner.refined
+
+
+async def test_promotion_escalate_pauses_once_no_force_fail() -> None:
+    """3rd-occurrence promotion re-fire → exactly ONE pause, no force-FAIL.
+
+    The pacing-escalate dispatches PAUSE_ESCALATE itself and returns 'stop'; it
+    must NOT fall through to #469's `_ledger_retire_refine`, which for a looping
+    kind would force-FAIL the task (and a hard-safety kind would dispatch a
+    SECOND pause). Composition bug = a FAILED task or two pauses.
+    """
+    steerer, planner = _ledger_steerer(grace=3)
+    channel = ControlChannel()
+    steerer.bind_control_channel(channel)
+    session = _ledger_session(turn=20)
+    q = ObserverNoteQueue.for_session(session)
+    for i in range(steerer.REFINE_FAILURE_THRESHOLD):
+        _enqueue(session, drift_id=f"d{i}", turn=i)
+        q.mark_delivered(f"d{i}", channel="request_context", turn=i)
+    await steerer.drift.handle_drift(_promotion_drift(), session)
+    assert _t1(session).status is not TaskStatus.FAILED
+    assert not planner.refined
+    drained: list[Any] = []
+    inbox = channel._inbox  # noqa: SLF001 — test inspection
+    while not inbox.empty():
+        drained.append(inbox.get_nowait())
+    pauses = [
+        m
+        for m in drained
+        if getattr(m, "kind", None) is ControlKind.GOLDFIVE_PAUSE_ESCALATE
+    ]
+    assert len(pauses) == 1, (
+        f"expected exactly one pause; got {[getattr(m, 'kind', None) for m in drained]}"
+    )
+
+
+async def test_promotion_proceed_runs_ledger_retire_in_ledger_mode() -> None:
+    """Past the window, < threshold prior signals → proceed → #469's ledger
+    fork fires (force-FAIL the looping bound task). The 'else' arm of the
+    composition: when pacing proceeds, the ledger retirement still happens."""
+    steerer, planner = _ledger_steerer(grace=3)
+    session = _ledger_session(turn=8)
+    _enqueue(session, drift_id="d1", turn=4)
+    ObserverNoteQueue.for_session(session).mark_delivered(
+        "d1", channel="request_context", turn=4
+    )
+    await steerer.drift.handle_drift(_promotion_drift(), session)
+    assert _t1(session).status is TaskStatus.FAILED
+    # Ledger mode retires the forecast-repair refine — no planner refine ran.
+    assert not planner.refined
 
 
 # ---------------------------------------------------------------------------
