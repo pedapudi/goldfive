@@ -2122,7 +2122,12 @@ class SequentialExecutor(Executor):
 
         try:
             queue = ObserverNoteQueue.for_session(session)
-            note = queue.peek_for_render()
+            # task #11: the boundary replay re-invokes at the coordinator
+            # level and cannot attribute a note to a specific sub-agent, so
+            # it delivers BROADCAST notes only. An agent-specific note (e.g.
+            # a correction) stays pending for its own agent-aware surface —
+            # better undelivered than misdelivered (§0 dormancy bias).
+            note = queue.peek_for_render(broadcast_only=True)
         except Exception as exc:  # noqa: BLE001
             log.debug("SequentialExecutor: observer-note queue read raised: %s", exc)
             return None
@@ -2141,7 +2146,9 @@ class SequentialExecutor(Executor):
             return None
         if not newly:
             return None
-        return render_block(note)
+        # task #11 cross-surface fold: carry the plan-state Status line on
+        # the boundary-replay surface too (identical to before_model).
+        return render_block(note, plan=getattr(session, "plan", None))
 
     @staticmethod
     def _compose_steer_restart_message(

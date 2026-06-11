@@ -637,17 +637,16 @@ class PromptShaper:
                 # Legacy ``signal_channel`` keeps the pin (byte-identical;
                 # §5.1).
                 #
-                # KNOWN LIMITATION (request_context + pin off): this also
-                # drops the pending-CORRECTION block that legacy rides on
-                # this pin. Corrections are still WRITTEN
-                # (``queue_corrections_for_revision``) but go UNREAD in
-                # this regime until task #11 migrates them to the
-                # ObserverNoteQueue at write time (which requires an
-                # agent-scoped ``peek_for_render`` so a per-(agent,task)
-                # correction reaches only its agent). ``request_context``
-                # is opt-in / non-default, so this is a documented gap in
-                # the new regime, not a production regression. Re-enable
-                # delivery meanwhile via ``pin_assigned_task=True``.
+                # Pending corrections (which legacy rides on this pin) are
+                # NOT lost in this regime: task #11 routes them to the
+                # agent-scoped ObserverNoteQueue at write time
+                # (``queue_corrections_for_revision(corrections_via_notes=
+                # True)``), delivered via the observer-note surfaces — the
+                # ``peek_for_render`` agent filter ensures a per-(agent,task)
+                # correction reaches only its agent. (The PR-9 "written but
+                # unread" gap this note once flagged is now closed.) The
+                # ``pin_assigned_task=True`` escape hatch instead keeps the
+                # pin AND the legacy correction-slot read.
                 if shaper._request_context(steerer) and not shaper._pin_assigned_task(
                     steerer
                 ):
@@ -732,45 +731,19 @@ class PromptShaper:
 
     @staticmethod
     def _plan_state_line(session: Any) -> str:
-        """Return a factual per-agent open-work line for the note (PR 9 Site 3 fold).
+        """Return the factual per-agent open-work line for the note Status fold.
 
-        Replaces the retired per-turn plan-state hint: groups
-        ``session.plan.tasks`` by assignee and reports each agent's open
-        (non-terminal) vs complete count. Bookkeeping only — no "choose
-        the agent whose tasks are still PENDING" imperative (the means-
-        directive PR 9 drops). Returns ``""`` when there is no plan / no
-        tasks so the note block is unchanged on pre-plan turns. Never
-        raises.
+        AGENCY-PRESERVATION.md PR 9 introduced this fold on the
+        before_model surface; task #11 centralised the composition in
+        :func:`goldfive.observer_note_queue.plan_state_line` so the
+        boundary-replay + claude surfaces render an identical line. This
+        thin wrapper preserves the ``(session)`` call shape; the shared
+        helper takes the plan. Returns ``""`` when there is no plan.
         """
         try:
-            plan = _safe_attr(session, "plan", None)
-            tasks = _safe_attr(plan, "tasks", None) if plan is not None else None
-            if not tasks:
-                return ""
-            from goldfive.types import TERMINAL_TASK_STATUSES
+            from goldfive.observer_note_queue import plan_state_line
 
-            by_agent: dict[str, list[int]] = {}
-            for t in tasks:
-                agent = _safe_attr(t, "assignee_agent_id", "") or "<unassigned>"
-                bucket = by_agent.setdefault(agent, [0, 0])  # [open, done]
-                status = _safe_attr(t, "status", None)
-                if status in TERMINAL_TASK_STATUSES:
-                    bucket[1] += 1
-                else:
-                    bucket[0] += 1
-            frags: list[str] = []
-            for agent in sorted(by_agent):
-                bare = agent.split(":")[-1] if ":" in agent else agent
-                open_n, _done_n = by_agent[agent]
-                # "no open tasks" carries the anti-re-invoke fact the
-                # retired Site-3 hint used to provide ("all assigned tasks
-                # complete") — factual, no "do NOT re-invoke" imperative.
-                frags.append(
-                    f"{bare}: {open_n} open" if open_n else f"{bare}: no open tasks"
-                )
-            if not frags:
-                return ""
-            return "Plan state (goldfive bookkeeping): " + "; ".join(frags) + "."
+            return plan_state_line(_safe_attr(session, "plan", None))
         except Exception:  # noqa: BLE001
             return ""
 
@@ -780,6 +753,7 @@ class PromptShaper:
         llm_request: Any,
         session: Any,
         session_context: Any = None,
+        current_agent_name: str = "",
     ) -> Any:
         """Render the most-severe pending observer note onto the request.
 
@@ -822,7 +796,6 @@ class PromptShaper:
         """
         try:
             from goldfive.observer_note_queue import (
-                OBSERVER_NOTE_BLOCK_END,
                 OBSERVER_NOTE_MARKER_PREFIX,
                 ObserverNoteQueue,
                 render_block,
@@ -856,7 +829,13 @@ class PromptShaper:
 
         try:
             queue = ObserverNoteQueue.for_session(session)
-            note = queue.peek_for_render()
+            # Agent-scoped (task #11): the before_model surface KNOWS the
+            # agent whose model call this is, so an agent-specific note
+            # (e.g. a per-(agent,task) correction) is rendered only on
+            # its own agent's call — never on a sibling's. ``""`` (no
+            # agent resolved, e.g. a unit-test stub) → no filter,
+            # preserving the pre-task-#11 broadcast behaviour (§5.1).
+            note = queue.peek_for_render(agent_id=current_agent_name or None)
         except Exception as exc:  # noqa: BLE001
             log.debug("PromptShaper.inject_observer_note: queue read raised: %s", exc)
             return None
@@ -864,20 +843,12 @@ class PromptShaper:
             return None
 
         if self.should_inject(steerer):
-            block = render_block(note)
-            # AGENCY-PRESERVATION.md PR 9 — Site 3 fold. The retired
-            # per-turn plan-state hint's content rides the observer note
-            # instead: a factual per-agent open-work line, placed INSIDE
-            # the marker block (before the END marker) so strip-and-refresh
-            # removes it as one unit and the marker count stays 1. Factual
-            # bookkeeping only — no "choose the agent" imperative.
-            plan_state = self._plan_state_line(session)
-            if plan_state and OBSERVER_NOTE_BLOCK_END in block:
-                block = block.replace(
-                    OBSERVER_NOTE_BLOCK_END,
-                    f"{plan_state}\n{OBSERVER_NOTE_BLOCK_END}",
-                    1,
-                )
+            # task #11 cross-surface fold: render_block composes the
+            # plan-state Status line from the plan INSIDE the marker block
+            # (strip-and-refresh removes it as one unit; marker count stays
+            # 1). Centralised so this surface, the boundary replay, and the
+            # claude surface render an identical line.
+            block = render_block(note, plan=_safe_attr(session, "plan", None))
             append = getattr(llm_request, "append_instructions", None)
             wrote = False
             if callable(append):
