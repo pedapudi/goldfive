@@ -290,9 +290,9 @@ def test_outcome_judge_grades_deliverables_against_evidence() -> None:
         captured["user"] = user
         return (
             '{"outcomes": ['
-            '{"task_id": "o1", "met": true, "reason": "summary present", '
+            '{"task_id": "o1", "assessment": "met", "reason": "summary present", '
             '"contributing_task_ids": ["d1"]},'
-            '{"task_id": "o2", "met": false, "reason": "no translation", '
+            '{"task_id": "o2", "assessment": "pending", "reason": "not yet", '
             '"contributing_task_ids": []}]}'
         )
 
@@ -307,8 +307,10 @@ def test_outcome_judge_grades_deliverables_against_evidence() -> None:
     )
     by_id = {v.task_id: v for v in verdicts}
     assert by_id["o1"].met is True
+    assert by_id["o1"].assessment == "met"
     assert by_id["o1"].contributing_task_ids == ("d1",)
     assert by_id["o2"].met is False
+    assert by_id["o2"].assessment == "pending"
     # The prompt carried the goals, deliverables, trajectory, and evidence.
     assert "DELIVERABLES TO JUDGE" in captured["user"]
     assert "EVIDENCE" in captured["user"]
@@ -354,8 +356,8 @@ def test_outcome_judge_ignores_unknown_outcome_ids() -> None:
             completed_outputs={},
             model="m",
             call_llm=_outcome_llm(
-                '{"outcomes": [{"task_id": "bogus", "met": true}, '
-                '{"task_id": "o1", "met": true, "contributing_task_ids": ["nope"]}]}'
+                '{"outcomes": [{"task_id": "bogus", "assessment": "met"}, '
+                '{"task_id": "o1", "assessment": "met", "contributing_task_ids": ["nope"]}]}'
             ),
         )
     )
@@ -369,8 +371,10 @@ def test_plan_transitions_met_completes_and_stamps_contributes_to() -> None:
     from goldfive.drift.outcome_progress import OutcomeVerdict
 
     verdicts = [
-        OutcomeVerdict(task_id="o1", met=True, reason="done", contributing_task_ids=("d1",)),
-        OutcomeVerdict(task_id="o2", met=False, reason="not yet"),
+        OutcomeVerdict(
+            task_id="o1", assessment="met", reason="done", contributing_task_ids=("d1",)
+        ),
+        OutcomeVerdict(task_id="o2", assessment="pending", reason="not yet"),
     ]
     tr = plan_outcome_transitions(_outcome_ledger(), verdicts, run_ending=False)
     assert len(tr) == 1
@@ -379,10 +383,11 @@ def test_plan_transitions_met_completes_and_stamps_contributes_to() -> None:
     assert tr[0].contributes_stamps == (("d1", "o1"),)
 
 
-def test_plan_transitions_unmet_fails_only_at_run_end() -> None:
+def test_plan_transitions_confident_fail_only_at_run_end() -> None:
     from goldfive.drift.outcome_progress import OutcomeVerdict
 
-    verdicts = [OutcomeVerdict(task_id="o2", met=False, reason="no translation")]
+    # CONFIDENTLY-unmet ("failed") → FAILED only at run end.
+    verdicts = [OutcomeVerdict(task_id="o2", assessment="failed", reason="user cancelled it")]
     assert plan_outcome_transitions(_outcome_ledger(), verdicts, run_ending=False) == []
     tr = plan_outcome_transitions(_outcome_ledger(), verdicts, run_ending=True)
     assert len(tr) == 1
@@ -390,10 +395,19 @@ def test_plan_transitions_unmet_fails_only_at_run_end() -> None:
     assert tr[0].new_status is TaskStatus.FAILED
 
 
+def test_plan_transitions_pending_never_fails_even_at_run_end() -> None:
+    from goldfive.drift.outcome_progress import OutcomeVerdict
+
+    # #208 carry-forward: not-yet-met ("pending") is NOT failed at run end
+    # — it stays PENDING for the next turn.
+    verdicts = [OutcomeVerdict(task_id="o2", assessment="pending", reason="still working")]
+    assert plan_outcome_transitions(_outcome_ledger(), verdicts, run_ending=True) == []
+
+
 def test_plan_transitions_predicate_authoritative_blocks_completion() -> None:
     from goldfive.drift.outcome_progress import OutcomeVerdict
 
-    verdicts = [OutcomeVerdict(task_id="o1", met=True, reason="llm says done")]
+    verdicts = [OutcomeVerdict(task_id="o1", assessment="met", reason="llm says done")]
     # User predicate is explicitly unmet → the deterministic predicate
     # overrides the LLM and the outcome is NOT completed.
     assert (
@@ -414,5 +428,5 @@ def test_plan_transitions_skips_terminal_outcomes() -> None:
         tasks=(Task(id="o1", title="done", kind=TaskKind.OUTCOME, status=TaskStatus.COMPLETED),),
         edges=(),
     )
-    verdicts = [OutcomeVerdict(task_id="o1", met=False)]
+    verdicts = [OutcomeVerdict(task_id="o1", assessment="failed")]
     assert plan_outcome_transitions(plan, verdicts, run_ending=True) == []

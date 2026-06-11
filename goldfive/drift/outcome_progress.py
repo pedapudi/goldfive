@@ -62,6 +62,9 @@ __all__ = [
     "CallLLM",
     "OutcomeVerdict",
     "OutcomeTransition",
+    "OUTCOME_ASSESSMENT_MET",
+    "OUTCOME_ASSESSMENT_FAILED",
+    "OUTCOME_ASSESSMENT_PENDING",
     "evaluate_outcome_progress",
     "plan_outcome_transitions",
     "OUTCOME_PROGRESS_SYSTEM_PROMPT",
@@ -99,21 +102,30 @@ OUTCOME_PROGRESS_USER_PROMPT_TEMPLATE: str = (
     "{trajectory_block}\n\n"
     "EVIDENCE (the agent's captured outputs, keyed by trajectory id):\n"
     "{evidence_block}\n\n"
-    "For each deliverable in DELIVERABLES TO JUDGE, decide whether the "
-    "EVIDENCE shows it has been produced. Be strict: mark met=true only "
-    "when the evidence actually contains or demonstrates the "
-    "deliverable, not merely that the agent attempted it.\n\n"
+    "For each deliverable in DELIVERABLES TO JUDGE, classify it into "
+    "EXACTLY ONE of three states, grounded in the EVIDENCE:\n"
+    '  - "met": the evidence actually contains or demonstrates the '
+    "deliverable. Be strict — an attempt is not a deliverable.\n"
+    '  - "failed": the goal this deliverable serves is contradicted or '
+    "the deliverable provably CANNOT be produced (e.g. the user "
+    "cancelled it, or a hard prerequisite is impossible). Use this ONLY "
+    "when you are CONFIDENT the deliverable will never be met — not for "
+    "work that simply is not done yet.\n"
+    '  - "pending": not done yet, in progress, or you cannot tell from '
+    "the evidence. This is the default — a run boundary is often just a "
+    "pause, and pending work legitimately continues later.\n\n"
     "Reply with a single JSON object and nothing else:\n"
     "{{\n"
     '  "outcomes": [\n'
-    '    {{"task_id": "<deliverable id>", "met": true|false, '
+    '    {{"task_id": "<deliverable id>", '
+    '"assessment": "met" | "failed" | "pending", '
     '"reason": "one-sentence justification grounded in the evidence", '
     '"contributing_task_ids": ["<trajectory id that produced it>", ...]}}\n'
     "  ]\n"
     "}}\n\n"
     "Include exactly one entry per deliverable id listed above. "
     "``contributing_task_ids`` lists the trajectory ids whose evidence "
-    "supports a met=true verdict (empty list when met=false or unknown)."
+    'supports a "met" verdict (empty list for "failed" / "pending").'
 )
 
 
@@ -183,14 +195,40 @@ def _format_evidence(
     return "\n\n".join(blocks)
 
 
+#: The three outcome assessments. ``met`` → the deliverable exists;
+#: ``failed`` → CONFIDENTLY unmet (goal contradicted / cannot be met);
+#: ``pending`` → not done yet / uncertain (the default — carries forward
+#: across a turn boundary like a goldfive#208 reachable-PENDING task). An
+#: unrecognised assessment degrades to ``pending`` (never to a transition).
+OUTCOME_ASSESSMENT_MET = "met"
+OUTCOME_ASSESSMENT_FAILED = "failed"
+OUTCOME_ASSESSMENT_PENDING = "pending"
+_VALID_ASSESSMENTS = frozenset(
+    {OUTCOME_ASSESSMENT_MET, OUTCOME_ASSESSMENT_FAILED, OUTCOME_ASSESSMENT_PENDING}
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class OutcomeVerdict:
-    """One outcome-progress verdict (no plan mutation; advisory data)."""
+    """One outcome-progress verdict (no plan mutation; advisory data).
+
+    ``assessment`` is one of :data:`OUTCOME_ASSESSMENT_MET` /
+    ``_FAILED`` / ``_PENDING``. The three-state shape (vs a ``met`` bool)
+    is the goldfive#208-forced narrowing of "unmet at exit → FAILED": a
+    run end is usually just a turn boundary, so only a CONFIDENTLY-unmet
+    deliverable is failed; merely not-yet-met work stays PENDING and
+    carries to the next turn (the dormancy-respecting choice — goldfive
+    does not manufacture failure verdicts at every turn boundary).
+    """
 
     task_id: str
-    met: bool
+    assessment: str
     reason: str = ""
     contributing_task_ids: tuple[str, ...] = ()
+
+    @property
+    def met(self) -> bool:
+        return self.assessment == OUTCOME_ASSESSMENT_MET
 
 
 @dataclasses.dataclass(frozen=True)
@@ -296,7 +334,11 @@ async def evaluate_outcome_progress(
         if tid not in valid_outcome_ids or tid in seen:
             continue
         seen.add(tid)
-        met = bool(entry.get("met", False))
+        assessment = str(entry.get("assessment", "") or "").strip().lower()
+        # Unrecognised / missing assessment degrades to PENDING — never to
+        # a transition (a flaky judge must not manufacture a terminal).
+        if assessment not in _VALID_ASSESSMENTS:
+            assessment = OUTCOME_ASSESSMENT_PENDING
         reason = str(entry.get("reason", "") or "").strip()
         contributing = entry.get("contributing_task_ids") or []
         contrib_ids = tuple(
@@ -307,7 +349,7 @@ async def evaluate_outcome_progress(
         verdicts.append(
             OutcomeVerdict(
                 task_id=tid,
-                met=met,
+                assessment=assessment,
                 reason=reason,
                 contributing_task_ids=contrib_ids,
             )
@@ -329,8 +371,12 @@ def plan_outcome_transitions(
     * ``met`` OUTCOME (non-terminal) → COMPLETED at any cadence, BUT only
       when ``goal_predicates_met`` (a user-supplied predicate that is
       explicitly unmet overrides the LLM and blocks completion).
-    * ``unmet`` OUTCOME → FAILED only when ``run_ending`` (a deliverable
-      that is not yet met mid-run is simply not done yet, not failed).
+    * ``failed`` (CONFIDENTLY unmet) OUTCOME → FAILED only when
+      ``run_ending``. A deliverable the judge merely cannot confirm yet is
+      ``pending``, not ``failed``; a run end is usually just a turn
+      boundary (goldfive#208), so uncertain work carries forward as
+      reachable-PENDING and the next boundary judge re-evaluates.
+    * ``pending`` OUTCOME → no transition (left PENDING to carry forward).
     * A met → COMPLETED transition carries ``contributes_stamps`` for the
       named DISCOVERED tasks (``discovered_id -> outcome_id``), but only
       for tasks that exist in the plan and are not already stamped with a
@@ -347,7 +393,7 @@ def plan_outcome_transitions(
         task = tasks_by_id.get(v.task_id)
         if task is None or not _is_outcome(task) or _is_terminal(task):
             continue
-        if v.met:
+        if v.assessment == OUTCOME_ASSESSMENT_MET:
             if not goal_predicates_met:
                 # A user predicate is authoritative and currently unmet —
                 # do not complete the deliverable on the LLM's say-so.
@@ -372,12 +418,13 @@ def plan_outcome_transitions(
                     contributes_stamps=tuple(stamps),
                 )
             )
-        elif run_ending:
+        elif v.assessment == OUTCOME_ASSESSMENT_FAILED and run_ending:
             transitions.append(
                 OutcomeTransition(
                     task_id=v.task_id,
                     new_status=TaskStatus.FAILED,
-                    reason=v.reason or "outcome unmet at run end",
+                    reason=v.reason or "outcome cannot be met",
                 )
             )
+        # OUTCOME_ASSESSMENT_PENDING (and "failed" mid-run) → no transition.
     return transitions
