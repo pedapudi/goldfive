@@ -1255,7 +1255,23 @@ class PruneTransientErrorRule:
     (:func:`_response_has_error_indicator`) AND its error text matches a
     configured transient marker. Free-form data fields are never scanned
     — only flagged statuses, never "anything that looks like an error".
-    No regex/NL classification (the #166/#167 anti-pattern).
+
+    NL-heuristics boundary (binding)
+    --------------------------------
+    The marker allowlist matches ONLY **machine-generated error
+    signatures**: HTTP status reason phrases (RFC-standardised:
+    "Too Many Requests", "Service Unavailable", …), SDK / runtime
+    exception class names ("RateLimitError", "APITimeoutError",
+    "JSONDecodeError", …), and structured error codes / types
+    ("rate_limit_exceeded", "ECONNRESET", "overloaded_error", …). These
+    are emitted by infrastructure, not authored by the agent. This rule
+    MUST NOT be extended into semantic matching of natural-language prose
+    — neither agent reasoning nor free-text tool output — which is the
+    #166/#167 anti-pattern (retired ``_GENERIC_VERB_PREFIX_RE`` /
+    ``_FACTUAL_QUESTION_RE``). The matched fields are restricted to the
+    error-shaped keys of a response that already carries a structural
+    error indicator, precisely to keep the boundary at "machine error
+    payload", never "looks like an error in English".
 
     Dormancy
     --------
@@ -1271,32 +1287,41 @@ class PruneTransientErrorRule:
     _DEFAULT_STATUS_CODES: frozenset[int] = frozenset(
         {408, 425, 429, 500, 502, 503, 504, 509, 529}
     )
-    #: Default transient error-text markers (lowercased substrings).
+    #: Default transient error-text markers (lowercased substrings). STRICTLY
+    #: machine-generated error signatures — see the rule's "NL-heuristics
+    #: boundary" docstring. Do NOT add natural-language prose here.
     _DEFAULT_MARKERS: tuple[str, ...] = (
-        "rate limit",
-        "rate_limit",
-        "ratelimit",
-        "too many requests",
-        "timeout",
-        "timed out",
-        "deadline exceeded",
-        "etimedout",
-        "temporarily unavailable",
-        "service unavailable",
-        "try again",
-        "connection reset",
-        "connection aborted",
-        "connection error",
-        "econnreset",
-        "network error",
-        "overloaded",
-        "could not parse",
-        "parse error",
-        "parse failure",
+        # SDK / runtime exception class names
+        "ratelimiterror",
+        "apitimeouterror",
+        "apiconnectionerror",
+        "serviceunavailableerror",
+        "internalservererror",
+        "overloadederror",
+        "timeouterror",
+        "readtimeout",
+        "connecttimeout",
+        "connectionreseterror",
+        "connectionerror",
         "jsondecodeerror",
-        "json decode",
-        "malformed response",
-        "unexpected eof",
+        # structured error codes / types
+        "rate_limit_exceeded",
+        "rate_limit",
+        "too_many_requests",
+        "service_unavailable",
+        "gateway_timeout",
+        "deadline_exceeded",
+        "overloaded_error",
+        "econnreset",
+        "etimedout",
+        "econnaborted",
+        # RFC-standardised HTTP status reason phrases
+        "too many requests",
+        "service unavailable",
+        "gateway timeout",
+        "bad gateway",
+        "request timeout",
+        "rate limit exceeded",
     )
 
     def __init__(
@@ -1403,13 +1428,6 @@ class PruneTransientErrorRule:
 # ---------------------------------------------------------------------------
 
 
-#: Stable goldfive-minted marker that prefixes a rendered observer-note
-#: block (AGENCY-PRESERVATION.md §"PR 6" rendered-block shape). PR 6's
-#: channel wraps notes in this marker; matching it is a stable-key match
-#: on goldfive's OWN constant, never an NL classification of agent text.
-_OBSERVER_NOTE_MARKER: str = "[GOLDFIVE OBSERVER NOTE"
-
-
 class PruneStaleSteerRule:
     """Drop goldfive's own synthetic steer / observer-note user-messages once stale.
 
@@ -1419,15 +1437,18 @@ class PruneStaleSteerRule:
     toward a correction that is no longer relevant (CONTEXT-EDITING.md
     rule 3).
 
-    Identification (stable-keyed)
-    -----------------------------
+    Identification (stable-keyed, single-source)
+    --------------------------------------------
     A candidate is a ``Content`` whose text carries one of goldfive's
     OWN constants: the observer-note marker
-    (:data:`_OBSERVER_NOTE_MARKER`) or the pinned advisory footer
-    (``goldfive.observer_notes.ADVISORY_FOOTER``). Both are goldfive-
-    minted strings, so matching is a stable-identity check, NOT an NL
-    heuristic over agent output (the #166/#167 anti-pattern). Other
-    contents are never touched.
+    (``goldfive.observer_notes.OBSERVER_NOTE_MARKER``) or the pinned
+    advisory footer (``goldfive.observer_notes.ADVISORY_FOOTER``). Both
+    constants live ONLY in :mod:`goldfive.observer_notes` (the #455
+    module) — the SAME place PR 6's channel renders them from — so the
+    writer and this reader can never drift. Both are goldfive-minted
+    strings, so matching is a stable-identity check, NOT an NL heuristic
+    over agent output (the #166/#167 anti-pattern). Other contents are
+    never touched.
 
     Staleness (the trigger)
     -----------------------
@@ -1456,8 +1477,8 @@ class PruneStaleSteerRule:
     ---------------
     Full coverage of legacy plain-text notes arrives when AGENCY-
     PRESERVATION.md PR 6's channel wraps every delivered note in
-    :data:`_OBSERVER_NOTE_MARKER`; until then the advisory-footer match
-    already catches notes rendered through
+    ``goldfive.observer_notes.OBSERVER_NOTE_MARKER``; until then the
+    advisory-footer match already catches notes rendered through
     :mod:`goldfive.observer_notes`.
     """
 
@@ -1469,10 +1490,12 @@ class PruneStaleSteerRule:
         contents: list[Any],
         ctx: ContextEditContext,
     ) -> list[Any] | None:
-        footer = self._advisory_footer()
+        footer, marker = self._note_markers()
+        if not footer and not marker:
+            return None
         note_idx: set[int] = set()
         for i, content in enumerate(contents):
-            if self._is_goldfive_note(content, footer):
+            if self._is_goldfive_note(content, footer, marker):
                 note_idx.add(i)
         if not note_idx:
             return None
@@ -1493,19 +1516,28 @@ class PruneStaleSteerRule:
     # ---- internals ----------------------------------------------------
 
     @staticmethod
-    def _advisory_footer() -> str:
+    def _note_markers() -> tuple[str, str]:
+        """Return ``(advisory_footer, observer_note_marker)`` — both goldfive
+        constants, single-sourced from :mod:`goldfive.observer_notes`.
+
+        Returns ``("", "")`` if the module can't be imported so the rule
+        degrades to a clean no-op rather than raising into the callback.
+        """
         try:
-            from goldfive.observer_notes import ADVISORY_FOOTER  # noqa: PLC0415
+            from goldfive.observer_notes import (  # noqa: PLC0415
+                ADVISORY_FOOTER,
+                OBSERVER_NOTE_MARKER,
+            )
 
-            return str(ADVISORY_FOOTER or "")
+            return (str(ADVISORY_FOOTER or ""), str(OBSERVER_NOTE_MARKER or ""))
         except Exception:  # noqa: BLE001
-            return ""
+            return ("", "")
 
-    def _is_goldfive_note(self, content: Any, footer: str) -> bool:
+    def _is_goldfive_note(self, content: Any, footer: str, marker: str) -> bool:
         text = _content_text(content)
         if not text:
             return False
-        if _OBSERVER_NOTE_MARKER in text:
+        if marker and marker in text:
             return True
         return bool(footer) and footer in text
 

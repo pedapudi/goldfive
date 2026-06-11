@@ -846,6 +846,37 @@ async def test_prune_stale_steer_keeps_active_note() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prune_stale_steer_detects_observer_note_marker() -> None:
+    """A note bearing the canonical OBSERVER_NOTE block marker (no footer)
+    is detected — pins the single-source marker import from observer_notes."""
+    from goldfive.observer_notes import OBSERVER_NOTE_BLOCK_BEGIN, OBSERVER_NOTE_MARKER
+
+    # The detection marker must be a prefix of the rendered block opening.
+    assert OBSERVER_NOTE_BLOCK_BEGIN.startswith(OBSERVER_NOTE_MARKER)
+
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[sink])
+    request = FakeRequest(
+        contents=[
+            _text_content("real user request"),
+            _text_content(
+                f"{OBSERVER_NOTE_BLOCK_BEGIN}\nObservation: something\n[/GOLDFIVE OBSERVER NOTE]"
+            ),
+        ]
+    )
+
+    result = await editor.apply(
+        request,
+        session=FakeSession(),  # no active steer -> the note is stale
+        host_agent_name="a",
+        observation_only=False,
+    )
+
+    assert result.applied_rules == ["prune_stale_steer"]
+    assert [c.parts[0].text for c in request.contents] == ["real user request"]
+
+
+@pytest.mark.asyncio
 async def test_prune_stale_steer_noop_without_notes() -> None:
     """A transcript with no goldfive notes is left untouched."""
     editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[InMemorySink()])
