@@ -750,7 +750,12 @@ class PromptShaper:
             for agent in sorted(by_agent):
                 bare = agent.split(":")[-1] if ":" in agent else agent
                 open_n, _done_n = by_agent[agent]
-                frags.append(f"{bare}: {open_n} open" if open_n else f"{bare}: complete")
+                # "no open tasks" carries the anti-re-invoke fact the
+                # retired Site-3 hint used to provide ("all assigned tasks
+                # complete") — factual, no "do NOT re-invoke" imperative.
+                frags.append(
+                    f"{bare}: {open_n} open" if open_n else f"{bare}: no open tasks"
+                )
             if not frags:
                 return ""
             return "Plan state (goldfive bookkeeping): " + "; ".join(frags) + "."

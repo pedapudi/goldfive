@@ -292,8 +292,9 @@ def test_site5_folds_plan_state_into_note_block() -> None:
     assert si.count(OBSERVER_NOTE_MARKER_PREFIX) == 1
     assert "Plan state (goldfive bookkeeping)" in si
     assert "writer: 1 open" in si
-    assert "reviewer: complete" in si
+    assert "reviewer: no open tasks" in si
     assert "Choose the agent" not in si  # the dropped imperative
+    assert "do NOT re-invoke" not in si  # the dropped imperative
 
 
 def test_site5_plan_state_does_not_stack_across_calls() -> None:
@@ -331,6 +332,100 @@ def test_site5_plan_state_does_not_stack_across_calls() -> None:
 def test_plan_state_line_empty_without_plan() -> None:
     sess = Session(run_id="r-empty")
     assert PromptShaper._plan_state_line(sess) == ""
+
+
+def test_site3_anti_reinvoke_fact_survives_in_note_status() -> None:
+    """The retired hint's anti-re-invoke protection ("all assigned tasks
+    complete") must survive via the note's folded Status line when an
+    agent's tasks are ALL terminal AND a note is pending."""
+    from goldfive.observer_note_queue import ObserverNoteQueue
+
+    sess = Session(run_id="r-terminal")
+    sess.goals = [Goal(id="g1", summary="x")]
+    sess.plan = Plan(
+        id="plan-1",
+        run_id="r-terminal",
+        goal_ids=["g1"],
+        tasks=[
+            # researcher: every task terminal (one COMPLETED, one FAILED).
+            Task(
+                id="t1",
+                title="Gather",
+                description="d",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="t2",
+                title="Verify",
+                description="d",
+                assignee_agent_id="researcher",
+                status=TaskStatus.FAILED,
+            ),
+            # writer: still has open work.
+            Task(
+                id="t3",
+                title="Draft",
+                description="d",
+                assignee_agent_id="writer",
+                status=TaskStatus.RUNNING,
+            ),
+        ],
+        edges=[],
+        summary="x",
+        revision_index=1,
+    )
+    ObserverNoteQueue.for_session(sess).enqueue(
+        body="Observation: a signal fired.",
+        observation="a signal fired",
+        severity="warning",
+        drift_id="d1",
+        kind="looping_tool_call",
+        task_id="t3",
+    )
+    req = _FakeReq(system_instruction="base")
+    note = PromptShaper().inject_observer_note(
+        llm_request=req,
+        session=sess,
+        session_context=_Ctx(_steerer(channel="request_context"), session=sess),
+    )
+    assert note is not None
+    si = req.config.system_instruction or ""
+    # The "no remaining tracked tasks" fact for the fully-terminal agent
+    # survives — factual, no imperative.
+    assert "researcher: no open tasks" in si
+    assert "writer: 1 open" in si
+    assert "do NOT re-invoke" not in si
+
+
+def test_site3_dormant_when_no_note_pending() -> None:
+    """No pending note → no hint, no plan-state, nothing injected anywhere.
+
+    With Site 3's standalone hint retired under request_context, dormancy
+    wins when nothing is pending: neither inject_runtime_tools_hint nor
+    inject_observer_note touches the request."""
+    sess = _session_with_plan()
+    steerer = _steerer(channel="request_context")
+
+    # Site 3 standalone hint: suppressed.
+    req = _FakeReq(system_instruction="base instruction")
+    PromptShaper().inject_runtime_tools_hint(
+        callback_context=None,
+        llm_request=req,
+        session=sess,
+        session_context=_Ctx(steerer),
+    )
+    assert req.config.system_instruction == "base instruction"
+
+    # Observer note: queue empty → nothing rendered, no plan-state line.
+    note = PromptShaper().inject_observer_note(
+        llm_request=req,
+        session=sess,
+        session_context=_Ctx(steerer, session=sess),
+    )
+    assert note is None
+    assert req.config.system_instruction == "base instruction"
+    assert "Plan state (goldfive bookkeeping)" not in req.config.system_instruction
 
 
 # ---------------------------------------------------------------------------
