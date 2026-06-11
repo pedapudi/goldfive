@@ -679,13 +679,28 @@ class SteeringConfig:
     #: even instantiates the editor and the codepath is zero-overhead.
     #:
     #: Set to a list of rule names (e.g. ``["prune_cancelled_reasoning"]``)
-    #: to opt in. Unknown rule names are logged and ignored at registration
+    #: to opt in. Recognised rules (AGENCY-PRESERVATION.md PR 6b):
+    #:
+    #: * ``"prune_cancelled_reasoning"`` — strip cancelled-invocation
+    #:   tool pairs (drop-only).
+    #: * ``"prune_transient_error"`` — redact 429 / 5xx / timeout /
+    #:   parse-blip ``function_response`` payloads in place
+    #:   (byte-monotonic replace).
+    #: * ``"prune_stale_steer"`` — drop goldfive's own synthetic
+    #:   steer / observer-note user-messages once stale (drop-only).
+    #: * ``"compact_prior_reasoning"`` — collapse N identical failed
+    #:   tool-call pairs into one summarized survivor (byte-monotonic
+    #:   replace).
+    #:
+    #: Unknown rule names are logged and ignored at registration
     #: time; an empty list after filtering also keeps the editor unwired.
+    #: Every rule is dormant on healthy turns — it edits ``contents``
+    #: ONLY on a tripped guardrail counter or drift verdict (§0).
     #:
     #: Per-rule (rather than a single master switch) so e2e regressions
     #: from a single rule can be bisected without disabling the whole
     #: capability. See ``docs/design/CONTEXT-EDITING.md`` for the rule
-    #: catalog and the rationale behind drop-only edits.
+    #: catalog and the drop-only / byte-monotonic-replace rule classes.
     context_editor_rules: list[str] | None = None
     #: Plan-descriptive growth for unmatched delegations (goldfive#423,
     #: completed by AGENCY-PRESERVATION.md Stage 1 PR 2). When ``True``

@@ -36,8 +36,11 @@ from typing import Any
 import pytest
 
 from goldfive.context_editor import (
+    CompactPriorReasoningRule,
     ContextEditor,
     PruneCancelledReasoningRule,
+    PruneStaleSteerRule,
+    PruneTransientErrorRule,
     build_editor_from_config,
 )
 from goldfive.sinks.memory import InMemorySink
@@ -532,3 +535,500 @@ async def test_rule_that_raises_is_skipped_chain_continues() -> None:
     assert ("raiser", "rule_raised") in result.rejected_rules
     assert "drop_first" in result.applied_rules
     assert [c.parts[0].text for c in request.contents] == ["survive"]
+
+
+# ---------------------------------------------------------------------------
+# PR 6b — additional helpers
+# ---------------------------------------------------------------------------
+
+
+def _failed_response_content(
+    fc_id: str, name: str = "do_work", *, detail: str = "internal tool error"
+) -> FakeContent:
+    """A function_response carrying an explicit error shape."""
+    return FakeContent(
+        role="user",
+        parts=[
+            FakePart(
+                function_response=FakeFunctionResponse(
+                    id=fc_id,
+                    name=name,
+                    # Reasonably large so collapsing several of these
+                    # clearly beats the one-line summary (byte-monotonic).
+                    response={"error": (detail + " ") * 12},
+                )
+            )
+        ],
+    )
+
+
+def _transient_response_content(
+    fc_id: str, name: str = "fetch", *, response: dict[str, Any] | None = None
+) -> FakeContent:
+    """A function_response carrying a transient (429-ish) error payload."""
+    payload = response or {
+        "error": {
+            "code": 429,
+            "message": (
+                "rate limit exceeded; please retry after 30 seconds "
+                "(HTTP 429 Too Many Requests) — quota will reset shortly"
+            ),
+        }
+    }
+    return FakeContent(
+        role="user",
+        parts=[
+            FakePart(
+                function_response=FakeFunctionResponse(
+                    id=fc_id, name=name, response=payload
+                )
+            )
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# rule_class — drop-only vs byte-monotonic-replace enforcement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_drop_only_rule_synthesizing_content_is_rejected() -> None:
+    """A ``drop_only`` rule that returns a NEW (smaller) Content is reverted.
+
+    The byte/count gate passes (the synth is smaller) but the structural
+    identity check catches that the survivor was not in the input.
+    """
+
+    class _Synthesizer:
+        name = "synthesizer"  # no rule_class -> defaults to drop_only
+
+        def edit(self, contents, ctx):  # type: ignore[no-untyped-def]
+            return [_text_content("brand new tiny turn")]
+
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[_Synthesizer()], sinks=[sink])
+    request = FakeRequest(
+        contents=[
+            _text_content("a much longer original turn number one here"),
+            _text_content("a much longer original turn number two here"),
+        ]
+    )
+    original_contents = list(request.contents)
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert request.contents == original_contents
+    assert result.applied_rules == []
+    assert ("synthesizer", "injected_content") in result.rejected_rules
+    rejected = [
+        e
+        for e in sink.events
+        if isinstance(e, dict) and e.get("kind") == "context_edit_rejected"
+    ]
+    assert rejected[0]["payload"]["reason"] == "injected_content"
+
+
+@pytest.mark.asyncio
+async def test_byte_monotonic_replace_rule_may_synthesize() -> None:
+    """A ``byte_monotonic_replace`` rule MAY return a modified/synth Content."""
+
+    class _Replacer:
+        name = "replacer"
+        rule_class = "byte_monotonic_replace"
+
+        def edit(self, contents, ctx):  # type: ignore[no-untyped-def]
+            # Replace the first content with a smaller synthesized one.
+            return [_text_content("x")] + list(contents[1:])
+
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[_Replacer()], sinks=[sink])
+    request = FakeRequest(
+        contents=[_text_content("a long original preamble turn"), _text_content("keep")]
+    )
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == ["replacer"]
+    assert request.contents[0].parts[0].text == "x"
+    edited = [
+        e for e in sink.events if isinstance(e, dict) and e.get("kind") == "context_edited"
+    ]
+    assert edited[0]["payload"]["rule_class"] == "byte_monotonic_replace"
+
+
+# ---------------------------------------------------------------------------
+# PruneTransientErrorRule
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prune_transient_error_redacts_in_place() -> None:
+    """A transient (429) function_response is redacted; pairing + count intact."""
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[PruneTransientErrorRule()], sinks=[sink])
+    request = FakeRequest(
+        contents=[
+            _text_content("user input"),
+            _call_content("fc-OK", name="search"),
+            _response_content("fc-OK", name="search"),  # success -> untouched
+            _call_content("fc-429", name="fetch"),
+            _transient_response_content("fc-429", name="fetch"),
+        ]
+    )
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == ["prune_transient_error"]
+    # Count is preserved (redaction in place, not a drop).
+    assert len(request.contents) == 5
+    # Pairing preserved: same fc/fr ids before and after.
+    fc_ids = {
+        p.function_call.id
+        for c in request.contents
+        for p in c.parts
+        if p.function_call is not None
+    }
+    fr_ids = {
+        p.function_response.id
+        for c in request.contents
+        for p in c.parts
+        if p.function_response is not None
+    }
+    assert fc_ids == fr_ids == {"fc-OK", "fc-429"}
+    # The transient payload is redacted; the success payload is intact.
+    by_id = {
+        p.function_response.id: p.function_response.response
+        for c in request.contents
+        for p in c.parts
+        if p.function_response is not None
+    }
+    assert by_id["fc-429"] == {"goldfive_redacted": "transient_error_elided"}
+    assert by_id["fc-OK"] == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_prune_transient_error_status_code_shape() -> None:
+    """A top-level 503 status_code is recognised as transient."""
+    editor = ContextEditor(rules=[PruneTransientErrorRule()], sinks=[InMemorySink()])
+    request = FakeRequest(
+        contents=[
+            _text_content("hi"),
+            _call_content("fc-1", name="call"),
+            _transient_response_content(
+                "fc-1",
+                name="call",
+                response={
+                    "status_code": 503,
+                    "detail": "service unavailable, please retry later soon",
+                },
+            ),
+        ]
+    )
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+    assert result.applied_rules == ["prune_transient_error"]
+
+
+@pytest.mark.asyncio
+async def test_prune_transient_error_ignores_non_transient() -> None:
+    """A normal error / success result is NOT touched (conservative)."""
+    editor = ContextEditor(rules=[PruneTransientErrorRule()], sinks=[InMemorySink()])
+    request = FakeRequest(
+        contents=[
+            _text_content("hi"),
+            _call_content("fc-1", name="call"),
+            # An error, but a non-transient one (validation error): keep it.
+            _transient_response_content(
+                "fc-1",
+                name="call",
+                response={"error": "validation failed: field 'x' is required"},
+            ),
+            _call_content("fc-2", name="ok_call"),
+            _response_content("fc-2", name="ok_call"),  # success
+            # A benign data field that merely mentions "timeout" — not an
+            # error shape, must NOT trip.
+            _call_content("fc-3", name="lookup"),
+            FakeContent(
+                role="user",
+                parts=[
+                    FakePart(
+                        function_response=FakeFunctionResponse(
+                            id="fc-3",
+                            name="lookup",
+                            response={"value": "the meeting timed out at 5pm"},
+                        )
+                    )
+                ],
+            ),
+        ]
+    )
+    original = list(request.contents)
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+    assert result.applied_rules == []
+    assert request.contents == original
+
+
+# ---------------------------------------------------------------------------
+# PruneStaleSteerRule
+# ---------------------------------------------------------------------------
+
+
+def _note_content(body: str) -> FakeContent:
+    """A goldfive synthetic note carrying the stable advisory footer."""
+    from goldfive.observer_notes import ADVISORY_FOOTER
+
+    return _text_content(f"{body}\n{ADVISORY_FOOTER}")
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_steer_no_active_steer_drops_all_notes() -> None:
+    """With no active steer recorded, every goldfive note is residue."""
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[sink])
+    request = FakeRequest(
+        contents=[
+            _text_content("real user request"),
+            _note_content("Observation: search_web called 5x with identical args"),
+            _text_content("model reply", role="model"),
+            _note_content("Observation: an older note about something else"),
+        ]
+    )
+
+    result = await editor.apply(
+        request,
+        session=FakeSession(),  # no active steer
+        host_agent_name="a",
+        observation_only=False,
+    )
+
+    assert result.applied_rules == ["prune_stale_steer"]
+    texts = [c.parts[0].text for c in request.contents]
+    assert texts == ["real user request", "model reply"]
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_steer_keeps_active_note() -> None:
+    """The note matching the active-steer body is kept; older notes drop."""
+    from goldfive import state_store as _ostate
+
+    active_body = "Observation: the current active steer body text"
+    session = FakeSession()
+    _ostate.set_active_steer(session.state, body=active_body, at_turn=2, source="goldfive")
+
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[sink])
+    request = FakeRequest(
+        contents=[
+            _text_content("real user request"),
+            _note_content("Observation: a stale prior note"),
+            _note_content(active_body),  # the currently-active steer
+        ]
+    )
+
+    result = await editor.apply(
+        request, session=session, host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == ["prune_stale_steer"]
+    # Two survivors: the user request + the active note.
+    assert len(request.contents) == 2
+    assert active_body in request.contents[1].parts[0].text
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_steer_noop_without_notes() -> None:
+    """A transcript with no goldfive notes is left untouched."""
+    editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[InMemorySink()])
+    request = FakeRequest(
+        contents=[_text_content("user"), _text_content("model", role="model")]
+    )
+    original = list(request.contents)
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+    assert result.applied_rules == []
+    assert request.contents == original
+
+
+# ---------------------------------------------------------------------------
+# CompactPriorReasoningRule
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compact_prior_reasoning_collapses_identical_failures() -> None:
+    """3 identical failed calls collapse to one summarized survivor."""
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[CompactPriorReasoningRule()], sinks=[sink])
+    request = FakeRequest(
+        contents=[
+            _text_content("user input"),
+            _call_content("fc-1", name="search"),
+            _failed_response_content("fc-1", name="search"),
+            _call_content("fc-2", name="search"),  # identical args ({"k":"v"})
+            _failed_response_content("fc-2", name="search"),
+            _call_content("fc-3", name="search"),  # identical
+            _failed_response_content("fc-3", name="search"),
+            _call_content("fc-other", name="distinct"),
+            _response_content("fc-other", name="distinct"),  # success, distinct
+        ]
+    )
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == ["compact_prior_reasoning"]
+    fc_ids = [
+        p.function_call.id
+        for c in request.contents
+        for p in c.parts
+        if p.function_call is not None
+    ]
+    fr_ids = [
+        p.function_response.id
+        for c in request.contents
+        for p in c.parts
+        if p.function_response is not None
+    ]
+    # Only the first of the looping group survives, plus the distinct call.
+    assert fc_ids == ["fc-1", "fc-other"]
+    assert fr_ids == ["fc-1", "fc-other"]
+    # The survivor's response is the summary.
+    kept = {
+        p.function_response.id: p.function_response.response
+        for c in request.contents
+        for p in c.parts
+        if p.function_response is not None
+    }
+    assert "goldfive_compacted" in kept["fc-1"]
+    assert "3 times" in kept["fc-1"]["goldfive_compacted"]
+
+
+@pytest.mark.asyncio
+async def test_compact_prior_reasoning_below_threshold_is_noop() -> None:
+    """2 identical failures with default min_repeats=3 → no-op."""
+    editor = ContextEditor(rules=[CompactPriorReasoningRule()], sinks=[InMemorySink()])
+    request = FakeRequest(
+        contents=[
+            _text_content("user input"),
+            _call_content("fc-1", name="search"),
+            _failed_response_content("fc-1", name="search"),
+            _call_content("fc-2", name="search"),
+            _failed_response_content("fc-2", name="search"),
+        ]
+    )
+    original = list(request.contents)
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+    assert result.applied_rules == []
+    assert request.contents == original
+
+
+@pytest.mark.asyncio
+async def test_compact_prior_reasoning_drift_verdict_lowers_threshold() -> None:
+    """An active LOOPING_TOOL_CALL verdict lowers the threshold to 2."""
+    from goldfive import state_store as _ostate
+    from goldfive.types import DriftKind, DriftSeverity
+
+    session = FakeSession()
+    _ostate.open_or_escalate_drift(
+        session.state,
+        kind=DriftKind.LOOPING_TOOL_CALL,
+        task_id="t1",
+        agent_id="a1",
+        turn_id="turn-1",
+        severity=DriftSeverity.WARNING,
+    )
+
+    editor = ContextEditor(rules=[CompactPriorReasoningRule()], sinks=[InMemorySink()])
+    request = FakeRequest(
+        contents=[
+            _text_content("user input"),
+            _call_content("fc-1", name="search"),
+            _failed_response_content("fc-1", name="search"),
+            _call_content("fc-2", name="search"),
+            _failed_response_content("fc-2", name="search"),
+        ]
+    )
+
+    result = await editor.apply(
+        request, session=session, host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == ["compact_prior_reasoning"]
+    fc_ids = [
+        p.function_call.id
+        for c in request.contents
+        for p in c.parts
+        if p.function_call is not None
+    ]
+    assert fc_ids == ["fc-1"]
+
+
+# ---------------------------------------------------------------------------
+# Dormancy — a healthy transcript passes through byte-identical
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_healthy_transcript_is_byte_identical_with_all_rules() -> None:
+    """All production rules registered + a healthy transcript → zero edits.
+
+    The §0 dormancy contract: no cancelled ids, no transient errors, no
+    stale notes, no repeated failures, no active drifts → every rule is a
+    no-op and ``llm_request.contents`` is the SAME object, byte-identical.
+    """
+    editor = build_editor_from_config(
+        [
+            "prune_cancelled_reasoning",
+            "prune_transient_error",
+            "prune_stale_steer",
+            "compact_prior_reasoning",
+        ],
+        sinks=[InMemorySink()],
+    )
+    assert editor is not None
+    request = FakeRequest(
+        contents=[
+            _text_content("user request: summarize the docs"),
+            _call_content("fc-1", name="read_docs"),
+            _response_content("fc-1", name="read_docs"),  # success
+            _text_content("here is the summary", role="model"),
+        ]
+    )
+    original_ref = request.contents
+    bytes_before = sum(
+        len(p.text)
+        for c in request.contents
+        for p in c.parts
+        if p.text
+    )
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    # No rule applied; the contents reference was never swapped.
+    assert result.applied_rules == []
+    assert result.rejected_rules == []
+    assert request.contents is original_ref
+    assert result.bytes_after == result.bytes_before
+    bytes_after = sum(
+        len(p.text)
+        for c in request.contents
+        for p in c.parts
+        if p.text
+    )
+    assert bytes_after == bytes_before
