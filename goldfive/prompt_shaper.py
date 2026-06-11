@@ -41,12 +41,28 @@ Sites
    ``[GOLDFIVE PLAN-STATE HINT — …]`` block listing each agent's
    PENDING / DONE task summary so the coordinator has structural
    guidance about which sub-agent to call next (R3 / F2-alternative).
+   AGENCY-PRESERVATION.md PR 9 prompt-shaping diet: RETIRED under the
+   ``signal_channel == "request_context"`` regime (its per-turn
+   footprint violates dormancy §1.1); the plan-state content folds into
+   the observer note's Status surface (Site 5). Legacy regime unchanged.
 
 4. **Dynamic instruction resolver** —
    :meth:`PromptShaper.make_dynamic_instruction`. Returns an ADK
    ``InstructionProvider`` callable that resolves the current pinned
    task + pending-correction block on every turn and appends them to
    the agent's ``original_instruction`` (goldfive#251).
+   AGENCY-PRESERVATION.md PR 9: the ``[CURRENT ASSIGNED TASK]`` pin is
+   RETIRED by default under ``request_context`` (the wrapped agent owns
+   its decomposition / ordering); ``SteeringConfig.pin_assigned_task``
+   re-enables it for trees built around the pinned block. Legacy regime
+   unchanged.
+
+5. **Observer-note channel** —
+   :meth:`PromptShaper.inject_observer_note` (AGENCY-PRESERVATION.md
+   PR 6). The one remaining goldfive injection surface in the
+   ``request_context`` regime (alongside Site 2's planner contract):
+   renders the most-severe pending observer note onto the request,
+   carrying the folded plan-state line (Site 3).
 
 Each method first asks :meth:`should_inject` whether the gate is open
 for its context. When :meth:`should_inject` returns ``False`` the
@@ -112,6 +128,38 @@ class PromptShaper:
             return True
         return not bool(getattr(steerer, "_observation_only", False))
 
+    @staticmethod
+    def _signal_channel(steerer: Any) -> str:
+        """Return the steerer's resolved ``signal_channel`` (default legacy).
+
+        AGENCY-PRESERVATION.md PR 9 gates the prompt-shaping diet on the
+        ``request_context`` regime: under ``"legacy_user_message"`` (the
+        production default and what every existing suite runs with) the
+        four sites behave byte-identically to pre-PR-9, so existing tests
+        pass unmodified (§5.1). Tolerant of ``None`` / minimal stubs —
+        both resolve to ``"legacy_user_message"`` so the legacy path is
+        the safe fallback.
+        """
+        channel = getattr(steerer, "_signal_channel", "legacy_user_message")
+        return str(channel or "legacy_user_message")
+
+    @classmethod
+    def _request_context(cls, steerer: Any) -> bool:
+        """True when the steerer is in the PR-9 ``request_context`` diet regime."""
+        return cls._signal_channel(steerer) == "request_context"
+
+    @staticmethod
+    def _pin_assigned_task(steerer: Any) -> bool:
+        """Return ``SteeringConfig.pin_assigned_task`` off the steerer.
+
+        The Site-4 escape hatch (AGENCY-PRESERVATION.md PR 9): when
+        ``True`` the ``[CURRENT ASSIGNED TASK]`` instruction pin injects
+        even under ``request_context``. Defaults to ``False`` and is
+        tolerant of steerers without a typed config (returns ``False``).
+        """
+        cfg = getattr(steerer, "_steering_config", None)
+        return bool(getattr(cfg, "pin_assigned_task", False))
+
     # ----------------------------------------------------------------
     # Site 1 — conversational follow-up wrap
     # ----------------------------------------------------------------
@@ -128,20 +176,28 @@ class PromptShaper:
         F6 (closes goldfive#277). When :meth:`Planner.handle_turn`
         returns ``None`` on a turn with a real prior plan, the runner
         reuses ``session.plan`` but still drives the executor over the
-        input — without this wrapper the coordinator typically treats
-        the question as a fresh task and re-delegates to sub-agents,
-        wasting an invocation. The wrapper:
+        input. The wrapper supplies the coordinator with the prior-plan
+        context (summary + completed tasks) so it can answer the
+        follow-up from history. Lives in the message body (no
+        system-prompt contract — users bring their own coordinator
+        prompts; goldfive must not require a specific contract).
 
-        * tags the message as a conversational follow-up,
-        * gives the coordinator the plan summary + completed task
-          context so it can answer from history,
-        * asks it explicitly NOT to delegate.
+        Two regimes (AGENCY-PRESERVATION.md PR 9 prompt-shaping diet):
 
-        Lives in the message body (no system-prompt contract). A
-        parallel layer (the ADK plugin's pre-dispatch interceptor,
-        keyed off ``session._conversational_turn``) tightens the
-        tool surface so the coordinator literally cannot delegate
-        even if it tried; this wrapper is the cooperative half.
+        * ``signal_channel == "legacy_user_message"`` (the default) —
+          the legacy wrapper: the prior-plan context PLUS an explicit
+          "do not delegate / Do NOT call any AgentTool" directive. Kept
+          byte-identical so existing suites pass unmodified (§5.1).
+        * ``signal_channel == "request_context"`` — the diet wrapper:
+          the same prior-plan CONTEXT, but WITHOUT the means-directive.
+          goldfive owns goals; the wrapped agent owns MEANS (whether to
+          delegate is its call). The agent is informed, not commanded.
+
+        Note: there is no ADK-plugin "tool-surface-tightening
+        interceptor" — it was described in a stale docstring but never
+        shipped (verified PR 9). ``session._conversational_turn`` is
+        consumed only by the runner itself to decide whether to call
+        this wrapper.
 
         Under ``observation_only=True`` (:meth:`should_inject` →
         ``False``) the wrapper is skipped and ``user_input`` is
@@ -173,6 +229,20 @@ class PromptShaper:
         completed_block = (
             "\n".join(completed_lines) if completed_lines else "  (none yet)"
         )
+
+        if self._request_context(steerer):
+            # Diet: prior-plan CONTEXT only — no means-directive. The
+            # agent decides whether to delegate.
+            return (
+                "[CONVERSATIONAL FOLLOW-UP — prior plan context for "
+                "reference]\n\n"
+                "The user is asking a follow-up question about prior work. "
+                "The prior plan and completed tasks are below for context.\n\n"
+                f"Plan summary: {plan_summary}\n"
+                f"Completed tasks:\n{completed_block}\n\n"
+                f"User question: {user_input}"
+            )
+
         return (
             "[CONVERSATIONAL FOLLOW-UP — reuse prior plan, don't delegate "
             "to sub-agents]\n\n"
@@ -408,16 +478,15 @@ class PromptShaper:
             _strip_prior_runtime_tools_hint,
         )
 
-        hint = _build_runtime_tools_hint(session)
-
         config = _safe_attr(llm_request, "config", None)
         if config is None:
             return
         existing = getattr(config, "system_instruction", None)
 
-        # Strip any prior hint regardless of whether we'll re-inject. A
-        # None ``hint`` (plan disappeared or all groups empty) should
-        # still remove the stale marker block from the request.
+        # Strip any prior hint regardless of regime. A None ``hint``
+        # (plan disappeared or all groups empty) — and the diet regime
+        # below — should still remove a stale marker block left over from
+        # a legacy-channel turn.
         if isinstance(existing, str) and _RUNTIME_TOOLS_HINT_PREFIX in existing:
             try:
                 config.system_instruction = _strip_prior_runtime_tools_hint(existing) or None
@@ -430,6 +499,16 @@ class PromptShaper:
                 return
             existing = getattr(config, "system_instruction", None)
 
+        # AGENCY-PRESERVATION.md PR 9 — Site 3 diet. Under the
+        # ``request_context`` regime the per-turn standalone plan-state
+        # hint is RETIRED (it was a per-turn footprint — the dormancy
+        # violation §1.1 calls out). Its plan-state content is folded
+        # into the observer note's Status surface (see
+        # :meth:`inject_observer_note`). Legacy regime is unchanged.
+        if self._request_context(steerer):
+            return
+
+        hint = _build_runtime_tools_hint(session)
         if not hint:
             return
 
@@ -548,6 +627,27 @@ class PromptShaper:
                     )
                     return original_instruction
 
+                # AGENCY-PRESERVATION.md PR 9 — Site 4 diet. Under the
+                # ``request_context`` regime the per-turn
+                # ``[CURRENT ASSIGNED TASK]`` pin is RETIRED by default:
+                # the wrapped agent owns its own decomposition / ordering
+                # and does not need goldfive restating the bound task into
+                # every model call. ``pin_assigned_task`` is the escape
+                # hatch for trees built around the pinned-task block.
+                # Legacy ``signal_channel`` keeps the pin (byte-identical;
+                # §5.1).
+                if shaper._request_context(steerer) and not shaper._pin_assigned_task(
+                    steerer
+                ):
+                    log.info(
+                        "PromptShaper.make_dynamic_instruction resolver: "
+                        "request_context regime + pin_assigned_task=False — "
+                        "retiring the [CURRENT ASSIGNED TASK] pin for "
+                        "agent=%r (returning original instruction verbatim)",
+                        agent_name,
+                    )
+                    return original_instruction
+
                 state = _state_from_readonly_context(readonly_ctx)
                 session = getattr(ctx, "session", None) if ctx is not None else None
 
@@ -618,6 +718,45 @@ class PromptShaper:
     # Site 5 — observer-note channel (AGENCY-PRESERVATION.md PR 6)
     # ----------------------------------------------------------------
 
+    @staticmethod
+    def _plan_state_line(session: Any) -> str:
+        """Return a factual per-agent open-work line for the note (PR 9 Site 3 fold).
+
+        Replaces the retired per-turn plan-state hint: groups
+        ``session.plan.tasks`` by assignee and reports each agent's open
+        (non-terminal) vs complete count. Bookkeeping only — no "choose
+        the agent whose tasks are still PENDING" imperative (the means-
+        directive PR 9 drops). Returns ``""`` when there is no plan / no
+        tasks so the note block is unchanged on pre-plan turns. Never
+        raises.
+        """
+        try:
+            plan = _safe_attr(session, "plan", None)
+            tasks = _safe_attr(plan, "tasks", None) if plan is not None else None
+            if not tasks:
+                return ""
+            from goldfive.types import TERMINAL_TASK_STATUSES
+
+            by_agent: dict[str, list[int]] = {}
+            for t in tasks:
+                agent = _safe_attr(t, "assignee_agent_id", "") or "<unassigned>"
+                bucket = by_agent.setdefault(agent, [0, 0])  # [open, done]
+                status = _safe_attr(t, "status", None)
+                if status in TERMINAL_TASK_STATUSES:
+                    bucket[1] += 1
+                else:
+                    bucket[0] += 1
+            frags: list[str] = []
+            for agent in sorted(by_agent):
+                bare = agent.split(":")[-1] if ":" in agent else agent
+                open_n, _done_n = by_agent[agent]
+                frags.append(f"{bare}: {open_n} open" if open_n else f"{bare}: complete")
+            if not frags:
+                return ""
+            return "Plan state (goldfive bookkeeping): " + "; ".join(frags) + "."
+        except Exception:  # noqa: BLE001
+            return ""
+
     def inject_observer_note(
         self,
         *,
@@ -666,6 +805,7 @@ class PromptShaper:
         """
         try:
             from goldfive.observer_note_queue import (
+                OBSERVER_NOTE_BLOCK_END,
                 OBSERVER_NOTE_MARKER_PREFIX,
                 ObserverNoteQueue,
                 render_block,
@@ -708,6 +848,19 @@ class PromptShaper:
 
         if self.should_inject(steerer):
             block = render_block(note)
+            # AGENCY-PRESERVATION.md PR 9 — Site 3 fold. The retired
+            # per-turn plan-state hint's content rides the observer note
+            # instead: a factual per-agent open-work line, placed INSIDE
+            # the marker block (before the END marker) so strip-and-refresh
+            # removes it as one unit and the marker count stays 1. Factual
+            # bookkeeping only — no "choose the agent" imperative.
+            plan_state = self._plan_state_line(session)
+            if plan_state and OBSERVER_NOTE_BLOCK_END in block:
+                block = block.replace(
+                    OBSERVER_NOTE_BLOCK_END,
+                    f"{plan_state}\n{OBSERVER_NOTE_BLOCK_END}",
+                    1,
+                )
             append = getattr(llm_request, "append_instructions", None)
             wrote = False
             if callable(append):

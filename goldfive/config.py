@@ -882,6 +882,25 @@ class SteeringConfig:
     #: AGENCY-PRESERVATION.md PR 13 flips it after the bench gate.
     #: Env: ``GOLDFIVE_PLAN_MODE``.
     plan_mode: str = "forecast"
+    #: AGENCY-PRESERVATION.md Stage 2 PR 9 — Site-4 escape hatch for the
+    #: per-turn ``[CURRENT ASSIGNED TASK]`` instruction pin.
+    #:
+    #: The prompt-shaping diet retires the per-turn task pin (Site 4 of
+    #: :class:`~goldfive.prompt_shaper.PromptShaper`) in the new
+    #: ``signal_channel == "request_context"`` regime: the agent owns its
+    #: own decomposition / ordering and does not need goldfive restating
+    #: the bound task into every model call. When ``True`` the pin is
+    #: re-enabled even under ``request_context`` — an escape hatch for
+    #: trees specifically built around the pinned-task block.
+    #:
+    #: Default ``False``. This GATES NOTHING in the legacy
+    #: ``signal_channel == "legacy_user_message"`` regime (the default):
+    #: there the pin always injects, exactly as pre-PR-9, so every
+    #: existing suite passes unmodified (§5.1). The diet only takes
+    #: effect once an operator opts into ``request_context``; this flag
+    #: then lets them keep the pin if their tree depends on it.
+    #: Env: ``GOLDFIVE_STEER_PIN_ASSIGNED_TASK``.
+    pin_assigned_task: bool = False
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -949,6 +968,10 @@ class SteeringConfig:
             plan_mode=_read_plan_mode_env(
                 "GOLDFIVE_PLAN_MODE",
                 defaults.plan_mode,
+            ),
+            pin_assigned_task=_read_bool_env(
+                "GOLDFIVE_STEER_PIN_ASSIGNED_TASK",
+                defaults.pin_assigned_task,
             ),
         )
 
