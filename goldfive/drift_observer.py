@@ -953,6 +953,83 @@ class DriftObserver:
         except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
             log.debug("signal_outcome emit failed: %s", exc)
 
+    # ------------------------------------------------------------------
+    # Observer-note channel (AGENCY-PRESERVATION.md PR 6)
+    # ------------------------------------------------------------------
+
+    async def _route_corrective_note(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        note_text: str,
+        *,
+        ladder_level: str,
+    ) -> None:
+        """Route a composed observer note to the configured delivery channel.
+
+        Both channels emit ``SignalDelivered`` at the **dispatch decision
+        point** (here) — the PR-5 model the §5.4 shadow/differential diff is
+        built on (the divergence report compares the *decisions* the legacy
+        and new regimes make on the same run, not delivery mechanics). The
+        only difference is *where the note is queued* and *how it is rendered*:
+
+        * ``signal_channel="legacy_user_message"`` (default) — append to
+          ``session.pending_nudges``; the executor's boundary nudge-replay
+          renders it. ``channel="nudge_replay"``. Byte-identical to pre-PR-6,
+          so existing suites pass unmodified (§5.1).
+        * ``signal_channel="request_context"`` (PR 6) — enqueue onto the
+          :class:`~goldfive.observer_note_queue.ObserverNoteQueue`; the four
+          observer-note surfaces render it, each marking the queue's
+          ``delivered`` flag so the note is *rendered* exactly once across
+          surfaces. ``channel="request_context"``. Whether the note actually
+          reaches the agent is gated on ``observation_only`` at the surface,
+          which is exactly what ``dry_run`` (== ``observation_only``) records
+          on this event — so the event and the mechanism never disagree.
+        """
+        channel = getattr(self._steerer, "_signal_channel", "legacy_user_message")
+        if channel == "request_context":
+            from goldfive.events import SIGNAL_CHANNEL_REQUEST_CONTEXT
+            from goldfive.observer_note_queue import ObserverNoteQueue
+            from goldfive.observer_notes import observation_for_drift
+
+            try:
+                observation, _question = observation_for_drift(drift)
+                ObserverNoteQueue.for_session(session).enqueue(
+                    body=note_text,
+                    observation=observation,
+                    severity=drift.severity.value,
+                    drift_id=str(getattr(drift, "id", "") or ""),
+                    kind=drift.kind.value,
+                    task_id=drift.current_task_id or "",
+                    agent_id=drift.current_agent_id or "",
+                    turn=int(getattr(session, "_reasoning_turn", 0) or 0),
+                    ladder_level=ladder_level,
+                )
+            except Exception as exc:  # noqa: BLE001 -- best-effort enqueue
+                log.debug("observer-note enqueue failed: %s", exc)
+            await self._emit_signal_delivered(
+                session,
+                drift,
+                channel=SIGNAL_CHANNEL_REQUEST_CONTEXT,
+                note_text=note_text,
+                ladder_level=ladder_level,
+                extra_decision={"channel_action": "enqueued"},
+            )
+            return
+
+        # Legacy channel — the pre-PR-6 behaviour.
+        session.pending_nudges.append(note_text)
+        from goldfive.events import SIGNAL_CHANNEL_NUDGE_REPLAY
+
+        await self._emit_signal_delivered(
+            session,
+            drift,
+            channel=SIGNAL_CHANNEL_NUDGE_REPLAY,
+            note_text=note_text,
+            ladder_level=ladder_level,
+            extra_decision={"channel_action": "queued"},
+        )
+
     async def _note_signal_drift_fire(self, session: Session, drift: DriftEvent) -> None:
         """Record a drift fire on the ledger (or a user-intervention outcome).
 
@@ -4337,29 +4414,20 @@ class DriftObserver:
         if level is InterventionLevel.ABSORB and drift.kind in _ABSORB_NUDGE_KINDS:
             # AGENCY-PRESERVATION.md PR 4: the nudge body is an
             # observation+goal advisory note, not a directive about
-            # which task / agent comes next. Same queue, same overlay
-            # replay path — content only.
+            # which task / agent comes next. PR 6: routed to the
+            # configured delivery channel — legacy ``pending_nudges`` or
+            # the request_context observer-note queue. ``ladder_level="absorb"``
+            # lets the divergence report tell this post-ABSORB delivery apart
+            # from the Level-2 ``_dispatch_nudge`` one.
             nudge_msg = compose_note_for_drift(drift=drift, session=session)
-            session.pending_nudges.append(nudge_msg)
             log.debug(
                 "DefaultSteerer._handle_drift: queued post-ABSORB nudge for kind=%s task=%s: %s",
                 drift.kind.value,
                 drift.current_task_id or "-",
                 nudge_msg,
             )
-            # AGENCY-PRESERVATION.md PR 5 (observe-only): the post-ABSORB
-            # nudge is a second nudge_replay delivery site (distinct from
-            # Level-2 ``_dispatch_nudge``). ``ladder_level="absorb"`` lets the
-            # divergence report tell the two apart.
-            from goldfive.events import SIGNAL_CHANNEL_NUDGE_REPLAY
-
-            await self._emit_signal_delivered(
-                session,
-                drift,
-                channel=SIGNAL_CHANNEL_NUDGE_REPLAY,
-                note_text=nudge_msg,
-                ladder_level="absorb",
-                extra_decision={"channel_action": "queued"},
+            await self._route_corrective_note(
+                session, drift, nudge_msg, ladder_level="absorb"
             )
 
     # ------------------------------------------------------------------
@@ -4381,31 +4449,23 @@ class DriftObserver:
         from goldfive.observer_notes import compose_note_for_drift
 
         msg = compose_note_for_drift(drift=drift, session=session)
-        session.pending_nudges.append(msg)
         log.debug(
             "DefaultSteerer: queued nudge for kind=%s task=%s: %s",
             drift.kind.value,
             drift.current_task_id or "-",
             msg,
         )
-        # AGENCY-PRESERVATION.md PR 5 (observe-only): record the nudge_replay
-        # delivery. The legacy nudge queue is NOT gated by ``observation_only``
-        # (only the steer / pause / cancel write-paths are — see
-        # SteeringConfig.observation_only) so the message physically queues in
-        # both modes; ``channel_action="queued"`` records that mechanical
-        # truth, while the event's ``dry_run`` flag still tracks shadow-mode
-        # for the §5.4 divergence report. PR 6 routes this through the gated
-        # observer-note channel and the asymmetry goes away.
-        from goldfive.events import SIGNAL_CHANNEL_NUDGE_REPLAY
-
-        await self._emit_signal_delivered(
-            session,
-            drift,
-            channel=SIGNAL_CHANNEL_NUDGE_REPLAY,
-            note_text=msg,
-            ladder_level="nudge",
-            extra_decision={"channel_action": "queued"},
-        )
+        # AGENCY-PRESERVATION.md PR 5/6: route to the configured delivery
+        # channel. Legacy (default) appends to ``session.pending_nudges`` and
+        # records the nudge_replay delivery at enqueue — the message physically
+        # queues even under ``observation_only`` (only the steer / pause /
+        # cancel write-paths are gated), so ``channel_action="queued"`` records
+        # that mechanical truth while ``dry_run`` tracks shadow-mode for the
+        # §5.4 divergence report. PR 6's request_context channel routes through
+        # the gated observer-note queue and the asymmetry goes away (the note
+        # is delivered — and SignalDelivered emitted — only when a surface
+        # actually renders it, under ``_should_inject``).
+        await self._route_corrective_note(session, drift, msg, ladder_level="nudge")
 
     async def _dispatch_goldfive_steer_control(
         self,

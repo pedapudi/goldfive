@@ -1367,6 +1367,37 @@ class SequentialExecutor(Executor):
             # prevent the #163-style amplification: a coordinator
             # whose tree keeps producing nudge-eligible drift on every
             # turn must eventually stop triggering re-invokes.
+            # AGENCY-PRESERVATION.md PR 6 — observer-note channel surface 2.
+            # In ``signal_channel="request_context"`` mode the boundary replay
+            # consumes the ObserverNoteQueue (≤1 block, most-severe pending note
+            # wins) instead of ``session.pending_nudges``. Gated on the
+            # steerer's ``_should_inject`` so a note is delivered only when
+            # steering has authority — the legacy ``pending_nudges`` asymmetry
+            # (queued even under ``observation_only``) goes away. A note already
+            # delivered mid-invocation via the before_model surface is no longer
+            # pending here, so it is never re-delivered (exactly-once, §5.2).
+            if getattr(steerer, "_signal_channel", "legacy_user_message") == "request_context":
+                replay_msg: str | None = None
+                if (
+                    nudge_replays < self._MAX_NUDGE_REPLAYS
+                    and _has_live_pending_or_running(session.plan or plan)
+                    and _steerer_should_inject(steerer)
+                ):
+                    replay_msg = await self._consume_observer_note_for_replay(session)
+                if replay_msg is not None:
+                    nudge_replays += 1
+                    current_user_input = replay_msg
+                    log.info(
+                        "SequentialExecutor._run_overlay: observer-note replay "
+                        "%d/%d — re-invoking passthrough with queued note",
+                        nudge_replays,
+                        self._MAX_NUDGE_REPLAYS,
+                    )
+                    reconciler.reset_for_new_plan(session.plan)
+                    next_reentry_kind = ReentryKind.NUDGE_REPLAY
+                    continue
+                break
+
             pending = list(session.pending_nudges)
             if (
                 pending
@@ -1991,6 +2022,46 @@ class SequentialExecutor(Executor):
             f"{body}"
         )
 
+    async def _consume_observer_note_for_replay(
+        self,
+        session: Session,
+    ) -> str | None:
+        """Consume the most-severe pending observer note for a boundary replay.
+
+        Surface 2 of the PR 6 observer-note channel. Selects the most-severe
+        pending note (≤1 per replay), marks it delivered — the exactly-once
+        *rendering* chokepoint, so a note already shown mid-invocation via the
+        ``before_model`` surface is skipped here — and returns the rendered
+        block to feed as the next user turn. (``SignalDelivered`` is emitted
+        once at the dispatch point, not here.) Returns ``None`` when no note is
+        pending (the caller falls through to the end-of-overlay sweep).
+        Best-effort: never raises into the overlay loop.
+        """
+        from goldfive.observer_note_queue import ObserverNoteQueue, render_block
+
+        try:
+            queue = ObserverNoteQueue.for_session(session)
+            note = queue.peek_for_render()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("SequentialExecutor: observer-note queue read raised: %s", exc)
+            return None
+        if note is None:
+            return None
+        turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+        try:
+            newly = queue.mark_delivered(
+                note.note_id,
+                channel="request_context",
+                turn=turn,
+                surface="boundary_replay",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("SequentialExecutor: observer-note mark_delivered raised: %s", exc)
+            return None
+        if not newly:
+            return None
+        return render_block(note)
+
     @staticmethod
     def _compose_steer_restart_message(
         msg: object,
@@ -2169,6 +2240,24 @@ def _has_live_pending_or_running(plan: Plan) -> bool:
     against a terminated plan.
     """
     return any(t.status in (TaskStatus.PENDING, TaskStatus.RUNNING) for t in plan.tasks)
+
+
+def _steerer_should_inject(steerer: Any) -> bool:
+    """Return the steerer's active-steering injection gate (PR 6 surface 2).
+
+    Mirrors :meth:`goldfive.prompt_shaper.PromptShaper.should_inject` and the
+    steerer's own ``_should_inject``: under ``observation_only=True`` steering
+    has no authority and the boundary replay must not re-invoke with a note.
+    Tolerant of steerers without the predicate (returns ``True`` so pre-#271
+    paths and minimal stubs keep working).
+    """
+    should = getattr(steerer, "_should_inject", None)
+    if callable(should):
+        try:
+            return bool(should())
+        except Exception:  # noqa: BLE001
+            return True
+    return not bool(getattr(steerer, "_observation_only", False))
 
 
 def _has_live_replacement(plan: Plan, failed: Task) -> bool:

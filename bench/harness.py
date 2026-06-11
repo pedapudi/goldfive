@@ -121,6 +121,7 @@ KNOWN_STEER_ENV: frozenset[str] = frozenset(
         "GOLDFIVE_STEER_SIGNAL_TELEMETRY",
         "GOLDFIVE_CANCEL_INFLIGHT_SCOPE",
         "GOLDFIVE_PLAN_MODE",  # PR 10 — SteeringConfig.from_env now reads it
+        "GOLDFIVE_STEER_SIGNAL_CHANNEL",  # PR 6 — SteeringConfig.from_env now reads it
     }
 )
 
@@ -132,7 +133,6 @@ KNOWN_STEER_ENV: frozenset[str] = frozenset(
 _PENDING_STEER_ENV: frozenset[str] = frozenset(
     {
         "GOLDFIVE_STEER_LEGACY_LADDER",  # PR 7 escape hatch
-        "GOLDFIVE_STEER_SIGNAL_CHANNEL",  # PR 6 (request_context | legacy_user_message)
     }
 )
 

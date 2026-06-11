@@ -651,6 +651,89 @@ without per-test surgery.
 
 ---
 
+## §5.6 The observer-note channel (AGENCY-PRESERVATION.md PR 6)
+
+The actor mailbox (§3.1) carries **control**: cancel / pause /
+restart — authority that never depends on the agent cooperating.
+Corrective *information* — "you've called `search_web` five times
+with identical args; the user's goal is X" — is different: it is
+advisory, and the agency-preservation roadmap delivers it on a
+separate **observer-note channel** so a Level-2 signal never has to
+ride a cancel-and-restart (§1's false-positive cascades are partly
+the cost of conflating the two).
+
+**Content vs. delivery.** `goldfive/observer_notes.py` (PR 4)
+composes *what* goldfive says — a neutral observation, the user's
+goal, an advisory footer, never an imperative means-verb.
+`goldfive/observer_note_queue.py` (PR 6) is *where* it lands.
+
+**The queue.** `ObserverNoteQueue` is a StateStore-backed slot on
+goldfive `Session.state` (`goldfive.observer_note_queue`), a sibling
+of the `SignalLedger` / `active_drifts` slots — the same
+JSON-serialisable read-modify-write convention. A note's identity
+(`note_id`) is goldfive-minted (the originating `DriftEvent.id`, or a
+content hash) and **never** an LLM-minted id, so the exactly-once
+flag can't churn (§5.6 of the roadmap — the stable-keys scar tissue).
+
+**Four delivery surfaces, in preference order.** A supervisor at the
+callback layer can reach the agent four ways; the queue is the shared
+substrate so delivery is exactly-once across all of them:
+
+1. **ADK `before_model_callback`** — `PromptShaper.inject_observer_note`
+   renders the most-severe pending note as a marker-bracketed
+   `[GOLDFIVE OBSERVER NOTE …]` block on `system_instruction`, using the
+   strip-and-refresh pattern (two consecutive calls never stack blocks).
+   Reaches a *mid-invocation* agent on its next model call — the surface
+   that removes the only remaining justification for
+   cancel-as-information-delivery.
+2. **Invocation-boundary replay** — `SequentialExecutor._run_overlay`
+   consumes the queue (instead of `session.pending_nudges`) and
+   re-invokes with the note as the next turn.
+3. **claude-agent-sdk** — a system-prompt section + a `PostToolUse`
+   hook's `additionalContext`.
+4. **Tool-result annotation** — for loop-shaped drift, an append-only
+   attributed one-liner (`[goldfive observer: …]`) on the repeated
+   tool's `function_response`, landing adjacent to the evidence. The
+   real result keys are preserved verbatim; only a reserved
+   `goldfive_observer_note` key is added.
+
+**Exactly-once + coalescing.** Each note carries a `delivered` flag;
+the first surface to render a note marks it, and every other surface
+only ever looks at *pending* notes (`peek_for_render`), so a note shown
+mid-invocation is never re-rendered at the boundary (the classic
+two-mode double-delivery bug). At most one block leaves the queue per
+request, and the most-severe pending note wins; lower-severity notes
+surface on subsequent requests (none is dropped).
+
+**Telemetry at the dispatch decision point.** `SignalDelivered` is
+emitted once, at the dispatch decision (`_route_corrective_note`) —
+the PR-5 model the §5.4 shadow/differential diff is built on (the
+divergence report compares the *decisions* the legacy and new regimes
+make on the same run, not delivery mechanics). Both channels emit
+there; request_context uses `channel="request_context"`. The four
+surfaces are the exactly-once *rendering* leg only — they mark the
+queue's `delivered` flag but emit no second event. `dry_run`
+(== `observation_only`) records whether the note will actually reach
+the agent, which is consistent with the surface behaviour: under
+`observation_only` the surface skips injection (the strict-passive
+operator sees the raw prompt) and the note is consumed as a dry-run.
+
+**Config (no-op by default).** `SteeringConfig.signal_channel`
+selects the channel:
+
+* `"legacy_user_message"` (the default) — notes queue on
+  `session.pending_nudges` and reach the agent via the pre-PR-6
+  boundary nudge-replay; `SignalDelivered` is emitted at enqueue
+  (`channel="nudge_replay"`). With this default the observer queue is
+  never populated and all four surfaces are inert, so PR 6 ships dark
+  (§5.1 no-op-by-default; existing suites pass unmodified).
+* `"request_context"` — notes route through `ObserverNoteQueue` and
+  the four surfaces above.
+
+Env: `GOLDFIVE_STEER_SIGNAL_CHANNEL=request_context`.
+
+---
+
 ## §6. References
 
 ### §6.1 Sibling design docs

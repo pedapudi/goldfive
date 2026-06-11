@@ -592,6 +592,29 @@ class DefaultSteerer:
         self._signal_telemetry_enabled: bool = bool(
             getattr(steering_config, "signal_telemetry", False)
         )
+        # AGENCY-PRESERVATION.md PR 6: observer-note delivery channel.
+        # ``"legacy_user_message"`` (the default) keeps corrective notes on
+        # ``session.pending_nudges`` (the pre-PR-6 boundary replay);
+        # ``"request_context"`` routes them through the
+        # :class:`~goldfive.observer_note_queue.ObserverNoteQueue` and the four
+        # observer-note delivery surfaces. The drift observer (enqueue) and the
+        # executor / adapters (delivery) read this flag; with the legacy
+        # default the queue is never populated and the new surfaces are inert,
+        # so PR 6 ships dark (§5.1). Normalised + validated on
+        # :class:`SteeringConfig`; a bare ``DefaultSteerer()`` with no config
+        # defaults to legacy.
+        _channel = str(
+            getattr(steering_config, "signal_channel", "legacy_user_message")
+            or "legacy_user_message"
+        ).strip().lower()
+        if _channel not in {"legacy_user_message", "request_context"}:
+            log.warning(
+                "DefaultSteerer: unknown signal_channel=%r; "
+                "falling back to 'legacy_user_message'",
+                _channel,
+            )
+            _channel = "legacy_user_message"
+        self._signal_channel: str = _channel
         # Background reasoning-judge tasks (goldfive#251). The LLM-judge
         # path in :meth:`observe_reasoning` is fire-and-forget so the
         # adapter's model-response callback can return immediately and

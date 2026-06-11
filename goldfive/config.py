@@ -82,6 +82,16 @@ _VALID_STEER_THRESHOLDS: frozenset[str] = frozenset({"off", "warning", "critical
 
 _VALID_CANCEL_INFLIGHT_SCOPES: frozenset[str] = frozenset({"user_and_safety", "all"})
 
+#: Valid values for :attr:`SteeringConfig.signal_channel`
+#: (AGENCY-PRESERVATION.md PR 6). ``"legacy_user_message"`` is the default and
+#: routes corrective notes through ``session.pending_nudges`` (the pre-PR-6
+#: invocation-boundary replay); ``"request_context"`` routes them through the
+#: StateStore-backed :class:`~goldfive.observer_note_queue.ObserverNoteQueue`
+#: and the four observer-note delivery surfaces.
+_VALID_SIGNAL_CHANNELS: frozenset[str] = frozenset(
+    {"legacy_user_message", "request_context"}
+)
+
 #: Valid values for :attr:`SteeringConfig.plan_mode` (AGENCY-PRESERVATION.md
 #: Stage 3 PR 10). ``"forecast"`` is the legacy default; ``"ledger"`` is
 #: the goal-anchored OUTCOME + descriptively-grown DISCOVERED regime.
@@ -251,6 +261,30 @@ def _read_cancel_inflight_scope_env(name: str, default: str) -> str:
         name,
         raw,
         sorted(_VALID_CANCEL_INFLIGHT_SCOPES),
+        default,
+    )
+    return default
+
+
+def _read_signal_channel_env(name: str, default: str) -> str:
+    """Return ``os.environ[name]`` as a signal-channel literal, or ``default``.
+
+    Accepts ``"legacy_user_message"`` / ``"request_context"``
+    (case-insensitive). Anything else logs a WARNING and falls back so a typo
+    never silently flips the observer-note delivery channel
+    (AGENCY-PRESERVATION.md PR 6).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _VALID_SIGNAL_CHANNELS:
+        return value
+    log.warning(
+        "ignoring unknown %s=%r (expected one of %s); using default %r",
+        name,
+        raw,
+        sorted(_VALID_SIGNAL_CHANNELS),
         default,
     )
     return default
@@ -801,6 +835,30 @@ class SteeringConfig:
     #: the plugin cancel call itself; this knob decides which drift
     #: AUTHORITIES may request it in the first place.
     cancel_inflight_scope: str = "user_and_safety"
+    #: Delivery channel for goldfive-authored corrective notes
+    #: (AGENCY-PRESERVATION.md PR 6).
+    #:
+    #: * ``"legacy_user_message"`` (the default) — corrective notes queue on
+    #:   ``session.pending_nudges`` and reach the agent as the next user
+    #:   message via the executor's invocation-boundary nudge-replay loop
+    #:   (the pre-PR-6 mechanism). ``channel="nudge_replay"``.
+    #: * ``"request_context"`` — notes route through the StateStore-backed
+    #:   :class:`~goldfive.observer_note_queue.ObserverNoteQueue` and the four
+    #:   observer-note delivery surfaces (ADK ``before_model`` system-prompt
+    #:   block; invocation-boundary replay consuming the queue; the
+    #:   claude-agent-sdk system prompt + ``PostToolUse`` ``additionalContext``;
+    #:   the append-only tool-result annotation for loop-shaped drift). Per
+    #:   request at most one block is rendered (most-severe pending note wins)
+    #:   and rendering is exactly-once across surfaces. Whether a note actually
+    #:   reaches the agent is gated on ``observation_only`` at the surface.
+    #:
+    #: ``SignalDelivered`` is emitted once at the dispatch decision point for
+    #: BOTH channels (``channel="request_context"`` for the new one) — the PR-5
+    #: model the §5.4 shadow diff is built on; the surfaces are the rendering
+    #: leg only. Default ``"legacy_user_message"`` keeps PR 6 a no-op (§5.1):
+    #: with the legacy channel the queue is never populated and every delivery
+    #: surface is inert. Env: ``GOLDFIVE_STEER_SIGNAL_CHANNEL``.
+    signal_channel: str = "legacy_user_message"
     #: AGENCY-PRESERVATION.md Stage 3 PR 10 — the plan-as-ledger regime
     #: (design doc ``docs/design/AGENCY-PRESERVATION.md`` §2).
     #:
@@ -847,6 +905,10 @@ class SteeringConfig:
           ``all`` (case-insensitive). ``all`` is the PR-1 kill-switch
           that restores the legacy cancel-on-every-install behaviour
           (AGENCY-PRESERVATION.md §5.1).
+        * ``GOLDFIVE_STEER_SIGNAL_CHANNEL`` — ``legacy_user_message`` /
+          ``request_context`` (case-insensitive). Selects the
+          observer-note delivery channel (AGENCY-PRESERVATION.md PR 6);
+          default ``legacy_user_message``.
         """
         defaults = cls()
         raw_rules = os.environ.get("GOLDFIVE_STEER_CONTEXT_EDITOR_RULES", "").strip()
@@ -879,6 +941,10 @@ class SteeringConfig:
             cancel_inflight_scope=_read_cancel_inflight_scope_env(
                 "GOLDFIVE_CANCEL_INFLIGHT_SCOPE",
                 defaults.cancel_inflight_scope,
+            ),
+            signal_channel=_read_signal_channel_env(
+                "GOLDFIVE_STEER_SIGNAL_CHANNEL",
+                defaults.signal_channel,
             ),
             plan_mode=_read_plan_mode_env(
                 "GOLDFIVE_PLAN_MODE",
