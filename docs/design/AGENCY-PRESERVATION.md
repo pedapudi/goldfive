@@ -1,6 +1,11 @@
 # Agency Preservation: from always-on controller to dormant supervisor
 
-Status: ROADMAP (not yet implemented)
+Status: **IMPLEMENTED** on the `agency-preservation` branch (PRs #453–#472),
+**default-OFF** pending the §6.4 bench gate (PR 13b). The roadmap below
+(§§0–5) is preserved as the original design rationale; **§6 records the
+as-built status, the deliberate deviations from this roadmap, what is still
+default-OFF, and the 13b pre-flip checklist.** Read §6 first for "what
+actually shipped."
 
 ## 0. What goldfive is
 
@@ -154,6 +159,14 @@ new regime is measurably non-inferior to no-steering (judge-only
 counterfactual baseline).
 
 ## 3. Roadmap
+
+> **Implementation status:** Stages 1–3 (PRs 1–12) and their fast-follows
+> are **IMPLEMENTED and merged** on the `agency-preservation` branch
+> (PRs #453–#472), default-OFF pending PR 13b. Stage 4 is unbuilt
+> (exploratory). The per-PR text below is the original plan; see **§6** for
+> the as-built status table, the deliberate deviations from this plan
+> (each with its PR), and the 13b pre-flip checklist. PR 13b
+> (measurement + default flips + hard deletions) has **not** started.
 
 ### Stage 1 — Stop the bleeding
 
@@ -587,3 +600,186 @@ one-line PRs makes rollback a 60-second operation. The honest residual
 risk is emergent behavior in the two-mode period that no test
 anticipates — that is what §5.4 and §5.5 exist for: shadow mileage on
 real workloads before any new path gets authority.
+
+## 6. As-built: implementation status, deviations, and the 13b gate
+
+Stages 1–3 of this roadmap, plus their fast-follows, are **implemented and
+merged on the `agency-preservation` branch** (NOT `main`). The roadmap
+above (§§0–5) is the design rationale as authored; this section is the
+honest as-built record: it marks what shipped, documents every deliberate
+deviation from the roadmap (each a reviewed decision, with its PR), states
+what is still default-OFF, and reproduces the PR-13b pre-flip checklist so
+it survives outside the task tracker. Stage 4 remains exploratory (unbuilt).
+
+### 6.1 Status by stage (PRs #453–#472)
+
+| Roadmap item | PR(s) | Status |
+|---|---|---|
+| PR 1 — gate in-flight cancel on authority (`cancel_inflight_scope`) | #453 | merged |
+| PR 2 — finish #423 (descriptive growth at pin time) | #454 | merged |
+| PR 3 — ladder demotions + decision-table snapshot | #457 (+ #458 pin) | merged |
+| PR 4 — intervention content rewrite (`observer_notes.py`) | #455 | merged |
+| PR 5 — signal telemetry (`SignalDelivered`/`SignalOutcome`, `SignalLedger`) | #456 | merged |
+| PR 6 — observer-note channel (`ObserverNoteQueue` + 4 surfaces) | #462 | merged |
+| PR 6b — context-editing rules (finish #397) | #459, #463 | merged |
+| PR 7 — cancel policy + ladder restructure (NUDGE→SIGNAL) | #467 | merged |
+| PR 8 — pacing / grace windows (visibility-keyed) | #470 (+ #472 follow-ups) | merged |
+| PR 9 — prompt-shaping diet (sites 1/3/4) | #466 | merged |
+| PR 9 follow-up — agent-scoped note delivery + correction migration + cross-surface fold | #468 | merged |
+| PR 10 — ledger plan mode foundations | (ledger line) | merged |
+| PR 11 — goal-grounded judging | #464 | merged |
+| PR 12 — refine retirement in ledger mode + `[GOALS]` block | #469 | merged |
+| PR 13a — three-arm bench harness + shadow-diff tooling | (bench line) | merged |
+| PR 13b — run bench, evaluate, **default flips** | — | **NOT STARTED** (§6.4) |
+
+### 6.2 Still default-OFF (nothing flips until 13b)
+
+Every new regime ships behind a flag whose **default preserves legacy
+behavior** (§5.1). As of #472 the production defaults are unchanged:
+
+- `SteeringConfig.plan_mode = "forecast"` (ledger mode opt-in)
+- `SteeringConfig.signal_channel = "legacy_user_message"` (observer-note
+  channel + pacing + the PR-9 diet + correction-via-notes are all
+  `request_context`-only)
+- `SteeringConfig.observation_only = True` (active steering opt-in)
+- `SteeringConfig.signal_telemetry = False` (the §5.4 shadow campaign must
+  enable it explicitly)
+
+The full implementation accumulates production mileage with zero production
+authority until the 13b bench gate flips these (each flip a separate
+one-line, revertable PR).
+
+### 6.3 Deliberate deviations & discoveries
+
+Each item below is a reviewed decision that departs from, or was discovered
+during, the roadmap as written. They are intentional — not drift.
+
+1. **#208 outcome semantics — uncertain stays PENDING, not FAILED**
+   (#464, PR 11). §3 PR 11 said OUTCOME tasks transition "unmet at exit →
+   FAILED." As built: **met → COMPLETED; *confidently*-unmet → FAILED at
+   run end only; uncertain → stays PENDING** and carries forward (the #208
+   reachable-PENDING rule; run end is usually itself a turn boundary). No
+   manufactured failures. Consequence: `run.success` can be `True` with
+   OUTCOME tasks still PENDING — runs are graded on **goal predicates +
+   OUTCOME-task terminality**, never on `run.success` alone (see the 13b
+   grading rule, §6.4).
+
+2. **Shared budget-row fix — PAUSE_ESCALATE-first in both regimes**
+   (#467, PR 7). The budget/timeout guardrail kinds
+   (`RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`,
+   `LLM_CALL_TIMEOUT`) are **PAUSE_ESCALATE-first in BOTH the legacy and
+   the new ladder** — "a restart can't refund a spent budget," so
+   cancel-reinvoke was never the right response for them. `RUNAWAY_DELEGATION`
+   stays cancel-first (it protects against unbounded fan-out, not a spent
+   budget). Bench consequence: **arm C is the pre-PR-7 *steering policy*,
+   not a byte-exact pre-PR-7 build** — re-introducing the budget-row bug
+   into arm C would bias the B-vs-C comparison toward B (a confound). The
+   `GOLDFIVE_STEER_LEGACY_LADDER` escape hatch restores the legacy ladder
+   *cells + promotion side-effects only*.
+
+3. **Two-path refine gate** (#469, PR 12). The roadmap cited only the
+   ladder ABSORB/CANCEL_REINVOKE refine branch as needing the
+   `plan_mode == "forecast"` gate. Implementation found the **promotion
+   `refine_steer` path also needed gating** — it fires *before* the ladder.
+   Both refine entry points are now gated on `plan_mode`.
+
+4. **Force-FAIL contract — no terminal from a fallible signal** (#469,
+   PR 12). Ledger-mode force-FAIL is restricted to the **two deterministic
+   looping detectors** (`LOOPING_TOOL_CALL`, `LOOPING_REASONING`). This is
+   the dual of PR 11's outcome-progress contract (deviation 1): no terminal
+   disposition is ever manufactured from a FALLIBLE / UNCERTAIN judge
+   signal. A drift-judge *opinion* (`GOAL_DRIFT`, `OFF_TOPIC`, reasoning
+   verdicts) takes the note rung and never force-FAILs a task in ledger
+   mode; the outcome-progress judge mints OUTCOME terminals only on a
+   CONFIDENT verdict (uncertainty carries forward as PENDING — deviation 1).
+   Terminal dispositions come from a deterministic counter, a confident
+   outcome verdict, or a user / predicate — never from a fallible
+   mid-trajectory drift opinion.
+
+5. **Agent-aware-surfaces principle** (#468). Agent-specific notes (notably
+   per-(agent, task) corrections) render **only on agent-aware surfaces**:
+   the ADK `before_model` surface (resolves the running agent) and the
+   claude surface (one agent per invoke, scoped to `task.assignee_agent_id`).
+   The boundary-replay surface is **broadcast-only** (it re-invokes at the
+   coordinator level and cannot attribute to a sub-agent); the tool-result
+   annotation **excludes correction-origin notes** (keyed on the shared
+   `CORRECTION_DRIFT_ID_PREFIX`). Governing rule: **"better undelivered
+   than misdelivered"** — an agent-specific note that finds no agent-aware
+   surface stays pending, and under PR-8 visibility-keyed attribution a
+   drift that resolves anyway is correctly recorded `self_corrected_unaided`
+   (the truthful record), whereas misdelivery to the wrong agent would be a
+   silent correctness bug. This realises surface (2)/(3) of §2's
+   least-invasive-surface ordering for the correction case.
+
+6. **The Site-1 "tool-surface tightening interceptor" never shipped**
+   (#466, PR 9 — closes the doc's open verification item). §1.3 / the
+   PromptShaper docstrings described a parallel ADK-plugin "pre-dispatch
+   interceptor," keyed off `session._conversational_turn`, that would
+   tighten the tool surface on a conversational follow-up so the
+   coordinator literally could not delegate. **Verified: it was never
+   built.** `_conversational_turn` is consumed *only* by the runner's own
+   wrap gating (it decides whether to call
+   `wrap_conversational_input`); no ADK-plugin consumer exists. The stale
+   docstring/comment claims were deleted; the flag is kept (load-bearing
+   for the wrap gating). The PR-9 diet therefore *informs* on a follow-up
+   (keeps the plan context, drops the "do NOT call any AgentTool" command);
+   it never structurally constrains the tool surface.
+
+7. **Emission vs. visibility split** (#462 + #470, PRs 6 + 8).
+   `SignalDelivered` fires at the **dispatch decision point**
+   (`DriftObserver._route_corrective_note`) — it is the §5.4 *decision*
+   record ("what the regime decided to do"), emitted once, including the
+   `dry_run=True` shadow form under `observation_only`. The note queue's
+   `delivered_turn` / `delivered_surface` is a **separate *visibility*
+   record** ("when/where a note actually reached the model"). PR 8's grace
+   windows and the `self_corrected_after_signal` attribution key on
+   **visibility**, not emission. Pacing is **`request_context`-only** —
+   the legacy channel stays unpaced, which keeps bench arm C's policy pure
+   (deviation 2).
+
+### 6.4 PR-13b pre-flip checklist (the bench gate)
+
+PR 13b — run the three-arm bench on real workloads, produce the
+non-inferiority evaluation, then (gated on results **and explicit user
+sign-off**) flip `plan_mode=ledger` and `observation_only=False` as
+separate one-line PRs, followed by the §3 PR-13 hard deletions + the
+sibling-doc updates (PLAN-LIFECYCLE.md, PLAN-DESCRIPTIVE-GROWTH.md,
+DRIFT.md, CONTROL-CHANNEL.md, RATIONALE.md). **Do NOT start without bench
+results and explicit user sign-off on the flips.** Requirements
+accumulated during implementation (reproduced here so they survive outside
+the task tracker):
+
+1. **Grade ledger runs on goal predicates + OUTCOME-task terminality, NOT
+   `run.success`** (bench, #464 review). Uncertain outcomes legitimately
+   stay PENDING across turn boundaries (#208 carry-forward; deviation 1),
+   and a force-FAILED looping DISCOVERED task can fail the run via the
+   fatal gate.
+
+2. **Stage-3 layered e2e: "ledger-mode runaway → clean PAUSE"** (#469
+   review; SHIPPED + merged as the standalone §5.7 e2e
+   `tests/test_ledger_runaway_e2e.py` — #471). The no-hang/no-silent-death
+   contract is an *integration* property (executor pause-block + ledger
+   plan structure + run-end disposition) that unit tests cannot show —
+   §5.7 scar tissue: narrow criteria pass on broken runs. Drives a real
+   coordinator+AgentTool tree through `wrap()` → `Runner.run()` in
+   `plan_mode=ledger`, trips a runaway, and asserts a clean PAUSE
+   (`outcome.reason` carries the runaway cause + a
+   `HUMAN_INTERVENTION_REQUIRED` drift + the OUTCOME stays PENDING; 30s
+   wall-clock bound). Bench's call: keep it STANDALONE — NOT a 2d27ff4a
+   refold.
+
+3. **The §5.4 shadow campaign must enable `signal_telemetry` explicitly**
+   (channel, #462) — it defaults OFF (§6.2).
+
+4. **Bench arm definitions** (#464/#467/#469 reviews):
+   - **A (baseline)** = `judge_only` counterfactual.
+   - **B (signal regime)** = `signal_channel=request_context` + the new
+     ladder + `plan_mode=ledger` + `observation_only=False`.
+   - **C (legacy)** = `GOLDFIVE_STEER_LEGACY_LADDER=1` +
+     `observation_only=False` — the pre-PR-7 *steering policy*, NOT a
+     byte-exact pre-PR-7 build (deviation 2: re-introducing the budget-row
+     bug would confound B-vs-C).
+
+   The flips proceed only when arm B is non-inferior to arm A on goal
+   success and not worse on turns/tokens beyond the agreed margin across
+   ≥2 tree shapes (§4 / §5.8).
