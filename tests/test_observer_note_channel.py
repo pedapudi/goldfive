@@ -132,6 +132,7 @@ def _enqueue(
     severity: str = "warning",
     kind: str = "looping_tool_call",
     turn: int = 0,
+    agent_id: str = "agent",
 ) -> None:
     ObserverNoteQueue.for_session(session).enqueue(
         body=(
@@ -144,7 +145,7 @@ def _enqueue(
         drift_id=drift_id,
         kind=kind,
         task_id="t1",
-        agent_id="agent",
+        agent_id=agent_id,
         turn=turn,
     )
 
@@ -237,9 +238,16 @@ async def test_exactly_once_before_model_consumes_then_boundary_skips() -> None:
 
 
 async def test_exactly_once_boundary_delivers_when_before_model_did_not() -> None:
-    """The reverse path: if no model call fired, the boundary renders once."""
+    """The reverse path: if no model call fired, the boundary renders once.
+
+    task #11: the boundary replay delivers BROADCAST notes only (it cannot
+    attribute to a sub-agent), so this uses a broadcast note (``agent_id=""``).
+    An agent-specific note is intentionally NOT delivered here — pinned by
+    ``test_boundary_replay_skips_agent_specific_note`` in
+    ``test_observer_note_agent_scope.py``.
+    """
     session = _make_session()
-    _enqueue(session, drift_id="d1")
+    _enqueue(session, drift_id="d1", agent_id="")
 
     executor = SequentialExecutor()
     replay = await executor._consume_observer_note_for_replay(session)

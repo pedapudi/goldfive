@@ -259,3 +259,87 @@ async def test_boundary_replay_surface_carries_plan_state() -> None:
     assert block is not None
     assert "Plan state (goldfive bookkeeping)" in block
     assert "writer: 1 open" in block
+
+
+# ---------------------------------------------------------------------------
+# 5. Coarse-surface defense (the channel-review MEDIUM): agent-specific
+#    notes render ONLY on agent-aware surfaces.
+# ---------------------------------------------------------------------------
+
+
+def test_peek_broadcast_only_skips_agent_specific() -> None:
+    session = _session()
+    _enqueue(session, drift_id="dW", agent_id="writer", severity="critical")
+    _enqueue(session, drift_id="dB", agent_id="", severity="info")
+    q = ObserverNoteQueue.for_session(session)
+    # broadcast_only delivers the broadcast (info) note even though the
+    # agent-specific (critical) one is more severe.
+    note = q.peek_for_render(broadcast_only=True)
+    assert note is not None and note.drift_id == "dB"
+    # With only an agent-specific note pending, broadcast_only → nothing.
+    session2 = _session()
+    _enqueue(session2, drift_id="dW", agent_id="writer", severity="critical")
+    assert ObserverNoteQueue.for_session(session2).peek_for_render(broadcast_only=True) is None
+
+
+async def test_boundary_replay_skips_agent_specific_note() -> None:
+    from goldfive.executors.sequential import SequentialExecutor
+
+    session = _session()
+    _enqueue(session, drift_id="dW", agent_id="writer", severity="warning")
+    executor = SequentialExecutor()
+    # The boundary replay is coordinator-level → it must NOT deliver the
+    # agent-specific note; it stays pending for writer's own surface.
+    assert await executor._consume_observer_note_for_replay(session) is None
+    pend = ObserverNoteQueue.for_session(session).pending()
+    assert len(pend) == 1 and pend[0].drift_id == "dW"
+
+
+def test_peek_excludes_correction_notes_for_tool_annotation() -> None:
+    from goldfive.observer_note_queue import CORRECTION_DRIFT_ID_PREFIX
+
+    session = _session()
+    # A correction whose triggering drift WAS a loop kind — without the
+    # structural exclusion it would leak onto the loop-only annotation.
+    ObserverNoteQueue.for_session(session).enqueue(
+        body="correction body",
+        observation="corr",
+        severity="warning",
+        drift_id=f"{CORRECTION_DRIFT_ID_PREFIX}writer:t1:2",
+        kind="looping_tool_call",
+        task_id="t1",
+        agent_id="writer",
+    )
+    _enqueue(session, drift_id="dLoop", agent_id="", severity="warning")  # real loop note
+    q = ObserverNoteQueue.for_session(session)
+    loop_kinds = frozenset({"looping_tool_call", "looping_reasoning"})
+    note = q.peek_for_render(kinds=loop_kinds, exclude_correction_notes=True)
+    assert note is not None and note.drift_id == "dLoop"  # the correction is excluded
+
+
+async def test_claude_surface_is_agent_scoped() -> None:
+    """claude.invoke runs one agent → its note surface scopes to that agent."""
+    from goldfive.adapters.claude import ClaudeAgentSDKAdapter
+    from goldfive.config import SteeringConfig
+    from goldfive.steerer import DefaultSteerer
+
+    # Bypass __init__ (which requires the claude-agent-sdk) — we only
+    # exercise the SDK-independent _consume_observer_note path.
+    adapter = object.__new__(ClaudeAgentSDKAdapter)
+    adapter._steerer = DefaultSteerer(
+        steering_config=SteeringConfig(
+            observation_only=False, signal_channel="request_context"
+        )
+    )
+    session = _session()
+    _enqueue(session, drift_id="dW", agent_id="writer", severity="warning")
+    _enqueue(session, drift_id="dR", agent_id="researcher", severity="critical")
+
+    block = await adapter._consume_observer_note(
+        session, surface="claude_system_prompt", current_agent_id="writer"
+    )
+    # writer's surface gets writer's note, NOT researcher's (more severe,
+    # wrong agent). researcher's note stays pending.
+    assert block is not None and "signal dW" in block
+    pend = {n.drift_id for n in ObserverNoteQueue.for_session(session).pending()}
+    assert pend == {"dR"}

@@ -292,12 +292,19 @@ class ClaudeAgentSDKAdapter:
         # under the legacy default (the queue is never populated) or
         # observation_only. Best-effort: never blocks the invocation.
         note_block = await self._consume_observer_note(
-            session, surface="claude_system_prompt"
+            session,
+            surface="claude_system_prompt",
+            current_agent_id=task.assignee_agent_id,
         )
         if note_block:
             system_prompt = f"{system_prompt}\n\n{note_block}"
 
-        options = self._build_options(sdk=sdk, system_prompt=system_prompt, session=session)
+        options = self._build_options(
+            sdk=sdk,
+            system_prompt=system_prompt,
+            session=session,
+            current_agent_id=task.assignee_agent_id,
+        )
 
         client = self._client_factory()
         # ``ClaudeSDKClient`` options are set on the instance; some
@@ -366,6 +373,7 @@ class ClaudeAgentSDKAdapter:
         sdk: Any,
         system_prompt: str,
         session: Session,
+        current_agent_id: str = "",
     ) -> Any:
         """Assemble a fresh ``ClaudeAgentOptions`` for this invocation."""
 
@@ -386,7 +394,13 @@ class ClaudeAgentSDKAdapter:
             == "request_context"
         ):
             hooks["PostToolUse"] = [
-                sdk.HookMatcher(hooks=[self._make_posttooluse_hook(session)])
+                sdk.HookMatcher(
+                    hooks=[
+                        self._make_posttooluse_hook(
+                            session, current_agent_id=current_agent_id
+                        )
+                    ]
+                )
             ]
 
         kwargs: dict[str, Any] = {
@@ -477,6 +491,8 @@ class ClaudeAgentSDKAdapter:
     def _make_posttooluse_hook(
         self,
         session: Session,
+        *,
+        current_agent_id: str = "",
     ) -> Callable[..., Awaitable[dict[str, Any]]]:
         """Build the async ``PostToolUse`` hook (PR 6 observer-note surface 3b).
 
@@ -494,7 +510,9 @@ class ClaudeAgentSDKAdapter:
         ) -> dict[str, Any]:
             try:
                 block = await self._consume_observer_note(
-                    session, surface="claude_posttooluse"
+                    session,
+                    surface="claude_posttooluse",
+                    current_agent_id=current_agent_id,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.debug("claude PostToolUse: observer-note consume raised: %s", exc)
@@ -515,6 +533,7 @@ class ClaudeAgentSDKAdapter:
         session: Session,
         *,
         surface: str,
+        current_agent_id: str = "",
     ) -> str | None:
         """Consume the most-severe pending observer note for a claude surface.
 
@@ -539,7 +558,11 @@ class ClaudeAgentSDKAdapter:
             from goldfive.observer_note_queue import ObserverNoteQueue, render_block
 
             queue = ObserverNoteQueue.for_session(session)
-            note = queue.peek_for_render()
+            # task #11: claude.invoke runs exactly one agent, so this is an
+            # agent-AWARE surface — scope to its assignee so an
+            # agent-specific note (e.g. a correction) reaches only the right
+            # agent (plus broadcast notes).
+            note = queue.peek_for_render(agent_id=current_agent_id or None)
         except Exception as exc:  # noqa: BLE001
             log.debug("claude adapter: observer-note queue read raised: %s", exc)
             return None

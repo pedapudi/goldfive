@@ -6714,7 +6714,13 @@ def make_adk_plugin(
 
             _LOOP_KINDS = frozenset({"looping_tool_call", "looping_reasoning"})
             queue = ObserverNoteQueue.for_session(ctx.session)
-            note = queue.peek_for_render(kinds=_LOOP_KINDS)
+            # task #11: loop observations belong on the tool annotation;
+            # agent-targeted corrections do NOT (they ride the agent-aware
+            # block surfaces). Exclude correction-origin notes structurally
+            # even if a correction's triggering drift was a loop kind.
+            note = queue.peek_for_render(
+                kinds=_LOOP_KINDS, exclude_correction_notes=True
+            )
             if note is None:
                 return None
             turn = int(_safe_attr(ctx.session, "_reasoning_turn", 0) or 0)

@@ -2122,7 +2122,12 @@ class SequentialExecutor(Executor):
 
         try:
             queue = ObserverNoteQueue.for_session(session)
-            note = queue.peek_for_render()
+            # task #11: the boundary replay re-invokes at the coordinator
+            # level and cannot attribute a note to a specific sub-agent, so
+            # it delivers BROADCAST notes only. An agent-specific note (e.g.
+            # a correction) stays pending for its own agent-aware surface —
+            # better undelivered than misdelivered (§0 dormancy bias).
+            note = queue.peek_for_render(broadcast_only=True)
         except Exception as exc:  # noqa: BLE001
             log.debug("SequentialExecutor: observer-note queue read raised: %s", exc)
             return None

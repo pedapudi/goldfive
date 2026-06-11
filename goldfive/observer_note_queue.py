@@ -98,6 +98,14 @@ if TYPE_CHECKING:  # pragma: no cover - type-check only
 #: ``goldfive.signal_ledger`` / ``goldfive.active_drifts``.
 KEY_OBSERVER_NOTE_QUEUE = "goldfive.observer_note_queue"
 
+#: ``drift_id`` prefix minted for correction-origin notes (task #11). The
+#: SINGLE SOURCE for the prefix: ``_correction_injection`` mints
+#: ``correction:<agent>:<task>:<rev>`` and the queue's structural filters
+#: (``peek_for_render(exclude_correction_notes=True)``) recognise it — so a
+#: correction (agent-targeted) is never surfaced where only loop
+#: observations belong (the tool-result annotation).
+CORRECTION_DRIFT_ID_PREFIX = "correction:"
+
 #: Cap on the retained note list. Delivered notes are kept as tombstones so
 #: ``enqueue`` dedup and the exactly-once flag survive, but a pathologically
 #: long-lived session cannot balloon ``Session.state``: on overflow the
@@ -383,6 +391,8 @@ class ObserverNoteQueue:
         *,
         kinds: frozenset[str] | None = None,
         agent_id: str | None = None,
+        broadcast_only: bool = False,
+        exclude_correction_notes: bool = False,
     ) -> ObserverNote | None:
         """Return the most-severe pending note (per-request coalescing).
 
@@ -413,6 +423,19 @@ class ObserverNoteQueue:
           The surface that knows its agent (notably the ADK
           ``before_model`` surface) passes it; coarse surfaces leave it
           ``None``.
+
+        ``broadcast_only`` (task #11 — coarse-surface defense) selects ONLY
+        broadcast (empty ``agent_id``) notes, skipping every agent-specific
+        one. A surface that cannot resolve its agent (the boundary replay,
+        which re-invokes at the coordinator level) sets this so an
+        agent-specific note is never misdelivered there — it stays pending
+        for its own agent's agent-aware surface (better undelivered than
+        misdelivered; §0 dormancy bias). Takes precedence over ``agent_id``.
+
+        ``exclude_correction_notes`` (task #11) skips notes whose
+        ``drift_id`` carries :data:`CORRECTION_DRIFT_ID_PREFIX` — used by the
+        tool-result annotation surface so agent-targeted corrections never
+        ride the loop-observation channel, regardless of their drift kind.
         """
         target = _bare_agent(agent_id) if agent_id else None
         best: ObserverNote | None = None
@@ -422,8 +445,17 @@ class ObserverNoteQueue:
                 continue
             if kinds is not None and n.kind not in kinds:
                 continue
-            if target is not None:
-                note_agent = _bare_agent(n.agent_id)
+            if exclude_correction_notes and str(n.drift_id or "").startswith(
+                CORRECTION_DRIFT_ID_PREFIX
+            ):
+                continue
+            note_agent = _bare_agent(n.agent_id)
+            if broadcast_only:
+                # Only broadcast notes here; agent-specific notes wait for
+                # their own agent-aware surface.
+                if note_agent:
+                    continue
+            elif target is not None:
                 # Empty note_agent = broadcast (reaches any agent); a
                 # non-empty agent-specific note must match the target.
                 if note_agent and note_agent != target:
@@ -541,6 +573,7 @@ class ObserverNoteQueue:
 
 
 __all__ = [
+    "CORRECTION_DRIFT_ID_PREFIX",
     "KEY_OBSERVER_NOTE_QUEUE",
     # Re-exported from goldfive.observer_notes (single source) for callers that
     # import the marker constants alongside the queue API.

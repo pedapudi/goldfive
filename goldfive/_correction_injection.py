@@ -363,10 +363,14 @@ def _enqueue_correction_note(
     AGENCY-PRESERVATION.md task #11. The note carries the assignee as
     ``agent_id`` (bare) so the agent-scoped delivery surfaces (notably
     the ADK ``before_model`` surface) render it only on that agent's own
-    model call — never on a sibling's. ``drift_id`` is a stable,
-    goldfive-minted key (``correction:<agent>:<task>:<rev>``) so a
-    re-revision coalesces onto the same note rather than duplicating
-    (the stable-key-for-lifecycle-gates rule — never an LLM-minted id).
+    model call — never on a sibling's, never on the coordinator boundary
+    replay, and never on the loop-only tool-annotation surface. The
+    ``drift_id`` is a stable, goldfive-minted key
+    (:data:`~goldfive.observer_note_queue.CORRECTION_DRIFT_ID_PREFIX` +
+    ``<agent>:<task>:<rev>``) — never an LLM-minted id. It is unique per
+    revision: a later revision (higher ``rev``) mints a NEW note;
+    re-enqueuing the SAME revision (e.g. a retry of the same refine)
+    coalesces onto the existing entry.
     Returns the note id, or ``None`` on any failure (best-effort — a
     correction that can't be enqueued must not break the refine path).
     """
@@ -375,7 +379,10 @@ def _enqueue_correction_note(
         # (pending_correction_key et al.), so a module-level import here
         # would be circular.
         from goldfive.adapters.adk_llm_instrumentation import format_correction_block
-        from goldfive.observer_note_queue import ObserverNoteQueue
+        from goldfive.observer_note_queue import (
+            CORRECTION_DRIFT_ID_PREFIX,
+            ObserverNoteQueue,
+        )
 
         agent = str(payload.get("agent_name", "") or "")
         task_id = str(payload.get("task_id", "") or "")
@@ -400,7 +407,7 @@ def _enqueue_correction_note(
             body=body,
             observation=observation,
             severity=severity,
-            drift_id=f"correction:{agent}:{task_id}:{rev}",
+            drift_id=f"{CORRECTION_DRIFT_ID_PREFIX}{agent}:{task_id}:{rev}",
             kind=kind,
             task_id=task_id,
             agent_id=agent,
