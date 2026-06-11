@@ -32,7 +32,7 @@ from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.events import SIGNAL_CHANNEL_REQUEST_CONTEXT  # noqa: E402
 from goldfive.executors.sequential import SequentialExecutor  # noqa: E402
 from goldfive.observer_note_queue import (  # noqa: E402
-    OBSERVER_NOTE_PREFIX,
+    OBSERVER_NOTE_MARKER_PREFIX,
     ObserverNoteQueue,
 )
 from goldfive.prompt_shaper import PromptShaper  # noqa: E402
@@ -226,7 +226,7 @@ async def test_exactly_once_before_model_consumes_then_boundary_skips() -> None:
         llm_request=req, session=session, session_context=ctx
     )
     assert note is not None and note.note_id == "d1"
-    assert req.config.system_instruction.count(OBSERVER_NOTE_PREFIX) == 1
+    assert req.config.system_instruction.count(OBSERVER_NOTE_MARKER_PREFIX) == 1
 
     # Surface 2 (invocation-boundary replay): the SAME note is no longer
     # pending, so the boundary renders NOTHING — never a second delivery.
@@ -244,7 +244,7 @@ async def test_exactly_once_boundary_delivers_when_before_model_did_not() -> Non
     executor = SequentialExecutor()
     replay = await executor._consume_observer_note_for_replay(session)
     assert replay is not None
-    assert replay.count(OBSERVER_NOTE_PREFIX) == 1
+    assert replay.count(OBSERVER_NOTE_MARKER_PREFIX) == 1
     # And a second boundary pass finds nothing — exactly once.
     again = await executor._consume_observer_note_for_replay(session)
     assert again is None
@@ -265,12 +265,12 @@ def test_two_before_model_calls_never_stack_blocks() -> None:
     shaper = PromptShaper()
 
     shaper.inject_observer_note(llm_request=req, session=session, session_context=ctx)
-    assert req.config.system_instruction.count(OBSERVER_NOTE_PREFIX) == 1
+    assert req.config.system_instruction.count(OBSERVER_NOTE_MARKER_PREFIX) == 1
 
     # Second consecutive call: the prior block is stripped and the (now
     # delivered) note is not re-injected — never two blocks.
     shaper.inject_observer_note(llm_request=req, session=session, session_context=ctx)
-    assert req.config.system_instruction.count(OBSERVER_NOTE_PREFIX) == 0
+    assert req.config.system_instruction.count(OBSERVER_NOTE_MARKER_PREFIX) == 0
     assert "base instruction" in req.config.system_instruction
 
 
@@ -289,14 +289,14 @@ def test_two_pending_notes_drain_one_per_call_never_stack() -> None:
         llm_request=req, session=session, session_context=ctx
     )
     assert n1.note_id == "d_crit"
-    assert req.config.system_instruction.count(OBSERVER_NOTE_PREFIX) == 1
+    assert req.config.system_instruction.count(OBSERVER_NOTE_MARKER_PREFIX) == 1
 
     # Call 2: prior block stripped, the warning note delivered — still ONE.
     n2 = shaper.inject_observer_note(
         llm_request=req, session=session, session_context=ctx
     )
     assert n2.note_id == "d_warn"
-    assert req.config.system_instruction.count(OBSERVER_NOTE_PREFIX) == 1
+    assert req.config.system_instruction.count(OBSERVER_NOTE_MARKER_PREFIX) == 1
 
 
 # ---------------------------------------------------------------------------

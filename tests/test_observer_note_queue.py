@@ -19,9 +19,9 @@ from hypothesis import strategies as st
 
 from goldfive.observer_note_queue import (
     KEY_OBSERVER_NOTE_QUEUE,
-    OBSERVER_NOTE_END,
-    OBSERVER_NOTE_HEADER,
-    OBSERVER_NOTE_PREFIX,
+    OBSERVER_NOTE_BLOCK_BEGIN,
+    OBSERVER_NOTE_BLOCK_END,
+    OBSERVER_NOTE_MARKER_PREFIX,
     ObserverNote,
     ObserverNoteQueue,
     render_block,
@@ -187,13 +187,13 @@ def test_render_block_shape() -> None:
         severity="warning",
     )
     block = render_block(note)
-    assert block.startswith(OBSERVER_NOTE_HEADER)
-    assert block.rstrip().endswith(OBSERVER_NOTE_END)
-    assert OBSERVER_NOTE_PREFIX in block
+    assert block.startswith(OBSERVER_NOTE_BLOCK_BEGIN)
+    assert block.rstrip().endswith(OBSERVER_NOTE_BLOCK_END)
+    assert OBSERVER_NOTE_MARKER_PREFIX in block
     assert "Observation: x" in block
     # Exactly one marker pair.
-    assert block.count(OBSERVER_NOTE_PREFIX) == 1
-    assert block.count(OBSERVER_NOTE_END) == 1
+    assert block.count(OBSERVER_NOTE_MARKER_PREFIX) == 1
+    assert block.count(OBSERVER_NOTE_BLOCK_END) == 1
 
 
 def test_render_tool_annotation_compact_and_attributed() -> None:
@@ -206,7 +206,7 @@ def test_render_tool_annotation_compact_and_attributed() -> None:
     ann = render_tool_annotation(note)
     assert ann == "[goldfive observer: `search_web` was invoked 5 times with identical arguments]"
     # Compact — a single line, no block markers (it rides the tool result).
-    assert OBSERVER_NOTE_PREFIX not in ann
+    assert OBSERVER_NOTE_MARKER_PREFIX not in ann
     assert "\n" not in ann
 
 
@@ -215,7 +215,7 @@ def test_strip_prior_block_round_trip() -> None:
     note = ObserverNote(note_id="d1", body="Observation: x", observation="x", severity="info")
     combined = base + "\n\n" + render_block(note)
     stripped = strip_prior_block(combined)
-    assert OBSERVER_NOTE_PREFIX not in stripped
+    assert OBSERVER_NOTE_MARKER_PREFIX not in stripped
     assert "helpful agent" in stripped
     # Idempotent: stripping again is a no-op.
     assert strip_prior_block(stripped) == stripped

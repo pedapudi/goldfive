@@ -201,18 +201,17 @@ async def test_single_log_census(tmp_path: Path) -> None:
 
 def test_arm_flag_status_reports_pending_flags() -> None:
     arms = {a.kind: a for a in default_arms()}
-    # The new SIGNAL arm carries flags this build does not yet consult
-    # (PR 6 ``GOLDFIVE_STEER_SIGNAL_CHANNEL``); they must be reported as
-    # PENDING, not silently applied.
     applied, pending = arm_flag_status(arms["signal"])
-    assert "GOLDFIVE_STEER_SIGNAL_CHANNEL" in pending
-    # PR 10 promotion: ``GOLDFIVE_PLAN_MODE`` is now read by
+    # PR 6 promotion: ``GOLDFIVE_STEER_SIGNAL_CHANNEL`` is now read by
     # ``SteeringConfig.from_env``, so it reports as APPLIED, not pending
     # (the promotion contract: the PR that adds the env read moves its
     # flag from _PENDING_STEER_ENV into KNOWN_STEER_ENV).
+    assert "GOLDFIVE_STEER_SIGNAL_CHANNEL" in applied
+    assert "GOLDFIVE_STEER_SIGNAL_CHANNEL" not in pending
+    # PR 10 promotion: ``GOLDFIVE_PLAN_MODE`` likewise reports APPLIED.
     assert "GOLDFIVE_PLAN_MODE" in applied
     assert "GOLDFIVE_PLAN_MODE" not in pending
-    # The legacy arm's escape hatch is likewise pending until PR 7.
+    # The legacy arm's escape hatch is still pending until PR 7.
     _, legacy_pending = arm_flag_status(arms["legacy"])
     assert "GOLDFIVE_STEER_LEGACY_LADDER" in legacy_pending
     # The flags this build DOES consult are reported as applied.

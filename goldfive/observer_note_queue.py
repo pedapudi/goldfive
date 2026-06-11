@@ -78,6 +78,18 @@ from typing import TYPE_CHECKING, Any
 
 from goldfive import state_store as _ostate
 
+# Single-source observer-note marker constants live in ``observer_notes`` (the
+# PR 4 composer module) so the PR 6 channel (writer) and the PR 6b
+# ``PruneStaleSteerRule`` (reader) can never drift — both import from there.
+# ``OBSERVER_NOTE_BLOCK_BEGIN`` / ``_END`` are the rendered opening / closing
+# lines; ``OBSERVER_NOTE_MARKER_PREFIX`` is the detection substring (a prefix
+# of the opening line by construction) used as the strip-and-refresh anchor.
+from goldfive.observer_notes import (
+    OBSERVER_NOTE_BLOCK_BEGIN,
+    OBSERVER_NOTE_BLOCK_END,
+    OBSERVER_NOTE_MARKER_PREFIX,
+)
+
 if TYPE_CHECKING:  # pragma: no cover - type-check only
     from goldfive.types import Session
 
@@ -85,19 +97,6 @@ if TYPE_CHECKING:  # pragma: no cover - type-check only
 #: so the state_store write-guard accepts it; sibling of
 #: ``goldfive.signal_ledger`` / ``goldfive.active_drifts``.
 KEY_OBSERVER_NOTE_QUEUE = "goldfive.observer_note_queue"
-
-#: Marker bracketing the rendered note block (surfaces 1 + 2). The header
-#: line's wording is pinned by the AGENCY-PRESERVATION.md PR 6 "Rendered
-#: block shape"; :data:`OBSERVER_NOTE_PREFIX` is the strip-and-refresh anchor
-#: (a follow-up ``before_model`` call locates and removes the prior block so
-#: the marker count stays at exactly one — the R3 dedup contract the runtime
-#: tool-surface hint already uses).
-OBSERVER_NOTE_PREFIX = "[GOLDFIVE OBSERVER NOTE —"
-OBSERVER_NOTE_HEADER = (
-    "[GOLDFIVE OBSERVER NOTE — from an external monitoring layer, "
-    "not from the user]"
-)
-OBSERVER_NOTE_END = "[/GOLDFIVE OBSERVER NOTE]"
 
 #: Cap on the retained note list. Delivered notes are kept as tombstones so
 #: ``enqueue`` dedup and the exactly-once flag survive, but a pathologically
@@ -226,7 +225,7 @@ def render_block(note: ObserverNote) -> str:
     function only adds the attribution header + closing marker.
     """
     body = (note.body or "").strip()
-    return f"{OBSERVER_NOTE_HEADER}\n{body}\n{OBSERVER_NOTE_END}"
+    return f"{OBSERVER_NOTE_BLOCK_BEGIN}\n{body}\n{OBSERVER_NOTE_BLOCK_END}"
 
 
 def render_tool_annotation(note: ObserverNote) -> str:
@@ -246,21 +245,21 @@ def strip_prior_block(existing: str) -> str:
     """Remove a previously-injected observer-note block from ``existing``.
 
     Mirrors ``adk_llm_instrumentation._strip_prior_runtime_tools_hint``: the
-    block is bracketed by :data:`OBSERVER_NOTE_PREFIX` /
-    :data:`OBSERVER_NOTE_END`; when found both markers and the text between
-    them are removed and orphan blank lines collapsed. Returns ``existing``
-    unchanged when no prior block is present. This is the strip half of the
-    strip-and-refresh idempotency contract (two consecutive ``before_model``
-    calls never stack blocks).
+    block is bracketed by :data:`OBSERVER_NOTE_MARKER_PREFIX` (the detection
+    anchor, a prefix of the opening line) / :data:`OBSERVER_NOTE_BLOCK_END`;
+    when found both markers and the text between them are removed and orphan
+    blank lines collapsed. Returns ``existing`` unchanged when no prior block
+    is present. This is the strip half of the strip-and-refresh idempotency
+    contract (two consecutive ``before_model`` calls never stack blocks).
     """
-    if OBSERVER_NOTE_PREFIX not in existing:
+    if OBSERVER_NOTE_MARKER_PREFIX not in existing:
         return existing
-    start = existing.find(OBSERVER_NOTE_PREFIX)
-    end = existing.find(OBSERVER_NOTE_END, start)
+    start = existing.find(OBSERVER_NOTE_MARKER_PREFIX)
+    end = existing.find(OBSERVER_NOTE_BLOCK_END, start)
     if end == -1:
         cleaned = existing[:start]
     else:
-        cleaned = existing[:start] + existing[end + len(OBSERVER_NOTE_END) :]
+        cleaned = existing[:start] + existing[end + len(OBSERVER_NOTE_BLOCK_END) :]
     while "\n\n\n" in cleaned:
         cleaned = cleaned.replace("\n\n\n", "\n\n")
     return cleaned.strip("\n")
@@ -457,9 +456,11 @@ class ObserverNoteQueue:
 
 __all__ = [
     "KEY_OBSERVER_NOTE_QUEUE",
-    "OBSERVER_NOTE_END",
-    "OBSERVER_NOTE_HEADER",
-    "OBSERVER_NOTE_PREFIX",
+    # Re-exported from goldfive.observer_notes (single source) for callers that
+    # import the marker constants alongside the queue API.
+    "OBSERVER_NOTE_BLOCK_BEGIN",
+    "OBSERVER_NOTE_BLOCK_END",
+    "OBSERVER_NOTE_MARKER_PREFIX",
     "ObserverNote",
     "ObserverNoteQueue",
     "render_block",

@@ -633,10 +633,10 @@ class PromptShaper:
         Uses the marker strip-and-refresh pattern (mirrors
         :meth:`inject_runtime_tools_hint`): any prior observer-note block,
         bracketed by
-        :data:`~goldfive.observer_note_queue.OBSERVER_NOTE_PREFIX` /
-        ``OBSERVER_NOTE_END``, is stripped from ``system_instruction`` before
-        the current one is appended — so two consecutive ``before_model`` calls
-        never stack blocks (the idempotency half of §5.2).
+        :data:`~goldfive.observer_note_queue.OBSERVER_NOTE_MARKER_PREFIX` /
+        ``OBSERVER_NOTE_BLOCK_END``, is stripped from ``system_instruction``
+        before the current one is appended — so two consecutive
+        ``before_model`` calls never stack blocks (the idempotency half of §5.2).
 
         Per-request coalescing: at most ONE block is rendered, the most-severe
         pending note wins
@@ -666,7 +666,7 @@ class PromptShaper:
         """
         try:
             from goldfive.observer_note_queue import (
-                OBSERVER_NOTE_PREFIX,
+                OBSERVER_NOTE_MARKER_PREFIX,
                 ObserverNoteQueue,
                 render_block,
                 strip_prior_block,
@@ -686,7 +686,7 @@ class PromptShaper:
         existing = getattr(config, "system_instruction", None)
         # Strip any prior observer-note block regardless of whether we
         # re-inject this call (strip-and-refresh: never stack blocks).
-        if isinstance(existing, str) and OBSERVER_NOTE_PREFIX in existing:
+        if isinstance(existing, str) and OBSERVER_NOTE_MARKER_PREFIX in existing:
             try:
                 config.system_instruction = strip_prior_block(existing) or None
             except Exception as exc:  # noqa: BLE001
