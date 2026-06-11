@@ -4462,9 +4462,11 @@ class DriftObserver:
         # cancel write-paths are gated), so ``channel_action="queued"`` records
         # that mechanical truth while ``dry_run`` tracks shadow-mode for the
         # §5.4 divergence report. PR 6's request_context channel routes through
-        # the gated observer-note queue and the asymmetry goes away (the note
-        # is delivered — and SignalDelivered emitted — only when a surface
-        # actually renders it, under ``_should_inject``).
+        # the gated observer-note queue: SignalDelivered is emitted once HERE at
+        # the dispatch decision point (the PR-5 model the §5.4 diff is built on),
+        # and a delivery surface later RENDERS the note exactly-once under
+        # ``_should_inject`` — rendering at a surface does NOT emit a second
+        # event; ``dry_run`` records whether the note actually reaches the agent.
         await self._route_corrective_note(session, drift, msg, ladder_level="nudge")
 
     async def _dispatch_goldfive_steer_control(
