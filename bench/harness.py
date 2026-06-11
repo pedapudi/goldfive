@@ -122,6 +122,7 @@ KNOWN_STEER_ENV: frozenset[str] = frozenset(
         "GOLDFIVE_CANCEL_INFLIGHT_SCOPE",
         "GOLDFIVE_PLAN_MODE",  # PR 10 — SteeringConfig.from_env now reads it
         "GOLDFIVE_STEER_SIGNAL_CHANNEL",  # PR 6 — SteeringConfig.from_env now reads it
+        "GOLDFIVE_STEER_LEGACY_LADDER",  # PR 7 — SteeringConfig.from_env now reads it
     }
 )
 
@@ -129,12 +130,9 @@ KNOWN_STEER_ENV: frozenset[str] = frozenset(
 #: harness *clears* them between arms (no cross-arm leakage) even before any
 #: build consults them — and so an operator reading an arm's flag dict sees
 #: the intended end-state. They remain *pending* until promoted into
-#: :data:`KNOWN_STEER_ENV`.
-_PENDING_STEER_ENV: frozenset[str] = frozenset(
-    {
-        "GOLDFIVE_STEER_LEGACY_LADDER",  # PR 7 escape hatch
-    }
-)
+#: :data:`KNOWN_STEER_ENV`. (Empty now that PR 7 promoted the legacy-ladder
+#: hatch; kept as the extension point for future roadmap flags.)
+_PENDING_STEER_ENV: frozenset[str] = frozenset()
 
 #: Every env var the harness owns: snapshotted-and-cleared on each arm so
 #: an arm only ever sees its own flag dict plus the ambient (non-managed)

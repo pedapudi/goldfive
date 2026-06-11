@@ -654,12 +654,12 @@ severity:
 - **WARNING** → Level 1 (`ABSORB`): call `planner.refine`. Unchanged
   from pre-#204 — work-tool loops at 3+ calls, meta at 6+, work
   name-axis at 5.
-- **CRITICAL** first → Level 2 (`NUDGE`): refine **and** queue a soft
-  corrective follow-up on `session.pending_nudges` for the overlay
-  loop to pick up. Coordinates with the forward-progress work that
-  wires nudge consumption.
+- **CRITICAL** first → Level 2 (`SIGNAL`, renamed from `NUDGE` in
+  AGENCY-PRESERVATION.md PR 7): enqueue an advisory observer note for
+  the agent (no refine, no cancel, no steer). The proportional,
+  trajectory-preserving response.
 - **CRITICAL** repeat → Level 4 (`PAUSE_ESCALATE`): if the loop
-  survives the nudge and re-fires CRITICAL after
+  survives the signal and re-fires CRITICAL after
   `REFINE_FAILURE_THRESHOLD` occurrences, escalate to a human pause.
 
 ### Task-progress gate
@@ -717,13 +717,28 @@ Rule C). `CAPABILITY_MISMATCH` at WARNING stays `ABSORB` so Rule B
 (user-declared `required_tools`) keeps refining. `WRONG_AGENT` is
 deprecated with no ladder row.
 
+**Cancel-policy + ladder restructure (AGENCY-PRESERVATION.md PR 7).** The
+goldfive-authored `CANCEL_REINVOKE` cells were demoted to `SIGNAL` (advisory
+note, no refine/cancel/steer); repeat-escalation lands on `PAUSE_ESCALATE`
+(stop-and-ask preserves trajectory; cancel-and-redirect does not).
+`CANCEL_REINVOKE` survives **only** for the user-steer junction and the
+hard-safety kinds (`RUNAWAY_DELEGATION`, `RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`,
+`TASK_TIMEOUT`, `LLM_CALL_TIMEOUT` — whose CRITICAL-first cell was also fixed
+from the §0-violating `ABSORB` to a stop). `_promote_drift_to_steer` likewise
+dropped its steering side-effects: no cancel-reason tag, no `GOLDFIVE_STEER`
+dispatch, no `active_steer(source="goldfive")` stamp — it refines, emits
+`PlanRevised`, and enqueues an advisory note. `GOLDFIVE_STEER_LEGACY_LADDER=1`
+is a one-release escape hatch that restores the pre-PR-7 cells + promotion
+side-effects (the §5.8 measurable-regression arm); both regimes are
+snapshotted in `tests/test_ladder_decision_table.py`.
+
 | Level | Name | Action | Typical triggers |
 |---|---|---|---|
-| **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift. |
-| **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `TOOL_ERROR`, `AGENT_REFUSAL`, `INTENT_DIVERGENCE`, and `CAPABILITY_MISMATCH` Rule B, etc.); CRITICAL first-occurrence of most kinds. |
-| **2** | `NUDGE` | Queue a short corrective user message on `session.pending_nudges` for the Runner's overlay loop to pick up at the next invocation boundary. | `LOOPING_REASONING` at CRITICAL (first occurrence) after goldfive#204 — gives the agent a soft corrective prompt before escalating. Also available for caller overrides. |
-| **3** | `CANCEL_REINVOKE` | Refine the plan; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel**. The executor's invoke loop cancels the in-flight invocation and restarts the passthrough with a `[GOLDFIVE STEERING CONTROL …]` framed corrective body. | CRITICAL first-occurrence for most refinable kinds (`TOOL_ERROR`, `AGENT_REFUSAL`, `MODEL_REFUSAL`, `OFF_TOPIC`, `RUNAWAY_DELEGATION`, ...). (`LOOPING_REASONING` CRITICAL-first now routes to Level 2 via goldfive#204.) |
-| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives on the channel. | `GOAL_DRIFT` (first & repeat); `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind. |
+| **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift; the forecast-mismatch demotions. |
+| **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `TOOL_ERROR`, `AGENT_REFUSAL`, `CAPABILITY_MISMATCH` Rule B, etc.). |
+| **2** | `SIGNAL` (was `NUDGE`) | Enqueue an advisory observer note on the configured channel (PR 6) — **no refine, no cancel, no steer**. The agent reads it at its next model call / invocation boundary. | CRITICAL-first of the goldfive-authored content kinds (`TOOL_ERROR`, `AGENT_REFUSAL`, `MODEL_REFUSAL`, `OFF_TOPIC`, `CONFABULATION_RISK`, `LOOPING_*`, `SELF_REPORTED_STUCK`); `GOAL_DRIFT` at WARNING + CRITICAL-first. |
+| **3** | `CANCEL_REINVOKE` | Refine; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage** so the executor cancels the in-flight invocation and restarts with a framed corrective body. | **Hard-safety only** (`RUNAWAY_DELEGATION`, `RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`) at CRITICAL-first; the USER_STEER junction; and every goldfive-authored row under `GOLDFIVE_STEER_LEGACY_LADDER=1`. |
+| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives. | `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind (incl. `GOAL_DRIFT`, the hard-safety kinds). |
 | **5** | `TERMINATE` | Run-level abort. Currently only reachable when a Level-4-initiated pause times out and `HUMAN_INTERVENTION_REQUIRED` re-fires as a repeat CRITICAL. | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
 
 ### Dispatch routing — single junction (Phase 2 of #246)

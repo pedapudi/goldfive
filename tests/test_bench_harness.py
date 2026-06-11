@@ -199,21 +199,22 @@ async def test_single_log_census(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_arm_flag_status_reports_pending_flags() -> None:
+def test_arm_flag_status_reports_promoted_flags_as_applied() -> None:
     arms = {a.kind: a for a in default_arms()}
     applied, pending = arm_flag_status(arms["signal"])
-    # PR 6 promotion: ``GOLDFIVE_STEER_SIGNAL_CHANNEL`` is now read by
-    # ``SteeringConfig.from_env``, so it reports as APPLIED, not pending
-    # (the promotion contract: the PR that adds the env read moves its
-    # flag from _PENDING_STEER_ENV into KNOWN_STEER_ENV).
+    # The promotion contract: the PR that teaches ``SteeringConfig.from_env``
+    # about a flag moves it from _PENDING_STEER_ENV into KNOWN_STEER_ENV, so it
+    # reports APPLIED. As of PR 7 every roadmap flag the bench carries is
+    # promoted: GOLDFIVE_STEER_SIGNAL_CHANNEL (PR 6), GOLDFIVE_PLAN_MODE
+    # (PR 10), and GOLDFIVE_STEER_LEGACY_LADDER (PR 7).
     assert "GOLDFIVE_STEER_SIGNAL_CHANNEL" in applied
     assert "GOLDFIVE_STEER_SIGNAL_CHANNEL" not in pending
-    # PR 10 promotion: ``GOLDFIVE_PLAN_MODE`` likewise reports APPLIED.
     assert "GOLDFIVE_PLAN_MODE" in applied
-    assert "GOLDFIVE_PLAN_MODE" not in pending
-    # The legacy arm's escape hatch is still pending until PR 7.
-    _, legacy_pending = arm_flag_status(arms["legacy"])
-    assert "GOLDFIVE_STEER_LEGACY_LADDER" in legacy_pending
+    # The legacy arm's escape hatch is now APPLIED (PR 7 read it into from_env);
+    # nothing the bench carries is pending anymore.
+    legacy_applied, legacy_pending = arm_flag_status(arms["legacy"])
+    assert "GOLDFIVE_STEER_LEGACY_LADDER" in legacy_applied
+    assert legacy_pending == []
     # The flags this build DOES consult are reported as applied.
     assert "GOLDFIVE_STEER_SIGNAL_TELEMETRY" in applied
     assert set(applied) <= KNOWN_STEER_ENV

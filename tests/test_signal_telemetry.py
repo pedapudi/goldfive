@@ -268,13 +268,24 @@ async def test_pause_control_dispatch_emits_delivery_and_escalated_outcome() -> 
 
 
 async def test_handle_drift_promotion_path_emits_signal_end_to_end() -> None:
-    """Full chain: handle_drift -> promote_drift_to_steer -> dispatch -> emit."""
+    """Full chain: handle_drift -> promote_drift_to_steer -> note enqueue -> emit.
+
+    AGENCY-PRESERVATION.md PR 7: the default-regime promotion enqueues an
+    advisory note instead of dispatching GOLDFIVE_STEER, so the emitted
+    ``SignalDelivered`` rides the note channel (``nudge_replay`` under the
+    default ``signal_channel``) and carries ``ladder_level="promotion"`` in its
+    decision payload rather than ``channel == SIGNAL_CHANNEL_PROMOTION`` (the
+    legacy-only dispatch channel). The end-to-end emission is what this pins.
+    """
     steerer, session, sink = _setup(observation_only=False)
     # OFF_TOPIC + WARNING is on the promote-to-steer path.
     await steerer.drift.handle_drift(_drift(kind=DriftKind.OFF_TOPIC), session)
     await steerer.drift._wait_background_drifts_idle()
     rows = _delivered(sink)
-    assert any(r.signal_delivered.channel == SIGNAL_CHANNEL_PROMOTION for r in rows)
+    assert any(
+        json.loads(r.signal_delivered.decision_json).get("ladder_level") == "promotion"
+        for r in rows
+    ), "promotion path must emit a SignalDelivered with ladder_level=promotion"
 
 
 # ---------------------------------------------------------------------------

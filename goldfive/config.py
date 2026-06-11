@@ -882,6 +882,25 @@ class SteeringConfig:
     #: AGENCY-PRESERVATION.md PR 13 flips it after the bench gate.
     #: Env: ``GOLDFIVE_PLAN_MODE``.
     plan_mode: str = "forecast"
+    #: AGENCY-PRESERVATION.md PR 7 — the one-release escape hatch that restores
+    #: the pre-PR-7 ladder + promotion behaviour.
+    #:
+    #: When ``False`` (the default) the new ladder applies: goldfive-authored
+    #: ``CANCEL_REINVOKE`` cells are demoted to ``SIGNAL`` (advisory note, no
+    #: refine/cancel/steer), repeat-escalation lands on ``PAUSE_ESCALATE``
+    #: (stop-and-ask), and :meth:`~goldfive.drift_observer.DriftObserver._promote_drift_to_steer`
+    #: drops its steering side-effects (no cancel-reason tag, no GOLDFIVE_STEER
+    #: dispatch, no ``active_steer(source="goldfive")`` stamp) — it refines,
+    #: emits ``PlanRevised``, and enqueues a note.
+    #:
+    #: When ``True`` the pre-PR-7 ladder cells (``CANCEL_REINVOKE`` in the
+    #: goldfive-authored rows) and the full promotion side-effects are
+    #: restored — the §5.8 measurable-regression arm (the bench's arm C).
+    #: The two deferred Stage-1 correctness fixes that also land in PR 7 (the
+    #: hard-safety CRITICAL-first stop and the PLAN_DIVERGENCE eligible-kinds
+    #: removal) are NOT toggled by this flag — they apply in both regimes.
+    #: Env: ``GOLDFIVE_STEER_LEGACY_LADDER``.
+    legacy_ladder: bool = False
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -909,6 +928,9 @@ class SteeringConfig:
           ``request_context`` (case-insensitive). Selects the
           observer-note delivery channel (AGENCY-PRESERVATION.md PR 6);
           default ``legacy_user_message``.
+        * ``GOLDFIVE_STEER_LEGACY_LADDER`` — boolean. The PR-7 escape hatch
+          restoring the pre-PR-7 ladder cells + promotion side-effects
+          (AGENCY-PRESERVATION.md PR 7 / §5.8); default ``False``.
         """
         defaults = cls()
         raw_rules = os.environ.get("GOLDFIVE_STEER_CONTEXT_EDITOR_RULES", "").strip()
@@ -949,6 +971,10 @@ class SteeringConfig:
             plan_mode=_read_plan_mode_env(
                 "GOLDFIVE_PLAN_MODE",
                 defaults.plan_mode,
+            ),
+            legacy_ladder=_read_bool_env(
+                "GOLDFIVE_STEER_LEGACY_LADDER",
+                defaults.legacy_ladder,
             ),
         )
 

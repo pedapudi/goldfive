@@ -126,7 +126,12 @@ class InterventionLevel(enum.IntEnum):
 
     OBSERVE = 0
     ABSORB = 1
-    NUDGE = 2
+    # AGENCY-PRESERVATION.md PR 7: NUDGE renamed to SIGNAL. The level now
+    # enqueues an advisory observer note (the request_context channel / the
+    # legacy nudge replay) WITHOUT a refine/cancel/steer — the proportional,
+    # trajectory-preserving response that replaces the goldfive-authored
+    # CANCEL_REINVOKE cells. The enum value (2) is unchanged.
+    SIGNAL = 2
     CANCEL_REINVOKE = 3
     PAUSE_ESCALATE = 4
     TERMINATE = 5
@@ -615,6 +620,16 @@ class DefaultSteerer:
             )
             _channel = "legacy_user_message"
         self._signal_channel: str = _channel
+        # AGENCY-PRESERVATION.md PR 7: the one-release legacy-ladder escape
+        # hatch. When True the pre-PR-7 ladder cells (CANCEL_REINVOKE in the
+        # goldfive-authored rows) and the full _promote_drift_to_steer
+        # side-effects are restored; the drift observer reads this flag in
+        # ``_ladder_level_for`` and ``_promote_drift_to_steer``. Default OFF
+        # (the new SIGNAL ladder). The two deferred correctness fixes
+        # (hard-safety stop, PLAN_DIVERGENCE removal) are NOT gated by it.
+        self._legacy_ladder: bool = bool(
+            getattr(steering_config, "legacy_ladder", False)
+        )
         # Background reasoning-judge tasks (goldfive#251). The LLM-judge
         # path in :meth:`observe_reasoning` is fire-and-forget so the
         # adapter's model-response callback can return immediately and
