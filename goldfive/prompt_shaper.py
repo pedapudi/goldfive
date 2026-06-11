@@ -636,6 +636,18 @@ class PromptShaper:
                 # hatch for trees built around the pinned-task block.
                 # Legacy ``signal_channel`` keeps the pin (byte-identical;
                 # §5.1).
+                #
+                # KNOWN LIMITATION (request_context + pin off): this also
+                # drops the pending-CORRECTION block that legacy rides on
+                # this pin. Corrections are still WRITTEN
+                # (``queue_corrections_for_revision``) but go UNREAD in
+                # this regime until task #11 migrates them to the
+                # ObserverNoteQueue at write time (which requires an
+                # agent-scoped ``peek_for_render`` so a per-(agent,task)
+                # correction reaches only its agent). ``request_context``
+                # is opt-in / non-default, so this is a documented gap in
+                # the new regime, not a production regression. Re-enable
+                # delivery meanwhile via ``pin_assigned_task=True``.
                 if shaper._request_context(steerer) and not shaper._pin_assigned_task(
                     steerer
                 ):
