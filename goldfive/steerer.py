@@ -24,12 +24,16 @@ tangle of conditionals. Levels, ordered by intrusiveness:
 
 * Level 0 — OBSERVE: record the drift, no action.
 * Level 1 — ABSORB: call ``planner.refine``; continue.
-* Level 2 — NUDGE: queue a soft follow-up message on the session for
-  the Runner's overlay loop to pick up at the next invocation boundary.
+* Level 2 — SIGNAL (renamed from NUDGE in AGENCY-PRESERVATION.md PR 7):
+  enqueue an advisory observer note on the configured channel — no
+  refine, no cancel, no steer. The proportional, trajectory-preserving
+  response the goldfive-authored ``CANCEL_REINVOKE`` cells were demoted to.
 * Level 3 — CANCEL_REINVOKE: dispatch a ``GOLDFIVE_STEER`` control
   message on the bound channel so the executor cancels in-flight work
-  and restarts with a goldfive-authored corrective. Phase 2 of the
-  path-duality fix routes this through the same junction as USER_STEER.
+  and restarts with a goldfive-authored corrective. PR 7 narrows this to
+  the user-steer junction + hard-safety kinds only (every other
+  goldfive-authored row signals); the ``GOLDFIVE_STEER_LEGACY_LADDER=1``
+  escape hatch restores the pre-PR-7 cells.
 * Level 4 — PAUSE_ESCALATE: dispatch a ``GOLDFIVE_PAUSE_ESCALATE``
   control message and emit ``HUMAN_INTERVENTION_REQUIRED`` so the
   executor's pre-task loop blocks waiting for operator action.
