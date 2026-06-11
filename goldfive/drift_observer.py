@@ -151,6 +151,7 @@ from goldfive.drift import (
 from goldfive.types import (
     RECENT_EVENT_AGENT_ACTIVITY_KINDS,
     RECENT_EVENT_KIND_TOOL_OBSERVED,
+    TERMINAL_TASK_STATUSES,
     CancellationRequest,
     DriftEvent,
     DriftKind,
@@ -158,8 +159,12 @@ from goldfive.types import (
     RefineOutcome,
     Session,
     Task,
+    TaskKind,
     TaskStatus,
+    channel_processor_active,
     filter_recent_events_by_kind,
+    replace_task,
+    set_session_plan,
 )
 
 if TYPE_CHECKING:
@@ -2309,6 +2314,10 @@ class DriftObserver:
                     sink=judge_sink,
                     agent_name=agent_name,
                     available_agents=judge_available_agents,
+                    # AGENCY-PRESERVATION.md PR 11(b) — ledger mode
+                    # re-grounds the judge on goals (primary) with the
+                    # bound task as context.
+                    ledger=self._ledger_mode(),
                 )
             finally:
                 # Restore the live history. Any entries appended by
@@ -3185,7 +3194,9 @@ class DriftObserver:
         session._agent_turns_since_goal_check = 0
         self._spawn_goal_drift_judge_background(session)
 
-    async def _maybe_run_goal_drift_on_task_boundary(self, session: Session) -> None:
+    async def _maybe_run_goal_drift_on_task_boundary(
+        self, session: Session, transitioned_task: Task | None = None
+    ) -> None:
         """Fire :meth:`maybe_run_goal_drift_check` on a task transition.
 
         Task completions / failures / cancellations are natural
@@ -3227,6 +3238,19 @@ class DriftObserver:
         :meth:`_run_judge_background` — keeps it alive across cancel
         propagation and drainable at :meth:`shutdown`.
         """
+        # AGENCY-PRESERVATION.md PR 11(c) re-entrancy guard: an OUTCOME
+        # task only transitions via goldfive's own outcome-progress judge
+        # (the agent never reports on deliverables). Those transitions are
+        # judge-authored bookkeeping, not agent progress, so re-firing the
+        # task-boundary cadence on them adds no information and would loop
+        # (outcome judge marks an OUTCOME COMPLETED → mark_task_completed
+        # → this hook → re-judge → …). Skip the whole cadence on OUTCOME
+        # transitions. A no-op in forecast mode (no OUTCOME-kind tasks).
+        if (
+            transitioned_task is not None
+            and getattr(transitioned_task, "kind", None) is TaskKind.OUTCOME
+        ):
+            return
         if self._steerer._goal_drift_call_llm is None:
             return
         now = time.time()
@@ -3238,6 +3262,26 @@ class DriftObserver:
         # fresh rather than firing one more judge call on the next turn.
         session._agent_turns_since_goal_check = 0
         self._spawn_goal_drift_judge_background(session)
+        # AGENCY-PRESERVATION.md PR 11(c): in ledger mode the task boundary
+        # is also where met OUTCOME deliverables transition to COMPLETED.
+        # Fire-and-forget + single-in-flight (see the spawn helper).
+        self._spawn_outcome_progress_background(session)
+
+    def _ledger_mode(self) -> bool:
+        """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 11. Read off the steerer's
+        typed config exactly as the pin path / reviser read it. Defensive:
+        any read failure resolves to forecast mode, so the goal-drift
+        judge stays on its pre-PR-11 binary/CRITICAL path by default.
+        """
+        try:
+            cfg = getattr(self._steerer, "_steering_config", None)
+            if cfg is None:
+                return False
+            return str(getattr(cfg, "plan_mode", "forecast")).strip().lower() == "ledger"
+        except Exception:  # noqa: BLE001
+            return False
 
     async def maybe_run_goal_drift_check(self, session: Session) -> None:
         """Run the trajectory-level GOAL_DRIFT judge once, cost-bounded.
@@ -3282,6 +3326,10 @@ class DriftObserver:
             model=self._steerer._goal_drift_model,
             call_llm=call_llm,
             current_task_id=session.current_task_id,
+            # AGENCY-PRESERVATION.md PR 11(a) — in ledger mode the judge
+            # uses the graduated (uncertain → WARNING / off_track →
+            # CRITICAL) verdict and reads the plan as the ledger.
+            graduated=self._ledger_mode(),
             sinks=self._steerer._sinks,
             run_id=session.run_id,
             session_id=session.id,
@@ -3391,6 +3439,179 @@ class DriftObserver:
                 "(swallowed): %s",
                 exc,
             )
+
+    # ------------------------------------------------------------------
+    # AGENCY-PRESERVATION.md PR 11(c): outcome-progress judge.
+    #
+    # In ledger plan mode the Plan is a ledger of OUTCOME deliverables +
+    # a DISCOVERED trajectory. The wrapped agent never reports on OUTCOME
+    # tasks, so they reach a terminal status only via goldfive's own
+    # judge here. Run completion ("all outcomes terminal") is therefore
+    # decided WITHOUT agent cooperation. Two cadences:
+    #   * task boundary — fire-and-forget, completes MET deliverables as
+    #     they are achieved (``_spawn_outcome_progress_background``);
+    #   * run end — awaited finalize, completes MET + fails CONFIDENTLY-
+    #     unmet, leaving uncertain deliverables PENDING to carry forward
+    #     (``finalize_outcomes``).
+    # All ledger-gated; a no-op in forecast mode.
+    # ------------------------------------------------------------------
+
+    async def finalize_outcomes(self, session: Session) -> None:
+        """Judge + finalize OUTCOME deliverables at the run boundary.
+
+        Awaited (not fire-and-forget) so the transitions land BEFORE the
+        executor's end-of-overlay PENDING disposition (goldfive#208) and
+        the fatal-failure gate read it. Ledger-gated; no-op otherwise.
+        """
+        await self._run_outcome_progress(session, run_ending=True)
+
+    def _spawn_outcome_progress_background(self, session: Session) -> None:
+        """Fire-and-forget the task-boundary outcome-progress judge.
+
+        Single-in-flight per session (``session._outcome_progress_inflight``):
+        a second task boundary that lands while one judge is mid-flight
+        does not stack a second judge — the in-flight one already sees the
+        latest plan. Tracked on ``_background_judges`` so :meth:`shutdown`
+        drains it, matching the goal-drift background pattern. No-op when
+        not in ledger mode, when no judge ``call_llm`` is configured, or
+        when no event loop is running.
+        """
+        if not self._ledger_mode() or self._steerer._goal_drift_call_llm is None:
+            return
+        if getattr(session, "_outcome_progress_inflight", False):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        session._outcome_progress_inflight = True
+        bg_task = asyncio.create_task(
+            self._run_outcome_progress_background(session),
+            name=f"goldfive-outcome-progress:{session.id}",
+        )
+        self._steerer._background_judges.add(bg_task)
+        bg_task.add_done_callback(self._steerer._background_judges.discard)
+
+    async def _run_outcome_progress_background(self, session: Session) -> None:
+        """Body of the fire-and-forget task-boundary outcome-progress judge."""
+        try:
+            await self._run_outcome_progress(session, run_ending=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — background task
+            log.warning(
+                "DefaultSteerer: background outcome-progress judge raised "
+                "(swallowed): %s",
+                exc,
+            )
+        finally:
+            session._outcome_progress_inflight = False
+
+    async def _run_outcome_progress(self, session: Session, *, run_ending: bool) -> None:
+        """Judge non-terminal OUTCOME tasks and apply the transitions.
+
+        Ledger-gated shared body for both cadences. Quiet on every failure
+        (the judge module never raises into the run). User goal predicates
+        remain authoritative: a predicate that is explicitly unmet blocks
+        LLM-driven completion.
+        """
+        if not self._ledger_mode():
+            return
+        call_llm = self._steerer._goal_drift_call_llm
+        if call_llm is None:
+            return
+        plan = session.plan
+        outcome_tasks = [
+            t
+            for t in (getattr(plan, "tasks", None) or ())
+            if getattr(t, "kind", None) is TaskKind.OUTCOME
+            and getattr(t, "status", None) not in TERMINAL_TASK_STATUSES
+        ]
+        if not outcome_tasks:
+            return
+        from goldfive.drift.outcome_progress import (
+            evaluate_outcome_progress,
+            plan_outcome_transitions,
+        )
+
+        verdicts = await evaluate_outcome_progress(
+            goals=session.goals,
+            plan=plan,
+            completed_outputs=getattr(session, "completed_outputs", None),
+            model=self._steerer._goal_drift_model,
+            call_llm=call_llm,
+            sinks=self._steerer._sinks,
+            run_id=session.run_id,
+            session_id=session.id,
+            sequence_fn=session.next_sequence,
+        )
+        if not verdicts:
+            return
+        from goldfive.results import evaluate_goal_predicates
+
+        predicates_met = evaluate_goal_predicates(session) is None
+        transitions = plan_outcome_transitions(
+            plan,
+            verdicts,
+            run_ending=run_ending,
+            goal_predicates_met=predicates_met,
+        )
+        await self._apply_outcome_transitions(session, transitions)
+
+    async def _apply_outcome_transitions(
+        self, session: Session, transitions: list[Any]
+    ) -> None:
+        """Apply outcome transitions: stamp contributes_to, then transition.
+
+        ``contributes_to`` stamps land first in a single
+        channel-processor envelope (one plan rebuild for all stamps);
+        then each OUTCOME task is transitioned via the task state machine
+        so the normal TaskCompleted / TaskFailed events + cascade fire.
+        Marking an OUTCOME terminal re-enters ``mark_task_*`` → the
+        task-boundary hook, which the PR 11(c) OUTCOME-skip guard
+        short-circuits, so this does not recurse.
+        """
+        if not transitions:
+            return
+        stamps: list[tuple[str, str]] = [
+            pair for tr in transitions for pair in getattr(tr, "contributes_stamps", ())
+        ]
+        if stamps:
+            try:
+                with channel_processor_active():
+                    plan = session.plan
+                    for discovered_id, outcome_id in stamps:
+                        plan = replace_task(plan, discovered_id, contributes_to=outcome_id)
+                    set_session_plan(session, plan)
+            except Exception as exc:  # noqa: BLE001 — observability stamp
+                log.warning(
+                    "DefaultSteerer: contributes_to stamp raised (swallowed): %s",
+                    exc,
+                )
+        for tr in transitions:
+            try:
+                if tr.new_status is TaskStatus.COMPLETED:
+                    await self._steerer.tasks.mark_task_completed(
+                        tr.task_id,
+                        session=session,
+                        summary=tr.reason,
+                        source="goldfive_outcome_judge",
+                    )
+                elif tr.new_status is TaskStatus.FAILED:
+                    await self._steerer.tasks.mark_task_failed(
+                        tr.task_id,
+                        session=session,
+                        reason=tr.reason,
+                        recoverable=True,
+                        source="goldfive_outcome_judge",
+                    )
+            except Exception as exc:  # noqa: BLE001 — never break the run
+                log.warning(
+                    "DefaultSteerer: outcome transition for %r raised "
+                    "(swallowed): %s",
+                    tr.task_id,
+                    exc,
+                )
 
     # ------------------------------------------------------------------
     # iter-11A: fire-and-forget drift-cascade dispatch.

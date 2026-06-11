@@ -267,7 +267,9 @@ class TaskStateMachine:
             source=source,
         )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
-        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(
+            session, transitioned_task=task
+        )
 
     async def mark_task_failed(
         self,
@@ -332,7 +334,9 @@ class TaskStateMachine:
             source=source,
         )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
-        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(
+            session, transitioned_task=task
+        )
         # Fatal failures cascade downstream via the same primitive used
         # by mark_task_cancelled, so both §6.2 and §6.3 produce the
         # same TaskCancelled event stream and share rejection guards.
@@ -460,7 +464,9 @@ class TaskStateMachine:
         # cascade-cancel downstream tasks share the same rate-limit bucket
         # and will no-op as subsequent boundary fires fall within the
         # 10s guard.
-        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(
+            session, transitioned_task=task
+        )
         await self.cascade_cancel_downstream(session, task_id, source="cancellation")
 
     async def mark_task_not_needed(
@@ -519,7 +525,9 @@ class TaskStateMachine:
             source=source,
         )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
-        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(
+            session, transitioned_task=task
+        )
 
     async def cascade_cancel_downstream(
         self,

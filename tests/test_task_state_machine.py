@@ -95,7 +95,13 @@ class _StubDrift:
     ) -> None:
         self.spawn_drift_calls.append((drift, session))
 
-    async def _maybe_run_goal_drift_on_task_boundary(self, session: Session) -> None:
+    async def _maybe_run_goal_drift_on_task_boundary(
+        self, session: Session, transitioned_task: Any = None
+    ) -> None:
+        # AGENCY-PRESERVATION.md PR 11(c): mirror the production
+        # signature, which gained an optional ``transitioned_task`` so the
+        # boundary cadence can skip OUTCOME-kind transitions. Interface
+        # sync only — no behavioural assertion changes.
         self.goal_drift_boundary_calls += 1
 
 

@@ -57,6 +57,7 @@ __all__ = [
     "classify_goal_drift",
     "GOAL_DRIFT_SYSTEM_PROMPT",
     "GOAL_DRIFT_USER_PROMPT_TEMPLATE",
+    "GOAL_DRIFT_GRADUATED_USER_PROMPT_TEMPLATE",
     "GOAL_DRIFT_CHECK_INTERVAL",
     "GOAL_DRIFT_IDLE_SECONDS",
     "GOAL_DRIFT_MAX_OUTPUT_TOKENS",
@@ -119,6 +120,59 @@ GOAL_DRIFT_USER_PROMPT_TEMPLATE: str = (
 )
 
 
+# AGENCY-PRESERVATION.md Stage 3 PR 11(a) — the GRADUATED goal-drift
+# prompt. Used only in ledger plan mode (``graduated=True``). It asks for
+# a three-state verdict so WARNING can fire BEFORE CRITICAL: an
+# ``uncertain`` band lets goldfive surface "this may be drifting" as a
+# proportional advisory note, reserving CRITICAL for clearly off-track
+# trajectories. The plan rendered here is the LEDGER (goal-anchored
+# OUTCOME deliverables + the descriptively-grown DISCOVERED trajectory),
+# which is the agent's own observed intent — a self-consistent,
+# adaptive reference rather than a forecast the agent is graded against.
+GOAL_DRIFT_GRADUATED_USER_PROMPT_TEMPLATE: str = (
+    "You are assessing whether an autonomous agent tree is making "
+    "progress toward a stated goal.\n\n"
+    "GOALS (what the user wants — the primary reference):\n{goals_block}\n\n"
+    "LEDGER (OUTCOME = deliverables that define success; DISCOVERED = "
+    "what the agent has actually done so far):\n{tasks_block}\n\n"
+    "RECENT AGENT ACTIVITY (most recent {activity_count} invocations, "
+    "newest last):\n{activity_block}\n\n"
+    "Decide how the recent activity relates to the GOALS, given the "
+    "agent's own observed trajectory in the LEDGER. Answer STRICTLY in "
+    "one of these three JSON shapes:\n"
+    '{{"progressing": true}}\n'
+    "OR\n"
+    '{{"progressing": false, "band": "uncertain", "reason": '
+    '"one-sentence explanation", "note_to_agent": "..."}}\n'
+    "OR\n"
+    '{{"progressing": false, "band": "off_track", "reason": '
+    '"one-sentence explanation", "note_to_agent": "..."}}\n\n'
+    "progressing=true — activity plausibly advances the goals; no concern.\n"
+    'band="uncertain" — the connection to the goals is unclear or the '
+    "trajectory may be starting to drift, but it is not yet clearly "
+    "wrong. This is an EARLY, proportional signal.\n"
+    'band="off_track" — activity is clearly not advancing the goals '
+    "(looping, refusing, pursuing a different objective).\n\n"
+    "``note_to_agent`` is one or two sentences addressed to the agent "
+    "itself: state only what you observed and how it relates to the "
+    "goals. Neutral and factual — no commands, no instructions about "
+    "which task, tool, or agent to use next, and no fault language. For "
+    'the "uncertain" band especially, prefer a QUESTION (e.g. "Does the '
+    'current approach still serve the goal of X?") over a statement.'
+)
+
+
+# Graduated-mode band → severity map. ``uncertain`` fires WARNING (the
+# early, proportional signal); ``off_track`` — and any unrecognised /
+# missing band on a non-progressing verdict — fires CRITICAL, matching
+# the binary judge's pre-PR-11 behaviour so a graduated judge that omits
+# the band degrades safely to the legacy severity.
+_GRADUATED_BAND_SEVERITY: dict[str, DriftSeverity] = {
+    "uncertain": DriftSeverity.WARNING,
+    "off_track": DriftSeverity.CRITICAL,
+}
+
+
 # Liberal JSON extraction + goals rendering live in
 # :mod:`goldfive.drift.registry` so the goal-drift judge and the
 # per-reasoning judge share one implementation. The aliased imports at
@@ -127,7 +181,15 @@ GOAL_DRIFT_USER_PROMPT_TEMPLATE: str = (
 # work) without re-declaring the function bodies here.
 
 
-def _format_tasks(plan: Plan | Any | None) -> str:
+def _format_tasks(plan: Plan | Any | None, *, annotate_kind: bool = False) -> str:
+    """Render the plan's tasks for the judge prompt.
+
+    When ``annotate_kind`` (ledger / graduated mode), each task is
+    tagged with its ``kind`` (OUTCOME / DISCOVERED / FORECAST) so the
+    judge reads the plan as a LEDGER — deliverables vs the agent's
+    observed trajectory — rather than a flat task list. Forecast mode
+    (``annotate_kind=False``, the default) renders exactly as before.
+    """
     if plan is None:
         return "(no plan yet)"
     tasks = getattr(plan, "tasks", None) or []
@@ -139,10 +201,16 @@ def _format_tasks(plan: Plan | Any | None) -> str:
         title = str(getattr(t, "title", "") or "")
         status = getattr(t, "status", "")
         status_str = str(getattr(status, "value", status) or "").upper() or "UNSPECIFIED"
+        kind_tag = ""
+        if annotate_kind:
+            kind = getattr(t, "kind", "")
+            kind_str = str(getattr(kind, "value", kind) or "").upper()
+            if kind_str:
+                kind_tag = f"{kind_str} "
         if tid:
-            lines.append(f"{i}. [{tid}] {title} ({status_str})")
+            lines.append(f"{i}. {kind_tag}[{tid}] {title} ({status_str})")
         else:
-            lines.append(f"{i}. {title} ({status_str})")
+            lines.append(f"{i}. {kind_tag}{title} ({status_str})")
     return "\n".join(lines)
 
 
@@ -201,6 +269,7 @@ async def classify_goal_drift(
     current_agent_id: str = "",
     system_prompt: str | None = None,
     user_prompt_template: str | None = None,
+    graduated: bool = False,
     sinks: list[Any] | None = None,
     run_id: str = "",
     session_id: str = "",
@@ -255,7 +324,16 @@ async def classify_goal_drift(
         pinned in :data:`GOAL_DRIFT_USER_PROMPT_TEMPLATE`.
     """
     system = system_prompt or GOAL_DRIFT_SYSTEM_PROMPT
-    template = user_prompt_template or GOAL_DRIFT_USER_PROMPT_TEMPLATE
+    # AGENCY-PRESERVATION.md PR 11(a) — in ledger mode (``graduated``) ask
+    # for the three-band verdict so WARNING can fire before CRITICAL. An
+    # explicit ``user_prompt_template`` override always wins; otherwise
+    # the band selection is forecast (binary) vs ledger (graduated).
+    if user_prompt_template is not None:
+        template = user_prompt_template
+    elif graduated:
+        template = GOAL_DRIFT_GRADUATED_USER_PROMPT_TEMPLATE
+    else:
+        template = GOAL_DRIFT_USER_PROMPT_TEMPLATE
     # goldfive#245 — capture the plan-revision the judge is observing
     # BEFORE we render the prompt or await the LLM. The post-LLM
     # re-read below uses this snapshot to detect when the plan moved
@@ -276,7 +354,7 @@ async def classify_goal_drift(
             status = getattr(t, "status", "")
             pre_call_task_status[tid] = str(getattr(status, "value", status) or "")
     goals_block = _format_goals(goals)
-    tasks_block = _format_tasks(plan)
+    tasks_block = _format_tasks(plan, annotate_kind=graduated)
     activity_block, activity_count = _format_activity(observed_actions)
     user = template.format(
         goals_block=goals_block,
@@ -486,9 +564,20 @@ async def classify_goal_drift(
     # observer-note composer falls back to ``detail``.
     note_raw = parsed.get("note_to_agent", "")
     note_to_agent = note_raw.strip() if isinstance(note_raw, str) else ""
+    # AGENCY-PRESERVATION.md PR 11(a) — graduated severity. In ledger mode
+    # the judge may band a non-progressing verdict as ``uncertain`` (early,
+    # proportional → WARNING) vs ``off_track`` (clear drift → CRITICAL).
+    # Forecast mode (``graduated=False``) keeps the pre-PR-11 behaviour
+    # exactly: every non-progressing verdict is CRITICAL. A graduated
+    # verdict missing / with an unrecognised band degrades to CRITICAL so
+    # the severity never silently softens below the legacy default.
+    severity = DriftSeverity.CRITICAL
+    if graduated:
+        band = str(parsed.get("band", "") or "").strip().lower()
+        severity = _GRADUATED_BAND_SEVERITY.get(band, DriftSeverity.CRITICAL)
     return DriftEvent(
         kind=DriftKind.GOAL_DRIFT,
-        severity=DriftSeverity.CRITICAL,
+        severity=severity,
         detail=detail,
         current_task_id=current_task_id,
         current_agent_id=current_agent_id,
