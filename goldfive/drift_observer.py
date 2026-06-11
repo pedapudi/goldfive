@@ -3283,6 +3283,68 @@ class DriftObserver:
         except Exception:  # noqa: BLE001
             return False
 
+    #: AGENCY-PRESERVATION.md Stage 3 PR 12 — the looping kinds whose
+    #: ledger-mode rung is a deterministic force-FAIL of the bound task.
+    #: A loop on a DISCOVERED task means that unit of means-level work is
+    #: stuck and there is no forecast to route around, so the
+    #: deterministic looping fallback (planner ``_refine_looping_tool_call``
+    #: in forecast mode) reduces to "fail the looping ledger task".
+    _LEDGER_FORCE_FAIL_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
+        {DriftKind.LOOPING_TOOL_CALL, DriftKind.LOOPING_REASONING}
+    )
+
+    async def _ledger_retire_refine(self, drift: DriftEvent, session: Session) -> None:
+        """Ledger-mode substitute for the drift-triggered forecast-repair refine.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 12. In ledger plan mode there is
+        no forecast plan to repair, so a goldfive-authored drift that would
+        otherwise reach ``planner.refine`` (ladder ABSORB/CANCEL_REINVOKE)
+        or ``refine_steer`` (promotion) instead takes one of the ledger
+        rungs:
+
+        * **looping kinds** (:data:`_LEDGER_FORCE_FAIL_DRIFT_KINDS`) with a
+          bound task → **force-FAIL** the bound ledger task. ``recoverable``
+          is True — a sibling/replacement DISCOVERED task may still cover
+          the work, and the outcome-progress judge (PR 11) still grades the
+          OUTCOME deliverables independently.
+        * **everything else** → enqueue the advisory observer **note** (the
+          SIGNAL rung's trajectory-preserving influence), via
+          :meth:`_dispatch_nudge`.
+
+        The PAUSE_ESCALATE / SIGNAL / OBSERVE rungs never reach here — they
+        return earlier in :meth:`_handle_drift_dispatch` and are already
+        mode-agnostic. USER_STEER, ``handle_turn`` replans, and descriptive
+        absorption are SEPARATE dispatch paths and keep their refine. Never
+        raises into the dispatch.
+        """
+        task_id = drift.current_task_id or ""
+        if drift.kind in self._LEDGER_FORCE_FAIL_DRIFT_KINDS and task_id:
+            reason = (
+                f"ledger force-fail (loop): {drift.detail}"
+                if drift.detail
+                else f"ledger force-fail (loop): {drift.kind.value}"
+            )
+            try:
+                await self._steerer.tasks.mark_task_failed(
+                    task_id,
+                    session=session,
+                    reason=reason,
+                    recoverable=True,
+                    source="goldfive_ledger_refine_retire",
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 — never break the run
+                log.warning(
+                    "DefaultSteerer._ledger_retire_refine: force-fail of %r "
+                    "raised (falling back to note): %s",
+                    task_id,
+                    exc,
+                )
+        # Default rung: the advisory note. Trajectory-preserving influence
+        # instead of repairing a forecast that does not exist in ledger
+        # mode.
+        await self._dispatch_nudge(drift, session)
+
     async def maybe_run_goal_drift_check(self, session: Session) -> None:
         """Run the trajectory-level GOAL_DRIFT judge once, cost-bounded.
 
@@ -4346,7 +4408,17 @@ class DriftObserver:
                     exc,
                 )
         if promote_to_steer:
-            await self._promote_drift_to_steer(drift, session)
+            # AGENCY-PRESERVATION.md Stage 3 PR 12 — refine retirement in
+            # ledger plan mode. Promotion produces a forecast-repair
+            # ``refine_steer`` (PR 7 kept it on the promotion path); in
+            # ledger mode there is no forecast to repair, so route to the
+            # ledger rung instead. Promotion never selects USER_STEER
+            # (``_should_promote_to_steer`` returns False for user-authored
+            # kinds), so this is always a goldfive-authored drift.
+            if self._ledger_mode():
+                await self._ledger_retire_refine(drift, session)
+            else:
+                await self._promote_drift_to_steer(drift, session)
             return
         # Route through the intervention ladder. The per-(kind, task)
         # occurrence count drives the "first vs repeat" distinction in
@@ -4408,6 +4480,22 @@ class DriftObserver:
         # (goldfive#141). The refine call itself is identical so we
         # share the implementation below and read the level at the end
         # to decide whether to emit the follow-up handoff.
+        #
+        # AGENCY-PRESERVATION.md Stage 3 PR 12 — refine retirement in
+        # ledger plan mode. The drift-triggered forecast-repair refine has
+        # no forecast to repair in ledger mode (the plan is a ledger of
+        # OUTCOME deliverables + a DISCOVERED trajectory record, not a
+        # forecast the agent is graded against). Refine survives for
+        # exactly three authors (§3 PR 12): USER_STEER (handled here —
+        # falls through to the refine below), turn-level ``handle_turn``
+        # replans, and descriptive absorption (both SEPARATE dispatch
+        # paths, untouched). Every other (goldfive-authored)
+        # ABSORB/CANCEL_REINVOKE drift takes the ledger rung instead. The
+        # OBSERVE / SIGNAL / PAUSE_ESCALATE rungs returned earlier and are
+        # already mode-agnostic.
+        if self._ledger_mode() and drift.kind is not DriftKind.USER_STEER:
+            await self._ledger_retire_refine(drift, session)
+            return
         if self._steerer._planner is None or session.plan is None:
             return
         if drift.kind is DriftKind.REFINE_VALIDATION_FAILED:

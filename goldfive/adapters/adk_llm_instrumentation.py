@@ -526,10 +526,12 @@ def _compose_instruction(
     task_title: str,
     task_description: str,
     pending_correction: str,
+    task_kind: str = "",
+    goals_block: str = "",
 ) -> str:
     """Assemble the final prompt string the LLM sees this turn.
 
-    Shape:
+    Shape (FORECAST / OUTCOME pin — the legacy task block):
 
         {original}
 
@@ -541,7 +543,53 @@ def _compose_instruction(
           description: {task_description}
 
         {pending_correction}  # appended only when non-empty
+
+    AGENCY-PRESERVATION.md Stage 3 PR 12 — when the pinned task is
+    DISCOVERED-kind (``task_kind == TaskKind.DISCOVERED.value`` and a
+    non-empty ``goals_block`` is supplied), render a ``[GOALS]`` block
+    INSTEAD of the ``Current assigned task:`` block:
+
+        {original}
+
+        ---
+
+        [GOALS]
+        {goals_block}
+
+        {pending_correction}
+
+    Rationale: a DISCOVERED task is the agent's OWN observed means-work
+    (the trajectory lane of the ledger), not a forecast the agent is
+    graded against. Pinning it back as a prescription re-imposes exactly
+    the forecast framing PR 11/12 retire — so for a discovered pin we
+    ground the agent on the user's GOALS and let it own the means.
+    ``task_kind``/``goals_block`` default to ``""`` so every legacy /
+    forecast / OUTCOME caller renders the unchanged task block (the
+    DISCOVERED kind only exists in ledger plan mode — forecast-mode pins
+    are byte-identical, §5.1).
+
+    Interaction with the PR 9 prompt-shaping diet: under
+    ``signal_channel == "request_context"`` with ``pin_assigned_task``
+    off, the resolver returns the original instruction BEFORE reaching
+    this function (the pin is retired entirely), so the ``[GOALS]`` block
+    applies only where a pin WOULD render — legacy ``signal_channel`` or
+    ``pin_assigned_task=True``.
     """
+    from goldfive.types import TaskKind
+
+    if task_kind == TaskKind.DISCOVERED.value and goals_block:
+        block = (
+            f"{original}\n"
+            "\n"
+            "---\n"
+            "\n"
+            "[GOALS]\n"
+            f"{goals_block}\n"
+        )
+        if pending_correction:
+            block = f"{block}\n{pending_correction}\n"
+        return block
+
     title = task_title or _MISSING_TITLE_PLACEHOLDER
     description = task_description or _MISSING_DESCRIPTION_PLACEHOLDER
 
@@ -647,6 +695,49 @@ def _task_title_description_from_session(session: Any, task_id: str) -> tuple[st
             description = str(getattr(task, "description", "") or "")
             return title, description
     return "", ""
+
+
+def _task_kind_from_session(session: Any, task_id: str) -> str:
+    """Return the :attr:`Task.kind` VALUE for ``task_id`` in ``session.plan``.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 12. Returns the kind's string value
+    (e.g. ``"DISCOVERED"`` / ``"OUTCOME"`` / ``"FORECAST"``) so the
+    resolver can choose the ``[GOALS]`` block for a discovered pin. Returns
+    ``""`` when the plan / task is missing or carries no kind — the caller
+    then renders the unchanged task block. Forecast-mode tasks are always
+    FORECAST-kind, so this never selects the discovered branch outside
+    ledger plan mode (§5.1 forecast bit-identity).
+    """
+    if session is None or not task_id:
+        return ""
+    plan = getattr(session, "plan", None)
+    if plan is None:
+        return ""
+    for task in getattr(plan, "tasks", None) or ():
+        if str(getattr(task, "id", "") or "") == task_id:
+            kind = getattr(task, "kind", None)
+            return str(getattr(kind, "value", kind) or "")
+    return ""
+
+
+def _goals_block_from_session(session: Any) -> str:
+    """Render ``session.goals`` as the body of the PR-12 ``[GOALS]`` block.
+
+    One bullet per goal summary; goals without a summary are skipped.
+    Returns ``""`` when there are no goals so the caller falls back to the
+    task block (a discovered pin with no goals has nothing to ground on).
+    Never raises.
+    """
+    try:
+        goals = getattr(session, "goals", None) or ()
+        lines: list[str] = []
+        for g in goals:
+            summary = str(getattr(g, "summary", "") or "").strip()
+            if summary:
+                lines.append(f"  - {summary}")
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def is_dynamic_instruction(value: Any) -> bool:
