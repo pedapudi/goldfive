@@ -105,3 +105,88 @@ raise your eval's signal-to-noise ratio. Adapters that cannot
 distinguish turns leave `text_turns` empty; `full_text` then falls back
 to `text`, and `completed_outputs` falls back to whatever the adapter
 recorded, so a grader can always read the new fields safely.
+
+## The three-arm counterfactual bench (`bench/`)
+
+The AGENCY-PRESERVATION rollout (`docs/design/AGENCY-PRESERVATION.md`)
+flips `observation_only=False` (and `plan_mode=ledger`) back to the
+default **only** when the new steering regime is measurably non-inferior
+to a *disabled* goldfive. That decision is gated on one artifact: the
+three-arm bench in `bench/`, plus the §5.4 shadow-diff that must show a
+*reviewed* legacy-vs-new divergence report before any behavior PR is
+enabled.
+
+The library lives in `bench/harness.py` (the harness) and
+`bench/shadow_diff.py` (the divergence tool); `bench/run_100_tasks.py` is
+the CLI. Running the real bench against a live model is the *next* task —
+this is the tooling.
+
+### The three arms
+
+The harness runs the **same workload** under three steering regimes and
+records per-arm metrics from *captured artifacts* (`completed_outputs`,
+goal predicates, the `SignalLedger`) and the *sink event stream*
+(`SignalDelivered` / `SignalOutcome` / `DriftDetected`) — never from
+parsing agent prose:
+
+| Arm | Kind | What it is |
+|---|---|---|
+| A | `baseline` | `wrap(judge_only=True)` — the judge-only counterfactual (goldfive#446). The agent runs natively, judges stay armed, zero steering authority. This is the bar arm B must be non-inferior to. |
+| B | `signal` | the new SIGNAL regime — `observation_only=False` + the new-regime flags (`signal_channel=request_context`, `plan_mode=ledger`). |
+| C | `legacy` | the legacy ladder — `GOLDFIVE_STEER_LEGACY_LADDER=1` + `cancel_inflight_scope=all`, kept alive so regressions are measurable rather than argued about (§5.8). |
+
+Arms are defined as **flag dicts of environment variables**, not
+`SteeringConfig` kwargs, so the harness does not hard-depend on unmerged
+PRs. A flag whose env var this build's `RuntimeConfig.from_env` does not
+yet consult (e.g. `GOLDFIVE_STEER_SIGNAL_CHANNEL` before PR 6) is applied
+to the environment, reported as **pending**, and simply no-ops until the
+PR that reads it lands — graceful degradation by construction.
+`arm_flag_status(arm)` returns `(applied, pending)` so a pending flag is
+never silently mistaken for an applied one.
+
+```bash
+uv run python bench/run_100_tasks.py three-arm --out-dir /tmp/bench
+```
+
+Per-arm metrics (`ArmMetrics`): goal-predicate success, turns/tokens to
+completion, `intervention_count` (real, non-dry-run deliveries),
+`post_signal_refire_rate` (from the `SignalLedger`), run-abort, and the
+PR-5 **self-correction base rate** (`self_corrected_unaided` vs.
+`self_corrected_after_signal` from `SignalOutcome`).
+
+### `signal_telemetry` is DEFAULT OFF
+
+`SteeringConfig.signal_telemetry` ships off (goldfive#456): a run that
+does not set it emits **no** `SignalDelivered` events. Every arm here
+enables it explicitly, and the tooling treats *zero parsed signal events*
+as a **loud error**, never an empty report — `load_signals()` raises
+`ShadowDiffError` on a zero-delivery log so "the flag was off" can never
+masquerade as "no divergence". Pass `--allow-empty` only for a run known
+to be genuinely drift-free.
+
+### The §5.4 shadow diff
+
+Shadow mode runs arms B/C with `observation_only=1` so the new decision
+logic runs *dry* — `SignalDelivered(dry_run=true)` with a full decision
+payload — and accrues production mileage with zero production authority.
+The tool then diffs legacy-would-do vs. new-would-do **on the same
+runs**, aligning deliveries by a stable cross-run key
+`(kind, task_id, occurrence#)` (drift ids are per-run minted, so they are
+never the join key — the project's stable-keys discipline):
+
+```bash
+uv run python bench/run_100_tasks.py shadow --out-dir /tmp/bench
+# or diff two existing logs directly:
+uv run python bench/shadow_diff.py --legacy C.jsonl --new B.jsonl
+# single-log census of one shadow run:
+uv run python bench/shadow_diff.py B.jsonl
+```
+
+Even before PR 7's ladder restructure lands, the diff surfaces a real,
+merged divergence: a CRITICAL goldfive-authored `OFF_TOPIC` drift cancels
+in-flight work under `cancel_inflight_scope=all` (legacy) but not under
+`user_and_safety` (new) — the PR-1 authority split — so the report reads
+`would_cancel_inflight: legacy=True -> new=False`. Once the behavior PRs
+merge, `ladder_level` and channel divergences appear in the same report.
+The reviewed two-log report is the **exit criterion** for enabling any
+behavior PR (§5.4, §5.8).
