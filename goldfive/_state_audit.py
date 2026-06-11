@@ -297,7 +297,14 @@ def assert_can_write(
 # ``llm_request.contents`` independently).
 #
 # The :class:`~goldfive.context_editor.ContextEditor` is the ONE goldfive
-# site authorised to mutate ``llm_request.contents``. Every other
+# site authorised to mutate ``llm_request.contents``. This holds even
+# for the PR-6b byte-monotonic-replace rules
+# (``PruneTransientErrorRule`` redacts a transient-error payload;
+# ``CompactPriorReasoningRule`` summarizes a collapsed run): each rule
+# returns a NEW list built from ``copy.deepcopy``'d ``Content`` objects
+# and NEVER mutates the live ``contents`` list or its objects in place —
+# only ``ContextEditor.apply`` swaps the ``llm_request.contents``
+# reference, and only after the invariant chain passes. Every other
 # goldfive code path that touches the field is strictly read-only:
 #
 # * ``goldfive/adapters/adk_llm_instrumentation.py::_measure_request_chars``

@@ -99,6 +99,9 @@ if TYPE_CHECKING:
 __all__ = [
     "ADVISORY_FOOTER",
     "GOAL_QUESTION",
+    "OBSERVER_NOTE_BLOCK_BEGIN",
+    "OBSERVER_NOTE_BLOCK_END",
+    "OBSERVER_NOTE_MARKER",
     "compose_note_for_drift",
     "compose_observer_note",
     "compose_status_line",
@@ -114,6 +117,25 @@ ADVISORY_FOOTER: str = (
     "This note is advisory. How to proceed is your decision; the user's "
     "instructions remain authoritative."
 )
+
+#: Stable goldfive-minted marker that prefixes a rendered observer-note
+#: block (AGENCY-PRESERVATION.md PR 6 "Rendered block shape"). This is the
+#: SINGLE SOURCE for the marker: the PR 6 channel renders the block
+#: opening with this prefix, and the PR 6b
+#: :class:`~goldfive.context_editor.PruneStaleSteerRule` detects goldfive
+#: notes by matching this substring. Both sides import from here so the
+#: constant can never drift between the writer and the reader.
+OBSERVER_NOTE_MARKER: str = "[GOLDFIVE OBSERVER NOTE"
+
+#: The full opening / closing lines of a rendered observer-note block.
+#: Derived from :data:`OBSERVER_NOTE_MARKER` so the detection prefix is
+#: guaranteed to be a prefix of the rendered opening line. The PR 6
+#: channel wraps each delivered note between these two lines.
+OBSERVER_NOTE_BLOCK_BEGIN: str = (
+    f"{OBSERVER_NOTE_MARKER} — from an external monitoring layer, "
+    "not from the user]"
+)
+OBSERVER_NOTE_BLOCK_END: str = "[/GOLDFIVE OBSERVER NOTE]"
 
 #: Question-form suffix appended to the observation when the verdict is
 #: a low-confidence judge opinion (see module docstring). Mirrors the

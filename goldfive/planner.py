@@ -41,6 +41,7 @@ from goldfive.types import (
     SupersessionKind,
     Task,
     TaskEdge,
+    TaskKind,
     TaskStatus,
     bump_revision,
     replace_task,
@@ -126,6 +127,72 @@ markdown fences. Schema:
   "edges": [
     {"from_task_id": "research", "to_task_id": "draft"}
   ]
+}
+"""
+
+
+# AGENCY-PRESERVATION.md Stage 3 PR 10 — the LEDGER plan-mode generate
+# prompt. Deliberately short and a deliberate inverse of
+# ``_DEFAULT_SYSTEM_PROMPT``: it asks for 1–5 goal-anchored OUTCOME
+# tasks (deliverables that restate what success looks like), NOT a 5–20
+# task forecast of HOW the agent will work. The wrapped agent owns the
+# means (decomposition, delegation, ordering, retries); goldfive's plan
+# is a ledger of outcomes, and the agent's actual trajectory is grown in
+# later as DISCOVERED tasks (design doc §2 authority split). Used by
+# :meth:`LLMPlanner.generate` only when ``plan_mode == "ledger"``.
+_LEDGER_GENERATE_SYSTEM_PROMPT = """\
+You are an OUTCOME-planning assistant for a multi-agent system. The
+system already has a capable agent that decides for itself HOW to do the
+work — which sub-agents to call, in what order, and when to retry. Your
+job is NOT to predict or prescribe any of that. Your job is to state, in
+the form of a short checklist of DELIVERABLES, what "success" looks like
+for the user's GOALS.
+
+Produce a small set of OUTCOME tasks. Each one names a concrete,
+verifiable deliverable — what must EXIST or be TRUE when the run is done
+— restating the goal as a finished result. Never describe agent
+behaviour, tools, or steps.
+
+Requirements:
+
+1. FEW OUTCOMES. Produce between 1 and 5 outcome tasks. Most goal sets
+   need 1–3. One deliverable per distinct goal is the norm; only split a
+   goal into multiple outcomes when it genuinely has separable
+   deliverables.
+
+2. DELIVERABLES, NOT FORECASTS. Each title states a finished result, in
+   the past/perfect framing of "done":
+     GOOD: "Presentation summary delivered to the user"
+     GOOD: "Bug root cause identified and a fix verified"
+     BAD:  "Research the topic, then draft, then review"  (a forecast)
+     BAD:  "Call the research_agent to gather sources"     (prescribes means)
+   The description is one sentence naming the acceptance criterion — how
+   a reader would confirm the deliverable exists.
+
+3. NO ORDERING UNLESS THE GOALS THEMSELVES ARE ORDERED. Leave `edges`
+   empty. Add an edge ONLY when one deliverable literally cannot be
+   judged complete until another is (a hard data dependency the GOALS
+   state), never to model an expected workflow sequence.
+
+4. NO ASSIGNMENTS, NO TOOLS. Do NOT populate `assignee_agent_id` and do
+   NOT list required tools — the agent owns the means.
+
+5. STABLE IDS + SUMMARY. Task ids are short, unique, stable strings
+   (e.g. "summary_delivered"). Provide a one-sentence `summary`.
+
+Respond with a single JSON object and NOTHING ELSE — no prose, no
+markdown fences. Schema:
+
+{
+  "summary": "<one-sentence description of the overall deliverable set>",
+  "tasks": [
+    {
+      "id": "summary_delivered",
+      "title": "<a finished deliverable, e.g. 'Summary delivered'>",
+      "description": "<one sentence: how to confirm this deliverable exists>"
+    }
+  ],
+  "edges": []
 }
 """
 
@@ -1073,6 +1140,52 @@ def _check_supersedes_coverage(
     return orphans
 
 
+def _plan_mode_from_context(context: Mapping[str, Any] | None) -> str:
+    """Resolve the ledger/forecast plan mode from the planner context.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 10. The Runner threads
+    ``SteeringConfig.plan_mode`` into the per-turn planner ``context``
+    (just like ``descriptive_growth_enabled`` is read off the steerer at
+    the pin path). Anything that is not the literal ``"ledger"`` resolves
+    to ``"forecast"`` so the default path — and every existing caller
+    that passes no ``plan_mode`` key — is byte-identical to pre-PR-10.
+    """
+    if not context:
+        return "forecast"
+    mode = str(context.get("plan_mode") or "forecast").strip().lower()
+    return "ledger" if mode == "ledger" else "forecast"
+
+
+def _stamp_ledger_outcome_kinds(plan: Plan, prior_plan: Plan | None) -> Plan:
+    """Stamp :attr:`TaskKind.OUTCOME` onto a ledger-mode plan's tasks.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 10. Called ONLY on the ledger-mode
+    generate / handle_turn paths, never in forecast mode — so it cannot
+    perturb the forecast-bit-identical guarantee.
+
+    A task whose id already exists in ``prior_plan`` with a non-FORECAST
+    ledger kind (OUTCOME / DISCOVERED) keeps that kind verbatim — a
+    revision must not silently relabel a preserved DISCOVERED trajectory
+    task as an OUTCOME deliverable. Every other task (genuinely new
+    deliverables, and the all-new generate case where ``prior_plan`` is
+    None/empty) is stamped OUTCOME.
+
+    Uses :func:`dataclasses.replace` so the input plan/tasks are not
+    mutated (the frozen-Plan invariant, goldfive#247).
+    """
+    prior_kinds: dict[str, TaskKind] = {}
+    if prior_plan is not None:
+        prior_kinds = {t.id: t.kind for t in prior_plan.tasks if t.id}
+    new_tasks: list[Task] = []
+    for t in plan.tasks:
+        prior_kind = prior_kinds.get(t.id)
+        if prior_kind is not None and prior_kind is not TaskKind.FORECAST:
+            new_tasks.append(dataclasses.replace(t, kind=prior_kind))
+        else:
+            new_tasks.append(dataclasses.replace(t, kind=TaskKind.OUTCOME))
+    return dataclasses.replace(plan, tasks=tuple(new_tasks))
+
+
 def _plan_from_json(
     obj: Any,
     *,
@@ -1241,6 +1354,14 @@ class StaticPlanner:
                     # CLIs) see it survive the per-call clone.
                     supersedes=t.supersedes,
                     supersedes_kind=t.supersedes_kind,
+                    # AGENCY-PRESERVATION.md Stage 3 PR 10 — a hand-authored
+                    # StaticPlanner plan is genuine PRESCRIPTIVE intent, so
+                    # whatever kind / contributes_to the author baked in
+                    # survives the per-call clone. The default is FORECAST,
+                    # so StaticPlanner users keep forecast semantics unless
+                    # they explicitly opt a task into the ledger taxonomy.
+                    kind=t.kind,
+                    contributes_to=t.contributes_to,
                 )
                 for t in self._template.tasks
             ],
@@ -1332,12 +1453,20 @@ class LLMPlanner:
         user_steer_system_prompt: str | None = None,
         looping_tool_call_system_prompt: str | None = None,
         plan_divergence_system_prompt: str | None = None,
+        ledger_system_prompt: str | None = None,
+        ledger_handle_turn_system_prompt: str | None = None,
         max_refine_attempts: int | None = None,
         user_steer_one_attempt: Callable[..., Awaitable[tuple[Any, str]]] | None = None,
     ) -> None:
         self._call_llm = call_llm
         self._model = model
         self._system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        # AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan-mode prompts.
+        # Used only when the per-turn planner context carries
+        # ``plan_mode == "ledger"``; the forecast defaults above are
+        # untouched, so forecast-mode generate / handle_turn are
+        # byte-identical to pre-PR-10.
+        self._ledger_system_prompt = ledger_system_prompt or _LEDGER_GENERATE_SYSTEM_PROMPT
         self._refine_system_prompt = refine_system_prompt or _REFINE_SYSTEM_PROMPT
         self._user_steer_system_prompt = user_steer_system_prompt or _USER_STEER_SYSTEM_PROMPT
         self._looping_tool_call_system_prompt = (
@@ -1345,6 +1474,11 @@ class LLMPlanner:
         )
         self._plan_divergence_system_prompt = (
             plan_divergence_system_prompt or _PLAN_DIVERGENCE_SYSTEM_PROMPT
+        )
+        # Bound at construction so a None kwarg resolves to the class
+        # default; assigned after the class body defines the constant.
+        self._ledger_handle_turn_system_prompt = (
+            ledger_handle_turn_system_prompt or self._LEDGER_HANDLE_TURN_SYSTEM_PROMPT
         )
         self._max_refine_attempts = (
             int(max_refine_attempts)
@@ -1831,6 +1965,27 @@ class LLMPlanner:
             f"{prior_block}"
             f"{context_block}\n"
             "Respond with a single JSON object following the schema."
+        )
+
+    def _build_ledger_generate_prompt(
+        self,
+        goals: list[Goal],
+        context: Mapping[str, Any] | None,
+    ) -> str:
+        """Build the ledger-mode generate user prompt (PR 10).
+
+        Deliberately omits the AGENT TREE block: in ledger mode the agent
+        owns the means, so the planner never sees (or prescribes)
+        assignees. Only the goals + prior-turn context are rendered, and
+        the ledger system prompt asks for OUTCOME deliverables.
+        """
+        goals_block = self._render_goals_block(goals)
+        prior_block = self._render_prior_turns_block(context)
+        return (
+            f"Goals:\n{goals_block}\n"
+            f"{prior_block}"
+            "\nRespond with a single JSON object of 1-5 OUTCOME "
+            "deliverables following the schema."
         )
 
     def _build_user_steer_prompt(
@@ -2961,7 +3116,18 @@ class LLMPlanner:
         if not goals:
             log.debug("LLMPlanner.generate: no goals provided; skipping plan")
             return None
-        base_prompt = self._build_generate_prompt(goals, available_agents, context)
+        # AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode. In
+        # ledger mode the planner produces 1–5 goal-anchored OUTCOME
+        # deliverables via a dedicated short prompt instead of a 5–20
+        # task forecast. ``plan_mode`` defaults to "forecast", so every
+        # caller that does not pass the key takes the unchanged path.
+        ledger_mode = _plan_mode_from_context(context) == "ledger"
+        if ledger_mode:
+            system_prompt = self._ledger_system_prompt
+            base_prompt = self._build_ledger_generate_prompt(goals, context)
+        else:
+            system_prompt = self._system_prompt
+            base_prompt = self._build_generate_prompt(goals, available_agents, context)
         from goldfive._llm_span import goldfive_llm_span
 
         run_id = ""
@@ -3003,7 +3169,7 @@ class LLMPlanner:
                         call_llm_budget(self.MAX_OUTPUT_TOKENS),
                         call_llm_thinking_disabled(),
                     ):
-                        raw = await self._call_llm(self._system_prompt, user_prompt, self._model)
+                        raw = await self._call_llm(system_prompt, user_prompt, self._model)
                     span.output_preview = (
                         raw[:4096] if isinstance(raw, str) else "(non-str response)"
                     )
@@ -3093,6 +3259,11 @@ class LLMPlanner:
                 if attempt < attempts:
                     user_prompt = self._build_correction_prompt(base_prompt, last_error)
                 continue
+            if ledger_mode:
+                # AGENCY-PRESERVATION.md PR 10 — every generated task is a
+                # goal-anchored OUTCOME deliverable. Stamp the kind after
+                # validation (validate treats kind as opaque metadata).
+                plan = _stamp_ledger_outcome_kinds(plan, None)
             return plan
         # Empty / non-string responses already logged INFO at the
         # short-circuit site (goldfive#182); avoid a redundant WARNING
@@ -4130,6 +4301,61 @@ SUMMARY POLICY (applies to ``plan.summary``):
   * WRONG: "Plan unchanged because no specific details were provided."
 """
 
+    # AGENCY-PRESERVATION.md Stage 3 PR 10 — the LEDGER per-turn prompt.
+    # Same decision shape as ``_HANDLE_TURN_SYSTEM_PROMPT`` (decide
+    # whether the new message warrants a plan change; preserve terminal
+    # tasks) but the produced ``tasks`` are goal-anchored OUTCOME
+    # DELIVERABLES, not a behaviour forecast. Used only when
+    # ``plan_mode == "ledger"``.
+    _LEDGER_HANDLE_TURN_SYSTEM_PROMPT: str = """\
+You are the OUTCOME planner for a multi-agent system. The system already
+has a capable agent that decides for itself HOW to do the work. The user
+sent a NEW MESSAGE on a conversation that already has a PRIOR LEDGER of
+OUTCOME deliverables (possibly partially executed). Decide whether the
+new message changes WHAT success looks like. If so, produce the next
+ledger of deliverables in the same response. If not, return null.
+
+Reply with a single JSON object and NOTHING ELSE:
+{
+  "reasoning": "<one-sentence why>",
+  "replaces_prior": <bool — true only when the user abandons the prior
+                     deliverables entirely (a topic/artefact pivot)>,
+  "plan": null OR {
+    "id": "<short-id — REUSE the prior id for a revision>",
+    "summary": "<noun phrase describing the deliverable set>",
+    "tasks": [
+      {
+        "id": "<short-id>",
+        "title": "<a finished DELIVERABLE, e.g. 'Summary delivered'>",
+        "description": "<one sentence: how to confirm it exists>",
+        "status": "PENDING"
+      }
+    ],
+    "edges": []
+  }
+}
+
+RULES:
+
+* DELIVERABLES, NOT FORECASTS. Every NEW task names a concrete,
+  verifiable outcome ("Two-slide deck on solar flares delivered"), never
+  agent behaviour, tools, or steps. Keep the set small (1–5 outcomes).
+* KEEP terminal tasks (COMPLETED / FAILED / CANCELLED / NOT_NEEDED)
+  verbatim — same id, same status — in ``tasks``. The validator REJECTS
+  a revision that drops or regresses a terminal task. Echo prior
+  deliverables you are carrying forward under their SAME id.
+* NO ORDERING UNLESS THE GOALS THEMSELVES ARE ORDERED. Leave ``edges``
+  empty unless one deliverable literally cannot be judged complete until
+  another exists.
+* DO NOT populate ``assignee_agent_id``. The agent owns the means.
+* MERGE persistent qualifications (numeric caps, format, output type)
+  from the prior deliverables and the user's history into the new
+  deliverables AND the ``summary``; drop one only when the user removes
+  it explicitly.
+* Return ``"plan": null`` when the message is purely conversational and
+  the current deliverables still describe the right success.
+"""
+
     async def handle_turn(
         self,
         *,
@@ -4196,6 +4422,18 @@ SUMMARY POLICY (applies to ``plan.summary``):
         )
         from goldfive._llm_span import goldfive_llm_span
 
+        # AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode. In
+        # ledger mode the per-turn decision produces OUTCOME-deliverable
+        # revisions via the ledger system prompt; the user prompt (prior
+        # plan + goals rendering) is mode-agnostic. ``plan_mode`` defaults
+        # to "forecast" so every existing caller keeps the legacy prompt.
+        ledger_mode = _plan_mode_from_context(context) == "ledger"
+        handle_turn_system_prompt = (
+            self._ledger_handle_turn_system_prompt
+            if ledger_mode
+            else self._HANDLE_TURN_SYSTEM_PROMPT
+        )
+
         # ``handle_turn`` is trajectory-level (decides whether the turn
         # goes through planning at all), so ``target_agent_id`` /
         # ``target_task_id`` stay empty. A compact rendering of the
@@ -4236,7 +4474,7 @@ SUMMARY POLICY (applies to ``plan.summary``):
                         call_llm_thinking_disabled(),
                     ):
                         raw = await self._call_llm(
-                            self._HANDLE_TURN_SYSTEM_PROMPT,
+                            handle_turn_system_prompt,
                             user_prompt,
                             self._model,
                         )
@@ -4302,6 +4540,13 @@ SUMMARY POLICY (applies to ``plan.summary``):
                 break
             plan = candidate
             break
+        if ledger_mode and plan is not None:
+            # AGENCY-PRESERVATION.md PR 10 — new tasks are OUTCOME
+            # deliverables; tasks carried forward from the prior ledger
+            # keep their existing kind (DISCOVERED trajectory tasks are
+            # not relabelled). Stamping is post-validation (kind is opaque
+            # to the validator).
+            plan = _stamp_ledger_outcome_kinds(plan, prior_plan)
         log.info(
             "LLMPlanner.handle_turn: produced_plan=%s prior_plan_id=%s%s",
             "yes" if plan is not None else "no",

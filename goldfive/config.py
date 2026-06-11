@@ -92,6 +92,11 @@ _VALID_SIGNAL_CHANNELS: frozenset[str] = frozenset(
     {"legacy_user_message", "request_context"}
 )
 
+#: Valid values for :attr:`SteeringConfig.plan_mode` (AGENCY-PRESERVATION.md
+#: Stage 3 PR 10). ``"forecast"`` is the legacy default; ``"ledger"`` is
+#: the goal-anchored OUTCOME + descriptively-grown DISCOVERED regime.
+_VALID_PLAN_MODES: frozenset[str] = frozenset({"forecast", "ledger"})
+
 
 # Test-only override hook for :class:`SteeringConfig.observation_only`'s
 # default (goldfive#254). Production code path: this stays ``None`` and
@@ -280,6 +285,29 @@ def _read_signal_channel_env(name: str, default: str) -> str:
         name,
         raw,
         sorted(_VALID_SIGNAL_CHANNELS),
+        default,
+    )
+    return default
+
+
+def _read_plan_mode_env(name: str, default: str) -> str:
+    """Return ``os.environ[name]`` as a plan-mode literal, or ``default``.
+
+    Accepts ``"forecast"`` / ``"ledger"`` (case-insensitive). Anything
+    else logs a WARNING and falls back so a typo never silently flips the
+    plan mode (AGENCY-PRESERVATION.md Stage 3 PR 10).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _VALID_PLAN_MODES:
+        return value
+    log.warning(
+        "ignoring unknown %s=%r (expected one of %s); using default %r",
+        name,
+        raw,
+        sorted(_VALID_PLAN_MODES),
         default,
     )
     return default
@@ -713,13 +741,28 @@ class SteeringConfig:
     #: even instantiates the editor and the codepath is zero-overhead.
     #:
     #: Set to a list of rule names (e.g. ``["prune_cancelled_reasoning"]``)
-    #: to opt in. Unknown rule names are logged and ignored at registration
+    #: to opt in. Recognised rules (AGENCY-PRESERVATION.md PR 6b):
+    #:
+    #: * ``"prune_cancelled_reasoning"`` — strip cancelled-invocation
+    #:   tool pairs (drop-only).
+    #: * ``"prune_transient_error"`` — redact 429 / 5xx / timeout /
+    #:   parse-blip ``function_response`` payloads in place
+    #:   (byte-monotonic replace).
+    #: * ``"prune_stale_steer"`` — drop goldfive's own synthetic
+    #:   steer / observer-note user-messages once stale (drop-only).
+    #: * ``"compact_prior_reasoning"`` — collapse N identical failed
+    #:   tool-call pairs into one summarized survivor (byte-monotonic
+    #:   replace).
+    #:
+    #: Unknown rule names are logged and ignored at registration
     #: time; an empty list after filtering also keeps the editor unwired.
+    #: Every rule is dormant on healthy turns — it edits ``contents``
+    #: ONLY on a tripped guardrail counter or drift verdict (§0).
     #:
     #: Per-rule (rather than a single master switch) so e2e regressions
     #: from a single rule can be bisected without disabling the whole
     #: capability. See ``docs/design/CONTEXT-EDITING.md`` for the rule
-    #: catalog and the rationale behind drop-only edits.
+    #: catalog and the drop-only / byte-monotonic-replace rule classes.
     context_editor_rules: list[str] | None = None
     #: Plan-descriptive growth for unmatched delegations (goldfive#423,
     #: completed by AGENCY-PRESERVATION.md Stage 1 PR 2). When ``True``
@@ -798,25 +841,47 @@ class SteeringConfig:
     #: * ``"legacy_user_message"`` (the default) — corrective notes queue on
     #:   ``session.pending_nudges`` and reach the agent as the next user
     #:   message via the executor's invocation-boundary nudge-replay loop
-    #:   (the pre-PR-6 mechanism). ``SignalDelivered`` is emitted at enqueue
-    #:   (``channel="nudge_replay"``, ``channel_action="queued"``).
+    #:   (the pre-PR-6 mechanism). ``channel="nudge_replay"``.
     #: * ``"request_context"`` — notes route through the StateStore-backed
     #:   :class:`~goldfive.observer_note_queue.ObserverNoteQueue` and the four
     #:   observer-note delivery surfaces (ADK ``before_model`` system-prompt
     #:   block; invocation-boundary replay consuming the queue; the
     #:   claude-agent-sdk system prompt + ``PostToolUse`` ``additionalContext``;
     #:   the append-only tool-result annotation for loop-shaped drift). Per
-    #:   request at most one block is rendered (most-severe pending note wins),
-    #:   delivery is exactly-once across surfaces, and ``SignalDelivered``
-    #:   (``channel="request_context"``) is emitted at *actual* delivery —
-    #:   gated by ``observation_only`` like every other steering surface, so
-    #:   the pre-PR-6 asymmetry (the legacy nudge queued even under
-    #:   ``observation_only``) goes away.
+    #:   request at most one block is rendered (most-severe pending note wins)
+    #:   and rendering is exactly-once across surfaces. Whether a note actually
+    #:   reaches the agent is gated on ``observation_only`` at the surface.
     #:
-    #: Default ``"legacy_user_message"`` keeps PR 6 a no-op (§5.1): with the
-    #: legacy channel the queue is never populated and every delivery surface
-    #: is inert. Env: ``GOLDFIVE_STEER_SIGNAL_CHANNEL``.
+    #: ``SignalDelivered`` is emitted once at the dispatch decision point for
+    #: BOTH channels (``channel="request_context"`` for the new one) — the PR-5
+    #: model the §5.4 shadow diff is built on; the surfaces are the rendering
+    #: leg only. Default ``"legacy_user_message"`` keeps PR 6 a no-op (§5.1):
+    #: with the legacy channel the queue is never populated and every delivery
+    #: surface is inert. Env: ``GOLDFIVE_STEER_SIGNAL_CHANNEL``.
     signal_channel: str = "legacy_user_message"
+    #: AGENCY-PRESERVATION.md Stage 3 PR 10 — the plan-as-ledger regime
+    #: (design doc ``docs/design/AGENCY-PRESERVATION.md`` §2).
+    #:
+    #: * ``"forecast"`` (the default) — legacy behaviour, BIT-IDENTICAL to
+    #:   pre-PR-10. ``LLMPlanner.generate`` predicts the full task DAG up
+    #:   front; the pin tiers + descriptive growth run as before; no task
+    #:   ever carries a non-FORECAST :attr:`~goldfive.types.Task.kind`.
+    #: * ``"ledger"`` — the Plan becomes a ledger. ``LLMPlanner.generate``
+    #:   produces 1–5 goal-anchored OUTCOME tasks (deliverables, not
+    #:   behaviour forecasts) via a dedicated short prompt; the delegation
+    #:   pin tiers are bypassed so every unforecast delegation grows a
+    #:   DISCOVERED task via the existing descriptive-growth machinery
+    #:   (dedup-hash → grow → pin); ``handle_turn`` produces OUTCOME-shaped
+    #:   revisions. ``StaticPlanner`` users keep forecast semantics — a
+    #:   hand-authored plan is genuine prescriptive intent.
+    #:
+    #: Threaded like ``descriptive_growth_enabled``: consumed at the pin
+    #: path / reconciler / reviser via ``steerer._steering_config`` and
+    #: surfaced to the planner through the per-turn planner ``context``
+    #: the Runner builds. Default ``"forecast"`` keeps the flag OFF until
+    #: AGENCY-PRESERVATION.md PR 13 flips it after the bench gate.
+    #: Env: ``GOLDFIVE_PLAN_MODE``.
+    plan_mode: str = "forecast"
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -880,6 +945,10 @@ class SteeringConfig:
             signal_channel=_read_signal_channel_env(
                 "GOLDFIVE_STEER_SIGNAL_CHANNEL",
                 defaults.signal_channel,
+            ),
+            plan_mode=_read_plan_mode_env(
+                "GOLDFIVE_PLAN_MODE",
+                defaults.plan_mode,
             ),
         )
 
