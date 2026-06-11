@@ -27,6 +27,10 @@ from goldfive.drift.goals import (  # noqa: E402
     GOAL_DRIFT_GRADUATED_USER_PROMPT_TEMPLATE,
     classify_goal_drift,
 )
+from goldfive.drift.outcome_progress import (  # noqa: E402
+    evaluate_outcome_progress,
+    plan_outcome_transitions,
+)
 from goldfive.drift.reasoning_judge import (  # noqa: E402
     classify_reasoning_drift_with_focus,
 )
@@ -37,6 +41,7 @@ from goldfive.types import (  # noqa: E402
     Plan,
     Task,
     TaskKind,
+    TaskStatus,
 )
 
 
@@ -239,3 +244,175 @@ def test_reasoning_ledger_verdict_shape_unchanged() -> None:
     )
     assert verdict.drift is None
     assert verdict.focused_task_id == "o1"
+
+
+# ---------------------------------------------------------------------------
+# (c) Outcome-progress judge + pure transition planning
+# ---------------------------------------------------------------------------
+
+
+def _outcome_ledger() -> Plan:
+    return Plan(
+        id="p",
+        run_id="r",
+        goal_ids=["g"],
+        tasks=(
+            Task(
+                id="o1",
+                title="Summary delivered",
+                kind=TaskKind.OUTCOME,
+                description="has summary",
+            ),
+            Task(id="o2", title="Translation delivered", kind=TaskKind.OUTCOME),
+            Task(
+                id="d1",
+                title="writer: drafted summary",
+                discovered=True,
+                kind=TaskKind.DISCOVERED,
+                status=TaskStatus.COMPLETED,
+            ),
+        ),
+        edges=(),
+    )
+
+
+def _outcome_llm(payload: str):
+    async def llm(system: str, user: str, model: str) -> str:
+        return payload
+
+    return llm
+
+
+def test_outcome_judge_grades_deliverables_against_evidence() -> None:
+    captured: dict[str, str] = {}
+
+    async def llm(system: str, user: str, model: str) -> str:
+        captured["user"] = user
+        return (
+            '{"outcomes": ['
+            '{"task_id": "o1", "met": true, "reason": "summary present", '
+            '"contributing_task_ids": ["d1"]},'
+            '{"task_id": "o2", "met": false, "reason": "no translation", '
+            '"contributing_task_ids": []}]}'
+        )
+
+    verdicts = asyncio.run(
+        evaluate_outcome_progress(
+            goals=_goals(),
+            plan=_outcome_ledger(),
+            completed_outputs={"d1": "Full summary of the deck: ...."},
+            model="m",
+            call_llm=llm,
+        )
+    )
+    by_id = {v.task_id: v for v in verdicts}
+    assert by_id["o1"].met is True
+    assert by_id["o1"].contributing_task_ids == ("d1",)
+    assert by_id["o2"].met is False
+    # The prompt carried the goals, deliverables, trajectory, and evidence.
+    assert "DELIVERABLES TO JUDGE" in captured["user"]
+    assert "EVIDENCE" in captured["user"]
+    assert "[d1]" in captured["user"]
+
+
+def test_outcome_judge_no_outcome_tasks_skips_llm() -> None:
+    async def boom(system: str, user: str, model: str) -> str:
+        raise AssertionError("must not call the LLM when there are no OUTCOME tasks")
+
+    plan = Plan(
+        id="p", run_id="r", goal_ids=["g"], tasks=(Task(id="f1", title="forecast"),), edges=()
+    )
+    assert (
+        asyncio.run(
+            evaluate_outcome_progress(
+                goals=_goals(), plan=plan, completed_outputs={}, model="m", call_llm=boom
+            )
+        )
+        == []
+    )
+
+
+def test_outcome_judge_quiet_on_malformed_json() -> None:
+    verdicts = asyncio.run(
+        evaluate_outcome_progress(
+            goals=_goals(),
+            plan=_outcome_ledger(),
+            completed_outputs={},
+            model="m",
+            call_llm=_outcome_llm("not json at all"),
+        )
+    )
+    assert verdicts == []
+
+
+def test_outcome_judge_ignores_unknown_outcome_ids() -> None:
+    # A verdict for an id that is not a non-terminal OUTCOME is dropped.
+    verdicts = asyncio.run(
+        evaluate_outcome_progress(
+            goals=_goals(),
+            plan=_outcome_ledger(),
+            completed_outputs={},
+            model="m",
+            call_llm=_outcome_llm(
+                '{"outcomes": [{"task_id": "bogus", "met": true}, '
+                '{"task_id": "o1", "met": true, "contributing_task_ids": ["nope"]}]}'
+            ),
+        )
+    )
+    by_id = {v.task_id: v for v in verdicts}
+    assert set(by_id) == {"o1"}
+    # contributing id "nope" is not a DISCOVERED task → filtered out.
+    assert by_id["o1"].contributing_task_ids == ()
+
+
+def test_plan_transitions_met_completes_and_stamps_contributes_to() -> None:
+    from goldfive.drift.outcome_progress import OutcomeVerdict
+
+    verdicts = [
+        OutcomeVerdict(task_id="o1", met=True, reason="done", contributing_task_ids=("d1",)),
+        OutcomeVerdict(task_id="o2", met=False, reason="not yet"),
+    ]
+    tr = plan_outcome_transitions(_outcome_ledger(), verdicts, run_ending=False)
+    assert len(tr) == 1
+    assert tr[0].task_id == "o1"
+    assert tr[0].new_status is TaskStatus.COMPLETED
+    assert tr[0].contributes_stamps == (("d1", "o1"),)
+
+
+def test_plan_transitions_unmet_fails_only_at_run_end() -> None:
+    from goldfive.drift.outcome_progress import OutcomeVerdict
+
+    verdicts = [OutcomeVerdict(task_id="o2", met=False, reason="no translation")]
+    assert plan_outcome_transitions(_outcome_ledger(), verdicts, run_ending=False) == []
+    tr = plan_outcome_transitions(_outcome_ledger(), verdicts, run_ending=True)
+    assert len(tr) == 1
+    assert tr[0].task_id == "o2"
+    assert tr[0].new_status is TaskStatus.FAILED
+
+
+def test_plan_transitions_predicate_authoritative_blocks_completion() -> None:
+    from goldfive.drift.outcome_progress import OutcomeVerdict
+
+    verdicts = [OutcomeVerdict(task_id="o1", met=True, reason="llm says done")]
+    # User predicate is explicitly unmet → the deterministic predicate
+    # overrides the LLM and the outcome is NOT completed.
+    assert (
+        plan_outcome_transitions(
+            _outcome_ledger(), verdicts, run_ending=False, goal_predicates_met=False
+        )
+        == []
+    )
+
+
+def test_plan_transitions_skips_terminal_outcomes() -> None:
+    from goldfive.drift.outcome_progress import OutcomeVerdict
+
+    plan = Plan(
+        id="p",
+        run_id="r",
+        goal_ids=["g"],
+        tasks=(Task(id="o1", title="done", kind=TaskKind.OUTCOME, status=TaskStatus.COMPLETED),),
+        edges=(),
+    )
+    verdicts = [OutcomeVerdict(task_id="o1", met=False)]
+    assert plan_outcome_transitions(plan, verdicts, run_ending=True) == []
