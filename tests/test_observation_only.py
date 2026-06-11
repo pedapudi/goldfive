@@ -360,8 +360,16 @@ async def test_warning_drift_active_steering_drives_all_three_injections() -> No
     (legacy) here so the observation_only gate remains the ONLY
     variable under test; the new-default cancel policy has its own
     coverage in ``tests/test_cancel_authority_gate.py``.
+
+    AGENCY-PRESERVATION.md PR 7: the GOLDFIVE_STEER dispatch is likewise the
+    legacy promotion mechanism, so ``legacy_ladder=True`` is pinned here too —
+    again keeping the observation_only gate the only variable. The default
+    regime's note-enqueue promotion is covered in
+    ``test_promote_drift_to_steer.py``.
     """
-    cfg = SteeringConfig(observation_only=False, cancel_inflight_scope="all")
+    cfg = SteeringConfig(
+        observation_only=False, cancel_inflight_scope="all", legacy_ladder=True
+    )
     steerer = DefaultSteerer(steering_config=cfg)
     session = _make_session()
     sink = ListSink()

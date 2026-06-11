@@ -132,12 +132,21 @@ def _make_session() -> Session:
 
 
 def _bind(
-    *, threshold: str = "warning", window: int = 3
+    *, threshold: str = "warning", window: int = 3, legacy_ladder: bool = True
 ) -> tuple[DefaultSteerer, Session, ListSink, _StubPlanner, _FakeAdapter]:
+    # AGENCY-PRESERVATION.md PR 7: the goldfive-steer promotion MECHANISM this
+    # module exercises (the ``active_steer(source="goldfive")`` stamp, the
+    # adapter cancel-reason tag, and the ``GOLDFIVE_STEER`` ControlMessage
+    # dispatch) now lives behind the ``legacy_ladder`` escape hatch. These
+    # tests are the §5.8 legacy-regime coverage, so they bind with the hatch
+    # ON by default. The default (non-legacy) promotion — refine + PlanRevised
+    # + advisory note, NO steer side-effects — is covered by
+    # ``test_promote_drift_to_steer.py::test_promote_drift_new_regime_enqueues_note_no_steer``.
     steerer = DefaultSteerer(
         goldfive_steer_threshold=threshold,
         goldfive_steer_suppression_window_turns=window,
     )
+    steerer._legacy_ladder = bool(legacy_ladder)
     revised = Plan(
         id="p1",
         run_id="r1",

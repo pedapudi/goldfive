@@ -373,7 +373,7 @@ def test_f4_goal_drift_warning_routes_to_nudge() -> None:
     level = steerer.drift._ladder_level_for(
         DriftKind.GOAL_DRIFT, DriftSeverity.WARNING, occurrence_count=0
     )
-    assert level is InterventionLevel.NUDGE
+    assert level is InterventionLevel.SIGNAL
 
 
 def test_f4_goal_drift_critical_first_routes_to_nudge() -> None:
@@ -386,21 +386,23 @@ def test_f4_goal_drift_critical_first_routes_to_nudge() -> None:
     level = steerer.drift._ladder_level_for(
         DriftKind.GOAL_DRIFT, DriftSeverity.CRITICAL, occurrence_count=0
     )
-    assert level is InterventionLevel.NUDGE
+    assert level is InterventionLevel.SIGNAL
 
 
-def test_f4_goal_drift_critical_repeat_routes_to_cancel_reinvoke() -> None:
-    """F4: CRITICAL-severity GOAL_DRIFT repeat -> CANCEL_REINVOKE.
+def test_f4_goal_drift_critical_repeat_routes_to_pause_escalate() -> None:
+    """F4: CRITICAL-severity GOAL_DRIFT repeat -> PAUSE_ESCALATE.
 
-    PAUSE_ESCALATE is the last-resort fallback the default ladder
-    surfaces only after CANCEL_REINVOKE also fails to break the loop."""
+    AGENCY-PRESERVATION.md PR 7 moved the repeat-escalation cell from
+    CANCEL_REINVOKE (cancel-and-redirect) to PAUSE_ESCALATE (stop-and-ask):
+    when an advisory SIGNAL doesn't break the loop, goldfive halts for the
+    operator rather than grabbing the wheel."""
     steerer = DefaultSteerer()
     level = steerer.drift._ladder_level_for(
         DriftKind.GOAL_DRIFT,
         DriftSeverity.CRITICAL,
         occurrence_count=DefaultSteerer.REFINE_FAILURE_THRESHOLD,
     )
-    assert level is InterventionLevel.CANCEL_REINVOKE
+    assert level is InterventionLevel.PAUSE_ESCALATE
 
 
 # The three pre-PR-4 tests here pinned the GOAL_DRIFT corrective

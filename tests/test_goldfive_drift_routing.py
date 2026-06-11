@@ -140,11 +140,19 @@ def _bound_steerer(
     *,
     revised: Plan | None = None,
     threshold: str = "warning",
+    legacy_ladder: bool = True,
 ) -> tuple[DefaultSteerer, _RevisedPlanPlanner, ControlChannel, _ListSink]:
+    # AGENCY-PRESERVATION.md PR 7: the GOLDFIVE_STEER routing this module pins
+    # (promotion → cancel-and-restart on the control channel) is the legacy
+    # mechanism, now behind the ``legacy_ladder`` escape hatch. Bind with the
+    # hatch ON by default so the routing coverage survives; the default-regime
+    # behaviour (advisory note, no GOLDFIVE_STEER) is covered in
+    # ``test_promote_drift_to_steer.py``.
     steerer = DefaultSteerer(
         goldfive_steer_threshold=threshold,
         goldfive_steer_suppression_window_turns=3,
     )
+    steerer._legacy_ladder = bool(legacy_ladder)
     planner = _RevisedPlanPlanner(revised=revised or _make_revised_plan())
     sink = _ListSink()
     channel = ControlChannel()
@@ -332,6 +340,8 @@ async def test_multiple_goldfive_drifts_queue_in_order_on_channel() -> None:
         goldfive_steer_threshold="warning",
         goldfive_steer_suppression_window_turns=3,
     )
+    # PR 7: GOLDFIVE_STEER dispatch is the legacy promotion mechanism.
+    steerer._legacy_ladder = True
     planner = _DistinctRevisedPlanner()
     sink = _ListSink()
     channel = ControlChannel()

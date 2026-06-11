@@ -24,7 +24,7 @@ bounded note-buffer family (``note_agent_activity`` /
 machinery: ``handle_drift`` (the central drift-routing method),
 ``_promote_drift_to_steer`` (audit issue #402 — dispatch-before-plan-swap
 ordering is preserved here, not fixed), the intervention ladder
-(``_ladder_level_for`` / ``_LADDER`` / ``_LADDER_BY_VALUE``), ladder
+(``_ladder_level_for`` / ``_LADDER`` / ``_LADDER_LEGACY``), ladder
 dispatch (``_dispatch_nudge`` / ``_dispatch_goldfive_steer_control`` /
 ``_dispatch_goldfive_pause_control`` / ``_dispatch_pause_escalate``),
 adapter cancel tagging, the late-drift gate
@@ -58,9 +58,9 @@ Responsibilities (this PR)
 * :meth:`_is_terminal_drift` + :attr:`_TERMINAL_DRIFT_KINDS` — the
   whitelist of drift kinds that trigger plugin-side boundary cleanup
   on emit. ``LOOPING_REASONING`` is **deliberately excluded** — its
-  CRITICAL-first tier maps to ``NUDGE`` (recoverable); the eventual
-  ``HUMAN_INTERVENTION_REQUIRED`` emission on escalation is the
-  cleanup trigger.
+  CRITICAL-first tier maps to ``SIGNAL`` (recoverable; PR 7 renamed
+  ``NUDGE``); the eventual ``HUMAN_INTERVENTION_REQUIRED`` emission on
+  escalation is the cleanup trigger.
 
 * :meth:`_resolve_authored_by` + :attr:`_USER_AUTHORED_DRIFT_KINDS`
   + :meth:`_drift_annotation_id` — source-attribution helpers.
@@ -266,8 +266,8 @@ class DriftObserver:
     #   resume it.
     # * ``LOOPING_REASONING`` is deliberately NOT here despite being
     #   listed in the v15 evidence: it is graduated (INFO / WARNING /
-    #   CRITICAL) and CRITICAL-first maps to ``NUDGE`` (recoverable —
-    #   refine + corrective follow-up). Closing on the LOOPING_REASONING
+    #   CRITICAL) and CRITICAL-first maps to ``SIGNAL`` (recoverable —
+    #   advisory note; PR 7 renamed ``NUDGE``). Closing on the LOOPING_REASONING
     #   emission itself would corrupt the boundary pair when the run
     #   actually recovers. The CRITICAL-repeat path escalates to
     #   ``PAUSE_ESCALATE``, which emits a fresh
@@ -3749,8 +3749,17 @@ class DriftObserver:
     # import-cycle with :mod:`goldfive.steerer` (which defines the
     # :class:`InterventionLevel` enum).
 
-    _LADDER_BY_VALUE: dict[
-        str,
+    # AGENCY-PRESERVATION.md PR 7 — the pre-PR-7 ladder, used when the
+    # ``legacy_ladder`` escape hatch is on. Identical to :attr:`_LADDER`
+    # EXCEPT the goldfive-authored rows whose CANCEL_REINVOKE cells PR 7
+    # demoted to SIGNAL (and GOAL_DRIFT's CRITICAL-repeat, which moved
+    # CANCEL_REINVOKE → PAUSE_ESCALATE): the overrides in
+    # :data:`_PR7_LEGACY_LADDER_OVERRIDES` restore those cells. The two
+    # deferred correctness fixes (hard-safety CRITICAL stop; the NUDGE→SIGNAL
+    # rename) are inherited from :attr:`_LADDER` — they are NOT toggled by the
+    # escape hatch. Populated lazily alongside :attr:`_LADDER`.
+    _LADDER_LEGACY: dict[
+        DriftKind,
         tuple[
             InterventionLevel | None,
             InterventionLevel | None,
@@ -3762,7 +3771,7 @@ class DriftObserver:
 
     @classmethod
     def _load_ladder_tables(cls) -> None:
-        """Populate :attr:`_LADDER` / :attr:`_LADDER_BY_VALUE` on first use.
+        """Populate :attr:`_LADDER` / :attr:`_LADDER_LEGACY` on first use.
 
         Lazy load defers the :class:`InterventionLevel` import so this
         module can be imported before :mod:`goldfive.steerer` finishes
@@ -3774,30 +3783,36 @@ class DriftObserver:
         from goldfive.steerer import InterventionLevel as _IL
 
         cls._LADDER = {
+            # AGENCY-PRESERVATION.md PR 7: goldfive-authored CANCEL_REINVOKE
+            # cells demote to SIGNAL (advisory note, no refine/cancel/steer);
+            # the CRITICAL-repeat escalation stays PAUSE_ESCALATE (stop-and-ask
+            # preserves trajectory; cancel-and-redirect does not). The
+            # ``legacy_ladder`` escape hatch restores the CANCEL_REINVOKE cells
+            # via :data:`_PR7_LEGACY_LADDER_OVERRIDES`.
             DriftKind.CONFABULATION_RISK: (
                 _IL.OBSERVE,
                 _IL.ABSORB,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.AGENT_REFUSAL: (
                 _IL.OBSERVE,
                 _IL.ABSORB,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.MODEL_REFUSAL: (
                 _IL.OBSERVE,
                 _IL.ABSORB,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.LOOPING_REASONING: (
                 None,
                 _IL.ABSORB,
-                (_IL.NUDGE, _IL.PAUSE_ESCALATE),
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.LOOPING_TOOL_CALL: (
                 None,
                 _IL.ABSORB,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.REASONING_CLUSTER_TIGHTENING: (
                 _IL.OBSERVE,
@@ -3885,7 +3900,7 @@ class DriftObserver:
             DriftKind.OFF_TOPIC: (
                 _IL.OBSERVE,
                 _IL.ABSORB,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.JUSTIFIED_DEVIATION: (
                 _IL.OBSERVE,
@@ -3900,12 +3915,52 @@ class DriftObserver:
             DriftKind.TOOL_ERROR: (
                 _IL.OBSERVE,
                 _IL.ABSORB,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
             ),
+            # RUNAWAY_DELEGATION is hard-safety (a guardrail, not steering): it
+            # KEEPS CANCEL_REINVOKE — the §0 stop authority survives only for
+            # the user-steer junction and hard-safety kinds (PR 7).
             DriftKind.RUNAWAY_DELEGATION: (
                 None,
                 None,
                 (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+            ),
+            # AGENCY-PRESERVATION.md PR 7 (deferred Stage-1 fix): the
+            # budget/timeout hard-safety kinds previously fell through to the
+            # default mapping, whose CRITICAL-first cell is ABSORB ("refine and
+            # continue") — a §0 stop-not-redirect violation for a guardrail.
+            # Give them explicit rows that STOP at CRITICAL → PAUSE_ESCALATE
+            # (halt-and-ask-human), NOT CANCEL_REINVOKE: restart can't refund a
+            # spent budget — a cancel-and-reinvoke on an exhausted budget just
+            # burns more of it or immediately re-trips the same cap. The
+            # immediate in-flight stop these kinds need already comes from the
+            # PR-1 cancel-authority path (they are in ``_HARD_SAFETY_DRIFT_KINDS``,
+            # i.e. cancel scope); the ladder cell's job is the follow-on, which
+            # for a spent resource is the pause. (RUNAWAY_DELEGATION above is the
+            # exception: the *behaviour* is the problem, not a spent budget, so
+            # killing the runaway subtree and letting non-runaway work continue
+            # is plausibly productive — it keeps CANCEL_REINVOKE.) INFO/WARNING
+            # are OBSERVE. Applies in BOTH ladder regimes (NOT gated by
+            # ``legacy_ladder``).
+            DriftKind.RESOURCE_EXHAUSTED: (
+                None,
+                None,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.TOO_MANY_STEPS: (
+                None,
+                None,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.TASK_TIMEOUT: (
+                None,
+                None,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.LLM_CALL_TIMEOUT: (
+                None,
+                None,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.REFINE_VALIDATION_FAILED: (
                 None,
@@ -3917,17 +3972,77 @@ class DriftObserver:
                 None,
                 (_IL.PAUSE_ESCALATE, _IL.TERMINATE),
             ),
+            # GOAL_DRIFT: WARNING + CRITICAL-first both SIGNAL (was NUDGE — pure
+            # rename); the CRITICAL-repeat escalation moves CANCEL_REINVOKE →
+            # PAUSE_ESCALATE (PR 7 repeat-escalation = stop-and-ask).
             DriftKind.GOAL_DRIFT: (
                 None,
-                _IL.NUDGE,
-                (_IL.NUDGE, _IL.CANCEL_REINVOKE),
+                _IL.SIGNAL,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.SELF_REPORTED_STUCK: (
+                None,
+                _IL.ABSORB,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+        }
+        # PR 7 legacy-ladder overrides: the exact cells the new ladder demoted.
+        # ``_LADDER_LEGACY = {**_LADDER, **overrides}`` so the escape hatch
+        # restores ONLY these rows; every other row (incl. the deferred
+        # hard-safety stop fix and the NUDGE→SIGNAL rename) is shared. This
+        # small override map IS the reviewable PR-7 ladder diff (§5.3).
+        _pr7_legacy_overrides: dict[
+            DriftKind,
+            tuple[
+                InterventionLevel | None,
+                InterventionLevel | None,
+                tuple[InterventionLevel, InterventionLevel],
+            ],
+        ] = {
+            DriftKind.CONFABULATION_RISK: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.AGENT_REFUSAL: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.MODEL_REFUSAL: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.LOOPING_TOOL_CALL: (
+                None,
+                _IL.ABSORB,
+                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.OFF_TOPIC: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.TOOL_ERROR: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.SELF_REPORTED_STUCK: (
                 None,
                 _IL.ABSORB,
                 (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
             ),
+            # LOOPING_REASONING is NOT here: its CRITICAL-first was NUDGE (now
+            # SIGNAL — pure rename), never CANCEL_REINVOKE, so new == legacy.
+            DriftKind.GOAL_DRIFT: (
+                None,
+                _IL.SIGNAL,
+                (_IL.SIGNAL, _IL.CANCEL_REINVOKE),
+            ),
         }
+        cls._LADDER_LEGACY = {**cls._LADDER, **_pr7_legacy_overrides}
         cls._LADDER_LOADED = True
 
     def _ladder_level_for(
@@ -3945,9 +4060,14 @@ class DriftObserver:
         from goldfive.steerer import InterventionLevel as _IL
 
         self._load_ladder_tables()
-        entry = self._LADDER_BY_VALUE.get(kind.value)
-        if entry is None:
-            entry = self._LADDER.get(kind)
+        # AGENCY-PRESERVATION.md PR 7: the ``legacy_ladder`` escape hatch picks
+        # the pre-PR-7 cells (CANCEL_REINVOKE in the goldfive-authored rows).
+        ladder = (
+            self._LADDER_LEGACY
+            if getattr(self._steerer, "_legacy_ladder", False)
+            else self._LADDER
+        )
+        entry = ladder.get(kind)
         is_repeat = occurrence_count >= self._steerer.REFINE_FAILURE_THRESHOLD
         if entry is not None:
             info_level, warning_level, critical_pair = entry
@@ -4264,7 +4384,13 @@ class DriftObserver:
         )
         if level is InterventionLevel.OBSERVE:
             return
-        if level is InterventionLevel.NUDGE:
+        if level is InterventionLevel.SIGNAL:
+            # AGENCY-PRESERVATION.md PR 7: the SIGNAL level (was NUDGE) enqueues
+            # an advisory observer note and returns — NO refine, NO cancel, NO
+            # steer. This is the cell the goldfive-authored CANCEL_REINVOKE rows
+            # were demoted to: proportional, trajectory-preserving influence.
+            # The dispatch method keeps its ``_dispatch_nudge`` name (internal;
+            # widely referenced) — it enqueues the SIGNAL-level note.
             await self._dispatch_nudge(drift, session)
             return
         if level is InterventionLevel.PAUSE_ESCALATE:
@@ -5452,9 +5578,10 @@ class DriftObserver:
           either periodic-check signals or soft one-shots; cancel
           would be disproportionate.
         * ``DriftSeverity.WARNING`` — never cancels. Warning drifts
-          route to the existing ABSORB / NUDGE ladder paths; the
-          refined plan lands on the next task boundary without
-          preempting the in-flight turn.
+          route to the existing ABSORB / SIGNAL ladder paths (PR 7
+          renamed NUDGE → SIGNAL); the refined plan / advisory note
+          lands on the next task boundary without preempting the
+          in-flight turn.
         * ``DriftSeverity.CRITICAL`` — cancels, *if the drift's
           authority permits it* (see below). The in-flight turn's
           output is likely to contaminate its parent's transcript
@@ -5690,7 +5817,12 @@ class DriftObserver:
             DriftKind.CONFABULATION_RISK,
             DriftKind.LOOPING_REASONING,
             DriftKind.LOOPING_TOOL_CALL,
-            DriftKind.PLAN_DIVERGENCE,
+            # AGENCY-PRESERVATION.md PR 7 (deferred Stage-1 fix): PLAN_DIVERGENCE
+            # removed. It is dropped at the top of :meth:`handle_drift` (#252,
+            # reconciler emitter dead) and its ladder row is OBSERVE at every
+            # severity (PR 3), so it could never reach promotion — its presence
+            # here was unreachable dead config. Removing it makes the eligible
+            # set honest.
         }
     )
 
@@ -5817,15 +5949,25 @@ class DriftObserver:
             _planner_refine_accepts_available_agents,
         )
 
-        # 1. Tag adapter cancel reason.
-        cancel_reason = self._tag_adapter_cancel_reason_for_promotion(drift, session=session)
-        # Session-visible cancel prefix so ``_mark_cancelled_if_live``
-        # stamps it on any TaskCancelled the executor emits for the
-        # in-flight task as part of the promotion.
-        try:
-            session._last_cancel_reason_prefix = cancel_reason
-        except Exception:  # noqa: BLE001
-            pass
+        # AGENCY-PRESERVATION.md PR 7: strip the steering side-effects from
+        # promotion. Promotion now refines, emits PlanRevised, and enqueues an
+        # advisory note — it no longer tags the adapter's cancel reason, stamps
+        # ``active_steer(source="goldfive")``, or dispatches GOLDFIVE_STEER.
+        # The ``legacy_ladder`` escape hatch restores all three. ``legacy``
+        # captured once so the gates read consistently within this call.
+        legacy = bool(getattr(self._steerer, "_legacy_ladder", False))
+        # 1. Tag adapter cancel reason (legacy only).
+        if legacy:
+            cancel_reason = self._tag_adapter_cancel_reason_for_promotion(
+                drift, session=session
+            )
+            # Session-visible cancel prefix so ``_mark_cancelled_if_live``
+            # stamps it on any TaskCancelled the executor emits for the
+            # in-flight task as part of the promotion.
+            try:
+                session._last_cancel_reason_prefix = cancel_reason
+            except Exception:  # noqa: BLE001
+                pass
         # 1a. NOTE (#241 emergency revert): previously we fired
         # ``adapter.request_cancel(reason)`` here to terminate the
         # in-flight LLM call immediately. In practice that
@@ -5846,19 +5988,23 @@ class DriftObserver:
         # same surface the user-steer freshness window reads.
         at_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
         body = self._compose_goldfive_steer_body(drift, session)
-        try:
-            _ostate.set_active_steer(
-                session.state,
-                body=body,
-                at_turn=at_turn,
-                author="goldfive",
-                source="goldfive",
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "DefaultSteerer._promote_drift_to_steer: set_active_steer raised: %s",
-                exc,
-            )
+        # 2. Stamp active-steer state (legacy only). The new regime does NOT
+        # stamp ``active_steer(source="goldfive")`` — a promoted goldfive drift
+        # is advisory, not an authoritative steer overriding the agent's means.
+        if legacy:
+            try:
+                _ostate.set_active_steer(
+                    session.state,
+                    body=body,
+                    at_turn=at_turn,
+                    author="goldfive",
+                    source="goldfive",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "DefaultSteerer._promote_drift_to_steer: set_active_steer raised: %s",
+                    exc,
+                )
         # NOTE: the ``GOLDFIVE_STEER`` ControlMessage dispatch used to
         # fire HERE, BEFORE the refine + plan install below. That left
         # the payload carrying the PRIOR plan's task ids in
@@ -6131,9 +6277,16 @@ class DriftObserver:
         # ``cancel_inflight_scope="user_and_safety"`` the helper's
         # authority gate makes this a no-op — the refined plan installs
         # for bookkeeping and the corrective reaches the agent via the
-        # GOLDFIVE_STEER restart at the invocation boundary instead of
-        # a mid-flight ``task.cancel()``. ``"all"`` (the §5.1
-        # kill-switch) restores the empirically-motivated v15 cancel.
+        # advisory note at the invocation boundary instead of a
+        # mid-flight ``task.cancel()``. ``"all"`` (the §5.1 kill-switch)
+        # restores the empirically-motivated v15 cancel.
+        #
+        # PR 7 (intentional — do NOT "clean this up"): this call is KEPT
+        # even though PR 7 strips promotion's other steering side-effects.
+        # The PR-1 ``_cancel_inflight_for_revision`` authority gate is the
+        # SINGLE source of cancel policy; this is a no-op under the default
+        # scope. Removing it would double-encode the cancel decision here
+        # and break the ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`` kill-switch.
         await self._cancel_inflight_for_revision(drift, session)
         await self._steerer.plans._emit_plan_revised(
             session,
@@ -6143,18 +6296,27 @@ class DriftObserver:
             attempt_id=attempt_id,
             dry_run=not was_installed,
         )
-        # Audit #402 fix: dispatch the ``GOLDFIVE_STEER`` ControlMessage
-        # AFTER ``_emit_plan_revised`` has swapped ``session.plan`` to
-        # the revised version. ``_dispatch_goldfive_steer_control``
-        # re-reads ``session.plan`` to derive ``replacement_task_ids``,
-        # so dispatching here ensures the payload points the
-        # executor's restart at the NEW plan's PENDING tasks rather
-        # than the prior plan's (which may have been removed /
-        # cancelled by the just-installed revision). Mirrors the
-        # ordering in :meth:`_handle_drift`'s CANCEL_REINVOKE branch.
-        await self._dispatch_goldfive_steer_control(
-            drift, session, body_override=body
-        )
+        # AGENCY-PRESERVATION.md PR 7: in the new regime the promotion's
+        # corrective reaches the agent as an advisory observer note on the
+        # configured channel — NOT a GOLDFIVE_STEER cancel-and-restart. The
+        # ``legacy_ladder`` escape hatch restores the GOLDFIVE_STEER dispatch.
+        if legacy:
+            # Audit #402 fix: dispatch the ``GOLDFIVE_STEER`` ControlMessage
+            # AFTER ``_emit_plan_revised`` has swapped ``session.plan`` to the
+            # revised version so the payload's ``replacement_task_ids`` point
+            # at the NEW plan's PENDING tasks. Mirrors :meth:`_handle_drift`'s
+            # CANCEL_REINVOKE branch.
+            await self._dispatch_goldfive_steer_control(
+                drift, session, body_override=body
+            )
+        else:
+            # New regime: enqueue the advisory note (request_context queue or
+            # legacy pending_nudges, per ``signal_channel``). ``ladder_level=
+            # "promotion"`` lets the §5.4 divergence report tell a promoted
+            # SIGNAL apart from a Level-2 one.
+            await self._route_corrective_note(
+                session, drift, body, ladder_level="promotion"
+            )
 
     @staticmethod
     def _compose_goldfive_steer_body(drift: DriftEvent, session: Session) -> str:

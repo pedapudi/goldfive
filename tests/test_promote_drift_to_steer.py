@@ -144,13 +144,16 @@ def _make_session() -> Session:
     )
 
 
-def _bound_steerer() -> tuple[
+def _bound_steerer(*, legacy_ladder: bool = False) -> tuple[
     DefaultSteerer, _RevisedPlanPlanner, ControlChannel, _ListSink
 ]:
     steerer = DefaultSteerer(
         goldfive_steer_threshold="warning",
         goldfive_steer_suppression_window_turns=3,
     )
+    # AGENCY-PRESERVATION.md PR 7: promotion strips its GOLDFIVE_STEER dispatch
+    # + active_steer stamp by default; ``legacy_ladder=True`` restores them.
+    steerer._legacy_ladder = bool(legacy_ladder)
     planner = _RevisedPlanPlanner(revised=_make_revised_plan())
     sink = _ListSink()
     channel = ControlChannel()
@@ -188,8 +191,15 @@ async def test_promote_drift_dispatches_after_plan_swap_audit_402() -> None:
     swapped ``session.plan`` to the revised version, so
     ``_dispatch_goldfive_steer_control`` reads the NEW plan's PENDING
     tasks and the wire payload carries ``t_new_pending``.
+
+    AGENCY-PRESERVATION.md PR 7: promotion's GOLDFIVE_STEER dispatch now fires
+    only under the ``legacy_ladder`` escape hatch (the default regime enqueues
+    an advisory note instead — see
+    ``test_promote_drift_new_regime_enqueues_note_no_steer``). This audit-#402
+    ordering regression is pinned in the legacy regime where the dispatch
+    survives.
     """
-    steerer, planner, channel, _sink = _bound_steerer()
+    steerer, planner, channel, _sink = _bound_steerer(legacy_ladder=True)
     drift = DriftEvent(
         kind=DriftKind.OFF_TOPIC,
         severity=DriftSeverity.WARNING,
@@ -244,3 +254,47 @@ async def test_promote_drift_dispatches_after_plan_swap_audit_402() -> None:
     # Drift kind + body still propagate.
     assert payload["drift_kind"] == DriftKind.OFF_TOPIC.value
     assert "raccoons" in payload["body"]
+
+
+async def test_promote_drift_new_regime_enqueues_note_no_steer() -> None:
+    """AGENCY-PRESERVATION.md PR 7: default-regime promotion strips its
+    steering side-effects.
+
+    The promotion still refines (``refine_steer``) and emits ``PlanRevised``,
+    but it no longer dispatches a ``GOLDFIVE_STEER`` ControlMessage, tags the
+    adapter cancel reason, or stamps ``active_steer(source="goldfive")``.
+    Instead it enqueues an advisory observer note on the configured channel
+    (legacy ``pending_nudges`` by default).
+    """
+    steerer, planner, channel, _sink = _bound_steerer()  # legacy_ladder=False
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="agent wandered off into raccoons",
+        current_task_id="t_running",
+        authored_by="goldfive",
+    )
+    session = _make_session()
+    await steerer.drift.handle_drift(drift, session)
+
+    # Kept: refine_steer fired + the plan swapped.
+    assert planner.refine_steer_calls, "refine_steer should still fire"
+    assert session.plan is not None
+
+    # Stripped: no GOLDFIVE_STEER ControlMessage.
+    steer_msgs = [
+        m for m in _drain_channel(channel) if m.kind is ControlKind.GOLDFIVE_STEER
+    ]
+    assert steer_msgs == [], "default regime must not dispatch GOLDFIVE_STEER"
+
+    # Stripped: active_steer not stamped with the goldfive source.
+    from goldfive.state_store import StateStore
+
+    active = StateStore.for_session(session).get_active_steer()
+    assert active is None or active.source.lower() != "goldfive"
+
+    # Added: an advisory note was enqueued (legacy_user_message channel).
+    from goldfive.observer_notes import ADVISORY_FOOTER
+
+    assert len(session.pending_nudges) == 1
+    assert ADVISORY_FOOTER in session.pending_nudges[0]

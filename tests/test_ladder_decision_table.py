@@ -80,25 +80,77 @@ def render_ladder_surface(steerer: DefaultSteerer) -> str:
 # intended ladder demotion (update + justify in the PR body) or a
 # regression (fix the code, not the golden).
 #
-# AGENCY-PRESERVATION.md PR 3 demoted exactly three rows from this table
-# (the forecast-mismatch family); every other row is byte-for-byte the
-# Commit-1 baseline:
-#   * plan_divergence     WARNING ABSORB→OBSERVE, CRITICAL
-#                         [CANCEL_REINVOKE|PAUSE_ESCALATE]→[OBSERVE|OBSERVE]
-#   * capability_mismatch CRITICAL [ABSORB|PAUSE_ESCALATE]→[OBSERVE|OBSERVE]
-#                         (WARNING stays ABSORB: Rule B / "WARNING-max").
-#                         The CRITICAL→OBSERVE cells are unreachable in the
-#                         DEFAULT config — Rule A and Rule C are both env-
-#                         gated OFF and the only live emitter (Rule B) emits
-#                         WARNING; the cells bite only under the Rule A/C
-#                         escape hatches (belt-and-suspenders).
-#   * new_work_discovered WARNING ABSORB→OBSERVE, CRITICAL
-#                         [ABSORB|PAUSE_ESCALATE]→[OBSERVE|OBSERVE]
-# wrong_agent is unchanged here: it is deprecated with no _LADDER row and
-# no emitter, so its dead default-fallthrough line is moot (see the
-# types.py deprecation note + the _load_ladder_tables comment).
+# AGENCY-PRESERVATION.md PR 7 restructured the ladder. Changes from the PR-3
+# baseline (every other row byte-for-byte unchanged):
+#   * NUDGE → SIGNAL rename (the enum member): goal_drift + looping_reasoning.
+#   * goldfive-authored CANCEL_REINVOKE cells → SIGNAL (advisory note, no
+#     refine/cancel/steer): agent_refusal, confabulation_risk, looping_tool_call,
+#     model_refusal, off_topic, self_reported_stuck, tool_error CRITICAL-first.
+#   * goal_drift CRITICAL-repeat CANCEL_REINVOKE → PAUSE_ESCALATE (repeat-
+#     escalation is stop-and-ask) and WARNING/CRITICAL-first NUDGE → SIGNAL.
+#   * Deferred Stage-1 fix — hard-safety budget/timeout kinds (resource_exhausted,
+#     too_many_steps, task_timeout, llm_call_timeout) previously fell through to
+#     the default whose CRITICAL-first is ABSORB ("redirect"); they now STOP:
+#     CRITICAL [ABSORB|PAUSE_ESCALATE] → [PAUSE_ESCALATE|PAUSE_ESCALATE] and
+#     WARNING ABSORB → OBSERVE. PAUSE_ESCALATE (not CANCEL_REINVOKE): restart
+#     can't refund a spent budget. The immediate in-flight stop comes from the
+#     PR-1 cancel-authority path (these kinds are in cancel scope); the ladder
+#     cell's follow-on for a spent resource is halt-and-ask-human.
+#   * runaway_delegation KEEPS [CANCEL_REINVOKE|PAUSE_ESCALATE] — the behaviour
+#     is the problem (not a spent budget), so killing the runaway subtree and
+#     continuing non-runaway work is plausibly productive.
+# capability_mismatch / new_work_discovered / plan_divergence keep their PR-3
+# OBSERVE demotions; wrong_agent's dead default-fallthrough line is moot.
 # ---------------------------------------------------------------------------
 EXPECTED_LADDER_SURFACE = """\
+agent_refusal                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
+agent_transfer               INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+ambiguous_intent             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+blocked                      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+capability_mismatch          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[OBSERVE|OBSERVE]
+confabulation_risk           INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
+context_pressure             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+custom                       INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+goal_drift                   INFO=OBSERVE WARNING=SIGNAL  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
+goal_unreachable             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+hallucination_suspected      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+human_intervention_required  INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|TERMINATE]
+intent_divergence            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+justified_deviation          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|ABSORB]
+llm_call_timeout             INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+looping_reasoning            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
+looping_tool_call            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
+model_refusal                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
+new_work_discovered          INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
+off_topic                    INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
+plan_divergence              INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
+reasoning_cluster_tightening INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
+refine_validation_failed     INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+repeated_failure             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+resource_exhausted           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+runaway_delegation           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
+safety_concern               INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+schema_violation             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+self_reported_stuck          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
+stopped_early                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+task_failed_fatal            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+task_failed_recoverable      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+task_timeout                 INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+too_many_steps               INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+tool_error                   INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
+uncertain_progress           INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+unexpected_output            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+user_cancel                  INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+user_pause                   INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+user_steer                   INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+wrong_agent                  INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]"""
+
+
+# The ``legacy_ladder`` escape hatch (GOLDFIVE_STEER_LEGACY_LADDER=1) restores
+# the pre-PR-7 goldfive-authored CANCEL_REINVOKE cells. It differs from the new
+# surface above on exactly the eight demoted rows; the NUDGE→SIGNAL rename and
+# the hard-safety stop fix are NOT toggled (they apply in both regimes).
+EXPECTED_LADDER_SURFACE_LEGACY = """\
 agent_refusal                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 agent_transfer               INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 ambiguous_intent             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
@@ -107,14 +159,14 @@ capability_mismatch          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[OBSERVE|OBSE
 confabulation_risk           INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 context_pressure             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 custom                       INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-goal_drift                   INFO=OBSERVE WARNING=NUDGE   CRITICAL=[NUDGE|CANCEL_REINVOKE]
+goal_drift                   INFO=OBSERVE WARNING=SIGNAL  CRITICAL=[SIGNAL|CANCEL_REINVOKE]
 goal_unreachable             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 hallucination_suspected      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 human_intervention_required  INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|TERMINATE]
 intent_divergence            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 justified_deviation          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|ABSORB]
-llm_call_timeout             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-looping_reasoning            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[NUDGE|PAUSE_ESCALATE]
+llm_call_timeout             INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+looping_reasoning            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
 looping_tool_call            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 model_refusal                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 new_work_discovered          INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
@@ -123,7 +175,7 @@ plan_divergence              INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSE
 reasoning_cluster_tightening INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
 refine_validation_failed     INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 repeated_failure             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-resource_exhausted           INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+resource_exhausted           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 runaway_delegation           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 safety_concern               INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 schema_violation             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
@@ -131,8 +183,8 @@ self_reported_stuck          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINV
 stopped_early                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 task_failed_fatal            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 task_failed_recoverable      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-task_timeout                 INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-too_many_steps               INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
+task_timeout                 INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+too_many_steps               INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 tool_error                   INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 uncertain_progress           INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 unexpected_output            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
@@ -155,6 +207,46 @@ def test_ladder_decision_table_snapshot() -> None:
         "golden; an intended demotion updates the golden in the SAME "
         "commit and documents the cells in the PR body (§5.3)."
     )
+
+
+def test_ladder_decision_table_snapshot_legacy_regime() -> None:
+    """The ``legacy_ladder`` escape hatch restores the pre-PR-7 cells.
+
+    §5.3 snapshots the ladder in BOTH regimes so the PR-7 restructure surfaces
+    as an explicit diff. This golden differs from the default surface on
+    exactly the eight goldfive-authored rows whose CANCEL_REINVOKE cells PR 7
+    demoted (plus GOAL_DRIFT's CRITICAL-repeat); the NUDGE→SIGNAL rename and
+    the hard-safety stop fix are shared (NOT toggled by the escape hatch).
+    """
+    from goldfive.config import SteeringConfig
+
+    steerer = DefaultSteerer(steering_config=SteeringConfig(legacy_ladder=True))
+    surface = render_ladder_surface(steerer)
+    assert surface == EXPECTED_LADDER_SURFACE_LEGACY
+
+
+def test_legacy_overrides_are_exactly_the_demoted_rows() -> None:
+    """The two regimes differ on exactly the rows PR 7 demoted — no others.
+
+    Guards the override map against accidentally restoring (or failing to
+    restore) an unrelated row: the diff between the default and legacy goldens
+    must be precisely the eight goldfive-authored CANCEL_REINVOKE rows.
+    """
+    new = EXPECTED_LADDER_SURFACE.splitlines()
+    legacy = EXPECTED_LADDER_SURFACE_LEGACY.splitlines()
+    differing = {
+        n.split()[0] for n, leg in zip(new, legacy, strict=True) if n != leg
+    }
+    assert differing == {
+        "agent_refusal",
+        "confabulation_risk",
+        "goal_drift",
+        "looping_tool_call",
+        "model_refusal",
+        "off_topic",
+        "self_reported_stuck",
+        "tool_error",
+    }
 
 
 def test_every_drift_kind_is_in_the_surface() -> None:
@@ -227,12 +319,12 @@ def test_hard_safety_kinds_stay_armed_at_critical() -> None:
     :attr:`DriftObserver._HARD_SAFETY_DRIFT_KINDS` (#453) so a future
     ladder edit cannot demote a guardrail row by accident.
 
-    Note (consistency, not a fix): RESOURCE_EXHAUSTED / TOO_MANY_STEPS /
-    TASK_TIMEOUT / LLM_CALL_TIMEOUT are hard-safety (cancel-authorised)
-    yet map CRITICAL-first to ABSORB (refine), i.e. "redirect" rather
-    than the §0 "stop". That latent mismatch predates PR 3 and is the
-    ladder restructure's concern (PR 7); this test only asserts they are
-    not OBSERVE.
+    PR 7 closed the latent mismatch this note used to flag: RESOURCE_EXHAUSTED
+    / TOO_MANY_STEPS / TASK_TIMEOUT / LLM_CALL_TIMEOUT now map CRITICAL-first to
+    PAUSE_ESCALATE (stop — restart can't refund a spent budget), not ABSORB
+    (redirect); RUNAWAY_DELEGATION maps to CANCEL_REINVOKE — verified by the
+    snapshot. This test additionally pins that hard-safety kinds never map
+    CRITICAL to ABSORB (the §0 stop-not-redirect guarantee).
     """
     steerer = DefaultSteerer()
     threshold = steerer.REFINE_FAILURE_THRESHOLD
@@ -241,3 +333,9 @@ def test_hard_safety_kinds_stay_armed_at_critical() -> None:
         repeat = steerer.drift._ladder_level_for(kind, DriftSeverity.CRITICAL, threshold)
         assert first is not InterventionLevel.OBSERVE, kind
         assert repeat is not InterventionLevel.OBSERVE, kind
+        # PR 7 stop-not-redirect: a CRITICAL guardrail trip must STOP, never
+        # ABSORB (refine-and-continue). The budget/timeout kinds +
+        # HUMAN_INTERVENTION_REQUIRED map to PAUSE_ESCALATE (restart can't
+        # refund a spent budget); RUNAWAY_DELEGATION to CANCEL_REINVOKE (kill
+        # the runaway subtree, continue non-runaway work).
+        assert first is not InterventionLevel.ABSORB, kind

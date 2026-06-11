@@ -24,12 +24,16 @@ tangle of conditionals. Levels, ordered by intrusiveness:
 
 * Level 0 — OBSERVE: record the drift, no action.
 * Level 1 — ABSORB: call ``planner.refine``; continue.
-* Level 2 — NUDGE: queue a soft follow-up message on the session for
-  the Runner's overlay loop to pick up at the next invocation boundary.
+* Level 2 — SIGNAL (renamed from NUDGE in AGENCY-PRESERVATION.md PR 7):
+  enqueue an advisory observer note on the configured channel — no
+  refine, no cancel, no steer. The proportional, trajectory-preserving
+  response the goldfive-authored ``CANCEL_REINVOKE`` cells were demoted to.
 * Level 3 — CANCEL_REINVOKE: dispatch a ``GOLDFIVE_STEER`` control
   message on the bound channel so the executor cancels in-flight work
-  and restarts with a goldfive-authored corrective. Phase 2 of the
-  path-duality fix routes this through the same junction as USER_STEER.
+  and restarts with a goldfive-authored corrective. PR 7 narrows this to
+  the user-steer junction + hard-safety kinds only (every other
+  goldfive-authored row signals); the ``GOLDFIVE_STEER_LEGACY_LADDER=1``
+  escape hatch restores the pre-PR-7 cells.
 * Level 4 — PAUSE_ESCALATE: dispatch a ``GOLDFIVE_PAUSE_ESCALATE``
   control message and emit ``HUMAN_INTERVENTION_REQUIRED`` so the
   executor's pre-task loop blocks waiting for operator action.
@@ -126,7 +130,12 @@ class InterventionLevel(enum.IntEnum):
 
     OBSERVE = 0
     ABSORB = 1
-    NUDGE = 2
+    # AGENCY-PRESERVATION.md PR 7: NUDGE renamed to SIGNAL. The level now
+    # enqueues an advisory observer note (the request_context channel / the
+    # legacy nudge replay) WITHOUT a refine/cancel/steer — the proportional,
+    # trajectory-preserving response that replaces the goldfive-authored
+    # CANCEL_REINVOKE cells. The enum value (2) is unchanged.
+    SIGNAL = 2
     CANCEL_REINVOKE = 3
     PAUSE_ESCALATE = 4
     TERMINATE = 5
@@ -615,6 +624,16 @@ class DefaultSteerer:
             )
             _channel = "legacy_user_message"
         self._signal_channel: str = _channel
+        # AGENCY-PRESERVATION.md PR 7: the one-release legacy-ladder escape
+        # hatch. When True the pre-PR-7 ladder cells (CANCEL_REINVOKE in the
+        # goldfive-authored rows) and the full _promote_drift_to_steer
+        # side-effects are restored; the drift observer reads this flag in
+        # ``_ladder_level_for`` and ``_promote_drift_to_steer``. Default OFF
+        # (the new SIGNAL ladder). The two deferred correctness fixes
+        # (hard-safety stop, PLAN_DIVERGENCE removal) are NOT gated by it.
+        self._legacy_ladder: bool = bool(
+            getattr(steering_config, "legacy_ladder", False)
+        )
         # Background reasoning-judge tasks (goldfive#251). The LLM-judge
         # path in :meth:`observe_reasoning` is fire-and-forget so the
         # adapter's model-response callback can return immediately and

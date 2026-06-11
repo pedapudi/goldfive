@@ -165,6 +165,10 @@ def _bind(adapter: Any) -> tuple[DefaultSteerer, Session, _StubPlanner]:
         goldfive_steer_threshold="warning",
         goldfive_steer_suppression_window_turns=3,
     )
+    # AGENCY-PRESERVATION.md PR 7: the promotion-driven request_cancel this
+    # module pins is the legacy mechanism (the new regime enqueues an advisory
+    # note and never tags a cancel reason). Bind with the escape hatch ON.
+    steerer._legacy_ladder = True
     revised = Plan(
         id="p1",
         run_id="r1",

@@ -210,15 +210,15 @@ async def test_refine_validation_failed_pauses_without_refining() -> None:
 async def test_ladder_level_for_pause_escalate_on_repeat() -> None:
     """Threshold-crossing occurrence drives CRITICAL to Level 4.
 
-    Uses TOOL_ERROR: first CRITICAL = CANCEL_REINVOKE, repeat =
-    PAUSE_ESCALATE. (Was PLAN_DIVERGENCE, demoted to OBSERVE at all
-    severities in AGENCY-PRESERVATION.md PR 3 — re-pointed to a kind
-    that still exhibits the first→repeat escalation this test pins.)
+    Uses TOOL_ERROR: first CRITICAL = SIGNAL, repeat = PAUSE_ESCALATE.
+    (AGENCY-PRESERVATION.md PR 7 demoted the goldfive-authored CANCEL_REINVOKE
+    first cell to SIGNAL; the repeat-escalation to PAUSE_ESCALATE this test
+    pins is unchanged.)
     """
     steerer = DefaultSteerer()
     assert (
         steerer.drift._ladder_level_for(DriftKind.TOOL_ERROR, DriftSeverity.CRITICAL, 0)
-        is InterventionLevel.CANCEL_REINVOKE
+        is InterventionLevel.SIGNAL
     )
     # Threshold is 2 in DefaultSteerer.REFINE_FAILURE_THRESHOLD.
     assert (
@@ -408,22 +408,23 @@ async def test_cancel_reinvoke_dispatches_goldfive_steer_control() -> None:
             )
 
     steerer.bind(sinks=[], planner=GoodPlanner())
-    # Use TOOL_ERROR for the Level 3 first-occurrence check:
-    # LOOPING_REASONING's CRITICAL-first tier routes to NUDGE
-    # (Level 2) after goldfive#204, so we pick a drift kind whose
-    # CRITICAL-first tier still routes to CANCEL_REINVOKE AND whose
-    # corrective-template interpolates the current_task_id.
+    # AGENCY-PRESERVATION.md PR 7 re-point: CANCEL_REINVOKE survives ONLY for
+    # the user-steer junction and hard-safety kinds — the goldfive-authored
+    # content kinds (TOOL_ERROR / OFF_TOPIC / …) were demoted to SIGNAL (note,
+    # no GOLDFIVE_STEER). RUNAWAY_DELEGATION is a hard-safety kind whose
+    # CRITICAL-first still maps to CANCEL_REINVOKE, so it exercises the
+    # surviving Level-3 GOLDFIVE_STEER dispatch this test pins.
     drift = DriftEvent(
-        kind=DriftKind.TOOL_ERROR,
+        kind=DriftKind.RUNAWAY_DELEGATION,
         severity=DriftSeverity.CRITICAL,
-        detail="tool error",
+        detail="runaway delegation",
         current_task_id="t1",
     )
     await steerer.drift.handle_drift(drift, session)
     steer_msgs = _drain_goldfive_steer(channel)
     assert len(steer_msgs) == 1
     payload = steer_msgs[0].payload
-    assert payload["drift_kind"] == DriftKind.TOOL_ERROR.value
+    assert payload["drift_kind"] == DriftKind.RUNAWAY_DELEGATION.value
     assert "t1" in payload["body"]
     # Re-pointed by AGENCY-PRESERVATION.md PR 4: the body used to
     # interpolate the next PENDING task's title ("Try a different
