@@ -618,7 +618,7 @@ it survives outside the task tracker. Stage 4 remains exploratory (unbuilt).
 | PR 1 — gate in-flight cancel on authority (`cancel_inflight_scope`) | #453 | merged |
 | PR 2 — finish #423 (descriptive growth at pin time) | #454 | merged |
 | PR 3 — ladder demotions + decision-table snapshot | #457 (+ #458 pin) | merged |
-| PR 4 — intervention content rewrite (`observer_notes.py`) | (in the PR-6 line) | merged |
+| PR 4 — intervention content rewrite (`observer_notes.py`) | #455 | merged |
 | PR 5 — signal telemetry (`SignalDelivered`/`SignalOutcome`, `SignalLedger`) | #456 | merged |
 | PR 6 — observer-note channel (`ObserverNoteQueue` + 4 surfaces) | #462 | merged |
 | PR 6b — context-editing rules (finish #397) | #459, #463 | merged |
@@ -754,7 +754,9 @@ the task tracker):
    no-hang/no-silent-death contract is an *integration* property (executor
    pause-block + ledger plan structure + run-end disposition) that unit
    tests cannot show — §5.7 scar tissue: narrow criteria pass on broken
-   runs. Use the 2d27ff4a-style replay.
+   runs. Shipped standalone as `tests/test_ledger_runaway_e2e.py` (#471);
+   keep standalone per bench's harness ruling — the canonical pause probes
+   are `outcome.reason` + the HIR drift on the sink + OUTCOME-stays-PENDING.
 
 3. **The §5.4 shadow campaign must enable `signal_telemetry` explicitly**
    (channel, #462) — it defaults OFF (§6.2).
