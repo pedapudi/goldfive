@@ -82,6 +82,11 @@ _VALID_STEER_THRESHOLDS: frozenset[str] = frozenset({"off", "warning", "critical
 
 _VALID_CANCEL_INFLIGHT_SCOPES: frozenset[str] = frozenset({"user_and_safety", "all"})
 
+#: Valid values for :attr:`SteeringConfig.plan_mode` (AGENCY-PRESERVATION.md
+#: Stage 3 PR 10). ``"forecast"`` is the legacy default; ``"ledger"`` is
+#: the goal-anchored OUTCOME + descriptively-grown DISCOVERED regime.
+_VALID_PLAN_MODES: frozenset[str] = frozenset({"forecast", "ledger"})
+
 
 # Test-only override hook for :class:`SteeringConfig.observation_only`'s
 # default (goldfive#254). Production code path: this stays ``None`` and
@@ -246,6 +251,29 @@ def _read_cancel_inflight_scope_env(name: str, default: str) -> str:
         name,
         raw,
         sorted(_VALID_CANCEL_INFLIGHT_SCOPES),
+        default,
+    )
+    return default
+
+
+def _read_plan_mode_env(name: str, default: str) -> str:
+    """Return ``os.environ[name]`` as a plan-mode literal, or ``default``.
+
+    Accepts ``"forecast"`` / ``"ledger"`` (case-insensitive). Anything
+    else logs a WARNING and falls back so a typo never silently flips the
+    plan mode (AGENCY-PRESERVATION.md Stage 3 PR 10).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _VALID_PLAN_MODES:
+        return value
+    log.warning(
+        "ignoring unknown %s=%r (expected one of %s); using default %r",
+        name,
+        raw,
+        sorted(_VALID_PLAN_MODES),
         default,
     )
     return default
@@ -758,6 +786,29 @@ class SteeringConfig:
     #: the plugin cancel call itself; this knob decides which drift
     #: AUTHORITIES may request it in the first place.
     cancel_inflight_scope: str = "user_and_safety"
+    #: AGENCY-PRESERVATION.md Stage 3 PR 10 — the plan-as-ledger regime
+    #: (design doc ``docs/design/AGENCY-PRESERVATION.md`` §2).
+    #:
+    #: * ``"forecast"`` (the default) — legacy behaviour, BIT-IDENTICAL to
+    #:   pre-PR-10. ``LLMPlanner.generate`` predicts the full task DAG up
+    #:   front; the pin tiers + descriptive growth run as before; no task
+    #:   ever carries a non-FORECAST :attr:`~goldfive.types.Task.kind`.
+    #: * ``"ledger"`` — the Plan becomes a ledger. ``LLMPlanner.generate``
+    #:   produces 1–5 goal-anchored OUTCOME tasks (deliverables, not
+    #:   behaviour forecasts) via a dedicated short prompt; the delegation
+    #:   pin tiers are bypassed so every unforecast delegation grows a
+    #:   DISCOVERED task via the existing descriptive-growth machinery
+    #:   (dedup-hash → grow → pin); ``handle_turn`` produces OUTCOME-shaped
+    #:   revisions. ``StaticPlanner`` users keep forecast semantics — a
+    #:   hand-authored plan is genuine prescriptive intent.
+    #:
+    #: Threaded like ``descriptive_growth_enabled``: consumed at the pin
+    #: path / reconciler / reviser via ``steerer._steering_config`` and
+    #: surfaced to the planner through the per-turn planner ``context``
+    #: the Runner builds. Default ``"forecast"`` keeps the flag OFF until
+    #: AGENCY-PRESERVATION.md PR 13 flips it after the bench gate.
+    #: Env: ``GOLDFIVE_PLAN_MODE``.
+    plan_mode: str = "forecast"
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -813,6 +864,10 @@ class SteeringConfig:
             cancel_inflight_scope=_read_cancel_inflight_scope_env(
                 "GOLDFIVE_CANCEL_INFLIGHT_SCOPE",
                 defaults.cancel_inflight_scope,
+            ),
+            plan_mode=_read_plan_mode_env(
+                "GOLDFIVE_PLAN_MODE",
+                defaults.plan_mode,
             ),
         )
 

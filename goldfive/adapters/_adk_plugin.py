@@ -1623,6 +1623,53 @@ def _growth_at_pin_enabled(steerer: Any) -> bool:
         return False
 
 
+def _plan_mode(steerer: Any) -> str:
+    """Return ``SteeringConfig.plan_mode`` ("forecast" / "ledger").
+
+    AGENCY-PRESERVATION.md Stage 3 PR 10. Reads through
+    ``steerer._steering_config.plan_mode`` the same way
+    :func:`_descriptive_growth_enabled` reads its flag. Any read failure
+    (custom steerer, test stub) resolves to ``"forecast"`` so the legacy
+    pin path is preserved.
+    """
+    if steerer is None:
+        return "forecast"
+    try:
+        cfg = getattr(steerer, "_steering_config", None)
+        if cfg is None:
+            return "forecast"
+        mode = str(getattr(cfg, "plan_mode", "forecast")).strip().lower()
+        return "ledger" if mode == "ledger" else "forecast"
+    except Exception:  # noqa: BLE001
+        return "forecast"
+
+
+def _ledger_mode_enabled(steerer: Any) -> bool:
+    """Return True iff ledger plan mode is on AND growth is wireable.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 10. Two conditions, mirroring
+    :func:`_growth_at_pin_enabled`:
+
+    1. ``plan_mode == "ledger"`` (:func:`_plan_mode`).
+    2. The steerer exposes ``plans.install_descriptive_growth`` — ledger
+       mode fundamentally relies on the descriptive-growth write path to
+       record the agent's trajectory as DISCOVERED tasks. A custom
+       steerer without the helper keeps the legacy pin behaviour.
+
+    When this returns True, ``_maybe_pin_delegation_task`` bypasses the
+    pin tiers entirely: OUTCOME tasks are deliverables, never
+    agent-behaviour forecasts, so a delegation never matches one — every
+    unforecast delegation grows a DISCOVERED ledger task.
+    """
+    if _plan_mode(steerer) != "ledger":
+        return False
+    try:
+        plans = getattr(steerer, "plans", None)
+        return callable(getattr(plans, "install_descriptive_growth", None))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def _attempt_descriptive_growth(
     *,
     steerer: Any,
@@ -4167,7 +4214,12 @@ def make_adk_plugin(
                 return False
             tasks = tuple(_safe_attr(plan, "tasks", None) or ())
             growth_mode = _growth_at_pin_enabled(ctx.steerer)
-            if not tasks and not growth_mode:
+            # AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode.
+            # When on, the pin tiers are bypassed: every unforecast
+            # delegation dedup-checks then grows a DISCOVERED ledger task.
+            ledger_mode = _ledger_mode_enabled(ctx.steerer)
+            grow_capable = growth_mode or ledger_mode
+            if not tasks and not grow_capable:
                 return False
             try:
                 from goldfive.types import (  # noqa: PLC0415 — lazy
@@ -4186,7 +4238,7 @@ def make_adk_plugin(
                 return False
 
             chosen: Any = None
-            if growth_mode:
+            if grow_capable:
                 # Step 0 — dedup-hash re-pin (§4.3.0 / §11.1). Scans ALL
                 # non-terminal tasks (not just the DAG-ready eligible
                 # set) because the previously-discovered task is
@@ -4209,6 +4261,23 @@ def make_adk_plugin(
                     ):
                         chosen = task
                         break
+
+            if chosen is None and ledger_mode:
+                # AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode
+                # bypasses the pin tiers entirely. OUTCOME tasks are
+                # goal-anchored deliverables, never agent-behaviour
+                # forecasts, so a delegation must never be pinned to one.
+                # Step 0 already re-pinned to an existing DISCOVERED task
+                # on a hash hit; a miss here is a NEW (agent,
+                # args-token-set) unit of means-level work and grows a
+                # fresh DISCOVERED ledger task (dedup-hash → grow → pin).
+                log.info(
+                    "_maybe_pin_delegation_task: ledger mode — delegation to "
+                    "%s is unmatched means-level work; requesting "
+                    "descriptive growth (pin tiers bypassed)",
+                    invoked_agent_name,
+                )
+                return True
 
             edges = tuple(_safe_attr(plan, "edges", None) or ())
             completed_ids: set[str] = set()

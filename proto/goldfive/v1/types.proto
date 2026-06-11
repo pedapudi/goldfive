@@ -299,6 +299,37 @@ enum SupersessionKind {
   SUPERSESSION_KIND_CORRECT = 2;
 }
 
+// Provenance taxonomy for a Task within a Plan (AGENCY-PRESERVATION.md
+// Stage 3 PR 10; design doc ``docs/design/AGENCY-PRESERVATION.md`` §2).
+// Additive overlay over the existing ``Task.discovered`` bool: the bool
+// stays for wire compat; ``kind`` is the richer three-way taxonomy the
+// ledger plan mode reads.
+//
+//   * FORECAST — a planner-predicted task (the legacy default). What
+//     ``LLMPlanner.generate`` produced in the pre-ledger "forecast" plan
+//     mode: a prediction of what the run would do, against which the
+//     agent was graded. Value 0, so every legacy-serialised Task (which
+//     never set the field) deserialises to FORECAST — full back-compat,
+//     and forecast-mode output stays byte-identical because proto3 does
+//     not serialise a field at its default value.
+//   * OUTCOME — a goal-anchored deliverable ("presentation summary
+//     delivered"), NOT a forecast of agent behaviour. Produced by
+//     ``LLMPlanner.generate`` / ``handle_turn`` only in ledger plan mode
+//     (``SteeringConfig.plan_mode == "ledger"``). These are what success
+//     looks like; the agent owns HOW it gets there.
+//   * DISCOVERED — a descriptively-grown record of what the agent
+//     actually did (paired with ``discovered=true``). Stamped by the
+//     descriptive-growth write path in ledger mode — the means-level
+//     trajectory lane of the ledger.
+//
+// UNSPECIFIED-equivalent reads fold onto FORECAST in the Python
+// converter so the proto3 zero value and the dataclass default agree.
+enum TaskKind {
+  TASK_KIND_FORECAST = 0;
+  TASK_KIND_OUTCOME = 1;
+  TASK_KIND_DISCOVERED = 2;
+}
+
 // A single unit of work within a Plan.
 message Task {
   string id = 1;
@@ -362,6 +393,26 @@ message Task {
   // forecast tasks. Opaque metadata — the validator does not inspect
   // it.
   string discovery_identity_hash = 12;
+
+  // AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode (design doc
+  // ``docs/design/AGENCY-PRESERVATION.md`` §2). Provenance taxonomy
+  // overlaid on the ``discovered`` bool. ``TASK_KIND_FORECAST`` (the
+  // proto3 default, value 0) on every legacy task and on every task
+  // produced in the default "forecast" plan mode, so old serialised
+  // events deserialise unchanged and forecast-mode wire output stays
+  // byte-identical. ``TASK_KIND_OUTCOME`` on goal-anchored deliverables
+  // produced by the planner in ledger mode; ``TASK_KIND_DISCOVERED`` on
+  // descriptively-grown tasks (paired with ``discovered=true``) in
+  // ledger mode. Opaque to the structural validator.
+  TaskKind kind = 13;
+
+  // AGENCY-PRESERVATION.md Stage 3 PR 10 + PR 11. Stable id of the
+  // OUTCOME task (or goal) this task advances. Empty on FORECAST tasks
+  // and on OUTCOME tasks themselves. PR 10 ships the slot; PR 11's
+  // outcome-progress judge stamps it onto DISCOVERED tasks as it links
+  // observed trajectory to deliverables. Opaque metadata — the
+  // validator does not inspect it.
+  string contributes_to = 14;
 }
 
 // A Plan is a DAG of Tasks with a revision history. The initial plan
