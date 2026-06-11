@@ -3938,32 +3938,38 @@ class DriftObserver:
             # budget/timeout hard-safety kinds previously fell through to the
             # default mapping, whose CRITICAL-first cell is ABSORB ("refine and
             # continue") — a §0 stop-not-redirect violation for a guardrail.
-            # Give them explicit rows that STOP at CRITICAL, matching their
-            # sibling RUNAWAY_DELEGATION: cancel the runaway (they retain cancel
-            # authority via ``_HARD_SAFETY_DRIFT_KINDS``), escalate to a pause
-            # on repeat. INFO/WARNING are OBSERVE — a budget trip is CRITICAL by
-            # construction; a sub-CRITICAL budget signal is informational, never
-            # a refine. This correctness fix applies in BOTH ladder regimes (it
-            # is NOT gated by ``legacy_ladder``).
+            # Give them explicit rows that STOP at CRITICAL → PAUSE_ESCALATE
+            # (halt-and-ask-human), NOT CANCEL_REINVOKE: restart can't refund a
+            # spent budget — a cancel-and-reinvoke on an exhausted budget just
+            # burns more of it or immediately re-trips the same cap. The
+            # immediate in-flight stop these kinds need already comes from the
+            # PR-1 cancel-authority path (they are in ``_HARD_SAFETY_DRIFT_KINDS``,
+            # i.e. cancel scope); the ladder cell's job is the follow-on, which
+            # for a spent resource is the pause. (RUNAWAY_DELEGATION above is the
+            # exception: the *behaviour* is the problem, not a spent budget, so
+            # killing the runaway subtree and letting non-runaway work continue
+            # is plausibly productive — it keeps CANCEL_REINVOKE.) INFO/WARNING
+            # are OBSERVE. Applies in BOTH ladder regimes (NOT gated by
+            # ``legacy_ladder``).
             DriftKind.RESOURCE_EXHAUSTED: (
                 None,
                 None,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.TOO_MANY_STEPS: (
                 None,
                 None,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.TASK_TIMEOUT: (
                 None,
                 None,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.LLM_CALL_TIMEOUT: (
                 None,
                 None,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.REFINE_VALIDATION_FAILED: (
                 None,
@@ -6282,9 +6288,16 @@ class DriftObserver:
         # ``cancel_inflight_scope="user_and_safety"`` the helper's
         # authority gate makes this a no-op — the refined plan installs
         # for bookkeeping and the corrective reaches the agent via the
-        # GOLDFIVE_STEER restart at the invocation boundary instead of
-        # a mid-flight ``task.cancel()``. ``"all"`` (the §5.1
-        # kill-switch) restores the empirically-motivated v15 cancel.
+        # advisory note at the invocation boundary instead of a
+        # mid-flight ``task.cancel()``. ``"all"`` (the §5.1 kill-switch)
+        # restores the empirically-motivated v15 cancel.
+        #
+        # PR 7 (intentional — do NOT "clean this up"): this call is KEPT
+        # even though PR 7 strips promotion's other steering side-effects.
+        # The PR-1 ``_cancel_inflight_for_revision`` authority gate is the
+        # SINGLE source of cancel policy; this is a no-op under the default
+        # scope. Removing it would double-encode the cancel decision here
+        # and break the ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`` kill-switch.
         await self._cancel_inflight_for_revision(drift, session)
         await self._steerer.plans._emit_plan_revised(
             session,

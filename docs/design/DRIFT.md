@@ -721,10 +721,16 @@ deprecated with no ladder row.
 goldfive-authored `CANCEL_REINVOKE` cells were demoted to `SIGNAL` (advisory
 note, no refine/cancel/steer); repeat-escalation lands on `PAUSE_ESCALATE`
 (stop-and-ask preserves trajectory; cancel-and-redirect does not).
-`CANCEL_REINVOKE` survives **only** for the user-steer junction and the
-hard-safety kinds (`RUNAWAY_DELEGATION`, `RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`,
-`TASK_TIMEOUT`, `LLM_CALL_TIMEOUT` — whose CRITICAL-first cell was also fixed
-from the §0-violating `ABSORB` to a stop). `_promote_drift_to_steer` likewise
+`CANCEL_REINVOKE` survives **only** for the user-steer junction and
+`RUNAWAY_DELEGATION` (the behaviour is the problem, not a spent budget — kill
+the runaway subtree and continue non-runaway work). The other hard-safety
+kinds (`RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`)
+also had their §0-violating `ABSORB` cell fixed, but to **`PAUSE_ESCALATE`**,
+not `CANCEL_REINVOKE`: restart can't refund a spent budget (a cancel-and-reinvoke
+on an exhausted budget just re-trips the same cap). Their immediate in-flight
+stop already comes from the PR-1 cancel-authority path (they are in cancel
+scope); the ladder cell's follow-on for a spent resource is halt-and-ask-human.
+`_promote_drift_to_steer` likewise
 dropped its steering side-effects: no cancel-reason tag, no `GOLDFIVE_STEER`
 dispatch, no `active_steer(source="goldfive")` stamp — it refines, emits
 `PlanRevised`, and enqueues an advisory note. `GOLDFIVE_STEER_LEGACY_LADDER=1`
@@ -737,8 +743,8 @@ snapshotted in `tests/test_ladder_decision_table.py`.
 | **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift; the forecast-mismatch demotions. |
 | **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `TOOL_ERROR`, `AGENT_REFUSAL`, `CAPABILITY_MISMATCH` Rule B, etc.). |
 | **2** | `SIGNAL` (was `NUDGE`) | Enqueue an advisory observer note on the configured channel (PR 6) — **no refine, no cancel, no steer**. The agent reads it at its next model call / invocation boundary. | CRITICAL-first of the goldfive-authored content kinds (`TOOL_ERROR`, `AGENT_REFUSAL`, `MODEL_REFUSAL`, `OFF_TOPIC`, `CONFABULATION_RISK`, `LOOPING_*`, `SELF_REPORTED_STUCK`); `GOAL_DRIFT` at WARNING + CRITICAL-first. |
-| **3** | `CANCEL_REINVOKE` | Refine; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage** so the executor cancels the in-flight invocation and restarts with a framed corrective body. | **Hard-safety only** (`RUNAWAY_DELEGATION`, `RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`) at CRITICAL-first; the USER_STEER junction; and every goldfive-authored row under `GOLDFIVE_STEER_LEGACY_LADDER=1`. |
-| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives. | `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind (incl. `GOAL_DRIFT`, the hard-safety kinds). |
+| **3** | `CANCEL_REINVOKE` | Refine; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage** so the executor cancels the in-flight invocation and restarts with a framed corrective body. | `RUNAWAY_DELEGATION` at CRITICAL-first; the USER_STEER junction; and every goldfive-authored row under `GOLDFIVE_STEER_LEGACY_LADDER=1`. |
+| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives. | The budget/timeout hard-safety kinds (`RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`) at CRITICAL-first; `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind (incl. `GOAL_DRIFT`, `RUNAWAY_DELEGATION`). |
 | **5** | `TERMINATE` | Run-level abort. Currently only reachable when a Level-4-initiated pause times out and `HUMAN_INTERVENTION_REQUIRED` re-fires as a repeat CRITICAL. | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
 
 ### Dispatch routing — single junction (Phase 2 of #246)

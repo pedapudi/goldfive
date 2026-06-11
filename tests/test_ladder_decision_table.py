@@ -91,10 +91,14 @@ def render_ladder_surface(steerer: DefaultSteerer) -> str:
 #   * Deferred Stage-1 fix — hard-safety budget/timeout kinds (resource_exhausted,
 #     too_many_steps, task_timeout, llm_call_timeout) previously fell through to
 #     the default whose CRITICAL-first is ABSORB ("redirect"); they now STOP:
-#     CRITICAL [ABSORB|PAUSE_ESCALATE] → [CANCEL_REINVOKE|PAUSE_ESCALATE] and
-#     WARNING ABSORB → OBSERVE (a sub-CRITICAL budget signal is informational).
-#   * runaway_delegation is UNCHANGED — hard-safety keeps CANCEL_REINVOKE (the
-#     §0 stop authority survives for the user-steer junction + hard-safety).
+#     CRITICAL [ABSORB|PAUSE_ESCALATE] → [PAUSE_ESCALATE|PAUSE_ESCALATE] and
+#     WARNING ABSORB → OBSERVE. PAUSE_ESCALATE (not CANCEL_REINVOKE): restart
+#     can't refund a spent budget. The immediate in-flight stop comes from the
+#     PR-1 cancel-authority path (these kinds are in cancel scope); the ladder
+#     cell's follow-on for a spent resource is halt-and-ask-human.
+#   * runaway_delegation KEEPS [CANCEL_REINVOKE|PAUSE_ESCALATE] — the behaviour
+#     is the problem (not a spent budget), so killing the runaway subtree and
+#     continuing non-runaway work is plausibly productive.
 # capability_mismatch / new_work_discovered / plan_divergence keep their PR-3
 # OBSERVE demotions; wrong_agent's dead default-fallthrough line is moot.
 # ---------------------------------------------------------------------------
@@ -113,7 +117,7 @@ hallucination_suspected      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE
 human_intervention_required  INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|TERMINATE]
 intent_divergence            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 justified_deviation          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|ABSORB]
-llm_call_timeout             INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
+llm_call_timeout             INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 looping_reasoning            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
 looping_tool_call            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
 model_refusal                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
@@ -123,7 +127,7 @@ plan_divergence              INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSE
 reasoning_cluster_tightening INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
 refine_validation_failed     INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 repeated_failure             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-resource_exhausted           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
+resource_exhausted           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 runaway_delegation           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 safety_concern               INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 schema_violation             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
@@ -131,8 +135,8 @@ self_reported_stuck          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE
 stopped_early                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 task_failed_fatal            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 task_failed_recoverable      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-task_timeout                 INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
-too_many_steps               INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
+task_timeout                 INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+too_many_steps               INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 tool_error                   INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
 uncertain_progress           INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 unexpected_output            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
@@ -161,7 +165,7 @@ hallucination_suspected      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE
 human_intervention_required  INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|TERMINATE]
 intent_divergence            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 justified_deviation          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|ABSORB]
-llm_call_timeout             INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
+llm_call_timeout             INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 looping_reasoning            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[SIGNAL|PAUSE_ESCALATE]
 looping_tool_call            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 model_refusal                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
@@ -171,7 +175,7 @@ plan_divergence              INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSE
 reasoning_cluster_tightening INFO=OBSERVE WARNING=OBSERVE CRITICAL=[OBSERVE|OBSERVE]
 refine_validation_failed     INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 repeated_failure             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-resource_exhausted           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
+resource_exhausted           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 runaway_delegation           INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 safety_concern               INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 schema_violation             INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
@@ -179,8 +183,8 @@ self_reported_stuck          INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINV
 stopped_early                INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 task_failed_fatal            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 task_failed_recoverable      INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
-task_timeout                 INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
-too_many_steps               INFO=OBSERVE WARNING=OBSERVE CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
+task_timeout                 INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
+too_many_steps               INFO=OBSERVE WARNING=OBSERVE CRITICAL=[PAUSE_ESCALATE|PAUSE_ESCALATE]
 tool_error                   INFO=OBSERVE WARNING=ABSORB  CRITICAL=[CANCEL_REINVOKE|PAUSE_ESCALATE]
 uncertain_progress           INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
 unexpected_output            INFO=OBSERVE WARNING=ABSORB  CRITICAL=[ABSORB|PAUSE_ESCALATE]
@@ -329,6 +333,8 @@ def test_hard_safety_kinds_stay_armed_at_critical() -> None:
         assert first is not InterventionLevel.OBSERVE, kind
         assert repeat is not InterventionLevel.OBSERVE, kind
         # PR 7 stop-not-redirect: a CRITICAL guardrail trip must STOP, never
-        # ABSORB (refine-and-continue). HUMAN_INTERVENTION_REQUIRED maps to
-        # PAUSE_ESCALATE; the budget/timeout kinds to CANCEL_REINVOKE.
+        # ABSORB (refine-and-continue). The budget/timeout kinds +
+        # HUMAN_INTERVENTION_REQUIRED map to PAUSE_ESCALATE (restart can't
+        # refund a spent budget); RUNAWAY_DELEGATION to CANCEL_REINVOKE (kill
+        # the runaway subtree, continue non-runaway work).
         assert first is not InterventionLevel.ABSORB, kind
