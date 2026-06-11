@@ -123,6 +123,7 @@ KNOWN_STEER_ENV: frozenset[str] = frozenset(
         "GOLDFIVE_PLAN_MODE",  # PR 10 — SteeringConfig.from_env now reads it
         "GOLDFIVE_STEER_SIGNAL_CHANNEL",  # PR 6 — SteeringConfig.from_env now reads it
         "GOLDFIVE_STEER_LEGACY_LADDER",  # PR 7 — SteeringConfig.from_env now reads it
+        "GOLDFIVE_STEER_PIN_ASSIGNED_TASK",  # PR 9 — SteeringConfig.from_env now reads it
     }
 )
 

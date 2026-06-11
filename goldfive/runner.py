@@ -967,17 +967,19 @@ class Runner:
             # session.plan unchanged. No PlanRevised — the prior
             # revision is still the right one for this turn.
             #
-            # F6 (closes goldfive#277): wrap ``user_input`` with a
-            # directive that tells the coordinator to answer briefly
-            # from history rather than re-delegating to sub-agents.
-            # The directive lives in the message body — NOT the system
-            # prompt — to preserve the no-prompt-contract principle:
-            # users bring their own coordinator prompts; goldfive must
-            # not require them to honour a specific system-prompt
-            # contract. The session flag below lets a parallel
-            # adapter-plugin layer (e.g. the ADK plugin's pre-dispatch
-            # interceptor) tighten the tool surface for this turn
-            # without coordinating through the message body.
+            # F6 (closes goldfive#277): mark this turn as a
+            # conversational follow-up so the executor handoff below
+            # wraps ``user_input`` with the prior-plan context via
+            # :meth:`PromptShaper.wrap_conversational_input`. The wrap
+            # lives in the message body — NOT the system prompt — to
+            # preserve the no-prompt-contract principle: users bring
+            # their own coordinator prompts; goldfive must not require a
+            # specific system-prompt contract. (Historical note: a
+            # docstring once described a parallel ADK-plugin "pre-dispatch
+            # interceptor" keyed off this flag that tightened the tool
+            # surface; that interceptor was never built — the flag's only
+            # consumer is the runner's own wrap gating below. Verified
+            # AGENCY-PRESERVATION.md PR 9.)
             log.info(
                 "Runner.run: conversational turn — reusing prior plan_id=%s revision_index=%d",
                 (session.plan.id or "")[:16] or "<none>",

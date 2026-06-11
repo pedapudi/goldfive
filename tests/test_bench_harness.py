@@ -269,20 +269,41 @@ def test_arm_flag_status_reports_promoted_flags_as_applied() -> None:
     applied, pending = arm_flag_status(arms["signal"])
     # The promotion contract: the PR that teaches ``SteeringConfig.from_env``
     # about a flag moves it from _PENDING_STEER_ENV into KNOWN_STEER_ENV, so it
-    # reports APPLIED. As of PR 7 every roadmap flag the bench carries is
+    # reports APPLIED. As of PR 7 + PR 9 every roadmap flag the bench carries is
     # promoted: GOLDFIVE_STEER_SIGNAL_CHANNEL (PR 6), GOLDFIVE_PLAN_MODE
-    # (PR 10), and GOLDFIVE_STEER_LEGACY_LADDER (PR 7).
+    # (PR 10), GOLDFIVE_STEER_LEGACY_LADDER (PR 7), and
+    # GOLDFIVE_STEER_PIN_ASSIGNED_TASK (PR 9).
     assert "GOLDFIVE_STEER_SIGNAL_CHANNEL" in applied
     assert "GOLDFIVE_STEER_SIGNAL_CHANNEL" not in pending
     assert "GOLDFIVE_PLAN_MODE" in applied
-    # The legacy arm's escape hatch is now APPLIED (PR 7 read it into from_env);
-    # nothing the bench carries is pending anymore.
+    assert "GOLDFIVE_PLAN_MODE" not in pending
+    # PR 9 promotion: ``GOLDFIVE_STEER_PIN_ASSIGNED_TASK`` is read by
+    # ``SteeringConfig.from_env``, so it is registered as APPLIED. The
+    # signal arm does NOT set it — the diet keeps the pin OFF by default
+    # under request_context — so its promotion is asserted via the
+    # registry here + the synthetic-arm test below, not the signal arm.
+    assert "GOLDFIVE_STEER_PIN_ASSIGNED_TASK" in KNOWN_STEER_ENV
+    # PR 7 promotion: the legacy arm's escape hatch is now APPLIED (read into
+    # from_env); with PR 9 also promoted, nothing the bench carries is pending.
     legacy_applied, legacy_pending = arm_flag_status(arms["legacy"])
     assert "GOLDFIVE_STEER_LEGACY_LADDER" in legacy_applied
     assert legacy_pending == []
     # The flags this build DOES consult are reported as applied.
     assert "GOLDFIVE_STEER_SIGNAL_TELEMETRY" in applied
     assert set(applied) <= KNOWN_STEER_ENV
+
+
+def test_pin_assigned_task_env_promoted_to_applied() -> None:
+    """PR 9 same-PR contract: an arm setting GOLDFIVE_STEER_PIN_ASSIGNED_TASK
+    reports it APPLIED (read by from_env), never pending."""
+    arm = Arm(
+        name="pin-escape-hatch",
+        kind="signal",
+        env={"GOLDFIVE_STEER_PIN_ASSIGNED_TASK": "1"},
+    )
+    applied, pending = arm_flag_status(arm)
+    assert "GOLDFIVE_STEER_PIN_ASSIGNED_TASK" in applied
+    assert "GOLDFIVE_STEER_PIN_ASSIGNED_TASK" not in pending
 
 
 async def test_unknown_flag_degrades_gracefully(tmp_path: Path) -> None:
