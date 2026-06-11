@@ -1441,9 +1441,9 @@ class PruneStaleSteerRule:
     --------------------------------------------
     A candidate is a ``Content`` whose text carries one of goldfive's
     OWN constants: the observer-note marker
-    (``goldfive.observer_notes.OBSERVER_NOTE_MARKER``) or the pinned
-    advisory footer (``goldfive.observer_notes.ADVISORY_FOOTER``). Both
-    constants live ONLY in :mod:`goldfive.observer_notes` (the #455
+    (``goldfive.observer_notes.OBSERVER_NOTE_MARKER_PREFIX``) or the
+    pinned advisory footer (``goldfive.observer_notes.ADVISORY_FOOTER``).
+    Both constants live ONLY in :mod:`goldfive.observer_notes` (the #455
     module) — the SAME place PR 6's channel renders them from — so the
     writer and this reader can never drift. Both are goldfive-minted
     strings, so matching is a stable-identity check, NOT an NL heuristic
@@ -1477,8 +1477,8 @@ class PruneStaleSteerRule:
     ---------------
     Full coverage of legacy plain-text notes arrives when AGENCY-
     PRESERVATION.md PR 6's channel wraps every delivered note in
-    ``goldfive.observer_notes.OBSERVER_NOTE_MARKER``; until then the
-    advisory-footer match already catches notes rendered through
+    ``goldfive.observer_notes.OBSERVER_NOTE_MARKER_PREFIX``; until then
+    the advisory-footer match already catches notes rendered through
     :mod:`goldfive.observer_notes`.
     """
 
@@ -1515,23 +1515,38 @@ class PruneStaleSteerRule:
 
     # ---- internals ----------------------------------------------------
 
-    @staticmethod
-    def _note_markers() -> tuple[str, str]:
-        """Return ``(advisory_footer, observer_note_marker)`` — both goldfive
-        constants, single-sourced from :mod:`goldfive.observer_notes`.
+    #: Literal fail-safe used ONLY if :mod:`goldfive.observer_notes` can't
+    #: be imported. The canonical source is
+    #: ``observer_notes.OBSERVER_NOTE_MARKER_PREFIX``; this mirror exists so
+    #: a (near-impossible) import failure of a core module degrades to
+    #: still-functioning detection rather than silently matching nothing.
+    #: observer_notes is the single source in every normal path.
+    _MARKER_FALLBACK = "[GOLDFIVE OBSERVER NOTE"
 
-        Returns ``("", "")`` if the module can't be imported so the rule
-        degrades to a clean no-op rather than raising into the callback.
+    @classmethod
+    def _note_markers(cls) -> tuple[str, str]:
+        """Return ``(advisory_footer, observer_note_marker_prefix)`` — both
+        goldfive constants, single-sourced from
+        :mod:`goldfive.observer_notes`.
+
+        On the (near-impossible) import failure of that core module, the
+        marker degrades to the literal fallback so detection keeps
+        functioning (fail-safe); the footer has no safe literal mirror
+        (it is long pinned prose) and degrades to empty — the marker
+        alone still catches PR-6-wrapped notes.
         """
         try:
             from goldfive.observer_notes import (  # noqa: PLC0415
                 ADVISORY_FOOTER,
-                OBSERVER_NOTE_MARKER,
+                OBSERVER_NOTE_MARKER_PREFIX,
             )
 
-            return (str(ADVISORY_FOOTER or ""), str(OBSERVER_NOTE_MARKER or ""))
+            return (
+                str(ADVISORY_FOOTER or ""),
+                str(OBSERVER_NOTE_MARKER_PREFIX or "") or cls._MARKER_FALLBACK,
+            )
         except Exception:  # noqa: BLE001
-            return ("", "")
+            return ("", cls._MARKER_FALLBACK)
 
     def _is_goldfive_note(self, content: Any, footer: str, marker: str) -> bool:
         text = _content_text(content)
