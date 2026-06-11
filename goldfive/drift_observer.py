@@ -3239,6 +3239,22 @@ class DriftObserver:
         session._agent_turns_since_goal_check = 0
         self._spawn_goal_drift_judge_background(session)
 
+    def _ledger_mode(self) -> bool:
+        """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 11. Read off the steerer's
+        typed config exactly as the pin path / reviser read it. Defensive:
+        any read failure resolves to forecast mode, so the goal-drift
+        judge stays on its pre-PR-11 binary/CRITICAL path by default.
+        """
+        try:
+            cfg = getattr(self._steerer, "_steering_config", None)
+            if cfg is None:
+                return False
+            return str(getattr(cfg, "plan_mode", "forecast")).strip().lower() == "ledger"
+        except Exception:  # noqa: BLE001
+            return False
+
     async def maybe_run_goal_drift_check(self, session: Session) -> None:
         """Run the trajectory-level GOAL_DRIFT judge once, cost-bounded.
 
@@ -3282,6 +3298,10 @@ class DriftObserver:
             model=self._steerer._goal_drift_model,
             call_llm=call_llm,
             current_task_id=session.current_task_id,
+            # AGENCY-PRESERVATION.md PR 11(a) — in ledger mode the judge
+            # uses the graduated (uncertain → WARNING / off_track →
+            # CRITICAL) verdict and reads the plan as the ledger.
+            graduated=self._ledger_mode(),
             sinks=self._steerer._sinks,
             run_id=session.run_id,
             session_id=session.id,
