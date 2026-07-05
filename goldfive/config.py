@@ -472,6 +472,19 @@ class ReasoningDriftConfig:
     looping_reasoning_similarity_threshold: float = 0.9
     reasoning_cluster_similarity_threshold: float = 0.75
     looping_reasoning_hash_window: int = 5
+    max_concurrent_judges: int = 3
+    """Per-steerer cap on concurrently RUNNING background reasoning-judge
+    LLM calls (judge-scheduling guards).
+
+    N agents thinking in the same event-loop tick used to fire N
+    parallel judge calls (each with a 16384-token output ceiling) at
+    the judge endpoint — which, under the default :func:`goldfive.wrap`
+    auto-detect, is the agent tree's OWN model. The cap bounds the
+    burst; requests beyond it queue on a per-steerer
+    ``asyncio.Semaphore`` and per-(agent, task) queued windows coalesce
+    onto the newest observation. Values below 1 are clamped to 1.
+    Env: ``GOLDFIVE_DRIFT_MAX_CONCURRENT_JUDGES``.
+    """
     fallback_to_content_when_no_reasoning: bool = False
     """Synthesize a reasoning signal from the response body on
     non-thinking models (goldfive#263).
@@ -548,6 +561,10 @@ class ReasoningDriftConfig:
             looping_reasoning_hash_window=_read_int_env(
                 "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
                 defaults.looping_reasoning_hash_window,
+            ),
+            max_concurrent_judges=_read_int_env(
+                "GOLDFIVE_DRIFT_MAX_CONCURRENT_JUDGES",
+                defaults.max_concurrent_judges,
             ),
             fallback_to_content_when_no_reasoning=_read_bool_env(
                 "GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT",

@@ -656,6 +656,15 @@ class ReasoningJudgeVerdict:
     # change ships in PR 3 (parser) + PR 4 (routing).
     classification: str = ""
     provenance: str = ""
+    # Judge-scheduling guards: measurement fields. ``judge_ran`` is
+    # True iff the judge LLM was actually dispatched (False on the
+    # empty-reasoning early return, the embedding-only path, and
+    # ``mode="off"``), so callers can distinguish "quiet-fail sentinel"
+    # (``judge_ran and not classification``) from "judge never ran".
+    # ``elapsed_ms`` mirrors the value stamped on the
+    # ``ReasoningJudgeInvoked`` event; 0 when ``judge_ran`` is False.
+    judge_ran: bool = False
+    elapsed_ms: int = 0
 
 
 # Map the judge's ``severity`` string to a :class:`DriftSeverity`. Missing
@@ -1289,6 +1298,8 @@ async def classify_reasoning_drift_with_focus(
         stated_intent=stated_intent_parsed,
         classification=classification_parsed,
         provenance=provenance_parsed,
+        judge_ran=True,
+        elapsed_ms=elapsed_ms,
     )
 
 

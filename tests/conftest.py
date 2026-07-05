@@ -382,6 +382,7 @@ _REASONING_DRIFT_ENV: dict[str, str] = {
     "looping_similarity": "GOLDFIVE_DRIFT_LOOPING_SIMILARITY",
     "cluster_similarity": "GOLDFIVE_DRIFT_CLUSTER_SIMILARITY",
     "looping_hash_window": "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
+    "max_concurrent_judges": "GOLDFIVE_DRIFT_MAX_CONCURRENT_JUDGES",
     "fallback_to_content": "GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT",
 }
 
