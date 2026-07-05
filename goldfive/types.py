@@ -1904,6 +1904,13 @@ class Session:
     # :class:`goldfive.control.ControlKind.GOLDFIVE_STEER` and
     # :class:`goldfive.control.ControlKind.GOLDFIVE_PAUSE_ESCALATE`.
     pending_nudges: list[str] = dataclasses.field(default_factory=list)
+    # Whether the current ``pending_nudges`` batch follows a plan
+    # revision that was actually installed (post-ABSORB enqueue with
+    # ``was_installed=True``). The overlay's replay path threads this
+    # into its framing header so the header only claims a plan revision
+    # when one really landed; Level 2 NUDGE dispatch never refines, so
+    # it never sets this. Reset when the drain consumes the batch.
+    pending_nudges_revision_installed: bool = False
     # Orchestration-level session state dict (goldfive#152). Goldfive
     # owns keys under the ``goldfive.*`` namespace — see
     # :mod:`goldfive.state_store` for the documented key names

@@ -211,11 +211,24 @@ _CORRECTIVE_TEMPLATES: dict[DriftKind, str] = {
     # itself is fine; the agent just needs a pointer at the next hand-
     # off. Includes ``{next_task_agent}`` so the coordinator can route
     # to the assignee directly rather than re-invoking the stuck agent.
+    # Only used when the referenced task really is COMPLETED at compose
+    # time; :func:`compose_corrective_user_message` falls back to
+    # :data:`_GOAL_DRIFT_NOT_COMPLETE_TEMPLATE` otherwise so the
+    # message never asserts a completion the plan does not show.
     DriftKind.GOAL_DRIFT: (
         "Task '{current_task_id}' is already complete. "
         "Please proceed to '{next_task_title}' via {next_task_agent}."
     ),
 }
+
+# GOAL_DRIFT variant for a referenced task that is NOT COMPLETED at
+# compose time (the judge can fire while the task is still PENDING /
+# RUNNING, or after it FAILED). A directive rather than a status
+# assertion, so it stays truthful whatever the task's actual state.
+_GOAL_DRIFT_NOT_COMPLETE_TEMPLATE: str = (
+    "Set task '{current_task_id}' aside for now. "
+    "Please proceed to '{next_task_title}' via {next_task_agent}."
+)
 
 
 def compose_corrective_user_message(
@@ -234,6 +247,12 @@ def compose_corrective_user_message(
     next_title = _next_pending_task_title(refined_plan) or "the next planned step"
     next_agent = _next_pending_task_agent(refined_plan) or "the next assigned agent"
     template = _CORRECTIVE_TEMPLATES.get(drift.kind)
+    if drift.kind is DriftKind.GOAL_DRIFT and not _task_is_completed(
+        refined_plan, drift.current_task_id
+    ):
+        # The default GOAL_DRIFT template asserts "already complete";
+        # only true when the plan shows the task terminal-COMPLETED.
+        template = _GOAL_DRIFT_NOT_COMPLETE_TEMPLATE
     if template is None:
         # Generic fallback for drift kinds that didn't get a
         # custom shape. Keep it tight and action-focused.
@@ -246,6 +265,16 @@ def compose_corrective_user_message(
         next_task_title=next_title,
         next_task_agent=next_agent,
     )
+
+
+def _task_is_completed(plan: Plan | None, task_id: str) -> bool:
+    """True iff ``task_id`` resolves on ``plan`` with COMPLETED status."""
+    if plan is None or not task_id:
+        return False
+    for t in plan.tasks:
+        if t.id == task_id:
+            return t.status is TaskStatus.COMPLETED
+    return False
 
 
 def _next_pending_task_title(plan: Plan | None) -> str:
@@ -1272,7 +1301,7 @@ class DefaultSteerer:
     def _should_inject(self) -> bool:
         """Return ``True`` iff the steerer should actually inject side effects.
 
-        Single named gate for the three steering injection points
+        Single named gate for the steering injection points
         (goldfive#254):
 
         * plan mutation in :meth:`PlanReviser._apply_revision`
@@ -1280,15 +1309,20 @@ class DefaultSteerer:
         * ``GOLDFIVE_STEER`` ControlMessage enqueue in
           :meth:`DriftObserver._dispatch_goldfive_steer_control`;
         * the plugin ``request_invocation_cancel`` flag in
-          :meth:`DriftObserver.request_invocation_cancel`.
+          :meth:`DriftObserver.request_invocation_cancel`;
+        * the ``session.pending_nudges`` enqueues in
+          :meth:`DriftObserver._dispatch_nudge` and the post-ABSORB
+          nudge handoff (goldfive#202) — the overlay drains the queue
+          into a synthetic user turn and re-invokes the tree, so the
+          enqueue is an injection, not an observation.
 
         ``False`` when :class:`~goldfive.config.SteeringConfig.observation_only`
         is in effect — detection still runs, ``planner.refine_steer``
         still runs, ``PlanRevised`` still emits (with ``dry_run=True``),
         but the in-flight invocation is not touched. Defined as a tiny
         helper rather than inlining ``not self._observation_only`` at
-        three sites so the intent is grep-able and a future fourth
-        injection point has a single gate to honour.
+        each site so the intent is grep-able and a future injection
+        point has a single gate to honour.
         """
         return not self._observation_only
 

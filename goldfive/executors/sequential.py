@@ -1357,9 +1357,35 @@ class SequentialExecutor(Executor):
                 and nudge_replays < self._MAX_NUDGE_REPLAYS
                 and _has_live_pending_or_running(session.plan or plan)
             ):
+                # goldfive#264-style observation-only carve-out
+                # (defense-in-depth). The primary gates are at the
+                # steerer's nudge enqueue sites (``_dispatch_nudge`` /
+                # the post-ABSORB handoff): under
+                # ``observation_only=True`` nothing is queued and this
+                # branch never sees a nudge. Custom steerer subclasses
+                # or direct ``session.pending_nudges`` writers would
+                # otherwise drive a goldfive-authored re-invocation of
+                # the tree here — exactly the enforcement
+                # ``observation_only`` exists to suppress. Discard the
+                # queue (never inject it later) and end the turn.
+                if getattr(steerer, "_observation_only", False):
+                    log.info(
+                        "SequentialExecutor._run_overlay: "
+                        "observation_only=True — would have replayed %d "
+                        "queued nudge(s) but observation_only is in "
+                        "effect; ending the turn without re-invoking",
+                        len(pending),
+                    )
+                    session.pending_nudges.clear()
+                    session.pending_nudges_revision_installed = False
+                    break
+                plan_revised = session.pending_nudges_revision_installed
                 session.pending_nudges.clear()
+                session.pending_nudges_revision_installed = False
                 nudge_replays += 1
-                current_user_input = self._compose_nudge_replay_message(pending)
+                current_user_input = self._compose_nudge_replay_message(
+                    pending, plan_revised=plan_revised
+                )
                 log.info(
                     "SequentialExecutor._run_overlay: nudge replay %d/%d "
                     "(nudges=%d) — re-invoking passthrough with queued nudge",
@@ -1937,7 +1963,9 @@ class SequentialExecutor(Executor):
             log.warning("SequentialExecutor: steerer.drift.observe(STEER) raised: %s", exc)
 
     @staticmethod
-    def _compose_nudge_replay_message(nudges: list[str]) -> str:
+    def _compose_nudge_replay_message(
+        nudges: list[str], *, plan_revised: bool = False
+    ) -> str:
         """Wrap queued nudges in a goldfive-authored framing header.
 
         Mirrors :meth:`_compose_steer_restart_message` but for the
@@ -1945,20 +1973,42 @@ class SequentialExecutor(Executor):
 
         * A header distinguishing this from a fresh user turn: the
           operator did not intervene; goldfive detected drift (e.g.
-          repeated ``report_task_completed`` calls), revised the plan,
-          and is directing the coordinator to the new next task.
+          repeated ``report_task_completed`` calls) and is directing
+          the coordinator to the next useful step.
         * Each queued nudge verbatim (short, action-focused strings
           composed by :func:`compose_corrective_user_message`).
-        * A brief instruction to continue with the revised plan.
+        * A brief instruction to continue.
+
+        ``plan_revised`` selects the framing: the header only claims a
+        plan revision when the steerer recorded that ``_apply_revision``
+        actually installed one
+        (``session.pending_nudges_revision_installed``); a Level 2
+        nudge with no refine, or a dry-run revision, gets a
+        course-correction header that asserts nothing about the plan.
 
         The scoped replay path is the carefully-narrowed successor to
         the blanket follow-up loop that goldfive#163 removed. #163's
         removal was correct when every PENDING task triggered a
         follow-up; this path only fires when the STEERER explicitly
-        queued a nudge in response to a tracked drift + plan
-        revision — not on every PENDING-at-invocation-end.
+        queued a nudge in response to a tracked drift — not on every
+        PENDING-at-invocation-end.
         """
         body = "\n".join(f"- {n}" for n in nudges if n)
+        if not plan_revised:
+            return (
+                "[GOLDFIVE COURSE CORRECTION]\n"
+                "\n"
+                "Goldfive detected drift during the prior turn. The "
+                "active plan is unchanged; the directive(s) below "
+                "redirect you to the next useful step.\n"
+                "\n"
+                f"{body}\n"
+                "\n"
+                "Notes:\n"
+                "- Continue the run with the current plan. Resume with "
+                "the next unfinished task.\n"
+                "- Do not repeat the prior attempt unchanged."
+            )
         return (
             "[GOLDFIVE PLAN REVISION — replace superseded task(s)]\n"
             "\n"
