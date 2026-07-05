@@ -563,6 +563,14 @@ class GoalDriftConfig:
         )
 
 
+#: Fallback wait budget, in milliseconds, for a ``report_awaiting_approval``
+#: call that omits ``timeout_ms`` (or passes ``<= 0``) while a control
+#: channel is attached. Referenced by
+#: :attr:`SteeringConfig.approval_default_timeout_ms` and by the handler's
+#: fallback when the steerer carries no :class:`SteeringConfig` at all.
+DEFAULT_APPROVAL_TIMEOUT_MS: int = 600_000
+
+
 @dataclasses.dataclass
 class SteeringConfig:
     """Drift → steer promotion policy (goldfive-steer-unification).
@@ -679,6 +687,19 @@ class SteeringConfig:
     #: ``Task.discovery_identity_hash``, ``DelegationObserved.tool_args_json``)
     #: are always available regardless of this flag.
     descriptive_growth_enabled: bool = False
+    #: Wait budget, in milliseconds, substituted when a
+    #: ``report_awaiting_approval`` call omits ``timeout_ms`` (or passes
+    #: ``<= 0``) and a control channel is attached. Historically that
+    #: path awaited the APPROVE / REJECT waiter with no bound, so an
+    #: operator who never dispatched a decision hung the tool call — and
+    #: the run — forever (no invocation wall clock covers tool waits).
+    #: On expiry the handler returns ``decision="timeout"`` and emits a
+    #: ``HUMAN_INTERVENTION_REQUIRED`` WARNING drift so operators see
+    #: the unresolved approval. An explicit positive ``timeout_ms`` from
+    #: the agent still wins; a non-positive value here falls back to
+    #: :data:`DEFAULT_APPROVAL_TIMEOUT_MS`.
+    #: Env: ``GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS``.
+    approval_default_timeout_ms: int = DEFAULT_APPROVAL_TIMEOUT_MS
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -698,6 +719,9 @@ class SteeringConfig:
         * ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES`` — comma-separated rule
           names (goldfive#397). Empty / unset → ``None`` (editor unwired).
           Example: ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES=prune_cancelled_reasoning``.
+        * ``GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS`` — positive int
+          (milliseconds); non-positive / non-integer values fall back
+          to the default.
         """
         defaults = cls()
         raw_rules = os.environ.get("GOLDFIVE_STEER_CONTEXT_EDITOR_RULES", "").strip()
@@ -722,6 +746,10 @@ class SteeringConfig:
             descriptive_growth_enabled=_read_bool_env(
                 "GOLDFIVE_STEER_DESCRIPTIVE_GROWTH",
                 defaults.descriptive_growth_enabled,
+            ),
+            approval_default_timeout_ms=_read_int_env(
+                "GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS",
+                defaults.approval_default_timeout_ms,
             ),
         )
 

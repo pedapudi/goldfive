@@ -13,7 +13,9 @@ framework wants (ADK ``FunctionTool``, Claude Agent SDK tool blocks, …).
 The eighth tool, ``report_awaiting_approval``, is the task-level half of
 the human-in-the-loop approval flow described in
 ``docs/design/APPROVAL.md``. Its handler blocks the calling tool-call
-until the control dispatcher lands an ``APPROVE`` or ``REJECT``.
+until the control dispatcher lands an ``APPROVE`` or ``REJECT`` (with a
+finite timeout, and an immediate degraded ack when no control channel
+is bound).
 
 Package structure (post-split, Wave A piece 3):
 
