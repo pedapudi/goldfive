@@ -718,7 +718,7 @@ Intervention ladder (goldfive#142):
 | 2 | NUDGE | Queue a soft follow-up on `session.pending_nudges`; overlay loop picks it up at the next invocation boundary. |
 | 3 | CANCEL_REINVOKE | Refine; install revised plan; dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel so the executor cancels the in-flight invoke and restarts with a `[GOLDFIVE STEERING CONTROL …]` framed corrective. (Phase 2 of #246.) |
 | 4 | PAUSE_ESCALATE | Emit `HUMAN_INTERVENTION_REQUIRED`; dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel so the executor's pre-task loop blocks for operator intervention. (Phase 2 of #246.) |
-| 5 | TERMINATE | Run-level abort (reserved for unhandled Level 4 timeouts). |
+| 5 | TERMINATE | Pause-with-deadline: same dispatch as Level 4 but always deadline-bounded (`SteeringConfig.pause_escalate_deadline_s`, or 600 s when unset); on expiry the executor cancels non-terminal tasks and emits `RunAborted`. |
 
 Mapping from `(drift_kind, severity, occurrence_count)` to level lives
 in `DefaultSteerer._ladder_level_for`.

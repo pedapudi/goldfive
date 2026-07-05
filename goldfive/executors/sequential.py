@@ -37,6 +37,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 import warnings
 from typing import TYPE_CHECKING, Any
 
@@ -50,8 +51,10 @@ from goldfive.events import (
 )
 from goldfive.executors._control import (
     _ControlCancelled,
+    abort_expired_pause,
     dispatch_control,
     drain_controls,
+    pause_deadline_s,
 )
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
@@ -1702,6 +1705,13 @@ class SequentialExecutor(Executor):
         (Phase 2 of the path-duality fix) — that message sets
         ``request_pause=True`` so the executor's pause loop is
         indistinguishable from an explicit user-initiated PAUSE.
+
+        A goldfive pause whose payload carries ``deadline_s``
+        (``SteeringConfig.pause_escalate_deadline_s``, or the Level-5
+        TERMINATE fallback) bounds the wait: on expiry the run aborts
+        via :func:`abort_expired_pause` (non-terminal tasks CANCELLED,
+        ``RunAborted`` with the escalation lineage). Operator-issued
+        PAUSE carries no deadline and blocks unbounded as before.
         """
         if control is None:
             # Without a control channel the ladder-initiated pause has
@@ -1720,6 +1730,7 @@ class SequentialExecutor(Executor):
         cancel_prefix = ""
         steer_msg: object | None = None
         paused = False
+        pause_msg: object | None = None
         for o in outcomes:
             if o.cancel_run:
                 cancel_run = True
@@ -1730,8 +1741,11 @@ class SequentialExecutor(Executor):
                 steer_msg = o.steer_message
             if o.request_pause:
                 paused = True
+                if o.goldfive_pause_message is not None:
+                    pause_msg = o.goldfive_pause_message
             if o.request_resume:
                 paused = False
+                pause_msg = None
 
         if cancel_run:
             # goldfive#205: stash the structured cancel prefix on the
@@ -1742,9 +1756,31 @@ class SequentialExecutor(Executor):
             raise _ControlCancelled(cancel_reason or "cancelled by control")
 
         # Honour PAUSE by blocking on the channel until a RESUME /
-        # CANCEL / STEER arrives.
+        # CANCEL / STEER arrives — or, for a deadline-carrying
+        # goldfive pause, until the deadline expires.
+        deadline_s = pause_deadline_s(pause_msg)
+        deadline_at = time.monotonic() + deadline_s if deadline_s is not None else None
         while paused:
-            msg = await control.receive()
+            if deadline_at is None:
+                msg = await control.receive()
+            else:
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    await abort_expired_pause(
+                        session=session,
+                        steerer=steerer,
+                        pause_msg=pause_msg,
+                        deadline_s=deadline_s or 0.0,
+                    )
+                try:
+                    msg = await asyncio.wait_for(control.receive(), timeout=remaining)
+                except TimeoutError:
+                    await abort_expired_pause(
+                        session=session,
+                        steerer=steerer,
+                        pause_msg=pause_msg,
+                        deadline_s=deadline_s or 0.0,
+                    )
             if msg is None:
                 # Channel closed — treat as resume so we don't wedge.
                 paused = False
@@ -1780,12 +1816,21 @@ class SequentialExecutor(Executor):
                 steer_msg = outcome.goldfive_steer_message
                 paused = False
             # goldfive#404: GOLDFIVE_PAUSE_ESCALATE while already paused
-            # is a no-op — re-entering a pause state we're already in
-            # would only re-arm the same wait. The ack has already been
-            # published; keep blocking on the channel for a real
-            # RESUME / CANCEL / STEER. (The overlay path's
-            # ``goldfive_pause`` branch cancels the in-flight invoke and
-            # returns; here there is no in-flight invoke to cancel.)
+            # does not re-enter the pause state — but a deadline it
+            # carries is adopted (tightening only). This is how the
+            # ladder's TERMINATE row lands while the executor is
+            # already parked on an unbounded Level-4 pause: the repeat
+            # escalation's deadline converts the wait into a bounded
+            # one. The ack has already been published; keep blocking
+            # on the channel for a real RESUME / CANCEL / STEER.
+            if outcome.goldfive_pause_message is not None:
+                new_deadline_s = pause_deadline_s(outcome.goldfive_pause_message)
+                if new_deadline_s is not None:
+                    new_deadline_at = time.monotonic() + new_deadline_s
+                    if deadline_at is None or new_deadline_at < deadline_at:
+                        deadline_s = new_deadline_s
+                        deadline_at = new_deadline_at
+                        pause_msg = outcome.goldfive_pause_message
             if outcome.rewind_task_id:
                 paused = False
 

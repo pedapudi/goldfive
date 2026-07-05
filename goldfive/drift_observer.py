@@ -171,6 +171,14 @@ if TYPE_CHECKING:
 # through :mod:`goldfive.steerer` (avoids a circular import).
 ReflectiveCallLLM = Callable[[str, str, str], Awaitable[str]]
 
+# Fallback deadline (seconds) for the Level-5 TERMINATE pause when
+# ``SteeringConfig.pause_escalate_deadline_s`` is unset. TERMINATE must
+# terminate by definition — an unbounded pause would silently degrade
+# it back to Level 4 (the pre-fix behaviour). Conservative: long enough
+# for an on-call operator to intervene, short enough that unattended
+# deployments do not wedge indefinitely.
+DEFAULT_TERMINATE_PAUSE_DEADLINE_S: float = 600.0
+
 log = logging.getLogger(__name__)
 # Wave C bucket 3b/3c post-cleanup: the module previously kept a
 # sibling ``_steerer_log = logging.getLogger("goldfive.steerer")``
@@ -3508,10 +3516,14 @@ class DriftObserver:
             await self._dispatch_pause_escalate(drift, session)
             return
         if level is InterventionLevel.TERMINATE:
-            # Level 5 is reserved for a future Runner-side timeout on a
-            # stuck Level 4 pause. Today we fall back to PAUSE_ESCALATE
-            # so no code path silently drops the drift.
-            await self._dispatch_pause_escalate(drift, session)
+            # Level 5: pause-with-deadline. Same channel dispatch as
+            # Level 4, but the payload always carries a ``deadline_s``
+            # (configured value, or DEFAULT_TERMINATE_PAUSE_DEADLINE_S
+            # when unset) so the executor's pause wait aborts the run
+            # instead of blocking forever. Pre-fix this silently
+            # degraded to another PAUSE_ESCALATE, making the
+            # (PAUSE_ESCALATE, TERMINATE) ladder rows identical.
+            await self._dispatch_pause_escalate(drift, session, terminate=True)
             return
         # ABSORB and CANCEL_REINVOKE both call ``planner.refine`` and
         # install the revised plan. CANCEL_REINVOKE additionally queues
@@ -4064,12 +4076,31 @@ class DriftObserver:
         )
         return landed
 
+    def _pause_escalate_deadline_s(self) -> float | None:
+        """Return the configured pause-escalation deadline, or ``None``.
+
+        Reads :attr:`~goldfive.config.SteeringConfig.pause_escalate_deadline_s`
+        off the bound steerer's config. Non-positive values are treated
+        as unset so a misconfigured deadline never produces an
+        immediately-expired pause.
+        """
+        cfg = getattr(self._steerer, "_steering_config", None)
+        raw = getattr(cfg, "pause_escalate_deadline_s", None) if cfg is not None else None
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     async def _dispatch_goldfive_pause_control(
         self,
         drift: DriftEvent,
         session: Session,
         *,
         reason: str,
+        terminate: bool = False,
     ) -> bool:
         """Mint and dispatch a ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessage.
 
@@ -4078,6 +4109,14 @@ class DriftObserver:
         every Level-4 / progress-stall / handler-exhausted escalation
         site so the executor's pre-task loop blocks via the same
         channel state as a user-issued ``PAUSE``.
+
+        The payload carries the escalation lineage (``drift_kind``,
+        ``ladder_level``) and — when a deadline applies — ``deadline_s``,
+        which bounds the executor's pause wait. Level 4 uses the
+        configured :meth:`_pause_escalate_deadline_s` (``None`` = wait
+        forever, the historical behaviour). ``terminate=True`` (Level 5)
+        always attaches a deadline: the configured value when set,
+        otherwise :data:`DEFAULT_TERMINATE_PAUSE_DEADLINE_S`.
 
         Returns ``True`` on successful dispatch, ``False`` on no
         bound channel / send failure.
@@ -4121,21 +4160,29 @@ class DriftObserver:
                 reason,
             )
             return False
+        deadline_s = self._pause_escalate_deadline_s()
+        if terminate and deadline_s is None:
+            deadline_s = DEFAULT_TERMINATE_PAUSE_DEADLINE_S
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "drift_id": str(getattr(drift, "id", "") or ""),
+            "drift_kind": drift.kind.value,
+            "ladder_level": "terminate" if terminate else "pause_escalate",
+        }
+        if deadline_s is not None:
+            payload["deadline_s"] = deadline_s
         msg = ControlMessage(
             kind=ControlKind.GOLDFIVE_PAUSE_ESCALATE,
-            payload={
-                "reason": reason,
-                "drift_id": str(getattr(drift, "id", "") or ""),
-                "drift_kind": drift.kind.value,
-            },
+            payload=payload,
         )
         landed = await self._steerer._dispatch_goldfive_control(msg)
         log.debug(
             "DefaultSteerer._dispatch_goldfive_pause_control: "
-            "kind=%s task=%s landed=%s reason=%r",
+            "kind=%s task=%s landed=%s deadline_s=%s reason=%r",
             drift.kind.value,
             drift.current_task_id or "-",
             landed,
+            deadline_s,
             reason,
         )
         return landed
@@ -4144,6 +4191,8 @@ class DriftObserver:
         self,
         drift: DriftEvent,
         session: Session,
+        *,
+        terminate: bool = False,
     ) -> None:
         """Level 4 dispatch: emit HUMAN_INTERVENTION_REQUIRED and pause.
 
@@ -4157,6 +4206,11 @@ class DriftObserver:
         was synonymous with the channel signal but parallel-tracked
         from the user-PAUSE path.
 
+        ``terminate=True`` is the Level 5 variant: identical dispatch,
+        but the pause always carries a hard deadline (see
+        :meth:`_dispatch_goldfive_pause_control`) so the executor
+        aborts the run when no operator intervenes in time.
+
         Emits a CRITICAL ``HUMAN_INTERVENTION_REQUIRED`` drift so
         sinks / the UI can surface the pause and let the user decide
         what to do.
@@ -4167,14 +4221,16 @@ class DriftObserver:
         a second time -- the original DriftDetected emission at the
         top of :meth:`handle_drift` already carried the signal.
         """
+        label = "terminate" if terminate else "pause_escalate"
         await self._dispatch_goldfive_pause_control(
             drift,
             session,
             reason=(
-                f"pause_escalate from {drift.kind.value}: {drift.detail}"
+                f"{label} from {drift.kind.value}: {drift.detail}"
                 if drift.detail
-                else f"pause_escalate from {drift.kind.value}"
+                else f"{label} from {drift.kind.value}"
             ),
+            terminate=terminate,
         )
         if drift.kind is DriftKind.HUMAN_INTERVENTION_REQUIRED:
             # Already emitted at the top of _handle_drift; just pause.

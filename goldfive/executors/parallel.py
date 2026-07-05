@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import warnings
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -41,8 +42,10 @@ from goldfive.events import (
 from goldfive.executors._control import (
     ControlOutcome,
     _ControlCancelled,
+    abort_expired_pause,
     dispatch_control,
     drain_controls,
+    pause_deadline_s,
 )
 from goldfive.protocols import (
     AgentAdapter,
@@ -1162,6 +1165,13 @@ class ParallelDAGExecutor:
         path-duality fix) — that message sets ``request_pause=True``
         so the executor's pause loop is indistinguishable from an
         explicit user-initiated PAUSE.
+
+        A goldfive pause whose payload carries ``deadline_s``
+        (``SteeringConfig.pause_escalate_deadline_s``, or the Level-5
+        TERMINATE fallback) bounds the wait: on expiry the run aborts
+        via :func:`abort_expired_pause` (non-terminal tasks CANCELLED,
+        ``RunAborted`` with the escalation lineage). Operator-issued
+        PAUSE carries no deadline and blocks unbounded as before.
         """
         if control is None:
             # Without a control channel the ladder-initiated pause has
@@ -1179,6 +1189,7 @@ class ParallelDAGExecutor:
         cancel_run = False
         steer_msg: object | None = None
         paused = False
+        pause_msg: object | None = None
         cancel_prefix = ""
         for o in outcomes:
             if o.cancel_run:
@@ -1190,8 +1201,11 @@ class ParallelDAGExecutor:
                 steer_msg = o.steer_message
             if o.request_pause:
                 paused = True
+                if o.goldfive_pause_message is not None:
+                    pause_msg = o.goldfive_pause_message
             if o.request_resume:
                 paused = False
+                pause_msg = None
 
         if cancel_run:
             # goldfive#205: stash structured cancel prefix for downstream
@@ -1200,8 +1214,29 @@ class ParallelDAGExecutor:
                 session._last_cancel_reason_prefix = cancel_prefix
             raise _ControlCancelled(cancel_reason or "cancelled by control")
 
+        deadline_s = pause_deadline_s(pause_msg)
+        deadline_at = time.monotonic() + deadline_s if deadline_s is not None else None
         while paused:
-            msg = await control.receive()
+            if deadline_at is None:
+                msg = await control.receive()
+            else:
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    await abort_expired_pause(
+                        session=session,
+                        steerer=steerer,
+                        pause_msg=pause_msg,
+                        deadline_s=deadline_s or 0.0,
+                    )
+                try:
+                    msg = await asyncio.wait_for(control.receive(), timeout=remaining)
+                except TimeoutError:
+                    await abort_expired_pause(
+                        session=session,
+                        steerer=steerer,
+                        pause_msg=pause_msg,
+                        deadline_s=deadline_s or 0.0,
+                    )
             if msg is None:
                 paused = False
                 break
@@ -1219,6 +1254,18 @@ class ParallelDAGExecutor:
             if outcome.steer_message is not None:
                 steer_msg = outcome.steer_message
                 paused = False
+            # A GOLDFIVE_PAUSE_ESCALATE while already paused adopts a
+            # tighter deadline (mirrors the sequential executor): this
+            # is how a TERMINATE escalation lands on an unbounded
+            # Level-4 pause.
+            if outcome.goldfive_pause_message is not None:
+                new_deadline_s = pause_deadline_s(outcome.goldfive_pause_message)
+                if new_deadline_s is not None:
+                    new_deadline_at = time.monotonic() + new_deadline_s
+                    if deadline_at is None or new_deadline_at < deadline_at:
+                        deadline_s = new_deadline_s
+                        deadline_at = new_deadline_at
+                        pause_msg = outcome.goldfive_pause_message
             if outcome.rewind_task_id:
                 paused = False
 

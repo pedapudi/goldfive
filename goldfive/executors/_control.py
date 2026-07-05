@@ -53,6 +53,11 @@ members and their raw string equivalents — ``ControlKind`` is a
   ``session.paused_for_human_intervention`` flag. Cancels in-flight
   work and parks the run in the same blocking wait as a user-issued
   ``PAUSE`` — the next ``RESUME`` / ``CANCEL`` / ``STEER`` unwinds it.
+  The payload may carry ``deadline_s`` (``SteeringConfig.
+  pause_escalate_deadline_s``, or the built-in TERMINATE fallback):
+  when present the executor's pause wait is bounded and expiry aborts
+  the run (non-terminal tasks CANCELLED + ``RunAborted`` carrying the
+  escalation lineage) instead of blocking forever.
 """
 
 from __future__ import annotations
@@ -60,9 +65,10 @@ from __future__ import annotations
 import dataclasses
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from goldfive.types import (
+    TERMINAL_TASK_STATUSES,
     Session,
     Task,
     TaskStatus,
@@ -81,9 +87,11 @@ log = logging.getLogger(__name__)
 __all__ = [
     "ControlOutcome",
     "_ControlCancelled",
+    "abort_expired_pause",
     "build_status_snapshot",
     "dispatch_control",
     "drain_controls",
+    "pause_deadline_s",
 ]
 
 
@@ -459,6 +467,70 @@ async def drain_controls(
         except Exception as exc:  # noqa: BLE001
             log.debug("drain_controls: channel.ack raised: %s", exc)
     return outcomes
+
+
+def pause_deadline_s(msg: object) -> float | None:
+    """Return the ``deadline_s`` carried by a GOLDFIVE_PAUSE_ESCALATE payload.
+
+    ``None`` when the message is absent, carries no deadline, or the
+    value is non-numeric / non-positive — i.e. the pause blocks
+    unbounded, the historical behaviour.
+    """
+    payload = getattr(msg, "payload", None) or {}
+    try:
+        value = float(payload.get("deadline_s"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+async def abort_expired_pause(
+    *,
+    session: Session,
+    steerer: Steerer,
+    pause_msg: object,
+    deadline_s: float,
+) -> NoReturn:
+    """Abort the run after a pause-escalation deadline expired.
+
+    Transitions every non-terminal task to CANCELLED (mirroring the
+    operator-CANCEL cascade; ``mark_task_cancelled`` cascades to
+    downstream tasks and no-ops on already-terminal ones), then raises
+    :class:`_ControlCancelled` so the executor's existing abort path
+    drains background steerer/judge tasks and emits ``RunAborted``.
+    The abort reason carries the escalation lineage (originating drift
+    kind + ladder level) from the pause message payload.
+    """
+    payload = getattr(pause_msg, "payload", None) or {}
+    drift_kind = str(payload.get("drift_kind", "") or "unknown")
+    ladder_level = str(payload.get("ladder_level", "") or "pause_escalate")
+    reason = (
+        f"pause escalation deadline expired after {deadline_s:g}s with no "
+        f"operator action (drift_kind={drift_kind}, ladder_level={ladder_level})"
+    )
+    log.warning("pause-escalation deadline expired; aborting run: %s", reason)
+    plan = session.plan
+    live_ids = (
+        [t.id for t in plan.tasks if t.id and t.status not in TERMINAL_TASK_STATUSES]
+        if plan is not None
+        else []
+    )
+    for task_id in live_ids:
+        try:
+            await steerer.transition(
+                task_id,
+                TaskStatus.CANCELLED,
+                detail=reason,
+                cancel_reason=f"run_aborted:pause_escalate_deadline:{drift_kind}",
+                session=session,
+            )
+        except Exception as exc:  # noqa: BLE001 — abort must not wedge on a sink
+            log.debug(
+                "abort_expired_pause: cancelled transition raised for task=%s: %s",
+                task_id,
+                exc,
+            )
+    raise _ControlCancelled(reason)
 
 
 async def _resolve_approval(
