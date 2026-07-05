@@ -65,6 +65,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+from goldfive.steerer import steering_is_active
+
 if TYPE_CHECKING:
     from goldfive.types import Session
 
@@ -92,25 +94,17 @@ class PromptShaper:
     def should_inject(steerer: Any) -> bool:
         """Return True when prompt-shaping injections are permitted.
 
-        Reads ``steerer._observation_only`` and returns its logical
-        complement: under strict-passive (``observation_only=True``)
-        injections are suppressed; otherwise the active-steering path
-        runs.
-
-        Tolerant of ``steerer is None`` and steerers that don't carry
-        a ``_observation_only`` attribute — both cases return ``True``
-        so pre-#271 paths and minimal test stubs (which never set up a
-        steerer) keep working byte-identically.
-
-        This is the single source of truth the four inject methods
-        consult. Mirrors :meth:`DefaultSteerer._should_inject` in
-        intent — that predicate gates enforcement-side dispatch (steer,
-        pause-escalate, cancel); this one gates prompt-shape
-        injections.
+        Delegates to :func:`goldfive.steerer.steering_is_active` — the
+        one kill-switch predicate for
+        :class:`~goldfive.config.SteeringConfig.observation_only`.
+        ``steerer is None`` and steerers that don't expose
+        :meth:`~goldfive.steerer.DefaultSteerer.is_active_steering`
+        resolve to ``False`` (injections suppressed): passive is the
+        fail-safe direction. Pre-refactor this site defaulted ACTIVE on
+        a missing attribute; the flip to the passive fallback is
+        deliberate.
         """
-        if steerer is None:
-            return True
-        return not bool(getattr(steerer, "_observation_only", False))
+        return steering_is_active(steerer)
 
     # ----------------------------------------------------------------
     # Site 1 — conversational follow-up wrap
@@ -236,9 +230,9 @@ class PromptShaper:
 
         ``session_context`` carries the live
         :class:`~goldfive.adapters._adk_plugin.SessionContext` from the
-        plugin so the gate can reach the steerer. May be ``None`` on
-        unit-test stubs that never wire one up — those paths default
-        to the active-steering branch (pre-#271 behaviour).
+        plugin so the gate can reach the steerer. ``None`` (or a
+        context without a steerer) resolves passive — injections
+        suppressed, the fail-safe direction.
         """
         steerer = getattr(session_context, "steerer", None) if session_context is not None else None
         if not self.should_inject(steerer):

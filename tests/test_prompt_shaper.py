@@ -79,22 +79,23 @@ def test_should_inject_false_when_steerer_passive() -> None:
     assert PromptShaper.should_inject(_make_steerer(observation_only=True)) is False
 
 
-def test_should_inject_true_when_steerer_is_none() -> None:
-    """Defensive: a missing steerer (unit-test stubs without a wired
-    DefaultSteerer) must not flip the gate closed — pre-#271 paths
-    keep working byte-identically."""
-    assert PromptShaper.should_inject(None) is True
+def test_should_inject_false_when_steerer_is_none() -> None:
+    """A missing steerer resolves passive — injections suppressed.
+
+    Passive is the documented fail-safe direction of
+    :func:`goldfive.steerer.steering_is_active` (pre-refactor this
+    site defaulted ACTIVE on a missing steerer)."""
+    assert PromptShaper.should_inject(None) is False
 
 
-def test_should_inject_true_when_steerer_lacks_attribute() -> None:
-    """A duck-typed steerer that doesn't carry ``_observation_only``
-    (custom impls predating #254) returns True so pre-#254 paths keep
-    working."""
+def test_should_inject_false_when_steerer_lacks_predicate() -> None:
+    """A duck-typed steerer without ``is_active_steering`` resolves
+    passive — same fail-safe direction as a missing steerer."""
 
     class _LegacySteerer:
         pass
 
-    assert PromptShaper.should_inject(_LegacySteerer()) is True
+    assert PromptShaper.should_inject(_LegacySteerer()) is False
 
 
 # ---------------------------------------------------------------------------
@@ -338,12 +339,10 @@ def test_inject_runtime_tools_hint_byte_identical_when_active() -> None:
     assert _RUNTIME_TOOLS_HINT_END in expected
 
 
-def test_inject_runtime_tools_hint_gate_open_with_no_session_context() -> None:
-    """Without a ``SessionContext`` (test stubs) the gate defaults to
-    open — the inject runs. This preserves the pre-#271 paths that
-    drove the helper without ever wiring a steerer."""
-    from goldfive.adapters._adk_plugin import _RUNTIME_TOOLS_HINT_PREFIX
-
+def test_inject_runtime_tools_hint_gate_closed_with_no_session_context() -> None:
+    """Without a ``SessionContext`` (no reachable steerer) the gate
+    resolves passive — the inject is suppressed. Fail-safe direction of
+    :func:`goldfive.steerer.steering_is_active`."""
     shaper = PromptShaper()
     sess = Session(
         run_id="r-test",
@@ -372,8 +371,7 @@ def test_inject_runtime_tools_hint_gate_open_with_no_session_context() -> None:
         session_context=None,
     )
 
-    assert llm_request.append_calls, "inject must run when no SessionContext"
-    assert _RUNTIME_TOOLS_HINT_PREFIX in llm_request.append_calls[0][0]
+    assert llm_request.append_calls == [], "inject must be suppressed without a steerer"
 
 
 # ---------------------------------------------------------------------------

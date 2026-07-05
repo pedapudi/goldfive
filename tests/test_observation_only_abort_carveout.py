@@ -49,8 +49,8 @@ from goldfive.types import (
 
 # ---------------------------------------------------------------------------
 # Stubs (mirror tests/test_sequential_executor.py shapes; the steerer
-# carries the ``_observation_only`` attribute the executor's carve-out
-# reads).
+# exposes the ``is_active_steering`` predicate the executor's carve-out
+# resolves via ``steering_is_active``).
 # ---------------------------------------------------------------------------
 
 
@@ -78,10 +78,9 @@ class RecordingSink:
 
 
 class StubSteerer:
-    """Minimal Steerer that exposes ``_observation_only`` the way the
+    """Minimal Steerer that exposes ``is_active_steering`` the way the
     real :class:`~goldfive.steerer.DefaultSteerer` does (the executor's
-    carve-out reads the private attribute directly so the goldfive#260
-    patch stays small).
+    carve-out resolves it via ``steering_is_active``).
     """
 
     def __init__(self, *, observation_only: bool = False) -> None:
@@ -91,6 +90,9 @@ class StubSteerer:
         self.observed: list[Any] = []
         self.transitions: list[tuple[str, TaskStatus]] = []
         self.emitted_plan_revised: list[Any] = []
+
+    def is_active_steering(self) -> bool:
+        return not self._observation_only
 
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks

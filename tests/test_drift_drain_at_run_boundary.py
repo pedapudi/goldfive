@@ -63,6 +63,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.executors.sequential import (  # noqa: E402
     SequentialExecutor,
     _drain_steerer_at_run_boundary,
@@ -515,7 +516,7 @@ async def test_executor_run_aborted_drains_in_flight_drift_end_to_end() -> None:
     from goldfive.results import InvocationResult
 
     slow_planner = _SlowPlanner(delay=30.0)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     sink = _ListSink()
 
     class _Adapter:

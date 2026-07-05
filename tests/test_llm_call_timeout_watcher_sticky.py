@@ -45,6 +45,7 @@ from goldfive.adapters._adk_plugin import (  # noqa: E402
     SessionContext,
     make_adk_plugin,
 )
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     CancellationRequest,
@@ -172,7 +173,9 @@ def _make_plan() -> Plan:
 def _make_plugin_with_ctx() -> tuple[Any, _ListSink]:
     plugin = make_adk_plugin(host_agent_name="coordinator")
     sink = _ListSink()
-    steerer = DefaultSteerer()
+    # Explicit active mode: the watcher's cancel-flag write under test
+    # is suppressed under the shipped observation-only default.
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=None)
     session = Session(
         run_id="run-test",

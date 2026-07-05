@@ -31,20 +31,27 @@ from goldfive.prompt_shaper import PromptShaper
 from goldfive.types import Plan, Session, Task, TaskStatus
 
 
+class _ActiveSteerer:
+    def is_active_steering(self) -> bool:
+        return True
+
+
 def _inject_runtime_tools_hint(
     *, callback_context: Any, llm_request: Any, session: Any
 ) -> None:
     """Wave B1 shim: forward to :meth:`PromptShaper.inject_runtime_tools_hint`.
 
-    These unit tests drive the helper without a ``SessionContext`` so the
-    gate falls back to "inject" (steerer is None → ``should_inject`` →
-    True) — exactly the pre-refactor behaviour.
+    Pins an explicit active-steerer stub: with no reachable steerer the
+    ``steering_is_active`` gate resolves passive and the injection under
+    test would be suppressed.
     """
+    from types import SimpleNamespace
+
     PromptShaper().inject_runtime_tools_hint(
         callback_context=callback_context,
         llm_request=llm_request,
         session=session,
-        session_context=None,
+        session_context=SimpleNamespace(steerer=_ActiveSteerer()),
     )
 
 # ---------------------------------------------------------------------------
@@ -487,7 +494,10 @@ async def test_before_model_callback_injects_runtime_tools_hint() -> None:
     session = _make_session(tasks)
     ctx = SessionContext(
         session=session,
-        steerer=None,
+        # Explicit active mode: the hint injection rides the
+        # ``steering_is_active`` gate and a missing steerer resolves
+        # passive.
+        steerer=_ActiveSteerer(),
         task=tasks[0],
         tool_handlers={},
         host_agent_name="coordinator",

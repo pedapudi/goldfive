@@ -149,11 +149,14 @@ async def test_idempotent_ack_includes_plan_state_in_active_mode() -> None:
     assert second["plan_state"]["next_pending"]["id"] == "t2"
 
 
-def test_rendering_helpers_default_to_directive_shape_without_steerer() -> None:
-    # Legacy callers / stubs that pass no steerer keep the pre-gate
-    # shape — same tolerance as PromptShaper.should_inject.
+def test_rendering_helpers_suppress_directive_shape_without_steerer() -> None:
+    # No reachable steerer resolves passive (the fail-safe direction of
+    # ``steering_is_active``): the goldfive-authored ``plan_state``
+    # directive is suppressed, leaving the factual echo only.
     session = _session()
     out = _directive_ack(session=session, task_id="t1", new_status=TaskStatus.COMPLETED)
-    assert "plan_state" in out
+    assert "plan_state" not in out
+    assert out["acknowledged"] is True
     idem = _idempotent_response(TaskStatus.COMPLETED, session=session, task_id="t1")
-    assert "plan_state" in idem
+    assert "plan_state" not in idem
+    assert idem["idempotent"] is True

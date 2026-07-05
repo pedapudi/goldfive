@@ -22,6 +22,11 @@ from goldfive.adapters._adk_plugin import (  # noqa: E402
 from goldfive.prompt_shaper import PromptShaper  # noqa: E402
 
 
+class _ActiveSteerer:
+    def is_active_steering(self) -> bool:
+        return True
+
+
 async def _inject_goldfive_planner_instruction(
     *, callback_context: Any, llm_request: Any
 ) -> None:
@@ -31,14 +36,16 @@ async def _inject_goldfive_planner_instruction(
     The pre-refactor signature took only ``(callback_context,
     llm_request)``; the shaper additionally accepts a
     ``session_context`` to read the steerer. These tests don't exercise
-    the strict-passive gate (they predate it and pass no SessionContext),
-    so we pin ``session_context=None`` — the gate then defaults to
-    "inject" (matches pre-refactor behaviour byte-identically).
+    the strict-passive gate, so we pin an explicit active-steerer stub —
+    with no reachable steerer the gate resolves passive and the
+    injection under test would be suppressed.
     """
+    from types import SimpleNamespace
+
     await PromptShaper().inject_goldfive_planner_instruction(
         callback_context=callback_context,
         llm_request=llm_request,
-        session_context=None,
+        session_context=SimpleNamespace(steerer=_ActiveSteerer()),
     )
 from goldfive.adapters._adk_state_protocol import (  # noqa: E402
     KEY_CURRENT_TASK_ID,
@@ -964,7 +971,10 @@ async def test_plugin_injection_via_full_before_model_callback() -> None:
     state = {
         SESSION_CONTEXT_STATE_KEY: SessionContext(
             session=session,
-            steerer=None,
+            # Explicit active mode: the injection under test rides the
+            # ``steering_is_active`` gate and a missing steerer
+            # resolves passive.
+            steerer=_ActiveSteerer(),
             task=task,
             tool_handlers={},
             host_agent_name="h",

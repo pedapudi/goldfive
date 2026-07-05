@@ -44,6 +44,7 @@ from goldfive._correction_injection import (  # noqa: E402
     write_correction,
 )
 from goldfive.adapters import _adk_state_protocol as _sp  # noqa: E402
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
@@ -187,7 +188,7 @@ async def _emit(
 async def test_correct_kind_supersedes_writes_correction_to_state() -> None:
     session = _session(_base_plan())
     revised = _revised_with_one_correct()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
 
     drift = _drift(kind=DriftKind.OFF_TOPIC, detail="veered to batteries")
@@ -327,7 +328,7 @@ async def test_multiple_correct_supersedes_write_multiple_corrections() -> None:
         revision_index=1,
     )
 
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
     await _emit(steerer, session, revised, _drift())
 
@@ -481,7 +482,7 @@ async def test_correction_cleared_when_correction_task_itself_superseded() -> No
         revision_index=2,
     )
 
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
     await _emit(steerer, session, revised, _drift())
 
@@ -601,7 +602,20 @@ def test_dynamic_resolver_picks_up_correction_dict() -> None:
         def __init__(self, state: dict[str, Any]) -> None:
             self.state = state
 
+    class _ActiveSteerer:
+        def is_active_steering(self) -> bool:
+            return True
+
+    from types import SimpleNamespace
+
     state: dict[str, Any] = {
+        # The resolver's augmentation rides the ``steering_is_active``
+        # gate; plant an active-steerer stash so this test exercises
+        # the composed instruction (suppressed under the shipped
+        # observation-only default).
+        "goldfive._session_context": SimpleNamespace(
+            steerer=_ActiveSteerer(), session=None
+        ),
         _sp.KEY_CURRENT_TASK_ID: "research_solar_corrected",
         _sp.KEY_CURRENT_TASK_TITLE: "Research solar options (corrected)",
         _sp.KEY_CURRENT_TASK_DESCRIPTION: "narrowed scope",

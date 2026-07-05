@@ -299,21 +299,21 @@ async def test_conversational_wrap_log_emitted_under_observation_only(
 #     block listing pending agents
 #
 # Both fire inside ``_GoldfiveADKPlugin.before_model_callback``. The
-# strict-passive gate is a single check on
-# ``ctx.steerer._observation_only`` via :meth:`PromptShaper.should_inject`
-# — the same shape DefaultSteerer._should_inject uses elsewhere. The
+# strict-passive gate is :func:`goldfive.steerer.steering_is_active`
+# via :meth:`PromptShaper.should_inject` — the same truth source
+# ``DefaultSteerer.is_active_steering`` provides elsewhere. The
 # unit test below drives the gate predicate directly (the full ADK
 # callback requires google-adk + a live LlmRequest; the predicate is
 # the behaviour-defining surface).
 
 
-def test_should_inject_returns_true_when_no_steerer() -> None:
-    """:meth:`PromptShaper.should_inject` degrades safely to ``True``
-    when no steerer is reachable — pre-#271 paths (unit-test stubs that
-    never call ``set_active_context``) keep working byte-identically."""
+def test_should_inject_returns_false_when_no_steerer() -> None:
+    """:meth:`PromptShaper.should_inject` degrades safely to ``False``
+    (suppress) when no steerer is reachable — passive is the fail-safe
+    direction of :func:`goldfive.steerer.steering_is_active`."""
     from goldfive.prompt_shaper import PromptShaper
 
-    assert PromptShaper.should_inject(None) is True
+    assert PromptShaper.should_inject(None) is False
 
 
 def test_should_inject_returns_false_when_steerer_passive() -> None:
@@ -340,16 +340,16 @@ def test_should_inject_returns_true_when_steerer_active() -> None:
     assert PromptShaper.should_inject(steerer) is True
 
 
-def test_should_inject_returns_true_when_steerer_lacks_attribute() -> None:
-    """A duck-typed steerer that doesn't carry ``_observation_only``
-    (custom :class:`~goldfive.protocols.Steerer` impls predating #254)
-    returns ``True`` so pre-#254 paths keep working."""
+def test_should_inject_returns_false_when_steerer_lacks_predicate() -> None:
+    """A duck-typed steerer without ``is_active_steering`` (custom
+    :class:`~goldfive.protocols.Steerer` impls predating the predicate)
+    resolves passive — the fail-safe direction."""
     from goldfive.prompt_shaper import PromptShaper
 
     class _LegacySteerer:
         pass
 
-    assert PromptShaper.should_inject(_LegacySteerer()) is True
+    assert PromptShaper.should_inject(_LegacySteerer()) is False
 
 
 # ---------------------------------------------------------------------------

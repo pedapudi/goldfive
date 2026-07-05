@@ -30,7 +30,9 @@ from goldfive.adapters.adk_llm_instrumentation import (
     is_dynamic_instruction,
     pending_correction_key,
 )
+from goldfive.config import SteeringConfig
 from goldfive.prompt_shaper import PromptShaper
+from goldfive.steerer import DefaultSteerer
 from goldfive.types import Plan, Task
 
 
@@ -97,6 +99,25 @@ class _ReadonlyCtxStub:
         self.state = state
 
 
+class _ActiveSteerer:
+    def is_active_steering(self) -> bool:
+        return True
+
+
+def _active_steering_stash() -> Any:
+    """Legacy V7 SessionContext stash carrying an active steerer.
+
+    The resolver's augmentation rides the ``steering_is_active`` gate,
+    which resolves passive when no steerer is reachable — tests that
+    assert the composed instruction opt into active mode explicitly by
+    planting this stash on the state dict (``session=None`` keeps the
+    legacy ADK-state read path these tests exercise).
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(steerer=_ActiveSteerer(), session=None)
+
+
 # ---------------------------------------------------------------------------
 # Resolver semantics
 # ---------------------------------------------------------------------------
@@ -125,6 +146,7 @@ def test_resolver_composes_when_pinned() -> None:
     )
     ctx = _ReadonlyCtxStub(
         state={
+            "goldfive._session_context": _active_steering_stash(),
             _sp.KEY_CURRENT_TASK_ID: "t1",
             _sp.KEY_CURRENT_TASK_TITLE: "the task",
             _sp.KEY_CURRENT_TASK_DESCRIPTION: "do the thing",
@@ -144,7 +166,12 @@ def test_resolver_uses_placeholders_for_legacy_state() -> None:
         original_instruction="you are a helper",
         agent_name="inner_agent",
     )
-    ctx = _ReadonlyCtxStub(state={_sp.KEY_CURRENT_TASK_ID: "t1"})
+    ctx = _ReadonlyCtxStub(
+        state={
+            "goldfive._session_context": _active_steering_stash(),
+            _sp.KEY_CURRENT_TASK_ID: "t1",
+        }
+    )
     out = resolver(ctx)
     assert "id: t1" in out
     assert "(title unset)" in out
@@ -160,6 +187,7 @@ def test_resolver_appends_correction_when_present() -> None:
     key = pending_correction_key("inner_agent", "t1")
     ctx = _ReadonlyCtxStub(
         state={
+            "goldfive._session_context": _active_steering_stash(),
             _sp.KEY_CURRENT_TASK_ID: "t1",
             _sp.KEY_CURRENT_TASK_TITLE: "the task",
             _sp.KEY_CURRENT_TASK_DESCRIPTION: "do the thing",
@@ -198,6 +226,7 @@ def test_resolver_re_evaluates_per_turn() -> None:
         agent_name="inner_agent",
     )
     state: dict[str, Any] = {
+        "goldfive._session_context": _active_steering_stash(),
         _sp.KEY_CURRENT_TASK_ID: "t1",
         _sp.KEY_CURRENT_TASK_TITLE: "first",
         _sp.KEY_CURRENT_TASK_DESCRIPTION: "first description",
@@ -333,6 +362,7 @@ def test_multiple_agents_resolve_independently() -> None:
     install_dynamic_instructions(container)
 
     state = {
+        "goldfive._session_context": _active_steering_stash(),
         _sp.KEY_CURRENT_TASK_ID: "tA",
         _sp.KEY_CURRENT_TASK_TITLE: "title for A",
         _sp.KEY_CURRENT_TASK_DESCRIPTION: "description for A",
@@ -360,6 +390,7 @@ def test_resolver_survives_canonical_instruction_contract() -> None:
     install_dynamic_instructions(leaf)
 
     state = {
+        "goldfive._session_context": _active_steering_stash(),
         _sp.KEY_CURRENT_TASK_ID: "t1",
         _sp.KEY_CURRENT_TASK_TITLE: "title",
         _sp.KEY_CURRENT_TASK_DESCRIPTION: "desc",
@@ -525,6 +556,7 @@ async def test_templating_composes_with_task_pin_in_active_mode() -> None:
     )
     state: dict[str, Any] = {
         "topic": "llamas",
+        "goldfive._session_context": _active_steering_stash(),
         _sp.KEY_CURRENT_TASK_ID: "t1",
         _sp.KEY_CURRENT_TASK_TITLE: "the task",
         _sp.KEY_CURRENT_TASK_DESCRIPTION: "do the thing",
@@ -555,7 +587,10 @@ async def test_templating_still_runs_under_observation_only() -> None:
         agent_name="inner_agent",
     )
     stash = SimpleNamespace(
-        steerer=SimpleNamespace(_observation_only=True), session=None
+        steerer=DefaultSteerer(
+            steering_config=SteeringConfig(observation_only=True)
+        ),
+        session=None,
     )
     state: dict[str, Any] = {
         "topic": "llamas",

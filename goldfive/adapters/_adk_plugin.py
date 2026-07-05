@@ -95,6 +95,7 @@ from goldfive.state_store import (
     BindingSource,
     StateStore,
 )
+from goldfive.steerer import steering_is_active
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
@@ -1931,27 +1932,19 @@ DEFAULT_LLM_CALL_TIMEOUT_MS: int = 1_800_000
 def _is_observation_only(ctx: Any) -> bool:
     """Return True iff the steerer behind ``ctx`` is in observation-only mode.
 
-    Read by the request-side :class:`~goldfive.context_editor.ContextEditor`
-    (goldfive#397) — every steering surface MUST be a complete no-op
-    under :class:`~goldfive.config.SteeringConfig.observation_only=True`
+    Read by the plugin's intervention surfaces (cancel-flag writes, the
+    F3 pre-dispatch redirect, the request-side
+    :class:`~goldfive.context_editor.ContextEditor`; goldfive#397) —
+    every steering surface MUST be a complete no-op under
+    :class:`~goldfive.config.SteeringConfig.observation_only=True`
     (the strict-passive pattern established by goldfive#271).
 
-    The steerer exposes ``_observation_only`` as its public-ish field
-    (set from ``SteeringConfig.observation_only`` at construction). We
-    treat any failure to read it as "observation_only" — the safer
-    default for a surface whose whole purpose is to NOT fire when the
-    operator has opted into passive observation.
+    Delegates to :func:`goldfive.steerer.steering_is_active`, the one
+    kill-switch predicate: a missing / broken steerer resolves passive
+    — the safer default for a surface whose whole purpose is to NOT
+    fire when the operator has opted into passive observation.
     """
-    try:
-        steerer = _safe_attr(ctx, "steerer", None)
-        if steerer is None:
-            return True
-        flag = _safe_attr(steerer, "_observation_only", None)
-        if flag is None:
-            return True
-        return bool(flag)
-    except Exception:  # noqa: BLE001
-        return True
+    return not steering_is_active(_safe_attr(ctx, "steerer", None))
 
 
 # ``_apply_agent_max_output_tokens_cap`` (goldfive#256) was lifted into
@@ -5661,8 +5654,8 @@ def make_adk_plugin(
             # goldfive#271 strict-passive carve-out + Wave B1: the
             # injection + ``observation_only`` gate live in
             # :class:`~goldfive.prompt_shaper.PromptShaper`. The shaper
-            # short-circuits when ``ctx.steerer._observation_only`` is
-            # True; otherwise the byte-identical pre-#271 inject runs.
+            # short-circuits unless ``steering_is_active(ctx.steerer)``;
+            # otherwise the byte-identical pre-#271 inject runs.
             try:
                 await self._prompt_shaper.inject_goldfive_planner_instruction(
                     callback_context=callback_context,
@@ -5723,8 +5716,8 @@ def make_adk_plugin(
             # goldfive#271 strict-passive carve-out + Wave B1: the
             # hint + ``observation_only`` gate live in
             # :class:`~goldfive.prompt_shaper.PromptShaper`. The shaper
-            # short-circuits when ``ctx.steerer._observation_only`` is
-            # True; otherwise the byte-identical pre-#271 inject runs.
+            # short-circuits unless ``steering_is_active(ctx.steerer)``;
+            # otherwise the byte-identical pre-#271 inject runs.
             try:
                 if ctx is not None and ctx.session is not None:
                     self._prompt_shaper.inject_runtime_tools_hint(

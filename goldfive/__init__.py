@@ -57,7 +57,7 @@ from goldfive.sinks import (
     LoggingSink,
     SQLitePersistenceSink,
 )
-from goldfive.steerer import DefaultSteerer
+from goldfive.steerer import DefaultSteerer, steering_is_active
 from goldfive.types import (
     GOAL_SOURCE_USER_STEER,
     DriftEvent,
@@ -137,5 +137,6 @@ __all__ = [
     "classify_tool_error",
     "quickstart",
     "run",
+    "steering_is_active",
     "wrap",
 ]

@@ -120,6 +120,18 @@ class Steerer(Protocol):
     plans: Any
     drift: Any
 
+    def is_active_steering(self) -> bool:
+        """Return ``True`` iff interventions may mutate state or inject.
+
+        The kill-switch predicate for
+        :class:`~goldfive.config.SteeringConfig.observation_only`.
+        Consumers holding a maybe-steerer resolve through
+        :func:`goldfive.steerer.steering_is_active`, which treats a
+        missing implementation as passive (``False``) — the fail-safe
+        direction.
+        """
+        ...
+
     async def transition(
         self,
         task_id: str,

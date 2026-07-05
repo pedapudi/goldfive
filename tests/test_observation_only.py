@@ -15,12 +15,10 @@ operators can see what the planner WOULD have produced via the
 ``PlanRevised`` event with ``dry_run=True``. The in-flight invocation
 is otherwise untouched.
 
-The autouse ``_goldfive_active_steering_default`` fixture in
-``tests/conftest.py`` flips the implicit default to ``False`` for the
-test suite (matching pre-#254 active-steering semantics). Tests in this
-file deliberately pass ``observation_only=True`` (or
-``observation_only=False``) explicitly — the dataclass honours explicit
-kwargs over the fixture's override, so the test's intent wins.
+The suite runs against the shipped default (``observation_only=True``
+— strict-passive). Tests in this file pass ``observation_only=True``
+(or ``observation_only=False``) explicitly so each test's mode is
+visible at its construction site.
 """
 
 from __future__ import annotations
@@ -40,11 +38,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 import goldfive  # noqa: E402
-from goldfive.config import (  # noqa: E402
-    RuntimeConfig,
-    SteeringConfig,
-    _resolve_observation_only_default,
-)
+from goldfive.config import RuntimeConfig, SteeringConfig  # noqa: E402
 from goldfive.control import ControlKind  # noqa: E402
 from goldfive.results import InvocationResult  # noqa: E402
 from goldfive.state_store import StateStore  # noqa: E402
@@ -209,25 +203,53 @@ def _plan_revised_events(sink: ListSink) -> list[Any]:
 
 
 # ---------------------------------------------------------------------------
-# Conftest fixture interaction
+# Shipped default
 # ---------------------------------------------------------------------------
 
 
-def test_conftest_fixture_flips_implicit_default_to_active() -> None:
-    """Inside the test suite, the implicit default is active-steering.
+def test_shipped_default_is_observation_only() -> None:
+    """The suite exercises the production default: strict-passive.
 
-    Sanity check that the autouse
-    ``_goldfive_active_steering_default`` fixture in
-    ``tests/conftest.py`` is in effect — without it the bulk of the
-    existing test corpus would silently skip the injection paths and
-    pass for the wrong reason.
+    ``SteeringConfig()`` and a bare ``DefaultSteerer()`` both come up
+    with ``observation_only=True`` — there is no test-only override
+    hook. Tests that need active mode say so explicitly.
     """
-    assert _resolve_observation_only_default() is False
-    # SteeringConfig() (no explicit kwarg) honours the override.
-    assert SteeringConfig().observation_only is False
-    # An explicit kwarg still wins over the fixture (test intent
-    # beats the fixture's override).
-    assert SteeringConfig(observation_only=True).observation_only is True
+    assert SteeringConfig().observation_only is True
+    steerer = DefaultSteerer()
+    assert steerer.is_active_steering() is False
+    assert steerer._should_inject() is False
+    # An explicit kwarg wins in either direction.
+    assert SteeringConfig(observation_only=False).observation_only is False
+    active = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
+    assert active.is_active_steering() is True
+
+
+def test_steering_is_active_fallback_is_passive(active_steering_config: Any) -> None:
+    """:func:`goldfive.steerer.steering_is_active` is the one documented
+    fallback for consumers holding a maybe-steerer: ``None``, a steerer
+    without the predicate, and a raising predicate all resolve passive.
+    """
+    from goldfive.steerer import steering_is_active
+
+    assert steering_is_active(None) is False
+
+    class _Legacy:
+        pass
+
+    assert steering_is_active(_Legacy()) is False
+
+    class _Broken:
+        def is_active_steering(self) -> bool:
+            raise RuntimeError("boom")
+
+    assert steering_is_active(_Broken()) is False
+
+    # Real steerers resolve through the predicate.
+    assert steering_is_active(DefaultSteerer()) is False
+    assert (
+        steering_is_active(DefaultSteerer(steering_config=active_steering_config))
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -455,10 +477,7 @@ def test_steering_config_from_env_observation_only(
 
     * ``"0"`` / ``"false"`` / ``"no"`` / ``"off"`` -> False.
     * ``"1"`` / ``"true"`` / ``"yes"`` / ``"on"`` -> True.
-    * Unset -> the effective default. In the test-suite fixture path
-      that's ``False`` (the autouse fixture overrides the implicit
-      default); a test that suppresses the fixture would see the
-      production ``True`` default.
+    * Unset -> the production default (``True``).
     """
     for falsey in ("0", "false", "no", "off"):
         goldfive_steer_env.set(observation_only=falsey)
@@ -468,31 +487,10 @@ def test_steering_config_from_env_observation_only(
         goldfive_steer_env.set(observation_only=truthy)
         assert SteeringConfig.from_env().observation_only is True
 
-    # Unset: in the suite, the autouse fixture overrides to False.
+    # Unset: the production default (strict-passive).
     goldfive_steer_env.unset("observation_only")
-    assert SteeringConfig.from_env().observation_only is False
-
-
-def test_steering_config_from_env_production_default(
-    monkeypatch: pytest.MonkeyPatch,
-    goldfive_steer_env: Any,
-) -> None:
-    """Outside the suite override, the production default is ``True``.
-
-    Suppresses the autouse fixture's override for this test (by
-    flipping the module-level hook back to ``None``) so the unset env
-    path returns the production default. Restored on exit.
-    """
-    from goldfive import config as _gf_config
-
-    goldfive_steer_env.unset("observation_only")
-    prior = _gf_config._OBSERVATION_ONLY_DEFAULT
-    _gf_config._OBSERVATION_ONLY_DEFAULT = None
-    try:
-        assert SteeringConfig().observation_only is True
-        assert SteeringConfig.from_env().observation_only is True
-    finally:
-        _gf_config._OBSERVATION_ONLY_DEFAULT = prior
+    assert SteeringConfig().observation_only is True
+    assert SteeringConfig.from_env().observation_only is True
 
 
 # ---------------------------------------------------------------------------
@@ -870,17 +868,20 @@ async def test_goldfive_corrective_drift_is_gated_under_observation_only() -> No
     )
 
 
-async def test_goldfive_corrective_drift_lands_with_observation_only_false() -> None:
+async def test_goldfive_corrective_drift_lands_with_observation_only_false(
+    make_active_steerer: Any,
+) -> None:
     """goldfive#255 positive control: with ``observation_only=False`` the
     same corrective drift lands.
 
     Toggling the flag off removes ALL three sources of gating
-    (``gate_active`` becomes False because ``not self._should_inject()``
-    is False). The refactor must not introduce a hidden gate that
-    survives the flag flip.
+    (``gate_active`` becomes False because ``is_active_steering()``
+    is True). The refactor must not introduce a hidden gate that
+    survives the flag flip. Uses the ``make_active_steerer`` conftest
+    fixture — the sanctioned way for tests to opt into active mode.
     """
-    cfg = SteeringConfig(observation_only=False)
-    steerer = DefaultSteerer(steering_config=cfg)
+    steerer = make_active_steerer()
+    assert steerer.is_active_steering() is True
     session = _make_session()
     prior_plan = session.plan
     assert prior_plan is not None

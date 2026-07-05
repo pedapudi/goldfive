@@ -30,6 +30,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.control import (  # noqa: E402
     ControlChannel,
     ControlKind,
@@ -89,7 +90,13 @@ def _fresh() -> tuple[DefaultSteerer, Session, ListSink, StubPlanner, ControlCha
     # Phase 2 of the path-duality fix: bind a real ControlChannel so
     # the steerer's ``GOLDFIVE_PAUSE_ESCALATE`` dispatch lands somewhere
     # observable to the assertions.
-    steerer = DefaultSteerer(goldfive_steer_threshold="off")
+    #
+    # Explicit active mode: the dispatch under test is suppressed under
+    # the shipped observation-only default.
+    steerer = DefaultSteerer(
+        goldfive_steer_threshold="off",
+        steering_config=SteeringConfig(observation_only=False),
+    )
     session = Session(run_id="pause-test", current_task_id="t1")
     session.plan = Plan(
         id="p1",
@@ -162,6 +169,46 @@ async def test_pause_escalate_dispatches_control_and_emits_drift() -> None:
     assert _drift_kind_pb("HUMAN_INTERVENTION_REQUIRED") in kinds
     # Level 4 does not call refine.
     assert planner.refine_calls == []
+
+
+async def test_pause_escalate_dispatch_suppressed_under_observation_only() -> None:
+    """Observation-only counterpart of the dispatch test above: under
+    the shipped default the drift still emits on the sink stream but no
+    ``GOLDFIVE_PAUSE_ESCALATE`` reaches the channel — the
+    ``is_active_steering`` gate suppresses the send."""
+    steerer = DefaultSteerer(
+        goldfive_steer_threshold="off",
+        steering_config=SteeringConfig(observation_only=True),
+    )
+    session = Session(run_id="pause-test", current_task_id="t1")
+    session.plan = Plan(
+        id="p1",
+        run_id="pause-test",
+        goal_ids=[],
+        tasks=[Task(id="t1", title="work", status=TaskStatus.RUNNING)],
+        edges=[],
+    )
+    sink = ListSink()
+    channel = ControlChannel()
+    steerer.bind(sinks=[sink], planner=StubPlanner())
+    steerer.bind_control_channel(channel)
+
+    drift = DriftEvent(
+        kind=DriftKind.INTENT_DIVERGENCE,
+        severity=DriftSeverity.CRITICAL,
+        detail="critical intent drift",
+        current_task_id="t1",
+    )
+    await steerer.drift.handle_drift(drift, session)
+
+    assert _drain_goldfive_pause(channel) == []
+    # Detection is independent of injection: the drift still emitted.
+    kinds = [
+        evt.drift_detected.kind
+        for evt in sink.events
+        if evt.WhichOneof("payload") == "drift_detected"
+    ]
+    assert _drift_kind_pb("INTENT_DIVERGENCE") in kinds
 
 
 async def test_pause_escalate_does_not_double_emit_human_intervention() -> None:

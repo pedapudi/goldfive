@@ -85,6 +85,9 @@ class _SteererStub:
         self.plans: Any = object()
         self.drift: Any = object()
 
+    def is_active_steering(self) -> bool:
+        return False
+
     async def transition(
         self,
         task_id: str,

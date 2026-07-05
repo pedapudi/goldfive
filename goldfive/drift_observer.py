@@ -376,8 +376,8 @@ class DriftObserver:
         # :class:`~goldfive.task_state_machine.TaskStateMachine`), and
         # the router-owned shared state (the per-async-task
         # ``_active_session_var`` ContextVar plumbing for the planner
-        # span-context provider, the ``_observation_only`` gate read
-        # via :meth:`DefaultSteerer._should_inject`, and the
+        # span-context provider, the ``observation_only`` gate read
+        # via :meth:`DefaultSteerer.is_active_steering`, and the
         # ``REFINE_FAILURE_THRESHOLD`` / ``PROGRESS_STALL_THRESHOLD_SECONDS``
         # class constants).
         self._steerer = steerer
@@ -4410,7 +4410,7 @@ class DriftObserver:
             # observation. Skip the enqueue but log the would-be message
             # and stamp the gate, mirroring
             # ``_dispatch_goldfive_steer_control``.
-            if not self._steerer._should_inject():
+            if not self._steerer.is_active_steering():
                 log.info(
                     "DefaultSteerer._handle_drift: observation_only=True — "
                     "SKIPPING post-ABSORB nudge enqueue. would_have_queued "
@@ -4458,7 +4458,7 @@ class DriftObserver:
 
         Observation-only: the overlay drains the queue into a
         goldfive-authored user turn that re-invokes the tree, so the
-        enqueue is gated on :meth:`DefaultSteerer._should_inject` like
+        enqueue is gated on :meth:`DefaultSteerer.is_active_steering` like
         the other injection points; the would-be nudge is logged and
         the gate stamped as decision telemetry.
         """
@@ -4468,7 +4468,7 @@ class DriftObserver:
             drift=drift,
             refined_plan=session.plan,
         )
-        if not self._steerer._should_inject():
+        if not self._steerer.is_active_steering():
             log.info(
                 "DefaultSteerer._dispatch_nudge: observation_only=True — "
                 "SKIPPING nudge enqueue. would_have_queued kind=%s "
@@ -4562,7 +4562,7 @@ class DriftObserver:
         # see what would have been dispatched (drift kind, task id, body).
         # No cancel-and-restart fires on the executor; the live invocation
         # continues against the prior plan.
-        if not self._steerer._should_inject():
+        if not self._steerer.is_active_steering():
             log.info(
                 "DefaultSteerer._dispatch_goldfive_steer_control: "
                 "observation_only=True — SKIPPING GOLDFIVE_STEER enqueue. "
@@ -4670,7 +4670,7 @@ class DriftObserver:
         """
         from goldfive.control import ControlKind, ControlMessage
 
-        if not self._steerer._should_inject():
+        if not self._steerer.is_active_steering():
             log.info(
                 "DefaultSteerer._dispatch_goldfive_pause_control: "
                 "observation_only=True — SKIPPING GOLDFIVE_PAUSE_ESCALATE "
@@ -5092,14 +5092,14 @@ class DriftObserver:
           break — the task-cancel step is silently skipped.
 
         Observation-only mode (goldfive#254): when
-        :meth:`DefaultSteerer._should_inject` is ``False`` this method
+        :meth:`DefaultSteerer.is_active_steering` is ``False`` this method
         returns ``[]`` without consulting the plugin or stamping
         ``cancel_requested_invocation_ids``. Logged at INFO so an
         operator can see WHAT would have been cancelled (drift kind,
         task / agent id) without the cancel actually firing on the
         live invocation.
         """
-        if not self._steerer._should_inject():
+        if not self._steerer.is_active_steering():
             log.info(
                 "DefaultSteerer.request_invocation_cancel: "
                 "observation_only=True — SKIPPING cancel for "
