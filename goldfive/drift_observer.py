@@ -24,7 +24,7 @@ bounded note-buffer family (``note_agent_activity`` /
 machinery: ``handle_drift`` (the central drift-routing method),
 ``_promote_drift_to_steer`` (audit issue #402 — dispatch-before-plan-swap
 ordering is preserved here, not fixed), the intervention ladder
-(``_ladder_level_for`` / ``_LADDER`` / ``_LADDER_BY_VALUE``), ladder
+(``_ladder_level_for`` / ``_LADDER``), ladder
 dispatch (``_dispatch_nudge`` / ``_dispatch_goldfive_steer_control`` /
 ``_dispatch_goldfive_pause_control`` / ``_dispatch_pause_escalate``),
 adapter cancel tagging, the late-drift gate
@@ -3562,20 +3562,11 @@ class DriftObserver:
     # import-cycle with :mod:`goldfive.steerer` (which defines the
     # :class:`InterventionLevel` enum).
 
-    _LADDER_BY_VALUE: dict[
-        str,
-        tuple[
-            InterventionLevel | None,
-            InterventionLevel | None,
-            tuple[InterventionLevel, InterventionLevel],
-        ],
-    ] = {}
-
     _LADDER_LOADED: bool = False
 
     @classmethod
     def _load_ladder_tables(cls) -> None:
-        """Populate :attr:`_LADDER` / :attr:`_LADDER_BY_VALUE` on first use.
+        """Populate :attr:`_LADDER` on first use.
 
         Lazy load defers the :class:`InterventionLevel` import so this
         module can be imported before :mod:`goldfive.steerer` finishes
@@ -3701,9 +3692,7 @@ class DriftObserver:
         from goldfive.steerer import InterventionLevel as _IL
 
         self._load_ladder_tables()
-        entry = self._LADDER_BY_VALUE.get(kind.value)
-        if entry is None:
-            entry = self._LADDER.get(kind)
+        entry = self._LADDER.get(kind)
         is_repeat = occurrence_count >= self._steerer.REFINE_FAILURE_THRESHOLD
         if entry is not None:
             info_level, warning_level, critical_pair = entry
@@ -5903,8 +5892,7 @@ class DriftObserver:
         """Side-effects for USER_STEER drift that aren't refine: state
         bookkeeping.
 
-        Called from :meth:`handle_drift` and
-        :meth:`apply_user_steer_with_plan` just before
+        Called from :meth:`handle_drift` just before
         ``_emit_drift_detected`` and well before any plan install so:
 
         1. The ``goldfive.active_steer.*`` keys are set so downstream

@@ -669,8 +669,7 @@ async def test_analyze_reasoning_returns_none_on_clean_text() -> None:
     # Every 5+ char non-stopword token in the reasoning also appears in
     # the default goals+task reference ("produce a slide review report"
     # + "Review the slides" + "Read every slide and list any typos
-    # found.") so the standalone ``detect_unreferenced_keyword`` stays
-    # silent alongside the intent-divergence / off-topic paths.
+    # found.") so the intent-divergence / off-topic paths stay silent.
     session = _session_with_task()
     text = "slide review: read each slide, list the typos found."
     assert await dreason.analyze_reasoning(text, session, mode="embedding") is None

@@ -19,10 +19,10 @@ What lives here (truly shared across detectors)
 * :func:`format_goals_block` — render
   :class:`~goldfive.types.Goal` sequences as a human-readable block.
   Identical between the goal-drift and reasoning-judge prompts.
-* :func:`register` / :func:`classify` — the registry API. Each detector
-  registers a ``(DriftKind, classifier_fn, DetectorConfig)`` triple;
-  callers can dispatch by kind via :func:`classify` without importing
-  the detector module directly.
+* :func:`register` / :func:`get_config` / :func:`list_registered` — the
+  registry API. Each detector registers a ``(DriftKind, classifier_fn,
+  DetectorConfig)`` triple; callers look up per-detector config by kind
+  without importing the detector module directly.
 
 What stays in the detector modules (deliberately not centralised)
 -----------------------------------------------------------------
@@ -78,7 +78,6 @@ __all__ = [
     "DetectorConfig",
     "TRUNCATE_SUFFIX",
     "JSON_OBJECT_RE",
-    "classify",
     "format_goals_block",
     "get_config",
     "list_registered",
@@ -255,8 +254,7 @@ def format_goals_block(goals: Sequence[Goal] | Iterable[Any] | None) -> str:
 
 #: Type alias for a registered classifier. Each detector exposes its
 #: own positional/keyword shape; the registry stores them as ``**kwargs``
-#: callables so :func:`classify` can dispatch without knowing the per-
-#: detector signature.
+#: callables without knowing the per-detector signature.
 ClassifierFn = Callable[..., Any]
 
 
@@ -296,9 +294,8 @@ def register(
         forwards by kind.
     classifier_fn:
         The detector entry point. May be sync or async — set
-        ``is_async`` accordingly so :func:`classify` can ``await`` it
-        when appropriate. The classifier owns its own kwargs shape; the
-        registry forwards ``**observation`` verbatim.
+        ``is_async`` accordingly. The classifier owns its own kwargs
+        shape.
     config:
         The :class:`DetectorConfig` pinning per-detector knobs.
     is_async:
@@ -335,36 +332,6 @@ def list_registered() -> tuple[DriftKind, ...]:
     tests and diagnostics.
     """
     return tuple(_REGISTRY.keys())
-
-
-def classify(*, kind: DriftKind, **observation: Any) -> Any:
-    """Dispatch to the classifier registered for ``kind``.
-
-    Forwards ``**observation`` verbatim to the registered classifier.
-    Returns the classifier's return value as-is — typically a
-    :class:`~goldfive.types.DriftEvent` or ``None``, but the reasoning
-    judge returns a :class:`~goldfive.drift.reasoning_judge.ReasoningJudgeVerdict`,
-    which is wider than ``DriftEvent | None``. Callers that prefer the
-    narrow shape can ignore the extra fields or call the detector
-    entry point directly.
-
-    Raises :class:`KeyError` when no detector is registered for ``kind``
-    so a typo at the call site is loud rather than silent.
-
-    When the registered classifier is async (``is_async=True`` at
-    registration time), the function returns the awaitable from the
-    classifier — callers must ``await`` the result. Sync classifiers
-    return their value directly. Mixing in one call site is rare
-    enough that auto-detection isn't worth the runtime cost; pass
-    ``is_async`` explicitly at registration.
-    """
-    reg = _REGISTRY.get(kind)
-    if reg is None:
-        raise KeyError(
-            f"no drift detector registered for kind={kind!r}; "
-            f"registered kinds: {list_registered()!r}"
-        )
-    return reg.classifier(**observation)
 
 
 # ---------------------------------------------------------------------------
