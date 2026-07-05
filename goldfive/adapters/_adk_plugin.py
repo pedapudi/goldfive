@@ -586,6 +586,45 @@ def _agent_has_pending_candidates(ctx: Any, agent_name: str) -> bool:
     return False
 
 
+def _completed_task_ids(tasks: Any) -> set[str]:
+    """Return the ids of tasks whose status is COMPLETED."""
+    from goldfive.types import TaskStatus
+
+    out: set[str] = set()
+    for t in tasks or ():
+        if _safe_attr(t, "status", None) is TaskStatus.COMPLETED:
+            tid = str(_safe_attr(t, "id", "") or "")
+            if tid:
+                out.add(tid)
+    return out
+
+
+def _predecessors_completed(task_id: str, *, edges: Any, completed_ids: set[str]) -> bool:
+    """True iff every incoming-edge predecessor of ``task_id`` is COMPLETED.
+
+    The single DAG-readiness predicate shared by the delegation-pin
+    paths (:meth:`_GoldfiveADKPlugin._pin_delegation_task_id`,
+    :meth:`_GoldfiveADKPlugin._maybe_pin_delegation_task`) and the F3
+    pre-dispatch redirect (:func:`_maybe_redirect_completed_agent`).
+
+    COMPLETED — not merely terminal — is the semantics that won when F3
+    was aligned with the pin paths: a FAILED / CANCELLED / NOT_NEEDED
+    predecessor produced no output for a successor to consume, so the
+    pins never bind such a successor. F3's original local copy counted
+    merely-terminal predecessors, so a NOT_NEEDED sweep could make F3
+    refuse-and-redirect toward a task the pin machinery would then
+    decline to pin. A task with no incoming edges trivially passes.
+    """
+    for e in edges or ():
+        to_id = str(_safe_attr(e, "to_task_id", "") or "")
+        if to_id != task_id:
+            continue
+        from_id = str(_safe_attr(e, "from_task_id", "") or "")
+        if from_id and from_id not in completed_ids:
+            return False
+    return True
+
+
 def _maybe_redirect_completed_agent(
     *,
     ctx: Any,
@@ -613,6 +652,11 @@ def _maybe_redirect_completed_agent(
     completed task and re-invokes the same agent because nothing told
     it to stop. F1's directive payload is the proactive anchor; this
     is the structural fence.
+
+    ``next_pending`` uses the delegation pin's DAG-readiness predicate
+    (:func:`_predecessors_completed` — COMPLETED predecessors, not
+    merely terminal) so a redirect never points at a task the pin
+    would decline to bind.
     """
     if not target_agent:
         return None
@@ -648,18 +692,12 @@ def _maybe_redirect_completed_agent(
             return None
 
         # All assigned tasks are terminal. Find the next PENDING task
-        # whose every predecessor is terminal — same definition the F1
-        # plan_state helper uses, kept local so this module stays
-        # decoupled from goldfive.reporting.
+        # whose every predecessor is COMPLETED — the same readiness
+        # predicate the delegation pin uses, so F3 never redirects the
+        # coordinator toward a task the pin would decline to bind (see
+        # :func:`_predecessors_completed` for the semantics rationale).
         edges = list(_safe_attr(plan, "edges", None) or ())
-        by_id = {str(_safe_attr(t, "id", "") or ""): t for t in tasks}
-        incoming: dict[str, list[str]] = {tid: [] for tid in by_id}
-        for e in edges:
-            to_id = str(_safe_attr(e, "to_task_id", "") or "")
-            from_id = str(_safe_attr(e, "from_task_id", "") or "")
-            if to_id in incoming and from_id:
-                incoming[to_id].append(from_id)
-
+        completed_ids = _completed_task_ids(tasks)
         next_pending: Any = None
         for task in tasks:
             if _safe_attr(task, "status", None) is not TaskStatus.PENDING:
@@ -667,12 +705,7 @@ def _maybe_redirect_completed_agent(
             tid = str(_safe_attr(task, "id", "") or "")
             if not tid:
                 continue
-            preds = incoming.get(tid, [])
-            if all(
-                by_id.get(p) is not None
-                and _safe_attr(by_id[p], "status", None) in TERMINAL_TASK_STATUSES
-                for p in preds
-            ):
+            if _predecessors_completed(tid, edges=edges, completed_ids=completed_ids):
                 next_pending = task
                 break
 
@@ -1550,6 +1583,44 @@ async def _emit_approval_requested_from_plugin(
         await emit(sinks, evt)
     except Exception as exc:  # noqa: BLE001
         log.debug("_emit_approval_requested_from_plugin: sink emit failed: %s", exc)
+
+
+async def _emit_policy_applied_from_plugin(
+    *,
+    session: Any,
+    steerer: Any,
+    policy_name: str,
+    outcome: str,
+    reason: str = "",
+    detail: str = "",
+) -> None:
+    """Emit a ``PolicyApplied`` envelope from a plugin callback.
+
+    Mirrors ``DriftObserver._emit_policy_applied`` for decision
+    telemetry that originates inside the ADK plugin (e.g. the F3
+    redirect suppressed by the observation-only gate). Best-effort;
+    any failure is logged at DEBUG and dropped.
+    """
+    sinks = getattr(steerer, "_sinks", None) or []
+    if not sinks:
+        return
+    try:
+        from goldfive.events import emit, policy_applied_event
+
+        seq, event_id = session.next_sequence_and_event_id()
+        evt = policy_applied_event(
+            str(getattr(session, "run_id", "") or ""),
+            seq,
+            policy_name=policy_name,
+            outcome=outcome,
+            reason=reason,
+            detail=detail,
+            session_id=str(getattr(session, "id", "") or ""),
+            event_id=event_id,
+        )
+        await emit(sinks, evt)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("_emit_policy_applied_from_plugin: sink emit failed: %s", exc)
 
 
 def _jsonable(v: Any) -> Any:
@@ -3741,22 +3812,7 @@ def make_adk_plugin(
             edges = _safe_attr(plan, "edges", None) or ()
             from goldfive.types import TaskStatus
 
-            completed_ids: set[str] = set()
-            for t in tasks:
-                if _safe_attr(t, "status", None) is TaskStatus.COMPLETED:
-                    tid = str(_safe_attr(t, "id", "") or "")
-                    if tid:
-                        completed_ids.add(tid)
-
-            def _upstream_ok(task_id: str) -> bool:
-                for e in edges:
-                    to_id = str(_safe_attr(e, "to_task_id", "") or "")
-                    if to_id != task_id:
-                        continue
-                    from_id = str(_safe_attr(e, "from_task_id", "") or "")
-                    if from_id and from_id not in completed_ids:
-                        return False
-                return True
+            completed_ids = _completed_task_ids(tasks)
 
             candidates: list[Any] = []
             for task in tasks:
@@ -3767,7 +3823,9 @@ def make_adk_plugin(
                 if status is not TaskStatus.PENDING and status is not TaskStatus.RUNNING:
                     continue
                 tid = str(_safe_attr(task, "id", "") or "")
-                if not tid or not _upstream_ok(tid):
+                if not tid or not _predecessors_completed(
+                    tid, edges=edges, completed_ids=completed_ids
+                ):
                     continue
                 candidates.append(task)
 
@@ -4146,29 +4204,16 @@ def make_adk_plugin(
                 return
 
             edges = tuple(_safe_attr(plan, "edges", None) or ())
-            completed_ids: set[str] = set()
-            for t in tasks:
-                if _safe_attr(t, "status", None) is TaskStatus.COMPLETED:
-                    tid = str(_safe_attr(t, "id", "") or "")
-                    if tid:
-                        completed_ids.add(tid)
-
-            def _upstream_ok(task_id: str) -> bool:
-                for e in edges:
-                    to_id = str(_safe_attr(e, "to_task_id", "") or "")
-                    if to_id != task_id:
-                        continue
-                    from_id = str(_safe_attr(e, "from_task_id", "") or "")
-                    if from_id and from_id not in completed_ids:
-                        return False
-                return True
+            completed_ids = _completed_task_ids(tasks)
 
             eligible: list[Any] = []
             for task in tasks:
                 if _safe_attr(task, "status", None) is not TaskStatus.PENDING:
                     continue
                 tid = str(_safe_attr(task, "id", "") or "")
-                if not tid or not _upstream_ok(tid):
+                if not tid or not _predecessors_completed(
+                    tid, edges=edges, completed_ids=completed_ids
+                ):
                     continue
                 eligible.append(task)
 
@@ -5874,6 +5919,8 @@ def make_adk_plugin(
                 # next_pending task assigned to a *different* agent,
                 # refuse the dispatch with a redirect error so the
                 # coordinator stops re-invoking a completed-work agent.
+                # Active mode only — under observation_only the refusal
+                # is suppressed (telemetry-only) below.
                 # The post-hoc PLAN_DIVERGENCE detector still exists as
                 # a safety net, but closing the loop at the dispatch
                 # point eliminates the round-trip-and-detect cost.
@@ -5887,13 +5934,38 @@ def make_adk_plugin(
                     target_agent=to_agent,
                 )
                 if redirect is not None:
-                    log.info(
-                        "before_tool_callback: F3 redirect — all plan tasks "
-                        "for %s are terminal; redirecting coordinator to %s",
-                        to_agent,
-                        redirect.get("redirect_to") or "?",
-                    )
-                    return redirect
+                    # Observation-only gate (strict-passive pattern from
+                    # goldfive#254/#271): refusing the dispatch is an
+                    # intervention. Log + telemetry only; the AgentTool
+                    # dispatch proceeds untouched.
+                    if _is_observation_only(ctx):
+                        log.info(
+                            "before_tool_callback: observation_only=True — "
+                            "F3 redirect for %s SUPPRESSED (would have "
+                            "redirected coordinator to %s); dispatch proceeds",
+                            to_agent,
+                            redirect.get("redirect_to") or "?",
+                        )
+                        await _emit_policy_applied_from_plugin(
+                            session=ctx.session,
+                            steerer=ctx.steerer,
+                            policy_name="observation_only_gate",
+                            outcome="suppressed",
+                            reason="observation_only=True",
+                            detail=(
+                                f"intervention=f3_predispatch_redirect "
+                                f"target_agent={to_agent} "
+                                f"redirect_to={redirect.get('redirect_to') or ''}"
+                            ),
+                        )
+                    else:
+                        log.info(
+                            "before_tool_callback: F3 redirect — all plan tasks "
+                            "for %s are terminal; redirecting coordinator to %s",
+                            to_agent,
+                            redirect.get("redirect_to") or "?",
+                        )
+                        return redirect
                 # Fall through: AgentTool still runs, we're just observing.
 
             # Tool-level approval (Flow B). If the tool opts into
