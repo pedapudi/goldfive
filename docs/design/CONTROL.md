@@ -442,8 +442,12 @@ handler:
    stashes metadata in `session.pending_approvals_meta[task_id]`.
 3. Emits `ApprovalRequested{target_id=task_id, kind="task", prompt=...}`.
 4. `await`s the event.
-5. Returns `{"decision": "approve"|"reject"|"timeout", "detail": ...}`
-   to the agent.
+5. Returns `{"decision": "approve"|"reject"|"timeout"|"unavailable",
+   "detail": ...}` to the agent. The wait is finite (`timeout_ms`, or
+   `SteeringConfig.approval_default_timeout_ms` when omitted); with no
+   control channel bound at all the handler skips steps 1-4 and
+   returns `"unavailable"` immediately — see
+   [APPROVAL.md](APPROVAL.md).
 
 The UI renders buttons on `ApprovalRequested` and sends
 `ControlMessage(kind=APPROVE|REJECT, payload={"target_id": task_id})`.

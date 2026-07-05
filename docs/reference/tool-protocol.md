@@ -350,16 +350,23 @@ report_awaiting_approval(
 **Call when:** a task needs a human decision before it can proceed.
 Blocks the calling tool-call until an `APPROVE` or `REJECT`
 `ControlMessage` targeting the same id lands on the runner's
-`ControlChannel`.
+`ControlChannel`. The wait is finite: an explicit `timeout_ms > 0`
+is honoured; omitting it applies
+`SteeringConfig.approval_default_timeout_ms` (default 600 s). Expiry
+returns `decision="timeout"` and emits a
+`HUMAN_INTERVENTION_REQUIRED` WARNING drift. When the runner has no
+`ControlChannel` at all (the default `wrap()` posture) the handler
+returns `decision="unavailable"` immediately instead of blocking a
+task no human can ever unblock.
 
 **Side effects:**
 
 - Registers an `asyncio.Event` on
   `session.pending_approvals[target_id]` (defaults to `task_id`).
 - Emits `ApprovalRequested(task_id, target_id, detail)`.
-- Blocks until the control dispatcher sets the event, then returns
-  `{"acknowledged": True, "decision": "approve"|"reject",
-  "detail": "..."}`.
+- Blocks until the control dispatcher sets the event (or the finite
+  wait expires), then returns `{"acknowledged": True, "decision":
+  "approve"|"reject"|"timeout"|"unavailable", "detail": "..."}`.
 
 **Example:**
 

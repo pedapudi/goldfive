@@ -57,9 +57,25 @@ Notes:
 - The `ApprovalGranted` / `ApprovalRejected` events are a separate channel from
   the task state machine — they are *resolution* events, not transitions. A
   rejected approval does not automatically fail the task; the agent chooses.
-- A `timeout_ms` parameter on `report_awaiting_approval` is accepted but
-  currently implemented as a pure `asyncio.wait_for`. On timeout the handler
-  returns `{"decision": "timeout", "detail": ...}` and leaves the task blocked.
+- **No control channel bound** (the default `goldfive.wrap()` posture —
+  `control=None`): nothing can ever dispatch APPROVE / REJECT, so the handler
+  returns `{"decision": "unavailable", "detail": ...}` immediately without
+  blocking the task, registering a waiter, or emitting `ApprovalRequested`.
+  The agent is told approval is unavailable and decides for itself how to
+  continue; goldfive does not force a transition. (Historically this path
+  awaited a waiter that could never be set — the tool call, and the run,
+  hung forever.)
+- The wait is always finite. An explicit `timeout_ms > 0` is honoured
+  verbatim; `timeout_ms <= 0` (including the omitted default) substitutes
+  `SteeringConfig.approval_default_timeout_ms` (600 s;
+  env `GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS`) instead of the historical
+  unbounded wait — no invocation wall clock covers tool waits, so infinity
+  was a run-hang.
+- On timeout the handler returns `{"decision": "timeout", "detail": ...}`,
+  leaves the task blocked (a later APPROVE / REJECT still resolves via
+  `session.pending_approvals`), and emits a `HUMAN_INTERVENTION_REQUIRED`
+  drift at WARNING severity (emit-only — no ladder dispatch) so operators
+  see the unresolved approval instead of a silently BLOCKED task.
 
 ## Flow B — ADK tool confirmation (ADK-specific)
 

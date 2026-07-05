@@ -37,7 +37,9 @@ from goldfive.adapters._adk_plugin import (  # noqa: E402
     _await_tool_approval,
     _tool_requires_confirmation,
 )
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.control import (  # noqa: E402
+    ControlChannel,
     ControlKind,
     ControlMessage,
 )
@@ -48,6 +50,8 @@ from goldfive.reporting import (  # noqa: E402
 )
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
+    DriftKind,
+    DriftSeverity,
     Goal,
     Plan,
     Session,
@@ -152,6 +156,9 @@ async def test_task_level_approve_resumes_handler() -> None:
     sink = ListSink()
     steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=None)
+    # A bound channel is what makes waiting meaningful — without one the
+    # handler degrades to decision='unavailable' (covered below).
+    steerer.bind_control_channel(ControlChannel())
 
     handler = _find_handler("report_awaiting_approval")
 
@@ -197,6 +204,7 @@ async def test_task_level_reject_resumes_handler() -> None:
     sink = ListSink()
     steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=None)
+    steerer.bind_control_channel(ControlChannel())
 
     handler = _find_handler("report_awaiting_approval")
 
@@ -230,6 +238,7 @@ async def test_task_level_approval_timeout_returns_timeout_decision() -> None:
     sink = ListSink()
     steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=None)
+    steerer.bind_control_channel(ControlChannel())
 
     handler = _find_handler("report_awaiting_approval")
 
@@ -239,9 +248,95 @@ async def test_task_level_approval_timeout_returns_timeout_decision() -> None:
         steerer,
     )
     assert result["decision"] == "timeout"
+    assert "50ms" in result["detail"]
     # Task remains blocked; next APPROVE / REJECT still resolves via the map.
     assert "t1" in session.pending_approvals
     assert session.plan.tasks[0].status == TaskStatus.BLOCKED
+    # The expiry is surfaced to operators as a WARNING drift.
+    timeout_drifts = [
+        d for d in session.drift_events if d.kind is DriftKind.HUMAN_INTERVENTION_REQUIRED
+    ]
+    assert len(timeout_drifts) == 1
+    assert timeout_drifts[0].severity is DriftSeverity.WARNING
+    assert timeout_drifts[0].current_task_id == "t1"
+    assert "drift_detected" in sink.payload_kinds()
+
+
+async def test_no_control_channel_returns_unavailable_without_blocking() -> None:
+    """Default wrap() posture (control=None): nothing can ever dispatch
+    APPROVE / REJECT, so the handler must not wait, block the task, or
+    register a waiter — it degrades to decision='unavailable'."""
+    session = _session_with_plan("t1")
+    sink = ListSink()
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[sink], planner=None)
+
+    handler = _find_handler("report_awaiting_approval")
+    result = await asyncio.wait_for(
+        handler({"task_id": "t1", "prompt": "ok to spend $500?"}, session, steerer),
+        timeout=1.0,
+    )
+
+    assert result["acknowledged"] is True
+    assert result["decision"] == "unavailable"
+    assert result["detail"]
+    # No waiter, no BLOCKED transition, no ApprovalRequested — there is
+    # no controller that could ever answer.
+    assert "t1" not in session.pending_approvals
+    assert session.plan.tasks[0].status == TaskStatus.PENDING
+    assert "approval_requested" not in sink.payload_kinds()
+
+
+async def test_no_control_channel_unavailable_under_observation_only() -> None:
+    """The degraded ack is mode-independent: strict-passive runs return
+    the same immediate 'unavailable' decision."""
+    session = _session_with_plan("t1")
+    sink = ListSink()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=True))
+    steerer.bind(sinks=[sink], planner=None)
+
+    handler = _find_handler("report_awaiting_approval")
+    result = await asyncio.wait_for(
+        handler({"task_id": "t1", "prompt": "?"}, session, steerer),
+        timeout=1.0,
+    )
+    assert result["decision"] == "unavailable"
+    assert "t1" not in session.pending_approvals
+
+
+@pytest.mark.parametrize("observation_only", [True, False])
+async def test_omitted_timeout_uses_configured_finite_default(
+    observation_only: bool,
+) -> None:
+    """timeout_ms omitted (or <= 0) no longer means wait-forever: the
+    SteeringConfig default applies, and expiry emits the WARNING drift
+    in both steering modes."""
+    session = _session_with_plan("t1")
+    sink = ListSink()
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(
+            observation_only=observation_only,
+            approval_default_timeout_ms=50,
+        )
+    )
+    steerer.bind(sinks=[sink], planner=None)
+    steerer.bind_control_channel(ControlChannel())
+
+    handler = _find_handler("report_awaiting_approval")
+    result = await asyncio.wait_for(
+        handler({"task_id": "t1", "prompt": "?"}, session, steerer),
+        timeout=5.0,
+    )
+
+    assert result["decision"] == "timeout"
+    assert "50ms" in result["detail"]
+    # Task stays blocked and resolvable; the drift is the operator signal.
+    assert "t1" in session.pending_approvals
+    assert session.plan.tasks[0].status == TaskStatus.BLOCKED
+    assert any(
+        d.kind is DriftKind.HUMAN_INTERVENTION_REQUIRED and d.severity is DriftSeverity.WARNING
+        for d in session.drift_events
+    )
 
 
 async def test_dispatch_approve_unknown_target_fails_ack() -> None:
@@ -468,6 +563,7 @@ async def test_task_and_tool_waiters_resolve_independently() -> None:
     sink = ListSink()
     steerer = DefaultSteerer()
     steerer.bind(sinks=[sink], planner=None)
+    steerer.bind_control_channel(ControlChannel())
 
     # Register a task-level waiter via the reporting handler.
     task_handler = _find_handler("report_awaiting_approval")
