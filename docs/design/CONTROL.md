@@ -557,7 +557,7 @@ both paths route through `DefaultSteerer._handle_drift` which maps
 | **2** | `NUDGE` | Queue a corrective user message on `session.pending_nudges`. Not on the default table today; reserved for future policies. |
 | **3** | `CANCEL_REINVOKE` | Refine; install revised plan; **dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel** so the executor's invoke loop cancels the in-flight invocation and restarts with a `[GOLDFIVE STEERING CONTROL …]` framed corrective. |
 | **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel** so the executor's pre-task loop blocks for user input. (Phase 2 of #246 replaced the deleted `session.paused_for_human_intervention` flag with this channel-routed signal.) |
-| **5** | `TERMINATE` | Run-level abort. Only reached on repeat Level-4 that didn't resolve. |
+| **5** | `TERMINATE` | Pause-with-deadline: same dispatch as Level 4 but the payload always carries `deadline_s` (`SteeringConfig.pause_escalate_deadline_s`, or 600 s when unset). On expiry the executor cancels non-terminal tasks and emits `RunAborted` with the escalation lineage. Reached on repeat Level-4 that didn't resolve. |
 
 The per-`(drift_kind, severity)` mapping lives in
 `DefaultSteerer._LADDER` (see `goldfive/steerer.py`). A subclass can

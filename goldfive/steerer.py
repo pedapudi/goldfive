@@ -32,10 +32,18 @@ tangle of conditionals. Levels, ordered by intrusiveness:
   path-duality fix routes this through the same junction as USER_STEER.
 * Level 4 — PAUSE_ESCALATE: dispatch a ``GOLDFIVE_PAUSE_ESCALATE``
   control message and emit ``HUMAN_INTERVENTION_REQUIRED`` so the
-  executor's pre-task loop blocks waiting for operator action.
-* Level 5 — TERMINATE: run-level abort (currently only reached when an
-  unhandled Level 4 times out; actual termination is driven by the
-  executor, not the steerer).
+  executor's pre-task loop blocks waiting for operator action. The
+  wait is unbounded unless
+  ``SteeringConfig.pause_escalate_deadline_s`` is set, in which case
+  the message carries a ``deadline_s`` payload the executor enforces.
+* Level 5 — TERMINATE: pause-with-deadline. Same channel dispatch as
+  Level 4, but the payload ALWAYS carries a deadline (the configured
+  ``pause_escalate_deadline_s``, or
+  :data:`goldfive.drift_observer.DEFAULT_TERMINATE_PAUSE_DEADLINE_S`
+  when unset). On expiry the executor aborts the run: non-terminal
+  tasks are CANCELLED and ``RunAborted`` is emitted carrying the
+  escalation lineage. Termination is driven by the executor, not the
+  steerer.
 
 The mapping from (drift_kind, severity, occurrence_count) to level
 lives in :meth:`DefaultSteerer._ladder_level_for`. Level dispatch is

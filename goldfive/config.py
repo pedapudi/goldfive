@@ -220,6 +220,30 @@ def _read_float_env(name: str, default: float) -> float:
         return default
 
 
+def _read_optional_float_env(name: str, default: float | None) -> float | None:
+    """Best-effort optional-float env override; returns default on any failure.
+
+    Used for fields whose Python type is ``float | None`` where ``None``
+    means "feature disabled" (e.g. ``pause_escalate_deadline_s``). A
+    non-positive value is treated as an explicit "disable" and maps to
+    ``None``; parse failures fall back to the default with a debug log.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        log.debug(
+            "runtime-config: ignoring non-float %s=%r (using default %s)",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value if value > 0 else None
+
+
 _VALID_REASONING_DRIFT_MODES: frozenset[str] = frozenset(
     {"judge", "embedding", "both", "off"}
 )
@@ -707,6 +731,23 @@ class SteeringConfig:
     #: :data:`DEFAULT_APPROVAL_TIMEOUT_MS`.
     #: Env: ``GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS``.
     approval_default_timeout_ms: int = DEFAULT_APPROVAL_TIMEOUT_MS
+    #: Deadline, in seconds, on the executor's pause wait after a Level-4
+    #: ``GOLDFIVE_PAUSE_ESCALATE`` dispatch. The pre-task / pre-stage
+    #: pause loop historically awaited ``ControlChannel.receive()`` with
+    #: no bound, so an unattended deployment whose ladder escalated to a
+    #: pause hung forever waiting for an operator RESUME / CANCEL /
+    #: STEER that never came. When set, the executor aborts the run on
+    #: expiry: background steerer/judge tasks are drained, every
+    #: non-terminal task is CANCELLED, and a ``RunAborted`` carrying the
+    #: escalation lineage (originating drift kind + ladder level) is
+    #: emitted. ``None`` (the default) preserves the block-forever
+    #: behaviour for Level 4 — EXCEPT for Level 5 (TERMINATE), which by
+    #: definition must terminate: with no configured deadline it falls
+    #: back to
+    #: :data:`goldfive.drift_observer.DEFAULT_TERMINATE_PAUSE_DEADLINE_S`.
+    #: Operator-issued ``PAUSE`` controls are never bounded by this knob.
+    #: Env: ``GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S``.
+    pause_escalate_deadline_s: float | None = None
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -729,6 +770,9 @@ class SteeringConfig:
         * ``GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS`` — positive int
           (milliseconds); non-positive / non-integer values fall back
           to the default.
+        * ``GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S`` — positive float
+          (seconds); non-positive values disable the deadline (``None``),
+          non-float values fall back to the default.
         """
         defaults = cls()
         raw_rules = os.environ.get("GOLDFIVE_STEER_CONTEXT_EDITOR_RULES", "").strip()
@@ -757,6 +801,10 @@ class SteeringConfig:
             approval_default_timeout_ms=_read_int_env(
                 "GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS",
                 defaults.approval_default_timeout_ms,
+            ),
+            pause_escalate_deadline_s=_read_optional_float_env(
+                "GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S",
+                defaults.pause_escalate_deadline_s,
             ),
         )
 
