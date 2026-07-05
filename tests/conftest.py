@@ -357,6 +357,7 @@ _EMBEDDING_ENV: dict[str, str] = {
     "model": "GOLDFIVE_EMBEDDING_MODEL",
     "api_key": "GOLDFIVE_EMBEDDING_API_KEY",
     "timeout_ms": "GOLDFIVE_EMBEDDING_TIMEOUT_MS",
+    "breaker_cooldown_s": "GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S",
 }
 
 _STEER_ENV: dict[str, str] = {
