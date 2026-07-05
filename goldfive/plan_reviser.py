@@ -22,7 +22,6 @@ Responsibilities
     delegation-observation time for unmatched delegations (goldfive#423
     PR 2). See ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3 + §5
     Option D for the lock-acquiring synchronous growth contract.
-  - :meth:`apply_user_steer_with_plan` — deprecated back-compat shim.
 
 * The shared install pipeline :meth:`_install_with_drift`:
   ``DriftDetected`` emit → fold runtime terminals → validate →
@@ -97,7 +96,6 @@ import contextlib
 import dataclasses
 import logging
 import uuid
-import warnings
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
@@ -610,9 +608,8 @@ class PlanReviser:
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         # goldfive#247: rebind to the stamped instance.
         # goldfive#255: thread ``was_installed`` into PlanRevised.dry_run.
-        # ``install_revision_for_user_steer`` and the user-steer routing
-        # in ``apply_user_steer_with_plan`` enter through here too — the
-        # ``authored_by == "user"`` carve-out inside ``_apply_revision``
+        # ``install_revision_for_user_steer`` enters through here too —
+        # the ``authored_by == "user"`` carve-out inside ``_apply_revision``
         # makes ``was_installed`` True for those even under observation_only.
         revised_plan, was_installed = self._apply_revision(
             session, revised_plan, drift
@@ -627,73 +624,6 @@ class PlanReviser:
             dry_run=not was_installed,
         )
         return True
-
-    async def apply_user_steer_with_plan(
-        self,
-        *,
-        drift: DriftEvent,
-        session: Session,
-        revised_plan: Plan,
-    ) -> bool:
-        """Back-compat shim — prefer :meth:`install_revision_for_drift`
-        or :meth:`install_revision_for_user_steer` instead.
-
-        Routes based on ``drift.kind`` + ``drift.raw``:
-
-        * ``USER_STEER`` with ``raw`` populated → routed to
-          :meth:`install_revision_for_user_steer`. The ``raw`` from
-          the supplied drift is forwarded; ``drift.detail`` /
-          ``drift.authored_by`` are ignored (the new API rebuilds
-          them from ``raw`` deterministically).
-        * ``USER_STEER`` with ``raw is None`` → was the
-          :meth:`Runner._install_revision` synthetic install path
-          before Option A. The new Runner path no longer reaches this
-          shim; callers in this state probably mean
-          :meth:`install_initial_plan` (turn 1) or
-          :meth:`install_revision_for_drift` with a real drift kind
-          (turn N+1). Routed defensively to ``install_initial_plan``
-          when ``session.plan`` is empty, otherwise to
-          ``install_revision_for_drift`` with a synthesized
-          ``NEW_WORK_DISCOVERED`` drift so legacy callers keep
-          working — but a deprecation warning fires.
-        * Any other drift kind → routed to
-          :meth:`install_revision_for_drift`.
-
-        Slated for removal once external callers migrate.
-        """
-        warnings.warn(
-            "DefaultSteerer.apply_user_steer_with_plan is deprecated; "
-            "use install_initial_plan / install_revision_for_drift / "
-            "install_revision_for_user_steer (goldfive#271 Option A).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if drift.kind is DriftKind.USER_STEER and getattr(drift, "raw", None) is not None:
-            return await self.install_revision_for_user_steer(
-                session=session,
-                raw=drift.raw,
-                revised_plan=revised_plan,
-            )
-        if drift.kind is DriftKind.USER_STEER:
-            # Legacy synthetic-install path. Pick the new-API equivalent.
-            if session.plan is None or not session.plan.tasks:
-                return await self.install_initial_plan(
-                    session=session, plan=revised_plan
-                )
-            replan_drift = DriftEvent(
-                kind=DriftKind.NEW_WORK_DISCOVERED,
-                severity=DriftSeverity.INFO,
-                detail=drift.detail,
-                authored_by="goldfive",
-            )
-            return await self.install_revision_for_drift(
-                session=session,
-                drift=replan_drift,
-                revised_plan=revised_plan,
-            )
-        return await self.install_revision_for_drift(
-            session=session, drift=drift, revised_plan=revised_plan
-        )
 
     # ------------------------------------------------------------------
     # Descriptive growth — synchronous, lock-acquiring plan growth at
