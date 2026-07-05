@@ -1693,25 +1693,24 @@ class DriftObserver:
         # regardless of verdict. ``None`` when no sinks are bound —
         # the classifier then stays sink-less and behaves as before.
         judge_sink = self._steerer._sinks[0] if self._steerer._sinks else None
-        # Snapshot the reasoning-history position at schedule time so
-        # the bg pipeline sees the same view the inline pattern
-        # detectors just saw, even if subsequent turns append more
-        # entries before the bg task runs. Without this, a detector
-        # that slices ``history[-N:-1]`` (expecting ``text`` to be the
-        # last entry) would see ``text`` itself in the comparison
-        # window and trivially self-match (goldfive#251 ordering
-        # regression surfaced by the cluster-tightening one-shot
-        # test). ``history_length`` is the length AFTER ``text`` was
-        # appended — the bg path trims ``session.reasoning_history``
-        # to this length for its invocation.
-        history_length = len(session.reasoning_history)
+        # Snapshot the reasoning history at schedule time so the bg
+        # pipeline sees the same view the inline pattern detectors
+        # just saw, even if subsequent turns append more entries (or
+        # the cap trims old ones) before the bg task runs. Without
+        # this, a detector that slices ``history[-N:-1]`` (expecting
+        # ``text`` to be the last entry) would see ``text`` itself in
+        # the comparison window and trivially self-match (goldfive#251
+        # ordering regression surfaced by the cluster-tightening
+        # one-shot test). ``text`` was appended above, so it is the
+        # snapshot's last entry.
+        pinned_history = list(session.reasoning_history)
         bg_task = asyncio.create_task(
             self._run_judge_background(
                 text=text,
                 session=session,
                 call_llm=rl_call_llm,
                 judge_sink=judge_sink,
-                history_length=history_length,
+                pinned_history=pinned_history,
                 agent_name=agent_name,
             ),
             # goldfive#243: encode session.id in the task name so
@@ -1798,7 +1797,7 @@ class DriftObserver:
         session: Session,
         call_llm: ReflectiveCallLLM | None,
         judge_sink: Any,
-        history_length: int,
+        pinned_history: list[str],
         agent_name: str = "",
     ) -> None:
         """Run the mode-selected reasoning drift pipeline off the critical path.
@@ -1811,17 +1810,14 @@ class DriftObserver:
         :meth:`_handle_drift` — same effect as the historical inline
         path, just resolving later.
 
-        ``history_length`` pins the ``session.reasoning_history`` view
-        the pipeline sees to the same tail index that was in effect
-        when the bg task was scheduled. Later turns that append to
-        the shared history (this same session receiving more
-        reasoning blocks before the bg task runs) would otherwise
-        shift the detectors' "exclude self" slice and generate false
-        self-match LOOPING signals. We temporarily truncate the
-        session view for the duration of this bg invocation and
-        restore it after; concurrent bg tasks serialize on the same
-        session's reasoning_history via the asyncio event loop (no
-        threading) so the save/restore pattern is safe in practice.
+        ``pinned_history`` is the ``session.reasoning_history``
+        snapshot captured at schedule time, forwarded to the pipeline
+        explicitly. Later turns that append to the shared live history
+        (this same session receiving more reasoning blocks before the
+        bg task runs) would otherwise shift the detectors' "exclude
+        self" slice and generate false self-match LOOPING signals.
+        ``session.reasoning_history`` itself is never touched here, so
+        concurrent readers always see the live list.
 
         Never raises: any exception (from the judge LLM, the embedding
         pipeline, or ``_handle_drift``) is logged at ``WARNING`` and
@@ -1831,50 +1827,35 @@ class DriftObserver:
         try:
             from goldfive.drift.reasoning import analyze_reasoning_with_focus
 
-            # Save the shared live history and swap in a list snapshot
-            # truncated to the length captured at schedule time. Using
-            # list slicing (not mutation) keeps any already-escaped
-            # reference (e.g. a concurrent detector) pointing at the
-            # original list. We restore the live reference in a
-            # ``finally`` so intervening appends are not lost.
-            original_history = session.reasoning_history
-            pinned_history = list(original_history[:history_length])
-            session.reasoning_history = pinned_history
-            try:
-                # Phase 1 of goldfive#271 — call the focused-verdict
-                # path so we get the judge's plan-task attribution
-                # alongside the drift signal. ``analyze_reasoning_with_focus``
-                # is a sibling of ``analyze_reasoning`` that threads a
-                # :class:`ReasoningJudgeVerdict` instead of just the
-                # drift; legacy callers of ``analyze_reasoning`` keep
-                # their existing return shape.
-                #
-                # goldfive#244 — also forward the wrapped agent tree so
-                # the judge can recognise legitimate coordinator → sub-
-                # agent delegation as ON-TASK rather than OFF_TOPIC.
-                # Reuses the same shape the planner already consumes
-                # (``ADKAdapter.available_agents_tree``); legacy adapters
-                # without the property fall back to a flat
-                # ``available_agents`` list, and adapters with neither
-                # leave ``available_agents=None`` — the judge prompt
-                # then renders byte-identically to pre-#244.
-                judge_available_agents = self._resolve_available_agents()
-                verdict = await analyze_reasoning_with_focus(
-                    text,
-                    session,
-                    mode=self._steerer._reasoning_drift_mode,
-                    call_llm=call_llm,
-                    model=self._steerer._reasoning_drift_model,
-                    sink=judge_sink,
-                    agent_name=agent_name,
-                    available_agents=judge_available_agents,
-                )
-            finally:
-                # Restore the live history. Any entries appended by
-                # subsequent turns are preserved because we pointed
-                # ``session.reasoning_history`` at a separate list for
-                # our window.
-                session.reasoning_history = original_history
+            # Phase 1 of goldfive#271 — call the focused-verdict
+            # path so we get the judge's plan-task attribution
+            # alongside the drift signal. ``analyze_reasoning_with_focus``
+            # is a sibling of ``analyze_reasoning`` that threads a
+            # :class:`ReasoningJudgeVerdict` instead of just the
+            # drift; legacy callers of ``analyze_reasoning`` keep
+            # their existing return shape.
+            #
+            # goldfive#244 — also forward the wrapped agent tree so
+            # the judge can recognise legitimate coordinator → sub-
+            # agent delegation as ON-TASK rather than OFF_TOPIC.
+            # Reuses the same shape the planner already consumes
+            # (``ADKAdapter.available_agents_tree``); legacy adapters
+            # without the property fall back to a flat
+            # ``available_agents`` list, and adapters with neither
+            # leave ``available_agents=None`` — the judge prompt
+            # then renders byte-identically to pre-#244.
+            judge_available_agents = self._resolve_available_agents()
+            verdict = await analyze_reasoning_with_focus(
+                text,
+                session,
+                mode=self._steerer._reasoning_drift_mode,
+                call_llm=call_llm,
+                model=self._steerer._reasoning_drift_model,
+                sink=judge_sink,
+                agent_name=agent_name,
+                available_agents=judge_available_agents,
+                reasoning_history=pinned_history,
+            )
 
             # Record the reasoning-extracted binding onto the
             # orchestration store regardless of the drift verdict —

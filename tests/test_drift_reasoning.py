@@ -880,3 +880,31 @@ async def test_observe_reasoning_truncates_long_trigger_input() -> None:
     # At the 2048-char cap + suffix length.
     assert len(trigger_input) == 2048 + len(" … [truncated]")
 
+
+
+# ---------------------------------------------------------------------------
+# Pinned-history threading (background judge snapshot)
+# ---------------------------------------------------------------------------
+
+
+async def test_analyze_with_focus_honours_pinned_history() -> None:
+    """``reasoning_history`` pins the detectors' window: entries appended
+    to the live session list after the snapshot cannot self-match."""
+    session = _session_with_task()
+    text = "Let me re-examine the slide content and look for typos."
+    # Snapshot at schedule time: ``text`` is the last (and only) entry.
+    pinned = [text]
+    # A later turn appends a byte-identical block to the live list.
+    session.reasoning_history = [text, text]
+
+    verdict = await dreason.analyze_reasoning_with_focus(
+        text, session, mode="embedding", reasoning_history=pinned
+    )
+    assert verdict.drift is None
+
+    # Without the pin the live list is read and the duplicate matches.
+    verdict = await dreason.analyze_reasoning_with_focus(
+        text, session, mode="embedding"
+    )
+    assert verdict.drift is not None
+    assert verdict.drift.kind is DriftKind.LOOPING_REASONING
