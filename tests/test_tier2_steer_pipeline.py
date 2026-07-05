@@ -54,6 +54,8 @@ from goldfive import (  # noqa: E402
     TaskEdge,
     TaskStatus,
 )
+from goldfive.config import SteeringConfig  # noqa: E402
+from goldfive.steerer import DefaultSteerer  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers (model on tests/test_planner_handle_turn.py + test_runner_multi_turn.py)
@@ -406,6 +408,9 @@ async def test_f6_conversational_turn_wraps_user_input_for_executor() -> None:
         executor=SequentialExecutor(),
         goal_deriver=PassthroughGoalDeriver("demo"),
         sinks=[sink],
+        # Explicit active mode: the F6 conversational wrap under test is
+        # suppressed under the shipped observation-only default.
+        steerer=DefaultSteerer(steering_config=SteeringConfig(observation_only=False)),
     )
 
     # Wrap the executor.run to snapshot the user_input it receives.

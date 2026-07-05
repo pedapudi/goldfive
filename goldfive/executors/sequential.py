@@ -64,6 +64,7 @@ from goldfive.executors._shared import (
 )
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
+from goldfive.steerer import steering_is_active
 from goldfive.types import (
     DriftKind,
     DriftSeverity,
@@ -683,7 +684,7 @@ class SequentialExecutor(Executor):
                             task.id,
                         )
                         failure_reason = ""  # not actually fatal
-                    elif getattr(steerer, "_observation_only", False):
+                    elif not steering_is_active(steerer):
                         # goldfive#260: under observation_only, do NOT
                         # enforce the "failed-task must have a live
                         # replacement" invariant. The replacement-
@@ -774,7 +775,7 @@ class SequentialExecutor(Executor):
             # observation_only's "passive — observe, don't enforce"
             # contract; the coordinator's autonomous flow decides
             # whether the failure is recoverable.
-            if getattr(steerer, "_observation_only", False):
+            if not steering_is_active(steerer):
                 log.info(
                     "SequentialExecutor: observation_only=True — "
                     "skipping abort-on-failed-without-replacement "
@@ -1280,7 +1281,7 @@ class SequentialExecutor(Executor):
                 # originating ``HUMAN_INTERVENTION_REQUIRED`` drift
                 # the steerer emitted remains the durable signal on
                 # the sink stream.
-                if getattr(steerer, "_observation_only", False):
+                if not steering_is_active(steerer):
                     log.info(
                         "SequentialExecutor._run_overlay: "
                         "observation_only=True — would have paused on "
@@ -1336,7 +1337,7 @@ class SequentialExecutor(Executor):
                 # the tree here — exactly the enforcement
                 # ``observation_only`` exists to suppress. Discard the
                 # queue (never inject it later) and end the turn.
-                if getattr(steerer, "_observation_only", False):
+                if not steering_is_active(steerer):
                     log.info(
                         "SequentialExecutor._run_overlay: "
                         "observation_only=True — would have replayed %d "
@@ -1457,7 +1458,7 @@ class SequentialExecutor(Executor):
             # failure to the user). If it can't, the run terminates
             # naturally when the coordinator stops dispatching
             # invocations and we fall through to run_completed below.
-            if getattr(steerer, "_observation_only", False):
+            if not steering_is_active(steerer):
                 log.info(
                     "SequentialExecutor._run_overlay: observation_only=True "
                     "— skipping abort-on-failed-without-replacement for "
@@ -1630,7 +1631,7 @@ class SequentialExecutor(Executor):
                 # ``HUMAN_INTERVENTION_REQUIRED`` drift on the sink
                 # stream remains the durable signal) and keep waiting
                 # on the invoke task / next control message.
-                if getattr(steerer, "_observation_only", False):
+                if not steering_is_active(steerer):
                     log.info(
                         "SequentialExecutor: observation_only=True — "
                         "dropping GOLDFIVE_PAUSE_ESCALATE without "

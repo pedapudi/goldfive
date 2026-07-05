@@ -100,7 +100,30 @@ __all__ = [
     "InterventionLevel",
     "RefineExhausted",
     "compose_corrective_user_message",
+    "steering_is_active",
 ]
+
+
+def steering_is_active(steerer: Any) -> bool:
+    """Return ``True`` iff ``steerer`` permits active-steering interventions.
+
+    The one documented fallback for consumers holding a maybe-steerer
+    (executors, the ADK plugin, prompt shaping, reporting acks):
+    delegates to :meth:`DefaultSteerer.is_active_steering` when the
+    steerer exposes it, and answers ``False`` when ``steerer`` is
+    ``None``, lacks the predicate, or the predicate raises. Passive is
+    the fail-safe direction — a surface whose whole purpose is to NOT
+    intervene under :class:`~goldfive.config.SteeringConfig.observation_only`
+    must not start intervening because a stub steerer forgot a method.
+    Consumers must not read ``_observation_only`` directly.
+    """
+    predicate = getattr(steerer, "is_active_steering", None)
+    if not callable(predicate):
+        return False
+    try:
+        return bool(predicate())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class RefineExhausted(Exception):
@@ -670,23 +693,18 @@ class DefaultSteerer:
         # (``session.plan`` mutation in ``_apply_revision``, the
         # ``GOLDFIVE_STEER`` ControlMessage enqueue, the
         # ``request_invocation_cancel`` plugin call) are gated by
-        # :meth:`_should_inject`. The flag lives on :class:`SteeringConfig`
-        # — NOT a constructor parameter on this class — so operators
-        # set it via ``RuntimeConfig(steering=SteeringConfig(...))``
-        # at :func:`goldfive.wrap` time. Default for the bare
+        # :meth:`is_active_steering`. The flag lives on
+        # :class:`SteeringConfig` — NOT a constructor parameter on this
+        # class — so operators set it via
+        # ``RuntimeConfig(steering=SteeringConfig(...))`` at
+        # :func:`goldfive.wrap` time. Default for the bare
         # ``DefaultSteerer()`` constructor (no config) is the safer
         # passive observation (``True``) — matches the production
         # default on :class:`SteeringConfig` and avoids surprising
         # third-party callers who construct ``DefaultSteerer`` directly.
-        if steering_config is not None:
-            self._observation_only: bool = bool(steering_config.observation_only)
-        else:
-            # Honour the test-only override hook so the autouse fixture
-            # in ``tests/conftest.py`` can flip the implicit default for
-            # the entire test suite without touching every call site.
-            from goldfive.config import _resolve_observation_only_default
-
-            self._observation_only = _resolve_observation_only_default()
+        self._observation_only: bool = (
+            bool(steering_config.observation_only) if steering_config is not None else True
+        )
         # Wall-clock stall watchdog knobs (flag-gated, default OFF). Read
         # by the ADK plugin's per-dispatch watchdog task — see
         # :class:`~goldfive.config.SteeringConfig.stall_watchdog_enabled`.
@@ -1318,11 +1336,13 @@ class DefaultSteerer:
     # :meth:`__init__` from :class:`~goldfive.config.SteeringConfig`).
     # ------------------------------------------------------------------
 
-    def _should_inject(self) -> bool:
-        """Return ``True`` iff the steerer should actually inject side effects.
+    def is_active_steering(self) -> bool:
+        """Return ``True`` iff interventions may mutate state or inject.
 
-        Single named gate for the steering injection points
-        (goldfive#254):
+        The single source of truth for the
+        :class:`~goldfive.config.SteeringConfig.observation_only`
+        kill-switch (goldfive#254). Named gate for the steering
+        injection points:
 
         * plan mutation in :meth:`PlanReviser._apply_revision`
           (``set_session_plan`` + ``last_addressed_revision_by_drift_key``);
@@ -1334,17 +1354,29 @@ class DefaultSteerer:
           :meth:`DriftObserver._dispatch_nudge` and the post-ABSORB
           nudge handoff (goldfive#202) — the overlay drains the queue
           into a synthetic user turn and re-invokes the tree, so the
-          enqueue is an injection, not an observation.
+          enqueue is an injection, not an observation;
+        * the prompt-shape injections
+          (:meth:`~goldfive.prompt_shaper.PromptShaper.should_inject`),
+          the executor carve-outs, the plugin's pre-dispatch gates, and
+          the F1 directive acks — all via :func:`steering_is_active`.
 
         ``False`` when :class:`~goldfive.config.SteeringConfig.observation_only`
         is in effect — detection still runs, ``planner.refine_steer``
         still runs, ``PlanRevised`` still emits (with ``dry_run=True``),
-        but the in-flight invocation is not touched. Defined as a tiny
-        helper rather than inlining ``not self._observation_only`` at
-        each site so the intent is grep-able and a future injection
-        point has a single gate to honour.
+        but the in-flight invocation is not touched. Consumers holding a
+        maybe-steerer resolve through :func:`steering_is_active`, which
+        treats a missing implementation as passive.
         """
         return not self._observation_only
+
+    def _should_inject(self) -> bool:
+        """Steerer-internal alias for :meth:`is_active_steering`.
+
+        Same truth source — kept because "should inject" reads
+        naturally at the dispatch gates and pre-refactor callers/tests
+        address it by name.
+        """
+        return self.is_active_steering()
 
     # Consecutive refine failures tolerated per (drift_kind, task_id)
     # before we give up and mark the task FAILED. Class attribute so

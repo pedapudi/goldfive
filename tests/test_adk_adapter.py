@@ -1903,6 +1903,11 @@ async def test_reporting_tool_duplicate_returns_idempotent_ack(state_ctx_cls) ->
         def __init__(self) -> None:
             self.tasks = _Tasks()
 
+        def is_active_steering(self) -> bool:
+            # Explicit active mode: the F1 directive ack under test is
+            # suppressed under the shipped observation-only default.
+            return True
+
         @property
         def running_calls(self) -> int:
             return self.tasks.running_calls

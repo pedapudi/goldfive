@@ -220,15 +220,17 @@ class _CapturingSteerer:
     Shape mirrors the live :class:`DefaultSteerer` interface for the
     watcher's emission path after goldfive#410: the watcher reaches
     for ``steerer.drift.observe`` and ``steerer.drift._emit_drift_detected``.
-    ``_observation_only=False`` pins active mode — the watcher's
-    cancel-flag write is gated on the flag and a missing attribute
+    ``is_active_steering() -> True`` pins active mode — the watcher's
+    cancel-flag write is gated on the predicate and a missing method
     reads as passive.
     """
 
     def __init__(self) -> None:
         self.drift = _CapturingDrift()
         self._sinks: list[Any] = []
-        self._observation_only = False
+
+    def is_active_steering(self) -> bool:
+        return True
 
     @property
     def observations(self) -> list[Any]:

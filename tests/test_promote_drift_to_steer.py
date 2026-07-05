@@ -32,6 +32,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.control import (  # noqa: E402
     ControlChannel,
     ControlKind,
@@ -147,9 +148,13 @@ def _make_session() -> Session:
 def _bound_steerer() -> tuple[
     DefaultSteerer, _RevisedPlanPlanner, ControlChannel, _ListSink
 ]:
+    # Explicit active mode: the plan swap + GOLDFIVE_STEER dispatch
+    # under test are suppressed under the shipped observation-only
+    # default.
     steerer = DefaultSteerer(
         goldfive_steer_threshold="warning",
         goldfive_steer_suppression_window_turns=3,
+        steering_config=SteeringConfig(observation_only=False),
     )
     planner = _RevisedPlanPlanner(revised=_make_revised_plan())
     sink = _ListSink()

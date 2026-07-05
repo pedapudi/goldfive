@@ -546,11 +546,11 @@ async def test_active_steering_no_op_refine_dispatches_pause_escalate() -> None:
 
 
 class _StubSteererForOverlay:
-    """Bare-bones Steerer for overlay tests; carries the
-    ``_observation_only`` attribute the executor's defense-in-depth gate
-    reads. Avoids the full DefaultSteerer to keep these overlay tests
-    fast and avoid wiring planner / refine plumbing — the executor's
-    gate is read structurally from ``steerer._observation_only``.
+    """Bare-bones Steerer for overlay tests; exposes the
+    ``is_active_steering`` predicate the executor's defense-in-depth
+    gate resolves via ``steering_is_active``. Avoids the full
+    DefaultSteerer to keep these overlay tests fast and avoid wiring
+    planner / refine plumbing.
     """
 
     def __init__(self, *, observation_only: bool = False) -> None:
@@ -558,6 +558,9 @@ class _StubSteererForOverlay:
         self._sinks: list[EventSink] = []
         self._planner: Any = None
         self.observed: list[Any] = []
+
+    def is_active_steering(self) -> bool:
+        return not self._observation_only
 
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks

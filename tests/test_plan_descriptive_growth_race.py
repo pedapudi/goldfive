@@ -34,6 +34,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     DriftEvent,
@@ -410,7 +411,7 @@ async def test_pre_fix_lock_free_growth_demonstrates_race() -> None:
         session = _make_session()
         planner = _StubPlanner(revised_factory=_refine_revised)
         sink = _ListSink()
-        steerer = DefaultSteerer()
+        steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
         steerer.bind(sinks=[sink], planner=planner)
 
         steerer.plans.install_descriptive_growth = (  # type: ignore[method-assign]

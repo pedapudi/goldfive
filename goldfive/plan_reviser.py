@@ -1866,7 +1866,7 @@ class PlanReviser:
             (not is_bootstrap)
             and (not is_user_authored)
             and (not is_discovery)
-            and (not self._steerer._should_inject())
+            and (not self._steerer.is_active_steering())
         )
         if gate_active:
             log.info(
@@ -1965,7 +1965,7 @@ class PlanReviser:
             # every side-effect site below can gate consistently. Mirrors
             # the wire-stamp resolution further down (caller threads through
             # ``not was_installed``; legacy callers pass ``None`` and fall
-            # back to ``not self._should_inject()``). Computed once,
+            # back to ``not is_active_steering()``). Computed once,
             # consumed by:
             #   * the supersedes-integration ``set_session_plan`` swap;
             #   * ``clear_obsolete_corrections_on_revision`` (state pop);
@@ -1980,7 +1980,7 @@ class PlanReviser:
             effective_dry_run = (
                 bool(dry_run)
                 if dry_run is not None
-                else (not self._steerer._should_inject())
+                else (not self._steerer.is_active_steering())
             )
             prior_plan_id_short = (
                 (session.plan.id if session.plan is not None else "")[:16]
@@ -2186,7 +2186,7 @@ class PlanReviser:
             # marker reflects whether this SPECIFIC revision was actually
             # suppressed (a bootstrap install or user-authored steer
             # under observation_only is a REAL revision — dry_run False
-            # — even though ``self._should_inject()`` is False). Legacy
+            # — even though ``is_active_steering()`` is False). Legacy
             # callers that don't pass ``dry_run`` fall back to the
             # pre-#255 behaviour for back-compat.
             #

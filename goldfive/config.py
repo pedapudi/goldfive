@@ -81,32 +81,6 @@ __all__ = [
 _VALID_STEER_THRESHOLDS: frozenset[str] = frozenset({"off", "warning", "critical"})
 
 
-# Test-only override hook for :class:`SteeringConfig.observation_only`'s
-# default (goldfive#254). Production code path: this stays ``None`` and
-# every fresh ``SteeringConfig()`` instance gets the documented production
-# default of ``True`` (passive observation). The pytest autouse fixture
-# ``tests/conftest.py::_goldfive_active_steering_default`` flips this to
-# ``False`` for the test suite so the broad existing test corpus —
-# written against the prior active-steering default — stays green
-# without per-test surgery. Tests that explicitly pass
-# ``observation_only=True`` (or ``=False``) still win — the override
-# only applies when the field was not explicitly set by the caller.
-_OBSERVATION_ONLY_DEFAULT: bool | None = None
-
-
-def _resolve_observation_only_default() -> bool:
-    """Resolve the active default for :class:`SteeringConfig.observation_only`.
-
-    Reads :data:`_OBSERVATION_ONLY_DEFAULT`. ``None`` means "no test
-    override is in effect" — return the production default (``True``).
-    Anything else means a test fixture has flipped the default
-    explicitly; honour the override.
-    """
-    if _OBSERVATION_ONLY_DEFAULT is None:
-        return True
-    return bool(_OBSERVATION_ONLY_DEFAULT)
-
-
 def _read_bool_env(name: str, default: bool) -> bool:
     """Read ``os.environ[name]`` as a boolean; fall back to ``default``.
 
@@ -660,8 +634,15 @@ class SteeringConfig:
     cancel or refine fires. Default ``3`` keeps a live operator
     override dominant across a few agent turns.
 
-    ``observation_only`` (goldfive#254) gates the actual steering
-    injection points on :class:`~goldfive.steerer.DefaultSteerer`:
+    ``observation_only`` (goldfive#254) is the master kill-switch for
+    steering interventions. The single source of truth at runtime is
+    :meth:`~goldfive.steerer.DefaultSteerer.is_active_steering`
+    (``True`` iff interventions may mutate or inject); consumers
+    holding a maybe-steerer resolve through
+    :func:`~goldfive.steerer.steering_is_active`, which treats a
+    missing steerer / missing predicate as passive. No other code may
+    read the flag directly. The gated injection points on
+    :class:`~goldfive.steerer.DefaultSteerer`:
 
     * the would-be revised plan replacing ``session.plan`` in
       :meth:`~goldfive.steerer.DefaultSteerer._apply_revision`;
@@ -713,9 +694,7 @@ class SteeringConfig:
 
     threshold: str = "warning"
     suppression_window_turns: int = 3
-    observation_only: bool = dataclasses.field(
-        default_factory=_resolve_observation_only_default
-    )
+    observation_only: bool = True
     #: Names of :class:`~goldfive.context_editor.ContextEditRule` rules to
     #: register on the ADK plugin's :class:`~goldfive.context_editor.ContextEditor`
     #: (goldfive#397). ``None`` (the default) AND an empty list both leave
@@ -814,9 +793,7 @@ class SteeringConfig:
         * ``GOLDFIVE_STEER_OBSERVATION_ONLY`` — boolean
           (``1``/``true``/``yes``/``on`` truthy; ``0``/``false``/
           ``no``/``off`` falsy; case-insensitive). Defaults to the
-          built-in default (``True`` in production, flipped to
-          ``False`` for the goldfive test suite via the autouse
-          ``_goldfive_active_steering_default`` fixture).
+          built-in default (``True``).
         * ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES`` — comma-separated rule
           names (goldfive#397). Empty / unset → ``None`` (editor unwired).
           Example: ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES=prune_cancelled_reasoning``.

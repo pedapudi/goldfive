@@ -322,6 +322,11 @@ async def test_parallel_pause_deadline_expiry_aborts_run() -> None:
 def _bound_steerer(
     steering_config: SteeringConfig | None = None,
 ) -> tuple[DefaultSteerer, Session, RecordingSink, ControlChannel]:
+    # Explicit active mode unless the caller supplies its own config:
+    # the pause dispatch under test is suppressed under the shipped
+    # observation-only default.
+    if steering_config is None:
+        steering_config = SteeringConfig(observation_only=False)
     steerer = DefaultSteerer(goldfive_steer_threshold="off", steering_config=steering_config)
     session = Session(run_id="terminate-test", current_task_id="t1")
     session.plan = Plan(

@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from goldfive.config import SteeringConfig
 from goldfive.executors.sequential import (
     SequentialExecutor,
     _fatally_failed_task_ids,
@@ -69,6 +70,12 @@ class StubSteerer:
         self._planner: Any = None
         self.observed: list[Any] = []
         self.transitions: list[tuple[str, TaskStatus]] = []
+
+    def is_active_steering(self) -> bool:
+        # Explicit active mode: the executor's nudge replay and
+        # abort-on-fatal-failure enforcement under test are suppressed
+        # under the shipped observation-only default.
+        return True
 
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks
@@ -681,7 +688,10 @@ async def test_absorb_on_looping_reasoning_queues_nudge() -> None:
     # LEGACY ABSORB-with-nudge behaviour for operators who disable
     # promotion; cover the promotion path in
     # tests/test_steer_unification.py.
-    steerer = DefaultSteerer(goldfive_steer_threshold="off")
+    steerer = DefaultSteerer(
+        goldfive_steer_threshold="off",
+        steering_config=SteeringConfig(observation_only=False, threshold="off"),
+    )
     steerer.bind(sinks=[sink], planner=_StubPlanner())
 
     drift = DriftEvent(

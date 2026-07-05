@@ -596,8 +596,10 @@ that allowed stale verdicts to cascade is gone.
 explicitly), detection still runs in full and `planner.refine_steer`
 still runs, but no side effect lands on the in-flight invocation.
 
-The three gated sites — all routed through a single named helper
-`DefaultSteerer._should_inject()` so the contract is grep-able:
+The three gated sites — all routed through the single public
+predicate `DefaultSteerer.is_active_steering()` (consumers holding a
+maybe-steerer resolve through `goldfive.steerer.steering_is_active`,
+whose documented fallback is passive) so the contract is grep-able:
 
 1. **Plan mutation** — `DefaultSteerer._apply_revision` skips the
    `set_session_plan(session, revised)` write and the
@@ -643,11 +645,12 @@ goldfive.wrap(
 
 Or via env: `GOLDFIVE_STEER_OBSERVATION_ONLY=0` /
 `false` / `no` for active steering; `=1` / `true` / `yes` for
-passive observation. The test suite flips the implicit default to
-`False` via the autouse `_goldfive_active_steering_default`
-fixture in `tests/conftest.py` so the existing test corpus
-(written against the prior active-steering default) stays green
-without per-test surgery.
+passive observation. The test suite runs against the shipped
+default (`observation_only=True`); tests that exercise
+interventions opt into active mode explicitly (the
+`active_steering_config` / `make_active_steerer` fixtures in
+`tests/conftest.py`, or an inline
+`SteeringConfig(observation_only=False)`).
 
 ---
 

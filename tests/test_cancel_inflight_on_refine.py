@@ -59,6 +59,7 @@ from goldfive.adapters._adk_plugin import (  # noqa: E402
     SessionContext,
     make_adk_plugin,
 )
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     CancellationRequest,
@@ -436,7 +437,7 @@ async def test_cancel_inflight_for_revision_fires_for_real_drift() -> None:
             self.calls.append(kwargs)
             return [str(kwargs.get("invocation_id", ""))]
 
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     adapter = _CountingAdapter()
     steerer.bind_adapter(adapter)
     drift = DriftEvent(
@@ -515,6 +516,7 @@ async def test_plan_divergence_refine_cancels_inflight_coordinator_task() -> Non
     steerer = DefaultSteerer(
         goldfive_steer_threshold="warning",
         goldfive_steer_suppression_window_turns=3,
+        steering_config=SteeringConfig(observation_only=False),
     )
     steerer.bind(sinks=[], planner=_StubPlanner())
 

@@ -49,6 +49,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.state_store import StateStore  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
@@ -289,7 +290,7 @@ async def test_request_invocation_cancel_stamps_cancel_pending_synchronously() -
     """
     plugin = _RecordingPlugin()
     adapter = _StubAdapter(plugin)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer._adapter = adapter  # type: ignore[assignment]
 
     session = _session(run_id="r-stamp")

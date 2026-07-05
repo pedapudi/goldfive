@@ -37,6 +37,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS, ReportingToolSpec  # noqa: E402
 from goldfive.steerer import (  # noqa: E402
     DefaultSteerer,
@@ -132,7 +133,7 @@ async def test_f1_report_task_completed_returns_plan_state_pointer() -> None:
     an information-free ack."""
     session = _multi_task_session(initial_status=TaskStatus.RUNNING)
     sink = _ListSink()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=_StubPlanner())
 
     out = await _tool("report_task_completed").handler(
@@ -159,7 +160,7 @@ async def test_f1_skips_predecessor_blocked_pending_tasks() -> None:
     edge predecessor is terminal. t3 should NOT be surfaced over t2 even
     though both are PENDING — t3's predecessor (t2) is still PENDING."""
     session = _multi_task_session(initial_status=TaskStatus.RUNNING)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[_ListSink()], planner=_StubPlanner())
 
     out = await _tool("report_task_completed").handler(
@@ -174,7 +175,7 @@ async def test_f1_idempotent_re_report_still_includes_plan_state() -> None:
     task still carries the rich payload so the LLM sees the live plan
     state, not just an ack — that's the anchor that breaks the loop."""
     session = _multi_task_session(initial_status=TaskStatus.RUNNING)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[_ListSink()], planner=_StubPlanner())
 
     # First call: real transition.
@@ -209,7 +210,7 @@ async def test_f1_no_next_pending_when_plan_done() -> None:
         edges=[],
     )
     session = Session(run_id="r1", goals=[Goal(id="g1", summary="x")], plan=plan)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[_ListSink()], planner=_StubPlanner())
 
     out = await _tool("report_task_completed").handler(
@@ -464,6 +465,9 @@ class _StubSteererWithFlag:
     def __init__(self, *, observation_only: bool, sinks: list[Any]) -> None:
         self._observation_only = observation_only
         self._sinks = sinks
+
+    def is_active_steering(self) -> bool:
+        return not self._observation_only
 
 
 def _plugin_redirect_harness(
@@ -755,7 +759,10 @@ async def test_f10_overlay_returns_early_on_goldfive_pause() -> None:
             await asyncio.sleep(60)
 
     class _StubSteerer:
-        pass
+        # Explicit active mode: the executor drops the pause message
+        # under the shipped observation-only default.
+        def is_active_steering(self) -> bool:
+            return True
 
     class _StubReconciler:
         def reset_for_new_plan(self, plan: Any) -> None:

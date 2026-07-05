@@ -49,14 +49,17 @@ class _CapturingSteerer:
     captures every observation seen + every drift emitted via the
     conventional ``_emit_drift_detected`` path.
 
-    ``_observation_only`` mirrors :class:`DefaultSteerer`'s field: the
-    watcher's cancel-flag write is gated on it (missing flag reads as
-    passive — the fail-safe direction)."""
+    ``is_active_steering`` mirrors :class:`DefaultSteerer`'s predicate:
+    the watcher's cancel-flag write is gated on it (a missing predicate
+    reads as passive — the fail-safe direction)."""
 
     def __init__(self, *, observation_only: bool = False) -> None:
         self.drift = _CapturingDrift()
         self._sinks: list[Any] = []
         self._observation_only = observation_only
+
+    def is_active_steering(self) -> bool:
+        return not self._observation_only
 
     @property
     def observations(self) -> list[Any]:
