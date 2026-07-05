@@ -590,13 +590,13 @@ that allowed stale verdicts to cascade is gone.
 
 ## §5.5 Observation-only mode (goldfive#254)
 
-`SteeringConfig.observation_only` gates the three actual steering
+`SteeringConfig.observation_only` gates the four actual steering
 **injection points** in `DefaultSteerer`. When the flag is `True`
 (the production default — operators graduate to active steering
 explicitly), detection still runs in full and `planner.refine_steer`
 still runs, but no side effect lands on the in-flight invocation.
 
-The three gated sites — all routed through the single public
+The four gated sites — all routed through the single public
 predicate `DefaultSteerer.is_active_steering()` (consumers holding a
 maybe-steerer resolve through `goldfive.steerer.steering_is_active`,
 whose documented fallback is passive) so the contract is grep-able:
@@ -615,6 +615,14 @@ whose documented fallback is passive) so the contract is grep-able:
    returns `[]` without consulting the plugin, so no
    `CancellationRequest` is written and the
    `cancel_requested_invocation_ids()` registry stays empty.
+4. **Level 2 nudge enqueue** (goldfive#475) — `_dispatch_nudge` and
+   the post-ABSORB handoff skip the `session.pending_nudges` write
+   (the overlay would otherwise drain the queue into a
+   goldfive-authored synthetic user turn and re-invoke the tree).
+   The would-be nudge is logged and an `observation_only_gate`
+   `PolicyApplied` event is stamped; the executor's drain carries a
+   matching defense-in-depth gate for steerer subclasses that bypass
+   the dispatcher.
 
 The paired `PlanRevised` event carries `dry_run=true` so consumers
 (harmonograf, custom sinks) can surface a "would-have-applied"
@@ -627,7 +635,7 @@ tracks the producer's live state.
 injection. Suppression accounting (`suppressed_by_user_steer`),
 drift lifecycle (PR #271), and reporting events (`ReasoningJudgeInvoked`,
 `GoldfiveLLMCallStart`/`End`, sink-side observability) all keep
-running. The mode is purely about whether the steerer's three
+running. The mode is purely about whether the steerer's four
 **write** paths fire.
 
 Operators opt in / out via the typed config surface — no

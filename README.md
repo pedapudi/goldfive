@@ -275,7 +275,7 @@ inspect the event stream. Concrete and runnable.
 ### Reference
 
 - [`docs/reference/api.md`](docs/reference/api.md) — public API surface.
-- [`docs/reference/tool-protocol.md`](docs/reference/tool-protocol.md) — the eight reporting tools.
+- [`docs/reference/tool-protocol.md`](docs/reference/tool-protocol.md) — the reporting tools (seven lifecycle tools registered by default; three drift self-reporting tools opt-in via `drift_self_reporting`).
 - [`docs/performance.md`](docs/performance.md) — orchestration-overhead baseline.
 
 ## License

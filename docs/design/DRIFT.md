@@ -136,8 +136,8 @@ the full Rule A/B/C table under the new model.
 | `RUNAWAY_DELEGATION` | `35` | ADK coordinator delegated via `AgentTool` more than `ADKAdapter(agent_tool_cap=N)` allows (default 16). | `critical` | `_GoldfiveADKPlugin._emit_runaway_delegation_drift` | Level 3 → Level 4 (cancel + refine; escalate on repeat) |
 | `CONFABULATION_RISK` | `34` | Two sources: (a) `GoldfivePlanner.process_planning_response` sees a `function_call` whose name is neither in the running agent's own tools nor in the tree agent registry (pure hallucination, three-stage gate #178); (b) `goldfive.drift.classify_confabulation_risk` spots the cheap structural pattern "task title implies external data access but the agent produced output without calling any tool." | `warning` (three-stage gate) / `info` (structural) | `GoldfivePlanner` or `after_run_callback` | Level 1 → Level 3 on repeat |
 | `REFINE_VALIDATION_FAILED` | `36` | `LLMPlanner` exhausted its refine retry budget (attempts 1 & 2 both rejected by the structural validator). Terminal signal. | `critical` | `LLMPlanner._emit_refine_validation_failed` | Level 4 (PAUSE_ESCALATE — steerer deliberately does NOT re-refine) |
-| `HUMAN_INTERVENTION_REQUIRED` | `37` | Escalation target emitted by the intervention ladder when Level 4 fires (persistent refine failures, goal drift, repeated critical drift). | `critical` | `DefaultSteerer._dispatch_pause_escalate` | Level 4; repeat → Level 5 (TERMINATE) |
-| `GOAL_DRIFT` | `38` | Periodic trajectory-level LLM-judge: every N invocations, classify whether accumulated activity advances `session.goals`. Gated behind `Runner(goal_drift_enabled=...)` + a `goal_drift_call_llm` callable on the steerer. **On the `goldfive.wrap(...)` path the judge is wired automatically** from the resolved planner `call_llm` (goldfive#217): any `wrap()` call that ends up with a real LLM — explicit `call_llm=` or `detect_llm(agent)` hit — also arms this judge. Opt out by passing an explicit steerer, e.g. `goldfive.wrap(agent, steerer=DefaultSteerer(goal_drift_call_llm=None))`, or by setting `Runner(goal_drift_enabled=False)` when building manually. When `goal_drift_enabled=True` but no callable is wired (operator-built `Runner` with a bare `DefaultSteerer()`), the Runner emits a one-shot WARNING and the check stays inert. | `critical` | `goldfive.drift.goals.classify_goal_drift` | Level 4 both on first and repeat (refine cannot recover from trajectory-level drift) |
+| `HUMAN_INTERVENTION_REQUIRED` | `37` | Escalation target emitted by the intervention ladder when Level 4 fires (persistent refine failures, repeated critical drift). | `critical` | `DriftObserver._dispatch_pause_escalate` | Level 4; repeat → Level 5 (TERMINATE) |
+| `GOAL_DRIFT` | `38` | Periodic trajectory-level LLM-judge: every N invocations, classify whether accumulated activity advances `session.goals`. Gated behind `Runner(goal_drift_enabled=...)` + a `goal_drift_call_llm` callable on the steerer. **On the `goldfive.wrap(...)` path the judge is wired automatically** from the resolved planner `call_llm` (goldfive#217): any `wrap()` call that ends up with a real LLM — explicit `call_llm=` or `detect_llm(agent)` hit — also arms this judge. Opt out by passing an explicit steerer, e.g. `goldfive.wrap(agent, steerer=DefaultSteerer(goal_drift_call_llm=None))`, or by setting `Runner(goal_drift_enabled=False)` when building manually. When `goal_drift_enabled=True` but no callable is wired (operator-built `Runner` with a bare `DefaultSteerer()`), the Runner emits a one-shot WARNING and the check stays inert. | `critical` | `goldfive.drift.goals.classify_goal_drift` | WARNING → Level 2 (NUDGE); CRITICAL first → Level 2 (NUDGE), repeat → Level 3 (CANCEL_REINVOKE). goldfive#324 F4: the plan is usually still right — the agent's next-action reasoning is what's stuck — so a corrective message naming the next pending task and its agent beats a refine. |
 
 ### Goal category — we will not be able to finish
 
@@ -708,17 +708,19 @@ Drift handling routes through an explicit six-level ladder
 (goldfive#142) so "when does goldfive interrupt the tree" is a single
 table, not a tangle of conditionals. The live mapping from
 `(drift_kind, severity, occurrence_count)` to level is
-`DefaultSteerer._LADDER` plus the fallback in
-`DefaultSteerer._ladder_level_for`. See `goldfive/steerer.py` for
-the authoritative table.
+`DriftObserver._LADDER` plus the fallback in
+`DriftObserver._ladder_level_for` (the ladder moved from
+`DefaultSteerer` into the `steerer.drift` component in the steerer
+split, bucket 3c). See `goldfive/drift_observer.py` for the
+authoritative table.
 
 | Level | Name | Action | Typical triggers |
 |---|---|---|---|
 | **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift. |
-| **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `PLAN_DIVERGENCE`, `TOOL_ERROR`, `AGENT_REFUSAL`, `INTENT_DIVERGENCE`, etc.); CRITICAL first-occurrence of most kinds. |
-| **2** | `NUDGE` | Queue a short corrective user message on `session.pending_nudges` for the Runner's overlay loop to pick up at the next invocation boundary. | `LOOPING_REASONING` at CRITICAL (first occurrence) after goldfive#204 — gives the agent a soft corrective prompt before escalating. Also available for caller overrides. |
-| **3** | `CANCEL_REINVOKE` | Refine the plan; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel**. The executor's invoke loop cancels the in-flight invocation and restarts the passthrough with a `[GOLDFIVE STEERING CONTROL …]` framed corrective body. | CRITICAL first-occurrence for most refinable kinds (`PLAN_DIVERGENCE`, `TOOL_ERROR`, `RUNAWAY_DELEGATION`, ...). (`LOOPING_REASONING` CRITICAL-first now routes to Level 2 via goldfive#204.) |
-| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives on the channel — unbounded unless `SteeringConfig.pause_escalate_deadline_s` is set, in which case the message carries a `deadline_s` payload and expiry aborts the run. | `GOAL_DRIFT` (first & repeat); `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind. |
+| **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `PLAN_DIVERGENCE`, `TOOL_ERROR`, `AGENT_REFUSAL`, `INTENT_DIVERGENCE`, etc. — but `GOAL_DRIFT` and `TASK_TIMEOUT` route WARNING to Level 2 instead); `JUSTIFIED_DEVIATION` at CRITICAL (first & repeat); CRITICAL first-occurrence of kinds with no explicit table row (severity fallback). |
+| **2** | `NUDGE` | Queue a short corrective user message on `session.pending_nudges` for the Runner's overlay loop to pick up at the next invocation boundary. The enqueue is gated on `is_active_steering()` (goldfive#475) — under `observation_only=True` the would-be nudge is logged and a `PolicyApplied` gate event is stamped instead. | `LOOPING_REASONING` at CRITICAL (first occurrence) after goldfive#204; `GOAL_DRIFT` at WARNING and CRITICAL-first (goldfive#324 F4); `TASK_TIMEOUT` at WARNING (goldfive#487). Also available for caller overrides. |
+| **3** | `CANCEL_REINVOKE` | Refine the plan; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel**. The executor's invoke loop cancels the in-flight invocation and restarts the passthrough with a `[GOLDFIVE STEERING CONTROL …]` framed corrective body. | CRITICAL first-occurrence for most refinable kinds (`PLAN_DIVERGENCE`, `TOOL_ERROR`, `RUNAWAY_DELEGATION`, ...); `GOAL_DRIFT` at CRITICAL-repeat. (`LOOPING_REASONING` CRITICAL-first now routes to Level 2 via goldfive#204.) |
+| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives on the channel — unbounded unless `SteeringConfig.pause_escalate_deadline_s` is set, in which case the message carries a `deadline_s` payload and expiry aborts the run. | `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; `TASK_TIMEOUT` at CRITICAL (first & repeat); CRITICAL-repeat of almost every kind. |
 | **5** | `TERMINATE` | Pause-with-deadline. Same dispatch as Level 4 but the payload ALWAYS carries `deadline_s` (`SteeringConfig.pause_escalate_deadline_s`, or `DEFAULT_TERMINATE_PAUSE_DEADLINE_S` = 600 s when unset). On expiry the executor cancels every non-terminal task and emits `RunAborted` carrying the escalation lineage (drift kind + ladder level). | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
 
 ### Dispatch routing — single junction (Phase 2 of #246)
@@ -777,8 +779,10 @@ table entry fall through to:
 - `WARNING` → `ABSORB`
 - `CRITICAL` first → `ABSORB`; repeat → `PAUSE_ESCALATE`
 
-Subclasses of `DefaultSteerer` override `_ladder_level_for` to tune
-the table without re-implementing `_handle_drift`.
+The tune point is `DriftObserver._ladder_level_for`
+(`goldfive/drift_observer.py`); a custom steerer replaces its
+`drift` component (or subclasses `DriftObserver`) to adjust the
+table without re-implementing `handle_drift`.
 
 See goldfive#179 (umbrella) for future detection work — additional
 detectors will register new rows on `_LADDER` rather than editing the

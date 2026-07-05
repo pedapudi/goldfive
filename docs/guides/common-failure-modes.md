@@ -11,6 +11,18 @@ catch-all, reach for
 For the taxonomy of every drift kind, severity rules, and the refine
 policy, see [../design/DRIFT.md](../design/DRIFT.md).
 
+> **Mode caveat.** The shipped default is
+> `SteeringConfig(observation_only=True)` (goldfive#254): detection
+> runs in full and every drift below still fires, but goldfive-authored
+> interventions (plan installs from refine, `GOLDFIVE_STEER` cancels,
+> nudge injection, `GOLDFIVE_PAUSE_ESCALATE` pauses) are suppressed —
+> `PlanRevised` events carry
+> `dry_run=true` and no plan mutates. Recovery narratives below that
+> lean on refine / the intervention ladder apply as described only
+> under active steering (`observation_only=False`); in the default
+> mode they tell you what goldfive *would have done*, and recovery is
+> the operator's move (steer, cancel, fix the prompt).
+
 ## 1. Tool-call loop — agent stuck calling the same tool
 
 The canonical filler loop post-#181: the agent keeps calling the same
@@ -35,9 +47,10 @@ are excluded — they're progress signals, not work.
   `detail` starting `tool_loop_exact:`, `tool_loop_name:`, or
   `tool_loop_alternating:`.
 - `raw.mode` on the drift identifies which mode fired.
-- Downstream: the steerer escalates through the intervention ladder
-  (Level 1 ABSORB → refine; escalates to Level 3 CANCEL_REINVOKE on
-  repeat).
+- Downstream: the steerer routes through the intervention ladder
+  (WARNING → Level 1 ABSORB / refine; CRITICAL first → Level 2 NUDGE,
+  repeat → Level 4 PAUSE_ESCALATE) — interventions suppressed under
+  the default observation-only mode.
 
 **Configuration.** Defaults tuned for a 10-call window. Override via
 env vars:
@@ -60,8 +73,10 @@ See `goldfive/drift/tool_loops.py` for the full contract.
    or clear the buffer with `ToolLoopTracker.on_task_progress(...)`
    on your own progress signal.
 3. If it's genuine drift, let the intervention ladder handle it —
-   `planner.refine` typically produces a revised task that escapes
-   the loop.
+   under active steering (`observation_only=False`), `planner.refine`
+   typically produces a revised task that escapes the loop. Under the
+   default observation-only mode the refine is dry-run
+   (`PlanRevised{dry_run=true}`); steer or cancel manually.
 
 ## 2. Plan divergence — agent ran an unplanned agent
 
@@ -95,8 +110,9 @@ are stripped before classification runs.
 
 **Recovery path.**
 
-- `PLAN_DIVERGENCE` → the refine path typically narrows the tool /
-  agent scope or adjusts assignee hints.
+- `PLAN_DIVERGENCE` → under active steering the refine path typically
+  narrows the tool / agent scope or adjusts assignee hints; in the
+  default observation-only mode the drift is signal for the operator.
 - `CONFABULATION_RISK` → usually the prompt is wrong. Either (a)
   narrow the coordinator's instruction to only describe tools it
   actually has, or (b) add the missing tool / agent to the tree.
@@ -160,9 +176,11 @@ LLM keeps re-routing. Goldfive cannot require prompt cooperation
 2. **Reasoning-content drift detectors.** `LOOPING_REASONING` (hash-
    or embedding-based) and `INTENT_DIVERGENCE` fire when the
    coordinator's chain-of-thought shows the pattern.
-3. **Refine-driven recovery.** A WARNING-or-higher drift flows
-   through the ladder into `planner.refine`, which can narrow the
-   assignee hint or split into sub-tasks before the next turn.
+3. **Refine-driven recovery** (active steering only). A
+   WARNING-or-higher drift flows through the ladder into
+   `planner.refine`, which can narrow the assignee hint or split into
+   sub-tasks before the next turn. Under the default observation-only
+   mode the refine is dry-run and the plan does not change.
 4. **AgentTool cap.** The last-resort safety net.
 
 **Recovery path.**
@@ -175,35 +193,45 @@ LLM keeps re-routing. Goldfive cannot require prompt cooperation
 - Raise `agent_tool_cap` only if legitimate delegation exceeds 16
   per turn.
 
-## 5. Goal drift (opt-in)
+## 5. Goal drift
 
 Periodic trajectory-level check: every N agent turns, an LLM-judge
 looks at the recent activity window and decides whether the tree is
 advancing `session.goals` (goldfive#143). Emits `GOAL_DRIFT` /
 CRITICAL when the judge concludes progress has stalled.
 
-**Feature gate.** Opt-in via `DefaultSteerer(goal_drift_enabled=True,
-goal_drift_call_llm=...)`. Operators who don't configure it never
-trigger it and pay no LLM cost.
+**Feature gate.** On the `goldfive.wrap(...)` path the judge is wired
+automatically from the resolved planner `call_llm` (goldfive#217);
+opt out with an explicit steerer
+(`DefaultSteerer(goal_drift_call_llm=None)`) or
+`Runner(goal_drift_enabled=False)`. Operators hand-building a Runner
+with a bare `DefaultSteerer()` never trigger it and pay no LLM cost.
 
 **Signature.**
 
 - `DriftDetected{kind=goal_drift, severity=critical}`.
-- Routes to Level 4 PAUSE_ESCALATE → `HUMAN_INTERVENTION_REQUIRED`.
+- Routes to Level 2 NUDGE on first fire (goldfive#324: the plan is
+  usually still right — the agent's next-action reasoning is stuck,
+  so the corrective names the next pending task and its agent);
+  CRITICAL-repeat escalates to Level 3 CANCEL_REINVOKE. Both are
+  suppressed under the default observation-only mode.
 
 ## 6. Human intervention required
 
-The steerer escalated a drift to Level 4. Paused the run by
-dispatching a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound
-channel (Phase 2 of #246 replaced the deleted
-`session.paused_for_human_intervention` flag); the executor's
+The steerer escalated a drift to Level 4. Under active steering it
+pauses the run by dispatching a `GOLDFIVE_PAUSE_ESCALATE`
+ControlMessage on the bound channel (Phase 2 of #246 replaced the
+deleted `session.paused_for_human_intervention` flag); the executor's
 pre-task loop blocks waiting for a `CONTROL_RESUME` /
-`CONTROL_STEER` / `CONTROL_CANCEL`. Emitted for:
+`CONTROL_STEER` / `CONTROL_CANCEL`. Under the default
+observation-only mode the drift is emitted but the pause dispatch is
+suppressed and the run keeps going. Emitted for:
 
 - Persistent refine failures.
-- `GOAL_DRIFT` (CRITICAL).
 - `REFINE_VALIDATION_FAILED`.
 - `RUNAWAY_DELEGATION` on repeat.
+- `INTENT_DIVERGENCE` at CRITICAL.
+- `TASK_TIMEOUT` at CRITICAL (flag-gated stall watchdog, goldfive#487).
 
 **Signature.**
 

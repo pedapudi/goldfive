@@ -160,7 +160,9 @@ universal and which should not be re-implemented per executor:
   moments.
 - Calling `goal_deriver.derive` (or accepting `list[Goal]` directly).
 - Calling `planner.generate` and swapping the result onto the session.
-- Registering the seven canonical reporting tools on the adapter.
+- Registering the canonical reporting tools on the adapter (the
+  seven-tool lifecycle subset by default; drift self-reporting tools
+  opt-in via `drift_self_reporting`).
 - Binding the steerer to sinks+planner.
 - Emitting `RunAborted` on any pre-executor failure.
 
@@ -280,7 +282,7 @@ adapter knows how to:
 
 - Render the current `Task` + `Session` into whatever input channel
   the framework expects.
-- Register the seven canonical reporting tools in the framework's
+- Register the canonical reporting tools in the framework's
   tool-registration format.
 - Intercept tool calls and route them through the Steerer.
 - Return an `InvocationResult` with the stop reason and final text.
