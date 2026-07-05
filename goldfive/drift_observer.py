@@ -91,8 +91,8 @@ Responsibilities (this PR)
   :meth:`_summarize_recent_reasoning`. Bounded summarisation used by
   the reflective check prompt and by ``trigger_input`` stamping.
 
-* :meth:`_parse_reflective_response` — tolerant JSON-from-LLM parser
-  used by the reflective check verdict path.
+* :meth:`_parse_reflective_response` — the reflective check's verdict
+  parser; delegates to :func:`goldfive.drift.registry.parse_json_response`.
 
 The module DOES NOT own
 ----------------------
@@ -135,9 +135,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
-import json
 import logging
-import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -359,10 +357,6 @@ class DriftObserver:
             DriftKind.GOAL_DRIFT,
         }
     )
-
-    # Liberal JSON extractor: tolerates markdown code fences and leading /
-    # trailing prose around the object.
-    _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
     def __init__(self, steerer: DefaultSteerer) -> None:
         # Back-reference to the router. Used to reach the shared
@@ -1492,11 +1486,9 @@ class DriftObserver:
         observability event so consumers see one truncation marker
         regardless of which detector produced the drift.
         """
-        if not isinstance(text, str):
-            return ""
-        if len(text) <= limit:
-            return text
-        return text[:limit] + " … [truncated]"
+        from goldfive.drift.registry import truncate_for_observability
+
+        return truncate_for_observability(text, limit)
 
     @staticmethod
     def _summarize_recent_tool_calls(session: Session, *, limit: int = 10) -> str:
@@ -1555,33 +1547,16 @@ class DriftObserver:
         trimmed = [r[:240] + ("…" if len(r) > 240 else "") for r in tail]
         return " | ".join(trimmed)
 
-    @classmethod
-    def _parse_reflective_response(cls, raw: Any) -> dict[str, Any] | None:
-        """Extract the first JSON object from ``raw`` or return None.
+    @staticmethod
+    def _parse_reflective_response(raw: Any) -> dict[str, Any] | None:
+        """Parse the reflective-check verdict via the shared judge parser.
 
-        Tolerates markdown code fences (``\\`\\`\\`json ... \\`\\`\\``) and
-        prose wrapping, which real LLMs emit even with strong "reply JSON
-        only" instructions. Returns ``None`` for any shape that is not a
-        dict once parsed, so downstream code can check one failure mode.
+        Delegates to :func:`goldfive.drift.registry.parse_json_response`
+        — one liberal JSON-from-LLM parser for every verdict path.
         """
-        if not isinstance(raw, str) or not raw.strip():
-            return None
-        stripped = raw.strip()
-        # Fast path: parse verbatim.
-        try:
-            decoded = json.loads(stripped)
-        except (json.JSONDecodeError, ValueError):
-            # Try extracting the first {...} block.
-            match = cls._JSON_OBJECT_RE.search(stripped)
-            if match is None:
-                return None
-            try:
-                decoded = json.loads(match.group(0))
-            except (json.JSONDecodeError, ValueError):
-                return None
-        if not isinstance(decoded, dict):
-            return None
-        return decoded
+        from goldfive.drift.registry import parse_json_response
+
+        return parse_json_response(raw)
 
     # ------------------------------------------------------------------
     # Structural-escalation helpers (progress-stall, handler-exhausted)
@@ -2830,11 +2805,13 @@ class DriftObserver:
                 from goldfive._llm import (
                     call_llm_budget,
                     call_llm_thinking_disabled,
+                    llm_call_diagnostics,
                 )
 
                 with (
                     call_llm_budget(self.REFLECTIVE_MAX_OUTPUT_TOKENS),
                     call_llm_thinking_disabled(),
+                    llm_call_diagnostics() as llm_diag,
                 ):
                     raw = await call_llm(
                         self.REFLECTIVE_SYSTEM_PROMPT,
@@ -2845,11 +2822,10 @@ class DriftObserver:
                 if parsed is None:
                     # Distinguish "model returned all thinking, no
                     # answer" from "model returned garbage" — see
-                    # goldfive#271 follow-up to #311. ``call_llm`` is
-                    # the closure built by ``make_default_adk_call_llm``
-                    # / ``_build_judge_call_llm`` which stashes part
-                    # counts on itself.
-                    _thought_n = int(getattr(call_llm, "last_thought_count", 0) or 0)
+                    # goldfive#271 follow-up to #311. The default
+                    # builders record part counts into the per-call
+                    # diagnostics object.
+                    _thought_n = llm_diag.thought_count
                     _raw_str = raw if isinstance(raw, str) else ""
                     if not _raw_str.strip() and _thought_n > 0:
                         span.output_preview = (

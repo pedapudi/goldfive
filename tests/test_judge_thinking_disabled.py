@@ -16,8 +16,10 @@ These tests pin the contract:
    ``ThinkingConfig(include_thoughts=False, thinking_budget=0)`` to the
    ``GenerateContentConfig`` it sends to ``BaseLlm.generate_content_async``.
 3. The default OpenAI / Qwen-via-litellm judge builder reads the var
-   and sends ``extra_body={"enable_thinking": False}`` plus a
-   ``/no_think`` system-prompt prefix.
+   and — for Qwen-family models only, per the
+   :data:`goldfive._llm.THINKING_DISABLE_CAPABILITIES` table — sends
+   ``extra_body={"enable_thinking": False}`` plus a ``/no_think``
+   system-prompt prefix. Non-Qwen models get no vendor hacks.
 4. Each judge / goal_deriver / planner-refine call site enters
    :func:`call_llm_thinking_disabled` around its
    ``await call_llm(...)`` so a wrapping shim sees the flag.
@@ -126,29 +128,33 @@ async def test_adk_builder_attaches_thinking_config_when_disabled():
 
 
 # ---------------------------------------------------------------------------
+# Capability-table routing (vendor thinking-disable conventions)
+# ---------------------------------------------------------------------------
+
+
+def test_thinking_disable_caps_routes_by_model_family():
+    """Qwen-family names (including litellm-prefixed) get the vendor
+    hacks; Gemini / OpenAI / unknown models get none."""
+    from goldfive._llm import thinking_disable_caps
+
+    for name in ("qwen3-35b", "openai/Qwen3-32B", "hosted_vllm/Qwen/Qwen3-32B"):
+        caps = thinking_disable_caps(name)
+        assert caps.openai_enable_thinking_field, name
+        assert caps.no_think_prompt_prefix, name
+
+    for name in ("gemini-2.0-flash", "gpt-4o", "stub-judge", ""):
+        caps = thinking_disable_caps(name)
+        assert not caps.openai_enable_thinking_field, name
+        assert not caps.no_think_prompt_prefix, name
+
+
+# ---------------------------------------------------------------------------
 # OpenAI / Qwen builder integration
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_openai_builder_threads_enable_thinking_false_when_disabled():
-    """``_build_judge_call_llm`` must send ``extra_body={"enable_thinking":
-    False}`` and prepend ``/no_think`` to the system prompt when the
-    disable-thinking flag is set."""
-    pytest.importorskip("openai")
-    from goldfive.config import JudgeConfig
-    from goldfive.convenience import _build_judge_call_llm
-
-    config = JudgeConfig(
-        base_url="http://stub-judge.invalid",
-        model="stub-judge",
-        api_key="not-needed",
-    )
-
-    built = _build_judge_call_llm(config)
-    assert built is not None
-    call_llm, _model = built
-
+def _patch_openai_client(call_llm: Any) -> list[dict[str, Any]]:
+    """Swap the builder's AsyncOpenAI client for a capture stub."""
     captured_kwargs: list[dict[str, Any]] = []
     fake_response = MagicMock()
     fake_response.choices = [MagicMock(message=MagicMock(content="ok"))]
@@ -166,9 +172,31 @@ async def test_openai_builder_threads_enable_thinking_false_when_disabled():
             break
     assert client_cell is not None
     client_cell.cell_contents.chat.completions.create = fake_create
+    return captured_kwargs
+
+
+@pytest.mark.asyncio
+async def test_openai_builder_threads_enable_thinking_false_when_disabled():
+    """``_build_judge_call_llm`` must send ``extra_body={"enable_thinking":
+    False}`` and prepend ``/no_think`` to the system prompt when the
+    disable-thinking flag is set and the model is Qwen-family."""
+    pytest.importorskip("openai")
+    from goldfive.config import JudgeConfig
+    from goldfive.convenience import _build_judge_call_llm
+
+    config = JudgeConfig(
+        base_url="http://stub-judge.invalid",
+        model="qwen3-35b",
+        api_key="not-needed",
+    )
+
+    built = _build_judge_call_llm(config)
+    assert built is not None
+    call_llm, _model = built
+    captured_kwargs = _patch_openai_client(call_llm)
 
     # Default: no extra_body, no /no_think prefix.
-    out = await call_llm("system", "user", "stub-judge")
+    out = await call_llm("system", "user", "qwen3-35b")
     assert out == "ok"
     assert "extra_body" not in captured_kwargs[-1]
     sys_msg = captured_kwargs[-1]["messages"][0]["content"]
@@ -176,11 +204,39 @@ async def test_openai_builder_threads_enable_thinking_false_when_disabled():
 
     # With disable-thinking flag: extra_body present, /no_think prepended.
     with call_llm_thinking_disabled():
-        await call_llm("system", "user", "stub-judge")
+        await call_llm("system", "user", "qwen3-35b")
     last = captured_kwargs[-1]
     assert last["extra_body"] == {"enable_thinking": False}
     sys_msg = last["messages"][0]["content"]
     assert sys_msg.startswith("/no_think"), "Qwen prompt-level fallback must be prepended"
+
+
+@pytest.mark.asyncio
+async def test_openai_builder_no_vendor_hacks_for_unknown_model():
+    """Non-Qwen models must get neither ``extra_body`` nor the
+    ``/no_think`` prefix even with the disable-thinking flag set — the
+    hacks are Qwen / litellm conventions, not core wrap() behaviour."""
+    pytest.importorskip("openai")
+    from goldfive.config import JudgeConfig
+    from goldfive.convenience import _build_judge_call_llm
+
+    config = JudgeConfig(
+        base_url="http://stub-judge.invalid",
+        model="stub-judge",
+        api_key="not-needed",
+    )
+
+    built = _build_judge_call_llm(config)
+    assert built is not None
+    call_llm, _model = built
+    captured_kwargs = _patch_openai_client(call_llm)
+
+    with call_llm_thinking_disabled():
+        out = await call_llm("system", "user", "stub-judge")
+    assert out == "ok"
+    last = captured_kwargs[-1]
+    assert "extra_body" not in last
+    assert "/no_think" not in last["messages"][0]["content"]
 
 
 # ---------------------------------------------------------------------------
