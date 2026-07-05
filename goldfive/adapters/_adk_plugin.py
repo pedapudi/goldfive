@@ -25,6 +25,18 @@ goldfive's :class:`~goldfive.protocols.Steerer`. It does four jobs:
    ``on_tool_error_callback`` feed raw signals into
    ``steerer.drift.observe(...)`` so the steerer can classify drift.
 
+The plugin also hosts the flag-gated **wall-clock stall watchdog**
+(``SteeringConfig.stall_watchdog_enabled``, default OFF): one
+background task per dispatch that fires ``TASK_TIMEOUT`` drifts when
+the session's liveness watermark goes silent. Honest limitation: the
+watchdog is an asyncio task on the same event loop as the wrapped
+tree, so a **synchronously-blocking tool** (a ``def`` tool doing
+blocking I/O / CPU work without yielding) starves the loop and the
+watchdog cannot fire until the block ends. Detecting sync-blocked
+loops is out of scope; the watchdog covers hung *async* tool calls
+and idle-with-no-transitions runs — the cases that previously
+produced zero signal.
+
 The plugin never imports ``google.adk`` at module load. It imports the
 ADK ``BasePlugin`` base class lazily inside :func:`make_adk_plugin`,
 which is only called from the adapter's ``__init__``. That keeps this
@@ -2165,6 +2177,12 @@ def make_adk_plugin(
             # sub-Runners get their own invocation_id). Each entry is
             # a small dict to keep the payload auditable in tests.
             self._invocation_llm_pending: dict[str, dict[str, Any]] = {}
+            # Wall-clock stall watchdog (flag-gated, default OFF).
+            # Spawned by :meth:`set_active_context` when the bound
+            # steerer carries ``SteeringConfig.stall_watchdog_enabled``;
+            # cancelled by :meth:`clear_active_context` (the adapter's
+            # ``finally`` teardown) so it never outlives the dispatch.
+            self._stall_watchdog_task: asyncio.Task[None] | None = None
             # Tool-loop drift detector (goldfive#181). Observes every
             # tool call the plugin sees in ``after_tool_callback`` and
             # fires a ``LOOPING_REASONING`` drift when any of the
@@ -2333,6 +2351,10 @@ def make_adk_plugin(
             # invocation so a prior trip doesn't leak into this one.
             self._agent_tool_spawn_count = 0
             self.runaway_delegation_tripped = False
+            # Wall-clock stall watchdog (flag-gated, default OFF). One
+            # task per dispatch; a fresh dispatch replaces any prior
+            # watchdog (sequential invocations reuse the adapter).
+            self._maybe_start_stall_watchdog(ctx)
 
         def clear_active_context(self) -> None:
             """Release the active ``SessionContext`` reference.
@@ -2349,6 +2371,10 @@ def make_adk_plugin(
                 self._invocation_tasks.clear()
             except Exception as exc:  # noqa: BLE001
                 log.debug("clear_active_context: registry clear raised: %s", exc)
+            # Cancel the stall watchdog BEFORE dropping the context so
+            # a watchdog waking up mid-teardown cannot observe a
+            # half-cleared plugin.
+            self._cancel_stall_watchdog()
             self._active_ctx = None
             self._top_invocation_id = ""
             self._agent_tool_spawn_count = 0
@@ -5290,6 +5316,266 @@ def make_adk_plugin(
                     "_run_llm_call_timeout_watcher: cancel-flag write raised: %s",
                     exc,
                 )
+
+        # --- Wall-clock stall watchdog (flag-gated, default OFF) --------
+
+        def _maybe_start_stall_watchdog(self, ctx: SessionContext) -> None:
+            """Spawn the per-dispatch stall watchdog when the flag is on.
+
+            Called from :meth:`set_active_context`. Gated on the bound
+            steerer carrying ``_stall_watchdog_enabled=True`` (stashed
+            from :class:`~goldfive.config.SteeringConfig` by
+            ``DefaultSteerer.__init__``) and a positive
+            ``_stall_timeout_s``; both default OFF, so the un-flagged
+            path costs one attribute read and spawns nothing. A prior
+            watchdog (sequential dispatch reusing the adapter) is
+            cancelled first so at most one runs per plugin.
+            """
+            self._cancel_stall_watchdog()
+            steerer = getattr(ctx, "steerer", None)
+            session = getattr(ctx, "session", None)
+            if steerer is None or session is None:
+                return
+            if not bool(getattr(steerer, "_stall_watchdog_enabled", False)):
+                return
+            try:
+                timeout_s = float(getattr(steerer, "_stall_timeout_s", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return
+            if timeout_s <= 0:
+                return
+            try:
+                self._stall_watchdog_task = asyncio.create_task(
+                    self._run_stall_watchdog(ctx=ctx, timeout_s=timeout_s),
+                    name=f"goldfive_stall_watchdog_{getattr(session, 'id', '') or ''}",
+                )
+            except RuntimeError as exc:
+                # No running loop (synchronous harnesses) — the
+                # watchdog degrades to off, same as the LLM watcher.
+                log.debug(
+                    "_maybe_start_stall_watchdog: cannot schedule: %s", exc
+                )
+
+        def _cancel_stall_watchdog(self) -> None:
+            """Cancel the stall watchdog if one is live. Idempotent."""
+            task = self._stall_watchdog_task
+            self._stall_watchdog_task = None
+            if task is not None and not task.done():
+                task.cancel()
+
+        def _llm_watcher_inflight(self) -> bool:
+            """True while any LLM call runs under its own per-call watcher.
+
+            The stall watchdog consults this to avoid double-reporting:
+            a hung LLM dispatch within its wall-clock budget is the
+            per-call watcher's case (``LLM_CALL_TIMEOUT``), not a stall.
+            Entries without a live watcher (budget disabled via
+            ``llm_call_timeout_ms<=0``) do NOT count — nothing else
+            covers that hang, so the stall watchdog must.
+            """
+            for pending in self._invocation_llm_pending.values():
+                watcher = pending.get("watcher") if isinstance(pending, dict) else None
+                if watcher is not None and not watcher.done():
+                    return True
+            return False
+
+        @staticmethod
+        def _stall_liveness_watermark(session: Any, *, floor: float) -> float:
+            """Newest liveness signal on ``session`` (monotonic seconds).
+
+            The max of every ``task_last_progress_at`` stamp (task
+            transitions + progress reports) and
+            ``last_observed_event_at`` (every observation dispatched
+            into the drift pipeline — reasoning, tool observations,
+            agent activity), floored at ``floor`` (watchdog start) so a
+            fresh session with no stamps yet is not instantly stale.
+            """
+            watermark = floor
+            progress = getattr(session, "task_last_progress_at", None)
+            if isinstance(progress, dict):
+                for value in progress.values():
+                    try:
+                        watermark = max(watermark, float(value))
+                    except (TypeError, ValueError):
+                        continue
+            try:
+                observed = float(getattr(session, "last_observed_event_at", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                observed = 0.0
+            return max(watermark, observed)
+
+        @staticmethod
+        def _goal_drift_idle_seconds() -> float:
+            """Live read of :data:`goldfive.drift.goals.GOAL_DRIFT_IDLE_SECONDS`.
+
+            Module-attribute read per poll (not captured at spawn) so
+            an optimization-manifest ``setattr`` on the knob takes
+            effect on a running watchdog.
+            """
+            try:
+                from goldfive.drift import goals as _goals  # noqa: PLC0415 — lazy
+
+                # Floor keeps a zero/negative override from turning the
+                # idle trigger into a per-poll judge storm.
+                return max(0.001, float(getattr(_goals, "GOAL_DRIFT_IDLE_SECONDS", 300)))
+            except Exception:  # noqa: BLE001
+                return 300.0
+
+        def _trigger_idle_goal_drift_check(
+            self, steerer: Any, session: Any, idle_s: float
+        ) -> None:
+            """Fire the trajectory-level goal-drift judge for an idle episode.
+
+            The ``GOAL_DRIFT_IDLE_SECONDS`` consumer (goldfive#143
+            promised idle-based judge scheduling; the stall watchdog is
+            its producer). Spawn-and-detach through the steerer's
+            tracked background-judge machinery; no-ops when the judge
+            ``call_llm`` is unconfigured or the steerer is a stub.
+            """
+            drift_obs = getattr(steerer, "drift", None)
+            spawn = (
+                getattr(drift_obs, "_spawn_goal_drift_judge_background", None)
+                if drift_obs is not None
+                else None
+            )
+            if spawn is None:
+                return
+            note = f"{idle_s:.0f}s since last observed activity"
+            try:
+                spawn(session, idle_note=note)
+            except TypeError:
+                # Custom DriftObserver predating the idle_note kwarg.
+                try:
+                    spawn(session)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "_trigger_idle_goal_drift_check: spawn raised: %s", exc
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("_trigger_idle_goal_drift_check: spawn raised: %s", exc)
+
+        async def _run_stall_watchdog(
+            self, *, ctx: SessionContext, timeout_s: float
+        ) -> None:
+            """Poll the session's liveness watermark; fire ``TASK_TIMEOUT`` on silence.
+
+            Spawned by :meth:`set_active_context` (one per dispatch)
+            and cancelled by :meth:`clear_active_context` — the
+            adapter's ``finally`` teardown — so it never outlives the
+            run. Behaviour per poll tick:
+
+            * Watermark advanced since the last tick → the stall
+              episode (if any) is over; reset the graduated-severity
+              and idle-judge bookkeeping.
+            * Idle beyond :data:`~goldfive.drift.goals.GOAL_DRIFT_IDLE_SECONDS`
+              → trigger the trajectory-level goal-drift judge, once per
+              idle episode.
+            * Idle beyond ``timeout_s`` → emit a ``TASK_TIMEOUT`` drift
+              at WARNING, escalating to CRITICAL at each further
+              multiple of ``timeout_s`` with no fresh activity
+              (graduated severity — same shape as tool_loops). Routed
+              through ``steerer.drift.handle_drift`` so under
+              ``observation_only`` (production default) it is
+              telemetry-only and in active mode the intervention
+              ladder handles it.
+            * SKIPPED while an LLM call is in flight under its own
+              per-call budget — :meth:`_run_llm_call_timeout_watcher`
+              owns that hang (``LLM_CALL_TIMEOUT``); firing here too
+              would double-report.
+
+            Honest limitation: this is an asyncio task on the wrapped
+            tree's own event loop. A synchronously-blocking tool (a
+            ``def`` tool doing blocking I/O or CPU work) starves the
+            loop, so the watchdog cannot fire until the block ends —
+            sync-blocked stalls are out of scope. The covered cases are
+            hung *async* tool calls and idle-with-no-transitions runs.
+            """
+            session = ctx.session if ctx is not None else None
+            steerer = ctx.steerer if ctx is not None else None
+            if session is None or steerer is None:
+                return
+            try:
+                from goldfive.types import (  # noqa: PLC0415 — lazy
+                    DriftEvent,
+                    DriftKind,
+                    DriftSeverity,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("_run_stall_watchdog: cannot import types: %s", exc)
+                return
+            started = time.monotonic()
+            last_watermark = started
+            episode_fires = 0
+            goal_judge_fired = False
+            try:
+                while True:
+                    idle_goal_s = self._goal_drift_idle_seconds()
+                    # Poll cadence tracks the tighter of the two
+                    # thresholds so neither fires grossly late; floored
+                    # so a tiny test timeout cannot busy-spin the loop.
+                    await asyncio.sleep(max(0.005, min(timeout_s, idle_goal_s) / 8.0))
+                    watermark = self._stall_liveness_watermark(session, floor=started)
+                    if watermark > last_watermark:
+                        # Fresh activity ends the stall episode.
+                        last_watermark = watermark
+                        episode_fires = 0
+                        goal_judge_fired = False
+                    idle_s = time.monotonic() - watermark
+                    if not goal_judge_fired and idle_s >= idle_goal_s:
+                        goal_judge_fired = True
+                        self._trigger_idle_goal_drift_check(steerer, session, idle_s)
+                    if idle_s < timeout_s * (episode_fires + 1):
+                        continue
+                    if self._llm_watcher_inflight():
+                        continue
+                    severity = (
+                        DriftSeverity.WARNING
+                        if episode_fires == 0
+                        else DriftSeverity.CRITICAL
+                    )
+                    episode_fires += 1
+                    task_id = str(getattr(session, "current_task_id", "") or "") or str(
+                        _safe_attr(getattr(ctx, "task", None), "id", "") or ""
+                    )
+                    log.warning(
+                        "goldfive.stall.watchdog idle_s=%.1f threshold_s=%.1f "
+                        "severity=%s agent=%s task_id=%s",
+                        idle_s,
+                        timeout_s,
+                        severity.value,
+                        self._host_agent_name or "?",
+                        task_id or "?",
+                    )
+                    # goldfive#245 — stamp observation-time plan revision.
+                    _gf_plan = getattr(session, "plan", None)
+                    _observed_rev = (
+                        int(getattr(_gf_plan, "revision_index", 0) or 0)
+                        if _gf_plan is not None
+                        else 0
+                    )
+                    drift = DriftEvent(
+                        kind=DriftKind.TASK_TIMEOUT,
+                        severity=severity,
+                        detail=(
+                            f"no observed activity for {idle_s:.1f}s "
+                            f"(stall watchdog, threshold {timeout_s:.1f}s)"
+                        ),
+                        current_task_id=task_id,
+                        current_agent_id=self._host_agent_name or "",
+                        observed_revision_index=_observed_rev,
+                    )
+                    handle = getattr(getattr(steerer, "drift", None), "handle_drift", None)
+                    if handle is None:
+                        continue
+                    try:
+                        await handle(drift, session)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("_run_stall_watchdog: handle_drift raised: %s", exc)
+            except asyncio.CancelledError:
+                # Teardown (clear_active_context) — exit cleanly.
+                return
 
         # --- Plan + current-task context -------------------------------
 

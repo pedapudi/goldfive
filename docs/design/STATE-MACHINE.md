@@ -204,9 +204,29 @@ transition**. It:
 - Writes `session.agent_notes[task_id] = detail`.
 - Emits `TaskProgress(task_id, fraction, detail)`.
 
-Sinks can use progress events for liveness indicators. goldfive does
-not use them internally (not even for drift — stalled tasks are
-detected via elapsed time, not via progress gaps).
+Sinks can use progress events for liveness indicators. Internally,
+each progress report (like every task transition) refreshes
+`session.task_last_progress_at` — the per-task liveness watermark
+consulted by two mechanisms:
+
+- the steerer's progress-stall escalation gate: a *drift* firing on a
+  task that has been silent longer than
+  `DefaultSteerer.PROGRESS_STALL_THRESHOLD_SECONDS` escalates to
+  `HUMAN_INTERVENTION_REQUIRED` instead of looping the planner;
+- the flag-gated wall-clock stall watchdog
+  (`SteeringConfig.stall_watchdog_enabled`, default OFF): a
+  per-dispatch background task that emits `TASK_TIMEOUT` drifts
+  (WARNING, then CRITICAL on continued silence) when the session-wide
+  watermark — `task_last_progress_at` plus
+  `session.last_observed_event_at`, stamped on every observation the
+  drift pipeline sees — goes silent for
+  `SteeringConfig.stall_timeout_s`.
+
+There is **no always-on elapsed-time stall detector**: with the
+watchdog flag off (the default), a run wedged in a hung async tool
+call or idling with no transitions produces no drift signal at all.
+Sync-blocking tools starve the event loop and are out of scope even
+with the watchdog on (see `goldfive/adapters/_adk_plugin.py`).
 
 ## Cascade semantics on unrecoverable drift
 

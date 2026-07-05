@@ -1623,6 +1623,23 @@ class DriftObserver:
     # Observation entry points
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _stamp_last_observed(session: Session) -> None:
+        """Refresh ``session.last_observed_event_at`` (liveness watermark).
+
+        Called from every observation entry point (``observe`` /
+        ``observe_reasoning`` / ``note_agent_activity`` /
+        ``note_tool_observation``) so the wall-clock stall watchdog
+        (``SteeringConfig.stall_watchdog_enabled``) sees any observed
+        activity — including tool calls on a long-running single task
+        that never transitions — as liveness. Best-effort: a session
+        stub without the field must not break observation dispatch.
+        """
+        try:
+            session.last_observed_event_at = time.monotonic()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("_stamp_last_observed: swallowed: %s", exc)
+
     async def observe(self, event: Any, session: Session) -> None:
         """Inspect ``event``, classify drift, and refine if severe enough.
 
@@ -1641,6 +1658,7 @@ class DriftObserver:
         based drifts (LOOPING_REASONING, tool errors, …) are NOT
         deduped — they're heuristic signals, not user actions.
         """
+        self._stamp_last_observed(session)
         # First observe call on a session snapshots the detector
         # dispatch order so an optimizer can see WHICH detectors were
         # in play independent of which ones fired. Idempotent (the
@@ -1738,6 +1756,7 @@ class DriftObserver:
         """
         if not text:
             return
+        self._stamp_last_observed(session)
         # goldfive#441 — advance the logical-turn counter once per
         # reasoning observation. The user-steer suppression window
         # (:meth:`_should_promote_to_steer`) measures freshness against
@@ -2822,6 +2841,7 @@ class DriftObserver:
         """
         if not kind:
             return
+        self._stamp_last_observed(session)
         entry: dict[str, Any] = {"kind": kind}
         if agent_name:
             entry["agent_name"] = agent_name
@@ -2874,6 +2894,7 @@ class DriftObserver:
         an ADK callback. The catch is intentionally broad.
         """
         try:
+            self._stamp_last_observed(session)
             ts_ms = time.monotonic_ns() // 1_000_000
             try:
                 args_preview = repr(args)[:240]
@@ -3063,7 +3084,9 @@ class DriftObserver:
         session._agent_turns_since_goal_check = 0
         self._spawn_goal_drift_judge_background(session)
 
-    async def maybe_run_goal_drift_check(self, session: Session) -> None:
+    async def maybe_run_goal_drift_check(
+        self, session: Session, *, idle_note: str = ""
+    ) -> None:
         """Run the trajectory-level GOAL_DRIFT judge once, cost-bounded.
 
         Opt-in, feature-gated by ``goal_drift_call_llm``. Does NOT
@@ -3071,6 +3094,13 @@ class DriftObserver:
         scheduling go through :meth:`note_agent_turn`. Public so
         operators can trigger a one-shot check from outside the
         interval (e.g. on a long idle period with no task transitions).
+
+        ``idle_note`` — non-empty when the caller is the wall-clock
+        stall watchdog's idle trigger (the ``GOAL_DRIFT_IDLE_SECONDS``
+        consumer). Appended to the activity snapshot as a synthetic
+        entry so the judge's activity block renders e.g.
+        ``- idle_observed: 300s since last observed activity`` without
+        any change to the prompt template.
 
         Outcomes:
 
@@ -3099,6 +3129,8 @@ class DriftObserver:
         activity = filter_recent_events_by_kind(
             session.recent_events, RECENT_EVENT_AGENT_ACTIVITY_KINDS
         )
+        if idle_note:
+            activity = [*activity, {"kind": "idle_observed", "detail": idle_note}]
         drift = await classify_goal_drift(
             goals=session.goals,
             plan=session.plan,
@@ -3130,7 +3162,9 @@ class DriftObserver:
             return
         await self.handle_drift(drift, session)
 
-    def _spawn_goal_drift_judge_background(self, session: Session) -> None:
+    def _spawn_goal_drift_judge_background(
+        self, session: Session, *, idle_note: str = ""
+    ) -> None:
         """Spawn :meth:`maybe_run_goal_drift_check` as a fire-and-forget task.
 
         Goldfive v22 regression fix. The trajectory-level GOAL_DRIFT
@@ -3165,6 +3199,10 @@ class DriftObserver:
         synchronous test harnesses that build a steerer outside an
         async context from raising). No-op when no judge ``call_llm``
         is configured.
+
+        ``idle_note`` (stall watchdog, goldfive#143 idle scheduling) is
+        threaded to :meth:`maybe_run_goal_drift_check`, which renders
+        it into the judge's activity block.
         """
         if self._steerer._goal_drift_call_llm is None:
             return
@@ -3178,7 +3216,7 @@ class DriftObserver:
             # judge anyway.
             return
         bg_task = asyncio.create_task(
-            self._run_goal_drift_judge_background(session),
+            self._run_goal_drift_judge_background(session, idle_note=idle_note),
             # goldfive#243: encode session.id in the task name so
             # :meth:`drain_session_background_tasks` can filter pending
             # tasks by the run boundary that's terminating, leaving any
@@ -3188,7 +3226,9 @@ class DriftObserver:
         self._steerer._background_judges.add(bg_task)
         bg_task.add_done_callback(self._steerer._background_judges.discard)
 
-    async def _run_goal_drift_judge_background(self, session: Session) -> None:
+    async def _run_goal_drift_judge_background(
+        self, session: Session, *, idle_note: str = ""
+    ) -> None:
         """Body of the fire-and-forget GOAL_DRIFT judge task.
 
         Mirrors :meth:`_run_judge_background` (the reasoning-judge
@@ -3203,7 +3243,7 @@ class DriftObserver:
         cancellable agent task that hosted us.
         """
         try:
-            await self.maybe_run_goal_drift_check(session)
+            await self.maybe_run_goal_drift_check(session, idle_note=idle_note)
         except asyncio.CancelledError:
             # Propagate so :meth:`shutdown` / teardown sees a clean
             # cancel. The shutdown path expects this and counts it
@@ -3456,6 +3496,22 @@ class DriftObserver:
                 None,
                 _IL.ABSORB,
                 (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+            ),
+            # Wall-clock stall watchdog (flag-gated, default OFF —
+            # ``SteeringConfig.stall_watchdog_enabled``). Conservative
+            # row: a stall is a liveness signal, not a plan defect, so
+            # WARNING nudges rather than refining (ABSORB would loop
+            # the planner against a plan that isn't wrong). CRITICAL
+            # pauses at BOTH positions: the watchdog only emits
+            # CRITICAL on continued silence after its WARNING, so a
+            # CRITICAL is by construction already a repeat — and the
+            # refine-outcome-based occurrence counter never advances on
+            # the NUDGE path, so the pair's repeat slot alone would be
+            # unreachable.
+            DriftKind.TASK_TIMEOUT: (
+                _IL.OBSERVE,
+                _IL.NUDGE,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
             ),
         }
         cls._LADDER_LOADED = True

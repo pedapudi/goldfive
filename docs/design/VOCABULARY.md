@@ -373,7 +373,7 @@ rather than a reasoning error."
 |---|---|---|---|
 | `CONTEXT_PRESSURE` | `"context_pressure"` | `WARNING` | `classify_stop_reason` matched a `CONTEXT_PRESSURE_STOP_REASONS` value (`MAX_TOKENS`, `LENGTH`, `TRUNCATED`, `CONTENT_FILTER`, `MAX_OUTPUT_TOKENS`). |
 | `TOO_MANY_STEPS` | `"too_many_steps"` | `WARNING` | Adapter observed an unreasonable step count in a single invocation. Adapter-synthesized. |
-| `TASK_TIMEOUT` | `"task_timeout"` | `WARNING` | Task exceeded its predicted duration by a large factor. |
+| `TASK_TIMEOUT` | `"task_timeout"` | `WARNING` (escalating `CRITICAL`) | Wall-clock stall watchdog (`SteeringConfig.stall_watchdog_enabled`, default OFF): session liveness watermark silent for `stall_timeout_s`; CRITICAL on continued silence. |
 | `REPEATED_FAILURE` | `"repeated_failure"` | `CRITICAL` | Same task has now failed `>= N` times in one run. |
 | `RESOURCE_EXHAUSTED` | `"resource_exhausted"` | `WARNING` | Rate-limit or quota exhaustion observed by the adapter. |
 | `TASK_FAILED_RECOVERABLE` | `"task_failed_recoverable"` | `WARNING` | `mark_task_failed(..., recoverable=True)` (default). |

@@ -362,7 +362,7 @@ use snake_case for forward compatibility with sinks.
 | 14 | STOPPED_EARLY | `"stopped_early"` | Response truncated before the task completed. |
 | 15 | TOO_MANY_STEPS | `"too_many_steps"` | Per-task / per-lineage step cap exceeded. |
 | 16 | GOAL_UNREACHABLE | `"goal_unreachable"` | Planner concluded no plan can satisfy the goal. |
-| 17 | TASK_TIMEOUT | `"task_timeout"` | Task exceeded `predicted_duration_ms` by threshold. |
+| 17 | TASK_TIMEOUT | `"task_timeout"` | Stall watchdog (`SteeringConfig.stall_watchdog_enabled`, default OFF): no observed activity for `stall_timeout_s`. |
 | 18 | REPEATED_FAILURE | `"repeated_failure"` | N consecutive refine failures for the same `(kind, task)` pair. |
 | 19 | UNEXPECTED_OUTPUT | `"unexpected_output"` | Output shape violates declared schema. |
 | 20 | SCHEMA_VIOLATION | `"schema_violation"` | Hard JSON / schema parse failure. |

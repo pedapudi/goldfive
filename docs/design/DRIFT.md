@@ -79,7 +79,7 @@ kinds group naturally into six categories.
 | `TASK_FAILED_RECOVERABLE` | `report_task_failed(task_id, reason, recoverable=True)` | `warning` | yes |
 | `TASK_FAILED_FATAL` | `report_task_failed(task_id, reason, recoverable=False)` | `critical` | no |
 | `REPEATED_FAILURE` | Same task has now failed `>= N` times in one run. | `critical` | sometimes |
-| `TASK_TIMEOUT` | Task exceeded its predicted duration by a wide factor. | `warning` | yes |
+| `TASK_TIMEOUT` | Wall-clock stall watchdog (`SteeringConfig.stall_watchdog_enabled`, default OFF): the session's liveness watermark (`task_last_progress_at` + `last_observed_event_at`) silent for `stall_timeout_s`. Graduated: WARNING on first fire, CRITICAL at each further multiple of the timeout with no fresh activity. Suppressed while an LLM call is in flight under its own per-call budget (that hang is `LLM_CALL_TIMEOUT`). | `warning`, escalating `critical` | yes |
 
 ### Divergence category — work no longer matches the plan
 
@@ -754,6 +754,15 @@ with `source="goldfive"`) is byte-distinct from the `[USER STEERING
 CONTROL …]` header, so plugins / sinks can attribute the corrective
 to its actual origin. See `tests/test_goldfive_drift_routing.py` for
 the contract pins.
+
+**`TASK_TIMEOUT` row (stall watchdog).** The flag-gated wall-clock
+stall watchdog's drift has a deliberately conservative row:
+`INFO → OBSERVE`, `WARNING → NUDGE` (a stall is a liveness signal,
+not a plan defect — `ABSORB` would loop the planner against a plan
+that isn't wrong), `CRITICAL → PAUSE_ESCALATE` (first and repeat —
+the watchdog only emits CRITICAL on *continued* silence after its
+WARNING, so a CRITICAL is by construction already a repeat). Under
+`observation_only` the whole dispatch is telemetry-only as usual.
 
 **Repeat detection.** Occurrence count per `(drift.kind, task_id)` is
 tracked on the session; a drift crosses "repeat" once

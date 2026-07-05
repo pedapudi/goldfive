@@ -1829,6 +1829,17 @@ class Session:
     # does not. Sentinel task_id ``""`` covers trajectory-wide signals
     # which never gate (no task to be stalled).
     task_last_progress_at: dict[str, float] = dataclasses.field(default_factory=dict)
+    # Session-level ``time.monotonic()`` timestamp of the most recent
+    # observation dispatched into the drift pipeline — stamped by
+    # :class:`~goldfive.drift_observer.DriftObserver` on every
+    # ``observe`` / ``observe_reasoning`` / ``note_agent_activity`` /
+    # ``note_tool_observation`` entry. Complements
+    # :attr:`task_last_progress_at` (which only moves on task
+    # transitions): a long-running single task that emits many tool
+    # calls without transitioning keeps this stamp fresh, so the
+    # wall-clock stall watchdog (``SteeringConfig.stall_watchdog_enabled``)
+    # does not false-positive on it. ``0.0`` means "never stamped".
+    last_observed_event_at: float = 0.0
     # Counter of LLM turns observed since the last reflective self-progress
     # check. Incremented by ``DefaultSteerer.note_llm_call`` (which adapters
     # call once per LLM invocation when the opt-in reflective check is

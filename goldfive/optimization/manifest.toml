@@ -329,9 +329,9 @@ tags = ["threshold", "tool_loops"]
 [[mutation]]
 id = "goal_drift_check_interval"
 kind = "numeric"
-source = "goldfive/drift/goals.py:GOAL_DRIFT_CHECK_INTERVAL"
-python_attr = "goldfive.drift.goals:GOAL_DRIFT_CHECK_INTERVAL"
-description = "Number of agent-invocation turns between trajectory-level GOAL_DRIFT judge calls."
+source = "goldfive/config.py:GoalDriftConfig.check_interval"
+python_attr = "goldfive.config:GoalDriftConfig.check_interval"
+description = "Dataclass-default number of agent-invocation turns between trajectory-level GOAL_DRIFT judge calls. DefaultSteerer reads this via GoalDriftConfig; the legacy goldfive.drift.goals:GOAL_DRIFT_CHECK_INTERVAL constant is a back-compat re-export with no runtime consumer."
 type = "int"
 range = [1, 100]
 default = 5
@@ -342,11 +342,22 @@ id = "goal_drift_idle_seconds"
 kind = "numeric"
 source = "goldfive/drift/goals.py:GOAL_DRIFT_IDLE_SECONDS"
 python_attr = "goldfive.drift.goals:GOAL_DRIFT_IDLE_SECONDS"
-description = "Wall-clock idle threshold (seconds) above which the trajectory-level GOAL_DRIFT judge fires."
+description = "Wall-clock idle threshold (seconds) above which the stall watchdog (SteeringConfig.stall_watchdog_enabled) triggers the trajectory-level GOAL_DRIFT judge, once per idle episode. Read live per watchdog poll."
 type = "int"
 range = [10, 3600]
 default = 300
 tags = ["threshold", "goal_drift"]
+
+[[mutation]]
+id = "stall_watchdog_timeout_seconds"
+kind = "numeric"
+source = "goldfive/config.py:SteeringConfig.stall_timeout_s"
+python_attr = "goldfive.config:SteeringConfig.stall_timeout_s"
+description = "Dataclass-default idle threshold (seconds) before the flag-gated wall-clock stall watchdog fires TASK_TIMEOUT at WARNING (CRITICAL at each further multiple with no fresh activity). Inert unless SteeringConfig.stall_watchdog_enabled is set."
+type = "float"
+range = [10.0, 7200.0]
+default = 600.0
+tags = ["config", "steerer", "timeout", "watchdog"]
 
 # ---------------------------------------------------------------------------
 # Reasoning-judge prompt size budgets
