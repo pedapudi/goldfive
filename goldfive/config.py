@@ -779,6 +779,28 @@ class SteeringConfig:
     #: Operator-issued ``PAUSE`` controls are never bounded by this knob.
     #: Env: ``GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S``.
     pause_escalate_deadline_s: float | None = None
+    #: Wall-clock stall watchdog (default OFF). When enabled, the ADK
+    #: plugin spawns one background task per dispatch that watches a
+    #: liveness watermark — the max of every
+    #: :attr:`~goldfive.types.Session.task_last_progress_at` stamp and
+    #: :attr:`~goldfive.types.Session.last_observed_event_at` (stamped on
+    #: every observation dispatched into the drift pipeline). When the
+    #: watermark goes silent for :attr:`stall_timeout_s` seconds, a
+    #: ``TASK_TIMEOUT`` drift fires at WARNING, escalating to CRITICAL
+    #: on continued silence. Routed through the normal drift dispatch,
+    #: so under ``observation_only`` (the production default) the drift
+    #: is telemetry-only; in active mode the intervention ladder handles
+    #: it. This is the producer for runs wedged in a hung async tool
+    #: call or idling with no task transitions — which previously
+    #: produced ZERO signal. Env: ``GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED``.
+    stall_watchdog_enabled: bool = False
+    #: Idle threshold, in seconds, before the stall watchdog fires its
+    #: first ``TASK_TIMEOUT`` WARNING; each further multiple of the
+    #: timeout with no fresh activity fires a CRITICAL. Non-positive
+    #: values disable the watchdog even when
+    #: :attr:`stall_watchdog_enabled` is True.
+    #: Env: ``GOLDFIVE_STEER_STALL_TIMEOUT_S``.
+    stall_timeout_s: float = 600.0
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -804,6 +826,11 @@ class SteeringConfig:
         * ``GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S`` — positive float
           (seconds); non-positive values disable the deadline (``None``),
           non-float values fall back to the default.
+        * ``GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED`` — boolean (same
+          literals as ``GOLDFIVE_STEER_OBSERVATION_ONLY``). Default
+          False (watchdog off).
+        * ``GOLDFIVE_STEER_STALL_TIMEOUT_S`` — float (seconds);
+          non-float values fall back to the default (600).
         """
         defaults = cls()
         raw_rules = os.environ.get("GOLDFIVE_STEER_CONTEXT_EDITOR_RULES", "").strip()
@@ -836,6 +863,14 @@ class SteeringConfig:
             pause_escalate_deadline_s=_read_optional_float_env(
                 "GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S",
                 defaults.pause_escalate_deadline_s,
+            ),
+            stall_watchdog_enabled=_read_bool_env(
+                "GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED",
+                defaults.stall_watchdog_enabled,
+            ),
+            stall_timeout_s=_read_float_env(
+                "GOLDFIVE_STEER_STALL_TIMEOUT_S",
+                defaults.stall_timeout_s,
             ),
         )
 

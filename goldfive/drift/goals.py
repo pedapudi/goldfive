@@ -63,10 +63,23 @@ __all__ = [
 ]
 
 
-# Default periodic-check cadence. Consumed by ``DefaultSteerer`` (see
-# :class:`~goldfive.steerer.DefaultSteerer` -- ``goal_drift_check_interval``
-# parameter). One LLM call per check, so defaults are deliberately
-# low-frequency; operators who want tighter monitoring can shorten it.
+# Default check cadences. One LLM call per check, so defaults are
+# deliberately low-frequency; operators who want tighter monitoring
+# can shorten them.
+#
+# ``GOAL_DRIFT_CHECK_INTERVAL`` documents the turn-based default; the
+# LIVE runtime knob is :attr:`goldfive.config.GoalDriftConfig.check_interval`
+# (which ``DefaultSteerer`` reads — this constant is a public re-export
+# kept for back-compat and is not consulted at runtime).
+#
+# ``GOAL_DRIFT_IDLE_SECONDS`` is the idle-based scheduling threshold:
+# when the wall-clock stall watchdog is enabled
+# (``SteeringConfig.stall_watchdog_enabled``) and the session's
+# liveness watermark has been silent this long, the watchdog triggers
+# :meth:`~goldfive.drift_observer.DriftObserver.maybe_run_goal_drift_check`
+# once per idle episode. Read live from this module attribute on every
+# watchdog poll, so optimization-manifest ``setattr`` mutations take
+# effect on a running watchdog.
 GOAL_DRIFT_CHECK_INTERVAL: int = 5
 GOAL_DRIFT_IDLE_SECONDS: int = 300
 

@@ -17,8 +17,11 @@ Covers:
 
 from __future__ import annotations
 
+import ast
 import importlib
 import textwrap
+from collections import Counter
+from pathlib import Path
 
 import pytest
 
@@ -213,6 +216,108 @@ def test_numeric_mutations_match_live_python_attrs() -> None:
             "numeric default diverged from live Python attribute for: "
             + ", ".join(f"{i} (code={c!r}, manifest={m!r})" for i, c, m in drifts)
         )
+
+
+# ---------------------------------------------------------------------------
+# Manifest liveness — every numeric knob must have a runtime consumer
+# ---------------------------------------------------------------------------
+
+
+def _goldfive_attr_read_counts() -> Counter[str]:
+    """Count *read* sites per attribute leaf-name across goldfive sources.
+
+    A read is any of:
+
+    * a bare ``Name`` in ``Load`` context (module constants used after
+      import or within their own module);
+    * an ``Attribute`` in ``Load`` context (``config.check_interval``,
+      ``self.MAX_OUTPUT_TOKENS``, ``_goals.GOAL_DRIFT_IDLE_SECONDS``);
+    * a ``getattr(obj, "leaf", ...)`` call with a string-literal name.
+
+    Definitions (``Store`` contexts), ``import`` aliases, ``__all__``
+    strings, comments, and docstrings do NOT count — so a constant that
+    is merely defined + re-exported registers zero reads. Name-based,
+    so a generic leaf (``timeout_ms``) can alias across classes; the
+    check is a liveness smoke test, not a proof of the exact consumer.
+    """
+    import goldfive
+
+    counts: Counter[str] = Counter()
+    root = Path(goldfive.__file__).parent
+    for path in sorted(root.rglob("*.py")):
+        if "pb" in path.parts:
+            continue  # generated proto stubs
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                counts[node.id] += 1
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                counts[node.attr] += 1
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                counts[node.args[1].value] += 1
+    return counts
+
+
+def test_numeric_mutations_have_live_runtime_consumers() -> None:
+    """Every numeric knob's ``python_attr`` must be read somewhere at runtime.
+
+    The default-sync test above only proves the manifest's ``default``
+    matches the attribute's value — a constant that nothing consumes
+    still passes it (the historical ``goal_drift_check_interval`` entry
+    pointed at ``goldfive.drift.goals:GOAL_DRIFT_CHECK_INTERVAL``,
+    which was defined + re-exported but read by no runtime code, so an
+    optimizer mutating it changed nothing). This test statically counts
+    read sites for the attribute's leaf name across the ``goldfive``
+    package; zero reads means the knob is dead and its ``python_attr``
+    must be repointed at the live path.
+    """
+    manifest = Manifest.load()
+    counts = _goldfive_attr_read_counts()
+    dead: list[str] = []
+    for mut in manifest:
+        if mut.kind != "numeric":
+            continue
+        leaf = mut.python_attr.partition(":")[2].split(".")[-1]
+        if counts[leaf] == 0:
+            dead.append(f"{mut.id} ({mut.python_attr})")
+    assert not dead, (
+        "numeric manifest knobs whose python_attr has no runtime read "
+        f"site: {dead} — repoint python_attr at the attribute a runtime "
+        "consumer actually reads"
+    )
+
+
+def test_liveness_counter_flags_the_known_dead_constant() -> None:
+    """Self-check for the liveness heuristic: the legacy
+    ``GOAL_DRIFT_CHECK_INTERVAL`` constant (defined + re-exported, no
+    runtime consumer — the live path is
+    ``GoalDriftConfig.check_interval``) must register zero reads, and
+    the newly-consumed ``GOAL_DRIFT_IDLE_SECONDS`` (stall watchdog)
+    must register at least one."""
+    counts = _goldfive_attr_read_counts()
+    assert counts["GOAL_DRIFT_CHECK_INTERVAL"] == 0
+    assert counts["GOAL_DRIFT_IDLE_SECONDS"] >= 1
+
+
+def test_goal_drift_check_interval_points_at_live_config_path() -> None:
+    """Regression pin for the repointed knob (see liveness test above)."""
+    manifest = Manifest.load()
+    mut = {m.id: m for m in manifest}["goal_drift_check_interval"]
+    assert mut.python_attr == "goldfive.config:GoalDriftConfig.check_interval"
+
+
+def test_manifest_covers_stall_watchdog_knob() -> None:
+    manifest = Manifest.load()
+    mut = {m.id: m for m in manifest}["stall_watchdog_timeout_seconds"]
+    assert mut.python_attr == "goldfive.config:SteeringConfig.stall_timeout_s"
+    assert mut.default == 600.0
 
 
 # ---------------------------------------------------------------------------

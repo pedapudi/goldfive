@@ -687,6 +687,18 @@ class DefaultSteerer:
             from goldfive.config import _resolve_observation_only_default
 
             self._observation_only = _resolve_observation_only_default()
+        # Wall-clock stall watchdog knobs (flag-gated, default OFF). Read
+        # by the ADK plugin's per-dispatch watchdog task — see
+        # :class:`~goldfive.config.SteeringConfig.stall_watchdog_enabled`.
+        # Bare-constructor default matches the ``SteeringConfig`` field
+        # defaults so a steerer built without a config keeps the
+        # watchdog off.
+        if steering_config is not None:
+            self._stall_watchdog_enabled: bool = bool(steering_config.stall_watchdog_enabled)
+            self._stall_timeout_s: float = float(steering_config.stall_timeout_s)
+        else:
+            self._stall_watchdog_enabled = False
+            self._stall_timeout_s = 600.0
         # Background reasoning-judge tasks (goldfive#251). The LLM-judge
         # path in :meth:`observe_reasoning` is fire-and-forget so the
         # adapter's model-response callback can return immediately and
