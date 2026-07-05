@@ -180,7 +180,9 @@ async def test_on_task_false_maps_severity(
     assert drift.current_agent_id == "a1"
 
 
-async def test_missing_severity_defaults_to_warning() -> None:
+async def test_missing_severity_defaults_to_info() -> None:
+    # INFO, not WARNING: a malformed severity must not make the drift
+    # promotion-eligible (_should_promote_to_steer gates on WARNING+).
     call_llm = _stub_call_llm([{"on_task": False, "reason": "drifted"}])
     drift = await rjudge.classify_reasoning_drift(
         reasoning="off-topic thought",
@@ -190,10 +192,10 @@ async def test_missing_severity_defaults_to_warning() -> None:
         call_llm=call_llm,
     )
     assert drift is not None
-    assert drift.severity is DriftSeverity.WARNING
+    assert drift.severity is DriftSeverity.INFO
 
 
-async def test_unknown_severity_defaults_to_warning() -> None:
+async def test_unknown_severity_defaults_to_info() -> None:
     call_llm = _stub_call_llm([{"on_task": False, "severity": "CATASTROPHIC"}])
     drift = await rjudge.classify_reasoning_drift(
         reasoning="off-topic thought",
@@ -203,7 +205,7 @@ async def test_unknown_severity_defaults_to_warning() -> None:
         call_llm=call_llm,
     )
     assert drift is not None
-    assert drift.severity is DriftSeverity.WARNING
+    assert drift.severity is DriftSeverity.INFO
 
 
 async def test_tolerates_markdown_fenced_json() -> None:

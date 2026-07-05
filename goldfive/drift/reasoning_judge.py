@@ -659,8 +659,10 @@ class ReasoningJudgeVerdict:
 
 
 # Map the judge's ``severity`` string to a :class:`DriftSeverity`. Missing
-# or unknown values fall through to WARNING so a drift verdict is never
-# silently swallowed by a bad severity string.
+# or unknown values fall through to INFO: the drift verdict is still
+# emitted (never silently swallowed), but a malformed severity string
+# must not be promotion-eligible —
+# :meth:`DriftObserver._should_promote_to_steer` gates on WARNING-and-up.
 _SEVERITY_MAP: dict[str, DriftSeverity] = {
     "info": DriftSeverity.INFO,
     "warning": DriftSeverity.WARNING,
@@ -669,9 +671,16 @@ _SEVERITY_MAP: dict[str, DriftSeverity] = {
 
 
 def _severity_from_verdict(raw: Any) -> DriftSeverity:
-    if not isinstance(raw, str):
-        return DriftSeverity.WARNING
-    return _SEVERITY_MAP.get(raw.strip().lower(), DriftSeverity.WARNING)
+    if isinstance(raw, str):
+        severity = _SEVERITY_MAP.get(raw.strip().lower())
+        if severity is not None:
+            return severity
+    log.debug(
+        "classify_reasoning_drift: severity %r missing or unrecognised; "
+        "defaulting to INFO",
+        raw,
+    )
+    return DriftSeverity.INFO
 
 
 # iter-10 PR 3: three-state classification + provenance enums. Keep
