@@ -711,8 +711,15 @@ async def test_integration_capability_mismatch_flows_through_handle_drift() -> N
     assert drift.severity is DriftSeverity.CRITICAL
     assert drift.current_task_id == "t-draft"
     assert drift.current_agent_id == "underqualified"
-    # Positive fire must NOT also record a no-drift decision.
-    assert steerer.drift.no_drift_decisions == []
+    # Positive fire must NOT also record a capability-check no-drift
+    # decision. (The tool-loop tracker's aggregated negative class may
+    # legitimately fire for the same invocation -- scope by detector.)
+    capability_decisions = [
+        d
+        for d in steerer.drift.no_drift_decisions
+        if d["detector_name"] == "capability_check"
+    ]
+    assert capability_decisions == []
 
 
 async def test_integration_rule_c_dag_order_mismatch_through_pin() -> None:
@@ -877,9 +884,14 @@ async def test_integration_no_capability_mismatch_when_agent_has_leaf_tool() -> 
         f"tool; got {capability_drifts}"
     )
     # Negative class for the optimizer: the detector ran on a resolved
-    # task and passed, so a no-drift decision is recorded.
-    decisions = steerer.drift.no_drift_decisions
+    # task and passed, so a no-drift decision is recorded. Scope by
+    # detector -- the tool-loop tracker's aggregated negative class may
+    # also fire for the same invocation.
+    decisions = [
+        d
+        for d in steerer.drift.no_drift_decisions
+        if d["detector_name"] == "capability_check"
+    ]
     assert len(decisions) == 1, decisions
-    assert decisions[0]["detector_name"] == "capability_check"
     assert decisions[0]["task_id"] == "t-draft"
     assert decisions[0]["agent_name"] == "qualified"

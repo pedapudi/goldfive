@@ -794,6 +794,7 @@ class ToolLoopTracker:
         exact_threshold: int = 3,          # DEFAULT_EXACT_THRESHOLD (overrides work-WARNING exact)
         name_threshold: int = 5,           # DEFAULT_NAME_THRESHOLD (overrides work-WARNING name)
         alternating_threshold: int = 5,    # DEFAULT_ALTERNATING_THRESHOLD
+        name_axis_max_severity: str = "info",  # DEFAULT_NAME_AXIS_MAX_SEVERITY (uncorroborated name-axis cap)
     ) -> None: ...
 
     def observe_tool_call(
@@ -816,7 +817,7 @@ class ToolLoopTracker:
 
 
 def args_hash(args: Any) -> str: ...          # 8-char md5 hex of sorted-keys JSON
-def load_thresholds_from_env() -> dict[str, int]: ...
+def load_thresholds_from_env() -> dict[str, int | str]: ...
 ```
 
 Detection modes:
@@ -824,7 +825,7 @@ Detection modes:
 | Mode | Pattern | Default | Severity |
 |---|---|---|---|
 | Exact | same `(tool_name, args_hash)` ≥ threshold in last `window` | 3 / 7 | WARNING |
-| Name | same `tool_name` ≥ threshold in last `window`, no task progress | 5 / 7 | WARNING |
+| Name | same `tool_name` ≥ threshold in last `window`, no task progress | 5 / 7 | tier severity when the window also holds an exact repeat; capped at `name_axis_max_severity` (default `"info"`) otherwise |
 | Alternating | A,B,A,B,A pattern in last `alternating_threshold` | 5 | INFO |
 
 Progress-reporting tools (`report_task_*`) call
@@ -835,7 +836,8 @@ Env-var overrides:
 `GOLDFIVE_TOOL_LOOP_WINDOW`,
 `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD`,
 `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD`,
-`GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD`.
+`GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD`,
+`GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY`.
 
 Follow-ups tracked: #179 (umbrella), #182 (args-quality),
 #183 (silent-success), #185 (wrong-tool).

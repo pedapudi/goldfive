@@ -3,7 +3,8 @@
 Covers the eight contracts named in the PR plan:
 
 1. Exact ``(tool_name, args_hash)`` repeat fires a WARNING.
-2. Same-name (args-varying) repeat fires a WARNING.
+2. Same-name (args-varying) repeat matches the WARNING tier but emits
+   INFO without exact-repeat corroboration (name-axis precision cap).
 3. Alternating A,B,A,B,A fires an INFO.
 4. ``on_task_progress`` clears the window.
 5. Cross-invocation buffers are isolated.
@@ -27,6 +28,7 @@ import pytest
 from goldfive.drift.tool_loops import (
     DEFAULT_ALTERNATING_THRESHOLD,
     DEFAULT_EXACT_THRESHOLD,
+    DEFAULT_NAME_AXIS_MAX_SEVERITY,
     DEFAULT_NAME_THRESHOLD,
     DEFAULT_WINDOW,
     ToolLoopTracker,
@@ -101,6 +103,7 @@ def test_load_thresholds_defaults_when_unset() -> None:
             "GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD",
             "GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD",
             "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD",
+            "GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY",
         ):
             os.environ.pop(var, None)
         thresholds = load_thresholds_from_env()
@@ -109,6 +112,7 @@ def test_load_thresholds_defaults_when_unset() -> None:
         "exact_threshold": DEFAULT_EXACT_THRESHOLD,
         "name_threshold": DEFAULT_NAME_THRESHOLD,
         "alternating_threshold": DEFAULT_ALTERNATING_THRESHOLD,
+        "name_axis_max_severity": DEFAULT_NAME_AXIS_MAX_SEVERITY,
     }
 
 
@@ -118,6 +122,7 @@ def test_load_thresholds_respects_env_overrides() -> None:
         "GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD": "4",
         "GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD": "7",
         "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD": "6",
+        "GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY": "critical",
     }
     with mock.patch.dict(os.environ, overrides, clear=False):
         thresholds = load_thresholds_from_env()
@@ -126,16 +131,19 @@ def test_load_thresholds_respects_env_overrides() -> None:
         "exact_threshold": 4,
         "name_threshold": 7,
         "alternating_threshold": 6,
+        "name_axis_max_severity": "critical",
     }
 
 
 def test_load_thresholds_rejects_bad_values() -> None:
-    # Non-integer and non-positive overrides degrade to defaults.
+    # Non-integer / non-positive / unknown-severity overrides degrade
+    # to defaults.
     bad = {
         "GOLDFIVE_TOOL_LOOP_WINDOW": "not-an-int",
         "GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD": "0",
         "GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD": "-3",
         "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD": "  ",
+        "GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY": "loud",
     }
     with mock.patch.dict(os.environ, bad, clear=False):
         thresholds = load_thresholds_from_env()
@@ -143,6 +151,7 @@ def test_load_thresholds_rejects_bad_values() -> None:
     assert thresholds["exact_threshold"] == DEFAULT_EXACT_THRESHOLD
     assert thresholds["name_threshold"] == DEFAULT_NAME_THRESHOLD
     assert thresholds["alternating_threshold"] == DEFAULT_ALTERNATING_THRESHOLD
+    assert thresholds["name_axis_max_severity"] == DEFAULT_NAME_AXIS_MAX_SEVERITY
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +172,11 @@ def test_load_thresholds_rejects_bad_values() -> None:
 def test_constructor_rejects_non_positive(kwargs: dict[str, int]) -> None:
     with pytest.raises(ValueError):
         ToolLoopTracker(**kwargs)
+
+
+def test_constructor_rejects_unknown_name_axis_max_severity() -> None:
+    with pytest.raises(ValueError):
+        ToolLoopTracker(name_axis_max_severity="loud")
 
 
 # ---------------------------------------------------------------------------
@@ -206,8 +220,15 @@ def test_exact_repeat_fires_warning() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_name_repeat_fires_warning() -> None:
-    """Mode 2: five same-name, distinct-args calls fire a WARNING."""
+def test_name_repeat_uncorroborated_emits_info_only() -> None:
+    """Mode 2: five same-name, distinct-args calls emit INFO, not WARNING.
+
+    Name-axis precision: same-name-varied-args is ambiguous with
+    definitionally-healthy iteration (reading five different files with
+    the same tool), so without an exact-repeat in the window the
+    WARNING tier's threshold still matches but the emitted severity is
+    capped at INFO. The tier is preserved on ``raw`` for telemetry.
+    """
     tracker = ToolLoopTracker()
     drifts_per_call = _seed(
         tracker,
@@ -220,13 +241,136 @@ def test_name_repeat_fires_warning() -> None:
     assert len(drifts_per_call[4]) == 1
     drift = drifts_per_call[4][0]
     assert drift.kind is DriftKind.LOOPING_REASONING
-    assert drift.severity is DriftSeverity.WARNING
+    assert drift.severity is DriftSeverity.INFO
     assert "tool_loop_name" in drift.detail
+    assert "severity capped" in drift.detail
     assert drift.raw is not None
     assert drift.raw.get("mode") == "name"
     assert drift.raw.get("tool_name") == "read_file"
     assert drift.raw.get("count") == 5
+    assert drift.raw.get("tier") == "warning"
+    assert drift.raw.get("severity_capped_from") == "warning"
+    # detector_name stamping (#480) must survive the capped emission path.
     assert drift.detector_name == "tool_loops"
+
+
+def test_six_varied_args_reads_emit_info_only() -> None:
+    """The headline false-positive: 6 reads of 6 different files stays INFO.
+
+    Pre-fix this window fired WARNING at call 5 -- routing a
+    definitionally-healthy pattern into ``planner.refine`` (ABSORB).
+    Now every drift the window produces is INFO (OBSERVE: telemetry
+    only, no refine, no active-steer promotion -- LOOPING_REASONING is
+    excluded from ``_GOLDFIVE_STEER_ELIGIBLE_KINDS``).
+    """
+    tracker = ToolLoopTracker()
+    drifts_per_call = _seed(
+        tracker,
+        [("read_file", {"path": f"chapter_{i}.md"}) for i in range(6)],
+    )
+    fired = [d for drifts in drifts_per_call for d in drifts]
+    assert fired, "the name tier should still produce INFO telemetry"
+    assert all(d.severity is DriftSeverity.INFO for d in fired), (
+        f"expected INFO only, got {[d.severity for d in fired]}"
+    )
+
+
+def test_name_axis_with_exact_repeat_corroboration_keeps_tier_severity() -> None:
+    """Corroborated name-axis hits keep the tier's full severity.
+
+    A window with 5 same-name calls where two share identical args is
+    no longer plain iteration -- the exact-repeat corroborates the
+    loop hypothesis, so the WARNING tier fires uncapped.
+    """
+    tracker = ToolLoopTracker()
+    calls: list[tuple[str, dict[str, Any]]] = [
+        ("read_file", {"path": "p0.txt"}),
+        ("read_file", {"path": "p1.txt"}),
+        ("read_file", {"path": "p2.txt"}),
+        ("read_file", {"path": "p0.txt"}),  # exact repeat of call 1
+        ("read_file", {"path": "p3.txt"}),
+    ]
+    drifts_per_call = _seed(tracker, calls)
+    fifth = drifts_per_call[4]
+    assert len(fifth) == 1
+    drift = fifth[0]
+    assert drift.severity is DriftSeverity.WARNING
+    assert drift.raw is not None
+    assert drift.raw.get("mode") == "name"
+    assert drift.raw.get("tier") == "warning"
+    assert "severity_capped_from" not in drift.raw
+
+
+def test_name_axis_max_severity_critical_restores_legacy_behavior() -> None:
+    """``name_axis_max_severity="critical"`` disables the cap entirely.
+
+    Operators who want the pre-cap semantics get them back: WARNING at
+    5 same-name-varied-args calls, CRITICAL at 7.
+    """
+    tracker = ToolLoopTracker(name_axis_max_severity="critical")
+    drifts_per_call = _seed(
+        tracker,
+        [("web_developer_agent", {"q": f"q{i}"}) for i in range(7)],
+    )
+    fifth = drifts_per_call[4]
+    assert len(fifth) == 1
+    assert fifth[0].severity is DriftSeverity.WARNING
+    assert "severity_capped_from" not in fifth[0].raw
+    seventh = drifts_per_call[6]
+    assert len(seventh) == 1
+    assert seventh[0].severity is DriftSeverity.CRITICAL
+    assert seventh[0].raw.get("tier") == "critical"
+    assert "severity_capped_from" not in seventh[0].raw
+
+
+def test_name_axis_max_severity_warning_caps_critical_tier() -> None:
+    """An intermediate cap: CRITICAL-tier name hits emit WARNING."""
+    tracker = ToolLoopTracker(name_axis_max_severity="warning")
+    drifts_per_call = _seed(
+        tracker,
+        [("web_developer_agent", {"q": f"q{i}"}) for i in range(7)],
+    )
+    # WARNING tier at 5 is at-or-below the cap -- unchanged.
+    assert drifts_per_call[4][0].severity is DriftSeverity.WARNING
+    # CRITICAL tier at 7 is capped to WARNING.
+    seventh = drifts_per_call[6]
+    assert len(seventh) == 1
+    drift = seventh[0]
+    assert drift.severity is DriftSeverity.WARNING
+    assert drift.raw.get("tier") == "critical"
+    assert drift.raw.get("severity_capped_from") == "critical"
+
+
+def test_capped_name_hit_does_not_shadow_other_tools_exact_warning() -> None:
+    """Cross-tool selection ranks by EMITTED severity, not matched tier.
+
+    A window holding an uncorroborated name-axis CRITICAL-tier hit
+    (capped to INFO) for one tool AND a genuine exact-axis WARNING for
+    another must emit the WARNING -- the capped INFO would otherwise
+    win on raw tier and hide the actionable signal.
+    """
+    tracker = ToolLoopTracker()
+    calls: list[tuple[str, dict[str, Any]]] = [
+        ("browse", {"u": "0"}),
+        ("browse", {"u": "1"}),
+        ("patch_file", {"path": "a", "diff": "x"}),
+        ("browse", {"u": "2"}),
+        ("patch_file", {"path": "a", "diff": "x"}),
+        ("browse", {"u": "3"}),
+        ("browse", {"u": "4"}),
+        ("browse", {"u": "5"}),
+        ("browse", {"u": "6"}),
+        ("patch_file", {"path": "a", "diff": "x"}),
+    ]
+    drifts_per_call = _seed(tracker, calls)
+    last = drifts_per_call[-1]
+    # Window: browse x 7 varied (name CRITICAL tier, capped to INFO) +
+    # patch_file x 3 identical (exact WARNING). WARNING wins.
+    assert len(last) == 1
+    drift = last[0]
+    assert drift.severity is DriftSeverity.WARNING
+    assert drift.raw.get("mode") == "exact"
+    assert drift.raw.get("tool_name") == "patch_file"
 
 
 # ---------------------------------------------------------------------------
@@ -350,16 +494,19 @@ def test_run_scoped_bucket_accumulates_across_reinvocations() -> None:
     failure mode where ``debugger_agent`` was re-invoked 11+ times,
     each time calling ``find_presentation_files`` with varying args.
     Pre-#420 the per-(invocation_id, agent_name) bucket gave every
-    re-invocation a fresh 2-entry window — never tripping the 7-call
-    CRITICAL name-tier. With ``session_run_id`` threaded, the calls
-    accumulate into one bucket and CRITICAL fires once the cumulative
-    name-tier threshold is met.
+    re-invocation a fresh 2-entry window — never tripping the name-
+    tier thresholds. With ``session_run_id`` threaded, the calls
+    accumulate into one bucket and the tiers match on the cumulative
+    counts. Under the name-axis precision cap the varied-args signal
+    emits INFO (the tier is preserved on ``raw``); the
+    corroborated / legacy-config paths are covered by the name-axis
+    tests above.
     """
     tracker = ToolLoopTracker()
     # 11 re-invocations of the same agent, each emitting one
     # find_presentation_files call with varying args. After 7 cumulative
     # calls on the (run-id, agent) bucket the WORK name-tier CRITICAL
-    # (count >= 7) fires.
+    # threshold (count >= 7) matches.
     drifts_per_call: list[list[Any]] = []
     for i in range(11):
         result = tracker.observe_tool_call(
@@ -371,21 +518,24 @@ def test_run_scoped_bucket_accumulates_across_reinvocations() -> None:
             session_run_id="run-cherry-tree",
         )
         drifts_per_call.append(result)
-    # By call 5: name count = 5 -> WARNING (work name warning=5).
-    assert drifts_per_call[4], "expected WARNING at cumulative call 5"
-    assert drifts_per_call[4][0].severity is DriftSeverity.WARNING
-    # By call 7: name count = 7 -> CRITICAL.
+    # By call 5: name count = 5 -> WARNING tier matches; emitted as
+    # INFO (uncorroborated name axis).
+    assert drifts_per_call[4], "expected a drift at cumulative call 5"
+    assert drifts_per_call[4][0].severity is DriftSeverity.INFO
+    assert drifts_per_call[4][0].raw.get("tier") == "warning"
+    # By call 7: name count = 7 -> CRITICAL tier matches; still INFO.
     seventh = drifts_per_call[6]
     assert len(seventh) == 1, (
         f"goldfive#420: cumulative same-name calls across re-invocations "
-        f"should trip CRITICAL at 7, got {seventh}"
+        f"should match the CRITICAL tier at 7, got {seventh}"
     )
     drift = seventh[0]
-    assert drift.severity is DriftSeverity.CRITICAL
+    assert drift.severity is DriftSeverity.INFO
     assert drift.kind is DriftKind.LOOPING_REASONING
     assert drift.raw is not None
     assert drift.raw.get("category") == "work"
     assert drift.raw.get("tier") == "critical"
+    assert drift.raw.get("severity_capped_from") == "critical"
     assert drift.raw.get("mode") == "name"
     # The drift event records the actual ADK invocation id (so the
     # cancel target is right), not the run-scoped bucket key.
@@ -755,25 +905,30 @@ def test_critical_tool_loops_at_10_meta_or_6_work() -> None:
     assert sixth[0].raw.get("tier") == "critical"
 
 
-def test_work_name_tier_fires_critical_at_7() -> None:
-    """Work tool, args varying, 7 same-name calls -> CRITICAL."""
+def test_work_name_tier_at_7_is_capped_without_corroboration() -> None:
+    """Work tool, args varying, 7 same-name calls -> CRITICAL tier, INFO emit.
+
+    Formerly asserted CRITICAL: the name-axis precision cap keeps the
+    tier thresholds but emits INFO when the window has no exact-repeat
+    corroboration. ``test_name_axis_max_severity_critical_restores_legacy_behavior``
+    covers the uncapped severities under the legacy config.
+    """
     tracker = ToolLoopTracker()
-    # 7 calls to the same work tool with distinct args -- no exact
-    # signature hits, but the name axis trips CRITICAL at 7.
     drifts = _seed(
         tracker,
         [("web_developer_agent", {"q": f"q{i}"}) for i in range(7)],
     )
-    # Call 5: name count = 5 -> WARNING tier (work name warning=5).
-    assert drifts[4], "expected WARNING at call 5"
-    assert drifts[4][0].severity is DriftSeverity.WARNING
-    # Call 7: name count = 7 -> CRITICAL.
+    # Call 5: name count = 5 -> WARNING tier matches, INFO emitted.
+    assert drifts[4], "expected a drift at call 5"
+    assert drifts[4][0].severity is DriftSeverity.INFO
+    # Call 7: name count = 7 -> CRITICAL tier matches, INFO emitted.
     seventh = drifts[6]
     assert len(seventh) == 1
     drift = seventh[0]
-    assert drift.severity is DriftSeverity.CRITICAL
+    assert drift.severity is DriftSeverity.INFO
     assert drift.raw.get("category") == "work"
     assert drift.raw.get("tier") == "critical"
+    assert drift.raw.get("severity_capped_from") == "critical"
     assert drift.raw.get("mode") == "name"
 
 

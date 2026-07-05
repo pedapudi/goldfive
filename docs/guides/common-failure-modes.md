@@ -46,6 +46,10 @@ env vars:
 - `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` (default 3, work-WARNING only)
 - `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` (default 5, work-WARNING only)
 - `GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD` (default 5)
+- `GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY` (default `info`; the
+  same-name-varied-args axis emits at most this severity unless the
+  window also holds an exact-args repeat — set `critical` for the
+  legacy uncapped behaviour)
 
 See `goldfive/drift/tool_loops.py` for the full contract.
 

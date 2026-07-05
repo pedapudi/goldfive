@@ -415,12 +415,20 @@ class ToolLoopConfig:
     preserves the pre-#204 single-threshold semantics for work tools.
     See :mod:`goldfive.drift.tool_loops` §"Graduated thresholds per
     category" for the full table.
+
+    ``name_axis_max_severity`` caps the severity of same-name-varied-
+    args (name-axis) hits that lack exact-repeat corroboration in the
+    window -- ``"info"`` (default) keeps the uncorroborated name axis
+    signal-only; ``"critical"`` restores the legacy uncapped
+    behaviour. See :mod:`goldfive.drift.tool_loops` §"Name-axis
+    precision".
     """
 
     window: int = 10
     exact_threshold: int = 3
     name_threshold: int = 5
     alternating_threshold: int = 5
+    name_axis_max_severity: str = "info"
 
     @classmethod
     def from_env(cls) -> ToolLoopConfig:
@@ -428,6 +436,8 @@ class ToolLoopConfig:
 
         Names preserved from :func:`goldfive.drift.tool_loops.load_thresholds_from_env`.
         """
+        from goldfive.drift.tool_loops import _read_severity_env
+
         defaults = cls()
         return cls(
             window=_read_int_env("GOLDFIVE_TOOL_LOOP_WINDOW", defaults.window),
@@ -440,6 +450,10 @@ class ToolLoopConfig:
             alternating_threshold=_read_int_env(
                 "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD",
                 defaults.alternating_threshold,
+            ),
+            name_axis_max_severity=_read_severity_env(
+                "GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY",
+                defaults.name_axis_max_severity,
             ),
         )
 

@@ -2183,6 +2183,14 @@ def make_adk_plugin(
             self._tool_loop_tracker = _tool_loops.ToolLoopTracker(
                 **_tool_loops.resolve_thresholds()
             )
+            # Negative-class aggregation for the tool-loop detector:
+            # per-invocation counters of tracker observations and drifts
+            # fired. ``after_run_callback`` consumes an entry to emit ONE
+            # aggregated ``no_drift`` SteeringDecisionMade when the
+            # tracker ran for the invocation and fired nothing, so
+            # optimizers can tell "tracker quiet" from "tracker never
+            # ran".
+            self._tool_loop_invocation_stats: dict[str, dict[str, int]] = {}
             # Reporting-tool names that indicate forward task progress
             # and therefore can clear the tool-loop tracker's window
             # for the current (invocation, agent) key — SUBJECT to the
@@ -2361,6 +2369,10 @@ def make_adk_plugin(
             # state from the just-finished dispatch doesn't leak into
             # the next one on the same plugin instance (goldfive#181).
             self._tool_loop_tracker.clear()
+            # Drop straggling negative-class counters (normal operation
+            # pops each entry in ``after_run_callback``; this catches
+            # invocations that errored before their after_run fired).
+            self._tool_loop_invocation_stats.clear()
             # Drop any lingering cancellation state / parent map so the
             # next dispatch starts clean (goldfive#251). A request that
             # was never consumed means the callback path never ran —
@@ -3967,6 +3979,16 @@ def make_adk_plugin(
                 finishing_agent_name=agent_name,
             )
 
+            # Tool-loop negative class: one aggregated ``no_drift``
+            # decision per invocation whose tracker ran and fired
+            # nothing. Consumes the per-invocation stats entry either
+            # way so the dict stays bounded.
+            await self._maybe_emit_tool_loop_no_drift(
+                ctx=ctx,
+                inv_id=inv_id,
+                agent_name=agent_name,
+            )
+
             # If the finishing invocation is the top-level one, release
             # the pin so a subsequent invoke() on the same plugin gets a
             # fresh dispatch.
@@ -4115,6 +4137,52 @@ def make_adk_plugin(
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "_maybe_emit_confabulation_risk: steerer.drift.observe raised: %s",
+                    exc,
+                )
+
+        async def _maybe_emit_tool_loop_no_drift(
+            self,
+            *,
+            ctx: SessionContext,
+            inv_id: str,
+            agent_name: str,
+        ) -> None:
+            """Emit one aggregated ``no_drift`` decision for a clean invocation.
+
+            The tool-loop tracker runs per tool call; a per-call silent-
+            path decision would flood the wire, so the negative class is
+            aggregated: when the invocation ends with >= 1 observed tool
+            call and zero tool-loop drifts fired, emit a single
+            ``SteeringDecisionMade(outcome="no_drift")`` via the
+            steerer's :meth:`emit_no_drift_decision` hook. Telemetry
+            only — identical in observe-only and active modes. Silent
+            when the steerer stub doesn't expose the hook.
+            """
+            stats = self._tool_loop_invocation_stats.pop(inv_id, None) if inv_id else None
+            if not stats or stats["drifts"] or not stats["calls"]:
+                return
+            if ctx.steerer is None:
+                return
+            emit = getattr(
+                getattr(ctx.steerer, "drift", None), "emit_no_drift_decision", None
+            )
+            if emit is None:
+                return
+            try:
+                await emit(
+                    session=ctx.session,
+                    detector_name="tool_loops",
+                    reason=(
+                        f"tool-loop tracker observed {stats['calls']} tool "
+                        f"call(s); no loop pattern matched"
+                    ),
+                    task_id=str(_safe_attr(ctx.task, "id", "") or ""),
+                    agent_name=agent_name,
+                    invocation_id=inv_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_maybe_emit_tool_loop_no_drift: emit_no_drift_decision raised: %s",
                     exc,
                 )
 
@@ -6549,6 +6617,17 @@ def make_adk_plugin(
                     exc,
                 )
                 return None
+
+            # Negative-class aggregation: count the observation (and any
+            # drifts it produced) against the invocation so
+            # ``after_run_callback`` can emit one aggregated ``no_drift``
+            # decision for clean windows.
+            if inv_id:
+                stats = self._tool_loop_invocation_stats.setdefault(
+                    inv_id, {"calls": 0, "drifts": 0}
+                )
+                stats["calls"] += 1
+                stats["drifts"] += len(drifts)
 
             # Iter-10 PR 2: record the call in the session-scoped
             # ``recent_tool_observations`` ring buffer so the
