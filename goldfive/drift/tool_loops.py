@@ -67,11 +67,38 @@ any other call in the window.)
 Work-tier thresholds are chosen to be backwards-compatible with the
 pre-#204 detector: three identical work calls still fire WARNING (what
 the single-threshold detector did), and same-name 5-in-window still
-fires WARNING. CRITICAL is new -- escalates plan revision into cancel-
-reinvoke at higher counts. Meta-tier thresholds push the first WARNING
-out from 3 to 6 so benign ``report_task_*`` retries trigger only an
-INFO drift (OBSERVE -- no plan mutation) until the loop genuinely
-persists.
+matches the WARNING tier (though the emitted severity is subject to
+the name-axis cap below). CRITICAL is new -- escalates plan revision
+into cancel-reinvoke at higher counts. Meta-tier thresholds push the
+first WARNING out from 3 to 6 so benign ``report_task_*`` retries
+trigger only an INFO drift (OBSERVE -- no plan mutation) until the
+loop genuinely persists.
+
+Name-axis precision
+-------------------
+
+The name axis counts same-``name``-any-args calls -- a signal that is
+ambiguous between a stuck loop and definitionally-healthy behaviour
+(an agent reading six different files with the same tool is doing its
+job). Because the window is keyed on ``(session.run_id, agent_name)``
+and accumulates across re-invocations (goldfive#420), the old WARNING-
+at-5 / CRITICAL-at-7 name tiers false-positived on healthy varied-args
+bursts and escalated on that axis alone.
+
+By default the name axis is therefore **capped at INFO** (signal-only telemetry)
+unless the window corroborates the loop hypothesis with exact-repeat
+evidence: at least :data:`_NAME_AXIS_CORROBORATION_MIN_EXACT` identical
+``(name, args_hash)`` calls for the same tool. The graduated tiers
+keep their thresholds -- the matched tier is still recorded on
+``raw["tier"]`` (with ``raw["severity_capped_from"]`` naming the
+uncapped severity) so telemetry consumers see what would have fired.
+The exact axis is unchanged: identical-args repeats are definitionally
+redundant and keep their full graduated severities.
+
+The cap is configurable via ``ToolLoopConfig.name_axis_max_severity``
+/ :envvar:`GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY` (``"info"`` |
+``"warning"`` | ``"critical"``; default ``"info"``). Operators who
+want the legacy uncapped behaviour set ``"critical"``.
 
 The alternating-cycle mode (A,B,A,B,A in the tail) remains INFO-only
 and is independent of category -- it's a textural signal that can
@@ -133,7 +160,9 @@ thresholds are module-level constants (:data:`_META_THRESHOLDS`,
 ``GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD`` / ``GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD``
 vars are still read by :func:`load_thresholds_from_env` for backwards
 compatibility and override the **work** category's WARNING tier
-(preserving the pre-#204 single-threshold semantics).
+(preserving the pre-#204 single-threshold semantics). The name-axis
+severity cap is env-overridable via
+``GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY``.
 
 The detector is intentionally deterministic (no embeddings, no LLM
 calls). O(1) per tool call modulo the `window` length.
@@ -158,6 +187,7 @@ __all__ = [
     "DEFAULT_EXACT_THRESHOLD",
     "DEFAULT_NAME_THRESHOLD",
     "DEFAULT_ALTERNATING_THRESHOLD",
+    "DEFAULT_NAME_AXIS_MAX_SEVERITY",
     "ToolLoopTracker",
     "args_hash",
     "load_thresholds_from_env",
@@ -190,7 +220,7 @@ def configure(config: ToolLoopConfig | None) -> None:
     _CONFIG = config
 
 
-def resolve_thresholds() -> dict[str, int]:
+def resolve_thresholds() -> dict[str, int | str]:
     """Return tracker-constructor kwargs sourced from the active config.
 
     Precedence: the installed :class:`~goldfive.config.ToolLoopConfig`
@@ -288,6 +318,27 @@ _SEVERITY_TIERS: tuple[tuple[str, DriftSeverity], ...] = (
     ("info", DriftSeverity.INFO),
 )
 
+#: Severity intrusiveness rank: lower is more severe. Drives both the
+#: name-axis cap comparison and the cross-tool "highest emitted
+#: severity wins" selection in :meth:`ToolLoopTracker._classify`.
+_SEVERITY_RANK: dict[DriftSeverity, int] = {
+    DriftSeverity.CRITICAL: 0,
+    DriftSeverity.WARNING: 1,
+    DriftSeverity.INFO: 2,
+}
+
+#: Valid values for ``name_axis_max_severity`` (ctor kwarg, config
+#: field, and env var alike).
+_VALID_SEVERITY_NAMES: frozenset[str] = frozenset({"info", "warning", "critical"})
+
+#: Minimum identical ``(name, args_hash)`` repeats in the window for the
+#: name axis to count as corroborated. ``2`` is the smallest count that
+#: is a genuine exact repeat: a window with 5+ same-name calls AND at
+#: least one identical-args repeat looks like a stuck loop; 5+ same-name
+#: calls with all-distinct args looks like legitimate iteration (e.g.
+#: reading six different files with the same tool).
+_NAME_AXIS_CORROBORATION_MIN_EXACT: int = 2
+
 
 # ---------------------------------------------------------------------------
 # Legacy tunables (retained for env-override compatibility + docs)
@@ -313,6 +364,12 @@ DEFAULT_NAME_THRESHOLD: int = 5
 
 #: Mode 3 threshold: alternating pattern length (A,B,A,B,A == 5).
 DEFAULT_ALTERNATING_THRESHOLD: int = 5
+
+#: Maximum severity the name axis may emit WITHOUT exact-repeat
+#: corroboration in the window (see §"Name-axis precision"). ``"info"``
+#: keeps the uncorroborated name axis signal-only; the exact axis and
+#: corroborated name-axis hits are unaffected.
+DEFAULT_NAME_AXIS_MAX_SEVERITY: str = "info"
 
 
 def _read_int_env(name: str, default: int) -> int:
@@ -341,7 +398,28 @@ def _read_int_env(name: str, default: int) -> int:
     return val
 
 
-def load_thresholds_from_env() -> dict[str, int]:
+def _read_severity_env(name: str, default: str) -> str:
+    """Best-effort severity-name env override; returns default when invalid.
+
+    Mirrors :func:`_read_int_env`'s lenient contract so a typo'd env
+    var degrades to the safe default instead of failing plugin init.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    val = raw.strip().lower()
+    if val not in _VALID_SEVERITY_NAMES:
+        log.debug(
+            "tool-loop detector: ignoring invalid %s=%r (using default %r)",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return val
+
+
+def load_thresholds_from_env() -> dict[str, int | str]:
     """Read ``GOLDFIVE_TOOL_LOOP_*`` env vars; return overrides dict.
 
     Suitable for ``**kwargs``-splatting into :class:`ToolLoopTracker`.
@@ -367,10 +445,13 @@ def load_thresholds_from_env() -> dict[str, int]:
         "alternating_threshold": _read_int_env(
             "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD", DEFAULT_ALTERNATING_THRESHOLD
         ),
+        "name_axis_max_severity": _read_severity_env(
+            "GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY", DEFAULT_NAME_AXIS_MAX_SEVERITY
+        ),
     }
 
 
-def thresholds_from_config(config: ToolLoopConfig) -> dict[str, int]:
+def thresholds_from_config(config: ToolLoopConfig) -> dict[str, int | str]:
     """Adapt a :class:`~goldfive.config.ToolLoopConfig` to tracker kwargs.
 
     Mirrors :func:`load_thresholds_from_env` so callers can splat the
@@ -383,6 +464,7 @@ def thresholds_from_config(config: ToolLoopConfig) -> dict[str, int]:
         "exact_threshold": config.exact_threshold,
         "name_threshold": config.name_threshold,
         "alternating_threshold": config.alternating_threshold,
+        "name_axis_max_severity": config.name_axis_max_severity,
     }
 
 
@@ -423,6 +505,11 @@ class ToolLoopTracker:
     alternating-cycle mode (independent, A,B,A,B,A-shaped) still fires
     INFO only.
 
+    Name-axis hits without exact-repeat corroboration are capped at
+    ``name_axis_max_severity`` (default ``"info"`` -- see the module
+    docstring's §"Name-axis precision"). Exact-axis behaviour is
+    unchanged at any cap setting.
+
     The classifier never mutates its buffers after firing -- we do not
     dedupe drifts here. Upstream (the steerer's intervention ladder)
     already dedupes by ``(kind, task_id)`` occurrence count, and a
@@ -446,6 +533,7 @@ class ToolLoopTracker:
         exact_threshold: int = DEFAULT_EXACT_THRESHOLD,
         name_threshold: int = DEFAULT_NAME_THRESHOLD,
         alternating_threshold: int = DEFAULT_ALTERNATING_THRESHOLD,
+        name_axis_max_severity: str = DEFAULT_NAME_AXIS_MAX_SEVERITY,
     ) -> None:
         if window <= 0:
             raise ValueError(f"window must be positive, got {window}")
@@ -455,11 +543,18 @@ class ToolLoopTracker:
             raise ValueError(f"name_threshold must be positive, got {name_threshold}")
         if alternating_threshold <= 0:
             raise ValueError(f"alternating_threshold must be positive, got {alternating_threshold}")
+        if name_axis_max_severity not in _VALID_SEVERITY_NAMES:
+            raise ValueError(
+                f"name_axis_max_severity must be one of "
+                f"{sorted(_VALID_SEVERITY_NAMES)}, got {name_axis_max_severity!r}"
+            )
 
         self.window = window
         self.exact_threshold = exact_threshold
         self.name_threshold = name_threshold
         self.alternating_threshold = alternating_threshold
+        self.name_axis_max_severity = name_axis_max_severity
+        self._name_axis_severity_cap = DriftSeverity(name_axis_max_severity)
 
         # Build the effective threshold tables. The work-WARNING tier
         # is overridden by the legacy kwargs so callers supplying the
@@ -654,8 +749,9 @@ class ToolLoopTracker:
         """Return zero or more drift observations for the current window.
 
         Emits **at most one** exact/name-based drift (the highest
-        severity tier matched for the tool that hit threshold) plus,
-        independently, **at most one** alternating-cycle INFO drift.
+        EMITTED severity across tools that hit threshold, after the
+        name-axis corroboration cap) plus, independently, **at most
+        one** alternating-cycle INFO drift.
         Alternating is suppressed when an exact/name drift already
         fired -- same rationale as pre-#204 (the weaker signal would
         be noise on top of the stronger).
@@ -693,11 +789,12 @@ class ToolLoopTracker:
         # We iterate over unique tool names (not signatures) so a tool
         # with varied args contributes to "name" counts even when no
         # single signature hits the "exact" threshold. We pick the
-        # name with the highest matched tier; if several names match,
-        # we pick the highest severity first (ties broken by
-        # dictionary iteration order, which is stable on CPython).
+        # name with the highest EMITTED severity (post name-axis cap);
+        # if several names match, we pick the highest severity first
+        # (ties broken by dictionary iteration order, which is stable
+        # on CPython).
         best_drift: DriftEvent | None = None
-        best_tier_index: int | None = None  # 0=critical, 1=warning, 2=info (lower = better)
+        best_rank: int | None = None  # _SEVERITY_RANK of emitted severity (lower = better)
 
         for name in name_counts:
             thresholds = self._thresholds_for_tool(name)
@@ -707,8 +804,14 @@ class ToolLoopTracker:
                 (c for sig, c in exact_counts.items() if sig[0] == name),
                 default=0,
             )
-            # Walk tiers from highest severity to lowest.
-            for tier_index, (tier_key, severity) in enumerate(_SEVERITY_TIERS):
+            # Walk tiers from highest severity to lowest, tracking the
+            # tool's best candidate by EMITTED severity. A hit whose
+            # severity was not capped ends the walk (lower tiers cannot
+            # emit higher); a capped name-axis hit keeps walking so a
+            # lower tier's uncapped exact hit is not shadowed.
+            tool_best_rank: int | None = None
+            tool_best_drift: DriftEvent | None = None
+            for tier_key, severity in _SEVERITY_TIERS:
                 tier = thresholds.get(tier_key) or {}
                 exact_thr = tier.get("exact")
                 name_thr = tier.get("name")
@@ -721,6 +824,19 @@ class ToolLoopTracker:
                 # Prefer the "exact" detail when both axes are
                 # satisfied -- the more specific signal.
                 mode = "exact" if hit_exact else "name"
+                emit_severity = severity
+                capped_from = ""
+                if mode == "name":
+                    # Name-axis precision: same-name-varied-args alone is
+                    # ambiguous with healthy iteration, so without an
+                    # exact-repeat in the window the emitted severity is
+                    # capped at ``name_axis_max_severity``. The tier keeps
+                    # its threshold and is still recorded on ``raw``.
+                    corroborated = exact_for_name >= _NAME_AXIS_CORROBORATION_MIN_EXACT
+                    cap = self._name_axis_severity_cap
+                    if not corroborated and _SEVERITY_RANK[severity] < _SEVERITY_RANK[cap]:
+                        emit_severity = cap
+                        capped_from = severity.value
                 if mode == "exact":
                     sig = next(
                         sig
@@ -743,6 +859,8 @@ class ToolLoopTracker:
                         f"tool_loop_name: {name} x {name_total} in last "
                         f"{len(buf)} calls (no task progress)"
                     )
+                    if capped_from:
+                        detail += " (severity capped: no exact-repeat corroboration)"
                     raw = {
                         "mode": "name",
                         "tool_name": name,
@@ -752,6 +870,8 @@ class ToolLoopTracker:
                         "category": _classify_tool_category(name),
                         "tier": tier_key,
                     }
+                    if capped_from:
+                        raw["severity_capped_from"] = capped_from
 
                 # trigger_input: summarise the window the detector
                 # matched so sinks can render "what were the tool calls
@@ -763,7 +883,7 @@ class ToolLoopTracker:
                 )
                 candidate = DriftEvent(
                     kind=DriftKind.LOOPING_REASONING,
-                    severity=severity,
+                    severity=emit_severity,
                     detail=detail,
                     current_task_id=current_task_id,
                     current_agent_id=agent_name,
@@ -775,13 +895,19 @@ class ToolLoopTracker:
                     # source so decision telemetry attributes correctly.
                     detector_name="tool_loops",
                 )
-                # Keep the highest-severity candidate seen across all
-                # tools. tier_index is 0 for CRITICAL, so "lower is
-                # better" for our "best" accumulator.
-                if best_tier_index is None or tier_index < best_tier_index:
-                    best_drift = candidate
-                    best_tier_index = tier_index
-                break  # stop at the highest tier for this tool
+                rank = _SEVERITY_RANK[emit_severity]
+                if tool_best_rank is None or rank < tool_best_rank:
+                    tool_best_rank = rank
+                    tool_best_drift = candidate
+                if not capped_from:
+                    break  # uncapped hit: lower tiers cannot emit higher
+
+            # Keep the candidate with the highest EMITTED severity
+            # across all tools, so a capped name-axis INFO never
+            # shadows another tool's genuine exact-axis WARNING.
+            if tool_best_rank is not None and (best_rank is None or tool_best_rank < best_rank):
+                best_drift = tool_best_drift
+                best_rank = tool_best_rank
 
         if best_drift is not None:
             observations.append(best_drift)

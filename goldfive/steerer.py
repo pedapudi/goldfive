@@ -490,7 +490,7 @@ class DefaultSteerer:
             vars. The steerer itself does NOT instantiate a
             :class:`~goldfive.drift.tool_loops.ToolLoopTracker` — the
             plugin still owns that — but exposing the config here
-            keeps the four typed knobs co-located on a single
+            keeps the typed knobs co-located on a single
             component. Precedence: the config field is advisory; the
             plugin is free to honour or ignore it. Added in #225.
         reasoning_drift_config:

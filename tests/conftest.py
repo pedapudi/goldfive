@@ -371,6 +371,7 @@ _TOOL_LOOP_ENV: dict[str, str] = {
     "exact_threshold": "GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD",
     "name_threshold": "GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD",
     "alternating_threshold": "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD",
+    "name_axis_max_severity": "GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY",
 }
 
 _REASONING_DRIFT_ENV: dict[str, str] = {

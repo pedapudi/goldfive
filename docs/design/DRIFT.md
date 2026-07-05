@@ -156,7 +156,7 @@ parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
 
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
-| `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). Also fired by the tool-call-loop detector in `goldfive.drift.tool_loops` when the ADK plugin's `after_tool_callback` observes repeated `(tool_name, args_hash)` patterns (exact / name / alternating) — see goldfive#181 and the graduated-severity table in goldfive#204. | `info` · `warning` · `critical` (graduated per tool category + count; `info` for the alternating-cycle variant) | yes |
+| `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). Also fired by the tool-call-loop detector in `goldfive.drift.tool_loops` when the ADK plugin's `after_tool_callback` observes repeated `(tool_name, args_hash)` patterns (exact / name / alternating) — see goldfive#181 and the graduated-severity table in goldfive#204. | `info` · `warning` · `critical` (graduated per tool category + count; `info` for the alternating-cycle variant; name-axis hits without exact-repeat corroboration are capped at `info` by default — see §"Name-axis precision") | yes |
 | `REASONING_CLUSTER_TIGHTENING` | Max cosine similarity between current reasoning and the last N=5 blocks falls in `[0.75, 0.9)` (opt-in, `goldfive[embedding]`). Graduated early-warning tier below the `LOOPING_REASONING` cliff. One-shot per task. | `info` | yes |
 | `OFF_TOPIC` | Reasoning cosine-distance from the current task description ≥ `0.7` (requires `goldfive[embedding]`). | `warning` | yes |
 | `INTENT_DIVERGENCE` | Reasoning has drifted from `session.goals` + the current task topic. Severity is **graduated** — see table below. | `info` · `warning` · `critical` | depends on severity |
@@ -582,13 +582,41 @@ emits ONE drift at the first matching tier — no cascade of
 | `meta`   | exact | 3 | 6 | 10 |
 | `meta`   | name  | —  | — | —  |
 | `work`   | exact | 3 | 3 | 6  |
-| `work`   | name  | — | 5 | 7  |
+| `work`   | name  | — | 5\* | 7\* |
 
 "exact" counts identical `(tool_name, args_hash)` signatures in the
 window; "name" counts same-`tool_name`-any-args signatures. Category
 is determined per tool — a window containing 3 meta retries **and** 3
 work retries classifies each tool independently and picks the highest
 severity across tools.
+
+\* Name-axis tiers keep their thresholds but the **emitted** severity
+is capped without corroboration — see the next section.
+
+### Name-axis precision: corroboration cap
+
+The name axis alone is ambiguous between a stuck loop and
+definitionally-healthy behaviour — an agent reading six different
+files with the same tool is doing its job, yet counts 6 on the name
+axis. Because the window is keyed on `(session.run_id, agent_name)`
+and accumulates across re-invocations (goldfive#420), and is reset
+only by acknowledged `report_task_*` calls (cooperation goldfive's
+design does not require), the uncapped WARNING-at-5 / CRITICAL-at-7
+name tiers false-positived on healthy varied-args bursts.
+
+A name-axis hit is therefore capped at **INFO** (signal-only
+telemetry, ladder Level 0 `OBSERVE`) unless the window corroborates
+the loop hypothesis with **exact-repeat evidence**: at least 2
+identical `(tool_name, args_hash)` calls for the same tool. The
+matched tier is still recorded on `raw["tier"]`, and a capped drift
+carries `raw["severity_capped_from"]` naming the uncapped severity so
+telemetry consumers see what would have fired. Exact-axis hits are
+unchanged at any cap setting.
+
+The cap is configurable via `ToolLoopConfig.name_axis_max_severity` /
+`GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY` (`"info"` | `"warning"` |
+`"critical"`; default `"info"`). Operators who want the legacy
+uncapped behaviour set `"critical"`.
 
 An independent **alternating-cycle** mode still fires INFO when the
 last `alternating_threshold=5` calls match an `A,B,A,B,A` pattern
@@ -607,10 +635,11 @@ via `GOLDFIVE_TOOL_LOOP_WINDOW` / `GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD`.
 The legacy `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` /
 `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` env vars still work and override
 the **work-category WARNING tier** only (preserving pre-#204
-single-threshold semantics). The graduated CRITICAL tiers and the
-meta-category thresholds are module-level constants (grouped in
-`_META_THRESHOLDS` / `_WORK_THRESHOLDS`) pending a follow-up that
-exposes them via `ServerConfig`.
+single-threshold semantics). The name-axis severity cap is tunable
+via `GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY`. The graduated
+CRITICAL tiers and the meta-category thresholds are module-level
+constants (grouped in `_META_THRESHOLDS` / `_WORK_THRESHOLDS`)
+pending a follow-up that exposes them via `ServerConfig`.
 
 ### Ladder routing for graduated severity
 
@@ -618,10 +647,13 @@ The intervention ladder (below) routes `LOOPING_REASONING` by
 severity:
 
 - **INFO** → Level 0 (`OBSERVE`): record the drift, no plan mutation.
-  This is the benign tier — meta-tool retries at count 3 land here.
+  This is the benign tier — meta-tool retries at count 3 land here,
+  as do uncorroborated name-axis hits at any count (default cap).
 - **WARNING** → Level 1 (`ABSORB`): call `planner.refine`. Unchanged
-  from pre-#204 — work-tool loops at 3+ calls, meta at 6+, work
-  name-axis at 5.
+  from pre-#204 for the exact axis — work-tool loops at 3+ identical
+  calls, meta at 6+. Work name-axis at 5 reaches WARNING only with
+  exact-repeat corroboration in the window (or a raised
+  `name_axis_max_severity`).
 - **CRITICAL** first → Level 2 (`NUDGE`): refine **and** queue a soft
   corrective follow-up on `session.pending_nudges` for the overlay
   loop to pick up. Coordinates with the forward-progress work that
@@ -629,6 +661,16 @@ severity:
 - **CRITICAL** repeat → Level 4 (`PAUSE_ESCALATE`): if the loop
   survives the nudge and re-fires CRITICAL after
   `REFINE_FAILURE_THRESHOLD` occurrences, escalate to a human pause.
+
+### Negative class
+
+When an invocation ends with at least one tracker observation and
+zero tool-loop drifts fired, the ADK plugin's `after_run_callback`
+emits one aggregated `SteeringDecisionMade(outcome="no_drift",
+detector_name="tool_loops")` — telemetry only, identical in
+observe-only and active modes — so downstream optimizers can
+distinguish "tracker quiet" from "tracker never ran". Aggregated
+per invocation rather than per tool call to keep wire volume bounded.
 
 ### Task-progress gate
 
