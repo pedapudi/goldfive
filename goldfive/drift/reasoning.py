@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from goldfive.drift import _embed
@@ -550,7 +551,7 @@ def _has_unreferenced_keyword(
 
 
 def detect_looping_reasoning(
-    text: str, session: Session
+    text: str, session: Session, history: Sequence[str] | None = None
 ) -> DriftEvent | None:
     """Return :data:`DriftKind.LOOPING_REASONING` when ``text``
     byte-identically or semantically matches a recent entry in
@@ -559,11 +560,15 @@ def detect_looping_reasoning(
     The hash-based check is always on; the semantic check fires only
     when the embedding model is loadable. ``session.reasoning_history``
     is inspected but not mutated here -- the steerer appends the new
-    reasoning block before running the pipeline.
+    reasoning block before running the pipeline. ``history`` overrides
+    the session's live list (background judge runs pass the snapshot
+    captured at schedule time — ``text`` is its last entry).
     """
+    if history is None:
+        history = session.reasoning_history
     hash_window = _looping_hash_window()
     history = [
-        h for h in session.reasoning_history[-hash_window - 1 : -1]
+        h for h in history[-hash_window - 1 : -1]
         if h
     ]
     if not history or not text:
@@ -606,7 +611,7 @@ def detect_looping_reasoning(
 
 
 def detect_reasoning_cluster_tightening(
-    text: str, session: Session
+    text: str, session: Session, history: Sequence[str] | None = None
 ) -> DriftEvent | None:
     """Return :data:`DriftKind.REASONING_CLUSTER_TIGHTENING` when recent
     reasoning blocks are semantically clustering tight -- max cosine
@@ -631,12 +636,14 @@ def detect_reasoning_cluster_tightening(
     """
     if not text:
         return None
+    if history is None:
+        history = session.reasoning_history
     task_id = session.current_task_id or ""
     if task_id and task_id in session.reasoning_cluster_flagged:
         return None
     hash_window = _looping_hash_window()
     history = [
-        h for h in session.reasoning_history[-hash_window - 1 : -1]
+        h for h in history[-hash_window - 1 : -1]
         if h
     ]
     if not history:
@@ -909,14 +916,18 @@ _SEVERITY_ORDER: dict[DriftSeverity, int] = {
 }
 
 
-def _embedding_pipeline(text: str, session: Session) -> DriftEvent | None:
+def _embedding_pipeline(
+    text: str, session: Session, history: Sequence[str] | None = None
+) -> DriftEvent | None:
     """Run the embedding-based pipeline (``mode="embedding"``).
 
     Detectors run in worst-signal-wins order:
     INTENT_DIVERGENCE -> LOOPING_REASONING -> OFF_TOPIC (with the
     sentence-level min-cosine path from #224) ->
     REASONING_CLUSTER_TIGHTENING. Ordering rationale lives in
-    :func:`analyze_reasoning`.
+    :func:`analyze_reasoning`. ``history`` overrides the live
+    ``session.reasoning_history`` for the history-window detectors
+    (background judge runs pass a snapshot pinned at schedule time).
 
     .. note::
 
@@ -932,13 +943,13 @@ def _embedding_pipeline(text: str, session: Session) -> DriftEvent | None:
     drift = detect_intent_divergence(text, session)
     if drift is not None:
         return drift
-    drift = detect_looping_reasoning(text, session)
+    drift = detect_looping_reasoning(text, session, history)
     if drift is not None:
         return drift
     drift = detect_off_topic(text, session)
     if drift is not None:
         return drift
-    drift = detect_reasoning_cluster_tightening(text, session)
+    drift = detect_reasoning_cluster_tightening(text, session, history)
     if drift is not None:
         return drift
     return None
@@ -1069,6 +1080,7 @@ async def analyze_reasoning_with_focus(
     available_agents: list[str] | list[dict[str, Any]] | None = None,
     embedding_pipeline: Any = None,
     judge_runner: Any = None,
+    reasoning_history: Sequence[str] | None = None,
 ) -> ReasoningJudgeVerdict:
     """Phase-1 sibling of :func:`analyze_reasoning` returning a focused verdict.
 
@@ -1105,8 +1117,23 @@ async def analyze_reasoning_with_focus(
     :func:`_run_judge_with_focus`; tests use it to short-circuit the
     judge round-trip. Both default to ``None`` (use the in-module
     implementations) so production callers see no behaviour change.
+
+    ``reasoning_history`` pins the view the history-window detectors
+    see instead of the live ``session.reasoning_history`` — the
+    background judge passes the snapshot captured at schedule time so
+    entries appended by later turns cannot produce false self-match
+    LOOPING signals. ``None`` (the default) reads the live session
+    list. A caller-supplied ``embedding_pipeline`` keeps its
+    ``(text, session)`` signature and is responsible for its own
+    history handling.
     """
-    embed = embedding_pipeline if embedding_pipeline is not None else _embedding_pipeline
+    if embedding_pipeline is not None:
+        embed = embedding_pipeline
+    else:
+
+        def embed(t: str, s: Session) -> DriftEvent | None:
+            return _embedding_pipeline(t, s, reasoning_history)
+
     judge = judge_runner if judge_runner is not None else _run_judge_with_focus
     if not text or mode == "off":
         return ReasoningJudgeVerdict(drift=None)

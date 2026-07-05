@@ -418,9 +418,9 @@ def _clear_correction_on_started(session: Session, task: Task | None) -> None:
     task_id = str(getattr(task, "id", "") or "").strip()
     if not assignee or not task_id:
         return
-    # Normalise the same way the write-side does so keys round-trip.
-    if "." in assignee:
-        assignee = assignee.rsplit(".", 1)[-1]
+    # The write-side keys corrections by the verbatim assignee id
+    # (``_correction_injection._normalize_agent_name``), so the clear
+    # uses the same string and keys round-trip.
     try:
         clear_correction(session, agent_name=assignee, task_id=task_id)
     except Exception as exc:  # noqa: BLE001

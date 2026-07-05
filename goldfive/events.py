@@ -13,7 +13,10 @@ optional-dependency group.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # NOTE: EventSink is a protocol with an async ``emit(event_pb)`` method.
 # We type it as ``Any`` here to avoid a circular dependency on the
@@ -102,9 +105,10 @@ async def emit(sinks: list[Any], event_pb: Any) -> None:
     """Fan ``event_pb`` out to every sink concurrently.
 
     Each sink's ``emit`` coroutine is awaited. Exceptions from individual
-    sinks are collected via ``return_exceptions=True`` so one faulty sink
-    cannot prevent others from observing the event. The first exception
-    encountered is re-raised after all sinks have been awaited.
+    sinks are collected via ``return_exceptions=True`` and logged so one
+    faulty sink can neither prevent others from observing the event nor
+    abort the emitting run — sinks are observability, never control flow.
+    ``CancelledError`` is re-raised so task cancellation still propagates.
     """
     if not sinks:
         return
@@ -112,9 +116,15 @@ async def emit(sinks: list[Any], event_pb: Any) -> None:
         *(sink.emit(event_pb) for sink in sinks),
         return_exceptions=True,
     )
-    for r in results:
-        if isinstance(r, BaseException):
+    for sink, r in zip(sinks, results, strict=True):
+        if isinstance(r, asyncio.CancelledError):
             raise r
+        if isinstance(r, BaseException):
+            log.exception(
+                "sink %s.emit raised; event dropped for this sink only",
+                type(sink).__name__,
+                exc_info=r,
+            )
 
 
 def make_event(

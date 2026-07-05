@@ -817,3 +817,103 @@ def test_pending_correction_key_prefix_is_stable() -> None:
     assert pending_correction_key("a", "t") == "goldfive.pending_corrections.a.t"
     assert is_pending_correction_key("goldfive.pending_corrections.a.t")
     assert not is_pending_correction_key("goldfive.current_task_id")
+
+
+# ---------------------------------------------------------------------------
+# Same-named agents in different subtrees must not share a correction key.
+# ---------------------------------------------------------------------------
+
+
+def _plan_with_same_named_agents(revision_index: int, corrected: bool) -> Plan:
+    tasks = [
+        Task(
+            id="research_a",
+            title="Research (team A)",
+            status=TaskStatus.COMPLETED,
+            assignee_agent_id="team_a.researcher",
+        ),
+        Task(
+            id="research_b",
+            title="Research (team B)",
+            status=TaskStatus.COMPLETED,
+            assignee_agent_id="team_b.researcher",
+        ),
+    ]
+    if corrected:
+        tasks += [
+            Task(
+                id="research_a_corrected",
+                title="Research (team A, corrected)",
+                status=TaskStatus.PENDING,
+                assignee_agent_id="team_a.researcher",
+                supersedes="research_a",
+                supersedes_kind=SupersessionKind.CORRECT,
+            ),
+            Task(
+                id="research_b_corrected",
+                title="Research (team B, corrected)",
+                status=TaskStatus.PENDING,
+                assignee_agent_id="team_b.researcher",
+                supersedes="research_b",
+                supersedes_kind=SupersessionKind.CORRECT,
+            ),
+        ]
+    return Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=tasks,
+        edges=[],
+        revision_index=revision_index,
+    )
+
+
+def test_same_named_agents_in_different_subtrees_get_distinct_keys() -> None:
+    """Fully-qualified assignee ids are keyed verbatim: corrections for
+    ``team_a.researcher`` and ``team_b.researcher`` land under distinct
+    keys instead of colliding on a shared ``researcher`` entry."""
+    prev = _plan_with_same_named_agents(0, corrected=False)
+    revised = _plan_with_same_named_agents(1, corrected=True)
+    session = _session(prev)
+
+    keys = queue_corrections_for_revision(
+        session=session,
+        revised=revised,
+        prev_plan=prev,
+        drift=_drift(),
+    )
+
+    key_a = pending_correction_key("team_a.researcher", "research_a_corrected")
+    key_b = pending_correction_key("team_b.researcher", "research_b_corrected")
+    assert sorted(keys) == sorted([key_a, key_b])
+    assert session.state[key_a]["agent_name"] == "team_a.researcher"
+    assert session.state[key_b]["agent_name"] == "team_b.researcher"
+    assert session.state[key_a]["superseded_task_id"] == "research_a"
+    assert session.state[key_b]["superseded_task_id"] == "research_b"
+
+
+async def test_full_path_correction_cleared_on_report_task_started() -> None:
+    """The clear on ``report_task_started`` uses the same verbatim
+    assignee id as the write side, so full-path keys round-trip."""
+    plan = _plan_with_same_named_agents(1, corrected=True)
+    session = _session(plan)
+    keys = queue_corrections_for_revision(
+        session=session,
+        revised=plan,
+        prev_plan=None,
+        drift=_drift(),
+    )
+    key_a = pending_correction_key("team_a.researcher", "research_a_corrected")
+    key_b = pending_correction_key("team_b.researcher", "research_b_corrected")
+    assert sorted(keys) == sorted([key_a, key_b])
+
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
+    await _tool("report_task_started").handler(
+        {"task_id": "research_a_corrected", "detail": "starting"},
+        session,
+        steerer,
+    )
+    # Only team A's correction is acknowledged; team B's survives.
+    assert key_a not in session.state
+    assert key_b in session.state
