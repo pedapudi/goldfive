@@ -119,27 +119,22 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _bare_agent_name(value: Any) -> str:
-    """Normalise a raw agent id to its bare form.
+def _normalize_agent_name(value: Any) -> str:
+    """Normalise a raw agent id to the string used in correction keys.
 
-    Accepts strings like ``"agent.sub"`` or namespaced variants and
-    returns the last dotted segment. Tolerates anything mapping-shaped
-    or with a ``.name`` attribute so the caller doesn't have to
-    pre-strip. Empty / malformed input yields ``""``.
+    Keeps the id verbatim (whitespace-stripped) — a fully-qualified
+    path like ``"team_a.researcher"`` stays intact so two same-named
+    agents in different subtrees get distinct correction keys.
+    (Collapsing to the last dotted segment made ``team_a.researcher``
+    and ``team_b.researcher`` collide on one key.) Tolerates anything
+    mapping-shaped or with a ``.name`` attribute so the caller doesn't
+    have to pre-strip. Empty / malformed input yields ``""``.
     """
     if value is None:
         return ""
     if isinstance(value, str):
-        s = value.strip()
-    else:
-        s = str(getattr(value, "name", value) or "").strip()
-    if not s:
-        return ""
-    # Many call sites already pass a bare name; this is defensive for
-    # call sites that may pass a fully-qualified id.
-    if "." in s:
-        return s.rsplit(".", 1)[-1]
-    return s
+        return value.strip()
+    return str(getattr(value, "name", value) or "").strip()
 
 
 def build_correction_payload(
@@ -173,7 +168,7 @@ def build_correction_payload(
     ts = issued_at_ms if issued_at_ms is not None else _now_ms()
 
     return {
-        "agent_name": _bare_agent_name(getattr(new_task, "assignee_agent_id", "")),
+        "agent_name": _normalize_agent_name(getattr(new_task, "assignee_agent_id", "")),
         "task_id": str(getattr(new_task, "id", "") or ""),
         "superseded_task_id": str(getattr(new_task, "supersedes", "") or ""),
         "superseded_task_title": str(getattr(old_task, "title", "") or ""),
@@ -277,7 +272,7 @@ def queue_corrections_for_revision(
         new_id = str(getattr(new_task, "id", "") or "").strip()
         if not old_id or not new_id:
             continue
-        assignee = _bare_agent_name(getattr(new_task, "assignee_agent_id", ""))
+        assignee = _normalize_agent_name(getattr(new_task, "assignee_agent_id", ""))
         if not assignee:
             # Without an assignee we have no (agent, task) key to write.
             # Log and skip; the plan is still structurally valid (the

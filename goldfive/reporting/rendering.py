@@ -104,10 +104,11 @@ def _next_pending_with_completed_predecessors(plan: Any) -> Any | None:
 def _bare_agent_name(name: str) -> str:
     """Return the bare agent name (last dot-separated segment).
 
-    Mirrors the normalization used by ``_correction_injection`` —
-    fully-qualified ADK agent paths like ``coordinator.research_agent``
-    collapse to ``research_agent`` so the LLM sees a name it can pass
-    back as the AgentTool target.
+    Display-only: fully-qualified ADK agent paths like
+    ``coordinator.research_agent`` collapse to ``research_agent`` so
+    the LLM sees a name it can pass back as the AgentTool target.
+    (Correction keys, by contrast, use the verbatim assignee id — see
+    ``_correction_injection._normalize_agent_name``.)
     """
     s = (name or "").strip()
     if not s:
