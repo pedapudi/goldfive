@@ -631,6 +631,27 @@ message ReasoningJudgeInvoked {
   // ``classification == "on_task"``. PR 1 emits the field unconditionally
   // (defaults to "" until the parser starts populating it in PR 3).
   string classification = 11;
+
+  // Parsed attribution fields, mirrored from
+  // ``ReasoningJudgeVerdict`` (the in-process dataclass) so the wire
+  // carries the judge's full verdict, not just the drift projection.
+  // All four are populated on every emission regardless of verdict;
+  // old events deserialize to ""/0.0 defaults.
+  //
+  // ``focused_task_id`` — the plan-task id the judge identified the
+  // reasoning as actually pursuing ("" when off-plan / unattributed).
+  // ``focus_confidence`` — the judge's subjective certainty in that
+  // attribution, clamped to [0.0, 1.0] at parse time.
+  // ``stated_intent`` — the judge's one-sentence summary of what the
+  // agent says it is doing.
+  // ``provenance`` — the justified-deviation provoking signal, one of
+  //   "tool_error" | "surprising_result" | "discovered_dependency" |
+  //   "new_information" | "" (empty unless
+  //   ``classification == "justified_deviation"``; post-demotion).
+  string focused_task_id = 12;
+  float focus_confidence = 13;
+  string stated_intent = 14;
+  string provenance = 15;
 }
 
 // ---------------------------------------------------------------------------

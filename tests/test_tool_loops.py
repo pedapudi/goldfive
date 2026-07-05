@@ -196,6 +196,9 @@ def test_exact_repeat_fires_warning() -> None:
     assert drift.raw.get("count") == 3
     assert drift.current_task_id == "t1"
     assert drift.current_agent_id == "agent-a"
+    # Kind is shared with the embedding detector (#204); the stamped
+    # detector_name is what keeps decision telemetry attributable.
+    assert drift.detector_name == "tool_loops"
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +226,7 @@ def test_name_repeat_fires_warning() -> None:
     assert drift.raw.get("mode") == "name"
     assert drift.raw.get("tool_name") == "read_file"
     assert drift.raw.get("count") == 5
+    assert drift.detector_name == "tool_loops"
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +257,7 @@ def test_alternating_pattern_fires_info() -> None:
     assert drift.raw is not None
     assert drift.raw.get("mode") == "alternating"
     assert set(drift.raw.get("tools", [])) == {"A", "B"}
+    assert drift.detector_name == "tool_loops"
 
 
 def test_alternating_requires_two_distinct_tools() -> None:

@@ -1277,6 +1277,10 @@ async def classify_reasoning_drift_with_focus(
             severity=severity_str,
             reason=reason,
             classification=classification_parsed,
+            focused_task_id=focused_task_id_parsed,
+            focus_confidence=focus_confidence_parsed,
+            stated_intent=stated_intent_parsed,
+            provenance=provenance_parsed,
         )
     return ReasoningJudgeVerdict(
         drift=drift,
@@ -1304,6 +1308,10 @@ async def _emit_judge_invoked(
     severity: str,
     reason: str,
     classification: str = "",
+    focused_task_id: str = "",
+    focus_confidence: float = 0.0,
+    stated_intent: str = "",
+    provenance: str = "",
 ) -> None:
     """Build and emit a ``ReasoningJudgeInvoked`` envelope onto ``sink``.
 
@@ -1315,6 +1323,11 @@ async def _emit_judge_invoked(
     ``classification`` is the iter-10 three-state verdict string; PR 1
     accepts the kwarg with a default of ``""`` so existing call sites
     don't break. PR 3 starts populating it from the parser.
+
+    ``focused_task_id`` / ``focus_confidence`` / ``stated_intent`` /
+    ``provenance`` mirror the same-named ``ReasoningJudgeVerdict``
+    fields onto the wire — parsed and clamped by the caller; defaults
+    keep older call sites working.
     """
     try:
         from goldfive.events import new_event
@@ -1344,6 +1357,10 @@ async def _emit_judge_invoked(
         payload.severity = severity
         payload.reason = reason
         payload.classification = classification
+        payload.focused_task_id = focused_task_id
+        payload.focus_confidence = float(focus_confidence)
+        payload.stated_intent = stated_intent
+        payload.provenance = provenance
         await sink.emit(evt)
     except Exception as exc:  # noqa: BLE001 - observability must never break
         log.warning(

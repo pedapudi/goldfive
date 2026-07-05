@@ -770,6 +770,10 @@ class ToolLoopTracker:
                     raw=raw,
                     trigger_input=trigger_input,
                     observed_revision_index=observed_revision_index,
+                    # The kind is deliberately LOOPING_REASONING (#204),
+                    # shared with the embedding detector — stamp the true
+                    # source so decision telemetry attributes correctly.
+                    detector_name="tool_loops",
                 )
                 # Keep the highest-severity candidate seen across all
                 # tools. tier_index is 0 for CRITICAL, so "lower is
@@ -818,6 +822,7 @@ class ToolLoopTracker:
                                 + " -> ".join(names)
                             ),
                             observed_revision_index=observed_revision_index,
+                            detector_name="tool_loops",
                         )
                     )
         return observations

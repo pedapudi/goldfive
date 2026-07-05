@@ -244,6 +244,111 @@ def test_detector_name_for_drift_unknown_falls_back_to_kind_value() -> None:
     assert name == "custom"
 
 
+def test_detector_name_for_drift_prefers_stamped_detector_name() -> None:
+    """A ``detector_name`` on the drift wins over the kind-keyed table.
+
+    The tool-loop tracker emits LOOPING_REASONING (goldfive#204) — the
+    same kind as the embedding detector — so the kind table alone would
+    misattribute every tool-loop fire to ``reasoning_loop_embedding``.
+    """
+    from goldfive.drift_observer import DriftObserver
+
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_REASONING,
+        severity=DriftSeverity.WARNING,
+        detector_name="tool_loops",
+    )
+    assert DriftObserver._detector_name_for_drift(drift) == "tool_loops"
+
+
+async def test_tool_loop_sourced_drift_decision_attributes_to_tool_loops() -> None:
+    """Tool-loop drifts carry detector_name='tool_loops' on the wire."""
+    steerer, sink, session = _build_steerer()
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_REASONING,
+        severity=DriftSeverity.WARNING,
+        detail="tool_loop_exact: read_file x 3 in last 3 calls",
+        detector_name="tool_loops",
+    )
+    await steerer.drift._emit_drift_detected(session, drift)
+    decisions = _steering_decisions(sink)
+    assert len(decisions) == 1
+    assert decisions[0].steering_decision_made.detector_name == "tool_loops"
+
+
+async def test_embedding_sourced_looping_drift_keeps_embedding_attribution() -> None:
+    """Unstamped LOOPING_REASONING still resolves via the kind table."""
+    steerer, sink, session = _build_steerer()
+    drift = DriftEvent(
+        kind=DriftKind.LOOPING_REASONING,
+        severity=DriftSeverity.WARNING,
+        detail="reasoning looped",
+    )
+    await steerer.drift._emit_drift_detected(session, drift)
+    decisions = _steering_decisions(sink)
+    assert len(decisions) == 1
+    assert decisions[0].steering_decision_made.detector_name == "reasoning_loop_embedding"
+
+
+# ---------------------------------------------------------------------------
+# Gate drops carry distinct outcomes (not "drift_emitted")
+# ---------------------------------------------------------------------------
+
+
+async def test_freshness_gate_drop_stamps_drift_dropped_stale() -> None:
+    """A stale verdict dropped by the freshness gate must not read as a fire."""
+    steerer, sink, session = _build_steerer()
+    # Prior refine addressed (OFF_TOPIC, t1) at revision 4; this
+    # verdict observed revision 3 — redundant, gate drops it.
+    session.last_addressed_revision_by_drift_key[(DriftKind.OFF_TOPIC.value, "t1")] = 4
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="stale verdict",
+        current_task_id="t1",
+        authored_by="goldfive",
+        observed_revision_index=3,
+    )
+    await steerer.drift.handle_drift(drift, session)
+    # DriftDetected still emits for observability.
+    assert len(_drift_detected(sink)) == 1
+    decisions = _steering_decisions(sink)
+    assert len(decisions) == 1
+    decision = decisions[0].steering_decision_made
+    assert decision.outcome == "drift_dropped_stale"
+    assert decision.considered_severity == "warning"
+    # The drift was not applied — chosen_severity stays empty.
+    assert decision.chosen_severity == ""
+    assert "revision" in decision.reason
+
+
+async def test_inflight_gate_drop_stamps_drift_dropped_inflight() -> None:
+    """A concurrent same-key verdict dropped by the in-flight gate is distinct."""
+    steerer, sink, session = _build_steerer()
+    inflight_key = (
+        str(session.id or session.run_id or ""),
+        DriftKind.OFF_TOPIC.value,
+        "t1",
+    )
+    steerer.drift._inflight_refine_keys.add(inflight_key)
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="concurrent verdict",
+        current_task_id="t1",
+        authored_by="goldfive",
+        observed_revision_index=3,
+    )
+    await steerer.drift.handle_drift(drift, session)
+    assert len(_drift_detected(sink)) == 1
+    decisions = _steering_decisions(sink)
+    assert len(decisions) == 1
+    decision = decisions[0].steering_decision_made
+    assert decision.outcome == "drift_dropped_inflight"
+    assert decision.chosen_severity == ""
+    assert "in-flight" in decision.reason
+
+
 # ---------------------------------------------------------------------------
 # Sequence ordering: DriftDetected first, paired SteeringDecisionMade second
 # ---------------------------------------------------------------------------
