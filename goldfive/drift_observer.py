@@ -160,6 +160,7 @@ from goldfive.types import (
     Session,
     Task,
     TaskStatus,
+    _uuid_hex,
     filter_recent_events_by_kind,
 )
 
@@ -312,6 +313,24 @@ class DriftObserver:
         {
             DriftKind.HUMAN_INTERVENTION_REQUIRED,
             DriftKind.REPEATED_FAILURE,
+        }
+    )
+
+    # Drift kinds the reasoning-analysis pipeline
+    # (:func:`~goldfive.drift.reasoning.analyze_reasoning_with_focus`)
+    # can open. An ON-TASK verdict from that pipeline is the negative
+    # outcome of exactly these checks, so it (and only it) can resolve
+    # their open conditions. GOAL_DRIFT is deliberately absent: it is
+    # opened by the goal-drift judge, which answers a trajectory-level
+    # question a reasoning-scoped on-task verdict carries no evidence
+    # about; its conditions resolve at task-terminal instead.
+    _REASONING_PIPELINE_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
+        {
+            DriftKind.LOOPING_REASONING,
+            DriftKind.REASONING_CLUSTER_TIGHTENING,
+            DriftKind.OFF_TOPIC,
+            DriftKind.JUSTIFIED_DEVIATION,
+            DriftKind.INTENT_DIVERGENCE,
         }
     )
 
@@ -1041,6 +1060,147 @@ class DriftObserver:
         }
         name = mapping.get(lifecycle, "DRIFT_LIFECYCLE_UNSPECIFIED")
         return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_LIFECYCLE_UNSPECIFIED", 0))
+
+    # ------------------------------------------------------------------
+    # Drift-condition resolution (lifecycle truth, observability-only)
+    # ------------------------------------------------------------------
+
+    async def resolve_conditions_for_terminal_task(
+        self,
+        session: Session,
+        *,
+        task_id: str,
+        to_status: TaskStatus,
+    ) -> None:
+        """Resolve every open condition pinned to a task that went terminal.
+
+        A terminal task (COMPLETED / FAILED / CANCELLED / NOT_NEEDED)
+        moots every condition still open against it: no further
+        observation on that task can escalate or recover them, so
+        leaving them in ``KEY_ACTIVE_DRIFTS`` makes the active set grow
+        monotonically per run and downstream consumers never see an
+        intervention succeed. Pure lifecycle telemetry — no intervention
+        decision reads the result, so behaviour is identical under
+        ``observation_only`` True and False.
+        """
+        if not task_id:
+            return
+        try:
+            resolved = _ostate.resolve_drifts_matching(session.state, task_id=task_id)
+        except Exception as exc:  # noqa: BLE001
+            # Lifecycle bookkeeping must never break a live transition
+            # path (same contract as :meth:`_stamp_drift_lifecycle`).
+            log.debug(
+                "DriftObserver.resolve_conditions_for_terminal_task: "
+                "resolve skipped (%s)",
+                exc,
+            )
+            return
+        if not resolved:
+            return
+        status_label = str(getattr(to_status, "value", to_status) or "")
+        await self._emit_resolved_conditions(
+            session,
+            resolved,
+            reason=f"task {task_id} reached terminal status {status_label}",
+        )
+
+    async def _resolve_conditions_on_on_task_verdict(
+        self,
+        session: Session,
+        *,
+        agent_name: str,
+    ) -> None:
+        """Resolve reasoning-pipeline conditions after an ON-TASK verdict.
+
+        The verdict is the same pipeline's clean bill for the current
+        ``(task, agent, run)``, so only the kinds that pipeline can open
+        (:data:`_REASONING_PIPELINE_DRIFT_KINDS`) resolve — deterministic
+        detector conditions (tool loops, task failures, plan divergence)
+        keep their own lifecycle. The empty agent_id is accepted because
+        the embedding-side detectors open conditions without agent
+        attribution. Callers gate on the same late-verdict staleness
+        check as the drift side (:meth:`_invocation_target_gone`).
+        """
+        task_id = str(getattr(session, "current_task_id", "") or "")
+        if not task_id:
+            return
+        resolved = _ostate.resolve_drifts_matching(
+            session.state,
+            task_id=task_id,
+            agent_ids={agent_name, ""},
+            turn_id=str(getattr(session, "run_id", "") or ""),
+            kinds=self._REASONING_PIPELINE_DRIFT_KINDS,
+        )
+        if not resolved:
+            return
+        await self._emit_resolved_conditions(
+            session,
+            resolved,
+            reason=(
+                f"reasoning judge returned on-task verdict for agent "
+                f"{agent_name or '(unknown)'}"
+            ),
+        )
+
+    async def _emit_resolved_conditions(
+        self,
+        session: Session,
+        resolved: list[_ostate.Drift],
+        *,
+        reason: str,
+    ) -> None:
+        """Emit one ``DriftDetected(lifecycle=RESOLVED)`` per resolved condition.
+
+        Wire mirror of a batch :func:`state_store.resolve_drifts_matching`
+        call — the state mutation already happened in the caller, so a
+        missing sink list or proto stub leaves lifecycle truth intact.
+        Severity is INFO (the resolving emit is a recovery marker, not a
+        new firing); ``prev_severity`` carries the condition's last
+        recorded severity so sinks can render "recovered from WARNING".
+        Deliberately does NOT route through :meth:`_emit_drift_detected`:
+        resolution is not a detector decision, so no paired
+        ``SteeringDecisionMade`` / ``JudgementEmitted`` and no
+        ``session.drift_events`` append.
+        """
+        if not self._steerer._sinks:
+            return
+        try:
+            from goldfive.pb.goldfive.v1 import types_pb2
+        except Exception as exc:  # noqa: BLE001 — proto stubs may be missing
+            log.debug(
+                "DriftObserver._emit_resolved_conditions: proto stubs unavailable: %s",
+                exc,
+            )
+            return
+        for condition in resolved:
+            try:
+                evt = self._steerer._new_envelope(session)
+                payload = evt.drift_detected
+                if condition.kind is not None:
+                    payload.kind = self._steerer._drift_kind_pb_value(condition.kind)
+                payload.severity = self._steerer._drift_severity_pb_value(DriftSeverity.INFO)
+                if condition.severity is not None:
+                    payload.prev_severity = self._steerer._drift_severity_pb_value(
+                        condition.severity
+                    )
+                payload.detail = reason
+                payload.current_task_id = condition.task_id
+                payload.current_agent_id = condition.agent_id
+                payload.id = _uuid_hex()
+                payload.authored_by = "goldfive"
+                payload.condition_id = condition.condition_id
+                payload.lifecycle = self._drift_lifecycle_pb_value(
+                    condition.lifecycle, types_pb2
+                )
+                await self._steerer._emit(evt)
+            except Exception as exc:  # noqa: BLE001 — observability-only
+                log.debug(
+                    "DriftObserver._emit_resolved_conditions: emit failed for "
+                    "condition %s: %s",
+                    condition.condition_id,
+                    exc,
+                )
 
     # ------------------------------------------------------------------
     # Source attribution helpers
@@ -2076,6 +2236,16 @@ class DriftObserver:
                     task_id=session.current_task_id,
                     agent_name=agent_name,
                 )
+                # An on-task verdict is the recovery signal for
+                # conditions this same pipeline opened. Gated on the
+                # same staleness predicate as the drift branch below
+                # (goldfive#319) so a verdict landing after its
+                # invocation terminated cannot resolve a fresh
+                # condition opened by a newer turn.
+                if not self._invocation_target_gone(session):
+                    await self._resolve_conditions_on_on_task_verdict(
+                        session, agent_name=agent_name
+                    )
                 return
             if not drift.trigger_input:
                 drift.trigger_input = self._truncate_trigger_input(text)
@@ -4732,6 +4902,17 @@ class DriftObserver:
         # normalised at the top of :meth:`handle_drift`.
         if (drift.authored_by or "").lower() == "user":
             return False
+        return self._invocation_target_gone(session)
+
+    def _invocation_target_gone(self, session: Session) -> bool:
+        """Return True when no invocation is live for the session.
+
+        Store-backed half of the late-verdict staleness gate, shared by
+        :meth:`_is_late_drift_for_terminated_invocation` (drift-side)
+        and the on-task condition-resolution path so a stale background
+        verdict can neither dispatch against nor resolve a fresh
+        condition.
+        """
         try:
             from goldfive.state_store import StateStore
 
@@ -4740,7 +4921,7 @@ class DriftObserver:
             cancel_pending = store.cancel_requested_invocation_ids()
         except Exception as exc:  # noqa: BLE001 — defensive
             log.debug(
-                "DefaultSteerer._is_late_drift_for_terminated_invocation: "
+                "DefaultSteerer._invocation_target_gone: "
                 "active_invocation_ids lookup raised (treating as not-late): %s",
                 exc,
             )

@@ -733,6 +733,16 @@ class TaskStateMachine:
         task_id_for_progress = str(getattr(task, "id", "") or "")
         if task_id_for_progress:
             session.task_last_progress_at[task_id_for_progress] = time.monotonic()
+        # Drift-condition lifecycle: a terminal task moots every
+        # condition still open against it. Done here because every
+        # transition path funnels through this method (mark_task_*,
+        # cascade, plan-revision transitions), and BEFORE the sink
+        # check because the ``KEY_ACTIVE_DRIFTS`` cleanup is lifecycle
+        # truth that must land even when emission is impossible.
+        if task_id_for_progress and to_status in _TERMINAL_TASK_STATUSES:
+            await self._steerer.drift.resolve_conditions_for_terminal_task(
+                session, task_id=task_id_for_progress, to_status=to_status
+            )
         sinks = self._steerer._sinks
         if not sinks:
             return
