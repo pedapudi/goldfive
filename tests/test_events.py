@@ -702,8 +702,6 @@ async def test_runner_survives_raising_sink() -> None:
 
     assert outcome.success
     assert bad.calls > 0
-    kinds = [
-        e.WhichOneof("payload") for e in good.events if hasattr(e, "DESCRIPTOR")
-    ]
+    kinds = [e.WhichOneof("payload") for e in good.events if hasattr(e, "DESCRIPTOR")]
     assert "run_started" in kinds
     assert "task_completed" in kinds
