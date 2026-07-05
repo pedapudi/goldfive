@@ -56,6 +56,12 @@ from goldfive.executors._control import (
     drain_controls,
     pause_deadline_s,
 )
+from goldfive.executors._shared import (
+    apply_steer,
+    emit_pipeline_failure_drift,
+    mark_cancelled_if_live,
+    tag_adapter_cancel_user_steer,
+)
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
 from goldfive.types import (
@@ -73,13 +79,6 @@ if TYPE_CHECKING:
     from goldfive.control import ControlChannel
 
 log = logging.getLogger(__name__)
-
-
-# Symbolic cancel-reason for USER_STEER. Mirrors
-# :data:`goldfive.adapters.adk.SYMBOLIC_REASON_USER_STEER` but duplicated
-# as a plain string to avoid importing the optional ADK adapter module
-# from the provider-agnostic executor. Keep in sync. See goldfive#139.
-_CANCEL_REASON_USER_STEER: str = "user_steer"
 
 
 def _steer_cancel_reason_prefix(steer_msg: Any) -> str:
@@ -101,40 +100,6 @@ def _steer_cancel_reason_prefix(steer_msg: Any) -> str:
     if msg_id:
         return f"user_steer:{msg_id}"
     return "user_steer:steer"
-
-
-def _tag_adapter_cancel_user_steer(adapter: Any, session: Any = None) -> None:
-    """Tag the adapter's next mid-invocation cancel with the USER_STEER reason.
-
-    Called just before the executor triggers ``task.cancel()`` on the
-    in-flight invoke task so the adapter's mid-invocation cancel
-    handler picks up the tag and appends an LLM-actionable synthetic
-    ``function_response`` (instead of the legacy generic jargon). See
-    goldfive#139.
-
-    Routes through :meth:`ADKAdapter.set_next_cancel_reason` when the
-    adapter exposes it (PR #294 audit / goldfive#271 follow-up) so the
-    tag is keyed by ``session.id`` and cannot bleed across concurrent
-    goldfive sessions sharing one adapter. Falls back to the bare
-    ``_next_cancel_reason`` attribute for adapters / stubs that
-    predate the helper.
-    """
-    setter = getattr(adapter, "set_next_cancel_reason", None)
-    if callable(setter) and session is not None:
-        try:
-            setter(session, _CANCEL_REASON_USER_STEER)
-            return
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "SequentialExecutor: set_next_cancel_reason raised: %s", exc
-            )
-    try:
-        adapter._next_cancel_reason = _CANCEL_REASON_USER_STEER
-    except Exception as exc:  # noqa: BLE001
-        log.debug(
-            "SequentialExecutor: could not tag adapter cancel reason: %s",
-            exc,
-        )
 
 
 async def _drain_steerer_at_run_boundary(
@@ -432,7 +397,7 @@ class SequentialExecutor(Executor):
                 run_failed = True
                 break
             if steer_msg is not None:
-                await self._apply_steer(steer_msg, steerer=steerer, session=session)
+                await apply_steer(steer_msg, steerer=steerer, session=session)
                 # The steerer swapped session.plan; pick up the revision
                 # on the next outer iteration.
 
@@ -577,7 +542,7 @@ class SequentialExecutor(Executor):
                 # emitted TaskCancelled carries the reason.
                 cancel_prefix = getattr(session, "_last_cancel_reason_prefix", "")
                 session._last_cancel_reason_prefix = ""
-                await self._mark_cancelled_if_live(
+                await mark_cancelled_if_live(
                     task_id=task.id,
                     steerer=steerer,
                     session=session,
@@ -604,13 +569,13 @@ class SequentialExecutor(Executor):
                 # distinguish "superseded by user steering" from
                 # generic run-aborts / cascade-cancels.
                 steer_prefix = _steer_cancel_reason_prefix(outcome_payload)
-                await self._mark_cancelled_if_live(
+                await mark_cancelled_if_live(
                     task_id=task.id,
                     steerer=steerer,
                     session=session,
                     cancel_reason=steer_prefix,
                 )
-                await self._apply_steer(outcome_payload, steerer=steerer, session=session)
+                await apply_steer(outcome_payload, steerer=steerer, session=session)
                 continue
 
             # outcome_kind == "result"
@@ -646,7 +611,7 @@ class SequentialExecutor(Executor):
                         task.id,
                         observe_exc,
                     )
-                    await _emit_pipeline_failure_drift(
+                    await emit_pipeline_failure_drift(
                         session=session,
                         sinks=sinks,
                         task_id=task.id,
@@ -1212,7 +1177,7 @@ class SequentialExecutor(Executor):
                     "SequentialExecutor._run_overlay: STEER received; "
                     "feeding steerer.drift.observe for USER_STEER drift + refine",
                 )
-                await self._apply_steer(payload, steerer=steerer, session=session)
+                await apply_steer(payload, steerer=steerer, session=session)
                 # goldfive#152: wrap the steer body in a goldfive-authored
                 # override header so the LLM sees it as a USER STEERING
                 # CONTROL directive, not a fresh user turn. Supersedes
@@ -1927,7 +1892,7 @@ class SequentialExecutor(Executor):
                 # handler (and the synthetic function_response it
                 # appends) carries LLM-actionable content instead of
                 # the legacy generic jargon. See goldfive#139.
-                _tag_adapter_cancel_user_steer(adapter, session=session)
+                tag_adapter_cancel_user_steer(adapter, session=session)
                 await self._cancel_invoke_task(invoke_task)
                 return ("steer", outcome.steer_message)
 
@@ -1958,54 +1923,6 @@ class SequentialExecutor(Executor):
         log.warning(
             "SequentialExecutor: adapter ignored task.cancel(); abandoning after 5s grace window"
         )
-
-    @staticmethod
-    async def _mark_cancelled_if_live(
-        *,
-        task_id: str,
-        steerer: Steerer,
-        session: Session,
-        cancel_reason: str = "",
-    ) -> None:
-        """Transition a not-yet-terminal task to CANCELLED.
-
-        ``cancel_reason`` (goldfive#205): structured reason stamped on the
-        emitted ``TaskCancelled``. Defaults to a generic
-        ``user_cancel:cancelled_by_control`` when the caller does not
-        pass something more specific (e.g. an annotation_id).
-        """
-        if session.plan is None:
-            return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                if t.status in (
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
-                ):
-                    return
-                reason_value = cancel_reason or "user_cancel:cancelled_by_control"
-                await steerer.transition(
-                    task_id,
-                    TaskStatus.CANCELLED,
-                    detail="cancelled by control",
-                    cancel_reason=reason_value,
-                    session=session,
-                )
-                return
-
-    @staticmethod
-    async def _apply_steer(
-        message: object,
-        *,
-        steerer: Steerer,
-        session: Session,
-    ) -> None:
-        """Feed a STEER :class:`ControlMessage` to the steerer."""
-        try:
-            await steerer.drift.observe(message, session)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("SequentialExecutor: steerer.drift.observe(STEER) raised: %s", exc)
 
     @staticmethod
     def _compose_nudge_replay_message(
@@ -2471,49 +2388,6 @@ def _unreachable_pending_task_ids(plan: Plan) -> set[str]:
                     break
 
     return unreachable_pending
-
-
-async def _emit_pipeline_failure_drift(
-    *,
-    session: Session,
-    sinks: list[EventSink],
-    task_id: str,
-    reason: str,
-) -> None:
-    """Emit an INFO ``CUSTOM`` drift when the drift pipeline itself raised.
-
-    Mirrors the helper in
-    :mod:`goldfive.executors.parallel`: a bug in the steerer's observe
-    path must not silently disappear. INFO severity so the run does not
-    trigger another refine — the goal is to make the plumbing failure
-    visible, not to recover from it. Sinks that care can filter on
-    the ``drift_pipeline_failed:`` detail prefix. See goldfive#134.
-
-    Uses the steerer's proto-enum mapping shape
-    (``DRIFT_KIND_<NAME>``) so the emitted envelope carries a real
-    enum value rather than UNSPECIFIED — the
-    :func:`goldfive.events.drift_detected_event` helper does a
-    best-effort lookup that silently drops StrEnum-style values.
-    """
-    from goldfive.pb.goldfive.v1 import types_pb2
-
-    evt = new_event(session.run_id, session.next_sequence(), session_id=session.id)
-    evt.drift_detected.kind = getattr(
-        types_pb2,
-        f"DRIFT_KIND_{DriftKind.CUSTOM.name}",
-        0,
-    )
-    evt.drift_detected.severity = getattr(
-        types_pb2,
-        f"DRIFT_SEVERITY_{DriftSeverity.INFO.name}",
-        0,
-    )
-    evt.drift_detected.detail = reason
-    evt.drift_detected.current_task_id = task_id or ""
-    try:
-        await emit(sinks, evt)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("_emit_pipeline_failure_drift: sink emit raised: %s", exc)
 
 
 def _plan_divergence_drift_event(session: Session, detail: str) -> object:

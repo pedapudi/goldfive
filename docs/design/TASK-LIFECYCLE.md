@@ -567,20 +567,21 @@ Open issues against the design, ranked by impact. The current
 implementation is sound for the common happy path; these are edge
 cases or failure-mode ergonomics.
 
-### 7.1 Multiple sources of truth for `_TERMINAL_TASK_STATUSES`
+### 7.1 Multiple sources of truth for `_TERMINAL_TASK_STATUSES` (closed)
 
-Three modules each define the same frozenset:
-
-- `steerer.py:47–55`
-- `adapters/_tool_invocation.py:30–37`
-- `adapters/adk.py:239–244`
-
-Each carries a comment warning maintainers to update all three in
-lockstep. No automated check enforces it.
-
-**Fix direction:** extract to a single module (e.g.
-`goldfive.types._constants`) and import from it. Low effort, high
-impact.
+Closed. `goldfive.types.TERMINAL_TASK_STATUSES` is the single
+definition; every other module imports it (some alias it to a
+module-local `_TERMINAL_TASK_STATUSES` name, which is fine — the
+alias references the canonical set). Historic duplicates in
+`steerer.py`, `adapters/_tool_invocation.py`, and `adapters/adk.py`
+were folded in earlier; the last two divergent copies lived in the
+executors — `executors/parallel.py` defined a three-status frozenset
+*without* `NOT_NEEDED` (so a reconciler-stamped `NOT_NEEDED` task was
+still scheduled for an LLM turn) plus a second four-status inline
+tuple, and `executors/sequential.py` carried a three-status tuple in
+its cancel bookkeeping. All are now imports of the canonical set, and
+`tests/test_terminal_statuses_single_source.py` walks the package
+AST to reject any future redefinition.
 
 ### 7.2 Plan validation at creation and revision (closed)
 
