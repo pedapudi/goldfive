@@ -634,13 +634,25 @@ def wrap(
         # LLM was detected from. Fall through to the class name only when the
         # object has no usable ``.name`` attribute (non-ADK shapes).
         _agent_label = getattr(agent, "name", "") or type(agent).__name__
+        # Name the cost explicitly: background reasoning-judge calls
+        # (up to ``max_concurrent_judges`` in flight, each with the
+        # judge's output-token ceiling) land on the SAME endpoint the
+        # agent tree bills against, competing with the tree's own
+        # calls for capacity / rate limits.
+        from goldfive.drift.reasoning_judge import REASONING_JUDGE_MAX_OUTPUT_TOKENS
+
         log.warning(
             "goldfive.wrap: judge LLM not explicitly configured; inheriting "
-            "%r from agent %r (detected via ADK model attribute). Set "
+            "%r from agent %r (detected via ADK model attribute). Judge "
+            "traffic (up to %d concurrent background calls, %d output "
+            "tokens each) will share this endpoint with — and compete "
+            "against — the agent tree's own calls. Set "
             "GOLDFIVE_JUDGE_BASE_URL / GOLDFIVE_JUDGE_MODEL to route "
             "goldfive's judges to a dedicated endpoint.",
             _detected_model_name,
             _agent_label,
+            max(1, int(resolved_runtime.reasoning_drift.max_concurrent_judges)),
+            REASONING_JUDGE_MAX_OUTPUT_TOKENS,
         )
 
     resolved_planner: Planner

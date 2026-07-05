@@ -133,6 +133,7 @@ components decoupled and lets the router own the shared state
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import logging
@@ -178,6 +179,36 @@ ReflectiveCallLLM = Callable[[str, str, str], Awaitable[str]]
 # for an on-call operator to intervene, short enough that unattended
 # deployments do not wedge indefinitely.
 DEFAULT_TERMINATE_PAUSE_DEADLINE_S: float = 600.0
+
+
+@dataclasses.dataclass
+class _QueuedJudgeWindow:
+    """Mutable payload for a scheduled-but-not-yet-running judge request.
+
+    While the owning background task waits on the per-steerer
+    judge-concurrency semaphore the request is QUEUED: a newer
+    reasoning observation for the same (session, agent, task) key
+    replaces ``text`` / ``pinned_history`` in place (coalescing —
+    newest window wins) instead of scheduling another task. A granted
+    judge slot (``call_llm``) is never downgraded by a slotless newer
+    observation. Once the semaphore is acquired the entry leaves
+    :attr:`DriftObserver._queued_judge_windows` and the call is
+    RUNNING — never coalesced again.
+    """
+
+    text: str
+    pinned_history: list[str]
+    call_llm: ReflectiveCallLLM | None
+    coalesced: int = 0
+
+
+def _nearest_rank_percentile(sorted_samples: list[int], q: float) -> int:
+    """Nearest-rank percentile of an already-sorted sample list; 0 when empty."""
+    if not sorted_samples:
+        return 0
+    idx = min(len(sorted_samples) - 1, max(0, round(q * (len(sorted_samples) - 1))))
+    return int(sorted_samples[idx])
+
 
 log = logging.getLogger(__name__)
 # Wave C bucket 3b/3c post-cleanup: the module previously kept a
@@ -373,6 +404,36 @@ class DriftObserver:
         # firings (separate dispatch instances at higher occurrence
         # counts) each get their own slot.
         self._cancelled_drift_ids: set[str] = set()
+        # Judge-scheduling guards — concurrency cap. Bounds the number
+        # of concurrently RUNNING background reasoning-judge LLM calls.
+        # Per-steerer-instance (NOT module-global) so multi-Runner
+        # processes never share one gate. Sized from
+        # ``ReasoningDriftConfig.max_concurrent_judges`` (env:
+        # ``GOLDFIVE_DRIFT_MAX_CONCURRENT_JUDGES``); a bare
+        # ``DefaultSteerer()`` without a config uses the dataclass
+        # default. Clamped to >= 1 so a bad value can never wedge the
+        # judge pipeline shut.
+        _rd_config = getattr(steerer, "_reasoning_drift_config", None)
+        try:
+            _judge_limit = int(getattr(_rd_config, "max_concurrent_judges", 3))
+        except (TypeError, ValueError):
+            _judge_limit = 3
+        self._judge_semaphore = asyncio.Semaphore(max(1, _judge_limit))
+        # QUEUED judge windows keyed by (session_id, agent_name,
+        # task_id). Entries are removed when the owning background task
+        # acquires the semaphore (QUEUED -> RUNNING) or is cancelled
+        # while still queued; while present, newer observations for the
+        # same key coalesce onto the entry instead of scheduling
+        # another task. See :class:`_QueuedJudgeWindow`.
+        self._queued_judge_windows: dict[tuple[str, str, str], _QueuedJudgeWindow] = {}
+        # Verdict-utility ledger, keyed by session id: plain counters
+        # {acted_on, emitted_late, emitted_redundant, parse_fail} plus
+        # a bounded elapsed_ms sample list. Created lazily on first
+        # increment; popped and summarised as a
+        # ``reasoning_judge_utility_summary`` dict event by
+        # :meth:`drain_session_background_tasks` (run boundary) with a
+        # :meth:`shutdown` flush as the process-teardown fallback.
+        self._verdict_ledgers: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Drift event emission + lifecycle stamping
@@ -1553,6 +1614,11 @@ class DriftObserver:
     # and is not affected by this guard.
     _GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S: float = 10.0
 
+    # Upper bound on per-session judge-latency samples retained for the
+    # verdict-utility summary. Keeps the ledger cheap on pathological
+    # runs; p50/p95 over the first N calls is representative enough.
+    _LEDGER_ELAPSED_SAMPLES_CAP: ClassVar[int] = 1024
+
     # ------------------------------------------------------------------
     # Observation entry points
     # ------------------------------------------------------------------
@@ -1741,13 +1807,44 @@ class DriftObserver:
         # one-shot test). ``text`` was appended above, so it is the
         # snapshot's last entry.
         pinned_history = list(session.reasoning_history)
+        # Judge-scheduling guards — coalescing. When a request for the
+        # same (session, agent, task) key is still QUEUED (its
+        # background task has not yet acquired the judge-concurrency
+        # semaphore), fold this observation into it: newest window
+        # wins, a granted judge slot is never downgraded, and no
+        # second task is scheduled. A RUNNING call is never coalesced —
+        # its entry left the registry when it acquired the semaphore.
+        queue_key = (
+            str(session.id or ""),
+            agent_name or "",
+            str(session.current_task_id or ""),
+        )
+        queued = self._queued_judge_windows.get(queue_key)
+        if queued is not None:
+            queued.text = text
+            queued.pinned_history = pinned_history
+            if rl_call_llm is not None:
+                queued.call_llm = rl_call_llm
+            queued.coalesced += 1
+            log.debug(
+                "DefaultSteerer.observe_reasoning: coalesced queued judge "
+                "window for key=%r (%d observation(s) folded)",
+                queue_key,
+                queued.coalesced,
+            )
+            return
+        window = _QueuedJudgeWindow(
+            text=text,
+            pinned_history=pinned_history,
+            call_llm=rl_call_llm,
+        )
+        self._queued_judge_windows[queue_key] = window
         bg_task = asyncio.create_task(
             self._run_judge_background(
-                text=text,
+                queue_key=queue_key,
+                window=window,
                 session=session,
-                call_llm=rl_call_llm,
                 judge_sink=judge_sink,
-                pinned_history=pinned_history,
                 agent_name=agent_name,
             ),
             # goldfive#243: encode session.id in the task name so
@@ -1830,6 +1927,52 @@ class DriftObserver:
     async def _run_judge_background(
         self,
         *,
+        queue_key: tuple[str, str, str],
+        window: _QueuedJudgeWindow,
+        session: Session,
+        judge_sink: Any,
+        agent_name: str = "",
+    ) -> None:
+        """Semaphore-gated dispatch of one queued judge window.
+
+        Scheduled by :meth:`observe_reasoning` as an
+        :func:`asyncio.create_task`. Waits on the per-steerer
+        judge-concurrency semaphore (:attr:`_judge_semaphore`) so at
+        most ``ReasoningDriftConfig.max_concurrent_judges`` background
+        judge calls run at once — while waiting, the ``window`` payload
+        stays coalescable in :attr:`_queued_judge_windows` (newest
+        observation for the same key replaces it in place). On acquire
+        the entry is removed (QUEUED -> RUNNING) and the pipeline runs
+        via :meth:`_run_judge_window` on the freshest payload.
+
+        A task cancelled while still queued (run-boundary drain,
+        shutdown) removes its registry entry in the ``finally`` so
+        later observations cannot coalesce onto a dead window and
+        silently vanish.
+        """
+        try:
+            async with self._judge_semaphore:
+                # QUEUED -> RUNNING: release the coalescing slot BEFORE
+                # reading the payload so a newer observation for the
+                # same key schedules a fresh request instead of
+                # mutating a window that is already being judged.
+                if self._queued_judge_windows.get(queue_key) is window:
+                    del self._queued_judge_windows[queue_key]
+                await self._run_judge_window(
+                    text=window.text,
+                    session=session,
+                    call_llm=window.call_llm,
+                    judge_sink=judge_sink,
+                    pinned_history=window.pinned_history,
+                    agent_name=agent_name,
+                )
+        finally:
+            if self._queued_judge_windows.get(queue_key) is window:
+                del self._queued_judge_windows[queue_key]
+
+    async def _run_judge_window(
+        self,
+        *,
         text: str,
         session: Session,
         call_llm: ReflectiveCallLLM | None,
@@ -1839,10 +1982,9 @@ class DriftObserver:
     ) -> None:
         """Run the mode-selected reasoning drift pipeline off the critical path.
 
-        Scheduled by :meth:`observe_reasoning` as an
-        :func:`asyncio.create_task` so the adapter's model-response
-        callback can return before ADK dispatches the response's tool
-        calls. Awaits :func:`~goldfive.drift.reasoning.analyze_reasoning`
+        Body of the historical ``_run_judge_background`` (which is now
+        the semaphore-gated wrapper above). Awaits
+        :func:`~goldfive.drift.reasoning.analyze_reasoning`
         and, if it yields a :class:`DriftEvent`, routes it through
         :meth:`_handle_drift` — same effect as the historical inline
         path, just resolving later.
@@ -1893,6 +2035,19 @@ class DriftObserver:
                 available_agents=judge_available_agents,
                 reasoning_history=pinned_history,
             )
+
+            # Verdict-utility ledger — latency + quiet-fail accounting.
+            # ``judge_ran`` distinguishes "the judge LLM was dispatched"
+            # from the embedding-only / mode-off paths; the empty
+            # ``classification`` on a ran judge is the quiet-fail
+            # sentinel (call raised, non-JSON response, missing keys).
+            if getattr(verdict, "judge_ran", False):
+                ledger = self._verdict_ledger(session)
+                samples = ledger["elapsed_ms"]
+                if len(samples) < self._LEDGER_ELAPSED_SAMPLES_CAP:
+                    samples.append(int(getattr(verdict, "elapsed_ms", 0)))
+                if not getattr(verdict, "classification", ""):
+                    ledger["parse_fail"] += 1
 
             # Record the reasoning-extracted binding onto the
             # orchestration store regardless of the drift verdict —
@@ -1948,10 +2103,12 @@ class DriftObserver:
                     drift.current_task_id or "-",
                     drift.kind.value,
                 )
+                self._verdict_ledger(session)["emitted_late"] += 1
                 if not drift.authored_by:
                     drift.authored_by = self._resolve_authored_by(drift)
                 await self._emit_drift_detected(session, drift)
                 return
+            self._verdict_ledger(session)["acted_on"] += 1
             await self.handle_drift(drift, session)
         except asyncio.CancelledError:
             # Propagate cancellation so :meth:`shutdown` / event-loop
@@ -2031,6 +2188,86 @@ class DriftObserver:
             )
 
     # ------------------------------------------------------------------
+    # Verdict-utility ledger (judge-scheduling guards)
+    # ------------------------------------------------------------------
+
+    def _verdict_ledger(self, session: Session) -> dict[str, Any]:
+        """Get-or-create the per-session verdict-utility ledger.
+
+        Plain dict on the steerer — cheap by design. ``session`` is
+        retained on the entry so the teardown summary can stamp
+        ``run_id`` and draw a gap-free sequence number. Counters:
+
+        * ``acted_on`` — reasoning-judge verdicts dispatched into
+          :meth:`handle_drift` (past the late gate).
+        * ``emitted_late`` — verdicts emitted-only because the
+          originating invocation had already terminated (goldfive#319
+          gate in :meth:`_run_judge_window`).
+        * ``emitted_redundant`` — verdicts emitted-only at
+          :meth:`handle_drift`'s entry gates (addressed-watermark and
+          in-flight-refine); counts every observation-stamped verdict
+          that hits those gates, reasoning-judge or otherwise.
+        * ``parse_fail`` — judge calls that quiet-failed (empty
+          classification sentinel).
+        * ``elapsed_ms`` — bounded judge-call latency samples.
+        """
+        sid = str(session.id or "")
+        ledger = self._verdict_ledgers.get(sid)
+        if ledger is None:
+            ledger = {
+                "session": session,
+                "acted_on": 0,
+                "emitted_late": 0,
+                "emitted_redundant": 0,
+                "parse_fail": 0,
+                "elapsed_ms": [],
+            }
+            self._verdict_ledgers[sid] = ledger
+        return ledger
+
+    async def _emit_verdict_utility_summary(self, session_id: str) -> None:
+        """Pop the session's ledger and emit its summary, if one exists.
+
+        Emits a ``reasoning_judge_utility_summary`` dict envelope (via
+        :func:`goldfive.events.make_event` — no proto change) carrying
+        the four utility counters plus judge-call count and nearest-rank
+        p50/p95 of the in-session ``elapsed_ms`` samples. A session with
+        no judge activity never created a ledger, so quiet runs emit
+        nothing; the pop makes repeat drains idempotent.
+        """
+        ledger = self._verdict_ledgers.pop(session_id, None)
+        if ledger is None:
+            return
+        session = ledger["session"]
+        samples = sorted(int(s) for s in ledger["elapsed_ms"])
+        payload: dict[str, Any] = {
+            "acted_on": int(ledger["acted_on"]),
+            "emitted_late": int(ledger["emitted_late"]),
+            "emitted_redundant": int(ledger["emitted_redundant"]),
+            "parse_fail": int(ledger["parse_fail"]),
+            "judge_calls": len(samples),
+            "elapsed_ms_p50": _nearest_rank_percentile(samples, 0.5),
+            "elapsed_ms_p95": _nearest_rank_percentile(samples, 0.95),
+        }
+        try:
+            from goldfive.events import emit, make_event
+
+            evt = make_event(
+                str(session.run_id or ""),
+                session.next_sequence(),
+                "reasoning_judge_utility_summary",
+                payload,
+                session_id=session_id,
+            )
+            await emit(self._steerer._sinks, evt)
+        except Exception as exc:  # noqa: BLE001 — observability only
+            log.warning(
+                "DriftObserver._emit_verdict_utility_summary: emit failed "
+                "(swallowed): %s",
+                exc,
+            )
+
+    # ------------------------------------------------------------------
     # Background-task lifecycle (drain + shutdown)
     # ------------------------------------------------------------------
 
@@ -2059,6 +2296,11 @@ class DriftObserver:
             await self._drain_background_set(
                 self._steerer._background_drifts, label="drift", timeout=timeout
             )
+        # Flush verdict-utility ledgers whose sessions never hit a
+        # run-boundary drain (custom executors, aborted loops). Sessions
+        # already summarised at their run boundary were popped there.
+        for sid in list(self._verdict_ledgers):
+            await self._emit_verdict_utility_summary(sid)
 
     async def drain_session_background_tasks(
         self, *, session_id: str, timeout: float = 2.0
@@ -2122,6 +2364,11 @@ class DriftObserver:
             await self._drain_background_set(
                 judge_subset, label="judge", timeout=timeout
             )
+        # Run-boundary summary: judges that finished during the drain
+        # above have already counted; stragglers were cancelled and
+        # count nothing. Emitted BEFORE the executor's terminal
+        # RunAborted / RunCompleted so the summary rides inside the run.
+        await self._emit_verdict_utility_summary(session_id)
 
     async def _drain_background_set(
         self,
@@ -3342,6 +3589,7 @@ class DriftObserver:
                 )
                 # Emit for observability so operators see the detector
                 # ran; do NOT cancel / refine on a redundant view.
+                self._verdict_ledger(session)["emitted_redundant"] += 1
                 await self._emit_drift_detected(
                     session,
                     drift,
@@ -3383,6 +3631,7 @@ class DriftObserver:
                     drift.current_task_id or "<trajectory>",
                     drift.observed_revision_index,
                 )
+                self._verdict_ledger(session)["emitted_redundant"] += 1
                 await self._emit_drift_detected(
                     session,
                     drift,

@@ -39,6 +39,7 @@ semantic ground robustly.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import re
@@ -1172,23 +1173,18 @@ async def analyze_reasoning_with_focus(
         # (deterministic, synchronous path). Either way, the
         # attribution fields come from the judge — the embedding
         # pipeline doesn't produce them.
+        # ``dataclasses.replace`` (vs field-by-field reconstruction)
+        # keeps every judge-derived field — attribution, classification /
+        # provenance, and the judge-scheduling measurement fields
+        # (``judge_ran`` / ``elapsed_ms``) — on the returned verdict
+        # even when the embedding drift wins.
         if judge_verdict.drift is None:
-            return ReasoningJudgeVerdict(
-                drift=embedding_drift,
-                focused_task_id=judge_verdict.focused_task_id,
-                focus_confidence=judge_verdict.focus_confidence,
-                stated_intent=judge_verdict.stated_intent,
-            )
+            return dataclasses.replace(judge_verdict, drift=embedding_drift)
         if _SEVERITY_ORDER[judge_verdict.drift.severity] > _SEVERITY_ORDER[
             embedding_drift.severity
         ]:
             return judge_verdict
-        return ReasoningJudgeVerdict(
-            drift=embedding_drift,
-            focused_task_id=judge_verdict.focused_task_id,
-            focus_confidence=judge_verdict.focus_confidence,
-            stated_intent=judge_verdict.stated_intent,
-        )
+        return dataclasses.replace(judge_verdict, drift=embedding_drift)
     log.warning(
         "analyze_reasoning_with_focus: unknown mode=%r; falling back "
         "to 'embedding'",
