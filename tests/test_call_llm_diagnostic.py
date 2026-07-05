@@ -7,27 +7,34 @@ parts, the function returned ``""`` — indistinguishable from "the model
 truly produced empty output" or "the network ate the response". Two
 days were lost to that ambiguity in the v16 / Qwen 35B investigation.
 
-Post-fix:
+Post-fix (one-llm-call-module refactor):
 
-1. The default ADK builder counts ``thought=True`` vs answer parts on
-   every dispatch and stashes the counts on the closure
-   (``_call_llm.last_thought_count`` / ``last_answer_count``).
+1. The default builders count ``thought=True`` vs answer parts on every
+   dispatch and record them into the per-call
+   :class:`goldfive._llm.LlmCallDiagnostics` object installed by the
+   consumer via :func:`goldfive._llm.llm_call_diagnostics`. The counts
+   previously travelled as attributes mutated on the shared callable —
+   last-writer-wins under concurrent background judges.
 2. When the answer is empty AND there were thought parts, the builder
    logs at INFO with a diagnostic message naming the failure shape so
    operators can distinguish "model spent its budget thinking" from
    "real empty response".
 3. The judge call sites (reasoning_judge, classify_goal_drift,
-   reflective check) read the stashed counts when they fail to parse
+   reflective check) read the recorded counts when they fail to parse
    the response and surface ``"empty answer (N thought parts)"`` on the
    span ``output_preview`` rather than the indistinguishable ``raw=''``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+
+from goldfive._llm import llm_call_diagnostics, record_llm_call_diagnostics
 
 
 @pytest.mark.asyncio
@@ -67,12 +74,13 @@ async def test_adk_builder_logs_diagnostic_when_all_thoughts_no_answer(caplog):
     assert call_llm is not None
 
     with caplog.at_level(logging.INFO, logger="goldfive"):
-        out = await call_llm("system", "user", "stub")
+        with llm_call_diagnostics() as diag:
+            out = await call_llm("system", "user", "stub")
 
     assert out == "", "all-thought response must produce empty answer"
-    # Part counts stashed on the closure for the caller.
-    assert getattr(call_llm, "last_thought_count", None) == 3
-    assert getattr(call_llm, "last_answer_count", None) == 0
+    # Part counts recorded into the per-call diagnostics object.
+    assert diag.thought_count == 3
+    assert diag.answer_count == 0
     # Diagnostic INFO log fired.
     matching = [
         rec
@@ -118,34 +126,115 @@ async def test_adk_builder_no_diagnostic_on_normal_response(caplog):
     assert call_llm is not None
 
     with caplog.at_level(logging.INFO, logger="goldfive"):
-        out = await call_llm("system", "user", "stub")
+        with llm_call_diagnostics() as diag:
+            out = await call_llm("system", "user", "stub")
 
     assert out == '{"on_task": true}'
-    assert getattr(call_llm, "last_thought_count", None) == 1
-    assert getattr(call_llm, "last_answer_count", None) == 1
+    assert diag.thought_count == 1
+    assert diag.answer_count == 1
     # No diagnostic fired.
-    diag = [rec for rec in caplog.records if "answer text empty" in rec.message]
-    assert not diag
+    diag_records = [rec for rec in caplog.records if "answer text empty" in rec.message]
+    assert not diag_records
+
+
+@pytest.mark.asyncio
+async def test_openai_builder_records_diagnostic_when_all_reasoning_no_answer(caplog):
+    """The OpenAI-compatible builder reports ``reasoning_content`` with
+    empty ``content`` as the all-thought-no-answer shape (0/1 sentinel
+    counts) through the same diagnostics channel as the ADK builder."""
+    pytest.importorskip("openai")
+    from goldfive._llm import make_default_openai_call_llm
+    from goldfive.config import JudgeConfig
+
+    built = make_default_openai_call_llm(
+        JudgeConfig(base_url="http://stub-judge.invalid", model="stub-judge")
+    )
+    assert built is not None
+    call_llm, _model = built
+
+    fake_message = MagicMock(content="")
+    type(fake_message).reasoning_content = "chain of thought " * 20  # type: ignore[attr-defined]
+    fake_response = MagicMock()
+    fake_response.choices = [MagicMock(message=fake_message)]
+
+    async def fake_create(**kwargs: Any) -> Any:
+        return fake_response
+
+    client_cell = None
+    for c in call_llm.__closure__ or ():
+        if hasattr(c.cell_contents, "chat"):
+            client_cell = c
+            break
+    assert client_cell is not None
+    client_cell.cell_contents.chat.completions.create = fake_create
+
+    with caplog.at_level(logging.INFO, logger="goldfive"):
+        with llm_call_diagnostics() as diag:
+            out = await call_llm("system", "user", "stub-judge")
+
+    assert out == ""
+    assert diag.thought_count == 1
+    assert diag.answer_count == 0
+    matching = [
+        rec
+        for rec in caplog.records
+        if "thought part" in rec.message and "answer text empty" in rec.message
+    ]
+    assert matching, (
+        f"expected the all-thought-no-answer diagnostic; got log records: "
+        f"{[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_isolated_across_concurrent_calls():
+    """Three concurrent judge-shaped dispatches each observe their own
+    counts — the race the old closure-attribute side channel had once
+    Wave-2's semaphore allowed up to 3 background judges in flight."""
+    started = asyncio.Event()
+
+    async def fake_call_llm(thought_count: int) -> str:
+        # Simulate the consolidated builder: record after a suspension
+        # point so the three calls fully interleave.
+        started.set()
+        await asyncio.sleep(0.01 * thought_count)
+        record_llm_call_diagnostics(thought_count=thought_count, answer_count=0)
+        await asyncio.sleep(0.01)
+        return ""
+
+    async def judge_dispatch(thought_count: int) -> tuple[int, int]:
+        # Each consumer installs its own per-call diagnostics object,
+        # exactly like the judge / reflective-check call sites.
+        with llm_call_diagnostics() as diag:
+            await fake_call_llm(thought_count)
+        return diag.thought_count, diag.answer_count
+
+    results = await asyncio.gather(judge_dispatch(1), judge_dispatch(2), judge_dispatch(3))
+    assert results == [(1, 0), (2, 0), (3, 0)]
+
+
+def test_record_is_noop_without_installed_diagnostics():
+    """Recording outside ``llm_call_diagnostics()`` must not raise —
+    diagnostics are optional and absent for operator-supplied callables."""
+    record_llm_call_diagnostics(thought_count=5, answer_count=1)
 
 
 @pytest.mark.asyncio
 async def test_reasoning_judge_surfaces_diagnostic_in_span():
     """``classify_reasoning_drift`` records an "empty answer (N thought
     parts)" output_preview on the span when the call_llm returned ``""``
-    and stashed a positive thought count. Replaces the previous
+    and recorded a positive thought count. Replaces the previous
     indistinguishable ``raw=''`` shape."""
     from goldfive.drift.reasoning_judge import classify_reasoning_drift
     from goldfive.protocols import EventSink
     from goldfive.types import Task
 
-    # Stub call_llm returning empty AND advertising 3 thought parts via
-    # the closure-attached attribute (the same shape the default ADK
-    # builder produces).
+    # Stub call_llm returning empty AND recording 3 thought parts via
+    # the per-call diagnostics channel (the same shape the default
+    # builders produce).
     async def stub_call_llm(system: str, user: str, model: str) -> str:
+        record_llm_call_diagnostics(thought_count=3, answer_count=0)
         return ""
-
-    stub_call_llm.last_thought_count = 3  # type: ignore[attr-defined]
-    stub_call_llm.last_answer_count = 0  # type: ignore[attr-defined]
 
     captured: list[Any] = []
 

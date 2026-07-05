@@ -969,9 +969,17 @@ async def classify_reasoning_drift_with_focus(
             # deep reasoning. Letting the model burn the 16k budget on
             # ``<think>`` was the v16 / Qwen 35B failure mode — the cap
             # bump was the symptom-fix, this is the cause-fix.
-            from goldfive._llm import call_llm_budget, call_llm_thinking_disabled
+            from goldfive._llm import (
+                call_llm_budget,
+                call_llm_thinking_disabled,
+                llm_call_diagnostics,
+            )
 
-            with call_llm_budget(REASONING_JUDGE_MAX_OUTPUT_TOKENS), call_llm_thinking_disabled():
+            with (
+                call_llm_budget(REASONING_JUDGE_MAX_OUTPUT_TOKENS),
+                call_llm_thinking_disabled(),
+                llm_call_diagnostics() as llm_diag,
+            ):
                 raw = await call_llm(system, user, model)
             # Parse inside the with-block so we can stamp
             # decision-context onto the span before the End event fires
@@ -1072,12 +1080,12 @@ async def classify_reasoning_drift_with_focus(
             if on_task_parsed is None:
                 # Distinguish "model returned all thinking, no answer"
                 # from "model returned garbage" (goldfive#271 follow-up
-                # to #311). The default ADK / OpenAI builders stash the
-                # part counts on the call_llm closure; when the answer
-                # is empty AND we saw ``thought=True`` parts the
-                # diagnostic should say so rather than show an
+                # to #311). The default ADK / OpenAI builders record the
+                # part counts into the per-call diagnostics object; when
+                # the answer is empty AND we saw ``thought=True`` parts
+                # the diagnostic should say so rather than show an
                 # indistinguishable ``raw=''``.
-                _thought_n = int(getattr(call_llm, "last_thought_count", 0) or 0)
+                _thought_n = llm_diag.thought_count
                 if not raw_str_inline.strip() and _thought_n > 0:
                     span.output_preview = (
                         f"empty answer ({_thought_n} thought part(s); "

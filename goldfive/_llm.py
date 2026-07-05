@@ -1,4 +1,4 @@
-"""Shared typing + lifecycle helpers for the planner / goal-deriver LLM callable.
+"""The one internal LLM-call module: typing, lifecycle, budget, and builders.
 
 Goldfive accepts an opaque ``call_llm(system, user, model) -> str`` async
 callable for both :class:`LLMPlanner` and :class:`LLMGoalDeriver`. That
@@ -6,6 +6,15 @@ keeps the framework decoupled from any specific SDK, but it also leaves
 resource cleanup ambiguous — the most common pattern (an OpenAI
 ``AsyncClient`` whose ``aiohttp.ClientSession`` lives until garbage
 collection) leaks at process exit.
+
+Besides the protocols and ContextVar plumbing, this module owns the two
+default ``call_llm`` builders (:func:`make_default_adk_call_llm` for ADK
+trees, :func:`make_default_openai_call_llm` for a dedicated
+:class:`~goldfive.config.JudgeConfig` endpoint), the model-capability
+table for vendor thinking-disable conventions, and the per-dispatch
+diagnostics channel (:func:`llm_call_diagnostics`). They previously
+lived as two divergent copies in :mod:`goldfive._llm_detect` and
+:mod:`goldfive.convenience`; those modules keep thin re-export shims.
 
 This module standardises a duck-typed close protocol:
 
@@ -52,7 +61,11 @@ import contextvars
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from goldfive.config import JudgeConfig
 
 log = logging.getLogger("goldfive.llm")
 
@@ -198,6 +211,157 @@ def call_llm_budget(max_output_tokens: int | None) -> Iterator[None]:
         MAX_OUTPUT_TOKENS_VAR.reset(token)
 
 
+# ---------------------------------------------------------------------------
+# Model-capability table: vendor thinking-disable conventions
+# ---------------------------------------------------------------------------
+#
+# How a "disable thinking" request is expressed on the wire is a vendor
+# convention, not a property of the transport. The genai
+# ``ThinkingConfig(include_thoughts=False, thinking_budget=0)`` opt-out is
+# first-class SDK surface on the ADK path and is applied there for every
+# model (unchanged behaviour). The two Qwen-specific hacks — the
+# ``enable_thinking`` extra-body field and the ``/no_think`` prompt
+# prefix — ride the OpenAI-compatible wire format and are meaningful only
+# to the Qwen / litellm family, so they are keyed off the model name
+# here. This is a lookup table of vendor conventions (configuration),
+# not NL classification.
+
+
+@dataclass(frozen=True)
+class ThinkingDisableCaps:
+    """Vendor-convention knobs available for suppressing thinking."""
+
+    #: ``extra_body={"enable_thinking": False}`` on
+    #: ``chat.completions.create`` (Qwen-via-litellm / OpenAI-compatible).
+    openai_enable_thinking_field: bool = False
+    #: ``/no_think`` prepended to the system prompt (Qwen prompt-level
+    #: toggle; fallback for endpoints that drop unknown request fields).
+    no_think_prompt_prefix: bool = False
+
+
+_NO_VENDOR_THINKING_CAPS = ThinkingDisableCaps()
+
+#: ``(model-name substring, caps)`` pairs, matched case-insensitively in
+#: order. Models that match no entry get NO vendor hacks — the genai
+#: ``ThinkingConfig`` opt-out on the ADK path still applies regardless.
+THINKING_DISABLE_CAPABILITIES: tuple[tuple[str, ThinkingDisableCaps], ...] = (
+    (
+        "qwen",
+        ThinkingDisableCaps(openai_enable_thinking_field=True, no_think_prompt_prefix=True),
+    ),
+)
+
+
+def thinking_disable_caps(model_name: str) -> ThinkingDisableCaps:
+    """Return the vendor thinking-disable conventions for ``model_name``.
+
+    Matches :data:`THINKING_DISABLE_CAPABILITIES` by lowercase substring
+    so litellm-prefixed names (``"openai/Qwen3-32B"``,
+    ``"hosted_vllm/Qwen/Qwen3-32B"``) route to the same family. Unknown
+    models get the empty caps — no vendor hacks.
+    """
+    lowered = (model_name or "").lower()
+    for marker, caps in THINKING_DISABLE_CAPABILITIES:
+        if marker in lowered:
+            return caps
+    return _NO_VENDOR_THINKING_CAPS
+
+
+# ---------------------------------------------------------------------------
+# Per-dispatch diagnostics (goldfive#271 follow-up to #311)
+# ---------------------------------------------------------------------------
+#
+# When a judge / reflective-check response fails to parse, the call site
+# wants to distinguish "the model spent its budget thinking and emitted
+# no answer" from "the model returned garbage". The default builders
+# below count thought vs answer parts on every dispatch. The counts used
+# to be smuggled as attributes mutated on the shared callable
+# (``call_llm.last_thought_count``) — last-writer-wins once concurrent
+# background judges dispatch through the same closure. They now travel
+# through a ContextVar-bound per-call object: each consumer installs a
+# fresh :class:`LlmCallDiagnostics` via :func:`llm_call_diagnostics`
+# around its own ``await call_llm(...)``, so concurrent tasks cannot
+# observe each other's counts. Diagnostics are optional — user-supplied
+# callables that never call :func:`record_llm_call_diagnostics` simply
+# leave the counts at zero.
+
+
+@dataclass
+class LlmCallDiagnostics:
+    """Per-dispatch part counts recorded by goldfive's default builders.
+
+    ``thought_count`` counts real ``thought=True`` parts on the ADK
+    path; the OpenAI-compatible path reports the presence of
+    ``reasoning_content`` as a 0/1 sentinel. ``answer_count`` counts
+    non-empty answer parts (0/1 sentinel on the OpenAI path).
+    """
+
+    thought_count: int = 0
+    answer_count: int = 0
+
+
+#: ContextVar carrying the per-call diagnostics object, or ``None`` when
+#: no consumer asked for diagnostics (user-supplied dispatch paths).
+LLM_CALL_DIAGNOSTICS_VAR: contextvars.ContextVar[LlmCallDiagnostics | None] = (
+    contextvars.ContextVar("goldfive_call_llm_diagnostics", default=None)
+)
+
+
+@contextmanager
+def llm_call_diagnostics() -> Iterator[LlmCallDiagnostics]:
+    """Install a fresh diagnostics object for the dispatch inside the block.
+
+    Yields the object; the caller reads its counts after ``await
+    call_llm(...)`` returns (the object outlives the with-block). Resets
+    the var on exit even if the body raises, so a failed dispatch cannot
+    leak stale counts into a sibling call in the same context.
+    """
+    diag = LlmCallDiagnostics()
+    token = LLM_CALL_DIAGNOSTICS_VAR.set(diag)
+    try:
+        yield diag
+    finally:
+        LLM_CALL_DIAGNOSTICS_VAR.reset(token)
+
+
+def record_llm_call_diagnostics(*, thought_count: int, answer_count: int) -> None:
+    """Record part counts into the current dispatch's diagnostics object.
+
+    No-op when no consumer installed one via
+    :func:`llm_call_diagnostics` — recording is strictly optional, and
+    user-supplied ``call_llm`` callables are not expected to call this.
+    """
+    diag = LLM_CALL_DIAGNOSTICS_VAR.get()
+    if diag is None:
+        return
+    diag.thought_count = thought_count
+    diag.answer_count = answer_count
+
+
+def _note_dispatch_result(
+    *, transport: str, result: str, thought_count: int, answer_count: int
+) -> None:
+    """Record diagnostics and log the all-thought-no-answer failure shape.
+
+    Shared by both default builders so success and failure expose the
+    same observable shape (goldfive#271 follow-up to #311: pre-fix, an
+    all-thought response returned an indistinguishable ``raw=''`` that
+    cost two days of misdiagnosis on v16 / Qwen 35B).
+    """
+    record_llm_call_diagnostics(thought_count=thought_count, answer_count=answer_count)
+    if not result and thought_count > 0:
+        log.info(
+            "goldfive._llm.%s: model returned %d thought part(s), %d answer "
+            "part(s), answer text empty — check thinking-mode config or "
+            "max_output_tokens (the model spent its budget thinking and "
+            "emitted no answer). Goldfive's judges should run with "
+            "call_llm_thinking_disabled() entered.",
+            transport,
+            thought_count,
+            answer_count,
+        )
+
+
 @runtime_checkable
 class CallLLM(Protocol):
     """Async callable shape: ``(system, user, model) -> str``.
@@ -241,15 +405,286 @@ async def maybe_close_call_llm(call_llm: Any, *, label: str = "call_llm") -> Non
         log.warning("%s.close() raised %s; ignored", label, exc)
 
 
+# ---------------------------------------------------------------------------
+# Default ``call_llm`` builders (ADK tree LLM / OpenAI-compatible endpoint)
+# ---------------------------------------------------------------------------
+
+
+async def _probe_close(target: Any, *, label: str) -> None:
+    """Close ``target``'s network resources via duck-typed probing.
+
+    Probes ``aclose`` / ``close`` on ``target`` itself, then on a nested
+    ``._client`` / ``.client`` (LiteLlm and friends stash the HTTP
+    session there). Awaits the first hit; silently no-ops when nothing
+    is found. Exceptions are logged and swallowed — teardown must not
+    raise.
+    """
+    candidates: list[tuple[str, Any]] = [(label, target)]
+    for client_attr in ("_client", "client"):
+        client = getattr(target, client_attr, None)
+        if client is not None:
+            candidates.append((f"{label}.{client_attr}", client))
+    for name, obj in candidates:
+        for attr_name in ("aclose", "close"):
+            closer = getattr(obj, attr_name, None)
+            if callable(closer):
+                try:
+                    result = closer()
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception as exc:  # noqa: BLE001 - cleanup must not raise
+                    log.debug("%s.%s raised %s", name, attr_name, exc)
+                return
+
+
+def make_default_adk_call_llm(model: Any) -> CallLLM | None:
+    """Return a ``call_llm(system, user, model) -> str`` backed by ADK.
+
+    ``model`` may be a string alias (``"gpt-4o"``), a ``BaseLlm``
+    instance (including ``LiteLlm``), or anything ``LLMRegistry`` can
+    resolve. Returns ``None`` when ADK is not installed or the model
+    cannot be resolved to a ``BaseLlm``.
+    """
+    try:
+        from google.adk.models.base_llm import BaseLlm  # type: ignore
+        from google.adk.models.llm_request import LlmRequest  # type: ignore
+        from google.adk.models.registry import LLMRegistry  # type: ignore
+        from google.genai import types as genai_types  # type: ignore
+    except ImportError:
+        log.debug("goldfive._llm: google.adk not installed")
+        return None
+
+    if isinstance(model, BaseLlm):
+        llm: Any = model
+    elif isinstance(model, str) and model:
+        try:
+            llm_cls = LLMRegistry.new_llm(model)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001
+            log.debug("goldfive._llm: LLMRegistry.new_llm(%r) raised: %s", model, exc)
+            return None
+        llm = llm_cls
+    else:
+        return None
+
+    async def _call_llm(system: str, user: str, model_str: str) -> str:
+        _ = model_str  # ADK's BaseLlm is already model-bound
+        # Per-callsite cap (see :func:`call_llm_budget`); ``None`` falls
+        # back to DEFAULT_MAX_OUTPUT_TOKENS so an unsupervised dispatch
+        # still has a finite ceiling (goldfive#271: pre-fix evidence in
+        # demo-v8.log showed unbounded calls reaching 9961 completion
+        # tokens / 9.6 minutes wall on a Qwen Q4 endpoint).
+        max_output_tokens = get_max_output_tokens()
+        # Per-callsite disable-thinking signal (goldfive#271 follow-up
+        # to #311). The genai ``ThinkingConfig`` opt-out is first-class
+        # SDK surface on this path and applies to every model —
+        # without it, the 16k cap from #311 is spent inside ``<think>``
+        # and the JSON answer comes back truncated. The Qwen-only
+        # prompt/extra-body hacks live in the OpenAI builder, gated on
+        # :func:`thinking_disable_caps`.
+        thinking_config: Any = None
+        if get_thinking_disabled():
+            try:
+                thinking_config = genai_types.ThinkingConfig(
+                    include_thoughts=False,
+                    thinking_budget=0,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Older google.genai shapes may not expose ThinkingConfig;
+                # the model just keeps thinking, as before this fix.
+                log.debug(
+                    "goldfive._llm: ThinkingConfig unavailable (%s); "
+                    "continuing without thinking-disabled hint",
+                    exc,
+                )
+                thinking_config = None
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": system,
+            "max_output_tokens": max_output_tokens,
+        }
+        if thinking_config is not None:
+            config_kwargs["thinking_config"] = thinking_config
+        req = LlmRequest(
+            contents=[
+                genai_types.Content(
+                    role="user",
+                    parts=[genai_types.Part(text=user)],
+                ),
+            ],
+            config=genai_types.GenerateContentConfig(**config_kwargs),
+        )
+        chunks: list[str] = []
+        thought_part_count = 0
+        answer_part_count = 0
+        async for resp in llm.generate_content_async(req, stream=False):
+            content = getattr(resp, "content", None)
+            if content is None:
+                continue
+            for part in getattr(content, "parts", None) or ():
+                if getattr(part, "thought", False):
+                    thought_part_count += 1
+                    continue
+                text = getattr(part, "text", "") or ""
+                if text:
+                    answer_part_count += 1
+                    chunks.append(str(text))
+        result = "".join(chunks).strip()
+        _note_dispatch_result(
+            transport="adk_call_llm",
+            result=result,
+            thought_count=thought_part_count,
+            answer_count=answer_part_count,
+        )
+        return result
+
+    async def _close() -> None:
+        await _probe_close(llm, label="adk_call_llm")
+
+    _call_llm.close = _close  # type: ignore[attr-defined]
+    return _call_llm
+
+
+def make_default_openai_call_llm(config: JudgeConfig) -> tuple[CallLLM, str] | None:
+    """Construct an OpenAI-compatible ``CallLLM`` from a :class:`JudgeConfig`.
+
+    Returns ``(call_llm, model)`` or ``None`` when the ``openai``
+    package is not importable / the client cannot be built. Shape
+    mirrors :func:`make_default_adk_call_llm`: the returned callable
+    exposes a ``close`` coroutine so :class:`Runner` can tear down its
+    HTTP session on shutdown.
+
+    Design parallels :class:`goldfive.drift._embed._OpenAIEmbeddingBackend`
+    — we intentionally tolerate missing / placeholder ``api_key`` so
+    llama.cpp / Ollama endpoints "just work" (they don't check the
+    header).
+    """
+    base_url = (config.base_url or "").strip()
+    if not base_url:
+        return None
+    try:
+        from openai import AsyncOpenAI  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "goldfive._llm: openai SDK not importable for JudgeConfig (base_url=%r): %s",
+            base_url,
+            exc,
+        )
+        return None
+    timeout_s = max(0.1, config.timeout_ms / 1000.0)
+    try:
+        client: Any = AsyncOpenAI(
+            base_url=f"{base_url.rstrip('/')}/v1",
+            api_key=config.api_key or "not-needed",
+            timeout=timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "goldfive._llm: AsyncOpenAI client construction failed for "
+            "JudgeConfig (base_url=%r): %s",
+            base_url,
+            exc,
+        )
+        return None
+
+    model_name = config.model or ""
+
+    async def _call_llm(system: str, user: str, model_str: str) -> str:
+        # Prefer the model argument supplied by the caller (matches the
+        # contract used by :class:`~goldfive.planner.LLMPlanner`); fall
+        # back to the config model when the caller passes the empty
+        # string. An empty-string model is tolerated by llama.cpp /
+        # Ollama even against an OpenAI endpoint that requires one,
+        # because we only hit endpoints the operator configured.
+        effective_model = model_str or model_name
+        # Per-callsite disable-thinking signal (goldfive#271 follow-up
+        # to #311). The ``enable_thinking`` extra-body field and the
+        # ``/no_think`` prompt prefix are Qwen / litellm conventions —
+        # applied only when the model matches that family (see
+        # :func:`thinking_disable_caps`). Other vendors get no hacks on
+        # this wire format.
+        effective_system = system
+        extra_body: dict[str, Any] = {}
+        if get_thinking_disabled():
+            caps = thinking_disable_caps(effective_model)
+            if caps.openai_enable_thinking_field:
+                extra_body["enable_thinking"] = False
+            if caps.no_think_prompt_prefix and "/no_think" not in (system or ""):
+                effective_system = f"/no_think\n{system}" if system else "/no_think"
+
+        create_kwargs: dict[str, Any] = {
+            "model": effective_model,
+            "messages": [
+                {"role": "system", "content": effective_system},
+                {"role": "user", "content": user},
+            ],
+            # Per-callsite cap (see :func:`call_llm_budget`). Pre-fix:
+            # unbounded → 9961-token responses (goldfive#271 demo-v8.log).
+            "max_tokens": get_max_output_tokens(),
+        }
+        if extra_body:
+            create_kwargs["extra_body"] = extra_body
+        try:
+            resp = await client.chat.completions.create(**create_kwargs)
+        except TypeError as exc:
+            # Older OpenAI client versions don't accept ``extra_body``.
+            # Retry without it — the ``/no_think`` system-prompt prefix
+            # still does its job for Qwen. Other TypeErrors are real
+            # failures; fall through.
+            if "extra_body" not in create_kwargs:
+                raise
+            log.debug(
+                "goldfive._llm: AsyncOpenAI rejected extra_body=%r (%s); retrying without it",
+                extra_body,
+                exc,
+            )
+            create_kwargs.pop("extra_body", None)
+            resp = await client.chat.completions.create(**create_kwargs)
+        try:
+            content = resp.choices[0].message.content or ""
+        except Exception:  # noqa: BLE001
+            return ""
+        # Qwen-via-litellm returns reasoning text on a sibling field
+        # (``reasoning_content``); when ``content == ""`` but reasoning
+        # is present, the model spent its budget thinking and produced
+        # no answer — the OpenAI-compatible analogue of the ADK
+        # all-thought-no-answer shape, reported as 0/1 sentinels.
+        result = str(content)
+        try:
+            reasoning_content = getattr(resp.choices[0].message, "reasoning_content", "") or ""
+        except Exception:  # noqa: BLE001
+            reasoning_content = ""
+        _note_dispatch_result(
+            transport="openai_call_llm",
+            result=result,
+            thought_count=1 if reasoning_content else 0,
+            answer_count=1 if result else 0,
+        )
+        return result
+
+    async def _close() -> None:
+        await _probe_close(client, label="openai_call_llm")
+
+    _call_llm.close = _close  # type: ignore[attr-defined]
+    return _call_llm, model_name
+
+
 __all__ = [
     "CallLLM",
     "ClosableCallLLM",
     "DEFAULT_MAX_OUTPUT_TOKENS",
+    "LLM_CALL_DIAGNOSTICS_VAR",
+    "LlmCallDiagnostics",
     "MAX_OUTPUT_TOKENS_VAR",
     "THINKING_DISABLED_VAR",
+    "THINKING_DISABLE_CAPABILITIES",
+    "ThinkingDisableCaps",
     "call_llm_budget",
     "call_llm_thinking_disabled",
     "get_max_output_tokens",
     "get_thinking_disabled",
+    "llm_call_diagnostics",
+    "make_default_adk_call_llm",
+    "make_default_openai_call_llm",
     "maybe_close_call_llm",
+    "record_llm_call_diagnostics",
+    "thinking_disable_caps",
 ]
