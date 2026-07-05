@@ -59,21 +59,24 @@ and dispatches to one of three paths:
 
 ### 1.3 Invariants the steerer enforces on any refined plan
 
-`DefaultSteerer._apply_revision` (`steerer.py:512–531`):
+`PlanReviser._apply_revision` (`goldfive/plan_reviser.py`; the
+steerer's `plans` component):
 
 - `revision_index` monotonically increases: `new_index ≥
   old_index + 1`.
 - `revision_kind` / `revision_severity` / `revision_reason` are
   stamped from the triggering drift if the planner didn't set them.
-- `session.plan` is replaced as a single atomic assignment — readers
-  in the adapter / executor see either the old plan or the new plan,
-  never a half-merged state.
+- `session.plan` is replaced atomically under the per-session plan
+  lock in `_emit_plan_revised` (goldfive#403) — readers in the
+  adapter / executor see either the old plan or the new plan, never
+  a half-merged state.
 
-**Soundness gap (open):** `Plan` has no structural validation at
-creation or revision — duplicate task IDs, edges referencing missing
-tasks, or cycles are silently accepted. `topological_stages()`
-tolerates cycles by appending un-placeable tasks to a final stage.
-See §7.
+**Structural validation (closed by #100/#105, see §7.2):**
+`Plan.validate(for_revision=..., prior=...)` runs at creation and on
+every revision — duplicate task IDs, dangling edges, and cycles are
+rejected with `ValueError` before install. `topological_stages()`
+still tolerates cycles defensively by appending un-placeable tasks
+to a final stage.
 
 ---
 

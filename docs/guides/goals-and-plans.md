@@ -355,11 +355,16 @@ See [DRIFT.md](../design/DRIFT.md) for the full kind list.
 
 ## Success predicates
 
-A `Goal` can carry an optional `success_predicate: Callable[[Session], bool]`
-that the caller or a future `Runner` can consult to decide "are we
-done yet?". In v0.1, the predicate is not auto-consulted — the
-`Runner` just carries it. Sinks and custom executors can call it; the
-contract is that the predicate is pure and cheap.
+A `Goal` can carry an optional `success_predicate: Callable[[Session], bool]`.
+Both bundled executors consult it at end-of-run: once every task is
+terminal (and no orphans remain), `evaluate_goal_predicates`
+(`goldfive/results.py`, PLAN-LIFECYCLE.md §6.1 third clause) evaluates
+every goal's predicate in order. The first predicate that returns
+`False` — or raises; a crashing predicate is never a pass — fails the
+run with `success=False` and a descriptive `reason` on the
+`ExecutionOutcome` (and a matching `RunAborted`). `None` predicates
+are vacuously met. The contract is that the predicate is pure and
+cheap.
 
 A typical use:
 
@@ -374,9 +379,11 @@ goal = Goal(
 )
 ```
 
-A future version is likely to consult the predicate between tasks and
-fire `GOAL_UNREACHABLE` drift if the plan hasn't made progress toward
-it after N tasks. For now, the mechanism is opt-in.
+There is no mid-run consultation: the predicate is only evaluated at
+the end-of-run gate. A future version may consult it between tasks
+and fire `GOAL_UNREACHABLE` drift if the plan hasn't made progress
+toward it after N tasks (the enum value exists; nothing emits it
+today).
 
 ## Tuning the LLM planner prompts
 

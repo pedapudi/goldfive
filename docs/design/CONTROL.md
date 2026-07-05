@@ -547,21 +547,23 @@ STEER / CANCEL against an offline canned-LLM planner lives at
 A STEER control message is the user-initiated entry into a broader
 intervention story. Goldfive-internal drift detectors (loop, refusal,
 goal drift, ...) enter the same pipeline via synthesized drifts, and
-both paths route through `DefaultSteerer._handle_drift` which maps
+both paths route through `DriftObserver.handle_drift` (the steerer's
+`drift` component) which maps
 `(drift_kind, severity, occurrence_count)` to one of six levels:
 
 | Level | Name | What happens |
 |---|---|---|
 | **0** | `OBSERVE` | Emit `DriftDetected`; no further action. |
 | **1** | `ABSORB` | Call `planner.refine`; install revised plan; continue. This is where USER_STEER lands. |
-| **2** | `NUDGE` | Queue a corrective user message on `session.pending_nudges`. Not on the default table today; reserved for future policies. |
+| **2** | `NUDGE` | Queue a corrective user message on `session.pending_nudges` for the overlay loop to replay at the next invocation boundary. On the default table for `LOOPING_REASONING` CRITICAL-first (goldfive#204), `GOAL_DRIFT` WARNING / CRITICAL-first (goldfive#324), and `TASK_TIMEOUT` WARNING (goldfive#487). The enqueue is gated on `is_active_steering()` (goldfive#475): under `observation_only=True` the would-be nudge is logged and a `PolicyApplied` gate event is stamped instead. |
 | **3** | `CANCEL_REINVOKE` | Refine; install revised plan; **dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel** so the executor's invoke loop cancels the in-flight invocation and restarts with a `[GOLDFIVE STEERING CONTROL …]` framed corrective. |
 | **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel** so the executor's pre-task loop blocks for user input. (Phase 2 of #246 replaced the deleted `session.paused_for_human_intervention` flag with this channel-routed signal.) |
 | **5** | `TERMINATE` | Pause-with-deadline: same dispatch as Level 4 but the payload always carries `deadline_s` (`SteeringConfig.pause_escalate_deadline_s`, or 600 s when unset). On expiry the executor cancels non-terminal tasks and emits `RunAborted` with the escalation lineage. Reached on repeat Level-4 that didn't resolve. |
 
 The per-`(drift_kind, severity)` mapping lives in
-`DefaultSteerer._LADDER` (see `goldfive/steerer.py`). A subclass can
-override `_ladder_level_for` to tune the table.
+`DriftObserver._LADDER` (see `goldfive/drift_observer.py`; the
+steerer's `drift` component). Replace the component or subclass
+`DriftObserver` and override `_ladder_level_for` to tune the table.
 
 USER_STEER specifically maps to **Level 1 (ABSORB)** at WARNING (the
 default severity) — refine runs synchronously, the revised plan
@@ -572,7 +574,7 @@ ladder into an unconditional `RunAborted`.
 
 See [DRIFT.md §"Intervention ladder (Levels 0-5)"](DRIFT.md#intervention-ladder-levels-0-5)
 for the full per-drift-kind mapping and the corresponding code
-path in `goldfive/steerer.py`.
+path in `goldfive/drift_observer.py`.
 
 ## 8. What ControlChannel is *not*
 

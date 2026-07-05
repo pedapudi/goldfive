@@ -246,12 +246,10 @@ Unlike flows A and B — which are agent-initiated approvals — flow C is
 
 Typical Level-4 triggers:
 
-- `GOAL_DRIFT` at CRITICAL (every occurrence — the trajectory LLM
-  judge says the tree is no longer advancing goals).
 - `REFINE_VALIDATION_FAILED` at CRITICAL (planner exhausted its
   retry budget; steerer deliberately does NOT re-refine to avoid an
   infinite loop).
-- `INTENT_DIVERGENCE` at CRITICAL (or at WARNING on repeat).
+- `INTENT_DIVERGENCE` at CRITICAL (first and repeat).
 - `RUNAWAY_DELEGATION` on repeat.
 - Any `CRITICAL` drift whose first-occurrence Level-3 CANCEL_REINVOKE
   didn't resolve and it repeats.

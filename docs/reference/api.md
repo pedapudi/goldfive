@@ -1165,7 +1165,7 @@ class ReportingToolSpec:
     ]
 
 
-# The seven canonical tool names (stable contract).
+# The ten canonical tool names (stable contract).
 REPORTING_TOOL_NAMES: tuple[str, ...] = (
     "report_task_started",
     "report_task_progress",
@@ -1174,13 +1174,22 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
     "report_task_blocked",
     "report_new_work_discovered",
     "report_plan_divergence",
+    "report_awaiting_approval",
+    "declare_task_skipped",
+    "declare_task_not_needed",
 )
 
 
-# Pre-built list of the seven canonical specs. ``Runner`` registers
-# these with the adapter automatically; custom adapters can consume
-# the list directly.
+# Pre-built list of the ten canonical specs. ``Runner`` registers the
+# seven-tool lifecycle subset (LIFECYCLE_REPORTING_TOOLS) with the
+# adapter automatically; the three drift self-reporting tools
+# (report_plan_divergence, declare_task_skipped,
+# declare_task_not_needed) are opt-in via
+# ``Runner(drift_self_reporting=...)``. Custom adapters can consume
+# the lists directly.
 BUILTIN_REPORTING_TOOLS: list[ReportingToolSpec]
+LIFECYCLE_REPORTING_TOOLS: list[ReportingToolSpec]
+DRIFT_SELF_REPORTING_TOOLS: list[ReportingToolSpec]
 ```
 
 See [tool-protocol.md](tool-protocol.md) for full semantics.

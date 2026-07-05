@@ -430,8 +430,12 @@ enum values and [DRIFT.md](DRIFT.md) for per-kind semantics.
 
 Every event on every sink is a proto `Event` envelope (see
 [EVENT-MODEL.md](EVENT-MODEL.md) for the envelope spec). The payload
-is a `oneof` with thirteen variants. This section lists all thirteen
-and who emits each. Factories for every kind live in `goldfive/events.py`.
+is a `oneof`; `proto/goldfive/v1/events.proto` is the authoritative
+variant list (well past thirty by now — observability payloads such
+as `SteeringDecisionMade`, `PolicyApplied`, and `JudgementEmitted`
+joined the original set). This section lists the core thirteen
+run/task/drift variants and who emits each. Factories for every kind
+live in `goldfive/events.py`.
 
 | Payload `oneof` variant | Factory | Emitter | When |
 |---|---|---|---|
