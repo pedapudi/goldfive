@@ -619,3 +619,91 @@ def test_delegation_observed_event_wire_bytes_change_only_when_tool_args_passed(
     )
     evt_with_args.emitted_at.CopyFrom(evt_empty.emitted_at)
     assert evt_empty.SerializeToString() != evt_with_args.SerializeToString()
+
+
+# ---------------------------------------------------------------------------
+# emit: fan-out isolation
+# ---------------------------------------------------------------------------
+
+
+class _RaisingSink:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def emit(self, event_pb: object) -> None:
+        self.calls += 1
+        raise RuntimeError("sink is broken")
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_emit_logs_and_swallows_sink_exceptions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising sink is logged with its class name; siblings still see
+    the event and the caller never observes the exception."""
+    import logging
+
+    from goldfive.events import emit, new_event
+    from goldfive.sinks import InMemorySink
+
+    bad = _RaisingSink()
+    good = InMemorySink()
+    evt = new_event(run_id="r1", sequence=0)
+
+    with caplog.at_level(logging.ERROR, logger="goldfive.events"):
+        await emit([bad, good], evt)
+
+    assert bad.calls == 1
+    assert [e.sequence for e in good.events] == [0]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("_RaisingSink" in m for m in messages)
+
+
+async def test_runner_survives_raising_sink() -> None:
+    """Lifecycle emits in Runner.run must not abort the turn when a
+    sink raises (documented fan-out isolation)."""
+    from goldfive import (
+        CallableAdapter,
+        InMemorySink,
+        InvocationResult,
+        Plan,
+        ReportingToolSpec,
+        Runner,
+        SequentialExecutor,
+        Session,
+        StaticPlanner,
+    )
+
+    async def agent(
+        task: Task, session: Session, tools: list[ReportingToolSpec]
+    ) -> InvocationResult:
+        return InvocationResult(task_id=task.id, text=task.title)
+
+    plan = Plan(
+        id="p",
+        run_id="",
+        goal_ids=["g1"],
+        tasks=[Task(id="t1", title="a", assignee_agent_id="worker")],
+        edges=[],
+        summary="",
+    )
+    bad = _RaisingSink()
+    good = InMemorySink()
+    runner = Runner(
+        agent=CallableAdapter(agent, available_agents=["worker"]),
+        planner=StaticPlanner(plan),
+        executor=SequentialExecutor(),
+        sinks=[bad, good],
+    )
+    outcome = await runner.run("go")
+    await runner.close()
+
+    assert outcome.success
+    assert bad.calls > 0
+    kinds = [
+        e.WhichOneof("payload") for e in good.events if hasattr(e, "DESCRIPTOR")
+    ]
+    assert "run_started" in kinds
+    assert "task_completed" in kinds
