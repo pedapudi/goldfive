@@ -1381,6 +1381,13 @@ def _choose_reasoning_text(
     return "", ""
 
 
+#: Consecutive no-reasoning text turns per agent before the one-shot
+#: reasoning-channel-disarmed WARNING fires. Three rules out a thinking
+#: model's occasional streamless turn without letting a whole run pass
+#: unnoticed.
+_NO_REASONING_WARN_STREAK: int = 3
+
+
 def _extract_function_calls(llm_response: Any) -> list[dict]:
     content = _safe_attr(llm_response, "content", None)
     if content is None:
@@ -2055,6 +2062,15 @@ def make_adk_plugin(
             # sub-Runners get their own counters.
             self._invocation_tool_calls: dict[str, int] = {}
             self._invocation_last_text: dict[str, str] = {}
+            # Reasoning-channel silent-disarm visibility (goldfive#263
+            # follow-up). Per-agent count of CONSECUTIVE LLM responses
+            # whose reasoning extraction came back empty despite a
+            # non-empty text body, plus the agents already warned about.
+            # Plugin-lifetime state — deliberately NOT cleared in
+            # :meth:`clear_active_context` so the WARNING stays one-shot
+            # per agent across dispatches on the same wrapped tree.
+            self._no_reasoning_streak: dict[str, int] = {}
+            self._no_reasoning_warned: set[str] = set()
             # AgentTool-per-invoke counter (goldfive#130). Scoped to
             # the current top-level invocation; reset in
             # :meth:`clear_active_context`. When the counter exceeds
@@ -5895,6 +5911,99 @@ def make_adk_plugin(
 
         # --- Drift observation -----------------------------------------
 
+        async def _note_reasoning_channel_signal(
+            self,
+            *,
+            ctx: SessionContext,
+            agent_name: str,
+            reasoning: str,
+            texts: list[str],
+        ) -> None:
+            """One-shot per-agent visibility for a disarmed reasoning channel.
+
+            Non-thinking models (Gemma 4, Mistral, several base-model
+            deployments) never emit a separate reasoning/thinking
+            stream, so ``observe_reasoning`` never fires and every
+            LLM-judge reasoning detector (OFF_TOPIC, GOAL_DRIFT,
+            INTENT_DIVERGENCE, LOOPING_REASONING) silently disarms for
+            the whole run — pre-fix the only trace was a DEBUG line
+            behind the opt-in fallback flag. Mirrors the judge-LLM
+            misconfiguration precedent in :func:`goldfive.wrap`: a loud
+            WARNING plus a record-only sink event naming the remedy
+            (:attr:`~goldfive.config.ReasoningDriftConfig.fallback_to_content_when_no_reasoning`).
+            The fallback is NOT auto-enabled — that behaviour change is
+            reserved for the operator.
+
+            Counting rules: a turn that fed the channel (real reasoning
+            or content-fallback) resets the per-agent streak; a turn
+            with an empty reasoning source but a non-empty text body
+            increments it; function-call-only / empty turns neither
+            count nor reset — thinking models frequently omit the
+            stream on pure tool turns, so counting them would
+            false-positive.
+            """
+            key = agent_name or "?"
+            if reasoning:
+                self._no_reasoning_streak.pop(key, None)
+                return
+            body = " ".join(t for t in texts if t).strip()
+            if not body:
+                return
+            streak = self._no_reasoning_streak.get(key, 0) + 1
+            self._no_reasoning_streak[key] = streak
+            if streak < _NO_REASONING_WARN_STREAK or key in self._no_reasoning_warned:
+                return
+            self._no_reasoning_warned.add(key)
+            log.warning(
+                "goldfive.reasoning.disarmed agent=%s — %d consecutive LLM "
+                "responses carried a text body but no reasoning/thinking "
+                "stream; the reasoning-judge detectors are receiving no "
+                "input for this agent. If the model is non-thinking, set "
+                "ReasoningDriftConfig.fallback_to_content_when_no_reasoning=True "
+                "(or GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT=1) to synthesise a "
+                "signal from the response body.",
+                key,
+                streak,
+            )
+            # Record-only sink event so operators watching the wire (not
+            # stderr) also see the disarm + remedy. ``_emit_drift_detected``
+            # is the plugin's established record-only emission path — no
+            # policy dispatch, so it is equally safe under
+            # ``observation_only``.
+            steerer = ctx.steerer if ctx is not None else None
+            session = ctx.session if ctx is not None else None
+            emit_drift = getattr(getattr(steerer, "drift", None), "_emit_drift_detected", None)
+            if emit_drift is None or session is None:
+                return
+            try:
+                from goldfive.types import (  # noqa: PLC0415 — lazy
+                    DriftEvent,
+                    DriftKind,
+                    DriftSeverity,
+                )
+
+                await emit_drift(
+                    session,
+                    DriftEvent(
+                        kind=DriftKind.CUSTOM,
+                        severity=DriftSeverity.INFO,
+                        detail=(
+                            f"reasoning_channel_disarmed: agent {key!r} produced "
+                            f"{streak} consecutive responses with a text body but "
+                            "no reasoning/thinking stream; reasoning-judge "
+                            "detectors are receiving no input. Remedy: "
+                            "ReasoningDriftConfig.fallback_to_content_when_no_reasoning=True "
+                            "(GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT=1)."
+                        ),
+                        current_agent_id=key,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_note_reasoning_channel_signal: sink emit raised: %s",
+                    exc,
+                )
+
         async def after_model_callback(self, *, callback_context: Any, llm_response: Any) -> None:
             ctx = self._resolve_ctx(callback_context)
             if ctx is None or ctx.steerer is None:
@@ -5941,6 +6050,27 @@ def make_adk_plugin(
                     joined = " ".join(texts).strip()
                     if joined:
                         self._invocation_last_text[inv_id] = joined
+            # Reasoning-channel silent-disarm visibility (goldfive#263
+            # follow-up). Runs on every model turn — including the ones
+            # where ``reasoning`` is empty and the observe_reasoning
+            # block below never fires. Best-effort: visibility must not
+            # shadow the real response path.
+            try:
+                running_agent = _safe_attr(inv_ctx, "agent", None)
+                agent_label = str(_safe_attr(running_agent, "name", "") or "") or (
+                    self._host_agent_name or ""
+                )
+                await self._note_reasoning_channel_signal(
+                    ctx=ctx,
+                    agent_name=agent_label,
+                    reasoning=reasoning,
+                    texts=texts,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "after_model_callback: reasoning-channel visibility raised: %s",
+                    exc,
+                )
             # Per-LLM-call instrumentation (goldfive#172). Pair with the
             # before_model_callback stash to compute duration, extract
             # token usage, log the result, and enrich the observation
