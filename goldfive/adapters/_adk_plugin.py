@@ -4438,6 +4438,33 @@ def make_adk_plugin(
                 )
                 return
             if drift is None:
+                # Negative class for the optimizer: the detector ran on
+                # a resolved task and passed. Runs once per observed
+                # delegation (AgentTool dispatch) — same cadence as the
+                # positive-fire path, so no aggregation needed. The
+                # earlier early-returns (no plan / no pin / import
+                # failure) deliberately do NOT emit: the detector never
+                # ran there and "no_drift" would be a false negative
+                # record. Best-effort like every observability hook.
+                emit_no_drift = getattr(
+                    getattr(steerer, "drift", None), "emit_no_drift_decision", None
+                )
+                if callable(emit_no_drift):
+                    try:
+                        await emit_no_drift(
+                            session=ctx.session,
+                            detector_name="capability_check",
+                            reason="capability check passed",
+                            task_id=str(_safe_attr(chosen_task, "id", "") or ""),
+                            agent_name=invoked_agent_name,
+                            invocation_id=invocation_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "_maybe_emit_capability_mismatch: no-drift "
+                            "decision emit failed: %s",
+                            exc,
+                        )
                 return
 
             # goldfive#245 — stamp the plan revision the detector

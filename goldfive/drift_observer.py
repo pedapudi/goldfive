@@ -370,7 +370,22 @@ class DriftObserver:
     # Drift event emission + lifecycle stamping
     # ------------------------------------------------------------------
 
-    async def _emit_drift_detected(self, session: Session, drift: DriftEvent) -> None:
+    async def _emit_drift_detected(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        *,
+        decision_outcome: str = "",
+        decision_reason: str = "",
+    ) -> None:
+        # ``decision_outcome`` / ``decision_reason`` override the paired
+        # ``SteeringDecisionMade`` outcome for callers that emit the
+        # ``DriftDetected`` for observability but DROP the drift instead
+        # of dispatching it (the freshness / in-flight gates in
+        # :meth:`handle_drift` stamp ``"drift_dropped_stale"`` /
+        # ``"drift_dropped_inflight"``). Without the override those
+        # drops would be indistinguishable from real fires
+        # (``"drift_emitted"``) in the optimizer's training set.
         # zicato-optimization-surface: record the drift on the session's
         # aggregate list BEFORE the wire emit so the in-memory
         # ``Session.drift_summary`` view stays consistent with the
@@ -447,19 +462,24 @@ class DriftObserver:
         # know at this emit site; the broader observation-only /
         # stale-verdict suppression paths are stamped from the
         # dispatch-time call sites that gate them.
-        outcome = "drift_suppressed" if drift.suppressed_by_user_steer else "drift_emitted"
-        reason = (
-            "suppressed by recent user steer"
-            if drift.suppressed_by_user_steer
-            else (drift.detail or "")
-        )
+        if decision_outcome:
+            outcome = decision_outcome
+            reason = decision_reason or (drift.detail or "")
+        elif drift.suppressed_by_user_steer:
+            outcome = "drift_suppressed"
+            reason = "suppressed by recent user steer"
+        else:
+            outcome = "drift_emitted"
+            reason = drift.detail or ""
         await self._emit_steering_decision(
             session=session,
             detector_name=self._detector_name_for_drift(drift),
             outcome=outcome,
             reason=reason,
             considered_severity=str(drift.severity),
-            chosen_severity=("" if drift.suppressed_by_user_steer else str(drift.severity)),
+            # ``chosen_severity`` stays empty whenever the drift was not
+            # actually applied — suppression AND gate drops.
+            chosen_severity=(str(drift.severity) if outcome == "drift_emitted" else ""),
             drift_id=str(getattr(drift, "id", "") or ""),
             task_id=drift.current_task_id,
             agent_name=drift.current_agent_id,
@@ -525,12 +545,19 @@ class DriftObserver:
 
     @classmethod
     def _detector_name_for_drift(cls, drift: DriftEvent) -> str:
-        """Return the symbolic detector name for a drift's kind.
+        """Return the symbolic detector name for a drift.
 
-        Falls back to the bare lowercase kind value for kinds not in
-        :data:`_DETECTOR_NAME_BY_KIND` so unfamiliar kinds still produce
-        a meaningful field rather than ``""``.
+        A ``detector_name`` stamped on the drift itself wins — the kind
+        alone cannot distinguish sources that share a kind (the
+        tool-loop tracker emits ``LOOPING_REASONING`` per #204, same as
+        the embedding detector). Falls back to
+        :data:`_DETECTOR_NAME_BY_KIND`, then to the bare lowercase kind
+        value so unfamiliar kinds still produce a meaningful field
+        rather than ``""``.
         """
+        stamped = str(getattr(drift, "detector_name", "") or "")
+        if stamped:
+            return stamped
         return cls._DETECTOR_NAME_BY_KIND.get(drift.kind, str(drift.kind))
 
     async def _emit_steering_decision(
@@ -552,10 +579,12 @@ class DriftObserver:
     ) -> None:
         """Emit a ``SteeringDecisionMade`` envelope onto every sink.
 
-        The full positive-path / suppression-path / silent-path tri-state
-        is collapsed into the ``outcome`` argument: callers stamp
-        ``"drift_emitted"``, ``"drift_suppressed"``, or ``"no_drift"``
-        and the routing is identical otherwise.
+        The full positive-path / suppression-path / silent-path /
+        drop-path split is collapsed into the ``outcome`` argument:
+        callers stamp ``"drift_emitted"``, ``"drift_suppressed"``,
+        ``"no_drift"``, ``"drift_dropped_stale"``, or
+        ``"drift_dropped_inflight"`` and the routing is identical
+        otherwise.
 
         Best-effort: if the proto stubs are unavailable (the legacy
         environment that runs the import-only smoke tests without the
@@ -3305,7 +3334,16 @@ class DriftObserver:
                 )
                 # Emit for observability so operators see the detector
                 # ran; do NOT cancel / refine on a redundant view.
-                await self._emit_drift_detected(session, drift)
+                await self._emit_drift_detected(
+                    session,
+                    drift,
+                    decision_outcome="drift_dropped_stale",
+                    decision_reason=(
+                        f"stale verdict: observed revision "
+                        f"{drift.observed_revision_index} but same "
+                        f"(kind, target) addressed at revision {last_addressed}"
+                    ),
+                )
                 return
             # goldfive#405 MEDIUM #4 — concurrent-refine race close. The
             # watermark above stamps AT THE END of a successful refine
@@ -3337,7 +3375,16 @@ class DriftObserver:
                     drift.current_task_id or "<trajectory>",
                     drift.observed_revision_index,
                 )
-                await self._emit_drift_detected(session, drift)
+                await self._emit_drift_detected(
+                    session,
+                    drift,
+                    decision_outcome="drift_dropped_inflight",
+                    decision_reason=(
+                        f"concurrent refine already in-flight for "
+                        f"(kind={drift.kind.value}, "
+                        f"target={drift.current_task_id or '<trajectory>'})"
+                    ),
+                )
                 return
             self._inflight_refine_keys.add(inflight_key)
         try:

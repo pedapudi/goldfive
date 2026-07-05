@@ -539,6 +539,7 @@ pytest.importorskip("google.adk")
 class _RecordingDrift:
     def __init__(self) -> None:
         self.drifts: list[Any] = []
+        self.no_drift_decisions: list[dict[str, Any]] = []
 
     async def observe(self, *a: Any, **kw: Any) -> None:
         pass
@@ -548,6 +549,9 @@ class _RecordingDrift:
 
     async def handle_drift(self, drift: Any, session: Any) -> None:  # noqa: ARG002
         self.drifts.append(drift)
+
+    async def emit_no_drift_decision(self, **kw: Any) -> None:
+        self.no_drift_decisions.append(kw)
 
 
 class _RecordingSteerer:
@@ -707,6 +711,8 @@ async def test_integration_capability_mismatch_flows_through_handle_drift() -> N
     assert drift.severity is DriftSeverity.CRITICAL
     assert drift.current_task_id == "t-draft"
     assert drift.current_agent_id == "underqualified"
+    # Positive fire must NOT also record a no-drift decision.
+    assert steerer.drift.no_drift_decisions == []
 
 
 async def test_integration_rule_c_dag_order_mismatch_through_pin() -> None:
@@ -870,3 +876,10 @@ async def test_integration_no_capability_mismatch_when_agent_has_leaf_tool() -> 
         f"Rule A must NOT fire when sub-agent has a leaf-capability "
         f"tool; got {capability_drifts}"
     )
+    # Negative class for the optimizer: the detector ran on a resolved
+    # task and passed, so a no-drift decision is recorded.
+    decisions = steerer.drift.no_drift_decisions
+    assert len(decisions) == 1, decisions
+    assert decisions[0]["detector_name"] == "capability_check"
+    assert decisions[0]["task_id"] == "t-draft"
+    assert decisions[0]["agent_name"] == "qualified"

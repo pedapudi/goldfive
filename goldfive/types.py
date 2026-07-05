@@ -1500,6 +1500,17 @@ class DriftEvent:
     # round-trip cannot move the cursor between observation and emit
     # without the gate noticing.
     observed_revision_index: int = 0
+    # Symbolic name of the detector that minted this drift (e.g.
+    # ``"tool_loops"``). Needed where the kind alone cannot identify
+    # the source: the tool-loop tracker deliberately emits
+    # ``LOOPING_REASONING`` (goldfive#204) — the same kind as the
+    # embedding-based reasoning-loop detector — so a kind-keyed lookup
+    # would misattribute every tool-loop fire. Consumed by
+    # :meth:`goldfive.drift_observer.DriftObserver._detector_name_for_drift`
+    # for ``SteeringDecisionMade.detector_name``; empty string falls
+    # back to the kind-keyed table so detectors whose kind IS unique
+    # need not stamp it.
+    detector_name: str = ""
 
 
 @dataclasses.dataclass
