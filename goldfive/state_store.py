@@ -891,6 +891,52 @@ def resolve_drift(
     return drift
 
 
+def resolve_drifts_matching(
+    state: MutableMapping[str, Any],
+    *,
+    task_id: str | None = None,
+    agent_ids: Iterable[str] | None = None,
+    turn_id: str | None = None,
+    kinds: Iterable[DriftKind] | None = None,
+) -> list[Drift]:
+    """Resolve every active condition matching all supplied filters.
+
+    Batch counterpart of :func:`resolve_drift`: a single read + single
+    write over the active set, so a task-terminal transition that moots
+    several conditions does not rewrite ``KEY_ACTIVE_DRIFTS`` once per
+    condition. Filters are conjunctive; a ``None`` filter matches every
+    condition, so callers must supply at least one. ``agent_ids`` /
+    ``kinds`` are membership filters (e.g. ``{"agent", ""}`` to include
+    conditions a detector opened without agent attribution).
+
+    Returns the resolved :class:`Drift` objects (``lifecycle`` set to
+    :data:`LIFECYCLE_RESOLVED`, same finalisation as
+    :func:`resolve_drift`) in active-set order; ``[]`` when nothing
+    matches.
+    """
+    agent_set = frozenset(agent_ids) if agent_ids is not None else None
+    kind_set = frozenset(kinds) if kinds is not None else None
+    active = _read_active_drifts(state)
+    resolved: list[Drift] = []
+    for cid in list(active):
+        drift = Drift.from_dict(active[cid])
+        if task_id is not None and drift.task_id != task_id:
+            continue
+        if agent_set is not None and drift.agent_id not in agent_set:
+            continue
+        if turn_id is not None and drift.turn_id != turn_id:
+            continue
+        if kind_set is not None and drift.kind not in kind_set:
+            continue
+        del active[cid]
+        drift.prev_severity = None
+        drift.lifecycle = LIFECYCLE_RESOLVED
+        resolved.append(drift)
+    if resolved:
+        _write_active_drifts(state, active)
+    return resolved
+
+
 def escalate_drift_to_human_intervention(
     state: MutableMapping[str, Any],
     condition_id: str,
@@ -1913,6 +1959,25 @@ class StateStore:
             return None
         return resolve_drift(self._state, condition_id)
 
+    def resolve_drifts_matching(
+        self,
+        *,
+        task_id: str | None = None,
+        agent_ids: Iterable[str] | None = None,
+        turn_id: str | None = None,
+        kinds: Iterable[DriftKind] | None = None,
+    ) -> list[Drift]:
+        """Batch-resolve active conditions matching the supplied filters."""
+        if not isinstance(self._state, MutableMapping):
+            return []
+        return resolve_drifts_matching(
+            self._state,
+            task_id=task_id,
+            agent_ids=agent_ids,
+            turn_id=turn_id,
+            kinds=kinds,
+        )
+
     def escalate_to_human_intervention(self, condition_id: str) -> Drift | None:
         """Mark a condition as escalated to human intervention."""
         if not isinstance(self._state, MutableMapping):
@@ -1966,6 +2031,7 @@ __all__ = [
     "record_processed_steer_id",
     "refresh_goals_summary",
     "resolve_drift",
+    "resolve_drifts_matching",
     "rotate_current_task_id",
     "set_active_steer",
     "set_current_plan",

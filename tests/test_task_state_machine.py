@@ -71,6 +71,7 @@ class _StubDrift:
         self.note_agent_activity_calls: list[dict[str, Any]] = []
         self.spawn_drift_calls: list[tuple[DriftEvent, Session]] = []
         self.goal_drift_boundary_calls: int = 0
+        self.resolve_terminal_calls: list[tuple[str, TaskStatus]] = []
 
     def note_agent_activity(
         self,
@@ -97,6 +98,11 @@ class _StubDrift:
 
     async def _maybe_run_goal_drift_on_task_boundary(self, session: Session) -> None:
         self.goal_drift_boundary_calls += 1
+
+    async def resolve_conditions_for_terminal_task(
+        self, session: Session, *, task_id: str, to_status: TaskStatus
+    ) -> None:
+        self.resolve_terminal_calls.append((task_id, to_status))
 
 
 class _StubRouter:
