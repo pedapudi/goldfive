@@ -5005,6 +5005,14 @@ def make_adk_plugin(
               :meth:`request_invocation_cancel` so subsequent callbacks
               short-circuit. The current LLM call still completes, but
               the invocation as a whole stops at the next checkpoint.
+              ACTIVE MODE ONLY — under
+              :attr:`~goldfive.config.SteeringConfig.observation_only`
+              the drift/telemetry above still fires but the cancel-flag
+              write is skipped: healthy local models can genuinely need
+              longer than the budget (see
+              :attr:`~goldfive.config.AgentConfig.call_timeout_ms`), and
+              a passive observer must not discard work the unwrapped
+              system would complete.
 
             CancelledError propagates back to the caller (the
             after_model_callback path that cancels us) so the watcher
@@ -5091,6 +5099,19 @@ def make_adk_plugin(
                         "_run_llm_call_timeout_watcher: drift emission raised: %s",
                         exc,
                     )
+            # Observation-only gate (strict-passive pattern from
+            # goldfive#254/#271): the drift above is telemetry, the
+            # cancel-flag write below is an intervention.
+            # :func:`_is_observation_only` treats a missing steerer /
+            # missing flag as passive — the fail-safe direction for a
+            # surface that cancels in-flight work.
+            if _is_observation_only(ctx):
+                log.info(
+                    "goldfive.llm.timeout invocation_id=%s observation_only=True "
+                    "— cancel-flag write skipped",
+                    invocation_id,
+                )
+                return
             # Flag the invocation for cooperative cancel so the next
             # callback (whether after_model fires first, or the next
             # before_tool / before_model on a follow-up) short-circuits.
