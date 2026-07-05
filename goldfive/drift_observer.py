@@ -3870,7 +3870,39 @@ class DriftObserver:
                 drift=drift,
                 refined_plan=session.plan,
             )
+            # Observation-only: the queued nudge would be drained by the
+            # overlay's replay path into a goldfive-authored user turn
+            # that re-invokes the tree — an injection, not an
+            # observation. Skip the enqueue but log the would-be message
+            # and stamp the gate, mirroring
+            # ``_dispatch_goldfive_steer_control``.
+            if not self._steerer._should_inject():
+                log.info(
+                    "DefaultSteerer._handle_drift: observation_only=True — "
+                    "SKIPPING post-ABSORB nudge enqueue. would_have_queued "
+                    "kind=%s task=%s body=%r",
+                    drift.kind.value,
+                    drift.current_task_id or "-",
+                    nudge_msg[:200],
+                )
+                await self._emit_policy_applied(
+                    session=session,
+                    policy_name="observation_only_gate",
+                    outcome="suppressed",
+                    reason="observation_only=True",
+                    detail=(
+                        f"intervention=post_absorb_nudge "
+                        f"kind={drift.kind.value} "
+                        f"task_id={drift.current_task_id or ''}"
+                    ),
+                )
+                return
             session.pending_nudges.append(nudge_msg)
+            # Thread the install fact to the overlay so the replay
+            # header only claims a plan revision when ``_apply_revision``
+            # actually installed one.
+            if was_installed:
+                session.pending_nudges_revision_installed = True
             log.debug(
                 "DefaultSteerer._handle_drift: queued post-ABSORB nudge for kind=%s task=%s: %s",
                 drift.kind.value,
@@ -3889,6 +3921,12 @@ class DriftObserver:
         nudge at the next invocation boundary and sends it as a gentle
         corrective user message. Until #141 lands, the queue is
         observable but inert; nothing consumes it.
+
+        Observation-only: the overlay drains the queue into a
+        goldfive-authored user turn that re-invokes the tree, so the
+        enqueue is gated on :meth:`DefaultSteerer._should_inject` like
+        the other injection points; the would-be nudge is logged and
+        the gate stamped as decision telemetry.
         """
         from goldfive.steerer import compose_corrective_user_message
 
@@ -3896,6 +3934,27 @@ class DriftObserver:
             drift=drift,
             refined_plan=session.plan,
         )
+        if not self._steerer._should_inject():
+            log.info(
+                "DefaultSteerer._dispatch_nudge: observation_only=True — "
+                "SKIPPING nudge enqueue. would_have_queued kind=%s "
+                "task=%s body=%r",
+                drift.kind.value,
+                drift.current_task_id or "-",
+                msg[:200],
+            )
+            await self._emit_policy_applied(
+                session=session,
+                policy_name="observation_only_gate",
+                outcome="suppressed",
+                reason="observation_only=True",
+                detail=(
+                    f"intervention=nudge "
+                    f"kind={drift.kind.value} "
+                    f"task_id={drift.current_task_id or ''}"
+                ),
+            )
+            return
         session.pending_nudges.append(msg)
         log.debug(
             "DefaultSteerer: queued nudge for kind=%s task=%s: %s",

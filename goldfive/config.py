@@ -605,7 +605,7 @@ class SteeringConfig:
     cancel or refine fires. Default ``3`` keeps a live operator
     override dominant across a few agent turns.
 
-    ``observation_only`` (goldfive#254) gates the three actual steering
+    ``observation_only`` (goldfive#254) gates the actual steering
     injection points on :class:`~goldfive.steerer.DefaultSteerer`:
 
     * the would-be revised plan replacing ``session.plan`` in
@@ -613,7 +613,14 @@ class SteeringConfig:
     * the ``GOLDFIVE_STEER`` ControlMessage enqueue in
       :meth:`~goldfive.steerer.DefaultSteerer._dispatch_goldfive_steer_control`;
     * the ``request_invocation_cancel`` plugin call in
-      :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`.
+      :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`;
+    * the Level 2 nudge enqueues onto ``session.pending_nudges``
+      (``_dispatch_nudge`` and the post-ABSORB handoff, goldfive#202) —
+      the overlay would otherwise drain the queue into a
+      goldfive-authored synthetic user turn and re-invoke the tree.
+      The executor's drain carries a matching defense-in-depth gate
+      (goldfive#264 pattern) for steerer subclasses that bypass the
+      dispatcher.
 
     The plan-install gate suppresses only **corrective**
     goldfive-authored revisions. Three categories always land as real

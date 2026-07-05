@@ -531,6 +531,9 @@ async def test_level_2_nudge_triggers_overlay_replay() -> None:
                 "The prior attempt looped on define_structure. Refined plan: "
                 "define (v2). Please try a different approach."
             )
+            # The real steerer records the install fact alongside the
+            # enqueue so the replay header may claim a plan revision.
+            session.pending_nudges_revision_installed = True
             return InvocationResult(task_id="", text="")
         # Second invocation (nudge replay): coordinator sees the framing
         # message, proceeds with the replacement + downstream.
@@ -696,7 +699,9 @@ async def test_absorb_on_looping_reasoning_queues_nudge() -> None:
     assert session.plan is not None
     assert session.plan.id == revised.id
     assert session.plan.revision_index == 1
-    # Nudge queued for consumption by the overlay.
+    # Nudge queued for consumption by the overlay, with the install
+    # fact threaded so the replay header may claim a plan revision.
     assert len(session.pending_nudges) == 1
     nudge = session.pending_nudges[0]
     assert "define_structure" in nudge
+    assert session.pending_nudges_revision_installed is True
