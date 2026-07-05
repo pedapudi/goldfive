@@ -750,9 +750,14 @@ class AgentConfig:
     ``max_output_tokens`` on ``llm_request.config``, that smaller value
     wins — goldfive only ratchets the cap DOWN, never up.
 
-    ``call_timeout_ms`` is the wall-clock budget per call. On expiry the
-    call cancels and an ``LLM_CALL_TIMEOUT`` drift fires (CRITICAL,
-    capacity-shaped) so the existing drift dispatch handles escalation.
+    ``call_timeout_ms`` is the wall-clock budget per call. On expiry an
+    ``LLM_CALL_TIMEOUT`` drift fires (CRITICAL, capacity-shaped) so the
+    existing drift dispatch handles escalation; in active mode
+    (``SteeringConfig.observation_only=False``) the invocation is also
+    flagged for cooperative cancel. Under ``observation_only`` (the
+    production default) the drift is telemetry-only — the in-flight
+    call is never cancelled, since healthy models can genuinely need
+    longer than the budget (see below).
     Default 120s — Qwen 35B-class models can take 60-90s on long
     prompts; operators who genuinely need longer (slow judges, weak
     hardware, multi-step research synthesis) override via env or the
