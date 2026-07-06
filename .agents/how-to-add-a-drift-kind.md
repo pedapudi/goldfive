@@ -6,13 +6,17 @@ applies-when: ["add drift kind", "new drift signal", "DriftKind enum", "drift ta
 
 # Add a new `DriftKind`
 
-Every drift signal goldfive understands is a `DriftKind` enum
-value. Adding one is a six-step walk across Python, proto, the
-classifier, the steerer, tests, and the taxonomy doc.
+> **Canonical procedure: [docs/dev-guide/16-recipes.md](../docs/dev-guide/16-recipes.md)
+> Recipe 1 (Add a DriftKind end-to-end).** This skill is the terse
+> checklist; the recipe is the full, code-verified walk (enum → proto →
+> stubs → detector → ladder row → wire → taxonomy doc). Where they
+> differ, the recipe wins. Read
+> [docs/dev-guide/17-invariants-hazards-history.md](../docs/dev-guide/17-invariants-hazards-history.md)
+> first — invariant 2 (no regex/keyword NL classifiers) binds this task.
 
-Worked example this week: #112 added `UNCERTAIN_PROGRESS` /
-`SELF_REPORTED_STUCK` for the opt-in reflective self-progress
-check. Follow its diff if the code shape below is ambiguous.
+Every drift signal goldfive understands is a `DriftKind` enum
+value. Adding one is a walk across Python, proto, a detector, the
+intervention ladder, tests, and the taxonomy doc.
 
 ## 1. Add the Python enum value
 
@@ -55,13 +59,12 @@ The Python-to-proto bridge is by name: the steerer looks up
 `SequentialExecutor._plan_divergence_drift_event`). The Python
 enum name and the proto enum suffix must match exactly.
 
-**Reserved slots 34-38.** The current highest assigned slot in
-`DriftKind` (proto) is typically in the mid-30s. Check the current
-proto file before picking a number; slots 34-38 are reserved for
-in-flight work (goldfive#181 tool-loop detector; goldfive#142
-intervention-ladder kinds; goldfive#143 `GOAL_DRIFT`). Always append
-to the end of the enum rather than filling gaps — that way two
-concurrent PRs don't collide on the same slot.
+**Next free slot.** As of #492 the highest assigned slot is
+`DRIFT_KIND_CAPABILITY_MISMATCH = 41`, so the next new kind is `42`.
+Always re-check the current maximum in `types.proto` before picking —
+never fill a gap, never reuse a retired number (e.g. `CONFUSION = 28`
+is reserved), and append at the end so two concurrent PRs don't
+collide.
 
 ## 3. Regenerate the proto stubs
 
@@ -77,11 +80,15 @@ This regenerates `goldfive/pb/goldfive/v1/types_pb2.py` and
 uv run python -c "from goldfive.pb.goldfive.v1 import types_pb2; print([n for n in dir(types_pb2) if 'DRIFT_KIND' in n])"
 ```
 
-## 4. Wire a classifier (if the detection is pattern-based)
+## 4. Wire a detector (if the detection is non-trivial)
 
-For drifts whose detection is non-trivial (pattern match, regex,
-embedding cosine, LLM call, threshold on session state), add a
-classifier helper. Two homes:
+For drifts whose detection is non-trivial add a detector helper.
+Allowed detection methods: exact-equality / hash matching of
+structured data, embedding cosine, threshold on session state, or an
+LLM classifier. **NOT allowed** (invariant 2, retired #166/#167):
+regex or keyword heuristics over natural language. If detection needs
+to read intent from prose, use an LLM judge (Recipe 3), not a pattern.
+Two homes:
 
 - **Upstream / tool-facing drifts** — `goldfive/drift/__init__.py`
   alongside `classify_tool_error`, `classify_refusal`,
@@ -105,7 +112,33 @@ For drifts that fire directly from a reporting-tool handler
 `report_task_blocked`), there's no separate classifier — the
 handler emits the `DriftEvent` inline.
 
-## 5. Wire the steerer dispatch
+## 5. Add the intervention-ladder row (NOT the steerer)
+
+The ladder moved OFF `DefaultSteerer` and onto `DriftObserver` in the
+bucket-3c refactor. Its home is
+`goldfive/drift_observer.py::DriftObserver._load_ladder_tables`, which
+populates the class attribute `_LADDER` (an
+`{InterventionLevel-tuple}` per kind). Omit the row to inherit the
+default shape; add a row only for a non-default shape. See Recipe 1
+Step 1.5 for how the 3-tuple `(info, warning, (crit_first, crit_repeat))`
+is read.
+
+**Stamp `detector_name` when the kind is shared (#480).** When you
+construct the `DriftEvent`, set `detector_name` ONLY if more than one
+detector can mint this `DriftKind` (e.g. the tool-loop tracker stamps
+`detector_name="tool_loops"` because it also emits `LOOPING_REASONING`).
+A kind with a single detector leaves it `""`. It feeds
+`SteeringDecisionMade.detector_name` in decision telemetry.
+
+**Tool-loop name-axis cap (#484).** If your detector is a tool-loop
+variant, a repeat on the *name* axis alone is capped at INFO
+(`name_axis_max_severity`, `raw["severity_capped_from"]`) unless there
+are `>=2` identical `(name, args_hash)` exact repeats. Don't promote on
+name-only repetition.
+
+**Capability-check negative class (#480).** If you extend
+`capability_check`, remember it emits a negative (no-mismatch)
+decision-telemetry class too — don't drop the negative path.
 
 `goldfive/steerer.py::DefaultSteerer.detect_drift` (for passive
 classification on adapter events) or a direct call site in the
@@ -184,11 +217,12 @@ required for the kind to function — the UI degrades gracefully.
 
 ```
 [ ] goldfive/types.py::DriftKind — enum value + comment
-[ ] proto/goldfive/v1/types.proto — DRIFT_KIND_<NAME>
-[ ] make proto — regenerate types_pb2
-[ ] goldfive/drift/__init__.py or drift/reasoning.py — classifier
-[ ] goldfive/steerer.py — detect_drift dispatch OR new public method
-[ ] tests/test_drift_taxonomy.py — enum + proto + severity
+[ ] proto/goldfive/v1/types.proto — DRIFT_KIND_<NAME> (next free slot; 42+ as of #492)
+[ ] make proto — regenerate types_pb2 (commit the stubs)
+[ ] goldfive/drift/__init__.py or drift/reasoning.py — detector (no regex/keyword NL)
+[ ] DriftEvent construction — detector_name only if kind is shared (#480)
+[ ] goldfive/drift_observer.py::_load_ladder_tables — _LADDER row (only if non-default)
+[ ] tests/test_drift_taxonomy.py — enum + proto + severity; BOTH modes for any wire action
 [ ] tests/test_drift_reasoning.py — if reasoning-channel
 [ ] docs/design/DRIFT.md — taxonomy row + optional sub-section
 [ ] CHANGELOG.md — Added / Changed entry
@@ -197,6 +231,8 @@ required for the kind to function — the UI degrades gracefully.
 
 ## Related
 
+- [docs/dev-guide/16-recipes.md](../docs/dev-guide/16-recipes.md) — **Recipe 1 (canonical, code-verified end-to-end procedure).**
+- [docs/dev-guide/07-deterministic-drift-detection.md](../docs/dev-guide/07-deterministic-drift-detection.md) / [08-llm-judges.md](../docs/dev-guide/08-llm-judges.md) — where detectors and judges live.
 - [docs/design/DRIFT.md](../docs/design/DRIFT.md) — full taxonomy + refine policy.
 - [docs/design/VOCABULARY.md §5](../docs/design/VOCABULARY.md#5-driftkind-taxonomy) — enum-value-by-enum-value reference.
 - [events.md](events.md) — proto event factories.

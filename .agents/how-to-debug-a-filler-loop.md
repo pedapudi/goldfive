@@ -208,6 +208,13 @@ wasn't.
 
 ## Related
 
+- **Deep reference:** why the guard exists and where it lives —
+  [docs/dev-guide/07-deterministic-drift-detection.md](../docs/dev-guide/07-deterministic-drift-detection.md)
+  (tool-loop detector, the #484 name-axis INFO cap, the stall
+  watchdog), [09-steering-ladder-and-gates.md](../docs/dev-guide/09-steering-ladder-and-gates.md)
+  (the ladder, the gates, and Appendix D "a drift fired but the agent
+  kept going"), and [12-events-sinks-telemetry.md](../docs/dev-guide/12-events-sinks-telemetry.md)
+  (reading the event stream / decision telemetry to see what fired).
 - [docs/guides/common-failure-modes.md](../docs/guides/common-failure-modes.md) — each failure mode in detail with its recovery path.
 - [docs/design/TASK-LIFECYCLE.md §5](../docs/design/TASK-LIFECYCLE.md) — the four guard layers and their ordering.
 - [docs/design/TASK-LIFECYCLE.md §7.3 / §7.4](../docs/design/TASK-LIFECYCLE.md) — refine-failure threshold and ADK session heal.
