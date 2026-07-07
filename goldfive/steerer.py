@@ -1416,15 +1416,20 @@ class DefaultSteerer:
 
     @staticmethod
     def _drift_kind_pb_value(kind: DriftKind) -> int:
-        from goldfive.pb.goldfive.v1 import types_pb2
+        # Delegate to the shared by-name bridge in goldfive.events so the
+        # steerer's primary DriftObserver emit path and the events.py
+        # factories (drift_detected_event / plan_revised_event) resolve the
+        # proto enum through ONE implementation and can never re-diverge.
+        # Unknown kinds fall back to DRIFT_KIND_CUSTOM here (historical
+        # steerer behavior); the factories fall back to UNSPECIFIED. Lazy
+        # import — events.py never imports steerer at module load.
+        from goldfive.events import _drift_kind_pb_value as _bridge
 
-        name = f"DRIFT_KIND_{kind.name}"
-        return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_KIND_CUSTOM", 0))
+        return _bridge(kind, unknown_member="CUSTOM")
 
     @staticmethod
     def _drift_severity_pb_value(severity: DriftSeverity) -> int:
-        from goldfive.pb.goldfive.v1 import types_pb2
+        from goldfive.events import _drift_severity_pb_value as _bridge
 
-        name = f"DRIFT_SEVERITY_{severity.name}"
-        return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_SEVERITY_UNSPECIFIED", 0))
+        return _bridge(severity)
 
