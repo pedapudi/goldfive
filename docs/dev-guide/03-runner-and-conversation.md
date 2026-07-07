@@ -834,7 +834,7 @@ ExecutionOutcome(success=<bool>, session=<the live Session>, reason=<str>)
 
 `close()` (gated on `self._closed`) does, in order:
 1. For every announced per-session Conversation: run the **orphan-PENDING audit** (`_audit_conversation_pending_at_close`, #212) — at conversation end there is no next turn, so any still-PENDING task is by definition orphaned; it transitions each to `CANCELLED` with `cancel_reason="conversation_ended:no_engaging_turn"` (idempotent — `mark_task_cancelled` no-ops on terminal tasks). Then emit `ConversationEnded`.
-2. `steerer.shutdown()` (duck-typed) — drain background reasoning-judge tasks (#251), bounded so a hung judge doesn't stall close.
+2. `getattr(self.steerer, "shutdown", None)` (duck-typed) — called only if the steerer exposes a top-level `shutdown`. **`DefaultSteerer` does not** (the drain lives on `DriftObserver`, reached as `steerer.drift.shutdown()`), so for the default steerer this step is a **no-op**; it is a cleanup hook for custom steerers. The background reasoning-judge tasks (#251) are actually drained at every run boundary by the executor's `_drain_steerer_at_run_boundary` (`goldfive/executors/sequential.py`), not at `close`.
 3. `sink.close()` for every sink.
 4. `maybe_close_call_llm` on `planner._call_llm` and `goal_deriver._call_llm` — standard SDK clients own aiohttp sessions that leak unless closed.
 5. Registered close hooks (via `add_close_hook`), in registration order, AFTER sinks. A raising hook is logged and does not block subsequent hooks.
@@ -915,7 +915,7 @@ When you see a `#NNN` comment in `runner.py` / `conversation.py` and need to kno
 | #212 | Close-time orphan-PENDING audit (`conversation_ended:no_engaging_turn`). | §7.4 |
 | #217 | `goal_drift_enabled=True` with no callable → warn, don't raise (mock runners construct). | §2.3 |
 | #247 | `Plan` frozen; all installs via `dataclasses.replace` + `channel_processor_active`. | §4 Phase 3a, §5b |
-| #251 | Background reasoning-judge tasks drained via `steerer.shutdown()` on close. | §7.4 |
+| #251 | Background reasoning-judge tasks drained at run boundaries via `_drain_steerer_at_run_boundary` (executor); `close`'s duck-typed `getattr(steerer,"shutdown")` is a no-op for `DefaultSteerer`. | §7.4 |
 | #271 Phase 4 | `planner.handle_turn` collapses the gate-then-refine pipeline into one LLM call. | §4 Phase 4a |
 | #271 Gap 1 | Prior-plan stash moved into the Phase-7 `finally` to survive `CancelledError`. | §4 Phase 7, §6.3 |
 | #271 Gap 2 | Conversation-level `_next_sequence` cursor keeps wire sequence collision-free under the pin. | §6.4 |
