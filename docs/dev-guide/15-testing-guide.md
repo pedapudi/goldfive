@@ -348,7 +348,8 @@ def _stub_call_llm(responses: list[Any]):
         if isinstance(resp, Exception):
             raise resp
         ...
-    return _call_llm, calls
+    _call_llm.calls = calls  # type: ignore[attr-defined]  # recorded calls attached as an attribute
+    return _call_llm
 ```
 
 Use the inline recording form when you must assert on the exact `system`/`user` prompt the component sent to the judge (prompt-shape regressions). Use `CannedCallLLM` (below) when you want the same recording + reset/inspection API as a reusable object.
@@ -565,7 +566,7 @@ Before writing a new test, open the closest existing one and copy its stub shape
 ### An LLM judge (reasoning / goal-drift classifier)
 
 - **Stub:** `call_llm` via the inline recording stub (`_stub_call_llm`) or `CannedCallLLM`. Feed the judge's verdict as a canned response.
-- **Drive:** call the classifier (`classify_goal_drift`, the reasoning judge) or drive `DefaultSteerer.note_agent_turn` / `mark_task_*`.
+- **Drive:** call the classifier (`classify_goal_drift`, the reasoning judge) or drive `steerer.drift.note_agent_turn` / `steerer.tasks.mark_task_*`.
 - **CRITICAL — drain background judges before asserting.** Goal-drift and reasoning judges are fire-and-forget tasks on `DefaultSteerer._background_judges` (#251/#319/v22). After `await note_agent_turn(...)` the judge has NOT run yet. Drain first:
 
   ```python
@@ -728,7 +729,7 @@ assert ledger["emitted_late"] == 1
 assert ledger["acted_on"] == 0
 ```
 
-The teardown summary event is emitted by `shutdown()` — after `await steerer.shutdown()` (or the runner close path) assert `steerer.drift._verdict_ledgers == {}` (flushed and cleared). A redundant verdict at the `handle_drift` gates increments `emitted_redundant`; a parse failure increments `parse_fail`. The `wrap()`-time endpoint-contention warning is a separate assertion: `test_wrap_warning_names_shared_endpoint_cost` asserts exactly one shared-endpoint WARNING log record fires when the judge and agent share an endpoint, and `test_wrap_warning_suppressed_when_call_llm_explicit` asserts it is suppressed when the operator supplied `call_llm=` explicitly. (This is one of the few sanctioned `caplog` assertions — the warning IS the contract.)
+The teardown summary event is emitted by `shutdown()` — after `await steerer.drift.shutdown()` (or the runner close path) assert `steerer.drift._verdict_ledgers == {}` (flushed and cleared). A redundant verdict at the `handle_drift` gates increments `emitted_redundant`; a parse failure increments `parse_fail`. The `wrap()`-time endpoint-contention warning is a separate assertion: `test_wrap_warning_names_shared_endpoint_cost` asserts exactly one shared-endpoint WARNING log record fires when the judge and agent share an endpoint, and `test_wrap_warning_suppressed_when_call_llm_explicit` asserts it is suppressed when the operator supplied `call_llm=` explicitly. (This is one of the few sanctioned `caplog` assertions — the warning IS the contract.)
 
 ---
 
@@ -906,7 +907,7 @@ The mistakes a weak model makes here: forgetting the drain, forgetting active mo
 
 ```python
 async def test_goal_drift_critical_routes_to_refine(active_steering_config) -> None:
-    call_llm, calls = _stub_call_llm([
+    call_llm = _stub_call_llm([
         {"off_goal": True, "reason": "coordinator abandoned the goal"},  # judge verdict
     ])
     sink = ListSink()
@@ -918,7 +919,7 @@ async def test_goal_drift_critical_routes_to_refine(active_steering_config) -> N
     steerer.bind(sinks=[sink], planner=planner)
     session = _session_with_plan()
 
-    await steerer.note_agent_turn(session)            # spawns a background judge (fire-and-forget)
+    await steerer.drift.note_agent_turn(session)      # spawns a background judge (fire-and-forget)
     await _drain_background_judges(steerer)           # <-- MUST drain before asserting
 
     drifts = [e for e in sink.events
@@ -926,7 +927,7 @@ async def test_goal_drift_critical_routes_to_refine(active_steering_config) -> N
               and e.drift_detected.kind == DriftKind.GOAL_DRIFT]
     assert drifts, "goal-drift judge verdict never produced a drift"
     assert planner.refine_calls, "CRITICAL goal drift must route to refine in active mode"
-    assert len(calls) == 1, "judge must be called at most once per check"
+    assert len(call_llm.calls) == 1, "judge must be called at most once per check"
 ```
 
 Then write the passive twin: same setup with `SteeringConfig(observation_only=True)`, assert the drift still emits but `planner.refine_calls` reflects only the passive `refine`/`refine_steer` behavior the gate permits (check `tests/test_goldfive_drift_routing.py` for exactly which planner method still runs passively — `refine_steer` does, the control-message enqueue does not).
@@ -939,20 +940,28 @@ Then write the passive twin: same setup with `SteeringConfig(observation_only=Tr
 def test_name_only_loop_caps_at_info() -> None:
     tracker = ToolLoopTracker()                       # defaults; verify ctor in goldfive/drift/...
     # five same-NAME calls, DISTINCT args -> no exact-repeat corroboration
-    drift = None
+    drifts: list[DriftEvent] = []
     for i in range(5):
-        drift = tracker.observe("search", {"q": f"query-{i}"})
-    assert drift is not None
-    assert drift.severity == DriftSeverity.INFO                  # capped
+        drifts = tracker.observe_tool_call(           # keyword-only; returns list[DriftEvent]
+            invocation_id="inv", agent_name="a", tool_name="search",
+            args={"q": f"query-{i}"},
+        )
+    assert drifts, "final call should surface a name-axis loop drift"
+    drift = drifts[-1]                                            # observe_tool_call returns a list
+    assert drift.severity is DriftSeverity.INFO                  # capped
     assert drift.raw.get("severity_capped_from") is not None     # audit trail
-    assert drift.raw.get("mode") in {"name", "name_axis"}        # verify exact key against source
+    assert drift.raw.get("mode") == "name"                       # name-axis mode value is "name"
 
 def test_exact_repeat_promotes_to_warning() -> None:
     tracker = ToolLoopTracker()
-    drift = None
+    drifts: list[DriftEvent] = []
     for _ in range(3):                                 # >=2 identical (name, args_hash)
-        drift = tracker.observe("search", {"q": "same"})
-    assert drift.severity == DriftSeverity.WARNING
+        drifts = tracker.observe_tool_call(
+            invocation_id="inv", agent_name="a", tool_name="search",
+            args={"q": "same"},
+        )
+    drift = drifts[-1]
+    assert drift.severity is DriftSeverity.WARNING
     assert drift.raw.get("mode") == "exact"
     assert "tool_loop_exact" in drift.detail
 ```
@@ -969,7 +978,7 @@ DO assert:
 - the **presence and payload of the load-bearing event** (`WhichOneof("payload") == "drift_detected"`, `payload.outcome == "suppressed"`);
 - the **state transition taken** (task status, `planner.refine_calls`, `session.pending_nudges`);
 - the **negative** where the whole point is suppression (channel empty, no re-invoke, handler not called);
-- **counts** where "at most once" is the contract (`len(calls) == 1`).
+- **counts** where "at most once" is the contract (`len(call_llm.calls) == 1`).
 
 DON'T assert:
 - exact free-text of a `detail` string (assert a substring that IS the contract, e.g. `"tool_loop_exact" in drift.detail`, not the whole sentence);

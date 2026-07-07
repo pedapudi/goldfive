@@ -654,8 +654,8 @@ quiet" is indistinguishable from "detector never ran".
 | `"no_drift"` | Detector ran, decided not to fire. Negative class. | `emit_no_drift_decision` |
 | `"drift_emitted"` | Detector fired AND the steerer dispatched it. Paired `DriftDetected` on the wire. | `_emit_drift_detected` (default branch) |
 | `"drift_suppressed"` | Detector fired but the steerer suppressed the dispatch (a fresher user-steer was active). Paired `DriftDetected` still emitted with `suppressed_by_user_steer=true`. | `_emit_drift_detected` (suppression branch) |
-| `"drift_dropped_stale"` | Verdict landed against a plan revision the system has already moved past (the redundant-verdict watermark, `#480`). Observability-only; no cancel/refine. | `_handle_drift` redundant-verdict gate → `_emit_drift_detected(decision_outcome="drift_dropped_stale")` |
-| `"drift_dropped_inflight"` | A concurrent refine for the same `(kind, target)` is already in flight (`#480`). Observability-only. | `_handle_drift` in-flight-key gate → `_emit_drift_detected(decision_outcome="drift_dropped_inflight")` |
+| `"drift_dropped_stale"` | Verdict landed against a plan revision the system has already moved past (the redundant-verdict watermark, `#480`). Observability-only; no cancel/refine. | `handle_drift` redundant-verdict gate → `_emit_drift_detected(decision_outcome="drift_dropped_stale")` |
+| `"drift_dropped_inflight"` | A concurrent refine for the same `(kind, target)` is already in flight (`#480`). Observability-only. | `handle_drift` in-flight-key gate → `_emit_drift_detected(decision_outcome="drift_dropped_inflight")` |
 
 **Full field table** (from `events.proto` and `steering_decision_made_event`):
 
@@ -681,7 +681,7 @@ mechanism is the `decision_outcome` / `decision_reason` kwargs on
 `_emit_drift_detected`:
 
 ```python
-# goldfive/drift_observer.py — _handle_drift stale-verdict gate (excerpt)
+# goldfive/drift_observer.py — handle_drift stale-verdict gate (excerpt)
 self._verdict_ledger(session)["emitted_redundant"] += 1
 await self._emit_drift_detected(
     session, drift,

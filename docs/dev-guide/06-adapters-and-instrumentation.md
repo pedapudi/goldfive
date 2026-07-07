@@ -384,7 +384,10 @@ benign stops are returned in the `InvocationResult`.
 
 `render_system_prompt` uses a plain `str.format` template
 (`DEFAULT_SYSTEM_PROMPT_TEMPLATE`) with four required placeholders:
-`{goal_block}`, `{task_block}`, `{plan_summary}`, `{completed}`. A
+`{goal_block}`, `{task_block}`, `{plan_summary}`, `{completed_block}`.
+(Note: the *parameter* is named `completed`, but the template placeholder
+is `{completed_block}` — the `.format(...)` call supplies
+`completed_block=_format_completed_block(completed)`, never `completed=`.) A
 `KeyError` from `str.format` surfaces unchanged so template bugs are loud,
 not silent. Callers override with `system_prompt_template=`.
 

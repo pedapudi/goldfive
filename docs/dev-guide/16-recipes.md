@@ -65,9 +65,11 @@ adapt any skeleton:
    `SteeringConfig.observation_only` or `DefaultSteerer._observation_only`
    directly from a new call site.
 6. **Lifecycle gates need stable identity keys.** Never key a gate, cooldown,
-   or dedupe set on an LLM-minted or churning id. Use
-   `DriftEvent.condition_id`, the full agent path, `(kind, task_id)`, or a
-   content hash.
+   or dedupe set on an LLM-minted or churning id. Use the emit-time
+   `state_store.compute_condition_id(...)` value, the full agent path,
+   `(kind, task_id)`, or a content hash. (`condition_id` is computed at emit
+   and stamped on the proto `DriftDetected` — it is not a `DriftEvent`
+   attribute.)
 
 Cross-references: the ladder itself is `09-steering-ladder-and-gates.md`;
 detectors are `07-deterministic-drift-detection.md`; judges are
@@ -141,12 +143,17 @@ collide.
   DRIFT_KIND_MY_NEW_DRIFT = 42;
 ```
 
-**The Python↔proto bridge is by name.** The emit path does
-`getattr(types_pb2, f"DRIFT_KIND_{kind.name}")` and the reverse via
-`pb.DriftKind.Value(...)` (see `drift_detected_event` in
-`goldfive/events.py`, line ~1197). The proto suffix **must** equal the Python
-enum member name exactly: `MY_NEW_DRIFT` ↔ `DRIFT_KIND_MY_NEW_DRIFT`. A
-mismatch silently drops the kind to `UNSPECIFIED` on the wire.
+**The Python↔proto bridge is by name.** The emit path resolves the proto
+value by name via `getattr(types_pb2, f"DRIFT_KIND_{kind.name}")` — see
+`DefaultSteerer._drift_kind_pb_value` in `goldfive/steerer.py`, used on the
+real `DriftDetected` emit at `DriftObserver._emit_drift_detected`
+(`goldfive/drift_observer.py:484`). Deserialisation is the reverse via
+`pb.DriftKind.Value("DRIFT_KIND_" + name)`. The proto suffix **must** equal the
+Python enum member name exactly: `MY_NEW_DRIFT` ↔ `DRIFT_KIND_MY_NEW_DRIFT`. A
+mismatch silently drops the kind to `UNSPECIFIED` on the wire. (Do **not** copy
+the mechanism from the `drift_detected_event()` factory in
+`goldfive/events.py` — it calls `pb.DriftKind.Value(str(drift.kind).upper())`
+without the `DRIFT_KIND_` prefix, so it drops the kind to `UNSPECIFIED`.)
 
 If you are retiring a value instead of adding one, follow the `CONFUSION`
 pattern (line ~120 of `types.proto`): a comment naming the retired value, a
@@ -209,11 +216,14 @@ DriftEvent(
 )
 ```
 
-- `id` (a UUID4) and `condition_id` are stamped automatically — do **not**
-  set them by hand. `condition_id` is
-  `sha1(f"{kind.value}|{task_id}|{agent_id}|{turn_id}")[:16]` — a **stable
-  lifecycle key** (invariant 6). If you need a gate keyed on "this logical
-  drift", key it on `condition_id`, never on `id`.
+- Only `id` (a UUID4) is stamped automatically on the `DriftEvent` dataclass —
+  do **not** set it by hand. `condition_id` is **not** a `DriftEvent`
+  attribute; it is computed at emit time by
+  `state_store.compute_condition_id(...)`
+  (= `sha1(f"{kind.value}|{task_id}|{agent_id}|{turn_id}")[:16]`) and stamped
+  on the proto `DriftDetected` (field 12) — a **stable lifecycle key**
+  (invariant 6). If you need a gate keyed on "this logical drift", compute it
+  via `compute_condition_id(...)`, never off `drift.id`.
 - `detector_name` is only needed when the same `DriftKind` is minted by more
   than one detector. The tool-loop tracker deliberately emits
   `LOOPING_REASONING` (same kind as the embedding reasoning-loop detector),
@@ -304,9 +314,15 @@ Add to `tests/test_drift_taxonomy.py` (the canonical home):
   is `"my_new_drift"`.
 - `test_my_new_drift_proto_mirror` — `types_pb2.DriftKind.Value("DRIFT_KIND_MY_NEW_DRIFT")`
   is non-zero and equals the number you assigned.
-- `test_my_new_drift_severity_roundtrips` — build a `DriftEvent(kind=...,
-  severity=WARNING)`, run it through `drift_detected_event(...)`, and assert
-  the proto `kind`/`severity` did not collapse to `UNSPECIFIED`.
+- `test_my_new_drift_severity_roundtrips` — assert the by-name bridge
+  directly (the path used for real emission):
+  `assert types_pb2.DriftKind.Value("DRIFT_KIND_" + DriftKind.MY_NEW_DRIFT.name) != 0`
+  and the `DriftSeverity` twin. Do **not** route this through
+  `drift_detected_event()`: that factory does **not** round-trip kind/severity
+  (it swallows the `ValueError` and leaves them `UNSPECIFIED`). The real
+  stamping is `DefaultSteerer._drift_kind_pb_value` /
+  `_drift_severity_pb_value`, invoked from `DriftObserver` at
+  `drift_observer.py:484`.
 
 Add to `tests/test_intervention_ladder.py`:
 

@@ -86,7 +86,7 @@ A weak model's most common runner bug is emitting a lifecycle event from the wro
 | `RunCompleted` / terminal `RunAborted` | Executor | `SequentialExecutor` / `ParallelDAGExecutor` at their own state-machine end. |
 | `DriftDetected`, `Task*` transitions | Steerer | see 07/08/09. |
 
-> **The `PlanSubmitted` gotcha.** The `runner.py` module docstring lists `PlanSubmitted` as a Runner-owned event. **The code disagrees, and the code wins.** `plan_submitted_event` (in `goldfive/events.py`) is *not emitted by any live dispatch path* on main — grep confirms it appears only in the factory definition, `sinks/persistence.py` (reconstruction), and `state_store.py`. The **initial** plan install emits `PlanRevised` with `revision_index = 1` via `PlanReviser.install_initial_plan` (`goldfive/plan_reviser.py`), *not* `PlanSubmitted`. Treat `PlanSubmitted` as a legacy/reconstruction-only envelope. If you are looking for "where the first plan is announced," it is `PlanRevised` rev 1. (Caveat logged.)
+> **The `PlanSubmitted` gotcha.** The `runner.py` module docstring lists `PlanSubmitted` as a Runner-owned event. **The code disagrees, and the code wins.** `plan_submitted_event` (in `goldfive/events.py`) is *not emitted by any live dispatch path* on main — the factory symbol appears only in its own definition in `events.py`. The `plan_submitted` *payload* is still handled on the reconstruction side (`sinks/persistence.py`, referenced in `state_store.py`), but nothing on main calls the factory to emit it. The **initial** plan install emits `PlanRevised` with `revision_index = 1` via `PlanReviser.install_initial_plan` (`goldfive/plan_reviser.py`), *not* `PlanSubmitted`. Treat `PlanSubmitted` as a legacy/reconstruction-only envelope. If you are looking for "where the first plan is announced," it is `PlanRevised` rev 1. (Caveat logged.)
 
 ### 1.2 conv.py is NOT conversation state
 
@@ -1095,8 +1095,10 @@ ruff check .              # MUST stay clean; do NOT ruff-format (repo is not for
 # There must be exactly 8 _abort_turn call sites + 1 definition (= 9 matches):
 grep -n "_abort_turn" goldfive/runner.py | wc -l    # expect 9
 
-# The Runner must NOT read the kill-switch directly. This should return NOTHING:
-grep -n "observation_only" goldfive/runner.py
+# The Runner must NOT *read* the kill-switch directly. The only matches must be
+# comments/docstrings — there must be NO code that reads it:
+grep -nE "self\._observation_only|steering_config\.observation_only|if .*\bobservation_only\b" goldfive/runner.py   # expect NOTHING
+# (a plain `grep observation_only goldfive/runner.py` returns 3 comment-only lines — expected, not a violation)
 
 # Every plan install in runner.py must be under channel_processor_active:
 grep -n "set_session_plan\|channel_processor_active" goldfive/runner.py

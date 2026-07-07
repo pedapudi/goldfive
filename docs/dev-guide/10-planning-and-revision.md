@@ -114,7 +114,7 @@ script the framework executes. This is why `Task.assignee_agent_id` is
 |--------|-------------|------|
 | `Runner._handle_turn_via_planner` (`runner.py`) | `planner.handle_turn(...)` | Every conversational turn — the single per-turn decision point (`#271` Phase 4). |
 | `Runner` first-turn path | `planner.generate(...)` | Legacy / goal-list entry — produces the initial plan when the caller passes `list[Goal]` and `handle_turn` did not produce one. |
-| `DefaultSteerer._handle_drift` (`drift_observer.py`) | `planner.refine(...)` | Autonomous / user drift the ladder routed to ABSORB / CANCEL_REINVOKE. |
+| `DriftObserver._handle_drift_dispatch` (`drift_observer.py`, reached via `steerer.drift`) | `planner.refine(...)` | Autonomous / user drift the ladder routed to ABSORB / CANCEL_REINVOKE. |
 | `DefaultSteerer._promote_drift_to_steer` | `planner.refine_steer(...)` | A goldfive-detected drift cleared the steer threshold + suppression window. |
 | `ParallelDAGExecutor._refine` (`executors/parallel.py`) | `planner.refine(...)` | The parallel executor's own drift-driven refine fallback. |
 
@@ -342,7 +342,7 @@ def set_session_plan(session: Session, plan: Plan | None) -> None: ...
 outside a `channel_processor_active()` region logs a WARNING (production) or
 raises `PlanOwnershipViolation` under `GOLDFIVE_STRICT_STATE_OWNERSHIP=1`
 (default-on under pytest). The channel processor — the steerer's
-`_handle_drift` / `_apply_revision` / the executor install paths — is the sole
+`_handle_drift_dispatch` / `_apply_revision` / the executor install paths — is the sole
 owner. Sinks and judges **read** `session.plan` and never write. See
 `11-state-ownership.md` for the full ownership map.
 
@@ -396,7 +396,7 @@ retry-style task ids (`retry_X` → `X`) that the LLM forgot to declare, and
 `PlanReviser._integrate_correction_supersedes(revised)` rewires the DAG for
 CORRECT-kind links (keeps old, inserts new as child).
 `_repin_current_task_on_supersedes` re-pins `session.current_task_id` onto the
-replacement. `DefaultSteerer._emit_plan_revised` calls both, then calls the
+replacement. `PlanReviser._emit_plan_revised` calls both, then calls the
 correction write-side (§9).
 
 ### 3.4 Assignees are observational (`#252`)
@@ -698,7 +698,7 @@ def _planner_refine_accepts_available_agents(planner: Any) -> bool:
     return False
 ```
 
-`DefaultSteerer._handle_drift` calls this and branches: when `True` it calls
+`DriftObserver._handle_drift_dispatch` calls this and branches: when `True` it calls
 `refine(plan=, drift=, goals=, available_agents=)`, otherwise the legacy
 `refine(plan=, drift=, goals=)`. The same helper gates the parallel-executor
 refine path. **Do not remove the probe** — it is what keeps the `#151` kwarg
@@ -1268,7 +1268,7 @@ produce the same key.
 
 ### 9.3 `queue_corrections_for_revision`
 
-Called from `DefaultSteerer._emit_plan_revised` right after
+Called from `PlanReviser._emit_plan_revised` right after
 `_integrate_correction_supersedes` rewired the DAG. For every new task with
 `supersedes_kind == CORRECT`:
 

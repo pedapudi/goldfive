@@ -42,7 +42,7 @@ the chapter that owns the deep dive.
 | `goldfive/reconciler.py` | `PlanReconciler` observation→task transitions | `10` |
 | `goldfive/steerer.py` | `DefaultSteerer` facade, `InterventionLevel`, ladder tables | `09` |
 | `goldfive/drift_observer.py` | `DriftObserver` (`observe`, `observe_reasoning`, `handle_drift`) | `07`, `08`, `09` |
-| `goldfive/plan_reviser.py` | `PlanReviser` (`refine`, `_apply_revision`, `PlanRevised`) | `10` |
+| `goldfive/plan_reviser.py` | `PlanReviser` (`_apply_revision`, `observe_refine`, `PlanRevised` emission) | `10` |
 | `goldfive/task_state_machine.py` | `TaskStateMachine` (`mark_task_*`, cascade cancel) | `11` |
 | `goldfive/protocols.py` | the five `Protocol` seams | this chapter (§ contract table) |
 | `goldfive/events.py` | `new_event` / `emit` fan-out | `12` |
@@ -152,8 +152,8 @@ work is `asyncio.create_task`, tracked in sets, and drained at the run boundary.
                           │                   │  (all injection gated on
                           │                   │   is_active_steering())
                           │                   ▼
-                          │        PlanReviser.refine + _apply_revision
-                          │        [plan_reviser.py]  → GOLDFIVE_STEER control msg
+                          │        Planner.refine → PlanReviser._apply_revision
+                          │        [planner.py + plan_reviser.py]  → GOLDFIVE_STEER control msg
                           │                   │
                           └─────────┬─────────┘
                                     ▼
@@ -753,9 +753,13 @@ Idempotent (`self._closed`). In order:
 
 1. For every announced `Conversation` slot: `_audit_conversation_pending_at_close`
    cancels orphan PENDING tasks (goldfive#212), then `ConversationEnded` is emitted.
-2. `steerer.shutdown()` (`drift_observer.py:2438`) — drains remaining background
-   judge/drift tasks (bounded, default 5.0s) and flushes any verdict ledger whose
-   session never hit a run boundary.
+2. `steerer.drift.shutdown()` (`DriftObserver.shutdown`, `drift_observer.py:2438`) —
+   drains remaining background judge/drift tasks (bounded, default 5.0s) and flushes
+   any verdict ledger whose session never hit a run boundary. `runner.close` reaches
+   it via a duck-typed `getattr(self.steerer, "shutdown", None)`; because
+   `DefaultSteerer` exposes no top-level `shutdown`, on the default path this step is
+   currently a no-op and the effective drain is the per-run
+   `steerer.drift.drain_session_background_tasks` (§4.1).
 3. Every sink's `close()` (exceptions logged, never fatal).
 4. `maybe_close_call_llm` on `planner._call_llm` and `goal_deriver._call_llm` (SDK
    clients own aiohttp sessions that leak otherwise).
@@ -957,7 +961,7 @@ you edit a consumer, it tells you what you must tolerate. Protocol seams are in
 | adapter plugin → `Steerer.drift` | `observe(observation, session)` | async | `ctx.steerer` may be `None` (callback returns) | `_adk_plugin.py:6589` |
 | adapter plugin → `Steerer.drift` | `observe_reasoning(text, *, task?, session, provider?, agent_name?)` | async | `task` may be `None`; empty `text` no-ops | schedules bg judge |
 | adapter plugin → `PlanReconciler` | `on_before_agent` / `on_after_agent` / `on_delegation_observed` | async | reconciler may be `None` in some paths | adaptive task transitions |
-| `DriftObserver` → `Steerer.plans` | `refine` → `_apply_revision` → `_emit_plan_revised` | async | `planner`/`session.plan` `None` ⇒ early return | mutation gated by `is_active_steering` |
+| `DriftObserver` → `Planner.refine` → `Steerer.plans` | `planner.refine(...)` → `_apply_revision` → `_emit_plan_revised` (refine is the Planner's; `PlanReviser` applies the revision) | async | `planner`/`session.plan` `None` ⇒ early return | mutation gated by `is_active_steering` |
 | `DriftObserver` → `Steerer.tasks` | `transition` → `mark_task_*` | async | — | single writer via `channel_processor_active` |
 | any → `is_active_steering()` | `DefaultSteerer.is_active_steering()` | sync | consumers holding maybe-steerer use `steering_is_active(steerer)` | `None`/raising ⇒ `False` |
 | any → sinks | `events.emit(sinks, event_pb)` | async | empty list no-ops | one sink raising ≠ run abort |
@@ -1157,13 +1161,17 @@ Run these after touching any hop on the spine. Commands assume repo root
    ```
    uv run pytest -q tests/ -k "handle_drift or ladder or observation_only or judge_semaphore or coalesc"
    ```
-7. **The `observation_only` invariant** — confirm no consumer reads the private
-   flag; there should be exactly one hit (inside `is_active_steering`):
+7. **The `observation_only` invariant** — confirm no consumer reads the bare
+   attribute directly. Use a word-boundary grep for the attribute access:
    ```
-   grep -rn "_observation_only" goldfive/ | grep -v "def is_active_steering"
+   grep -rn "\._observation_only\b" goldfive/ | grep -v test
    ```
-   Any hit outside `steerer.py:is_active_steering` is a bug — route it through
-   `is_active_steering()` / `steering_is_active(steerer)`.
+   Expect exactly two hits in `steerer.py`: the assignment in `__init__` and the
+   read inside `is_active_steering` (`steerer.py:1370`). Any OTHER
+   `._observation_only` attribute read is a bug — route it through
+   `is_active_steering()` / `steering_is_active(steerer)`. (The helper names
+   `_is_observation_only` / `_observation_only_active` are correct delegators, not
+   violations.)
 8. **Background-task naming** — every `create_task` on the drift path must carry the
    session-id suffix:
    ```

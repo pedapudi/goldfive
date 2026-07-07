@@ -161,7 +161,7 @@ Every environment variable goldfive reads, in one place. The "Owner" column tell
 | `GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL` | §14 | `"1"`/else | off | inline `== "1"` |
 | `GOLDFIVE_STRICT_STATE_OWNERSHIP` | §14 | tri-state | auto (on under pytest) | inline |
 
-That is the complete list — 38 environment variables. The `_read_*` readers all live in `goldfive/config.py`; `_read_severity_env` lives in `goldfive/drift/tool_loops.py`; the "inline" readers are the four documented exceptions plus `_embed`'s breaker cooldown.
+That is the complete list — 40 environment variables. The `_read_*` readers all live in `goldfive/config.py`; `_read_severity_env` lives in `goldfive/drift/tool_loops.py`; the "inline" readers are the four documented exceptions plus `_embed`'s breaker cooldown.
 
 ---
 

@@ -981,7 +981,7 @@ payload = {
 
 ## 16. `_record_refine_outcome` — the failure counter and REPEATED_FAILURE
 
-`_record_refine_outcome(session, drift, *, succeeded)` is the per-turn `(kind, task)` bookkeeping that both the ladder occurrence-count and the H3 refine-outcome gate read. It is the ONLY writer of `session.refine_outcomes`.
+`_record_refine_outcome(session, drift, *, succeeded)` is the per-turn `(kind, task)` bookkeeping that both the ladder occurrence-count and the H3 refine-outcome gate read. It is the only writer of `session.refine_outcomes` within the steerer/DriftObserver subsystem. (The alternate `ParallelDAGExecutor` in `executors/parallel.py` has its own refine machinery that writes the same table directly — but without the threshold-crossing REPEATED_FAILURE side effect — so it is not part of this subsystem's counter contract.)
 
 - `USER_STEER` / `USER_CANCEL` / `GOAL_DRIFT` (`_USER_OR_TRAJECTORY_DRIFT_KINDS`) bypass the write entirely — operator intent always honoured; trajectory drifts have their own rate limiters.
 - `succeeded=True` → `RefineOutcome(state="succeeded", fail_count=0)`. The "succeeded" state still encodes "attempted" so a follow-up same-`(kind, task)` drift on the same turn skips refine (H3).

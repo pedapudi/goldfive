@@ -1056,7 +1056,7 @@ The name axis is signal-only by default (capped at INFO). To make same-name-vari
 
 ### Recipe D — Enable the stall watchdog
 
-1. Set `SteeringConfig.stall_watchdog_enabled=True` (or `GOLDFIVE_STALL_WATCHDOG_ENABLED=1`) and pick `stall_timeout_s` (default 600.0). The flag is default-OFF for a reason — it spawns one asyncio task per dispatch.
+1. Set `SteeringConfig.stall_watchdog_enabled=True` (or `GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED=1`) and pick `stall_timeout_s` (env `GOLDFIVE_STEER_STALL_TIMEOUT_S`, default 600.0). The flag is default-OFF for a reason — it spawns one asyncio task per dispatch.
 2. Confirm the wrapped tree does async I/O in its tools, not sync-blocking work — a sync-blocking tool starves the loop and the watchdog cannot fire (documented limitation).
 3. The `TASK_TIMEOUT` drift routes through `handle_drift`, so under `observation_only` (default) it is telemetry-only. To have it *act*, run in active mode (`09-steering-ladder-and-gates.md`).
 4. Test with `test_stall_watchdog.py`; the AST-based manifest-liveness test guards the `GOAL_DRIFT_IDLE_SECONDS` live-read.
@@ -1292,7 +1292,7 @@ Consolidated defaults across the subsystem (all overridable per the precedence r
 | `_DEFAULT_MODEL_NAME` | `all-MiniLM-L6-v2` | `_embed` (sentence-transformers) |
 | `GOAL_DRIFT_IDLE_SECONDS` | 300 | `goals` (live-read by watchdog) |
 | `GOAL_DRIFT_CHECK_INTERVAL` | 5 | `goals` (back-compat re-export, not runtime) |
-| `stall_watchdog_enabled` / `GOLDFIVE_STALL_WATCHDOG_ENABLED` | `False` | `config.SteeringConfig` |
+| `stall_watchdog_enabled` / `GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED` | `False` | `config.SteeringConfig` |
 | `stall_timeout_s` | 600.0 | `config.SteeringConfig` |
 
 ## Verification checklist

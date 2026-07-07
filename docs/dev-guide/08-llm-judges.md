@@ -1526,7 +1526,7 @@ uv run pytest -q \
   tests/test_reasoning_judge_emission.py \
   tests/test_reasoning_judge_agent_tree.py \
   tests/test_reasoning_judge_covers_delegated_agents.py \
-  tests/test_reasoning_judge_uses_real_agent_id.py \
+  tests/test_judge_uses_real_agent_id.py \
   tests/test_goal_drift_classifier.py \
   tests/test_pluggable_judges.py
 ```

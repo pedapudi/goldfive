@@ -291,7 +291,7 @@ The obvious surfaces are nudge/cancel/plan-install. These four are easy to miss 
 
 If a component in your key churns, the gate opens a fresh entry per observation and **never engages** — it silently does nothing. Fix the churn upstream; do not make the key coarser to paper over it.
 
-**Why — the incident.** Memory `feedback_stable_keys_for_lifecycle_gates` and `feedback_reader_centric_versioning`. A per-condition gate keyed on a churning id opens a new entry every observation, so the suppression/freshness logic never fires. `#479` made correction keys use the **full agent path** (not a bare agent name) precisely so two agents in different subtrees get distinct, stable keys (`goldfive/_correction_injection.py`, `pending_correction_key(agent_name, task_id)` with `normalize_agent_id` producing the full path). `#442` keyed the user-steer suppression window on a **logical-turn counter** rather than anything the LLM controls. The drift-condition lifecycle keys on `sha1(kind, task_id, agent_id, turn_id)` — a content hash of stable structured fields, not the event id.
+**Why — the incident.** Memory `feedback_stable_keys_for_lifecycle_gates` and `feedback_reader_centric_versioning`. A per-condition gate keyed on a churning id opens a new entry every observation, so the suppression/freshness logic never fires. `#479` made correction keys use the **full agent path** (not a bare agent name) precisely so two agents in different subtrees get distinct, stable keys (`goldfive/_correction_injection.py`, `pending_correction_key(agent_name, task_id)` with `_normalize_agent_name` producing the full path). `#442` keyed the user-steer suppression window on a **logical-turn counter** rather than anything the LLM controls. The drift-condition lifecycle keys on `sha1(kind, task_id, agent_id, turn_id)` — a content hash of stable structured fields, not the event id.
 
 **How violations were caught historically.** A gate that "should suppress" but never does, observed as duplicate refines / duplicate drifts on the wire. `#420` fixed exactly this class (`tool_loops` bucket scoping + freshness-gate atomicity + double-cancel dedup).
 
@@ -300,7 +300,7 @@ If a component in your key churns, the gate opens a fresh entry per observation 
 ```bash
 # Gates keyed on drift.id are almost always wrong. Audit any dict keyed on a UUID.
 grep -rn "\.id\]" goldfive/drift_observer.py
-grep -rn "pending_correction_key\|normalize_agent_id" goldfive/_correction_injection.py
+grep -rn "pending_correction_key\|_normalize_agent_name" goldfive/_correction_injection.py
 ```
 
 Tests: `tests/test_correction_injection.py`, and the freshness/in-flight gate tests in the drift-observer test set. When you add a gate, write a test with **two observations that must collapse to one** — if they don't, your key is unstable.
@@ -803,7 +803,7 @@ def thinking_disable_caps(model_name: str) -> ThinkingDisableCaps:
 
 **Rule:** proto changes are **additive**. New fields get the **next** number; you never reuse or renumber. `#480` added `ReasoningJudgeInvoked` fields **12–15** (`focused_task_id`, `focus_confidence`, `stated_intent`, `provenance`) — appended, not inserted. `#318` added drift-as-condition fields additively. `event_id` (#289) is Phase 3 *Addition* B for the same reason. When you extend an event, append.
 
-**Check:** `git diff goldfive/pb/**/*.proto` — every changed line should be an addition at the end of a message, never a renumber. Regenerate the `_pb2`/`_pb2.pyi` stubs; do not hand-edit them.
+**Check:** `git diff proto/goldfive/v1/*.proto` — every changed line should be an addition at the end of a message, never a renumber. Regenerate the `_pb2`/`_pb2.pyi` stubs; do not hand-edit them.
 
 ## 4.12 `event_id` must stay globally unique on the wire
 
@@ -965,19 +965,21 @@ Weaker models re-derive intent from scratch and get it wrong. Here is the curate
 
 ## 5.7 The zicato optimization surface (2026-05-16)
 
-**What:** zicato is the third ecosystem repo — an **offline meta-loop optimizer** reading goldfive's telemetry + `optimization/manifest.toml` (memory `project_zicato_optimization_surface`). goldfive#436/439/440/442 shipped the manifest (expanded to 60 entries), `SteeringDecisionMade` decision telemetry, a testkit, and determinism guarantees. goldfive's JSONL sink emits **camelCase**.
+**What:** zicato is the third ecosystem repo — an **offline meta-loop optimizer** reading goldfive's telemetry + `optimization/manifest.toml` (memory `project_zicato_optimization_surface`). goldfive#436/439/440/442 shipped the manifest (expanded to ~60 entries), `SteeringDecisionMade` decision telemetry, a testkit, and determinism guarantees. goldfive's JSONL sink emits **camelCase**.
 
 **Residue:** `goldfive/optimization/manifest.toml` (the tunable-knob registry — every entry names a `source` file:symbol and a `python_attr`), `SteeringDecisionMade` and the `#480` decision-telemetry label fixes. When you add or rename a tunable knob, update the manifest entry (grep the knob name in `manifest.toml`). See `12-events-sinks-telemetry.md`.
 
-**The manifest entry shape** (`goldfive/optimization/manifest.toml`) — each tunable knob is a table with at least:
+**The manifest entry shape** (`goldfive/optimization/manifest.toml`) — each tunable knob is a `[[mutation]]` table with `id`, `kind`, `source`, and `python_attr` at minimum:
 
 ```toml
-[[knob]]
+[[mutation]]
+id = "goal_drift_idle_seconds"
+kind = "numeric"
 source = "goldfive/drift/goals.py:GOAL_DRIFT_IDLE_SECONDS"
 python_attr = "goldfive.drift.goals:GOAL_DRIFT_IDLE_SECONDS"
 ```
 
-The `python_attr` is how zicato *imports and sets* the knob at runtime; the `source` is the human breadcrumb. The manifest grew to 60 entries (#440). `#436` shipped determinism guarantees + a testkit so the meta-loop's reads are reproducible. **The AST-liveness test (#487)** parses the manifest and fails CI if any `python_attr` points at a symbol that no longer exists — so renaming a knob without updating the manifest is caught. **Rule:** rename a knob → update its manifest entry in the same commit, or the liveness test fails.
+The `python_attr` is how zicato *imports and sets* the knob at runtime; the `source` is the human breadcrumb. The manifest grew to ~60 entries (#440). `#436` shipped determinism guarantees + a testkit so the meta-loop's reads are reproducible. **The AST-liveness test (#487)** parses the manifest and fails CI if any `python_attr` points at a symbol that no longer exists — so renaming a knob without updating the manifest is caught. **Rule:** rename a knob → update its manifest entry in the same commit, or the liveness test fails.
 
 ## 5.8 The judge/config maturation (2026-06, #437–#447)
 
@@ -1207,7 +1209,7 @@ The distilled catalog of concrete wrong edits a weaker model plausibly makes in 
 | 1 | Read `steerer._observation_only` directly in a new consumer. | Bypasses the single predicate; likely wrong fail direction (Inv 5). | `steering_is_active(steerer)` (external) / `self.is_active_steering()` (in `DefaultSteerer`). |
 | 2 | Add an intervention, test it in active mode only. | The passive leak (the dangerous case) is untested. | Add BOTH a passive test (nothing happens) and an active test (it fires). |
 | 3 | Key a new gate on `drift.id`. | UUID4 per emit → gate never engages, silently a no-op (Inv 6). | Key on `(kind.value, current_task_id)` or a sha1 of stable structured fields. |
-| 4 | Make the correction key the bare agent name. | Two agents in different subtrees collide; churn if renamed (Inv 6). | Full agent path via `pending_correction_key` / `normalize_agent_id` (#479). |
+| 4 | Make the correction key the bare agent name. | Two agents in different subtrees collide; churn if renamed (Inv 6). | Full agent path via `pending_correction_key` / `_normalize_agent_name` (#479). |
 | 5 | Add a regex to classify thinking tokens into a drift kind. | NL classification by heuristic (Inv 2); brittle, un-tunable. | Reasoning judge → typed `JudgeVerdict`. |
 | 6 | Escalate a tool loop on "same tool name, different args". | Lexical near-match (Inv 2); no exact-repeat evidence. | Cap at INFO unless `>=2` identical `(name, args_hash)` (#484). |
 | 7 | Inject "please stop, you are off-task" and rely on it. | Cooperation contract (Inv 1); agent may ignore. | Level-3 `CANCEL_REINVOKE` via `GOLDFIVE_STEER` — structural. |
@@ -1280,7 +1282,7 @@ grep -rn "_GENERIC_VERB_PREFIX_RE\|_FACTUAL_QUESTION_RE\|CONFUSION" goldfive/
 
 ```bash
 grep -rn "\.id\]" goldfive/drift_observer.py
-grep -rn "pending_correction_key\|normalize_agent_id" goldfive/_correction_injection.py
+grep -rn "pending_correction_key\|_normalize_agent_name" goldfive/_correction_injection.py
 ```
 
 **Section 3.1 — both refine pipelines touched together:**
