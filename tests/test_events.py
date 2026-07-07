@@ -22,7 +22,9 @@ pytestmark = pytest.mark.skipif(
 from goldfive.control import ControlKind, ControlMessage  # noqa: E402
 from goldfive.events import (  # noqa: E402
     build_plan_revision_diff,
+    control_received_event,
     delegation_observed_event,
+    drift_detected_event,
     invocation_cancelled_event,
     plan_revised_event,
 )
@@ -360,6 +362,171 @@ def test_plan_revised_event_proto_round_trips_trigger_event_id() -> None:
     decoded.ParseFromString(encoded)
     assert decoded.plan_revised.trigger_event_id == "ann_roundtrip"
     assert decoded.plan_revised.plan.revision_trigger_event_id == "ann_roundtrip"
+
+
+# ---------------------------------------------------------------------------
+# drift_detected_event / plan_revised_event — kind & severity stamping.
+#
+# Regression for the telemetry bug where both factories resolved DriftKind /
+# DriftSeverity through ``_events_pb_module().DriftKind`` (absent — the enums
+# live in types_pb2), which AttributeError'd and, swallowed by a broad
+# ``except``, left both enums UNSPECIFIED (0) on every event they produced.
+# ---------------------------------------------------------------------------
+
+
+def _types_pb() -> object:
+    from goldfive.pb.goldfive.v1 import types_pb2
+
+    return types_pb2
+
+
+def test_drift_detected_event_stamps_kind_and_severity() -> None:
+    types_pb2 = _types_pb()
+    drift = DriftEvent(kind=DriftKind.OFF_TOPIC, severity=DriftSeverity.WARNING, detail="x")
+    evt = drift_detected_event("r", 1, drift)
+    # The proto values are prefixed + nonzero; the StrEnum value ("off_topic")
+    # differs in case from the .name ("OFF_TOPIC") the bridge resolves by.
+    assert evt.drift_detected.kind == types_pb2.DRIFT_KIND_OFF_TOPIC
+    assert evt.drift_detected.severity == types_pb2.DRIFT_SEVERITY_WARNING
+    assert evt.drift_detected.kind != 0
+    assert evt.drift_detected.severity != 0
+    # Sibling string fields still stamped correctly (never regressed).
+    assert evt.drift_detected.detail == "x"
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        DriftKind.OFF_TOPIC,
+        DriftKind.TOOL_ERROR,
+        DriftKind.USER_STEER,
+        DriftKind.RUNAWAY_DELEGATION,
+        DriftKind.CAPABILITY_MISMATCH,
+    ],
+)
+@pytest.mark.parametrize(
+    "severity",
+    [DriftSeverity.INFO, DriftSeverity.WARNING, DriftSeverity.CRITICAL],
+)
+def test_drift_detected_event_kind_severity_table(kind: DriftKind, severity: DriftSeverity) -> None:
+    types_pb2 = _types_pb()
+    # Every DriftKind's StrEnum .value is the lowercase of its .name, so
+    # str(kind) != kind.name in case; the bridge resolves by .name.
+    assert str(kind) != kind.name
+    expected_kind = getattr(types_pb2, f"DRIFT_KIND_{kind.name}")
+    expected_sev = getattr(types_pb2, f"DRIFT_SEVERITY_{severity.name}")
+    assert expected_kind != 0
+    assert expected_sev != 0
+    drift = DriftEvent(kind=kind, severity=severity, detail="d")
+    evt = drift_detected_event("r", 2, drift)
+    assert evt.drift_detected.kind == expected_kind
+    assert evt.drift_detected.severity == expected_sev
+
+
+def test_drift_detected_event_accepts_bare_string_kind() -> None:
+    """The bridge also resolves a lowercase value string (plan_revised path)."""
+    types_pb2 = _types_pb()
+
+    class _DuckDrift:
+        kind = "off_topic"  # StrEnum .value form, not the enum
+        severity = "warning"
+        detail = "d"
+
+    evt = drift_detected_event("r", 3, _DuckDrift())
+    assert evt.drift_detected.kind == types_pb2.DRIFT_KIND_OFF_TOPIC
+    assert evt.drift_detected.severity == types_pb2.DRIFT_SEVERITY_WARNING
+
+
+def test_control_received_event_stamps_kind_and_severity() -> None:
+    """The control-drift wrapper (fires on every operator steer/cancel) stamps kind."""
+    types_pb2 = _types_pb()
+    evt = control_received_event("r", 4, ControlKind.STEER, "ctl-1")
+    assert evt.drift_detected.kind == types_pb2.DRIFT_KIND_USER_STEER
+    assert evt.drift_detected.kind != 0
+    assert evt.drift_detected.severity == types_pb2.DRIFT_SEVERITY_WARNING
+    # CANCEL maps to USER_CANCEL — also nonzero.
+    cancel = control_received_event("r", 5, ControlKind.CANCEL, "ctl-2")
+    assert cancel.drift_detected.kind == types_pb2.DRIFT_KIND_USER_CANCEL
+    assert cancel.drift_detected.kind != 0
+
+
+def test_drift_detected_event_unknown_kind_degrades_to_unspecified() -> None:
+    """A synthetic/unknown kind name degrades to UNSPECIFIED without raising."""
+    types_pb2 = _types_pb()
+
+    class _DuckDrift:
+        kind = "TOTALLY_BOGUS_KIND"
+        severity = "ALSO_BOGUS"
+        detail = "d"
+
+    # Must not raise.
+    evt = drift_detected_event("r", 6, _DuckDrift())
+    assert evt.drift_detected.kind == types_pb2.DRIFT_KIND_UNSPECIFIED == 0
+    assert evt.drift_detected.severity == types_pb2.DRIFT_SEVERITY_UNSPECIFIED == 0
+    # detail is unaffected by the enum miss.
+    assert evt.drift_detected.detail == "d"
+
+
+def test_drift_detected_event_round_trips_kind_severity() -> None:
+    """kind/severity survive SerializeToString + FromString."""
+    from goldfive.pb.goldfive.v1 import events_pb2
+
+    types_pb2 = _types_pb()
+    drift = DriftEvent(
+        kind=DriftKind.CAPABILITY_MISMATCH, severity=DriftSeverity.CRITICAL, detail="d"
+    )
+    evt = drift_detected_event("r", 7, drift)
+    decoded = events_pb2.Event()
+    decoded.ParseFromString(evt.SerializeToString())
+    assert decoded.drift_detected.kind == types_pb2.DRIFT_KIND_CAPABILITY_MISMATCH != 0
+    assert decoded.drift_detected.severity == types_pb2.DRIFT_SEVERITY_CRITICAL != 0
+
+
+def test_plan_revised_event_stamps_drift_kind_and_severity() -> None:
+    """Sibling regression: plan_revised_event also stamps the two enums."""
+    types_pb2 = _types_pb()
+    plan = _revised_plan(trigger_event_id="ann_x")
+    evt = plan_revised_event(
+        run_id="r1",
+        sequence=8,
+        plan=plan,
+        drift_kind=plan.revision_kind,  # "user_steer" (StrEnum value)
+        severity=plan.revision_severity,  # "warning"
+        reason=plan.revision_reason,
+    )
+    assert evt.plan_revised.drift_kind == types_pb2.DRIFT_KIND_USER_STEER != 0
+    assert evt.plan_revised.severity == types_pb2.DRIFT_SEVERITY_WARNING != 0
+
+
+def test_plan_revised_event_round_trips_drift_kind_and_severity() -> None:
+    from goldfive.pb.goldfive.v1 import events_pb2
+
+    types_pb2 = _types_pb()
+    plan = _revised_plan(trigger_event_id="ann_y")
+    evt = plan_revised_event(
+        run_id="r1",
+        sequence=9,
+        plan=plan,
+        drift_kind=DriftKind.RUNAWAY_DELEGATION.value,
+        severity=DriftSeverity.CRITICAL.value,
+    )
+    decoded = events_pb2.Event()
+    decoded.ParseFromString(evt.SerializeToString())
+    assert decoded.plan_revised.drift_kind == types_pb2.DRIFT_KIND_RUNAWAY_DELEGATION != 0
+    assert decoded.plan_revised.severity == types_pb2.DRIFT_SEVERITY_CRITICAL != 0
+
+
+def test_factory_and_steerer_resolve_enums_identically() -> None:
+    """Lockstep guard: the shared bridge means the primary steerer emit path
+    (DefaultSteerer._drift_*_pb_value) and the factories never re-diverge."""
+    from goldfive.steerer import DefaultSteerer
+
+    for kind in [DriftKind.OFF_TOPIC, DriftKind.RUNAWAY_DELEGATION, DriftKind.USER_STEER]:
+        evt = drift_detected_event("r", 1, DriftEvent(kind=kind, severity=DriftSeverity.WARNING))
+        assert evt.drift_detected.kind == DefaultSteerer._drift_kind_pb_value(kind) != 0
+    for sev in [DriftSeverity.INFO, DriftSeverity.WARNING, DriftSeverity.CRITICAL]:
+        evt = drift_detected_event("r", 1, DriftEvent(kind=DriftKind.OFF_TOPIC, severity=sev))
+        assert evt.drift_detected.severity == DefaultSteerer._drift_severity_pb_value(sev) != 0
 
 
 # ---------------------------------------------------------------------------

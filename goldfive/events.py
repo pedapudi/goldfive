@@ -49,6 +49,82 @@ def _events_pb_module() -> Any:
     return events_pb2
 
 
+def _types_pb_module() -> Any:
+    """Return the ``types_pb2`` stub module (lazy, like ``_events_pb_module``).
+
+    ``DriftKind`` / ``DriftSeverity`` and the shared dataclass protos live
+    here — NOT in ``events_pb2``. Resolving a drift enum through
+    ``_events_pb_module()`` raises ``AttributeError`` (the enum is absent);
+    the drift-enum bridge below deliberately reads from *this* module.
+    """
+    try:
+        from goldfive.pb.goldfive.v1 import types_pb2
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "goldfive protobuf stubs not available; generate them via "
+            "`make proto` (requires the `proto` optional-dependency group) "
+            "or install the package with the `proto` extra. See issue #3."
+        ) from exc
+    return types_pb2
+
+
+def _proto_enum_member(value: Any, prefix: str) -> str:
+    """Normalize a drift kind/severity to its unprefixed UPPER proto member.
+
+    Accepts a :class:`~enum.Enum` (``.name`` is authoritative — for a
+    ``StrEnum`` it is the UPPER member like ``OFF_TOPIC`` regardless of the
+    lowercase ``.value``), a bare value/name string (``"off_topic"`` ->
+    ``"OFF_TOPIC"``), or an already-prefixed ``{prefix}_...`` string (which
+    is stripped so ``f"{prefix}_{member}"`` does not double up).
+    """
+    name = getattr(value, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    s = str(value or "").strip().upper()
+    if s.startswith(prefix + "_"):
+        s = s[len(prefix) + 1 :]
+    return s
+
+
+def _drift_kind_pb_value(kind: Any, *, unknown_member: str = "UNSPECIFIED") -> int:
+    """Resolve a ``DriftKind`` to its ``types_pb2`` enum int by member name.
+
+    The proto ``DriftKind`` enum lives in ``types_pb2`` with prefixed value
+    names (``DRIFT_KIND_OFF_TOPIC``); this bridges from a
+    :class:`goldfive.types.DriftKind` (or a name/value string) via
+    :func:`_proto_enum_member`. On an unknown/synthetic name, log.debug and
+    fall back to ``DRIFT_KIND_{unknown_member}`` (``UNSPECIFIED`` = 0 by
+    default; the steerer passes ``"CUSTOM"``) without raising, so a future
+    regression is visible in logs rather than masked.
+
+    Shared bridge: :meth:`goldfive.steerer.DefaultSteerer._drift_kind_pb_value`
+    delegates here. Keep the two in lockstep.
+    """
+    types_pb = _types_pb_module()
+    member = _proto_enum_member(kind, "DRIFT_KIND")
+    resolved = getattr(types_pb, f"DRIFT_KIND_{member}", None)
+    if resolved is not None:
+        return int(resolved)
+    log.debug("drift kind %r (proto member DRIFT_KIND_%s) is unknown", kind, member)
+    return int(getattr(types_pb, f"DRIFT_KIND_{unknown_member}", 0))
+
+
+def _drift_severity_pb_value(severity: Any, *, unknown_member: str = "UNSPECIFIED") -> int:
+    """Resolve a ``DriftSeverity`` to its ``types_pb2`` enum int by member name.
+
+    Mirror of :func:`_drift_kind_pb_value` for the ``DriftSeverity`` enum
+    (also in ``types_pb2``, value names prefixed ``DRIFT_SEVERITY_``).
+    Shared bridge for :meth:`goldfive.steerer.DefaultSteerer._drift_severity_pb_value`.
+    """
+    types_pb = _types_pb_module()
+    member = _proto_enum_member(severity, "DRIFT_SEVERITY")
+    resolved = getattr(types_pb, f"DRIFT_SEVERITY_{member}", None)
+    if resolved is not None:
+        return int(resolved)
+    log.debug("drift severity %r (proto member DRIFT_SEVERITY_%s) is unknown", severity, member)
+    return int(getattr(types_pb, f"DRIFT_SEVERITY_{unknown_member}", 0))
+
+
 def new_event(
     run_id: str,
     sequence: int,
@@ -295,22 +371,23 @@ def plan_revised_event(
         severity = severity or str(getattr(drift, "severity", ""))
         reason = reason or getattr(drift, "detail", "")
 
+    # DriftKind/DriftSeverity live in types_pb2, resolved via the shared
+    # by-name bridge (same one DefaultSteerer uses). A prior version read
+    # ``_events_pb_module().DriftKind`` — absent there — and the broad
+    # ``except AttributeError`` silently left both UNSPECIFIED on the wire
+    # (same telemetry bug fixed in ``drift_detected_event``). The try/except
+    # is now a defensive backstop only; unknown names degrade to UNSPECIFIED
+    # inside the bridge (log.debug) without raising.
     if drift_kind:
-        pb = _events_pb_module()
         try:
-            normalized = drift_kind.upper() if not drift_kind.startswith("DRIFT_") else drift_kind
-            evt.plan_revised.drift_kind = pb.DriftKind.Value(normalized)
-        except (ValueError, AttributeError):
-            pass
+            evt.plan_revised.drift_kind = _drift_kind_pb_value(drift_kind)
+        except Exception:  # noqa: BLE001 - observability must never raise
+            log.debug("plan_revised_event: unresolved drift_kind %r", drift_kind, exc_info=True)
     if severity:
-        pb = _events_pb_module()
         try:
-            normalized = (
-                severity.upper() if not severity.startswith("DRIFT_SEVERITY_") else severity
-            )
-            evt.plan_revised.severity = pb.DriftSeverity.Value(normalized)
-        except (ValueError, AttributeError):
-            pass
+            evt.plan_revised.severity = _drift_severity_pb_value(severity)
+        except Exception:  # noqa: BLE001 - observability must never raise
+            log.debug("plan_revised_event: could not resolve severity %r", severity, exc_info=True)
     evt.plan_revised.reason = reason
     evt.plan_revised.revision_index = int(
         revision_index if revision_index is not None else getattr(plan, "revision_index", 0)
@@ -1202,24 +1279,29 @@ def drift_detected_event(
     session_id: str = "",
     event_id: str = "",
 ) -> Any:
-    pb = _events_pb_module()
     evt = new_event(run_id, sequence, session_id=session_id, event_id=event_id)
-    kind_name = str(getattr(drift, "kind", ""))
-    sev_name = str(getattr(drift, "severity", ""))
-    if kind_name:
+    kind = getattr(drift, "kind", None)
+    severity = getattr(drift, "severity", None)
+    # Stamp the two proto enums via the shared by-name bridge. DriftKind /
+    # DriftSeverity live in types_pb2 (NOT events_pb2); a prior version
+    # resolved them through ``_events_pb_module().DriftKind`` which raised
+    # ``AttributeError`` and, swallowed by a broad ``except``, silently left
+    # BOTH enums UNSPECIFIED (0) on every event this factory produced. The
+    # bridge passes the enum straight through so ``.name`` (the UPPER member,
+    # e.g. OFF_TOPIC) resolves regardless of the StrEnum's lowercase value.
+    # The try/except is a defensive backstop only — a genuinely-unknown kind
+    # degrades to UNSPECIFIED inside the bridge (log.debug) without raising,
+    # so the normal path is never masked.
+    if kind:
         try:
-            evt.drift_detected.kind = pb.DriftKind.Value(
-                kind_name.upper() if not kind_name.startswith("DRIFT_") else kind_name
-            )
-        except (ValueError, AttributeError):
-            pass
-    if sev_name:
+            evt.drift_detected.kind = _drift_kind_pb_value(kind)
+        except Exception:  # noqa: BLE001 - observability must never raise
+            log.debug("drift_detected_event: could not resolve kind %r", kind, exc_info=True)
+    if severity:
         try:
-            evt.drift_detected.severity = pb.DriftSeverity.Value(
-                sev_name.upper() if not sev_name.startswith("DRIFT_SEVERITY_") else sev_name
-            )
-        except (ValueError, AttributeError):
-            pass
+            evt.drift_detected.severity = _drift_severity_pb_value(severity)
+        except Exception:  # noqa: BLE001 - observability must never raise
+            log.debug("drift_detected_event: unresolved severity %r", severity, exc_info=True)
     evt.drift_detected.detail = getattr(drift, "detail", "")
     evt.drift_detected.current_task_id = getattr(drift, "current_task_id", "")
     evt.drift_detected.current_agent_id = getattr(drift, "current_agent_id", "")
