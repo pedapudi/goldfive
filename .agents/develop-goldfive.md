@@ -9,6 +9,34 @@ applies-when: ["develop goldfive", "add a feature", "add an adapter", "contribut
 You're changing goldfive itself. This skill covers the repo layout,
 dev loop, and merge flow.
 
+## Read first (before any nontrivial edit)
+
+- **[docs/dev-guide/17-invariants-hazards-history.md](../docs/dev-guide/17-invariants-hazards-history.md)** —
+  the six hard invariants, the Protected List (KEEP decisions you must
+  not "clean up" without sign-off), the Deferred-Work Register, the
+  hazard catalog, and the pre-PR checklist. This is the constitution;
+  read it before you touch the observe/detect/intervene pipeline.
+- **[docs/dev-guide/16-recipes.md](../docs/dev-guide/16-recipes.md)** —
+  twelve copy-pasteable end-to-end procedures (add a DriftKind, detector,
+  judge, intervention surface, config knob, proto field, sink,
+  reporting tool, adapter; safe dead-code deletion; doc update). If your
+  task matches a recipe, follow it.
+- The full guide index with a task→chapter routing table is
+  [docs/dev-guide/00-index.md](../docs/dev-guide/00-index.md).
+
+**Mode discipline (post-#488):** the suite runs the shipped
+`observation_only=True` default — there is no autouse fixture that flips
+it. A test that needs active steering must construct the steerer in
+active mode explicitly, and any intervention feature must be tested in
+BOTH modes (passive: no wire action; active: the intervention fires).
+The only sanctioned kill-switch read is
+`DefaultSteerer.is_active_steering()` / `steering_is_active(steerer)`
+(missing/None/raising → PASSIVE). See
+[docs/dev-guide/15-testing-guide.md](../docs/dev-guide/15-testing-guide.md).
+
+**Pre-PR:** run the pre-PR checklist in chapter 17 §6 (invariants sweep,
+hazard sweep, mechanical hygiene) before opening the PR.
+
 ## Repo layout
 
 ```
