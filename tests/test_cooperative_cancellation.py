@@ -50,6 +50,7 @@ from goldfive.adapters._adk_plugin import (  # noqa: E402
     SessionContext,
     make_adk_plugin,
 )
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     CancellationRequest,
@@ -569,7 +570,13 @@ async def test_critical_drift_requests_cancel() -> None:
     # ``tests/test_cancel_authority_gate.py``.
     plugin, _sink, session = _make_plugin()
     adapter = _StubAdapter(plugin)
-    steerer = DefaultSteerer(cancel_inflight_scope="all")
+    steerer = DefaultSteerer(
+        # PR-1 legacy pin + explicit active mode (#488): the suite runs the
+        # shipped observation-only default, so the legacy any-CRITICAL-cancels
+        # contract under test opts in to both knobs.
+        cancel_inflight_scope="all",
+        steering_config=SteeringConfig(observation_only=False),
+    )
     steerer.bind(sinks=[], planner=None)
     steerer.bind_adapter(adapter)
     plugin._top_invocation_id = "inv-A"
@@ -659,7 +666,7 @@ async def test_cancel_inflight_for_revision_still_fires_without_precancel() -> N
     """
     plugin, _sink, session = _make_plugin()
     adapter = _StubAdapter(plugin)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[], planner=None)
     steerer.bind_adapter(adapter)
     plugin._top_invocation_id = "inv-A"
@@ -859,7 +866,7 @@ async def test_no_auto_redispatch_after_cancel() -> None:
 async def test_user_steer_drift_bypasses_severity_gate() -> None:
     plugin, _sink, session = _make_plugin()
     adapter = _StubAdapter(plugin)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[], planner=None)
     steerer.bind_adapter(adapter)
     plugin._top_invocation_id = "inv-A"

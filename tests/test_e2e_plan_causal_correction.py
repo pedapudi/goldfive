@@ -70,6 +70,7 @@ from goldfive.adapters.adk_llm_instrumentation import (  # noqa: E402
     format_correction_block,
     is_dynamic_instruction,
 )
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS  # noqa: E402
 from goldfive.sinks import InMemorySink  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
@@ -341,7 +342,9 @@ async def _drive_refine_cycle(
     """
     planner = _ScriptedRefinePlanner([revised])
     sink = _ListSink()
-    steerer = DefaultSteerer()
+    # Explicit active mode: the corrective install under test is
+    # suppressed under the shipped observation-only default.
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=planner)
 
     prev = session.plan
@@ -358,8 +361,21 @@ def _pin_task(session: Session, task: Task) -> None:
     The ADK plugin normally does this at ``before_run`` time; stamping
     directly keeps the test focused on the resolver's read contract
     rather than on the plugin's pinning pipeline (which has its own
-    dedicated tests).
+    dedicated tests). Also plants the legacy SessionContext stash with
+    an active steerer: the resolver's augmentation rides the
+    ``steering_is_active`` gate and is suppressed under the shipped
+    observation-only default (``session=None`` keeps the legacy
+    ADK-state read path these tests exercise).
     """
+    from types import SimpleNamespace
+
+    class _ActiveSteerer:
+        def is_active_steering(self) -> bool:
+            return True
+
+    session.state["goldfive._session_context"] = SimpleNamespace(
+        steerer=_ActiveSteerer(), session=None
+    )
     session.state[_sp.KEY_CURRENT_TASK_ID] = task.id
     session.state[_sp.KEY_CURRENT_TASK_TITLE] = task.title
     session.state[_sp.KEY_CURRENT_TASK_DESCRIPTION] = task.description
@@ -630,7 +646,7 @@ async def test_critical_drift_composes_cancel_with_correction() -> None:
     adapter = _StubAdapterWithPlugin(top_invocation_id="inv-research-1")
 
     planner = _ScriptedRefinePlanner()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[_ListSink()], planner=planner)
     steerer.bind_adapter(adapter)
 

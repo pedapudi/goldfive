@@ -18,6 +18,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.drift import (  # noqa: E402
     classify_refusal,
     classify_stop_reason,
@@ -549,7 +550,7 @@ async def test_observe_emits_drift_and_refines() -> None:
     revised = _make_plan(("t1", "t2", "t3"))
     planner = StubPlanner(revised=revised)
     sink = ListSink()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
@@ -837,7 +838,7 @@ async def test_successful_refine_resets_failure_counter() -> None:
     revised = _make_plan(("t1", "t2", "t3"))
     planner = StubPlanner(raise_exc=RuntimeError("planner down"))
     sink = ListSink()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 
@@ -1174,7 +1175,7 @@ async def test_apply_revision_silently_folds_terminal_regression(
     )
     planner = StubPlanner(revised=stale_revised)
     sink = ListSink()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session(plan=prior)
 

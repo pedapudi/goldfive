@@ -304,14 +304,32 @@ def test_golden_per_kind_fallback_observations() -> None:
 
 
 def test_golden_nudge_replay_wrapper() -> None:
-    """The executor's nudge framing: attribution header + note verbatim."""
-    msg = SequentialExecutor._compose_nudge_replay_message(["NOTE-BODY"])
+    """The executor's nudge framing: attribution header + note verbatim.
+
+    ``plan_revised`` selects the header (goldfive#475 truthfulness): the
+    PLAN REVISION framing only renders when the steerer recorded that a
+    revision actually installed; the default (no revision) framing
+    asserts nothing about the plan.
+    """
+    msg = SequentialExecutor._compose_nudge_replay_message(
+        ["NOTE-BODY"], plan_revised=True
+    )
     assert msg == (
         "[GOLDFIVE PLAN REVISION — observer note]\n"
         "\n"
         "goldfive — an external monitoring layer, not the user — revised "
         "its plan bookkeeping during the prior turn. The note(s) below "
         "describe what it observed.\n"
+        "\n"
+        "NOTE-BODY"
+    )
+    plain = SequentialExecutor._compose_nudge_replay_message(["NOTE-BODY"])
+    assert plain == (
+        "[GOLDFIVE OBSERVER NOTE]\n"
+        "\n"
+        "goldfive — an external monitoring layer, not the user — observed "
+        "drift during the prior turn. Its plan bookkeeping is unchanged. "
+        "The note(s) below describe what it observed.\n"
         "\n"
         "NOTE-BODY"
     )

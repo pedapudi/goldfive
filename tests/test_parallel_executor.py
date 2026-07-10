@@ -966,3 +966,73 @@ async def test_observer_exception_emits_pipeline_failure_drift() -> None:
         == types_pb2.DRIFT_SEVERITY_INFO
     )
     assert "classifier exploded" in pipeline_failures[0].drift_detected.detail
+
+
+@pytest.mark.asyncio
+async def test_not_needed_task_is_never_scheduled() -> None:
+    """A terminal-stamped task (e.g. reconciler NOT_NEEDED) must not
+    reach the adapter.
+
+    ``Plan.topological_stages`` is purely structural — it does not
+    filter by status — so the executor's stage filter has to drop
+    terminal tasks itself. Before the fix, only tasks completed within
+    the current ``run()`` call (``completed_stage_ids``) were filtered,
+    so a NOT_NEEDED task stamped before the run got at least one full
+    LLM turn.
+    """
+    tasks = [
+        Task(id="A", title="A"),
+        Task(id="B", title="B"),
+        Task(id="C", title="C", status=TaskStatus.NOT_NEEDED),
+        Task(id="D", title="D"),
+        Task(id="E", title="E"),
+    ]
+    plan = Plan(
+        id="plan-1",
+        run_id="run-1",
+        goal_ids=[],
+        tasks=tasks,
+        edges=list(_diamond_plan().edges),
+    )
+
+    adapter = TracingAdapter(delay=0.01)
+    executor = ParallelDAGExecutor(max_concurrency=0)
+    outcome = await executor.run(
+        plan=plan,
+        session=_new_session(),
+        adapter=adapter,
+        steerer=RecordingSteerer(),
+        planner=RecordingPlanner(),
+        sinks=[NoopSink()],
+    )
+
+    assert outcome.success is True
+    assert "C" not in adapter.order, "NOT_NEEDED task reached the adapter"
+    assert set(adapter.completed) == {"A", "B", "D", "E"}
+
+
+@pytest.mark.asyncio
+async def test_stage_of_only_terminal_tasks_is_skipped() -> None:
+    """A stage whose every task is already terminal is skipped entirely
+    (COMPLETED / CANCELLED tasks stamped before the run are not re-run)."""
+    tasks = [
+        Task(id="A", title="A", status=TaskStatus.COMPLETED),
+        Task(id="B", title="B", status=TaskStatus.CANCELLED),
+        Task(id="C", title="C"),
+    ]
+    edges = [TaskEdge("A", "C"), TaskEdge("B", "C")]
+    plan = Plan(id="plan-1", run_id="run-1", goal_ids=[], tasks=tasks, edges=edges)
+
+    adapter = TracingAdapter(delay=0.01)
+    executor = ParallelDAGExecutor(max_concurrency=0)
+    outcome = await executor.run(
+        plan=plan,
+        session=_new_session(),
+        adapter=adapter,
+        steerer=RecordingSteerer(),
+        planner=RecordingPlanner(),
+        sinks=[NoopSink()],
+    )
+
+    assert outcome.success is True
+    assert adapter.order == ["C"]

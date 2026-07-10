@@ -44,6 +44,7 @@ from goldfive._correction_injection import (  # noqa: E402
     write_correction,
 )
 from goldfive.adapters import _adk_state_protocol as _sp  # noqa: E402
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
@@ -187,7 +188,7 @@ async def _emit(
 async def test_correct_kind_supersedes_writes_correction_to_state() -> None:
     session = _session(_base_plan())
     revised = _revised_with_one_correct()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
 
     drift = _drift(kind=DriftKind.OFF_TOPIC, detail="veered to batteries")
@@ -327,7 +328,7 @@ async def test_multiple_correct_supersedes_write_multiple_corrections() -> None:
         revision_index=1,
     )
 
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
     await _emit(steerer, session, revised, _drift())
 
@@ -481,7 +482,7 @@ async def test_correction_cleared_when_correction_task_itself_superseded() -> No
         revision_index=2,
     )
 
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
     await _emit(steerer, session, revised, _drift())
 
@@ -601,7 +602,20 @@ def test_dynamic_resolver_picks_up_correction_dict() -> None:
         def __init__(self, state: dict[str, Any]) -> None:
             self.state = state
 
+    class _ActiveSteerer:
+        def is_active_steering(self) -> bool:
+            return True
+
+    from types import SimpleNamespace
+
     state: dict[str, Any] = {
+        # The resolver's augmentation rides the ``steering_is_active``
+        # gate; plant an active-steerer stash so this test exercises
+        # the composed instruction (suppressed under the shipped
+        # observation-only default).
+        "goldfive._session_context": SimpleNamespace(
+            steerer=_ActiveSteerer(), session=None
+        ),
         _sp.KEY_CURRENT_TASK_ID: "research_solar_corrected",
         _sp.KEY_CURRENT_TASK_TITLE: "Research solar options (corrected)",
         _sp.KEY_CURRENT_TASK_DESCRIPTION: "narrowed scope",
@@ -817,3 +831,103 @@ def test_pending_correction_key_prefix_is_stable() -> None:
     assert pending_correction_key("a", "t") == "goldfive.pending_corrections.a.t"
     assert is_pending_correction_key("goldfive.pending_corrections.a.t")
     assert not is_pending_correction_key("goldfive.current_task_id")
+
+
+# ---------------------------------------------------------------------------
+# Same-named agents in different subtrees must not share a correction key.
+# ---------------------------------------------------------------------------
+
+
+def _plan_with_same_named_agents(revision_index: int, corrected: bool) -> Plan:
+    tasks = [
+        Task(
+            id="research_a",
+            title="Research (team A)",
+            status=TaskStatus.COMPLETED,
+            assignee_agent_id="team_a.researcher",
+        ),
+        Task(
+            id="research_b",
+            title="Research (team B)",
+            status=TaskStatus.COMPLETED,
+            assignee_agent_id="team_b.researcher",
+        ),
+    ]
+    if corrected:
+        tasks += [
+            Task(
+                id="research_a_corrected",
+                title="Research (team A, corrected)",
+                status=TaskStatus.PENDING,
+                assignee_agent_id="team_a.researcher",
+                supersedes="research_a",
+                supersedes_kind=SupersessionKind.CORRECT,
+            ),
+            Task(
+                id="research_b_corrected",
+                title="Research (team B, corrected)",
+                status=TaskStatus.PENDING,
+                assignee_agent_id="team_b.researcher",
+                supersedes="research_b",
+                supersedes_kind=SupersessionKind.CORRECT,
+            ),
+        ]
+    return Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=tasks,
+        edges=[],
+        revision_index=revision_index,
+    )
+
+
+def test_same_named_agents_in_different_subtrees_get_distinct_keys() -> None:
+    """Fully-qualified assignee ids are keyed verbatim: corrections for
+    ``team_a.researcher`` and ``team_b.researcher`` land under distinct
+    keys instead of colliding on a shared ``researcher`` entry."""
+    prev = _plan_with_same_named_agents(0, corrected=False)
+    revised = _plan_with_same_named_agents(1, corrected=True)
+    session = _session(prev)
+
+    keys = queue_corrections_for_revision(
+        session=session,
+        revised=revised,
+        prev_plan=prev,
+        drift=_drift(),
+    )
+
+    key_a = pending_correction_key("team_a.researcher", "research_a_corrected")
+    key_b = pending_correction_key("team_b.researcher", "research_b_corrected")
+    assert sorted(keys) == sorted([key_a, key_b])
+    assert session.state[key_a]["agent_name"] == "team_a.researcher"
+    assert session.state[key_b]["agent_name"] == "team_b.researcher"
+    assert session.state[key_a]["superseded_task_id"] == "research_a"
+    assert session.state[key_b]["superseded_task_id"] == "research_b"
+
+
+async def test_full_path_correction_cleared_on_report_task_started() -> None:
+    """The clear on ``report_task_started`` uses the same verbatim
+    assignee id as the write side, so full-path keys round-trip."""
+    plan = _plan_with_same_named_agents(1, corrected=True)
+    session = _session(plan)
+    keys = queue_corrections_for_revision(
+        session=session,
+        revised=plan,
+        prev_plan=None,
+        drift=_drift(),
+    )
+    key_a = pending_correction_key("team_a.researcher", "research_a_corrected")
+    key_b = pending_correction_key("team_b.researcher", "research_b_corrected")
+    assert sorted(keys) == sorted([key_a, key_b])
+
+    steerer = DefaultSteerer()
+    steerer.bind(sinks=[ListSink()], planner=_StubPlanner())
+    await _tool("report_task_started").handler(
+        {"task_id": "research_a_corrected", "detail": "starting"},
+        session,
+        steerer,
+    )
+    # Only team A's correction is acknowledged; team B's survives.
+    assert key_a not in session.state
+    assert key_b in session.state

@@ -59,21 +59,24 @@ and dispatches to one of three paths:
 
 ### 1.3 Invariants the steerer enforces on any refined plan
 
-`DefaultSteerer._apply_revision` (`steerer.py:512–531`):
+`PlanReviser._apply_revision` (`goldfive/plan_reviser.py`; the
+steerer's `plans` component):
 
 - `revision_index` monotonically increases: `new_index ≥
   old_index + 1`.
 - `revision_kind` / `revision_severity` / `revision_reason` are
   stamped from the triggering drift if the planner didn't set them.
-- `session.plan` is replaced as a single atomic assignment — readers
-  in the adapter / executor see either the old plan or the new plan,
-  never a half-merged state.
+- `session.plan` is replaced atomically under the per-session plan
+  lock in `_emit_plan_revised` (goldfive#403) — readers in the
+  adapter / executor see either the old plan or the new plan, never
+  a half-merged state.
 
-**Soundness gap (open):** `Plan` has no structural validation at
-creation or revision — duplicate task IDs, edges referencing missing
-tasks, or cycles are silently accepted. `topological_stages()`
-tolerates cycles by appending un-placeable tasks to a final stage.
-See §7.
+**Structural validation (closed by #100/#105, see §7.2):**
+`Plan.validate(for_revision=..., prior=...)` runs at creation and on
+every revision — duplicate task IDs, dangling edges, and cycles are
+rejected with `ValueError` before install. `topological_stages()`
+still tolerates cycles defensively by appending un-placeable tasks
+to a final stage.
 
 ---
 
@@ -567,20 +570,21 @@ Open issues against the design, ranked by impact. The current
 implementation is sound for the common happy path; these are edge
 cases or failure-mode ergonomics.
 
-### 7.1 Multiple sources of truth for `_TERMINAL_TASK_STATUSES`
+### 7.1 Multiple sources of truth for `_TERMINAL_TASK_STATUSES` (closed)
 
-Three modules each define the same frozenset:
-
-- `steerer.py:47–55`
-- `adapters/_tool_invocation.py:30–37`
-- `adapters/adk.py:239–244`
-
-Each carries a comment warning maintainers to update all three in
-lockstep. No automated check enforces it.
-
-**Fix direction:** extract to a single module (e.g.
-`goldfive.types._constants`) and import from it. Low effort, high
-impact.
+Closed. `goldfive.types.TERMINAL_TASK_STATUSES` is the single
+definition; every other module imports it (some alias it to a
+module-local `_TERMINAL_TASK_STATUSES` name, which is fine — the
+alias references the canonical set). Historic duplicates in
+`steerer.py`, `adapters/_tool_invocation.py`, and `adapters/adk.py`
+were folded in earlier; the last two divergent copies lived in the
+executors — `executors/parallel.py` defined a three-status frozenset
+*without* `NOT_NEEDED` (so a reconciler-stamped `NOT_NEEDED` task was
+still scheduled for an LLM turn) plus a second four-status inline
+tuple, and `executors/sequential.py` carried a three-status tuple in
+its cancel bookkeeping. All are now imports of the canonical set, and
+`tests/test_terminal_statuses_single_source.py` walks the package
+AST to reject any future redefinition.
 
 ### 7.2 Plan validation at creation and revision (closed)
 

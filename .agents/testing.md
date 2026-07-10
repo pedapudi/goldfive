@@ -102,6 +102,31 @@ pytestmark = pytest.mark.skipif(
 )
 ```
 
+## Mode discipline (post-#488) — the single most important rule
+
+The suite runs the shipped production default `observation_only=True`
+(strictly passive). Since #488 there is **no autouse fixture** that
+flips the default, and the module-global test hook was deleted. This
+has two consequences you must respect:
+
+- **Active-mode tests opt in explicitly.** If your test needs goldfive
+  to actually act (nudge / cancel / escalate / terminate), construct
+  the steerer in active mode yourself — there is no ambient fixture
+  doing it. About ~90 tests do this; follow one of them.
+- **Interventions are tested in BOTH modes.** For any code that fires
+  on the wire, add a passive-mode test (asserts NO wire action) *and*
+  an active-mode test (asserts the intervention fires). A passive-only
+  test silently passes on a broken active path and vice versa.
+- **The `is_active_steering` trap.** The ONLY sanctioned kill-switch
+  read is `DefaultSteerer.is_active_steering()` /
+  `steering_is_active(steerer)` (missing/None/raising → PASSIVE). A
+  test that reaches for the flag any other way, or a helper that
+  forgets to check it, is the most common silent no-op. Full treatment:
+  [docs/dev-guide/15-testing-guide.md](../docs/dev-guide/15-testing-guide.md).
+
+Some older test docstrings on `main` still claim a conftest autouse flip
+exists — that is stale; conftest no longer flips the default. Code wins.
+
 ## Fixtures
 
 Most tests don't need fixtures beyond what's in `tests/conftest.py`.
@@ -154,6 +179,7 @@ uv run ruff check . && uv run ruff format --check .
 
 ## Related
 
+- [docs/dev-guide/15-testing-guide.md](../docs/dev-guide/15-testing-guide.md) — the full testing chapter (mode discipline, harness toolbox, worked examples).
 - [develop-goldfive.md](develop-goldfive.md) — dev loop and merge flow.
 - [adapters.md](adapters.md) / [sinks.md](sinks.md) — what you're testing.
 - [docs/design/EVENT-MODEL.md](../docs/design/EVENT-MODEL.md) — event shapes.

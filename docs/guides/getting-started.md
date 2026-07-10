@@ -462,8 +462,10 @@ Tasks whose dependencies are satisfied run concurrently via
   control channel.
 - [troubleshooting.md](troubleshooting.md) — common install / run-time
   failures.
-- [tool-protocol.md](../reference/tool-protocol.md) — the seven
-  reporting tools that drive task state.
+- [tool-protocol.md](../reference/tool-protocol.md) — the reporting
+  tools that drive task state (seven lifecycle tools registered by
+  default; three drift self-reporting tools opt-in via
+  `drift_self_reporting`).
 - [ARCHITECTURE.md](../design/ARCHITECTURE.md) — the full design
   reference.
 

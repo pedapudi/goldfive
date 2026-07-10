@@ -88,6 +88,11 @@ class StubSteerer:
         # assert on the structured reason strings the executor emits.
         self.transition_details: list[tuple[str, TaskStatus, str, str]] = []
 
+    def is_active_steering(self) -> bool:
+        # Explicit active mode: the overlay enforcement paths under test
+        # are suppressed under the shipped observation-only default.
+        return True
+
     @property
     def observed(self) -> list[Any]:
         return self.drift.observed

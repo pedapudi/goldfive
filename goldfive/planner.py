@@ -3857,19 +3857,6 @@ class LLMPlanner:
         await self._emit_refine_validation_failed(plan, drift, last_error)
         return None
 
-    # Backwards-compatible alias for :meth:`_refine_steer`. Existing
-    # callers / subclasses that referred to ``_refine_user_steer``
-    # directly keep working; new code should use ``_refine_steer`` with
-    # an explicit ``source`` or go through :meth:`refine_steer`.
-    async def _refine_user_steer(
-        self,
-        plan: Plan,
-        drift: DriftEvent,
-        goals: list[Goal],
-        available_agents: list[str] | list[dict[str, Any]] | None = None,
-    ) -> Plan | None:
-        return await self._refine_steer(plan, drift, goals, available_agents, source="user")
-
     async def _user_steer_one_attempt(
         self,
         *,

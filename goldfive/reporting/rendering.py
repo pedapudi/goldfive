@@ -7,7 +7,11 @@ read on the next turn — they're the contract surface between
 * **Directive acks** (:func:`_build_plan_state`, :func:`_directive_ack`)
   — successful transitions return ``plan_state`` so the coordinator
   sees the next pending hand-off instead of an information-free ack.
-  This is the F1 / Tier 1 loop-prevention pattern.
+  This is the F1 / Tier 1 loop-prevention pattern. ``plan_state`` is a
+  goldfive-authored steering surface, so it is suppressed under
+  ``observation_only`` via the same
+  :func:`~goldfive.steerer.steering_is_active` predicate the
+  prompt-shaping sites consult.
 * **Idempotent / invalid / refused** responses — branch shapes for
   retries, contract violations, and stale-pin refusals. Distinct
   shapes so loop-detector / observability layers can tell them apart.
@@ -25,6 +29,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from goldfive.reporting._internal import _ACK, _TERMINAL_STATUSES
+from goldfive.steerer import steering_is_active
 from goldfive.types import TaskStatus
 
 if TYPE_CHECKING:
@@ -104,10 +109,11 @@ def _next_pending_with_completed_predecessors(plan: Any) -> Any | None:
 def _bare_agent_name(name: str) -> str:
     """Return the bare agent name (last dot-separated segment).
 
-    Mirrors the normalization used by ``_correction_injection`` —
-    fully-qualified ADK agent paths like ``coordinator.research_agent``
-    collapse to ``research_agent`` so the LLM sees a name it can pass
-    back as the AgentTool target.
+    Display-only: fully-qualified ADK agent paths like
+    ``coordinator.research_agent`` collapse to ``research_agent`` so
+    the LLM sees a name it can pass back as the AgentTool target.
+    (Correction keys, by contrast, use the verbatim assignee id — see
+    ``_correction_injection._normalize_agent_name``.)
     """
     s = (name or "").strip()
     if not s:
@@ -153,18 +159,28 @@ def _directive_ack(
     session: Session,
     task_id: str,
     new_status: TaskStatus,
+    steerer: Any | None = None,
 ) -> dict[str, Any]:
     """Build the F1 directive payload for a report_task_* handler.
 
     ``new_status`` is the status the call moved (or would move) the task
     INTO. Idempotent / invalid / refused branches use their own shapes
     and do not call this helper.
+
+    ``plan_state`` (completed ids + next_pending hand-off) is a
+    goldfive-authored directive fed to the model, so it rides the same
+    ``observation_only`` gate as the four prompt-shaping sites
+    (:func:`~goldfive.steerer.steering_is_active`). Under
+    strict-passive the ack keeps only the factual echo of the
+    transition the agent itself reported.
     """
-    return {
+    response: dict[str, Any] = {
         "acknowledged": True,
         "task": {"id": task_id, "status": new_status.value},
-        "plan_state": _build_plan_state(getattr(session, "plan", None)),
     }
+    if steering_is_active(steerer):
+        response["plan_state"] = _build_plan_state(getattr(session, "plan", None))
+    return response
 
 
 def _idempotent_response(
@@ -172,6 +188,7 @@ def _idempotent_response(
     *,
     session: Session | None = None,
     task_id: str = "",
+    steerer: Any | None = None,
 ) -> dict[str, Any]:
     """Idempotent ack for a re-report on a task already in ``current_status``.
 
@@ -180,7 +197,8 @@ def _idempotent_response(
     coordinator sees the next pending hand-off instead of an
     information-free ack — the same anchor the directive ack provides
     on real transitions. Without ``session`` the helper degrades to the
-    pre-F1 shape (legacy callers, test stubs).
+    pre-F1 shape (legacy callers, test stubs). ``plan_state`` is gated
+    on ``observation_only`` exactly as in :func:`_directive_ack`.
     """
     response: dict[str, Any] = {
         "acknowledged": True,
@@ -189,7 +207,8 @@ def _idempotent_response(
     }
     if session is not None:
         response["task"] = {"id": task_id, "status": current_status.value}
-        response["plan_state"] = _build_plan_state(getattr(session, "plan", None))
+        if steering_is_active(steerer):
+            response["plan_state"] = _build_plan_state(getattr(session, "plan", None))
     return response
 
 

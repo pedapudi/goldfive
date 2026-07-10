@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import warnings
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -41,8 +42,17 @@ from goldfive.events import (
 from goldfive.executors._control import (
     ControlOutcome,
     _ControlCancelled,
+    abort_expired_pause,
     dispatch_control,
     drain_controls,
+    pause_deadline_s,
+)
+from goldfive.executors._shared import (
+    apply_steer,
+    emit_drift_event,
+    emit_pipeline_failure_drift,
+    mark_cancelled_if_live,
+    tag_adapter_cancel_user_steer,
 )
 from goldfive.protocols import (
     AgentAdapter,
@@ -53,8 +63,8 @@ from goldfive.protocols import (
 )
 from goldfive.results import ExecutionOutcome, InvocationResult, evaluate_goal_predicates
 from goldfive.types import (
+    TERMINAL_TASK_STATUSES,
     DriftEvent,
-    DriftKind,
     DriftSeverity,
     Plan,
     RefineOutcome,
@@ -75,55 +85,9 @@ log = logging.getLogger(__name__)
 
 _WARNING_RANK = severity_rank(DriftSeverity.WARNING)
 
-_TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset(
-    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
-)
-
-
 # A (task, result_or_drift) carrier for stage gather. Using a dataclass
 # would add import weight; a tuple is fine and stays local to this file.
 _StageResult = tuple[Task, InvocationResult | None, DriftEvent | None, BaseException | None]
-
-
-# Symbolic cancel-reason for USER_STEER. Mirrors
-# :data:`goldfive.adapters.adk.SYMBOLIC_REASON_USER_STEER` but duplicated
-# as a plain string to avoid importing the optional ADK adapter module
-# from the provider-agnostic executor. Keep in sync. See goldfive#139.
-_CANCEL_REASON_USER_STEER: str = "user_steer"
-
-
-def _tag_adapter_cancel_user_steer(adapter: Any, session: Any = None) -> None:
-    """Tag the adapter's next mid-invocation cancel with the USER_STEER reason.
-
-    Called just before the executor triggers ``task.cancel()`` on any
-    in-flight stage invoke task so the adapter's mid-invocation cancel
-    handler picks up the tag and appends an LLM-actionable synthetic
-    ``function_response`` (instead of the legacy generic jargon). See
-    goldfive#139.
-
-    Routes through :meth:`ADKAdapter.set_next_cancel_reason` when the
-    adapter exposes it (PR #294 audit / goldfive#271 follow-up) so
-    the tag is keyed by ``session.id`` and cannot bleed across
-    concurrent goldfive sessions sharing one adapter. Falls back to
-    the bare attribute write for adapters / stubs that predate the
-    helper.
-    """
-    setter = getattr(adapter, "set_next_cancel_reason", None)
-    if callable(setter) and session is not None:
-        try:
-            setter(session, _CANCEL_REASON_USER_STEER)
-            return
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "ParallelDAGExecutor: set_next_cancel_reason raised: %s", exc
-            )
-    try:
-        adapter._next_cancel_reason = _CANCEL_REASON_USER_STEER
-    except Exception as exc:  # noqa: BLE001
-        log.debug(
-            "ParallelDAGExecutor: could not tag adapter cancel reason: %s",
-            exc,
-        )
 
 
 class ParallelDAGExecutor:
@@ -242,28 +206,32 @@ class ParallelDAGExecutor:
                     abort_reason = "cancelled by control"
                     break
                 if pending_steer is not None:
-                    await self._apply_steer(pending_steer, steerer=steerer, session=session)
+                    await apply_steer(pending_steer, steerer=steerer, session=session)
                     # Fall through: refresh plan on next iteration.
 
-                # Recompute stages from current plan each outer iteration;
-                # tasks already completed in previous stages are filtered
-                # out by ``topological_stages`` (they sit in a terminal
-                # status). This mirrors harmonograf's approach of
+                # Recompute stages from current plan each outer iteration.
+                # ``topological_stages`` is purely structural — it does
+                # NOT filter by status — so terminal tasks (e.g. a
+                # reconciler-stamped NOT_NEEDED, or tasks completed
+                # before a refinement) must be dropped here or they get
+                # re-invoked. This mirrors harmonograf's approach of
                 # re-querying plan state after every batch.
                 current_plan = session.plan or plan
                 stages = current_plan.topological_stages()
-                # Drop any stage composed entirely of tasks we already ran
-                # (defensive — planner.refine may leave older tasks in).
-                pending_stages = [
-                    stage for stage in stages if any(t.id not in completed_stage_ids for t in stage)
-                ]
+
+                def _pending(t: Task) -> bool:
+                    return (
+                        t.id not in completed_stage_ids and t.status not in TERMINAL_TASK_STATUSES
+                    )
+
+                pending_stages = [stage for stage in stages if any(_pending(t) for t in stage)]
                 if not pending_stages:
                     break
 
                 stage = pending_stages[0]
-                # Filter already-completed tasks within this stage so we
-                # don't re-invoke them after a refinement.
-                stage_tasks = [t for t in stage if t.id not in completed_stage_ids]
+                # Filter tasks already run this call (or in a terminal
+                # status) so we don't re-invoke them after a refinement.
+                stage_tasks = [t for t in stage if _pending(t)]
                 if not stage_tasks:
                     continue
 
@@ -279,7 +247,7 @@ class ParallelDAGExecutor:
                         "user_cancel:cancelled_by_control"
                     )
                     for task, _inv, _drift, _err in stage_results:
-                        await self._mark_cancelled_if_live(
+                        await mark_cancelled_if_live(
                             task_id=task.id,
                             steerer=steerer,
                             session=session,
@@ -304,7 +272,7 @@ class ParallelDAGExecutor:
                 )
                 for task, inv, _task_drift, error in stage_results:
                     live_status = live_status_by_id.get(task.id, task.status)
-                    already_terminal = live_status in _TERMINAL_TASK_STATUSES
+                    already_terminal = live_status in TERMINAL_TASK_STATUSES
                     if error is not None and not isinstance(error, asyncio.CancelledError):
                         if not already_terminal:
                             await steerer.transition(
@@ -358,7 +326,7 @@ class ParallelDAGExecutor:
                 # cancelled by _run_stage, so the fold-back above has
                 # already recorded the tasks as CANCELLED).
                 if control_outcome is not None and control_outcome.steer_message is not None:
-                    await self._apply_steer(
+                    await apply_steer(
                         control_outcome.steer_message,
                         steerer=steerer,
                         session=session,
@@ -581,11 +549,9 @@ class ParallelDAGExecutor:
                 # consults the live plan post-fold for terminal
                 # detection.
                 prev_status = task.status
-                if prev_status is not TaskStatus.RUNNING and prev_status not in (
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
-                    TaskStatus.NOT_NEEDED,
+                if (
+                    prev_status is not TaskStatus.RUNNING
+                    and prev_status not in TERMINAL_TASK_STATUSES
                 ):
                     if session.plan is not None and any(
                         t.id == task.id for t in session.plan.tasks
@@ -652,7 +618,7 @@ class ParallelDAGExecutor:
                         task.id,
                         detect_exc,
                     )
-                    await _emit_pipeline_failure_drift(
+                    await emit_pipeline_failure_drift(
                         session=session,
                         sinks=sinks,
                         task_id=task.id,
@@ -756,7 +722,7 @@ class ParallelDAGExecutor:
                             # content instead of the legacy generic
                             # jargon. See goldfive#139.
                             if outcome.steer_message is not None:
-                                _tag_adapter_cancel_user_steer(adapter, session=session)
+                                tag_adapter_cancel_user_steer(adapter, session=session)
                             await _cancel_stage_tasks()
                             break
                         # Non-interrupting control (PAUSE/RESUME/
@@ -1120,7 +1086,7 @@ class ParallelDAGExecutor:
             current_task_id=source.current_task_id,
             current_agent_id=source.current_agent_id,
         )
-        await _emit_drift_event(session=session, sinks=sinks, drift=failure)
+        await emit_drift_event(session=session, sinks=sinks, drift=failure)
 
     def _bump_refine_failure(self, *, session: Session, drift: DriftEvent) -> int:
         """Bump the per-``(kind, task_id)`` refine-failure counter.
@@ -1162,6 +1128,13 @@ class ParallelDAGExecutor:
         path-duality fix) — that message sets ``request_pause=True``
         so the executor's pause loop is indistinguishable from an
         explicit user-initiated PAUSE.
+
+        A goldfive pause whose payload carries ``deadline_s``
+        (``SteeringConfig.pause_escalate_deadline_s``, or the Level-5
+        TERMINATE fallback) bounds the wait: on expiry the run aborts
+        via :func:`abort_expired_pause` (non-terminal tasks CANCELLED,
+        ``RunAborted`` with the escalation lineage). Operator-issued
+        PAUSE carries no deadline and blocks unbounded as before.
         """
         if control is None:
             # Without a control channel the ladder-initiated pause has
@@ -1179,6 +1152,7 @@ class ParallelDAGExecutor:
         cancel_run = False
         steer_msg: object | None = None
         paused = False
+        pause_msg: object | None = None
         cancel_prefix = ""
         for o in outcomes:
             if o.cancel_run:
@@ -1190,8 +1164,11 @@ class ParallelDAGExecutor:
                 steer_msg = o.steer_message
             if o.request_pause:
                 paused = True
+                if o.goldfive_pause_message is not None:
+                    pause_msg = o.goldfive_pause_message
             if o.request_resume:
                 paused = False
+                pause_msg = None
 
         if cancel_run:
             # goldfive#205: stash structured cancel prefix for downstream
@@ -1200,8 +1177,29 @@ class ParallelDAGExecutor:
                 session._last_cancel_reason_prefix = cancel_prefix
             raise _ControlCancelled(cancel_reason or "cancelled by control")
 
+        deadline_s = pause_deadline_s(pause_msg)
+        deadline_at = time.monotonic() + deadline_s if deadline_s is not None else None
         while paused:
-            msg = await control.receive()
+            if deadline_at is None:
+                msg = await control.receive()
+            else:
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    await abort_expired_pause(
+                        session=session,
+                        steerer=steerer,
+                        pause_msg=pause_msg,
+                        deadline_s=deadline_s or 0.0,
+                    )
+                try:
+                    msg = await asyncio.wait_for(control.receive(), timeout=remaining)
+                except TimeoutError:
+                    await abort_expired_pause(
+                        session=session,
+                        steerer=steerer,
+                        pause_msg=pause_msg,
+                        deadline_s=deadline_s or 0.0,
+                    )
             if msg is None:
                 paused = False
                 break
@@ -1219,60 +1217,22 @@ class ParallelDAGExecutor:
             if outcome.steer_message is not None:
                 steer_msg = outcome.steer_message
                 paused = False
+            # A GOLDFIVE_PAUSE_ESCALATE while already paused adopts a
+            # tighter deadline (mirrors the sequential executor): this
+            # is how a TERMINATE escalation lands on an unbounded
+            # Level-4 pause.
+            if outcome.goldfive_pause_message is not None:
+                new_deadline_s = pause_deadline_s(outcome.goldfive_pause_message)
+                if new_deadline_s is not None:
+                    new_deadline_at = time.monotonic() + new_deadline_s
+                    if deadline_at is None or new_deadline_at < deadline_at:
+                        deadline_s = new_deadline_s
+                        deadline_at = new_deadline_at
+                        pause_msg = outcome.goldfive_pause_message
             if outcome.rewind_task_id:
                 paused = False
 
         return False, steer_msg
-
-    @staticmethod
-    async def _mark_cancelled_if_live(
-        *,
-        task_id: str,
-        steerer: Steerer,
-        session: Session,
-        cancel_reason: str = "",
-    ) -> None:
-        """Transition a not-yet-terminal task to CANCELLED.
-
-        ``cancel_reason`` (goldfive#205): structured reason stamped on
-        the emitted ``TaskCancelled``. Defaults to a generic
-        ``user_cancel:cancelled_by_control`` when unspecified.
-        """
-        if session.plan is None:
-            return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                if t.status in _TERMINAL_TASK_STATUSES:
-                    return
-                reason_value = cancel_reason or "user_cancel:cancelled_by_control"
-                try:
-                    await steerer.transition(
-                        task_id,
-                        TaskStatus.CANCELLED,
-                        detail="cancelled by control",
-                        cancel_reason=reason_value,
-                        session=session,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "ParallelDAGExecutor: cancelled transition raised: %s",
-                        exc,
-                    )
-                return
-
-    @staticmethod
-    async def _apply_steer(
-        message: object,
-        *,
-        steerer: Steerer,
-        session: Session,
-    ) -> None:
-        """Feed a STEER :class:`ControlMessage` to the steerer."""
-        try:
-            await steerer.drift.observe(message, session)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("ParallelDAGExecutor: steerer.drift.observe(STEER) raised: %s", exc)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1281,68 +1241,6 @@ class ParallelDAGExecutor:
 
 def _outcome_summary(completed_task_ids: set[str]) -> str:
     return f"{len(completed_task_ids)} tasks completed"
-
-
-async def _emit_pipeline_failure_drift(
-    *,
-    session: Session,
-    sinks: list[EventSink],
-    task_id: str,
-    reason: str,
-) -> None:
-    """Emit an INFO ``CUSTOM`` drift when the drift pipeline itself raised.
-
-    Surfaces plumbing failures in ``steerer.drift.observe`` / ``detect_drift``
-    that would otherwise be swallowed. INFO severity so this is
-    record-only and does not trigger another refine. Sinks that care
-    can filter on the ``drift_pipeline_failed:`` detail prefix. See
-    goldfive#134.
-    """
-    drift = DriftEvent(
-        kind=DriftKind.CUSTOM,
-        severity=DriftSeverity.INFO,
-        detail=reason,
-        current_task_id=task_id or "",
-    )
-    await _emit_drift_event(session=session, sinks=sinks, drift=drift)
-
-
-async def _emit_drift_event(
-    *,
-    session: Session,
-    sinks: list[EventSink],
-    drift: DriftEvent,
-) -> None:
-    """Build a DriftDetected envelope with proto enum mapping, then emit.
-
-    Uses the same enum-mapping shape
-    :meth:`DefaultSteerer._emit_drift_detected` uses — the
-    :func:`drift_detected_event` helper in :mod:`goldfive.events` does
-    a best-effort name lookup that silently fails for StrEnum-style
-    kind/severity names (stored as lowercase like ``critical``), which
-    would leave the event with enum value ``0`` (UNSPECIFIED).
-    """
-    from goldfive.events import new_event
-    from goldfive.pb.goldfive.v1 import types_pb2
-
-    evt = new_event(session.run_id, session.next_sequence(), session_id=session.id)
-    evt.drift_detected.kind = getattr(
-        types_pb2,
-        f"DRIFT_KIND_{drift.kind.name}",
-        getattr(types_pb2, "DRIFT_KIND_CUSTOM", 0),
-    )
-    evt.drift_detected.severity = getattr(
-        types_pb2,
-        f"DRIFT_SEVERITY_{drift.severity.name}",
-        getattr(types_pb2, "DRIFT_SEVERITY_UNSPECIFIED", 0),
-    )
-    evt.drift_detected.detail = drift.detail
-    evt.drift_detected.current_task_id = drift.current_task_id or ""
-    evt.drift_detected.current_agent_id = drift.current_agent_id or ""
-    try:
-        await emit_event(sinks, evt)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("_emit_drift_event: sink emit raised: %s", exc)
 
 
 # Runtime conformance check — the class must satisfy the Executor protocol.

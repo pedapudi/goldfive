@@ -22,7 +22,6 @@ Responsibilities
     delegation-observation time for unmatched delegations (goldfive#423
     PR 2). See ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3 + §5
     Option D for the lock-acquiring synchronous growth contract.
-  - :meth:`apply_user_steer_with_plan` — deprecated back-compat shim.
 
 * The shared install pipeline :meth:`_install_with_drift`:
   ``DriftDetected`` emit → fold runtime terminals → validate →
@@ -97,7 +96,6 @@ import contextlib
 import dataclasses
 import logging
 import uuid
-import warnings
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
@@ -634,9 +632,8 @@ class PlanReviser:
         await self._emit_refine_attempted(session, drift, attempt_id=attempt_id)
         # goldfive#247: rebind to the stamped instance.
         # goldfive#255: thread ``was_installed`` into PlanRevised.dry_run.
-        # ``install_revision_for_user_steer`` and the user-steer routing
-        # in ``apply_user_steer_with_plan`` enter through here too — the
-        # ``authored_by == "user"`` carve-out inside ``_apply_revision``
+        # ``install_revision_for_user_steer`` enters through here too —
+        # the ``authored_by == "user"`` carve-out inside ``_apply_revision``
         # makes ``was_installed`` True for those even under observation_only.
         revised_plan, was_installed = self._apply_revision(
             session, revised_plan, drift
@@ -651,73 +648,6 @@ class PlanReviser:
             dry_run=not was_installed,
         )
         return True
-
-    async def apply_user_steer_with_plan(
-        self,
-        *,
-        drift: DriftEvent,
-        session: Session,
-        revised_plan: Plan,
-    ) -> bool:
-        """Back-compat shim — prefer :meth:`install_revision_for_drift`
-        or :meth:`install_revision_for_user_steer` instead.
-
-        Routes based on ``drift.kind`` + ``drift.raw``:
-
-        * ``USER_STEER`` with ``raw`` populated → routed to
-          :meth:`install_revision_for_user_steer`. The ``raw`` from
-          the supplied drift is forwarded; ``drift.detail`` /
-          ``drift.authored_by`` are ignored (the new API rebuilds
-          them from ``raw`` deterministically).
-        * ``USER_STEER`` with ``raw is None`` → was the
-          :meth:`Runner._install_revision` synthetic install path
-          before Option A. The new Runner path no longer reaches this
-          shim; callers in this state probably mean
-          :meth:`install_initial_plan` (turn 1) or
-          :meth:`install_revision_for_drift` with a real drift kind
-          (turn N+1). Routed defensively to ``install_initial_plan``
-          when ``session.plan`` is empty, otherwise to
-          ``install_revision_for_drift`` with a synthesized
-          ``NEW_WORK_DISCOVERED`` drift so legacy callers keep
-          working — but a deprecation warning fires.
-        * Any other drift kind → routed to
-          :meth:`install_revision_for_drift`.
-
-        Slated for removal once external callers migrate.
-        """
-        warnings.warn(
-            "DefaultSteerer.apply_user_steer_with_plan is deprecated; "
-            "use install_initial_plan / install_revision_for_drift / "
-            "install_revision_for_user_steer (goldfive#271 Option A).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if drift.kind is DriftKind.USER_STEER and getattr(drift, "raw", None) is not None:
-            return await self.install_revision_for_user_steer(
-                session=session,
-                raw=drift.raw,
-                revised_plan=revised_plan,
-            )
-        if drift.kind is DriftKind.USER_STEER:
-            # Legacy synthetic-install path. Pick the new-API equivalent.
-            if session.plan is None or not session.plan.tasks:
-                return await self.install_initial_plan(
-                    session=session, plan=revised_plan
-                )
-            replan_drift = DriftEvent(
-                kind=DriftKind.NEW_WORK_DISCOVERED,
-                severity=DriftSeverity.INFO,
-                detail=drift.detail,
-                authored_by="goldfive",
-            )
-            return await self.install_revision_for_drift(
-                session=session,
-                drift=replan_drift,
-                revised_plan=revised_plan,
-            )
-        return await self.install_revision_for_drift(
-            session=session, drift=drift, revised_plan=revised_plan
-        )
 
     # ------------------------------------------------------------------
     # Descriptive growth — synchronous, lock-acquiring plan growth at
@@ -1942,7 +1872,7 @@ class PlanReviser:
             (not is_bootstrap)
             and (not is_user_authored)
             and (not is_discovery)
-            and (not self._steerer._should_inject())
+            and (not self._steerer.is_active_steering())
         )
         if gate_active:
             log.info(
@@ -2041,7 +1971,7 @@ class PlanReviser:
             # every side-effect site below can gate consistently. Mirrors
             # the wire-stamp resolution further down (caller threads through
             # ``not was_installed``; legacy callers pass ``None`` and fall
-            # back to ``not self._should_inject()``). Computed once,
+            # back to ``not is_active_steering()``). Computed once,
             # consumed by:
             #   * the supersedes-integration ``set_session_plan`` swap;
             #   * ``clear_obsolete_corrections_on_revision`` (state pop);
@@ -2056,7 +1986,7 @@ class PlanReviser:
             effective_dry_run = (
                 bool(dry_run)
                 if dry_run is not None
-                else (not self._steerer._should_inject())
+                else (not self._steerer.is_active_steering())
             )
             prior_plan_id_short = (
                 (session.plan.id if session.plan is not None else "")[:16]
@@ -2280,7 +2210,7 @@ class PlanReviser:
             # marker reflects whether this SPECIFIC revision was actually
             # suppressed (a bootstrap install or user-authored steer
             # under observation_only is a REAL revision — dry_run False
-            # — even though ``self._should_inject()`` is False). Legacy
+            # — even though ``is_active_steering()`` is False). Legacy
             # callers that don't pass ``dry_run`` fall back to the
             # pre-#255 behaviour for back-compat.
             #

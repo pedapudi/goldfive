@@ -34,6 +34,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
     DriftEvent,
@@ -269,7 +270,7 @@ async def test_apply_revision_no_partial_state_visible_during_cancel_inflight_yi
 
     planner = _StubPlanner(revised=revised)
     sink = _ListSink()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=planner)
 
     drift = _drift(kind=DriftKind.TOOL_ERROR, task_id="t1")
@@ -385,7 +386,7 @@ async def test_apply_revision_does_not_mutate_session_before_emit() -> None:
 
     drift = _drift(kind=DriftKind.OFF_TOPIC, task_id="t1")
 
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     returned, was_installed = steerer.plans._apply_revision(session, revised, drift)
 
     # The decision is "install" (no observation-only carve-out fires).

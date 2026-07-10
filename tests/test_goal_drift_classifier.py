@@ -38,6 +38,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.drift import classify_goal_drift  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
@@ -392,6 +393,9 @@ async def test_steerer_off_track_emits_critical_drift_and_nudges() -> None:
     steerer = DefaultSteerer(
         goal_drift_check_interval=2,
         goal_drift_call_llm=call_llm,
+        # Explicit active mode: the Level 2 nudge enqueue under test is
+        # suppressed under the shipped observation-only default.
+        steering_config=SteeringConfig(observation_only=False),
     )
     planner = StubPlanner()
     sink = ListSink()

@@ -98,32 +98,6 @@ _VALID_SIGNAL_CHANNELS: frozenset[str] = frozenset(
 _VALID_PLAN_MODES: frozenset[str] = frozenset({"forecast", "ledger"})
 
 
-# Test-only override hook for :class:`SteeringConfig.observation_only`'s
-# default (goldfive#254). Production code path: this stays ``None`` and
-# every fresh ``SteeringConfig()`` instance gets the documented production
-# default of ``True`` (passive observation). The pytest autouse fixture
-# ``tests/conftest.py::_goldfive_active_steering_default`` flips this to
-# ``False`` for the test suite so the broad existing test corpus —
-# written against the prior active-steering default — stays green
-# without per-test surgery. Tests that explicitly pass
-# ``observation_only=True`` (or ``=False``) still win — the override
-# only applies when the field was not explicitly set by the caller.
-_OBSERVATION_ONLY_DEFAULT: bool | None = None
-
-
-def _resolve_observation_only_default() -> bool:
-    """Resolve the active default for :class:`SteeringConfig.observation_only`.
-
-    Reads :data:`_OBSERVATION_ONLY_DEFAULT`. ``None`` means "no test
-    override is in effect" — return the production default (``True``).
-    Anything else means a test fixture has flipped the default
-    explicitly; honour the override.
-    """
-    if _OBSERVATION_ONLY_DEFAULT is None:
-        return True
-    return bool(_OBSERVATION_ONLY_DEFAULT)
-
-
 def _read_bool_env(name: str, default: bool) -> bool:
     """Read ``os.environ[name]`` as a boolean; fall back to ``default``.
 
@@ -235,6 +209,30 @@ def _read_float_env(name: str, default: float) -> float:
             default,
         )
         return default
+
+
+def _read_optional_float_env(name: str, default: float | None) -> float | None:
+    """Best-effort optional-float env override; returns default on any failure.
+
+    Used for fields whose Python type is ``float | None`` where ``None``
+    means "feature disabled" (e.g. ``pause_escalate_deadline_s``). A
+    non-positive value is treated as an explicit "disable" and maps to
+    ``None``; parse failures fall back to the default with a debug log.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        log.debug(
+            "runtime-config: ignoring non-float %s=%r (using default %s)",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value if value > 0 else None
 
 
 _VALID_REASONING_DRIFT_MODES: frozenset[str] = frozenset(
@@ -479,12 +477,20 @@ class ToolLoopConfig:
     preserves the pre-#204 single-threshold semantics for work tools.
     See :mod:`goldfive.drift.tool_loops` §"Graduated thresholds per
     category" for the full table.
+
+    ``name_axis_max_severity`` caps the severity of same-name-varied-
+    args (name-axis) hits that lack exact-repeat corroboration in the
+    window -- ``"info"`` (default) keeps the uncorroborated name axis
+    signal-only; ``"critical"`` restores the legacy uncapped
+    behaviour. See :mod:`goldfive.drift.tool_loops` §"Name-axis
+    precision".
     """
 
     window: int = 10
     exact_threshold: int = 3
     name_threshold: int = 5
     alternating_threshold: int = 5
+    name_axis_max_severity: str = "info"
 
     @classmethod
     def from_env(cls) -> ToolLoopConfig:
@@ -492,6 +498,8 @@ class ToolLoopConfig:
 
         Names preserved from :func:`goldfive.drift.tool_loops.load_thresholds_from_env`.
         """
+        from goldfive.drift.tool_loops import _read_severity_env
+
         defaults = cls()
         return cls(
             window=_read_int_env("GOLDFIVE_TOOL_LOOP_WINDOW", defaults.window),
@@ -504,6 +512,10 @@ class ToolLoopConfig:
             alternating_threshold=_read_int_env(
                 "GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD",
                 defaults.alternating_threshold,
+            ),
+            name_axis_max_severity=_read_severity_env(
+                "GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY",
+                defaults.name_axis_max_severity,
             ),
         )
 
@@ -536,6 +548,19 @@ class ReasoningDriftConfig:
     looping_reasoning_similarity_threshold: float = 0.9
     reasoning_cluster_similarity_threshold: float = 0.75
     looping_reasoning_hash_window: int = 5
+    max_concurrent_judges: int = 3
+    """Per-steerer cap on concurrently RUNNING background reasoning-judge
+    LLM calls (judge-scheduling guards).
+
+    N agents thinking in the same event-loop tick used to fire N
+    parallel judge calls (each with a 16384-token output ceiling) at
+    the judge endpoint — which, under the default :func:`goldfive.wrap`
+    auto-detect, is the agent tree's OWN model. The cap bounds the
+    burst; requests beyond it queue on a per-steerer
+    ``asyncio.Semaphore`` and per-(agent, task) queued windows coalesce
+    onto the newest observation. Values below 1 are clamped to 1.
+    Env: ``GOLDFIVE_DRIFT_MAX_CONCURRENT_JUDGES``.
+    """
     fallback_to_content_when_no_reasoning: bool = False
     """Synthesize a reasoning signal from the response body on
     non-thinking models (goldfive#263).
@@ -613,6 +638,10 @@ class ReasoningDriftConfig:
                 "GOLDFIVE_DRIFT_LOOPING_HASH_WINDOW",
                 defaults.looping_reasoning_hash_window,
             ),
+            max_concurrent_judges=_read_int_env(
+                "GOLDFIVE_DRIFT_MAX_CONCURRENT_JUDGES",
+                defaults.max_concurrent_judges,
+            ),
             fallback_to_content_when_no_reasoning=_read_bool_env(
                 "GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT",
                 defaults.fallback_to_content_when_no_reasoning,
@@ -651,6 +680,14 @@ class GoalDriftConfig:
         )
 
 
+#: Fallback wait budget, in milliseconds, for a ``report_awaiting_approval``
+#: call that omits ``timeout_ms`` (or passes ``<= 0``) while a control
+#: channel is attached. Referenced by
+#: :attr:`SteeringConfig.approval_default_timeout_ms` and by the handler's
+#: fallback when the steerer carries no :class:`SteeringConfig` at all.
+DEFAULT_APPROVAL_TIMEOUT_MS: int = 600_000
+
+
 @dataclasses.dataclass
 class SteeringConfig:
     """Drift → steer promotion policy (goldfive-steer-unification).
@@ -685,15 +722,29 @@ class SteeringConfig:
     cancel or refine fires. Default ``3`` keeps a live operator
     override dominant across a few agent turns.
 
-    ``observation_only`` (goldfive#254) gates the three actual steering
-    injection points on :class:`~goldfive.steerer.DefaultSteerer`:
+    ``observation_only`` (goldfive#254) is the master kill-switch for
+    steering interventions. The single source of truth at runtime is
+    :meth:`~goldfive.steerer.DefaultSteerer.is_active_steering`
+    (``True`` iff interventions may mutate or inject); consumers
+    holding a maybe-steerer resolve through
+    :func:`~goldfive.steerer.steering_is_active`, which treats a
+    missing steerer / missing predicate as passive. No other code may
+    read the flag directly. The gated injection points on
+    :class:`~goldfive.steerer.DefaultSteerer`:
 
     * the would-be revised plan replacing ``session.plan`` in
       :meth:`~goldfive.steerer.DefaultSteerer._apply_revision`;
     * the ``GOLDFIVE_STEER`` ControlMessage enqueue in
       :meth:`~goldfive.steerer.DefaultSteerer._dispatch_goldfive_steer_control`;
     * the ``request_invocation_cancel`` plugin call in
-      :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`.
+      :meth:`~goldfive.steerer.DefaultSteerer.request_invocation_cancel`;
+    * the Level 2 nudge enqueues onto ``session.pending_nudges``
+      (``_dispatch_nudge`` and the post-ABSORB handoff, goldfive#202) —
+      the overlay would otherwise drain the queue into a
+      goldfive-authored synthetic user turn and re-invoke the tree.
+      The executor's drain carries a matching defense-in-depth gate
+      (goldfive#264 pattern) for steerer subclasses that bypass the
+      dispatcher.
 
     The plan-install gate suppresses only **corrective**
     goldfive-authored revisions. Three categories always land as real
@@ -731,9 +782,7 @@ class SteeringConfig:
 
     threshold: str = "warning"
     suppression_window_turns: int = 3
-    observation_only: bool = dataclasses.field(
-        default_factory=_resolve_observation_only_default
-    )
+    observation_only: bool = True
     #: Names of :class:`~goldfive.context_editor.ContextEditRule` rules to
     #: register on the ADK plugin's :class:`~goldfive.context_editor.ContextEditor`
     #: (goldfive#397). ``None`` (the default) AND an empty list both leave
@@ -939,6 +988,58 @@ class SteeringConfig:
     #: there); the legacy regime has no queue notes, so PR 8 is a no-op there
     #: (§5.1). Env: ``GOLDFIVE_STEER_GRACE_WINDOW_TURNS``.
     grace_window_turns: int = 3
+    #: Wait budget, in milliseconds, substituted when a
+    #: ``report_awaiting_approval`` call omits ``timeout_ms`` (or passes
+    #: ``<= 0``) and a control channel is attached. Historically that
+    #: path awaited the APPROVE / REJECT waiter with no bound, so an
+    #: operator who never dispatched a decision hung the tool call — and
+    #: the run — forever (no invocation wall clock covers tool waits).
+    #: On expiry the handler returns ``decision="timeout"`` and emits a
+    #: ``HUMAN_INTERVENTION_REQUIRED`` WARNING drift so operators see
+    #: the unresolved approval. An explicit positive ``timeout_ms`` from
+    #: the agent still wins; a non-positive value here falls back to
+    #: :data:`DEFAULT_APPROVAL_TIMEOUT_MS`.
+    #: Env: ``GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS``.
+    approval_default_timeout_ms: int = DEFAULT_APPROVAL_TIMEOUT_MS
+    #: Deadline, in seconds, on the executor's pause wait after a Level-4
+    #: ``GOLDFIVE_PAUSE_ESCALATE`` dispatch. The pre-task / pre-stage
+    #: pause loop historically awaited ``ControlChannel.receive()`` with
+    #: no bound, so an unattended deployment whose ladder escalated to a
+    #: pause hung forever waiting for an operator RESUME / CANCEL /
+    #: STEER that never came. When set, the executor aborts the run on
+    #: expiry: background steerer/judge tasks are drained, every
+    #: non-terminal task is CANCELLED, and a ``RunAborted`` carrying the
+    #: escalation lineage (originating drift kind + ladder level) is
+    #: emitted. ``None`` (the default) preserves the block-forever
+    #: behaviour for Level 4 — EXCEPT for Level 5 (TERMINATE), which by
+    #: definition must terminate: with no configured deadline it falls
+    #: back to
+    #: :data:`goldfive.drift_observer.DEFAULT_TERMINATE_PAUSE_DEADLINE_S`.
+    #: Operator-issued ``PAUSE`` controls are never bounded by this knob.
+    #: Env: ``GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S``.
+    pause_escalate_deadline_s: float | None = None
+    #: Wall-clock stall watchdog (default OFF). When enabled, the ADK
+    #: plugin spawns one background task per dispatch that watches a
+    #: liveness watermark — the max of every
+    #: :attr:`~goldfive.types.Session.task_last_progress_at` stamp and
+    #: :attr:`~goldfive.types.Session.last_observed_event_at` (stamped on
+    #: every observation dispatched into the drift pipeline). When the
+    #: watermark goes silent for :attr:`stall_timeout_s` seconds, a
+    #: ``TASK_TIMEOUT`` drift fires at WARNING, escalating to CRITICAL
+    #: on continued silence. Routed through the normal drift dispatch,
+    #: so under ``observation_only`` (the production default) the drift
+    #: is telemetry-only; in active mode the intervention ladder handles
+    #: it. This is the producer for runs wedged in a hung async tool
+    #: call or idling with no task transitions — which previously
+    #: produced ZERO signal. Env: ``GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED``.
+    stall_watchdog_enabled: bool = False
+    #: Idle threshold, in seconds, before the stall watchdog fires its
+    #: first ``TASK_TIMEOUT`` WARNING; each further multiple of the
+    #: timeout with no fresh activity fires a CRITICAL. Non-positive
+    #: values disable the watchdog even when
+    #: :attr:`stall_watchdog_enabled` is True.
+    #: Env: ``GOLDFIVE_STEER_STALL_TIMEOUT_S``.
+    stall_timeout_s: float = 600.0
 
     @classmethod
     def from_env(cls) -> SteeringConfig:
@@ -952,9 +1053,7 @@ class SteeringConfig:
         * ``GOLDFIVE_STEER_OBSERVATION_ONLY`` — boolean
           (``1``/``true``/``yes``/``on`` truthy; ``0``/``false``/
           ``no``/``off`` falsy; case-insensitive). Defaults to the
-          built-in default (``True`` in production, flipped to
-          ``False`` for the goldfive test suite via the autouse
-          ``_goldfive_active_steering_default`` fixture).
+          built-in default (``True``).
         * ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES`` — comma-separated rule
           names (goldfive#397). Empty / unset → ``None`` (editor unwired).
           Example: ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES=prune_cancelled_reasoning``.
@@ -974,6 +1073,17 @@ class SteeringConfig:
           (AGENCY-PRESERVATION.md PR 8); default ``3``. (Set ``0`` to disable
           via the typed config; ``_read_int_env`` rejects non-positive env
           values, so the env minimum is ``1``.)
+        * ``GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS`` — positive int
+          (milliseconds); non-positive / non-integer values fall back
+          to the default.
+        * ``GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S`` — positive float
+          (seconds); non-positive values disable the deadline (``None``),
+          non-float values fall back to the default.
+        * ``GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED`` — boolean (same
+          literals as ``GOLDFIVE_STEER_OBSERVATION_ONLY``). Default
+          False (watchdog off).
+        * ``GOLDFIVE_STEER_STALL_TIMEOUT_S`` — float (seconds);
+          non-float values fall back to the default (600).
         """
         defaults = cls()
         raw_rules = os.environ.get("GOLDFIVE_STEER_CONTEXT_EDITOR_RULES", "").strip()
@@ -1027,6 +1137,22 @@ class SteeringConfig:
                 "GOLDFIVE_STEER_GRACE_WINDOW_TURNS",
                 defaults.grace_window_turns,
             ),
+            approval_default_timeout_ms=_read_int_env(
+                "GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS",
+                defaults.approval_default_timeout_ms,
+            ),
+            pause_escalate_deadline_s=_read_optional_float_env(
+                "GOLDFIVE_STEER_PAUSE_ESCALATE_DEADLINE_S",
+                defaults.pause_escalate_deadline_s,
+            ),
+            stall_watchdog_enabled=_read_bool_env(
+                "GOLDFIVE_STEER_STALL_WATCHDOG_ENABLED",
+                defaults.stall_watchdog_enabled,
+            ),
+            stall_timeout_s=_read_float_env(
+                "GOLDFIVE_STEER_STALL_TIMEOUT_S",
+                defaults.stall_timeout_s,
+            ),
         )
 
 
@@ -1054,9 +1180,14 @@ class AgentConfig:
     ``max_output_tokens`` on ``llm_request.config``, that smaller value
     wins — goldfive only ratchets the cap DOWN, never up.
 
-    ``call_timeout_ms`` is the wall-clock budget per call. On expiry the
-    call cancels and an ``LLM_CALL_TIMEOUT`` drift fires (CRITICAL,
-    capacity-shaped) so the existing drift dispatch handles escalation.
+    ``call_timeout_ms`` is the wall-clock budget per call. On expiry an
+    ``LLM_CALL_TIMEOUT`` drift fires (CRITICAL, capacity-shaped) so the
+    existing drift dispatch handles escalation; in active mode
+    (``SteeringConfig.observation_only=False``) the invocation is also
+    flagged for cooperative cancel. Under ``observation_only`` (the
+    production default) the drift is telemetry-only — the in-flight
+    call is never cancelled, since healthy models can genuinely need
+    longer than the budget (see below).
     Default 120s — Qwen 35B-class models can take 60-90s on long
     prompts; operators who genuinely need longer (slow judges, weak
     hardware, multi-step research synthesis) override via env or the

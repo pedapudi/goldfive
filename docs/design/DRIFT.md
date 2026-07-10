@@ -79,7 +79,7 @@ kinds group naturally into six categories.
 | `TASK_FAILED_RECOVERABLE` | `report_task_failed(task_id, reason, recoverable=True)` | `warning` | yes |
 | `TASK_FAILED_FATAL` | `report_task_failed(task_id, reason, recoverable=False)` | `critical` | no |
 | `REPEATED_FAILURE` | Same task has now failed `>= N` times in one run. | `critical` | sometimes |
-| `TASK_TIMEOUT` | Task exceeded its predicted duration by a wide factor. | `warning` | yes |
+| `TASK_TIMEOUT` | Wall-clock stall watchdog (`SteeringConfig.stall_watchdog_enabled`, default OFF): the session's liveness watermark (`task_last_progress_at` + `last_observed_event_at`) silent for `stall_timeout_s`. Graduated: WARNING on first fire, CRITICAL at each further multiple of the timeout with no fresh activity. Suppressed while an LLM call is in flight under its own per-call budget (that hang is `LLM_CALL_TIMEOUT`). | `warning`, escalating `critical` | yes |
 
 ### Divergence category — work no longer matches the plan
 
@@ -168,8 +168,8 @@ mapping.
 | `RUNAWAY_DELEGATION` | `35` | ADK coordinator delegated via `AgentTool` more than `ADKAdapter(agent_tool_cap=N)` allows (default 16). | `critical` | `_GoldfiveADKPlugin._emit_runaway_delegation_drift` | Level 3 → Level 4 (cancel + refine; escalate on repeat) |
 | `CONFABULATION_RISK` | `34` | Two sources: (a) `GoldfivePlanner.process_planning_response` sees a `function_call` whose name is neither in the running agent's own tools nor in the tree agent registry (pure hallucination, three-stage gate #178); (b) `goldfive.drift.classify_confabulation_risk` spots the cheap structural pattern "task title implies external data access but the agent produced output without calling any tool." | `warning` (three-stage gate) / `info` (structural) | `GoldfivePlanner` or `after_run_callback` | Level 1 → Level 3 on repeat |
 | `REFINE_VALIDATION_FAILED` | `36` | `LLMPlanner` exhausted its refine retry budget (attempts 1 & 2 both rejected by the structural validator). Terminal signal. | `critical` | `LLMPlanner._emit_refine_validation_failed` | Level 4 (PAUSE_ESCALATE — steerer deliberately does NOT re-refine) |
-| `HUMAN_INTERVENTION_REQUIRED` | `37` | Escalation target emitted by the intervention ladder when Level 4 fires (persistent refine failures, goal drift, repeated critical drift). | `critical` | `DefaultSteerer._dispatch_pause_escalate` | Level 4; repeat → Level 5 (TERMINATE) |
-| `GOAL_DRIFT` | `38` | Periodic trajectory-level LLM-judge: every N invocations, classify whether accumulated activity advances `session.goals`. Gated behind `Runner(goal_drift_enabled=...)` + a `goal_drift_call_llm` callable on the steerer. **On the `goldfive.wrap(...)` path the judge is wired automatically** from the resolved planner `call_llm` (goldfive#217): any `wrap()` call that ends up with a real LLM — explicit `call_llm=` or `detect_llm(agent)` hit — also arms this judge. Opt out by passing an explicit steerer, e.g. `goldfive.wrap(agent, steerer=DefaultSteerer(goal_drift_call_llm=None))`, or by setting `Runner(goal_drift_enabled=False)` when building manually. When `goal_drift_enabled=True` but no callable is wired (operator-built `Runner` with a bare `DefaultSteerer()`), the Runner emits a one-shot WARNING and the check stays inert. | `critical` | `goldfive.drift.goals.classify_goal_drift` | Level 4 both on first and repeat (refine cannot recover from trajectory-level drift) |
+| `HUMAN_INTERVENTION_REQUIRED` | `37` | Escalation target emitted by the intervention ladder when Level 4 fires (persistent refine failures, repeated critical drift). | `critical` | `DriftObserver._dispatch_pause_escalate` | Level 4; repeat → Level 5 (TERMINATE) |
+| `GOAL_DRIFT` | `38` | Periodic trajectory-level LLM-judge: every N invocations, classify whether accumulated activity advances `session.goals`. Gated behind `Runner(goal_drift_enabled=...)` + a `goal_drift_call_llm` callable on the steerer. **On the `goldfive.wrap(...)` path the judge is wired automatically** from the resolved planner `call_llm` (goldfive#217): any `wrap()` call that ends up with a real LLM — explicit `call_llm=` or `detect_llm(agent)` hit — also arms this judge. Opt out by passing an explicit steerer, e.g. `goldfive.wrap(agent, steerer=DefaultSteerer(goal_drift_call_llm=None))`, or by setting `Runner(goal_drift_enabled=False)` when building manually. When `goal_drift_enabled=True` but no callable is wired (operator-built `Runner` with a bare `DefaultSteerer()`), the Runner emits a one-shot WARNING and the check stays inert. | `critical` | `goldfive.drift.goals.classify_goal_drift` | WARNING → Level 2 (NUDGE); CRITICAL first → Level 2 (NUDGE), repeat → Level 3 (CANCEL_REINVOKE). goldfive#324 F4: the plan is usually still right — the agent's next-action reasoning is what's stuck — so a corrective message naming the next pending task and its agent beats a refine. |
 
 ### Goal category — we will not be able to finish
 
@@ -188,7 +188,7 @@ parts). See `goldfive/drift/reasoning.py` for the detector pipeline.
 
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
-| `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). Also fired by the tool-call-loop detector in `goldfive.drift.tool_loops` when the ADK plugin's `after_tool_callback` observes repeated `(tool_name, args_hash)` patterns (exact / name / alternating) — see goldfive#181 and the graduated-severity table in goldfive#204. | `info` · `warning` · `critical` (graduated per tool category + count; `info` for the alternating-cycle variant) | yes |
+| `LOOPING_REASONING` | Consecutive reasoning blocks share the same SHA-256 prefix (always-on) or cosine-similar above `0.9` (opt-in, `goldfive[embedding]`). Also fired by the tool-call-loop detector in `goldfive.drift.tool_loops` when the ADK plugin's `after_tool_callback` observes repeated `(tool_name, args_hash)` patterns (exact / name / alternating) — see goldfive#181 and the graduated-severity table in goldfive#204. | `info` · `warning` · `critical` (graduated per tool category + count; `info` for the alternating-cycle variant; name-axis hits without exact-repeat corroboration are capped at `info` by default — see §"Name-axis precision") | yes |
 | `REASONING_CLUSTER_TIGHTENING` | Max cosine similarity between current reasoning and the last N=5 blocks falls in `[0.75, 0.9)` (opt-in, `goldfive[embedding]`). Graduated early-warning tier below the `LOOPING_REASONING` cliff. One-shot per task. | `info` | yes |
 | `OFF_TOPIC` | Reasoning cosine-distance from the current task description ≥ `0.7` (requires `goldfive[embedding]`). | `warning` | yes |
 | `INTENT_DIVERGENCE` | Reasoning has drifted from `session.goals` + the current task topic. Severity is **graduated** — see table below. | `info` · `warning` · `critical` | depends on severity |
@@ -614,13 +614,41 @@ emits ONE drift at the first matching tier — no cascade of
 | `meta`   | exact | 3 | 6 | 10 |
 | `meta`   | name  | —  | — | —  |
 | `work`   | exact | 3 | 3 | 6  |
-| `work`   | name  | — | 5 | 7  |
+| `work`   | name  | — | 5\* | 7\* |
 
 "exact" counts identical `(tool_name, args_hash)` signatures in the
 window; "name" counts same-`tool_name`-any-args signatures. Category
 is determined per tool — a window containing 3 meta retries **and** 3
 work retries classifies each tool independently and picks the highest
 severity across tools.
+
+\* Name-axis tiers keep their thresholds but the **emitted** severity
+is capped without corroboration — see the next section.
+
+### Name-axis precision: corroboration cap
+
+The name axis alone is ambiguous between a stuck loop and
+definitionally-healthy behaviour — an agent reading six different
+files with the same tool is doing its job, yet counts 6 on the name
+axis. Because the window is keyed on `(session.run_id, agent_name)`
+and accumulates across re-invocations (goldfive#420), and is reset
+only by acknowledged `report_task_*` calls (cooperation goldfive's
+design does not require), the uncapped WARNING-at-5 / CRITICAL-at-7
+name tiers false-positived on healthy varied-args bursts.
+
+A name-axis hit is therefore capped at **INFO** (signal-only
+telemetry, ladder Level 0 `OBSERVE`) unless the window corroborates
+the loop hypothesis with **exact-repeat evidence**: at least 2
+identical `(tool_name, args_hash)` calls for the same tool. The
+matched tier is still recorded on `raw["tier"]`, and a capped drift
+carries `raw["severity_capped_from"]` naming the uncapped severity so
+telemetry consumers see what would have fired. Exact-axis hits are
+unchanged at any cap setting.
+
+The cap is configurable via `ToolLoopConfig.name_axis_max_severity` /
+`GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY` (`"info"` | `"warning"` |
+`"critical"`; default `"info"`). Operators who want the legacy
+uncapped behaviour set `"critical"`.
 
 An independent **alternating-cycle** mode still fires INFO when the
 last `alternating_threshold=5` calls match an `A,B,A,B,A` pattern
@@ -639,10 +667,11 @@ via `GOLDFIVE_TOOL_LOOP_WINDOW` / `GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD`.
 The legacy `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD` /
 `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD` env vars still work and override
 the **work-category WARNING tier** only (preserving pre-#204
-single-threshold semantics). The graduated CRITICAL tiers and the
-meta-category thresholds are module-level constants (grouped in
-`_META_THRESHOLDS` / `_WORK_THRESHOLDS`) pending a follow-up that
-exposes them via `ServerConfig`.
+single-threshold semantics). The name-axis severity cap is tunable
+via `GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY`. The graduated
+CRITICAL tiers and the meta-category thresholds are module-level
+constants (grouped in `_META_THRESHOLDS` / `_WORK_THRESHOLDS`)
+pending a follow-up that exposes them via `ServerConfig`.
 
 ### Ladder routing for graduated severity
 
@@ -650,10 +679,14 @@ The intervention ladder (below) routes `LOOPING_REASONING` by
 severity:
 
 - **INFO** → Level 0 (`OBSERVE`): record the drift, no plan mutation.
-  This is the benign tier — meta-tool retries at count 3 land here.
+  This is the benign tier — meta-tool retries at count 3 land here,
+  as do uncorroborated name-axis hits at any count (default cap).
 - **WARNING** → Level 1 (`ABSORB`): call `planner.refine`. Unchanged
-  from pre-#204 — work-tool loops at 3+ calls, meta at 6+, work
-  name-axis at 5.
+  from pre-#204 for the exact axis — work-tool loops at 3+ identical
+  calls, meta at 6+. Work name-axis at 5 reaches WARNING only with
+  exact-repeat corroboration in the window (or a raised
+  `name_axis_max_severity`) — uncorroborated name-axis caps at INFO
+  (goldfive#484).
 - **CRITICAL** first → Level 2 (`SIGNAL`, renamed from `NUDGE` in
   AGENCY-PRESERVATION.md PR 7): enqueue an advisory observer note for
   the agent (no refine, no cancel, no steer). The proportional,
@@ -661,6 +694,16 @@ severity:
 - **CRITICAL** repeat → Level 4 (`PAUSE_ESCALATE`): if the loop
   survives the signal and re-fires CRITICAL after
   `REFINE_FAILURE_THRESHOLD` occurrences, escalate to a human pause.
+
+### Negative class
+
+When an invocation ends with at least one tracker observation and
+zero tool-loop drifts fired, the ADK plugin's `after_run_callback`
+emits one aggregated `SteeringDecisionMade(outcome="no_drift",
+detector_name="tool_loops")` — telemetry only, identical in
+observe-only and active modes — so downstream optimizers can
+distinguish "tracker quiet" from "tracker never ran". Aggregated
+per invocation rather than per tool call to keep wire volume bounded.
 
 ### Task-progress gate
 
@@ -741,11 +784,11 @@ snapshotted in `tests/test_ladder_decision_table.py`.
 | Level | Name | Action | Typical triggers |
 |---|---|---|---|
 | **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift; the forecast-mismatch demotions. |
-| **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `TOOL_ERROR`, `AGENT_REFUSAL`, `CAPABILITY_MISMATCH` Rule B, etc.). |
-| **2** | `SIGNAL` (was `NUDGE`) | Enqueue an advisory observer note on the configured channel (PR 6) — **no refine, no cancel, no steer**. The agent reads it at its next model call / invocation boundary. | CRITICAL-first of the goldfive-authored content kinds (`TOOL_ERROR`, `AGENT_REFUSAL`, `MODEL_REFUSAL`, `OFF_TOPIC`, `CONFABULATION_RISK`, `LOOPING_*`, `SELF_REPORTED_STUCK`); `GOAL_DRIFT` at WARNING + CRITICAL-first. |
+| **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `TOOL_ERROR`, `AGENT_REFUSAL`, `CAPABILITY_MISMATCH` Rule B, etc. — but `GOAL_DRIFT` and `TASK_TIMEOUT` route WARNING to Level 2 instead). |
+| **2** | `SIGNAL` (was `NUDGE`) | Enqueue an advisory observer note on the configured channel (PR 6) — **no refine, no cancel, no steer**. The agent reads it at its next model call / invocation boundary. The legacy-channel enqueue is gated on `is_active_steering()` (goldfive#475) — under `observation_only=True` the would-be note is logged and a `PolicyApplied` gate event is stamped instead; the request_context channel gates rendering at the delivery surfaces. | CRITICAL-first of the goldfive-authored content kinds (`TOOL_ERROR`, `AGENT_REFUSAL`, `MODEL_REFUSAL`, `OFF_TOPIC`, `CONFABULATION_RISK`, `LOOPING_*`, `SELF_REPORTED_STUCK`); `GOAL_DRIFT` at WARNING + CRITICAL-first; `TASK_TIMEOUT` at WARNING (the goldfive#487 stall watchdog). |
 | **3** | `CANCEL_REINVOKE` | Refine; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage** so the executor cancels the in-flight invocation and restarts with a framed corrective body. | `RUNAWAY_DELEGATION` at CRITICAL-first; the USER_STEER junction; and every goldfive-authored row under `GOLDFIVE_STEER_LEGACY_LADDER=1`. |
-| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives. | The budget/timeout hard-safety kinds (`RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`) at CRITICAL-first; `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind (incl. `GOAL_DRIFT`, `RUNAWAY_DELEGATION`). |
-| **5** | `TERMINATE` | Run-level abort. Currently only reachable when a Level-4-initiated pause times out and `HUMAN_INTERVENTION_REQUIRED` re-fires as a repeat CRITICAL. | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
+| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives — unbounded unless `SteeringConfig.pause_escalate_deadline_s` is set, in which case the message carries a `deadline_s` payload and expiry aborts the run (goldfive#482). | The budget/timeout hard-safety kinds (`RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`) at CRITICAL-first; `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind (incl. `GOAL_DRIFT`, `RUNAWAY_DELEGATION`). |
+| **5** | `TERMINATE` | Pause-with-deadline (goldfive#482). Same dispatch as Level 4 but the payload ALWAYS carries `deadline_s` (`SteeringConfig.pause_escalate_deadline_s`, or `DEFAULT_TERMINATE_PAUSE_DEADLINE_S` = 600 s when unset). On expiry the executor cancels every non-terminal task and emits `RunAborted` carrying the escalation lineage (drift kind + ladder level). | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
 
 ### Dispatch routing — single junction (Phase 2 of #246)
 
@@ -781,6 +824,15 @@ CONTROL …]` header, so plugins / sinks can attribute the corrective
 to its actual origin. See `tests/test_goldfive_drift_routing.py` for
 the contract pins.
 
+**`TASK_TIMEOUT` row (stall watchdog).** The flag-gated wall-clock
+stall watchdog's drift has a deliberately conservative row:
+`INFO → OBSERVE`, `WARNING → NUDGE` (a stall is a liveness signal,
+not a plan defect — `ABSORB` would loop the planner against a plan
+that isn't wrong), `CRITICAL → PAUSE_ESCALATE` (first and repeat —
+the watchdog only emits CRITICAL on *continued* silence after its
+WARNING, so a CRITICAL is by construction already a repeat). Under
+`observation_only` the whole dispatch is telemetry-only as usual.
+
 **Repeat detection.** Occurrence count per `(drift.kind, task_id)` is
 tracked on the session; a drift crosses "repeat" once
 `occurrence_count >= DefaultSteerer.REFINE_FAILURE_THRESHOLD`
@@ -794,8 +846,10 @@ table entry fall through to:
 - `WARNING` → `ABSORB`
 - `CRITICAL` first → `ABSORB`; repeat → `PAUSE_ESCALATE`
 
-Subclasses of `DefaultSteerer` override `_ladder_level_for` to tune
-the table without re-implementing `_handle_drift`.
+The tune point is `DriftObserver._ladder_level_for`
+(`goldfive/drift_observer.py`); a custom steerer replaces its
+`drift` component (or subclasses `DriftObserver`) to adjust the
+table without re-implementing `handle_drift`.
 
 See goldfive#179 (umbrella) for future detection work — additional
 detectors will register new rows on `_LADDER` rather than editing the

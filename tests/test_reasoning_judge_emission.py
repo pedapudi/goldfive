@@ -417,3 +417,106 @@ async def test_returned_drift_trigger_input_is_truncated_when_long() -> None:
     )
     assert drift is not None
     assert drift.trigger_input.endswith(" … [truncated]")
+
+
+# ---------------------------------------------------------------------------
+# Parsed attribution fields land on the wire
+# ---------------------------------------------------------------------------
+
+
+async def test_attribution_fields_land_on_judge_invoked_event() -> None:
+    """focused_task_id / focus_confidence / stated_intent / provenance
+    reach the ``ReasoningJudgeInvoked`` payload and survive a proto
+    serialize/parse round-trip.
+    """
+    sink = ListSink()
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "justified_deviation",
+                "provenance": "tool_error",
+                "severity": "info",
+                "reason": "tool failed, agent adapting",
+                "focused_task_id": "t1",
+                "focus_confidence": 0.8,
+                "stated_intent": "retrying the fetch with a fallback endpoint",
+            }
+        ]
+    )
+    drift = await rjudge.classify_reasoning_drift(
+        reasoning="the fetch tool errored; switching to the mirror",
+        task=_task(),
+        goals=_goals(),
+        model="m",
+        call_llm=call_llm,
+        current_task_id="t1",
+        sink=sink,
+    )
+    assert drift is not None
+    assert drift.kind is DriftKind.JUSTIFIED_DEVIATION
+    hits = [
+        e for e in sink.events
+        if e.WhichOneof("payload") == "reasoning_judge_invoked"
+    ]
+    assert len(hits) == 1
+    # Round-trip through the wire encoding — the fields must not be
+    # local-only attributes on the in-memory message.
+    from goldfive.pb.goldfive.v1 import events_pb2 as pb
+
+    parsed = pb.Event.FromString(hits[0].SerializeToString())
+    payload = parsed.reasoning_judge_invoked
+    assert payload.focused_task_id == "t1"
+    assert payload.focus_confidence == pytest.approx(0.8)
+    assert payload.stated_intent == "retrying the fetch with a fallback endpoint"
+    assert payload.provenance == "tool_error"
+
+
+async def test_attribution_fields_populated_on_on_task_verdict() -> None:
+    """Attribution is extracted regardless of verdict; confidence is
+    clamped to [0.0, 1.0] and provenance stays empty outside
+    justified_deviation.
+    """
+    sink = ListSink()
+    call_llm = _stub_call_llm(
+        [
+            {
+                "classification": "on_task",
+                "focused_task_id": "t1",
+                "focus_confidence": 1.7,
+                "stated_intent": "comparing panel specs",
+            }
+        ]
+    )
+    drift = await rjudge.classify_reasoning_drift(
+        reasoning="comparing spec sheets",
+        task=_task(),
+        goals=_goals(),
+        model="m",
+        call_llm=call_llm,
+        sink=sink,
+    )
+    assert drift is None
+    payload = _one_judge_event(sink)
+    assert payload.focused_task_id == "t1"
+    assert payload.focus_confidence == pytest.approx(1.0)  # clamped
+    assert payload.stated_intent == "comparing panel specs"
+    assert payload.provenance == ""
+
+
+async def test_attribution_fields_default_empty_on_malformed_response() -> None:
+    """Quiet-fail path leaves the attribution fields at proto defaults."""
+    sink = ListSink()
+    call_llm = _stub_call_llm(["not json"])
+    await rjudge.classify_reasoning_drift(
+        reasoning="thought",
+        task=_task(),
+        goals=_goals(),
+        model="m",
+        call_llm=call_llm,
+        sink=sink,
+    )
+    payload = _one_judge_event(sink)
+    assert payload.focused_task_id == ""
+    assert payload.focus_confidence == pytest.approx(0.0)
+    assert payload.stated_intent == ""
+    assert payload.provenance == ""

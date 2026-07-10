@@ -50,6 +50,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
@@ -155,7 +156,10 @@ def _session(plan: Plan | None) -> Session:
 
 
 def _bound_steerer(sink: ListSink) -> DefaultSteerer:
-    steerer = DefaultSteerer()
+    # Explicit active mode: the plan-revision transitions under test
+    # ride installs that are dry-run under the shipped observation-only
+    # default.
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=StubPlanner())
     return steerer
 

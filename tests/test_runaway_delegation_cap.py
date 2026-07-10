@@ -295,3 +295,63 @@ def test_adapter_records_configured_cap() -> None:
     assert adapter._agent_tool_cap == 7
     # The plugin's internal cap tracks the adapter's.
     assert adapter._plugin._agent_tool_cap == 7
+
+
+async def test_runaway_fallback_direct_sink_emit_stamps_nonzero_kind() -> None:
+    """E2E regression (goldfive drift-event kind/severity stamping).
+
+    The plugin's direct-sink fallback — taken when the steerer exposes no
+    ``drift.handle_drift`` — must emit a ``DriftDetected`` whose ``kind`` and
+    ``severity`` are the real NONZERO proto enum values. Before the events.py
+    fix this exact path reached harmonograf/zicato with kind=UNSPECIFIED
+    because ``drift_detected_event`` resolved ``DriftKind`` through the wrong
+    proto module (``events_pb2`` has no ``DriftKind``) and swallowed the
+    resulting AttributeError.
+
+    Exercises the real fallback code in ``_emit_runaway_delegation_drift``
+    (not the ``handle_drift`` branch the other tests in this file cover).
+    """
+    from goldfive.adapters._adk_plugin import SessionContext, make_adk_plugin
+    from goldfive.pb.goldfive.v1 import types_pb2
+    from goldfive.sinks import InMemorySink
+    from goldfive.types import DriftKind, DriftSeverity, Session
+
+    sink = InMemorySink()
+
+    class _FallbackSteerer:
+        # ``drift`` is None → getattr(..., "handle_drift", None) is None, so
+        # the emit method falls through to the direct-sink branch.
+        drift = None
+
+        def __init__(self, sinks: list[Any]) -> None:
+            self._sinks = sinks
+
+    plugin = make_adk_plugin(host_agent_name="host", agent_tool_cap=1)
+    ctx = SessionContext(
+        session=Session(run_id="r1"),
+        steerer=_FallbackSteerer([sink]),
+        task=None,
+        host_agent_name="host",
+    )
+
+    await plugin._emit_runaway_delegation_drift(
+        ctx=ctx,
+        from_agent="coord",
+        to_agent="worker",
+        task_id="t1",
+        invocation_id="inv1",
+        spawn_count=5,
+    )
+
+    drifts = [
+        e
+        for e in sink.events
+        if hasattr(e, "DESCRIPTOR") and e.WhichOneof("payload") == "drift_detected"
+    ]
+    assert len(drifts) == 1, "fallback path should emit exactly one DriftDetected"
+    dd = drifts[0].drift_detected
+    assert dd.kind == types_pb2.DRIFT_KIND_RUNAWAY_DELEGATION != 0
+    assert dd.severity == types_pb2.DRIFT_SEVERITY_CRITICAL != 0
+    # Sanity: the enum ints match the dataclass the plugin built.
+    assert dd.kind == getattr(types_pb2, f"DRIFT_KIND_{DriftKind.RUNAWAY_DELEGATION.name}")
+    assert dd.severity == getattr(types_pb2, f"DRIFT_SEVERITY_{DriftSeverity.CRITICAL.name}")

@@ -22,6 +22,7 @@ import pytest
 
 pytest.importorskip("google.adk")
 
+from goldfive.config import SteeringConfig
 from goldfive.types import Plan, Session, Task
 
 # ---------------------------------------------------------------------------
@@ -343,7 +344,7 @@ async def test_user_steer_to_planner_instruction_no_bridge() -> None:
         instruction="",
     )
     adapter = ADKAdapter(agent)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[], planner=None)  # type: ignore[arg-type]
     steerer.bind_adapter(adapter)
     adapter.bind_steerer(steerer)
@@ -489,7 +490,7 @@ async def test_user_steer_between_invocations_no_stale_session_valueerror() -> N
     agent = Agent(name="agent_a", model=_ScriptedLLM(), instruction="")
     adapter = ADKAdapter(agent)
     sink = InMemorySink()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=_RefiningPlanner())  # type: ignore[arg-type]
     steerer.bind_adapter(adapter)
     adapter.bind_steerer(steerer)

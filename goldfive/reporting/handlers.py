@@ -13,7 +13,9 @@ framework wants (ADK ``FunctionTool``, Claude Agent SDK tool blocks, …).
 The eighth tool, ``report_awaiting_approval``, is the task-level half of
 the human-in-the-loop approval flow described in
 ``docs/design/APPROVAL.md``. Its handler blocks the calling tool-call
-until the control dispatcher lands an ``APPROVE`` or ``REJECT``.
+until the control dispatcher lands an ``APPROVE`` or ``REJECT`` (with a
+finite timeout, and an immediate degraded ack when no control channel
+is bound).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from goldfive import _state_audit
+from goldfive.config import DEFAULT_APPROVAL_TIMEOUT_MS
 from goldfive.reporting._internal import (
     _ACK,
     _TERMINAL_STATUSES,
@@ -65,7 +68,7 @@ from goldfive.reporting.schemas import (
     _SCHEMA_TASK_PROGRESS,
     _SCHEMA_TASK_STARTED,
 )
-from goldfive.types import TaskStatus
+from goldfive.types import DriftEvent, DriftKind, DriftSeverity, TaskStatus
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
@@ -350,7 +353,9 @@ async def _handle_task_started(
     if task is not None:
         decision = _classify_transition(tool_name="report_task_started", current_status=task.status)
         if decision == "idempotent":
-            return _idempotent_response(task.status, session=session, task_id=task_id)
+            return _idempotent_response(
+                task.status, session=session, task_id=task_id, steerer=steerer
+            )
         if decision == "invalid":
             return _invalid_transition_response(
                 tool_name="report_task_started",
@@ -387,7 +392,9 @@ async def _handle_task_started(
             # exited. The boundary catch site can now confirm we
             # didn't bypass the stash.
             _state_audit.mark_stash_completed()
-    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.RUNNING)
+    return _directive_ack(
+        session=session, task_id=task_id, new_status=TaskStatus.RUNNING, steerer=steerer
+    )
 
 
 def _clear_correction_on_started(session: Session, task: Task | None) -> None:
@@ -411,9 +418,9 @@ def _clear_correction_on_started(session: Session, task: Task | None) -> None:
     task_id = str(getattr(task, "id", "") or "").strip()
     if not assignee or not task_id:
         return
-    # Normalise the same way the write-side does so keys round-trip.
-    if "." in assignee:
-        assignee = assignee.rsplit(".", 1)[-1]
+    # The write-side keys corrections by the verbatim assignee id
+    # (``_correction_injection._normalize_agent_name``), so the clear
+    # uses the same string and keys round-trip.
     try:
         clear_correction(session, agent_name=assignee, task_id=task_id)
     except Exception as exc:  # noqa: BLE001
@@ -462,7 +469,9 @@ async def _handle_task_progress(
     await steerer.tasks.mark_task_progress(
         task_id, session=session, fraction=fraction, detail=detail
     )
-    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.RUNNING)
+    return _directive_ack(
+        session=session, task_id=task_id, new_status=TaskStatus.RUNNING, steerer=steerer
+    )
 
 
 async def _handle_task_completed(
@@ -499,7 +508,9 @@ async def _handle_task_completed(
             tool_name="report_task_completed", current_status=task.status
         )
         if decision == "idempotent":
-            return _idempotent_response(task.status, session=session, task_id=task_id)
+            return _idempotent_response(
+                task.status, session=session, task_id=task_id, steerer=steerer
+            )
         if decision == "invalid":
             return _invalid_transition_response(
                 tool_name="report_task_completed",
@@ -513,7 +524,9 @@ async def _handle_task_completed(
     # Rotate the current-task pin now that this one has landed terminal.
     if task is not None:
         _rotate_after_terminal(session, task)
-    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.COMPLETED)
+    return _directive_ack(
+        session=session, task_id=task_id, new_status=TaskStatus.COMPLETED, steerer=steerer
+    )
 
 
 async def _handle_task_failed(
@@ -543,7 +556,9 @@ async def _handle_task_failed(
     if task is not None:
         decision = _classify_transition(tool_name="report_task_failed", current_status=task.status)
         if decision == "idempotent":
-            return _idempotent_response(task.status, session=session, task_id=task_id)
+            return _idempotent_response(
+                task.status, session=session, task_id=task_id, steerer=steerer
+            )
         if decision == "invalid":
             return _invalid_transition_response(
                 tool_name="report_task_failed",
@@ -560,7 +575,9 @@ async def _handle_task_failed(
     )
     if task is not None:
         _rotate_after_terminal(session, task)
-    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.FAILED)
+    return _directive_ack(
+        session=session, task_id=task_id, new_status=TaskStatus.FAILED, steerer=steerer
+    )
 
 
 async def _handle_task_blocked(
@@ -590,7 +607,9 @@ async def _handle_task_blocked(
     if task is not None:
         decision = _classify_transition(tool_name="report_task_blocked", current_status=task.status)
         if decision == "idempotent":
-            return _idempotent_response(task.status, session=session, task_id=task_id)
+            return _idempotent_response(
+                task.status, session=session, task_id=task_id, steerer=steerer
+            )
         if decision == "invalid":
             return _invalid_transition_response(
                 tool_name="report_task_blocked",
@@ -601,7 +620,9 @@ async def _handle_task_blocked(
     await steerer.tasks.mark_task_blocked(
         task_id, session=session, blocker=blocker, needed=needed, source=source
     )
-    return _directive_ack(session=session, task_id=task_id, new_status=TaskStatus.BLOCKED)
+    return _directive_ack(
+        session=session, task_id=task_id, new_status=TaskStatus.BLOCKED, steerer=steerer
+    )
 
 
 async def _handle_new_work_discovered(
@@ -746,6 +767,51 @@ async def _handle_declare_task_not_needed(
     )
 
 
+# Distinguishes "steerer exposes no channel state" (custom / stub
+# steerers — assume a controller may exist) from "steerer knows no
+# channel is bound" (``DefaultSteerer._control_channel is None`` — no
+# APPROVE / REJECT can ever arrive).
+_UNKNOWN_CHANNEL = object()
+
+
+async def _emit_approval_timeout_drift(
+    *,
+    session: Session,
+    steerer: Steerer,
+    task_id: str,
+    timeout_ms: int,
+) -> None:
+    """Surface an expired approval wait as a WARNING drift.
+
+    Emit-only (no ladder dispatch) — mirrors the Runner's
+    revision-rejection observability drift. The task stays BLOCKED and
+    the waiter stays registered; the drift is the operator-facing
+    signal that a human decision is still owed. Best-effort: steerers
+    without a ``drift`` component (test stubs) skip silently.
+    """
+    drift = DriftEvent(
+        kind=DriftKind.HUMAN_INTERVENTION_REQUIRED,
+        severity=DriftSeverity.WARNING,
+        detail=(
+            f"approval request for task {task_id!r} received no "
+            f"APPROVE/REJECT within {timeout_ms}ms; task remains "
+            "BLOCKED pending a decision"
+        ),
+        current_task_id=task_id,
+        authored_by="goldfive",
+    )
+    emit_helper = getattr(getattr(steerer, "drift", None), "_emit_drift_detected", None)
+    if not callable(emit_helper):
+        return
+    try:
+        await emit_helper(session, drift)
+    except Exception as exc:  # noqa: BLE001 — observability must not mask the timeout ack
+        log.warning(
+            "report_awaiting_approval: emitting approval-timeout drift raised: %s",
+            exc,
+        )
+
+
 async def _handle_awaiting_approval(
     args: dict[str, Any], session: Session, steerer: Steerer
 ) -> dict[str, Any]:
@@ -758,9 +824,22 @@ async def _handle_awaiting_approval(
 
     Returns ``{"decision": "approve" | "reject", "detail": ...}`` so the
     agent can decide whether to proceed or transition the task to
-    ``FAILED`` itself. A ``timeout_ms > 0`` that elapses before a
-    decision lands returns ``{"decision": "timeout", "detail": ...}``
-    and leaves the task blocked (the caller may re-prompt or fail).
+    ``FAILED`` itself. Two degraded decisions cover runs where no human
+    ever answers:
+
+    * ``"unavailable"`` — the steerer has no control channel bound, so
+      no APPROVE / REJECT can ever be dispatched. The handler does not
+      block the task or register a waiter; it returns immediately.
+    * ``"timeout"`` — the wait elapsed before a decision landed. The
+      task stays blocked (a later APPROVE / REJECT still resolves via
+      the pending map) and a ``HUMAN_INTERVENTION_REQUIRED`` WARNING
+      drift is emitted so operators see the unresolved approval.
+
+    ``timeout_ms <= 0`` (including the omitted default) no longer means
+    "wait forever" — the handler substitutes
+    :attr:`~goldfive.config.SteeringConfig.approval_default_timeout_ms`
+    so a run whose operator never answers cannot hang on the tool call.
+    An explicit positive ``timeout_ms`` wins over the config default.
     """
     err = _validate_required(args, _SCHEMA_AWAITING_APPROVAL, "report_awaiting_approval")
     if err is not None:
@@ -783,6 +862,32 @@ async def _handle_awaiting_approval(
             attempted=TaskStatus.BLOCKED,
             task_id=task_id,
         )
+
+    # A pending approval can only resolve through the control channel
+    # (``dispatch_control`` sets the waiter on APPROVE / REJECT). When
+    # the steerer exposes its bound channel and it is ``None`` — the
+    # default ``wrap()`` posture — no decision can ever arrive, so
+    # waiting any amount would wedge the tool call: return immediately
+    # without blocking the task, registering a waiter, or emitting
+    # ``ApprovalRequested`` (there is no controller to render it to).
+    # The agent learns approval is unavailable and decides for itself.
+    # Steerers that don't expose the attribute (custom implementations,
+    # legacy stubs) fall through to the finite-default wait below.
+    if getattr(steerer, "_control_channel", _UNKNOWN_CHANNEL) is None:
+        log.warning(
+            "report_awaiting_approval(task_id=%r): no control channel "
+            "attached to this run; returning decision='unavailable' "
+            "without blocking",
+            task_id,
+        )
+        return {
+            "acknowledged": True,
+            "decision": "unavailable",
+            "detail": (
+                "no approval controller is attached to this run; the "
+                "request cannot be received or answered by a human"
+            ),
+        }
 
     # Idempotency: reuse an existing waiter if one is already pending.
     waiter = session.pending_approvals.get(task_id)
@@ -814,16 +919,28 @@ async def _handle_awaiting_approval(
         metadata={},
     )
 
+    # ``timeout_ms <= 0`` historically meant an unbounded wait; no
+    # invocation wall clock covers tool waits, so a never-answered
+    # approval hung the run. Substitute the configured finite default.
+    effective_timeout_ms = timeout_ms
+    if effective_timeout_ms <= 0:
+        config = getattr(steerer, "_steering_config", None)
+        effective_timeout_ms = int(getattr(config, "approval_default_timeout_ms", 0) or 0)
+        if effective_timeout_ms <= 0:
+            effective_timeout_ms = DEFAULT_APPROVAL_TIMEOUT_MS
     try:
-        if timeout_ms > 0:
-            await asyncio.wait_for(waiter.wait(), timeout=timeout_ms / 1000.0)
-        else:
-            await waiter.wait()
+        await asyncio.wait_for(waiter.wait(), timeout=effective_timeout_ms / 1000.0)
     except TimeoutError:
+        await _emit_approval_timeout_drift(
+            session=session,
+            steerer=steerer,
+            task_id=task_id,
+            timeout_ms=effective_timeout_ms,
+        )
         return {
             "acknowledged": True,
             "decision": "timeout",
-            "detail": f"no decision after {timeout_ms}ms",
+            "detail": f"no decision after {effective_timeout_ms}ms",
         }
 
     decision = str(meta.get("decision", "")) or "approve"
@@ -936,11 +1053,16 @@ BUILTIN_REPORTING_TOOLS: list[ReportingToolSpec] = [
             "the control channel. Use this when the task has a side effect "
             "that needs sign-off (spending money, writing to a shared "
             "system, sending a message). The call blocks until the UI "
-            "dispatches an APPROVE or REJECT and returns "
-            "{'decision': 'approve' | 'reject' | 'timeout', 'detail': ...}. "
-            "The agent decides what to do with the decision: on approve, "
-            "proceed; on reject, typically report_task_failed with a "
-            "user-rejection reason."
+            "dispatches an APPROVE or REJECT and returns {'decision': "
+            "'approve' | 'reject' | 'timeout' | 'unavailable', 'detail': "
+            "...}. 'unavailable' means no approval controller is attached "
+            "to this run, so no human can answer; the call returns "
+            "immediately. Omitting timeout_ms (or passing 0) waits for a "
+            "framework-configured default period, not forever; 'timeout' "
+            "means the wait elapsed with no decision. The agent decides "
+            "what to do with the decision: on approve, proceed; on "
+            "reject, typically report_task_failed with a user-rejection "
+            "reason."
         ),
         parameters=_SCHEMA_AWAITING_APPROVAL,
         handler=_handle_awaiting_approval,

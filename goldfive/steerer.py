@@ -36,10 +36,18 @@ tangle of conditionals. Levels, ordered by intrusiveness:
   escape hatch restores the pre-PR-7 cells.
 * Level 4 — PAUSE_ESCALATE: dispatch a ``GOLDFIVE_PAUSE_ESCALATE``
   control message and emit ``HUMAN_INTERVENTION_REQUIRED`` so the
-  executor's pre-task loop blocks waiting for operator action.
-* Level 5 — TERMINATE: run-level abort (currently only reached when an
-  unhandled Level 4 times out; actual termination is driven by the
-  executor, not the steerer).
+  executor's pre-task loop blocks waiting for operator action. The
+  wait is unbounded unless
+  ``SteeringConfig.pause_escalate_deadline_s`` is set, in which case
+  the message carries a ``deadline_s`` payload the executor enforces.
+* Level 5 — TERMINATE: pause-with-deadline. Same channel dispatch as
+  Level 4, but the payload ALWAYS carries a deadline (the configured
+  ``pause_escalate_deadline_s``, or
+  :data:`goldfive.drift_observer.DEFAULT_TERMINATE_PAUSE_DEADLINE_S`
+  when unset). On expiry the executor aborts the run: non-terminal
+  tasks are CANCELLED and ``RunAborted`` is emitted carrying the
+  escalation lineage. Termination is driven by the executor, not the
+  steerer.
 
 The mapping from (drift_kind, severity, occurrence_count) to level
 lives in :meth:`DefaultSteerer._ladder_level_for`. Level dispatch is
@@ -96,7 +104,30 @@ __all__ = [
     "InterventionLevel",
     "RefineExhausted",
     "compose_corrective_user_message",
+    "steering_is_active",
 ]
+
+
+def steering_is_active(steerer: Any) -> bool:
+    """Return ``True`` iff ``steerer`` permits active-steering interventions.
+
+    The one documented fallback for consumers holding a maybe-steerer
+    (executors, the ADK plugin, prompt shaping, reporting acks):
+    delegates to :meth:`DefaultSteerer.is_active_steering` when the
+    steerer exposes it, and answers ``False`` when ``steerer`` is
+    ``None``, lacks the predicate, or the predicate raises. Passive is
+    the fail-safe direction — a surface whose whole purpose is to NOT
+    intervene under :class:`~goldfive.config.SteeringConfig.observation_only`
+    must not start intervening because a stub steerer forgot a method.
+    Consumers must not read ``_observation_only`` directly.
+    """
+    predicate = getattr(steerer, "is_active_steering", None)
+    if not callable(predicate):
+        return False
+    try:
+        return bool(predicate())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class RefineExhausted(Exception):
@@ -368,7 +399,7 @@ class DefaultSteerer:
             vars. The steerer itself does NOT instantiate a
             :class:`~goldfive.drift.tool_loops.ToolLoopTracker` — the
             plugin still owns that — but exposing the config here
-            keeps the four typed knobs co-located on a single
+            keeps the typed knobs co-located on a single
             component. Precedence: the config field is advisory; the
             plugin is free to honour or ignore it. Added in #225.
         reasoning_drift_config:
@@ -572,23 +603,30 @@ class DefaultSteerer:
         # (``session.plan`` mutation in ``_apply_revision``, the
         # ``GOLDFIVE_STEER`` ControlMessage enqueue, the
         # ``request_invocation_cancel`` plugin call) are gated by
-        # :meth:`_should_inject`. The flag lives on :class:`SteeringConfig`
-        # — NOT a constructor parameter on this class — so operators
-        # set it via ``RuntimeConfig(steering=SteeringConfig(...))``
-        # at :func:`goldfive.wrap` time. Default for the bare
+        # :meth:`is_active_steering`. The flag lives on
+        # :class:`SteeringConfig` — NOT a constructor parameter on this
+        # class — so operators set it via
+        # ``RuntimeConfig(steering=SteeringConfig(...))`` at
+        # :func:`goldfive.wrap` time. Default for the bare
         # ``DefaultSteerer()`` constructor (no config) is the safer
         # passive observation (``True``) — matches the production
         # default on :class:`SteeringConfig` and avoids surprising
         # third-party callers who construct ``DefaultSteerer`` directly.
+        self._observation_only: bool = (
+            bool(steering_config.observation_only) if steering_config is not None else True
+        )
+        # Wall-clock stall watchdog knobs (flag-gated, default OFF). Read
+        # by the ADK plugin's per-dispatch watchdog task — see
+        # :class:`~goldfive.config.SteeringConfig.stall_watchdog_enabled`.
+        # Bare-constructor default matches the ``SteeringConfig`` field
+        # defaults so a steerer built without a config keeps the
+        # watchdog off.
         if steering_config is not None:
-            self._observation_only: bool = bool(steering_config.observation_only)
+            self._stall_watchdog_enabled: bool = bool(steering_config.stall_watchdog_enabled)
+            self._stall_timeout_s: float = float(steering_config.stall_timeout_s)
         else:
-            # Honour the test-only override hook so the autouse fixture
-            # in ``tests/conftest.py`` can flip the implicit default for
-            # the entire test suite without touching every call site.
-            from goldfive.config import _resolve_observation_only_default
-
-            self._observation_only = _resolve_observation_only_default()
+            self._stall_watchdog_enabled = False
+            self._stall_timeout_s = 600.0
         # AGENCY-PRESERVATION.md PR 5 (#449/#452): signal telemetry —
         # SignalDelivered / SignalOutcome events + the SignalLedger
         # bookkeeping. Default OFF so PR 5 is a true no-op (§5.1
@@ -1283,28 +1321,47 @@ class DefaultSteerer:
     # :meth:`__init__` from :class:`~goldfive.config.SteeringConfig`).
     # ------------------------------------------------------------------
 
-    def _should_inject(self) -> bool:
-        """Return ``True`` iff the steerer should actually inject side effects.
+    def is_active_steering(self) -> bool:
+        """Return ``True`` iff interventions may mutate state or inject.
 
-        Single named gate for the three steering injection points
-        (goldfive#254):
+        The single source of truth for the
+        :class:`~goldfive.config.SteeringConfig.observation_only`
+        kill-switch (goldfive#254). Named gate for the steering
+        injection points:
 
         * plan mutation in :meth:`PlanReviser._apply_revision`
           (``set_session_plan`` + ``last_addressed_revision_by_drift_key``);
         * ``GOLDFIVE_STEER`` ControlMessage enqueue in
           :meth:`DriftObserver._dispatch_goldfive_steer_control`;
         * the plugin ``request_invocation_cancel`` flag in
-          :meth:`DriftObserver.request_invocation_cancel`.
+          :meth:`DriftObserver.request_invocation_cancel`;
+        * the ``session.pending_nudges`` enqueues in
+          :meth:`DriftObserver._dispatch_nudge` and the post-ABSORB
+          nudge handoff (goldfive#202) — the overlay drains the queue
+          into a synthetic user turn and re-invokes the tree, so the
+          enqueue is an injection, not an observation;
+        * the prompt-shape injections
+          (:meth:`~goldfive.prompt_shaper.PromptShaper.should_inject`),
+          the executor carve-outs, the plugin's pre-dispatch gates, and
+          the F1 directive acks — all via :func:`steering_is_active`.
 
         ``False`` when :class:`~goldfive.config.SteeringConfig.observation_only`
         is in effect — detection still runs, ``planner.refine_steer``
         still runs, ``PlanRevised`` still emits (with ``dry_run=True``),
-        but the in-flight invocation is not touched. Defined as a tiny
-        helper rather than inlining ``not self._observation_only`` at
-        three sites so the intent is grep-able and a future fourth
-        injection point has a single gate to honour.
+        but the in-flight invocation is not touched. Consumers holding a
+        maybe-steerer resolve through :func:`steering_is_active`, which
+        treats a missing implementation as passive.
         """
         return not self._observation_only
+
+    def _should_inject(self) -> bool:
+        """Steerer-internal alias for :meth:`is_active_steering`.
+
+        Same truth source — kept because "should inject" reads
+        naturally at the dispatch gates and pre-refactor callers/tests
+        address it by name.
+        """
+        return self.is_active_steering()
 
     # Consecutive refine failures tolerated per (drift_kind, task_id)
     # before we give up and mark the task FAILED. Class attribute so
@@ -1344,15 +1401,20 @@ class DefaultSteerer:
 
     @staticmethod
     def _drift_kind_pb_value(kind: DriftKind) -> int:
-        from goldfive.pb.goldfive.v1 import types_pb2
+        # Delegate to the shared by-name bridge in goldfive.events so the
+        # steerer's primary DriftObserver emit path and the events.py
+        # factories (drift_detected_event / plan_revised_event) resolve the
+        # proto enum through ONE implementation and can never re-diverge.
+        # Unknown kinds fall back to DRIFT_KIND_CUSTOM here (historical
+        # steerer behavior); the factories fall back to UNSPECIFIED. Lazy
+        # import — events.py never imports steerer at module load.
+        from goldfive.events import _drift_kind_pb_value as _bridge
 
-        name = f"DRIFT_KIND_{kind.name}"
-        return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_KIND_CUSTOM", 0))
+        return _bridge(kind, unknown_member="CUSTOM")
 
     @staticmethod
     def _drift_severity_pb_value(severity: DriftSeverity) -> int:
-        from goldfive.pb.goldfive.v1 import types_pb2
+        from goldfive.events import _drift_severity_pb_value as _bridge
 
-        name = f"DRIFT_SEVERITY_{severity.name}"
-        return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_SEVERITY_UNSPECIFIED", 0))
+        return _bridge(severity)
 

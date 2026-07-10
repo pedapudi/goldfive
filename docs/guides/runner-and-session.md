@@ -28,7 +28,7 @@ The Runner itself is small — it sequences the six primitives and owns a Sessio
 
 ### Constructing one
 
-For a custom tree you usually don't hand-wire this — use `goldfive.wrap(tree)` for ADK or `goldfive.quickstart(call_llm=..., goal="...")` for a plain callable. But the hand-wired form makes the composition explicit:
+For a custom tree you usually don't hand-wire this — use `goldfive.wrap(tree)` for ADK or `goldfive.quickstart(agent, goals)` for a plain callable (or pre-built adapter) plus goal summaries. But the hand-wired form makes the composition explicit:
 
 ```python
 from goldfive import Runner
