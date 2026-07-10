@@ -1,6 +1,11 @@
 # Agency Preservation: from always-on controller to dormant supervisor
 
-Status: ROADMAP (not yet implemented)
+Status: **IMPLEMENTED** on the `agency-preservation` branch (PRs #453–#472),
+**default-OFF** pending the §6.4 bench gate (PR 13b). The roadmap below
+(§§0–5) is preserved as the original design rationale; **§6 records the
+as-built status, the deliberate deviations from this roadmap, what is still
+default-OFF, and the 13b pre-flip checklist.** Read §6 first for "what
+actually shipped."
 
 ## 0. What goldfive is
 
@@ -154,6 +159,14 @@ new regime is measurably non-inferior to no-steering (judge-only
 counterfactual baseline).
 
 ## 3. Roadmap
+
+> **Implementation status:** Stages 1–3 (PRs 1–12) and their fast-follows
+> are **IMPLEMENTED and merged** on the `agency-preservation` branch
+> (PRs #453–#472), default-OFF pending PR 13b. Stage 4 is unbuilt
+> (exploratory). The per-PR text below is the original plan; see **§6** for
+> the as-built status table, the deliberate deviations from this plan
+> (each with its PR), and the 13b pre-flip checklist. PR 13b
+> (measurement + default flips + hard deletions) has **not** started.
 
 ### Stage 1 — Stop the bleeding
 
@@ -587,3 +600,333 @@ one-line PRs makes rollback a 60-second operation. The honest residual
 risk is emergent behavior in the two-mode period that no test
 anticipates — that is what §5.4 and §5.5 exist for: shadow mileage on
 real workloads before any new path gets authority.
+
+## 6. As-built: implementation status, deviations, and the 13b gate
+
+Stages 1–3 of this roadmap, plus their fast-follows, are **implemented and
+merged on the `agency-preservation` branch** (NOT `main`). The roadmap
+above (§§0–5) is the design rationale as authored; this section is the
+honest as-built record: it marks what shipped, documents every deliberate
+deviation from the roadmap (each a reviewed decision, with its PR), states
+what is still default-OFF, and reproduces the PR-13b pre-flip checklist so
+it survives outside the task tracker. Stage 4 remains exploratory (unbuilt).
+
+### 6.0 Reconcile with `main` (#475–#494)
+
+The branch was reconciled onto `main` and now carries main #475–#494 as
+ancestors (merge #496). The reconcile inherited main's post-branch
+hardening — at a high level: terminus handling (#482), telemetry labels
+(#480), judge scheduling (#483), the tool-loop cap (#484), executor
+cleanup (#485), resolution handling (#486), the stall watchdog (#487), the
+`is_active_steering()` / `steering_is_active(steerer)` kill-switch
+predicate (#488), hot-path extraction (#489), dead-code deletion (#490),
+LLM consolidation (#491), templating (#477), and the enum-bridge (#494).
+
+Two branch hunks were obviated by the reconcile and **dropped**: the
+`_LADDER_BY_VALUE` lookup and the `_OBSERVATION_ONLY_DEFAULT` machinery
+(both superseded by main's equivalents). The #475 `observation_only`
+gate was **re-applied** to the branch's `_route_corrective_note` legacy
+leg so the observation-only leak main closed does not reopen on the
+branch's added path. All regime flags remain default-OFF (§6.2); the
+reconcile changed no defaults.
+
+### 6.1 Status by stage (PRs #453–#472)
+
+| Roadmap item | PR(s) | Status |
+|---|---|---|
+| PR 1 — gate in-flight cancel on authority (`cancel_inflight_scope`) | #453 | merged |
+| PR 2 — finish #423 (descriptive growth at pin time) | #454 | merged |
+| PR 3 — ladder demotions + decision-table snapshot | #457 (+ #458 pin) | merged |
+| PR 4 — intervention content rewrite (`observer_notes.py`) | #455 | merged |
+| PR 5 — signal telemetry (`SignalDelivered`/`SignalOutcome`, `SignalLedger`) | #456 | merged |
+| PR 6 — observer-note channel (`ObserverNoteQueue` + 4 surfaces) | #462 | merged |
+| PR 6b — context-editing rules (finish #397) | #459, #463 | merged |
+| PR 7 — cancel policy + ladder restructure (NUDGE→SIGNAL) | #467 | merged |
+| PR 8 — pacing / grace windows (visibility-keyed) | #470 (+ #472 follow-ups) | merged |
+| PR 9 — prompt-shaping diet (sites 1/3/4) | #466 | merged |
+| PR 9 follow-up — agent-scoped note delivery + correction migration + cross-surface fold | #468 | merged |
+| PR 10 — ledger plan mode foundations | (ledger line) | merged |
+| PR 11 — goal-grounded judging | #464 | merged |
+| PR 12 — refine retirement in ledger mode + `[GOALS]` block | #469 | merged |
+| PR 13a — three-arm bench harness + shadow-diff tooling | (bench line) | merged |
+| PR 13b — run bench, evaluate, **default flips** | — | **NOT STARTED** (§6.4) |
+
+### 6.2 Still default-OFF (nothing flips until 13b)
+
+Every new regime ships behind a flag whose **default preserves legacy
+behavior** (§5.1). As of #472 the production defaults are unchanged:
+
+- `SteeringConfig.plan_mode = "forecast"` (ledger mode opt-in)
+- `SteeringConfig.signal_channel = "legacy_user_message"` (observer-note
+  channel + pacing + the PR-9 diet + correction-via-notes are all
+  `request_context`-only)
+- `SteeringConfig.observation_only = True` (active steering opt-in)
+- `SteeringConfig.signal_telemetry = False` (the §5.4 shadow campaign must
+  enable it explicitly)
+- `SteeringConfig.descriptive_growth_enabled = False` (restored to OFF this
+  wave — deviation 8, §6.3; growth is opt-in until 13b justifies it)
+
+The full implementation accumulates production mileage with zero production
+authority until the 13b bench gate flips these (each flip a separate
+one-line, revertable PR).
+
+### 6.3 Deliberate deviations & discoveries
+
+Each item below is a reviewed decision that departs from, or was discovered
+during, the roadmap as written. They are intentional — not drift.
+
+1. **#208 outcome semantics — uncertain stays PENDING, not FAILED**
+   (#464, PR 11). §3 PR 11 said OUTCOME tasks transition "unmet at exit →
+   FAILED." As built: **met → COMPLETED; *confidently*-unmet → FAILED at
+   run end only; uncertain → stays PENDING** and carries forward (the #208
+   reachable-PENDING rule; run end is usually itself a turn boundary). No
+   manufactured failures. Consequence: `run.success` can be `True` with
+   OUTCOME tasks still PENDING — runs are graded on **goal predicates +
+   OUTCOME-task terminality**, never on `run.success` alone (see the 13b
+   grading rule, §6.4).
+
+2. **Shared budget-row fix — PAUSE_ESCALATE-first in both regimes**
+   (#467, PR 7). The budget/timeout guardrail kinds
+   (`RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`,
+   `LLM_CALL_TIMEOUT`) are **PAUSE_ESCALATE-first in BOTH the legacy and
+   the new ladder** — "a restart can't refund a spent budget," so
+   cancel-reinvoke was never the right response for them. `RUNAWAY_DELEGATION`
+   stays cancel-first (it protects against unbounded fan-out, not a spent
+   budget). Bench consequence: **arm C is the pre-PR-7 *steering policy*,
+   not a byte-exact pre-PR-7 build** — re-introducing the budget-row bug
+   into arm C would bias the B-vs-C comparison toward B (a confound). The
+   `GOLDFIVE_STEER_LEGACY_LADDER` escape hatch restores the legacy ladder
+   *cells + promotion side-effects only*.
+
+3. **Two-path refine gate** (#469, PR 12). The roadmap cited only the
+   ladder ABSORB/CANCEL_REINVOKE refine branch as needing the
+   `plan_mode == "forecast"` gate. Implementation found the **promotion
+   `refine_steer` path also needed gating** — it fires *before* the ladder.
+   Both refine entry points are now gated on `plan_mode`.
+
+4. **Force-FAIL contract — no terminal from a fallible signal** (#469,
+   PR 12). Ledger-mode force-FAIL is restricted to the **two deterministic
+   looping detectors** (`LOOPING_TOOL_CALL`, `LOOPING_REASONING`). This is
+   the dual of PR 11's outcome-progress contract (deviation 1): no terminal
+   disposition is ever manufactured from a FALLIBLE / UNCERTAIN judge
+   signal. A drift-judge *opinion* (`GOAL_DRIFT`, `OFF_TOPIC`, reasoning
+   verdicts) takes the note rung and never force-FAILs a task in ledger
+   mode; the outcome-progress judge mints OUTCOME terminals only on a
+   CONFIDENT verdict (uncertainty carries forward as PENDING — deviation 1).
+   Terminal dispositions come from a deterministic counter, a confident
+   outcome verdict, or a user / predicate — never from a fallible
+   mid-trajectory drift opinion.
+
+5. **Agent-aware-surfaces principle** (#468). Agent-specific notes (notably
+   per-(agent, task) corrections) render **only on agent-aware surfaces**:
+   the ADK `before_model` surface (resolves the running agent) and the
+   claude surface (one agent per invoke, scoped to `task.assignee_agent_id`).
+   The boundary-replay surface is **broadcast-only** (it re-invokes at the
+   coordinator level and cannot attribute to a sub-agent); the tool-result
+   annotation **excludes correction-origin notes** (keyed on the shared
+   `CORRECTION_DRIFT_ID_PREFIX`). Governing rule: **"better undelivered
+   than misdelivered"** — an agent-specific note that finds no agent-aware
+   surface stays pending, and under PR-8 visibility-keyed attribution a
+   drift that resolves anyway is correctly recorded `self_corrected_unaided`
+   (the truthful record), whereas misdelivery to the wrong agent would be a
+   silent correctness bug. This realises surface (2)/(3) of §2's
+   least-invasive-surface ordering for the correction case.
+
+6. **The Site-1 "tool-surface tightening interceptor" never shipped**
+   (#466, PR 9 — closes the doc's open verification item). §1.3 / the
+   PromptShaper docstrings described a parallel ADK-plugin "pre-dispatch
+   interceptor," keyed off `session._conversational_turn`, that would
+   tighten the tool surface on a conversational follow-up so the
+   coordinator literally could not delegate. **Verified: it was never
+   built.** `_conversational_turn` is consumed *only* by the runner's own
+   wrap gating (it decides whether to call
+   `wrap_conversational_input`); no ADK-plugin consumer exists. The stale
+   docstring/comment claims were deleted; the flag is kept (load-bearing
+   for the wrap gating). The PR-9 diet therefore *informs* on a follow-up
+   (keeps the plan context, drops the "do NOT call any AgentTool" command);
+   it never structurally constrains the tool surface.
+
+7. **Emission vs. visibility split** (#462 + #470, PRs 6 + 8).
+   `SignalDelivered` fires at the **dispatch decision point**
+   (`DriftObserver._route_corrective_note`) — it is the §5.4 *decision*
+   record ("what the regime decided to do"), emitted once, including the
+   `dry_run=True` shadow form under `observation_only`. The note queue's
+   `delivered_turn` / `delivered_surface` is a **separate *visibility*
+   record** ("when/where a note actually reached the model"). PR 8's grace
+   windows and the `self_corrected_after_signal` attribution key on
+   **visibility**, not emission. Pacing is **`request_context`-only** —
+   the legacy channel stays unpaced, which keeps bench arm C's policy pure
+   (deviation 2).
+
+8. **`descriptive_growth_enabled` restored to default-OFF** (this wave).
+   PR 2 (#454) shipped `descriptive_growth_enabled` with a `True` default
+   — the ONE behavior-changing branch flag that defaulted ON, violating
+   the branch's own §5.1 "no-op by default; one-line revertible flips"
+   discipline (and `main`'s "every behavior-changing flag defaults OFF"
+   rule). Reverted to `False` in `goldfive/config.py` (the `from_env`
+   default threads through `defaults.descriptive_growth_enabled`, so the
+   env fallback follows). This is a **sanctioned default correction**: it
+   un-violates the invariant and *disables* an improperly-defaulted feature
+   — it enables nothing. Growth is now opt-in
+   (`descriptive_growth_enabled=True`) and re-flips to `True` by default
+   only if the 13b bench justifies it (a separate one-line PR, §6.4).
+
+### 6.4 PR-13b pre-flip checklist (the bench gate)
+
+PR 13b — run the three-arm bench on real workloads, produce the
+non-inferiority evaluation, then (gated on results **and explicit user
+sign-off**) flip `plan_mode=ledger` and `observation_only=False` as
+separate one-line PRs, followed by the §3 PR-13 hard deletions + the
+sibling-doc updates (PLAN-LIFECYCLE.md, PLAN-DESCRIPTIVE-GROWTH.md,
+DRIFT.md, CONTROL-CHANNEL.md, RATIONALE.md). **Do NOT start without bench
+results and explicit user sign-off on the flips.** Requirements
+accumulated during implementation (reproduced here so they survive outside
+the task tracker):
+
+1. **Grade ledger runs on goal predicates + OUTCOME-task terminality, NOT
+   `run.success`** (bench, #464 review). Uncertain outcomes legitimately
+   stay PENDING across turn boundaries (#208 carry-forward; deviation 1),
+   and a force-FAILED looping DISCOVERED task can fail the run via the
+   fatal gate.
+
+2. **Stage-3 layered e2e: "ledger-mode runaway → clean PAUSE"** (#469
+   review; SHIPPED + merged as the standalone §5.7 e2e
+   `tests/test_ledger_runaway_e2e.py` — #471). The no-hang/no-silent-death
+   contract is an *integration* property (executor pause-block + ledger
+   plan structure + run-end disposition) that unit tests cannot show —
+   §5.7 scar tissue: narrow criteria pass on broken runs. Drives a real
+   coordinator+AgentTool tree through `wrap()` → `Runner.run()` in
+   `plan_mode=ledger`, trips a runaway, and asserts a clean PAUSE
+   (`outcome.reason` carries the runaway cause + a
+   `HUMAN_INTERVENTION_REQUIRED` drift + the OUTCOME stays PENDING; 30s
+   wall-clock bound). Bench's call: keep it STANDALONE — NOT a 2d27ff4a
+   refold.
+
+3. **The §5.4 shadow campaign must enable `signal_telemetry` explicitly**
+   (channel, #462) — it defaults OFF (§6.2).
+
+4. **Bench arm definitions** (#464/#467/#469 reviews):
+   - **A (baseline)** = `judge_only` counterfactual.
+   - **B (signal regime)** = `signal_channel=request_context` + the new
+     ladder + `plan_mode=ledger` + `observation_only=False`.
+   - **C (legacy)** = `GOLDFIVE_STEER_LEGACY_LADDER=1` +
+     `observation_only=False` — the pre-PR-7 *steering policy*, NOT a
+     byte-exact pre-PR-7 build (deviation 2: re-introducing the budget-row
+     bug would confound B-vs-C).
+
+   The flips proceed only when arm B is non-inferior to arm A on goal
+   success and not worse on turns/tokens beyond the agreed margin across
+   ≥2 tree shapes (§4 / §5.8).
+
+### 6.5 Post-reconcile hardening wave (branch-native defects)
+
+Post-reconcile review surfaced branch-native defects that predate the merge
+(12 high / 20 medium / 13 low). A hardening wave addressed them. Every fix
+preserves the flags-OFF invariant (§6.2) — each either affects only a
+non-default regime, closes an `observation_only` leak (always correct), or
+is telemetry-only. **Merged:**
+
+- **Injection surface 4 gate** (#498) — the tool-result annotation surface
+  now carries the same `is_active_steering` gate as the other three, so no
+  note reaches the model under `observation_only`; a negative-control test
+  drives it end-to-end.
+- **`dry_run`/delivery telemetry truthfulness** (#502) — `ObserverNote`
+  gained `delivered_dry_run`; a passive/shadow consume is excluded from
+  `rendered_keys` (so `self_corrected_after_signal` is not over-attributed)
+  yet kept in `last_rendered_turn` (so grace-window pacing is byte-identical
+  between the shadow and live campaigns — §5.4 decision parity). Same PR:
+  `USER_PAUSE` no longer black-holes open signal keys (it is non-terminal),
+  and the run-boundary helper drains background drifts **before** finalizing
+  the ledger (a late drift no longer writes into a finalized ledger).
+- **Ledger-mode evidence wiring** (#500) — the outcome-progress judge's
+  evidence (`session.completed_outputs`) is now populated in overlay mode
+  (the only mode ledger supports) via the reconciler, and USER_STEER refine
+  no longer strips the OUTCOME/DISCOVERED task taxonomy.
+- **Bench measurement adequacy** (#499, #501) — the three-arm harness reports
+  `goal_grade=UNMEASURED` rather than silently passing when no goal predicate
+  and no genuinely-exercised OUTCOME task exist, and keys "ledger exercised"
+  on the outcome-progress judge's own `TaskTransitioned.source`
+  (`OUTCOME_JUDGE_SOURCE`, now a shared runtime constant so a rename cannot
+  silently dark the bench signal) rather than on stamped-OUTCOME terminality
+  (which a non-overlay stub force-completes via the legacy loop — a phantom).
+- **Flags-OFF invariant restored** (#497) — `descriptive_growth_enabled` was
+  the one behavior-changing flag shipping default-ON; reverted to `False`
+  (§5.1). Re-flips to `True` only if 13b justifies it.
+
+**Deferred to the 13b decision (NOT changed here):** two guardrail
+*reachability* gaps are genuine design decisions the flip work must resolve,
+not mechanical bugs — see §6.6. They are telemetry-only under the production
+default (`observation_only=True`), so leaving them for 13b changes no shipped
+behavior.
+
+The 13b LOCK (§6.4) remains intact — `plan_mode=ledger` and
+`observation_only=False` flip only on bench results plus explicit user
+sign-off.
+
+### 6.6 Guardrail-reachability gaps (decisions for the 13b work)
+
+PR 7 (ladder demotion, `legacy_ladder=False` — default-ON) and PR 8 (pacing
++ escalation, `signal_channel="request_context"` — default-OFF) have
+**inconsistent channel-conditionality**. On the default `legacy_user_message`
+channel the two interact badly, and the fixes change core escalation behavior
+that 13b is meant to measure, so they are documented here rather than changed
+unilaterally:
+
+- **SIGNAL repeat-escalation is unreachable on the legacy channel.** PR 7
+  demotes the goldfive-authored `CANCEL_REINVOKE` ladder cells to
+  `(SIGNAL, PAUSE_ESCALATE)` — the repeat cell is `PAUSE_ESCALATE` by design.
+  But the ladder's occurrence counter (`_occurrence_count_for_ladder`) reads
+  `session.refine_outcomes[…].fail_count`, and a SIGNAL-demoted kind no longer
+  refines (PR 7 stripped the promotion side-effects), so the counter stays `0`
+  forever → the ladder always resolves the first-occurrence `SIGNAL` cell and
+  the `PAUSE_ESCALATE` repeat cell is never reached. PR 8's grace-window
+  escalation would catch it, but PR 8 short-circuits to `"proceed"` on any
+  channel `!= "request_context"`. Net: on the default channel under active
+  steering, a repeated CRITICAL loop demoted to SIGNAL **advises forever with
+  no escalation path**. *Decision for 13b:* either feed a channel-independent
+  per-`(kind, task)` SIGNAL occurrence counter so the demoted ladder's repeat
+  cell fires on both channels, or accept that legacy = no PR-8 escalation and
+  gate the ladder demotion on the same channel as the escalation. (Under the
+  production default `observation_only=True` this is telemetry-only: the
+  escalate/advise decision is recorded but nothing dispatches.)
+- **Grace-window keys churn for trajectory-level kinds.** PR 8's grace window
+  keys on `(kind, current_task_id)`. For trajectory-level kinds (GOAL_DRIFT,
+  OFF_TOPIC, INTENT_DIVERGENCE) whose `current_task_id` churns or is empty,
+  the window never engages — the known gate-key failure mode (a per-condition
+  gate is only as good as its stable identity key). Effect is quality, not
+  safety: no suppression → noisier signals, never a runaway. *Decision for
+  13b:* choose the stable identity for a trajectory-level drift (e.g. keep the
+  task key for task-scoped kinds but fall back to a stable agent/goal anchor
+  for trajectory kinds) — a request_context-only change that alters that arm's
+  measured behavior, so it belongs with the flip experiment, not before it.
+
+Two further gaps recorded by the pre-merge fix wave — same disposition
+(genuine 13b-scope decisions, documented rather than changed unilaterally):
+
+- **Rule C posture gap: under pure defaults neither the growth rescue nor
+  the mismatch detection runs.** #497 turned prevention default-OFF
+  (`descriptive_growth_enabled=False` — the pin-time growth that fixes the
+  "no right task existed" cause at the source), while detection —
+  CAPABILITY_MISMATCH Rule C — was already soft-retired behind
+  `GOLDFIVE_CAPABILITY_RULE_C` (env-gated OFF) *on the rationale that growth
+  covers its trigger shape*. With both OFF, a delegation the pin binds to a
+  structurally-wrong task is neither rescued (no discovered-task growth) nor
+  flagged (no Rule C verdict). Under the production default
+  (`observation_only=True`) this is telemetry-only, and the legacy tier-3
+  pin fallback still runs — but the pure-defaults arm of the bench measures
+  a regime where Rule C's retirement premise does not hold. *Decision for
+  13b:* either `descriptive_growth_enabled` flips ON with the regime
+  (restoring the premise), or Rule C's retirement plan changes (it cannot be
+  deleted in PR 13 on the strength of a rescue that ships OFF).
+- **Banned-class lexical heuristics remain in-tree, env-gated OFF.** Rule A's
+  leaf-task marker scan (`_looks_like_delegation_task` + the leaf-title
+  heuristic, behind `GOLDFIVE_CAPABILITY_RULE_A`) and Rule C's role-stem
+  match (behind `GOLDFIVE_CAPABILITY_RULE_C`) are stem/keyword NL
+  classification — the exact #166/#167 anti-pattern the project retired
+  twice and the no-regex-heuristics rule bans. They are flagged here per that
+  rule: default-OFF makes them inert, but an env flip resurrects a banned
+  mechanism verbatim. *Decision (13b-adjacent):* delete them outright in
+  PR 13 (consistent with the rule; loses the debug signal) or replace with
+  an LLM classifier / a structural redesign that makes the classification
+  unnecessary — re-enabling the lexical form as-shipped is not an accepted
+  outcome.

@@ -14,29 +14,55 @@ planner LLM hallucinated the assignee), we ground the comparison in
 
 Detection rules (intentionally surgical):
 
-* **Rule A — coordinator-style leaf-assignment.** If every tool on the
+* **Rule A — coordinator-style leaf-assignment. SOFT-RETIRED
+  (AGENCY-PRESERVATION.md PR 3): OFF by default.** If every tool on the
   invoked agent is an ``AgentTool`` instance (i.e. its only capability
   is to delegate further) AND the bound task reads as a leaf authoring
   task ("draft", "write", "review", "research", "patch", "locate" …
   rather than "coordinate", "delegate", "orchestrate"), the agent
-  cannot actually do the work. Fires CRITICAL.
+  cannot actually do the work. The leaf-task read is stem/keyword NL
+  classification — the #166/#167 anti-pattern — and was the source of
+  the e2e 2d27ff4a refine storm, so Rule A no longer runs unless the
+  operator sets ``GOLDFIVE_CAPABILITY_RULE_A=1``. Even when re-enabled
+  it only OBSERVEs: the CAPABILITY_MISMATCH ladder demotes the CRITICAL
+  cells (PR 3). Fires CRITICAL (for the observability signal). Hard
+  deletion follows in PR 13.
 
 * **Rule B — required-tools advisory.** If
   :attr:`~goldfive.types.Task.required_tools` is non-empty and the
   invoked agent's tool names do not cover every required name, fire
-  CRITICAL. Skipped entirely when the advisory is empty (legacy plans
-  and planners that don't populate it are a no-op).
+  WARNING. Skipped entirely when the advisory is empty (legacy plans
+  and planners that don't populate it are a no-op). Rule B is the one
+  capability rule kept as a steering trigger (user-declared
+  ``required_tools`` is genuine intent, not a forecast); it fires
+  WARNING rather than CRITICAL ("WARNING-max", PR 3) so the ladder
+  refines but never escalates to cancel/pause.
 
-* **Rule C — out-of-DAG-order delegation (goldfive#268).** When the
-  invoked agent's *role stem* (the head of its name, with role-suffix
-  tokens like ``agent``/``worker`` trimmed) is absent from the bound
-  task's title+description AND present in some OTHER pending task,
-  the pin has bound the delegation to a structurally-wrong task —
+* **Rule C — out-of-DAG-order delegation (goldfive#268). SOFT-RETIRED
+  (goldfive#423 / AGENCY-PRESERVATION.md PR 2): OFF by default.** When
+  the invoked agent's *role stem* (the head of its name, with
+  role-suffix tokens like ``agent``/``worker`` trimmed) is absent from
+  the bound task's title+description AND present in some OTHER pending
+  task, the pin has bound the delegation to a structurally-wrong task —
   typically because the coordinator dispatched a downstream agent
   before its DAG predecessors completed and the pin had only one
   eligible candidate to choose from. Fires CRITICAL. Requires the
   caller to pass ``all_pending_tasks`` so the cross-task lookup can
   see non-DAG-ready tasks too; otherwise the rule is silent.
+
+  With descriptive growth at pin time enabled
+  (``SteeringConfig.descriptive_growth_enabled`` — default OFF pending
+  the AGENCY-PRESERVATION.md §6.4 13b bench gate; #497 reverted the
+  interim default-ON) the "no right task existed" cause Rule C papered
+  over is fixed at the source — the plan grows a ``discovered=True``
+  task carrying the agent's role stem, so Rule C's trigger shape no
+  longer occurs (design doc §7). The rule is disabled unless the
+  operator explicitly re-enables it via ``GOLDFIVE_CAPABILITY_RULE_C=1``
+  (per design doc §7.1 soft retirement; hard deletion follows in
+  AGENCY-PRESERVATION.md PR 13). Note the resulting pure-defaults
+  posture (growth OFF *and* Rule C OFF: neither the rescue nor the
+  detection runs) is a recorded 13b decision — see
+  AGENCY-PRESERVATION.md §6.6.
 
 All three rules return :class:`~goldfive.types.DriftEvent` carrying the
 agent name + bound task id + the structural gap, suitable for the
@@ -48,12 +74,70 @@ for AgentTool detection, ``.name`` for the required-tools cover).
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from typing import Any
 
 from goldfive.types import DriftEvent, DriftKind, DriftSeverity, Task
 
 log = logging.getLogger(__name__)
+
+
+#: Env flag that re-enables the soft-retired Rule C (goldfive#423 /
+#: AGENCY-PRESERVATION.md PR 2; retirement plan in design doc §7.1).
+#: Named so re-enabling is an explicit operator act:
+#: ``GOLDFIVE_CAPABILITY_RULE_C=1``. Read per call (not cached at
+#: import) so tests and operators can flip it without re-importing.
+_RULE_C_ENV_VAR = "GOLDFIVE_CAPABILITY_RULE_C"
+
+#: Env flag that re-enables the soft-retired Rule A (goldfive#253 /
+#: AGENCY-PRESERVATION.md PR 3). Rule A is default OFF for the same
+#: reason Rule C is: it is stem/keyword NL classification of whether a
+#: task "reads as a leaf authoring task" (the ``_looks_like_delegation_
+#: task`` marker scan + the leaf-title heuristic) — the exact
+#: #166/#167 anti-pattern the project retired twice. Its real-world
+#: failure mode is the cherry-tree refine storm (a coordinator
+#: delegating to a worker 20+ times, each delegation firing
+#: CAPABILITY_MISMATCH → refine; e2e session 2d27ff4a). Read per call
+#: so tests/operators can flip it without re-importing. When re-enabled
+#: it still only OBSERVEs (the CAPABILITY_MISMATCH ladder CRITICAL cells
+#: are OBSERVE per PR 3) — the flag restores the observability *signal*
+#: for debugging, not steering. Hard deletion follows in PR 13.
+_RULE_A_ENV_VAR = "GOLDFIVE_CAPABILITY_RULE_A"
+
+#: Truthy spellings accepted for :data:`_RULE_C_ENV_VAR` /
+#: :data:`_RULE_A_ENV_VAR` — same vocabulary as
+#: :func:`goldfive.config._read_bool_env` so the env surface stays
+#: consistent across the project. (No falsy/typo handling needed:
+#: anything that is not an explicit truthy spelling leaves the rule
+#: retired, which is the safe default.)
+_RULE_C_TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
+
+
+def _rule_c_enabled() -> bool:
+    """Return True iff the operator explicitly re-enabled Rule C.
+
+    Rule C is soft-retired (default OFF) because descriptive growth at
+    pin time — when enabled; it is itself default-OFF pending 13b
+    (#497) — removes the trigger shape Rule C existed to catch. See the
+    module docstring, ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §7, and
+    AGENCY-PRESERVATION.md §6.6 for the pure-defaults posture.
+    """
+    raw = os.environ.get(_RULE_C_ENV_VAR, "").strip().lower()
+    return raw in _RULE_C_TRUTHY
+
+
+def _rule_a_enabled() -> bool:
+    """Return True iff the operator explicitly re-enabled Rule A.
+
+    Rule A is soft-retired (default OFF) per AGENCY-PRESERVATION.md
+    PR 3: its leaf-task heuristic is NL classification (#166/#167), and
+    even when re-enabled it routes to OBSERVE (the CAPABILITY_MISMATCH
+    ladder demotes the CRITICAL cells). Same env vocabulary and
+    read-per-call discipline as :func:`_rule_c_enabled`.
+    """
+    raw = os.environ.get(_RULE_A_ENV_VAR, "").strip().lower()
+    return raw in _RULE_C_TRUTHY
 
 
 __all__ = [
@@ -280,17 +364,24 @@ def detect_capability_mismatch(
         Every ``PENDING`` task in the plan (DAG-ready and not). Powers
         the goldfive#268 Rule C cross-task lookup. ``None`` /empty
         disables Rule C — legacy callers and tests that don't pass it
-        keep their pre-#268 behaviour exactly.
+        keep their pre-#268 behaviour exactly. Note Rule C is
+        soft-retired and additionally requires
+        ``GOLDFIVE_CAPABILITY_RULE_C=1`` to run at all (goldfive#423 /
+        AGENCY-PRESERVATION.md PR 2).
 
     Returns
     -------
     DriftEvent | None
         ``None`` when no rule trips OR when ``invoked_agent_tools`` is
-        empty AND ``required_tools`` is empty AND Rule C has no signal.
-        A ``DriftEvent`` with ``severity=CRITICAL`` otherwise. Rules
-        evaluate in order B → A → C; the first to fire wins so the
-        higher-confidence signal (B, then A, then C) takes precedence
-        and the steerer's refine only sees one verdict per delegation.
+        empty AND ``required_tools`` is empty AND Rules A/C are disabled
+        or have no signal. Otherwise a ``DriftEvent`` whose severity is
+        ``WARNING`` for Rule B (the "WARNING-max" survivor) and
+        ``CRITICAL`` for Rule A / Rule C (both soft-retired, default
+        OFF; CRITICAL is the observability signal — the ladder demotes
+        their cells to OBSERVE). Rules evaluate in order B → A → C; the
+        first to fire wins so the higher-confidence signal (B, then A,
+        then C) takes precedence and the steerer sees one verdict per
+        delegation. By default only Rule B can fire (A/C gated off).
     """
     if task is None:
         return None
@@ -302,6 +393,17 @@ def detect_capability_mismatch(
     # Rule B first — it consults explicit planner output, so it is the
     # higher-confidence signal. Fires only when populated; an empty
     # advisory is not a no-op miss, it's "no opinion".
+    #
+    # AGENCY-PRESERVATION.md PR 3 ("WARNING-max"): Rule B is the ONE
+    # capability rule that survives as a steering trigger, because a
+    # user-declared ``required_tools`` advisory is genuine prescriptive
+    # intent (not goldfive's forecast). It now fires WARNING, not
+    # CRITICAL: the CAPABILITY_MISMATCH ladder maps WARNING→ABSORB
+    # (refine + continue) but CRITICAL→OBSERVE, so emitting WARNING
+    # keeps Rule B's refine while capping it below the cancel/pause
+    # escalation tier. (CAPABILITY_MISMATCH is not in
+    # ``_GOLDFIVE_STEER_ELIGIBLE_KINDS``, so WARNING cannot auto-promote
+    # to a steer either.)
     if required_tools:
         agent_tool_names = {n for n in (_tool_name(t) for t in tools) if n}
         missing = tuple(name for name in required_tools if name not in agent_tool_names)
@@ -314,17 +416,24 @@ def detect_capability_mismatch(
             )
             return DriftEvent(
                 kind=DriftKind.CAPABILITY_MISMATCH,
-                severity=DriftSeverity.CRITICAL,
+                severity=DriftSeverity.WARNING,
                 detail=detail,
                 current_task_id=task_id,
                 current_agent_id=invoked_agent_name,
             )
 
-    # Rule A — coordinator-style leaf-assignment. Empty tool list does
-    # not trip Rule A: we cannot distinguish "agent has no tools" from
-    # "test stub / introspection failure", and the cost of a false
-    # positive (cancelling + refine) is high.
-    if tools and all(is_agent_tool(t) for t in tools):
+    # Rule A — coordinator-style leaf-assignment. SOFT-RETIRED
+    # (AGENCY-PRESERVATION.md PR 3): default OFF, re-enabled only via
+    # ``GOLDFIVE_CAPABILITY_RULE_A=1``. Its leaf-task heuristic
+    # (``_looks_like_delegation_task`` keyword scan + the AgentTool-only
+    # leaf-title read) is stem/keyword NL classification — the
+    # #166/#167 anti-pattern — and was the source of the 2d27ff4a
+    # refine storm. Even when re-enabled it OBSERVEs (the ladder demotes
+    # the CRITICAL cells); the flag restores the signal for debugging,
+    # not steering. Hard deletion follows in PR 13. Empty tool list does
+    # not trip Rule A regardless: we cannot distinguish "agent has no
+    # tools" from "test stub / introspection failure".
+    if _rule_a_enabled() and tools and all(is_agent_tool(t) for t in tools):
         if not _looks_like_delegation_task(task):
             detail = (
                 f"agent {invoked_agent_name!r} has only AgentTool "
@@ -350,19 +459,29 @@ def detect_capability_mismatch(
     # pin's tier-2 stem disambiguator couldn't help because only one
     # task was eligible. Rule C fires on that exact shape.
     #
+    # SOFT-RETIRED (goldfive#423 / AGENCY-PRESERVATION.md PR 2): the
+    # rule no longer runs unless the operator explicitly re-enables it
+    # via ``GOLDFIVE_CAPABILITY_RULE_C=1``. Descriptive growth at pin
+    # time grows the plan when no structurally-right task exists, so
+    # the mispin shape Rule C detected no longer occurs (design doc
+    # §7). Hard deletion of ``_rule_c_dag_order`` + the
+    # ``all_pending_tasks`` parameter follows in AGENCY-PRESERVATION.md
+    # PR 13 (§7.1 step 2).
+    #
     # Cross-task signal — needs the full PENDING set (DAG-ready and
     # not). Silent when the caller didn't pass it, when the agent
     # name produces no usable stem (generic ``coordinator_agent`` style
     # names degrade gracefully), or when no other PENDING task
     # mentions the stem (in which case Rule C has nothing to say — the
     # pin is just doing its best with a generic agent).
-    drift_c = _rule_c_dag_order(
-        invoked_agent_name=invoked_agent_name,
-        bound_task=task,
-        all_pending_tasks=all_pending_tasks,
-    )
-    if drift_c is not None:
-        return drift_c
+    if _rule_c_enabled():
+        drift_c = _rule_c_dag_order(
+            invoked_agent_name=invoked_agent_name,
+            bound_task=task,
+            all_pending_tasks=all_pending_tasks,
+        )
+        if drift_c is not None:
+            return drift_c
 
     return None
 

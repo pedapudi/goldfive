@@ -41,13 +41,31 @@ Mandatory invariants (Phase 1, all enforced)
    reverts to the original ``contents`` and emits a
    ``ContextEditRejected`` event.
 
-3. **Drop-only / no injection.** Rules can prune or rewrite-to-shorter
-   existing parts; they cannot add material that wasn't in the prior
-   ``contents``. Additive shaping stays in ``PromptShaper``'s lane
-   (the ``system_instruction`` injections), where it is auditable.
-   Enforced via the byte / count monotonicity gate: the post-edit
-   byte total and content-count MUST be ≤ the pre-edit totals. A
-   rule that violates this triggers a revert.
+3. **Byte/count monotonicity + rule-class scoping.** The post-edit
+   byte total AND content-count MUST be ≤ the pre-rule totals — the
+   structural gate that keeps every rule subtractive in aggregate. A
+   rule that grows either triggers a revert
+   (``reason='not_drop_only'``). On top of that gate, each rule
+   declares a ``rule_class`` (PR 6b):
+
+   * ``"drop_only"`` (the Phase-1 default for rules that don't declare
+     one) — a rule may ONLY remove whole ``Content`` entries. Every
+     entry in its output must be identity-present in the input;
+     synthesizing or modifying an entry is reverted
+     (``reason='injected_content'``). ``PruneCancelledReasoningRule``
+     and ``PruneStaleSteerRule`` are drop-only.
+   * ``"byte_monotonic_replace"`` (the PR 6b relaxation) — a rule may
+     REWRITE an entry in place (redact a transient-error
+     ``function_response`` payload) or REPLACE a run of entries with a
+     single shorter summarized entry. Synthesized text is permitted
+     *only* for this class and *only* under the byte/count gate above,
+     so the edit stays subtractive in aggregate.
+     ``PruneTransientErrorRule`` and ``CompactPriorReasoningRule`` are
+     replace-class.
+
+   Free-form additive shaping (injecting brand-new guidance) stays in
+   ``PromptShaper``'s lane (the ``system_instruction`` injections),
+   where it is auditable. The editor never grows the transcript.
 
 4. **Idempotence per revision.** A deterministic rule applied twice
    to the same ``(observed_revision_index, contents)`` MUST produce
@@ -98,6 +116,7 @@ that touches it (``_measure_request_chars``) is strictly read-only.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -140,16 +159,32 @@ class ContextEditRule(Protocol):
     monotonically growing and revision-stamped, so deterministic per
     call.
 
-    Drop-only contract
-    ------------------
+    Rule-class contract
+    -------------------
     A rule's output ``contents`` MUST have ≤ the input's content count
-    AND ≤ the input's byte total. Rules may shorten ``part.text`` /
-    ``part.function_response.response`` payloads but MUST NOT introduce
-    new ``Content`` entries or grow any existing one. Adding belongs in
-    PromptShaper.
+    AND ≤ the input's byte total (the structural monotonicity gate).
+    Beyond that, the rule's optional ``rule_class`` attribute scopes
+    what shapes of edit are permitted:
+
+    * ``"drop_only"`` (the default when the attribute is absent) — the
+      rule may only DROP whole ``Content`` entries; every surviving
+      entry must be one of the input objects. Synthesizing or modifying
+      an entry is rejected (``reason='injected_content'``).
+    * ``"byte_monotonic_replace"`` — the rule may additionally redact a
+      payload in place or replace a run of entries with one shorter
+      summary. Synthesized text is permitted *only* under the
+      monotonicity gate above. Such a rule MUST build NEW ``Content`` /
+      part objects (e.g. via :func:`copy.deepcopy`) rather than mutate
+      the input objects, so a downstream invariant revert restores the
+      original transcript byte-for-byte.
+
+    Free-form additive shaping belongs in PromptShaper, never here.
     """
 
     name: str
+    #: One of :data:`_RULE_CLASSES`. Optional — a rule without it is
+    #: treated as ``"drop_only"`` (the Phase-1 contract).
+    rule_class: str
 
     def edit(
         self,
@@ -176,20 +211,41 @@ class ContextEditContext:
     """Read-only context handed to every rule's :meth:`edit` call.
 
     Carries the goldfive :class:`~goldfive.types.Session`, the host
-    agent name (the agent owning the wrapped ADK runner), and the
-    snapshot ``observed_revision_index`` captured at the top of
-    :meth:`ContextEditor.apply`.
+    agent name (the agent owning the wrapped ADK runner), the snapshot
+    ``observed_revision_index`` captured at the top of
+    :meth:`ContextEditor.apply`, and the set of currently-tripped drift
+    kinds.
 
     Rules use ``session`` to read orchestration state
     (e.g. ``state_store.read_cancelled_function_call_ids``) and
     ``observed_revision_index`` to stamp idempotence keys. The session
     handle is the goldfive Session (NOT the ADK session) — same handle
     every other steering surface reads from.
+
+    Dormancy gate (AGENCY-PRESERVATION.md §0)
+    ----------------------------------------
+    ``active_drift_kinds`` is the set of :class:`~goldfive.types.DriftKind`
+    *string values* for the conditions currently OPEN or ESCALATING on
+    the session (``state_store.list_active_drifts`` — resolved /
+    human-escalated conditions are popped, so this is the live "tripped"
+    set). It is the editor's contribution to the dormancy discipline:
+    context-editing rules are a steering surface, so they must stay
+    dormant on healthy turns and fire ONLY on a tripped guardrail
+    counter or a drift verdict. Every production rule self-gates on a
+    non-healthy trigger it can observe directly (cancelled ids, a
+    transient-error response in ``contents``, a stale goldfive note,
+    ≥N identical failed tool calls); rules that want to additionally
+    arm on a recorded drift *verdict* (e.g.
+    :class:`CompactPriorReasoningRule` lowering its repeat threshold
+    when a ``LOOPING_TOOL_CALL`` condition is open) read this set.
+    Empty by default — a rule MUST behave as a no-op when the set is
+    empty AND its own structural trigger is absent.
     """
 
     session: Any
     host_agent_name: str
     observed_revision_index: int
+    active_drift_kinds: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +257,29 @@ _REJECTED_REASONS = (
     "tool_call_id_pair_violation",
     "empty_contents",
     "not_drop_only",
+    "injected_content",
     "rule_raised",
     "unknown_rule",
 )
+
+# Recognised rule classes (the ``rule_class`` attribute on a rule).
+#
+# * ``"drop_only"`` (the default for any rule that doesn't declare one)
+#   — the Phase-1 contract: a rule may only REMOVE whole ``Content``
+#   entries. Every entry in its output MUST be identity-present in the
+#   input. Structurally enforced by :meth:`ContextEditor.apply` — a
+#   drop-only rule that returns a synthesized / modified ``Content`` is
+#   reverted with ``reason='injected_content'``.
+# * ``"byte_monotonic_replace"`` (PR 6b relaxation, AGENCY-PRESERVATION.md
+#   §"PR 6b") — a rule may REWRITE existing entries in place (redact a
+#   ``function_response`` payload) or REPLACE a run of entries with one
+#   shorter summarized entry. Synthesized text is permitted, but the
+#   structural byte/count monotonicity gate (Invariant 3) still binds:
+#   the post-edit byte total AND content count MUST be ≤ the pre-rule
+#   totals. The identity check is skipped for this class.
+_RULE_CLASS_DROP_ONLY = "drop_only"
+_RULE_CLASS_BYTE_MONOTONIC_REPLACE = "byte_monotonic_replace"
+_RULE_CLASSES = (_RULE_CLASS_DROP_ONLY, _RULE_CLASS_BYTE_MONOTONIC_REPLACE)
 
 
 # ---------------------------------------------------------------------------
@@ -503,15 +579,29 @@ class ContextEditor:
         # this stamping site being upstream of any rule that might
         # await.
         observed_rev = _resolve_observed_revision_index(session)
+        # Dormancy gate (AGENCY-PRESERVATION.md §0): snapshot the set of
+        # currently-tripped drift kinds so rules can arm on a recorded
+        # verdict in addition to their own structural trigger. Captured
+        # once, alongside the revision stamp, so the whole chain sees a
+        # consistent view.
+        active_drift_kinds = _resolve_active_drift_kinds(session)
         edit_ctx = ContextEditContext(
             session=session,
             host_agent_name=host_agent_name,
             observed_revision_index=observed_rev,
+            active_drift_kinds=active_drift_kinds,
         )
 
         current = original_contents
+        # ``ContextEdited`` emissions are DEFERRED until the final
+        # ``llm_request.contents`` swap succeeds — an event describing an
+        # edit that never reached the request would be a false claim in
+        # the timeline. Rejected events still emit inline (a rejection is
+        # a fact regardless of the swap outcome).
+        pending_applied_emits: list[dict[str, Any]] = []
         for rule in self._rules:
             rule_name = str(_safe_attr(rule, "name", "") or rule.__class__.__name__)
+            rule_class = _resolve_rule_class(rule)
 
             # Defensive: any rule that raises is logged + skipped.
             # We do NOT abort the chain — a subsequent rule can still
@@ -562,6 +652,31 @@ class ContextEditor:
                 )
                 continue
 
+            # Invariant 3 (cont.) — rule-class scoping. A ``drop_only``
+            # rule may only REMOVE whole entries: every surviving
+            # ``Content`` must be one of the input objects (identity
+            # match). A rule that synthesizes or modifies an entry while
+            # declaring (or defaulting to) ``drop_only`` is reverted.
+            # ``byte_monotonic_replace`` rules skip this check — they are
+            # explicitly permitted to redact / summarize in place, bounded
+            # only by the byte/count gate above.
+            if rule_class == _RULE_CLASS_DROP_ONLY and not _is_identity_subset(
+                candidate, current
+            ):
+                log.warning(
+                    "ContextEditor.apply: drop-only rule %r returned a "
+                    "synthesized/modified Content — reverting",
+                    rule_name,
+                )
+                result.rejected_rules.append((rule_name, "injected_content"))
+                await self._emit_rejected(
+                    session=session,
+                    rule_name=rule_name,
+                    reason="injected_content",
+                    observed_rev=observed_rev,
+                )
+                continue
+
             # Invariant 2 — tool_call_id pairing.
             if not _is_tool_call_id_paired(candidate):
                 log.warning(
@@ -596,40 +711,54 @@ class ContextEditor:
                 continue
 
             # Edit passed all invariants. Accept; subsequent rules
-            # see the edited contents.
+            # see the edited contents. The event's before-counts are
+            # PER-RULE (this rule's actual input), not the pre-chain
+            # totals — so two composing rules each report their own
+            # honest delta.
+            pre_rule_count = len(current)
             current = candidate
             result.applied_rules.append(rule_name)
-            try:
-                await self._emit_applied(
-                    session=session,
-                    rule_name=rule_name,
-                    bytes_before=pre_rule_bytes,
-                    bytes_after=cand_bytes,
-                    contents_count_before=len(original_contents),
-                    contents_count_after=len(candidate),
-                    observed_rev=observed_rev,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.debug(
-                    "ContextEditor.apply: emit ContextEdited raised: %s",
-                    exc,
-                )
+            pending_applied_emits.append(
+                {
+                    "session": session,
+                    "rule_name": rule_name,
+                    "rule_class": rule_class,
+                    "bytes_before": pre_rule_bytes,
+                    "bytes_after": cand_bytes,
+                    "contents_count_before": pre_rule_count,
+                    "contents_count_after": len(candidate),
+                    "observed_rev": observed_rev,
+                }
+            )
 
         # Commit the final ``contents`` onto the request only if a
         # rule actually applied. The defensive ``current is
         # original_contents`` check avoids touching the attribute when
         # nothing changed.
+        swap_failed = False
         if current is not original_contents and result.applied_rules:
             try:
                 llm_request.contents = current
             except Exception as exc:  # noqa: BLE001
                 log.warning(
                     "ContextEditor.apply: could not swap llm_request.contents "
-                    "— reverting: %s",
+                    "— reverting (suppressing %d ContextEdited event(s)): %s",
+                    len(pending_applied_emits),
                     exc,
                 )
                 result.applied_rules.clear()
                 current = original_contents
+                swap_failed = True
+
+        if not swap_failed:
+            for emit_kwargs in pending_applied_emits:
+                try:
+                    await self._emit_applied(**emit_kwargs)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "ContextEditor.apply: emit ContextEdited raised: %s",
+                        exc,
+                    )
 
         result.bytes_after = _content_bytes(current)
         result.contents_count_after = len(current)
@@ -642,6 +771,7 @@ class ContextEditor:
         *,
         session: Any,
         rule_name: str,
+        rule_class: str,
         bytes_before: int,
         bytes_after: int,
         contents_count_before: int,
@@ -666,6 +796,7 @@ class ContextEditor:
             seq = 0
         payload: dict[str, Any] = {
             "rule_name": str(rule_name),
+            "rule_class": str(rule_class),
             "bytes_before": int(bytes_before),
             "bytes_after": int(bytes_after),
             "contents_count_before": int(contents_count_before),
@@ -736,6 +867,72 @@ def _resolve_observed_revision_index(session: Any) -> int:
         return 0
 
 
+def _resolve_active_drift_kinds(session: Any) -> frozenset[str]:
+    """Return the set of currently-tripped drift-kind string values.
+
+    Reads ``state_store.list_active_drifts`` off the goldfive session —
+    the conditions OPEN or ESCALATING right now (resolved /
+    human-escalated entries are popped by the store, so the set is the
+    live "tripped" view). Used by the dormancy gate so rules can arm on
+    a recorded drift verdict in addition to their own structural
+    trigger. Returns an empty frozenset on any failure or when no plan/
+    state is present — never raises into the callback path.
+    """
+    try:
+        from goldfive import state_store as _ostate  # noqa: PLC0415
+
+        state = _safe_attr(session, "state", None)
+        if state is None:
+            return frozenset()
+        kinds: set[str] = set()
+        for drift in _ostate.list_active_drifts(state):
+            kind = _safe_attr(drift, "kind", None)
+            value = _safe_attr(kind, "value", None)
+            kinds.add(str(value if value is not None else kind))
+        kinds.discard("None")
+        kinds.discard("")
+        return frozenset(kinds)
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def _resolve_rule_class(rule: Any) -> str:
+    """Return the rule's declared ``rule_class``, defaulting to drop-only.
+
+    An unrecognised value is coerced to ``"drop_only"`` (the strictest
+    contract) and logged — a typo in a rule's class MUST NOT silently
+    grant it replace privileges.
+    """
+    raw = _safe_attr(rule, "rule_class", None)
+    if raw is None:
+        return _RULE_CLASS_DROP_ONLY
+    value = str(raw).strip().lower()
+    if value not in _RULE_CLASSES:
+        log.warning(
+            "ContextEditor: rule %r declares unknown rule_class %r — "
+            "treating as %r",
+            _safe_attr(rule, "name", rule.__class__.__name__),
+            raw,
+            _RULE_CLASS_DROP_ONLY,
+        )
+        return _RULE_CLASS_DROP_ONLY
+    return value
+
+
+def _is_identity_subset(candidate: list[Any], current: list[Any]) -> bool:
+    """Return True iff every entry in ``candidate`` is identity-present in ``current``.
+
+    The structural enforcement of the ``drop_only`` rule class: a
+    drop-only rule may reorder / remove entries but every surviving
+    entry must be one of the input objects (``is`` identity, not
+    equality). A rule that builds a fresh / modified ``Content`` fails
+    this check — that is the ``byte_monotonic_replace`` privilege it did
+    not claim.
+    """
+    current_ids = {id(c) for c in current}
+    return all(id(c) in current_ids for c in candidate)
+
+
 # ---------------------------------------------------------------------------
 # Initial rule — PruneCancelledReasoningRule
 # ---------------------------------------------------------------------------
@@ -790,9 +987,18 @@ class PruneCancelledReasoningRule:
     model's reasoning leading up to the cancelled action, which is
     exactly the material we're trying to strip. Conservative: this
     behaviour is what motivates the rule's existence.
+
+    Dormancy
+    --------
+    The trigger IS a non-healthy condition: ``contents`` is only edited
+    when ``goldfive.cancelled_function_call_ids`` is non-empty, i.e. a
+    cancel + heal actually happened. On a healthy turn the list is empty
+    and the rule returns ``None`` (skip). Drop-only: it removes whole
+    ``Content`` entries only.
     """
 
     name = "prune_cancelled_reasoning"
+    rule_class = _RULE_CLASS_DROP_ONLY
 
     def edit(
         self,
@@ -863,6 +1069,934 @@ def _content_touches_cancelled_id(content: Any, cancelled_ids: set[str]) -> bool
 
 
 # ---------------------------------------------------------------------------
+# Shared part / payload introspection helpers (rules 2-4)
+# ---------------------------------------------------------------------------
+
+
+def _iter_parts(content: Any) -> list[Any]:
+    """Return ``content.parts`` or ``[]`` — never raises."""
+    return _safe_attr(content, "parts", None) or []
+
+
+def _content_text(content: Any) -> str:
+    """Concatenate every ``part.text`` on ``content`` into one string."""
+    chunks: list[str] = []
+    for part in _iter_parts(content):
+        text = _safe_attr(part, "text", "") or ""
+        if text:
+            chunks.append(str(text))
+    return "\n".join(chunks)
+
+
+def _coerce_int(value: Any) -> int | None:
+    """Best-effort int coercion for status-code fields. ``None`` on failure."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _lower_keyed(resp: dict[Any, Any]) -> dict[str, Any]:
+    """Return ``resp`` with top-level keys lowercased + stripped."""
+    out: dict[str, Any] = {}
+    for k, v in resp.items():
+        try:
+            out[str(k).strip().lower()] = v
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+#: Recognised status / error-code field names (lowercased) inspected on a
+#: ``function_response.response`` dict. Structural — NOT a free-text scan.
+_CODE_FIELDS: tuple[str, ...] = (
+    "status_code",
+    "statuscode",
+    "http_status",
+    "httpstatus",
+    "error_code",
+    "errorcode",
+    "code",
+    "status",
+)
+
+#: ``status`` string values that denote a failed call.
+_ERROR_STATUS_WORDS: frozenset[str] = frozenset(
+    {"error", "failed", "failure", "timeout", "unavailable", "exception"}
+)
+
+#: Error-indicator + error-text field names (lowercased) inspected on a
+#: ``function_response.response`` dict.
+_ERROR_TEXT_FIELDS: tuple[str, ...] = (
+    "error",
+    "exception",
+    "message",
+    "detail",
+    "reason",
+    "type",
+    "status",
+    "title",
+)
+
+
+def _response_has_error_indicator(resp: Any) -> bool:
+    """Return True iff a ``function_response.response`` dict has an error SHAPE.
+
+    Conservative + structural: an HTTP-ish code ≥ 400 in a recognised
+    code field, a truthy ``error`` / ``exception`` field, an explicit
+    ``success``/``ok`` of ``False``, or a ``status`` string in
+    :data:`_ERROR_STATUS_WORDS`. Plain free text is NOT inspected — the
+    rule only flags structured statuses, never "anything that looks like
+    an error" (CONTEXT-EDITING.md rule-2/4 contract).
+    """
+    if not isinstance(resp, dict):
+        return False
+    lowered = _lower_keyed(resp)
+    for code_field in _CODE_FIELDS:
+        if code_field in lowered:
+            code = _coerce_int(lowered[code_field])
+            if code is not None and code >= 400:
+                return True
+    if lowered.get("error"):
+        return True
+    if lowered.get("exception"):
+        return True
+    if lowered.get("success") is False or lowered.get("ok") is False:
+        return True
+    status = lowered.get("status")
+    if isinstance(status, str) and status.strip().lower() in _ERROR_STATUS_WORDS:
+        return True
+    return False
+
+
+def _response_error_text(resp: Any) -> str:
+    """Gather lowercased text from a response dict's error-shaped fields only.
+
+    Used by :class:`PruneTransientErrorRule` to test transient markers
+    against the error message — NOT against arbitrary data fields, so a
+    benign payload that merely contains the word "timeout" never trips.
+    """
+    if not isinstance(resp, dict):
+        return ""
+    lowered = _lower_keyed(resp)
+    chunks: list[str] = []
+    for text_field in _ERROR_TEXT_FIELDS:
+        v = lowered.get(text_field)
+        if isinstance(v, str):
+            chunks.append(v)
+        elif isinstance(v, dict):
+            for kk in ("message", "reason", "detail", "type", "status", "code", "description"):
+                vv = v.get(kk)
+                if vv is not None:
+                    chunks.append(str(vv))
+        elif v is not None and not isinstance(v, (list, tuple)):
+            chunks.append(str(v))
+    return " ".join(chunks).lower()
+
+
+#: Key of the payload :class:`PruneTransientErrorRule` writes when it
+#: redacts a transient-error ``function_response`` in place. Shared so
+#: :class:`CompactPriorReasoningRule` can recognise an already-redacted
+#: failure (rule-composition contract: redaction upstream must not blind
+#: compaction to the loop it exists to compact). Structured exact-key
+#: check — not an NL heuristic.
+_REDACTION_KEY = "goldfive_redacted"
+
+
+def _is_goldfive_redaction(resp: Any) -> bool:
+    """True iff ``resp`` is a goldfive transient-error redaction payload."""
+    return isinstance(resp, dict) and _REDACTION_KEY in resp
+
+
+def _canonical_response_payload(resp: Any) -> str:
+    """Canonical serialised view of a ``function_response.response`` payload.
+
+    Order-insensitive JSON (``sort_keys=True``) so two structurally-equal
+    dicts compare equal regardless of key order — the result-identity key
+    :class:`CompactPriorReasoningRule` uses to decide whether repeated
+    calls truly returned IDENTICAL results (structured-data hashing, not
+    NL matching). Falls back to ``repr`` for unserialisable payloads.
+    """
+    try:
+        return json.dumps(resp, sort_keys=True, default=repr)
+    except Exception:  # noqa: BLE001
+        return repr(resp)
+
+
+def _function_call_signature(fc: Any) -> tuple[str, str]:
+    """Return ``(name, canonical-args-json)`` identifying a function call.
+
+    Two calls with the same name and the same (order-insensitive) args
+    share a signature — the "identical tool call" key
+    :class:`CompactPriorReasoningRule` groups on. Best-effort: args that
+    don't serialise fall back to ``repr``.
+    """
+    name = str(_safe_attr(fc, "name", "") or "")
+    args = _safe_attr(fc, "args", None)
+    if args is None:
+        return (name, "")
+    try:
+        return (name, json.dumps(args, sort_keys=True, default=repr))
+    except Exception:  # noqa: BLE001
+        return (name, repr(args))
+
+
+def _content_owned_by_id(content: Any, fc_id: str) -> bool:
+    """Return True iff every fc/fr part on ``content`` belongs to ``fc_id``.
+
+    The ownership guard for :class:`CompactPriorReasoningRule`: it only
+    drops / rewrites a ``Content`` when that content's tool parts ALL
+    belong to the call id being collapsed. A content batching parts for
+    several ids — or carrying an ID-LESS tool part, which cannot be
+    attributed to any call and would otherwise be silently clobbered /
+    dropped alongside the collapsed pair — is left untouched
+    (conservative; dropping it would affect unrelated calls). Text parts
+    are allowed (the reasoning text alongside the collapsed call is part
+    of what we're compacting).
+    """
+    for part in _iter_parts(content):
+        fc = _safe_attr(part, "function_call", None)
+        if fc is not None:
+            pid = str(_safe_attr(fc, "id", "") or "")
+            if pid != fc_id:
+                return False
+        fr = _safe_attr(part, "function_response", None)
+        if fr is not None:
+            pid = str(_safe_attr(fr, "id", "") or "")
+            if pid != fc_id:
+                return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Rule — PruneTransientErrorRule (byte-monotonic replace)
+# ---------------------------------------------------------------------------
+
+
+class PruneTransientErrorRule:
+    """Redact transient-error ``function_response`` payloads in place.
+
+    A 429 / 5xx / timeout / network blip / parse failure that propagated
+    through a ``function_response`` becomes a permanent fixture in the
+    transcript: subsequent turns re-read it, waste tokens, and may bias
+    their reasoning toward the failure (CONTEXT-EDITING.md "Motivation").
+    This rule replaces the offending response payload with a tiny marker
+    while leaving the ``function_call`` / ``function_response`` pair
+    structurally intact.
+
+    Why redact, not drop
+    --------------------
+    Dropping the ``function_response`` part alone would orphan its
+    ``function_call`` and trip the editor's pairing invariant (a revert);
+    dropping the whole pair would erase the fact that the tool was tried.
+    Redaction keeps the pair (same ``id`` + ``name``) so pairing holds
+    and the model still sees that it called the tool — only the noisy
+    error body is elided. This is why the rule is
+    ``byte_monotonic_replace``, not ``drop_only``.
+
+    Detection (conservative, structural)
+    ------------------------------------
+    A response is transient when it is a ``dict`` AND either (a) a
+    recognised code field (:data:`_CODE_FIELDS`) holds a status in the
+    configured transient set, or (b) it has an explicit error shape
+    (:func:`_response_has_error_indicator`) AND its error text matches a
+    configured transient marker. Free-form data fields are never scanned
+    — only flagged statuses, never "anything that looks like an error".
+
+    NL-heuristics boundary (binding)
+    --------------------------------
+    The marker allowlist matches ONLY **machine-generated error
+    signatures**: HTTP status reason phrases (RFC-standardised:
+    "Too Many Requests", "Service Unavailable", …), SDK / runtime
+    exception class names ("RateLimitError", "APITimeoutError",
+    "JSONDecodeError", …), and structured error codes / types
+    ("rate_limit_exceeded", "ECONNRESET", "overloaded_error", …). These
+    are emitted by infrastructure, not authored by the agent. This rule
+    MUST NOT be extended into semantic matching of natural-language prose
+    — neither agent reasoning nor free-text tool output — which is the
+    #166/#167 anti-pattern (retired ``_GENERIC_VERB_PREFIX_RE`` /
+    ``_FACTUAL_QUESTION_RE``). The matched fields are restricted to the
+    error-shaped keys of a response that already carries a structural
+    error indicator, precisely to keep the boundary at "machine error
+    payload", never "looks like an error in English".
+
+    Dormancy
+    --------
+    The trigger is the transient-error response itself — a guardrail-
+    observed fact (a failed tool result). A healthy turn carries no such
+    response, so the rule returns ``None``.
+    """
+
+    name = "prune_transient_error"
+    rule_class = _RULE_CLASS_BYTE_MONOTONIC_REPLACE
+
+    #: Default transient HTTP-ish status codes. Configurable per instance.
+    _DEFAULT_STATUS_CODES: frozenset[int] = frozenset(
+        {408, 425, 429, 500, 502, 503, 504, 509, 529}
+    )
+    #: Default transient error-text markers (lowercased substrings). STRICTLY
+    #: machine-generated error signatures — see the rule's "NL-heuristics
+    #: boundary" docstring. Do NOT add natural-language prose here.
+    _DEFAULT_MARKERS: tuple[str, ...] = (
+        # SDK / runtime exception class names
+        "ratelimiterror",
+        "apitimeouterror",
+        "apiconnectionerror",
+        "serviceunavailableerror",
+        "internalservererror",
+        "overloadederror",
+        "timeouterror",
+        "readtimeout",
+        "connecttimeout",
+        "connectionreseterror",
+        "connectionerror",
+        "jsondecodeerror",
+        # structured error codes / types
+        "rate_limit_exceeded",
+        "rate_limit",
+        "too_many_requests",
+        "service_unavailable",
+        "gateway_timeout",
+        "deadline_exceeded",
+        "overloaded_error",
+        "econnreset",
+        "etimedout",
+        "econnaborted",
+        # RFC-standardised HTTP status reason phrases
+        "too many requests",
+        "service unavailable",
+        "gateway timeout",
+        "bad gateway",
+        "request timeout",
+        "rate limit exceeded",
+    )
+
+    def __init__(
+        self,
+        *,
+        status_codes: frozenset[int] | set[int] | None = None,
+        markers: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
+        self._status_codes: frozenset[int] = (
+            frozenset(int(c) for c in status_codes)
+            if status_codes is not None
+            else self._DEFAULT_STATUS_CODES
+        )
+        self._markers: tuple[str, ...] = (
+            tuple(str(m).strip().lower() for m in markers)
+            if markers is not None
+            else self._DEFAULT_MARKERS
+        )
+
+    def edit(
+        self,
+        contents: list[Any],
+        ctx: ContextEditContext,
+    ) -> list[Any] | None:
+        out: list[Any] | None = None
+        for idx, content in enumerate(contents):
+            redacted = self._redact_content(content)
+            if redacted is None:
+                continue
+            if out is None:
+                out = list(contents)
+            out[idx] = redacted
+        return out
+
+    # ---- internals ----------------------------------------------------
+
+    def _redaction_value(self) -> dict[str, str]:
+        """A fresh, minimal redaction payload (new object each call)."""
+        return {_REDACTION_KEY: "transient_error_elided"}
+
+    def _is_transient(self, resp: Any) -> bool:
+        if not isinstance(resp, dict):
+            return False
+        lowered = _lower_keyed(resp)
+        for code_field in _CODE_FIELDS:
+            if code_field in lowered:
+                code = _coerce_int(lowered[code_field])
+                if code is not None and code in self._status_codes:
+                    return True
+        if not _response_has_error_indicator(resp):
+            return False
+        text = _response_error_text(resp)
+        return any(m in text for m in self._markers)
+
+    def _redact_content(self, content: Any) -> Any | None:
+        """Return a redacted deepcopy of ``content``, or ``None`` for no-op.
+
+        Only redacts a ``function_response`` part when the response is
+        transient AND the redaction strictly shrinks that part's
+        serialised bytes — guaranteeing the editor's byte-monotonicity
+        gate holds without a revert.
+        """
+        redaction = self._redaction_value()
+        redaction_len = len(json.dumps(redaction, default=repr))
+        target_part_indices: list[int] = []
+        parts = _iter_parts(content)
+        for i, part in enumerate(parts):
+            fr = _safe_attr(part, "function_response", None)
+            if fr is None:
+                continue
+            resp = _safe_attr(fr, "response", None)
+            if resp is None or not self._is_transient(resp):
+                continue
+            try:
+                resp_len = len(json.dumps(resp, default=repr))
+            except Exception:  # noqa: BLE001
+                continue
+            if resp_len <= redaction_len:
+                # Redaction wouldn't shrink this part — leave it.
+                continue
+            target_part_indices.append(i)
+        if not target_part_indices:
+            return None
+        try:
+            clone = copy.deepcopy(content)
+        except Exception:  # noqa: BLE001
+            return None
+        clone_parts = _iter_parts(clone)
+        if len(clone_parts) != len(parts):
+            return None
+        for i in target_part_indices:
+            fr = _safe_attr(clone_parts[i], "function_response", None)
+            if fr is None:
+                continue
+            try:
+                fr.response = self._redaction_value()
+            except Exception:  # noqa: BLE001
+                return None
+        return clone
+
+
+# ---------------------------------------------------------------------------
+# Rule — PruneStaleSteerRule (drop-only)
+# ---------------------------------------------------------------------------
+
+
+class PruneStaleSteerRule:
+    """Drop goldfive's own synthetic steer / observer-note user-messages once stale.
+
+    Today a synthetic steer message goldfive injected (the advisory note
+    delivered as a user turn) sticks in the transcript forever — even
+    after the steering took effect — wasting tokens and biasing the model
+    toward a correction that is no longer relevant (CONTEXT-EDITING.md
+    rule 3).
+
+    Identification (stable-keyed, single-source)
+    --------------------------------------------
+    A candidate is a ``Content`` whose text carries one of goldfive's
+    OWN constants: the observer-note marker
+    (``goldfive.observer_notes.OBSERVER_NOTE_MARKER_PREFIX``) or the
+    pinned advisory footer (``goldfive.observer_notes.ADVISORY_FOOTER``).
+    Both constants live ONLY in :mod:`goldfive.observer_notes` (the #455
+    module) — the SAME place PR 6's channel renders them from — so the
+    writer and this reader can never drift. Both are goldfive-minted
+    strings, so matching is a stable-identity check, NOT an NL heuristic
+    over agent output (the #166/#167 anti-pattern). Other contents are
+    never touched.
+
+    Staleness (the trigger)
+    -----------------------
+    A candidate is stale when the agent has already had its chance to
+    see it. Two bookkeeping sources decide that, matching the two ways
+    goldfive notes reach ``contents``:
+
+    * **New-channel notes** (the PR 6 request-context channel) — the
+      boundary replay renders a queued
+      :class:`~goldfive.observer_note_queue.ObserverNote` into
+      ``contents`` as the next user turn and stamps ``delivered`` /
+      ``delivered_turn`` on the queue (exactly-once). The new regime
+      does NOT write ``goldfive.active_steer.body`` (PR 7 scoped
+      ``set_active_steer`` to ``legacy_ladder`` only), so staleness for
+      these notes keys on the note channel's OWN bookkeeping: a
+      marker-wrapped content matching a delivered (non-dry-run) note's
+      body is FRESH while the session's reasoning turn has not advanced
+      past that note's ``delivered_turn`` — the agent has not yet had a
+      full turn to see it. Once the turn advances, the note is residue
+      and drops. Per-note clocks (rather than a single "most recent
+      delivered" winner) keep a contents-rendered note alive even when
+      another surface (``before_model`` → ``system_instruction``)
+      consumed a different note at the same turn.
+    * **Legacy-ladder footer bodies** — ``goldfive.active_steer.body``
+      (:func:`goldfive.state_store.set_active_steer` /
+      :func:`~goldfive.state_store.clear_active_steer`) is still
+      written under the ``legacy_ladder`` escape hatch: the note whose
+      text contains the active-steer body is kept.
+
+    A goldfive note matching NEITHER source is residue of a resolved
+    correction and drops. Both matches are exact substring containment
+    of goldfive-minted strings (the queue's stored ``body`` / the
+    active-steer body) — stable-identity checks, never NL heuristics.
+    Deterministic per ``(session.state, _reasoning_turn)`` snapshot;
+    drop-only is preserved (whole entries are removed, never rewritten).
+
+    Dormancy
+    --------
+    A healthy run never produced a steer, so there are no candidate
+    notes and the rule returns ``None``. Drop-only: it removes whole
+    note ``Content`` entries (plain user-text turns — no tool parts, so
+    pairing is unaffected).
+
+    PR-6 dependency
+    ---------------
+    Full coverage of legacy plain-text notes arrives when AGENCY-
+    PRESERVATION.md PR 6's channel wraps every delivered note in
+    ``goldfive.observer_notes.OBSERVER_NOTE_MARKER_PREFIX``; until then
+    the advisory-footer match already catches notes rendered through
+    :mod:`goldfive.observer_notes`.
+    """
+
+    name = "prune_stale_steer"
+    rule_class = _RULE_CLASS_DROP_ONLY
+
+    def edit(
+        self,
+        contents: list[Any],
+        ctx: ContextEditContext,
+    ) -> list[Any] | None:
+        footer, marker = self._note_markers()
+        if not footer and not marker:
+            return None
+        note_idx: set[int] = set()
+        for i, content in enumerate(contents):
+            if self._is_goldfive_note(content, footer, marker):
+                note_idx.add(i)
+        if not note_idx:
+            return None
+
+        active_body = self._read_active_steer_body(ctx.session)
+        fresh_bodies = self._fresh_delivered_note_bodies(ctx.session)
+        survivors: list[Any] = []
+        dropped = False
+        for i, content in enumerate(contents):
+            if i in note_idx and self._is_stale(content, active_body, fresh_bodies):
+                dropped = True
+                continue
+            survivors.append(content)
+
+        if not dropped or not survivors:
+            return None
+        return survivors
+
+    # ---- internals ----------------------------------------------------
+
+    #: Literal fail-safe used ONLY if :mod:`goldfive.observer_notes` can't
+    #: be imported. The canonical source is
+    #: ``observer_notes.OBSERVER_NOTE_MARKER_PREFIX``; this mirror exists so
+    #: a (near-impossible) import failure of a core module degrades to
+    #: still-functioning detection rather than silently matching nothing.
+    #: observer_notes is the single source in every normal path.
+    _MARKER_FALLBACK = "[GOLDFIVE OBSERVER NOTE"
+
+    @classmethod
+    def _note_markers(cls) -> tuple[str, str]:
+        """Return ``(advisory_footer, observer_note_marker_prefix)`` — both
+        goldfive constants, single-sourced from
+        :mod:`goldfive.observer_notes`.
+
+        On the (near-impossible) import failure of that core module, the
+        marker degrades to the literal fallback so detection keeps
+        functioning (fail-safe); the footer has no safe literal mirror
+        (it is long pinned prose) and degrades to empty — the marker
+        alone still catches PR-6-wrapped notes.
+        """
+        try:
+            from goldfive.observer_notes import (  # noqa: PLC0415
+                ADVISORY_FOOTER,
+                OBSERVER_NOTE_MARKER_PREFIX,
+            )
+
+            return (
+                str(ADVISORY_FOOTER or ""),
+                str(OBSERVER_NOTE_MARKER_PREFIX or "") or cls._MARKER_FALLBACK,
+            )
+        except Exception:  # noqa: BLE001
+            return ("", cls._MARKER_FALLBACK)
+
+    def _is_goldfive_note(self, content: Any, footer: str, marker: str) -> bool:
+        # Shape gate: goldfive's surfaces inject notes ONLY as plain
+        # user-text turns (the boundary replay's next-user-turn render
+        # and the legacy synthetic-steer injection). A MODEL turn that
+        # merely quotes the marker string, or any content carrying tool
+        # parts (function_call / function_response), is never a
+        # goldfive note and must not be dropped.
+        role = str(_safe_attr(content, "role", "") or "").strip().lower()
+        if role and role != "user":
+            return False
+        for part in _iter_parts(content):
+            if _safe_attr(part, "function_call", None) is not None:
+                return False
+            if _safe_attr(part, "function_response", None) is not None:
+                return False
+        text = _content_text(content)
+        if not text:
+            return False
+        if marker and marker in text:
+            return True
+        return bool(footer) and footer in text
+
+    def _is_stale(
+        self,
+        content: Any,
+        active_body: str,
+        fresh_bodies: tuple[str, ...],
+    ) -> bool:
+        text = _content_text(content)
+        # New-channel bookkeeping: a content carrying the body of a
+        # delivered note whose reasoning-turn window is still open is
+        # FRESH — the agent has not yet had a full turn to see it.
+        for body in fresh_bodies:
+            if body in text:
+                return False
+        # Legacy-ladder bookkeeping: the note matching the active-steer
+        # body is the currently-active steer.
+        if active_body and active_body in text:
+            return False
+        return True
+
+    @staticmethod
+    def _fresh_delivered_note_bodies(session: Any) -> tuple[str, ...]:
+        """Bodies of channel-delivered notes still inside their visibility window.
+
+        Reads the PR 6 :class:`~goldfive.observer_note_queue.ObserverNoteQueue`
+        off the session — the SAME bookkeeping the delivery surfaces stamp —
+        and returns the ``body`` of every note that was actually rendered
+        (``delivered`` and NOT a dry-run consume) whose ``delivered_turn``
+        the session's reasoning turn has not advanced past. Such a note was
+        just placed in front of the agent (e.g. the boundary replay's
+        next-user-turn render) and MUST survive the edit pass; once the
+        reasoning turn advances the agent has had its full turn to see it
+        and the note becomes prunable residue. Dry-run consumes are
+        excluded — the agent never saw those, so no content can
+        legitimately match them and they must not anchor freshness.
+        Best-effort: returns ``()`` on any failure.
+        """
+        try:
+            from goldfive.observer_note_queue import ObserverNoteQueue  # noqa: PLC0415
+
+            current_turn = int(_safe_attr(session, "_reasoning_turn", 0) or 0)
+            fresh: list[str] = []
+            for note in ObserverNoteQueue.for_session(session).notes():
+                if not note.delivered or note.delivered_dry_run:
+                    continue
+                body = str(note.body or "").strip()
+                if not body:
+                    continue
+                if current_turn <= int(note.delivered_turn):
+                    fresh.append(body)
+            return tuple(fresh)
+        except Exception:  # noqa: BLE001
+            return ()
+
+    @staticmethod
+    def _read_active_steer_body(session: Any) -> str:
+        try:
+            from goldfive import state_store as _ostate  # noqa: PLC0415
+
+            state = _safe_attr(session, "state", None)
+            if state is None:
+                return ""
+            return str(_ostate.read(state, _ostate.KEY_ACTIVE_STEER_BODY, "") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+# ---------------------------------------------------------------------------
+# Rule — CompactPriorReasoningRule (byte-monotonic replace)
+# ---------------------------------------------------------------------------
+
+
+class CompactPriorReasoningRule:
+    """Collapse N identical FAILED tool-call pairs into one summarized survivor.
+
+    When the wrapped agent loops — calling the same tool with the same
+    arguments and getting the same error every time — the failed trail
+    accumulates in context and the model re-anchors on it (largely what
+    looping *is*; CONTEXT-EDITING.md rule 4). This rule keeps the FIRST
+    call/response pair of each identical-failed run, replaces its
+    response with a one-line summary noting how many duplicates were
+    collapsed, and drops the rest.
+
+    Truthful summaries (result identity)
+    ------------------------------------
+    Grouping is by call SIGNATURE (name + canonical args), but the
+    synthesized claim is checked against result IDENTITY
+    (:func:`_canonical_response_payload` — structured-data comparison,
+    not NL matching): "identical results" is claimed only when the
+    compared payloads ARE identical; when args-identical calls returned
+    DIFFERING results the summary says so and preserves the LAST result
+    verbatim. Responses already redacted by
+    :class:`PruneTransientErrorRule` (the shared ``goldfive_redacted``
+    marker) count as failed and group naturally (every redaction of a
+    signature carries the same marker payload), so upstream redaction in
+    the same chain never blinds this rule — their summary states that
+    the transient-error payloads were elided rather than claiming
+    identical tool results.
+
+    Why byte-monotonic-replace
+    --------------------------
+    The summary is goldfive-synthesized text (it did not exist in the
+    prior ``contents``), so the rule is ``byte_monotonic_replace``, not
+    ``drop_only``. The structural gate still binds: dropping N-1 full
+    call/response pairs vastly outweighs the one short summary, so the
+    edit stays subtractive in both byte total and content count.
+
+    Pairing safety
+    --------------
+    Both halves of each dropped repeat (call content + response content)
+    are removed together, and the kept pair keeps its ``id`` + ``name``
+    (only the response payload is summarized), so the editor's pairing
+    invariant holds. An ownership guard (:func:`_content_owned_by_id`)
+    skips any content that batches parts for multiple call ids, so
+    unrelated calls are never disturbed.
+
+    Dormancy (the trigger)
+    ----------------------
+    Compaction fires only when a group of ≥ ``min_repeats`` identical
+    FAILED calls exists — itself the structural ``LOOPING_TOOL_CALL``
+    guardrail condition. When a ``looping_tool_call`` /
+    ``looping_reasoning`` drift verdict is ALSO recorded on the session
+    (``ctx.active_drift_kinds``) the threshold drops to 2 — the
+    guardrail counter has already tripped, so a single confirmed
+    duplicate is enough to act. A healthy run has no repeated failed
+    calls and the rule returns ``None``.
+    """
+
+    name = "compact_prior_reasoning"
+    rule_class = _RULE_CLASS_BYTE_MONOTONIC_REPLACE
+
+    _DEFAULT_MIN_REPEATS = 3
+    _LOOPING_DRIFT_KINDS: frozenset[str] = frozenset(
+        {"looping_tool_call", "looping_reasoning"}
+    )
+
+    def __init__(self, *, min_repeats: int | None = None) -> None:
+        raw = self._DEFAULT_MIN_REPEATS if min_repeats is None else int(min_repeats)
+        # Never below 2 — collapsing a single call is meaningless.
+        self._min_repeats = max(2, raw)
+
+    def edit(
+        self,
+        contents: list[Any],
+        ctx: ContextEditContext,
+    ) -> list[Any] | None:
+        threshold = self._min_repeats
+        if ctx.active_drift_kinds & self._LOOPING_DRIFT_KINDS:
+            threshold = 2
+
+        # Locate every call id's call content + signature.
+        call_idx_by_id: dict[str, int] = {}
+        sig_by_id: dict[str, tuple[str, str]] = {}
+        for i, content in enumerate(contents):
+            for part in _iter_parts(content):
+                fc = _safe_attr(part, "function_call", None)
+                if fc is None:
+                    continue
+                fc_id = str(_safe_attr(fc, "id", "") or "")
+                if not fc_id or fc_id in call_idx_by_id:
+                    continue
+                call_idx_by_id[fc_id] = i
+                sig_by_id[fc_id] = _function_call_signature(fc)
+
+        # Locate every call id's response content + whether it failed +
+        # its canonical result payload (the result-identity key). A
+        # payload already redacted by ``PruneTransientErrorRule`` counts
+        # as failed too — rule composition: upstream redaction must not
+        # blind this rule to the loop it exists to compact (and all
+        # redactions of a signature share one identical marker payload,
+        # so they group under result identity).
+        resp_idx_by_id: dict[str, int] = {}
+        resp_payload_by_id: dict[str, str] = {}
+        redacted_ids: set[str] = set()
+        failed_ids: set[str] = set()
+        for i, content in enumerate(contents):
+            for part in _iter_parts(content):
+                fr = _safe_attr(part, "function_response", None)
+                if fr is None:
+                    continue
+                fr_id = str(_safe_attr(fr, "id", "") or "")
+                if not fr_id or fr_id in resp_idx_by_id:
+                    continue
+                resp_idx_by_id[fr_id] = i
+                resp = _safe_attr(fr, "response", None)
+                resp_payload_by_id[fr_id] = _canonical_response_payload(resp)
+                if _is_goldfive_redaction(resp):
+                    redacted_ids.add(fr_id)
+                    failed_ids.add(fr_id)
+                elif _response_has_error_indicator(resp):
+                    failed_ids.add(fr_id)
+
+        # Group failed, fully-paired ids by call signature.
+        groups: dict[tuple[str, str], list[str]] = {}
+        for fc_id, sig in sig_by_id.items():
+            if fc_id in resp_idx_by_id and fc_id in failed_ids:
+                groups.setdefault(sig, []).append(fc_id)
+
+        drop_indices: set[int] = set()
+        summarize_clone: dict[int, Any] = {}  # kept resp content idx -> clone
+        for sig, ids in groups.items():
+            if len(ids) < threshold:
+                continue
+            ids_sorted = sorted(ids, key=lambda c: call_idx_by_id[c])
+            owned: dict[str, tuple[int, int]] = {}
+            ownership_ok = True
+            for fc_id in ids_sorted:
+                ci = call_idx_by_id[fc_id]
+                ri = resp_idx_by_id[fc_id]
+                if not _content_owned_by_id(contents[ci], fc_id) or not _content_owned_by_id(
+                    contents[ri], fc_id
+                ):
+                    ownership_ok = False
+                    break
+                owned[fc_id] = (ci, ri)
+            if not ownership_ok:
+                continue
+            keep = ids_sorted[0]
+            _keep_ci, keep_ri = owned[keep]
+
+            # Result-identity check (truthfulness contract): only claim
+            # "identical results" when the compared payloads ARE
+            # identical. When the args were identical but the results
+            # differed (e.g. an error progression), the summary says so
+            # honestly and preserves the LAST result verbatim — the
+            # progression's endpoint is the one datum the model still
+            # needs.
+            payloads = [resp_payload_by_id.get(fc_id, "") for fc_id in ids_sorted]
+            identical_results = len(set(payloads)) == 1
+            summary = self._summary_value(
+                name=sig[0],
+                count=len(ids_sorted),
+                identical_results=identical_results,
+                results_redacted=identical_results and keep in redacted_ids,
+                last_result=payloads[-1],
+            )
+
+            # Build the summarized survivor and only collapse this group
+            # when doing so STRICTLY reduces bytes. The summary is
+            # synthesized text, so a run of tiny failed responses could
+            # otherwise grow the transcript — in which case there is no
+            # benefit and the editor's byte gate would revert the whole
+            # edit. Self-checking here keeps the rule a clean no-op for
+            # the not-beneficial case instead of emitting a spurious
+            # ContextEditRejected.
+            clone = self._summarize_response(
+                contents[keep_ri], fc_id=keep, summary=summary
+            )
+            if clone is None:
+                continue
+            saved = 0
+            for fc_id in ids_sorted[1:]:
+                ci, ri = owned[fc_id]
+                saved += _content_bytes([contents[ci]]) + _content_bytes([contents[ri]])
+            saved += _content_bytes([contents[keep_ri]])  # kept response is replaced
+            added = _content_bytes([clone])
+            if saved <= added:
+                continue
+
+            for fc_id in ids_sorted[1:]:
+                ci, ri = owned[fc_id]
+                drop_indices.add(ci)
+                drop_indices.add(ri)
+            summarize_clone[keep_ri] = clone
+
+        if not drop_indices and not summarize_clone:
+            return None
+
+        out: list[Any] = []
+        for i, content in enumerate(contents):
+            if i in drop_indices:
+                continue
+            if i in summarize_clone:
+                out.append(summarize_clone[i])
+            else:
+                out.append(content)
+        return out
+
+    # ---- internals ----------------------------------------------------
+
+    @staticmethod
+    def _summary_value(
+        *,
+        name: str,
+        count: int,
+        identical_results: bool,
+        results_redacted: bool,
+        last_result: str,
+    ) -> dict[str, str]:
+        """Synthesize the survivor's summary payload — truthfully.
+
+        Three shapes (truthfulness contract — the summary must never
+        claim more than the compared payloads support):
+
+        * identical results, plain — the original "identical arguments
+          and identical results" claim (byte-pinned by tests).
+        * identical results, but each was a goldfive transient-error
+          redaction — the true statement is that every attempt returned
+          a transient error whose payload was already elided, not that
+          the tool returned "identical results".
+        * differing results — say so, and preserve the LAST result
+          verbatim (canonical JSON) so the error progression's endpoint
+          survives the collapse.
+        """
+        if identical_results and not results_redacted:
+            text = (
+                f"The tool '{name}' was invoked {count} times with identical "
+                f"arguments and identical results; {count - 1} duplicate "
+                f"invocations were collapsed to keep the context focused."
+            )
+        elif identical_results:
+            text = (
+                f"The tool '{name}' was invoked {count} times with identical "
+                f"arguments; each attempt returned a transient error whose "
+                f"payload was elided; {count - 1} duplicate invocations were "
+                f"collapsed to keep the context focused."
+            )
+        else:
+            text = (
+                f"The tool '{name}' was invoked {count} times with identical "
+                f"arguments but the results differed across attempts; "
+                f"{count - 1} earlier invocations were collapsed to keep the "
+                f"context focused. Last result (verbatim): {last_result}"
+            )
+        return {"goldfive_compacted": text}
+
+    def _summarize_response(
+        self, content: Any, *, fc_id: str, summary: dict[str, str]
+    ) -> Any | None:
+        """Return a deepcopy of ``content`` with the ``fc_id`` response summarized.
+
+        Only the ``function_response`` part(s) whose ``id`` matches the
+        collapsed call are rewritten — any other part on the content is
+        preserved verbatim (belt-and-braces alongside the
+        :func:`_content_owned_by_id` guard, which already skips contents
+        carrying foreign or id-less tool parts).
+        """
+        try:
+            clone = copy.deepcopy(content)
+        except Exception:  # noqa: BLE001
+            return None
+        touched = False
+        for part in _iter_parts(clone):
+            fr = _safe_attr(part, "function_response", None)
+            if fr is None:
+                continue
+            if str(_safe_attr(fr, "id", "") or "") != fc_id:
+                continue
+            try:
+                fr.response = dict(summary)
+                touched = True
+            except Exception:  # noqa: BLE001
+                return None
+        return clone if touched else None
+
+
+# ---------------------------------------------------------------------------
 # Rule registry — name -> factory
 # ---------------------------------------------------------------------------
 
@@ -873,6 +2007,9 @@ def _content_touches_cancelled_id(content: Any, cancelled_ids: set[str]) -> bool
 #: here AND under the catalog in ``docs/design/CONTEXT-EDITING.md``.
 _RULE_REGISTRY: dict[str, Any] = {
     "prune_cancelled_reasoning": PruneCancelledReasoningRule,
+    "prune_transient_error": PruneTransientErrorRule,
+    "prune_stale_steer": PruneStaleSteerRule,
+    "compact_prior_reasoning": CompactPriorReasoningRule,
 }
 
 
@@ -925,9 +2062,12 @@ def build_editor_from_config(
 
 
 __all__ = [
+    "CompactPriorReasoningRule",
     "ContextEditContext",
     "ContextEditRule",
     "ContextEditor",
     "PruneCancelledReasoningRule",
+    "PruneStaleSteerRule",
+    "PruneTransientErrorRule",
     "build_editor_from_config",
 ]

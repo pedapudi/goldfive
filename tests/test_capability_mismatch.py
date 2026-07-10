@@ -3,21 +3,31 @@
 Covers :func:`goldfive.drift.capability_check.detect_capability_mismatch`
 plus the integration wiring through the ADK adapter's
 ``before_tool_callback`` so a delegation to an under-qualified agent
-fires a CRITICAL ``CAPABILITY_MISMATCH`` drift through the steerer's
+fires a ``CAPABILITY_MISMATCH`` drift through the steerer's
 ``_handle_drift`` hook.
 
 Detection rules under test:
 
 * Rule A — coordinator-style leaf-assignment: agent has only AgentTool
   wrappers; bound task uses leaf-task verbs ("draft", "write", ...).
+  SOFT-RETIRED (AGENCY-PRESERVATION.md PR 3) — default OFF, fires
+  CRITICAL only under ``GOLDFIVE_CAPABILITY_RULE_A=1`` (the
+  rule-mechanics tests opt in via the ``_rule_a_escape_hatch``
+  fixture; ``test_rule_a_soft_retired_silent_by_default`` pins the new
+  default). The ladder additionally demotes its CRITICAL cells to
+  OBSERVE.
 * Rule B — task ``required_tools`` is non-empty and the invoked agent
-  doesn't cover the required names.
+  doesn't cover the required names. Kept as a steering trigger but
+  fires WARNING ("WARNING-max", PR 3), not CRITICAL.
 * Rule C (goldfive#268) — out-of-DAG-order delegation: agent role
   stem is absent from the bound task's title+description AND present
   in another PENDING task. Mirrors the live evidence from session
   ``f0630532-…`` where ``reviewer_agent`` got pinned to ``draft_slides``
   because ``review_presentation`` wasn't DAG-ready yet and only one
-  task was eligible.
+  task was eligible. SOFT-RETIRED by goldfive#423 /
+  AGENCY-PRESERVATION.md PR 2 — silent unless
+  ``GOLDFIVE_CAPABILITY_RULE_C=1`` (the rule-mechanics tests opt in
+  via the ``_rule_c_escape_hatch`` fixture).
 
 Negative cases mirror each positive: the same shapes WITHOUT the
 trigger condition must return ``None``.
@@ -83,9 +93,39 @@ class _FakeFunctionTool:
 # ---------------------------------------------------------------------------
 
 
+def test_rule_a_soft_retired_silent_by_default() -> None:
+    """AGENCY-PRESERVATION.md PR 3: the canonical Rule A positive shape
+    (all-AgentTool agent bound to a leaf authoring task) returns
+    ``None`` unless ``GOLDFIVE_CAPABILITY_RULE_A=1`` is explicitly set —
+    Rule A is soft-retired (stem/keyword NL classification, #166/#167).
+    """
+    agent_tools: list[Any] = [_FakeAgentTool("writer"), _FakeAgentTool("reviewer")]
+    task = Task(
+        id="t-draft",
+        title="Draft a presentation about LLM observability",
+        description="Produce slides covering the goldfive design.",
+        assignee_agent_id="coordinator",
+    )
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="coordinator",
+        invoked_agent_tools=agent_tools,
+        task=task,
+    )
+
+    assert drift is None, (
+        "Rule A is soft-retired (AGENCY-PRESERVATION.md PR 3) and must "
+        "be silent without GOLDFIVE_CAPABILITY_RULE_A=1"
+    )
+
+
+@pytest.mark.usefixtures("_rule_a_escape_hatch")
 def test_rule_a_positive_only_agent_tools_on_leaf_task() -> None:
     """An agent whose tools are ALL AgentTool wrappers, bound to a leaf
     authoring task ("Draft a presentation"), must fire CAPABILITY_MISMATCH.
+
+    Gated behind ``_rule_a_escape_hatch`` (Rule A is default OFF, PR 3):
+    this pins the retired-but-re-enableable detection mechanics.
     """
     agent_tools: list[Any] = [_FakeAgentTool("writer"), _FakeAgentTool("reviewer")]
     task = Task(
@@ -162,9 +202,12 @@ def test_rule_a_suppressed_for_each_delegation_marker(verb: str) -> None:
     assert drift is None, f"Rule A must be suppressed by marker {verb!r}"
 
 
+@pytest.mark.usefixtures("_rule_a_escape_hatch")
 def test_rule_a_negative_review_research_are_leaf_verbs() -> None:
     """"Review" and "research" are LEAF-task verbs — a coordinator
     structurally cannot do them. Self-review guard from the brief.
+
+    Gated behind ``_rule_a_escape_hatch`` (Rule A is default OFF, PR 3).
     """
     agent_tools: list[Any] = [_FakeAgentTool("writer"), _FakeAgentTool("reader")]
 
@@ -194,7 +237,14 @@ def test_rule_a_negative_review_research_are_leaf_verbs() -> None:
 
 def test_rule_b_positive_required_tool_missing() -> None:
     """``Task.required_tools`` is non-empty and the agent's tool names
-    do not cover the required names — fire CRITICAL.
+    do not cover the required names — fire WARNING.
+
+    AGENCY-PRESERVATION.md PR 3 ("WARNING-max"): Rule B is the surviving
+    steering trigger but now fires WARNING, not CRITICAL, so the ladder
+    refines (WARNING→ABSORB) without escalating to cancel/pause
+    (CRITICAL→OBSERVE for CAPABILITY_MISMATCH). Rule B is NOT behind an
+    escape hatch — user-declared ``required_tools`` is genuine intent
+    and stays armed by default.
     """
     agent_tools: list[Any] = [_FakeFunctionTool("read_presentation_files")]
     task = Task(
@@ -211,7 +261,7 @@ def test_rule_b_positive_required_tool_missing() -> None:
 
     assert drift is not None
     assert drift.kind is DriftKind.CAPABILITY_MISMATCH
-    assert drift.severity is DriftSeverity.CRITICAL
+    assert drift.severity is DriftSeverity.WARNING
     assert "write_webpage" in drift.detail
 
 
@@ -291,9 +341,70 @@ def test_is_agent_tool_duck_type() -> None:
 
 # ---------------------------------------------------------------------------
 # Rule C (goldfive#268) — out-of-DAG-order delegation
+#
+# SOFT-RETIRED by goldfive#423 / AGENCY-PRESERVATION.md PR 2: Rule C no
+# longer runs unless the operator explicitly sets
+# ``GOLDFIVE_CAPABILITY_RULE_C=1`` (descriptive growth at pin time fixes
+# the mispin shape Rule C detected — design doc §7/§7.1). The
+# rule-mechanics tests below opt in via the ``_rule_c_escape_hatch``
+# fixture so the retired-but-re-enableable implementation stays pinned
+# until its hard deletion (AGENCY-PRESERVATION.md PR 13);
+# ``test_rule_c_soft_retired_silent_by_default`` pins the new default.
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def _rule_c_escape_hatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-enable the soft-retired Rule C for rule-mechanics tests."""
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_C", "1")
+
+
+@pytest.fixture
+def _rule_a_escape_hatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-enable the soft-retired Rule A for rule-mechanics tests.
+
+    Rule A is default OFF (AGENCY-PRESERVATION.md PR 3; see
+    ``test_rule_a_soft_retired_silent_by_default`` for the new default).
+    The mechanics tests below opt in so the retired-but-re-enableable
+    detector stays pinned until its hard deletion in PR 13.
+    """
+    monkeypatch.setenv("GOLDFIVE_CAPABILITY_RULE_A", "1")
+
+
+def test_rule_c_soft_retired_silent_by_default() -> None:
+    """goldfive#423 / AGENCY-PRESERVATION.md PR 2: the canonical Rule C
+    positive shape (stem absent from bound task, present in another
+    PENDING task) returns ``None`` unless ``GOLDFIVE_CAPABILITY_RULE_C``
+    is explicitly set — Rule C is soft-retired.
+    """
+    bound = Task(
+        id="draft_slides",
+        title="Draft the presentation slides",
+        description="Author the slide content based on the outline.",
+    )
+    pending = [
+        bound,
+        Task(
+            id="review_presentation",
+            title="Review the presentation",
+            description="Read the slides and flag issues.",
+        ),
+    ]
+
+    drift = detect_capability_mismatch(
+        invoked_agent_name="reviewer_agent",
+        invoked_agent_tools=[_FakeFunctionTool("read_presentation_files")],
+        task=bound,
+        all_pending_tasks=pending,
+    )
+
+    assert drift is None, (
+        "Rule C is soft-retired (goldfive#423 PR 2) and must be silent "
+        "without GOLDFIVE_CAPABILITY_RULE_C=1"
+    )
+
+
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_positive_reviewer_pinned_to_draft() -> None:
     """Live evidence from session ``f0630532-…``: ``reviewer_agent``
     pinned to ``draft_slides`` while ``review_presentation`` sits
@@ -339,6 +450,7 @@ def test_rule_c_positive_reviewer_pinned_to_draft() -> None:
     assert "review_presentation" in drift.detail
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_stem_found_in_bound_task() -> None:
     """Stem ``reviewer`` is present in the bound task itself
     ("Review the presentation") — no conflict. Rule C must NOT fire.
@@ -362,6 +474,7 @@ def test_rule_c_negative_stem_found_in_bound_task() -> None:
     assert drift is None, "Rule C must not fire when stem is in the bound task"
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_stem_found_nowhere() -> None:
     """Agent ``helper_agent`` (stem ``helper``) bound to ``draft_slides``
     with no other ``helper``-shaped task — Rule C has no signal of
@@ -384,6 +497,7 @@ def test_rule_c_negative_stem_found_nowhere() -> None:
     assert drift is None, "Rule C must not fire when stem isn't anywhere"
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_generic_coordinator_agent_name() -> None:
     """``coordinator_agent`` has the stem ``coordinator`` — which would
     typically not appear anywhere in a normal pending plan. Rule C
@@ -409,6 +523,7 @@ def test_rule_c_negative_generic_coordinator_agent_name() -> None:
     )
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_short_stem_skipped() -> None:
     """Agent named ``qa_agent`` has stem ``qa`` (length 2) which is
     below the ≥4 length filter; ``agent_name_stems`` returns an empty
@@ -430,6 +545,7 @@ def test_rule_c_negative_short_stem_skipped() -> None:
     assert drift is None, "Short stems must skip Rule C cleanly"
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_negative_no_all_pending_tasks_passed() -> None:
     """Legacy callers that don't pass ``all_pending_tasks`` get the
     pre-#268 behaviour: Rules A/B still run, Rule C is silent.
@@ -446,11 +562,15 @@ def test_rule_c_negative_no_all_pending_tasks_passed() -> None:
     assert drift is None, "Rule C silent when caller doesn't pass pending set"
 
 
+@pytest.mark.usefixtures("_rule_a_escape_hatch", "_rule_c_escape_hatch")
 def test_rule_c_precedence_rule_a_still_wins() -> None:
     """When Rule A also fires (all AgentTool wrappers + leaf task) AND
     Rule C would also fire (stem mismatch), Rule A's verdict wins. The
     detector returns one drift; the detail string identifies Rule A
     by mentioning "AgentTool".
+
+    Both rules are soft-retired (default OFF), so this precedence test
+    opts BOTH in via the escape-hatch fixtures (PR 3 / PR 2).
     """
     bound = Task(
         id="draft_slides",
@@ -476,6 +596,7 @@ def test_rule_c_precedence_rule_a_still_wins() -> None:
     assert "role-stem" not in drift.detail
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_precedence_rule_b_still_wins() -> None:
     """Rule B (required_tools advisory) takes priority over Rule C.
     Same agent/task confusion shape as the positive case, but the
@@ -505,6 +626,7 @@ def test_rule_c_precedence_rule_b_still_wins() -> None:
     assert "role-stem" not in drift.detail
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 def test_rule_c_excludes_bound_task_by_id() -> None:
     """Even when the bound task itself appears in ``all_pending_tasks``
     (the natural shape — every pending task in the plan, including the
@@ -636,11 +758,16 @@ def _make_quiet_llm() -> Any:
     return _Quiet
 
 
+@pytest.mark.usefixtures("_rule_a_escape_hatch")
 async def test_integration_capability_mismatch_flows_through_handle_drift() -> None:
     """End-to-end: a coordinator delegates to a sub-agent whose only
     tools are AgentTool wrappers (so it cannot perform a leaf task).
     The plan task is assigned to that sub-agent. The capability detector
     fires and the drift lands on the steerer's ``_handle_drift``.
+
+    Exercises Rule A's wiring, so it opts in via ``_rule_a_escape_hatch``
+    (Rule A is default OFF, PR 3). The drift is still CRITICAL when
+    Rule A fires — the ladder, not the detector, demotes it to OBSERVE.
     """
     from google.adk.agents import Agent
     from google.adk.tools.agent_tool import AgentTool
@@ -722,6 +849,7 @@ async def test_integration_capability_mismatch_flows_through_handle_drift() -> N
     assert capability_decisions == []
 
 
+@pytest.mark.usefixtures("_rule_c_escape_hatch")
 async def test_integration_rule_c_dag_order_mismatch_through_pin() -> None:
     """End-to-end Rule C (goldfive#268): mirror the live evidence
     where ``reviewer_agent`` got delegated while only ``draft_slides``

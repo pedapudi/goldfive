@@ -170,6 +170,12 @@ def build_correction_payload(
     return {
         "agent_name": _normalize_agent_name(getattr(new_task, "assignee_agent_id", "")),
         "task_id": str(getattr(new_task, "id", "") or ""),
+        # The NEW (corrected) task's title — consumed by the self-contained
+        # rendering of ``format_correction_block`` (the note channel and the
+        # DISCOVERED ``[GOALS]`` branch render no "Current assigned task"
+        # section to point at, so the corrected target is inlined). Additive:
+        # the default slot-regime rendering ignores it.
+        "task_title": str(getattr(new_task, "title", "") or ""),
         "superseded_task_id": str(getattr(new_task, "supersedes", "") or ""),
         "superseded_task_title": str(getattr(old_task, "title", "") or ""),
         "drift_kind": drift_kind_value,
@@ -219,6 +225,7 @@ def queue_corrections_for_revision(
     revised: Plan,
     prev_plan: Plan | None,
     drift: DriftEvent,
+    corrections_via_notes: bool = False,
 ) -> list[str]:
     """Scan ``revised`` for CORRECT-kind supersedes and stamp corrections.
 
@@ -239,6 +246,19 @@ def queue_corrections_for_revision(
 
     Returns the list of state keys written so callers (tests, sinks)
     can assert on multi-correction revisions.
+
+    ``corrections_via_notes`` (AGENCY-PRESERVATION.md task #11) — when
+    ``True`` (the ``request_context`` regime with the Site-4 pin retired)
+    each correction is enqueued onto the StateStore-backed
+    :class:`~goldfive.observer_note_queue.ObserverNoteQueue` (carrying the
+    assignee as ``agent_id`` so the agent-scoped delivery surfaces route
+    it only to that agent) INSTEAD of the pending-correction state slot —
+    closing the "written but unread under request_context" gap PR 9's
+    KNOWN LIMITATION note marked. When ``False`` (the default, and the
+    legacy / ``pin_assigned_task=True`` paths) the pre-task-#11
+    ``write_correction`` slot is used unchanged (the dynamic-instruction
+    resolver reads it), so existing suites pass unmodified (§5.1). The
+    returned ids are note ids in the notes regime, state keys otherwise.
 
     No-op when ``revised`` has no CORRECT-kind supersedes links, when
     the session has no state dict, or when the triggering drift is
@@ -302,6 +322,23 @@ def queue_corrections_for_revision(
             revision_number=revision_number,
             issued_at_ms=now_ms,
         )
+        if corrections_via_notes:
+            note_id = _enqueue_correction_note(
+                session=session, payload=payload, drift=drift
+            )
+            if note_id:
+                written_keys.append(note_id)
+                log.info(
+                    "correction routed to observer-note queue for agent=%r "
+                    "task=%r (superseded=%r, drift=%s, rev=%d, note=%s)",
+                    payload["agent_name"],
+                    payload["task_id"],
+                    payload["superseded_task_id"],
+                    payload["drift_kind"] or "(none)",
+                    revision_number,
+                    note_id,
+                )
+            continue
         key = write_correction(session, payload)
         if key is not None:
             written_keys.append(key)
@@ -316,9 +353,112 @@ def queue_corrections_for_revision(
     return written_keys
 
 
+def _enqueue_correction_note(
+    *,
+    session: Any,
+    payload: Mapping[str, Any],
+    drift: DriftEvent,
+) -> str | None:
+    """Enqueue one CORRECT-kind correction onto the ObserverNoteQueue.
+
+    AGENCY-PRESERVATION.md task #11. The note carries the assignee as
+    ``agent_id`` (bare) so the agent-scoped delivery surfaces (notably
+    the ADK ``before_model`` surface) render it only on that agent's own
+    model call — never on a sibling's, never on the coordinator boundary
+    replay, and never on the loop-only tool-annotation surface. The
+    ``drift_id`` is a stable, goldfive-minted key
+    (:data:`~goldfive.observer_note_queue.CORRECTION_DRIFT_ID_PREFIX` +
+    ``<agent>:<task>:<rev>``) — never an LLM-minted id. It is unique per
+    revision: a later revision (higher ``rev``) mints a NEW note;
+    re-enqueuing the SAME revision (e.g. a retry of the same refine)
+    coalesces onto the existing entry.
+    Returns the note id, or ``None`` on any failure (best-effort — a
+    correction that can't be enqueued must not break the refine path).
+    """
+    try:
+        # Lazy imports: ``adk_llm_instrumentation`` imports this module
+        # (pending_correction_key et al.), so a module-level import here
+        # would be circular.
+        from goldfive.adapters.adk_llm_instrumentation import format_correction_block
+        from goldfive.observer_note_queue import (
+            CORRECTION_DRIFT_ID_PREFIX,
+            ObserverNoteQueue,
+        )
+
+        agent = str(payload.get("agent_name", "") or "")
+        task_id = str(payload.get("task_id", "") or "")
+        rev = int(payload.get("revision_number", 0) or 0)
+        if not agent or not task_id:
+            return None
+        # ``self_contained``: the note channel exists precisely because the
+        # request_context regime retired the prompt-shaping pin — there is
+        # no "Current assigned task" section for the default rendering to
+        # point at, so the corrected task title/id are inlined instead.
+        body = format_correction_block(payload, self_contained=True)
+        if not body:
+            return None
+        superseded = str(payload.get("superseded_task_id", "") or "")
+        observation = (
+            f"the plan was revised (rev {rev}); task {task_id} supersedes "
+            f"{superseded or '(prior task)'}"
+        )
+        severity = str(
+            getattr(getattr(drift, "severity", None), "value", "") or "warning"
+        ).lower()
+        kind = str(getattr(getattr(drift, "kind", None), "value", "") or "") or "correction"
+        turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+        queue = ObserverNoteQueue.for_session(session)
+        note = queue.enqueue(
+            body=body,
+            observation=observation,
+            severity=severity,
+            drift_id=f"{CORRECTION_DRIFT_ID_PREFIX}{agent}:{task_id}:{rev}",
+            kind=kind,
+            task_id=task_id,
+            agent_id=agent,
+            turn=turn,
+            ladder_level="correction",
+        )
+        return note.note_id
+    except Exception as exc:  # noqa: BLE001
+        log.debug("queue_corrections_for_revision: note enqueue raised: %s", exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Garbage-collection (clears)
 # ---------------------------------------------------------------------------
+
+
+def _evict_correction_notes(
+    session: Any,
+    *,
+    task_id: str,
+    agent_name: str = "",
+) -> list[str]:
+    """Evict pending correction-origin ObserverNotes for ``task_id``.
+
+    The note-channel (task #11 ``corrections_via_notes``) counterpart of
+    the slot pops below — both GC triggers (revision-supersession sweep
+    and the ``report_task_started`` ack) sweep BOTH channels so a stale
+    correction can never outlive its revision on either. No-op (empty
+    queue read) under the legacy regime, which never enqueues correction
+    notes. Best-effort: returns the evicted note ids, ``[]`` on any
+    failure.
+    """
+    try:
+        from goldfive.observer_note_queue import ObserverNoteQueue
+
+        return ObserverNoteQueue.for_session(session).evict_pending_correction_notes(
+            task_id=task_id, agent_id=agent_name
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "_evict_correction_notes: queue eviction raised for task=%r: %s",
+            task_id,
+            exc,
+        )
+        return []
 
 
 def clear_correction(
@@ -335,13 +475,28 @@ def clear_correction(
     Called from :mod:`goldfive.reporting` on
     :func:`report_task_started` for the correction task — the agent
     acknowledging the new task is our cue to stop re-injecting the
-    correction block on subsequent turns.
+    correction block on subsequent turns. Sweeps BOTH channels: the
+    legacy pending-correction state slot AND (task #11) any pending
+    correction-origin ObserverNote for the same ``(agent, task)`` — an
+    acknowledged correction must not be delivered again turns later via
+    the note channel.
     """
     if not agent_name or not task_id:
         return False
     state = _session_state(session)
     if state is None:
         return False
+    evicted_notes = _evict_correction_notes(
+        session, task_id=task_id, agent_name=agent_name
+    )
+    if evicted_notes:
+        log.info(
+            "evicted %d pending correction note(s) for agent=%r task=%r "
+            "(agent acknowledged the corrected task)",
+            len(evicted_notes),
+            agent_name,
+            task_id,
+        )
     key = pending_correction_key(agent_name, task_id)
     if key in state:
         state.pop(key, None)
@@ -351,7 +506,7 @@ def clear_correction(
             task_id,
         )
         return True
-    return False
+    return bool(evicted_notes)
 
 
 def clear_corrections_for_task(
@@ -368,7 +523,14 @@ def clear_corrections_for_task(
 
     Matches across all agents — a correction is ``(agent, task)``-keyed
     but a plan-revision supersession names a task, not an agent, so
-    the sweep is task-scoped. Returns the list of cleared state keys.
+    the sweep is task-scoped. Sweeps BOTH channels: the legacy
+    pending-correction state slots AND (task #11) pending
+    correction-origin ObserverNotes for the task — without the note
+    sweep a superseded correction stayed pending on the note channel
+    forever and could be delivered turns later against a plan that had
+    already moved past it. Returns the cleared identifiers (state keys
+    for slot entries, note ids for evicted notes — the same mixed
+    convention :func:`queue_corrections_for_revision` returns).
     """
     if not task_id:
         return []
@@ -392,6 +554,15 @@ def clear_corrections_for_task(
         log.info(
             "cleared %d pending correction(s) scoped to task=%r (task was superseded by revision)",
             len(cleared),
+            task_id,
+        )
+    evicted_notes = _evict_correction_notes(session, task_id=task_id)
+    if evicted_notes:
+        cleared.extend(evicted_notes)
+        log.info(
+            "evicted %d pending correction note(s) scoped to task=%r "
+            "(task was superseded by revision)",
+            len(evicted_notes),
             task_id,
         )
     return cleared

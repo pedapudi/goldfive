@@ -393,7 +393,11 @@ def pending_correction_key(agent_name: str, task_id: str) -> str:
     return f"{_sp.KEY_PENDING_CORRECTIONS}.{agent_name}.{task_id}"
 
 
-def format_correction_block(correction: Mapping[str, Any]) -> str:
+def format_correction_block(
+    correction: Mapping[str, Any],
+    *,
+    self_contained: bool = False,
+) -> str:
     """Render a pending-correction dict into the prompt block a resolver appends.
 
     Stream D (goldfive#251 :mod:`goldfive._correction_injection`) writes a
@@ -412,7 +416,7 @@ def format_correction_block(correction: Mapping[str, Any]) -> str:
     observability but is deliberately NOT interpolated into the LLM-
     visible block.
 
-    The rendered block is designed to slot after the ``Current
+    The default rendering is designed to slot after the ``Current
     assigned task`` section via :func:`_compose_instruction`:
 
         ---
@@ -424,6 +428,18 @@ def format_correction_block(correction: Mapping[str, Any]) -> str:
         "Current assigned task." Do not propagate the superseded
         content into downstream dispatches.
         ---
+
+    ``self_contained=True`` (AGENCY-PRESERVATION.md task #11 follow-up)
+    renders for surfaces where NO ``Current assigned task`` section
+    exists — the note-routed correction channel (the request_context
+    regime retires the prompt-shaping pin the default text points at)
+    and the DISCOVERED-pin ``[GOALS]`` branch of
+    :func:`_compose_instruction`. Instead of directing the agent to a
+    nonexistent section, the corrected task's title/id are inlined:
+
+        Your current assigned task is now
+        "{task_title}" (id {task_id}). Focus only on its revised
+        scope. Do not propagate ...
 
     Missing fields degrade to sensible placeholders so a partial dict
     (sink-shaped, persistence-restored) still renders cleanly.
@@ -439,14 +455,35 @@ def format_correction_block(correction: Mapping[str, Any]) -> str:
     superseded_id = str(correction.get("superseded_task_id", "") or "")
     id_fragment = f" (id {superseded_id})" if superseded_id else ""
 
+    if self_contained:
+        task_title = str(correction.get("task_title", "") or "")
+        task_id = str(correction.get("task_id", "") or "")
+        if task_title and task_id:
+            target = f'task "{task_title}" (id {task_id})'
+        elif task_title:
+            target = f'task "{task_title}"'
+        elif task_id:
+            target = f"task {task_id}"
+        else:
+            target = "the corrected task on the revised plan"
+        directive = (
+            f"Your current assigned task is now {target}. Focus only on "
+            "its revised scope. Do not propagate the superseded content "
+            "into downstream dispatches."
+        )
+    else:
+        directive = (
+            "Focus only on the revised scope as described above in "
+            '"Current assigned task." Do not propagate the superseded '
+            "content into downstream dispatches."
+        )
+
     return (
         "---\n"
         f"Plan was revised (REV {rev_num}). Your prior output for "
         f"task \"{superseded_title}\"{id_fragment} was superseded.\n"
         "\n"
-        "Focus only on the revised scope as described above in "
-        "\"Current assigned task.\" Do not propagate the superseded "
-        "content into downstream dispatches.\n"
+        f"{directive}\n"
         "---"
     )
 
@@ -457,6 +494,7 @@ def _read_pending_correction(
     state: Mapping[str, Any],
     agent_name: str,
     current_task_id: str,
+    self_contained: bool = False,
 ) -> str:
     """Resolve the pending-correction block for ``(agent, task)``.
 
@@ -467,6 +505,12 @@ def _read_pending_correction(
     tests / custom adapters that drive the resolver against a plain
     state dict without the stash).
 
+    ``self_contained`` is forwarded to :func:`format_correction_block`
+    — set by the resolver when the surrounding prompt renders NO
+    ``Current assigned task`` section (the DISCOVERED-pin ``[GOALS]``
+    branch), so the correction inlines the corrected task instead of
+    pointing at an absent section.
+
     Always returns a string (empty when no correction exists / the
     payload is malformed). Caller appends the result to the
     instruction block when non-empty.
@@ -476,34 +520,37 @@ def _read_pending_correction(
 
         store = StateStore.for_session(session)
         value = store.get_correction(agent_name, current_task_id)
-        return _resolve_pending_correction(value)
+        return _resolve_pending_correction(value, self_contained=self_contained)
     # Legacy fallback: no SessionContext reachable. Read directly off
     # ADK state. Used by unit tests that drive the resolver with a
     # plain state dict; production paths always carry the stash.
     return _resolve_pending_correction(
-        state.get(pending_correction_key(agent_name, current_task_id))
+        state.get(pending_correction_key(agent_name, current_task_id)),
+        self_contained=self_contained,
     )
 
 
-def _resolve_pending_correction(raw: Any) -> str:
+def _resolve_pending_correction(raw: Any, *, self_contained: bool = False) -> str:
     """Normalise a pending-correction state value to the final prompt string.
 
     Accepts three shapes so the resolver stays forgiving as Stream D's
     write contract evolves:
 
     * Mapping — the structured dict Stream D writes; rendered via
-      :func:`format_correction_block`.
+      :func:`format_correction_block` (``self_contained`` forwarded).
     * Non-empty string — treated as a pre-rendered block (back-compat
       path for tests and operators who stamped a literal string into
       state before Stream D existed, or who want to override the
-      template for a one-off).
+      template for a one-off). Returned verbatim — a pre-rendered
+      string cannot be re-composed, so ``self_contained`` does not
+      apply.
     * Anything else (None, empty string, bool, int) — degrades to an
       empty string, which :func:`_compose_instruction` then skips.
     """
     if raw is None:
         return ""
     if isinstance(raw, Mapping):
-        return format_correction_block(raw)
+        return format_correction_block(raw, self_contained=self_contained)
     if isinstance(raw, str):
         return raw
     return ""
@@ -530,10 +577,12 @@ def _compose_instruction(
     task_title: str,
     task_description: str,
     pending_correction: str,
+    task_kind: str = "",
+    goals_block: str = "",
 ) -> str:
     """Assemble the final prompt string the LLM sees this turn.
 
-    Shape:
+    Shape (FORECAST / OUTCOME pin — the legacy task block):
 
         {original}
 
@@ -545,7 +594,53 @@ def _compose_instruction(
           description: {task_description}
 
         {pending_correction}  # appended only when non-empty
+
+    AGENCY-PRESERVATION.md Stage 3 PR 12 — when the pinned task is
+    DISCOVERED-kind (``task_kind == TaskKind.DISCOVERED.value`` and a
+    non-empty ``goals_block`` is supplied), render a ``[GOALS]`` block
+    INSTEAD of the ``Current assigned task:`` block:
+
+        {original}
+
+        ---
+
+        [GOALS]
+        {goals_block}
+
+        {pending_correction}
+
+    Rationale: a DISCOVERED task is the agent's OWN observed means-work
+    (the trajectory lane of the ledger), not a forecast the agent is
+    graded against. Pinning it back as a prescription re-imposes exactly
+    the forecast framing PR 11/12 retire — so for a discovered pin we
+    ground the agent on the user's GOALS and let it own the means.
+    ``task_kind``/``goals_block`` default to ``""`` so every legacy /
+    forecast / OUTCOME caller renders the unchanged task block (the
+    DISCOVERED kind only exists in ledger plan mode — forecast-mode pins
+    are byte-identical, §5.1).
+
+    Interaction with the PR 9 prompt-shaping diet: under
+    ``signal_channel == "request_context"`` with ``pin_assigned_task``
+    off, the resolver returns the original instruction BEFORE reaching
+    this function (the pin is retired entirely), so the ``[GOALS]`` block
+    applies only where a pin WOULD render — legacy ``signal_channel`` or
+    ``pin_assigned_task=True``.
     """
+    from goldfive.types import TaskKind
+
+    if task_kind == TaskKind.DISCOVERED.value and goals_block:
+        block = (
+            f"{original}\n"
+            "\n"
+            "---\n"
+            "\n"
+            "[GOALS]\n"
+            f"{goals_block}\n"
+        )
+        if pending_correction:
+            block = f"{block}\n{pending_correction}\n"
+        return block
+
     title = task_title or _MISSING_TITLE_PLACEHOLDER
     description = task_description or _MISSING_DESCRIPTION_PLACEHOLDER
 
@@ -651,6 +746,49 @@ def _task_title_description_from_session(session: Any, task_id: str) -> tuple[st
             description = str(getattr(task, "description", "") or "")
             return title, description
     return "", ""
+
+
+def _task_kind_from_session(session: Any, task_id: str) -> str:
+    """Return the :attr:`Task.kind` VALUE for ``task_id`` in ``session.plan``.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 12. Returns the kind's string value
+    (e.g. ``"DISCOVERED"`` / ``"OUTCOME"`` / ``"FORECAST"``) so the
+    resolver can choose the ``[GOALS]`` block for a discovered pin. Returns
+    ``""`` when the plan / task is missing or carries no kind — the caller
+    then renders the unchanged task block. Forecast-mode tasks are always
+    FORECAST-kind, so this never selects the discovered branch outside
+    ledger plan mode (§5.1 forecast bit-identity).
+    """
+    if session is None or not task_id:
+        return ""
+    plan = getattr(session, "plan", None)
+    if plan is None:
+        return ""
+    for task in getattr(plan, "tasks", None) or ():
+        if str(getattr(task, "id", "") or "") == task_id:
+            kind = getattr(task, "kind", None)
+            return str(getattr(kind, "value", kind) or "")
+    return ""
+
+
+def _goals_block_from_session(session: Any) -> str:
+    """Render ``session.goals`` as the body of the PR-12 ``[GOALS]`` block.
+
+    One bullet per goal summary; goals without a summary are skipped.
+    Returns ``""`` when there are no goals so the caller falls back to the
+    task block (a discovered pin with no goals has nothing to ground on).
+    Never raises.
+    """
+    try:
+        goals = getattr(session, "goals", None) or ()
+        lines: list[str] = []
+        for g in goals:
+            summary = str(getattr(g, "summary", "") or "").strip()
+            if summary:
+                lines.append(f"  - {summary}")
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def is_dynamic_instruction(value: Any) -> bool:

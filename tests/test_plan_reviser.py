@@ -46,6 +46,7 @@ from goldfive.types import (  # noqa: E402
     SupersessionKind,
     Task,
     TaskEdge,
+    TaskKind,
     TaskStatus,
 )
 
@@ -410,3 +411,179 @@ async def test_apply_revision_does_not_mutate_session_before_emit() -> None:
         "target) watermark — the stamp moved into _emit_plan_revised's "
         "lock so it never appears without the matching session.plan swap"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ledger taxonomy preservation across a revision
+# (AGENCY-PRESERVATION.md Stage 3 PR 10/11(c)).
+#
+# The refine / user-steer paths rebuild the plan from LLM JSON, which
+# resets every ``Task.kind`` to FORECAST and drops the DISCOVERED
+# identity fields. ``_apply_revision`` (the single install chokepoint)
+# re-folds the ledger identity from the prior plan in ledger mode.
+# ---------------------------------------------------------------------------
+
+
+def _ledger_prior() -> Plan:
+    """A ledger plan: two OUTCOME deliverables + two DISCOVERED tasks."""
+    return Plan(
+        id="p-led",
+        run_id="r-led",
+        goal_ids=["g-led"],
+        tasks=[
+            Task(id="o1", title="Summary delivered", kind=TaskKind.OUTCOME),
+            Task(id="o2", title="Translation delivered", kind=TaskKind.OUTCOME),
+            Task(
+                id="d1",
+                title="writer: drafted summary",
+                assignee_agent_id="writer",
+                discovered=True,
+                discovery_identity_hash="hash-d1",
+                contributes_to="o1",
+                kind=TaskKind.DISCOVERED,
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="d2",
+                title="translator: running",
+                assignee_agent_id="translator",
+                discovered=True,
+                discovery_identity_hash="hash-d2",
+                kind=TaskKind.DISCOVERED,
+                status=TaskStatus.RUNNING,
+            ),
+        ],
+        edges=[],
+        revision_index=3,
+    )
+
+
+def _refined_forecast_shape(prior: Plan) -> Plan:
+    """The plan as it comes back from ``_plan_from_json`` after a refine.
+
+    Every task carries the FORECAST default and has lost the DISCOVERED
+    identity fields (assignee, discovered bool, hash, contributes_to) —
+    exactly what the LLM-rebuild path produces. ``d2`` (a non-terminal
+    DISCOVERED task) is silently DROPPED, and a genuinely-new task is
+    added.
+    """
+    return Plan(
+        id=prior.id,
+        run_id=prior.run_id,
+        goal_ids=list(prior.goal_ids),
+        tasks=[
+            # OUTCOME kind lost → FORECAST.
+            Task(id="o1", title="Summary delivered", status=TaskStatus.COMPLETED),
+            Task(id="o2", title="Translation delivered"),
+            # DISCOVERED identity lost → bare FORECAST task.
+            Task(id="d1", title="writer: drafted summary", status=TaskStatus.COMPLETED),
+            # d2 dropped entirely.
+            # brand-new deliverable produced by the steer.
+            Task(id="o3", title="Glossary delivered"),
+        ],
+        edges=[],
+        revision_index=prior.revision_index + 1,
+    )
+
+
+def test_preserve_ledger_identity_restores_kinds_and_identity() -> None:
+    prior = _ledger_prior()
+    revised = _refined_forecast_shape(prior)
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(observation_only=False, plan_mode="ledger")
+    )
+
+    out = steerer.plans._preserve_ledger_identity(revised, prior)
+    by_id = {t.id: t for t in out.tasks}
+
+    # OUTCOME taxonomy restored on surviving deliverables.
+    assert by_id["o1"].kind is TaskKind.OUTCOME
+    assert by_id["o2"].kind is TaskKind.OUTCOME
+    # DISCOVERED identity restored verbatim.
+    assert by_id["d1"].kind is TaskKind.DISCOVERED
+    assert by_id["d1"].discovered is True
+    assert by_id["d1"].discovery_identity_hash == "hash-d1"
+    assert by_id["d1"].contributes_to == "o1"
+    assert by_id["d1"].assignee_agent_id == "writer"
+    # A genuinely-new task becomes an OUTCOME deliverable.
+    assert by_id["o3"].kind is TaskKind.OUTCOME
+    # The dropped non-terminal DISCOVERED task is re-added, intact.
+    assert "d2" in by_id
+    assert by_id["d2"].kind is TaskKind.DISCOVERED
+    assert by_id["d2"].discovered is True
+    assert by_id["d2"].discovery_identity_hash == "hash-d2"
+    assert by_id["d2"].status is TaskStatus.RUNNING
+
+
+def test_preserve_ledger_identity_skips_non_ledger_shaped_prior() -> None:
+    """The repairs only restore a taxonomy that EXISTED: a prior with no
+    ledger-shaped task (the initial empty-seed install, or a hand-authored
+    forecast plan under a ledger config) must NOT have its tasks stamped
+    OUTCOME — "StaticPlanner users keep forecast semantics — a hand-authored
+    plan is genuine prescriptive intent" (design doc Stage 3)."""
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(observation_only=False, plan_mode="ledger")
+    )
+    hand_authored = Plan(
+        id="p-static",
+        run_id="r",
+        goal_ids=["g"],
+        tasks=[Task(id="t1", title="Do the work"), Task(id="t2", title="Review it")],
+        edges=[],
+        revision_index=1,
+    )
+
+    # Initial install: prior is the empty seed.
+    out = steerer.plans._preserve_ledger_identity(hand_authored, Plan.empty())
+    assert out is hand_authored
+    assert all(t.kind is TaskKind.FORECAST for t in out.tasks)
+
+    # Later revision of a forecast-shaped (never-a-ledger) prior: new
+    # tasks are NOT stamped OUTCOME either.
+    revised = Plan(
+        id="p-static",
+        run_id="r",
+        goal_ids=["g"],
+        tasks=[*hand_authored.tasks, Task(id="t3", title="Ship it")],
+        edges=[],
+        revision_index=2,
+    )
+    out = steerer.plans._preserve_ledger_identity(revised, hand_authored)
+    assert out is revised
+    assert all(t.kind is TaskKind.FORECAST for t in out.tasks)
+
+
+def test_preserve_ledger_identity_is_noop_in_forecast_mode() -> None:
+    prior = _ledger_prior()
+    revised = _refined_forecast_shape(prior)
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(observation_only=False, plan_mode="forecast")
+    )
+
+    out = steerer.plans._preserve_ledger_identity(revised, prior)
+
+    # Forecast mode: returned unchanged (same reference), kinds untouched.
+    assert out is revised
+    assert all(t.kind is TaskKind.FORECAST for t in out.tasks)
+    assert "d2" not in {t.id for t in out.tasks}
+
+
+def test_apply_revision_preserves_ledger_taxonomy_end_to_end() -> None:
+    prior = _ledger_prior()
+    session = _make_session(prior)
+    revised = _refined_forecast_shape(prior)
+    drift = _drift(kind=DriftKind.USER_STEER, task_id="o2")
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(observation_only=False, plan_mode="ledger")
+    )
+
+    returned, _was_installed = steerer.plans._apply_revision(session, revised, drift)
+    by_id = {t.id: t for t in returned.tasks}
+
+    # The install chokepoint carried the ledger taxonomy through — the
+    # outcome judge will still see OUTCOME tasks to grade.
+    assert by_id["o1"].kind is TaskKind.OUTCOME
+    assert by_id["o2"].kind is TaskKind.OUTCOME
+    assert by_id["o3"].kind is TaskKind.OUTCOME
+    assert by_id["d1"].kind is TaskKind.DISCOVERED
+    assert by_id["d2"].kind is TaskKind.DISCOVERED  # dropped task re-added

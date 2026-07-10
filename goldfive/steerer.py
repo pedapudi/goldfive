@@ -24,12 +24,16 @@ tangle of conditionals. Levels, ordered by intrusiveness:
 
 * Level 0 — OBSERVE: record the drift, no action.
 * Level 1 — ABSORB: call ``planner.refine``; continue.
-* Level 2 — NUDGE: queue a soft follow-up message on the session for
-  the Runner's overlay loop to pick up at the next invocation boundary.
+* Level 2 — SIGNAL (renamed from NUDGE in AGENCY-PRESERVATION.md PR 7):
+  enqueue an advisory observer note on the configured channel — no
+  refine, no cancel, no steer. The proportional, trajectory-preserving
+  response the goldfive-authored ``CANCEL_REINVOKE`` cells were demoted to.
 * Level 3 — CANCEL_REINVOKE: dispatch a ``GOLDFIVE_STEER`` control
   message on the bound channel so the executor cancels in-flight work
-  and restarts with a goldfive-authored corrective. Phase 2 of the
-  path-duality fix routes this through the same junction as USER_STEER.
+  and restarts with a goldfive-authored corrective. PR 7 narrows this to
+  the user-steer junction + hard-safety kinds only (every other
+  goldfive-authored row signals); the ``GOLDFIVE_STEER_LEGACY_LADDER=1``
+  escape hatch restores the pre-PR-7 cells.
 * Level 4 — PAUSE_ESCALATE: dispatch a ``GOLDFIVE_PAUSE_ESCALATE``
   control message and emit ``HUMAN_INTERVENTION_REQUIRED`` so the
   executor's pre-task loop blocks waiting for operator action. The
@@ -100,6 +104,8 @@ __all__ = [
     "InterventionLevel",
     "RefineExhausted",
     "compose_corrective_user_message",
+    "plan_mode_is_ledger",
+    "signal_channel",
     "steering_is_active",
 ]
 
@@ -122,6 +128,43 @@ def steering_is_active(steerer: Any) -> bool:
         return False
     try:
         return bool(predicate())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def signal_channel(steerer: Any) -> str:
+    """Return the resolved signal channel for a maybe-steerer.
+
+    The single definition of the ``"legacy_user_message"`` default — the
+    sibling of :func:`steering_is_active` for the channel flag. Before this
+    helper the default string was duplicated at nine read sites across five
+    modules; any one of them drifting (a typo, a stale copy after a rename)
+    would silently fork routing between surfaces. Consumers must not read
+    ``_signal_channel`` directly.
+
+    Fail-safe direction: ``None`` / missing attribute / non-string resolves to
+    the legacy channel — the regime whose delivery surfaces are fully
+    ``observation_only``-gated and default-inert.
+    """
+    raw = getattr(steerer, "_signal_channel", None)
+    if not isinstance(raw, str) or not raw:
+        return "legacy_user_message"
+    return raw
+
+
+def plan_mode_is_ledger(steerer: Any) -> bool:
+    """Return ``True`` iff the steerer's typed config selects ledger plan mode.
+
+    The single implementation of the ``plan_mode == "ledger"`` parse
+    (normalising case/whitespace, defaulting to ``"forecast"``) — previously
+    re-implemented verbatim by three ``_ledger_mode`` methods (reconciler,
+    plan reviser, drift observer). Reads the typed
+    :class:`~goldfive.config.SteeringConfig` stashed on the steerer; any
+    failure resolves ``False`` (forecast — the default, inert regime).
+    """
+    try:
+        cfg = getattr(steerer, "_steering_config", None)
+        return str(getattr(cfg, "plan_mode", "forecast")).strip().lower() == "ledger"
     except Exception:  # noqa: BLE001
         return False
 
@@ -157,7 +200,12 @@ class InterventionLevel(enum.IntEnum):
 
     OBSERVE = 0
     ABSORB = 1
-    NUDGE = 2
+    # AGENCY-PRESERVATION.md PR 7: NUDGE renamed to SIGNAL. The level now
+    # enqueues an advisory observer note (the request_context channel / the
+    # legacy nudge replay) WITHOUT a refine/cancel/steer — the proportional,
+    # trajectory-preserving response that replaces the goldfive-authored
+    # CANCEL_REINVOKE cells. The enum value (2) is unchanged.
+    SIGNAL = 2
     CANCEL_REINVOKE = 3
     PAUSE_ESCALATE = 4
     TERMINATE = 5
@@ -189,157 +237,33 @@ _ABSORB_NUDGE_KINDS: frozenset[DriftKind] = frozenset(
 )
 
 
-# Default drift messages per kind, used by
-# :func:`compose_corrective_user_message` when the drift carries no
-# kind-specific override. Keep SHORT, action-focused; no goldfive jargon
-# ("synthetic", "healed", "orphan", "drift") in user-facing copy.
-_CORRECTIVE_TEMPLATES: dict[DriftKind, str] = {
-    DriftKind.LOOPING_REASONING: (
-        "The prior attempt looped on {current_task_id}. "
-        "Refined plan: {next_task_title}. Please try a different approach."
-    ),
-    DriftKind.LOOPING_TOOL_CALL: (
-        "The prior attempt kept retrying the same tool call on "
-        "{current_task_id} without progress. Refined plan: "
-        "{next_task_title}. Please try a different approach."
-    ),
-    DriftKind.PLAN_DIVERGENCE: (
-        "The tree's prior activity diverged from the plan. "
-        "Refined plan: proceed with {next_task_title}."
-    ),
-    DriftKind.AGENT_REFUSAL: (
-        "The prior attempt could not complete {current_task_id}. "
-        "Refined plan: try {next_task_title}."
-    ),
-    DriftKind.MODEL_REFUSAL: (
-        "The model declined to proceed on {current_task_id}. Refined plan: try {next_task_title}."
-    ),
-    DriftKind.INTENT_DIVERGENCE: (
-        "The prior attempt strayed from the stated intent for "
-        "{current_task_id}. Refined plan: proceed with "
-        "{next_task_title}."
-    ),
-    DriftKind.TOOL_ERROR: (
-        "The prior attempt hit a tool error on {current_task_id}. "
-        "Refined plan: proceed with {next_task_title}."
-    ),
-    DriftKind.RUNAWAY_DELEGATION: (
-        "The prior attempt kept delegating without finishing "
-        "{current_task_id}. Refined plan: proceed with "
-        "{next_task_title} directly."
-    ),
-    DriftKind.SELF_REPORTED_STUCK: (
-        "The prior attempt reported being stuck on {current_task_id}. "
-        "Refined plan: try {next_task_title}."
-    ),
-    DriftKind.CONFABULATION_RISK: (
-        "The prior attempt may have produced {current_task_id} "
-        "without consulting external data. Refined plan: "
-        "{next_task_title}."
-    ),
-    # Tier 1 / F4 — GOAL_DRIFT corrective. The judge's signal is "agent
-    # is grinding on completed work / not advancing the goal". The plan
-    # itself is fine; the agent just needs a pointer at the next hand-
-    # off. Includes ``{next_task_agent}`` so the coordinator can route
-    # to the assignee directly rather than re-invoking the stuck agent.
-    # Only used when the referenced task really is COMPLETED at compose
-    # time; :func:`compose_corrective_user_message` falls back to
-    # :data:`_GOAL_DRIFT_NOT_COMPLETE_TEMPLATE` otherwise so the
-    # message never asserts a completion the plan does not show.
-    DriftKind.GOAL_DRIFT: (
-        "Task '{current_task_id}' is already complete. "
-        "Please proceed to '{next_task_title}' via {next_task_agent}."
-    ),
-}
-
-# GOAL_DRIFT variant for a referenced task that is NOT COMPLETED at
-# compose time (the judge can fire while the task is still PENDING /
-# RUNNING, or after it FAILED). A directive rather than a status
-# assertion, so it stays truthful whatever the task's actual state.
-_GOAL_DRIFT_NOT_COMPLETE_TEMPLATE: str = (
-    "Set task '{current_task_id}' aside for now. "
-    "Please proceed to '{next_task_title}' via {next_task_agent}."
-)
-
-
 def compose_corrective_user_message(
     *,
     drift: DriftEvent,
     refined_plan: Plan | None,
 ) -> str:
-    """Build a short directive user message for Level 3 re-invoke.
+    """DEPRECATED shim — delegates to :mod:`goldfive.observer_notes`.
 
-    Shape varies by drift kind (see :data:`_CORRECTIVE_TEMPLATES`). The
-    message is deliberately short, action-focused, and avoids goldfive
-    jargon -- the consumer is the agent's LLM, which should read a
-    natural instruction rather than a framework postmortem.
+    AGENCY-PRESERVATION.md PR 4 retired the ``_CORRECTIVE_TEMPLATES``
+    command templates this function used to render ("proceed to
+    '{next_task_title}' via {next_task_agent}", "do NOT retry", …):
+    goldfive owns goals / budgets / observability, the wrapped agent
+    owns MEANS (decomposition, delegation, ordering, retries), so the
+    agent-facing message is now an observation+goal advisory note, not
+    a directive about which task or agent comes next.
+
+    Kept as a thin delegating shim because the name is in the public
+    ``__all__`` and external callers / tests import it. In-tree call
+    sites (``goldfive.drift_observer``) call
+    :func:`goldfive.observer_notes.compose_note_for_drift` directly —
+    it accepts the ``session`` so the note carries the user's goals;
+    this shim cannot (signature compatibility), so notes it renders
+    carry the "(no goals recorded for this run)" placeholder. New code
+    should not call this.
     """
-    current = drift.current_task_id or "the current task"
-    next_title = _next_pending_task_title(refined_plan) or "the next planned step"
-    next_agent = _next_pending_task_agent(refined_plan) or "the next assigned agent"
-    template = _CORRECTIVE_TEMPLATES.get(drift.kind)
-    if drift.kind is DriftKind.GOAL_DRIFT and not _task_is_completed(
-        refined_plan, drift.current_task_id
-    ):
-        # The default GOAL_DRIFT template asserts "already complete";
-        # only true when the plan shows the task terminal-COMPLETED.
-        template = _GOAL_DRIFT_NOT_COMPLETE_TEMPLATE
-    if template is None:
-        # Generic fallback for drift kinds that didn't get a
-        # custom shape. Keep it tight and action-focused.
-        template = (
-            "The prior attempt on {current_task_id} did not complete "
-            "successfully. Refined plan: proceed with {next_task_title}."
-        )
-    return template.format(
-        current_task_id=current,
-        next_task_title=next_title,
-        next_task_agent=next_agent,
-    )
+    from goldfive.observer_notes import compose_note_for_drift
 
-
-def _task_is_completed(plan: Plan | None, task_id: str) -> bool:
-    """True iff ``task_id`` resolves on ``plan`` with COMPLETED status."""
-    if plan is None or not task_id:
-        return False
-    for t in plan.tasks:
-        if t.id == task_id:
-            return t.status is TaskStatus.COMPLETED
-    return False
-
-
-def _next_pending_task_title(plan: Plan | None) -> str:
-    """Return the title of the next PENDING task in topological order.
-
-    Falls back to the task id if no title is set. Returns an empty
-    string when there is no eligible task.
-    """
-    if plan is None:
-        return ""
-    for t in plan.tasks:
-        if t.status is TaskStatus.PENDING:
-            return (t.title or t.id or "").strip()
-    return ""
-
-
-def _next_pending_task_agent(plan: Plan | None) -> str:
-    """Return the bare agent name assigned to the next PENDING task.
-
-    Tier 1 / F4 — used by the GOAL_DRIFT corrective template, which
-    redirects the LLM's next action to a different agent. Returns the
-    last dot-separated segment of ``assignee_agent_id`` so the LLM sees
-    a name it can pass back as the AgentTool target. Empty string when
-    no eligible task exists or the task has no assignee.
-    """
-    if plan is None:
-        return ""
-    for t in plan.tasks:
-        if t.status is TaskStatus.PENDING:
-            assignee = (getattr(t, "assignee_agent_id", "") or "").strip()
-            if "." in assignee:
-                return assignee.rsplit(".", 1)[-1]
-            return assignee
-    return ""
+    return compose_note_for_drift(drift=drift, plan=refined_plan)
 
 
 def _enum_or_str_value(value: Any) -> str:
@@ -443,6 +367,7 @@ class DefaultSteerer:
         steering_config: SteeringConfig | None = None,
         goldfive_steer_threshold: str | None = None,
         goldfive_steer_suppression_window_turns: int | None = None,
+        cancel_inflight_scope: str | None = None,
         judges: list[Any] | None = None,
     ) -> None:
         """Build a steerer.
@@ -685,6 +610,30 @@ class DefaultSteerer:
         else:
             _window = 3
         self._goldfive_steer_suppression_window_turns = max(0, _window)
+        # AGENCY-PRESERVATION.md PR 1 (goldfive#449/#452): authority
+        # scope for cancelling the wrapped agent's in-flight invocation
+        # on a drift-driven plan install. Precedence mirrors the other
+        # goldfive#225 knobs: explicit kwarg > ``SteeringConfig`` >
+        # built-in default (``"user_and_safety"``). Consumed by
+        # :meth:`DriftObserver._drift_authorizes_inflight_cancel`;
+        # ``"all"`` is the §5.1 kill-switch restoring the legacy
+        # cancel-on-every-install behaviour (env:
+        # ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`` via
+        # :meth:`SteeringConfig.from_env`).
+        if cancel_inflight_scope is not None:
+            _cancel_scope = str(cancel_inflight_scope).strip().lower()
+        elif steering_config is not None:
+            _cancel_scope = str(steering_config.cancel_inflight_scope).strip().lower()
+        else:
+            _cancel_scope = "user_and_safety"
+        if _cancel_scope not in {"user_and_safety", "all"}:
+            log.warning(
+                "DefaultSteerer: unknown cancel_inflight_scope=%r; "
+                "falling back to 'user_and_safety'",
+                _cancel_scope,
+            )
+            _cancel_scope = "user_and_safety"
+        self._cancel_inflight_scope: str = _cancel_scope
         self._steering_config: SteeringConfig | None = steering_config
         # goldfive#254: observation-only mode. Detection still runs in
         # full and ``planner.refine_steer`` still runs (operators see the
@@ -717,6 +666,63 @@ class DefaultSteerer:
         else:
             self._stall_watchdog_enabled = False
             self._stall_timeout_s = 600.0
+        # AGENCY-PRESERVATION.md PR 5 (#449/#452): signal telemetry —
+        # SignalDelivered / SignalOutcome events + the SignalLedger
+        # bookkeeping. Default OFF so PR 5 is a true no-op (§5.1
+        # "no-op by default"): with the flag off the drift-observer's signal
+        # helpers early-return before touching the ledger or the wire, so the
+        # event stream every existing suite asserts on is byte-for-byte
+        # unchanged. The shadow/differential-validation campaign (§5.4) and
+        # PR 8's grace-window pacing enable it explicitly via
+        # ``SteeringConfig(signal_telemetry=True)``. Gates nothing either way.
+        self._signal_telemetry_enabled: bool = bool(
+            getattr(steering_config, "signal_telemetry", False)
+        )
+        # AGENCY-PRESERVATION.md PR 6: observer-note delivery channel.
+        # ``"legacy_user_message"`` (the default) keeps corrective notes on
+        # ``session.pending_nudges`` (the pre-PR-6 boundary replay);
+        # ``"request_context"`` routes them through the
+        # :class:`~goldfive.observer_note_queue.ObserverNoteQueue` and the four
+        # observer-note delivery surfaces. The drift observer (enqueue) and the
+        # executor / adapters (delivery) read this flag; with the legacy
+        # default the queue is never populated and the new surfaces are inert,
+        # so PR 6 ships dark (§5.1). Normalised + validated on
+        # :class:`SteeringConfig`; a bare ``DefaultSteerer()`` with no config
+        # defaults to legacy.
+        _channel = str(
+            getattr(steering_config, "signal_channel", "legacy_user_message")
+            or "legacy_user_message"
+        ).strip().lower()
+        if _channel not in {"legacy_user_message", "request_context"}:
+            log.warning(
+                "DefaultSteerer: unknown signal_channel=%r; "
+                "falling back to 'legacy_user_message'",
+                _channel,
+            )
+            _channel = "legacy_user_message"
+        self._signal_channel: str = _channel
+        # AGENCY-PRESERVATION.md PR 7: the one-release legacy-ladder escape
+        # hatch. When True the pre-PR-7 ladder cells (CANCEL_REINVOKE in the
+        # goldfive-authored rows) and the full _promote_drift_to_steer
+        # side-effects are restored; the drift observer reads this flag in
+        # ``_ladder_level_for`` and ``_promote_drift_to_steer``. Default OFF
+        # (the new SIGNAL ladder). The two deferred correctness fixes
+        # (hard-safety stop, PLAN_DIVERGENCE removal) are NOT gated by it.
+        self._legacy_ladder: bool = bool(
+            getattr(steering_config, "legacy_ladder", False)
+        )
+        # AGENCY-PRESERVATION.md PR 8: minimum-intervention grace window. After
+        # a note for a ``(kind, task)`` key is RENDERED, that key can't
+        # re-signal/escalate for this many logical turns (default 3; 0
+        # disables). The drift observer reads this in the signal-pacing gate,
+        # keyed on the ObserverNoteQueue's render-visibility (NOT the ledger's
+        # dispatch turn). Only active under ``signal_channel ==
+        # "request_context"`` (the queue tracks visibility there).
+        try:
+            _grace = int(getattr(steering_config, "grace_window_turns", 3))
+        except (TypeError, ValueError):
+            _grace = 3
+        self._grace_window_turns: int = max(0, _grace)
         # Background reasoning-judge tasks (goldfive#251). The LLM-judge
         # path in :meth:`observe_reasoning` is fire-and-forget so the
         # adapter's model-response callback can return immediately and
@@ -1035,6 +1041,12 @@ class DefaultSteerer:
             kind=kind,
             severity=severity,
             detail=str(getattr(verdict, "detail", "") or ""),
+            # AGENCY-PRESERVATION.md PR 4 — thread the judge-authored
+            # agent-facing observation onto the drift so
+            # ``goldfive.observer_notes`` can prefer it over ``detail``
+            # when composing notes. ``getattr`` keeps pre-PR-4 verdict
+            # shapes (no field) degrading to the empty string.
+            note_to_agent=str(getattr(verdict, "note_to_agent", "") or ""),
         )
 
     async def _emit_judgement(
@@ -1242,6 +1254,18 @@ class DefaultSteerer:
     # ------------------------------------------------------------------
     # Protocol-required: transition (generic)
     # ------------------------------------------------------------------
+
+    async def finalize_outcomes(self, session: Session) -> None:
+        """Judge + finalize ledger OUTCOME deliverables at the run boundary.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 11(c). Delegates to
+        :meth:`DriftObserver.finalize_outcomes` (the judge + transition
+        logic lives drift-side); the executor calls this single method at
+        the overlay run boundary, mirroring the
+        ``_drain_steerer_at_run_boundary`` contract. Ledger-gated and
+        quiet on failure — a no-op in forecast mode.
+        """
+        await self.drift.finalize_outcomes(session)
 
     async def transition(
         self,

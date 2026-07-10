@@ -32,6 +32,7 @@ This module is pinned to the shapes in ``docs/design/PROTOCOLS.md``.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +44,8 @@ from goldfive.adapters._tool_invocation import invoke_tool
 from goldfive.drift import classify_stop_reason
 from goldfive.reporting import REPORTING_TOOL_NAMES, ReportingToolSpec
 from goldfive.results import InvocationResult
+from goldfive.steerer import signal_channel as _signal_channel_of
+from goldfive.steerer import steering_is_active
 from goldfive.types import Session, Task
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +59,9 @@ except ImportError as _sdk_import_err:  # pragma: no cover
     _sdk = None  # type: ignore[assignment]
 else:
     _SDK_IMPORT_ERROR = None
+
+
+log = logging.getLogger("goldfive.adapters.claude")
 
 
 if TYPE_CHECKING:
@@ -282,17 +288,58 @@ class ClaudeAgentSDKAdapter:
             completed=session.completed_results,
         )
 
-        options = self._build_options(sdk=sdk, system_prompt=system_prompt, session=session)
-
         client = self._client_factory()
         # ``ClaudeSDKClient`` options are set on the instance; some
         # factories already attach them. We only overwrite when the
         # caller left ``options=None``.
-        if getattr(client, "options", None) is None:
+        operator_options = getattr(client, "options", None)
+        if operator_options is None:
+            # Observer-note channel surface 3a (AGENCY-PRESERVATION.md PR 6):
+            # system-prompt section. In request_context mode, append the
+            # most-severe pending observer note as a marker-bracketed block.
+            # No-op under the legacy default (the queue is never populated)
+            # or observation_only. Best-effort: never blocks the invocation.
+            #
+            # Consumed ONLY on this branch — when the operator's factory
+            # attached its own options, goldfive's options object (and the
+            # system prompt inside it) never reaches the client, so consuming
+            # the note here would mark a render that did not happen
+            # (``mark_delivered(dry_run=False)`` with nothing shown to the
+            # agent — a telemetry lie). On the operator-options branch the
+            # note stays pending and delivers truthfully via the merged
+            # ``PostToolUse`` hook (surface 3b) or another surface.
+            note_block = await self._consume_observer_note(
+                session,
+                surface="claude_system_prompt",
+                current_agent_id=task.assignee_agent_id,
+            )
+            if note_block:
+                system_prompt = f"{system_prompt}\n\n{note_block}"
+
+            options = self._build_options(
+                sdk=sdk,
+                system_prompt=system_prompt,
+                session=session,
+                current_agent_id=task.assignee_agent_id,
+            )
             try:
                 client.options = options  # type: ignore[attr-defined]
             except Exception:  # pragma: no cover - exotic client subclasses
                 pass
+        else:
+            # Factory-attached options: the operator's configuration wins for
+            # system prompt / model / MCP servers, but the observer-note
+            # ``PostToolUse`` hook (surface 3b) is merged in — best-effort,
+            # on a COPY of the operator's options — so pending notes still
+            # reach the agent. If the merge cannot attach, notes simply stay
+            # pending for another surface; nothing is falsely consumed.
+            self._merge_note_hook_into_operator_options(
+                sdk=sdk,
+                client=client,
+                operator_options=operator_options,
+                session=session,
+                current_agent_id=task.assignee_agent_id,
+            )
 
         final_text_parts: list[str] = []
         stop_reason: str = ""
@@ -325,13 +372,18 @@ class ClaudeAgentSDKAdapter:
 
         # Classify benign vs drift-worthy stop reasons. Only drift feeds
         # the steerer — benign stops are reported via the return value.
-        drift = classify_stop_reason(
-            stop_reason,
-            current_task_id=task.id,
-            current_agent_id=task.assignee_agent_id,
-        )
-        if drift is not None and self._steerer is not None:
-            await _safe_observe(self._steerer, drift, session)
+        # ``classify_stop_reason`` takes the reason alone (its signature
+        # was narrowed when it became the shared context-pressure
+        # classifier); the task/agent attribution is stamped here. The
+        # old kwargs call raised TypeError on every completed invocation.
+        drift = classify_stop_reason(stop_reason)
+        if drift is not None:
+            drift.current_task_id = drift.current_task_id or task.id
+            drift.current_agent_id = (
+                drift.current_agent_id or task.assignee_agent_id
+            )
+            if self._steerer is not None:
+                await _safe_observe(self._steerer, drift, session)
 
         return InvocationResult(
             task_id=task.id,
@@ -351,6 +403,7 @@ class ClaudeAgentSDKAdapter:
         sdk: Any,
         system_prompt: str,
         session: Session,
+        current_agent_id: str = "",
     ) -> Any:
         """Assemble a fresh ``ClaudeAgentOptions`` for this invocation."""
 
@@ -359,9 +412,30 @@ class ClaudeAgentSDKAdapter:
             hooks=[self._make_pretooluse_hook(session)],
         )
 
+        hooks: dict[str, Any] = {"PreToolUse": [hook_matcher]}
+        # Observer-note channel surface 3b (AGENCY-PRESERVATION.md PR 6):
+        # a PostToolUse hook surfaces the most-severe pending observer note as
+        # ``additionalContext`` adjacent to the tool use. Only registered in
+        # request_context mode so the legacy default (and every existing test,
+        # which never sets ``signal_channel``) keeps the unchanged single-hook
+        # options object.
+        if (
+            _signal_channel_of(self._steerer)
+            == "request_context"
+        ):
+            hooks["PostToolUse"] = [
+                sdk.HookMatcher(
+                    hooks=[
+                        self._make_posttooluse_hook(
+                            session, current_agent_id=current_agent_id
+                        )
+                    ]
+                )
+            ]
+
         kwargs: dict[str, Any] = {
             "system_prompt": system_prompt,
-            "hooks": {"PreToolUse": [hook_matcher]},
+            "hooks": hooks,
         }
         if self._model is not None:
             kwargs["model"] = self._model
@@ -443,6 +517,169 @@ class ClaudeAgentSDKAdapter:
             }
 
         return _hook
+
+    def _merge_note_hook_into_operator_options(
+        self,
+        *,
+        sdk: Any,
+        client: Any,
+        operator_options: Any,
+        session: Session,
+        current_agent_id: str = "",
+    ) -> None:
+        """Merge the observer-note ``PostToolUse`` hook into operator options.
+
+        When the client factory attached its own ``ClaudeAgentOptions``,
+        :meth:`invoke` does not install goldfive's options object — so the
+        note-injection ``PostToolUse`` hook (surface 3b) would silently never
+        attach and pending observer notes could never deliver on this
+        adapter. This helper preserves the operator's configuration by
+        mutating a shallow COPY of their options (fresh ``hooks`` dict,
+        fresh ``PostToolUse`` list with the operator's own matchers kept),
+        assigning the copy to this invocation's client only. The operator's
+        original options object is never touched, so a factory that reuses
+        one shared options instance across invokes cannot accumulate hooks.
+
+        Only active under ``signal_channel == "request_context"`` (the
+        regime that populates the note queue); a no-op otherwise, keeping
+        the legacy default byte-identical. Best-effort: any failure leaves
+        the operator options exactly as the factory attached them and the
+        note pending for another surface — never a consumed-but-unrendered
+        note.
+        """
+        if _signal_channel_of(self._steerer) != "request_context":
+            return
+        try:
+            import copy
+
+            merged = copy.copy(operator_options)
+            hooks = dict(getattr(operator_options, "hooks", None) or {})
+            post = list(hooks.get("PostToolUse") or [])
+            post.append(
+                sdk.HookMatcher(
+                    hooks=[
+                        self._make_posttooluse_hook(
+                            session, current_agent_id=current_agent_id
+                        )
+                    ]
+                )
+            )
+            hooks["PostToolUse"] = post
+            merged.hooks = hooks
+            client.options = merged
+        except Exception as exc:  # noqa: BLE001 - operator options win
+            log.debug(
+                "claude adapter: could not merge observer-note PostToolUse "
+                "hook into factory-attached options: %s "
+                "(pending notes stay queued for another surface)",
+                exc,
+            )
+
+    def _make_posttooluse_hook(
+        self,
+        session: Session,
+        *,
+        current_agent_id: str = "",
+    ) -> Callable[..., Awaitable[dict[str, Any]]]:
+        """Build the async ``PostToolUse`` hook (PR 6 observer-note surface 3b).
+
+        After each tool use the hook drains the most-severe pending observer
+        note (if any) and returns it as ``additionalContext`` — the
+        claude-agent-sdk equivalent of the ADK tool-result annotation. Marking
+        the note delivered on the queue keeps delivery exactly-once across
+        surfaces. Returns ``{}`` (no-op) when nothing is pending.
+        """
+
+        async def _hook(
+            _input_data: dict[str, Any],
+            _tool_use_id: str | None,
+            _context: Any,
+        ) -> dict[str, Any]:
+            try:
+                block = await self._consume_observer_note(
+                    session,
+                    surface="claude_posttooluse",
+                    current_agent_id=current_agent_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("claude PostToolUse: observer-note consume raised: %s", exc)
+                return {}
+            if not block:
+                return {}
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": block,
+                },
+            }
+
+        return _hook
+
+    async def _consume_observer_note(
+        self,
+        session: Session,
+        *,
+        surface: str,
+        current_agent_id: str = "",
+    ) -> str | None:
+        """Consume the most-severe pending observer note for a claude surface.
+
+        Shared by the system-prompt section (3a) and the ``PostToolUse`` hook
+        (3b). Gated on ``signal_channel == "request_context"``. Marks the note
+        delivered — the exactly-once *rendering* chokepoint — and returns the
+        rendered block to inject, but only when the kill-switch is open per
+        :func:`goldfive.steerer.steering_is_active` — the one documented,
+        FAIL-PASSIVE accessor every other surface uses (a stub steerer
+        missing the predicate reads as passive, never active). Under
+        ``observation_only`` (or a missing/raising predicate) the note is
+        consumed as a dry-run delivery and ``None`` is returned so nothing
+        reaches the agent. (``SignalDelivered`` is emitted once at the
+        dispatch point, not here.) Returns ``None`` when nothing is pending.
+        Best-effort: never raises.
+        """
+        steerer = self._steerer
+        if steerer is None:
+            return None
+        if (
+            _signal_channel_of(steerer)
+            != "request_context"
+        ):
+            return None
+        try:
+            from goldfive.observer_note_queue import ObserverNoteQueue, render_block
+
+            queue = ObserverNoteQueue.for_session(session)
+            # task #11: claude.invoke runs exactly one agent, so this is an
+            # agent-AWARE surface — scope to its assignee so an
+            # agent-specific note (e.g. a correction) reaches only the right
+            # agent (plus broadcast notes).
+            note = queue.peek_for_render(agent_id=current_agent_id or None)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("claude adapter: observer-note queue read raised: %s", exc)
+            return None
+        if note is None:
+            return None
+        # FAIL-PASSIVE kill-switch read (the fail-open ``getattr(...,
+        # "_should_inject")``-with-default-True this replaced inverted the
+        # contract: a stub steerer missing the predicate started injecting).
+        should = steering_is_active(steerer)
+        turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+        try:
+            newly = queue.mark_delivered(
+                note.note_id,
+                channel="request_context",
+                turn=turn,
+                surface=surface,
+                dry_run=not should,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("claude adapter: observer-note mark_delivered raised: %s", exc)
+            return None
+        if should and newly:
+            # task #11 cross-surface fold: carry the plan-state Status line
+            # on the claude surface too (identical to before_model).
+            return render_block(note, plan=getattr(session, "plan", None))
+        return None
 
 
 # --------------------------------------------------------------------------- #

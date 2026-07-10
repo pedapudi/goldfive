@@ -884,6 +884,7 @@ async def _run_judge_with_focus(
     sink: Any = None,
     agent_name: str = "",
     available_agents: list[str] | list[dict[str, Any]] | None = None,
+    ledger: bool = False,
 ) -> ReasoningJudgeVerdict:
     """Dispatch :func:`classify_reasoning_drift_with_focus` against the current task.
 
@@ -936,6 +937,8 @@ async def _run_judge_with_focus(
         task_lineage=getattr(session, "task_lineage", None),
         recent_tool_observations=tool_obs,
         available_agents=available_agents,
+        # AGENCY-PRESERVATION.md PR 11(b) — ledger re-grounding flag.
+        ledger=ledger,
     )
 
 
@@ -951,6 +954,7 @@ async def analyze_reasoning_with_focus(
     available_agents: list[str] | list[dict[str, Any]] | None = None,
     embedding_pipeline: Any = None,
     judge_runner: Any = None,
+    ledger: bool = False,
     reasoning_history: Sequence[str] | None = None,
 ) -> ReasoningJudgeVerdict:
     """Phase-1 sibling of :func:`analyze_reasoning` returning a focused verdict.
@@ -1021,6 +1025,7 @@ async def analyze_reasoning_with_focus(
             sink=sink,
             agent_name=agent_name,
             available_agents=available_agents,
+            ledger=ledger,
         )
     if mode == "both":
         embedding_drift = embed(text, session)
@@ -1034,6 +1039,7 @@ async def analyze_reasoning_with_focus(
                 sink=sink,
                 agent_name=agent_name,
                 available_agents=available_agents,
+                ledger=ledger,
             )
         if judge_verdict is None:
             return ReasoningJudgeVerdict(drift=embedding_drift)

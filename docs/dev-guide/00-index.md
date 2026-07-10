@@ -17,6 +17,28 @@ grep/pytest commands.
 
 ---
 
+## ⚠ Currency caveat: the agency-preservation merge
+
+The **agency-preservation re-architecture is merged** (PRs #453–#504 via the
+`agency-preservation` integration branch): interventions are advisory
+**observer notes** (`goldfive/observer_notes.py`, `observer_note_queue.py`),
+the ladder's Level-2 rung is **`SIGNAL`** (renamed from `NUDGE`; enum value 2
+unchanged), corrective command templates are retired behind a deprecating
+shim, a **plan-as-ledger** mode (`TaskKind`, `plan_mode`) and
+**signal telemetry** (`signal_ledger.py`, `SignalDelivered`/`SignalOutcome`)
+exist behind default-OFF flags, and in-flight cancellation is gated on drift
+**authority** (`cancel_inflight_scope`). All new-regime flags default OFF, so
+default-config behavior descriptions below remain accurate — but chapters
+**04, 09, 10, 12, 13, 14** predate the merge and describe the pre-merge
+mechanics of nudges/corrective templates/ladder cells and omit the new
+modules and config knobs. Until those chapters are refreshed:
+**`docs/design/AGENCY-PRESERVATION.md` §6 is the authoritative as-built
+record** for everything the merge changed; where this guide and that doc
+disagree, §6 wins. The invariants in chapter 17 are unchanged and remain
+binding (the kill-switch predicate gained siblings:
+`steerer.signal_channel()` / `steerer.plan_mode_is_ledger()` — same
+one-default fail-safe discipline).
+
 ## READ-FIRST rule
 
 **Before any nontrivial edit, read [17-invariants-hazards-history.md](17-invariants-hazards-history.md).**

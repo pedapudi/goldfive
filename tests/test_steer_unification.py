@@ -132,12 +132,21 @@ def _make_session() -> Session:
 
 
 def _bind(
-    *, threshold: str = "warning", window: int = 3
+    *, threshold: str = "warning", window: int = 3, legacy_ladder: bool = True
 ) -> tuple[DefaultSteerer, Session, ListSink, _StubPlanner, _FakeAdapter]:
+    # AGENCY-PRESERVATION.md PR 7: the goldfive-steer promotion MECHANISM this
+    # module exercises (the ``active_steer(source="goldfive")`` stamp, the
+    # adapter cancel-reason tag, and the ``GOLDFIVE_STEER`` ControlMessage
+    # dispatch) now lives behind the ``legacy_ladder`` escape hatch. These
+    # tests are the §5.8 legacy-regime coverage, so they bind with the hatch
+    # ON by default. The default (non-legacy) promotion — refine + PlanRevised
+    # + advisory note, NO steer side-effects — is covered by
+    # ``test_promote_drift_to_steer.py::test_promote_drift_new_regime_enqueues_note_no_steer``.
     steerer = DefaultSteerer(
         goldfive_steer_threshold=threshold,
         goldfive_steer_suppression_window_turns=window,
     )
+    steerer._legacy_ladder = bool(legacy_ladder)
     revised = Plan(
         id="p1",
         run_id="r1",
@@ -198,8 +207,16 @@ async def test_goldfive_steer_promotes_at_warning_severity() -> None:
     # DriftDetected + PlanRevised emitted.
     assert len(_drift_detected_events(sink)) >= 1
     assert len(_plan_revised_events(sink)) == 1
-    # active_steer state stamped with source="goldfive".
-    assert session.state[_ostate.KEY_ACTIVE_STEER_BODY] == "agent wandered into raccoons"
+    # active_steer state stamped with source="goldfive". Re-pointed by
+    # AGENCY-PRESERVATION.md PR 4: the body is now the full
+    # observation+goal advisory note (judge detail embedded as the
+    # observation, advisory footer appended) instead of the bare
+    # drift.detail.
+    from goldfive.observer_notes import ADVISORY_FOOTER
+
+    body = session.state[_ostate.KEY_ACTIVE_STEER_BODY]
+    assert "agent wandered into raccoons" in body
+    assert ADVISORY_FOOTER in body
     assert session.state[_ostate.KEY_ACTIVE_STEER_AUTHOR] == "goldfive"
     assert session.state[_ostate.KEY_ACTIVE_STEER_SOURCE] == "goldfive"
     # Adapter cancel reason tagged.
@@ -314,9 +331,12 @@ async def test_goldfive_steer_fires_when_user_steer_stale() -> None:
 
     # refine_steer fired now (stale user steer shouldn't block).
     assert len(planner.refine_steer_calls) == 1
-    # active_steer now carries the goldfive body.
+    # active_steer now carries the goldfive body. Re-pointed by
+    # AGENCY-PRESERVATION.md PR 4: the body is the full
+    # observation+goal advisory note embedding the judge detail, not
+    # the bare drift.detail.
     assert session.state[_ostate.KEY_ACTIVE_STEER_SOURCE] == "goldfive"
-    assert session.state[_ostate.KEY_ACTIVE_STEER_BODY] == "fresh detector fire"
+    assert "fresh detector fire" in session.state[_ostate.KEY_ACTIVE_STEER_BODY]
 
 
 async def test_suppression_window_unaffected_by_event_volume() -> None:
@@ -459,7 +479,18 @@ async def test_goldfive_steer_cancel_reason_intent_divergence_critical() -> None
 
 
 async def test_goldfive_steer_body_from_drift_detail() -> None:
-    """Non-empty drift.detail is used verbatim as the steer body."""
+    """Non-empty drift.detail is embedded as the note's observation.
+
+    Re-pointed by AGENCY-PRESERVATION.md PR 4: the pre-PR-4 contract
+    was "detail verbatim as the whole body"; the body is now the full
+    observation+goal advisory note. The detail is still carried
+    verbatim inside it (observation line), the goal line renders from
+    ``session.goals``, and — because a WARNING judge opinion with no
+    judge-authored ``note_to_agent`` is low-confidence — the
+    observation renders in question form.
+    """
+    from goldfive.observer_notes import ADVISORY_FOOTER, GOAL_QUESTION
+
     steerer, session, _sink, _planner, _adapter = _bind()
     drift = DriftEvent(
         kind=DriftKind.OFF_TOPIC,
@@ -468,14 +499,48 @@ async def test_goldfive_steer_body_from_drift_detail() -> None:
         current_task_id="t2",
     )
     await steerer.drift.handle_drift(drift, session)
-    assert (
-        session.state[_ostate.KEY_ACTIVE_STEER_BODY]
-        == "agent acknowledged discrepancy but chose to adopt expanded topic"
+    body = session.state[_ostate.KEY_ACTIVE_STEER_BODY]
+    assert "agent acknowledged discrepancy but chose to adopt expanded topic" in body
+    assert GOAL_QUESTION in body
+    assert ADVISORY_FOOTER in body
+
+
+async def test_goldfive_steer_body_prefers_note_to_agent() -> None:
+    """A judge-authored note_to_agent wins over detail (PR 4 chain)."""
+    from goldfive.observer_notes import ADVISORY_FOOTER
+
+    steerer, session, _sink, _planner, _adapter = _bind()
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="operator-facing reason string",
+        current_task_id="t2",
+        note_to_agent=(
+            "Does the recent focus on raccoons still serve the goal of "
+            "shipping the thing?"
+        ),
     )
+    await steerer.drift.handle_drift(drift, session)
+    body = session.state[_ostate.KEY_ACTIVE_STEER_BODY]
+    assert "Does the recent focus on raccoons" in body
+    # detail remains the observability rendering, NOT the agent-facing
+    # observation, when the judge authored a note.
+    assert "operator-facing reason string" not in body
+    assert ADVISORY_FOOTER in body
 
 
 async def test_goldfive_steer_body_fallback_when_detail_empty() -> None:
-    """Empty detail falls through to the synthesised template."""
+    """Empty detail falls through to the neutral per-kind fallback.
+
+    Re-pointed by AGENCY-PRESERVATION.md PR 4: the retired synthesised
+    template said "Goldfive detected OFF_TOPIC drift … Discard prior
+    work … proceed with the corrective plan" — a command about means.
+    The fallback is now a neutral observation; the task id stays
+    present as bookkeeping (Status line), and the advisory footer
+    closes the note.
+    """
+    from goldfive.observer_notes import ADVISORY_FOOTER
+
     steerer, session, _sink, _planner, _adapter = _bind()
     drift = DriftEvent(
         kind=DriftKind.OFF_TOPIC,
@@ -485,10 +550,11 @@ async def test_goldfive_steer_body_fallback_when_detail_empty() -> None:
     )
     await steerer.drift.handle_drift(drift, session)
     body = session.state[_ostate.KEY_ACTIVE_STEER_BODY]
-    assert "Goldfive detected" in body
-    assert "OFF_TOPIC" in body
-    assert "WARNING" in body
     assert "t2" in body
+    assert ADVISORY_FOOTER in body
+    # The retired command template must not resurface.
+    assert "Goldfive detected" not in body
+    assert "Discard prior" not in body
 
 
 # ---------------------------------------------------------------------------

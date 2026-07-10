@@ -561,9 +561,22 @@ async def test_info_drift_does_not_request_cancel() -> None:
 
 
 async def test_critical_drift_requests_cancel() -> None:
+    # AGENCY-PRESERVATION.md PR 1: OFF_TOPIC is goldfive-authored
+    # steering drift, which no longer cancels under the default
+    # ``cancel_inflight_scope="user_and_safety"``. This test pins the
+    # legacy any-CRITICAL-cancels contract, so it runs under the
+    # ``"all"`` kill-switch; the new-default policy (hard-safety
+    # cancels, goldfive steering does not) is covered in
+    # ``tests/test_cancel_authority_gate.py``.
     plugin, _sink, session = _make_plugin()
     adapter = _StubAdapter(plugin)
-    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
+    steerer = DefaultSteerer(
+        # PR-1 legacy pin + explicit active mode (#488): the suite runs the
+        # shipped observation-only default, so the legacy any-CRITICAL-cancels
+        # contract under test opts in to both knobs.
+        cancel_inflight_scope="all",
+        steering_config=SteeringConfig(observation_only=False),
+    )
     steerer.bind(sinks=[], planner=None)
     steerer.bind_adapter(adapter)
     plugin._top_invocation_id = "inv-A"
@@ -606,6 +619,11 @@ async def test_cancel_inflight_for_revision_skips_when_precancel_already_fired()
     ``_cancel_inflight_for_revision`` and assert the underlying
     plugin's ``request_invocation_cancel`` was NOT invoked.
     """
+    # AGENCY-PRESERVATION.md PR 1: the dedup machinery under test is
+    # downstream of the new authority gate, so the drift must be one
+    # that still cancels under the default scope. RUNAWAY_DELEGATION
+    # (hard-safety, CRITICAL by construction) replaces the original
+    # OFF_TOPIC — the dedup logic itself is kind-agnostic.
     plugin, _sink, session = _make_plugin()
     adapter = _StubAdapter(plugin)
     steerer = DefaultSteerer()
@@ -614,7 +632,7 @@ async def test_cancel_inflight_for_revision_skips_when_precancel_already_fired()
     plugin._top_invocation_id = "inv-A"
 
     drift = DriftEvent(
-        kind=DriftKind.OFF_TOPIC,
+        kind=DriftKind.RUNAWAY_DELEGATION,
         severity=DriftSeverity.CRITICAL,
         current_task_id="t1",
         current_agent_id="sub_agent",
@@ -639,6 +657,12 @@ async def test_cancel_inflight_for_revision_still_fires_without_precancel() -> N
     """When NO pre-cancel ran for the drift (e.g. WARNING severity
     promote-eligible kind), :meth:`_cancel_inflight_for_revision`
     must still fire — the dedup only kicks in for same-drift repeats.
+
+    AGENCY-PRESERVATION.md PR 1: drift kind re-pointed from OFF_TOPIC
+    to RUNAWAY_DELEGATION (hard-safety) so the post-refine cancel under
+    test still passes the new authority gate at the default scope.
+    WARNING severity is preserved — it is what guarantees the
+    pre-refine cancel (CRITICAL-only) did NOT stamp the dedup set.
     """
     plugin, _sink, session = _make_plugin()
     adapter = _StubAdapter(plugin)
@@ -648,7 +672,7 @@ async def test_cancel_inflight_for_revision_still_fires_without_precancel() -> N
     plugin._top_invocation_id = "inv-A"
 
     drift = DriftEvent(
-        kind=DriftKind.OFF_TOPIC,
+        kind=DriftKind.RUNAWAY_DELEGATION,
         severity=DriftSeverity.WARNING,
         current_task_id="t1",
         current_agent_id="sub_agent",
@@ -671,6 +695,12 @@ async def test_handle_drift_dispatch_records_drift_id_in_cancelled_set() -> None
     in :meth:`_cancel_inflight_for_revision` engages.
 
     Asserts the bookkeeping primitive that bug #6's fix relies on.
+
+    AGENCY-PRESERVATION.md PR 1: drift kind re-pointed from OFF_TOPIC
+    to RUNAWAY_DELEGATION (hard-safety, CRITICAL by construction) so
+    the pre-refine cancel under test still fires at the default
+    ``cancel_inflight_scope`` — the dedup-stamp bookkeeping is
+    kind-agnostic.
     """
     plugin, _sink, session = _make_plugin()
     adapter = _StubAdapter(plugin)
@@ -680,7 +710,7 @@ async def test_handle_drift_dispatch_records_drift_id_in_cancelled_set() -> None
     plugin._top_invocation_id = "inv-A"
 
     drift = DriftEvent(
-        kind=DriftKind.OFF_TOPIC,
+        kind=DriftKind.RUNAWAY_DELEGATION,
         severity=DriftSeverity.CRITICAL,
         current_task_id="t1",
         current_agent_id="sub_agent",

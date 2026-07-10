@@ -11,7 +11,7 @@ from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class Event(_message.Message):
-    __slots__ = ("event_id", "run_id", "sequence", "emitted_at", "session_id", "run_started", "goal_derived", "plan_submitted", "plan_revised", "task_started", "task_progress", "task_completed", "task_failed", "task_blocked", "task_cancelled", "drift_detected", "run_completed", "run_aborted", "conversation_started", "conversation_ended", "approval_requested", "approval_granted", "approval_rejected", "agent_invocation_started", "agent_invocation_completed", "delegation_observed", "reasoning_judge_invoked", "goldfive_llm_call_start", "goldfive_llm_call_end", "invocation_cancelled", "task_transitioned", "task_transition_refused", "invocation_boundary_entered", "invocation_boundary_exited", "steering_decision_made", "ladder_transition_decided", "detector_dispatch_ordered", "policy_applied", "retry_budget_spent", "judgement_emitted")
+    __slots__ = ("event_id", "run_id", "sequence", "emitted_at", "session_id", "run_started", "goal_derived", "plan_submitted", "plan_revised", "task_started", "task_progress", "task_completed", "task_failed", "task_blocked", "task_cancelled", "drift_detected", "run_completed", "run_aborted", "conversation_started", "conversation_ended", "approval_requested", "approval_granted", "approval_rejected", "agent_invocation_started", "agent_invocation_completed", "delegation_observed", "reasoning_judge_invoked", "goldfive_llm_call_start", "goldfive_llm_call_end", "invocation_cancelled", "task_transitioned", "task_transition_refused", "invocation_boundary_entered", "invocation_boundary_exited", "steering_decision_made", "ladder_transition_decided", "detector_dispatch_ordered", "policy_applied", "retry_budget_spent", "judgement_emitted", "signal_delivered", "signal_outcome")
     EVENT_ID_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     SEQUENCE_FIELD_NUMBER: _ClassVar[int]
@@ -52,6 +52,8 @@ class Event(_message.Message):
     POLICY_APPLIED_FIELD_NUMBER: _ClassVar[int]
     RETRY_BUDGET_SPENT_FIELD_NUMBER: _ClassVar[int]
     JUDGEMENT_EMITTED_FIELD_NUMBER: _ClassVar[int]
+    SIGNAL_DELIVERED_FIELD_NUMBER: _ClassVar[int]
+    SIGNAL_OUTCOME_FIELD_NUMBER: _ClassVar[int]
     event_id: str
     run_id: str
     sequence: int
@@ -92,7 +94,9 @@ class Event(_message.Message):
     policy_applied: PolicyApplied
     retry_budget_spent: RetryBudgetSpent
     judgement_emitted: JudgementEmitted
-    def __init__(self, event_id: _Optional[str] = ..., run_id: _Optional[str] = ..., sequence: _Optional[int] = ..., emitted_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., session_id: _Optional[str] = ..., run_started: _Optional[_Union[RunStarted, _Mapping]] = ..., goal_derived: _Optional[_Union[GoalDerived, _Mapping]] = ..., plan_submitted: _Optional[_Union[PlanSubmitted, _Mapping]] = ..., plan_revised: _Optional[_Union[PlanRevised, _Mapping]] = ..., task_started: _Optional[_Union[TaskStarted, _Mapping]] = ..., task_progress: _Optional[_Union[TaskProgress, _Mapping]] = ..., task_completed: _Optional[_Union[TaskCompleted, _Mapping]] = ..., task_failed: _Optional[_Union[TaskFailed, _Mapping]] = ..., task_blocked: _Optional[_Union[TaskBlocked, _Mapping]] = ..., task_cancelled: _Optional[_Union[TaskCancelled, _Mapping]] = ..., drift_detected: _Optional[_Union[DriftDetected, _Mapping]] = ..., run_completed: _Optional[_Union[RunCompleted, _Mapping]] = ..., run_aborted: _Optional[_Union[RunAborted, _Mapping]] = ..., conversation_started: _Optional[_Union[ConversationStarted, _Mapping]] = ..., conversation_ended: _Optional[_Union[ConversationEnded, _Mapping]] = ..., approval_requested: _Optional[_Union[ApprovalRequested, _Mapping]] = ..., approval_granted: _Optional[_Union[ApprovalGranted, _Mapping]] = ..., approval_rejected: _Optional[_Union[ApprovalRejected, _Mapping]] = ..., agent_invocation_started: _Optional[_Union[AgentInvocationStarted, _Mapping]] = ..., agent_invocation_completed: _Optional[_Union[AgentInvocationCompleted, _Mapping]] = ..., delegation_observed: _Optional[_Union[DelegationObserved, _Mapping]] = ..., reasoning_judge_invoked: _Optional[_Union[ReasoningJudgeInvoked, _Mapping]] = ..., goldfive_llm_call_start: _Optional[_Union[GoldfiveLLMCallStart, _Mapping]] = ..., goldfive_llm_call_end: _Optional[_Union[GoldfiveLLMCallEnd, _Mapping]] = ..., invocation_cancelled: _Optional[_Union[InvocationCancelled, _Mapping]] = ..., task_transitioned: _Optional[_Union[TaskTransitioned, _Mapping]] = ..., task_transition_refused: _Optional[_Union[TaskTransitionRefused, _Mapping]] = ..., invocation_boundary_entered: _Optional[_Union[InvocationBoundaryEntered, _Mapping]] = ..., invocation_boundary_exited: _Optional[_Union[InvocationBoundaryExited, _Mapping]] = ..., steering_decision_made: _Optional[_Union[SteeringDecisionMade, _Mapping]] = ..., ladder_transition_decided: _Optional[_Union[LadderTransitionDecided, _Mapping]] = ..., detector_dispatch_ordered: _Optional[_Union[DetectorDispatchOrdered, _Mapping]] = ..., policy_applied: _Optional[_Union[PolicyApplied, _Mapping]] = ..., retry_budget_spent: _Optional[_Union[RetryBudgetSpent, _Mapping]] = ..., judgement_emitted: _Optional[_Union[JudgementEmitted, _Mapping]] = ...) -> None: ...
+    signal_delivered: SignalDelivered
+    signal_outcome: SignalOutcome
+    def __init__(self, event_id: _Optional[str] = ..., run_id: _Optional[str] = ..., sequence: _Optional[int] = ..., emitted_at: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., session_id: _Optional[str] = ..., run_started: _Optional[_Union[RunStarted, _Mapping]] = ..., goal_derived: _Optional[_Union[GoalDerived, _Mapping]] = ..., plan_submitted: _Optional[_Union[PlanSubmitted, _Mapping]] = ..., plan_revised: _Optional[_Union[PlanRevised, _Mapping]] = ..., task_started: _Optional[_Union[TaskStarted, _Mapping]] = ..., task_progress: _Optional[_Union[TaskProgress, _Mapping]] = ..., task_completed: _Optional[_Union[TaskCompleted, _Mapping]] = ..., task_failed: _Optional[_Union[TaskFailed, _Mapping]] = ..., task_blocked: _Optional[_Union[TaskBlocked, _Mapping]] = ..., task_cancelled: _Optional[_Union[TaskCancelled, _Mapping]] = ..., drift_detected: _Optional[_Union[DriftDetected, _Mapping]] = ..., run_completed: _Optional[_Union[RunCompleted, _Mapping]] = ..., run_aborted: _Optional[_Union[RunAborted, _Mapping]] = ..., conversation_started: _Optional[_Union[ConversationStarted, _Mapping]] = ..., conversation_ended: _Optional[_Union[ConversationEnded, _Mapping]] = ..., approval_requested: _Optional[_Union[ApprovalRequested, _Mapping]] = ..., approval_granted: _Optional[_Union[ApprovalGranted, _Mapping]] = ..., approval_rejected: _Optional[_Union[ApprovalRejected, _Mapping]] = ..., agent_invocation_started: _Optional[_Union[AgentInvocationStarted, _Mapping]] = ..., agent_invocation_completed: _Optional[_Union[AgentInvocationCompleted, _Mapping]] = ..., delegation_observed: _Optional[_Union[DelegationObserved, _Mapping]] = ..., reasoning_judge_invoked: _Optional[_Union[ReasoningJudgeInvoked, _Mapping]] = ..., goldfive_llm_call_start: _Optional[_Union[GoldfiveLLMCallStart, _Mapping]] = ..., goldfive_llm_call_end: _Optional[_Union[GoldfiveLLMCallEnd, _Mapping]] = ..., invocation_cancelled: _Optional[_Union[InvocationCancelled, _Mapping]] = ..., task_transitioned: _Optional[_Union[TaskTransitioned, _Mapping]] = ..., task_transition_refused: _Optional[_Union[TaskTransitionRefused, _Mapping]] = ..., invocation_boundary_entered: _Optional[_Union[InvocationBoundaryEntered, _Mapping]] = ..., invocation_boundary_exited: _Optional[_Union[InvocationBoundaryExited, _Mapping]] = ..., steering_decision_made: _Optional[_Union[SteeringDecisionMade, _Mapping]] = ..., ladder_transition_decided: _Optional[_Union[LadderTransitionDecided, _Mapping]] = ..., detector_dispatch_ordered: _Optional[_Union[DetectorDispatchOrdered, _Mapping]] = ..., policy_applied: _Optional[_Union[PolicyApplied, _Mapping]] = ..., retry_budget_spent: _Optional[_Union[RetryBudgetSpent, _Mapping]] = ..., judgement_emitted: _Optional[_Union[JudgementEmitted, _Mapping]] = ..., signal_delivered: _Optional[_Union[SignalDelivered, _Mapping]] = ..., signal_outcome: _Optional[_Union[SignalOutcome, _Mapping]] = ...) -> None: ...
 
 class RunStarted(_message.Message):
     __slots__ = ("run_id", "goal_summary", "started_at")
@@ -632,3 +636,45 @@ class JudgementEmitted(_message.Message):
     metric_name: str
     detail: str
     def __init__(self, judge_name: _Optional[str] = ..., verdict_kind: _Optional[str] = ..., drift_kind: _Optional[str] = ..., severity: _Optional[str] = ..., rubric_score: _Optional[float] = ..., rubric_dimensions: _Optional[_Mapping[str, float]] = ..., boolean_result: bool = ..., numeric_value: _Optional[float] = ..., metric_name: _Optional[str] = ..., detail: _Optional[str] = ...) -> None: ...
+
+class SignalDelivered(_message.Message):
+    __slots__ = ("drift_id", "kind", "severity", "channel", "turn", "note_text", "dry_run", "task_id", "agent_id", "decision_json")
+    DRIFT_ID_FIELD_NUMBER: _ClassVar[int]
+    KIND_FIELD_NUMBER: _ClassVar[int]
+    SEVERITY_FIELD_NUMBER: _ClassVar[int]
+    CHANNEL_FIELD_NUMBER: _ClassVar[int]
+    TURN_FIELD_NUMBER: _ClassVar[int]
+    NOTE_TEXT_FIELD_NUMBER: _ClassVar[int]
+    DRY_RUN_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    AGENT_ID_FIELD_NUMBER: _ClassVar[int]
+    DECISION_JSON_FIELD_NUMBER: _ClassVar[int]
+    drift_id: str
+    kind: str
+    severity: str
+    channel: str
+    turn: int
+    note_text: str
+    dry_run: bool
+    task_id: str
+    agent_id: str
+    decision_json: str
+    def __init__(self, drift_id: _Optional[str] = ..., kind: _Optional[str] = ..., severity: _Optional[str] = ..., channel: _Optional[str] = ..., turn: _Optional[int] = ..., note_text: _Optional[str] = ..., dry_run: bool = ..., task_id: _Optional[str] = ..., agent_id: _Optional[str] = ..., decision_json: _Optional[str] = ...) -> None: ...
+
+class SignalOutcome(_message.Message):
+    __slots__ = ("drift_kind", "task_id", "outcome", "turns_to_resolution", "delivery_count", "had_real_delivery", "detail")
+    DRIFT_KIND_FIELD_NUMBER: _ClassVar[int]
+    TASK_ID_FIELD_NUMBER: _ClassVar[int]
+    OUTCOME_FIELD_NUMBER: _ClassVar[int]
+    TURNS_TO_RESOLUTION_FIELD_NUMBER: _ClassVar[int]
+    DELIVERY_COUNT_FIELD_NUMBER: _ClassVar[int]
+    HAD_REAL_DELIVERY_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    drift_kind: str
+    task_id: str
+    outcome: str
+    turns_to_resolution: int
+    delivery_count: int
+    had_real_delivery: bool
+    detail: str
+    def __init__(self, drift_kind: _Optional[str] = ..., task_id: _Optional[str] = ..., outcome: _Optional[str] = ..., turns_to_resolution: _Optional[int] = ..., delivery_count: _Optional[int] = ..., had_real_delivery: bool = ..., detail: _Optional[str] = ...) -> None: ...

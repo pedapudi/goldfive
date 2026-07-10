@@ -40,6 +40,7 @@ from goldfive.results import InvocationResult
 from goldfive.types import DriftKind, Session, Task
 
 __all__ = [
+    "MEANS_COMMAND_PHRASES",
     "AdversarialAgentBase",
     "CleanAgent",
     "HallucinatingAgent",
@@ -48,7 +49,62 @@ __all__ = [
     "RunawayDelegationAgent",
     "SlowAgent",
     "WanderingAgent",
+    "find_means_commands",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Agent-facing content checker (AGENCY-PRESERVATION.md PR 4 / §5)
+# ---------------------------------------------------------------------------
+
+#: Imperative means-command phrases that must never appear in
+#: goldfive-composed agent-facing text (observer notes, nudge bodies,
+#: GOLDFIVE steer correctives). The wrapped agent owns MEANS —
+#: decomposition, delegation, ordering, retries (AGENCY-PRESERVATION.md
+#: §2) — so goldfive's notes may state observations and goals but never
+#: command the agent's next move. Single words match whole tokens
+#: ("call" flags "call X" but not "called" / "tool calls"); multi-word
+#: phrases match consecutive tokens.
+#:
+#: TEST-SIDE ONLY. This is an assertion wordlist for adversarial
+#: content tests, not an NL classifier — production code MUST NOT use
+#: it (or any keyword/regex heuristic) to classify natural language
+#: (the #166/#167 rule).
+MEANS_COMMAND_PHRASES: tuple[str, ...] = (
+    "retry",
+    "proceed to",
+    "call",
+    "use agent",
+    "do not",
+    "don t",  # tokenised form of "don't"
+    "you must",
+    "switch to",
+)
+
+
+def _tokenize_for_content_check(text: str) -> list[str]:
+    """Lowercase ``text`` and split on non-alphanumerics (no regex)."""
+    normalized = "".join(c if c.isalnum() else " " for c in text.lower())
+    return normalized.split()
+
+
+def find_means_commands(text: str) -> list[str]:
+    """Return every means-command phrase present in ``text``.
+
+    Token-based matching: a single-word entry must match a whole token
+    (so "called" / "recall" / "tool calls" do not false-positive on
+    "call"), and a multi-word entry must match consecutive tokens.
+    Tests assert the result is empty for every rendered goldfive note;
+    a non-empty return names the offending phrases for the failure
+    message.
+    """
+    tokens = _tokenize_for_content_check(text)
+    joined = " " + " ".join(tokens) + " "
+    found: list[str] = []
+    for phrase in MEANS_COMMAND_PHRASES:
+        if f" {phrase} " in joined:
+            found.append(phrase)
+    return found
 
 
 @dataclasses.dataclass

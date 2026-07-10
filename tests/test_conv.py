@@ -75,6 +75,25 @@ def test_task_default_status_round_trip() -> None:
     assert from_pb_task(to_pb_task(t)) == t
 
 
+def test_forecast_task_omits_kind_and_contributes_to_in_json() -> None:
+    """A FORECAST task emits no ``kind`` / ``contributesTo`` JSON keys.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 10/11 carry-over — pins the zicato
+    JSON-emission contract directly (rather than relying on sink-snapshot
+    suites indirectly): in the default forecast plan mode the ledger
+    taxonomy fields are at their proto3 value-0 / empty defaults, so
+    ``MessageToJson`` omits them and forecast-mode JSON output is
+    byte-identical to pre-PR-10. This is the property the cardinal
+    "forecast bit-identical" rule protects.
+    """
+    from google.protobuf.json_format import MessageToJson
+
+    forecast_task = Task(id="t1", title="forecast task")
+    js = MessageToJson(to_pb_task(forecast_task))
+    assert "kind" not in js
+    assert "contributesTo" not in js
+
+
 def test_task_supersedes_string_round_trip_no_char_split() -> None:
     """``Task.supersedes`` survives proto round-trip as a single string.
 

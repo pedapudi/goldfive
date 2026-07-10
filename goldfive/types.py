@@ -120,6 +120,19 @@ class DriftKind(StrEnum):
     TASK_FAILED_FATAL = "task_failed_fatal"
     CONTEXT_PRESSURE = "context_pressure"
     BLOCKED = "blocked"
+    # WRONG_AGENT is DEPRECATED (AGENCY-PRESERVATION.md PR 3). No
+    # production code path ever constructs it — grep
+    # ``DriftKind.WRONG_AGENT`` finds only this enum def, the proto/pb
+    # stubs, and docs, never a ``DriftEvent(kind=DriftKind.WRONG_AGENT)``
+    # emission. The "reporting tool call arrived from an agent that is
+    # not ``task.assignee_agent_id``" signal it was meant to carry is
+    # subsumed by the structural CAPABILITY_MISMATCH detector (#253) and
+    # the goldfive#252 move off assignee-grading. The enum value stays
+    # reserved (wire/proto compat, same as the retired CONFUSION value
+    # below) and carries NO intervention-ladder row — there is no live
+    # dispatch to map. Do NOT add an emitter or a ladder row back; if a
+    # wrong-assignee signal is wanted, extend CAPABILITY_MISMATCH. Hard
+    # removal of any remaining references tracked for a later PR.
     WRONG_AGENT = "wrong_agent"
     AGENT_TRANSFER = "agent_transfer"
     MODEL_REFUSAL = "model_refusal"
@@ -287,6 +300,43 @@ class SupersessionKind(StrEnum):
     UNSPECIFIED = "UNSPECIFIED"
     REPLACE = "REPLACE"
     CORRECT = "CORRECT"
+
+
+class TaskKind(StrEnum):
+    """Provenance taxonomy for a :class:`Task` (AGENCY-PRESERVATION.md
+    Stage 3 PR 10; design doc ``docs/design/AGENCY-PRESERVATION.md`` §2).
+
+    Additive overlay over the existing :attr:`Task.discovered` bool. The
+    bool stays for wire compat (and is still what the descriptive-growth
+    machinery keys on); ``kind`` is the richer three-way taxonomy that the
+    *ledger* plan mode reads.
+
+    * ``FORECAST`` — a planner-predicted task. The legacy default and the
+      ONLY value produced in the default "forecast" plan mode: a
+      prediction of what the run would do, against which the agent was
+      graded. ``FORECAST`` is the str-enum default on every code path so
+      forecast-mode behaviour (and wire output, since the proto maps it
+      to the value-0 default that proto3 omits) is byte-identical to
+      pre-PR-10.
+    * ``OUTCOME`` — a goal-anchored deliverable ("presentation summary
+      delivered"), NOT a forecast of agent behaviour. Produced by
+      :meth:`LLMPlanner.generate` / :meth:`LLMPlanner.handle_turn` ONLY
+      when ``SteeringConfig.plan_mode == "ledger"``. These describe what
+      success looks like; the wrapped agent owns HOW it gets there.
+    * ``DISCOVERED`` — a descriptively-grown record of what the agent
+      actually did, paired with ``discovered=True``. Stamped by the
+      descriptive-growth write path (:meth:`PlanReviser.install_descriptive_growth`)
+      in ledger mode. The means-level trajectory lane of the ledger.
+
+    In forecast mode the field is never stamped — every task keeps the
+    ``FORECAST`` default, including descriptively-grown ``discovered=True``
+    tasks (whose ledger taxonomy is unused until ledger mode is on). This
+    is what makes the cardinal "forecast bit-identical" guarantee hold.
+    """
+
+    FORECAST = "FORECAST"
+    OUTCOME = "OUTCOME"
+    DISCOVERED = "DISCOVERED"
 
 
 _SEVERITY_RANK: dict[str, int] = {
@@ -485,6 +535,38 @@ class Task:
     #: Preserved across refines (§4.3.0 "Cross-refine survival"). PR 1
     #: only carries the slot — PR 2 wires the consumer.
     discovery_identity_hash: str = ""
+    #: AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode (design
+    #: doc ``docs/design/AGENCY-PRESERVATION.md`` §2). Provenance
+    #: taxonomy overlaid on :attr:`discovered`. Defaults to
+    #: :attr:`TaskKind.FORECAST` so every legacy call site, every plan
+    #: produced in the default "forecast" plan mode, and the proto
+    #: round-trip (FORECAST ↔ the proto3 value-0 default) are
+    #: byte-identical to pre-PR-10. Stamped to :attr:`TaskKind.OUTCOME`
+    #: by the planner only in ledger mode, and to
+    #: :attr:`TaskKind.DISCOVERED` by the descriptive-growth write path
+    #: only in ledger mode. Opaque to :meth:`Plan.validate`.
+    #:
+    #: AUTHORITY: ``kind`` is authoritative ONLY in ledger mode. In
+    #: forecast mode (the default) it is always ``FORECAST`` and the
+    #: :attr:`discovered` bool remains the source of truth for "was this
+    #: task descriptively grown?" — deliberately, so forecast-mode wire
+    #: bytes are unchanged (stamping ``DISCOVERED`` in forecast mode would
+    #: serialise field 13 and break the bit-identical guarantee). The
+    #: ``discovered``-bool ↔ ``kind`` invariant
+    #: (``discovered=True`` ⟺ ``kind is DISCOVERED``) is therefore NOT
+    #: enforced in forecast mode.
+    #: TODO(AGENCY-PRESERVATION PR 13 / cutover): normalise the
+    #: ``discovered`` ↔ ``kind`` invariant when ``plan_mode="ledger"``
+    #: becomes the default — that is the deliberate-wire-change PR where
+    #: forecast-mode events no longer exist to keep byte-identical.
+    kind: TaskKind = TaskKind.FORECAST
+    #: AGENCY-PRESERVATION.md Stage 3 PR 10 + PR 11. Stable id of the
+    #: OUTCOME task (or goal) this task advances. Empty on FORECAST tasks
+    #: and on the OUTCOME tasks themselves. PR 10 ships the slot; PR 11's
+    #: outcome-progress judge (``drift/outcome_progress.py``) stamps it
+    #: onto DISCOVERED tasks as it links observed trajectory to
+    #: deliverables. Opaque metadata — the validator does not inspect it.
+    contributes_to: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +855,16 @@ class Plan:
         otherwise opaque metadata at validate time. Plans containing
         only ``discovered=False`` tasks behave exactly as before this
         PR — full back-compat.
+
+        Ledger plan mode (AGENCY-PRESERVATION.md Stage 3 PR 10): the new
+        :attr:`Task.kind` (FORECAST / OUTCOME / DISCOVERED) and
+        :attr:`Task.contributes_to` fields are ALSO opaque to validation.
+        A ledger plan of edge-free OUTCOME roots (1–5 goal-anchored
+        deliverables with no ``edges``) is a valid creation-time plan —
+        every task is PENDING (rule 5) and the empty edge set trivially
+        satisfies rules 3/4/7/8 — and a ledger revision that grows
+        edge-free DISCOVERED roots alongside them validates for the same
+        reason discovery growth already does.
 
         8. **Corrective-predecessor topology (PLAN-LIFECYCLE.md §3.6,
            goldfive#248).** When a revised task ``X`` declares
@@ -1196,6 +1288,35 @@ def task_upstream_ready(plan: Plan, task_id: str) -> bool:
     return True
 
 
+def plan_has_ledger_shape(plan: Any) -> bool:
+    """Return ``True`` iff ``plan`` carries any ledger-taxonomy task.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 10: a plan is *ledger-shaped* when at
+    least one task carries :attr:`TaskKind.OUTCOME` or
+    :attr:`TaskKind.DISCOVERED` — the taxonomy only the ledger regime
+    produces (an :class:`LLMPlanner` OUTCOME ledger, or a hand-authored
+    plan whose author explicitly opted tasks in). A purely FORECAST-kind
+    plan (notably a ``StaticPlanner`` template that never set ``kind``) is
+    NOT ledger-shaped even when ``SteeringConfig.plan_mode == "ledger"``:
+    "StaticPlanner users keep forecast semantics — a hand-authored plan is
+    genuine prescriptive intent" (design doc Stage 3), so ledger-only
+    behaviour (the delegation pin-tier bypass) must key on the live plan's
+    actual shape, not on config alone. Defensive: any read failure
+    resolves ``False`` (forecast — the default, inert regime).
+    """
+    try:
+        for t in getattr(plan, "tasks", None) or ():
+            kind = getattr(t, "kind", None)
+            if kind is None:
+                continue
+            value = str(getattr(kind, "value", kind) or "").strip().upper()
+            if value in (TaskKind.OUTCOME.value, TaskKind.DISCOVERED.value):
+                return True
+    except Exception:  # noqa: BLE001 — shape probe must never raise
+        return False
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Plan / Task derivation helpers (goldfive#247)
 # ---------------------------------------------------------------------------
@@ -1500,6 +1621,22 @@ class DriftEvent:
     # round-trip cannot move the cursor between observation and emit
     # without the gate noticing.
     observed_revision_index: int = 0
+    # AGENCY-PRESERVATION.md PR 4 — judge-authored observation addressed
+    # to the wrapped agent. Populated by the LLM judges
+    # (:mod:`goldfive.drift.reasoning_judge`, :mod:`goldfive.drift.goals`,
+    # and drift-flavoured :class:`~goldfive.judges.JudgeVerdict`s via
+    # ``DefaultSteerer._drift_from_judge_verdict``) in the SAME call
+    # that produced the verdict: one or two neutral, factual sentences —
+    # no commands, no fault language; question form when the judge is
+    # unsure. ``goldfive.observer_notes.observation_for_drift`` prefers
+    # this verbatim over ``detail`` when composing the agent-facing
+    # note; ``detail`` remains the operator/observability rendering.
+    # In-process only in this PR — NOT mirrored onto the ``DriftDetected``
+    # / ``JudgementEmitted`` proto envelopes (that would require a proto
+    # regen; the PR 5 telemetry pass owns the wire surface). Old-style
+    # judge responses that omit the field leave this empty and the
+    # composer falls through to ``detail`` (graceful degradation).
+    note_to_agent: str = ""
     # Symbolic name of the detector that minted this drift (e.g.
     # ``"tool_loops"``). Needed where the kind alone cannot identify
     # the source: the tool-loop tracker deliberately emits

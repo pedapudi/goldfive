@@ -606,7 +606,7 @@ def test_f4_goal_drift_warning_routes_to_nudge() -> None:
     level = steerer.drift._ladder_level_for(
         DriftKind.GOAL_DRIFT, DriftSeverity.WARNING, occurrence_count=0
     )
-    assert level is InterventionLevel.NUDGE
+    assert level is InterventionLevel.SIGNAL
 
 
 def test_f4_goal_drift_critical_first_routes_to_nudge() -> None:
@@ -619,26 +619,44 @@ def test_f4_goal_drift_critical_first_routes_to_nudge() -> None:
     level = steerer.drift._ladder_level_for(
         DriftKind.GOAL_DRIFT, DriftSeverity.CRITICAL, occurrence_count=0
     )
-    assert level is InterventionLevel.NUDGE
+    assert level is InterventionLevel.SIGNAL
 
 
-def test_f4_goal_drift_critical_repeat_routes_to_cancel_reinvoke() -> None:
-    """F4: CRITICAL-severity GOAL_DRIFT repeat -> CANCEL_REINVOKE.
+def test_f4_goal_drift_critical_repeat_routes_to_pause_escalate() -> None:
+    """F4: CRITICAL-severity GOAL_DRIFT repeat -> PAUSE_ESCALATE.
 
-    PAUSE_ESCALATE is the last-resort fallback the default ladder
-    surfaces only after CANCEL_REINVOKE also fails to break the loop."""
+    AGENCY-PRESERVATION.md PR 7 moved the repeat-escalation cell from
+    CANCEL_REINVOKE (cancel-and-redirect) to PAUSE_ESCALATE (stop-and-ask):
+    when an advisory SIGNAL doesn't break the loop, goldfive halts for the
+    operator rather than grabbing the wheel."""
     steerer = DefaultSteerer()
     level = steerer.drift._ladder_level_for(
         DriftKind.GOAL_DRIFT,
         DriftSeverity.CRITICAL,
         occurrence_count=DefaultSteerer.REFINE_FAILURE_THRESHOLD,
     )
-    assert level is InterventionLevel.CANCEL_REINVOKE
+    assert level is InterventionLevel.PAUSE_ESCALATE
 
 
-def test_f4_goal_drift_template_renders_with_next_agent() -> None:
-    """F4: the GOAL_DRIFT corrective template names the next pending task
-    AND the agent it's assigned to so the coordinator routes directly."""
+# The three pre-PR-4 tests here pinned the GOAL_DRIFT corrective
+# template's next-task routing ("Please proceed to '{next_task_title}'
+# via {next_task_agent}"): rendering the next pending task's title, the
+# missing-assignee placeholder, and bare-agent-name collapsing.
+# AGENCY-PRESERVATION.md PR 4 retired that command surface entirely —
+# the wrapped agent owns MEANS (which task / agent comes next), so the
+# composed note must NOT name a next task or assignee. The re-pointed
+# tests below pin the replacement contract: triggering-task bookkeeping
+# stays, next-task / next-agent directives are gone.
+
+
+def test_f4_goal_drift_note_keeps_bookkeeping_drops_routing() -> None:
+    """PR 4 re-point of ``test_f4_goal_drift_template_renders_with_next_agent``:
+    the GOAL_DRIFT note keeps the triggering task's ledger status
+    ("recorded as completed" — the bookkeeping form of the old
+    "already complete" signal) and the judge detail, but no longer
+    names the next pending task or its assignee."""
+    from goldfive.observer_notes import ADVISORY_FOOTER
+
     plan = Plan(
         id="p1",
         run_id="r1",
@@ -661,41 +679,22 @@ def test_f4_goal_drift_template_renders_with_next_agent() -> None:
         current_task_id="t0",
     )
     msg = compose_corrective_user_message(drift=drift, refined_plan=plan)
+    # Bookkeeping: the triggering task and its recorded status survive.
     assert "t0" in msg
-    assert "already complete" in msg
-    assert "Draft the brief" in msg
-    assert "writer" in msg
+    assert "completed" in msg.lower()
+    assert "agent grinding on completed research" in msg
+    assert ADVISORY_FOOTER in msg
+    # The command surface is gone: no next-task title, no assignee
+    # routing, no "proceed to ... via ...".
+    assert "Draft the brief" not in msg
+    assert "writer" not in msg
+    assert "proceed to" not in msg.lower()
 
 
-def test_f4_goal_drift_template_handles_missing_assignee() -> None:
-    """F4: when the next pending task has no assignee, the template
-    falls back to a readable placeholder rather than interpolating an
-    empty agent name."""
-    plan = Plan(
-        id="p1",
-        run_id="r1",
-        goal_ids=[],
-        tasks=[
-            Task(id="t0", title="Research", status=TaskStatus.COMPLETED),
-            Task(id="t1", title="Draft", status=TaskStatus.PENDING),
-        ],
-        edges=[],
-    )
-    drift = DriftEvent(
-        kind=DriftKind.GOAL_DRIFT,
-        severity=DriftSeverity.CRITICAL,
-        detail="x",
-        current_task_id="t0",
-    )
-    msg = compose_corrective_user_message(drift=drift, refined_plan=plan)
-    assert "Draft" in msg
-    # No double-space artifact from an empty interpolation.
-    assert "via  " not in msg
-
-
-def test_f4_goal_drift_uses_bare_agent_name() -> None:
-    """F4: fully-qualified ADK agent paths collapse to the bare name so
-    the LLM sees something it can pass back as the AgentTool target."""
+def test_f4_goal_drift_note_never_names_next_assignee() -> None:
+    """PR 4 re-point of ``test_f4_goal_drift_uses_bare_agent_name``:
+    assignee names (qualified or bare) never appear in the note at
+    all — the routing decision belongs to the agent."""
     plan = Plan(
         id="p1",
         run_id="r1",
@@ -718,8 +717,10 @@ def test_f4_goal_drift_uses_bare_agent_name() -> None:
         current_task_id="t0",
     )
     msg = compose_corrective_user_message(drift=drift, refined_plan=plan)
-    assert "via writer_agent" in msg
+    assert "writer_agent" not in msg
     assert "coordinator.writer_agent" not in msg
+    # And no interpolation artifacts from the retired template.
+    assert "via " not in msg
 
 
 # ---------------------------------------------------------------------------

@@ -507,11 +507,20 @@ async def test_goal_drift_bypasses_outcome_gate() -> None:
     for (GOAL_DRIFT, t1). A fresh GOAL_DRIFT must STILL attempt refine —
     these drifts route operator/trajectory intent and must not be gated
     by per-task outcome state.
+
+    AGENCY-PRESERVATION.md PR 7: in the default regime GOAL_DRIFT now SIGNALs
+    (advisory note) at WARNING + CRITICAL-first and PAUSE_ESCALATEs on repeat —
+    it never reaches the refine path, so the outcome-gate bypass it exercises
+    is reachable only via the ``legacy_ladder`` escape hatch (where the
+    CRITICAL-repeat cell is CANCEL_REINVOKE → refine). The bypass contract is
+    pinned here in that regime; the new-regime GOAL_DRIFT routing is pinned in
+    ``test_intervention_ladder.py::test_ladder_covers_goal_drift``.
     """
     revised = _make_plan()
     planner = StubPlanner(revised=revised)
     sink = ListSink()
     steerer = DefaultSteerer()
+    steerer._legacy_ladder = True
     steerer.bind(sinks=[sink], planner=planner)
     session = _make_session()
 

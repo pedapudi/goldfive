@@ -118,6 +118,65 @@ All notable changes to goldfive are documented in this file. Dates are ISO-8601.
 ### Steering
 
 - **BREAKING:
+  [#449](https://github.com/pedapudi/goldfive/issues/449)/[#452](https://github.com/pedapudi/goldfive/issues/452)
+  (AGENCY-PRESERVATION.md PR 1) — in-flight cancellation is gated on
+  drift authority.** `DriftObserver._cancel_inflight_for_revision`
+  used to fire on EVERY drift-driven plan install — including Level-1
+  ABSORB refines and `NEW_WORK_DISCOVERED` installs — killing the
+  wrapped agent's in-flight invocation within ~one event-loop tick
+  (design doc §1.1). Under the new default
+  (`SteeringConfig.cancel_inflight_scope="user_and_safety"`) only
+  user-authored drifts (`USER_STEER` / `USER_CANCEL` / `USER_PAUSE`)
+  or hard-safety kinds (`RESOURCE_EXHAUSTED`, `RUNAWAY_DELEGATION`,
+  `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`,
+  `HUMAN_INTERVENTION_REQUIRED`) may preempt in-flight work; the same
+  authority gate applies to the pre-refine cooperative-cancel path
+  (`_should_request_cancel_for_drift`), so a CRITICAL
+  goldfive-authored steering drift no longer flags a cancel either.
+  Goldfive-authored revisions still install for bookkeeping (the
+  `PlanRevised` stream is unchanged) and corrections reach the agent
+  at the natural invocation boundary (nudge replay / `GOLDFIVE_STEER`
+  restart). Skipped cancels stamp NOTHING — no
+  `session._supersede_pending`, no per-invocation supersede-registry
+  entry — so the executor's cancelled branch cannot misread a
+  stranded flag. The v15 concurrent-invocation loop the unconditional
+  cancel guarded against stays bounded by the
+  [#245](https://github.com/pedapudi/goldfive/issues/245)
+  verdict-freshness gate, the
+  [#405](https://github.com/pedapudi/goldfive/issues/405) in-flight
+  refine registry, and no-op-revision rejection (pinned in
+  `tests/test_cancel_authority_gate.py`). Kill-switch:
+  `cancel_inflight_scope="all"` (env
+  `GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`) restores the legacy
+  cancel-on-every-install behaviour exactly.
+- **[#449](https://github.com/pedapudi/goldfive/issues/449)/[#452](https://github.com/pedapudi/goldfive/issues/452)
+  (AGENCY-PRESERVATION.md PR 5) — signal telemetry: `SignalDelivered` /
+  `SignalOutcome` events + an observe-only `SignalLedger`.** New, additive
+  and **off by default** (`SteeringConfig.signal_telemetry`, env
+  `GOLDFIVE_STEER_SIGNAL_TELEMETRY`). When enabled, the drift observer emits
+  a `SignalDelivered` event at each goldfive-authored dispatch decision point
+  (`nudge_replay` / `steer_control` / `pause_control` / `promotion`) and a
+  `SignalOutcome` event when a delivered-signal key resolves
+  (`self_corrected_unaided` | `self_corrected_after_signal` | `escalated` |
+  `user_intervened` | `invocation_ended`). `SignalDelivered.dry_run` is the
+  `observation_only` shadow-mode flag, and `decision_json` carries the
+  differential payload (ladder level, occurrence count, promotion verdict,
+  cancel-authority verdict, plan-swap targets) the §5.4 shadow/differential
+  report diffs over real traffic to establish the agent self-correction base
+  rate **before** any behavior change. The events are additive proto messages
+  (`Event.payload` tags 45/46 — no field renumbered) so every existing
+  `WhichOneof` reader and the JSONL sink keep working unchanged. A new
+  StateStore-backed `goldfive.signal_ledger.SignalLedger` (keyed
+  `(drift_kind, task_id)` — stable goldfive-minted task ids, never LLM-minted)
+  records deliveries, drift re-fires, and resolution outcomes turn-stamped on
+  the goldfive#441 `Session._reasoning_turn` clock. **It gates nothing** —
+  the grace-window bookkeeping is recorded for PR 8's pacing to consume;
+  pacing is PR 8. With the flag off (the default) every signal helper
+  early-returns, so the event stream and all existing suites are byte-for-byte
+  unchanged (§5.1 no-op-by-default). Hypothesis interleaving tests pin the
+  ledger invariants (no double-count per `drift_id`, monotone turn stamps,
+  exactly one terminal outcome per delivered key, always-parseable state).
+- **BREAKING:
   [#254](https://github.com/pedapudi/goldfive/issues/254) —
   observation-only is the new default on `goldfive.wrap()`.**
   `SteeringConfig.observation_only` (default `True`) gates the three

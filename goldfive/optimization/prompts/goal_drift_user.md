@@ -27,7 +27,7 @@ RECENT AGENT ACTIVITY (most recent {activity_count} invocations, newest last):
 Decide: is the recent activity moving toward the goals? Answer STRICTLY in one of these two JSON shapes:
 {{"progressing": true}}
 OR
-{{"progressing": false, "reason": "one-sentence explanation"}}
+{{"progressing": false, "reason": "one-sentence explanation", "note_to_agent": "one or two sentences addressed to the agent itself: state only what you observed and how it relates to the goals. Neutral and factual — no commands, no instructions about which task, tool, or agent to use next, and no fault language. If your confidence is low, phrase the note as a question (e.g. 'Does the current approach still serve the goal of X?')"}}
 
 Progressing = agents are doing work that plausibly contributes to the goal.
 Not progressing = agents are looping, refusing, off-topic, or otherwise not advancing.

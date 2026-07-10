@@ -527,3 +527,100 @@ async def test_wait_plan_stable_observes_no_partial_growth() -> None:
             "post-stable snapshot must reflect the grown plan; "
             f"discovered={discovered} ids={ids}"
         )
+
+
+async def test_concurrent_identical_delegations_through_pin_path_grow_once() -> None:
+    """Tier-3-path variant (goldfive#423 / AGENCY-PRESERVATION.md PR 2).
+
+    The growth trigger moved from the Rule-C verdict path to the
+    delegation pin (``before_tool_callback`` → tier-1/2 miss →
+    ``install_descriptive_growth``). Two IDENTICAL delegations racing
+    through the full plugin pin path must still produce exactly ONE
+    discovered task: both sync pins miss the step-0 hash lookup (no
+    task installed yet), both signal growth, and the per-session plan
+    lock inside ``install_descriptive_growth`` linearises the two
+    installs — the loser dedups against the winner's task (§11.6).
+    """
+    pytest.importorskip("google.adk")
+    from goldfive.adapters._adk_plugin import (
+        SESSION_CONTEXT_STATE_KEY,
+        SessionContext,
+        make_adk_plugin,
+    )
+    from goldfive.config import SteeringConfig
+
+    session = _make_session()
+    planner = _StubPlanner(revised_factory=_refine_revised)
+    sink = _ListSink()
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(
+            observation_only=False, descriptive_growth_enabled=True
+        )
+    )
+    steerer.bind(sinks=[sink], planner=planner)
+
+    plugin = make_adk_plugin(host_agent_name="coordinator")
+    ctx_obj = SessionContext(
+        session=session,
+        steerer=steerer,
+        task=None,
+        tool_handlers={},
+        host_agent_name="coordinator",
+    )
+    plugin.set_active_context(ctx_obj)
+    adk_state: dict[str, Any] = {SESSION_CONTEXT_STATE_KEY: ctx_obj}
+
+    class _FakeAgent:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _FakeLeafTool:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _FakeSubAgent:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.tools = [_FakeLeafTool("find_files")]
+
+    class _FakeAgentTool:
+        def __init__(self, sub: Any) -> None:
+            self.agent = sub
+            self.name = sub.name
+
+    class _FakeInvocationContext:
+        def __init__(self, state: dict, inv_id: str) -> None:
+            class _ADKSession:
+                def __init__(self, s: dict) -> None:
+                    self.state = s
+
+            self.session = _ADKSession(state)
+            self.invocation_id = inv_id
+            self.agent = _FakeAgent("coordinator")
+
+    class _FakeToolContext:
+        def __init__(self, inv_ctx: Any, fc_id: str) -> None:
+            self._invocation_context = inv_ctx
+            self.function_call_id = fc_id
+
+    async def dispatch(i: int) -> None:
+        inv_ctx = _FakeInvocationContext(adk_state, f"inv-race-{i}")
+        await plugin.before_tool_callback(
+            tool=_FakeAgentTool(_FakeSubAgent("debugger_agent")),
+            tool_args={"request": "locate cherry tree files"},
+            tool_context=_FakeToolContext(inv_ctx, f"fc-race-{i}"),
+        )
+
+    await asyncio.gather(*(dispatch(i) for i in range(5)))
+
+    assert session.plan is not None
+    discovered = [
+        t for t in session.plan.tasks if getattr(t, "discovered", False)
+    ]
+    assert len(discovered) == 1, (
+        f"5 concurrent identical delegations through the pin path must "
+        f"dedup to 1 discovered task; got {len(discovered)}: "
+        f"{[t.id for t in discovered]}"
+    )
+    # Every dispatch converged on the same pin.
+    assert session.current_task_id == discovered[0].id

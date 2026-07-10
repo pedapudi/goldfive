@@ -1,23 +1,43 @@
-"""100-task performance baseline for goldfive.
+"""goldfive bench entrypoints: perf baseline + AGENCY-PRESERVATION three-arm.
 
-Runs a synthetic 100-task linear plan through ``SequentialExecutor``
-plus ``JSONLPersistenceSink`` with a no-op ``CallableAdapter``. The
-goal is to measure goldfive's orchestration overhead in isolation —
-no LLM call, no network, no real agent work — so future regressions
-in the runner / executor / sink path are visible against a pinned
-baseline.
+Three subcommands (``perf`` is the default, so the original invocation is
+unchanged):
 
-Run with::
+``perf`` (default)
+    The 100-task performance baseline. Runs a synthetic 100-task linear
+    plan through ``SequentialExecutor`` + ``JSONLPersistenceSink`` with a
+    no-op ``CallableAdapter`` — no LLM, no network — so runner / executor /
+    sink regressions are visible against a pinned baseline. Prints one
+    block of measurements and exits 0.
 
-    uv run python bench/run_100_tasks.py
+        uv run python bench/run_100_tasks.py
+        uv run python bench/run_100_tasks.py perf
 
-The script prints a single block of measurements to stdout and exits
-with status 0. The temporary JSONL file is unlinked before exit.
+``three-arm``
+    The AGENCY-PRESERVATION.md PR 13 counterfactual harness: runs the same
+    workload under arm A (judge-only baseline), arm B (new SIGNAL regime)
+    and arm C (legacy ladder), printing the per-arm metric table sourced
+    from captured artifacts + sink events. With a stub model this exercises
+    the harness + telemetry plumbing; 13b plugs in a live model.
+
+        uv run python bench/run_100_tasks.py three-arm --out-dir /tmp/bench
+
+``shadow``
+    Runs the three arms in §5.4 shadow mode (behavior arms forced
+    ``observation_only`` so signals are dry-run) and diffs the legacy vs.
+    new logs into the divergence report — the exit-criterion artifact for
+    enabling a behavior PR.
+
+        uv run python bench/run_100_tasks.py shadow --out-dir /tmp/bench
+
+See :mod:`bench.harness` and :mod:`bench.shadow_diff` for the library API.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -41,6 +61,13 @@ from goldfive import (
     TaskEdge,
 )
 from goldfive.sinks import JSONLPersistenceSink
+
+# Ensure the repo root is importable so ``from bench.harness import ...`` works
+# both when this file is run as a script (``python bench/run_100_tasks.py``)
+# and when imported as ``bench.run_100_tasks``.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 NUM_TASKS = 100
 
@@ -107,7 +134,8 @@ async def run_benchmark(jsonl_path: Path) -> tuple[float, int, bool]:
     return elapsed, peak, outcome.success
 
 
-def main() -> int:
+def perf_main() -> int:
+    """The original 100-task perf baseline (the default subcommand)."""
     tmp = tempfile.NamedTemporaryFile(
         prefix="goldfive-bench-", suffix=".jsonl", delete=False
     )
@@ -142,6 +170,118 @@ def main() -> int:
     print(f"Python:           {py.major}.{py.minor}.{py.micro}")
     print(f"goldfive:         {goldfive.__version__}")
     return 0
+
+
+def _print_arm_metrics_table(results: list) -> None:
+    print("goldfive three-arm bench (AGENCY-PRESERVATION.md PR 13)")
+    print("=" * 72)
+    for m in results:
+        reason = f"({m.goal_reason})" if m.goal_reason else ""
+        tokens = m.tokens if m.tokens is not None else "n/a"
+        signals = f"{m.signals_total} / {m.signals_real} / {m.signals_dry_run}"
+        print(f"\narm {m.arm_name}  [{m.arm_kind}]")
+        print("-" * 72)
+        print(f"  goal_grade:              {m.goal_grade.upper()}  {reason}")
+        print(f"  goal_success (==MET):    {m.goal_success}")
+        print(f"  goal_predicate_count:    {m.goal_predicate_count}")
+        print(
+            f"  OUTCOME tasks:           {m.outcome_tasks_total}  "
+            f"terminal={m.outcome_terminal}"
+        )
+        print(
+            f"  plan_mode / exercised:   {m.plan_mode} / {m.ledger_exercised}"
+            + (
+                "  (configured but NOT exercised — does not validate ledger)"
+                if m.plan_mode == "ledger" and not m.ledger_exercised
+                else ""
+            )
+        )
+        print(f"  completed_outputs:       {m.completed_outputs}")
+        print(f"  turns / tokens:          {m.turns} / {tokens}")
+        print(f"  run aborted:             {m.aborted}  {m.abort_reason}")
+        print(f"  drift_detected:          {m.drift_detected}")
+        print(f"  signals (total/real/dry):{signals}")
+        print(f"  intervention_count:      {m.intervention_count}")
+        print(f"  by_channel:              {m.by_channel}")
+        print(f"  outcomes:                {m.outcomes}")
+        print(f"  self_correction_base:    {m.self_correction_base_rate}")
+        print(f"  post_signal_refire_rate: {m.post_signal_refire_rate}")
+        print(f"  applied flags:           {m.applied_flags}")
+        if m.pending_flags:
+            print(f"  PENDING flags (no-op):   {m.pending_flags}  (not consulted by this build)")
+        print(f"  jsonl artifact:          {m.jsonl_path}")
+
+
+def three_arm_main(args: argparse.Namespace) -> int:
+    """Run the three arms over the deterministic stub-model workload."""
+    from bench.harness import Scenario, default_arms, make_linear_run_driver, run_arms
+
+    out_dir = Path(args.out_dir)
+    scenario = Scenario(
+        name="linear-stub",
+        driver=make_linear_run_driver(num_tasks=args.tasks, inject_signals=True),
+    )
+    results = asyncio.run(run_arms(default_arms(), scenario, jsonl_dir=out_dir))
+    if args.json:
+        print(json.dumps([m.to_dict() for m in results], indent=2, sort_keys=True, default=str))
+    else:
+        _print_arm_metrics_table(results)
+    # A run is "ok" if every arm completed and emitted telemetry (loud signal
+    # the plumbing is wired); the comparative judgement is 13b's job.
+    if any(m.signals_total == 0 for m in results if m.arm_kind != "baseline"):
+        print("\nWARNING: a behavior arm emitted 0 signals — telemetry may be off", file=sys.stderr)
+        return 1
+    return 0
+
+
+def shadow_main(args: argparse.Namespace) -> int:
+    """Run the arms in shadow mode and emit the legacy-vs-new divergence report."""
+    from bench.harness import Scenario, make_linear_run_driver, run_arms, shadow_arms
+    from bench.shadow_diff import diff_two_logs, load_signals, render_two_log_text
+
+    out_dir = Path(args.out_dir)
+    arms = shadow_arms()
+    scenario = Scenario(
+        name="linear-stub-shadow",
+        driver=make_linear_run_driver(num_tasks=args.tasks, inject_signals=True),
+    )
+    results = asyncio.run(run_arms(arms, scenario, jsonl_dir=out_dir))
+    by_kind = {m.arm_kind: m for m in results}
+    legacy_log = by_kind["legacy"].jsonl_path
+    new_log = by_kind["signal"].jsonl_path
+
+    legacy = load_signals(legacy_log)
+    new = load_signals(new_log)
+    report = diff_two_logs(legacy, new, legacy_path=legacy_log, new_path=new_log)
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True, default=str))
+    else:
+        print(render_two_log_text(report))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="run_100_tasks", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("perf", help="100-task perf baseline (default)")
+    ta = sub.add_parser("three-arm", help="three-arm counterfactual bench")
+    ta.add_argument("--out-dir", default="/tmp/g5-bench-artifacts", help="JSONL artifact dir")
+    ta.add_argument("--tasks", type=int, default=3, help="tasks per arm (stub workload)")
+    ta.add_argument("--json", action="store_true")
+    sh = sub.add_parser("shadow", help="shadow-mode run + legacy-vs-new divergence report")
+    sh.add_argument("--out-dir", default="/tmp/g5-bench-artifacts", help="JSONL artifact dir")
+    sh.add_argument("--tasks", type=int, default=3, help="tasks per arm (stub workload)")
+    sh.add_argument("--json", action="store_true")
+
+    args = parser.parse_args(argv)
+    if args.cmd in (None, "perf"):
+        return perf_main()
+    if args.cmd == "three-arm":
+        return three_arm_main(args)
+    if args.cmd == "shadow":
+        return shadow_main(args)
+    parser.error(f"unknown command {args.cmd!r}")
+    return 2  # unreachable
 
 
 if __name__ == "__main__":

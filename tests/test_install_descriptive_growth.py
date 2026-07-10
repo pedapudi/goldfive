@@ -402,3 +402,42 @@ async def test_dedup_preserves_first_task_id_across_concurrent_calls() -> None:
         "concurrent same-args calls must dedup to a single discovered "
         f"task; got ids: {unique_ids}"
     )
+
+
+async def test_dedup_ttl_terminal_discovered_task_regrows() -> None:
+    """§11.1 TTL: dedup window ends when the discovered task goes terminal.
+
+    A fresh delegation whose identity hash matches a COMPLETED (or
+    otherwise terminal) discovered task is a genuinely new unit of
+    work — the helper must grow a NEW task instead of re-pinning the
+    finished one. (goldfive#423 / AGENCY-PRESERVATION.md PR 2.)
+    """
+    from goldfive.types import (
+        channel_processor_active,
+        set_session_plan,
+        with_task_status,
+    )
+
+    session = _make_session()
+    steerer = _make_steerer()
+
+    t1 = await steerer.plans.install_descriptive_growth(
+        session, agent_name="debugger_agent", tool_args_json='{"request": "locate"}'
+    )
+    # The discovered work finishes.
+    with channel_processor_active():
+        set_session_plan(
+            session, with_task_status(session.plan, t1.id, TaskStatus.COMPLETED)
+        )
+
+    t2 = await steerer.plans.install_descriptive_growth(
+        session, agent_name="debugger_agent", tool_args_json='{"request": "locate"}'
+    )
+
+    assert t2.id != t1.id, (
+        "a terminal discovered task must NOT absorb a fresh same-hash "
+        "delegation (§11.1 TTL)"
+    )
+    assert t2.discovery_identity_hash == t1.discovery_identity_hash
+    live = [t for t in session.plan.tasks if t.discovered]
+    assert {t.id for t in live} == {t1.id, t2.id}

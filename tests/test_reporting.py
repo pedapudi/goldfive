@@ -246,8 +246,20 @@ async def test_report_task_blocked_transitions_and_refines() -> None:
     assert planner.refine_calls[0]["drift"].kind is DriftKind.BLOCKED
 
 
-async def test_report_new_work_discovered_fires_refine() -> None:
-    steerer, session, _sink, planner = _fresh()
+async def test_report_new_work_discovered_grows_plan_not_refine() -> None:
+    """AGENCY-PRESERVATION.md PR 3: the agent-authored
+    ``report_new_work_discovered`` reporting tool now absorbs the report
+    as descriptive growth (a ``discovered=True`` ledger task) instead of
+    firing ``planner.refine``. Was ``test_report_new_work_discovered_
+    fires_refine`` (asserted one refine call).
+
+    Asserts: (1) NO refine call; (2) the plan grew by one discovered
+    task carrying the agent's verbatim title; (3) observability is
+    preserved — a NEW_WORK_DISCOVERED ``DriftDetected`` (INFO, from the
+    growth path) still reaches the sink.
+    """
+    steerer, session, sink, planner = _fresh()
+    before = len(session.plan.tasks)
     await _tool("report_new_work_discovered").handler(
         {
             "parent_task_id": "t1",
@@ -258,8 +270,19 @@ async def test_report_new_work_discovered_fires_refine() -> None:
         session,
         steerer,
     )
-    assert len(planner.refine_calls) == 1
-    assert planner.refine_calls[0]["drift"].kind is DriftKind.NEW_WORK_DISCOVERED
+    # (1) Absorbed as growth, never re-forecast.
+    assert planner.refine_calls == []
+    # (2) Plan grew by exactly one discovered task with the verbatim title.
+    assert len(session.plan.tasks) == before + 1
+    discovered = [t for t in session.plan.tasks if getattr(t, "discovered", False)]
+    assert len(discovered) == 1
+    assert discovered[0].title == "dig deeper"
+    assert discovered[0].assignee_agent_id == "analyst"
+    # (3) Observability preserved: DriftDetected still emits for the
+    # demoted kind (here via the growth path's INFO drift).
+    kinds = [e.WhichOneof("payload") for e in sink.proto_events]
+    assert "drift_detected" in kinds
+    assert "plan_revised" in kinds
 
 
 async def test_report_plan_divergence_sets_flag_only() -> None:

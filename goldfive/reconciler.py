@@ -65,8 +65,14 @@ Tolerance
   double-count: a sub-Runner whose agent name matches a plan task
   still produces one RUNNING→COMPLETED pair per plan task.
 - **Off-plan agents.** An agent whose name matches no plan
-  assignee emits a ``PLAN_DIVERGENCE`` drift at INFO severity.
-  Escalation is the steerer's job (see #142's intervention ladder).
+  assignee grows the plan with a ``discovered=True`` task and
+  claims it (goldfive#423 / AGENCY-PRESERVATION.md PR 2 — the
+  ``transfer_to_agent``-style counterpart of the AgentTool
+  delegation-pin growth; see :meth:`_maybe_grow_discovered_task`).
+  When descriptive growth is disabled or unavailable, the legacy
+  behaviour remains: a divergence record on
+  ``divergence_events`` (the PLAN_DIVERGENCE drift itself was
+  disabled by goldfive#252).
 
 The reconciler is deliberately small (~150 LOC) and framework-
 agnostic. It calls back into the :class:`~goldfive.protocols.Steerer`
@@ -252,6 +258,41 @@ class PlanReconciler:
             chain = self._parent_chain(invocation_id)
             if any(self._agent_has_any_plan_task(name) for name in chain):
                 return
+            # goldfive#423 / AGENCY-PRESERVATION.md PR 2 — descriptive
+            # growth for transfer_to_agent-style trees. The AgentTool
+            # delegation path grows the plan at pin time
+            # (``_maybe_pin_delegation_task``), but trees that move via
+            # ADK ``transfer_to_agent`` never cross that hook — their
+            # only goldfive-visible signal is this before_agent
+            # observation. Apply the same dedup-hash → grow → claim
+            # flow here so the ledger reflects observed work for every
+            # tree shape. On growth, claim the discovered task exactly
+            # like the direct-match path above (RUNNING transition +
+            # bookkeeping) so ``on_after_agent`` closes it out.
+            grown = await self._maybe_grow_discovered_task(agent_name)
+            if grown is not None:
+                self._running_by_agent[agent_name] = grown.id
+                self._observed_task_ids.add(grown.id)
+                try:
+                    await self._steerer.transition(
+                        grown.id,
+                        TaskStatus.RUNNING,
+                        detail=(
+                            f"observed: {agent_name} started "
+                            f"(discovered via descriptive growth)"
+                        ),
+                        session=self._session,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "PlanReconciler.on_before_agent: discovered-task "
+                        "transition(RUNNING) raised: %s",
+                        exc,
+                    )
+                _ostate.sync_current_task_from_transition(
+                    self._session.state, grown, TaskStatus.RUNNING
+                )
+                return
             self._off_plan_seen.add(agent_name)
             await self._emit_divergence(
                 agent_name=agent_name,
@@ -331,6 +372,19 @@ class PlanReconciler:
                 self._session.state, task, TaskStatus.FAILED
             )
             return
+        # AGENCY-PRESERVATION.md PR 11(c): capture the observed output as
+        # outcome-progress evidence BEFORE the COMPLETED transition (the
+        # transition re-enters the task-boundary hook that spawns the
+        # outcome-progress judge, which reads ``session.completed_outputs``).
+        # In overlay mode — the ONLY execution mode ledger plan mode
+        # supports — the executors that normally populate
+        # ``completed_outputs`` never run, so without this the outcome
+        # judge has no evidence and can never decide OUTCOME completion.
+        # Keyed by the closed task id (the DISCOVERED trajectory task) so
+        # the judge can attribute contributing steps. Ledger-gated: in
+        # forecast mode the dict is left untouched (bit-identical to
+        # pre-PR-11).
+        self._maybe_record_completed_output(task_id, summary)
         try:
             await self._steerer.transition(
                 task_id,
@@ -554,6 +608,103 @@ class PlanReconciler:
         if plan is None:
             return False
         return any(t.assignee_agent_id == agent_name for t in plan.tasks)
+
+    async def _maybe_grow_discovered_task(self, agent_name: str) -> Task | None:
+        """Grow the plan with a ``discovered=True`` task for an off-plan agent.
+
+        goldfive#423 / AGENCY-PRESERVATION.md PR 2 — the reconciler-side
+        descriptive-growth trigger for ``transfer_to_agent``-style trees
+        (the AgentTool path grows at delegation-pin time instead; see
+        ``_maybe_pin_delegation_task`` in the ADK plugin).
+
+        Gated on ``SteeringConfig.descriptive_growth_enabled`` (read off
+        the bound steerer's typed config, mirroring the ADK plugin's
+        ``_descriptive_growth_enabled``) and on the steerer exposing
+        :meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`
+        — custom :class:`~goldfive.protocols.Steerer` implementations
+        without either keep the pre-#423 divergence-record-only
+        behaviour.
+
+        Identity hash: ``before_agent`` observations carry NO tool
+        args (ADK's callback surfaces only the agent + invocation ids;
+        there is no ``DelegationObserved.tool_args_json`` equivalent
+        for a transfer), so we pass ``tool_args_json=""`` and the hash
+        degrades to the documented per-``(agent_name, "")`` key — the
+        §9 forward-compat fallback of
+        ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md``. Coarser than the
+        AgentTool path's per-(agent, args-token-set) granularity, but
+        still dedups repeat transfers to the same agent onto one
+        discovered task while it is live (§11.1 TTL).
+
+        Returns the discovered (or dedup-matched) task, or ``None``
+        when growth is unavailable / disabled / failed — the caller
+        then falls through to the legacy divergence record.
+        """
+        try:
+            cfg = getattr(self._steerer, "_steering_config", None)
+            if cfg is None or not bool(
+                getattr(cfg, "descriptive_growth_enabled", False)
+            ):
+                return None
+            plans = getattr(self._steerer, "plans", None)
+            install = getattr(plans, "install_descriptive_growth", None)
+            if not callable(install):
+                return None
+            return await install(
+                self._session,
+                agent_name=agent_name,
+                tool_args_json="",
+                delegation_event_id="",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "PlanReconciler._maybe_grow_discovered_task: growth "
+                "raised: %s; falling back to divergence record",
+                exc,
+            )
+            return None
+
+    def _ledger_mode(self) -> bool:
+        """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
+
+        Delegates to :func:`goldfive.steerer.plan_mode_is_ledger` — the
+        single implementation of the parse (three modules previously
+        re-implemented it verbatim). Defensive: any failure resolves to
+        forecast mode so the legacy overlay path is untouched.
+        """
+        try:
+            from goldfive.steerer import plan_mode_is_ledger
+
+            return plan_mode_is_ledger(self._steerer)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _maybe_record_completed_output(self, task_id: str, summary: str) -> None:
+        """Record ``summary`` as the outcome-progress evidence for ``task_id``.
+
+        AGENCY-PRESERVATION.md PR 11(c). In ledger plan mode the
+        outcome-progress judge (``drift/outcome_progress.py``) grades
+        OUTCOME deliverables against ``session.completed_outputs`` — the
+        full-output capture the executors populate in the driving model.
+        Ledger plan mode only ever runs the overlay model, where the
+        executors never see task outputs, so this is the observation
+        entry point that populates that evidence source. No-op (and no
+        write) in forecast mode, so forecast-mode observation state is
+        byte-identical to pre-PR-11.
+        """
+        if not task_id or not summary:
+            return
+        if not self._ledger_mode():
+            return
+        try:
+            self._session.completed_outputs[task_id] = summary
+        except Exception as exc:  # noqa: BLE001 — observability capture
+            log.debug(
+                "PlanReconciler._maybe_record_completed_output: capture "
+                "for %r raised: %s",
+                task_id,
+                exc,
+            )
 
     def _find_task(self, task_id: str) -> Task | None:
         plan = self._session.plan

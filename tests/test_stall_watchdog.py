@@ -454,7 +454,8 @@ async def test_active_mode_warning_routes_to_nudge() -> None:
 
 def test_task_timeout_has_a_ladder_row() -> None:
     """The ladder table carries the conservative TASK_TIMEOUT row:
-    INFO→OBSERVE, WARNING→NUDGE, CRITICAL→PAUSE_ESCALATE (first and
+    INFO→OBSERVE, WARNING→SIGNAL (renamed from NUDGE in
+    AGENCY-PRESERVATION.md PR 7), CRITICAL→PAUSE_ESCALATE (first and
     repeat — the watchdog's CRITICAL is by construction a repeat)."""
     from goldfive.drift_observer import DriftObserver
     from goldfive.steerer import DefaultSteerer, InterventionLevel
@@ -464,7 +465,7 @@ def test_task_timeout_has_a_ladder_row() -> None:
     assert isinstance(observer, DriftObserver)
     assert (
         observer._ladder_level_for(DriftKind.TASK_TIMEOUT, DriftSeverity.WARNING, 0)
-        is InterventionLevel.NUDGE
+        is InterventionLevel.SIGNAL
     )
     assert (
         observer._ladder_level_for(DriftKind.TASK_TIMEOUT, DriftSeverity.CRITICAL, 0)

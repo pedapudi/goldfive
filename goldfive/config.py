@@ -80,6 +80,23 @@ __all__ = [
 
 _VALID_STEER_THRESHOLDS: frozenset[str] = frozenset({"off", "warning", "critical"})
 
+_VALID_CANCEL_INFLIGHT_SCOPES: frozenset[str] = frozenset({"user_and_safety", "all"})
+
+#: Valid values for :attr:`SteeringConfig.signal_channel`
+#: (AGENCY-PRESERVATION.md PR 6). ``"legacy_user_message"`` is the default and
+#: routes corrective notes through ``session.pending_nudges`` (the pre-PR-6
+#: invocation-boundary replay); ``"request_context"`` routes them through the
+#: StateStore-backed :class:`~goldfive.observer_note_queue.ObserverNoteQueue`
+#: and the four observer-note delivery surfaces.
+_VALID_SIGNAL_CHANNELS: frozenset[str] = frozenset(
+    {"legacy_user_message", "request_context"}
+)
+
+#: Valid values for :attr:`SteeringConfig.plan_mode` (AGENCY-PRESERVATION.md
+#: Stage 3 PR 10). ``"forecast"`` is the legacy default; ``"ledger"`` is
+#: the goal-anchored OUTCOME + descriptively-grown DISCOVERED regime.
+_VALID_PLAN_MODES: frozenset[str] = frozenset({"forecast", "ledger"})
+
 
 def _read_bool_env(name: str, default: bool) -> bool:
     """Read ``os.environ[name]`` as a boolean; fall back to ``default``.
@@ -221,6 +238,77 @@ def _read_optional_float_env(name: str, default: float | None) -> float | None:
 _VALID_REASONING_DRIFT_MODES: frozenset[str] = frozenset(
     {"judge", "embedding", "both", "off"}
 )
+
+
+def _read_cancel_inflight_scope_env(name: str, default: str) -> str:
+    """Return ``os.environ[name]`` as a cancel-inflight scope literal, or ``default``.
+
+    Accepts ``"user_and_safety"`` / ``"all"`` (case-insensitive).
+    Anything else logs a WARNING and falls back so a typo never
+    silently re-enables (or disables) the in-flight cancel authority
+    gate (AGENCY-PRESERVATION.md PR 1, goldfive#449/#452).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _VALID_CANCEL_INFLIGHT_SCOPES:
+        return value
+    log.warning(
+        "ignoring unknown %s=%r (expected one of %s); using default %r",
+        name,
+        raw,
+        sorted(_VALID_CANCEL_INFLIGHT_SCOPES),
+        default,
+    )
+    return default
+
+
+def _read_signal_channel_env(name: str, default: str) -> str:
+    """Return ``os.environ[name]`` as a signal-channel literal, or ``default``.
+
+    Accepts ``"legacy_user_message"`` / ``"request_context"``
+    (case-insensitive). Anything else logs a WARNING and falls back so a typo
+    never silently flips the observer-note delivery channel
+    (AGENCY-PRESERVATION.md PR 6).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _VALID_SIGNAL_CHANNELS:
+        return value
+    log.warning(
+        "ignoring unknown %s=%r (expected one of %s); using default %r",
+        name,
+        raw,
+        sorted(_VALID_SIGNAL_CHANNELS),
+        default,
+    )
+    return default
+
+
+def _read_plan_mode_env(name: str, default: str) -> str:
+    """Return ``os.environ[name]`` as a plan-mode literal, or ``default``.
+
+    Accepts ``"forecast"`` / ``"ledger"`` (case-insensitive). Anything
+    else logs a WARNING and falls back so a typo never silently flips the
+    plan mode (AGENCY-PRESERVATION.md Stage 3 PR 10).
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _VALID_PLAN_MODES:
+        return value
+    log.warning(
+        "ignoring unknown %s=%r (expected one of %s); using default %r",
+        name,
+        raw,
+        sorted(_VALID_PLAN_MODES),
+        default,
+    )
+    return default
 
 
 def _read_reasoning_drift_mode_env(
@@ -702,32 +790,208 @@ class SteeringConfig:
     #: even instantiates the editor and the codepath is zero-overhead.
     #:
     #: Set to a list of rule names (e.g. ``["prune_cancelled_reasoning"]``)
-    #: to opt in. Unknown rule names are logged and ignored at registration
+    #: to opt in. Recognised rules (AGENCY-PRESERVATION.md PR 6b):
+    #:
+    #: * ``"prune_cancelled_reasoning"`` — strip cancelled-invocation
+    #:   tool pairs (drop-only).
+    #: * ``"prune_transient_error"`` — redact 429 / 5xx / timeout /
+    #:   parse-blip ``function_response`` payloads in place
+    #:   (byte-monotonic replace).
+    #: * ``"prune_stale_steer"`` — drop goldfive's own synthetic
+    #:   steer / observer-note user-messages once stale (drop-only).
+    #: * ``"compact_prior_reasoning"`` — collapse N identical failed
+    #:   tool-call pairs into one summarized survivor (byte-monotonic
+    #:   replace).
+    #:
+    #: Unknown rule names are logged and ignored at registration
     #: time; an empty list after filtering also keeps the editor unwired.
+    #: Every rule is dormant on healthy turns — it edits ``contents``
+    #: ONLY on a tripped guardrail counter or drift verdict (§0).
     #:
     #: Per-rule (rather than a single master switch) so e2e regressions
     #: from a single rule can be bisected without disabling the whole
     #: capability. See ``docs/design/CONTEXT-EDITING.md`` for the rule
-    #: catalog and the rationale behind drop-only edits.
+    #: catalog and the drop-only / byte-monotonic-replace rule classes.
     context_editor_rules: list[str] | None = None
-    #: Plan-descriptive growth fallback for unmatched delegations
-    #: (goldfive#423 PR 2). When ``True`` and the structural capability
-    #: detector returns a Rule C (out-of-DAG-order) verdict, the steerer
-    #: synthesises a ``discovered=True`` task via
+    #: Plan-descriptive growth for unmatched delegations (goldfive#423,
+    #: completed by AGENCY-PRESERVATION.md Stage 1 PR 2). When ``True``
+    #: the growth trigger lives at PIN time: when the
+    #: delegation pin's tier 1 (required-tools cover) and tier 2
+    #: (agent-name stem) both miss in
+    #: ``_maybe_pin_delegation_task``, the plugin synthesises a
+    #: ``discovered=True`` task via
     #: :meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`
-    #: and re-pins the delegation to it instead of firing the
-    #: CAPABILITY_MISMATCH drift. Rule A and Rule B are unaffected. When
-    #: ``False`` (the default) the existing CAPABILITY_MISMATCH Rule C
-    #: path fires as today, so PR 2 lands behind the flag without
-    #: behaviour change for existing tests/runs. PR 4 flips the default
-    #: after sufficient validation. Env: ``GOLDFIVE_STEER_DESCRIPTIVE_GROWTH``.
+    #: and pins the delegation to it — the tier-3 topic-args scorer is
+    #: bypassed and no CAPABILITY_MISMATCH rule ever sees a mispinned
+    #: task (this closes the Rule-A-bypass gap from the cherry-tree
+    #: failure, e2e session ``2d27ff4a``). The
+    #: :class:`~goldfive.reconciler.PlanReconciler` applies the same
+    #: dedup-hash → grow → claim flow to unmatched ``before_agent``
+    #: observations so ``transfer_to_agent``-style trees grow the
+    #: ledger too.
+    #:
+    #: When ``False`` — the DEFAULT: #497 reverted the interim
+    #: default-ON, pending the AGENCY-PRESERVATION.md §6.4 13b bench
+    #: gate — the legacy pre-#423 pin behaviour applies (tier-3
+    #: topic-args scorer + topo-order fallback; mispins are caught
+    #: downstream by the CAPABILITY_MISMATCH rules, themselves
+    #: env-gated OFF — see AGENCY-PRESERVATION.md §6.6 for the
+    #: pure-defaults posture). The tier-3 scorer survives only for this
+    #: legacy path and is scheduled for deletion (AGENCY-PRESERVATION.md
+    #: PR 13).
+    #: Env: ``GOLDFIVE_STEER_DESCRIPTIVE_GROWTH``.
     #:
     #: Design ref: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3 + §9
-    #: (PR table). The flag gates ONLY the §4.3 fallback; the data-model
-    #: fields shipped in PR 1 (``Task.discovered``,
+    #: (PR table). The flag gates ONLY the §4.3 growth flow; the
+    #: data-model fields shipped in PR 1 (``Task.discovered``,
     #: ``Task.discovery_identity_hash``, ``DelegationObserved.tool_args_json``)
     #: are always available regardless of this flag.
     descriptive_growth_enabled: bool = False
+    #: AGENCY-PRESERVATION.md PR 5 (#449/#452) — signal telemetry.
+    #: When ``True`` the drift observer emits ``SignalDelivered`` /
+    #: ``SignalOutcome`` events and maintains the StateStore-backed
+    #: ``SignalLedger`` (deliveries, drift re-fires, resolution outcomes).
+    #: When ``False`` (the default) the signal-telemetry helpers early-return
+    #: before touching the ledger or the wire, so PR 5 is a true no-op: the
+    #: event stream is byte-for-byte identical to pre-PR-5 and every existing
+    #: suite passes unmodified (§5.1 "no-op by default"). This GATES NOTHING in
+    #: the steering control-flow — it only turns the observe-only bookkeeping +
+    #: emission on. Operators running the §5.4 shadow/differential-validation
+    #: campaign (and PR 8's grace-window pacing, which reads the ledger) enable
+    #: it. Best left ON together with ``observation_only=True`` to record the
+    #: agent self-correction base rate before any behavior PR.
+    #: Env: ``GOLDFIVE_STEER_SIGNAL_TELEMETRY``.
+    signal_telemetry: bool = False
+    #: Authority scope for cancelling the wrapped agent's IN-FLIGHT
+    #: invocation on a drift-driven plan install (AGENCY-PRESERVATION.md
+    #: PR 1; goldfive#449/#452).
+    #:
+    #: * ``"user_and_safety"`` (the default) — in-flight cancellation is
+    #:   permitted ONLY when the triggering drift is user-authored
+    #:   (USER_STEER / USER_CANCEL / USER_PAUSE) or a hard-safety kind
+    #:   (budget/resource protection and termination — see
+    #:   :attr:`goldfive.drift_observer.DriftObserver._HARD_SAFETY_DRIFT_KINDS`).
+    #:   Goldfive-authored revisions (Level-1 ABSORB refines,
+    #:   NEW_WORK_DISCOVERED installs, drift→steer promotions) still
+    #:   install for bookkeeping, but the in-flight invocation runs to
+    #:   completion; corrections reach the agent at the natural
+    #:   invocation boundary (nudge replay / GOLDFIVE_STEER restart).
+    #: * ``"all"`` — the legacy behaviour: EVERY drift-driven plan
+    #:   install fires :meth:`DriftObserver._cancel_inflight_for_revision`
+    #:   (the goldfive#271-follow-up v15 concurrent-invocation fix in
+    #:   its original, unconditional form). This is the §5.1 one-line
+    #:   kill-switch for PR 1: setting
+    #:   ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`` restores today's
+    #:   behaviour exactly.
+    #:
+    #: Orthogonal to ``observation_only``: observation-only suppresses
+    #: the plugin cancel call itself; this knob decides which drift
+    #: AUTHORITIES may request it in the first place.
+    cancel_inflight_scope: str = "user_and_safety"
+    #: Delivery channel for goldfive-authored corrective notes
+    #: (AGENCY-PRESERVATION.md PR 6).
+    #:
+    #: * ``"legacy_user_message"`` (the default) — corrective notes queue on
+    #:   ``session.pending_nudges`` and reach the agent as the next user
+    #:   message via the executor's invocation-boundary nudge-replay loop
+    #:   (the pre-PR-6 mechanism). ``channel="nudge_replay"``.
+    #: * ``"request_context"`` — notes route through the StateStore-backed
+    #:   :class:`~goldfive.observer_note_queue.ObserverNoteQueue` and the four
+    #:   observer-note delivery surfaces (ADK ``before_model`` system-prompt
+    #:   block; invocation-boundary replay consuming the queue; the
+    #:   claude-agent-sdk system prompt + ``PostToolUse`` ``additionalContext``;
+    #:   the append-only tool-result annotation for loop-shaped drift). Per
+    #:   request at most one block is rendered (most-severe pending note wins)
+    #:   and rendering is exactly-once across surfaces. Whether a note actually
+    #:   reaches the agent is gated on ``observation_only`` at the surface.
+    #:
+    #: ``SignalDelivered`` is emitted once at the dispatch decision point for
+    #: BOTH channels (``channel="request_context"`` for the new one) — the PR-5
+    #: model the §5.4 shadow diff is built on; the surfaces are the rendering
+    #: leg only. Default ``"legacy_user_message"`` keeps PR 6 a no-op (§5.1):
+    #: with the legacy channel the queue is never populated and every delivery
+    #: surface is inert. Env: ``GOLDFIVE_STEER_SIGNAL_CHANNEL``.
+    signal_channel: str = "legacy_user_message"
+    #: AGENCY-PRESERVATION.md Stage 3 PR 10 — the plan-as-ledger regime
+    #: (design doc ``docs/design/AGENCY-PRESERVATION.md`` §2).
+    #:
+    #: * ``"forecast"`` (the default) — legacy behaviour, BIT-IDENTICAL to
+    #:   pre-PR-10. ``LLMPlanner.generate`` predicts the full task DAG up
+    #:   front; the pin tiers + descriptive growth run as before; no task
+    #:   ever carries a non-FORECAST :attr:`~goldfive.types.Task.kind`.
+    #: * ``"ledger"`` — the Plan becomes a ledger. ``LLMPlanner.generate``
+    #:   produces 1–5 goal-anchored OUTCOME tasks (deliverables, not
+    #:   behaviour forecasts) via a dedicated short prompt; the delegation
+    #:   pin tiers are bypassed so every unforecast delegation grows a
+    #:   DISCOVERED task via the existing descriptive-growth machinery
+    #:   (dedup-hash → grow → pin); ``handle_turn`` produces OUTCOME-shaped
+    #:   revisions. ``StaticPlanner`` users keep forecast semantics — a
+    #:   hand-authored plan is genuine prescriptive intent.
+    #:
+    #: Threaded like ``descriptive_growth_enabled``: consumed at the pin
+    #: path / reconciler / reviser via ``steerer._steering_config`` and
+    #: surfaced to the planner through the per-turn planner ``context``
+    #: the Runner builds. Default ``"forecast"`` keeps the flag OFF until
+    #: AGENCY-PRESERVATION.md PR 13 flips it after the bench gate.
+    #: Env: ``GOLDFIVE_PLAN_MODE``.
+    plan_mode: str = "forecast"
+    #: AGENCY-PRESERVATION.md PR 7 — the one-release escape hatch that restores
+    #: the pre-PR-7 ladder + promotion behaviour.
+    #:
+    #: When ``False`` (the default) the new ladder applies: goldfive-authored
+    #: ``CANCEL_REINVOKE`` cells are demoted to ``SIGNAL`` (advisory note, no
+    #: refine/cancel/steer), repeat-escalation lands on ``PAUSE_ESCALATE``
+    #: (stop-and-ask), and :meth:`~goldfive.drift_observer.DriftObserver._promote_drift_to_steer`
+    #: drops its steering side-effects (no cancel-reason tag, no GOLDFIVE_STEER
+    #: dispatch, no ``active_steer(source="goldfive")`` stamp) — it refines,
+    #: emits ``PlanRevised``, and enqueues a note.
+    #:
+    #: When ``True`` the pre-PR-7 ladder cells (``CANCEL_REINVOKE`` in the
+    #: goldfive-authored rows) and the full promotion side-effects are
+    #: restored — the §5.8 measurable-regression arm (the bench's arm C).
+    #: The two deferred Stage-1 correctness fixes that also land in PR 7 (the
+    #: hard-safety CRITICAL-first stop and the PLAN_DIVERGENCE eligible-kinds
+    #: removal) are NOT toggled by this flag — they apply in both regimes.
+    #: Env: ``GOLDFIVE_STEER_LEGACY_LADDER``.
+    legacy_ladder: bool = False
+    #: AGENCY-PRESERVATION.md Stage 2 PR 9 — Site-4 escape hatch for the
+    #: per-turn ``[CURRENT ASSIGNED TASK]`` instruction pin.
+    #:
+    #: The prompt-shaping diet retires the per-turn task pin (Site 4 of
+    #: :class:`~goldfive.prompt_shaper.PromptShaper`) in the new
+    #: ``signal_channel == "request_context"`` regime: the agent owns its
+    #: own decomposition / ordering and does not need goldfive restating
+    #: the bound task into every model call. When ``True`` the pin is
+    #: re-enabled even under ``request_context`` — an escape hatch for
+    #: trees specifically built around the pinned-task block.
+    #:
+    #: Default ``False``. This GATES NOTHING in the legacy
+    #: ``signal_channel == "legacy_user_message"`` regime (the default):
+    #: there the pin always injects, exactly as pre-PR-9, so every
+    #: existing suite passes unmodified (§5.1). The diet only takes
+    #: effect once an operator opts into ``request_context``; this flag
+    #: then lets them keep the pin if their tree depends on it.
+    #: Env: ``GOLDFIVE_STEER_PIN_ASSIGNED_TASK``.
+    pin_assigned_task: bool = False
+    #: AGENCY-PRESERVATION.md Stage 2 PR 8 — minimum-intervention pacing for
+    #: the observer-note channel. After a note for a ``(drift_kind, task)`` key
+    #: is RENDERED to the agent, that key cannot re-signal or escalate for this
+    #: many *logical turns* (``Session._reasoning_turn`` — the goldfive#441
+    #: clock; one tick per reasoning observation). The window keys on actual
+    #: VISIBILITY (the ObserverNoteQueue's ``delivered_turn``, stamped at
+    #: render), NOT the dispatch turn — under ``request_context`` dispatch and
+    #: render can be turns apart. Detectors keep running; a key resolving inside
+    #: the window still records ``self_corrected_after_signal``. After the
+    #: window the same key re-signals (the 2nd note re-authored quoting the
+    #: first); the 3rd occurrence escalates to a pause (REFINE_FAILURE_THRESHOLD
+    #: semantics).
+    #:
+    #: Default ``3``. ``0`` disables the grace window (every drift re-signals
+    #: immediately — the pre-PR-8 behaviour). Only takes effect under
+    #: ``signal_channel == "request_context"`` (the queue tracks visibility
+    #: there); the legacy regime has no queue notes, so PR 8 is a no-op there
+    #: (§5.1). Env: ``GOLDFIVE_STEER_GRACE_WINDOW_TURNS``.
+    grace_window_turns: int = 3
     #: Wait budget, in milliseconds, substituted when a
     #: ``report_awaiting_approval`` call omits ``timeout_ms`` (or passes
     #: ``<= 0``) and a control channel is attached. Historically that
@@ -797,6 +1061,22 @@ class SteeringConfig:
         * ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES`` — comma-separated rule
           names (goldfive#397). Empty / unset → ``None`` (editor unwired).
           Example: ``GOLDFIVE_STEER_CONTEXT_EDITOR_RULES=prune_cancelled_reasoning``.
+        * ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE`` — ``user_and_safety`` /
+          ``all`` (case-insensitive). ``all`` is the PR-1 kill-switch
+          that restores the legacy cancel-on-every-install behaviour
+          (AGENCY-PRESERVATION.md §5.1).
+        * ``GOLDFIVE_STEER_SIGNAL_CHANNEL`` — ``legacy_user_message`` /
+          ``request_context`` (case-insensitive). Selects the
+          observer-note delivery channel (AGENCY-PRESERVATION.md PR 6);
+          default ``legacy_user_message``.
+        * ``GOLDFIVE_STEER_LEGACY_LADDER`` — boolean. The PR-7 escape hatch
+          restoring the pre-PR-7 ladder cells + promotion side-effects
+          (AGENCY-PRESERVATION.md PR 7 / §5.8); default ``False``.
+        * ``GOLDFIVE_STEER_GRACE_WINDOW_TURNS`` — positive int. The PR-8
+          minimum-intervention grace window in logical turns
+          (AGENCY-PRESERVATION.md PR 8); default ``3``. (Set ``0`` to disable
+          via the typed config; ``_read_int_env`` rejects non-positive env
+          values, so the env minimum is ``1``.)
         * ``GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS`` — positive int
           (milliseconds); non-positive / non-integer values fall back
           to the default.
@@ -832,6 +1112,34 @@ class SteeringConfig:
             descriptive_growth_enabled=_read_bool_env(
                 "GOLDFIVE_STEER_DESCRIPTIVE_GROWTH",
                 defaults.descriptive_growth_enabled,
+            ),
+            signal_telemetry=_read_bool_env(
+                "GOLDFIVE_STEER_SIGNAL_TELEMETRY",
+                defaults.signal_telemetry,
+            ),
+            cancel_inflight_scope=_read_cancel_inflight_scope_env(
+                "GOLDFIVE_CANCEL_INFLIGHT_SCOPE",
+                defaults.cancel_inflight_scope,
+            ),
+            signal_channel=_read_signal_channel_env(
+                "GOLDFIVE_STEER_SIGNAL_CHANNEL",
+                defaults.signal_channel,
+            ),
+            plan_mode=_read_plan_mode_env(
+                "GOLDFIVE_PLAN_MODE",
+                defaults.plan_mode,
+            ),
+            legacy_ladder=_read_bool_env(
+                "GOLDFIVE_STEER_LEGACY_LADDER",
+                defaults.legacy_ladder,
+            ),
+            pin_assigned_task=_read_bool_env(
+                "GOLDFIVE_STEER_PIN_ASSIGNED_TASK",
+                defaults.pin_assigned_task,
+            ),
+            grace_window_turns=_read_int_env(
+                "GOLDFIVE_STEER_GRACE_WINDOW_TURNS",
+                defaults.grace_window_turns,
             ),
             approval_default_timeout_ms=_read_int_env(
                 "GOLDFIVE_STEER_APPROVAL_DEFAULT_TIMEOUT_MS",

@@ -24,7 +24,7 @@ bounded note-buffer family (``note_agent_activity`` /
 machinery: ``handle_drift`` (the central drift-routing method),
 ``_promote_drift_to_steer`` (audit issue #402 — dispatch-before-plan-swap
 ordering is preserved here, not fixed), the intervention ladder
-(``_ladder_level_for`` / ``_LADDER``), ladder
+(``_ladder_level_for`` / ``_LADDER`` / ``_LADDER_LEGACY``), ladder
 dispatch (``_dispatch_nudge`` / ``_dispatch_goldfive_steer_control`` /
 ``_dispatch_goldfive_pause_control`` / ``_dispatch_pause_escalate``),
 adapter cancel tagging, the late-drift gate
@@ -58,9 +58,9 @@ Responsibilities (this PR)
 * :meth:`_is_terminal_drift` + :attr:`_TERMINAL_DRIFT_KINDS` — the
   whitelist of drift kinds that trigger plugin-side boundary cleanup
   on emit. ``LOOPING_REASONING`` is **deliberately excluded** — its
-  CRITICAL-first tier maps to ``NUDGE`` (recoverable); the eventual
-  ``HUMAN_INTERVENTION_REQUIRED`` emission on escalation is the
-  cleanup trigger.
+  CRITICAL-first tier maps to ``SIGNAL`` (recoverable; PR 7 renamed
+  ``NUDGE``); the eventual ``HUMAN_INTERVENTION_REQUIRED`` emission on
+  escalation is the cleanup trigger.
 
 * :meth:`_resolve_authored_by` + :attr:`_USER_AUTHORED_DRIFT_KINDS`
   + :meth:`_drift_annotation_id` — source-attribution helpers.
@@ -135,6 +135,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -147,9 +148,11 @@ from goldfive.drift import (
     classify_stop_reason,
     classify_tool_error,
 )
+from goldfive.task_state_machine import OUTCOME_JUDGE_SOURCE
 from goldfive.types import (
     RECENT_EVENT_AGENT_ACTIVITY_KINDS,
     RECENT_EVENT_KIND_TOOL_OBSERVED,
+    TERMINAL_TASK_STATUSES,
     CancellationRequest,
     DriftEvent,
     DriftKind,
@@ -157,9 +160,13 @@ from goldfive.types import (
     RefineOutcome,
     Session,
     Task,
+    TaskKind,
     TaskStatus,
     _uuid_hex,
+    channel_processor_active,
     filter_recent_events_by_kind,
+    replace_task,
+    set_session_plan,
 )
 
 if TYPE_CHECKING:
@@ -210,6 +217,19 @@ def _nearest_rank_percentile(sorted_samples: list[int], q: float) -> int:
 
 
 log = logging.getLogger(__name__)
+
+
+def _signal_channel_of(steerer):
+    """Resolve the signal channel via :func:`goldfive.steerer.signal_channel`.
+
+    Lazy-import shim: this module cannot import :mod:`goldfive.steerer` at
+    load time (the steerer constructs :class:`DriftObserver`), so the shared
+    single-default helper is reached per call. Import cost is a dict hit
+    after the first call.
+    """
+    from goldfive.steerer import signal_channel
+
+    return signal_channel(steerer)
 # Wave C bucket 3b/3c post-cleanup: the module previously kept a
 # sibling ``_steerer_log = logging.getLogger("goldfive.steerer")``
 # because the test corpus asserted on ``record.name == "goldfive.steerer"``.
@@ -299,8 +319,8 @@ class DriftObserver:
     #   resume it.
     # * ``LOOPING_REASONING`` is deliberately NOT here despite being
     #   listed in the v15 evidence: it is graduated (INFO / WARNING /
-    #   CRITICAL) and CRITICAL-first maps to ``NUDGE`` (recoverable —
-    #   refine + corrective follow-up). Closing on the LOOPING_REASONING
+    #   CRITICAL) and CRITICAL-first maps to ``SIGNAL`` (recoverable —
+    #   advisory note; PR 7 renamed ``NUDGE``). Closing on the LOOPING_REASONING
     #   emission itself would corrupt the boundary pair when the run
     #   actually recovers. The CRITICAL-repeat path escalates to
     #   ``PAUSE_ESCALATE``, which emits a fresh
@@ -340,6 +360,65 @@ class DriftObserver:
             DriftKind.USER_STEER,
             DriftKind.USER_CANCEL,
             DriftKind.USER_PAUSE,
+        }
+    )
+
+    # AGENCY-PRESERVATION.md PR 1 (goldfive#449/#452): hard-safety drift
+    # kinds — the GUARDRAIL half of the §0 authority split. Together
+    # with :attr:`_USER_AUTHORED_DRIFT_KINDS` these are the ONLY drift
+    # authorities permitted to cancel the wrapped agent's in-flight
+    # invocation under the default ``cancel_inflight_scope=
+    # "user_and_safety"`` policy (see
+    # :meth:`_drift_authorizes_inflight_cancel`).
+    #
+    # Inclusion rationale — a kind belongs here iff it represents
+    # budget/resource protection or run termination, i.e. its job is to
+    # *stop* runaway behaviour (observed fact, no judgment call), not to
+    # redirect a trajectory:
+    #
+    # * ``RESOURCE_EXHAUSTED`` — budget exhaustion. Named explicitly in
+    #   the roadmap's PR-1 entry ("budget exhaustion"). No goldfive-core
+    #   emitter today, but external producers / adapters use the kind;
+    #   a budget trip must retain stop authority wherever it comes from.
+    # * ``RUNAWAY_DELEGATION`` — the AgentTool-per-invoke cap
+    #   (goldfive#130). The backstop for coordinator prompts that
+    #   delegate forever; CRITICAL by construction and named explicitly
+    #   in the roadmap ("runaway delegation").
+    # * ``TOO_MANY_STEPS`` — step-budget trip. Same observed-fact budget
+    #   family as RESOURCE_EXHAUSTED.
+    # * ``TASK_TIMEOUT`` — per-task wall-clock budget. Budget family.
+    # * ``LLM_CALL_TIMEOUT`` — per-LLM-call wall-clock budget
+    #   (goldfive#256 / #271 follow-up). Its plugin-side emitter already
+    #   pairs the drift with a cooperative cancel on the invocation;
+    #   excluding it here would leave the dispatch path's cancel policy
+    #   inconsistent with the emitter's own contract.
+    # * ``HUMAN_INTERVENTION_REQUIRED`` — the ONLY kind the ladder's
+    #   TERMINATE cell maps from (the CRITICAL-repeat pair of its
+    #   ``_LADDER`` row is ``(PAUSE_ESCALATE, TERMINATE)``; verified
+    #   against :meth:`_load_ladder_tables`). The run is stopping for an
+    #   operator; preempting in-flight work is stop authority, not
+    #   steering.
+    #
+    # Deliberately EXCLUDED:
+    #
+    # * ``REPEATED_FAILURE`` — terminal for the *task*, but it is
+    #   goldfive's own refine-failure escalation (a steering artifact,
+    #   not an external budget); its emitter already marked the task
+    #   FAILED and the executor will not resume it.
+    # * The loop/judge/forecast kinds (``LOOPING_*``, ``OFF_TOPIC``,
+    #   ``GOAL_DRIFT``, ``CAPABILITY_MISMATCH``, ``NEW_WORK_DISCOVERED``,
+    #   …) — goldfive-authored steering signals. Under the
+    #   dormant-supervisor identity their corrections arrive at the next
+    #   invocation boundary (nudge replay / GOLDFIVE_STEER restart);
+    #   they never preempt in-flight work.
+    _HARD_SAFETY_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
+        {
+            DriftKind.RESOURCE_EXHAUSTED,
+            DriftKind.RUNAWAY_DELEGATION,
+            DriftKind.TOO_MANY_STEPS,
+            DriftKind.TASK_TIMEOUT,
+            DriftKind.LLM_CALL_TIMEOUT,
+            DriftKind.HUMAN_INTERVENTION_REQUIRED,
         }
     )
 
@@ -597,6 +676,13 @@ class DriftObserver:
         # ``dur=(open)``.
         if self._is_terminal_drift(drift):
             await self._close_open_boundaries_for_terminal_drift(drift)
+
+        # AGENCY-PRESERVATION.md PR 5 (observe-only): record this fire on the
+        # SignalLedger. The single ``DriftDetected`` chokepoint sees every
+        # fire and re-fire exactly once per ``drift_id``; a USER_* fire
+        # resolves open delivered keys as ``user_intervened`` instead. Last,
+        # after the emit, and fully best-effort — gates nothing.
+        await self._note_signal_drift_fire(session, drift)
 
     # ------------------------------------------------------------------
     # SteeringDecisionMade emission (zicato-optimization-surface)
@@ -861,6 +947,526 @@ class DriftObserver:
             await self._steerer._emit(evt)
         except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
             log.debug("policy_applied emit failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Signal telemetry (AGENCY-PRESERVATION.md PR 5 — observe-only)
+    # ------------------------------------------------------------------
+    #
+    # These helpers are the ONLY new behavior PR 5 adds: each records a
+    # SignalLedger fact (gating nothing — §5.1) and emits a SignalDelivered /
+    # SignalOutcome event. They are wired into the real dispatch path (the four
+    # goldfive-authored dispatch decision points + the drift-emit chokepoint +
+    # the task-transition + run-end boundaries) so there is no dead middleware
+    # (§5.6). Every body is best-effort: a ledger or emit failure is logged at
+    # DEBUG and swallowed so dispatch is byte-for-byte unchanged.
+    #
+    # ALL of them short-circuit when ``SteeringConfig.signal_telemetry`` is
+    # off (the default) via :meth:`_signal_telemetry_on`, so with the flag off
+    # PR 5 is a true no-op: no ledger write, no wire event, no observable
+    # change to the event stream every existing suite asserts on (§5.1).
+
+    def _signal_telemetry_on(self) -> bool:
+        """True when ``SteeringConfig.signal_telemetry`` is enabled.
+
+        Default OFF. Gates the observe-only signal-telemetry helpers below so
+        PR 5 ships dark; the §5.4 validation campaign and PR 8 turn it on.
+        """
+        return bool(getattr(self._steerer, "_signal_telemetry_enabled", False))
+
+    async def _emit_signal_delivered(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        *,
+        channel: str,
+        note_text: str,
+        ladder_level: str = "",
+        extra_decision: dict[str, Any] | None = None,
+    ) -> None:
+        """Record + emit a ``SignalDelivered`` for a dispatch decision point.
+
+        ``dry_run`` is ``not _should_inject()`` (== ``observation_only``): the
+        §5.4 shadow-mode flag. The decision payload captures what the dispatch
+        path already computed — ladder level, occurrence count, the
+        cancel-authority verdict (PR 1's gate), promotion flag, and whatever
+        channel-specific ``extra_decision`` the caller passes (plan-swap
+        target ids, the mechanical ``channel_action``) — so the differential
+        report can diff legacy-would-do vs. new-would-do on the same run.
+        """
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.events import SIGNAL_CHANNEL_PROMOTION, signal_delivered_event
+
+            dry_run = not self._steerer._should_inject()
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            kind = drift.kind.value
+            task_id = drift.current_task_id or ""
+            severity = drift.severity.value
+            decision: dict[str, Any] = {
+                "ladder_level": str(ladder_level or ""),
+                "occurrence_count": self._occurrence_count_for_ladder(session, drift),
+                "observation_only": dry_run,
+                "would_cancel_inflight": self._should_request_cancel_for_drift(drift),
+                "authored_by": str(getattr(drift, "authored_by", "") or ""),
+                "suppressed_by_user_steer": bool(
+                    getattr(drift, "suppressed_by_user_steer", False)
+                ),
+                "promotion": channel == SIGNAL_CHANNEL_PROMOTION,
+            }
+            if extra_decision:
+                decision.update(extra_decision)
+            # Ledger first (gates nothing); the ledger's dedup is the
+            # authority — only emit a wire event when the delivery was newly
+            # recorded, so a redelivery of the same drift on the same channel
+            # never produces a duplicate SignalDelivered. ``recorded`` stays
+            # True if the ledger is unavailable (emit for observability).
+            recorded = True
+            try:
+                from goldfive.signal_ledger import SignalLedger
+
+                _, recorded = SignalLedger.for_session(session).record_delivery(
+                    drift_kind=kind,
+                    task_id=task_id,
+                    drift_id=str(getattr(drift, "id", "") or ""),
+                    channel=channel,
+                    turn=turn,
+                    dry_run=dry_run,
+                    severity=severity,
+                    ladder_level=str(ladder_level or ""),
+                    note_text=note_text,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("signal ledger record_delivery failed: %s", exc)
+                recorded = True
+            if not recorded:
+                return
+            seq, event_id = session.next_sequence_and_event_id()
+            evt = signal_delivered_event(
+                session.run_id,
+                seq,
+                drift_id=str(getattr(drift, "id", "") or ""),
+                kind=kind,
+                severity=severity,
+                channel=channel,
+                turn=turn,
+                note_text=note_text,
+                dry_run=dry_run,
+                task_id=task_id,
+                agent_id=drift.current_agent_id or "",
+                decision=decision,
+                session_id=session.id,
+                event_id=event_id,
+            )
+            await self._steerer._emit(evt)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal_delivered emit failed: %s", exc)
+
+    async def _emit_signal_outcome(self, session: Session, entry: Any) -> None:
+        """Emit a ``SignalOutcome`` for a freshly-resolved ledger entry."""
+        try:
+            from goldfive.events import signal_outcome_event
+
+            seq, event_id = session.next_sequence_and_event_id()
+            evt = signal_outcome_event(
+                session.run_id,
+                seq,
+                drift_kind=entry.drift_kind,
+                task_id=entry.task_id,
+                outcome=entry.outcome,
+                turns_to_resolution=entry.turns_to_resolution(),
+                delivery_count=len(entry.deliveries),
+                had_real_delivery=entry.has_real_delivery,
+                session_id=session.id,
+                event_id=event_id,
+            )
+            await self._steerer._emit(evt)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal_outcome emit failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Observer-note channel (AGENCY-PRESERVATION.md PR 6)
+    # ------------------------------------------------------------------
+
+    def _signal_pacing_decision(self, session: Session, drift: DriftEvent) -> str:
+        """Grace-window / escalation gate for a SIGNAL-level or promotion drift.
+
+        AGENCY-PRESERVATION.md PR 8 (minimum-intervention pacing). Returns one
+        of ``"proceed"`` / ``"suppress"`` / ``"escalate"`` for a
+        ``(drift.kind, drift.current_task_id)`` key:
+
+        * ``"suppress"`` — a note for the key was RENDERED within the last
+          ``grace_window_turns`` logical turns; the agent has not yet had a full
+          window to self-correct since it SAW the signal, so do not re-signal or
+          escalate. Keys on the ObserverNoteQueue's render-visibility
+          (``last_rendered_turn``), NOT the SignalLedger dispatch turn (binding
+          requirement: under request_context dispatch and render can be turns
+          apart).
+        * ``"escalate"`` — the key is past its grace window AND has already
+          signalled ``>= REFINE_FAILURE_THRESHOLD`` times (the 3rd-occurrence
+          rule); escalate to a pause rather than signal again.
+        * ``"proceed"`` — signal normally (the 1st note, or the 2nd which
+          ``_route_corrective_note`` re-authors quoting the first).
+
+        Only active under ``signal_channel == "request_context"`` with
+        ``grace_window_turns > 0`` (the queue tracks visibility there). The
+        legacy regime has no queue notes, so this returns ``"proceed"`` and PR 8
+        is a no-op there (§5.1). Best-effort: any failure degrades to
+        ``"proceed"`` so pacing never blocks a legitimate signal.
+        """
+        channel = _signal_channel_of(self._steerer)
+        if channel != "request_context":
+            # Legacy regime: no queue visibility, and the promotion path's #441
+            # gate is unchanged — PR 8 is a no-op here (§5.1).
+            return "proceed"
+        # Ordered gate 1: a fresh user steer suppresses the goldfive signal
+        # (the operator's correction is already in flight). Applies even when
+        # the grace window is disabled.
+        if self._user_steer_is_fresh(session):
+            return "suppress"
+        window = int(getattr(self._steerer, "_grace_window_turns", 0) or 0)
+        if window <= 0:
+            return "proceed"
+        try:
+            from goldfive.observer_note_queue import ObserverNoteQueue
+
+            queue = ObserverNoteQueue.for_session(session)
+            kind = drift.kind.value
+            task = drift.current_task_id or ""
+            current_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            # Ordered gate 2: same-key grace window, keyed on render-VISIBILITY
+            # (the queue's last render turn for the key), not the dispatch turn.
+            last_rendered = queue.last_rendered_turn(kind, task)
+            if last_rendered >= 0 and (current_turn - last_rendered) < window:
+                return "suppress"
+            # Past the window: the 3rd occurrence (>= REFINE_FAILURE_THRESHOLD
+            # prior signals) escalates to a pause. (Ordered gate 3, per-request
+            # coalescing, is enforced at render time by peek_for_render.)
+            if queue.signal_count(kind, task) >= self._steerer.REFINE_FAILURE_THRESHOLD:
+                return "escalate"
+            return "proceed"
+        except Exception as exc:  # noqa: BLE001 -- pacing must never wedge dispatch
+            log.debug("signal pacing decision failed: %s", exc)
+            return "proceed"
+
+    async def _apply_signal_pacing(
+        self, session: Session, drift: DriftEvent, decision: str
+    ) -> bool:
+        """Act on a non-``proceed`` :meth:`_signal_pacing_decision`.
+
+        Returns ``True`` when the caller should STOP (the signal was suppressed
+        or replaced by an escalation), ``False`` when it should proceed to the
+        normal signal dispatch. Centralises the suppress / escalate handling so
+        the promotion path and the ladder SIGNAL branch stay identical.
+        """
+        if decision == "suppress":
+            log.debug(
+                "DefaultSteerer: signal suppressed by grace window (kind=%s task=%s)",
+                drift.kind.value,
+                drift.current_task_id or "-",
+            )
+            return True
+        if decision == "escalate":
+            log.info(
+                "DefaultSteerer: signal escalated to pause — key re-signalled "
+                ">= REFINE_FAILURE_THRESHOLD times past its grace window "
+                "(kind=%s task=%s)",
+                drift.kind.value,
+                drift.current_task_id or "-",
+            )
+            await self._dispatch_pause_escalate(drift, session)
+            await self._record_signal_outcome_escalated(session, drift)
+            return True
+        return False
+
+    async def _route_corrective_note(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        note_text: str,
+        *,
+        ladder_level: str,
+        plan_revision_installed: bool = False,
+    ) -> None:
+        """Route a composed observer note to the configured delivery channel.
+
+        Both channels emit ``SignalDelivered`` at the **dispatch decision
+        point** (here) — the PR-5 model the §5.4 shadow/differential diff is
+        built on (the divergence report compares the *decisions* the legacy
+        and new regimes make on the same run, not delivery mechanics). The
+        only difference is *where the note is queued* and *how it is rendered*:
+
+        * ``signal_channel="legacy_user_message"`` (default) — append to
+          ``session.pending_nudges``; the executor's boundary nudge-replay
+          renders it. ``channel="nudge_replay"``. The enqueue is gated on
+          :meth:`DefaultSteerer.is_active_steering` (goldfive#475): the
+          overlay drains the queue into a goldfive-authored user turn that
+          re-invokes the tree — an injection, not an observation — so under
+          ``observation_only`` the would-be note is logged, the gate is
+          stamped as ``PolicyApplied`` decision telemetry, and
+          ``SignalDelivered`` still records the *decision* (with
+          ``dry_run=True``) so the §5.4 shadow diff sees it.
+        * ``signal_channel="request_context"`` (PR 6) — enqueue onto the
+          :class:`~goldfive.observer_note_queue.ObserverNoteQueue`; the four
+          observer-note surfaces render it, each marking the queue's
+          ``delivered`` flag so the note is *rendered* exactly once across
+          surfaces. ``channel="request_context"``. Whether the note actually
+          reaches the agent is gated on ``observation_only`` at the surface,
+          which is exactly what ``dry_run`` (== ``observation_only``) records
+          on this event — so the event and the mechanism never disagree.
+
+        ``plan_revision_installed`` threads the ``_apply_revision`` install
+        fact from the post-ABSORB handoff: when the legacy enqueue actually
+        happens it stamps ``session.pending_nudges_revision_installed`` so
+        the executor's replay header only claims a plan revision when one
+        truly installed (goldfive#475 truthfulness).
+        """
+        channel = _signal_channel_of(self._steerer)
+        if channel == "request_context":
+            from goldfive.events import SIGNAL_CHANNEL_REQUEST_CONTEXT
+            from goldfive.observer_note_queue import ObserverNoteQueue
+            from goldfive.observer_notes import observation_for_drift
+
+            try:
+                queue = ObserverNoteQueue.for_session(session)
+                kind = drift.kind.value
+                task = drift.current_task_id or ""
+                observation, _question = observation_for_drift(drift)
+                # AGENCY-PRESERVATION.md PR 8: the 2nd signal for a
+                # ``(kind, task)`` key is re-authored quoting the first — a
+                # self-reference is a lower-footprint reminder than a fresh
+                # statement, and it tells the agent goldfive is repeating, not
+                # raising a new concern. (The 1st signal, the grace-window
+                # suppression of in-window re-fires, and the 3rd-occurrence
+                # escalation are all decided in ``_signal_pacing_decision``
+                # before we get here; this only threads the quote into the
+                # body when exactly one prior SIGNAL note for the key
+                # exists.) Truthfulness gates on the claim (§0 — goldfive
+                # never lies to the agent):
+                #
+                # * priors are SIGNAL notes only (``signal_notes``) — a
+                #   task-#11 correction note is a plan-revision notice, not
+                #   "an earlier observer note" about this drift, so quoting
+                #   it here would be a false claim;
+                # * the prior must have been actually RENDERED to the agent
+                #   (``delivered`` and not ``delivered_dry_run``) — "This
+                #   repeats an earlier observer note" is only true if the
+                #   agent SAW that note; an enqueued-but-never-rendered or
+                #   dry-run-consumed prior repeats nothing the agent saw,
+                #   so the 2nd note composes without the claim.
+                body = note_text
+                priors = queue.signal_notes(kind, task)
+                if len(priors) == 1:
+                    prior = priors[0]
+                    first_obs = (prior.observation or "").strip()
+                    if first_obs and prior.delivered and not prior.delivered_dry_run:
+                        body = (
+                            f"{note_text}\n\nThis repeats an earlier observer "
+                            f'note for this work, which observed: "{first_obs}". '
+                            f"That situation appears unchanged."
+                        )
+                queue.enqueue(
+                    body=body,
+                    observation=observation,
+                    severity=drift.severity.value,
+                    drift_id=str(getattr(drift, "id", "") or ""),
+                    kind=kind,
+                    task_id=task,
+                    agent_id=drift.current_agent_id or "",
+                    turn=int(getattr(session, "_reasoning_turn", 0) or 0),
+                    ladder_level=ladder_level,
+                )
+            except Exception as exc:  # noqa: BLE001 -- best-effort enqueue
+                log.debug("observer-note enqueue failed: %s", exc)
+            await self._emit_signal_delivered(
+                session,
+                drift,
+                channel=SIGNAL_CHANNEL_REQUEST_CONTEXT,
+                note_text=note_text,
+                ladder_level=ladder_level,
+                extra_decision={"channel_action": "enqueued"},
+            )
+            return
+
+        # Legacy channel — the pre-PR-6 behaviour, with the goldfive#475
+        # observation-only gate: the queued note would be drained by the
+        # overlay's replay path into a goldfive-authored user turn that
+        # re-invokes the tree — an injection, not an observation. Skip the
+        # enqueue, log the would-be message, and stamp the gate as decision
+        # telemetry, mirroring ``_dispatch_goldfive_steer_control``. The
+        # executor's drain gate (#475 defense-in-depth) still covers custom
+        # steerer subclasses / direct ``session.pending_nudges`` writers.
+        from goldfive.events import SIGNAL_CHANNEL_NUDGE_REPLAY
+
+        if not self._steerer.is_active_steering():
+            log.info(
+                "DriftObserver._route_corrective_note: observation_only=True "
+                "— SKIPPING nudge enqueue. would_have_queued kind=%s "
+                "task=%s body=%r",
+                drift.kind.value,
+                drift.current_task_id or "-",
+                note_text[:200],
+            )
+            # Keep the goldfive#475 per-site stamp vocabulary: the Level-2
+            # ``_dispatch_nudge`` suppression reads ``intervention=nudge``,
+            # the post-ABSORB handoff reads ``intervention=post_absorb_nudge``
+            # — operators (and the #475 regression tests) tell the two
+            # enqueue sites apart by this label.
+            intervention = (
+                "post_absorb_nudge" if ladder_level == "absorb" else "nudge"
+            )
+            await self._emit_policy_applied(
+                session=session,
+                policy_name="observation_only_gate",
+                outcome="suppressed",
+                reason="observation_only=True",
+                detail=(
+                    f"intervention={intervention} "
+                    f"ladder_level={ladder_level} "
+                    f"kind={drift.kind.value} "
+                    f"task_id={drift.current_task_id or ''}"
+                ),
+            )
+            await self._emit_signal_delivered(
+                session,
+                drift,
+                channel=SIGNAL_CHANNEL_NUDGE_REPLAY,
+                note_text=note_text,
+                ladder_level=ladder_level,
+                extra_decision={"channel_action": "suppressed"},
+            )
+            return
+        session.pending_nudges.append(note_text)
+        # Thread the install fact to the overlay so the replay header only
+        # claims a plan revision when ``_apply_revision`` actually
+        # installed one.
+        if plan_revision_installed:
+            session.pending_nudges_revision_installed = True
+        await self._emit_signal_delivered(
+            session,
+            drift,
+            channel=SIGNAL_CHANNEL_NUDGE_REPLAY,
+            note_text=note_text,
+            ladder_level=ladder_level,
+            extra_decision={"channel_action": "queued"},
+        )
+
+    async def _note_signal_drift_fire(self, session: Session, drift: DriftEvent) -> None:
+        """Record a drift fire on the ledger (or a user-intervention outcome).
+
+        Wired into :meth:`_emit_drift_detected` — the single chokepoint every
+        ``DriftDetected`` flows through — so the ledger sees every fire and
+        re-fire exactly once per ``drift_id``. A USER_STEER / USER_CANCEL fire
+        is NOT a goldfive signal key: it resolves every open, delivered key as
+        ``user_intervened`` instead of opening a ``(USER_*, task)`` entry.
+        """
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.signal_ledger import SignalLedger
+
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            ledger = SignalLedger.for_session(session)
+            authored_by = str(getattr(drift, "authored_by", "") or "").lower()
+            # USER_PAUSE is a NON-terminal user control (the run resumes after a
+            # later RESUME), and it carries ``authored_by="user"`` — so it would
+            # otherwise fall into the terminal ``resolve_user_intervened`` branch
+            # below and black-hole every open signal key as ``user_intervened``,
+            # losing all post-resume outcome telemetry. Guard it explicitly: a
+            # pause is neither a goldfive signal (no key opened) nor a terminal
+            # intervention (no keys resolved) — leave open keys open.
+            if drift.kind is DriftKind.USER_PAUSE:
+                return
+            # USER_STEER / USER_CANCEL are TERMINAL user interventions: they
+            # resolve every open, delivered key as ``user_intervened`` rather
+            # than opening a ``(USER_*, task)`` signal entry.
+            if authored_by == "user" or drift.kind in self._USER_AUTHORED_DRIFT_KINDS:
+                for entry in ledger.resolve_user_intervened(turn=turn):
+                    await self._emit_signal_outcome(session, entry)
+                return
+            ledger.record_fire(
+                drift_kind=drift.kind.value,
+                task_id=drift.current_task_id or "",
+                turn=turn,
+                drift_id=str(getattr(drift, "id", "") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal ledger fire note failed: %s", exc)
+
+    async def _record_signal_outcome_escalated(
+        self, session: Session, drift: DriftEvent
+    ) -> None:
+        """Resolve the drift's ledger key as ``escalated`` (pause dispatch)."""
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.signal_ledger import SignalLedger
+
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            entry = SignalLedger.for_session(session).resolve_escalated(
+                drift_kind=drift.kind.value,
+                task_id=drift.current_task_id or "",
+                turn=turn,
+            )
+            if entry is not None:
+                await self._emit_signal_outcome(session, entry)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal ledger escalation note failed: %s", exc)
+
+    async def record_signal_outcomes_for_task(
+        self, session: Session, task_id: str
+    ) -> None:
+        """Resolve open, delivered keys bound to a now-terminal ``task_id``.
+
+        Public so :class:`~goldfive.task_state_machine.TaskStateMachine` can
+        call it from its task-transition emit chokepoint
+        (``self._steerer.drift.record_signal_outcomes_for_task``). Conservative
+        "resolved" detection: terminal task state only (never over-claims).
+        """
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.signal_ledger import SignalLedger
+
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            # AGENCY-PRESERVATION.md PR 8 (binding requirement, #462 review):
+            # attribute ``after_signal`` by VISIBILITY, not dispatch. Under
+            # request_context the queue's render-set is the source of truth — a
+            # note dispatched (recorded in the ledger) but never RENDERED
+            # resolves ``self_corrected_unaided``. In the legacy regime the
+            # queued message IS the delivery, so ``rendered_keys=None`` keeps
+            # the dispatch-time ``has_real_delivery`` attribution.
+            rendered_keys: set[tuple[str, str]] | None = None
+            if (
+                _signal_channel_of(self._steerer)
+                == "request_context"
+            ):
+                from goldfive.observer_note_queue import ObserverNoteQueue
+
+                rendered_keys = ObserverNoteQueue.for_session(session).rendered_keys()
+            for entry in SignalLedger.for_session(session).resolve_task(
+                task_id=str(task_id or ""), turn=turn, rendered_keys=rendered_keys
+            ):
+                await self._emit_signal_outcome(session, entry)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal ledger task-resolution note failed: %s", exc)
+
+    async def finalize_signal_ledger(self, session: Session) -> None:
+        """Resolve every still-open, delivered key as ``invocation_ended``.
+
+        Wired into the executor's run-boundary drain so it fires once per run
+        end. Idempotent (a second call finds nothing open).
+        """
+        if not self._signal_telemetry_on():
+            return
+        try:
+            from goldfive.signal_ledger import SignalLedger
+
+            turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            for entry in SignalLedger.for_session(session).finalize_open(turn=turn):
+                await self._emit_signal_outcome(session, entry)
+        except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+            log.debug("signal ledger finalize failed: %s", exc)
 
     async def _emit_judgement_from_drift(
         self, session: Session, drift: DriftEvent
@@ -1438,18 +2044,90 @@ class DriftObserver:
         description: str,
         assignee: str = "",
     ) -> None:
-        """Fire a ``NEW_WORK_DISCOVERED`` drift event → triggers refine."""
+        """Absorb agent-reported new work as descriptive growth (no refine).
+
+        AGENCY-PRESERVATION.md PR 3: the agent-authored
+        ``report_new_work_discovered`` reporting tool used to fire a
+        WARNING ``NEW_WORK_DISCOVERED`` drift through
+        :meth:`handle_drift`, which routed to ``planner.refine`` — i.e.
+        goldfive re-forecast the plan because the agent found work its
+        upfront forecast missed. That is exactly the "Plan is a forecast
+        the agent is graded against" defect (§1.2) and violates
+        PLAN-DESCRIPTIVE-GROWTH.md §13 ("adaptive, not predictive").
+
+        The reroute absorbs the report as a ``discovered=True`` ledger
+        task via
+        :meth:`~goldfive.plan_reviser.PlanReviser.install_descriptive_growth`
+        instead — the same absorb-as-growth machinery the pin-time and
+        reconciler paths use (goldfive#423 / PR 2). Observability is
+        preserved: ``install_descriptive_growth`` emits the
+        ``PlanRevised`` + ``DriftDetected`` pair (the drift is INFO —
+        "observational, not corrective", design doc §4.6 — a deliberate
+        severity drop from the old WARNING, since absorbed new work is
+        not a steering signal).
+
+        The agent's verbatim ``title`` / ``description`` are passed
+        through as overrides so the ledger task keeps the reported text.
+        ``tool_args_json`` encodes ``(parent_task_id, title,
+        description)`` purely to seed the dedup identity hash: a repeated
+        identical report is idempotent (dedup hit, no second task) while
+        two genuinely different reports under the same assignee stay
+        distinct.
+
+        The discovered task lands as an independent sub-DAG root (no edge
+        back to ``parent_task_id``); the forecast-DAG parent link the old
+        refine path could draw is intentionally not reconstructed — the
+        ledger records *what happened*, not a predicted decomposition.
+
+        Defensive fallback: when the bound steerer is a stub without
+        ``plans.install_descriptive_growth`` (some unit-test doubles),
+        emit a ``DriftDetected`` directly so the observability signal is
+        never silently dropped. Never routes back through
+        ``planner.refine``.
+        """
         detail = f"new work under {parent_task_id}: {title}: {description}" + (
             f" (assignee={assignee})" if assignee else ""
         )
+        plans = getattr(self._steerer, "plans", None)
+        install = getattr(plans, "install_descriptive_growth", None)
+        if callable(install):
+            # Seed the dedup identity from the full report so distinct
+            # reports don't collide and identical re-reports dedup.
+            tool_args_json = json.dumps(
+                {
+                    "parent_task_id": parent_task_id,
+                    "title": title,
+                    "description": description,
+                },
+                sort_keys=True,
+            )
+            try:
+                await install(
+                    session,
+                    agent_name=assignee or "",
+                    tool_args_json=tool_args_json,
+                    title=title,
+                    description=description,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 — growth is best-effort
+                log.debug(
+                    "DefaultSteerer.report_new_work_discovered: "
+                    "install_descriptive_growth raised: %s; falling back "
+                    "to direct DriftDetected emit",
+                    exc,
+                )
+        # Fallback (stub steerer / growth unavailable): preserve the
+        # observability signal without any refine/steer side effect.
         drift = DriftEvent(
             kind=DriftKind.NEW_WORK_DISCOVERED,
-            severity=DriftSeverity.WARNING,
+            severity=DriftSeverity.INFO,
             detail=detail,
             current_task_id=parent_task_id,
             current_agent_id=assignee,
+            authored_by="goldfive",
         )
-        await self.handle_drift(drift, session)
+        await self._emit_drift_detected(session, drift)
 
     async def report_plan_divergence(
         self,
@@ -2188,6 +2866,10 @@ class DriftObserver:
                 agent_name=agent_name,
                 available_agents=judge_available_agents,
                 reasoning_history=pinned_history,
+                # AGENCY-PRESERVATION.md PR 11(b) — ledger mode
+                # re-grounds the judge on goals (primary) with the
+                # bound task as context.
+                ledger=self._ledger_mode(),
             )
 
             # Verdict-utility ledger — latency + quiet-fail accounting.
@@ -3176,7 +3858,9 @@ class DriftObserver:
         session._agent_turns_since_goal_check = 0
         self._spawn_goal_drift_judge_background(session)
 
-    async def _maybe_run_goal_drift_on_task_boundary(self, session: Session) -> None:
+    async def _maybe_run_goal_drift_on_task_boundary(
+        self, session: Session, transitioned_task: Task | None = None
+    ) -> None:
         """Fire :meth:`maybe_run_goal_drift_check` on a task transition.
 
         Task completions / failures / cancellations are natural
@@ -3218,6 +3902,19 @@ class DriftObserver:
         :meth:`_run_judge_background` — keeps it alive across cancel
         propagation and drainable at :meth:`shutdown`.
         """
+        # AGENCY-PRESERVATION.md PR 11(c) re-entrancy guard: an OUTCOME
+        # task only transitions via goldfive's own outcome-progress judge
+        # (the agent never reports on deliverables). Those transitions are
+        # judge-authored bookkeeping, not agent progress, so re-firing the
+        # task-boundary cadence on them adds no information and would loop
+        # (outcome judge marks an OUTCOME COMPLETED → mark_task_completed
+        # → this hook → re-judge → …). Skip the whole cadence on OUTCOME
+        # transitions. A no-op in forecast mode (no OUTCOME-kind tasks).
+        if (
+            transitioned_task is not None
+            and getattr(transitioned_task, "kind", None) is TaskKind.OUTCOME
+        ):
+            return
         if self._steerer._goal_drift_call_llm is None:
             return
         now = time.time()
@@ -3229,6 +3926,108 @@ class DriftObserver:
         # fresh rather than firing one more judge call on the next turn.
         session._agent_turns_since_goal_check = 0
         self._spawn_goal_drift_judge_background(session)
+        # AGENCY-PRESERVATION.md PR 11(c): in ledger mode the task boundary
+        # is also where met OUTCOME deliverables transition to COMPLETED.
+        # Fire-and-forget + single-in-flight (see the spawn helper).
+        self._spawn_outcome_progress_background(session)
+
+    def _ledger_mode(self) -> bool:
+        """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 11. Delegates to
+        :func:`goldfive.steerer.plan_mode_is_ledger` — the single
+        implementation of the parse. Defensive: any failure resolves to
+        forecast mode, so the goal-drift judge stays on its pre-PR-11
+        binary/CRITICAL path by default.
+        """
+        try:
+            from goldfive.steerer import plan_mode_is_ledger
+
+            return plan_mode_is_ledger(self._steerer)
+        except Exception:  # noqa: BLE001
+            return False
+
+    #: AGENCY-PRESERVATION.md Stage 3 PR 12 — the looping kinds whose
+    #: ledger-mode rung is a deterministic force-FAIL of the bound task.
+    #: A loop on a DISCOVERED task means that unit of means-level work is
+    #: stuck and there is no forecast to route around, so the
+    #: deterministic looping fallback (planner ``_refine_looping_tool_call``
+    #: in forecast mode) reduces to "fail the looping ledger task".
+    _LEDGER_FORCE_FAIL_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
+        {DriftKind.LOOPING_TOOL_CALL, DriftKind.LOOPING_REASONING}
+    )
+
+    async def _ledger_retire_refine(self, drift: DriftEvent, session: Session) -> None:
+        """Ledger-mode substitute for the drift-triggered forecast-repair refine.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 12. In ledger plan mode there is
+        no forecast plan to repair, so a goldfive-authored drift that would
+        otherwise reach ``planner.refine`` (ladder ABSORB/CANCEL_REINVOKE)
+        or ``refine_steer`` (promotion) instead takes one of the ledger
+        rungs:
+
+        * **hard-safety kinds** (:attr:`_HARD_SAFETY_DRIFT_KINDS`, e.g.
+          ``RUNAWAY_DELEGATION`` — the only one that reaches here, the
+          others being PAUSE_ESCALATE-first and returning earlier) →
+          **PAUSE_ESCALATE** (stop-and-ask). Their forecast
+          CANCEL_REINVOKE follow-on depended on the refine's revised plan
+          to route around the offending subtree: the GOLDFIVE_STEER
+          restart carries ``replacement_task_ids`` picked from the
+          POST-refine ``session.plan`` (audit #402). In ledger mode there
+          is no refine to produce that plan, so a note-replay would just
+          re-invoke the same coordinator on the same plan and likely
+          re-trip the guardrail. The hard-safety CANCEL itself already
+          fired earlier in :meth:`_handle_drift_dispatch` (mode-agnostic);
+          this is purely the post-cancel disposition, and stop-and-ask is
+          the safe choice — consistent with PR 7's PAUSE_ESCALATE-first
+          treatment of the other hard-safety kinds.
+        * **looping kinds** (:data:`_LEDGER_FORCE_FAIL_DRIFT_KINDS`) with a
+          bound task → **force-FAIL** the bound ledger task. ``recoverable``
+          is True — a sibling/replacement DISCOVERED task may still cover
+          the work, and the outcome-progress judge (PR 11) still grades the
+          OUTCOME deliverables independently.
+        * **everything else** → enqueue the advisory observer **note** (the
+          SIGNAL rung's trajectory-preserving influence), via
+          :meth:`_dispatch_nudge`.
+
+        The PAUSE_ESCALATE / SIGNAL / OBSERVE rungs never reach here — they
+        return earlier in :meth:`_handle_drift_dispatch` and are already
+        mode-agnostic. USER_STEER, ``handle_turn`` replans, and descriptive
+        absorption are SEPARATE dispatch paths and keep their refine. Never
+        raises into the dispatch.
+        """
+        if drift.kind in self._HARD_SAFETY_DRIFT_KINDS:
+            # Hard-safety guardrail whose productive continuation needed the
+            # refine (see docstring). No refine in ledger mode → stop-and-ask.
+            await self._dispatch_pause_escalate(drift, session)
+            return
+        task_id = drift.current_task_id or ""
+        if drift.kind in self._LEDGER_FORCE_FAIL_DRIFT_KINDS and task_id:
+            reason = (
+                f"ledger force-fail (loop): {drift.detail}"
+                if drift.detail
+                else f"ledger force-fail (loop): {drift.kind.value}"
+            )
+            try:
+                await self._steerer.tasks.mark_task_failed(
+                    task_id,
+                    session=session,
+                    reason=reason,
+                    recoverable=True,
+                    source="goldfive_ledger_refine_retire",
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 — never break the run
+                log.warning(
+                    "DefaultSteerer._ledger_retire_refine: force-fail of %r "
+                    "raised (falling back to note): %s",
+                    task_id,
+                    exc,
+                )
+        # Default rung: the advisory note. Trajectory-preserving influence
+        # instead of repairing a forecast that does not exist in ledger
+        # mode.
+        await self._dispatch_nudge(drift, session)
 
     async def maybe_run_goal_drift_check(
         self, session: Session, *, idle_note: str = ""
@@ -3284,6 +4083,10 @@ class DriftObserver:
             model=self._steerer._goal_drift_model,
             call_llm=call_llm,
             current_task_id=session.current_task_id,
+            # AGENCY-PRESERVATION.md PR 11(a) — in ledger mode the judge
+            # uses the graduated (uncertain → WARNING / off_track →
+            # CRITICAL) verdict and reads the plan as the ledger.
+            graduated=self._ledger_mode(),
             sinks=self._steerer._sinks,
             run_id=session.run_id,
             session_id=session.id,
@@ -3401,6 +4204,263 @@ class DriftObserver:
                 "(swallowed): %s",
                 exc,
             )
+
+    # ------------------------------------------------------------------
+    # AGENCY-PRESERVATION.md PR 11(c): outcome-progress judge.
+    #
+    # In ledger plan mode the Plan is a ledger of OUTCOME deliverables +
+    # a DISCOVERED trajectory. The wrapped agent never reports on OUTCOME
+    # tasks, so they reach a terminal status only via goldfive's own
+    # judge here. Run completion ("all outcomes terminal") is therefore
+    # decided WITHOUT agent cooperation. Two cadences:
+    #   * task boundary — fire-and-forget, completes MET deliverables as
+    #     they are achieved (``_spawn_outcome_progress_background``);
+    #   * run end — awaited finalize, completes MET + fails CONFIDENTLY-
+    #     unmet, leaving uncertain deliverables PENDING to carry forward
+    #     (``finalize_outcomes``).
+    # All ledger-gated; a no-op in forecast mode.
+    # ------------------------------------------------------------------
+
+    async def finalize_outcomes(self, session: Session) -> None:
+        """Judge + finalize OUTCOME deliverables at the run boundary.
+
+        Awaited (not fire-and-forget) so the transitions land BEFORE the
+        executor's end-of-overlay PENDING disposition (goldfive#208) and
+        the fatal-failure gate read it. Ledger-gated; no-op otherwise.
+        """
+        await self._run_outcome_progress(session, run_ending=True)
+
+    def _spawn_outcome_progress_background(self, session: Session) -> None:
+        """Fire-and-forget the task-boundary outcome-progress judge.
+
+        Single-in-flight per session (``session._outcome_progress_inflight``):
+        a second task boundary that lands while one judge is mid-flight
+        does not stack a second judge — the in-flight one already sees the
+        latest plan. Tracked on ``_background_judges`` so :meth:`shutdown`
+        drains it, matching the goal-drift background pattern. No-op when
+        not in ledger mode, when no judge ``call_llm`` is configured, or
+        when no event loop is running.
+        """
+        if not self._ledger_mode() or self._steerer._goal_drift_call_llm is None:
+            return
+        if getattr(session, "_outcome_progress_inflight", False):
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        session._outcome_progress_inflight = True
+        bg_task = asyncio.create_task(
+            self._run_outcome_progress_background(session),
+            name=f"goldfive-outcome-progress:{session.id}",
+        )
+        self._steerer._background_judges.add(bg_task)
+        bg_task.add_done_callback(self._steerer._background_judges.discard)
+
+    async def _run_outcome_progress_background(self, session: Session) -> None:
+        """Body of the fire-and-forget task-boundary outcome-progress judge."""
+        try:
+            await self._run_outcome_progress(session, run_ending=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — background task
+            log.warning(
+                "DefaultSteerer: background outcome-progress judge raised "
+                "(swallowed): %s",
+                exc,
+            )
+        finally:
+            session._outcome_progress_inflight = False
+
+    async def _run_outcome_progress(self, session: Session, *, run_ending: bool) -> None:
+        """Judge non-terminal OUTCOME tasks and apply the transitions.
+
+        Ledger-gated shared body for both cadences. Quiet on every failure
+        (the judge module never raises into the run). User goal predicates
+        remain authoritative: a predicate that is explicitly unmet blocks
+        LLM-driven completion.
+        """
+        if not self._ledger_mode():
+            return
+        call_llm = self._steerer._goal_drift_call_llm
+        if call_llm is None:
+            return
+        plan = session.plan
+        outcome_tasks = [
+            t
+            for t in (getattr(plan, "tasks", None) or ())
+            if getattr(t, "kind", None) is TaskKind.OUTCOME
+            and getattr(t, "status", None) not in TERMINAL_TASK_STATUSES
+        ]
+        if not outcome_tasks:
+            return
+        from goldfive.drift.outcome_progress import (
+            evaluate_outcome_progress,
+            plan_outcome_transitions,
+        )
+
+        verdicts = await evaluate_outcome_progress(
+            goals=session.goals,
+            plan=plan,
+            completed_outputs=getattr(session, "completed_outputs", None),
+            model=self._steerer._goal_drift_model,
+            call_llm=call_llm,
+            sinks=self._steerer._sinks,
+            run_id=session.run_id,
+            session_id=session.id,
+            sequence_fn=session.next_sequence,
+        )
+        if not verdicts:
+            return
+        from goldfive.results import evaluate_goal_predicates
+
+        predicates_met = evaluate_goal_predicates(session) is None
+        transitions = plan_outcome_transitions(
+            plan,
+            verdicts,
+            run_ending=run_ending,
+            goal_predicates_met=predicates_met,
+        )
+        # ``plan`` is the snapshot the verdicts were computed against
+        # BEFORE the judge's LLM round-trip; ``session.plan`` may have
+        # been revised in between (a USER_STEER refine can regenerate
+        # OUTCOME deliverables under reused ids). Pass the snapshot so the
+        # apply path can drop any verdict whose target no longer matches.
+        await self._apply_outcome_transitions(
+            session, transitions, snapshot_plan=plan, run_ending=run_ending
+        )
+
+    @staticmethod
+    def _outcome_stability_token(task: Any) -> tuple[str, str]:
+        """Stability token for an OUTCOME task's identity across a revision.
+
+        Pairs the ledger ``kind`` with the (normalised) title. A verdict
+        computed against a snapshot task is only safe to apply to the live
+        task of the same id when this token still matches — a reused id
+        carrying a different deliverable (different kind or title) is a
+        distinct task the stale verdict must not touch.
+        """
+        kind = getattr(task, "kind", None)
+        kind_str = str(getattr(kind, "value", kind) or "")
+        title = (getattr(task, "title", "") or "").strip()
+        return (kind_str, title)
+
+    async def _apply_outcome_transitions(
+        self,
+        session: Session,
+        transitions: list[Any],
+        *,
+        snapshot_plan: Any | None = None,
+        run_ending: bool = False,
+    ) -> None:
+        """Apply outcome transitions: stamp contributes_to, then transition.
+
+        ``contributes_to`` stamps land first in a single
+        channel-processor envelope (one plan rebuild for all stamps);
+        then each OUTCOME task is transitioned via the task state machine
+        so the normal TaskCompleted / TaskFailed events + cascade fire.
+        Marking an OUTCOME terminal re-enters ``mark_task_*`` → the
+        task-boundary hook, which the PR 11(c) OUTCOME-skip guard
+        short-circuits, so this does not recurse.
+
+        ``run_ending=True`` (the ``finalize_outcomes`` cadence) suppresses
+        the FAILED transitions' advisory drift cascade: the run is over, so
+        the cascade's observer note / nudge could never be delivered to the
+        agent — dispatching it would only pollute signal telemetry with
+        forever-pending notes and phantom fire records. The FAILED status,
+        ``TaskFailed`` / ``TaskTransitioned`` events, and ledger
+        finalization all still land; only the never-deliverable signal
+        dispatch is skipped.
+
+        ``snapshot_plan`` (when supplied) is the plan the verdicts were
+        computed against, before the judge's LLM round-trip. The freshness
+        gate below mirrors the reasoning-judge late-verdict discipline
+        (goldfive#319): the evaluate → apply gap yields the event loop, so
+        a concurrent USER_STEER refine may have swapped ``session.plan``.
+        A transition is applied only when the LIVE task of the same id
+        still carries the snapshot's stability token and is non-terminal;
+        otherwise the verdict is stale (the deliverable it graded is gone
+        or has been replaced under the same id) and is skipped, so a stale
+        ``met`` verdict cannot false-complete a different deliverable.
+        """
+        if not transitions:
+            return
+        if snapshot_plan is not None:
+            snap_tokens = {
+                t.id: self._outcome_stability_token(t)
+                for t in (getattr(snapshot_plan, "tasks", None) or ())
+                if getattr(t, "id", "")
+            }
+            live_by_id = {
+                t.id: t
+                for t in (getattr(session.plan, "tasks", None) or ())
+                if getattr(t, "id", "")
+            }
+            fresh: list[Any] = []
+            for tr in transitions:
+                live = live_by_id.get(tr.task_id)
+                snap_token = snap_tokens.get(tr.task_id)
+                if (
+                    live is None
+                    or snap_token is None
+                    or self._outcome_stability_token(live) != snap_token
+                    or getattr(live, "status", None) in TERMINAL_TASK_STATUSES
+                ):
+                    log.info(
+                        "DefaultSteerer: stale outcome verdict for task %r "
+                        "skipped; plan was revised under the judge round-trip "
+                        "(snapshot token %r, live token %r)",
+                        tr.task_id,
+                        snap_token,
+                        None if live is None else self._outcome_stability_token(live),
+                    )
+                    continue
+                fresh.append(tr)
+            transitions = fresh
+            if not transitions:
+                return
+        stamps: list[tuple[str, str]] = [
+            pair for tr in transitions for pair in getattr(tr, "contributes_stamps", ())
+        ]
+        if stamps:
+            try:
+                with channel_processor_active():
+                    plan = session.plan
+                    for discovered_id, outcome_id in stamps:
+                        plan = replace_task(plan, discovered_id, contributes_to=outcome_id)
+                    set_session_plan(session, plan)
+            except Exception as exc:  # noqa: BLE001 — observability stamp
+                log.warning(
+                    "DefaultSteerer: contributes_to stamp raised (swallowed): %s",
+                    exc,
+                )
+        for tr in transitions:
+            try:
+                if tr.new_status is TaskStatus.COMPLETED:
+                    await self._steerer.tasks.mark_task_completed(
+                        tr.task_id,
+                        session=session,
+                        summary=tr.reason,
+                        source=OUTCOME_JUDGE_SOURCE,
+                    )
+                elif tr.new_status is TaskStatus.FAILED:
+                    await self._steerer.tasks.mark_task_failed(
+                        tr.task_id,
+                        session=session,
+                        reason=tr.reason,
+                        recoverable=True,
+                        source=OUTCOME_JUDGE_SOURCE,
+                        # Run-ending finalize: the advisory cascade's note
+                        # could never reach the agent (see docstring).
+                        dispatch_drift_cascade=not run_ending,
+                    )
+            except Exception as exc:  # noqa: BLE001 — never break the run
+                log.warning(
+                    "DefaultSteerer: outcome transition for %r raised "
+                    "(swallowed): %s",
+                    tr.task_id,
+                    exc,
+                )
 
     # ------------------------------------------------------------------
     # iter-11A: fire-and-forget drift-cascade dispatch.
@@ -3538,11 +4598,29 @@ class DriftObserver:
     # import-cycle with :mod:`goldfive.steerer` (which defines the
     # :class:`InterventionLevel` enum).
 
+    # AGENCY-PRESERVATION.md PR 7 — the pre-PR-7 ladder, used when the
+    # ``legacy_ladder`` escape hatch is on. Identical to :attr:`_LADDER`
+    # EXCEPT the goldfive-authored rows whose CANCEL_REINVOKE cells PR 7
+    # demoted to SIGNAL (and GOAL_DRIFT's CRITICAL-repeat, which moved
+    # CANCEL_REINVOKE → PAUSE_ESCALATE): the overrides in
+    # :data:`_PR7_LEGACY_LADDER_OVERRIDES` restore those cells. The two
+    # deferred correctness fixes (hard-safety CRITICAL stop; the NUDGE→SIGNAL
+    # rename) are inherited from :attr:`_LADDER` — they are NOT toggled by the
+    # escape hatch. Populated lazily alongside :attr:`_LADDER`.
+    _LADDER_LEGACY: dict[
+        DriftKind,
+        tuple[
+            InterventionLevel | None,
+            InterventionLevel | None,
+            tuple[InterventionLevel, InterventionLevel],
+        ],
+    ] = {}
+
     _LADDER_LOADED: bool = False
 
     @classmethod
     def _load_ladder_tables(cls) -> None:
-        """Populate :attr:`_LADDER` on first use.
+        """Populate :attr:`_LADDER` / :attr:`_LADDER_LEGACY` on first use.
 
         Lazy load defers the :class:`InterventionLevel` import so this
         module can be imported before :mod:`goldfive.steerer` finishes
@@ -3554,6 +4632,235 @@ class DriftObserver:
         from goldfive.steerer import InterventionLevel as _IL
 
         cls._LADDER = {
+            # AGENCY-PRESERVATION.md PR 7: goldfive-authored CANCEL_REINVOKE
+            # cells demote to SIGNAL (advisory note, no refine/cancel/steer);
+            # the CRITICAL-repeat escalation stays PAUSE_ESCALATE (stop-and-ask
+            # preserves trajectory; cancel-and-redirect does not). The
+            # ``legacy_ladder`` escape hatch restores the CANCEL_REINVOKE cells
+            # via :data:`_PR7_LEGACY_LADDER_OVERRIDES`.
+            DriftKind.CONFABULATION_RISK: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.AGENT_REFUSAL: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.MODEL_REFUSAL: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.LOOPING_REASONING: (
+                None,
+                _IL.ABSORB,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.LOOPING_TOOL_CALL: (
+                None,
+                _IL.ABSORB,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.REASONING_CLUSTER_TIGHTENING: (
+                _IL.OBSERVE,
+                None,
+                (_IL.OBSERVE, _IL.OBSERVE),
+            ),
+            # AGENCY-PRESERVATION.md PR 3 — forecast-mismatch demotions.
+            # These kinds are divergence from goldfive's *forecast* of how
+            # the agent would decompose the work, not divergence from the
+            # user's goal (§0/§1.2). They become observability-only:
+            # DriftDetected still emits, but the ladder takes no
+            # refine/steer/cancel action at any severity. Because OBSERVE
+            # short-circuits the dispatch before the refine path
+            # (:meth:`_handle_drift_dispatch`), a demoted kind also stops
+            # writing ``refine_outcomes`` — verified by the §5.3
+            # side-effect check (no other gate depended on those writes).
+            #
+            # PLAN_DIVERGENCE: belt-and-braces. The kind is ALSO dropped at
+            # the top of :meth:`handle_drift` (#252, reconciler emitter
+            # dead), so this row is normally unreachable; pinning it OBSERVE
+            # keeps the table honest and demotes any future / external
+            # producer that bypasses the #252 guard. The live observability
+            # signal comes from the executor reachability-audit emitter
+            # (``sequential._plan_divergence_drift_event``), which emits
+            # DriftDetected directly and is unchanged.
+            DriftKind.PLAN_DIVERGENCE: (
+                _IL.OBSERVE,
+                _IL.OBSERVE,
+                (_IL.OBSERVE, _IL.OBSERVE),
+            ),
+            # CAPABILITY_MISMATCH: Rule A (coordinator-style leaf-assignment)
+            # is stem/keyword NL classification — the #166/#167 anti-pattern
+            # — and is additionally gated OFF by default behind
+            # ``GOLDFIVE_CAPABILITY_RULE_A`` (see
+            # :mod:`goldfive.drift.capability_check`). The CRITICAL cells
+            # (where Rule A / the soft-retired Rule C fire) are demoted to
+            # OBSERVE so even a re-enabled rule only observes. WARNING stays
+            # ABSORB so Rule B — user-declared ``required_tools``, genuine
+            # prescriptive intent — keeps steering via refine, capped at the
+            # WARNING rung ("WARNING-max": Rule B now emits WARNING, never
+            # CRITICAL, so it cannot escalate to cancel/pause).
+            #
+            # Trajectory-safety synergy with #453: an ABSORB-driven refine
+            # is goldfive-authored, and post-#453 goldfive-authored drift
+            # never cancels the in-flight invocation (CAPABILITY_MISMATCH
+            # is not in ``_HARD_SAFETY_DRIFT_KINDS``). So Rule B's retained
+            # steering refines the ledger plan WITHOUT preempting the
+            # running agent — the demotion and the cancel-authority gate
+            # compose into "advise, don't grab the wheel".
+            #
+            # In the DEFAULT config the CRITICAL cells are unreachable
+            # belt-and-suspenders: Rule A and Rule C are both gated off,
+            # and the only live emitter (Rule B) emits WARNING. The
+            # CRITICAL→OBSERVE mapping bites only if an operator re-enables
+            # Rule A/C via the escape-hatch env flags. PR 13 hard-deletes
+            # Rule A/C and revisits this row.
+            DriftKind.CAPABILITY_MISMATCH: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.OBSERVE, _IL.OBSERVE),
+            ),
+            # NEW_WORK_DISCOVERED: explicit observability-only row. The
+            # agent-authored reporting-tool path
+            # (:meth:`report_new_work_discovered`) no longer reaches the
+            # ladder at all — it reroutes to descriptive growth
+            # (``install_descriptive_growth``, absorb-as-growth) instead of
+            # ``planner.refine`` (§1.2 / PLAN-DESCRIPTIVE-GROWTH.md §13:
+            # adaptive, not predictive). Framework-synthesised discoveries
+            # are INFO and were already non-steering via the default
+            # fallthrough; this row makes "non-steering at every severity"
+            # explicit so the table self-documents the demotion.
+            DriftKind.NEW_WORK_DISCOVERED: (
+                _IL.OBSERVE,
+                _IL.OBSERVE,
+                (_IL.OBSERVE, _IL.OBSERVE),
+            ),
+            # WRONG_AGENT is deliberately absent (deprecated; no production
+            # emitter — grep ``DriftKind.WRONG_AGENT`` finds only the enum
+            # def, proto/pb stubs, and docs, never a ``DriftEvent(kind=…)``
+            # construction). Its enum value stays reserved (see the
+            # deprecation note in :mod:`goldfive.types`), but it gets no
+            # ladder row: there is no live dispatch to map. Mirrors the
+            # JUSTIFIED_DEVIATION "lack of a _LADDER row is intentional"
+            # precedent. AGENCY-PRESERVATION.md PR 3.
+            DriftKind.OFF_TOPIC: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.JUSTIFIED_DEVIATION: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.ABSORB, _IL.ABSORB),
+            ),
+            DriftKind.INTENT_DIVERGENCE: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.TOOL_ERROR: (
+                _IL.OBSERVE,
+                _IL.ABSORB,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+            # RUNAWAY_DELEGATION is hard-safety (a guardrail, not steering): it
+            # KEEPS CANCEL_REINVOKE — the §0 stop authority survives only for
+            # the user-steer junction and hard-safety kinds (PR 7).
+            DriftKind.RUNAWAY_DELEGATION: (
+                None,
+                None,
+                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
+            ),
+            # AGENCY-PRESERVATION.md PR 7 (deferred Stage-1 fix): the
+            # budget/timeout hard-safety kinds previously fell through to the
+            # default mapping, whose CRITICAL-first cell is ABSORB ("refine and
+            # continue") — a §0 stop-not-redirect violation for a guardrail.
+            # Give them explicit rows that STOP at CRITICAL → PAUSE_ESCALATE
+            # (halt-and-ask-human), NOT CANCEL_REINVOKE: restart can't refund a
+            # spent budget — a cancel-and-reinvoke on an exhausted budget just
+            # burns more of it or immediately re-trips the same cap. The
+            # immediate in-flight stop these kinds need already comes from the
+            # PR-1 cancel-authority path (they are in ``_HARD_SAFETY_DRIFT_KINDS``,
+            # i.e. cancel scope); the ladder cell's job is the follow-on, which
+            # for a spent resource is the pause. (RUNAWAY_DELEGATION above is the
+            # exception: the *behaviour* is the problem, not a spent budget, so
+            # killing the runaway subtree and letting non-runaway work continue
+            # is plausibly productive — it keeps CANCEL_REINVOKE.) INFO/WARNING
+            # are OBSERVE. Applies in BOTH ladder regimes (NOT gated by
+            # ``legacy_ladder``).
+            DriftKind.RESOURCE_EXHAUSTED: (
+                None,
+                None,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.TOO_MANY_STEPS: (
+                None,
+                None,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            ),
+            # TASK_TIMEOUT WARNING cell (#487): the wall-clock stall
+            # watchdog (flag-gated, default OFF —
+            # ``SteeringConfig.stall_watchdog_enabled``) fires WARNING
+            # first. A stall is a liveness signal, not a plan defect, so
+            # WARNING signals rather than refining (ABSORB would loop the
+            # planner against a plan that isn't wrong). CRITICAL pauses at
+            # BOTH positions: the watchdog only emits CRITICAL on
+            # continued silence after its WARNING, so a CRITICAL is by
+            # construction already a repeat — and the refine-outcome-based
+            # occurrence counter never advances on the SIGNAL path, so the
+            # pair's repeat slot alone would be unreachable. Both regimes
+            # share the row (the SIGNAL cell delivers via whichever
+            # channel is configured).
+            DriftKind.TASK_TIMEOUT: (
+                _IL.OBSERVE,
+                _IL.SIGNAL,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.LLM_CALL_TIMEOUT: (
+                None,
+                None,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.REFINE_VALIDATION_FAILED: (
+                None,
+                None,
+                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.HUMAN_INTERVENTION_REQUIRED: (
+                None,
+                None,
+                (_IL.PAUSE_ESCALATE, _IL.TERMINATE),
+            ),
+            # GOAL_DRIFT: WARNING + CRITICAL-first both SIGNAL (was NUDGE — pure
+            # rename); the CRITICAL-repeat escalation moves CANCEL_REINVOKE →
+            # PAUSE_ESCALATE (PR 7 repeat-escalation = stop-and-ask).
+            DriftKind.GOAL_DRIFT: (
+                None,
+                _IL.SIGNAL,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+            DriftKind.SELF_REPORTED_STUCK: (
+                None,
+                _IL.ABSORB,
+                (_IL.SIGNAL, _IL.PAUSE_ESCALATE),
+            ),
+        }
+        # PR 7 legacy-ladder overrides: the exact cells the new ladder demoted.
+        # ``_LADDER_LEGACY = {**_LADDER, **overrides}`` so the escape hatch
+        # restores ONLY these rows; every other row (incl. the deferred
+        # hard-safety stop fix and the NUDGE→SIGNAL rename) is shared. This
+        # small override map IS the reviewable PR-7 ladder diff (§5.3).
+        _pr7_legacy_overrides: dict[
+            DriftKind,
+            tuple[
+                InterventionLevel | None,
+                InterventionLevel | None,
+                tuple[InterventionLevel, InterventionLevel],
+            ],
+        ] = {
             DriftKind.CONFABULATION_RISK: (
                 _IL.OBSERVE,
                 _IL.ABSORB,
@@ -3569,23 +4876,8 @@ class DriftObserver:
                 _IL.ABSORB,
                 (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
             ),
-            DriftKind.LOOPING_REASONING: (
-                None,
-                _IL.ABSORB,
-                (_IL.NUDGE, _IL.PAUSE_ESCALATE),
-            ),
             DriftKind.LOOPING_TOOL_CALL: (
                 None,
-                _IL.ABSORB,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
-            ),
-            DriftKind.REASONING_CLUSTER_TIGHTENING: (
-                _IL.OBSERVE,
-                None,
-                (_IL.OBSERVE, _IL.OBSERVE),
-            ),
-            DriftKind.PLAN_DIVERGENCE: (
-                _IL.OBSERVE,
                 _IL.ABSORB,
                 (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
             ),
@@ -3594,63 +4886,25 @@ class DriftObserver:
                 _IL.ABSORB,
                 (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
             ),
-            DriftKind.JUSTIFIED_DEVIATION: (
-                _IL.OBSERVE,
-                _IL.ABSORB,
-                (_IL.ABSORB, _IL.ABSORB),
-            ),
-            DriftKind.INTENT_DIVERGENCE: (
-                _IL.OBSERVE,
-                _IL.ABSORB,
-                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
-            ),
             DriftKind.TOOL_ERROR: (
                 _IL.OBSERVE,
                 _IL.ABSORB,
                 (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
-            ),
-            DriftKind.RUNAWAY_DELEGATION: (
-                None,
-                None,
-                (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
-            ),
-            DriftKind.REFINE_VALIDATION_FAILED: (
-                None,
-                None,
-                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
-            ),
-            DriftKind.HUMAN_INTERVENTION_REQUIRED: (
-                None,
-                None,
-                (_IL.PAUSE_ESCALATE, _IL.TERMINATE),
-            ),
-            DriftKind.GOAL_DRIFT: (
-                None,
-                _IL.NUDGE,
-                (_IL.NUDGE, _IL.CANCEL_REINVOKE),
             ),
             DriftKind.SELF_REPORTED_STUCK: (
                 None,
                 _IL.ABSORB,
                 (_IL.CANCEL_REINVOKE, _IL.PAUSE_ESCALATE),
             ),
-            # Wall-clock stall watchdog (flag-gated, default OFF —
-            # ``SteeringConfig.stall_watchdog_enabled``). Conservative
-            # row: a stall is a liveness signal, not a plan defect, so
-            # WARNING nudges rather than refining (ABSORB would loop
-            # the planner against a plan that isn't wrong). CRITICAL
-            # pauses at BOTH positions: the watchdog only emits
-            # CRITICAL on continued silence after its WARNING, so a
-            # CRITICAL is by construction already a repeat — and the
-            # refine-outcome-based occurrence counter never advances on
-            # the NUDGE path, so the pair's repeat slot alone would be
-            # unreachable.
-            DriftKind.TASK_TIMEOUT: (
-                _IL.OBSERVE,
-                _IL.NUDGE,
-                (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
+            # LOOPING_REASONING is NOT here: its CRITICAL-first was NUDGE (now
+            # SIGNAL — pure rename), never CANCEL_REINVOKE, so new == legacy.
+            DriftKind.GOAL_DRIFT: (
+                None,
+                _IL.SIGNAL,
+                (_IL.SIGNAL, _IL.CANCEL_REINVOKE),
             ),
         }
+        cls._LADDER_LEGACY = {**cls._LADDER, **_pr7_legacy_overrides}
         cls._LADDER_LOADED = True
 
     def _ladder_level_for(
@@ -3668,7 +4922,14 @@ class DriftObserver:
         from goldfive.steerer import InterventionLevel as _IL
 
         self._load_ladder_tables()
-        entry = self._LADDER.get(kind)
+        # AGENCY-PRESERVATION.md PR 7: the ``legacy_ladder`` escape hatch picks
+        # the pre-PR-7 cells (CANCEL_REINVOKE in the goldfive-authored rows).
+        ladder = (
+            self._LADDER_LEGACY
+            if getattr(self._steerer, "_legacy_ladder", False)
+            else self._LADDER
+        )
+        entry = ladder.get(kind)
         is_repeat = occurrence_count >= self._steerer.REFINE_FAILURE_THRESHOLD
         if entry is not None:
             info_level, warning_level, critical_pair = entry
@@ -3863,12 +5124,12 @@ class DriftObserver:
         (USER_STEER side effects, freshness-watermark check) have
         already run; this method jumps straight into cancel + refine.
         """
+        from goldfive.observer_notes import compose_note_for_drift
         from goldfive.steerer import (
             _ABSORB_NUDGE_KINDS,
             InterventionLevel,
             RefineExhausted,
             _planner_refine_accepts_available_agents,
-            compose_corrective_user_message,
         )
 
         # Tag the bound adapter's next cancel with a symbolic reason so
@@ -3930,6 +5191,15 @@ class DriftObserver:
         # the severity gate because an operator directive must be
         # honoured even when emitted at a lower severity tier.
         #
+        # AGENCY-PRESERVATION.md PR 1 (goldfive#449/#452): the CRITICAL
+        # arm is additionally authority-gated inside
+        # :meth:`_should_request_cancel_for_drift` — goldfive-authored
+        # steering drift never cancels in-flight work; only
+        # user-authored and hard-safety kinds
+        # (:attr:`_HARD_SAFETY_DRIFT_KINDS`) reach the cancel.
+        # ``cancel_inflight_scope="all"`` restores the legacy
+        # any-CRITICAL-cancels behaviour.
+        #
         # The actual short-circuit happens in the ADK plugin's next
         # ``before_agent_callback`` / ``before_model_callback`` /
         # ``before_tool_callback``; this call just writes the flag.
@@ -3958,7 +5228,30 @@ class DriftObserver:
                     exc,
                 )
         if promote_to_steer:
-            await self._promote_drift_to_steer(drift, session)
+            # AGENCY-PRESERVATION.md PR 8: pace the promotion signal — suppress
+            # a re-signal inside the grace window, escalate to a pause on the
+            # 3rd occurrence. This gate runs BEFORE the PR-12 ledger/forecast
+            # fork below: pacing is a property of the SIGNAL itself (is this
+            # the same advisory firing again too soon?), independent of which
+            # repair channel a "proceed" decision ultimately routes to. So a
+            # ledger-mode promotion paces identically to a forecast-mode one.
+            # ``"proceed"`` falls through to the fork (the note re-authoring
+            # for the 2nd occurrence is in ``_route_corrective_note``).
+            if await self._apply_signal_pacing(
+                session, drift, self._signal_pacing_decision(session, drift)
+            ):
+                return
+            # AGENCY-PRESERVATION.md Stage 3 PR 12 — refine retirement in
+            # ledger plan mode. Promotion produces a forecast-repair
+            # ``refine_steer`` (PR 7 kept it on the promotion path); in
+            # ledger mode there is no forecast to repair, so route to the
+            # ledger rung instead. Promotion never selects USER_STEER
+            # (``_should_promote_to_steer`` returns False for user-authored
+            # kinds), so this is always a goldfive-authored drift.
+            if self._ledger_mode():
+                await self._ledger_retire_refine(drift, session)
+            else:
+                await self._promote_drift_to_steer(drift, session)
             return
         # Route through the intervention ladder. The per-(kind, task)
         # occurrence count drives the "first vs repeat" distinction in
@@ -3996,7 +5289,20 @@ class DriftObserver:
         )
         if level is InterventionLevel.OBSERVE:
             return
-        if level is InterventionLevel.NUDGE:
+        if level is InterventionLevel.SIGNAL:
+            # AGENCY-PRESERVATION.md PR 7: the SIGNAL level (was NUDGE) enqueues
+            # an advisory observer note and returns — NO refine, NO cancel, NO
+            # steer. This is the cell the goldfive-authored CANCEL_REINVOKE rows
+            # were demoted to: proportional, trajectory-preserving influence.
+            # The dispatch method keeps its ``_dispatch_nudge`` name (internal;
+            # widely referenced) — it enqueues the SIGNAL-level note.
+            #
+            # AGENCY-PRESERVATION.md PR 8: pace it — suppress a re-signal inside
+            # the grace window, escalate to a pause on the 3rd occurrence.
+            if await self._apply_signal_pacing(
+                session, drift, self._signal_pacing_decision(session, drift)
+            ):
+                return
             await self._dispatch_nudge(drift, session)
             return
         if level is InterventionLevel.PAUSE_ESCALATE:
@@ -4018,6 +5324,22 @@ class DriftObserver:
         # (goldfive#141). The refine call itself is identical so we
         # share the implementation below and read the level at the end
         # to decide whether to emit the follow-up handoff.
+        #
+        # AGENCY-PRESERVATION.md Stage 3 PR 12 — refine retirement in
+        # ledger plan mode. The drift-triggered forecast-repair refine has
+        # no forecast to repair in ledger mode (the plan is a ledger of
+        # OUTCOME deliverables + a DISCOVERED trajectory record, not a
+        # forecast the agent is graded against). Refine survives for
+        # exactly three authors (§3 PR 12): USER_STEER (handled here —
+        # falls through to the refine below), turn-level ``handle_turn``
+        # replans, and descriptive absorption (both SEPARATE dispatch
+        # paths, untouched). Every other (goldfive-authored)
+        # ABSORB/CANCEL_REINVOKE drift takes the ledger rung instead. The
+        # OBSERVE / SIGNAL / PAUSE_ESCALATE rungs returned earlier and are
+        # already mode-agnostic.
+        if self._ledger_mode() and drift.kind is not DriftKind.USER_STEER:
+            await self._ledger_retire_refine(drift, session)
+            return
         if self._steerer._planner is None or session.plan is None:
             return
         if drift.kind is DriftKind.REFINE_VALIDATION_FAILED:
@@ -4327,6 +5649,10 @@ class DriftObserver:
         # sink event lands adjacent to the revision in the wire log
         # and operators can correlate the two. Best-effort, never
         # raises — a no-op cancel still leaves the new plan installed.
+        # AGENCY-PRESERVATION.md PR 1: the helper itself gates on drift
+        # authority — only user-authored / hard-safety drifts actually
+        # cancel; goldfive-authored steering installs land for
+        # bookkeeping while the invocation runs to completion.
         await self._cancel_inflight_for_revision(drift, session)
         await self._steerer.plans._emit_plan_revised(
             session,
@@ -4365,48 +5691,30 @@ class DriftObserver:
         # rescue — their corrective path fires at the next task
         # boundary or via Level 3 CANCEL_REINVOKE.
         if level is InterventionLevel.ABSORB and drift.kind in _ABSORB_NUDGE_KINDS:
-            nudge_msg = compose_corrective_user_message(
-                drift=drift,
-                refined_plan=session.plan,
-            )
-            # Observation-only: the queued nudge would be drained by the
-            # overlay's replay path into a goldfive-authored user turn
-            # that re-invokes the tree — an injection, not an
-            # observation. Skip the enqueue but log the would-be message
-            # and stamp the gate, mirroring
-            # ``_dispatch_goldfive_steer_control``.
-            if not self._steerer.is_active_steering():
-                log.info(
-                    "DefaultSteerer._handle_drift: observation_only=True — "
-                    "SKIPPING post-ABSORB nudge enqueue. would_have_queued "
-                    "kind=%s task=%s body=%r",
-                    drift.kind.value,
-                    drift.current_task_id or "-",
-                    nudge_msg[:200],
-                )
-                await self._emit_policy_applied(
-                    session=session,
-                    policy_name="observation_only_gate",
-                    outcome="suppressed",
-                    reason="observation_only=True",
-                    detail=(
-                        f"intervention=post_absorb_nudge "
-                        f"kind={drift.kind.value} "
-                        f"task_id={drift.current_task_id or ''}"
-                    ),
-                )
-                return
-            session.pending_nudges.append(nudge_msg)
-            # Thread the install fact to the overlay so the replay
-            # header only claims a plan revision when ``_apply_revision``
-            # actually installed one.
-            if was_installed:
-                session.pending_nudges_revision_installed = True
+            # AGENCY-PRESERVATION.md PR 4: the nudge body is an
+            # observation+goal advisory note, not a directive about
+            # which task / agent comes next. PR 6: routed to the
+            # configured delivery channel — legacy ``pending_nudges`` or
+            # the request_context observer-note queue. ``ladder_level="absorb"``
+            # lets the divergence report tell this post-ABSORB delivery apart
+            # from the Level-2 ``_dispatch_nudge`` one. The goldfive#475
+            # observation-only gate + PolicyApplied telemetry live on the
+            # router's legacy leg; ``plan_revision_installed`` threads the
+            # ``_apply_revision`` install fact so the executor's replay
+            # header only claims a revision when one truly installed.
+            nudge_msg = compose_note_for_drift(drift=drift, session=session)
             log.debug(
                 "DefaultSteerer._handle_drift: queued post-ABSORB nudge for kind=%s task=%s: %s",
                 drift.kind.value,
                 drift.current_task_id or "-",
                 nudge_msg,
+            )
+            await self._route_corrective_note(
+                session,
+                drift,
+                nudge_msg,
+                ladder_level="absorb",
+                plan_revision_installed=was_installed,
             )
 
     # ------------------------------------------------------------------
@@ -4421,46 +5729,41 @@ class DriftObserver:
         corrective user message. Until #141 lands, the queue is
         observable but inert; nothing consumes it.
 
-        Observation-only: the overlay drains the queue into a
-        goldfive-authored user turn that re-invokes the tree, so the
-        enqueue is gated on :meth:`DefaultSteerer.is_active_steering` like
-        the other injection points; the would-be nudge is logged and
-        the gate stamped as decision telemetry.
-        """
-        from goldfive.steerer import compose_corrective_user_message
+        Body content (AGENCY-PRESERVATION.md PR 4): an observation+goal
+        advisory note from :mod:`goldfive.observer_notes` — no
+        next-task / next-agent directives.
 
-        msg = compose_corrective_user_message(
-            drift=drift,
-            refined_plan=session.plan,
-        )
-        if not self._steerer.is_active_steering():
-            log.info(
-                "DefaultSteerer._dispatch_nudge: observation_only=True — "
-                "SKIPPING nudge enqueue. would_have_queued kind=%s "
-                "task=%s body=%r",
-                drift.kind.value,
-                drift.current_task_id or "-",
-                msg[:200],
-            )
-            await self._emit_policy_applied(
-                session=session,
-                policy_name="observation_only_gate",
-                outcome="suppressed",
-                reason="observation_only=True",
-                detail=(
-                    f"intervention=nudge "
-                    f"kind={drift.kind.value} "
-                    f"task_id={drift.current_task_id or ''}"
-                ),
-            )
-            return
-        session.pending_nudges.append(msg)
+        Observation-only: the overlay drains the legacy queue into a
+        goldfive-authored user turn that re-invokes the tree, so the
+        legacy-channel enqueue is gated on
+        :meth:`DefaultSteerer.is_active_steering` inside
+        :meth:`_route_corrective_note` (goldfive#475) like the other
+        injection points; the would-be nudge is logged and the gate
+        stamped as decision telemetry there.
+        """
+        from goldfive.observer_notes import compose_note_for_drift
+
+        msg = compose_note_for_drift(drift=drift, session=session)
         log.debug(
             "DefaultSteerer: queued nudge for kind=%s task=%s: %s",
             drift.kind.value,
             drift.current_task_id or "-",
             msg,
         )
+        # AGENCY-PRESERVATION.md PR 5/6: route to the configured delivery
+        # channel. Legacy (default) appends to ``session.pending_nudges`` and
+        # records the nudge_replay delivery at enqueue — gated on
+        # ``is_active_steering`` (goldfive#475: the pre-#475 asymmetry where
+        # the message physically queued even under ``observation_only`` is
+        # gone; a suppressed enqueue stamps ``channel_action="suppressed"``
+        # while ``dry_run`` tracks shadow-mode for the §5.4 divergence
+        # report). PR 6's request_context channel routes through the gated
+        # observer-note queue: SignalDelivered is emitted once HERE at the
+        # dispatch decision point (the PR-5 model the §5.4 diff is built on),
+        # and a delivery surface later RENDERS the note exactly-once under
+        # ``_should_inject`` — rendering at a surface does NOT emit a second
+        # event; ``dry_run`` records whether the note actually reaches the agent.
+        await self._route_corrective_note(session, drift, msg, ladder_level="nudge")
 
     async def _dispatch_goldfive_steer_control(
         self,
@@ -4481,23 +5784,21 @@ class DriftObserver:
         body. The promotion path passes its already-composed
         :meth:`_compose_goldfive_steer_body` output; the Level 3
         CANCEL_REINVOKE path leaves it empty and falls back to
-        :func:`compose_corrective_user_message` against the freshly
-        revised plan.
+        :func:`goldfive.observer_notes.compose_note_for_drift` against
+        the freshly revised plan (AGENCY-PRESERVATION.md PR 4 —
+        observation+goal note, not a next-task directive).
 
         Returns ``True`` on successful dispatch, ``False`` on no
         bound channel / send failure (best-effort — see
         :meth:`DefaultSteerer._dispatch_goldfive_control`).
         """
         from goldfive.control import ControlKind, ControlMessage
-        from goldfive.steerer import compose_corrective_user_message
+        from goldfive.observer_notes import compose_note_for_drift
 
         if body_override:
             body = body_override
         else:
-            body = compose_corrective_user_message(
-                drift=drift,
-                refined_plan=session.plan,
-            )
+            body = compose_note_for_drift(drift=drift, session=session)
         superseded_ids = (
             [str(drift.current_task_id)] if drift.current_task_id else []
         )
@@ -4520,6 +5821,32 @@ class DriftObserver:
                 "body": body,
                 "superseded_task_ids": superseded_ids,
                 "replacement_task_ids": replacement_ids,
+            },
+        )
+        # AGENCY-PRESERVATION.md PR 5 (observe-only): record the steer-control
+        # delivery decision BEFORE the observation_only gate so the suppressed
+        # (dry_run) path — the §5.4 base-rate substrate — is captured too. A
+        # ``body_override`` means this is the promote-to-steer path
+        # (:meth:`_promote_drift_to_steer`), so the signal rides the
+        # ``promotion`` channel; otherwise it is the Level-3 CANCEL_REINVOKE
+        # ``steer_control`` channel. The plan-swap target ids are exactly what
+        # the legacy regime would have steered toward — prime divergence
+        # substrate.
+        from goldfive.events import SIGNAL_CHANNEL_PROMOTION, SIGNAL_CHANNEL_STEER_CONTROL
+
+        _will_inject = self._steerer._should_inject()
+        await self._emit_signal_delivered(
+            session,
+            drift,
+            channel=(
+                SIGNAL_CHANNEL_PROMOTION if body_override else SIGNAL_CHANNEL_STEER_CONTROL
+            ),
+            note_text=body,
+            ladder_level="promotion" if body_override else "cancel_reinvoke",
+            extra_decision={
+                "superseded_task_ids": superseded_ids,
+                "replacement_task_ids": replacement_ids,
+                "channel_action": "dispatched" if _will_inject else "suppressed",
             },
         )
         # goldfive#254 — observation-only: skip the actual ControlMessage
@@ -4634,6 +5961,31 @@ class DriftObserver:
         the in-flight invoke. The carve-out below stops that chain.
         """
         from goldfive.control import ControlKind, ControlMessage
+
+        # AGENCY-PRESERVATION.md PR 5 (observe-only): record the pause-control
+        # delivery and resolve the key as ``escalated``. Emitted before the
+        # observation_only gate so the suppressed (dry_run) escalation decision
+        # is captured. Escalation is terminal for the key in BOTH modes — the
+        # *decision* to pause happened even when the pause channel send is
+        # suppressed under observation_only.
+        from goldfive.events import SIGNAL_CHANNEL_PAUSE_CONTROL
+
+        await self._emit_signal_delivered(
+            session,
+            drift,
+            channel=SIGNAL_CHANNEL_PAUSE_CONTROL,
+            note_text=reason,
+            ladder_level="pause_escalate",
+            extra_decision={
+                "reason": reason,
+                "channel_action": (
+                    "dispatched"
+                    if self._steerer.is_active_steering()
+                    else "suppressed"
+                ),
+            },
+        )
+        await self._record_signal_outcome_escalated(session, drift)
 
         if not self._steerer.is_active_steering():
             log.info(
@@ -5182,8 +6534,48 @@ class DriftObserver:
             )
         return flagged
 
-    @staticmethod
-    def _should_request_cancel_for_drift(drift: DriftEvent) -> bool:
+    def _drift_authorizes_inflight_cancel(self, drift: DriftEvent) -> bool:
+        """Authority predicate for cancelling in-flight work (AGENCY-PRESERVATION.md PR 1).
+
+        The single place the goldfive#449/#452 authority split is
+        encoded for the cancel surface: in-flight cancellation is
+        permitted ONLY when the triggering drift is
+
+        * **user-authored** — :attr:`_USER_AUTHORED_DRIFT_KINDS`
+          (USER_STEER / USER_CANCEL / USER_PAUSE). User authority is
+          absolute (§2 of the design doc); behaviour for these kinds is
+          byte-identical to the pre-PR-1 implementation.
+        * **hard safety** — :attr:`_HARD_SAFETY_DRIFT_KINDS` (budget /
+          resource protection and termination; see the constant's
+          rationale comment). Guardrails stop runaway behaviour; that
+          is stop authority, legitimately always armed.
+
+        Everything else — Level-1 ABSORB refines, NEW_WORK_DISCOVERED
+        installs, drift→steer promotions, every judge/forecast kind —
+        is goldfive-authored *steering* and never preempts the wrapped
+        agent's in-flight invocation. Corrections reach the agent at
+        the natural invocation boundary instead (the overlay loop's
+        nudge-replay path, the GOLDFIVE_STEER restart).
+
+        Kill-switch (§5.1): ``cancel_inflight_scope="all"`` (env
+        ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all``) short-circuits to
+        ``True`` for every drift, restoring the legacy
+        cancel-on-every-install behaviour exactly. The scope is read
+        off the router (:class:`DefaultSteerer`) the same way the
+        ``observation_only`` flag is, with a defensive default for
+        duck-typed steerers that predate the knob.
+        """
+        scope = str(
+            getattr(self._steerer, "_cancel_inflight_scope", "user_and_safety")
+            or "user_and_safety"
+        )
+        if scope == "all":
+            return True
+        if drift.kind in self._USER_AUTHORED_DRIFT_KINDS:
+            return True
+        return drift.kind in self._HARD_SAFETY_DRIFT_KINDS
+
+    def _should_request_cancel_for_drift(self, drift: DriftEvent) -> bool:
         """Decide whether a drift warrants a cooperative cancel.
 
         Severity ladder (goldfive#251 design decision):
@@ -5192,10 +6584,12 @@ class DriftObserver:
           either periodic-check signals or soft one-shots; cancel
           would be disproportionate.
         * ``DriftSeverity.WARNING`` — never cancels. Warning drifts
-          route to the existing ABSORB / NUDGE ladder paths; the
-          refined plan lands on the next task boundary without
-          preempting the in-flight turn.
-        * ``DriftSeverity.CRITICAL`` — cancels. The in-flight turn's
+          route to the existing ABSORB / SIGNAL ladder paths (PR 7
+          renamed NUDGE → SIGNAL); the refined plan / advisory note
+          lands on the next task boundary without preempting the
+          in-flight turn.
+        * ``DriftSeverity.CRITICAL`` — cancels, *if the drift's
+          authority permits it* (see below). The in-flight turn's
           output is likely to contaminate its parent's transcript
           (stale prompt, wrong scope, broken tool); short-circuit
           cleanly and let the parent see ``{"status": "cancelled"}``.
@@ -5203,14 +6597,26 @@ class DriftObserver:
         User-authored drifts (``USER_STEER`` / ``USER_CANCEL`` /
         ``USER_PAUSE``) bypass the severity gate — an operator
         directive must be honoured even when the ControlMessage-to-
-        DriftEvent coercion landed on a lower severity tier.
+        DriftEvent coercion landed on a lower severity tier. This arm
+        is byte-identical to the pre-PR-1 implementation.
+
+        AGENCY-PRESERVATION.md PR 1 (goldfive#449/#452): the CRITICAL
+        arm is additionally gated on
+        :meth:`_drift_authorizes_inflight_cancel`. Pre-PR-1 ANY
+        CRITICAL goldfive-authored drift (OFF_TOPIC, LOOPING_*, …)
+        could flag the in-flight invocation for cooperative cancel
+        here; under the new policy goldfive-authored *steering* drift
+        never cancels in-flight work — only hard-safety kinds
+        (:attr:`_HARD_SAFETY_DRIFT_KINDS`) keep the CRITICAL cancel.
+        ``cancel_inflight_scope="all"`` restores the legacy behaviour
+        (the predicate returns ``True`` unconditionally, so this
+        method degenerates to the pre-PR-1 ``severity is CRITICAL``
+        check).
         """
-        if drift.kind in (
-            DriftKind.USER_STEER,
-            DriftKind.USER_CANCEL,
-            DriftKind.USER_PAUSE,
-        ):
+        if drift.kind in self._USER_AUTHORED_DRIFT_KINDS:
             return True
+        if not self._drift_authorizes_inflight_cancel(drift):
+            return False
         return drift.severity is DriftSeverity.CRITICAL
 
     @staticmethod
@@ -5285,7 +6691,46 @@ class DriftObserver:
         supersede flag is still stamped in the no-op case — it costs
         nothing and a downstream overlay that DOES observe a cancel
         from a separate path stays correctly classified.
+
+        Authority gate (AGENCY-PRESERVATION.md PR 1; goldfive#449/#452):
+        the unconditional cancel described above fired on EVERY
+        drift-driven install — including Level-1 ABSORB refines and
+        NEW_WORK_DISCOVERED installs — which made it the single
+        largest trajectory destroyer in the system (design doc §1.1).
+        This method now early-returns for drifts that fail
+        :meth:`_drift_authorizes_inflight_cancel` (not user-authored,
+        not hard-safety), BEFORE any side effect: no
+        ``session._supersede_pending`` stamp, no per-invocation
+        supersede-registry entry, no plugin call. Stamping the flag
+        for a cancel that never fires would hand the executor's
+        cancelled branch a supersede signal with no matching cancel —
+        exactly the stranded-flag bug class the v22 Bug-A fix exists
+        to prevent (the executor only consumes the flag inside its
+        ``kind == "cancelled"`` branch, so a flag without a cancel
+        either goes stale or misclassifies a later EXTERNAL cancel as
+        an internal supersede). The revised plan still installs and
+        ``PlanRevised`` still emits; the in-flight invocation runs to
+        completion and picks up the correction at the next invocation
+        boundary. ``cancel_inflight_scope="all"`` restores the
+        unconditional behaviour exactly (§5.1 kill-switch).
         """
+        # AGENCY-PRESERVATION.md PR 1 authority gate — must run BEFORE
+        # the supersede stamp below (see the authority-gate paragraph
+        # in the docstring: a stamped-but-never-consumed supersede flag
+        # is the bug class to avoid).
+        if not self._drift_authorizes_inflight_cancel(drift):
+            log.info(
+                "DefaultSteerer._cancel_inflight_for_revision: drift "
+                "kind=%s severity=%s authored_by=%s is neither "
+                "user-authored nor hard-safety — leaving the in-flight "
+                "invocation running (AGENCY-PRESERVATION PR 1; set "
+                "cancel_inflight_scope='all' to restore the legacy "
+                "cancel-on-every-install behaviour)",
+                drift.kind.value,
+                drift.severity.value,
+                drift.authored_by or "-",
+            )
+            return []
         # Stamp the supersede marker so the overlay loop can
         # distinguish this internal cancel from an external one. See
         # the supersede-contract paragraph in the docstring above.
@@ -5378,7 +6823,12 @@ class DriftObserver:
             DriftKind.CONFABULATION_RISK,
             DriftKind.LOOPING_REASONING,
             DriftKind.LOOPING_TOOL_CALL,
-            DriftKind.PLAN_DIVERGENCE,
+            # AGENCY-PRESERVATION.md PR 7 (deferred Stage-1 fix): PLAN_DIVERGENCE
+            # removed. It is dropped at the top of :meth:`handle_drift` (#252,
+            # reconciler emitter dead) and its ladder row is OBSERVE at every
+            # severity (PR 3), so it could never reach promotion — its presence
+            # here was unreachable dead config. Removing it makes the eligible
+            # set honest.
         }
     )
 
@@ -5425,34 +6875,48 @@ class DriftObserver:
             return False
         if not self._severity_meets_promotion_threshold(drift.severity):
             return False
-        # Consult the active user steer freshness window.
-        # Phase 1 of goldfive#271 — read through StateStore so
-        # the active-steer slot reads from a single named accessor; the
-        # underlying ``_ostate.read`` calls still funnel through the
-        # goldfive Session.state dict, just behind a typed surface.
+        # Ordered-gate #1 (AGENCY-PRESERVATION.md PR 8 unification): a fresh
+        # operator USER_STEER suppresses the goldfive promotion — the operator's
+        # correction is already in flight; running goldfive's on top races it.
+        # ``_user_steer_is_fresh`` is the shared #441 freshness predicate (also
+        # gate 1 of the SIGNAL-level path in ``_signal_pacing_decision``).
+        if self._user_steer_is_fresh(session):
+            drift.suppressed_by_user_steer = True
+            log.info(
+                "goldfive steer suppressed: a fresh user steer is active "
+                "(kind=%s task=%s)",
+                drift.kind.value,
+                drift.current_task_id or "-",
+            )
+            return False
+        return True
+
+    def _user_steer_is_fresh(self, session: Session) -> bool:
+        """True iff an operator USER_STEER is active within the #441 window.
+
+        The shared ordered-gate #1 predicate: a user-authored ``active_steer``
+        whose age (in logical turns — ``Session._reasoning_turn``, goldfive#441,
+        NOT event sequence) is within ``suppression_window_turns``. Consulted by
+        both :meth:`_should_promote_to_steer` (the promotion path, all regimes)
+        and :meth:`_signal_pacing_decision` (the SIGNAL-level path, PR 8). Pure
+        predicate — never mutates the drift; callers stamp
+        ``suppressed_by_user_steer`` themselves where the wire flag is wanted.
+        """
         window = self._steerer._goldfive_steer_suppression_window_turns
-        if window > 0:
+        if window <= 0:
+            return False
+        try:
             from goldfive.state_store import StateStore
 
             active = StateStore.for_session(session).get_active_steer()
-            if active is not None and active.source.lower() == "user":
-                # goldfive#441 — freshness is measured in *logical
-                # turns* (``_reasoning_turn``: one tick per reasoning
-                # observation), NOT ``_next_sequence`` (per-event, and
-                # inflated by decision-telemetry volume from #436/#440).
-                current_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
-                age = current_turn - active.at_turn
-                if 0 <= age < window:
-                    drift.suppressed_by_user_steer = True
-                    log.info(
-                        "goldfive steer suppressed: user steer %r is active "
-                        "(age=%d turns, window=%d)",
-                        active.body,
-                        age,
-                        window,
-                    )
-                    return False
-        return True
+            if active is None or active.source.lower() != "user":
+                return False
+            current_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+            age = current_turn - active.at_turn
+            return 0 <= age < window
+        except Exception as exc:  # noqa: BLE001
+            log.debug("user-steer freshness check failed: %s", exc)
+            return False
 
     async def _promote_drift_to_steer(self, drift: DriftEvent, session: Session) -> None:
         """Promote a goldfive-detected drift into a full steer.
@@ -5505,15 +6969,25 @@ class DriftObserver:
             _planner_refine_accepts_available_agents,
         )
 
-        # 1. Tag adapter cancel reason.
-        cancel_reason = self._tag_adapter_cancel_reason_for_promotion(drift, session=session)
-        # Session-visible cancel prefix so ``_mark_cancelled_if_live``
-        # stamps it on any TaskCancelled the executor emits for the
-        # in-flight task as part of the promotion.
-        try:
-            session._last_cancel_reason_prefix = cancel_reason
-        except Exception:  # noqa: BLE001
-            pass
+        # AGENCY-PRESERVATION.md PR 7: strip the steering side-effects from
+        # promotion. Promotion now refines, emits PlanRevised, and enqueues an
+        # advisory note — it no longer tags the adapter's cancel reason, stamps
+        # ``active_steer(source="goldfive")``, or dispatches GOLDFIVE_STEER.
+        # The ``legacy_ladder`` escape hatch restores all three. ``legacy``
+        # captured once so the gates read consistently within this call.
+        legacy = bool(getattr(self._steerer, "_legacy_ladder", False))
+        # 1. Tag adapter cancel reason (legacy only).
+        if legacy:
+            cancel_reason = self._tag_adapter_cancel_reason_for_promotion(
+                drift, session=session
+            )
+            # Session-visible cancel prefix so ``_mark_cancelled_if_live``
+            # stamps it on any TaskCancelled the executor emits for the
+            # in-flight task as part of the promotion.
+            try:
+                session._last_cancel_reason_prefix = cancel_reason
+            except Exception:  # noqa: BLE001
+                pass
         # 1a. NOTE (#241 emergency revert): previously we fired
         # ``adapter.request_cancel(reason)`` here to terminate the
         # in-flight LLM call immediately. In practice that
@@ -5533,20 +7007,24 @@ class DriftObserver:
         # ``at_turn`` is the logical-turn counter (goldfive#441), the
         # same surface the user-steer freshness window reads.
         at_turn = int(getattr(session, "_reasoning_turn", 0) or 0)
-        body = self._compose_goldfive_steer_body(drift)
-        try:
-            _ostate.set_active_steer(
-                session.state,
-                body=body,
-                at_turn=at_turn,
-                author="goldfive",
-                source="goldfive",
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "DefaultSteerer._promote_drift_to_steer: set_active_steer raised: %s",
-                exc,
-            )
+        body = self._compose_goldfive_steer_body(drift, session)
+        # 2. Stamp active-steer state (legacy only). The new regime does NOT
+        # stamp ``active_steer(source="goldfive")`` — a promoted goldfive drift
+        # is advisory, not an authoritative steer overriding the agent's means.
+        if legacy:
+            try:
+                _ostate.set_active_steer(
+                    session.state,
+                    body=body,
+                    at_turn=at_turn,
+                    author="goldfive",
+                    source="goldfive",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "DefaultSteerer._promote_drift_to_steer: set_active_steer raised: %s",
+                    exc,
+                )
         # NOTE: the ``GOLDFIVE_STEER`` ControlMessage dispatch used to
         # fire HERE, BEFORE the refine + plan install below. That left
         # the payload carrying the PRIOR plan's task ids in
@@ -5812,6 +7290,23 @@ class DriftObserver:
         # InvocationCancelled sink event lands adjacent to the
         # revision and operators can correlate the two on the
         # gantt timeline.
+        #
+        # AGENCY-PRESERVATION.md PR 1: promotion is goldfive-authored
+        # by construction (``_should_promote_to_steer`` returns False
+        # for user drifts), so under the default
+        # ``cancel_inflight_scope="user_and_safety"`` the helper's
+        # authority gate makes this a no-op — the refined plan installs
+        # for bookkeeping and the corrective reaches the agent via the
+        # advisory note at the invocation boundary instead of a
+        # mid-flight ``task.cancel()``. ``"all"`` (the §5.1 kill-switch)
+        # restores the empirically-motivated v15 cancel.
+        #
+        # PR 7 (intentional — do NOT "clean this up"): this call is KEPT
+        # even though PR 7 strips promotion's other steering side-effects.
+        # The PR-1 ``_cancel_inflight_for_revision`` authority gate is the
+        # SINGLE source of cancel policy; this is a no-op under the default
+        # scope. Removing it would double-encode the cancel decision here
+        # and break the ``GOLDFIVE_CANCEL_INFLIGHT_SCOPE=all`` kill-switch.
         await self._cancel_inflight_for_revision(drift, session)
         await self._steerer.plans._emit_plan_revised(
             session,
@@ -5821,40 +7316,54 @@ class DriftObserver:
             attempt_id=attempt_id,
             dry_run=not was_installed,
         )
-        # Audit #402 fix: dispatch the ``GOLDFIVE_STEER`` ControlMessage
-        # AFTER ``_emit_plan_revised`` has swapped ``session.plan`` to
-        # the revised version. ``_dispatch_goldfive_steer_control``
-        # re-reads ``session.plan`` to derive ``replacement_task_ids``,
-        # so dispatching here ensures the payload points the
-        # executor's restart at the NEW plan's PENDING tasks rather
-        # than the prior plan's (which may have been removed /
-        # cancelled by the just-installed revision). Mirrors the
-        # ordering in :meth:`_handle_drift`'s CANCEL_REINVOKE branch.
-        await self._dispatch_goldfive_steer_control(
-            drift, session, body_override=body
-        )
+        # AGENCY-PRESERVATION.md PR 7: in the new regime the promotion's
+        # corrective reaches the agent as an advisory observer note on the
+        # configured channel — NOT a GOLDFIVE_STEER cancel-and-restart. The
+        # ``legacy_ladder`` escape hatch restores the GOLDFIVE_STEER dispatch.
+        if legacy:
+            # Audit #402 fix: dispatch the ``GOLDFIVE_STEER`` ControlMessage
+            # AFTER ``_emit_plan_revised`` has swapped ``session.plan`` to the
+            # revised version so the payload's ``replacement_task_ids`` point
+            # at the NEW plan's PENDING tasks. Mirrors :meth:`_handle_drift`'s
+            # CANCEL_REINVOKE branch.
+            await self._dispatch_goldfive_steer_control(
+                drift, session, body_override=body
+            )
+        else:
+            # New regime: enqueue the advisory note (request_context queue or
+            # legacy pending_nudges, per ``signal_channel``). ``ladder_level=
+            # "promotion"`` lets the §5.4 divergence report tell a promoted
+            # SIGNAL apart from a Level-2 one.
+            await self._route_corrective_note(
+                session, drift, body, ladder_level="promotion"
+            )
 
     @staticmethod
-    def _compose_goldfive_steer_body(drift: DriftEvent) -> str:
+    def _compose_goldfive_steer_body(drift: DriftEvent, session: Session) -> str:
         """Derive the steer body for a goldfive-promoted drift.
 
-        Prefers ``drift.detail`` verbatim — the reasoning judge and
-        other LLM-as-a-judge paths already emit human-readable reasons
-        like "agent acknowledged discrepancy but chose to adopt
-        expanded topic" that are directly usable as a corrective. When
-        ``detail`` is empty, synthesise a generic template from the
-        drift's kind / severity / task context.
+        AGENCY-PRESERVATION.md PR 4: renders the full observation+goal
+        advisory note via :mod:`goldfive.observer_notes`. The
+        observation-sourcing chain is formalised there
+        (:func:`~goldfive.observer_notes.observation_for_drift`):
+
+        1. ``drift.note_to_agent`` verbatim — the judge authored the
+           agent-facing observation in the same call that produced the
+           verdict;
+        2. structured detector facts (tool-loop counts / fingerprints
+           on ``drift.raw``);
+        3. ``drift.detail`` verbatim — the pre-PR-4 preference, kept as
+           the fallback for judges that don't author notes;
+        4. a per-kind neutral fallback template (replaces the retired
+           "Goldfive detected {KIND} drift … proceed with the
+           corrective plan" command text).
+
+        ``session`` supplies the goals line and the bookkeeping Status
+        snapshot.
         """
-        detail = str(getattr(drift, "detail", "") or "").strip()
-        if detail:
-            return detail
-        task_id = drift.current_task_id or "the current task"
-        return (
-            f"Goldfive detected {drift.kind.name} drift "
-            f"(severity={drift.severity.name}). The preceding agent "
-            f"output did not match the task: {task_id}. Discard prior "
-            "work on this task and proceed with the corrective plan."
-        )
+        from goldfive.observer_notes import compose_note_for_drift
+
+        return compose_note_for_drift(drift=drift, session=session)
 
     # ------------------------------------------------------------------
     # USER_STEER state handler (goldfive#152)

@@ -111,11 +111,13 @@ from goldfive.types import (
     SupersessionKind,
     Task,
     TaskEdge,
+    TaskKind,
     TaskStatus,
     add_tasks,
     bump_revision,
     channel_processor_active,
     discovery_identity_hash,
+    plan_has_ledger_shape,
     replace_edges,
     set_session_plan,
 )
@@ -146,6 +148,21 @@ class PlanReviser:
         # ``_emit_plan_revision_transitions`` when a revision changes
         # task statuses out-of-band.
         self._steerer = steerer
+
+    def _ledger_mode(self) -> bool:
+        """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 10. Delegates to
+        :func:`goldfive.steerer.plan_mode_is_ledger` — the single
+        implementation of the parse. Defensive: any failure resolves to
+        forecast mode, keeping the legacy behaviour.
+        """
+        try:
+            from goldfive.steerer import plan_mode_is_ledger
+
+            return plan_mode_is_ledger(self._steerer)
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------
     # Public install entry points (4 + 1 back-compat shim)
@@ -271,7 +288,11 @@ class PlanReviser:
         * :meth:`_apply_revision` — bump ``revision_index`` + stamp
           metadata
         * :meth:`_cancel_inflight_for_revision` — preempt any
-          in-flight invocation per the drift's severity
+          in-flight invocation, IF the drift's authority permits it
+          (AGENCY-PRESERVATION.md PR 1: user-authored / hard-safety
+          only under the default ``cancel_inflight_scope``; a
+          goldfive-authored install lands for bookkeeping while the
+          invocation runs to completion)
         * :meth:`_emit_plan_revised` — ``PlanRevised`` + the paired
           refine-attempted / -success sidecar envelopes
 
@@ -389,7 +410,9 @@ class PlanReviser:
         * :meth:`_emit_drift_detected` emits the ``USER_STEER`` drift.
         * :meth:`_apply_revision` swaps ``session.plan`` and bumps
           ``revision_index``.
-        * :meth:`_cancel_inflight_for_revision` preempts in-flight work.
+        * :meth:`_cancel_inflight_for_revision` preempts in-flight work
+          (USER_STEER is user-authored, so the AGENCY-PRESERVATION PR-1
+          authority gate always permits this cancel).
         * :meth:`_emit_plan_revised` fires ``PlanRevised``.
 
         The deterministic-fallback branch deliberately does NOT touch
@@ -637,6 +660,8 @@ class PlanReviser:
         agent_name: str,
         tool_args_json: str,
         delegation_event_id: str = "",
+        title: str | None = None,
+        description: str | None = None,
     ) -> Task:
         """Grow ``session.plan`` with a ``discovered=True`` task and return it.
 
@@ -652,11 +677,14 @@ class PlanReviser:
         method re-reads ``session.plan`` (the lock acquisition is the
         linearisation point — any concurrent refine has either completed
         before the read or is queued behind it) and checks for an
-        existing task with the same hash. If found, the existing task
-        is returned and the plan is NOT grown. Two delegations of the
-        same ``(agent, args-token-set)`` arriving simultaneously thus
-        produce ONE discovered task, not two (§11.6 dedup
-        linearisability).
+        existing NON-TERMINAL task with the same hash. If found, the
+        existing task is returned and the plan is NOT grown. Two
+        delegations of the same ``(agent, args-token-set)`` arriving
+        simultaneously thus produce ONE discovered task, not two
+        (§11.6 dedup linearisability). The dedup window follows the
+        §11.1 TTL: once the discovered task reaches a terminal status,
+        a fresh delegation with the same hash is a genuinely new unit
+        of work and grows the plan again.
 
         The new task lands as an independent sub-DAG root: no predecessor
         edges, no supersedes link. Rule 7 of :meth:`Plan.validate` allows
@@ -679,13 +707,21 @@ class PlanReviser:
         triggered the growth. Empty when the caller has no event id on
         hand; the helper still works.
 
+        ``title`` / ``description`` are optional verbatim overrides
+        (AGENCY-PRESERVATION.md PR 3). ``None`` (the default) derives
+        both from ``tool_args_json`` exactly as before — pin-time and
+        reconciler growth are unaffected. The agent-authored
+        ``report_new_work_discovered`` reroute passes the agent's own
+        title/description so absorb-as-growth keeps the reported text
+        instead of an auto-derived ``agent: request`` label.
+
         Pipeline (under lock):
 
         1. Compute ``identity_hash`` from ``(agent_name, tool_args_json)``.
         2. Acquire ``_get_plan_lock(session)``.
-        3. Re-read ``session.plan``. If any task already carries
-           ``discovery_identity_hash == identity_hash``, return it
-           (dedup; no growth).
+        3. Re-read ``session.plan``. If any NON-TERMINAL task already
+           carries ``discovery_identity_hash == identity_hash``,
+           return it (dedup; no growth — §11.1 TTL).
         4. Build the new :class:`Task` with ``discovered=True``,
            ``discovery_identity_hash=identity_hash``,
            ``status=PENDING``, ``assignee_agent_id=agent_name``, and a
@@ -721,8 +757,36 @@ class PlanReviser:
         from goldfive.events import build_plan_revision_diff
 
         identity_hash = discovery_identity_hash(agent_name, tool_args_json or None)
-        title = self._derive_discovered_task_title(agent_name, tool_args_json)
-        description = self._derive_discovered_task_description(tool_args_json)
+        # AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode. In
+        # ledger mode the descriptively-grown task is the means-level
+        # DISCOVERED trajectory record; in forecast mode the ledger
+        # taxonomy is unused, so the grown task keeps the FORECAST default
+        # and forecast-mode behaviour stays byte-identical (the
+        # ``discovered=True`` bool is the only overlay it carries, exactly
+        # as before PR 10). Read off the steerer's typed config the same
+        # way the pin path reads ``descriptive_growth_enabled``.
+        discovered_kind = (
+            TaskKind.DISCOVERED if self._ledger_mode() else TaskKind.FORECAST
+        )
+        # Explicit ``title`` / ``description`` overrides (None → derive
+        # from the observed ``tool_args_json`` as before) let the
+        # agent-authored ``report_new_work_discovered`` reroute
+        # (AGENCY-PRESERVATION.md PR 3) preserve the agent's own verbatim
+        # title/description while still landing as a discovered ledger
+        # task. The identity hash still keys on ``(agent_name,
+        # tool_args_json)``, so callers wanting per-report dedup encode
+        # the distinguishing fields into ``tool_args_json``. Pin-time and
+        # reconciler callers pass neither and keep the derived titles.
+        title = (
+            title
+            if title is not None
+            else self._derive_discovered_task_title(agent_name, tool_args_json)
+        )
+        description = (
+            description
+            if description is not None
+            else self._derive_discovered_task_description(tool_args_json)
+        )
         # Mint a fresh id so two concurrent growths on the same
         # (agent, args-token-set) cannot collide on plan-task id even
         # if both miss the dedup check (the lock makes them sequential
@@ -771,6 +835,16 @@ class PlanReviser:
                     ) == identity_hash and bool(
                         getattr(existing, "discovered", False)
                     ):
+                        # Dedup TTL (design doc §11.1): the window is
+                        # "until the discovered task reaches a terminal
+                        # status". A fresh delegation matching a TERMINAL
+                        # discovered task is a genuinely new unit of work
+                        # and grows the plan again.
+                        if (
+                            getattr(existing, "status", None)
+                            in TERMINAL_TASK_STATUSES
+                        ):
+                            continue
                         # Dedup hit — a prior delegation already grew the
                         # plan for this (agent, args-token-set). Re-pin
                         # to the existing task; no growth.
@@ -792,6 +866,7 @@ class PlanReviser:
                 status=TaskStatus.PENDING,
                 discovered=True,
                 discovery_identity_hash=identity_hash,
+                kind=discovered_kind,
             )
 
             if current_plan is None:
@@ -1384,6 +1459,110 @@ class PlanReviser:
         )
         return dataclasses.replace(revised, tasks=tuple(new_tasks))
 
+    def _preserve_ledger_identity(self, revised: Plan, prior: Plan | None) -> Plan:
+        """Carry the ledger taxonomy + DISCOVERED identity across a revision.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 10/11(c). A no-op unless
+        ``SteeringConfig.plan_mode == "ledger"`` — forecast-mode installs
+        return ``revised`` untouched (bit-identical guarantee).
+
+        In ledger mode the plan is a ledger of goal-anchored OUTCOME
+        deliverables plus a descriptively-grown DISCOVERED trajectory. The
+        LLM-driven refine / user-steer paths reconstruct the plan from
+        JSON (``_plan_from_json``), which resets every ``Task.kind`` to the
+        FORECAST default and drops ``discovered`` / ``discovery_identity_hash``
+        / ``contributes_to`` / ``assignee_agent_id``. Left alone that
+        relabels OUTCOME deliverables as FORECAST (the outcome-progress
+        judge only grades OUTCOME tasks, so the flagship regime goes dark)
+        and severs the DISCOVERED lane's provenance. Two repairs, keyed by
+        id against ``prior``:
+
+        * **Preserve** — for a revised task whose id exists in ``prior``
+          with a non-FORECAST ledger kind, copy the prior ``kind`` and the
+          DISCOVERED identity fields (a non-empty prior value wins for the
+          hash / contributes_to / assignee; the revised task never carries
+          them since ``_plan_from_json`` drops them).
+        * **Stamp** — a genuinely new task (id absent from ``prior``,
+          still FORECAST) is a new OUTCOME deliverable, matching
+          :func:`goldfive.planner._stamp_ledger_outcome_kinds`.
+
+        Additionally, a NON-TERMINAL DISCOVERED task in ``prior`` that the
+        revision silently dropped is re-appended as an independent node
+        (no edges — DISCOVERED tasks are sub-DAG roots): the observed
+        trajectory is a historical record a refine must not erase.
+        Terminal DISCOVERED tasks are already validator-protected
+        (terminal-task preservation) so they are never re-added here.
+
+        Both repairs additionally require the PRIOR plan to actually carry
+        ledger shape (:func:`goldfive.types.plan_has_ledger_shape`): the
+        repairs exist to restore a taxonomy the LLM rebuild ERASED, so
+        there must have been one to erase. A prior with no ledger-shaped
+        task — the initial install (the ``Plan.empty()`` seed) or a
+        hand-authored forecast-shaped plan under a ledger config — is not
+        a degraded ledger; stamping it would relabel genuine prescriptive
+        intent as OUTCOME deliverables, violating the documented
+        "StaticPlanner users keep forecast semantics" contract (design doc
+        Stage 3). Ledger-mode planners stamp their OWN initial output
+        (:func:`goldfive.planner._stamp_ledger_outcome_kinds`), so an
+        LLMPlanner ledger arrives here already shaped and the repairs
+        engage from the first revision onward.
+
+        Returns a NEW :class:`Plan` when anything changed (frozen-Plan
+        invariant, goldfive#247); the input reference otherwise.
+        """
+        if not self._ledger_mode():
+            return revised
+        if not plan_has_ledger_shape(prior):
+            # Nothing to preserve/restore: the prior was never a ledger
+            # (initial empty-seed install, or a hand-authored forecast
+            # plan that keeps forecast semantics under a ledger config).
+            return revised
+        prior_tasks = list(getattr(prior, "tasks", None) or ())
+        prior_by_id: dict[str, Task] = {t.id: t for t in prior_tasks if t.id}
+        revised_ids = {t.id for t in revised.tasks if t.id}
+        new_tasks: list[Task] = []
+        changed = False
+        for t in revised.tasks:
+            pt = prior_by_id.get(t.id)
+            if pt is not None and pt.kind is not TaskKind.FORECAST:
+                replacement = dataclasses.replace(
+                    t,
+                    kind=pt.kind,
+                    discovered=pt.discovered or t.discovered,
+                    discovery_identity_hash=(
+                        pt.discovery_identity_hash or t.discovery_identity_hash
+                    ),
+                    contributes_to=pt.contributes_to or t.contributes_to,
+                    assignee_agent_id=t.assignee_agent_id or pt.assignee_agent_id,
+                )
+                if replacement != t:
+                    changed = True
+                new_tasks.append(replacement)
+            elif pt is None and t.kind is TaskKind.FORECAST:
+                new_tasks.append(dataclasses.replace(t, kind=TaskKind.OUTCOME))
+                changed = True
+            else:
+                new_tasks.append(t)
+        readded: list[str] = []
+        for pt in prior_tasks:
+            if not pt.id or pt.id in revised_ids:
+                continue
+            is_discovered = pt.kind is TaskKind.DISCOVERED or pt.discovered
+            if is_discovered and pt.status not in TERMINAL_TASK_STATUSES:
+                new_tasks.append(pt)
+                readded.append(pt.id)
+        if readded:
+            changed = True
+            log.info(
+                "PlanReviser._preserve_ledger_identity: re-added %d dropped "
+                "non-terminal DISCOVERED task(s): %s",
+                len(readded),
+                ", ".join(readded),
+            )
+        if not changed:
+            return revised
+        return dataclasses.replace(revised, tasks=tuple(new_tasks))
+
     @staticmethod
     def _plans_structurally_identical(prior: Plan | None, revised: Plan) -> bool:
         """Return ``True`` iff ``revised`` has the same structural shape as ``prior``.
@@ -1741,6 +1920,18 @@ class PlanReviser:
         # already matches prior's terminal, this is a no-op. Returns a
         # NEW Plan (goldfive#247: Plan is frozen).
         revised = self._fold_runtime_terminal_statuses(revised, prev)
+        # AGENCY-PRESERVATION.md Stage 3 — ledger taxonomy preservation.
+        # The refine / user-steer paths rebuild the plan from LLM JSON via
+        # ``_plan_from_json``, which resets every ``Task.kind`` to the
+        # FORECAST default and drops the DISCOVERED identity fields. In
+        # ledger mode that silently erases the OUTCOME / DISCOVERED
+        # taxonomy — permanently disabling outcome judging — and can drop
+        # the DISCOVERED trajectory record. Re-fold the ledger identity
+        # from the prior plan here, the single chokepoint every install
+        # path (drift refine, user-steer, handle_turn, initial) funnels
+        # through. Ledger-gated: a no-op in forecast mode (Plan returned
+        # unchanged), so forecast-mode installs stay bit-identical.
+        revised = self._preserve_ledger_identity(revised, prev)
         prior_id = (getattr(prev, "id", "") or "") if prev is not None else ""
         next_index = (prev.revision_index + 1) if prev is not None else 1
         # goldfive#247: Plan is frozen — derive a new instance with the
@@ -2030,11 +2221,29 @@ class PlanReviser:
                 # dynamic instruction resolver (Stream B) reads this on the next
                 # turn and appends a directive-style correction block to the
                 # agent's system prompt. No-op on refines with no CORRECT links.
+                #
+                # AGENCY-PRESERVATION.md task #11: in the request_context regime
+                # with the Site-4 pin retired, corrections ride the agent-scoped
+                # ObserverNoteQueue instead of that slot (the suppressed resolver
+                # no longer reads it). ``pin_assigned_task`` keeps the pin — and
+                # hence the slot read — so corrections stay on the slot there.
+                # Legacy channel: unchanged.
+                _channel = getattr(
+                    self._steerer, "_signal_channel", "legacy_user_message"
+                )
+                _pin = bool(
+                    getattr(
+                        getattr(self._steerer, "_steering_config", None),
+                        "pin_assigned_task",
+                        False,
+                    )
+                )
                 queue_corrections_for_revision(
                     session=session,
                     revised=revised,
                     prev_plan=prev_plan,
                     drift=drift,
+                    corrections_via_notes=(_channel == "request_context" and not _pin),
                 )
 
             # goldfive#237: re-pin ``current_task_id`` onto any replacement

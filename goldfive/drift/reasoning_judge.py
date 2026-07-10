@@ -77,6 +77,7 @@ __all__ = [
     "REASONING_DRIFT_TOOL_OBS_MAX_CHARS",
     "REASONING_DRIFT_TOOL_OBS_MAX_ENTRIES",
     "REASONING_DRIFT_USER_PROMPT_TEMPLATE",
+    "REASONING_DRIFT_LEDGER_USER_PROMPT_TEMPLATE",
     "ReasoningJudgeVerdict",
     "classify_reasoning_drift",
     "classify_reasoning_drift_with_focus",
@@ -163,7 +164,7 @@ REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     "{tool_obs_block}\n\n"
     "REASONING (the agent's most recent chain-of-thought block):\n"
     "{reasoning_block}\n\n"
-    "Decide THREE things:\n"
+    "Decide FOUR things:\n"
     "1. CLASSIFICATION. Which best describes the reasoning?\n"
     "   - on_task: it advances the BOUND TASK or the GOALS.\n"
     "   - justified_deviation: it departs from the BOUND TASK, but a recent\n"
@@ -185,7 +186,15 @@ REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     "   signal that justifies the deviation. Pick exactly one of:\n"
     "     tool_error | surprising_result | discovered_dependency | new_information\n"
     "   When classification is on_task or erroneous_deviation, set\n"
-    '   provenance to "none".\n\n'
+    '   provenance to "none".\n'
+    "4. NOTE. ONLY when classification is NOT on_task, write note_to_agent:\n"
+    "   one or two sentences addressed to the agent itself, stating only what\n"
+    "   you observed and how it relates to the GOALS. Neutral and factual —\n"
+    "   no commands, no instructions about which task, tool, or agent to use\n"
+    "   next, and no fault language (avoid words like 'failed', 'wrong',\n"
+    "   'broken'). If your confidence in this verdict is low, phrase the note\n"
+    '   as a question (e.g. "Does the current approach still serve the goal\n'
+    '   of X?"). When classification is on_task, set note_to_agent to "".\n\n'
     "Reply with a single JSON object and nothing else, in this shape:\n"
     "{{\n"
     '  "classification": "on_task" | "justified_deviation" | "erroneous_deviation",\n'
@@ -196,7 +205,9 @@ REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     '  "focused_task_id": "<id from PLAN TASKS, or \'\' if off-plan>",\n'
     '  "focus_confidence": 0.0-1.0,\n'
     '  "stated_intent": "one-sentence summary of what the agent says it '
-    'is doing"\n'
+    'is doing",\n'
+    '  "note_to_agent": "one-or-two-sentence neutral observation for the '
+    "agent, or '' when on_task\"\n"
     "}}\n\n"
     "GUIDANCE:\n"
     "- on_task includes clarifying sub-steps, exploring tradeoffs, and\n"
@@ -228,6 +239,88 @@ REASONING_DRIFT_USER_PROMPT_TEMPLATE: str = (
     "any plan task. focus_confidence is your subjective certainty in "
     "the attribution: 1.0 when the reasoning explicitly names the "
     "task, 0.0 when you are guessing."
+)
+
+
+# AGENCY-PRESERVATION.md Stage 3 PR 11(b) — the LEDGER-regrounded
+# reasoning-judge prompt. Used only in ledger plan mode. The verdict
+# JSON shape and classification labels are IDENTICAL to the forecast
+# template (so the parser is unchanged), but the GROUNDING is inverted:
+#
+#   * GOALS lead — they are the PRIMARY reference for whether the
+#     reasoning is on task. The user's goal is what goldfive owns.
+#   * The bound task is presented as CONTEXT — in ledger mode it is the
+#     agent's OWN observed intent (an OUTCOME deliverable, or a
+#     DISCOVERED record of what it chose to do), not a forecast the agent
+#     is graded against. Divergence from the bound task is therefore NOT
+#     drift by itself; only divergence from the GOALS is. This is the
+#     self-consistent, adaptive reference §2 calls for.
+REASONING_DRIFT_LEDGER_USER_PROMPT_TEMPLATE: str = (
+    "You are assessing whether an autonomous agent's chain-of-thought "
+    "still serves the user's GOALS.\n\n"
+    "GOALS (what the user wants — the PRIMARY reference for this "
+    "judgement):\n{goals_block}\n\n"
+    "LEDGER — OUTCOME deliverables that define success + DISCOVERED "
+    "records of what the agent has actually done (id -> title):\n"
+    "{plan_tasks_summary}\n\n"
+    "CURRENTLY BOUND TASK (CONTEXT ONLY — in ledger mode this is the "
+    "agent's OWN observed intent, NOT a prescription to grade against; "
+    "the agent owns HOW it pursues the goals):\n{task_block}\n\n"
+    "Currently reasoning agent: {current_agent_id}\n"
+    "Task lineage: {task_lineage_block}\n\n"
+    "RECENT TOOL OBSERVATIONS (last {tool_obs_count}, oldest first):\n"
+    "{tool_obs_block}\n\n"
+    "REASONING (the agent's most recent chain-of-thought block):\n"
+    "{reasoning_block}\n\n"
+    "Decide FOUR things, grounding PRIMARILY on the GOALS:\n"
+    "1. CLASSIFICATION. Which best describes the reasoning?\n"
+    "   - on_task: it plausibly advances the GOALS. Choosing a different\n"
+    "     decomposition, sub-agent, tool, or order than the bound task\n"
+    "     suggests is the agent exercising its own judgement — that is\n"
+    "     on_task as long as it still serves the GOALS.\n"
+    "   - justified_deviation: it departs from the GOALS, but a recent\n"
+    "     tool observation, surprising result, discovered dependency, or\n"
+    "     new information visible above plausibly provoked it. The\n"
+    "     provoking signal MUST be visible in the GOALS or RECENT TOOL\n"
+    "     OBSERVATIONS — the agent's CLAIM is not itself evidence.\n"
+    "   - erroneous_deviation: it pursues an objective the GOALS do not\n"
+    "     support, with no provoking signal in the context above.\n"
+    "2. ATTRIBUTION. Which LEDGER task is the reasoning advancing right\n"
+    "   now? Use the literal id, or '' when it maps to no ledger task.\n"
+    "3. PROVENANCE. ONLY when classification is justified_deviation, name\n"
+    "   the signal: tool_error | surprising_result | "
+    "discovered_dependency | new_information. Otherwise \"none\".\n"
+    "4. NOTE. ONLY when classification is NOT on_task, write "
+    "note_to_agent:\n"
+    "   one or two sentences addressed to the agent itself, stating only\n"
+    "   what you observed and how it relates to the GOALS. Neutral and\n"
+    "   factual — no commands, no means-level instructions, no fault\n"
+    "   language. If your confidence is low, phrase it as a question\n"
+    '   (e.g. "Does the current approach still serve the goal of X?").\n'
+    '   When classification is on_task, set note_to_agent to "".\n\n'
+    "Reply with a single JSON object and nothing else, in this shape:\n"
+    "{{\n"
+    '  "classification": "on_task" | "justified_deviation" | "erroneous_deviation",\n'
+    '  "severity": "info" | "warning" | "critical",\n'
+    '  "reason": "one-sentence explanation",\n'
+    '  "provenance": "tool_error" | "surprising_result" | '
+    '"discovered_dependency" | "new_information" | "none",\n'
+    '  "focused_task_id": "<id from LEDGER, or \'\' if unmapped>",\n'
+    '  "focus_confidence": 0.0-1.0,\n'
+    '  "stated_intent": "one-sentence summary of what the agent says it '
+    'is doing",\n'
+    '  "note_to_agent": "one-or-two-sentence neutral observation for the '
+    "agent, or '' when on_task\"\n"
+    "}}\n\n"
+    "Severity guidance when classification is non-on_task:\n"
+    "  info     = mild deviation from the goals that may self-correct.\n"
+    "  warning  = clear deviation from the goals that deserves a note.\n"
+    "  critical = proposing to abandon the goals entirely.\n\n"
+    "focused_task_id MUST be the literal id of one of the listed ledger "
+    "tasks, or an empty string when the reasoning maps to no ledger "
+    "task. focus_confidence is your subjective certainty in the "
+    "attribution: 1.0 when the reasoning explicitly names the task, 0.0 "
+    "when you are guessing."
 )
 
 
@@ -656,6 +749,16 @@ class ReasoningJudgeVerdict:
     # change ships in PR 3 (parser) + PR 4 (routing).
     classification: str = ""
     provenance: str = ""
+    # AGENCY-PRESERVATION.md PR 4 — the judge's agent-facing
+    # observation, authored in the same call that produced the verdict
+    # (prompt decision 4). Neutral facts relative to the goals; question
+    # form when the judge is unsure. Mirrored onto
+    # ``DriftEvent.note_to_agent`` for non-on_task verdicts so the
+    # observer-note composers prefer it over ``detail``. Empty string
+    # for on_task verdicts, quiet-failure paths, and old-style
+    # responses that omit the field (graceful degradation: the
+    # composer falls back to ``detail``).
+    note_to_agent: str = ""
     # Judge-scheduling guards: measurement fields. ``judge_ran`` is
     # True iff the judge LLM was actually dispatched (False on the
     # empty-reasoning early return, the embedding-only path, and
@@ -774,6 +877,7 @@ async def classify_reasoning_drift_with_focus(
     current_agent_id: str = "",
     system_prompt: str | None = None,
     user_prompt_template: str | None = None,
+    ledger: bool = False,
     sink: Any = None,
     run_id: str = "",
     session_id: str = "",
@@ -870,7 +974,16 @@ async def classify_reasoning_drift_with_focus(
     if not reasoning or not reasoning.strip():
         return ReasoningJudgeVerdict(drift=None)
     system = system_prompt or REASONING_DRIFT_SYSTEM_PROMPT
-    template = user_prompt_template or REASONING_DRIFT_USER_PROMPT_TEMPLATE
+    # AGENCY-PRESERVATION.md PR 11(b) — in ledger mode re-ground the judge
+    # on the GOALS (primary) with the bound task as context (the agent's
+    # own observed intent). An explicit ``user_prompt_template`` override
+    # always wins; otherwise the grounding is forecast vs ledger.
+    if user_prompt_template is not None:
+        template = user_prompt_template
+    elif ledger:
+        template = REASONING_DRIFT_LEDGER_USER_PROMPT_TEMPLATE
+    else:
+        template = REASONING_DRIFT_USER_PROMPT_TEMPLATE
     # goldfive#245 — capture the plan revision the judge is observing
     # BEFORE we render the prompt or await the LLM. Stamped onto the
     # drift below; the dispatch-time gate in
@@ -950,6 +1063,10 @@ async def classify_reasoning_drift_with_focus(
     # below populates these post-call.
     classification_parsed: str = ""
     provenance_parsed: str = ""
+    # AGENCY-PRESERVATION.md PR 4 — judge-authored agent-facing
+    # observation. Empty for on_task verdicts, quiet-failures, and
+    # old-style responses missing the field.
+    note_to_agent_parsed: str = ""
     try:
         async with goldfive_llm_span(
             sinks=span_sinks,
@@ -1074,6 +1191,15 @@ async def classify_reasoning_drift_with_focus(
                 intent_raw = parsed.get("stated_intent", "")
                 if isinstance(intent_raw, str):
                     stated_intent_parsed = intent_raw.strip()
+                # AGENCY-PRESERVATION.md PR 4 — the agent-facing note.
+                # Only honoured on non-on_task verdicts (the prompt
+                # asks for "" on on_task; a chatty model that fills it
+                # anyway is ignored so healthy turns stay note-free).
+                # Old-style responses (key absent) degrade to "".
+                if classification_parsed and classification_parsed != "on_task":
+                    note_raw = parsed.get("note_to_agent", "")
+                    if isinstance(note_raw, str):
+                        note_to_agent_parsed = note_raw.strip()
             # Build the span's output / decision strings from the parsed
             # verdict so harmonograf can render "judged agent/task:
             # on-task" inline.
@@ -1205,6 +1331,7 @@ async def classify_reasoning_drift_with_focus(
                     reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
                 ),
                 observed_revision_index=observed_revision_index,
+                note_to_agent=note_to_agent_parsed,
             )
         else:
             # erroneous_deviation — same wire shape as the pre-iter-10
@@ -1262,6 +1389,7 @@ async def classify_reasoning_drift_with_focus(
                     reasoning, REASONING_JUDGE_MAX_REASONING_INPUT_CHARS
                 ),
                 observed_revision_index=observed_revision_index,
+                note_to_agent=note_to_agent_parsed,
             )
     # Emit ReasoningJudgeInvoked on every invocation, regardless of
     # verdict. Done after the drift decision so the event carries the
@@ -1306,6 +1434,7 @@ async def classify_reasoning_drift_with_focus(
         stated_intent=stated_intent_parsed,
         classification=classification_parsed,
         provenance=provenance_parsed,
+        note_to_agent=note_to_agent_parsed,
         judge_ran=True,
         elapsed_ms=elapsed_ms,
     )

@@ -85,7 +85,7 @@ kinds group naturally into six categories.
 
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
-| `PLAN_DIVERGENCE` | `report_plan_divergence(note, suggested_action)` | `warning` | yes |
+| `PLAN_DIVERGENCE` | `report_plan_divergence(note, suggested_action)` | `warning` | **observability-only** (AGENCY-PRESERVATION.md PR 3: ladder OBSERVE at all severities; also dropped at the top of `handle_drift` per #252. DriftDetected still emits via the executor reachability-audit emitter; no refine/steer/cancel.) |
 | `STOPPED_EARLY` | Agent stopped emitting before marking the task terminal. | `warning` | yes |
 | `TOO_MANY_STEPS` | Adapter observed an unreasonable step count in a single invocation. | `warning` | yes |
 | `UNEXPECTED_OUTPUT` | Output did not match a caller-supplied schema / heuristic. | `warning` | yes |
@@ -96,31 +96,63 @@ kinds group naturally into six categories.
 
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
-| `WRONG_AGENT` | Reporting tool call came from an agent that is not `task.assignee_agent_id`. | `warning` | yes |
+| `WRONG_AGENT` | **DEPRECATED (AGENCY-PRESERVATION.md PR 3) — no production emitter.** Was "reporting tool call came from an agent that is not `task.assignee_agent_id`". Subsumed by `CAPABILITY_MISMATCH` (#253) and the #252 move off assignee-grading. Enum value stays reserved (proto/wire compat); carries no intervention-ladder row. | n/a | n/a |
 | `AGENT_TRANSFER` | Adapter observed a transfer / delegation to an unplanned agent. | `info` | yes |
 | `CONTEXT_PRESSURE` | Adapter observed a `finish_reason` indicating the context window was hit. | `warning` | yes |
 | `RESOURCE_EXHAUSTED` | Adapter observed rate-limit or quota exhaustion. | `warning` | yes |
 | `BLOCKED` | `report_task_blocked(task_id, blocker)` with a structural blocker. | `warning` | sometimes |
-| `CAPABILITY_MISMATCH` | Structural capability gap at `delegation_observed` time: Rule A (coordinator-style leaf-assignment, #253), Rule B (required-tools cover, #253), Rule C (out-of-DAG-order delegation, #268). See `goldfive/drift/capability_check.py`. | `critical` | yes (refine) |
+| `CAPABILITY_MISMATCH` | Structural capability gap at `delegation_observed` time: Rule A (coordinator-style leaf-assignment, #253; **soft-retired, default OFF**), Rule B (required-tools cover, #253), Rule C (out-of-DAG-order delegation, #268; soft-retired). See `goldfive/drift/capability_check.py`. | Rule B `warning`; Rule A/C `critical` (gated off) | Rule B → refine (WARNING→ABSORB); Rule A/C → OBSERVE |
 
-**Rule C status under plan-descriptive growth (goldfive#423).** Rule A
-and Rule B still fire normally. **Rule C** is active until PR 4 of
-#423 lands. When `SteeringConfig.descriptive_growth_enabled=True`
-(env `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH=1`), the steerer bypasses
-Rule C in favour of synthesising a `discovered=True` task via
-`PlanReviser.install_descriptive_growth` — the plan grows to match
-reality rather than firing a structural drift. When the flag is
-False (the default until PR 4), Rule C fires as before. The data-
-model carriers (`Task.discovered`,
-`DelegationObserved.tool_args_json`) ship regardless of the flag.
-See [PLAN-DESCRIPTIVE-GROWTH.md](PLAN-DESCRIPTIVE-GROWTH.md) §7 for
-the full Rule A/B/C table under the new model.
+**Rule status under plan-descriptive growth + the PR 3 demotion
+(goldfive#423 / AGENCY-PRESERVATION.md PR 2 & PR 3).**
+
+* **Rule A is soft-retired (PR 3): default OFF**, re-enabled only via
+  `GOLDFIVE_CAPABILITY_RULE_A=1`. Its leaf-task read is stem/keyword
+  NL classification — the #166/#167 anti-pattern — and was the source
+  of the e2e 2d27ff4a refine storm. Even when re-enabled it only
+  OBSERVEs: the `CAPABILITY_MISMATCH` ladder row demotes the CRITICAL
+  cells to OBSERVE.
+* **Rule B is kept** as the one capability steering trigger
+  (user-declared `required_tools` is genuine prescriptive intent, not
+  a forecast), but now fires **WARNING, not CRITICAL** ("WARNING-max"):
+  the ladder refines (WARNING→ABSORB) but cannot escalate to
+  cancel/pause.
+* **Rule C is soft-retired** (PR 2): silent unless
+  `GOLDFIVE_CAPABILITY_RULE_C=1`; like Rule A it routes to OBSERVE when
+  re-enabled.
+* Both A and B are still skipped when the bound task is
+  `discovered=True` (PLAN-DESCRIPTIVE-GROWTH.md §11.4(a)). With
+  `SteeringConfig.descriptive_growth_enabled=True` (the default; env
+  `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`), the delegation pin grows a
+  `discovered=True` task via `PlanReviser.install_descriptive_growth`
+  whenever tier 1/2 matching misses — the plan grows to match reality
+  BEFORE any capability rule runs.
+
+Hard deletion of Rules A/C follows in AGENCY-PRESERVATION.md PR 13. The
+data-model carriers (`Task.discovered`,
+`DelegationObserved.tool_args_json`) ship regardless of the flags. See
+[PLAN-DESCRIPTIVE-GROWTH.md](PLAN-DESCRIPTIVE-GROWTH.md) §7 for the full
+Rule A/B/C table under the new model.
 
 ### Discovery category — new work that was not in the plan
 
 | Kind | Trigger | Default severity | Recoverable |
 |---|---|---|---|
-| `NEW_WORK_DISCOVERED` | `report_new_work_discovered(parent_task_id, title, description, assignee)` | `warning` | yes |
+| `NEW_WORK_DISCOVERED` | `report_new_work_discovered(parent_task_id, title, description, assignee)` | `info` (was `warning`) | **absorb-as-growth** (AGENCY-PRESERVATION.md PR 3) |
+
+**Reroute (AGENCY-PRESERVATION.md PR 3).** The agent-authored
+`report_new_work_discovered` reporting tool no longer fires a WARNING
+drift through `planner.refine` (the "Plan is a forecast the agent is
+graded against" defect, §1.2 / PLAN-DESCRIPTIVE-GROWTH.md §13). It now
+absorbs the report as a `discovered=True` ledger task via
+`PlanReviser.install_descriptive_growth` — the agent's verbatim
+title/description are preserved, the task lands as a sub-DAG root, and
+observability is kept (the growth path still emits `PlanRevised` +
+`DriftDetected`, now at INFO — "observational, not corrective"). The
+framework-synthesised discovery path (pin-time / reconciler growth) was
+already INFO and non-steering; the explicit `NEW_WORK_DISCOVERED`
+ladder row (OBSERVE at all severities) makes that the documented
+mapping.
 
 ### User category — external control signal
 
@@ -653,13 +685,14 @@ severity:
   from pre-#204 for the exact axis — work-tool loops at 3+ identical
   calls, meta at 6+. Work name-axis at 5 reaches WARNING only with
   exact-repeat corroboration in the window (or a raised
-  `name_axis_max_severity`).
-- **CRITICAL** first → Level 2 (`NUDGE`): refine **and** queue a soft
-  corrective follow-up on `session.pending_nudges` for the overlay
-  loop to pick up. Coordinates with the forward-progress work that
-  wires nudge consumption.
+  `name_axis_max_severity`) — uncorroborated name-axis caps at INFO
+  (goldfive#484).
+- **CRITICAL** first → Level 2 (`SIGNAL`, renamed from `NUDGE` in
+  AGENCY-PRESERVATION.md PR 7): enqueue an advisory observer note for
+  the agent (no refine, no cancel, no steer). The proportional,
+  trajectory-preserving response.
 - **CRITICAL** repeat → Level 4 (`PAUSE_ESCALATE`): if the loop
-  survives the nudge and re-fires CRITICAL after
+  survives the signal and re-fires CRITICAL after
   `REFINE_FAILURE_THRESHOLD` occurrences, escalate to a human pause.
 
 ### Negative class
@@ -709,19 +742,53 @@ Drift handling routes through an explicit six-level ladder
 table, not a tangle of conditionals. The live mapping from
 `(drift_kind, severity, occurrence_count)` to level is
 `DriftObserver._LADDER` plus the fallback in
-`DriftObserver._ladder_level_for` (the ladder moved from
-`DefaultSteerer` into the `steerer.drift` component in the steerer
-split, bucket 3c). See `goldfive/drift_observer.py` for the
-authoritative table.
+`DriftObserver._ladder_level_for` (in `goldfive/drift_observer.py` —
+the ladder moved off the router in the steerer split; a `steerer.py`
+reference in older docs is stale). The full `(kind × severity ×
+occurrence-bucket)` surface is snapshotted as a checked-in golden in
+`tests/test_ladder_decision_table.py` (AGENCY-PRESERVATION.md §5.3), so
+every cell change lands as an explicit, reviewable table diff.
+
+**Forecast-mismatch demotions (AGENCY-PRESERVATION.md PR 3).** Three
+kinds that signalled divergence from goldfive's *forecast* (not from
+the user's goal) are now observability-only — `DriftDetected` still
+emits, but the ladder takes no refine/steer/cancel action:
+`PLAN_DIVERGENCE` (OBSERVE at all severities), `NEW_WORK_DISCOVERED`
+(OBSERVE; the agent-authored reporting tool reroutes to descriptive
+growth), and `CAPABILITY_MISMATCH` at CRITICAL (Rule A / soft-retired
+Rule C). `CAPABILITY_MISMATCH` at WARNING stays `ABSORB` so Rule B
+(user-declared `required_tools`) keeps refining. `WRONG_AGENT` is
+deprecated with no ladder row.
+
+**Cancel-policy + ladder restructure (AGENCY-PRESERVATION.md PR 7).** The
+goldfive-authored `CANCEL_REINVOKE` cells were demoted to `SIGNAL` (advisory
+note, no refine/cancel/steer); repeat-escalation lands on `PAUSE_ESCALATE`
+(stop-and-ask preserves trajectory; cancel-and-redirect does not).
+`CANCEL_REINVOKE` survives **only** for the user-steer junction and
+`RUNAWAY_DELEGATION` (the behaviour is the problem, not a spent budget — kill
+the runaway subtree and continue non-runaway work). The other hard-safety
+kinds (`RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`)
+also had their §0-violating `ABSORB` cell fixed, but to **`PAUSE_ESCALATE`**,
+not `CANCEL_REINVOKE`: restart can't refund a spent budget (a cancel-and-reinvoke
+on an exhausted budget just re-trips the same cap). Their immediate in-flight
+stop already comes from the PR-1 cancel-authority path (they are in cancel
+scope); the ladder cell's follow-on for a spent resource is halt-and-ask-human.
+`_promote_drift_to_steer` likewise
+dropped its steering side-effects: no cancel-reason tag, no `GOLDFIVE_STEER`
+dispatch, no `active_steer(source="goldfive")` stamp — it refines, emits
+`PlanRevised`, and enqueues an advisory note. `GOLDFIVE_STEER_LEGACY_LADDER=1`
+is a one-release escape hatch that restores the pre-PR-7 cells + promotion
+side-effects (the §5.8 measurable-regression arm); both regimes are
+snapshotted in `tests/test_ladder_decision_table.py`.
 
 | Level | Name | Action | Typical triggers |
 |---|---|---|---|
-| **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift. |
-| **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `PLAN_DIVERGENCE`, `TOOL_ERROR`, `AGENT_REFUSAL`, `INTENT_DIVERGENCE`, etc. — but `GOAL_DRIFT` and `TASK_TIMEOUT` route WARNING to Level 2 instead); `JUSTIFIED_DEVIATION` at CRITICAL (first & repeat); CRITICAL first-occurrence of kinds with no explicit table row (severity fallback). |
-| **2** | `NUDGE` | Queue a short corrective user message on `session.pending_nudges` for the Runner's overlay loop to pick up at the next invocation boundary. The enqueue is gated on `is_active_steering()` (goldfive#475) — under `observation_only=True` the would-be nudge is logged and a `PolicyApplied` gate event is stamped instead. | `LOOPING_REASONING` at CRITICAL (first occurrence) after goldfive#204; `GOAL_DRIFT` at WARNING and CRITICAL-first (goldfive#324 F4); `TASK_TIMEOUT` at WARNING (goldfive#487). Also available for caller overrides. |
-| **3** | `CANCEL_REINVOKE` | Refine the plan; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel**. The executor's invoke loop cancels the in-flight invocation and restarts the passthrough with a `[GOLDFIVE STEERING CONTROL …]` framed corrective body. | CRITICAL first-occurrence for most refinable kinds (`PLAN_DIVERGENCE`, `TOOL_ERROR`, `RUNAWAY_DELEGATION`, ...); `GOAL_DRIFT` at CRITICAL-repeat. (`LOOPING_REASONING` CRITICAL-first now routes to Level 2 via goldfive#204.) |
-| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives on the channel — unbounded unless `SteeringConfig.pause_escalate_deadline_s` is set, in which case the message carries a `deadline_s` payload and expiry aborts the run. | `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; `TASK_TIMEOUT` at CRITICAL (first & repeat); CRITICAL-repeat of almost every kind. |
-| **5** | `TERMINATE` | Pause-with-deadline. Same dispatch as Level 4 but the payload ALWAYS carries `deadline_s` (`SteeringConfig.pause_escalate_deadline_s`, or `DEFAULT_TERMINATE_PAUSE_DEADLINE_S` = 600 s when unset). On expiry the executor cancels every non-terminal task and emits `RunAborted` carrying the escalation lineage (drift kind + ladder level). | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
+| **0** | `OBSERVE` | Emit `DriftDetected`; no further action. | Every `INFO` drift; the forecast-mismatch demotions. |
+| **1** | `ABSORB` | Call `planner.refine`; install the revised plan; continue. | `WARNING` drifts with a known kind (`LOOPING_REASONING`, `LOOPING_TOOL_CALL`, `TOOL_ERROR`, `AGENT_REFUSAL`, `CAPABILITY_MISMATCH` Rule B, etc. — but `GOAL_DRIFT` and `TASK_TIMEOUT` route WARNING to Level 2 instead). |
+| **2** | `SIGNAL` (was `NUDGE`) | Enqueue an advisory observer note on the configured channel (PR 6) — **no refine, no cancel, no steer**. The agent reads it at its next model call / invocation boundary. The legacy-channel enqueue is gated on `is_active_steering()` (goldfive#475) — under `observation_only=True` the would-be note is logged and a `PolicyApplied` gate event is stamped instead; the request_context channel gates rendering at the delivery surfaces. | CRITICAL-first of the goldfive-authored content kinds (`TOOL_ERROR`, `AGENT_REFUSAL`, `MODEL_REFUSAL`, `OFF_TOPIC`, `CONFABULATION_RISK`, `LOOPING_*`, `SELF_REPORTED_STUCK`); `GOAL_DRIFT` at WARNING + CRITICAL-first; `TASK_TIMEOUT` at WARNING (the goldfive#487 stall watchdog). |
+| **3** | `CANCEL_REINVOKE` | Refine; install the revision; **dispatch a `GOLDFIVE_STEER` ControlMessage** so the executor cancels the in-flight invocation and restarts with a framed corrective body. | `RUNAWAY_DELEGATION` at CRITICAL-first; the USER_STEER junction; and every goldfive-authored row under `GOLDFIVE_STEER_LEGACY_LADDER=1`. |
+| **4** | `PAUSE_ESCALATE` | Emit `HUMAN_INTERVENTION_REQUIRED`; **dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage**; do NOT call `planner.refine`. The executor's pre-task loop blocks until a user `RESUME` / `STEER` / `CANCEL` arrives — unbounded unless `SteeringConfig.pause_escalate_deadline_s` is set, in which case the message carries a `deadline_s` payload and expiry aborts the run (goldfive#482). | The budget/timeout hard-safety kinds (`RESOURCE_EXHAUSTED`, `TOO_MANY_STEPS`, `TASK_TIMEOUT`, `LLM_CALL_TIMEOUT`) at CRITICAL-first; `REFINE_VALIDATION_FAILED`; `HUMAN_INTERVENTION_REQUIRED`; `INTENT_DIVERGENCE` at CRITICAL; CRITICAL-repeat of almost every kind (incl. `GOAL_DRIFT`, `RUNAWAY_DELEGATION`). |
+| **5** | `TERMINATE` | Pause-with-deadline (goldfive#482). Same dispatch as Level 4 but the payload ALWAYS carries `deadline_s` (`SteeringConfig.pause_escalate_deadline_s`, or `DEFAULT_TERMINATE_PAUSE_DEADLINE_S` = 600 s when unset). On expiry the executor cancels every non-terminal task and emits `RunAborted` carrying the escalation lineage (drift kind + ladder level). | Repeat `HUMAN_INTERVENTION_REQUIRED`. |
 
 ### Dispatch routing — single junction (Phase 2 of #246)
 

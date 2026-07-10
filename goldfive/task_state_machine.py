@@ -79,6 +79,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+#: ``TaskTransitioned.source`` stamped when goldfive's own outcome-progress
+#: judge (ledger plan mode) transitions an OUTCOME deliverable — as opposed to
+#: the default ``"other"`` a legacy per-task-loop force-completion carries. The
+#: three-arm bench keys its "ledger genuinely EXERCISED" signal on this exact
+#: string (``bench.harness.OUTCOME_JUDGE_SOURCE``), so it is a shared constant
+#: rather than a bare literal: a silent rename would make the bench under-report
+#: real ledger runs as not-exercised (goldfive#501 review).
+OUTCOME_JUDGE_SOURCE = "goldfive_outcome_judge"
+
 
 # Re-export for compat with code that imported the private name from
 # :mod:`goldfive.steerer` historically; do NOT redefine.
@@ -267,7 +276,9 @@ class TaskStateMachine:
             source=source,
         )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
-        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(
+            session, transitioned_task=task
+        )
 
     async def mark_task_failed(
         self,
@@ -277,6 +288,7 @@ class TaskStateMachine:
         reason: str = "",
         recoverable: bool = True,
         source: str = "other",
+        dispatch_drift_cascade: bool = True,
     ) -> None:
         """Transition ``task_id`` to ``FAILED`` and emit ``TaskFailed``.
 
@@ -284,6 +296,17 @@ class TaskStateMachine:
         ``TASK_FAILED_FATAL``. The drift event is dispatched through the
         same drift pipeline as observer-detected drift: if severity is
         ``>= WARNING`` (both of these are) we invoke ``planner.refine``.
+
+        ``dispatch_drift_cascade=False`` skips ONLY that fire-and-forget
+        drift dispatch (the intervention-ladder cascade whose advisory
+        note / nudge targets the still-running agent). The one caller is
+        the run-ending outcome-progress finalize
+        (:meth:`~goldfive.drift_observer.DriftObserver._apply_outcome_transitions`
+        with ``run_ending=True``): the run is over, so a cascade signal
+        could never be delivered — dispatching it would pollute signal
+        telemetry with forever-pending notes and phantom fire records.
+        Status transition, ``TaskFailed`` / ``TaskTransitioned`` emission,
+        lineage cleanup, and the fatal downstream cascade are unaffected.
 
         When ``recoverable=False`` the failure is fatal for this task
         lineage: **cascade-cancel every reachable downstream non-terminal
@@ -332,7 +355,9 @@ class TaskStateMachine:
             source=source,
         )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
-        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(
+            session, transitioned_task=task
+        )
         # Fatal failures cascade downstream via the same primitive used
         # by mark_task_cancelled, so both §6.2 and §6.3 produce the
         # same TaskCancelled event stream and share rejection guards.
@@ -342,6 +367,15 @@ class TaskStateMachine:
             # ``"cancellation"`` from the framework's perspective — the
             # cascaded tasks weren't moved by the LLM directly).
             await self.cascade_cancel_downstream(session, task_id, source="cancellation")
+        if not dispatch_drift_cascade:
+            # Run-ending outcome finalize: no agent remains to receive the
+            # cascade's advisory signal (see docstring) — skip the dispatch.
+            log.debug(
+                "TaskStateMachine.mark_task_failed: drift cascade for task "
+                "%s suppressed (run-ending outcome finalize)",
+                task_id,
+            )
+            return
         kind = DriftKind.TASK_FAILED_RECOVERABLE if recoverable else DriftKind.TASK_FAILED_FATAL
         severity = DriftSeverity.WARNING if recoverable else DriftSeverity.CRITICAL
         drift = DriftEvent(
@@ -460,7 +494,9 @@ class TaskStateMachine:
         # cascade-cancel downstream tasks share the same rate-limit bucket
         # and will no-op as subsequent boundary fires fall within the
         # 10s guard.
-        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(
+            session, transitioned_task=task
+        )
         await self.cascade_cancel_downstream(session, task_id, source="cancellation")
 
     async def mark_task_not_needed(
@@ -519,7 +555,9 @@ class TaskStateMachine:
             source=source,
         )
         # goldfive#219: task boundary is a natural goal-drift checkpoint.
-        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(session)
+        await self._steerer.drift._maybe_run_goal_drift_on_task_boundary(
+            session, transitioned_task=task
+        )
 
     async def cascade_cancel_downstream(
         self,
@@ -733,13 +771,36 @@ class TaskStateMachine:
         task_id_for_progress = str(getattr(task, "id", "") or "")
         if task_id_for_progress:
             session.task_last_progress_at[task_id_for_progress] = time.monotonic()
-        # Drift-condition lifecycle: a terminal task moots every
-        # condition still open against it. Done here because every
-        # transition path funnels through this method (mark_task_*,
-        # cascade, plan-revision transitions), and BEFORE the sink
-        # check because the ``KEY_ACTIVE_DRIFTS`` cleanup is lifecycle
-        # truth that must land even when emission is impossible.
         if task_id_for_progress and to_status in _TERMINAL_TASK_STATUSES:
+            # AGENCY-PRESERVATION.md PR 5 (observe-only): when a task reaches a
+            # terminal status, resolve any open, delivered SignalLedger keys bound
+            # to it — ``self_corrected_after_signal`` if a real signal was
+            # delivered, ``self_corrected_unaided`` if only dry-run (the
+            # ``observation_only`` base rate). Terminal-only is the conservative
+            # "resolved" detection (never over-claims self-correction). Run before
+            # the sink guard so ledger state stays consistent even without sinks
+            # (mirrors the progress-liveness rationale above); the emit inside is
+            # a no-op when no sink is bound. Best-effort; gates nothing.
+            recorder = getattr(
+                getattr(self._steerer, "drift", None),
+                "record_signal_outcomes_for_task",
+                None,
+            )
+            if callable(recorder):
+                try:
+                    await recorder(session, task_id_for_progress)
+                except Exception as exc:  # noqa: BLE001 -- telemetry best-effort
+                    log.debug(
+                        "TaskStateMachine._emit_task_transitioned: signal-outcome "
+                        "resolution raised (swallowed): %s",
+                        exc,
+                    )
+            # Drift-condition lifecycle: a terminal task moots every
+            # condition still open against it. Done here because every
+            # transition path funnels through this method (mark_task_*,
+            # cascade, plan-revision transitions), and BEFORE the sink
+            # check because the ``KEY_ACTIVE_DRIFTS`` cleanup is lifecycle
+            # truth that must land even when emission is impossible.
             await self._steerer.drift.resolve_conditions_for_terminal_task(
                 session, task_id=task_id_for_progress, to_status=to_status
             )

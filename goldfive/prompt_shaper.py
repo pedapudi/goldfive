@@ -41,12 +41,28 @@ Sites
    ``[GOLDFIVE PLAN-STATE HINT — …]`` block listing each agent's
    PENDING / DONE task summary so the coordinator has structural
    guidance about which sub-agent to call next (R3 / F2-alternative).
+   AGENCY-PRESERVATION.md PR 9 prompt-shaping diet: RETIRED under the
+   ``signal_channel == "request_context"`` regime (its per-turn
+   footprint violates dormancy §1.1); the plan-state content folds into
+   the observer note's Status surface (Site 5). Legacy regime unchanged.
 
 4. **Dynamic instruction resolver** —
    :meth:`PromptShaper.make_dynamic_instruction`. Returns an ADK
    ``InstructionProvider`` callable that resolves the current pinned
    task + pending-correction block on every turn and appends them to
    the agent's ``original_instruction`` (goldfive#251).
+   AGENCY-PRESERVATION.md PR 9: the ``[CURRENT ASSIGNED TASK]`` pin is
+   RETIRED by default under ``request_context`` (the wrapped agent owns
+   its decomposition / ordering); ``SteeringConfig.pin_assigned_task``
+   re-enables it for trees built around the pinned block. Legacy regime
+   unchanged.
+
+5. **Observer-note channel** —
+   :meth:`PromptShaper.inject_observer_note` (AGENCY-PRESERVATION.md
+   PR 6). The one remaining goldfive injection surface in the
+   ``request_context`` regime (alongside Site 2's planner contract):
+   renders the most-severe pending observer note onto the request,
+   carrying the folded plan-state line (Site 3).
 
 Each method first asks :meth:`should_inject` whether the gate is open
 for its context. When :meth:`should_inject` returns ``False`` the
@@ -65,6 +81,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+from goldfive.steerer import signal_channel as _signal_channel_of
 from goldfive.steerer import steering_is_active
 
 if TYPE_CHECKING:
@@ -106,6 +123,38 @@ class PromptShaper:
         """
         return steering_is_active(steerer)
 
+    @staticmethod
+    def _signal_channel(steerer: Any) -> str:
+        """Return the steerer's resolved ``signal_channel`` (default legacy).
+
+        AGENCY-PRESERVATION.md PR 9 gates the prompt-shaping diet on the
+        ``request_context`` regime: under ``"legacy_user_message"`` (the
+        production default and what every existing suite runs with) the
+        four sites behave byte-identically to pre-PR-9, so existing tests
+        pass unmodified (§5.1). Tolerant of ``None`` / minimal stubs —
+        both resolve to ``"legacy_user_message"`` so the legacy path is
+        the safe fallback.
+        """
+        channel = _signal_channel_of(steerer)
+        return str(channel or "legacy_user_message")
+
+    @classmethod
+    def _request_context(cls, steerer: Any) -> bool:
+        """True when the steerer is in the PR-9 ``request_context`` diet regime."""
+        return cls._signal_channel(steerer) == "request_context"
+
+    @staticmethod
+    def _pin_assigned_task(steerer: Any) -> bool:
+        """Return ``SteeringConfig.pin_assigned_task`` off the steerer.
+
+        The Site-4 escape hatch (AGENCY-PRESERVATION.md PR 9): when
+        ``True`` the ``[CURRENT ASSIGNED TASK]`` instruction pin injects
+        even under ``request_context``. Defaults to ``False`` and is
+        tolerant of steerers without a typed config (returns ``False``).
+        """
+        cfg = getattr(steerer, "_steering_config", None)
+        return bool(getattr(cfg, "pin_assigned_task", False))
+
     # ----------------------------------------------------------------
     # Site 1 — conversational follow-up wrap
     # ----------------------------------------------------------------
@@ -122,20 +171,28 @@ class PromptShaper:
         F6 (closes goldfive#277). When :meth:`Planner.handle_turn`
         returns ``None`` on a turn with a real prior plan, the runner
         reuses ``session.plan`` but still drives the executor over the
-        input — without this wrapper the coordinator typically treats
-        the question as a fresh task and re-delegates to sub-agents,
-        wasting an invocation. The wrapper:
+        input. The wrapper supplies the coordinator with the prior-plan
+        context (summary + completed tasks) so it can answer the
+        follow-up from history. Lives in the message body (no
+        system-prompt contract — users bring their own coordinator
+        prompts; goldfive must not require a specific contract).
 
-        * tags the message as a conversational follow-up,
-        * gives the coordinator the plan summary + completed task
-          context so it can answer from history,
-        * asks it explicitly NOT to delegate.
+        Two regimes (AGENCY-PRESERVATION.md PR 9 prompt-shaping diet):
 
-        Lives in the message body (no system-prompt contract). A
-        parallel layer (the ADK plugin's pre-dispatch interceptor,
-        keyed off ``session._conversational_turn``) tightens the
-        tool surface so the coordinator literally cannot delegate
-        even if it tried; this wrapper is the cooperative half.
+        * ``signal_channel == "legacy_user_message"`` (the default) —
+          the legacy wrapper: the prior-plan context PLUS an explicit
+          "do not delegate / Do NOT call any AgentTool" directive. Kept
+          byte-identical so existing suites pass unmodified (§5.1).
+        * ``signal_channel == "request_context"`` — the diet wrapper:
+          the same prior-plan CONTEXT, but WITHOUT the means-directive.
+          goldfive owns goals; the wrapped agent owns MEANS (whether to
+          delegate is its call). The agent is informed, not commanded.
+
+        Note: there is no ADK-plugin "tool-surface-tightening
+        interceptor" — it was described in a stale docstring but never
+        shipped (verified PR 9). ``session._conversational_turn`` is
+        consumed only by the runner itself to decide whether to call
+        this wrapper.
 
         Under ``observation_only=True`` (:meth:`should_inject` →
         ``False``) the wrapper is skipped and ``user_input`` is
@@ -167,6 +224,20 @@ class PromptShaper:
         completed_block = (
             "\n".join(completed_lines) if completed_lines else "  (none yet)"
         )
+
+        if self._request_context(steerer):
+            # Diet: prior-plan CONTEXT only — no means-directive. The
+            # agent decides whether to delegate.
+            return (
+                "[CONVERSATIONAL FOLLOW-UP — prior plan context for "
+                "reference]\n\n"
+                "The user is asking a follow-up question about prior work. "
+                "The prior plan and completed tasks are below for context.\n\n"
+                f"Plan summary: {plan_summary}\n"
+                f"Completed tasks:\n{completed_block}\n\n"
+                f"User question: {user_input}"
+            )
+
         return (
             "[CONVERSATIONAL FOLLOW-UP — reuse prior plan, don't delegate "
             "to sub-agents]\n\n"
@@ -402,16 +473,15 @@ class PromptShaper:
             _strip_prior_runtime_tools_hint,
         )
 
-        hint = _build_runtime_tools_hint(session)
-
         config = _safe_attr(llm_request, "config", None)
         if config is None:
             return
         existing = getattr(config, "system_instruction", None)
 
-        # Strip any prior hint regardless of whether we'll re-inject. A
-        # None ``hint`` (plan disappeared or all groups empty) should
-        # still remove the stale marker block from the request.
+        # Strip any prior hint regardless of regime. A None ``hint``
+        # (plan disappeared or all groups empty) — and the diet regime
+        # below — should still remove a stale marker block left over from
+        # a legacy-channel turn.
         if isinstance(existing, str) and _RUNTIME_TOOLS_HINT_PREFIX in existing:
             try:
                 config.system_instruction = _strip_prior_runtime_tools_hint(existing) or None
@@ -424,6 +494,16 @@ class PromptShaper:
                 return
             existing = getattr(config, "system_instruction", None)
 
+        # AGENCY-PRESERVATION.md PR 9 — Site 3 diet. Under the
+        # ``request_context`` regime the per-turn standalone plan-state
+        # hint is RETIRED (it was a per-turn footprint — the dormancy
+        # violation §1.1 calls out). Its plan-state content is folded
+        # into the observer note's Status surface (see
+        # :meth:`inject_observer_note`). Legacy regime is unchanged.
+        if self._request_context(steerer):
+            return
+
+        hint = _build_runtime_tools_hint(session)
         if not hint:
             return
 
@@ -544,9 +624,11 @@ class PromptShaper:
                 from goldfive.adapters import _adk_state_protocol as _sp
                 from goldfive.adapters.adk_llm_instrumentation import (
                     _compose_instruction,
+                    _goals_block_from_session,
                     _goldfive_session_context_from_readonly_context,
                     _read_pending_correction,
                     _state_from_readonly_context,
+                    _task_kind_from_session,
                     _task_title_description_from_session,
                 )
 
@@ -561,6 +643,44 @@ class PromptShaper:
                         "(returning the caller's instruction un-augmented)",
                         agent_name,
                     )
+                    return base_instruction
+
+                # AGENCY-PRESERVATION.md PR 9 — Site 4 diet. Under the
+                # ``request_context`` regime the per-turn
+                # ``[CURRENT ASSIGNED TASK]`` pin is RETIRED by default:
+                # the wrapped agent owns its own decomposition / ordering
+                # and does not need goldfive restating the bound task into
+                # every model call. ``pin_assigned_task`` is the escape
+                # hatch for trees built around the pinned-task block.
+                # Legacy ``signal_channel`` keeps the pin (byte-identical;
+                # §5.1).
+                #
+                # Pending corrections (which legacy rides on this pin) are
+                # NOT lost in this regime: task #11 routes them to the
+                # agent-scoped ObserverNoteQueue at write time
+                # (``queue_corrections_for_revision(corrections_via_notes=
+                # True)``), delivered via the observer-note surfaces — the
+                # ``peek_for_render`` agent filter ensures a per-(agent,task)
+                # correction reaches only its agent. (The PR-9 "written but
+                # unread" gap this note once flagged is now closed.) The
+                # ``pin_assigned_task=True`` escape hatch instead keeps the
+                # pin AND the legacy correction-slot read.
+                if shaper._request_context(steerer) and not shaper._pin_assigned_task(
+                    steerer
+                ):
+                    log.info(
+                        "PromptShaper.make_dynamic_instruction resolver: "
+                        "request_context regime + pin_assigned_task=False — "
+                        "retiring the [CURRENT ASSIGNED TASK] pin for "
+                        "agent=%r (returning the templated instruction "
+                        "un-augmented)",
+                        agent_name,
+                    )
+                    # goldfive#477: return the TEMPLATED base, not the raw
+                    # ``original_instruction`` — the resolver bypasses ADK's
+                    # own state injection, so returning the raw template
+                    # would leak literal ``{var}`` placeholders to the
+                    # agent on the diet path.
                     return base_instruction
 
                 state = _state_from_readonly_context(readonly_ctx)
@@ -593,11 +713,44 @@ class PromptShaper:
                         state.get(_sp.KEY_CURRENT_TASK_DESCRIPTION, "") or ""
                     )
 
+                # AGENCY-PRESERVATION.md Stage 3 PR 12 — for a DISCOVERED
+                # pin (ledger plan mode), render a [GOALS] block instead of
+                # the task block (the agent owns its own means-work; ground
+                # it on goals, don't re-pin the discovered task as a
+                # prescription). ``_compose_instruction`` falls back to the
+                # task block when the kind is not DISCOVERED or there are no
+                # goals, so forecast / OUTCOME pins are byte-identical. This
+                # branch is reached only where the pin WOULD render — under
+                # the PR 9 request_context+pin-off diet the resolver already
+                # returned above.
+                task_kind = (
+                    _task_kind_from_session(session, current_task_id)
+                    if session is not None
+                    else ""
+                )
+                goals_block = (
+                    _goals_block_from_session(session) if session is not None else ""
+                )
+
+                # Computed BEFORE the correction read so the correction is
+                # composed for the surface it actually lands on: the
+                # ``[GOALS]`` branch renders NO "Current assigned task"
+                # section, so its correction must inline the corrected task
+                # (``self_contained``) rather than direct the agent to an
+                # absent section. Mirrors ``_compose_instruction``'s branch
+                # condition exactly; forecast / OUTCOME pins keep the
+                # byte-identical default text (§5.1).
+                from goldfive.types import TaskKind
+
+                discovered_goals_pin = bool(
+                    task_kind == TaskKind.DISCOVERED.value and goals_block
+                )
                 pending_correction = _read_pending_correction(
                     session=session,
                     state=state,
                     agent_name=agent_name,
                     current_task_id=current_task_id,
+                    self_contained=discovered_goals_pin,
                 )
 
                 return _compose_instruction(
@@ -606,6 +759,8 @@ class PromptShaper:
                     task_title=current_task_title,
                     task_description=current_task_description,
                     pending_correction=pending_correction,
+                    task_kind=task_kind,
+                    goals_block=goals_block,
                 )
             except Exception as exc:  # noqa: BLE001
                 # Instrumentation path — any failure here degrades to
@@ -658,6 +813,178 @@ class PromptShaper:
         resolver._goldfive_agent_name = agent_name  # type: ignore[attr-defined]
         resolver._goldfive_original_instruction = original_instruction  # type: ignore[attr-defined]
         return resolver
+
+    # ----------------------------------------------------------------
+    # Site 5 — observer-note channel (AGENCY-PRESERVATION.md PR 6)
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _plan_state_line(session: Any) -> str:
+        """Return the factual per-agent open-work line for the note Status fold.
+
+        AGENCY-PRESERVATION.md PR 9 introduced this fold on the
+        before_model surface; task #11 centralised the composition in
+        :func:`goldfive.observer_note_queue.plan_state_line` so the
+        boundary-replay + claude surfaces render an identical line. This
+        thin wrapper preserves the ``(session)`` call shape; the shared
+        helper takes the plan. Returns ``""`` when there is no plan.
+        """
+        try:
+            from goldfive.observer_note_queue import plan_state_line
+
+            return plan_state_line(_safe_attr(session, "plan", None))
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def inject_observer_note(
+        self,
+        *,
+        llm_request: Any,
+        session: Any,
+        session_context: Any = None,
+        current_agent_name: str = "",
+    ) -> Any:
+        """Render the most-severe pending observer note onto the request.
+
+        Surface 1 of the PR 6 observer-note channel — the preferred surface,
+        reaching a *mid-invocation* agent on its next model call (which removes
+        the only remaining justification for cancel-as-information-delivery).
+        Uses the marker strip-and-refresh pattern (mirrors
+        :meth:`inject_runtime_tools_hint`): any prior observer-note block,
+        bracketed by
+        :data:`~goldfive.observer_note_queue.OBSERVER_NOTE_MARKER_PREFIX` /
+        ``OBSERVER_NOTE_BLOCK_END``, is stripped from ``system_instruction``
+        before the current one is appended — so two consecutive
+        ``before_model`` calls never stack blocks (the idempotency half of §5.2).
+
+        Per-request coalescing: at most ONE block is rendered, the most-severe
+        pending note wins
+        (:meth:`~goldfive.observer_note_queue.ObserverNoteQueue.peek_for_render`),
+        and that note is marked delivered — the exactly-once *rendering*
+        chokepoint, so the invocation-boundary replay never re-renders a note
+        this surface showed.
+
+        Under ``observation_only=True`` (:meth:`should_inject` → ``False``) the
+        block is NOT appended (the strict-passive operator sees the raw prompt)
+        but the note is still consumed so the queue does not re-evaluate it —
+        the dispatch-point ``SignalDelivered(dry_run=True)`` already recorded
+        what *would* have been delivered (§5.4).
+
+        ``SignalDelivered`` is emitted once at the dispatch decision point
+        (``DriftObserver._route_corrective_note``), NOT here — this surface is
+        purely the *rendering* leg. Returns the
+        :class:`~goldfive.observer_note_queue.ObserverNote` it rendered (for
+        observability / tests), or ``None`` when nothing was pending (or on a
+        defensive failure). Best-effort: never raises into
+        ``before_model_callback``.
+
+        ``session`` MUST be the goldfive :class:`~goldfive.types.Session` (the
+        queue lives on goldfive ``Session.state``, the same dict the drift
+        observer enqueues onto — NOT ADK ``session.state``, which is
+        shallow-copied across the callback boundary).
+        """
+        try:
+            from goldfive.observer_note_queue import (
+                OBSERVER_NOTE_MARKER_PREFIX,
+                ObserverNoteQueue,
+                render_block,
+                strip_prior_block,
+            )
+        except Exception:  # pragma: no cover - defensive import
+            return None
+
+        steerer = (
+            getattr(session_context, "steerer", None)
+            if session_context is not None
+            else None
+        )
+
+        config = _safe_attr(llm_request, "config", None)
+        if config is None:
+            return None
+        existing = getattr(config, "system_instruction", None)
+        # Strip any prior observer-note block regardless of whether we
+        # re-inject this call (strip-and-refresh: never stack blocks).
+        if isinstance(existing, str) and OBSERVER_NOTE_MARKER_PREFIX in existing:
+            try:
+                config.system_instruction = strip_prior_block(existing) or None
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "PromptShaper.inject_observer_note: could not strip prior block: %s",
+                    exc,
+                )
+                return None
+            existing = getattr(config, "system_instruction", None)
+
+        try:
+            queue = ObserverNoteQueue.for_session(session)
+            # Agent-scoped (task #11): the before_model surface KNOWS the
+            # agent whose model call this is, so an agent-specific note
+            # (e.g. a per-(agent,task) correction) is rendered only on
+            # its own agent's call — never on a sibling's. ``""`` (no
+            # agent resolved, e.g. a unit-test stub) → no filter,
+            # preserving the pre-task-#11 broadcast behaviour (§5.1).
+            note = queue.peek_for_render(agent_id=current_agent_name or None)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("PromptShaper.inject_observer_note: queue read raised: %s", exc)
+            return None
+        if note is None:
+            return None
+
+        rendered = self.should_inject(steerer)
+        if rendered:
+            # task #11 cross-surface fold: render_block composes the
+            # plan-state Status line from the plan INSIDE the marker block
+            # (strip-and-refresh removes it as one unit; marker count stays
+            # 1). Centralised so this surface, the boundary replay, and the
+            # claude surface render an identical line.
+            block = render_block(note, plan=_safe_attr(session, "plan", None))
+            append = getattr(llm_request, "append_instructions", None)
+            wrote = False
+            if callable(append):
+                try:
+                    append([block])
+                    wrote = True
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "PromptShaper.inject_observer_note: "
+                        "append_instructions raised: %s",
+                        exc,
+                    )
+            if not wrote:
+                # Fallback for stubs / requests without ``append_instructions``.
+                try:
+                    if not existing:
+                        config.system_instruction = block
+                    elif isinstance(existing, str):
+                        config.system_instruction = existing + "\n\n" + block
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "PromptShaper.inject_observer_note: "
+                        "could not write system_instruction: %s",
+                        exc,
+                    )
+        else:
+            log.info(
+                "PromptShaper.inject_observer_note: observation_only=True — "
+                "consuming note %s as a dry-run delivery "
+                "(system_instruction unchanged)",
+                getattr(note, "note_id", "?"),
+            )
+
+        turn = int(_safe_attr(session, "_reasoning_turn", 0) or 0)
+        try:
+            newly = queue.mark_delivered(
+                note.note_id,
+                channel="request_context",
+                turn=turn,
+                surface="before_model",
+                dry_run=not rendered,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("PromptShaper.inject_observer_note: mark_delivered raised: %s", exc)
+            return None
+        return note if newly else None
 
 
 def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:

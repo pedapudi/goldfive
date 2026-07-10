@@ -65,6 +65,7 @@ from goldfive.executors._shared import (
 )
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
+from goldfive.steerer import signal_channel as _signal_channel_of
 from goldfive.steerer import steering_is_active
 from goldfive.types import (
     DriftKind,
@@ -72,6 +73,7 @@ from goldfive.types import (
     Plan,
     Session,
     Task,
+    TaskKind,
     TaskStatus,
     channel_processor_active,
     set_session_plan,
@@ -129,17 +131,87 @@ async def _drain_steerer_at_run_boundary(
     it; bounded wait + cancel-stragglers semantics match the existing
     :meth:`shutdown` drain.
     """
-    drain = getattr(getattr(steerer, "drift", None), "drain_session_background_tasks", None)
-    if not callable(drain):
+    drift_observer = getattr(steerer, "drift", None)
+    # ORDER MATTERS: drain the background drift / judge tasks FIRST, then
+    # finalize the SignalLedger. A late-resolving background drift (e.g. a
+    # fire-and-forget reasoning/goal judge still in flight) records its fire /
+    # outcome onto the ledger as it drains; if finalize ran first it would
+    # resolve every open key as ``invocation_ended`` and the drained drift
+    # would then write into an already-finalized ledger — a lost or
+    # double-counted outcome that corrupts the §5.4 self-correction rates.
+    # Both steps are best-effort and gate nothing.
+    drain = getattr(drift_observer, "drain_session_background_tasks", None)
+    if callable(drain):
+        try:
+            await drain(session_id=session.id)
+        except Exception as exc:  # noqa: BLE001 — never block run termination
+            log.warning(
+                "SequentialExecutor: steerer.drift.drain_session_background_tasks "
+                "raised at run boundary (swallowed): %s",
+                exc,
+            )
+    # AGENCY-PRESERVATION.md PR 5 (observe-only): finalize the SignalLedger at
+    # the run boundary — every still-open, delivered key resolves to
+    # ``invocation_ended`` (the conservative catch-all). Done AFTER the drain so
+    # every drift that was still in flight has landed on the ledger first.
+    finalize = getattr(drift_observer, "finalize_signal_ledger", None)
+    if callable(finalize):
+        try:
+            await finalize(session)
+        except Exception as exc:  # noqa: BLE001 — never block run termination
+            log.warning(
+                "SequentialExecutor: steerer.drift.finalize_signal_ledger "
+                "raised at run boundary (swallowed): %s",
+                exc,
+            )
+
+
+async def _finalize_outcomes_at_run_boundary(steerer: Any, session: Session) -> None:
+    """Judge + finalize ledger OUTCOME deliverables at the overlay boundary.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 11(c). In ledger plan mode OUTCOME
+    deliverables are never reported by the agent, so goldfive's
+    outcome-progress judge is what makes "run completion = all outcomes
+    terminal" decidable. Called from :meth:`SequentialExecutor._run_overlay`
+    immediately after the passthrough loop breaks and BEFORE the
+    goldfive#208 end-of-overlay PENDING disposition + the fatal-failure
+    gate, so met deliverables land COMPLETED and CONFIDENTLY-unmet ones
+    flow through the existing fatal-failure path (whose ``observation_only``
+    carve-out is already correct). Uncertain deliverables stay PENDING and
+    carry forward like any #208 reachable-PENDING task.
+
+    Duck-typed + ledger-gated inside the steerer: custom steerers without
+    ``finalize_outcomes`` (or forecast mode) fall through cleanly. Awaited
+    so the transitions are visible to the disposition that follows; never
+    blocks run termination.
+    """
+    finalize = getattr(steerer, "finalize_outcomes", None)
+    if not callable(finalize):
         return
     try:
-        await drain(session_id=session.id)
+        await finalize(session)
     except Exception as exc:  # noqa: BLE001 — never block run termination
         log.warning(
-            "SequentialExecutor: steerer.drift.drain_session_background_tasks "
-            "raised at run boundary (swallowed): %s",
+            "SequentialExecutor: steerer.finalize_outcomes raised at run "
+            "boundary (swallowed): %s",
             exc,
         )
+
+
+def _executor_plan_mode(steerer: Any) -> str:
+    """Read ``SteeringConfig.plan_mode`` off the steerer ("forecast"/"ledger").
+
+    AGENCY-PRESERVATION.md PR 11(c). Defensive: any read failure resolves
+    to ``"forecast"`` so the misconfiguration guard never fires
+    spuriously on a custom steerer without a typed config.
+    """
+    try:
+        cfg = getattr(steerer, "_steering_config", None)
+        if cfg is None:
+            return "forecast"
+        return str(getattr(cfg, "plan_mode", "forecast")).strip().lower()
+    except Exception:  # noqa: BLE001
+        return "forecast"
 
 
 _DEFAULT_MAX_NUDGE_REPLAYS: int = 3
@@ -369,7 +441,28 @@ class SequentialExecutor(Executor):
         # duck-typed so third-party AgentAdapter implementations that
         # predate the overlay refactor still work under ``overlay_mode=False``
         # (the caller's choice).
-        if self.overlay_mode and callable(getattr(adapter, "invoke_passthrough", None)):
+        _uses_overlay = self.overlay_mode and callable(
+            getattr(adapter, "invoke_passthrough", None)
+        )
+        if not _uses_overlay and _executor_plan_mode(steerer) == "ledger":
+            # AGENCY-PRESERVATION.md PR 11(c) misconfiguration guard.
+            # Ledger plan mode expects OVERLAY execution: the coordinator
+            # drives and OUTCOME deliverables are never per-task
+            # dispatched. The legacy per-task loop WOULD try to invoke an
+            # assignee-less OUTCOME root. We deliberately do NOT change the
+            # legacy scheduler (forecast risk for zero benefit); instead we
+            # warn loudly so the misconfiguration is visible.
+            log.warning(
+                "SequentialExecutor.run: plan_mode=ledger but the legacy "
+                "per-task loop was selected (overlay_mode=%s, "
+                "invoke_passthrough=%s). Ledger plan mode expects overlay "
+                "execution; OUTCOME deliverables are not per-task "
+                "dispatchable. Use SequentialExecutor(overlay_mode=True) "
+                "with an adapter exposing invoke_passthrough.",
+                self.overlay_mode,
+                callable(getattr(adapter, "invoke_passthrough", None)),
+            )
+        if _uses_overlay:
             return await self._run_overlay(
                 plan=plan,
                 session=session,
@@ -1063,9 +1156,10 @@ class SequentialExecutor(Executor):
                     return outcome
                 continue
             # kind == "result": invocation ended normally — check the
-            # scoped nudge-replay path (goldfive#202) before ending
-            # the loop.
-            if self._drain_nudges(
+            # scoped nudge-replay path (goldfive#202; observer-note
+            # surface 2 under ``signal_channel="request_context"``)
+            # before ending the loop.
+            if await self._drain_nudges(
                 plan=plan,
                 session=session,
                 steerer=steerer,
@@ -1074,6 +1168,17 @@ class SequentialExecutor(Executor):
             ):
                 continue
             break
+
+        # --- Outcome-progress finalize (AGENCY-PRESERVATION.md PR 11c).
+        #     The passthrough loop has ended; in ledger plan mode, judge
+        #     the OUTCOME deliverables now — BEFORE the #208 PENDING
+        #     disposition and the fatal-failure gate below — so met
+        #     deliverables land COMPLETED, CONFIDENTLY-unmet ones become
+        #     FAILED (flowing through the existing fatal-failure path),
+        #     and uncertain ones stay PENDING to carry forward exactly
+        #     like a #208 reachable-PENDING task. Ledger-gated inside the
+        #     steerer; a no-op in forecast mode.
+        await _finalize_outcomes_at_run_boundary(steerer, session)
 
         await self._sweep_unreachable_pending(plan=plan, session=session, steerer=steerer)
 
@@ -1495,7 +1600,7 @@ class SequentialExecutor(Executor):
             ),
         )
 
-    def _drain_nudges(
+    async def _drain_nudges(
         self,
         *,
         plan: Plan,
@@ -1516,7 +1621,40 @@ class SequentialExecutor(Executor):
         the #163-style amplification: a coordinator whose tree keeps
         producing nudge-eligible drift on every turn must eventually
         stop triggering re-invokes.
+
+        AGENCY-PRESERVATION.md PR 6 — observer-note channel surface 2.
+        In ``signal_channel="request_context"`` mode the boundary replay
+        consumes the ObserverNoteQueue (≤1 block, most-severe pending note
+        wins) instead of ``session.pending_nudges``. Gated on
+        :func:`goldfive.steerer.steering_is_active` so a note is delivered
+        only when steering has authority — the legacy ``pending_nudges``
+        asymmetry (queued even under ``observation_only``) goes away. A
+        note already delivered mid-invocation via the before_model surface
+        is no longer pending here, so it is never re-delivered
+        (exactly-once, §5.2).
         """
+        if _signal_channel_of(steerer) == "request_context":
+            replay_msg: str | None = None
+            if (
+                state.nudge_replays < self._MAX_NUDGE_REPLAYS
+                and _has_live_pending_or_running(session.plan or plan)
+                and steering_is_active(steerer)
+            ):
+                replay_msg = await self._consume_observer_note_for_replay(session)
+            if replay_msg is None:
+                return False
+            state.nudge_replays += 1
+            state.current_user_input = replay_msg
+            log.info(
+                "SequentialExecutor._run_overlay: observer-note replay "
+                "%d/%d — re-invoking passthrough with queued note",
+                state.nudge_replays,
+                self._MAX_NUDGE_REPLAYS,
+            )
+            reconciler.reset_for_new_plan(session.plan)
+            state.next_reentry_kind = ReentryKind.NUDGE_REPLAY
+            return True
+
         pending = list(session.pending_nudges)
         if (
             pending
@@ -2113,60 +2251,101 @@ class SequentialExecutor(Executor):
         Mirrors :meth:`_compose_steer_restart_message` but for the
         autonomous-nudge path (goldfive#202). The LLM sees:
 
-        * A header distinguishing this from a fresh user turn: the
-          operator did not intervene; goldfive detected drift (e.g.
-          repeated ``report_task_completed`` calls) and is directing
-          the coordinator to the next useful step.
-        * Each queued nudge verbatim (short, action-focused strings
-          composed by :func:`compose_corrective_user_message`).
-        * A brief instruction to continue.
+        * A header distinguishing this from a fresh user turn (the
+          ``[GOLDFIVE PLAN REVISION`` attribution marker is preserved
+          for plugins / sinks / prompt templates that match on it).
+        * Each queued nudge verbatim — full observation+goal advisory
+          notes composed by
+          :func:`goldfive.observer_notes.compose_note_for_drift`
+          (AGENCY-PRESERVATION.md PR 4: the pre-PR-4 body commanded
+          means — "Proceed with the replacement; do NOT retry the
+          prior task" — which overrode the agent's own judgment about
+          decomposition and retries; the note body now carries neutral
+          facts, the user's goal, and the advisory footer instead).
 
         ``plan_revised`` selects the framing: the header only claims a
         plan revision when the steerer recorded that ``_apply_revision``
         actually installed one
         (``session.pending_nudges_revision_installed``); a Level 2
-        nudge with no refine, or a dry-run revision, gets a
-        course-correction header that asserts nothing about the plan.
+        nudge with no refine, or a dry-run revision, gets an
+        observer-note header that asserts nothing about the plan.
 
         The scoped replay path is the carefully-narrowed successor to
         the blanket follow-up loop that goldfive#163 removed. #163's
         removal was correct when every PENDING task triggered a
         follow-up; this path only fires when the STEERER explicitly
         queued a nudge in response to a tracked drift — not on every
-        PENDING-at-invocation-end.
+        PENDING-at-invocation-end. Delivery mechanics (queue, replay
+        cap, reconciler reset, re-entry kind) are unchanged by PR 4 —
+        content only.
         """
-        body = "\n".join(f"- {n}" for n in nudges if n)
+        body = "\n\n".join(n for n in nudges if n)
         if not plan_revised:
             return (
-                "[GOLDFIVE COURSE CORRECTION]\n"
+                "[GOLDFIVE OBSERVER NOTE]\n"
                 "\n"
-                "Goldfive detected drift during the prior turn. The "
-                "active plan is unchanged; the directive(s) below "
-                "redirect you to the next useful step.\n"
+                "goldfive — an external monitoring layer, not the user — "
+                "observed drift during the prior turn. Its plan bookkeeping "
+                "is unchanged. The note(s) below describe what it observed.\n"
                 "\n"
-                f"{body}\n"
-                "\n"
-                "Notes:\n"
-                "- Continue the run with the current plan. Resume with "
-                "the next unfinished task.\n"
-                "- Do not repeat the prior attempt unchanged."
+                f"{body}"
             )
         return (
-            "[GOLDFIVE PLAN REVISION — replace superseded task(s)]\n"
+            "[GOLDFIVE PLAN REVISION — observer note]\n"
             "\n"
-            "Goldfive detected drift during the prior turn and revised "
-            "the active plan. The task you were last working on has "
-            "been superseded by a replacement. Proceed with the "
-            "replacement; do NOT retry the prior task.\n"
+            "goldfive — an external monitoring layer, not the user — "
+            "revised its plan bookkeeping during the prior turn. The "
+            "note(s) below describe what it observed.\n"
             "\n"
-            f"{body}\n"
-            "\n"
-            "Notes:\n"
-            "- Continue the run with the revised plan. Resume with the "
-            "next unfinished task — the replacement mentioned above, "
-            "or any other PENDING task your tree still owns.\n"
-            "- Do not re-invoke reporting tools for the superseded task."
+            f"{body}"
         )
+
+    async def _consume_observer_note_for_replay(
+        self,
+        session: Session,
+    ) -> str | None:
+        """Consume the most-severe pending observer note for a boundary replay.
+
+        Surface 2 of the PR 6 observer-note channel. Selects the most-severe
+        pending note (≤1 per replay), marks it delivered — the exactly-once
+        *rendering* chokepoint, so a note already shown mid-invocation via the
+        ``before_model`` surface is skipped here — and returns the rendered
+        block to feed as the next user turn. (``SignalDelivered`` is emitted
+        once at the dispatch point, not here.) Returns ``None`` when no note is
+        pending (the caller falls through to the end-of-overlay sweep).
+        Best-effort: never raises into the overlay loop.
+        """
+        from goldfive.observer_note_queue import ObserverNoteQueue, render_block
+
+        try:
+            queue = ObserverNoteQueue.for_session(session)
+            # task #11: the boundary replay re-invokes at the coordinator
+            # level and cannot attribute a note to a specific sub-agent, so
+            # it delivers BROADCAST notes only. An agent-specific note (e.g.
+            # a correction) stays pending for its own agent-aware surface —
+            # better undelivered than misdelivered (§0 dormancy bias).
+            note = queue.peek_for_render(broadcast_only=True)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("SequentialExecutor: observer-note queue read raised: %s", exc)
+            return None
+        if note is None:
+            return None
+        turn = int(getattr(session, "_reasoning_turn", 0) or 0)
+        try:
+            newly = queue.mark_delivered(
+                note.note_id,
+                channel="request_context",
+                turn=turn,
+                surface="boundary_replay",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("SequentialExecutor: observer-note mark_delivered raised: %s", exc)
+            return None
+        if not newly:
+            return None
+        # task #11 cross-surface fold: carry the plan-state Status line on
+        # the boundary-replay surface too (identical to before_model).
+        return render_block(note, plan=getattr(session, "plan", None))
 
     @staticmethod
     def _compose_steer_restart_message(
@@ -2193,14 +2372,21 @@ class SequentialExecutor(Executor):
 
         * ``"user"`` (default) — ``[USER STEERING CONTROL — supersedes
           prior task context]`` header: this is an operator override,
-          not a fresh user turn.
+          not a fresh user turn. **Byte-identical to the pre-PR-4
+          rendering** — AGENCY-PRESERVATION.md PR 4 changes only
+          goldfive-authored content; user-authority relay text is
+          untouched (and pinned by test).
         * ``"goldfive"`` — ``[GOLDFIVE STEERING CONTROL — supersedes
-          prior task context]`` header: goldfive's drift ladder
-          promoted a detector signal into a steer and is directing the
-          coordinator away from contaminated work. When the optional
+          prior task context]`` header (the attribution marker is
+          preserved so plugins / sinks can discriminate authors). The
+          body is the observation+goal advisory note the steerer
+          composed via :mod:`goldfive.observer_notes`. The optional
           ``superseded_task_ids`` / ``replacement_task_ids`` lists are
-          provided, a task-id block is appended so the LLM knows
-          precisely which ids are void and what replaced them.
+          rendered as a *bookkeeping* line — goldfive's ledger facts,
+          not instructions (the pre-PR-4 "do NOT resume these" /
+          "pick these up instead" command block is retired; the ids
+          also remain on the ControlMessage payload for
+          observability).
 
         Falls back to ``fallback`` when the extracted text is empty,
         then wraps that fallback in the same header so the re-invocation
@@ -2218,32 +2404,28 @@ class SequentialExecutor(Executor):
         source_norm = (source or "user").strip().lower()
         if source_norm == "goldfive":
             header = "[GOLDFIVE STEERING CONTROL — supersedes prior task context]"
-            extra_notes: list[str] = []
+            bookkeeping_bits: list[str] = []
             sup = [str(t) for t in (superseded_task_ids or []) if t]
             rep = [str(t) for t in (replacement_task_ids or []) if t]
             if sup:
-                extra_notes.append(
-                    "- Superseded task ids (do NOT resume these): "
+                bookkeeping_bits.append(
+                    "goldfive's plan tracking records task id(s) "
                     + ", ".join(sup)
+                    + " as superseded by this revision"
                 )
             if rep:
-                extra_notes.append(
-                    "- Replacement task ids (pick these up instead): "
-                    + ", ".join(rep)
+                bookkeeping_bits.append(
+                    "its ledger contains replacement entrie(s): " + ", ".join(rep)
                 )
-            extra_block = ("\n" + "\n".join(extra_notes)) if extra_notes else ""
+            extra_block = (
+                ("\n\ngoldfive bookkeeping (for reference): " + "; ".join(bookkeeping_bits) + ".")
+                if bookkeeping_bits
+                else ""
+            )
             return (
                 f"{header}\n"
                 "\n"
-                f"{effective}\n"
-                "\n"
-                "Notes:\n"
-                "- Goldfive detected drift in the prior turn's activity. "
-                "Prior research, partial work, or planned tasks from the "
-                "contaminated step are superseded unless this message "
-                "explicitly references them.\n"
-                "- Proceed with the corrective direction above. Do not "
-                "retry the superseded task."
+                f"{effective}"
                 f"{extra_block}"
             )
         return (
@@ -2335,14 +2517,26 @@ def _any_failed(plan: Plan) -> bool:
 
 
 def _has_live_pending_or_running(plan: Plan) -> bool:
-    """Return True if the plan has any PENDING or RUNNING task left.
+    """Return True if the plan has any non-OUTCOME PENDING/RUNNING task.
 
     Used by the overlay's nudge-replay gate (goldfive#202): a queued
     nudge should only trigger a re-invoke when there is actually
     outstanding work for the coordinator to do. Guards against replaying
     against a terminated plan.
+
+    AGENCY-PRESERVATION.md PR 11(c): OUTCOME-kind tasks (ledger
+    deliverables) are EXCLUDED. They stay PENDING for the whole run — the
+    agent never works on them directly — so counting them would make this
+    gate perpetually true and strip its discriminating power (it would
+    replay even when no real agent work remains). Only DISCOVERED /
+    forecast tasks count as "live work justifying a replay". A no-op in
+    forecast mode, where no OUTCOME-kind tasks exist.
     """
-    return any(t.status in (TaskStatus.PENDING, TaskStatus.RUNNING) for t in plan.tasks)
+    return any(
+        t.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+        and getattr(t, "kind", None) is not TaskKind.OUTCOME
+        for t in plan.tasks
+    )
 
 
 def _has_live_replacement(plan: Plan, failed: Task) -> bool:
