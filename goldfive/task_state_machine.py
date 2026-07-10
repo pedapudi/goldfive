@@ -79,6 +79,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+#: ``TaskTransitioned.source`` stamped when goldfive's own outcome-progress
+#: judge (ledger plan mode) transitions an OUTCOME deliverable — as opposed to
+#: the default ``"other"`` a legacy per-task-loop force-completion carries. The
+#: three-arm bench keys its "ledger genuinely EXERCISED" signal on this exact
+#: string (``bench.harness.OUTCOME_JUDGE_SOURCE``), so it is a shared constant
+#: rather than a bare literal: a silent rename would make the bench under-report
+#: real ledger runs as not-exercised (goldfive#501 review).
+OUTCOME_JUDGE_SOURCE = "goldfive_outcome_judge"
+
 
 # Re-export for compat with code that imported the private name from
 # :mod:`goldfive.steerer` historically; do NOT redefine.

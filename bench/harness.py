@@ -80,6 +80,7 @@ from goldfive.config import RuntimeConfig
 from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
 from goldfive.sinks import InMemorySink, JSONLPersistenceSink
 from goldfive.steerer import DefaultSteerer
+from goldfive.task_state_machine import OUTCOME_JUDGE_SOURCE as _OUTCOME_JUDGE_SOURCE
 from goldfive.types import (
     DriftEvent,
     DriftKind,
@@ -138,7 +139,12 @@ GOAL_GRADE_UNMEASURED = "unmeasured"
 #: genuine ledger deliverables. Grading/exercise must therefore key on the
 #: judge's own transition trace, never on OUTCOME terminality alone (the
 #: "plan_mode=ledger consulted-but-ineffective yet reported-as-applied" defect).
-OUTCOME_JUDGE_SOURCE = "goldfive_outcome_judge"
+#:
+#: Re-exported from the runtime (``goldfive.task_state_machine``) rather than
+#: duplicated, so a rename of the runtime source string cannot silently make
+#: this bench signal go dark — the two stay in lockstep by construction
+#: (goldfive#501 review follow-up).
+OUTCOME_JUDGE_SOURCE = _OUTCOME_JUDGE_SOURCE
 
 
 # ---------------------------------------------------------------------------
