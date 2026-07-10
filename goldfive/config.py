@@ -815,7 +815,7 @@ class SteeringConfig:
     context_editor_rules: list[str] | None = None
     #: Plan-descriptive growth for unmatched delegations (goldfive#423,
     #: completed by AGENCY-PRESERVATION.md Stage 1 PR 2). When ``True``
-    #: (the default) the growth trigger lives at PIN time: when the
+    #: the growth trigger lives at PIN time: when the
     #: delegation pin's tier 1 (required-tools cover) and tier 2
     #: (agent-name stem) both miss in
     #: ``_maybe_pin_delegation_task``, the plugin synthesises a
@@ -830,11 +830,15 @@ class SteeringConfig:
     #: observations so ``transfer_to_agent``-style trees grow the
     #: ledger too.
     #:
-    #: When ``False`` the legacy pre-#423 pin behaviour is restored
-    #: (tier-3 topic-args scorer + topo-order fallback; mispins are
-    #: caught downstream by the CAPABILITY_MISMATCH rules). The tier-3
-    #: scorer survives only for this legacy path and is scheduled for
-    #: deletion (AGENCY-PRESERVATION.md PR 13).
+    #: When ``False`` — the DEFAULT: #497 reverted the interim
+    #: default-ON, pending the AGENCY-PRESERVATION.md §6.4 13b bench
+    #: gate — the legacy pre-#423 pin behaviour applies (tier-3
+    #: topic-args scorer + topo-order fallback; mispins are caught
+    #: downstream by the CAPABILITY_MISMATCH rules, themselves
+    #: env-gated OFF — see AGENCY-PRESERVATION.md §6.6 for the
+    #: pure-defaults posture). The tier-3 scorer survives only for this
+    #: legacy path and is scheduled for deletion (AGENCY-PRESERVATION.md
+    #: PR 13).
     #: Env: ``GOLDFIVE_STEER_DESCRIPTIVE_GROWTH``.
     #:
     #: Design ref: ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3 + §9

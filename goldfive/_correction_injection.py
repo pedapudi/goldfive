@@ -170,6 +170,12 @@ def build_correction_payload(
     return {
         "agent_name": _normalize_agent_name(getattr(new_task, "assignee_agent_id", "")),
         "task_id": str(getattr(new_task, "id", "") or ""),
+        # The NEW (corrected) task's title — consumed by the self-contained
+        # rendering of ``format_correction_block`` (the note channel and the
+        # DISCOVERED ``[GOALS]`` branch render no "Current assigned task"
+        # section to point at, so the corrected target is inlined). Additive:
+        # the default slot-regime rendering ignores it.
+        "task_title": str(getattr(new_task, "title", "") or ""),
         "superseded_task_id": str(getattr(new_task, "supersedes", "") or ""),
         "superseded_task_title": str(getattr(old_task, "title", "") or ""),
         "drift_kind": drift_kind_value,
@@ -384,7 +390,11 @@ def _enqueue_correction_note(
         rev = int(payload.get("revision_number", 0) or 0)
         if not agent or not task_id:
             return None
-        body = format_correction_block(payload)
+        # ``self_contained``: the note channel exists precisely because the
+        # request_context regime retired the prompt-shaping pin — there is
+        # no "Current assigned task" section for the default rendering to
+        # point at, so the corrected task title/id are inlined instead.
+        body = format_correction_block(payload, self_contained=True)
         if not body:
             return None
         superseded = str(payload.get("superseded_task_id", "") or "")
@@ -420,6 +430,37 @@ def _enqueue_correction_note(
 # ---------------------------------------------------------------------------
 
 
+def _evict_correction_notes(
+    session: Any,
+    *,
+    task_id: str,
+    agent_name: str = "",
+) -> list[str]:
+    """Evict pending correction-origin ObserverNotes for ``task_id``.
+
+    The note-channel (task #11 ``corrections_via_notes``) counterpart of
+    the slot pops below — both GC triggers (revision-supersession sweep
+    and the ``report_task_started`` ack) sweep BOTH channels so a stale
+    correction can never outlive its revision on either. No-op (empty
+    queue read) under the legacy regime, which never enqueues correction
+    notes. Best-effort: returns the evicted note ids, ``[]`` on any
+    failure.
+    """
+    try:
+        from goldfive.observer_note_queue import ObserverNoteQueue
+
+        return ObserverNoteQueue.for_session(session).evict_pending_correction_notes(
+            task_id=task_id, agent_id=agent_name
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "_evict_correction_notes: queue eviction raised for task=%r: %s",
+            task_id,
+            exc,
+        )
+        return []
+
+
 def clear_correction(
     session: Any,
     *,
@@ -434,13 +475,28 @@ def clear_correction(
     Called from :mod:`goldfive.reporting` on
     :func:`report_task_started` for the correction task — the agent
     acknowledging the new task is our cue to stop re-injecting the
-    correction block on subsequent turns.
+    correction block on subsequent turns. Sweeps BOTH channels: the
+    legacy pending-correction state slot AND (task #11) any pending
+    correction-origin ObserverNote for the same ``(agent, task)`` — an
+    acknowledged correction must not be delivered again turns later via
+    the note channel.
     """
     if not agent_name or not task_id:
         return False
     state = _session_state(session)
     if state is None:
         return False
+    evicted_notes = _evict_correction_notes(
+        session, task_id=task_id, agent_name=agent_name
+    )
+    if evicted_notes:
+        log.info(
+            "evicted %d pending correction note(s) for agent=%r task=%r "
+            "(agent acknowledged the corrected task)",
+            len(evicted_notes),
+            agent_name,
+            task_id,
+        )
     key = pending_correction_key(agent_name, task_id)
     if key in state:
         state.pop(key, None)
@@ -450,7 +506,7 @@ def clear_correction(
             task_id,
         )
         return True
-    return False
+    return bool(evicted_notes)
 
 
 def clear_corrections_for_task(
@@ -467,7 +523,14 @@ def clear_corrections_for_task(
 
     Matches across all agents — a correction is ``(agent, task)``-keyed
     but a plan-revision supersession names a task, not an agent, so
-    the sweep is task-scoped. Returns the list of cleared state keys.
+    the sweep is task-scoped. Sweeps BOTH channels: the legacy
+    pending-correction state slots AND (task #11) pending
+    correction-origin ObserverNotes for the task — without the note
+    sweep a superseded correction stayed pending on the note channel
+    forever and could be delivered turns later against a plan that had
+    already moved past it. Returns the cleared identifiers (state keys
+    for slot entries, note ids for evicted notes — the same mixed
+    convention :func:`queue_corrections_for_revision` returns).
     """
     if not task_id:
         return []
@@ -491,6 +554,15 @@ def clear_corrections_for_task(
         log.info(
             "cleared %d pending correction(s) scoped to task=%r (task was superseded by revision)",
             len(cleared),
+            task_id,
+        )
+    evicted_notes = _evict_correction_notes(session, task_id=task_id)
+    if evicted_notes:
+        cleared.extend(evicted_notes)
+        log.info(
+            "evicted %d pending correction note(s) scoped to task=%r "
+            "(task was superseded by revision)",
+            len(evicted_notes),
             task_id,
         )
     return cleared

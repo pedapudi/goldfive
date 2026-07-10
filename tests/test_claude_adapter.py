@@ -49,6 +49,10 @@ class _RecordingSteerer:
     def __init__(self) -> None:
         self.events: list[Any] = []
         self.transitions: list[tuple[str, str]] = []
+        # The adapter routes observations through ``steerer.drift.observe``
+        # (see ``_safe_observe``); expose this object as its own drift
+        # observer so the recorded events actually accumulate.
+        self.drift = self
 
     async def observe(self, event: Any, session: Session) -> None:
         self.events.append(event)
@@ -173,24 +177,23 @@ def test_classify_stop_reason_benign() -> None:
     assert classify_stop_reason("some_future_reason") is None
 
 
-def test_classify_stop_reason_too_many_steps() -> None:
-    drift = classify_stop_reason("max_turns", current_task_id="t1")
+def test_classify_stop_reason_context_pressure() -> None:
+    # ``classify_stop_reason`` is the shared context-pressure classifier
+    # (its earlier per-kind behaviour moved elsewhere when the signature
+    # was narrowed to ``(reason)``); the adapter stamps task/agent
+    # attribution itself after calling it.
+    drift = classify_stop_reason("max_tokens")
     assert drift is not None
-    assert drift.kind is DriftKind.TOO_MANY_STEPS
-    assert drift.current_task_id == "t1"
+    assert drift.kind is DriftKind.CONTEXT_PRESSURE
 
 
-def test_classify_stop_reason_refusal_is_critical() -> None:
-    drift = classify_stop_reason("refusal")
-    assert drift is not None
-    assert drift.kind is DriftKind.MODEL_REFUSAL
-    assert str(drift.severity) == "critical"
-
-
-def test_classify_stop_reason_stopped_early() -> None:
-    drift = classify_stop_reason("end_turn")
-    assert drift is not None
-    assert drift.kind is DriftKind.STOPPED_EARLY
+def test_classify_stop_reason_non_pressure_reasons_are_benign() -> None:
+    # Reasons outside the context-pressure set produce no drift from
+    # this classifier (refusal / step-count classification live in
+    # their own detectors).
+    assert classify_stop_reason("max_turns") is None
+    assert classify_stop_reason("refusal") is None
+    assert classify_stop_reason("end_turn") is None
 
 
 def test_adapter_invoke_routes_tool_use_to_steerer() -> None:
@@ -294,10 +297,11 @@ def test_adapter_invoke_routes_tool_use_to_steerer() -> None:
     assert "_ToolCallObservation" in observed_types
 
 
-def test_adapter_invoke_reports_drift_on_max_turns() -> None:
-    """A ``max_turns`` stop_reason is classified and observed as drift."""
+def test_adapter_invoke_reports_drift_on_max_tokens() -> None:
+    """A context-pressure stop_reason is classified, attributed to the
+    invoked task/agent, and observed as drift."""
 
-    messages = [_make_result_message(stop_reason="max_turns")]
+    messages = [_make_result_message(stop_reason="max_tokens")]
     stub_client = _StubClient(messages)
     steerer = _RecordingSteerer()
     adapter = ClaudeAgentSDKAdapter(
@@ -307,14 +311,42 @@ def test_adapter_invoke_reports_drift_on_max_turns() -> None:
 
     async def _run() -> None:
         session = Session(run_id="r2")
-        result = await adapter.invoke(Task(id="t1", title="Do thing"), session)
-        assert result.stop_reason == "max_turns"
+        result = await adapter.invoke(
+            Task(id="t1", title="Do thing", assignee_agent_id="writer"), session
+        )
+        assert result.stop_reason == "max_tokens"
 
     asyncio.run(_run())
 
     drift_events = [e for e in steerer.events if type(e).__name__ == "DriftEvent"]
     assert len(drift_events) == 1
-    assert drift_events[0].kind is DriftKind.TOO_MANY_STEPS
+    assert drift_events[0].kind is DriftKind.CONTEXT_PRESSURE
+    # The adapter stamps the attribution the classifier no longer takes.
+    assert drift_events[0].current_task_id == "t1"
+    assert drift_events[0].current_agent_id == "writer"
+
+
+def test_adapter_invoke_benign_stop_reason_emits_no_drift() -> None:
+    """``end_turn`` completes cleanly: no drift, no TypeError from the
+    classifier call (regression: the old kwargs call raised on every
+    completed invocation)."""
+
+    messages = [_make_result_message(stop_reason="end_turn")]
+    steerer = _RecordingSteerer()
+    adapter = ClaudeAgentSDKAdapter(
+        client_factory=lambda: _StubClient(messages),
+        steerer=steerer,
+    )
+
+    async def _run() -> None:
+        result = await adapter.invoke(
+            Task(id="t1", title="Do thing"), Session(run_id="r3")
+        )
+        assert result.error is None
+        assert result.stop_reason == "end_turn"
+
+    asyncio.run(_run())
+    assert not [e for e in steerer.events if type(e).__name__ == "DriftEvent"]
 
 
 def test_adapter_available_agents_passthrough() -> None:

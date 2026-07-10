@@ -709,6 +709,7 @@ def test_build_correction_payload_shapes_fields() -> None:
     assert payload == {
         "agent_name": "agent_x",
         "task_id": "T_new",
+        "task_title": "New work (corrected)",
         "superseded_task_id": "T_old",
         "superseded_task_title": "Old work",
         "drift_kind": "off_topic",
@@ -931,3 +932,180 @@ async def test_full_path_correction_cleared_on_report_task_started() -> None:
     # Only team A's correction is acknowledged; team B's survives.
     assert key_a not in session.state
     assert key_b in session.state
+
+
+# ---------------------------------------------------------------------------
+# Self-contained rendering (fix wave: surfaces without the task pin)
+# ---------------------------------------------------------------------------
+
+
+def _self_contained_payload() -> dict[str, Any]:
+    return {
+        "agent_name": "research_agent",
+        "task_id": "T_corrected",
+        "task_title": "Research solar options (corrected scope)",
+        "superseded_task_id": "T_old",
+        "superseded_task_title": "Research solar options",
+        "drift_kind": "off_topic",
+        "drift_reason": "the agent veered into batteries",
+        "revision_number": 3,
+        "issued_at_ms": 123,
+    }
+
+
+def test_format_correction_block_default_references_the_pin_section() -> None:
+    """Byte-compat guard: the DEFAULT rendering (slot regime, where the
+    pin renders the section) still points at "Current assigned task"."""
+    from goldfive.adapters.adk_llm_instrumentation import format_correction_block
+
+    block = format_correction_block(_self_contained_payload())
+    assert 'as described above in "Current assigned task."' in block
+
+
+def test_format_correction_block_self_contained_inlines_target() -> None:
+    """``self_contained=True`` (note channel / [GOALS] pin): no reference
+    to the absent section; the corrected task is named inline. Directive
+    language preserved, diagnostic language still banned."""
+    from goldfive.adapters.adk_llm_instrumentation import format_correction_block
+
+    block = format_correction_block(_self_contained_payload(), self_contained=True)
+    assert "Current assigned task" not in block
+    assert '"Research solar options (corrected scope)" (id T_corrected)' in block
+    assert "Focus only on" in block
+    assert "Do not propagate" in block
+    low = block.lower()
+    for word in ["was broken", "broke", "failed", "error", "mistake", "incorrect", "wrong"]:
+        assert word not in low
+    # Diagnostic data still not interpolated.
+    assert "veered into batteries" not in block
+
+
+def test_format_correction_block_self_contained_degrades_without_title() -> None:
+    from goldfive.adapters.adk_llm_instrumentation import format_correction_block
+
+    payload = _self_contained_payload()
+    payload["task_title"] = ""
+    block = format_correction_block(payload, self_contained=True)
+    assert "Current assigned task" not in block
+    assert "task T_corrected" in block
+
+    payload["task_id"] = ""
+    block = format_correction_block(payload, self_contained=True)
+    assert "Current assigned task" not in block
+    assert "the corrected task on the revised plan" in block
+
+
+def test_discovered_goals_pin_correction_is_self_contained() -> None:
+    """Resolver-level: a DISCOVERED pin renders the [GOALS] block (no
+    "Current assigned task" section), so its appended correction must
+    not direct the agent to that absent section."""
+    from goldfive.adapters._adk_plugin import SessionContext
+    from goldfive.config import SteeringConfig
+    from goldfive.prompt_shaper import PromptShaper
+    from goldfive.state_store import StateStore
+    from goldfive.types import Goal, TaskKind
+
+    session = Session(run_id="r-goals-corr")
+    session.goals = [Goal(id="g1", summary="summarise the deck")]
+    session.plan = Plan(
+        id="p1",
+        run_id="r-goals-corr",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="d1",
+                title="research_agent: summarise",
+                description="observed delegation",
+                assignee_agent_id="research_agent",
+                status=TaskStatus.RUNNING,
+                kind=TaskKind.DISCOVERED,
+                discovered=True,
+            )
+        ],
+        edges=[],
+        revision_index=2,
+    )
+    StateStore.for_session(session).set_pin_current_task(
+        "d1", title="research_agent: summarise"
+    )
+    payload = _self_contained_payload()
+    payload["task_id"] = "d1"
+    write_correction(session, payload)
+
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
+    ctx_stash = SessionContext(
+        session=session,
+        steerer=steerer,
+        task=None,
+        tool_handlers={},
+        host_agent_name="coordinator",
+    )
+
+    class _ReadonlyCtx:
+        state = {"goldfive._session_context": ctx_stash}
+        _invocation_context = None
+
+    resolver = PromptShaper().make_dynamic_instruction(
+        original_instruction="You research things.",
+        agent_name="research_agent",
+    )
+    out = resolver(_ReadonlyCtx())
+    assert "[GOALS]" in out
+    assert "Current assigned task" not in out
+    # The correction landed, self-contained (inlined corrected task).
+    assert "Plan was revised (REV 3)" in out
+    assert '"Research solar options (corrected scope)" (id d1)' in out
+
+
+def test_forecast_pin_correction_keeps_default_reference() -> None:
+    """Resolver-level §5.1 guard: a forecast/legacy pin still renders the
+    task block AND the byte-identical default correction text."""
+    from goldfive.adapters._adk_plugin import SessionContext
+    from goldfive.config import SteeringConfig
+    from goldfive.prompt_shaper import PromptShaper
+    from goldfive.state_store import StateStore
+    from goldfive.types import Goal
+
+    session = Session(run_id="r-forecast-corr")
+    session.goals = [Goal(id="g1", summary="summarise the deck")]
+    session.plan = Plan(
+        id="p1",
+        run_id="r-forecast-corr",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="f1",
+                title="Summarise",
+                description="write the summary",
+                assignee_agent_id="research_agent",
+                status=TaskStatus.RUNNING,
+            )
+        ],
+        edges=[],
+        revision_index=2,
+    )
+    StateStore.for_session(session).set_pin_current_task("f1", title="Summarise")
+    payload = _self_contained_payload()
+    payload["task_id"] = "f1"
+    write_correction(session, payload)
+
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
+    ctx_stash = SessionContext(
+        session=session,
+        steerer=steerer,
+        task=None,
+        tool_handlers={},
+        host_agent_name="coordinator",
+    )
+
+    class _ReadonlyCtx:
+        state = {"goldfive._session_context": ctx_stash}
+        _invocation_context = None
+
+    resolver = PromptShaper().make_dynamic_instruction(
+        original_instruction="You research things.",
+        agent_name="research_agent",
+    )
+    out = resolver(_ReadonlyCtx())
+    assert "Current assigned task:" in out
+    assert 'as described above in "Current assigned task."' in out

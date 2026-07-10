@@ -147,7 +147,8 @@ GOAL_DRIFT_GRADUATED_USER_PROMPT_TEMPLATE: str = (
     "progress toward a stated goal.\n\n"
     "GOALS (what the user wants — the primary reference):\n{goals_block}\n\n"
     "LEDGER (OUTCOME = deliverables that define success; DISCOVERED = "
-    "what the agent has actually done so far):\n{tasks_block}\n\n"
+    "what the agent has actually done so far; FORECAST = a pre-planned "
+    "step, a prediction rather than an observation):\n{tasks_block}\n\n"
     "RECENT AGENT ACTIVITY (most recent {activity_count} invocations, "
     "newest last):\n{activity_block}\n\n"
     "Decide how the recent activity relates to the GOALS, given the "
@@ -292,10 +293,23 @@ async def classify_goal_drift(
     """Ask an LLM-judge whether recent activity is progressing the goals.
 
     Returns a :class:`DriftEvent` of kind
-    :data:`~goldfive.types.DriftKind.GOAL_DRIFT` at
-    :data:`~goldfive.types.DriftSeverity.CRITICAL` when the judge
-    returns ``{"progressing": false, "reason": "..."}``. Returns
-    ``None`` in every other case:
+    :data:`~goldfive.types.DriftKind.GOAL_DRIFT` when the judge returns
+    ``{"progressing": false, ...}``. The severity depends on the mode:
+
+    * ``graduated=False`` (forecast mode, the default) — every
+      non-progressing verdict is
+      :data:`~goldfive.types.DriftSeverity.CRITICAL` (the pre-PR-11
+      binary behaviour, byte-identical).
+    * ``graduated=True`` (ledger plan mode; AGENCY-PRESERVATION.md
+      PR 11(a)) — the judge is asked for a three-state verdict via
+      :data:`GOAL_DRIFT_GRADUATED_USER_PROMPT_TEMPLATE` and a
+      non-progressing verdict carries a ``band``:
+      ``"uncertain"`` fires :data:`~goldfive.types.DriftSeverity.WARNING`
+      (the early, proportional signal) and ``"off_track"`` fires
+      CRITICAL. A missing or unrecognised band degrades to CRITICAL so
+      the severity never silently softens below the legacy default.
+
+    Returns ``None`` in every other case:
 
     * judge returns ``{"progressing": true}`` (the on-track signal),
     * judge returns malformed / non-JSON text,
@@ -333,8 +347,17 @@ async def classify_goal_drift(
         Optional -- empty strings are fine when no task is active.
     system_prompt / user_prompt_template:
         Override the default prompts. Operators wanting a different
-        judge style can pass their own; the defaults match the shape
-        pinned in :data:`GOAL_DRIFT_USER_PROMPT_TEMPLATE`.
+        judge style can pass their own; an explicit
+        ``user_prompt_template`` wins over the ``graduated`` template
+        selection. The defaults match the shapes pinned in
+        :data:`GOAL_DRIFT_USER_PROMPT_TEMPLATE` /
+        :data:`GOAL_DRIFT_GRADUATED_USER_PROMPT_TEMPLATE`.
+    graduated:
+        ``True`` in ledger plan mode: selects the graduated (three-band)
+        prompt, renders the plan with task-kind annotations (OUTCOME /
+        DISCOVERED / FORECAST), and maps the verdict ``band`` to
+        severity as described above. ``False`` (the default) keeps the
+        binary CRITICAL-only forecast behaviour.
     """
     system = system_prompt or GOAL_DRIFT_SYSTEM_PROMPT
     # AGENCY-PRESERVATION.md PR 11(a) — in ledger mode (``graduated``) ask

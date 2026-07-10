@@ -4280,8 +4280,10 @@ def make_adk_plugin(
             :func:`_resolve_pinned_task_id` finds the task without needing a
             pre-declared assignee.
 
-            Selection algorithm with descriptive growth ON (the default —
-            :attr:`SteeringConfig.descriptive_growth_enabled`; design doc
+            Selection algorithm with descriptive growth ON
+            (:attr:`SteeringConfig.descriptive_growth_enabled` — default
+            OFF pending the AGENCY-PRESERVATION.md §6.4 13b bench gate;
+            #497 reverted the interim default-ON; design doc
             ``PLAN-DESCRIPTIVE-GROWTH.md`` §4.3):
 
             0. **Dedup-hash re-pin.** If any non-terminal plan task carries

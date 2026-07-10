@@ -686,6 +686,53 @@ class ObserverNoteQueue:
             return True
         return False
 
+    def evict_pending_correction_notes(
+        self,
+        *,
+        task_id: str,
+        agent_id: str = "",
+    ) -> list[str]:
+        """Drop PENDING correction-origin notes targeted at ``task_id``.
+
+        The note-channel counterpart of the slot regime's obsolescence GC
+        (``_correction_injection.clear_corrections_for_task`` /
+        ``clear_correction``): when a correction task is itself superseded
+        by a later revision, or the agent has acknowledged the corrected
+        task via ``report_task_started``, the pending correction note is
+        stale — delivering it turns later would direct the agent at a task
+        the plan has already moved past. Without this sweep a superseded
+        correction note stayed pending forever.
+
+        Selection is structural: ``drift_id`` carries
+        :data:`CORRECTION_DRIFT_ID_PREFIX` (goldfive-minted — never NL
+        matching), the note is still pending, ``note.task_id`` equals
+        ``task_id``, and — when ``agent_id`` is given — the note's agent
+        matches by bare name. DELIVERED correction notes are kept as
+        tombstones (enqueue dedup / exactly-once bookkeeping); drift-signal
+        notes are never touched. Returns the evicted note ids.
+        """
+        tid = str(task_id or "")
+        if not tid:
+            return []
+        target = _bare_agent(agent_id) if agent_id else None
+        notes = self._read_notes()
+        evicted: list[str] = []
+        kept: list[dict[str, Any]] = []
+        for raw in notes:
+            n = ObserverNote.from_dict(raw)
+            if (
+                n.is_pending
+                and str(n.drift_id or "").startswith(CORRECTION_DRIFT_ID_PREFIX)
+                and n.task_id == tid
+                and (target is None or _bare_agent(n.agent_id) == target)
+            ):
+                evicted.append(n.note_id)
+                continue
+            kept.append(raw)
+        if evicted:
+            self._write_notes(kept)
+        return evicted
+
     def _prune(self, notes: list[dict[str, Any]]) -> None:
         """Evict oldest *delivered* notes when over the cap (in place)."""
         if len(notes) <= _NOTES_CAP:
