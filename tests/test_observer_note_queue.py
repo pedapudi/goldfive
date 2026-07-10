@@ -151,6 +151,66 @@ def test_mark_delivered_idempotent() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# delivered_dry_run — attribution truthfulness vs pacing decision-parity
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_consume_excluded_from_rendered_keys_but_kept_for_pacing() -> None:
+    # A DRY-RUN consume (a passive surface under observation_only) marks the
+    # note delivered for pacing/coalescing decision parity, but the agent never
+    # SAW it: it must be excluded from rendered_keys (else after_signal
+    # attribution is a lie and the §5.4 shadow campaign over-counts
+    # self_corrected_after_signal) yet KEPT in last_rendered_turn (grace-window
+    # pacing must be byte-identical between the shadow and live campaigns).
+    q = ObserverNoteQueue({})
+    note = _enqueue(q, kind="looping_tool_call", task_id="t1")
+    assert q.mark_delivered(
+        note.note_id,
+        channel="request_context",
+        turn=5,
+        surface="before_model",
+        dry_run=True,
+    )
+    # exactly-once still holds — a dry-run consume consumes the note.
+    assert q.peek_for_render() is None
+    # attribution: the agent did NOT see it.
+    assert ("looping_tool_call", "t1") not in q.rendered_keys()
+    # pacing: the grace window IS anchored at the consume turn.
+    assert q.last_rendered_turn("looping_tool_call", "t1") == 5
+    stored = q.notes()[0]
+    assert stored.delivered is True
+    assert stored.delivered_dry_run is True
+
+
+def test_real_render_counts_for_both_attribution_and_pacing() -> None:
+    q = ObserverNoteQueue({})
+    note = _enqueue(q, kind="looping_tool_call", task_id="t1")
+    assert q.mark_delivered(
+        note.note_id,
+        channel="request_context",
+        turn=5,
+        surface="before_model",
+        dry_run=False,
+    )
+    assert ("looping_tool_call", "t1") in q.rendered_keys()
+    assert q.last_rendered_turn("looping_tool_call", "t1") == 5
+    assert q.notes()[0].delivered_dry_run is False
+
+
+def test_delivered_dry_run_defaults_false_and_survives_serialization() -> None:
+    # Back-compat: a note serialized before the field existed reads False.
+    note = ObserverNote(note_id="n1", body="b", observation="o", severity="warning")
+    assert note.delivered_dry_run is False
+    round_tripped = ObserverNote.from_dict(note.to_dict())
+    assert round_tripped.delivered_dry_run is False
+    # And a dry-run mark survives the dict round-trip.
+    marked = ObserverNote.from_dict(
+        {**note.to_dict(), "delivered": True, "delivered_dry_run": True}
+    )
+    assert marked.delivered_dry_run is True
+
+
 def test_delivered_note_skipped_by_peek() -> None:
     q = ObserverNoteQueue({})
     _enqueue(q, drift_id="d1")

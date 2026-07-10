@@ -172,6 +172,15 @@ class ObserverNote:
     delivered_channel: str = ""
     delivered_surface: str = ""
     delivered_turn: int = -1
+    #: Whether the exactly-once consume was a DRY-RUN: the surface was passive
+    #: (``observation_only=True`` / ``is_active_steering`` False), so the note
+    #: was consumed for pacing/coalescing decision parity but NEVER rendered to
+    #: the agent. Excluded from :meth:`ObserverNoteQueue.rendered_keys` (the
+    #: ``after_signal`` attribution source — the agent did not SEE it, so the
+    #: drift resolves ``self_corrected_unaided``), but KEPT in
+    #: :meth:`ObserverNoteQueue.last_rendered_turn` so grace-window pacing is
+    #: byte-identical between the §5.4 shadow (dry-run) and live campaigns.
+    delivered_dry_run: bool = False
 
     @property
     def is_pending(self) -> bool:
@@ -194,6 +203,7 @@ class ObserverNote:
             "delivered_channel": str(self.delivered_channel or ""),
             "delivered_surface": str(self.delivered_surface or ""),
             "delivered_turn": int(self.delivered_turn),
+            "delivered_dry_run": bool(self.delivered_dry_run),
         }
 
     @classmethod
@@ -214,6 +224,7 @@ class ObserverNote:
             delivered_channel=str(data.get("delivered_channel", "") or ""),
             delivered_surface=str(data.get("delivered_surface", "") or ""),
             delivered_turn=_coerce_int(data.get("delivered_turn", -1), default=-1),
+            delivered_dry_run=bool(data.get("delivered_dry_run", False)),
         )
 
 
@@ -496,12 +507,18 @@ class ObserverNoteQueue:
     def last_rendered_turn(self, kind: str, task_id: str) -> int:
         """Return the most-recent SIGNAL render turn for a ``(kind, task)`` key.
 
-        The max ``delivered_turn`` over delivered (rendered) *signal* notes
+        The max ``delivered_turn`` over delivered (consumed) *signal* notes
         matching ``(kind, task_id)`` (correction notes excluded — see
         :meth:`_is_signal_note`); ``-1`` when no signal for that key has been
-        rendered yet. This is the grace-window anchor: an enqueued-but-never-
-        rendered signal returns ``-1`` (it never started a grace window — the
-        agent has not seen it).
+        consumed yet. This is the grace-window anchor: an enqueued-but-never-
+        consumed signal returns ``-1`` (it never started a grace window).
+
+        Unlike :meth:`rendered_keys`, this DELIBERATELY includes DRY-RUN
+        consumes (``delivered_dry_run``): the grace window is a pacing decision
+        that must be byte-identical between the §5.4 shadow (dry-run) and live
+        campaigns, so a note consumed-but-not-shown still anchors the window.
+        Do not add a ``delivered_dry_run`` filter here — that would fork pacing
+        behavior between the two campaigns and break the shadow diff.
         """
         k = str(kind or "")
         t = str(task_id or "")
@@ -539,11 +556,16 @@ class ObserverNoteQueue:
         enqueued-but-never-rendered key resolves ``self_corrected_unaided``.
         Correction notes (task #11) are excluded — a rendered correction is
         not "the agent saw the SIGNAL" (and corrections carry no ledger entry
-        to attribute anyway).
+        to attribute anyway). DRY-RUN consumes are excluded too
+        (:attr:`ObserverNote.delivered_dry_run`): under ``observation_only`` a
+        surface consumes the note for pacing parity but never shows it to the
+        agent, so it must NOT count as "the agent saw the SIGNAL" — otherwise
+        the §5.4 shadow campaign over-attributes ``after_signal`` and inflates
+        the self-correction rate the flip decision reads.
         """
         out: set[tuple[str, str]] = set()
         for n in self.notes():
-            if n.delivered and self._is_signal_note(n):
+            if n.delivered and not n.delivered_dry_run and self._is_signal_note(n):
                 out.add((n.kind, n.task_id))
         return out
 
@@ -615,15 +637,24 @@ class ObserverNoteQueue:
         channel: str,
         turn: int,
         surface: str = "",
+        dry_run: bool = False,
     ) -> bool:
         """Mark ``note_id`` delivered; return ``True`` iff newly delivered.
 
         Idempotent: a second mark (or a mark of an unknown id) returns
         ``False`` and leaves the record untouched. This is the exactly-once
-        chokepoint — the first surface to render a note flips the flag, and
+        chokepoint — the first surface to consume a note flips the flag, and
         :meth:`peek_for_render` skips it forever after, so no other surface
-        re-delivers it. The ``True`` return is the caller's signal to emit
+        re-consumes it. The ``True`` return is the caller's signal to emit
         exactly one ``SignalDelivered``.
+
+        ``dry_run`` records whether this consume was a passive/shadow consume
+        (the surface was under ``observation_only`` and did NOT render the note
+        to the agent — it consumed it only for pacing/coalescing decision
+        parity). It is stamped onto :attr:`ObserverNote.delivered_dry_run` so
+        :meth:`rendered_keys` can exclude it from ``after_signal`` attribution
+        while :meth:`last_rendered_turn` still counts it for grace-window
+        pacing (§5.4 decision parity). Exactly-once still holds either way.
         """
         notes = self._read_notes()
         for raw in notes:
@@ -635,6 +666,7 @@ class ObserverNoteQueue:
             raw["delivered_channel"] = str(channel or "")
             raw["delivered_surface"] = str(surface or "")
             raw["delivered_turn"] = _coerce_int(turn)
+            raw["delivered_dry_run"] = bool(dry_run)
             self._write_notes(notes)
             return True
         return False

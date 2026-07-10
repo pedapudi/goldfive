@@ -916,7 +916,8 @@ class PromptShaper:
         if note is None:
             return None
 
-        if self.should_inject(steerer):
+        rendered = self.should_inject(steerer)
+        if rendered:
             # task #11 cross-surface fold: render_block composes the
             # plan-state Status line from the plan INSIDE the marker block
             # (strip-and-refresh removes it as one unit; marker count stays
@@ -963,6 +964,7 @@ class PromptShaper:
                 channel="request_context",
                 turn=turn,
                 surface="before_model",
+                dry_run=not rendered,
             )
         except Exception as exc:  # noqa: BLE001
             log.debug("PromptShaper.inject_observer_note: mark_delivered raised: %s", exc)

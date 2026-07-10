@@ -380,6 +380,27 @@ async def test_user_steer_resolves_user_intervened() -> None:
     assert [o.signal_outcome.outcome for o in outcomes] == [SIGNAL_OUTCOME_USER_INTERVENED]
 
 
+async def test_user_pause_does_not_black_hole_open_keys() -> None:
+    # USER_PAUSE is NON-terminal (the run resumes after a later RESUME) and
+    # carries authored_by="user"; it must NOT fall into the terminal
+    # user-intervened branch and resolve every open key, or all post-resume
+    # outcome telemetry is lost. The key stays OPEN — proven by a later
+    # finalize resolving it invocation_ended (not user_intervened at pause).
+    steerer, session, sink = _setup(observation_only=False)
+    await steerer.drift._dispatch_nudge(_drift(), session)
+    pause_drift = _drift(kind=DriftKind.USER_PAUSE, authored_by="user")
+    await steerer.drift._emit_drift_detected(session, pause_drift)
+    # The pause emitted no user_intervened outcome — the key was left open.
+    assert all(
+        o.signal_outcome.outcome != SIGNAL_OUTCOME_USER_INTERVENED for o in _outcomes(sink)
+    )
+    # Still open: finalize now resolves it invocation_ended.
+    await steerer.drift.finalize_signal_ledger(session)
+    assert [o.signal_outcome.outcome for o in _outcomes(sink)] == [
+        SIGNAL_OUTCOME_INVOCATION_ENDED
+    ]
+
+
 async def test_run_end_finalize_resolves_invocation_ended() -> None:
     steerer, session, sink = _setup(observation_only=False)
     await steerer.drift._dispatch_nudge(_drift(), session)
@@ -401,6 +422,33 @@ async def test_executor_drain_helper_finalizes_ledger() -> None:
     assert [o.signal_outcome.outcome for o in _outcomes(sink)] == [
         SIGNAL_OUTCOME_INVOCATION_ENDED
     ]
+
+
+async def test_run_boundary_drains_background_before_finalizing_ledger() -> None:
+    # ORDER MATTERS: a late-resolving background drift records onto the ledger
+    # as it drains; if finalize ran first it would resolve every open key and
+    # the drained drift would write into an already-finalized ledger (a lost or
+    # double-counted outcome). The helper must drain THEN finalize.
+    from goldfive.executors.sequential import _drain_steerer_at_run_boundary
+
+    steerer, session, _sink = _setup(observation_only=False)
+    order: list[str] = []
+    drift_obs = steerer.drift
+    real_drain = drift_obs.drain_session_background_tasks
+    real_finalize = drift_obs.finalize_signal_ledger
+
+    async def _spy_drain(*a: object, **k: object) -> object:
+        order.append("drain")
+        return await real_drain(*a, **k)
+
+    async def _spy_finalize(*a: object, **k: object) -> object:
+        order.append("finalize")
+        return await real_finalize(*a, **k)
+
+    drift_obs.drain_session_background_tasks = _spy_drain  # type: ignore[method-assign]
+    drift_obs.finalize_signal_ledger = _spy_finalize  # type: ignore[method-assign]
+    await _drain_steerer_at_run_boundary(steerer, session)
+    assert order == ["drain", "finalize"]
 
 
 # ---------------------------------------------------------------------------

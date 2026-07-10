@@ -7350,17 +7350,18 @@ def make_adk_plugin(
                 channel="request_context",
                 turn=turn,
                 surface="tool_annotation",
+                dry_run=passive,
             )
             if not newly:
                 return None
             if passive:
                 # observation_only: ``mark_delivered`` ran above (decision
                 # parity — pacing / coalescing behave identically to the
-                # active path), but return None so the real tool result
-                # passes through UNANNOTATED. Follow-up: a sibling PR owns
-                # the dry_run-truthfulness refactor; once it lands the
-                # dry-run marker on this consume lets telemetry attribution
-                # distinguish it from an active delivery.
+                # active path) and stamped ``delivered_dry_run=True`` so the
+                # ledger's ``rendered_keys`` excludes this consume from
+                # ``after_signal`` attribution (the agent never saw it), while
+                # ``last_rendered_turn`` still counts it for the grace window.
+                # Return None so the real tool result passes through UNANNOTATED.
                 return None
             # Append-only: copy the result and add the reserved annotation key.
             annotated = dict(result)

@@ -1342,6 +1342,18 @@ class DriftObserver:
             turn = int(getattr(session, "_reasoning_turn", 0) or 0)
             ledger = SignalLedger.for_session(session)
             authored_by = str(getattr(drift, "authored_by", "") or "").lower()
+            # USER_PAUSE is a NON-terminal user control (the run resumes after a
+            # later RESUME), and it carries ``authored_by="user"`` — so it would
+            # otherwise fall into the terminal ``resolve_user_intervened`` branch
+            # below and black-hole every open signal key as ``user_intervened``,
+            # losing all post-resume outcome telemetry. Guard it explicitly: a
+            # pause is neither a goldfive signal (no key opened) nor a terminal
+            # intervention (no keys resolved) — leave open keys open.
+            if drift.kind is DriftKind.USER_PAUSE:
+                return
+            # USER_STEER / USER_CANCEL are TERMINAL user interventions: they
+            # resolve every open, delivered key as ``user_intervened`` rather
+            # than opening a ``(USER_*, task)`` signal entry.
             if authored_by == "user" or drift.kind in self._USER_AUTHORED_DRIFT_KINDS:
                 for entry in ledger.resolve_user_intervened(turn=turn):
                     await self._emit_signal_outcome(session, entry)
