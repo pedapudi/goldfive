@@ -20,9 +20,12 @@ and the injected text is truthful: the GOAL_DRIFT corrective only
 claims "already complete" for a COMPLETED task, and the replay header
 only claims a plan revision when one was actually installed.
 
-Note: tests pass ``observation_only`` EXPLICITLY — tests/conftest.py
-flips the *implicit* default to False for the legacy corpus, so
-``observation_only=True`` here is exactly the production default.
+Note: bare steerers / configs run PASSIVE — ``observation_only=True``
+is the shipped production default (there is no conftest override that
+flips it). Tests that exercise active interventions opt in explicitly
+(``SteeringConfig(observation_only=False)`` inline, or the
+``active_steering_config`` / ``make_active_steerer`` fixtures), so the
+``observation_only=True`` cases here are exactly the production default.
 """
 
 from __future__ import annotations
