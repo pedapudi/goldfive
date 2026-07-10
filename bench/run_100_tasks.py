@@ -181,7 +181,21 @@ def _print_arm_metrics_table(results: list) -> None:
         signals = f"{m.signals_total} / {m.signals_real} / {m.signals_dry_run}"
         print(f"\narm {m.arm_name}  [{m.arm_kind}]")
         print("-" * 72)
-        print(f"  goal_success:            {m.goal_success}  {reason}")
+        print(f"  goal_grade:              {m.goal_grade.upper()}  {reason}")
+        print(f"  goal_success (==MET):    {m.goal_success}")
+        print(f"  goal_predicate_count:    {m.goal_predicate_count}")
+        print(
+            f"  OUTCOME tasks:           {m.outcome_tasks_total}  "
+            f"terminal={m.outcome_terminal}"
+        )
+        print(
+            f"  plan_mode / exercised:   {m.plan_mode} / {m.ledger_exercised}"
+            + (
+                "  (configured but NOT exercised — does not validate ledger)"
+                if m.plan_mode == "ledger" and not m.ledger_exercised
+                else ""
+            )
+        )
         print(f"  completed_outputs:       {m.completed_outputs}")
         print(f"  turns / tokens:          {m.turns} / {tokens}")
         print(f"  run aborted:             {m.aborted}  {m.abort_reason}")
