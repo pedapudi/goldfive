@@ -1,5 +1,12 @@
 # 12. Events, Sinks, and Telemetry
 
+> **⚠ Predates the agency-preservation merge.** This chapter describes the
+> pre-merge mechanics; the merge (PRs #453–#504) renamed `NUDGE`→`SIGNAL`,
+> replaced corrective templates with advisory observer notes, and added the
+> default-OFF ledger/signal regimes. Default-flag behavior described here is
+> still accurate; for the merged as-built state read
+> `docs/design/AGENCY-PRESERVATION.md` §6 first — it wins on any conflict.
+
 ## Read this chapter when...
 
 - You are adding a new event kind, or a new field to an existing event
