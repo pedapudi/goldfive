@@ -463,3 +463,121 @@ def test_replay_header_claims_revision_only_when_installed() -> None:
     revised = SequentialExecutor._compose_nudge_replay_message(nudges, plan_revised=True)
     assert "PLAN REVISION" in revised
     assert nudges[0] in revised
+
+
+# ---------------------------------------------------------------------------
+# goldfive#475 × AGENCY-PRESERVATION PR 6: the same gate contract on the
+# request_context channel. A note must not reach the agent under
+# ``observation_only`` on EITHER channel — legacy suppresses the enqueue at
+# the dispatch chokepoint; request_context enqueues (observation-side
+# bookkeeping) but every delivery surface, including the executor's
+# boundary replay, is gated on ``steering_is_active``.
+# ---------------------------------------------------------------------------
+
+
+async def test_overlay_never_reinvokes_under_observation_only_request_context() -> None:
+    """observation_only + signal_channel=request_context: the SIGNAL-routed
+    note lands on the ObserverNoteQueue (decision bookkeeping) but the
+    boundary replay must NOT re-invoke the tree with it — one user turn,
+    one invocation, and the note stays undelivered."""
+    from goldfive.observer_note_queue import ObserverNoteQueue
+
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(
+            observation_only=True, signal_channel="request_context"
+        ),
+    )
+    session = _make_session()
+    sink = ListSink()
+
+    async def _passthrough(
+        user_message: str,
+        session: Session,
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        drift = DriftEvent(
+            kind=DriftKind.GOAL_DRIFT,
+            severity=DriftSeverity.WARNING,
+            detail="synthetic WARNING goal drift",
+            current_task_id="t1",
+        )
+        await steerer.drift.handle_drift(drift, session)
+        # Leave t2 PENDING so the drain gate (not "no live work") is the
+        # reason the replay does not fire.
+        await steerer.transition("t1", TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id="", text="done")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    executor = SequentialExecutor(overlay_mode=True, fail_fast=False)
+    await executor.run(
+        plan=session.plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="write the memo",
+    )
+
+    # ONE user turn, ONE invocation — the gated boundary replay did not
+    # re-invoke with the queued note.
+    assert adapter.passthrough_calls == ["write the memo"]
+    # The legacy queue was never touched on this channel.
+    assert session.pending_nudges == []
+    # The note was enqueued (the PR-6 decision record) but never rendered:
+    # no surface delivered it under observation_only.
+    notes = ObserverNoteQueue.for_session(session).notes()
+    assert notes, "request_context dispatch should have enqueued the note"
+    assert all(not n.delivered for n in notes), (
+        "no observer note may reach the agent under observation_only"
+    )
+
+
+async def test_note_replay_delivers_at_boundary_in_active_request_context() -> None:
+    """Positive control for the gate above: in ACTIVE mode the same
+    request_context note IS consumed by the boundary replay — proving the
+    observation_only gate (not a dead channel) is the discriminator."""
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(
+            observation_only=False, signal_channel="request_context"
+        ),
+    )
+    session = _make_session()
+    sink = ListSink()
+
+    async def _passthrough(
+        user_message: str,
+        session: Session,
+        reconciler: Any,  # noqa: ARG001
+    ) -> InvocationResult:
+        if len(adapter.passthrough_calls) == 1:
+            drift = DriftEvent(
+                kind=DriftKind.GOAL_DRIFT,
+                severity=DriftSeverity.WARNING,
+                detail="synthetic WARNING goal drift",
+                current_task_id="t1",
+            )
+            await steerer.drift.handle_drift(drift, session)
+            return InvocationResult(task_id="", text="healthy turn output")
+        await steerer.transition("t1", TaskStatus.COMPLETED, session=session)
+        await steerer.transition("t2", TaskStatus.COMPLETED, session=session)
+        return InvocationResult(task_id="", text="done")
+
+    adapter = OverlayStubAdapter(passthrough_effect=_passthrough)
+    executor = SequentialExecutor(overlay_mode=True)
+    outcome = await executor.run(
+        plan=session.plan,
+        session=session,
+        adapter=adapter,
+        steerer=steerer,
+        planner=StubPlanner(),
+        sinks=[sink],
+        user_input="write the memo",
+    )
+
+    assert outcome.success is True
+    assert len(adapter.passthrough_calls) == 2
+    replay = adapter.passthrough_calls[1]
+    assert "GOLDFIVE OBSERVER NOTE" in replay
+    # Advisory note content, not the legacy pending_nudges mechanism.
+    assert session.pending_nudges == []
