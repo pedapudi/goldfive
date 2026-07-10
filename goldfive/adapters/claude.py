@@ -582,6 +582,7 @@ class ClaudeAgentSDKAdapter:
                 channel="request_context",
                 turn=turn,
                 surface=surface,
+                dry_run=not should,
             )
         except Exception as exc:  # noqa: BLE001
             log.debug("claude adapter: observer-note mark_delivered raised: %s", exc)

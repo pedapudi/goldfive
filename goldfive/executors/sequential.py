@@ -131,11 +131,28 @@ async def _drain_steerer_at_run_boundary(
     :meth:`shutdown` drain.
     """
     drift_observer = getattr(steerer, "drift", None)
+    # ORDER MATTERS: drain the background drift / judge tasks FIRST, then
+    # finalize the SignalLedger. A late-resolving background drift (e.g. a
+    # fire-and-forget reasoning/goal judge still in flight) records its fire /
+    # outcome onto the ledger as it drains; if finalize ran first it would
+    # resolve every open key as ``invocation_ended`` and the drained drift
+    # would then write into an already-finalized ledger — a lost or
+    # double-counted outcome that corrupts the §5.4 self-correction rates.
+    # Both steps are best-effort and gate nothing.
+    drain = getattr(drift_observer, "drain_session_background_tasks", None)
+    if callable(drain):
+        try:
+            await drain(session_id=session.id)
+        except Exception as exc:  # noqa: BLE001 — never block run termination
+            log.warning(
+                "SequentialExecutor: steerer.drift.drain_session_background_tasks "
+                "raised at run boundary (swallowed): %s",
+                exc,
+            )
     # AGENCY-PRESERVATION.md PR 5 (observe-only): finalize the SignalLedger at
     # the run boundary — every still-open, delivered key resolves to
-    # ``invocation_ended`` (the conservative catch-all). Done here because this
-    # helper is the documented run-boundary chokepoint with the ``session`` in
-    # scope; best-effort and gates nothing.
+    # ``invocation_ended`` (the conservative catch-all). Done AFTER the drain so
+    # every drift that was still in flight has landed on the ledger first.
     finalize = getattr(drift_observer, "finalize_signal_ledger", None)
     if callable(finalize):
         try:
@@ -146,17 +163,6 @@ async def _drain_steerer_at_run_boundary(
                 "raised at run boundary (swallowed): %s",
                 exc,
             )
-    drain = getattr(drift_observer, "drain_session_background_tasks", None)
-    if not callable(drain):
-        return
-    try:
-        await drain(session_id=session.id)
-    except Exception as exc:  # noqa: BLE001 — never block run termination
-        log.warning(
-            "SequentialExecutor: steerer.drift.drain_session_background_tasks "
-            "raised at run boundary (swallowed): %s",
-            exc,
-        )
 
 
 async def _finalize_outcomes_at_run_boundary(steerer: Any, session: Session) -> None:
