@@ -366,3 +366,57 @@ async def test_synchronous_tool_flow_unaffected_by_late_drift_guard() -> None:
         "still reach planner.refine; got "
         f"{len(planner.refine_calls)} call(s)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Shared-state safety: the judge never mutates session.reasoning_history
+# ---------------------------------------------------------------------------
+
+
+async def test_judge_never_mutates_session_reasoning_history() -> None:
+    """The background judge receives its history snapshot as an explicit
+    argument; ``session.reasoning_history`` keeps its identity and its
+    live contents for the whole judge round-trip, so concurrent readers
+    (and appends from later turns) are never affected."""
+    session = _session()
+    live_history = session.reasoning_history
+    seen: dict[str, Any] = {}
+
+    async def slow_call_llm(system: str, user: str, model: str) -> str:  # noqa: ARG001
+        # Runs mid-judge: the session must still expose the live list.
+        seen["identity_mid_judge"] = session.reasoning_history
+        seen["contents_mid_judge"] = list(session.reasoning_history)
+        await asyncio.sleep(0.05)
+        seen["identity_after_sleep"] = session.reasoning_history
+        return json.dumps({"on_task": True})
+
+    steerer = DefaultSteerer(
+        reasoning_drift_call_llm=slow_call_llm,
+        reasoning_drift_model="fake",
+        reasoning_drift_mode="judge",
+    )
+    sink = ListSink()
+    steerer.bind(sinks=[sink], planner=NullPlanner())
+
+    await steerer.drift.observe_reasoning("first reasoning block", session=session)
+    # Let the background judge start and enter the slow LLM call.
+    await asyncio.sleep(0)
+    # A later turn appends while the judge is in flight.
+    session.reasoning_history.append("second reasoning block")
+
+    pending = list(steerer._background_judges)
+    results = await asyncio.gather(*pending, return_exceptions=True)
+    for r in results:
+        assert not isinstance(r, BaseException), (
+            f"background judge raised {r!r}; expected clean completion"
+        )
+
+    assert seen["identity_mid_judge"] is live_history
+    assert seen["identity_after_sleep"] is live_history
+    assert seen["contents_mid_judge"] == ["first reasoning block"]
+    # The mid-flight append landed on the live list and survived.
+    assert session.reasoning_history is live_history
+    assert session.reasoning_history == [
+        "first reasoning block",
+        "second reasoning block",
+    ]

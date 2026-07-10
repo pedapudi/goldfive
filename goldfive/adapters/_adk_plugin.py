@@ -25,6 +25,18 @@ goldfive's :class:`~goldfive.protocols.Steerer`. It does four jobs:
    ``on_tool_error_callback`` feed raw signals into
    ``steerer.drift.observe(...)`` so the steerer can classify drift.
 
+The plugin also hosts the flag-gated **wall-clock stall watchdog**
+(``SteeringConfig.stall_watchdog_enabled``, default OFF): one
+background task per dispatch that fires ``TASK_TIMEOUT`` drifts when
+the session's liveness watermark goes silent. Honest limitation: the
+watchdog is an asyncio task on the same event loop as the wrapped
+tree, so a **synchronously-blocking tool** (a ``def`` tool doing
+blocking I/O / CPU work without yielding) starves the loop and the
+watchdog cannot fire until the block ends. Detecting sync-blocked
+loops is out of scope; the watchdog covers hung *async* tool calls
+and idle-with-no-transitions runs — the cases that previously
+produced zero signal.
+
 The plugin never imports ``google.adk`` at module load. It imports the
 ADK ``BasePlugin`` base class lazily inside :func:`make_adk_plugin`,
 which is only called from the adapter's ``__init__``. That keeps this
@@ -83,6 +95,7 @@ from goldfive.state_store import (
     BindingSource,
     StateStore,
 )
+from goldfive.steerer import steering_is_active
 
 if TYPE_CHECKING:
     from goldfive.protocols import Steerer
@@ -586,6 +599,45 @@ def _agent_has_pending_candidates(ctx: Any, agent_name: str) -> bool:
     return False
 
 
+def _completed_task_ids(tasks: Any) -> set[str]:
+    """Return the ids of tasks whose status is COMPLETED."""
+    from goldfive.types import TaskStatus
+
+    out: set[str] = set()
+    for t in tasks or ():
+        if _safe_attr(t, "status", None) is TaskStatus.COMPLETED:
+            tid = str(_safe_attr(t, "id", "") or "")
+            if tid:
+                out.add(tid)
+    return out
+
+
+def _predecessors_completed(task_id: str, *, edges: Any, completed_ids: set[str]) -> bool:
+    """True iff every incoming-edge predecessor of ``task_id`` is COMPLETED.
+
+    The single DAG-readiness predicate shared by the delegation-pin
+    paths (:meth:`_GoldfiveADKPlugin._pin_delegation_task_id`,
+    :meth:`_GoldfiveADKPlugin._maybe_pin_delegation_task`) and the F3
+    pre-dispatch redirect (:func:`_maybe_redirect_completed_agent`).
+
+    COMPLETED — not merely terminal — is the semantics that won when F3
+    was aligned with the pin paths: a FAILED / CANCELLED / NOT_NEEDED
+    predecessor produced no output for a successor to consume, so the
+    pins never bind such a successor. F3's original local copy counted
+    merely-terminal predecessors, so a NOT_NEEDED sweep could make F3
+    refuse-and-redirect toward a task the pin machinery would then
+    decline to pin. A task with no incoming edges trivially passes.
+    """
+    for e in edges or ():
+        to_id = str(_safe_attr(e, "to_task_id", "") or "")
+        if to_id != task_id:
+            continue
+        from_id = str(_safe_attr(e, "from_task_id", "") or "")
+        if from_id and from_id not in completed_ids:
+            return False
+    return True
+
+
 def _maybe_redirect_completed_agent(
     *,
     ctx: Any,
@@ -613,6 +665,11 @@ def _maybe_redirect_completed_agent(
     completed task and re-invokes the same agent because nothing told
     it to stop. F1's directive payload is the proactive anchor; this
     is the structural fence.
+
+    ``next_pending`` uses the delegation pin's DAG-readiness predicate
+    (:func:`_predecessors_completed` — COMPLETED predecessors, not
+    merely terminal) so a redirect never points at a task the pin
+    would decline to bind.
     """
     if not target_agent:
         return None
@@ -648,18 +705,12 @@ def _maybe_redirect_completed_agent(
             return None
 
         # All assigned tasks are terminal. Find the next PENDING task
-        # whose every predecessor is terminal — same definition the F1
-        # plan_state helper uses, kept local so this module stays
-        # decoupled from goldfive.reporting.
+        # whose every predecessor is COMPLETED — the same readiness
+        # predicate the delegation pin uses, so F3 never redirects the
+        # coordinator toward a task the pin would decline to bind (see
+        # :func:`_predecessors_completed` for the semantics rationale).
         edges = list(_safe_attr(plan, "edges", None) or ())
-        by_id = {str(_safe_attr(t, "id", "") or ""): t for t in tasks}
-        incoming: dict[str, list[str]] = {tid: [] for tid in by_id}
-        for e in edges:
-            to_id = str(_safe_attr(e, "to_task_id", "") or "")
-            from_id = str(_safe_attr(e, "from_task_id", "") or "")
-            if to_id in incoming and from_id:
-                incoming[to_id].append(from_id)
-
+        completed_ids = _completed_task_ids(tasks)
         next_pending: Any = None
         for task in tasks:
             if _safe_attr(task, "status", None) is not TaskStatus.PENDING:
@@ -667,12 +718,7 @@ def _maybe_redirect_completed_agent(
             tid = str(_safe_attr(task, "id", "") or "")
             if not tid:
                 continue
-            preds = incoming.get(tid, [])
-            if all(
-                by_id.get(p) is not None
-                and _safe_attr(by_id[p], "status", None) in TERMINAL_TASK_STATUSES
-                for p in preds
-            ):
+            if _predecessors_completed(tid, edges=edges, completed_ids=completed_ids):
                 next_pending = task
                 break
 
@@ -1381,6 +1427,13 @@ def _choose_reasoning_text(
     return "", ""
 
 
+#: Consecutive no-reasoning text turns per agent before the one-shot
+#: reasoning-channel-disarmed WARNING fires. Three rules out a thinking
+#: model's occasional streamless turn without letting a whole run pass
+#: unnoticed.
+_NO_REASONING_WARN_STREAK: int = 3
+
+
 def _extract_function_calls(llm_response: Any) -> list[dict]:
     content = _safe_attr(llm_response, "content", None)
     if content is None:
@@ -1543,6 +1596,44 @@ async def _emit_approval_requested_from_plugin(
         await emit(sinks, evt)
     except Exception as exc:  # noqa: BLE001
         log.debug("_emit_approval_requested_from_plugin: sink emit failed: %s", exc)
+
+
+async def _emit_policy_applied_from_plugin(
+    *,
+    session: Any,
+    steerer: Any,
+    policy_name: str,
+    outcome: str,
+    reason: str = "",
+    detail: str = "",
+) -> None:
+    """Emit a ``PolicyApplied`` envelope from a plugin callback.
+
+    Mirrors ``DriftObserver._emit_policy_applied`` for decision
+    telemetry that originates inside the ADK plugin (e.g. the F3
+    redirect suppressed by the observation-only gate). Best-effort;
+    any failure is logged at DEBUG and dropped.
+    """
+    sinks = getattr(steerer, "_sinks", None) or []
+    if not sinks:
+        return
+    try:
+        from goldfive.events import emit, policy_applied_event
+
+        seq, event_id = session.next_sequence_and_event_id()
+        evt = policy_applied_event(
+            str(getattr(session, "run_id", "") or ""),
+            seq,
+            policy_name=policy_name,
+            outcome=outcome,
+            reason=reason,
+            detail=detail,
+            session_id=str(getattr(session, "id", "") or ""),
+            event_id=event_id,
+        )
+        await emit(sinks, evt)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("_emit_policy_applied_from_plugin: sink emit failed: %s", exc)
 
 
 def _jsonable(v: Any) -> Any:
@@ -1891,27 +1982,19 @@ DEFAULT_LLM_CALL_TIMEOUT_MS: int = 1_800_000
 def _is_observation_only(ctx: Any) -> bool:
     """Return True iff the steerer behind ``ctx`` is in observation-only mode.
 
-    Read by the request-side :class:`~goldfive.context_editor.ContextEditor`
-    (goldfive#397) — every steering surface MUST be a complete no-op
-    under :class:`~goldfive.config.SteeringConfig.observation_only=True`
+    Read by the plugin's intervention surfaces (cancel-flag writes, the
+    F3 pre-dispatch redirect, the request-side
+    :class:`~goldfive.context_editor.ContextEditor`; goldfive#397) —
+    every steering surface MUST be a complete no-op under
+    :class:`~goldfive.config.SteeringConfig.observation_only=True`
     (the strict-passive pattern established by goldfive#271).
 
-    The steerer exposes ``_observation_only`` as its public-ish field
-    (set from ``SteeringConfig.observation_only`` at construction). We
-    treat any failure to read it as "observation_only" — the safer
-    default for a surface whose whole purpose is to NOT fire when the
-    operator has opted into passive observation.
+    Delegates to :func:`goldfive.steerer.steering_is_active`, the one
+    kill-switch predicate: a missing / broken steerer resolves passive
+    — the safer default for a surface whose whole purpose is to NOT
+    fire when the operator has opted into passive observation.
     """
-    try:
-        steerer = _safe_attr(ctx, "steerer", None)
-        if steerer is None:
-            return True
-        flag = _safe_attr(steerer, "_observation_only", None)
-        if flag is None:
-            return True
-        return bool(flag)
-    except Exception:  # noqa: BLE001
-        return True
+    return not steering_is_active(_safe_attr(ctx, "steerer", None))
 
 
 # ``_apply_agent_max_output_tokens_cap`` (goldfive#256) was lifted into
@@ -2105,6 +2188,15 @@ def make_adk_plugin(
             # sub-Runners get their own counters.
             self._invocation_tool_calls: dict[str, int] = {}
             self._invocation_last_text: dict[str, str] = {}
+            # Reasoning-channel silent-disarm visibility (goldfive#263
+            # follow-up). Per-agent count of CONSECUTIVE LLM responses
+            # whose reasoning extraction came back empty despite a
+            # non-empty text body, plus the agents already warned about.
+            # Plugin-lifetime state — deliberately NOT cleared in
+            # :meth:`clear_active_context` so the WARNING stays one-shot
+            # per agent across dispatches on the same wrapped tree.
+            self._no_reasoning_streak: dict[str, int] = {}
+            self._no_reasoning_warned: set[str] = set()
             # AgentTool-per-invoke counter (goldfive#130). Scoped to
             # the current top-level invocation; reset in
             # :meth:`clear_active_context`. When the counter exceeds
@@ -2128,6 +2220,12 @@ def make_adk_plugin(
             # sub-Runners get their own invocation_id). Each entry is
             # a small dict to keep the payload auditable in tests.
             self._invocation_llm_pending: dict[str, dict[str, Any]] = {}
+            # Wall-clock stall watchdog (flag-gated, default OFF).
+            # Spawned by :meth:`set_active_context` when the bound
+            # steerer carries ``SteeringConfig.stall_watchdog_enabled``;
+            # cancelled by :meth:`clear_active_context` (the adapter's
+            # ``finally`` teardown) so it never outlives the dispatch.
+            self._stall_watchdog_task: asyncio.Task[None] | None = None
             # Tool-loop drift detector (goldfive#181). Observes every
             # tool call the plugin sees in ``after_tool_callback`` and
             # fires a ``LOOPING_REASONING`` drift when any of the
@@ -2146,6 +2244,14 @@ def make_adk_plugin(
             self._tool_loop_tracker = _tool_loops.ToolLoopTracker(
                 **_tool_loops.resolve_thresholds()
             )
+            # Negative-class aggregation for the tool-loop detector:
+            # per-invocation counters of tracker observations and drifts
+            # fired. ``after_run_callback`` consumes an entry to emit ONE
+            # aggregated ``no_drift`` SteeringDecisionMade when the
+            # tracker ran for the invocation and fired nothing, so
+            # optimizers can tell "tracker quiet" from "tracker never
+            # ran".
+            self._tool_loop_invocation_stats: dict[str, dict[str, int]] = {}
             # Reporting-tool names that indicate forward task progress
             # and therefore can clear the tool-loop tracker's window
             # for the current (invocation, agent) key — SUBJECT to the
@@ -2288,6 +2394,10 @@ def make_adk_plugin(
             # invocation so a prior trip doesn't leak into this one.
             self._agent_tool_spawn_count = 0
             self.runaway_delegation_tripped = False
+            # Wall-clock stall watchdog (flag-gated, default OFF). One
+            # task per dispatch; a fresh dispatch replaces any prior
+            # watchdog (sequential invocations reuse the adapter).
+            self._maybe_start_stall_watchdog(ctx)
 
         def clear_active_context(self) -> None:
             """Release the active ``SessionContext`` reference.
@@ -2304,6 +2414,10 @@ def make_adk_plugin(
                 self._invocation_tasks.clear()
             except Exception as exc:  # noqa: BLE001
                 log.debug("clear_active_context: registry clear raised: %s", exc)
+            # Cancel the stall watchdog BEFORE dropping the context so
+            # a watchdog waking up mid-teardown cannot observe a
+            # half-cleared plugin.
+            self._cancel_stall_watchdog()
             self._active_ctx = None
             self._top_invocation_id = ""
             self._agent_tool_spawn_count = 0
@@ -2324,6 +2438,10 @@ def make_adk_plugin(
             # state from the just-finished dispatch doesn't leak into
             # the next one on the same plugin instance (goldfive#181).
             self._tool_loop_tracker.clear()
+            # Drop straggling negative-class counters (normal operation
+            # pops each entry in ``after_run_callback``; this catches
+            # invocations that errored before their after_run fired).
+            self._tool_loop_invocation_stats.clear()
             # Drop any lingering cancellation state / parent map so the
             # next dispatch starts clean (goldfive#251). A request that
             # was never consumed means the callback path never ran —
@@ -3775,22 +3893,7 @@ def make_adk_plugin(
             edges = _safe_attr(plan, "edges", None) or ()
             from goldfive.types import TaskStatus
 
-            completed_ids: set[str] = set()
-            for t in tasks:
-                if _safe_attr(t, "status", None) is TaskStatus.COMPLETED:
-                    tid = str(_safe_attr(t, "id", "") or "")
-                    if tid:
-                        completed_ids.add(tid)
-
-            def _upstream_ok(task_id: str) -> bool:
-                for e in edges:
-                    to_id = str(_safe_attr(e, "to_task_id", "") or "")
-                    if to_id != task_id:
-                        continue
-                    from_id = str(_safe_attr(e, "from_task_id", "") or "")
-                    if from_id and from_id not in completed_ids:
-                        return False
-                return True
+            completed_ids = _completed_task_ids(tasks)
 
             candidates: list[Any] = []
             for task in tasks:
@@ -3801,7 +3904,9 @@ def make_adk_plugin(
                 if status is not TaskStatus.PENDING and status is not TaskStatus.RUNNING:
                     continue
                 tid = str(_safe_attr(task, "id", "") or "")
-                if not tid or not _upstream_ok(tid):
+                if not tid or not _predecessors_completed(
+                    tid, edges=edges, completed_ids=completed_ids
+                ):
                     continue
                 candidates.append(task)
 
@@ -3941,6 +4046,16 @@ def make_adk_plugin(
                 ctx=ctx,
                 inv_id=inv_id,
                 finishing_agent_name=agent_name,
+            )
+
+            # Tool-loop negative class: one aggregated ``no_drift``
+            # decision per invocation whose tracker ran and fired
+            # nothing. Consumes the per-invocation stats entry either
+            # way so the dict stays bounded.
+            await self._maybe_emit_tool_loop_no_drift(
+                ctx=ctx,
+                inv_id=inv_id,
+                agent_name=agent_name,
             )
 
             # If the finishing invocation is the top-level one, release
@@ -4091,6 +4206,52 @@ def make_adk_plugin(
             except Exception as exc:  # noqa: BLE001
                 log.debug(
                     "_maybe_emit_confabulation_risk: steerer.drift.observe raised: %s",
+                    exc,
+                )
+
+        async def _maybe_emit_tool_loop_no_drift(
+            self,
+            *,
+            ctx: SessionContext,
+            inv_id: str,
+            agent_name: str,
+        ) -> None:
+            """Emit one aggregated ``no_drift`` decision for a clean invocation.
+
+            The tool-loop tracker runs per tool call; a per-call silent-
+            path decision would flood the wire, so the negative class is
+            aggregated: when the invocation ends with >= 1 observed tool
+            call and zero tool-loop drifts fired, emit a single
+            ``SteeringDecisionMade(outcome="no_drift")`` via the
+            steerer's :meth:`emit_no_drift_decision` hook. Telemetry
+            only — identical in observe-only and active modes. Silent
+            when the steerer stub doesn't expose the hook.
+            """
+            stats = self._tool_loop_invocation_stats.pop(inv_id, None) if inv_id else None
+            if not stats or stats["drifts"] or not stats["calls"]:
+                return
+            if ctx.steerer is None:
+                return
+            emit = getattr(
+                getattr(ctx.steerer, "drift", None), "emit_no_drift_decision", None
+            )
+            if emit is None:
+                return
+            try:
+                await emit(
+                    session=ctx.session,
+                    detector_name="tool_loops",
+                    reason=(
+                        f"tool-loop tracker observed {stats['calls']} tool "
+                        f"call(s); no loop pattern matched"
+                    ),
+                    task_id=str(_safe_attr(ctx.task, "id", "") or ""),
+                    agent_name=agent_name,
+                    invocation_id=inv_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_maybe_emit_tool_loop_no_drift: emit_no_drift_decision raised: %s",
                     exc,
                 )
 
@@ -4280,29 +4441,16 @@ def make_adk_plugin(
                 return True
 
             edges = tuple(_safe_attr(plan, "edges", None) or ())
-            completed_ids: set[str] = set()
-            for t in tasks:
-                if _safe_attr(t, "status", None) is TaskStatus.COMPLETED:
-                    tid = str(_safe_attr(t, "id", "") or "")
-                    if tid:
-                        completed_ids.add(tid)
-
-            def _upstream_ok(task_id: str) -> bool:
-                for e in edges:
-                    to_id = str(_safe_attr(e, "to_task_id", "") or "")
-                    if to_id != task_id:
-                        continue
-                    from_id = str(_safe_attr(e, "from_task_id", "") or "")
-                    if from_id and from_id not in completed_ids:
-                        return False
-                return True
+            completed_ids = _completed_task_ids(tasks)
 
             eligible: list[Any] = []
             for task in tasks:
                 if _safe_attr(task, "status", None) is not TaskStatus.PENDING:
                     continue
                 tid = str(_safe_attr(task, "id", "") or "")
-                if not tid or not _upstream_ok(tid):
+                if not tid or not _predecessors_completed(
+                    tid, edges=edges, completed_ids=completed_ids
+                ):
                     continue
                 eligible.append(task)
 
@@ -4638,6 +4786,33 @@ def make_adk_plugin(
                 )
                 return
             if drift is None:
+                # Negative class for the optimizer: the detector ran on
+                # a resolved task and passed. Runs once per observed
+                # delegation (AgentTool dispatch) — same cadence as the
+                # positive-fire path, so no aggregation needed. The
+                # earlier early-returns (no plan / no pin / import
+                # failure) deliberately do NOT emit: the detector never
+                # ran there and "no_drift" would be a false negative
+                # record. Best-effort like every observability hook.
+                emit_no_drift = getattr(
+                    getattr(steerer, "drift", None), "emit_no_drift_decision", None
+                )
+                if callable(emit_no_drift):
+                    try:
+                        await emit_no_drift(
+                            session=ctx.session,
+                            detector_name="capability_check",
+                            reason="capability check passed",
+                            task_id=str(_safe_attr(chosen_task, "id", "") or ""),
+                            agent_name=invoked_agent_name,
+                            invocation_id=invocation_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug(
+                            "_maybe_emit_capability_mismatch: no-drift "
+                            "decision emit failed: %s",
+                            exc,
+                        )
                 return
 
             # goldfive#245 — stamp the plan revision the detector
@@ -5189,6 +5364,14 @@ def make_adk_plugin(
               :meth:`request_invocation_cancel` so subsequent callbacks
               short-circuit. The current LLM call still completes, but
               the invocation as a whole stops at the next checkpoint.
+              ACTIVE MODE ONLY — under
+              :attr:`~goldfive.config.SteeringConfig.observation_only`
+              the drift/telemetry above still fires but the cancel-flag
+              write is skipped: healthy local models can genuinely need
+              longer than the budget (see
+              :attr:`~goldfive.config.AgentConfig.call_timeout_ms`), and
+              a passive observer must not discard work the unwrapped
+              system would complete.
 
             CancelledError propagates back to the caller (the
             after_model_callback path that cancels us) so the watcher
@@ -5275,6 +5458,19 @@ def make_adk_plugin(
                         "_run_llm_call_timeout_watcher: drift emission raised: %s",
                         exc,
                     )
+            # Observation-only gate (strict-passive pattern from
+            # goldfive#254/#271): the drift above is telemetry, the
+            # cancel-flag write below is an intervention.
+            # :func:`_is_observation_only` treats a missing steerer /
+            # missing flag as passive — the fail-safe direction for a
+            # surface that cancels in-flight work.
+            if _is_observation_only(ctx):
+                log.info(
+                    "goldfive.llm.timeout invocation_id=%s observation_only=True "
+                    "— cancel-flag write skipped",
+                    invocation_id,
+                )
+                return
             # Flag the invocation for cooperative cancel so the next
             # callback (whether after_model fires first, or the next
             # before_tool / before_model on a follow-up) short-circuits.
@@ -5297,6 +5493,266 @@ def make_adk_plugin(
                     "_run_llm_call_timeout_watcher: cancel-flag write raised: %s",
                     exc,
                 )
+
+        # --- Wall-clock stall watchdog (flag-gated, default OFF) --------
+
+        def _maybe_start_stall_watchdog(self, ctx: SessionContext) -> None:
+            """Spawn the per-dispatch stall watchdog when the flag is on.
+
+            Called from :meth:`set_active_context`. Gated on the bound
+            steerer carrying ``_stall_watchdog_enabled=True`` (stashed
+            from :class:`~goldfive.config.SteeringConfig` by
+            ``DefaultSteerer.__init__``) and a positive
+            ``_stall_timeout_s``; both default OFF, so the un-flagged
+            path costs one attribute read and spawns nothing. A prior
+            watchdog (sequential dispatch reusing the adapter) is
+            cancelled first so at most one runs per plugin.
+            """
+            self._cancel_stall_watchdog()
+            steerer = getattr(ctx, "steerer", None)
+            session = getattr(ctx, "session", None)
+            if steerer is None or session is None:
+                return
+            if not bool(getattr(steerer, "_stall_watchdog_enabled", False)):
+                return
+            try:
+                timeout_s = float(getattr(steerer, "_stall_timeout_s", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return
+            if timeout_s <= 0:
+                return
+            try:
+                self._stall_watchdog_task = asyncio.create_task(
+                    self._run_stall_watchdog(ctx=ctx, timeout_s=timeout_s),
+                    name=f"goldfive_stall_watchdog_{getattr(session, 'id', '') or ''}",
+                )
+            except RuntimeError as exc:
+                # No running loop (synchronous harnesses) — the
+                # watchdog degrades to off, same as the LLM watcher.
+                log.debug(
+                    "_maybe_start_stall_watchdog: cannot schedule: %s", exc
+                )
+
+        def _cancel_stall_watchdog(self) -> None:
+            """Cancel the stall watchdog if one is live. Idempotent."""
+            task = self._stall_watchdog_task
+            self._stall_watchdog_task = None
+            if task is not None and not task.done():
+                task.cancel()
+
+        def _llm_watcher_inflight(self) -> bool:
+            """True while any LLM call runs under its own per-call watcher.
+
+            The stall watchdog consults this to avoid double-reporting:
+            a hung LLM dispatch within its wall-clock budget is the
+            per-call watcher's case (``LLM_CALL_TIMEOUT``), not a stall.
+            Entries without a live watcher (budget disabled via
+            ``llm_call_timeout_ms<=0``) do NOT count — nothing else
+            covers that hang, so the stall watchdog must.
+            """
+            for pending in self._invocation_llm_pending.values():
+                watcher = pending.get("watcher") if isinstance(pending, dict) else None
+                if watcher is not None and not watcher.done():
+                    return True
+            return False
+
+        @staticmethod
+        def _stall_liveness_watermark(session: Any, *, floor: float) -> float:
+            """Newest liveness signal on ``session`` (monotonic seconds).
+
+            The max of every ``task_last_progress_at`` stamp (task
+            transitions + progress reports) and
+            ``last_observed_event_at`` (every observation dispatched
+            into the drift pipeline — reasoning, tool observations,
+            agent activity), floored at ``floor`` (watchdog start) so a
+            fresh session with no stamps yet is not instantly stale.
+            """
+            watermark = floor
+            progress = getattr(session, "task_last_progress_at", None)
+            if isinstance(progress, dict):
+                for value in progress.values():
+                    try:
+                        watermark = max(watermark, float(value))
+                    except (TypeError, ValueError):
+                        continue
+            try:
+                observed = float(getattr(session, "last_observed_event_at", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                observed = 0.0
+            return max(watermark, observed)
+
+        @staticmethod
+        def _goal_drift_idle_seconds() -> float:
+            """Live read of :data:`goldfive.drift.goals.GOAL_DRIFT_IDLE_SECONDS`.
+
+            Module-attribute read per poll (not captured at spawn) so
+            an optimization-manifest ``setattr`` on the knob takes
+            effect on a running watchdog.
+            """
+            try:
+                from goldfive.drift import goals as _goals  # noqa: PLC0415 — lazy
+
+                # Floor keeps a zero/negative override from turning the
+                # idle trigger into a per-poll judge storm.
+                return max(0.001, float(getattr(_goals, "GOAL_DRIFT_IDLE_SECONDS", 300)))
+            except Exception:  # noqa: BLE001
+                return 300.0
+
+        def _trigger_idle_goal_drift_check(
+            self, steerer: Any, session: Any, idle_s: float
+        ) -> None:
+            """Fire the trajectory-level goal-drift judge for an idle episode.
+
+            The ``GOAL_DRIFT_IDLE_SECONDS`` consumer (goldfive#143
+            promised idle-based judge scheduling; the stall watchdog is
+            its producer). Spawn-and-detach through the steerer's
+            tracked background-judge machinery; no-ops when the judge
+            ``call_llm`` is unconfigured or the steerer is a stub.
+            """
+            drift_obs = getattr(steerer, "drift", None)
+            spawn = (
+                getattr(drift_obs, "_spawn_goal_drift_judge_background", None)
+                if drift_obs is not None
+                else None
+            )
+            if spawn is None:
+                return
+            note = f"{idle_s:.0f}s since last observed activity"
+            try:
+                spawn(session, idle_note=note)
+            except TypeError:
+                # Custom DriftObserver predating the idle_note kwarg.
+                try:
+                    spawn(session)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(
+                        "_trigger_idle_goal_drift_check: spawn raised: %s", exc
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("_trigger_idle_goal_drift_check: spawn raised: %s", exc)
+
+        async def _run_stall_watchdog(
+            self, *, ctx: SessionContext, timeout_s: float
+        ) -> None:
+            """Poll the session's liveness watermark; fire ``TASK_TIMEOUT`` on silence.
+
+            Spawned by :meth:`set_active_context` (one per dispatch)
+            and cancelled by :meth:`clear_active_context` — the
+            adapter's ``finally`` teardown — so it never outlives the
+            run. Behaviour per poll tick:
+
+            * Watermark advanced since the last tick → the stall
+              episode (if any) is over; reset the graduated-severity
+              and idle-judge bookkeeping.
+            * Idle beyond :data:`~goldfive.drift.goals.GOAL_DRIFT_IDLE_SECONDS`
+              → trigger the trajectory-level goal-drift judge, once per
+              idle episode.
+            * Idle beyond ``timeout_s`` → emit a ``TASK_TIMEOUT`` drift
+              at WARNING, escalating to CRITICAL at each further
+              multiple of ``timeout_s`` with no fresh activity
+              (graduated severity — same shape as tool_loops). Routed
+              through ``steerer.drift.handle_drift`` so under
+              ``observation_only`` (production default) it is
+              telemetry-only and in active mode the intervention
+              ladder handles it.
+            * SKIPPED while an LLM call is in flight under its own
+              per-call budget — :meth:`_run_llm_call_timeout_watcher`
+              owns that hang (``LLM_CALL_TIMEOUT``); firing here too
+              would double-report.
+
+            Honest limitation: this is an asyncio task on the wrapped
+            tree's own event loop. A synchronously-blocking tool (a
+            ``def`` tool doing blocking I/O or CPU work) starves the
+            loop, so the watchdog cannot fire until the block ends —
+            sync-blocked stalls are out of scope. The covered cases are
+            hung *async* tool calls and idle-with-no-transitions runs.
+            """
+            session = ctx.session if ctx is not None else None
+            steerer = ctx.steerer if ctx is not None else None
+            if session is None or steerer is None:
+                return
+            try:
+                from goldfive.types import (  # noqa: PLC0415 — lazy
+                    DriftEvent,
+                    DriftKind,
+                    DriftSeverity,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("_run_stall_watchdog: cannot import types: %s", exc)
+                return
+            started = time.monotonic()
+            last_watermark = started
+            episode_fires = 0
+            goal_judge_fired = False
+            try:
+                while True:
+                    idle_goal_s = self._goal_drift_idle_seconds()
+                    # Poll cadence tracks the tighter of the two
+                    # thresholds so neither fires grossly late; floored
+                    # so a tiny test timeout cannot busy-spin the loop.
+                    await asyncio.sleep(max(0.005, min(timeout_s, idle_goal_s) / 8.0))
+                    watermark = self._stall_liveness_watermark(session, floor=started)
+                    if watermark > last_watermark:
+                        # Fresh activity ends the stall episode.
+                        last_watermark = watermark
+                        episode_fires = 0
+                        goal_judge_fired = False
+                    idle_s = time.monotonic() - watermark
+                    if not goal_judge_fired and idle_s >= idle_goal_s:
+                        goal_judge_fired = True
+                        self._trigger_idle_goal_drift_check(steerer, session, idle_s)
+                    if idle_s < timeout_s * (episode_fires + 1):
+                        continue
+                    if self._llm_watcher_inflight():
+                        continue
+                    severity = (
+                        DriftSeverity.WARNING
+                        if episode_fires == 0
+                        else DriftSeverity.CRITICAL
+                    )
+                    episode_fires += 1
+                    task_id = str(getattr(session, "current_task_id", "") or "") or str(
+                        _safe_attr(getattr(ctx, "task", None), "id", "") or ""
+                    )
+                    log.warning(
+                        "goldfive.stall.watchdog idle_s=%.1f threshold_s=%.1f "
+                        "severity=%s agent=%s task_id=%s",
+                        idle_s,
+                        timeout_s,
+                        severity.value,
+                        self._host_agent_name or "?",
+                        task_id or "?",
+                    )
+                    # goldfive#245 — stamp observation-time plan revision.
+                    _gf_plan = getattr(session, "plan", None)
+                    _observed_rev = (
+                        int(getattr(_gf_plan, "revision_index", 0) or 0)
+                        if _gf_plan is not None
+                        else 0
+                    )
+                    drift = DriftEvent(
+                        kind=DriftKind.TASK_TIMEOUT,
+                        severity=severity,
+                        detail=(
+                            f"no observed activity for {idle_s:.1f}s "
+                            f"(stall watchdog, threshold {timeout_s:.1f}s)"
+                        ),
+                        current_task_id=task_id,
+                        current_agent_id=self._host_agent_name or "",
+                        observed_revision_index=_observed_rev,
+                    )
+                    handle = getattr(getattr(steerer, "drift", None), "handle_drift", None)
+                    if handle is None:
+                        continue
+                    try:
+                        await handle(drift, session)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        log.debug("_run_stall_watchdog: handle_drift raised: %s", exc)
+            except asyncio.CancelledError:
+                # Teardown (clear_active_context) — exit cleanly.
+                return
 
         # --- Plan + current-task context -------------------------------
 
@@ -5382,8 +5838,8 @@ def make_adk_plugin(
             # goldfive#271 strict-passive carve-out + Wave B1: the
             # injection + ``observation_only`` gate live in
             # :class:`~goldfive.prompt_shaper.PromptShaper`. The shaper
-            # short-circuits when ``ctx.steerer._observation_only`` is
-            # True; otherwise the byte-identical pre-#271 inject runs.
+            # short-circuits unless ``steering_is_active(ctx.steerer)``;
+            # otherwise the byte-identical pre-#271 inject runs.
             try:
                 await self._prompt_shaper.inject_goldfive_planner_instruction(
                     callback_context=callback_context,
@@ -5444,8 +5900,8 @@ def make_adk_plugin(
             # goldfive#271 strict-passive carve-out + Wave B1: the
             # hint + ``observation_only`` gate live in
             # :class:`~goldfive.prompt_shaper.PromptShaper`. The shaper
-            # short-circuits when ``ctx.steerer._observation_only`` is
-            # True; otherwise the byte-identical pre-#271 inject runs.
+            # short-circuits unless ``steering_is_active(ctx.steerer)``;
+            # otherwise the byte-identical pre-#271 inject runs.
             try:
                 if ctx is not None and ctx.session is not None:
                     self._prompt_shaper.inject_runtime_tools_hint(
@@ -6102,6 +6558,8 @@ def make_adk_plugin(
                 # next_pending task assigned to a *different* agent,
                 # refuse the dispatch with a redirect error so the
                 # coordinator stops re-invoking a completed-work agent.
+                # Active mode only — under observation_only the refusal
+                # is suppressed (telemetry-only) below.
                 # The post-hoc PLAN_DIVERGENCE detector still exists as
                 # a safety net, but closing the loop at the dispatch
                 # point eliminates the round-trip-and-detect cost.
@@ -6115,13 +6573,38 @@ def make_adk_plugin(
                     target_agent=to_agent,
                 )
                 if redirect is not None:
-                    log.info(
-                        "before_tool_callback: F3 redirect — all plan tasks "
-                        "for %s are terminal; redirecting coordinator to %s",
-                        to_agent,
-                        redirect.get("redirect_to") or "?",
-                    )
-                    return redirect
+                    # Observation-only gate (strict-passive pattern from
+                    # goldfive#254/#271): refusing the dispatch is an
+                    # intervention. Log + telemetry only; the AgentTool
+                    # dispatch proceeds untouched.
+                    if _is_observation_only(ctx):
+                        log.info(
+                            "before_tool_callback: observation_only=True — "
+                            "F3 redirect for %s SUPPRESSED (would have "
+                            "redirected coordinator to %s); dispatch proceeds",
+                            to_agent,
+                            redirect.get("redirect_to") or "?",
+                        )
+                        await _emit_policy_applied_from_plugin(
+                            session=ctx.session,
+                            steerer=ctx.steerer,
+                            policy_name="observation_only_gate",
+                            outcome="suppressed",
+                            reason="observation_only=True",
+                            detail=(
+                                f"intervention=f3_predispatch_redirect "
+                                f"target_agent={to_agent} "
+                                f"redirect_to={redirect.get('redirect_to') or ''}"
+                            ),
+                        )
+                    else:
+                        log.info(
+                            "before_tool_callback: F3 redirect — all plan tasks "
+                            "for %s are terminal; redirecting coordinator to %s",
+                            to_agent,
+                            redirect.get("redirect_to") or "?",
+                        )
+                        return redirect
                 # Fall through: AgentTool still runs, we're just observing.
 
             # Tool-level approval (Flow B). If the tool opts into
@@ -6138,6 +6621,99 @@ def make_adk_plugin(
             return None
 
         # --- Drift observation -----------------------------------------
+
+        async def _note_reasoning_channel_signal(
+            self,
+            *,
+            ctx: SessionContext,
+            agent_name: str,
+            reasoning: str,
+            texts: list[str],
+        ) -> None:
+            """One-shot per-agent visibility for a disarmed reasoning channel.
+
+            Non-thinking models (Gemma 4, Mistral, several base-model
+            deployments) never emit a separate reasoning/thinking
+            stream, so ``observe_reasoning`` never fires and every
+            LLM-judge reasoning detector (OFF_TOPIC, GOAL_DRIFT,
+            INTENT_DIVERGENCE, LOOPING_REASONING) silently disarms for
+            the whole run — pre-fix the only trace was a DEBUG line
+            behind the opt-in fallback flag. Mirrors the judge-LLM
+            misconfiguration precedent in :func:`goldfive.wrap`: a loud
+            WARNING plus a record-only sink event naming the remedy
+            (:attr:`~goldfive.config.ReasoningDriftConfig.fallback_to_content_when_no_reasoning`).
+            The fallback is NOT auto-enabled — that behaviour change is
+            reserved for the operator.
+
+            Counting rules: a turn that fed the channel (real reasoning
+            or content-fallback) resets the per-agent streak; a turn
+            with an empty reasoning source but a non-empty text body
+            increments it; function-call-only / empty turns neither
+            count nor reset — thinking models frequently omit the
+            stream on pure tool turns, so counting them would
+            false-positive.
+            """
+            key = agent_name or "?"
+            if reasoning:
+                self._no_reasoning_streak.pop(key, None)
+                return
+            body = " ".join(t for t in texts if t).strip()
+            if not body:
+                return
+            streak = self._no_reasoning_streak.get(key, 0) + 1
+            self._no_reasoning_streak[key] = streak
+            if streak < _NO_REASONING_WARN_STREAK or key in self._no_reasoning_warned:
+                return
+            self._no_reasoning_warned.add(key)
+            log.warning(
+                "goldfive.reasoning.disarmed agent=%s — %d consecutive LLM "
+                "responses carried a text body but no reasoning/thinking "
+                "stream; the reasoning-judge detectors are receiving no "
+                "input for this agent. If the model is non-thinking, set "
+                "ReasoningDriftConfig.fallback_to_content_when_no_reasoning=True "
+                "(or GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT=1) to synthesise a "
+                "signal from the response body.",
+                key,
+                streak,
+            )
+            # Record-only sink event so operators watching the wire (not
+            # stderr) also see the disarm + remedy. ``_emit_drift_detected``
+            # is the plugin's established record-only emission path — no
+            # policy dispatch, so it is equally safe under
+            # ``observation_only``.
+            steerer = ctx.steerer if ctx is not None else None
+            session = ctx.session if ctx is not None else None
+            emit_drift = getattr(getattr(steerer, "drift", None), "_emit_drift_detected", None)
+            if emit_drift is None or session is None:
+                return
+            try:
+                from goldfive.types import (  # noqa: PLC0415 — lazy
+                    DriftEvent,
+                    DriftKind,
+                    DriftSeverity,
+                )
+
+                await emit_drift(
+                    session,
+                    DriftEvent(
+                        kind=DriftKind.CUSTOM,
+                        severity=DriftSeverity.INFO,
+                        detail=(
+                            f"reasoning_channel_disarmed: agent {key!r} produced "
+                            f"{streak} consecutive responses with a text body but "
+                            "no reasoning/thinking stream; reasoning-judge "
+                            "detectors are receiving no input. Remedy: "
+                            "ReasoningDriftConfig.fallback_to_content_when_no_reasoning=True "
+                            "(GOLDFIVE_DRIFT_FALLBACK_TO_CONTENT=1)."
+                        ),
+                        current_agent_id=key,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_note_reasoning_channel_signal: sink emit raised: %s",
+                    exc,
+                )
 
         async def after_model_callback(self, *, callback_context: Any, llm_response: Any) -> None:
             ctx = self._resolve_ctx(callback_context)
@@ -6185,6 +6761,27 @@ def make_adk_plugin(
                     joined = " ".join(texts).strip()
                     if joined:
                         self._invocation_last_text[inv_id] = joined
+            # Reasoning-channel silent-disarm visibility (goldfive#263
+            # follow-up). Runs on every model turn — including the ones
+            # where ``reasoning`` is empty and the observe_reasoning
+            # block below never fires. Best-effort: visibility must not
+            # shadow the real response path.
+            try:
+                running_agent = _safe_attr(inv_ctx, "agent", None)
+                agent_label = str(_safe_attr(running_agent, "name", "") or "") or (
+                    self._host_agent_name or ""
+                )
+                await self._note_reasoning_channel_signal(
+                    ctx=ctx,
+                    agent_name=agent_label,
+                    reasoning=reasoning,
+                    texts=texts,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "after_model_callback: reasoning-channel visibility raised: %s",
+                    exc,
+                )
             # Per-LLM-call instrumentation (goldfive#172). Pair with the
             # before_model_callback stash to compute duration, extract
             # token usage, log the result, and enrich the observation
@@ -6564,6 +7161,17 @@ def make_adk_plugin(
                     exc,
                 )
                 return None
+
+            # Negative-class aggregation: count the observation (and any
+            # drifts it produced) against the invocation so
+            # ``after_run_callback`` can emit one aggregated ``no_drift``
+            # decision for clean windows.
+            if inv_id:
+                stats = self._tool_loop_invocation_stats.setdefault(
+                    inv_id, {"calls": 0, "drifts": 0}
+                )
+                stats["calls"] += 1
+                stats["drifts"] += len(drifts)
 
             # Iter-10 PR 2: record the call in the session-scoped
             # ``recent_tool_observations`` ring buffer so the

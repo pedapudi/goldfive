@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -81,10 +82,20 @@ _BACKEND_CLASS_OVERRIDE: Any | None = None
 # :func:`distance_to_topic`. The counter below trips the same flag
 # after :data:`_RUNTIME_FAILURE_THRESHOLD` consecutive failures so a
 # dead endpoint degrades to "no signal" after a bounded period of
-# wasted I/O. ``reset_circuit_breaker()`` exposes a test escape hatch.
+# wasted I/O. A tripped breaker recovers via a timed half-open probe
+# (see :func:`_get_model`) so a transient outage does not disable
+# embeddings for the process lifetime. ``reset_circuit_breaker()``
+# exposes a test escape hatch.
 _RUNTIME_FAILURE_COUNT: int = 0
 _RUNTIME_FAILURE_THRESHOLD: int = 3
 _RUNTIME_FAILURE_TRIPPED: bool = False
+# Monotonic timestamp of the trip (or the last failed half-open probe).
+# ``None`` while the breaker is closed.
+_RUNTIME_TRIPPED_AT: float | None = None
+# Cooldown before a tripped breaker admits a half-open probe encode.
+# ``GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S`` overrides at read time —
+# same env pattern as ``GOLDFIVE_EMBEDDING_TIMEOUT_MS``.
+_RUNTIME_RECOVERY_COOLDOWN_S: float = 60.0
 
 # Installed per-Runner embedding config (goldfive#225). When non-None,
 # the :func:`_get_model` lazy-load path reads backend parameters from
@@ -184,10 +195,12 @@ def reset_circuit_breaker() -> None:
     over.
     """
     global _RUNTIME_FAILURE_COUNT, _RUNTIME_FAILURE_TRIPPED, _MODEL_UNAVAILABLE
+    global _RUNTIME_TRIPPED_AT
     if _RUNTIME_FAILURE_TRIPPED:
         _MODEL_UNAVAILABLE = False
     _RUNTIME_FAILURE_COUNT = 0
     _RUNTIME_FAILURE_TRIPPED = False
+    _RUNTIME_TRIPPED_AT = None
 
 
 def configure(config: EmbeddingConfig | None) -> None:
@@ -223,6 +236,29 @@ def _reset_cache() -> None:
     _CACHE.clear()
 
 
+def _recovery_cooldown_s() -> float:
+    """Return the half-open cooldown, honouring the env override."""
+    raw = os.environ.get("GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S", "")
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return _RUNTIME_RECOVERY_COOLDOWN_S
+
+
+def _breaker_cooldown_elapsed() -> bool:
+    """True when a *tripped* breaker has waited out its cooldown.
+
+    Always False for a non-tripped ``_MODEL_UNAVAILABLE`` (import
+    failure / :func:`force_unavailable`) — those states have no
+    recovery path by design.
+    """
+    if not _RUNTIME_FAILURE_TRIPPED or _RUNTIME_TRIPPED_AT is None:
+        return False
+    return time.monotonic() - _RUNTIME_TRIPPED_AT >= _recovery_cooldown_s()
+
+
 def _get_model() -> Any | None:
     """Return the lazily-loaded encoder, or ``None``.
 
@@ -237,14 +273,27 @@ def _get_model() -> Any | None:
     The first failed path flips ``_MODEL_UNAVAILABLE`` so subsequent
     calls skip the import cost. Callers must check for ``None``.
     """
-    global _MODEL, _MODEL_UNAVAILABLE
+    global _MODEL, _MODEL_UNAVAILABLE, _RUNTIME_TRIPPED_AT
     # Check ``_MODEL_UNAVAILABLE`` before ``_MODEL`` so the runtime
     # circuit breaker (see :func:`_note_backend_failure`) actually
     # short-circuits. The tripped flag is also cleared by
     # :func:`reset_circuit_breaker` / :func:`set_model` /
     # :func:`configure` for callers that want a fresh start.
     if _MODEL_UNAVAILABLE:
-        return None
+        if not _breaker_cooldown_elapsed():
+            return None
+        # Half-open: admit one probe encode. A success closes the
+        # breaker (:func:`_note_backend_success`); a failure re-opens
+        # it (:func:`_note_backend_failure`). Restart the cooldown
+        # clock now so a probe that dies during backend construction
+        # (below) also waits a full cooldown before the next attempt.
+        _RUNTIME_TRIPPED_AT = time.monotonic()
+        _MODEL_UNAVAILABLE = False
+        log.info(
+            "embedding circuit breaker half-open after %.0fs cooldown; "
+            "probing backend",
+            _recovery_cooldown_s(),
+        )
     if _MODEL is not None:
         return _MODEL
 
@@ -475,16 +524,24 @@ def _note_backend_success() -> None:
     non-empty vector list comes back. Keeping the reset in one place
     means a transient outage (two failures, one success, two more
     failures) never trips the circuit breaker — only *consecutive*
-    failures count.
+    failures count. A success on a half-open probe fully closes a
+    tripped breaker.
     """
-    global _RUNTIME_FAILURE_COUNT
-    if _RUNTIME_FAILURE_COUNT:
+    global _RUNTIME_FAILURE_COUNT, _RUNTIME_FAILURE_TRIPPED, _RUNTIME_TRIPPED_AT
+    if _RUNTIME_FAILURE_TRIPPED:
+        log.info(
+            "embedding backend recovered on half-open probe; "
+            "circuit breaker closed",
+        )
+    elif _RUNTIME_FAILURE_COUNT:
         log.debug(
             "embedding backend recovered after %d failures; "
             "resetting circuit breaker",
             _RUNTIME_FAILURE_COUNT,
         )
     _RUNTIME_FAILURE_COUNT = 0
+    _RUNTIME_FAILURE_TRIPPED = False
+    _RUNTIME_TRIPPED_AT = None
 
 
 def _note_backend_failure(base_url: str) -> None:
@@ -499,9 +556,14 @@ def _note_backend_failure(base_url: str) -> None:
     default without paying the network timeout. The WARNING mentions
     ``GOLDFIVE_EMBEDDING_BASE_URL`` so operators can identify the
     unreachable endpoint from logs.
+
+    A failure while the breaker is already tripped is a failed
+    half-open probe (:func:`_get_model` admitted one encode after the
+    cooldown): the breaker re-opens immediately and the cooldown
+    restarts.
     """
     global _RUNTIME_FAILURE_COUNT, _MODEL_UNAVAILABLE
-    global _RUNTIME_FAILURE_TRIPPED, _MODEL
+    global _RUNTIME_FAILURE_TRIPPED, _RUNTIME_TRIPPED_AT, _MODEL
     _RUNTIME_FAILURE_COUNT += 1
     log.debug(
         "embedding backend %r: failure %d/%d",
@@ -509,22 +571,33 @@ def _note_backend_failure(base_url: str) -> None:
         _RUNTIME_FAILURE_COUNT,
         _RUNTIME_FAILURE_THRESHOLD,
     )
-    if (
-        _RUNTIME_FAILURE_COUNT >= _RUNTIME_FAILURE_THRESHOLD
-        and not _RUNTIME_FAILURE_TRIPPED
-    ):
+    if _RUNTIME_FAILURE_TRIPPED:
+        _MODEL_UNAVAILABLE = True
+        _MODEL = None
+        _RUNTIME_TRIPPED_AT = time.monotonic()
+        log.debug(
+            "embedding backend %r: half-open probe failed; breaker "
+            "re-opened for %.0fs",
+            base_url,
+            _recovery_cooldown_s(),
+        )
+        return
+    if _RUNTIME_FAILURE_COUNT >= _RUNTIME_FAILURE_THRESHOLD:
         _RUNTIME_FAILURE_TRIPPED = True
         _MODEL_UNAVAILABLE = True
         # Drop the cached backend too: ``_get_model`` short-circuits on
         # ``_MODEL_UNAVAILABLE`` only when ``_MODEL is None``, otherwise
         # the already-cached (dead) backend keeps getting handed back.
         _MODEL = None
+        _RUNTIME_TRIPPED_AT = time.monotonic()
         log.warning(
             "embedding backend at %s has failed %d times in a row; "
-            "disabling for this process (set GOLDFIVE_EMBEDDING_BASE_URL=... "
-            "to redirect or unset to disable silently)",
+            "disabling for %.0fs, then probing once "
+            "(set GOLDFIVE_EMBEDDING_BASE_URL=... to redirect or unset "
+            "to disable silently)",
             base_url,
             _RUNTIME_FAILURE_COUNT,
+            _recovery_cooldown_s(),
         )
 
 

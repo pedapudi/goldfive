@@ -43,6 +43,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.control import (  # noqa: E402
     ControlChannel,
     ControlKind,
@@ -147,10 +148,13 @@ def _bound_steerer(
     # mechanism, now behind the ``legacy_ladder`` escape hatch. Bind with the
     # hatch ON by default so the routing coverage survives; the default-regime
     # behaviour (advisory note, no GOLDFIVE_STEER) is covered in
-    # ``test_promote_drift_to_steer.py``.
+    # ``test_promote_drift_to_steer.py``. Explicit active mode: the
+    # control-channel dispatches under test are suppressed under the shipped
+    # observation-only default (#488), so this binder opts in.
     steerer = DefaultSteerer(
         goldfive_steer_threshold=threshold,
         goldfive_steer_suppression_window_turns=3,
+        steering_config=SteeringConfig(observation_only=False),
     )
     steerer._legacy_ladder = bool(legacy_ladder)
     planner = _RevisedPlanPlanner(revised=revised or _make_revised_plan())
@@ -202,6 +206,38 @@ async def test_goldfive_off_topic_drift_dispatches_goldfive_steer_control() -> N
     assert "raccoons" in payload["body"]
     # Superseded task ids carry the originating task.
     assert payload["superseded_task_ids"] == ["t2"]
+
+
+async def test_goldfive_steer_dispatch_suppressed_under_observation_only() -> None:
+    """Observation-only counterpart of the dispatch test above: detection
+    and ``refine_steer`` still run under the shipped default, but no
+    ``GOLDFIVE_STEER`` ControlMessage reaches the channel — the
+    ``is_active_steering`` gate suppresses the enqueue."""
+    steerer = DefaultSteerer(
+        goldfive_steer_threshold="warning",
+        goldfive_steer_suppression_window_turns=3,
+        steering_config=SteeringConfig(observation_only=True),
+    )
+    planner = _RevisedPlanPlanner(revised=_make_revised_plan())
+    sink = _ListSink()
+    channel = ControlChannel()
+    steerer.bind(sinks=[sink], planner=planner)
+    steerer.bind_control_channel(channel)
+
+    drift = DriftEvent(
+        kind=DriftKind.OFF_TOPIC,
+        severity=DriftSeverity.WARNING,
+        detail="agent wandered off into raccoons",
+        current_task_id="t2",
+        authored_by="goldfive",
+    )
+    session = _make_session()
+    await steerer.drift.handle_drift(drift, session)
+
+    # Detection-side machinery still ran.
+    assert planner.refine_steer_calls, "refine_steer must still run passively"
+    # But nothing was enqueued on the channel.
+    assert _drain_channel(channel) == []
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +375,7 @@ async def test_multiple_goldfive_drifts_queue_in_order_on_channel() -> None:
     steerer = DefaultSteerer(
         goldfive_steer_threshold="warning",
         goldfive_steer_suppression_window_turns=3,
+        steering_config=SteeringConfig(observation_only=False),
     )
     # PR 7: GOLDFIVE_STEER dispatch is the legacy promotion mechanism.
     steerer._legacy_ladder = True

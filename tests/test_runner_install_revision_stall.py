@@ -180,8 +180,8 @@ async def test_install_revision_two_turns_stable_session_id_no_stall() -> None:
     install → executor → stash, then turn 2's ``handle_turn`` fired but
     ``_install_revision`` never logged ``_apply_revision``. A regression
     that re-introduced a per-session leaked lock or a recursive emit
-    loop in :meth:`apply_user_steer_with_plan` would manifest here as
-    turn 2 timing out.
+    loop in the reviser install path would manifest here as turn 2
+    timing out.
     """
     plan1, plan2 = _two_plans()
     sink = InMemorySink()

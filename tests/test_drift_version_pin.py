@@ -37,6 +37,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.drift.goals import classify_goal_drift  # noqa: E402
 from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import (  # noqa: E402
@@ -633,7 +634,7 @@ async def test_apply_revision_stamps_per_key_watermark() -> None:
     # NOT mutate session state; _emit_plan_revised performs the
     # session-mutation triad (set_session_plan + watermark stamp +
     # orchestration-state pointer) atomically under the lock.
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     revised, _ = steerer.plans._apply_revision(session, revised, drift)
     await steerer.plans._emit_plan_revised(session, revised, drift, prev_plan=session.plan)
 

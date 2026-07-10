@@ -16,6 +16,28 @@ learning and reference. `.agents/` is terse, task-shaped, and optimised
 for a sibling agent that wants the shortest correct path from intent to
 action.
 
+## Deep reference: `docs/dev-guide/`
+
+These skills point; the guide explains. When a task needs more than the
+shortest path — the *why*, the blast radius, the invariant that will bite
+you — go to [`docs/dev-guide/`](../docs/dev-guide/), a 17-chapter
+developer's guide grounded in current `main`. Start at
+[`docs/dev-guide/00-index.md`](../docs/dev-guide/00-index.md) for the
+routing table (task → chapters).
+
+**Read-first rule:** before any nontrivial edit to goldfive itself, read
+[`17-invariants-hazards-history.md`](../docs/dev-guide/17-invariants-hazards-history.md)
+(the six hard invariants, the Protected List, the Deferred-Work Register,
+the hazard catalog, the pre-PR checklist). For common extensions, follow
+the matching recipe in
+[`16-recipes.md`](../docs/dev-guide/16-recipes.md) rather than
+reconstructing the steps.
+
+Routing hints (skill → guide chapter): use/wrap → user guides; develop →
+16 + 17; debug → 09/12/08; adapters → 06 + Recipe 10; sinks/events → 12 +
+Recipes 6-7; testing → 15; add-a-drift-kind → Recipe 1 (07/08, 09);
+filler-loop → 07/09/12.
+
 ## When to read which
 
 | I want to… | Read |

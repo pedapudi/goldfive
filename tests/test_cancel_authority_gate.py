@@ -350,7 +350,11 @@ async def test_skipped_cancel_stamps_no_supersede_flag_or_registry() -> None:
 async def test_user_steer_cancel_still_stamps_and_fires() -> None:
     """The user-authored arm is byte-identical: supersede flag stamped,
     plugin reached with ``cancel_inflight_task=True``."""
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(
+        # Explicit active mode (#488): the suite runs the shipped
+        # observation-only default; the cancel machinery under test opts in.
+        steering_config=SteeringConfig(observation_only=False),
+    )
     adapter = _CountingAdapter()
     steerer.bind_adapter(adapter)
     session = _make_session()
@@ -367,7 +371,11 @@ async def test_user_steer_cancel_still_stamps_and_fires() -> None:
 
 async def test_hard_safety_cancel_still_stamps_and_fires() -> None:
     """Hard-safety drifts keep stop authority through the install path."""
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(
+        # Explicit active mode (#488): the suite runs the shipped
+        # observation-only default; the cancel machinery under test opts in.
+        steering_config=SteeringConfig(observation_only=False),
+    )
     adapter = _CountingAdapter()
     steerer.bind_adapter(adapter)
     session = _make_session()
@@ -429,7 +437,11 @@ async def test_user_steer_install_path_still_cancels() -> None:
     """``install_user_steer`` (the plan_reviser user-steer install path)
     keeps its cancel: a genuine operator pivot preempts in-flight work
     exactly as before PR 1."""
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(
+        # Explicit active mode (#488): the suite runs the shipped
+        # observation-only default; the cancel machinery under test opts in.
+        steering_config=SteeringConfig(observation_only=False),
+    )
     adapter = _CountingAdapter()
     sink = _ListSink()
     steerer.bind(sinks=[sink], planner=None)
@@ -491,7 +503,11 @@ async def test_promotion_install_does_not_cancel_inflight() -> None:
             return revised
 
     planner = _StubPlanner()
-    steerer = DefaultSteerer(goldfive_steer_threshold="warning")
+    steerer = DefaultSteerer(
+        goldfive_steer_threshold="warning",
+        # Explicit active mode (#488) — see module note.
+        steering_config=SteeringConfig(observation_only=False),
+    )
     adapter = _CountingAdapter(top_invocation_id="inv-coord-1")
     sink = _ListSink()
     steerer.bind(sinks=[sink], planner=planner)
@@ -569,7 +585,11 @@ async def test_v15_pin_slow_refine_with_concurrent_drift_does_not_loop() -> None
             return await self.refine_steer()
 
     planner = _SlowPlanner()
-    steerer = DefaultSteerer(goldfive_steer_threshold="warning")
+    steerer = DefaultSteerer(
+        goldfive_steer_threshold="warning",
+        # Explicit active mode (#488) — see module note.
+        steering_config=SteeringConfig(observation_only=False),
+    )
     adapter = _CountingAdapter(top_invocation_id="inv-coord-1")
     sink = _ListSink()
     steerer.bind(sinks=[sink], planner=planner)
@@ -655,7 +675,11 @@ async def test_nudge_delivers_at_natural_boundary_without_cancel() -> None:
     # threshold="critical" keeps the WARNING LOOPING_REASONING on the
     # ladder's ABSORB row (the promotion path is exercised separately
     # above) so the post-ABSORB nudge queueing fires.
-    steerer = DefaultSteerer(goldfive_steer_threshold="critical")
+    steerer = DefaultSteerer(
+        goldfive_steer_threshold="critical",
+        # Explicit active mode (#488) — see module note.
+        steering_config=SteeringConfig(observation_only=False),
+    )
     sink = _ListSink()
 
     class _OverlayAdapter:
@@ -752,7 +776,11 @@ async def test_legacy_scope_all_cancel_inflight_fires_for_every_install(
     supersede flag and forwards ``cancel_inflight_task=True`` to the
     plugin — including the goldfive-authored kinds the default scope
     now withholds."""
-    steerer = DefaultSteerer(cancel_inflight_scope="all")
+    steerer = DefaultSteerer(
+        cancel_inflight_scope="all",
+        # Explicit active mode (#488) — see module note.
+        steering_config=SteeringConfig(observation_only=False),
+    )
     adapter = _CountingAdapter()
     steerer.bind_adapter(adapter)
     session = _make_session()

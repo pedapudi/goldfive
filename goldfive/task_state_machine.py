@@ -741,16 +741,16 @@ class TaskStateMachine:
         task_id_for_progress = str(getattr(task, "id", "") or "")
         if task_id_for_progress:
             session.task_last_progress_at[task_id_for_progress] = time.monotonic()
-        # AGENCY-PRESERVATION.md PR 5 (observe-only): when a task reaches a
-        # terminal status, resolve any open, delivered SignalLedger keys bound
-        # to it — ``self_corrected_after_signal`` if a real signal was
-        # delivered, ``self_corrected_unaided`` if only dry-run (the
-        # ``observation_only`` base rate). Terminal-only is the conservative
-        # "resolved" detection (never over-claims self-correction). Run before
-        # the sink guard so ledger state stays consistent even without sinks
-        # (mirrors the progress-liveness rationale above); the emit inside is
-        # a no-op when no sink is bound. Best-effort; gates nothing.
         if task_id_for_progress and to_status in _TERMINAL_TASK_STATUSES:
+            # AGENCY-PRESERVATION.md PR 5 (observe-only): when a task reaches a
+            # terminal status, resolve any open, delivered SignalLedger keys bound
+            # to it — ``self_corrected_after_signal`` if a real signal was
+            # delivered, ``self_corrected_unaided`` if only dry-run (the
+            # ``observation_only`` base rate). Terminal-only is the conservative
+            # "resolved" detection (never over-claims self-correction). Run before
+            # the sink guard so ledger state stays consistent even without sinks
+            # (mirrors the progress-liveness rationale above); the emit inside is
+            # a no-op when no sink is bound. Best-effort; gates nothing.
             recorder = getattr(
                 getattr(self._steerer, "drift", None),
                 "record_signal_outcomes_for_task",
@@ -765,6 +765,15 @@ class TaskStateMachine:
                         "resolution raised (swallowed): %s",
                         exc,
                     )
+            # Drift-condition lifecycle: a terminal task moots every
+            # condition still open against it. Done here because every
+            # transition path funnels through this method (mark_task_*,
+            # cascade, plan-revision transitions), and BEFORE the sink
+            # check because the ``KEY_ACTIVE_DRIFTS`` cleanup is lifecycle
+            # truth that must land even when emission is impossible.
+            await self._steerer.drift.resolve_conditions_for_terminal_task(
+                session, task_id=task_id_for_progress, to_status=to_status
+            )
         sinks = self._steerer._sinks
         if not sinks:
             return

@@ -39,9 +39,11 @@ semantic ground robustly.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import re
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from goldfive.drift import _embed
@@ -102,7 +104,6 @@ __all__ = [
     "detect_looping_reasoning",
     "detect_off_topic",
     "detect_reasoning_cluster_tightening",
-    "detect_unreferenced_keyword",
     "reasoning_hash",
 ]
 
@@ -374,11 +375,10 @@ def detect_intent_divergence(
 
        The historical ``_has_unreferenced_keyword`` severity-bump that
        promoted one tier on any 5+ char token absent from goals + task
-       was removed. The lexical heuristic fired on generic English
+       was removed (goldfive#226/#230), and the helper itself has since
+       been deleted. The lexical heuristic fired on generic English
        vocabulary not present in the task description, contaminating
-       the embedding signal with noise. The helper is preserved for
-       backward compatibility (external callers may still import it)
-       but has no in-tree consumer.
+       the embedding signal with noise.
     """
     if not text:
         return None
@@ -510,47 +510,8 @@ def _bump_severity(sev: DriftSeverity) -> DriftSeverity:
     return DriftSeverity.CRITICAL
 
 
-def _has_unreferenced_keyword(
-    text: str, goals_text: str, task_topic: str
-) -> bool:
-    """Return True if the reasoning mentions a keyword not in goals or task.
-
-    A "keyword" is any 5+ char alphabetic token from ``text`` that is
-    not a stopword. If at least one such keyword is absent from both
-    ``goals_text`` and ``task_topic`` (lower-cased, substring match),
-    we treat the reasoning as talking about something unrelated.
-
-    We require a 5-char minimum to avoid matching on generic English
-    (``with``, ``from``); stopwords strip the common connectives that
-    slip past the length gate.
-
-    .. deprecated:: goldfive#226
-
-       This helper has **no in-tree consumer** after the keyword
-       severity-bump was removed from :func:`detect_intent_divergence`
-       and :func:`_pattern_intent_divergence`. The 5-char stopword
-       rule still fired on generic English vocabulary absent from
-       task descriptions, so a noisy heuristic was bumping real
-       embedding signals to spurious CRITICAL severities. Kept as a
-       module-private helper for symmetry with
-       :func:`detect_unreferenced_keyword` (which is itself retained
-       for backward compatibility with external imports).
-    """
-    if not text:
-        return False
-    reference = (goals_text + " " + task_topic).lower()
-    if not reference.strip():
-        return False
-    for tok in re.findall(r"[a-z]{5,}", text.lower()):
-        if tok in _STOPWORDS:
-            continue
-        if tok not in reference:
-            return True
-    return False
-
-
 def detect_looping_reasoning(
-    text: str, session: Session
+    text: str, session: Session, history: Sequence[str] | None = None
 ) -> DriftEvent | None:
     """Return :data:`DriftKind.LOOPING_REASONING` when ``text``
     byte-identically or semantically matches a recent entry in
@@ -559,11 +520,15 @@ def detect_looping_reasoning(
     The hash-based check is always on; the semantic check fires only
     when the embedding model is loadable. ``session.reasoning_history``
     is inspected but not mutated here -- the steerer appends the new
-    reasoning block before running the pipeline.
+    reasoning block before running the pipeline. ``history`` overrides
+    the session's live list (background judge runs pass the snapshot
+    captured at schedule time — ``text`` is its last entry).
     """
+    if history is None:
+        history = session.reasoning_history
     hash_window = _looping_hash_window()
     history = [
-        h for h in session.reasoning_history[-hash_window - 1 : -1]
+        h for h in history[-hash_window - 1 : -1]
         if h
     ]
     if not history or not text:
@@ -606,7 +571,7 @@ def detect_looping_reasoning(
 
 
 def detect_reasoning_cluster_tightening(
-    text: str, session: Session
+    text: str, session: Session, history: Sequence[str] | None = None
 ) -> DriftEvent | None:
     """Return :data:`DriftKind.REASONING_CLUSTER_TIGHTENING` when recent
     reasoning blocks are semantically clustering tight -- max cosine
@@ -631,12 +596,14 @@ def detect_reasoning_cluster_tightening(
     """
     if not text:
         return None
+    if history is None:
+        history = session.reasoning_history
     task_id = session.current_task_id or ""
     if task_id and task_id in session.reasoning_cluster_flagged:
         return None
     hash_window = _looping_hash_window()
     history = [
-        h for h in session.reasoning_history[-hash_window - 1 : -1]
+        h for h in history[-hash_window - 1 : -1]
         if h
     ]
     if not history:
@@ -810,93 +777,6 @@ def _is_sentence_candidate(sentence: str) -> bool:
     return bool(re.search(r"[a-zA-Z]{5,}", sentence))
 
 
-def detect_unreferenced_keyword(
-    text: str, session: Session
-) -> DriftEvent | None:
-    """Return :data:`DriftKind.OFF_TOPIC` when the reasoning mentions
-    significant keywords that are absent from ``session.goals`` and the
-    current task topic.
-
-    Graduated severity by surplus-keyword count:
-
-    ========================  ==========
-    surplus keyword count     severity
-    ========================  ==========
-    1                          INFO
-    2 - 3                      WARNING
-    >= 4                       CRITICAL
-    ========================  ==========
-
-    A "keyword" is any 5+ char alpha token from ``text`` that is not a
-    stopword — same rule as :func:`_has_unreferenced_keyword`.
-
-    One-shot per task: the detector fires at most once per
-    ``session.current_task_id`` via ``session.unreferenced_keyword_flagged``.
-    Same pattern as :func:`detect_reasoning_cluster_tightening` — avoids
-    drift-spam when the same off-topic reasoning block repeats across
-    turns.
-
-    Returns ``None`` when there is no reference text (no goals and no
-    bound task), matching :func:`detect_off_topic`'s precondition.
-
-    .. deprecated:: goldfive#226
-
-       This detector is **no longer wired into** :func:`analyze_reasoning`
-       in any mode. The lexical heuristic fired on generic English
-       vocabulary not present in the task description (``wants``,
-       ``asking``, ``interactive``, ``slideshow``), producing noisy
-       CRITICAL drifts on routine reasoning. The function is retained
-       as an exported helper for external callers that imported it
-       directly, but there is no in-tree consumer. Prefer the LLM-judge
-       mode (:func:`goldfive.drift.reasoning_judge.classify_reasoning_drift`)
-       or the embedding pipeline for genuine off-topic detection.
-    """
-    if not text:
-        return None
-    goals_text = _goals_text(session)
-    task_topic = _task_topic(_current_task(session))
-    reference = (goals_text + " " + task_topic).strip().lower()
-    if not reference:
-        return None
-    task_id = session.current_task_id or ""
-    if task_id and task_id in session.unreferenced_keyword_flagged:
-        return None
-    # Preserve first-seen order so the diagnostic message reflects what
-    # the operator would read top-to-bottom.
-    seen: set[str] = set()
-    surplus: list[str] = []
-    for tok in re.findall(r"[a-z]{5,}", text.lower()):
-        if tok in _STOPWORDS:
-            continue
-        if tok in seen:
-            continue
-        seen.add(tok)
-        if tok not in reference:
-            surplus.append(tok)
-    if not surplus:
-        return None
-    count = len(surplus)
-    if count >= 4:
-        severity = DriftSeverity.CRITICAL
-    elif count >= 2:
-        severity = DriftSeverity.WARNING
-    else:
-        severity = DriftSeverity.INFO
-    preview = ", ".join(surplus[:3])
-    if count > 3:
-        preview = f"{preview} (+{count - 3} more)"
-    if task_id:
-        session.unreferenced_keyword_flagged.add(task_id)
-    return DriftEvent(
-        kind=DriftKind.OFF_TOPIC,
-        severity=severity,
-        detail=f"reasoning mentions off-task keywords: {preview}",
-        current_task_id=session.current_task_id,
-        raw=text,
-        observed_revision_index=_observed_revision_index(session),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
@@ -909,36 +789,38 @@ _SEVERITY_ORDER: dict[DriftSeverity, int] = {
 }
 
 
-def _embedding_pipeline(text: str, session: Session) -> DriftEvent | None:
+def _embedding_pipeline(
+    text: str, session: Session, history: Sequence[str] | None = None
+) -> DriftEvent | None:
     """Run the embedding-based pipeline (``mode="embedding"``).
 
     Detectors run in worst-signal-wins order:
     INTENT_DIVERGENCE -> LOOPING_REASONING -> OFF_TOPIC (with the
     sentence-level min-cosine path from #224) ->
     REASONING_CLUSTER_TIGHTENING. Ordering rationale lives in
-    :func:`analyze_reasoning`.
+    :func:`analyze_reasoning`. ``history`` overrides the live
+    ``session.reasoning_history`` for the history-window detectors
+    (background judge runs pass a snapshot pinned at schedule time).
 
     .. note::
 
-       :func:`detect_unreferenced_keyword` is intentionally NOT called
-       here. The lexical keyword heuristic fired on generic English
-       vocabulary not present in the task description (``wants``,
-       ``asking``, ``interactive``, ``slideshow``), producing noisy
-       CRITICAL drifts on routine reasoning. The function is retained
-       as an exported helper for backward compatibility with external
-       callers, but it no longer contributes to the pipeline's output
-       post goldfive#226.
+       The historical lexical keyword detector
+       (``detect_unreferenced_keyword``) was unwired here in
+       goldfive#226 and has since been deleted. It fired on generic
+       English vocabulary not present in the task description
+       (``wants``, ``asking``, ``interactive``, ``slideshow``),
+       producing noisy CRITICAL drifts on routine reasoning.
     """
     drift = detect_intent_divergence(text, session)
     if drift is not None:
         return drift
-    drift = detect_looping_reasoning(text, session)
+    drift = detect_looping_reasoning(text, session, history)
     if drift is not None:
         return drift
     drift = detect_off_topic(text, session)
     if drift is not None:
         return drift
-    drift = detect_reasoning_cluster_tightening(text, session)
+    drift = detect_reasoning_cluster_tightening(text, session, history)
     if drift is not None:
         return drift
     return None
@@ -1073,6 +955,7 @@ async def analyze_reasoning_with_focus(
     embedding_pipeline: Any = None,
     judge_runner: Any = None,
     ledger: bool = False,
+    reasoning_history: Sequence[str] | None = None,
 ) -> ReasoningJudgeVerdict:
     """Phase-1 sibling of :func:`analyze_reasoning` returning a focused verdict.
 
@@ -1109,8 +992,23 @@ async def analyze_reasoning_with_focus(
     :func:`_run_judge_with_focus`; tests use it to short-circuit the
     judge round-trip. Both default to ``None`` (use the in-module
     implementations) so production callers see no behaviour change.
+
+    ``reasoning_history`` pins the view the history-window detectors
+    see instead of the live ``session.reasoning_history`` — the
+    background judge passes the snapshot captured at schedule time so
+    entries appended by later turns cannot produce false self-match
+    LOOPING signals. ``None`` (the default) reads the live session
+    list. A caller-supplied ``embedding_pipeline`` keeps its
+    ``(text, session)`` signature and is responsible for its own
+    history handling.
     """
-    embed = embedding_pipeline if embedding_pipeline is not None else _embedding_pipeline
+    if embedding_pipeline is not None:
+        embed = embedding_pipeline
+    else:
+
+        def embed(t: str, s: Session) -> DriftEvent | None:
+            return _embedding_pipeline(t, s, reasoning_history)
+
     judge = judge_runner if judge_runner is not None else _run_judge_with_focus
     if not text or mode == "off":
         return ReasoningJudgeVerdict(drift=None)
@@ -1151,23 +1049,18 @@ async def analyze_reasoning_with_focus(
         # (deterministic, synchronous path). Either way, the
         # attribution fields come from the judge — the embedding
         # pipeline doesn't produce them.
+        # ``dataclasses.replace`` (vs field-by-field reconstruction)
+        # keeps every judge-derived field — attribution, classification /
+        # provenance, and the judge-scheduling measurement fields
+        # (``judge_ran`` / ``elapsed_ms``) — on the returned verdict
+        # even when the embedding drift wins.
         if judge_verdict.drift is None:
-            return ReasoningJudgeVerdict(
-                drift=embedding_drift,
-                focused_task_id=judge_verdict.focused_task_id,
-                focus_confidence=judge_verdict.focus_confidence,
-                stated_intent=judge_verdict.stated_intent,
-            )
+            return dataclasses.replace(judge_verdict, drift=embedding_drift)
         if _SEVERITY_ORDER[judge_verdict.drift.severity] > _SEVERITY_ORDER[
             embedding_drift.severity
         ]:
             return judge_verdict
-        return ReasoningJudgeVerdict(
-            drift=embedding_drift,
-            focused_task_id=judge_verdict.focused_task_id,
-            focus_confidence=judge_verdict.focus_confidence,
-            stated_intent=judge_verdict.stated_intent,
-        )
+        return dataclasses.replace(judge_verdict, drift=embedding_drift)
     log.warning(
         "analyze_reasoning_with_focus: unknown mode=%r; falling back "
         "to 'embedding'",
@@ -1223,13 +1116,12 @@ async def analyze_reasoning(
 
     .. note::
 
-       The keyword heuristic (:func:`detect_unreferenced_keyword`) is
-       no longer part of the active pipeline in any mode. It fired on
-       generic English vocabulary that isn't in the task description
-       (real examples: ``wants``, ``asking``, ``interactive``,
-       ``slideshow``), producing noisy CRITICAL drifts on routine
-       reasoning. The function is retained as an exported helper for
-       backward compatibility with external callers.
+       The historical keyword heuristic (``detect_unreferenced_keyword``)
+       was unwired from every mode in goldfive#226 and has since been
+       deleted. It fired on generic English vocabulary that isn't in the
+       task description (real examples: ``wants``, ``asking``,
+       ``interactive``, ``slideshow``), producing noisy CRITICAL drifts
+       on routine reasoning.
 
     The ``embedding_pipeline`` and ``judge_classifier`` parameters are
     test seams. ``embedding_pipeline`` is a callable

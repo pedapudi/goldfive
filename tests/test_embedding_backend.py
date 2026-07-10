@@ -506,3 +506,123 @@ def test_reset_circuit_breaker_clears_state() -> None:
     _embed.reset_circuit_breaker()
     assert _embed._RUNTIME_FAILURE_COUNT == 0
     assert _embed._RUNTIME_FAILURE_TRIPPED is False
+
+
+# ---------------------------------------------------------------------------
+# Runtime circuit breaker: timed half-open recovery
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_clock(
+    monkeypatch: pytest.MonkeyPatch, start: float = 1000.0
+) -> dict[str, float]:
+    """Replace ``_embed.time`` with a controllable monotonic clock."""
+    import types
+
+    clock = {"t": start}
+    monkeypatch.setattr(
+        _embed, "time", types.SimpleNamespace(monotonic=lambda: clock["t"])
+    )
+    return clock
+
+
+def _make_working_backend() -> Any:
+    """Build a backend whose httpx path always returns one unit vector."""
+
+    class _OK:
+        def post(self, *args: Any, **kwargs: Any) -> Any:
+            class _Resp:
+                def raise_for_status(self) -> None:
+                    pass
+
+                def json(self) -> dict[str, Any]:
+                    return _canonical_response([[1.0, 0.0]])
+
+            return _Resp()
+
+    backend = _embed._OpenAIEmbeddingBackend(
+        base_url="http://alive:9999",
+        model="",
+        api_key=None,
+        timeout_ms=1000,
+    )
+    backend._prefer_sdk = False
+    backend._openai_client = None
+    backend._httpx_client = _OK()
+    return backend
+
+
+def test_circuit_breaker_half_open_probe_failure_reopens_success_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    goldfive_embedding_env: Any,
+) -> None:
+    """A tripped breaker admits one probe per cooldown; a failed probe
+    re-opens it and restarts the cooldown, a successful one closes it."""
+    clock = _install_fake_clock(monkeypatch)
+    goldfive_embedding_env.set(base_url="http://dead:9999")
+    failing = _make_always_failing_backend()
+    _embed.set_backend_loader(lambda _url: failing)
+    request.addfinalizer(lambda: _embed.set_backend_loader(None))
+
+    for _ in range(3):
+        failing.encode(["x"])
+    assert _embed._MODEL_UNAVAILABLE is True
+
+    # Open: cooldown not elapsed -- still short-circuits.
+    clock["t"] += 59.0
+    assert _embed._get_model() is None
+
+    # Half-open: cooldown elapsed -- one probe encode is admitted.
+    clock["t"] += 2.0
+    assert _embed._get_model() is failing
+
+    # Probe fails: breaker re-opens immediately and the cooldown restarts.
+    assert failing.encode(["y"]) == []
+    assert _embed._MODEL_UNAVAILABLE is True
+    assert _embed._RUNTIME_FAILURE_TRIPPED is True
+    clock["t"] += 59.0
+    assert _embed._get_model() is None
+
+    # Next probe succeeds: the breaker closes and stays closed.
+    clock["t"] += 2.0
+    working = _make_working_backend()
+    _embed.set_backend_loader(lambda _url: working)
+    model = _embed._get_model()
+    assert model is working
+    assert model.encode(["z"]) == [[1.0, 0.0]]
+    assert _embed._MODEL_UNAVAILABLE is False
+    assert _embed._RUNTIME_FAILURE_TRIPPED is False
+    assert _embed._RUNTIME_FAILURE_COUNT == 0
+    assert _embed._get_model() is working
+
+
+def test_circuit_breaker_cooldown_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    goldfive_embedding_env: Any,
+) -> None:
+    """``GOLDFIVE_EMBEDDING_BREAKER_COOLDOWN_S`` shortens the cooldown."""
+    clock = _install_fake_clock(monkeypatch)
+    goldfive_embedding_env.set(base_url="http://dead:9999", breaker_cooldown_s="5")
+    failing = _make_always_failing_backend()
+    _embed.set_backend_loader(lambda _url: failing)
+    request.addfinalizer(lambda: _embed.set_backend_loader(None))
+
+    for _ in range(3):
+        failing.encode(["x"])
+    clock["t"] += 4.0
+    assert _embed._get_model() is None
+    clock["t"] += 1.5
+    assert _embed._get_model() is failing
+
+
+def test_import_unavailability_has_no_timed_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-tripped unavailability (import failure / ``force_unavailable``)
+    keeps the pre-existing process-lifetime semantics."""
+    clock = _install_fake_clock(monkeypatch)
+    _embed.force_unavailable()
+    clock["t"] += 10_000.0
+    assert _embed._get_model() is None

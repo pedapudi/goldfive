@@ -85,6 +85,12 @@ class StubSteerer:
         self._planner: Any = None
         self.drift = _StubDrift()
 
+    def is_active_steering(self) -> bool:
+        # Explicit active mode: the executor's failed-without-replacement
+        # enforcement under test is suppressed under the shipped
+        # observation-only default.
+        return True
+
     @property
     def observed(self) -> list[Any]:
         return self.drift.observed

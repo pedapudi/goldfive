@@ -33,6 +33,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from goldfive import state_store as _ostate  # noqa: E402
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.plan_reviser import PlanReviser  # noqa: E402
 from goldfive.reporting import (  # noqa: E402
     BUILTIN_REPORTING_TOOLS,
@@ -167,7 +168,7 @@ async def test_current_task_id_repins_on_revision() -> None:
 
     revised = _revised_with_replacement()
     planner = _StubPlanner(revised=revised)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[ListSink()], planner=planner)
     # goldfive#247: rebind to the stamped instance.
     # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.
@@ -820,7 +821,7 @@ async def test_correct_integration_via_emit_plan_revised_end_to_end() -> None:
 
     sink = ListSink()
     planner = _StubPlanner(revised=revised)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=planner)
     # goldfive#247: rebind to the stamped instance.
     # goldfive#255: _apply_revision now returns ``(revised, was_installed)``.

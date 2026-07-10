@@ -34,9 +34,11 @@ per-task ``Task*`` events (the latter via the steerer).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 import re
+import time
 import warnings
 from typing import TYPE_CHECKING, Any
 
@@ -50,11 +52,20 @@ from goldfive.events import (
 )
 from goldfive.executors._control import (
     _ControlCancelled,
+    abort_expired_pause,
     dispatch_control,
     drain_controls,
+    pause_deadline_s,
+)
+from goldfive.executors._shared import (
+    apply_steer,
+    emit_pipeline_failure_drift,
+    mark_cancelled_if_live,
+    tag_adapter_cancel_user_steer,
 )
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
+from goldfive.steerer import steering_is_active
 from goldfive.types import (
     DriftKind,
     DriftSeverity,
@@ -71,13 +82,6 @@ if TYPE_CHECKING:
     from goldfive.control import ControlChannel
 
 log = logging.getLogger(__name__)
-
-
-# Symbolic cancel-reason for USER_STEER. Mirrors
-# :data:`goldfive.adapters.adk.SYMBOLIC_REASON_USER_STEER` but duplicated
-# as a plain string to avoid importing the optional ADK adapter module
-# from the provider-agnostic executor. Keep in sync. See goldfive#139.
-_CANCEL_REASON_USER_STEER: str = "user_steer"
 
 
 def _steer_cancel_reason_prefix(steer_msg: Any) -> str:
@@ -99,40 +103,6 @@ def _steer_cancel_reason_prefix(steer_msg: Any) -> str:
     if msg_id:
         return f"user_steer:{msg_id}"
     return "user_steer:steer"
-
-
-def _tag_adapter_cancel_user_steer(adapter: Any, session: Any = None) -> None:
-    """Tag the adapter's next mid-invocation cancel with the USER_STEER reason.
-
-    Called just before the executor triggers ``task.cancel()`` on the
-    in-flight invoke task so the adapter's mid-invocation cancel
-    handler picks up the tag and appends an LLM-actionable synthetic
-    ``function_response`` (instead of the legacy generic jargon). See
-    goldfive#139.
-
-    Routes through :meth:`ADKAdapter.set_next_cancel_reason` when the
-    adapter exposes it (PR #294 audit / goldfive#271 follow-up) so the
-    tag is keyed by ``session.id`` and cannot bleed across concurrent
-    goldfive sessions sharing one adapter. Falls back to the bare
-    ``_next_cancel_reason`` attribute for adapters / stubs that
-    predate the helper.
-    """
-    setter = getattr(adapter, "set_next_cancel_reason", None)
-    if callable(setter) and session is not None:
-        try:
-            setter(session, _CANCEL_REASON_USER_STEER)
-            return
-        except Exception as exc:  # noqa: BLE001
-            log.debug(
-                "SequentialExecutor: set_next_cancel_reason raised: %s", exc
-            )
-    try:
-        adapter._next_cancel_reason = _CANCEL_REASON_USER_STEER
-    except Exception as exc:  # noqa: BLE001
-        log.debug(
-            "SequentialExecutor: could not tag adapter cancel reason: %s",
-            exc,
-        )
 
 
 async def _drain_steerer_at_run_boundary(
@@ -238,6 +208,34 @@ def _executor_plan_mode(steerer: Any) -> str:
 
 
 _DEFAULT_MAX_NUDGE_REPLAYS: int = 3
+
+
+@dataclasses.dataclass
+class _OverlayTurnState:
+    """Mutable per-turn loop state threaded through the overlay stage methods.
+
+    One instance per :meth:`SequentialExecutor._run_overlay` call — the
+    stage methods (:meth:`_race_control`,
+    :meth:`_restart_after_user_steer`,
+    :meth:`_restart_after_goldfive_steer`, :meth:`_drain_nudges`) read
+    and mutate it in place so the loop skeleton stays free of
+    positional bookkeeping.
+    """
+
+    current_user_input: str
+    # Re-entry contract (harmonograf#234). The very first iteration
+    # of the overlay loop carries the operator's verbatim user_input —
+    # for plugins observing the inner runner that's still a goldfive
+    # OVERLAY_REPLAY (the outer adk-web runner already emitted the
+    # USER_TURN); ADKAdapter.invoke_passthrough pins OVERLAY_REPLAY
+    # itself, so the default value here is "no executor-level pin".
+    # Subsequent iterations triggered by a STEER or queued nudge
+    # MUST carry the more-specific kind so plugins can attribute
+    # the replay to the correct cause (operator-issued steer vs
+    # autonomous drift-driven nudge); see ReentryKind.reentry()
+    # for stack-precedence rules.
+    next_reentry_kind: ReentryKind | None = None
+    nudge_replays: int = 0
 
 
 class SequentialExecutor(Executor):
@@ -515,7 +513,7 @@ class SequentialExecutor(Executor):
                 run_failed = True
                 break
             if steer_msg is not None:
-                await self._apply_steer(steer_msg, steerer=steerer, session=session)
+                await apply_steer(steer_msg, steerer=steerer, session=session)
                 # The steerer swapped session.plan; pick up the revision
                 # on the next outer iteration.
 
@@ -660,7 +658,7 @@ class SequentialExecutor(Executor):
                 # emitted TaskCancelled carries the reason.
                 cancel_prefix = getattr(session, "_last_cancel_reason_prefix", "")
                 session._last_cancel_reason_prefix = ""
-                await self._mark_cancelled_if_live(
+                await mark_cancelled_if_live(
                     task_id=task.id,
                     steerer=steerer,
                     session=session,
@@ -687,13 +685,13 @@ class SequentialExecutor(Executor):
                 # distinguish "superseded by user steering" from
                 # generic run-aborts / cascade-cancels.
                 steer_prefix = _steer_cancel_reason_prefix(outcome_payload)
-                await self._mark_cancelled_if_live(
+                await mark_cancelled_if_live(
                     task_id=task.id,
                     steerer=steerer,
                     session=session,
                     cancel_reason=steer_prefix,
                 )
-                await self._apply_steer(outcome_payload, steerer=steerer, session=session)
+                await apply_steer(outcome_payload, steerer=steerer, session=session)
                 continue
 
             # outcome_kind == "result"
@@ -729,7 +727,7 @@ class SequentialExecutor(Executor):
                         task.id,
                         observe_exc,
                     )
-                    await _emit_pipeline_failure_drift(
+                    await emit_pipeline_failure_drift(
                         session=session,
                         sinks=sinks,
                         task_id=task.id,
@@ -801,7 +799,7 @@ class SequentialExecutor(Executor):
                             task.id,
                         )
                         failure_reason = ""  # not actually fatal
-                    elif getattr(steerer, "_observation_only", False):
+                    elif not steering_is_active(steerer):
                         # goldfive#260: under observation_only, do NOT
                         # enforce the "failed-task must have a live
                         # replacement" invariant. The replacement-
@@ -892,7 +890,7 @@ class SequentialExecutor(Executor):
             # observation_only's "passive — observe, don't enforce"
             # contract; the coordinator's autonomous flow decides
             # whether the failure is recoverable.
-            if getattr(steerer, "_observation_only", False):
+            if not steering_is_active(steerer):
                 log.info(
                     "SequentialExecutor: observation_only=True — "
                     "skipping abort-on-failed-without-replacement "
@@ -1091,412 +1089,76 @@ class SequentialExecutor(Executor):
         # is queued) AND there is still live work to do; capped at
         # ``_MAX_NUDGE_REPLAYS`` so a pathological nudge-queueing drift
         # cannot re-introduce the #163 amplification.
-        current_user_input = user_input
-        failure_reason = ""
-        nudge_replays = 0
-        # Re-entry contract (harmonograf#234). The very first iteration
-        # of this loop carries the operator's verbatim user_input — for
-        # plugins observing the inner runner that's still a goldfive
-        # OVERLAY_REPLAY (the outer adk-web runner already emitted the
-        # USER_TURN); ADKAdapter.invoke_passthrough pins OVERLAY_REPLAY
-        # itself, so the default value here is "no executor-level pin".
-        # Subsequent iterations triggered by a STEER or queued nudge
-        # MUST carry the more-specific kind so plugins can attribute
-        # the replay to the correct cause (operator-issued steer vs
-        # autonomous drift-driven nudge); see ReentryKind.reentry()
-        # for stack-precedence rules.
-        next_reentry_kind: ReentryKind | None = None
+        state = _OverlayTurnState(current_user_input=user_input)
         while True:
-            # Defensive: clear any stale supersede flag from a prior
-            # iteration. The flag is set by
-            # :meth:`DefaultSteerer._cancel_inflight_for_revision`
-            # immediately before the cancel that the cancelled branch
-            # below consumes. Branches that don't visit the cancelled
-            # branch (e.g. STEER, which calls ``_cancel_invoke_task``
-            # directly and routes through the "steer" return) can
-            # still trigger the flag-set as a side effect of
-            # ``steerer.drift.observe`` → ``install_user_steer`` →
-            # ``_cancel_inflight_for_revision``; clearing here
-            # prevents that stale flag from misclassifying a genuine
-            # external cancel on the NEXT iteration as a supersede.
-            #
-            # Issue #405 LOW #7: also wipe the per-invocation supersede
-            # registry. The registry is the more defensive backstop
-            # (each invocation_id is unique, so it can't be clobbered
-            # cross-invocation) but at the top of a fresh iteration we
-            # are starting clean — any unconsumed entry from a prior
-            # iteration would only confuse the cancelled branch below.
-            try:
-                session._supersede_pending = False  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                from goldfive.state_store import StateStore  # noqa: PLC0415 — lazy
-
-                StateStore.for_session(session).clear_all_supersede_pending()
-            except Exception:  # noqa: BLE001 — registry is best-effort
-                pass
-            # ContextVars snapshot at ``asyncio.create_task`` time
-            # (which happens inside _invoke_passthrough_with_control),
-            # so the ``reentry()`` block must wrap the call site here.
-            if next_reentry_kind is None:
-                kind, payload = await self._invoke_passthrough_with_control(
-                    adapter=adapter,
+            self._clear_stale_supersede(session)
+            kind, payload = await self._race_control(
+                adapter=adapter,
+                session=session,
+                steerer=steerer,
+                sinks=sinks,
+                control=control,
+                reconciler=reconciler,
+                state=state,
+            )
+            if kind == "cancelled":
+                outcome = await self._handle_invoke_cancelled(
+                    payload=payload,
                     session=session,
                     steerer=steerer,
                     sinks=sinks,
-                    control=control,
                     reconciler=reconciler,
-                    user_input=current_user_input,
                 )
-            else:
-                with reentry(next_reentry_kind):
-                    kind, payload = await self._invoke_passthrough_with_control(
-                        adapter=adapter,
-                        session=session,
-                        steerer=steerer,
-                        sinks=sinks,
-                        control=control,
-                        reconciler=reconciler,
-                        user_input=current_user_input,
-                    )
-                # One-shot: clear after consumption so the next iteration
-                # falls back to whatever the next branch decides.
-                next_reentry_kind = None
-            if kind == "cancelled":
-                # Bug A from v22 validation: a goldfive-internal
-                # supersede-cancel (the steerer's
-                # :meth:`_cancel_inflight_for_revision` cancelling the
-                # in-flight invocation so the new revised plan can be
-                # exercised) used to fall through this branch and emit
-                # ``run_aborted``, terminating the user's turn even
-                # though the supersede was meant to *continue* the turn
-                # against the revised plan. The fix mirrors the STEER
-                # branch below: if the cancel was internal (the steerer
-                # stamped ``session._supersede_pending=True`` before
-                # initiating it), reset the reconciler for the new plan
-                # and restart the loop. Default is non-fatal; opt-in
-                # ``fail_fast_on_invoke_cancel`` (or
-                # ``GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL=1``) preserves
-                # the pre-fix abort behaviour for CI / regression /
-                # debugging. External cancels (USER_CANCEL via the
-                # control channel, asyncio.CancelledError propagated
-                # from the caller) ALWAYS abort regardless of the flag —
-                # they never set the supersede marker. See PR #332 for
-                # the principle this aligns with.
-                # Issue #405 LOW #7: union-of-signals read. The legacy
-                # ``session._supersede_pending`` bool is the primary
-                # signal (all existing supersede-cancel tests in
-                # ``tests/test_executor_supersede_cancel_nonfatal.py``
-                # exercise it directly), and the per-invocation set is
-                # the defensive backstop that survives concurrent
-                # overlay iterations. Either fires this branch. The
-                # dual read is transitional; see issue #430 for the
-                # follow-up to retire the bool.
-                supersede_bool = bool(
-                    getattr(session, "_supersede_pending", False)
-                )
-                supersede_registry = False
-                try:
-                    from goldfive.state_store import StateStore  # noqa: PLC0415
-
-                    supersede_registry = (
-                        StateStore.for_session(session).has_any_supersede_pending()
-                    )
-                except Exception:  # noqa: BLE001 — registry is best-effort
-                    pass
-                supersede_pending = supersede_bool or supersede_registry
-                if supersede_pending and not self._fail_fast_on_invoke_cancel:
-                    session._supersede_pending = False
-                    try:
-                        from goldfive.state_store import StateStore  # noqa: PLC0415
-
-                        StateStore.for_session(
-                            session
-                        ).clear_all_supersede_pending()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    log.info(
-                        "SequentialExecutor._run_overlay: goldfive-internal "
-                        "supersede cancel observed (revision_index=%d); "
-                        "restarting overlay loop with new plan instead of "
-                        "aborting",
-                        int(getattr(session.plan, "revision_index", -1) or -1),
-                    )
-                    # Reset reconciler bookkeeping so the revised plan's
-                    # tasks map fresh — stale task_id → agent claims from
-                    # the pre-supersede plan must not leak into the
-                    # restart. Mirrors the STEER branch below.
-                    reconciler.reset_for_new_plan(session.plan)
-                    # The user's input is unchanged — supersede swaps
-                    # the plan, not the user's request. Don't pin a
-                    # reentry kind: this is an autonomous-drift-driven
-                    # restart, not a STEER. Treat the next iteration as
-                    # a normal continuation.
-                    continue
-                # External cancel OR fail_fast_on_invoke_cancel=True:
-                # preserve the pre-fix abort path.
-                failure_reason = str(payload) or "cancelled by control"
-                # Clear any stale supersede flag so a subsequent run on
-                # the same Session does not inherit it.
-                if supersede_pending:
-                    session._supersede_pending = False
-                    try:
-                        from goldfive.state_store import StateStore  # noqa: PLC0415
-
-                        StateStore.for_session(
-                            session
-                        ).clear_all_supersede_pending()
-                    except Exception:  # noqa: BLE001
-                        pass
-                # goldfive#205: overlay path doesn't have a single
-                # "current task" to stamp — the orphan sweep below
-                # handles PENDING tasks. Clear the transient prefix so
-                # it doesn't leak to a subsequent run.
-                session._last_cancel_reason_prefix = ""
-                # goldfive#243: drain any background drift / judge tasks
-                # the steerer dispatched mid-run before the terminal
-                # emission. See ``_drain_steerer_at_run_boundary``.
-                await _drain_steerer_at_run_boundary(steerer, session)
-                await emit(
-                    sinks,
-                    run_aborted_event(
-                        run_id=session.run_id,
-                        sequence=session.next_sequence(),
-                        reason=failure_reason,
-                        session_id=session.id,
-                    ),
-                )
-                return ExecutionOutcome(success=False, session=session, reason=failure_reason)
+                if outcome is not None:
+                    return outcome
+                continue
             if kind == "adapter_error":
                 exc = payload
                 failure_reason = f"adapter.invoke_passthrough raised: {exc}"
                 log.exception("SequentialExecutor._run_overlay: passthrough raised")
-                await _drain_steerer_at_run_boundary(steerer, session)
-                await emit(
-                    sinks,
-                    run_aborted_event(
-                        run_id=session.run_id,
-                        sequence=session.next_sequence(),
-                        reason=failure_reason,
-                        session_id=session.id,
-                    ),
+                return await self._abort_overlay(
+                    session=session,
+                    steerer=steerer,
+                    sinks=sinks,
+                    reason=failure_reason,
                 )
-                return ExecutionOutcome(success=False, session=session, reason=failure_reason)
             if kind == "steer":
-                # Feed the STEER through the steerer so USER_STEER
-                # drift fires → cascade-cancel + planner.refine runs
-                # → session.plan is replaced with the revised plan.
-                # Without this call the overlay would just mark the
-                # pre-steer plan's tasks NOT_NEEDED on the ORIGINAL
-                # plan and miss the steer entirely (the goldfive#149
-                # regression, preserved here post-#163).
-                log.info(
-                    "SequentialExecutor._run_overlay: STEER received; "
-                    "feeding steerer.drift.observe for USER_STEER drift + refine",
+                await self._restart_after_user_steer(
+                    payload=payload,
+                    session=session,
+                    steerer=steerer,
+                    reconciler=reconciler,
+                    state=state,
                 )
-                await self._apply_steer(payload, steerer=steerer, session=session)
-                # goldfive#152: wrap the steer body in a goldfive-authored
-                # override header so the LLM sees it as a USER STEERING
-                # CONTROL directive, not a fresh user turn. Supersedes
-                # goldfive#149's raw-body handoff.
-                current_user_input = self._compose_steer_restart_message(
-                    payload, fallback=current_user_input
-                )
-                # Reset reconciler bookkeeping so the revised plan's
-                # tasks map fresh — stale task_id → agent claims from
-                # the pre-steer plan must not leak into the replay.
-                reconciler.reset_for_new_plan(session.plan)
-                # Re-entry contract (harmonograf#234): the next iteration
-                # re-feeds a goldfive-composed steer-restart message
-                # wrapped in USER STEERING CONTROL framing. Plugins
-                # observing the inner runner's user_message hook should
-                # see STEER_REPLAY, not USER_TURN, to suppress duplicate
-                # emission.
-                next_reentry_kind = ReentryKind.STEER_REPLAY
-                # Restart the invocation with the steer body as the
-                # new user input.
                 continue
             if kind == "goldfive_steer":
-                # Phase 2 of the path-duality fix: goldfive-authored
-                # drift triggered a ``GOLDFIVE_STEER`` ControlMessage
-                # on the channel. The steerer has already swapped
-                # ``session.plan`` and bundled the corrective body +
-                # superseded/replacement task ids on the message
-                # payload before dispatching, so the executor's only
-                # job is to compose the framed restart message and
-                # re-invoke. Mirrors the user-STEER branch above but
-                # with ``source="goldfive"`` framing and no
-                # ``steerer.drift.observe`` call (the steerer originated the
-                # message; observing again would loop).
-                control_msg = payload
-                payload_dict = (
-                    getattr(control_msg, "payload", None) or {}
-                ) if control_msg is not None else {}
-                body_text = str(payload_dict.get("body", "") or "")
-                superseded_ids = [
-                    str(t)
-                    for t in (payload_dict.get("superseded_task_ids") or [])
-                    if t
-                ]
-                replacement_ids = [
-                    str(t)
-                    for t in (payload_dict.get("replacement_task_ids") or [])
-                    if t
-                ]
-                log.info(
-                    "SequentialExecutor._run_overlay: GOLDFIVE_STEER "
-                    "received (drift_kind=%s); restarting invoke with "
-                    "[GOLDFIVE STEERING CONTROL] framed corrective",
-                    payload_dict.get("drift_kind", "<unknown>"),
+                self._restart_after_goldfive_steer(
+                    payload=payload,
+                    session=session,
+                    reconciler=reconciler,
+                    state=state,
                 )
-                current_user_input = self._compose_steer_restart_message(
-                    control_msg,
-                    fallback=body_text or current_user_input,
-                    source="goldfive",
-                    superseded_task_ids=superseded_ids,
-                    replacement_task_ids=replacement_ids,
-                )
-                # Reset reconciler bookkeeping so the revised plan's
-                # tasks map fresh — stale task_id → agent claims from
-                # the pre-revision plan must not leak into the replay.
-                reconciler.reset_for_new_plan(session.plan)
-                # Re-entry contract: the next iteration re-feeds the
-                # goldfive-composed corrective. Plugins observing the
-                # inner runner's ``on_user_message_callback`` should
-                # see ``GOLDFIVE_STEER_REPLAY``, not ``USER_TURN``, so
-                # they can suppress duplicate envelope emission.
-                next_reentry_kind = ReentryKind.GOLDFIVE_STEER_REPLAY
                 continue
             if kind == "goldfive_pause":
-                # Phase 2 of the path-duality fix: replaces the dead
-                # ``session.paused_for_human_intervention`` flag-set.
-                # The steerer signalled a Level-4 pause via the
-                # channel; we cancelled the in-flight invoke (above)
-                # and now break out of the overlay loop. The next
-                # ``run`` cycle's pre-task loop blocks on the channel
-                # waiting for an operator RESUME / CANCEL / STEER.
-                # The originating ``HUMAN_INTERVENTION_REQUIRED``
-                # drift the steerer emitted is the durable signal on
-                # the sink stream.
-                control_msg = payload
-                pause_payload = (
-                    getattr(control_msg, "payload", None) or {}
-                ) if control_msg is not None else {}
-                pause_reason = str(pause_payload.get("reason", "") or "")
-                # goldfive#264 — observation-only carve-out (defense-
-                # in-depth). The primary gate is at
-                # ``DefaultSteerer._dispatch_goldfive_pause_control``:
-                # under ``observation_only=True`` the channel send is
-                # skipped and the executor never observes this branch.
-                # Custom steerer subclasses or future code paths that
-                # bypass the dispatcher would otherwise drive an
-                # overlay-terminating pause here — exactly the
-                # enforcement ``observation_only`` exists to suppress.
-                # Log and continue the overlay loop without ending the
-                # turn or cancelling the upstream invoke. The
-                # originating ``HUMAN_INTERVENTION_REQUIRED`` drift
-                # the steerer emitted remains the durable signal on
-                # the sink stream.
-                if getattr(steerer, "_observation_only", False):
-                    log.info(
-                        "SequentialExecutor._run_overlay: "
-                        "observation_only=True — would have paused on "
-                        "GOLDFIVE_PAUSE_ESCALATE (reason=%r) but "
-                        "observation_only is in effect; continuing "
-                        "overlay without ending the turn",
-                        pause_reason or "<no reason>",
-                    )
-                    continue
-                log.info(
-                    "SequentialExecutor._run_overlay: GOLDFIVE_PAUSE_ESCALATE "
-                    "received (reason=%r); ending overlay turn — pre-task "
-                    "loop will block for operator intervention",
-                    pause_reason or "<no reason>",
-                )
-                # Drain background steerer tasks so any in-flight
-                # judges complete before we return.
-                await _drain_steerer_at_run_boundary(steerer, session)
-                return ExecutionOutcome(
-                    success=True,
+                outcome = await self._handle_goldfive_pause(
+                    payload=payload,
                     session=session,
-                    reason=(
-                        f"goldfive_pause_escalate: {pause_reason}"
-                        if pause_reason
-                        else "goldfive_pause_escalate"
-                    ),
+                    steerer=steerer,
                 )
-            # kind == "result": invocation ended normally. Before
-            # falling through to the NOT_NEEDED sweep, check whether
-            # the steerer queued a Level 2 nudge during this invocation
-            # (e.g. LOOPING_REASONING drift → refine spawned a
-            # replacement task → nudge queued describing the pivot).
-            # If so, and there is still live work for the tree to do,
-            # consume the queued nudge(s) as the next user message
-            # and re-invoke. Bounded by ``_MAX_NUDGE_REPLAYS`` to
-            # prevent the #163-style amplification: a coordinator
-            # whose tree keeps producing nudge-eligible drift on every
-            # turn must eventually stop triggering re-invokes.
-            # AGENCY-PRESERVATION.md PR 6 — observer-note channel surface 2.
-            # In ``signal_channel="request_context"`` mode the boundary replay
-            # consumes the ObserverNoteQueue (≤1 block, most-severe pending note
-            # wins) instead of ``session.pending_nudges``. Gated on the
-            # steerer's ``_should_inject`` so a note is delivered only when
-            # steering has authority — the legacy ``pending_nudges`` asymmetry
-            # (queued even under ``observation_only``) goes away. A note already
-            # delivered mid-invocation via the before_model surface is no longer
-            # pending here, so it is never re-delivered (exactly-once, §5.2).
-            if getattr(steerer, "_signal_channel", "legacy_user_message") == "request_context":
-                replay_msg: str | None = None
-                if (
-                    nudge_replays < self._MAX_NUDGE_REPLAYS
-                    and _has_live_pending_or_running(session.plan or plan)
-                    and _steerer_should_inject(steerer)
-                ):
-                    replay_msg = await self._consume_observer_note_for_replay(session)
-                if replay_msg is not None:
-                    nudge_replays += 1
-                    current_user_input = replay_msg
-                    log.info(
-                        "SequentialExecutor._run_overlay: observer-note replay "
-                        "%d/%d — re-invoking passthrough with queued note",
-                        nudge_replays,
-                        self._MAX_NUDGE_REPLAYS,
-                    )
-                    reconciler.reset_for_new_plan(session.plan)
-                    next_reentry_kind = ReentryKind.NUDGE_REPLAY
-                    continue
-                break
-
-            pending = list(session.pending_nudges)
-            if (
-                pending
-                and nudge_replays < self._MAX_NUDGE_REPLAYS
-                and _has_live_pending_or_running(session.plan or plan)
+                if outcome is not None:
+                    return outcome
+                continue
+            # kind == "result": invocation ended normally — check the
+            # scoped nudge-replay path (goldfive#202; observer-note
+            # surface 2 under ``signal_channel="request_context"``)
+            # before ending the loop.
+            if await self._drain_nudges(
+                plan=plan,
+                session=session,
+                steerer=steerer,
+                reconciler=reconciler,
+                state=state,
             ):
-                session.pending_nudges.clear()
-                nudge_replays += 1
-                current_user_input = self._compose_nudge_replay_message(pending)
-                log.info(
-                    "SequentialExecutor._run_overlay: nudge replay %d/%d "
-                    "(nudges=%d) — re-invoking passthrough with queued nudge",
-                    nudge_replays,
-                    self._MAX_NUDGE_REPLAYS,
-                    len(pending),
-                )
-                # Reset reconciler bookkeeping so the revised plan's
-                # tasks map fresh. The refine that queued the nudge
-                # likely added new PENDING tasks that reconciler-side
-                # agent claims should re-match against.
-                reconciler.reset_for_new_plan(session.plan)
-                # Re-entry contract (harmonograf#234): the next iteration
-                # re-feeds a goldfive-composed nudge body that the
-                # steerer authored in response to autonomous drift +
-                # plan revision (e.g. LOOPING_REASONING → refine spawned
-                # ``<task>_v2``). Plugins observing the inner runner's
-                # user_message hook should see NUDGE_REPLAY, not
-                # USER_TURN.
-                next_reentry_kind = ReentryKind.NUDGE_REPLAY
                 continue
             break
 
@@ -1511,34 +1173,576 @@ class SequentialExecutor(Executor):
         #     steerer; a no-op in forecast mode.
         await _finalize_outcomes_at_run_boundary(steerer, session)
 
-        # --- End-of-overlay PENDING disposition (goldfive#163, revised
-        #     by goldfive#208). The tree finished its natural flow; we
-        #     now have to decide what to do with PENDING tasks the tree
-        #     didn't exercise. The legacy policy (#163) was a blanket
-        #     NOT_NEEDED reap, which silently destroyed user intent
-        #     across turn boundaries: a user-pivoted plan whose first
-        #     stage completes but whose downstream stages haven't been
-        #     dispatched yet would have those downstream stages reaped
-        #     before the next turn could pick them up.
-        #
-        #     The revised policy is structural reachability:
-        #
-        #     * REACHABLE PENDING (every predecessor either COMPLETED
-        #       or itself a still-running PENDING/RUNNING task that can
-        #       reach COMPLETED) — leave PENDING. The Conversation
-        #       carry-forward (`stash_plan` / `prior_plan_for`) will
-        #       seed the next turn with this task still live.
-        #     * UNREACHABLE PENDING (at least one predecessor reached
-        #       a terminal-non-COMPLETED status — CANCELLED / FAILED /
-        #       NOT_NEEDED — with no live replacement in the lineage)
-        #       — CANCEL with the same `run_aborted:orphaned by plan
-        #       revision failure` reason the legacy executor's
-        #       reachability audit uses (`_run` body around L732).
-        #
-        #     Tier 1 / F10 still applies: when paused for human
-        #     intervention, leave EVERY PENDING alone — the operator
-        #     hasn't decided yet whether unreachable work should be
-        #     dropped, so we should not pre-empt that decision.
+        await self._sweep_unreachable_pending(plan=plan, session=session, steerer=steerer)
+
+        # --- Terminal emission: success if no failures. -----------
+        reason = self._classify_fatal_failure(plan=plan, session=session, steerer=steerer)
+        if reason is not None:
+            return await self._abort_overlay(
+                session=session, steerer=steerer, sinks=sinks, reason=reason
+            )
+
+        unmet = evaluate_goal_predicates(session)
+        if unmet is not None:
+            return await self._abort_overlay(
+                session=session, steerer=steerer, sinks=sinks, reason=unmet
+            )
+
+        await _drain_steerer_at_run_boundary(steerer, session)
+        await emit(
+            sinks,
+            run_completed_event(
+                run_id=session.run_id,
+                sequence=session.next_sequence(),
+                outcome_summary=_outcome_summary(session),
+                session_id=session.id,
+            ),
+        )
+        return ExecutionOutcome(success=True, session=session)
+
+    # ------------------------------------------------------------------
+    # Overlay stage methods — one per branch of the _run_overlay loop
+    # ------------------------------------------------------------------
+
+    def _clear_stale_supersede(self, session: Session) -> None:
+        """Wipe supersede markers at the top of each overlay iteration.
+
+        Defensive: clear any stale supersede flag from a prior
+        iteration. The flag is set by
+        :meth:`DefaultSteerer._cancel_inflight_for_revision`
+        immediately before the cancel that the cancelled branch
+        consumes. Branches that don't visit the cancelled branch
+        (e.g. STEER, which calls ``_cancel_invoke_task`` directly and
+        routes through the "steer" return) can still trigger the
+        flag-set as a side effect of ``steerer.drift.observe`` →
+        ``install_user_steer`` → ``_cancel_inflight_for_revision``;
+        clearing here prevents that stale flag from misclassifying a
+        genuine external cancel on the NEXT iteration as a supersede.
+
+        Issue #405 LOW #7: also wipe the per-invocation supersede
+        registry. The registry is the more defensive backstop (each
+        invocation_id is unique, so it can't be clobbered
+        cross-invocation) but at the top of a fresh iteration we are
+        starting clean — any unconsumed entry from a prior iteration
+        would only confuse the cancelled branch.
+        """
+        try:
+            session._supersede_pending = False  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from goldfive.state_store import StateStore  # noqa: PLC0415 — lazy
+
+            StateStore.for_session(session).clear_all_supersede_pending()
+        except Exception:  # noqa: BLE001 — registry is best-effort
+            pass
+
+    async def _race_control(
+        self,
+        *,
+        adapter: AgentAdapter,
+        session: Session,
+        steerer: Steerer,
+        sinks: list[EventSink],
+        control: ControlChannel | None,
+        reconciler: Any,
+        state: _OverlayTurnState,
+    ) -> tuple[str, object | None]:
+        """One passthrough invocation raced against the control channel.
+
+        Wraps :meth:`_invoke_passthrough_with_control` in the pending
+        re-entry pin (harmonograf#234): ContextVars snapshot at
+        ``asyncio.create_task`` time (which happens inside
+        ``_invoke_passthrough_with_control``), so the ``reentry()``
+        block must wrap the call site here.
+        """
+        if state.next_reentry_kind is None:
+            return await self._invoke_passthrough_with_control(
+                adapter=adapter,
+                session=session,
+                steerer=steerer,
+                sinks=sinks,
+                control=control,
+                reconciler=reconciler,
+                user_input=state.current_user_input,
+            )
+        with reentry(state.next_reentry_kind):
+            kind_payload = await self._invoke_passthrough_with_control(
+                adapter=adapter,
+                session=session,
+                steerer=steerer,
+                sinks=sinks,
+                control=control,
+                reconciler=reconciler,
+                user_input=state.current_user_input,
+            )
+        # One-shot: clear after consumption so the next iteration
+        # falls back to whatever the next branch decides.
+        state.next_reentry_kind = None
+        return kind_payload
+
+    async def _abort_overlay(
+        self,
+        *,
+        session: Session,
+        steerer: Steerer,
+        sinks: list[EventSink],
+        reason: str,
+    ) -> ExecutionOutcome:
+        """Shared abort tail for every failure path in :meth:`_run_overlay`.
+
+        goldfive#243: drain any background drift / judge tasks the
+        steerer dispatched mid-run before the terminal emission. See
+        ``_drain_steerer_at_run_boundary``.
+        """
+        await _drain_steerer_at_run_boundary(steerer, session)
+        await emit(
+            sinks,
+            run_aborted_event(
+                run_id=session.run_id,
+                sequence=session.next_sequence(),
+                reason=reason,
+                session_id=session.id,
+            ),
+        )
+        return ExecutionOutcome(success=False, session=session, reason=reason)
+
+    async def _handle_invoke_cancelled(
+        self,
+        *,
+        payload: Any,
+        session: Session,
+        steerer: Steerer,
+        sinks: list[EventSink],
+        reconciler: Any,
+    ) -> ExecutionOutcome | None:
+        """Classify a cancelled invoke: internal supersede vs external abort.
+
+        Returns ``None`` when the overlay loop should restart against
+        the revised plan (goldfive-internal supersede-cancel), or the
+        aborted :class:`ExecutionOutcome` to return.
+
+        Bug A from v22 validation: a goldfive-internal
+        supersede-cancel (the steerer's
+        :meth:`_cancel_inflight_for_revision` cancelling the
+        in-flight invocation so the new revised plan can be
+        exercised) used to fall through this branch and emit
+        ``run_aborted``, terminating the user's turn even
+        though the supersede was meant to *continue* the turn
+        against the revised plan. The fix mirrors the STEER
+        branch: if the cancel was internal (the steerer
+        stamped ``session._supersede_pending=True`` before
+        initiating it), reset the reconciler for the new plan
+        and restart the loop. Default is non-fatal; opt-in
+        ``fail_fast_on_invoke_cancel`` (or
+        ``GOLDFIVE_FAIL_FAST_ON_INVOKE_CANCEL=1``) preserves
+        the pre-fix abort behaviour for CI / regression /
+        debugging. External cancels (USER_CANCEL via the
+        control channel, asyncio.CancelledError propagated
+        from the caller) ALWAYS abort regardless of the flag —
+        they never set the supersede marker. See PR #332 for
+        the principle this aligns with.
+        """
+        # Issue #405 LOW #7: union-of-signals read. The legacy
+        # ``session._supersede_pending`` bool is the primary
+        # signal (all existing supersede-cancel tests in
+        # ``tests/test_executor_supersede_cancel_nonfatal.py``
+        # exercise it directly), and the per-invocation set is
+        # the defensive backstop that survives concurrent
+        # overlay iterations. Either fires this branch. The
+        # dual read is transitional; see issue #430 for the
+        # follow-up to retire the bool.
+        supersede_bool = bool(
+            getattr(session, "_supersede_pending", False)
+        )
+        supersede_registry = False
+        try:
+            from goldfive.state_store import StateStore  # noqa: PLC0415
+
+            supersede_registry = (
+                StateStore.for_session(session).has_any_supersede_pending()
+            )
+        except Exception:  # noqa: BLE001 — registry is best-effort
+            pass
+        supersede_pending = supersede_bool or supersede_registry
+        if supersede_pending and not self._fail_fast_on_invoke_cancel:
+            session._supersede_pending = False
+            try:
+                from goldfive.state_store import StateStore  # noqa: PLC0415
+
+                StateStore.for_session(
+                    session
+                ).clear_all_supersede_pending()
+            except Exception:  # noqa: BLE001
+                pass
+            log.info(
+                "SequentialExecutor._run_overlay: goldfive-internal "
+                "supersede cancel observed (revision_index=%d); "
+                "restarting overlay loop with new plan instead of "
+                "aborting",
+                int(getattr(session.plan, "revision_index", -1) or -1),
+            )
+            # Reset reconciler bookkeeping so the revised plan's
+            # tasks map fresh — stale task_id → agent claims from
+            # the pre-supersede plan must not leak into the
+            # restart. Mirrors the STEER branch.
+            reconciler.reset_for_new_plan(session.plan)
+            # The user's input is unchanged — supersede swaps
+            # the plan, not the user's request. Don't pin a
+            # reentry kind: this is an autonomous-drift-driven
+            # restart, not a STEER. Treat the next iteration as
+            # a normal continuation.
+            return None
+        # External cancel OR fail_fast_on_invoke_cancel=True:
+        # preserve the pre-fix abort path.
+        failure_reason = str(payload) or "cancelled by control"
+        # Clear any stale supersede flag so a subsequent run on
+        # the same Session does not inherit it.
+        if supersede_pending:
+            session._supersede_pending = False
+            try:
+                from goldfive.state_store import StateStore  # noqa: PLC0415
+
+                StateStore.for_session(
+                    session
+                ).clear_all_supersede_pending()
+            except Exception:  # noqa: BLE001
+                pass
+        # goldfive#205: overlay path doesn't have a single
+        # "current task" to stamp — the orphan sweep after the loop
+        # handles PENDING tasks. Clear the transient prefix so
+        # it doesn't leak to a subsequent run.
+        session._last_cancel_reason_prefix = ""
+        return await self._abort_overlay(
+            session=session, steerer=steerer, sinks=sinks, reason=failure_reason
+        )
+
+    async def _restart_after_user_steer(
+        self,
+        *,
+        payload: Any,
+        session: Session,
+        steerer: Steerer,
+        reconciler: Any,
+        state: _OverlayTurnState,
+    ) -> None:
+        """Compose the next overlay iteration after a user STEER.
+
+        Feed the STEER through the steerer so USER_STEER drift fires →
+        cascade-cancel + planner.refine runs → session.plan is
+        replaced with the revised plan. Without this call the overlay
+        would just mark the pre-steer plan's tasks NOT_NEEDED on the
+        ORIGINAL plan and miss the steer entirely (the goldfive#149
+        regression, preserved here post-#163). The caller restarts the
+        invocation with the steer body as the new user input.
+        """
+        log.info(
+            "SequentialExecutor._run_overlay: STEER received; "
+            "feeding steerer.drift.observe for USER_STEER drift + refine",
+        )
+        await apply_steer(payload, steerer=steerer, session=session)
+        # goldfive#152: wrap the steer body in a goldfive-authored
+        # override header so the LLM sees it as a USER STEERING
+        # CONTROL directive, not a fresh user turn. Supersedes
+        # goldfive#149's raw-body handoff.
+        state.current_user_input = self._compose_steer_restart_message(
+            payload, fallback=state.current_user_input
+        )
+        # Reset reconciler bookkeeping so the revised plan's
+        # tasks map fresh — stale task_id → agent claims from
+        # the pre-steer plan must not leak into the replay.
+        reconciler.reset_for_new_plan(session.plan)
+        # Re-entry contract (harmonograf#234): the next iteration
+        # re-feeds a goldfive-composed steer-restart message
+        # wrapped in USER STEERING CONTROL framing. Plugins
+        # observing the inner runner's user_message hook should
+        # see STEER_REPLAY, not USER_TURN, to suppress duplicate
+        # emission.
+        state.next_reentry_kind = ReentryKind.STEER_REPLAY
+
+    def _restart_after_goldfive_steer(
+        self,
+        *,
+        payload: Any,
+        session: Session,
+        reconciler: Any,
+        state: _OverlayTurnState,
+    ) -> None:
+        """Compose the next overlay iteration after a GOLDFIVE_STEER.
+
+        Phase 2 of the path-duality fix: goldfive-authored
+        drift triggered a ``GOLDFIVE_STEER`` ControlMessage
+        on the channel. The steerer has already swapped
+        ``session.plan`` and bundled the corrective body +
+        superseded/replacement task ids on the message
+        payload before dispatching, so the executor's only
+        job is to compose the framed restart message and
+        re-invoke. Mirrors the user-STEER branch but
+        with ``source="goldfive"`` framing and no
+        ``steerer.drift.observe`` call (the steerer originated the
+        message; observing again would loop).
+        """
+        control_msg = payload
+        payload_dict = (
+            getattr(control_msg, "payload", None) or {}
+        ) if control_msg is not None else {}
+        body_text = str(payload_dict.get("body", "") or "")
+        superseded_ids = [
+            str(t)
+            for t in (payload_dict.get("superseded_task_ids") or [])
+            if t
+        ]
+        replacement_ids = [
+            str(t)
+            for t in (payload_dict.get("replacement_task_ids") or [])
+            if t
+        ]
+        log.info(
+            "SequentialExecutor._run_overlay: GOLDFIVE_STEER "
+            "received (drift_kind=%s); restarting invoke with "
+            "[GOLDFIVE STEERING CONTROL] framed corrective",
+            payload_dict.get("drift_kind", "<unknown>"),
+        )
+        state.current_user_input = self._compose_steer_restart_message(
+            control_msg,
+            fallback=body_text or state.current_user_input,
+            source="goldfive",
+            superseded_task_ids=superseded_ids,
+            replacement_task_ids=replacement_ids,
+        )
+        # Reset reconciler bookkeeping so the revised plan's
+        # tasks map fresh — stale task_id → agent claims from
+        # the pre-revision plan must not leak into the replay.
+        reconciler.reset_for_new_plan(session.plan)
+        # Re-entry contract: the next iteration re-feeds the
+        # goldfive-composed corrective. Plugins observing the
+        # inner runner's ``on_user_message_callback`` should
+        # see ``GOLDFIVE_STEER_REPLAY``, not ``USER_TURN``, so
+        # they can suppress duplicate envelope emission.
+        state.next_reentry_kind = ReentryKind.GOLDFIVE_STEER_REPLAY
+
+    async def _handle_goldfive_pause(
+        self,
+        *,
+        payload: Any,
+        session: Session,
+        steerer: Steerer,
+    ) -> ExecutionOutcome | None:
+        """Handle a GOLDFIVE_PAUSE_ESCALATE control message.
+
+        Phase 2 of the path-duality fix: replaces the dead
+        ``session.paused_for_human_intervention`` flag-set.
+        The steerer signalled a Level-4 pause via the
+        channel; the in-flight invoke was cancelled and we now
+        break out of the overlay loop. The next
+        ``run`` cycle's pre-task loop blocks on the channel
+        waiting for an operator RESUME / CANCEL / STEER.
+        The originating ``HUMAN_INTERVENTION_REQUIRED``
+        drift the steerer emitted is the durable signal on
+        the sink stream.
+
+        Returns ``None`` to continue the overlay loop
+        (observation-only carve-out) or the terminal outcome ending
+        the turn.
+        """
+        control_msg = payload
+        pause_payload = (
+            getattr(control_msg, "payload", None) or {}
+        ) if control_msg is not None else {}
+        pause_reason = str(pause_payload.get("reason", "") or "")
+        # goldfive#264 — observation-only carve-out (defense-
+        # in-depth). The primary gate is at
+        # ``DefaultSteerer._dispatch_goldfive_pause_control``:
+        # under ``observation_only=True`` the channel send is
+        # skipped and the executor never observes this branch.
+        # Custom steerer subclasses or future code paths that
+        # bypass the dispatcher would otherwise drive an
+        # overlay-terminating pause here — exactly the
+        # enforcement ``observation_only`` exists to suppress.
+        # Log and continue the overlay loop without ending the
+        # turn or cancelling the upstream invoke. The
+        # originating ``HUMAN_INTERVENTION_REQUIRED`` drift
+        # the steerer emitted remains the durable signal on
+        # the sink stream.
+        if not steering_is_active(steerer):
+            log.info(
+                "SequentialExecutor._run_overlay: "
+                "observation_only=True — would have paused on "
+                "GOLDFIVE_PAUSE_ESCALATE (reason=%r) but "
+                "observation_only is in effect; continuing "
+                "overlay without ending the turn",
+                pause_reason or "<no reason>",
+            )
+            return None
+        log.info(
+            "SequentialExecutor._run_overlay: GOLDFIVE_PAUSE_ESCALATE "
+            "received (reason=%r); ending overlay turn — pre-task "
+            "loop will block for operator intervention",
+            pause_reason or "<no reason>",
+        )
+        # Drain background steerer tasks so any in-flight
+        # judges complete before we return.
+        await _drain_steerer_at_run_boundary(steerer, session)
+        return ExecutionOutcome(
+            success=True,
+            session=session,
+            reason=(
+                f"goldfive_pause_escalate: {pause_reason}"
+                if pause_reason
+                else "goldfive_pause_escalate"
+            ),
+        )
+
+    async def _drain_nudges(
+        self,
+        *,
+        plan: Plan,
+        session: Session,
+        steerer: Steerer,
+        reconciler: Any,
+        state: _OverlayTurnState,
+    ) -> bool:
+        """Consume steerer-queued nudges; True re-invokes, False ends the loop.
+
+        The invocation ended normally. Before falling through to the
+        NOT_NEEDED sweep, check whether the steerer queued a Level 2
+        nudge during this invocation (e.g. LOOPING_REASONING drift →
+        refine spawned a replacement task → nudge queued describing
+        the pivot). If so, and there is still live work for the tree
+        to do, consume the queued nudge(s) as the next user message
+        and re-invoke. Bounded by ``_MAX_NUDGE_REPLAYS`` to prevent
+        the #163-style amplification: a coordinator whose tree keeps
+        producing nudge-eligible drift on every turn must eventually
+        stop triggering re-invokes.
+
+        AGENCY-PRESERVATION.md PR 6 — observer-note channel surface 2.
+        In ``signal_channel="request_context"`` mode the boundary replay
+        consumes the ObserverNoteQueue (≤1 block, most-severe pending note
+        wins) instead of ``session.pending_nudges``. Gated on
+        :func:`goldfive.steerer.steering_is_active` so a note is delivered
+        only when steering has authority — the legacy ``pending_nudges``
+        asymmetry (queued even under ``observation_only``) goes away. A
+        note already delivered mid-invocation via the before_model surface
+        is no longer pending here, so it is never re-delivered
+        (exactly-once, §5.2).
+        """
+        if getattr(steerer, "_signal_channel", "legacy_user_message") == "request_context":
+            replay_msg: str | None = None
+            if (
+                state.nudge_replays < self._MAX_NUDGE_REPLAYS
+                and _has_live_pending_or_running(session.plan or plan)
+                and steering_is_active(steerer)
+            ):
+                replay_msg = await self._consume_observer_note_for_replay(session)
+            if replay_msg is None:
+                return False
+            state.nudge_replays += 1
+            state.current_user_input = replay_msg
+            log.info(
+                "SequentialExecutor._run_overlay: observer-note replay "
+                "%d/%d — re-invoking passthrough with queued note",
+                state.nudge_replays,
+                self._MAX_NUDGE_REPLAYS,
+            )
+            reconciler.reset_for_new_plan(session.plan)
+            state.next_reentry_kind = ReentryKind.NUDGE_REPLAY
+            return True
+
+        pending = list(session.pending_nudges)
+        if (
+            pending
+            and state.nudge_replays < self._MAX_NUDGE_REPLAYS
+            and _has_live_pending_or_running(session.plan or plan)
+        ):
+            # goldfive#264-style observation-only carve-out
+            # (defense-in-depth). The primary gates are at the
+            # steerer's nudge enqueue sites (``_dispatch_nudge`` /
+            # the post-ABSORB handoff): under
+            # ``observation_only=True`` nothing is queued and this
+            # branch never sees a nudge. Custom steerer subclasses
+            # or direct ``session.pending_nudges`` writers would
+            # otherwise drive a goldfive-authored re-invocation of
+            # the tree here — exactly the enforcement
+            # ``observation_only`` exists to suppress. Discard the
+            # queue (never inject it later) and end the turn.
+            if not steering_is_active(steerer):
+                log.info(
+                    "SequentialExecutor._run_overlay: "
+                    "observation_only=True — would have replayed %d "
+                    "queued nudge(s) but observation_only is in "
+                    "effect; ending the turn without re-invoking",
+                    len(pending),
+                )
+                session.pending_nudges.clear()
+                session.pending_nudges_revision_installed = False
+                return False
+            plan_revised = session.pending_nudges_revision_installed
+            session.pending_nudges.clear()
+            session.pending_nudges_revision_installed = False
+            state.nudge_replays += 1
+            state.current_user_input = self._compose_nudge_replay_message(
+                pending, plan_revised=plan_revised
+            )
+            log.info(
+                "SequentialExecutor._run_overlay: nudge replay %d/%d "
+                "(nudges=%d) — re-invoking passthrough with queued nudge",
+                state.nudge_replays,
+                self._MAX_NUDGE_REPLAYS,
+                len(pending),
+            )
+            # Reset reconciler bookkeeping so the revised plan's
+            # tasks map fresh. The refine that queued the nudge
+            # likely added new PENDING tasks that reconciler-side
+            # agent claims should re-match against.
+            reconciler.reset_for_new_plan(session.plan)
+            # Re-entry contract (harmonograf#234): the next iteration
+            # re-feeds a goldfive-composed nudge body that the
+            # steerer authored in response to autonomous drift +
+            # plan revision (e.g. LOOPING_REASONING → refine spawned
+            # ``<task>_v2``). Plugins observing the inner runner's
+            # user_message hook should see NUDGE_REPLAY, not
+            # USER_TURN.
+            state.next_reentry_kind = ReentryKind.NUDGE_REPLAY
+            return True
+        return False
+
+    async def _sweep_unreachable_pending(
+        self,
+        *,
+        plan: Plan,
+        session: Session,
+        steerer: Steerer,
+    ) -> None:
+        """End-of-overlay PENDING disposition (goldfive#163, revised by goldfive#208).
+
+        The tree finished its natural flow; we
+        now have to decide what to do with PENDING tasks the tree
+        didn't exercise. The legacy policy (#163) was a blanket
+        NOT_NEEDED reap, which silently destroyed user intent
+        across turn boundaries: a user-pivoted plan whose first
+        stage completes but whose downstream stages haven't been
+        dispatched yet would have those downstream stages reaped
+        before the next turn could pick them up.
+
+        The revised policy is structural reachability:
+
+        * REACHABLE PENDING (every predecessor either COMPLETED
+          or itself a still-running PENDING/RUNNING task that can
+          reach COMPLETED) — leave PENDING. The Conversation
+          carry-forward (`stash_plan` / `prior_plan_for`) will
+          seed the next turn with this task still live.
+        * UNREACHABLE PENDING (at least one predecessor reached
+          a terminal-non-COMPLETED status — CANCELLED / FAILED /
+          NOT_NEEDED — with no live replacement in the lineage)
+          — CANCEL with the same `run_aborted:orphaned by plan
+          revision failure` reason the legacy executor's
+          reachability audit uses (`_run` body around L732).
+
+        Tier 1 / F10 still applies: when paused for human
+        intervention, leave EVERY PENDING alone — the operator
+        hasn't decided yet whether unreachable work should be
+        dropped, so we should not pre-empt that decision.
+        """
         live_plan = session.plan or plan
         pending_ids = [
             t.id
@@ -1572,12 +1776,21 @@ class SequentialExecutor(Executor):
                         session=session,
                     )
 
-        # --- Terminal emission: success if no failures. -----------
-        # goldfive#202: a FAILED task with a live replacement (refine
-        # spawned a successor like ``retry_<id>`` / ``<id>_v2``) is not
-        # fatal — the replacement is the forward-progress path. Only
-        # abort when at least one FAILED task has no live replacement
-        # in the current plan revision.
+    def _classify_fatal_failure(
+        self,
+        *,
+        plan: Plan,
+        session: Session,
+        steerer: Steerer,
+    ) -> str | None:
+        """Return the abort reason for a fatal FAILED task, or ``None``.
+
+        goldfive#202: a FAILED task with a live replacement (refine
+        spawned a successor like ``retry_<id>`` / ``<id>_v2``) is not
+        fatal — the replacement is the forward-progress path. Only
+        abort when at least one FAILED task has no live replacement
+        in the current plan revision.
+        """
         fatally_failed = _fatally_failed_task_ids(session.plan or plan)
         if fatally_failed and self.fail_fast:
             # goldfive#260: under observation_only, skip the abort
@@ -1590,8 +1803,8 @@ class SequentialExecutor(Executor):
             # another path, dispatch a different agent, surface the
             # failure to the user). If it can't, the run terminates
             # naturally when the coordinator stops dispatching
-            # invocations and we fall through to run_completed below.
-            if getattr(steerer, "_observation_only", False):
+            # invocations and we fall through to run_completed.
+            if not steering_is_active(steerer):
                 log.info(
                     "SequentialExecutor._run_overlay: observation_only=True "
                     "— skipping abort-on-failed-without-replacement for "
@@ -1600,47 +1813,11 @@ class SequentialExecutor(Executor):
                     sorted(tid for tid in fatally_failed if tid),
                 )
             else:
-                reason = (
+                return (
                     "one or more tasks failed without a live replacement: "
                     f"{', '.join(tid for tid in fatally_failed if tid)}"
                 )
-                await _drain_steerer_at_run_boundary(steerer, session)
-                await emit(
-                    sinks,
-                    run_aborted_event(
-                        run_id=session.run_id,
-                        sequence=session.next_sequence(),
-                        reason=reason,
-                        session_id=session.id,
-                    ),
-                )
-                return ExecutionOutcome(success=False, session=session, reason=reason)
-
-        unmet = evaluate_goal_predicates(session)
-        if unmet is not None:
-            await _drain_steerer_at_run_boundary(steerer, session)
-            await emit(
-                sinks,
-                run_aborted_event(
-                    run_id=session.run_id,
-                    sequence=session.next_sequence(),
-                    reason=unmet,
-                    session_id=session.id,
-                ),
-            )
-            return ExecutionOutcome(success=False, session=session, reason=unmet)
-
-        await _drain_steerer_at_run_boundary(steerer, session)
-        await emit(
-            sinks,
-            run_completed_event(
-                run_id=session.run_id,
-                sequence=session.next_sequence(),
-                outcome_summary=_outcome_summary(session),
-                session_id=session.id,
-            ),
-        )
-        return ExecutionOutcome(success=True, session=session)
+        return None
 
     async def _invoke_passthrough_with_control(
         self,
@@ -1764,7 +1941,7 @@ class SequentialExecutor(Executor):
                 # ``HUMAN_INTERVENTION_REQUIRED`` drift on the sink
                 # stream remains the durable signal) and keep waiting
                 # on the invoke task / next control message.
-                if getattr(steerer, "_observation_only", False):
+                if not steering_is_active(steerer):
                     log.info(
                         "SequentialExecutor: observation_only=True — "
                         "dropping GOLDFIVE_PAUSE_ESCALATE without "
@@ -1804,6 +1981,13 @@ class SequentialExecutor(Executor):
         (Phase 2 of the path-duality fix) — that message sets
         ``request_pause=True`` so the executor's pause loop is
         indistinguishable from an explicit user-initiated PAUSE.
+
+        A goldfive pause whose payload carries ``deadline_s``
+        (``SteeringConfig.pause_escalate_deadline_s``, or the Level-5
+        TERMINATE fallback) bounds the wait: on expiry the run aborts
+        via :func:`abort_expired_pause` (non-terminal tasks CANCELLED,
+        ``RunAborted`` with the escalation lineage). Operator-issued
+        PAUSE carries no deadline and blocks unbounded as before.
         """
         if control is None:
             # Without a control channel the ladder-initiated pause has
@@ -1822,6 +2006,7 @@ class SequentialExecutor(Executor):
         cancel_prefix = ""
         steer_msg: object | None = None
         paused = False
+        pause_msg: object | None = None
         for o in outcomes:
             if o.cancel_run:
                 cancel_run = True
@@ -1832,8 +2017,11 @@ class SequentialExecutor(Executor):
                 steer_msg = o.steer_message
             if o.request_pause:
                 paused = True
+                if o.goldfive_pause_message is not None:
+                    pause_msg = o.goldfive_pause_message
             if o.request_resume:
                 paused = False
+                pause_msg = None
 
         if cancel_run:
             # goldfive#205: stash the structured cancel prefix on the
@@ -1844,9 +2032,31 @@ class SequentialExecutor(Executor):
             raise _ControlCancelled(cancel_reason or "cancelled by control")
 
         # Honour PAUSE by blocking on the channel until a RESUME /
-        # CANCEL / STEER arrives.
+        # CANCEL / STEER arrives — or, for a deadline-carrying
+        # goldfive pause, until the deadline expires.
+        deadline_s = pause_deadline_s(pause_msg)
+        deadline_at = time.monotonic() + deadline_s if deadline_s is not None else None
         while paused:
-            msg = await control.receive()
+            if deadline_at is None:
+                msg = await control.receive()
+            else:
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    await abort_expired_pause(
+                        session=session,
+                        steerer=steerer,
+                        pause_msg=pause_msg,
+                        deadline_s=deadline_s or 0.0,
+                    )
+                try:
+                    msg = await asyncio.wait_for(control.receive(), timeout=remaining)
+                except TimeoutError:
+                    await abort_expired_pause(
+                        session=session,
+                        steerer=steerer,
+                        pause_msg=pause_msg,
+                        deadline_s=deadline_s or 0.0,
+                    )
             if msg is None:
                 # Channel closed — treat as resume so we don't wedge.
                 paused = False
@@ -1882,12 +2092,21 @@ class SequentialExecutor(Executor):
                 steer_msg = outcome.goldfive_steer_message
                 paused = False
             # goldfive#404: GOLDFIVE_PAUSE_ESCALATE while already paused
-            # is a no-op — re-entering a pause state we're already in
-            # would only re-arm the same wait. The ack has already been
-            # published; keep blocking on the channel for a real
-            # RESUME / CANCEL / STEER. (The overlay path's
-            # ``goldfive_pause`` branch cancels the in-flight invoke and
-            # returns; here there is no in-flight invoke to cancel.)
+            # does not re-enter the pause state — but a deadline it
+            # carries is adopted (tightening only). This is how the
+            # ladder's TERMINATE row lands while the executor is
+            # already parked on an unbounded Level-4 pause: the repeat
+            # escalation's deadline converts the wait into a bounded
+            # one. The ack has already been published; keep blocking
+            # on the channel for a real RESUME / CANCEL / STEER.
+            if outcome.goldfive_pause_message is not None:
+                new_deadline_s = pause_deadline_s(outcome.goldfive_pause_message)
+                if new_deadline_s is not None:
+                    new_deadline_at = time.monotonic() + new_deadline_s
+                    if deadline_at is None or new_deadline_at < deadline_at:
+                        deadline_s = new_deadline_s
+                        deadline_at = new_deadline_at
+                        pause_msg = outcome.goldfive_pause_message
             if outcome.rewind_task_id:
                 paused = False
 
@@ -1984,7 +2203,7 @@ class SequentialExecutor(Executor):
                 # handler (and the synthetic function_response it
                 # appends) carries LLM-actionable content instead of
                 # the legacy generic jargon. See goldfive#139.
-                _tag_adapter_cancel_user_steer(adapter, session=session)
+                tag_adapter_cancel_user_steer(adapter, session=session)
                 await self._cancel_invoke_task(invoke_task)
                 return ("steer", outcome.steer_message)
 
@@ -2017,55 +2236,9 @@ class SequentialExecutor(Executor):
         )
 
     @staticmethod
-    async def _mark_cancelled_if_live(
-        *,
-        task_id: str,
-        steerer: Steerer,
-        session: Session,
-        cancel_reason: str = "",
-    ) -> None:
-        """Transition a not-yet-terminal task to CANCELLED.
-
-        ``cancel_reason`` (goldfive#205): structured reason stamped on the
-        emitted ``TaskCancelled``. Defaults to a generic
-        ``user_cancel:cancelled_by_control`` when the caller does not
-        pass something more specific (e.g. an annotation_id).
-        """
-        if session.plan is None:
-            return
-        for t in session.plan.tasks:
-            if t.id == task_id:
-                if t.status in (
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
-                ):
-                    return
-                reason_value = cancel_reason or "user_cancel:cancelled_by_control"
-                await steerer.transition(
-                    task_id,
-                    TaskStatus.CANCELLED,
-                    detail="cancelled by control",
-                    cancel_reason=reason_value,
-                    session=session,
-                )
-                return
-
-    @staticmethod
-    async def _apply_steer(
-        message: object,
-        *,
-        steerer: Steerer,
-        session: Session,
-    ) -> None:
-        """Feed a STEER :class:`ControlMessage` to the steerer."""
-        try:
-            await steerer.drift.observe(message, session)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("SequentialExecutor: steerer.drift.observe(STEER) raised: %s", exc)
-
-    @staticmethod
-    def _compose_nudge_replay_message(nudges: list[str]) -> str:
+    def _compose_nudge_replay_message(
+        nudges: list[str], *, plan_revised: bool = False
+    ) -> str:
         """Wrap queued nudges in a goldfive-authored framing header.
 
         Mirrors :meth:`_compose_steer_restart_message` but for the
@@ -2083,16 +2256,33 @@ class SequentialExecutor(Executor):
           decomposition and retries; the note body now carries neutral
           facts, the user's goal, and the advisory footer instead).
 
+        ``plan_revised`` selects the framing: the header only claims a
+        plan revision when the steerer recorded that ``_apply_revision``
+        actually installed one
+        (``session.pending_nudges_revision_installed``); a Level 2
+        nudge with no refine, or a dry-run revision, gets an
+        observer-note header that asserts nothing about the plan.
+
         The scoped replay path is the carefully-narrowed successor to
         the blanket follow-up loop that goldfive#163 removed. #163's
         removal was correct when every PENDING task triggered a
         follow-up; this path only fires when the STEERER explicitly
-        queued a nudge in response to a tracked drift + plan
-        revision — not on every PENDING-at-invocation-end. Delivery
-        mechanics (queue, replay cap, reconciler reset, re-entry
-        kind) are unchanged by PR 4 — content only.
+        queued a nudge in response to a tracked drift — not on every
+        PENDING-at-invocation-end. Delivery mechanics (queue, replay
+        cap, reconciler reset, re-entry kind) are unchanged by PR 4 —
+        content only.
         """
         body = "\n\n".join(n for n in nudges if n)
+        if not plan_revised:
+            return (
+                "[GOLDFIVE OBSERVER NOTE]\n"
+                "\n"
+                "goldfive — an external monitoring layer, not the user — "
+                "observed drift during the prior turn. Its plan bookkeeping "
+                "is unchanged. The note(s) below describe what it observed.\n"
+                "\n"
+                f"{body}"
+            )
         return (
             "[GOLDFIVE PLAN REVISION — observer note]\n"
             "\n"
@@ -2342,24 +2532,6 @@ def _has_live_pending_or_running(plan: Plan) -> bool:
     )
 
 
-def _steerer_should_inject(steerer: Any) -> bool:
-    """Return the steerer's active-steering injection gate (PR 6 surface 2).
-
-    Mirrors :meth:`goldfive.prompt_shaper.PromptShaper.should_inject` and the
-    steerer's own ``_should_inject``: under ``observation_only=True`` steering
-    has no authority and the boundary replay must not re-invoke with a note.
-    Tolerant of steerers without the predicate (returns ``True`` so pre-#271
-    paths and minimal stubs keep working).
-    """
-    should = getattr(steerer, "_should_inject", None)
-    if callable(should):
-        try:
-            return bool(should())
-        except Exception:  # noqa: BLE001
-            return True
-    return not bool(getattr(steerer, "_observation_only", False))
-
-
 def _has_live_replacement(plan: Plan, failed: Task) -> bool:
     """Return True iff ``failed`` has a *live* replacement task in ``plan``.
 
@@ -2583,49 +2755,6 @@ def _unreachable_pending_task_ids(plan: Plan) -> set[str]:
                     break
 
     return unreachable_pending
-
-
-async def _emit_pipeline_failure_drift(
-    *,
-    session: Session,
-    sinks: list[EventSink],
-    task_id: str,
-    reason: str,
-) -> None:
-    """Emit an INFO ``CUSTOM`` drift when the drift pipeline itself raised.
-
-    Mirrors the helper in
-    :mod:`goldfive.executors.parallel`: a bug in the steerer's observe
-    path must not silently disappear. INFO severity so the run does not
-    trigger another refine — the goal is to make the plumbing failure
-    visible, not to recover from it. Sinks that care can filter on
-    the ``drift_pipeline_failed:`` detail prefix. See goldfive#134.
-
-    Uses the steerer's proto-enum mapping shape
-    (``DRIFT_KIND_<NAME>``) so the emitted envelope carries a real
-    enum value rather than UNSPECIFIED — the
-    :func:`goldfive.events.drift_detected_event` helper does a
-    best-effort lookup that silently drops StrEnum-style values.
-    """
-    from goldfive.pb.goldfive.v1 import types_pb2
-
-    evt = new_event(session.run_id, session.next_sequence(), session_id=session.id)
-    evt.drift_detected.kind = getattr(
-        types_pb2,
-        f"DRIFT_KIND_{DriftKind.CUSTOM.name}",
-        0,
-    )
-    evt.drift_detected.severity = getattr(
-        types_pb2,
-        f"DRIFT_SEVERITY_{DriftSeverity.INFO.name}",
-        0,
-    )
-    evt.drift_detected.detail = reason
-    evt.drift_detected.current_task_id = task_id or ""
-    try:
-        await emit(sinks, evt)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("_emit_pipeline_failure_drift: sink emit raised: %s", exc)
 
 
 def _plan_divergence_drift_event(session: Session, detail: str) -> object:

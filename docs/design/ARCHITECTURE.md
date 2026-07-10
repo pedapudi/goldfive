@@ -58,8 +58,10 @@ swapped in.
 **GoalDeriver** — one job: take whatever the caller handed in
 (`user_input: str` or a pre-built `list[Goal]`) and return an explicit
 list of `Goal`s. Each goal has a `summary` and, optionally, a
-`success_predicate: Callable[[Session], bool]` that the framework can
-consult to decide "are we done yet?".
+`success_predicate: Callable[[Session], bool]` that the executors
+evaluate at end-of-run (`evaluate_goal_predicates`,
+PLAN-LIFECYCLE.md §6.1): an unmet or raising predicate fails the run.
+There is no mid-run consultation.
 
 **Planner** — produces a `Plan` (DAG of `Task`s) from goals, and
 revises it on drift via `refine(plan, drift, goals)`. The planner is

@@ -759,11 +759,22 @@ class ReasoningJudgeVerdict:
     # responses that omit the field (graceful degradation: the
     # composer falls back to ``detail``).
     note_to_agent: str = ""
+    # Judge-scheduling guards: measurement fields. ``judge_ran`` is
+    # True iff the judge LLM was actually dispatched (False on the
+    # empty-reasoning early return, the embedding-only path, and
+    # ``mode="off"``), so callers can distinguish "quiet-fail sentinel"
+    # (``judge_ran and not classification``) from "judge never ran".
+    # ``elapsed_ms`` mirrors the value stamped on the
+    # ``ReasoningJudgeInvoked`` event; 0 when ``judge_ran`` is False.
+    judge_ran: bool = False
+    elapsed_ms: int = 0
 
 
 # Map the judge's ``severity`` string to a :class:`DriftSeverity`. Missing
-# or unknown values fall through to WARNING so a drift verdict is never
-# silently swallowed by a bad severity string.
+# or unknown values fall through to INFO: the drift verdict is still
+# emitted (never silently swallowed), but a malformed severity string
+# must not be promotion-eligible —
+# :meth:`DriftObserver._should_promote_to_steer` gates on WARNING-and-up.
 _SEVERITY_MAP: dict[str, DriftSeverity] = {
     "info": DriftSeverity.INFO,
     "warning": DriftSeverity.WARNING,
@@ -772,9 +783,16 @@ _SEVERITY_MAP: dict[str, DriftSeverity] = {
 
 
 def _severity_from_verdict(raw: Any) -> DriftSeverity:
-    if not isinstance(raw, str):
-        return DriftSeverity.WARNING
-    return _SEVERITY_MAP.get(raw.strip().lower(), DriftSeverity.WARNING)
+    if isinstance(raw, str):
+        severity = _SEVERITY_MAP.get(raw.strip().lower())
+        if severity is not None:
+            return severity
+    log.debug(
+        "classify_reasoning_drift: severity %r missing or unrecognised; "
+        "defaulting to INFO",
+        raw,
+    )
+    return DriftSeverity.INFO
 
 
 # iter-10 PR 3: three-state classification + provenance enums. Keep
@@ -1068,9 +1086,17 @@ async def classify_reasoning_drift_with_focus(
             # deep reasoning. Letting the model burn the 16k budget on
             # ``<think>`` was the v16 / Qwen 35B failure mode — the cap
             # bump was the symptom-fix, this is the cause-fix.
-            from goldfive._llm import call_llm_budget, call_llm_thinking_disabled
+            from goldfive._llm import (
+                call_llm_budget,
+                call_llm_thinking_disabled,
+                llm_call_diagnostics,
+            )
 
-            with call_llm_budget(REASONING_JUDGE_MAX_OUTPUT_TOKENS), call_llm_thinking_disabled():
+            with (
+                call_llm_budget(REASONING_JUDGE_MAX_OUTPUT_TOKENS),
+                call_llm_thinking_disabled(),
+                llm_call_diagnostics() as llm_diag,
+            ):
                 raw = await call_llm(system, user, model)
             # Parse inside the with-block so we can stamp
             # decision-context onto the span before the End event fires
@@ -1180,12 +1206,12 @@ async def classify_reasoning_drift_with_focus(
             if on_task_parsed is None:
                 # Distinguish "model returned all thinking, no answer"
                 # from "model returned garbage" (goldfive#271 follow-up
-                # to #311). The default ADK / OpenAI builders stash the
-                # part counts on the call_llm closure; when the answer
-                # is empty AND we saw ``thought=True`` parts the
-                # diagnostic should say so rather than show an
+                # to #311). The default ADK / OpenAI builders record the
+                # part counts into the per-call diagnostics object; when
+                # the answer is empty AND we saw ``thought=True`` parts
+                # the diagnostic should say so rather than show an
                 # indistinguishable ``raw=''``.
-                _thought_n = int(getattr(call_llm, "last_thought_count", 0) or 0)
+                _thought_n = llm_diag.thought_count
                 if not raw_str_inline.strip() and _thought_n > 0:
                     span.output_preview = (
                         f"empty answer ({_thought_n} thought part(s); "
@@ -1396,6 +1422,10 @@ async def classify_reasoning_drift_with_focus(
             severity=severity_str,
             reason=reason,
             classification=classification_parsed,
+            focused_task_id=focused_task_id_parsed,
+            focus_confidence=focus_confidence_parsed,
+            stated_intent=stated_intent_parsed,
+            provenance=provenance_parsed,
         )
     return ReasoningJudgeVerdict(
         drift=drift,
@@ -1405,6 +1435,8 @@ async def classify_reasoning_drift_with_focus(
         classification=classification_parsed,
         provenance=provenance_parsed,
         note_to_agent=note_to_agent_parsed,
+        judge_ran=True,
+        elapsed_ms=elapsed_ms,
     )
 
 
@@ -1424,6 +1456,10 @@ async def _emit_judge_invoked(
     severity: str,
     reason: str,
     classification: str = "",
+    focused_task_id: str = "",
+    focus_confidence: float = 0.0,
+    stated_intent: str = "",
+    provenance: str = "",
 ) -> None:
     """Build and emit a ``ReasoningJudgeInvoked`` envelope onto ``sink``.
 
@@ -1435,6 +1471,11 @@ async def _emit_judge_invoked(
     ``classification`` is the iter-10 three-state verdict string; PR 1
     accepts the kwarg with a default of ``""`` so existing call sites
     don't break. PR 3 starts populating it from the parser.
+
+    ``focused_task_id`` / ``focus_confidence`` / ``stated_intent`` /
+    ``provenance`` mirror the same-named ``ReasoningJudgeVerdict``
+    fields onto the wire — parsed and clamped by the caller; defaults
+    keep older call sites working.
     """
     try:
         from goldfive.events import new_event
@@ -1464,6 +1505,10 @@ async def _emit_judge_invoked(
         payload.severity = severity
         payload.reason = reason
         payload.classification = classification
+        payload.focused_task_id = focused_task_id
+        payload.focus_confidence = float(focus_confidence)
+        payload.stated_intent = stated_intent
+        payload.provenance = provenance
         await sink.emit(evt)
     except Exception as exc:  # noqa: BLE001 - observability must never break
         log.warning(

@@ -107,23 +107,26 @@ def test_tool_loop_config_defaults() -> None:
     assert cfg.exact_threshold == 3
     assert cfg.name_threshold == 5
     assert cfg.alternating_threshold == 5
+    assert cfg.name_axis_max_severity == "info"
 
 
 def test_tool_loop_config_from_env_all_vars(
     goldfive_tool_loop_env: Any,
 ) -> None:
-    """All four env vars map to the matching fields."""
+    """All five env vars map to the matching fields."""
     goldfive_tool_loop_env.set(
         window=12,
         exact_threshold=4,
         name_threshold=7,
         alternating_threshold=6,
+        name_axis_max_severity="critical",
     )
     cfg = ToolLoopConfig.from_env()
     assert cfg.window == 12
     assert cfg.exact_threshold == 4
     assert cfg.name_threshold == 7
     assert cfg.alternating_threshold == 6
+    assert cfg.name_axis_max_severity == "critical"
 
 
 def test_tool_loop_config_from_env_subset(
@@ -137,6 +140,16 @@ def test_tool_loop_config_from_env_subset(
     assert cfg.exact_threshold == 3
     assert cfg.name_threshold == 5
     assert cfg.alternating_threshold == 5
+    assert cfg.name_axis_max_severity == "info"
+
+
+def test_tool_loop_config_from_env_rejects_bad_severity(
+    goldfive_tool_loop_env: Any,
+) -> None:
+    """An unknown severity name degrades to the default, not an error."""
+    goldfive_tool_loop_env.set(name_axis_max_severity="loud")
+    cfg = ToolLoopConfig.from_env()
+    assert cfg.name_axis_max_severity == "info"
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +170,7 @@ def test_reasoning_drift_config_defaults() -> None:
     assert cfg.looping_reasoning_similarity_threshold == 0.9
     assert cfg.reasoning_cluster_similarity_threshold == 0.75
     assert cfg.looping_reasoning_hash_window == 5
+    assert cfg.max_concurrent_judges == 3
 
 
 @pytest.mark.parametrize("mode", ["judge", "embedding", "both", "off"])
@@ -205,6 +219,7 @@ def test_reasoning_drift_config_from_env_all_vars(
         looping_similarity="0.85",
         cluster_similarity="0.7",
         looping_hash_window="8",
+        max_concurrent_judges="7",
     )
     cfg = ReasoningDriftConfig.from_env()
     assert cfg.off_topic_distance_threshold == 0.55
@@ -214,6 +229,7 @@ def test_reasoning_drift_config_from_env_all_vars(
     assert cfg.looping_reasoning_similarity_threshold == 0.85
     assert cfg.reasoning_cluster_similarity_threshold == 0.7
     assert cfg.looping_reasoning_hash_window == 8
+    assert cfg.max_concurrent_judges == 7
 
 
 def test_reasoning_drift_config_from_env_missing_falls_back(

@@ -362,7 +362,7 @@ use snake_case for forward compatibility with sinks.
 | 14 | STOPPED_EARLY | `"stopped_early"` | Response truncated before the task completed. |
 | 15 | TOO_MANY_STEPS | `"too_many_steps"` | Per-task / per-lineage step cap exceeded. |
 | 16 | GOAL_UNREACHABLE | `"goal_unreachable"` | Planner concluded no plan can satisfy the goal. |
-| 17 | TASK_TIMEOUT | `"task_timeout"` | Task exceeded `predicted_duration_ms` by threshold. |
+| 17 | TASK_TIMEOUT | `"task_timeout"` | Stall watchdog (`SteeringConfig.stall_watchdog_enabled`, default OFF): no observed activity for `stall_timeout_s`. |
 | 18 | REPEATED_FAILURE | `"repeated_failure"` | N consecutive refine failures for the same `(kind, task)` pair. |
 | 19 | UNEXPECTED_OUTPUT | `"unexpected_output"` | Output shape violates declared schema. |
 | 20 | SCHEMA_VIOLATION | `"schema_violation"` | Hard JSON / schema parse failure. |
@@ -718,7 +718,7 @@ Intervention ladder (goldfive#142):
 | 2 | NUDGE | Queue a soft follow-up on `session.pending_nudges`; overlay loop picks it up at the next invocation boundary. |
 | 3 | CANCEL_REINVOKE | Refine; install revised plan; dispatch a `GOLDFIVE_STEER` ControlMessage on the bound channel so the executor cancels the in-flight invoke and restarts with a `[GOLDFIVE STEERING CONTROL …]` framed corrective. (Phase 2 of #246.) |
 | 4 | PAUSE_ESCALATE | Emit `HUMAN_INTERVENTION_REQUIRED`; dispatch a `GOLDFIVE_PAUSE_ESCALATE` ControlMessage on the bound channel so the executor's pre-task loop blocks for operator intervention. (Phase 2 of #246.) |
-| 5 | TERMINATE | Run-level abort (reserved for unhandled Level 4 timeouts). |
+| 5 | TERMINATE | Pause-with-deadline: same dispatch as Level 4 but always deadline-bounded (`SteeringConfig.pause_escalate_deadline_s`, or 600 s when unset); on expiry the executor cancels non-terminal tasks and emits `RunAborted`. |
 
 Mapping from `(drift_kind, severity, occurrence_count)` to level lives
 in `DefaultSteerer._ladder_level_for`.
@@ -794,6 +794,7 @@ class ToolLoopTracker:
         exact_threshold: int = 3,          # DEFAULT_EXACT_THRESHOLD (overrides work-WARNING exact)
         name_threshold: int = 5,           # DEFAULT_NAME_THRESHOLD (overrides work-WARNING name)
         alternating_threshold: int = 5,    # DEFAULT_ALTERNATING_THRESHOLD
+        name_axis_max_severity: str = "info",  # DEFAULT_NAME_AXIS_MAX_SEVERITY (uncorroborated name-axis cap)
     ) -> None: ...
 
     def observe_tool_call(
@@ -816,7 +817,7 @@ class ToolLoopTracker:
 
 
 def args_hash(args: Any) -> str: ...          # 8-char md5 hex of sorted-keys JSON
-def load_thresholds_from_env() -> dict[str, int]: ...
+def load_thresholds_from_env() -> dict[str, int | str]: ...
 ```
 
 Detection modes:
@@ -824,7 +825,7 @@ Detection modes:
 | Mode | Pattern | Default | Severity |
 |---|---|---|---|
 | Exact | same `(tool_name, args_hash)` ≥ threshold in last `window` | 3 / 7 | WARNING |
-| Name | same `tool_name` ≥ threshold in last `window`, no task progress | 5 / 7 | WARNING |
+| Name | same `tool_name` ≥ threshold in last `window`, no task progress | 5 / 7 | tier severity when the window also holds an exact repeat; capped at `name_axis_max_severity` (default `"info"`) otherwise |
 | Alternating | A,B,A,B,A pattern in last `alternating_threshold` | 5 | INFO |
 
 Progress-reporting tools (`report_task_*`) call
@@ -835,7 +836,8 @@ Env-var overrides:
 `GOLDFIVE_TOOL_LOOP_WINDOW`,
 `GOLDFIVE_TOOL_LOOP_EXACT_THRESHOLD`,
 `GOLDFIVE_TOOL_LOOP_NAME_THRESHOLD`,
-`GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD`.
+`GOLDFIVE_TOOL_LOOP_ALTERNATING_THRESHOLD`,
+`GOLDFIVE_TOOL_LOOP_NAME_AXIS_MAX_SEVERITY`.
 
 Follow-ups tracked: #179 (umbrella), #182 (args-quality),
 #183 (silent-success), #185 (wrong-tool).
@@ -1163,7 +1165,7 @@ class ReportingToolSpec:
     ]
 
 
-# The seven canonical tool names (stable contract).
+# The ten canonical tool names (stable contract).
 REPORTING_TOOL_NAMES: tuple[str, ...] = (
     "report_task_started",
     "report_task_progress",
@@ -1172,13 +1174,22 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
     "report_task_blocked",
     "report_new_work_discovered",
     "report_plan_divergence",
+    "report_awaiting_approval",
+    "declare_task_skipped",
+    "declare_task_not_needed",
 )
 
 
-# Pre-built list of the seven canonical specs. ``Runner`` registers
-# these with the adapter automatically; custom adapters can consume
-# the list directly.
+# Pre-built list of the ten canonical specs. ``Runner`` registers the
+# seven-tool lifecycle subset (LIFECYCLE_REPORTING_TOOLS) with the
+# adapter automatically; the three drift self-reporting tools
+# (report_plan_divergence, declare_task_skipped,
+# declare_task_not_needed) are opt-in via
+# ``Runner(drift_self_reporting=...)``. Custom adapters can consume
+# the lists directly.
 BUILTIN_REPORTING_TOOLS: list[ReportingToolSpec]
+LIFECYCLE_REPORTING_TOOLS: list[ReportingToolSpec]
+DRIFT_SELF_REPORTING_TOOLS: list[ReportingToolSpec]
 ```
 
 See [tool-protocol.md](tool-protocol.md) for full semantics.

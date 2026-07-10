@@ -358,6 +358,7 @@ is one of those three shapes.
 
 ## Related
 
+- **Deep reference:** [docs/dev-guide/](../docs/dev-guide/00-index.md) — when triage needs the *why*. A drift fired on the wire but the agent kept going → [09-steering-ladder-and-gates.md](../docs/dev-guide/09-steering-ladder-and-gates.md) (Appendix D). Sink/telemetry not showing what you expect → [12-events-sinks-telemetry.md](../docs/dev-guide/12-events-sinks-telemetry.md). A judge verdict looks wrong or absent → [08-llm-judges.md](../docs/dev-guide/08-llm-judges.md). The hazard catalog + symptom→cause table lives in [17-invariants-hazards-history.md](../docs/dev-guide/17-invariants-hazards-history.md) §4.
 - [docs/guides/troubleshooting.md](../docs/guides/troubleshooting.md) — detailed symptom → fix catalogue.
 - [docs/guides/common-failure-modes.md](../docs/guides/common-failure-modes.md) — catalog of observed failure modes with signatures.
 - [docs/design/PLAN-LIFECYCLE.md](../docs/design/PLAN-LIFECYCLE.md) — plan-level state machine; run-termination predicate.

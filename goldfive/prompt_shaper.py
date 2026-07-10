@@ -78,8 +78,10 @@ are NOT collapsed into one ``inject(...)`` method.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
+
+from goldfive.steerer import steering_is_active
 
 if TYPE_CHECKING:
     from goldfive.types import Session
@@ -108,25 +110,17 @@ class PromptShaper:
     def should_inject(steerer: Any) -> bool:
         """Return True when prompt-shaping injections are permitted.
 
-        Reads ``steerer._observation_only`` and returns its logical
-        complement: under strict-passive (``observation_only=True``)
-        injections are suppressed; otherwise the active-steering path
-        runs.
-
-        Tolerant of ``steerer is None`` and steerers that don't carry
-        a ``_observation_only`` attribute — both cases return ``True``
-        so pre-#271 paths and minimal test stubs (which never set up a
-        steerer) keep working byte-identically.
-
-        This is the single source of truth the four inject methods
-        consult. Mirrors :meth:`DefaultSteerer._should_inject` in
-        intent — that predicate gates enforcement-side dispatch (steer,
-        pause-escalate, cancel); this one gates prompt-shape
-        injections.
+        Delegates to :func:`goldfive.steerer.steering_is_active` — the
+        one kill-switch predicate for
+        :class:`~goldfive.config.SteeringConfig.observation_only`.
+        ``steerer is None`` and steerers that don't expose
+        :meth:`~goldfive.steerer.DefaultSteerer.is_active_steering`
+        resolve to ``False`` (injections suppressed): passive is the
+        fail-safe direction. Pre-refactor this site defaulted ACTIVE on
+        a missing attribute; the flip to the passive fallback is
+        deliberate.
         """
-        if steerer is None:
-            return True
-        return not bool(getattr(steerer, "_observation_only", False))
+        return steering_is_active(steerer)
 
     @staticmethod
     def _signal_channel(steerer: Any) -> str:
@@ -306,9 +300,9 @@ class PromptShaper:
 
         ``session_context`` carries the live
         :class:`~goldfive.adapters._adk_plugin.SessionContext` from the
-        plugin so the gate can reach the steerer. May be ``None`` on
-        unit-test stubs that never wire one up — those paths default
-        to the active-steering branch (pre-#271 behaviour).
+        plugin so the gate can reach the steerer. ``None`` (or a
+        context without a steerer) resolves passive — injections
+        suppressed, the fail-safe direction.
         """
         steerer = getattr(session_context, "steerer", None) if session_context is not None else None
         if not self.should_inject(steerer):
@@ -554,7 +548,7 @@ class PromptShaper:
         self,
         original_instruction: str,
         agent_name: str,
-    ) -> Callable[[Any], str]:
+    ) -> Callable[[Any], str | Awaitable[str]]:
         """Return a resolver matching ADK's ``InstructionProvider`` signature.
 
         The returned callable:
@@ -578,6 +572,19 @@ class PromptShaper:
         The resolver is pure: given the same Session.state it returns
         the same string. No side effects, no persistence.
 
+        ADK session-state templating: ``LlmAgent.canonical_instruction``
+        marks callable instructions ``bypass_state_injection=True``, so
+        installing the resolver over a string instruction would silently
+        disable the documented ``{var}`` / ``{artifact.var}``
+        substitution. When ``original_instruction`` carries a ``{`` the
+        resolver therefore returns an awaitable that first runs ADK's
+        own ``inject_session_state`` over the template (substitution
+        errors propagate exactly as they would unwrapped) and then
+        applies the goldfive augmentation to the templated result.
+        Placeholder-free instructions keep the synchronous, byte-
+        identical fast path. Both shapes satisfy ADK's
+        ``InstructionProvider`` alias (``str | Awaitable[str]``).
+
         Phase 2.0 of goldfive#271 — the bridge from goldfive
         Session.state onto ADK session.state is gone. The resolver
         reads goldfive Session directly via the SessionContext stash,
@@ -586,9 +593,12 @@ class PromptShaper:
         goldfive#275).
 
         Under ``observation_only=True`` (:meth:`should_inject` →
-        ``False``) the resolver returns ``original_instruction``
-        verbatim — no "Current assigned task" block, no pending-
-        correction block, no goldfive augmentation of any kind.
+        ``False``) the resolver returns the templated
+        ``original_instruction`` and nothing else — no "Current
+        assigned task" block, no pending-correction block, no goldfive
+        augmentation of any kind. State templating still runs because
+        ADK applies it to string instructions regardless of goldfive;
+        suppressing it would itself be a behaviour change.
 
         Legacy fallback: when the SessionContext stash is unreachable
         (a unit test drives the resolver against a plain state dict
@@ -600,7 +610,12 @@ class PromptShaper:
         # shaper's :meth:`should_inject` predicate.
         shaper = self
 
-        def resolver(readonly_ctx: Any) -> str:
+        def _resolve(readonly_ctx: Any, base_instruction: str) -> str:
+            # ``base_instruction`` is ``original_instruction`` with ADK
+            # session-state templating already applied (or verbatim on
+            # the placeholder-free fast path). Every degradation path
+            # below returns it so a goldfive failure never costs the
+            # agent its templated instruction.
             try:
                 # Reach the goldfive SessionContext to read the
                 # steerer + session. The same walk supplies both the
@@ -624,10 +639,10 @@ class PromptShaper:
                         "PromptShaper.make_dynamic_instruction resolver: "
                         "observation_only=True — SKIPPING goldfive "
                         "prompt augmentation for agent=%r "
-                        "(returning original instruction verbatim)",
+                        "(returning the caller's instruction un-augmented)",
                         agent_name,
                     )
-                    return original_instruction
+                    return base_instruction
 
                 # AGENCY-PRESERVATION.md PR 9 — Site 4 diet. Under the
                 # ``request_context`` regime the per-turn
@@ -656,10 +671,16 @@ class PromptShaper:
                         "PromptShaper.make_dynamic_instruction resolver: "
                         "request_context regime + pin_assigned_task=False — "
                         "retiring the [CURRENT ASSIGNED TASK] pin for "
-                        "agent=%r (returning original instruction verbatim)",
+                        "agent=%r (returning the templated instruction "
+                        "un-augmented)",
                         agent_name,
                     )
-                    return original_instruction
+                    # goldfive#477: return the TEMPLATED base, not the raw
+                    # ``original_instruction`` — the resolver bypasses ADK's
+                    # own state injection, so returning the raw template
+                    # would leak literal ``{var}`` placeholders to the
+                    # agent on the diet path.
+                    return base_instruction
 
                 state = _state_from_readonly_context(readonly_ctx)
                 session = getattr(ctx, "session", None) if ctx is not None else None
@@ -675,8 +696,8 @@ class PromptShaper:
                 if not current_task_id:
                     # No pin — pre-plan turn, or an agent that doesn't
                     # need plan-causal augmentation this turn. Return
-                    # the caller's instruction verbatim.
-                    return original_instruction
+                    # the caller's instruction un-augmented.
+                    return base_instruction
 
                 if session is not None:
                     current_task_title, current_task_description = (
@@ -718,7 +739,7 @@ class PromptShaper:
                 )
 
                 return _compose_instruction(
-                    original=original_instruction,
+                    original=base_instruction,
                     task_id=current_task_id,
                     task_title=current_task_title,
                     task_description=current_task_description,
@@ -728,18 +749,48 @@ class PromptShaper:
                 )
             except Exception as exc:  # noqa: BLE001
                 # Instrumentation path — any failure here degrades to
-                # the original instruction so the agent still runs.
+                # the base instruction so the agent still runs.
                 # ADK's own pipeline would otherwise surface this as an
                 # InternalError mid-turn, which is the worst possible
                 # failure mode.
                 log.debug(
                     "PromptShaper.make_dynamic_instruction resolver "
                     "raised for agent=%r: %s "
-                    "(falling back to original instruction)",
+                    "(falling back to the caller's instruction)",
                     agent_name,
                     exc,
                 )
-                return original_instruction
+                return base_instruction
+
+        def resolver(readonly_ctx: Any) -> str | Awaitable[str]:
+            # ADK marks callable instructions ``bypass_state_injection=
+            # True`` (``LlmAgent.canonical_instruction``), so the
+            # ``{var}`` / ``{artifact.var}`` templating a string
+            # instruction receives from ADK's flow must be re-applied
+            # here. A placeholder-free template cannot substitute, so
+            # it keeps the synchronous byte-identical path.
+            if "{" not in original_instruction:
+                return _resolve(readonly_ctx, original_instruction)
+
+            from goldfive.adapters.adk_llm_instrumentation import (
+                _adk_inject_session_state,
+            )
+
+            inject = _adk_inject_session_state()
+            if inject is None:
+                # install_dynamic_instructions refuses to wrap templated
+                # instructions when the helper is absent; a resolver
+                # built directly degrades to the literal template.
+                return _resolve(readonly_ctx, original_instruction)
+
+            async def _inject_then_resolve() -> str:
+                # Substitution errors (missing state var / artifact)
+                # propagate — a string instruction fails the same way
+                # unwrapped.
+                base = await inject(original_instruction, readonly_ctx)
+                return _resolve(readonly_ctx, base)
+
+            return _inject_then_resolve()
 
         # Stamp provenance on the closure so test code and tree-walk
         # idempotency checks can recognise it without relying on repr.

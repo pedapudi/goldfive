@@ -368,6 +368,10 @@ def _apply_agent_max_output_tokens_cap(llm_request: Any, ceiling: int) -> tuple[
 # ``canonical_instruction`` invokes the callable per turn and returns
 # ``bypass_state_injection=True`` for the result, so refine landing in
 # state is picked up on the NEXT turn with no transcript rewrite.
+# Because of that bypass, the resolver itself re-applies ADK's
+# ``inject_session_state`` to the original template when it carries
+# ``{var}`` / ``{artifact.var}`` placeholders — otherwise wrapping
+# would silently disable the documented session-state templating.
 #
 # The resolver is **agent-agnostic**: works for any wrapped ``LlmAgent``
 # (coordinator, sub-agent, root-with-tools, leaf). Current-task
@@ -745,6 +749,30 @@ def is_dynamic_instruction(value: Any) -> bool:
     return bool(getattr(value, "_goldfive_dynamic_instruction", False))
 
 
+def _adk_inject_session_state() -> Any:
+    """Return ADK's async ``inject_session_state`` helper, or ``None``.
+
+    ADK treats a callable ``instruction`` as ``bypass_state_injection=
+    True`` (``LlmAgent.canonical_instruction``), so swapping a string
+    instruction for a resolver silently disables the documented
+    ``{var}`` / ``{artifact.var}`` templating unless the resolver
+    re-applies it. The resolver calls this helper's return value on the
+    original template to restore wrapped == unwrapped semantics.
+
+    Probed lazily (never at import) so the module stays importable
+    without google-adk, and defensively so an ADK release that moves
+    the helper degrades to ``None`` instead of raising — the installer
+    then skips placeholder-bearing instructions with a WARNING rather
+    than break their templating.
+    """
+    try:
+        from google.adk.utils import instructions_utils
+    except Exception:  # noqa: BLE001 — ADK absent or restructured
+        return None
+    fn = getattr(instructions_utils, "inject_session_state", None)
+    return fn if callable(fn) else None
+
+
 def _looks_like_llm_agent(node: Any) -> bool:
     """Duck-type check for an ADK ``LlmAgent`` without importing ADK.
 
@@ -775,6 +803,9 @@ def install_dynamic_instructions(root_agent: Any) -> int:
     * If it is a string (the common case): capture the string as the
       closure's ``original``, capture ``agent.name`` for correction
       lookup, install the resolver.
+    * If the string carries ``{var}`` placeholders but ADK's
+      ``inject_session_state`` cannot be resolved: skip with a WARNING
+      so the agent keeps ADK's native string-instruction templating.
 
     Non-``LlmAgent`` nodes are walked through but not modified.
 
@@ -825,6 +856,20 @@ def install_dynamic_instructions(root_agent: Any) -> int:
             )
             continue
         original = existing if isinstance(existing, str) else ""
+        if "{" in original and _adk_inject_session_state() is None:
+            # ADK substitutes {var}/{artifact.var} for string
+            # instructions only; a resolver bypasses that. Without the
+            # inject helper the resolver cannot re-apply it, so leave
+            # the string in place — native templating beats goldfive's
+            # per-turn augmentation for this agent.
+            log.warning(
+                "goldfive.wrap: agent %r has a templated instruction "
+                "but ADK's inject_session_state is unavailable — "
+                "leaving the static instruction in place "
+                "(dynamic instruction disabled for this agent)",
+                getattr(cur, "name", "<unnamed>"),
+            )
+            continue
 
         agent_name = str(getattr(cur, "name", "") or "")
         # Wave B1 (refactor/prompt-shaper): the resolver factory lives

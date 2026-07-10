@@ -91,8 +91,8 @@ Responsibilities (this PR)
   :meth:`_summarize_recent_reasoning`. Bounded summarisation used by
   the reflective check prompt and by ``trigger_input`` stamping.
 
-* :meth:`_parse_reflective_response` — tolerant JSON-from-LLM parser
-  used by the reflective check verdict path.
+* :meth:`_parse_reflective_response` — the reflective check's verdict
+  parser; delegates to :func:`goldfive.drift.registry.parse_json_response`.
 
 The module DOES NOT own
 ----------------------
@@ -133,10 +133,10 @@ components decoupled and lets the router own the shared state
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import logging
-import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -161,6 +161,7 @@ from goldfive.types import (
     Task,
     TaskKind,
     TaskStatus,
+    _uuid_hex,
     channel_processor_active,
     filter_recent_events_by_kind,
     replace_task,
@@ -175,6 +176,44 @@ if TYPE_CHECKING:
 # judge plumbing can carry their typed signatures without round-tripping
 # through :mod:`goldfive.steerer` (avoids a circular import).
 ReflectiveCallLLM = Callable[[str, str, str], Awaitable[str]]
+
+# Fallback deadline (seconds) for the Level-5 TERMINATE pause when
+# ``SteeringConfig.pause_escalate_deadline_s`` is unset. TERMINATE must
+# terminate by definition — an unbounded pause would silently degrade
+# it back to Level 4 (the pre-fix behaviour). Conservative: long enough
+# for an on-call operator to intervene, short enough that unattended
+# deployments do not wedge indefinitely.
+DEFAULT_TERMINATE_PAUSE_DEADLINE_S: float = 600.0
+
+
+@dataclasses.dataclass
+class _QueuedJudgeWindow:
+    """Mutable payload for a scheduled-but-not-yet-running judge request.
+
+    While the owning background task waits on the per-steerer
+    judge-concurrency semaphore the request is QUEUED: a newer
+    reasoning observation for the same (session, agent, task) key
+    replaces ``text`` / ``pinned_history`` in place (coalescing —
+    newest window wins) instead of scheduling another task. A granted
+    judge slot (``call_llm``) is never downgraded by a slotless newer
+    observation. Once the semaphore is acquired the entry leaves
+    :attr:`DriftObserver._queued_judge_windows` and the call is
+    RUNNING — never coalesced again.
+    """
+
+    text: str
+    pinned_history: list[str]
+    call_llm: ReflectiveCallLLM | None
+    coalesced: int = 0
+
+
+def _nearest_rank_percentile(sorted_samples: list[int], q: float) -> int:
+    """Nearest-rank percentile of an already-sorted sample list; 0 when empty."""
+    if not sorted_samples:
+        return 0
+    idx = min(len(sorted_samples) - 1, max(0, round(q * (len(sorted_samples) - 1))))
+    return int(sorted_samples[idx])
+
 
 log = logging.getLogger(__name__)
 # Wave C bucket 3b/3c post-cleanup: the module previously kept a
@@ -281,6 +320,24 @@ class DriftObserver:
         }
     )
 
+    # Drift kinds the reasoning-analysis pipeline
+    # (:func:`~goldfive.drift.reasoning.analyze_reasoning_with_focus`)
+    # can open. An ON-TASK verdict from that pipeline is the negative
+    # outcome of exactly these checks, so it (and only it) can resolve
+    # their open conditions. GOAL_DRIFT is deliberately absent: it is
+    # opened by the goal-drift judge, which answers a trajectory-level
+    # question a reasoning-scoped on-task verdict carries no evidence
+    # about; its conditions resolve at task-terminal instead.
+    _REASONING_PIPELINE_DRIFT_KINDS: frozenset[DriftKind] = frozenset(
+        {
+            DriftKind.LOOPING_REASONING,
+            DriftKind.REASONING_CLUSTER_TIGHTENING,
+            DriftKind.OFF_TOPIC,
+            DriftKind.JUSTIFIED_DEVIATION,
+            DriftKind.INTENT_DIVERGENCE,
+        }
+    )
+
     # goldfive-steer-unification: drift kinds that are always "user"-
     # authored when no explicit source was stamped. Any other kind
     # defaults to "goldfive" (the detector path).
@@ -366,10 +423,6 @@ class DriftObserver:
         }
     )
 
-    # Liberal JSON extractor: tolerates markdown code fences and leading /
-    # trailing prose around the object.
-    _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
     def __init__(self, steerer: DefaultSteerer) -> None:
         # Back-reference to the router. Used to reach the shared
         # event-emission primitives (``_new_envelope`` / ``_emit`` /
@@ -382,8 +435,8 @@ class DriftObserver:
         # :class:`~goldfive.task_state_machine.TaskStateMachine`), and
         # the router-owned shared state (the per-async-task
         # ``_active_session_var`` ContextVar plumbing for the planner
-        # span-context provider, the ``_observation_only`` gate read
-        # via :meth:`DefaultSteerer._should_inject`, and the
+        # span-context provider, the ``observation_only`` gate read
+        # via :meth:`DefaultSteerer.is_active_steering`, and the
         # ``REFINE_FAILURE_THRESHOLD`` / ``PROGRESS_STALL_THRESHOLD_SECONDS``
         # class constants).
         self._steerer = steerer
@@ -429,12 +482,57 @@ class DriftObserver:
         # firings (separate dispatch instances at higher occurrence
         # counts) each get their own slot.
         self._cancelled_drift_ids: set[str] = set()
+        # Judge-scheduling guards — concurrency cap. Bounds the number
+        # of concurrently RUNNING background reasoning-judge LLM calls.
+        # Per-steerer-instance (NOT module-global) so multi-Runner
+        # processes never share one gate. Sized from
+        # ``ReasoningDriftConfig.max_concurrent_judges`` (env:
+        # ``GOLDFIVE_DRIFT_MAX_CONCURRENT_JUDGES``); a bare
+        # ``DefaultSteerer()`` without a config uses the dataclass
+        # default. Clamped to >= 1 so a bad value can never wedge the
+        # judge pipeline shut.
+        _rd_config = getattr(steerer, "_reasoning_drift_config", None)
+        try:
+            _judge_limit = int(getattr(_rd_config, "max_concurrent_judges", 3))
+        except (TypeError, ValueError):
+            _judge_limit = 3
+        self._judge_semaphore = asyncio.Semaphore(max(1, _judge_limit))
+        # QUEUED judge windows keyed by (session_id, agent_name,
+        # task_id). Entries are removed when the owning background task
+        # acquires the semaphore (QUEUED -> RUNNING) or is cancelled
+        # while still queued; while present, newer observations for the
+        # same key coalesce onto the entry instead of scheduling
+        # another task. See :class:`_QueuedJudgeWindow`.
+        self._queued_judge_windows: dict[tuple[str, str, str], _QueuedJudgeWindow] = {}
+        # Verdict-utility ledger, keyed by session id: plain counters
+        # {acted_on, emitted_late, emitted_redundant, parse_fail} plus
+        # a bounded elapsed_ms sample list. Created lazily on first
+        # increment; popped and summarised as a
+        # ``reasoning_judge_utility_summary`` dict event by
+        # :meth:`drain_session_background_tasks` (run boundary) with a
+        # :meth:`shutdown` flush as the process-teardown fallback.
+        self._verdict_ledgers: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Drift event emission + lifecycle stamping
     # ------------------------------------------------------------------
 
-    async def _emit_drift_detected(self, session: Session, drift: DriftEvent) -> None:
+    async def _emit_drift_detected(
+        self,
+        session: Session,
+        drift: DriftEvent,
+        *,
+        decision_outcome: str = "",
+        decision_reason: str = "",
+    ) -> None:
+        # ``decision_outcome`` / ``decision_reason`` override the paired
+        # ``SteeringDecisionMade`` outcome for callers that emit the
+        # ``DriftDetected`` for observability but DROP the drift instead
+        # of dispatching it (the freshness / in-flight gates in
+        # :meth:`handle_drift` stamp ``"drift_dropped_stale"`` /
+        # ``"drift_dropped_inflight"``). Without the override those
+        # drops would be indistinguishable from real fires
+        # (``"drift_emitted"``) in the optimizer's training set.
         # zicato-optimization-surface: record the drift on the session's
         # aggregate list BEFORE the wire emit so the in-memory
         # ``Session.drift_summary`` view stays consistent with the
@@ -511,19 +609,24 @@ class DriftObserver:
         # know at this emit site; the broader observation-only /
         # stale-verdict suppression paths are stamped from the
         # dispatch-time call sites that gate them.
-        outcome = "drift_suppressed" if drift.suppressed_by_user_steer else "drift_emitted"
-        reason = (
-            "suppressed by recent user steer"
-            if drift.suppressed_by_user_steer
-            else (drift.detail or "")
-        )
+        if decision_outcome:
+            outcome = decision_outcome
+            reason = decision_reason or (drift.detail or "")
+        elif drift.suppressed_by_user_steer:
+            outcome = "drift_suppressed"
+            reason = "suppressed by recent user steer"
+        else:
+            outcome = "drift_emitted"
+            reason = drift.detail or ""
         await self._emit_steering_decision(
             session=session,
             detector_name=self._detector_name_for_drift(drift),
             outcome=outcome,
             reason=reason,
             considered_severity=str(drift.severity),
-            chosen_severity=("" if drift.suppressed_by_user_steer else str(drift.severity)),
+            # ``chosen_severity`` stays empty whenever the drift was not
+            # actually applied — suppression AND gate drops.
+            chosen_severity=(str(drift.severity) if outcome == "drift_emitted" else ""),
             drift_id=str(getattr(drift, "id", "") or ""),
             task_id=drift.current_task_id,
             agent_name=drift.current_agent_id,
@@ -596,12 +699,19 @@ class DriftObserver:
 
     @classmethod
     def _detector_name_for_drift(cls, drift: DriftEvent) -> str:
-        """Return the symbolic detector name for a drift's kind.
+        """Return the symbolic detector name for a drift.
 
-        Falls back to the bare lowercase kind value for kinds not in
-        :data:`_DETECTOR_NAME_BY_KIND` so unfamiliar kinds still produce
-        a meaningful field rather than ``""``.
+        A ``detector_name`` stamped on the drift itself wins — the kind
+        alone cannot distinguish sources that share a kind (the
+        tool-loop tracker emits ``LOOPING_REASONING`` per #204, same as
+        the embedding detector). Falls back to
+        :data:`_DETECTOR_NAME_BY_KIND`, then to the bare lowercase kind
+        value so unfamiliar kinds still produce a meaningful field
+        rather than ``""``.
         """
+        stamped = str(getattr(drift, "detector_name", "") or "")
+        if stamped:
+            return stamped
         return cls._DETECTOR_NAME_BY_KIND.get(drift.kind, str(drift.kind))
 
     async def _emit_steering_decision(
@@ -623,10 +733,12 @@ class DriftObserver:
     ) -> None:
         """Emit a ``SteeringDecisionMade`` envelope onto every sink.
 
-        The full positive-path / suppression-path / silent-path tri-state
-        is collapsed into the ``outcome`` argument: callers stamp
-        ``"drift_emitted"``, ``"drift_suppressed"``, or ``"no_drift"``
-        and the routing is identical otherwise.
+        The full positive-path / suppression-path / silent-path /
+        drop-path split is collapsed into the ``outcome`` argument:
+        callers stamp ``"drift_emitted"``, ``"drift_suppressed"``,
+        ``"no_drift"``, ``"drift_dropped_stale"``, or
+        ``"drift_dropped_inflight"`` and the routing is identical
+        otherwise.
 
         Best-effort: if the proto stubs are unavailable (the legacy
         environment that runs the import-only smoke tests without the
@@ -1060,6 +1172,7 @@ class DriftObserver:
         note_text: str,
         *,
         ladder_level: str,
+        plan_revision_installed: bool = False,
     ) -> None:
         """Route a composed observer note to the configured delivery channel.
 
@@ -1071,8 +1184,14 @@ class DriftObserver:
 
         * ``signal_channel="legacy_user_message"`` (default) — append to
           ``session.pending_nudges``; the executor's boundary nudge-replay
-          renders it. ``channel="nudge_replay"``. Byte-identical to pre-PR-6,
-          so existing suites pass unmodified (§5.1).
+          renders it. ``channel="nudge_replay"``. The enqueue is gated on
+          :meth:`DefaultSteerer.is_active_steering` (goldfive#475): the
+          overlay drains the queue into a goldfive-authored user turn that
+          re-invokes the tree — an injection, not an observation — so under
+          ``observation_only`` the would-be note is logged, the gate is
+          stamped as ``PolicyApplied`` decision telemetry, and
+          ``SignalDelivered`` still records the *decision* (with
+          ``dry_run=True``) so the §5.4 shadow diff sees it.
         * ``signal_channel="request_context"`` (PR 6) — enqueue onto the
           :class:`~goldfive.observer_note_queue.ObserverNoteQueue`; the four
           observer-note surfaces render it, each marking the queue's
@@ -1081,6 +1200,12 @@ class DriftObserver:
           reaches the agent is gated on ``observation_only`` at the surface,
           which is exactly what ``dry_run`` (== ``observation_only``) records
           on this event — so the event and the mechanism never disagree.
+
+        ``plan_revision_installed`` threads the ``_apply_revision`` install
+        fact from the post-ABSORB handoff: when the legacy enqueue actually
+        happens it stamps ``session.pending_nudges_revision_installed`` so
+        the executor's replay header only claims a plan revision when one
+        truly installed (goldfive#475 truthfulness).
         """
         channel = getattr(self._steerer, "_signal_channel", "legacy_user_message")
         if channel == "request_context":
@@ -1137,10 +1262,60 @@ class DriftObserver:
             )
             return
 
-        # Legacy channel — the pre-PR-6 behaviour.
-        session.pending_nudges.append(note_text)
+        # Legacy channel — the pre-PR-6 behaviour, with the goldfive#475
+        # observation-only gate: the queued note would be drained by the
+        # overlay's replay path into a goldfive-authored user turn that
+        # re-invokes the tree — an injection, not an observation. Skip the
+        # enqueue, log the would-be message, and stamp the gate as decision
+        # telemetry, mirroring ``_dispatch_goldfive_steer_control``. The
+        # executor's drain gate (#475 defense-in-depth) still covers custom
+        # steerer subclasses / direct ``session.pending_nudges`` writers.
         from goldfive.events import SIGNAL_CHANNEL_NUDGE_REPLAY
 
+        if not self._steerer.is_active_steering():
+            log.info(
+                "DriftObserver._route_corrective_note: observation_only=True "
+                "— SKIPPING nudge enqueue. would_have_queued kind=%s "
+                "task=%s body=%r",
+                drift.kind.value,
+                drift.current_task_id or "-",
+                note_text[:200],
+            )
+            # Keep the goldfive#475 per-site stamp vocabulary: the Level-2
+            # ``_dispatch_nudge`` suppression reads ``intervention=nudge``,
+            # the post-ABSORB handoff reads ``intervention=post_absorb_nudge``
+            # — operators (and the #475 regression tests) tell the two
+            # enqueue sites apart by this label.
+            intervention = (
+                "post_absorb_nudge" if ladder_level == "absorb" else "nudge"
+            )
+            await self._emit_policy_applied(
+                session=session,
+                policy_name="observation_only_gate",
+                outcome="suppressed",
+                reason="observation_only=True",
+                detail=(
+                    f"intervention={intervention} "
+                    f"ladder_level={ladder_level} "
+                    f"kind={drift.kind.value} "
+                    f"task_id={drift.current_task_id or ''}"
+                ),
+            )
+            await self._emit_signal_delivered(
+                session,
+                drift,
+                channel=SIGNAL_CHANNEL_NUDGE_REPLAY,
+                note_text=note_text,
+                ladder_level=ladder_level,
+                extra_decision={"channel_action": "suppressed"},
+            )
+            return
+        session.pending_nudges.append(note_text)
+        # Thread the install fact to the overlay so the replay header only
+        # claims a plan revision when ``_apply_revision`` actually
+        # installed one.
+        if plan_revision_installed:
+            session.pending_nudges_revision_installed = True
         await self._emit_signal_delivered(
             session,
             drift,
@@ -1447,6 +1622,147 @@ class DriftObserver:
         }
         name = mapping.get(lifecycle, "DRIFT_LIFECYCLE_UNSPECIFIED")
         return getattr(types_pb2, name, getattr(types_pb2, "DRIFT_LIFECYCLE_UNSPECIFIED", 0))
+
+    # ------------------------------------------------------------------
+    # Drift-condition resolution (lifecycle truth, observability-only)
+    # ------------------------------------------------------------------
+
+    async def resolve_conditions_for_terminal_task(
+        self,
+        session: Session,
+        *,
+        task_id: str,
+        to_status: TaskStatus,
+    ) -> None:
+        """Resolve every open condition pinned to a task that went terminal.
+
+        A terminal task (COMPLETED / FAILED / CANCELLED / NOT_NEEDED)
+        moots every condition still open against it: no further
+        observation on that task can escalate or recover them, so
+        leaving them in ``KEY_ACTIVE_DRIFTS`` makes the active set grow
+        monotonically per run and downstream consumers never see an
+        intervention succeed. Pure lifecycle telemetry — no intervention
+        decision reads the result, so behaviour is identical under
+        ``observation_only`` True and False.
+        """
+        if not task_id:
+            return
+        try:
+            resolved = _ostate.resolve_drifts_matching(session.state, task_id=task_id)
+        except Exception as exc:  # noqa: BLE001
+            # Lifecycle bookkeeping must never break a live transition
+            # path (same contract as :meth:`_stamp_drift_lifecycle`).
+            log.debug(
+                "DriftObserver.resolve_conditions_for_terminal_task: "
+                "resolve skipped (%s)",
+                exc,
+            )
+            return
+        if not resolved:
+            return
+        status_label = str(getattr(to_status, "value", to_status) or "")
+        await self._emit_resolved_conditions(
+            session,
+            resolved,
+            reason=f"task {task_id} reached terminal status {status_label}",
+        )
+
+    async def _resolve_conditions_on_on_task_verdict(
+        self,
+        session: Session,
+        *,
+        agent_name: str,
+    ) -> None:
+        """Resolve reasoning-pipeline conditions after an ON-TASK verdict.
+
+        The verdict is the same pipeline's clean bill for the current
+        ``(task, agent, run)``, so only the kinds that pipeline can open
+        (:data:`_REASONING_PIPELINE_DRIFT_KINDS`) resolve — deterministic
+        detector conditions (tool loops, task failures, plan divergence)
+        keep their own lifecycle. The empty agent_id is accepted because
+        the embedding-side detectors open conditions without agent
+        attribution. Callers gate on the same late-verdict staleness
+        check as the drift side (:meth:`_invocation_target_gone`).
+        """
+        task_id = str(getattr(session, "current_task_id", "") or "")
+        if not task_id:
+            return
+        resolved = _ostate.resolve_drifts_matching(
+            session.state,
+            task_id=task_id,
+            agent_ids={agent_name, ""},
+            turn_id=str(getattr(session, "run_id", "") or ""),
+            kinds=self._REASONING_PIPELINE_DRIFT_KINDS,
+        )
+        if not resolved:
+            return
+        await self._emit_resolved_conditions(
+            session,
+            resolved,
+            reason=(
+                f"reasoning judge returned on-task verdict for agent "
+                f"{agent_name or '(unknown)'}"
+            ),
+        )
+
+    async def _emit_resolved_conditions(
+        self,
+        session: Session,
+        resolved: list[_ostate.Drift],
+        *,
+        reason: str,
+    ) -> None:
+        """Emit one ``DriftDetected(lifecycle=RESOLVED)`` per resolved condition.
+
+        Wire mirror of a batch :func:`state_store.resolve_drifts_matching`
+        call — the state mutation already happened in the caller, so a
+        missing sink list or proto stub leaves lifecycle truth intact.
+        Severity is INFO (the resolving emit is a recovery marker, not a
+        new firing); ``prev_severity`` carries the condition's last
+        recorded severity so sinks can render "recovered from WARNING".
+        Deliberately does NOT route through :meth:`_emit_drift_detected`:
+        resolution is not a detector decision, so no paired
+        ``SteeringDecisionMade`` / ``JudgementEmitted`` and no
+        ``session.drift_events`` append.
+        """
+        if not self._steerer._sinks:
+            return
+        try:
+            from goldfive.pb.goldfive.v1 import types_pb2
+        except Exception as exc:  # noqa: BLE001 — proto stubs may be missing
+            log.debug(
+                "DriftObserver._emit_resolved_conditions: proto stubs unavailable: %s",
+                exc,
+            )
+            return
+        for condition in resolved:
+            try:
+                evt = self._steerer._new_envelope(session)
+                payload = evt.drift_detected
+                if condition.kind is not None:
+                    payload.kind = self._steerer._drift_kind_pb_value(condition.kind)
+                payload.severity = self._steerer._drift_severity_pb_value(DriftSeverity.INFO)
+                if condition.severity is not None:
+                    payload.prev_severity = self._steerer._drift_severity_pb_value(
+                        condition.severity
+                    )
+                payload.detail = reason
+                payload.current_task_id = condition.task_id
+                payload.current_agent_id = condition.agent_id
+                payload.id = _uuid_hex()
+                payload.authored_by = "goldfive"
+                payload.condition_id = condition.condition_id
+                payload.lifecycle = self._drift_lifecycle_pb_value(
+                    condition.lifecycle, types_pb2
+                )
+                await self._steerer._emit(evt)
+            except Exception as exc:  # noqa: BLE001 — observability-only
+                log.debug(
+                    "DriftObserver._emit_resolved_conditions: emit failed for "
+                    "condition %s: %s",
+                    condition.condition_id,
+                    exc,
+                )
 
     # ------------------------------------------------------------------
     # Source attribution helpers
@@ -1810,11 +2126,9 @@ class DriftObserver:
         observability event so consumers see one truncation marker
         regardless of which detector produced the drift.
         """
-        if not isinstance(text, str):
-            return ""
-        if len(text) <= limit:
-            return text
-        return text[:limit] + " … [truncated]"
+        from goldfive.drift.registry import truncate_for_observability
+
+        return truncate_for_observability(text, limit)
 
     @staticmethod
     def _summarize_recent_tool_calls(session: Session, *, limit: int = 10) -> str:
@@ -1873,33 +2187,16 @@ class DriftObserver:
         trimmed = [r[:240] + ("…" if len(r) > 240 else "") for r in tail]
         return " | ".join(trimmed)
 
-    @classmethod
-    def _parse_reflective_response(cls, raw: Any) -> dict[str, Any] | None:
-        """Extract the first JSON object from ``raw`` or return None.
+    @staticmethod
+    def _parse_reflective_response(raw: Any) -> dict[str, Any] | None:
+        """Parse the reflective-check verdict via the shared judge parser.
 
-        Tolerates markdown code fences (``\\`\\`\\`json ... \\`\\`\\``) and
-        prose wrapping, which real LLMs emit even with strong "reply JSON
-        only" instructions. Returns ``None`` for any shape that is not a
-        dict once parsed, so downstream code can check one failure mode.
+        Delegates to :func:`goldfive.drift.registry.parse_json_response`
+        — one liberal JSON-from-LLM parser for every verdict path.
         """
-        if not isinstance(raw, str) or not raw.strip():
-            return None
-        stripped = raw.strip()
-        # Fast path: parse verbatim.
-        try:
-            decoded = json.loads(stripped)
-        except (json.JSONDecodeError, ValueError):
-            # Try extracting the first {...} block.
-            match = cls._JSON_OBJECT_RE.search(stripped)
-            if match is None:
-                return None
-            try:
-                decoded = json.loads(match.group(0))
-            except (json.JSONDecodeError, ValueError):
-                return None
-        if not isinstance(decoded, dict):
-            return None
-        return decoded
+        from goldfive.drift.registry import parse_json_response
+
+        return parse_json_response(raw)
 
     # ------------------------------------------------------------------
     # Structural-escalation helpers (progress-stall, handler-exhausted)
@@ -2092,9 +2389,31 @@ class DriftObserver:
     # and is not affected by this guard.
     _GOAL_DRIFT_TASK_BOUNDARY_MIN_INTERVAL_S: float = 10.0
 
+    # Upper bound on per-session judge-latency samples retained for the
+    # verdict-utility summary. Keeps the ledger cheap on pathological
+    # runs; p50/p95 over the first N calls is representative enough.
+    _LEDGER_ELAPSED_SAMPLES_CAP: ClassVar[int] = 1024
+
     # ------------------------------------------------------------------
     # Observation entry points
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _stamp_last_observed(session: Session) -> None:
+        """Refresh ``session.last_observed_event_at`` (liveness watermark).
+
+        Called from every observation entry point (``observe`` /
+        ``observe_reasoning`` / ``note_agent_activity`` /
+        ``note_tool_observation``) so the wall-clock stall watchdog
+        (``SteeringConfig.stall_watchdog_enabled``) sees any observed
+        activity — including tool calls on a long-running single task
+        that never transitions — as liveness. Best-effort: a session
+        stub without the field must not break observation dispatch.
+        """
+        try:
+            session.last_observed_event_at = time.monotonic()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("_stamp_last_observed: swallowed: %s", exc)
 
     async def observe(self, event: Any, session: Session) -> None:
         """Inspect ``event``, classify drift, and refine if severe enough.
@@ -2114,6 +2433,7 @@ class DriftObserver:
         based drifts (LOOPING_REASONING, tool errors, …) are NOT
         deduped — they're heuristic signals, not user actions.
         """
+        self._stamp_last_observed(session)
         # First observe call on a session snapshots the detector
         # dispatch order so an optimizer can see WHICH detectors were
         # in play independent of which ones fired. Idempotent (the
@@ -2211,6 +2531,7 @@ class DriftObserver:
         """
         if not text:
             return
+        self._stamp_last_observed(session)
         # goldfive#441 — advance the logical-turn counter once per
         # reasoning observation. The user-steer suppression window
         # (:meth:`_should_promote_to_steer`) measures freshness against
@@ -2269,25 +2590,55 @@ class DriftObserver:
         # regardless of verdict. ``None`` when no sinks are bound —
         # the classifier then stays sink-less and behaves as before.
         judge_sink = self._steerer._sinks[0] if self._steerer._sinks else None
-        # Snapshot the reasoning-history position at schedule time so
-        # the bg pipeline sees the same view the inline pattern
-        # detectors just saw, even if subsequent turns append more
-        # entries before the bg task runs. Without this, a detector
-        # that slices ``history[-N:-1]`` (expecting ``text`` to be the
-        # last entry) would see ``text`` itself in the comparison
-        # window and trivially self-match (goldfive#251 ordering
-        # regression surfaced by the cluster-tightening one-shot
-        # test). ``history_length`` is the length AFTER ``text`` was
-        # appended — the bg path trims ``session.reasoning_history``
-        # to this length for its invocation.
-        history_length = len(session.reasoning_history)
+        # Snapshot the reasoning history at schedule time so the bg
+        # pipeline sees the same view the inline pattern detectors
+        # just saw, even if subsequent turns append more entries (or
+        # the cap trims old ones) before the bg task runs. Without
+        # this, a detector that slices ``history[-N:-1]`` (expecting
+        # ``text`` to be the last entry) would see ``text`` itself in
+        # the comparison window and trivially self-match (goldfive#251
+        # ordering regression surfaced by the cluster-tightening
+        # one-shot test). ``text`` was appended above, so it is the
+        # snapshot's last entry.
+        pinned_history = list(session.reasoning_history)
+        # Judge-scheduling guards — coalescing. When a request for the
+        # same (session, agent, task) key is still QUEUED (its
+        # background task has not yet acquired the judge-concurrency
+        # semaphore), fold this observation into it: newest window
+        # wins, a granted judge slot is never downgraded, and no
+        # second task is scheduled. A RUNNING call is never coalesced —
+        # its entry left the registry when it acquired the semaphore.
+        queue_key = (
+            str(session.id or ""),
+            agent_name or "",
+            str(session.current_task_id or ""),
+        )
+        queued = self._queued_judge_windows.get(queue_key)
+        if queued is not None:
+            queued.text = text
+            queued.pinned_history = pinned_history
+            if rl_call_llm is not None:
+                queued.call_llm = rl_call_llm
+            queued.coalesced += 1
+            log.debug(
+                "DefaultSteerer.observe_reasoning: coalesced queued judge "
+                "window for key=%r (%d observation(s) folded)",
+                queue_key,
+                queued.coalesced,
+            )
+            return
+        window = _QueuedJudgeWindow(
+            text=text,
+            pinned_history=pinned_history,
+            call_llm=rl_call_llm,
+        )
+        self._queued_judge_windows[queue_key] = window
         bg_task = asyncio.create_task(
             self._run_judge_background(
-                text=text,
+                queue_key=queue_key,
+                window=window,
                 session=session,
-                call_llm=rl_call_llm,
                 judge_sink=judge_sink,
-                history_length=history_length,
                 agent_name=agent_name,
             ),
             # goldfive#243: encode session.id in the task name so
@@ -2370,34 +2721,76 @@ class DriftObserver:
     async def _run_judge_background(
         self,
         *,
+        queue_key: tuple[str, str, str],
+        window: _QueuedJudgeWindow,
+        session: Session,
+        judge_sink: Any,
+        agent_name: str = "",
+    ) -> None:
+        """Semaphore-gated dispatch of one queued judge window.
+
+        Scheduled by :meth:`observe_reasoning` as an
+        :func:`asyncio.create_task`. Waits on the per-steerer
+        judge-concurrency semaphore (:attr:`_judge_semaphore`) so at
+        most ``ReasoningDriftConfig.max_concurrent_judges`` background
+        judge calls run at once — while waiting, the ``window`` payload
+        stays coalescable in :attr:`_queued_judge_windows` (newest
+        observation for the same key replaces it in place). On acquire
+        the entry is removed (QUEUED -> RUNNING) and the pipeline runs
+        via :meth:`_run_judge_window` on the freshest payload.
+
+        A task cancelled while still queued (run-boundary drain,
+        shutdown) removes its registry entry in the ``finally`` so
+        later observations cannot coalesce onto a dead window and
+        silently vanish.
+        """
+        try:
+            async with self._judge_semaphore:
+                # QUEUED -> RUNNING: release the coalescing slot BEFORE
+                # reading the payload so a newer observation for the
+                # same key schedules a fresh request instead of
+                # mutating a window that is already being judged.
+                if self._queued_judge_windows.get(queue_key) is window:
+                    del self._queued_judge_windows[queue_key]
+                await self._run_judge_window(
+                    text=window.text,
+                    session=session,
+                    call_llm=window.call_llm,
+                    judge_sink=judge_sink,
+                    pinned_history=window.pinned_history,
+                    agent_name=agent_name,
+                )
+        finally:
+            if self._queued_judge_windows.get(queue_key) is window:
+                del self._queued_judge_windows[queue_key]
+
+    async def _run_judge_window(
+        self,
+        *,
         text: str,
         session: Session,
         call_llm: ReflectiveCallLLM | None,
         judge_sink: Any,
-        history_length: int,
+        pinned_history: list[str],
         agent_name: str = "",
     ) -> None:
         """Run the mode-selected reasoning drift pipeline off the critical path.
 
-        Scheduled by :meth:`observe_reasoning` as an
-        :func:`asyncio.create_task` so the adapter's model-response
-        callback can return before ADK dispatches the response's tool
-        calls. Awaits :func:`~goldfive.drift.reasoning.analyze_reasoning`
+        Body of the historical ``_run_judge_background`` (which is now
+        the semaphore-gated wrapper above). Awaits
+        :func:`~goldfive.drift.reasoning.analyze_reasoning`
         and, if it yields a :class:`DriftEvent`, routes it through
         :meth:`_handle_drift` — same effect as the historical inline
         path, just resolving later.
 
-        ``history_length`` pins the ``session.reasoning_history`` view
-        the pipeline sees to the same tail index that was in effect
-        when the bg task was scheduled. Later turns that append to
-        the shared history (this same session receiving more
-        reasoning blocks before the bg task runs) would otherwise
-        shift the detectors' "exclude self" slice and generate false
-        self-match LOOPING signals. We temporarily truncate the
-        session view for the duration of this bg invocation and
-        restore it after; concurrent bg tasks serialize on the same
-        session's reasoning_history via the asyncio event loop (no
-        threading) so the save/restore pattern is safe in practice.
+        ``pinned_history`` is the ``session.reasoning_history``
+        snapshot captured at schedule time, forwarded to the pipeline
+        explicitly. Later turns that append to the shared live history
+        (this same session receiving more reasoning blocks before the
+        bg task runs) would otherwise shift the detectors' "exclude
+        self" slice and generate false self-match LOOPING signals.
+        ``session.reasoning_history`` itself is never touched here, so
+        concurrent readers always see the live list.
 
         Never raises: any exception (from the judge LLM, the embedding
         pipeline, or ``_handle_drift``) is logged at ``WARNING`` and
@@ -2407,54 +2800,52 @@ class DriftObserver:
         try:
             from goldfive.drift.reasoning import analyze_reasoning_with_focus
 
-            # Save the shared live history and swap in a list snapshot
-            # truncated to the length captured at schedule time. Using
-            # list slicing (not mutation) keeps any already-escaped
-            # reference (e.g. a concurrent detector) pointing at the
-            # original list. We restore the live reference in a
-            # ``finally`` so intervening appends are not lost.
-            original_history = session.reasoning_history
-            pinned_history = list(original_history[:history_length])
-            session.reasoning_history = pinned_history
-            try:
-                # Phase 1 of goldfive#271 — call the focused-verdict
-                # path so we get the judge's plan-task attribution
-                # alongside the drift signal. ``analyze_reasoning_with_focus``
-                # is a sibling of ``analyze_reasoning`` that threads a
-                # :class:`ReasoningJudgeVerdict` instead of just the
-                # drift; legacy callers of ``analyze_reasoning`` keep
-                # their existing return shape.
-                #
-                # goldfive#244 — also forward the wrapped agent tree so
-                # the judge can recognise legitimate coordinator → sub-
-                # agent delegation as ON-TASK rather than OFF_TOPIC.
-                # Reuses the same shape the planner already consumes
-                # (``ADKAdapter.available_agents_tree``); legacy adapters
-                # without the property fall back to a flat
-                # ``available_agents`` list, and adapters with neither
-                # leave ``available_agents=None`` — the judge prompt
-                # then renders byte-identically to pre-#244.
-                judge_available_agents = self._resolve_available_agents()
-                verdict = await analyze_reasoning_with_focus(
-                    text,
-                    session,
-                    mode=self._steerer._reasoning_drift_mode,
-                    call_llm=call_llm,
-                    model=self._steerer._reasoning_drift_model,
-                    sink=judge_sink,
-                    agent_name=agent_name,
-                    available_agents=judge_available_agents,
-                    # AGENCY-PRESERVATION.md PR 11(b) — ledger mode
-                    # re-grounds the judge on goals (primary) with the
-                    # bound task as context.
-                    ledger=self._ledger_mode(),
-                )
-            finally:
-                # Restore the live history. Any entries appended by
-                # subsequent turns are preserved because we pointed
-                # ``session.reasoning_history`` at a separate list for
-                # our window.
-                session.reasoning_history = original_history
+            # Phase 1 of goldfive#271 — call the focused-verdict
+            # path so we get the judge's plan-task attribution
+            # alongside the drift signal. ``analyze_reasoning_with_focus``
+            # is a sibling of ``analyze_reasoning`` that threads a
+            # :class:`ReasoningJudgeVerdict` instead of just the
+            # drift; legacy callers of ``analyze_reasoning`` keep
+            # their existing return shape.
+            #
+            # goldfive#244 — also forward the wrapped agent tree so
+            # the judge can recognise legitimate coordinator → sub-
+            # agent delegation as ON-TASK rather than OFF_TOPIC.
+            # Reuses the same shape the planner already consumes
+            # (``ADKAdapter.available_agents_tree``); legacy adapters
+            # without the property fall back to a flat
+            # ``available_agents`` list, and adapters with neither
+            # leave ``available_agents=None`` — the judge prompt
+            # then renders byte-identically to pre-#244.
+            judge_available_agents = self._resolve_available_agents()
+            verdict = await analyze_reasoning_with_focus(
+                text,
+                session,
+                mode=self._steerer._reasoning_drift_mode,
+                call_llm=call_llm,
+                model=self._steerer._reasoning_drift_model,
+                sink=judge_sink,
+                agent_name=agent_name,
+                available_agents=judge_available_agents,
+                reasoning_history=pinned_history,
+                # AGENCY-PRESERVATION.md PR 11(b) — ledger mode
+                # re-grounds the judge on goals (primary) with the
+                # bound task as context.
+                ledger=self._ledger_mode(),
+            )
+
+            # Verdict-utility ledger — latency + quiet-fail accounting.
+            # ``judge_ran`` distinguishes "the judge LLM was dispatched"
+            # from the embedding-only / mode-off paths; the empty
+            # ``classification`` on a ran judge is the quiet-fail
+            # sentinel (call raised, non-JSON response, missing keys).
+            if getattr(verdict, "judge_ran", False):
+                ledger = self._verdict_ledger(session)
+                samples = ledger["elapsed_ms"]
+                if len(samples) < self._LEDGER_ELAPSED_SAMPLES_CAP:
+                    samples.append(int(getattr(verdict, "elapsed_ms", 0)))
+                if not getattr(verdict, "classification", ""):
+                    ledger["parse_fail"] += 1
 
             # Record the reasoning-extracted binding onto the
             # orchestration store regardless of the drift verdict —
@@ -2483,6 +2874,16 @@ class DriftObserver:
                     task_id=session.current_task_id,
                     agent_name=agent_name,
                 )
+                # An on-task verdict is the recovery signal for
+                # conditions this same pipeline opened. Gated on the
+                # same staleness predicate as the drift branch below
+                # (goldfive#319) so a verdict landing after its
+                # invocation terminated cannot resolve a fresh
+                # condition opened by a newer turn.
+                if not self._invocation_target_gone(session):
+                    await self._resolve_conditions_on_on_task_verdict(
+                        session, agent_name=agent_name
+                    )
                 return
             if not drift.trigger_input:
                 drift.trigger_input = self._truncate_trigger_input(text)
@@ -2510,10 +2911,12 @@ class DriftObserver:
                     drift.current_task_id or "-",
                     drift.kind.value,
                 )
+                self._verdict_ledger(session)["emitted_late"] += 1
                 if not drift.authored_by:
                     drift.authored_by = self._resolve_authored_by(drift)
                 await self._emit_drift_detected(session, drift)
                 return
+            self._verdict_ledger(session)["acted_on"] += 1
             await self.handle_drift(drift, session)
         except asyncio.CancelledError:
             # Propagate cancellation so :meth:`shutdown` / event-loop
@@ -2593,6 +2996,86 @@ class DriftObserver:
             )
 
     # ------------------------------------------------------------------
+    # Verdict-utility ledger (judge-scheduling guards)
+    # ------------------------------------------------------------------
+
+    def _verdict_ledger(self, session: Session) -> dict[str, Any]:
+        """Get-or-create the per-session verdict-utility ledger.
+
+        Plain dict on the steerer — cheap by design. ``session`` is
+        retained on the entry so the teardown summary can stamp
+        ``run_id`` and draw a gap-free sequence number. Counters:
+
+        * ``acted_on`` — reasoning-judge verdicts dispatched into
+          :meth:`handle_drift` (past the late gate).
+        * ``emitted_late`` — verdicts emitted-only because the
+          originating invocation had already terminated (goldfive#319
+          gate in :meth:`_run_judge_window`).
+        * ``emitted_redundant`` — verdicts emitted-only at
+          :meth:`handle_drift`'s entry gates (addressed-watermark and
+          in-flight-refine); counts every observation-stamped verdict
+          that hits those gates, reasoning-judge or otherwise.
+        * ``parse_fail`` — judge calls that quiet-failed (empty
+          classification sentinel).
+        * ``elapsed_ms`` — bounded judge-call latency samples.
+        """
+        sid = str(session.id or "")
+        ledger = self._verdict_ledgers.get(sid)
+        if ledger is None:
+            ledger = {
+                "session": session,
+                "acted_on": 0,
+                "emitted_late": 0,
+                "emitted_redundant": 0,
+                "parse_fail": 0,
+                "elapsed_ms": [],
+            }
+            self._verdict_ledgers[sid] = ledger
+        return ledger
+
+    async def _emit_verdict_utility_summary(self, session_id: str) -> None:
+        """Pop the session's ledger and emit its summary, if one exists.
+
+        Emits a ``reasoning_judge_utility_summary`` dict envelope (via
+        :func:`goldfive.events.make_event` — no proto change) carrying
+        the four utility counters plus judge-call count and nearest-rank
+        p50/p95 of the in-session ``elapsed_ms`` samples. A session with
+        no judge activity never created a ledger, so quiet runs emit
+        nothing; the pop makes repeat drains idempotent.
+        """
+        ledger = self._verdict_ledgers.pop(session_id, None)
+        if ledger is None:
+            return
+        session = ledger["session"]
+        samples = sorted(int(s) for s in ledger["elapsed_ms"])
+        payload: dict[str, Any] = {
+            "acted_on": int(ledger["acted_on"]),
+            "emitted_late": int(ledger["emitted_late"]),
+            "emitted_redundant": int(ledger["emitted_redundant"]),
+            "parse_fail": int(ledger["parse_fail"]),
+            "judge_calls": len(samples),
+            "elapsed_ms_p50": _nearest_rank_percentile(samples, 0.5),
+            "elapsed_ms_p95": _nearest_rank_percentile(samples, 0.95),
+        }
+        try:
+            from goldfive.events import emit, make_event
+
+            evt = make_event(
+                str(session.run_id or ""),
+                session.next_sequence(),
+                "reasoning_judge_utility_summary",
+                payload,
+                session_id=session_id,
+            )
+            await emit(self._steerer._sinks, evt)
+        except Exception as exc:  # noqa: BLE001 — observability only
+            log.warning(
+                "DriftObserver._emit_verdict_utility_summary: emit failed "
+                "(swallowed): %s",
+                exc,
+            )
+
+    # ------------------------------------------------------------------
     # Background-task lifecycle (drain + shutdown)
     # ------------------------------------------------------------------
 
@@ -2621,6 +3104,11 @@ class DriftObserver:
             await self._drain_background_set(
                 self._steerer._background_drifts, label="drift", timeout=timeout
             )
+        # Flush verdict-utility ledgers whose sessions never hit a
+        # run-boundary drain (custom executors, aborted loops). Sessions
+        # already summarised at their run boundary were popped there.
+        for sid in list(self._verdict_ledgers):
+            await self._emit_verdict_utility_summary(sid)
 
     async def drain_session_background_tasks(
         self, *, session_id: str, timeout: float = 2.0
@@ -2684,6 +3172,11 @@ class DriftObserver:
             await self._drain_background_set(
                 judge_subset, label="judge", timeout=timeout
             )
+        # Run-boundary summary: judges that finished during the drain
+        # above have already counted; stragglers were cancelled and
+        # count nothing. Emitted BEFORE the executor's terminal
+        # RunAborted / RunCompleted so the summary rides inside the run.
+        await self._emit_verdict_utility_summary(session_id)
 
     async def _drain_background_set(
         self,
@@ -2956,11 +3449,13 @@ class DriftObserver:
                 from goldfive._llm import (
                     call_llm_budget,
                     call_llm_thinking_disabled,
+                    llm_call_diagnostics,
                 )
 
                 with (
                     call_llm_budget(self.REFLECTIVE_MAX_OUTPUT_TOKENS),
                     call_llm_thinking_disabled(),
+                    llm_call_diagnostics() as llm_diag,
                 ):
                     raw = await call_llm(
                         self.REFLECTIVE_SYSTEM_PROMPT,
@@ -2971,11 +3466,10 @@ class DriftObserver:
                 if parsed is None:
                     # Distinguish "model returned all thinking, no
                     # answer" from "model returned garbage" — see
-                    # goldfive#271 follow-up to #311. ``call_llm`` is
-                    # the closure built by ``make_default_adk_call_llm``
-                    # / ``_build_judge_call_llm`` which stashes part
-                    # counts on itself.
-                    _thought_n = int(getattr(call_llm, "last_thought_count", 0) or 0)
+                    # goldfive#271 follow-up to #311. The default
+                    # builders record part counts into the per-call
+                    # diagnostics object.
+                    _thought_n = llm_diag.thought_count
                     _raw_str = raw if isinstance(raw, str) else ""
                     if not _raw_str.strip() and _thought_n > 0:
                         span.output_preview = (
@@ -3137,6 +3631,7 @@ class DriftObserver:
         """
         if not kind:
             return
+        self._stamp_last_observed(session)
         entry: dict[str, Any] = {"kind": kind}
         if agent_name:
             entry["agent_name"] = agent_name
@@ -3189,6 +3684,7 @@ class DriftObserver:
         an ADK callback. The catch is intentionally broad.
         """
         try:
+            self._stamp_last_observed(session)
             ts_ms = time.monotonic_ns() // 1_000_000
             try:
                 args_preview = repr(args)[:240]
@@ -3495,7 +3991,9 @@ class DriftObserver:
         # mode.
         await self._dispatch_nudge(drift, session)
 
-    async def maybe_run_goal_drift_check(self, session: Session) -> None:
+    async def maybe_run_goal_drift_check(
+        self, session: Session, *, idle_note: str = ""
+    ) -> None:
         """Run the trajectory-level GOAL_DRIFT judge once, cost-bounded.
 
         Opt-in, feature-gated by ``goal_drift_call_llm``. Does NOT
@@ -3503,6 +4001,13 @@ class DriftObserver:
         scheduling go through :meth:`note_agent_turn`. Public so
         operators can trigger a one-shot check from outside the
         interval (e.g. on a long idle period with no task transitions).
+
+        ``idle_note`` — non-empty when the caller is the wall-clock
+        stall watchdog's idle trigger (the ``GOAL_DRIFT_IDLE_SECONDS``
+        consumer). Appended to the activity snapshot as a synthetic
+        entry so the judge's activity block renders e.g.
+        ``- idle_observed: 300s since last observed activity`` without
+        any change to the prompt template.
 
         Outcomes:
 
@@ -3531,6 +4036,8 @@ class DriftObserver:
         activity = filter_recent_events_by_kind(
             session.recent_events, RECENT_EVENT_AGENT_ACTIVITY_KINDS
         )
+        if idle_note:
+            activity = [*activity, {"kind": "idle_observed", "detail": idle_note}]
         drift = await classify_goal_drift(
             goals=session.goals,
             plan=session.plan,
@@ -3566,7 +4073,9 @@ class DriftObserver:
             return
         await self.handle_drift(drift, session)
 
-    def _spawn_goal_drift_judge_background(self, session: Session) -> None:
+    def _spawn_goal_drift_judge_background(
+        self, session: Session, *, idle_note: str = ""
+    ) -> None:
         """Spawn :meth:`maybe_run_goal_drift_check` as a fire-and-forget task.
 
         Goldfive v22 regression fix. The trajectory-level GOAL_DRIFT
@@ -3601,6 +4110,10 @@ class DriftObserver:
         synchronous test harnesses that build a steerer outside an
         async context from raising). No-op when no judge ``call_llm``
         is configured.
+
+        ``idle_note`` (stall watchdog, goldfive#143 idle scheduling) is
+        threaded to :meth:`maybe_run_goal_drift_check`, which renders
+        it into the judge's activity block.
         """
         if self._steerer._goal_drift_call_llm is None:
             return
@@ -3614,7 +4127,7 @@ class DriftObserver:
             # judge anyway.
             return
         bg_task = asyncio.create_task(
-            self._run_goal_drift_judge_background(session),
+            self._run_goal_drift_judge_background(session, idle_note=idle_note),
             # goldfive#243: encode session.id in the task name so
             # :meth:`drain_session_background_tasks` can filter pending
             # tasks by the run boundary that's terminating, leaving any
@@ -3624,7 +4137,9 @@ class DriftObserver:
         self._steerer._background_judges.add(bg_task)
         bg_task.add_done_callback(self._steerer._background_judges.discard)
 
-    async def _run_goal_drift_judge_background(self, session: Session) -> None:
+    async def _run_goal_drift_judge_background(
+        self, session: Session, *, idle_note: str = ""
+    ) -> None:
         """Body of the fire-and-forget GOAL_DRIFT judge task.
 
         Mirrors :meth:`_run_judge_background` (the reasoning-judge
@@ -3639,7 +4154,7 @@ class DriftObserver:
         cancellable agent task that hosted us.
         """
         try:
-            await self.maybe_run_goal_drift_check(session)
+            await self.maybe_run_goal_drift_check(session, idle_note=idle_note)
         except asyncio.CancelledError:
             # Propagate so :meth:`shutdown` / teardown sees a clean
             # cancel. The shutdown path expects this and counts it
@@ -4164,9 +4679,22 @@ class DriftObserver:
                 None,
                 (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
             ),
+            # TASK_TIMEOUT WARNING cell (#487): the wall-clock stall
+            # watchdog (flag-gated, default OFF —
+            # ``SteeringConfig.stall_watchdog_enabled``) fires WARNING
+            # first. A stall is a liveness signal, not a plan defect, so
+            # WARNING signals rather than refining (ABSORB would loop the
+            # planner against a plan that isn't wrong). CRITICAL pauses at
+            # BOTH positions: the watchdog only emits CRITICAL on
+            # continued silence after its WARNING, so a CRITICAL is by
+            # construction already a repeat — and the refine-outcome-based
+            # occurrence counter never advances on the SIGNAL path, so the
+            # pair's repeat slot alone would be unreachable. Both regimes
+            # share the row (the SIGNAL cell delivers via whichever
+            # channel is configured).
             DriftKind.TASK_TIMEOUT: (
-                None,
-                None,
+                _IL.OBSERVE,
+                _IL.SIGNAL,
                 (_IL.PAUSE_ESCALATE, _IL.PAUSE_ESCALATE),
             ),
             DriftKind.LLM_CALL_TIMEOUT: (
@@ -4391,7 +4919,17 @@ class DriftObserver:
                 )
                 # Emit for observability so operators see the detector
                 # ran; do NOT cancel / refine on a redundant view.
-                await self._emit_drift_detected(session, drift)
+                self._verdict_ledger(session)["emitted_redundant"] += 1
+                await self._emit_drift_detected(
+                    session,
+                    drift,
+                    decision_outcome="drift_dropped_stale",
+                    decision_reason=(
+                        f"stale verdict: observed revision "
+                        f"{drift.observed_revision_index} but same "
+                        f"(kind, target) addressed at revision {last_addressed}"
+                    ),
+                )
                 return
             # goldfive#405 MEDIUM #4 — concurrent-refine race close. The
             # watermark above stamps AT THE END of a successful refine
@@ -4423,7 +4961,17 @@ class DriftObserver:
                     drift.current_task_id or "<trajectory>",
                     drift.observed_revision_index,
                 )
-                await self._emit_drift_detected(session, drift)
+                self._verdict_ledger(session)["emitted_redundant"] += 1
+                await self._emit_drift_detected(
+                    session,
+                    drift,
+                    decision_outcome="drift_dropped_inflight",
+                    decision_reason=(
+                        f"concurrent refine already in-flight for "
+                        f"(kind={drift.kind.value}, "
+                        f"target={drift.current_task_id or '<trajectory>'})"
+                    ),
+                )
                 return
             self._inflight_refine_keys.add(inflight_key)
         try:
@@ -4639,10 +5187,14 @@ class DriftObserver:
             await self._dispatch_pause_escalate(drift, session)
             return
         if level is InterventionLevel.TERMINATE:
-            # Level 5 is reserved for a future Runner-side timeout on a
-            # stuck Level 4 pause. Today we fall back to PAUSE_ESCALATE
-            # so no code path silently drops the drift.
-            await self._dispatch_pause_escalate(drift, session)
+            # Level 5: pause-with-deadline. Same channel dispatch as
+            # Level 4, but the payload always carries a ``deadline_s``
+            # (configured value, or DEFAULT_TERMINATE_PAUSE_DEADLINE_S
+            # when unset) so the executor's pause wait aborts the run
+            # instead of blocking forever. Pre-fix this silently
+            # degraded to another PAUSE_ESCALATE, making the
+            # (PAUSE_ESCALATE, TERMINATE) ladder rows identical.
+            await self._dispatch_pause_escalate(drift, session, terminate=True)
             return
         # ABSORB and CANCEL_REINVOKE both call ``planner.refine`` and
         # install the revised plan. CANCEL_REINVOKE additionally queues
@@ -5023,7 +5575,11 @@ class DriftObserver:
             # configured delivery channel — legacy ``pending_nudges`` or
             # the request_context observer-note queue. ``ladder_level="absorb"``
             # lets the divergence report tell this post-ABSORB delivery apart
-            # from the Level-2 ``_dispatch_nudge`` one.
+            # from the Level-2 ``_dispatch_nudge`` one. The goldfive#475
+            # observation-only gate + PolicyApplied telemetry live on the
+            # router's legacy leg; ``plan_revision_installed`` threads the
+            # ``_apply_revision`` install fact so the executor's replay
+            # header only claims a revision when one truly installed.
             nudge_msg = compose_note_for_drift(drift=drift, session=session)
             log.debug(
                 "DefaultSteerer._handle_drift: queued post-ABSORB nudge for kind=%s task=%s: %s",
@@ -5032,7 +5588,11 @@ class DriftObserver:
                 nudge_msg,
             )
             await self._route_corrective_note(
-                session, drift, nudge_msg, ladder_level="absorb"
+                session,
+                drift,
+                nudge_msg,
+                ladder_level="absorb",
+                plan_revision_installed=was_installed,
             )
 
     # ------------------------------------------------------------------
@@ -5050,6 +5610,14 @@ class DriftObserver:
         Body content (AGENCY-PRESERVATION.md PR 4): an observation+goal
         advisory note from :mod:`goldfive.observer_notes` — no
         next-task / next-agent directives.
+
+        Observation-only: the overlay drains the legacy queue into a
+        goldfive-authored user turn that re-invokes the tree, so the
+        legacy-channel enqueue is gated on
+        :meth:`DefaultSteerer.is_active_steering` inside
+        :meth:`_route_corrective_note` (goldfive#475) like the other
+        injection points; the would-be nudge is logged and the gate
+        stamped as decision telemetry there.
         """
         from goldfive.observer_notes import compose_note_for_drift
 
@@ -5062,13 +5630,14 @@ class DriftObserver:
         )
         # AGENCY-PRESERVATION.md PR 5/6: route to the configured delivery
         # channel. Legacy (default) appends to ``session.pending_nudges`` and
-        # records the nudge_replay delivery at enqueue — the message physically
-        # queues even under ``observation_only`` (only the steer / pause /
-        # cancel write-paths are gated), so ``channel_action="queued"`` records
-        # that mechanical truth while ``dry_run`` tracks shadow-mode for the
-        # §5.4 divergence report. PR 6's request_context channel routes through
-        # the gated observer-note queue: SignalDelivered is emitted once HERE at
-        # the dispatch decision point (the PR-5 model the §5.4 diff is built on),
+        # records the nudge_replay delivery at enqueue — gated on
+        # ``is_active_steering`` (goldfive#475: the pre-#475 asymmetry where
+        # the message physically queued even under ``observation_only`` is
+        # gone; a suppressed enqueue stamps ``channel_action="suppressed"``
+        # while ``dry_run`` tracks shadow-mode for the §5.4 divergence
+        # report). PR 6's request_context channel routes through the gated
+        # observer-note queue: SignalDelivered is emitted once HERE at the
+        # dispatch decision point (the PR-5 model the §5.4 diff is built on),
         # and a delivery surface later RENDERS the note exactly-once under
         # ``_should_inject`` — rendering at a surface does NOT emit a second
         # event; ``dry_run`` records whether the note actually reaches the agent.
@@ -5163,7 +5732,7 @@ class DriftObserver:
         # see what would have been dispatched (drift kind, task id, body).
         # No cancel-and-restart fires on the executor; the live invocation
         # continues against the prior plan.
-        if not self._steerer._should_inject():
+        if not self._steerer.is_active_steering():
             log.info(
                 "DefaultSteerer._dispatch_goldfive_steer_control: "
                 "observation_only=True — SKIPPING GOLDFIVE_STEER enqueue. "
@@ -5199,12 +5768,31 @@ class DriftObserver:
         )
         return landed
 
+    def _pause_escalate_deadline_s(self) -> float | None:
+        """Return the configured pause-escalation deadline, or ``None``.
+
+        Reads :attr:`~goldfive.config.SteeringConfig.pause_escalate_deadline_s`
+        off the bound steerer's config. Non-positive values are treated
+        as unset so a misconfigured deadline never produces an
+        immediately-expired pause.
+        """
+        cfg = getattr(self._steerer, "_steering_config", None)
+        raw = getattr(cfg, "pause_escalate_deadline_s", None) if cfg is not None else None
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     async def _dispatch_goldfive_pause_control(
         self,
         drift: DriftEvent,
         session: Session,
         *,
         reason: str,
+        terminate: bool = False,
     ) -> bool:
         """Mint and dispatch a ``GOLDFIVE_PAUSE_ESCALATE`` ControlMessage.
 
@@ -5213,6 +5801,14 @@ class DriftObserver:
         every Level-4 / progress-stall / handler-exhausted escalation
         site so the executor's pre-task loop blocks via the same
         channel state as a user-issued ``PAUSE``.
+
+        The payload carries the escalation lineage (``drift_kind``,
+        ``ladder_level``) and — when a deadline applies — ``deadline_s``,
+        which bounds the executor's pause wait. Level 4 uses the
+        configured :meth:`_pause_escalate_deadline_s` (``None`` = wait
+        forever, the historical behaviour). ``terminate=True`` (Level 5)
+        always attaches a deadline: the configured value when set,
+        otherwise :data:`DEFAULT_TERMINATE_PAUSE_DEADLINE_S`.
 
         Returns ``True`` on successful dispatch, ``False`` on no
         bound channel / send failure.
@@ -5261,13 +5857,15 @@ class DriftObserver:
             extra_decision={
                 "reason": reason,
                 "channel_action": (
-                    "dispatched" if self._steerer._should_inject() else "suppressed"
+                    "dispatched"
+                    if self._steerer.is_active_steering()
+                    else "suppressed"
                 ),
             },
         )
         await self._record_signal_outcome_escalated(session, drift)
 
-        if not self._steerer._should_inject():
+        if not self._steerer.is_active_steering():
             log.info(
                 "DefaultSteerer._dispatch_goldfive_pause_control: "
                 "observation_only=True — SKIPPING GOLDFIVE_PAUSE_ESCALATE "
@@ -5279,21 +5877,29 @@ class DriftObserver:
                 reason,
             )
             return False
+        deadline_s = self._pause_escalate_deadline_s()
+        if terminate and deadline_s is None:
+            deadline_s = DEFAULT_TERMINATE_PAUSE_DEADLINE_S
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "drift_id": str(getattr(drift, "id", "") or ""),
+            "drift_kind": drift.kind.value,
+            "ladder_level": "terminate" if terminate else "pause_escalate",
+        }
+        if deadline_s is not None:
+            payload["deadline_s"] = deadline_s
         msg = ControlMessage(
             kind=ControlKind.GOLDFIVE_PAUSE_ESCALATE,
-            payload={
-                "reason": reason,
-                "drift_id": str(getattr(drift, "id", "") or ""),
-                "drift_kind": drift.kind.value,
-            },
+            payload=payload,
         )
         landed = await self._steerer._dispatch_goldfive_control(msg)
         log.debug(
             "DefaultSteerer._dispatch_goldfive_pause_control: "
-            "kind=%s task=%s landed=%s reason=%r",
+            "kind=%s task=%s landed=%s deadline_s=%s reason=%r",
             drift.kind.value,
             drift.current_task_id or "-",
             landed,
+            deadline_s,
             reason,
         )
         return landed
@@ -5302,6 +5908,8 @@ class DriftObserver:
         self,
         drift: DriftEvent,
         session: Session,
+        *,
+        terminate: bool = False,
     ) -> None:
         """Level 4 dispatch: emit HUMAN_INTERVENTION_REQUIRED and pause.
 
@@ -5315,6 +5923,11 @@ class DriftObserver:
         was synonymous with the channel signal but parallel-tracked
         from the user-PAUSE path.
 
+        ``terminate=True`` is the Level 5 variant: identical dispatch,
+        but the pause always carries a hard deadline (see
+        :meth:`_dispatch_goldfive_pause_control`) so the executor
+        aborts the run when no operator intervenes in time.
+
         Emits a CRITICAL ``HUMAN_INTERVENTION_REQUIRED`` drift so
         sinks / the UI can surface the pause and let the user decide
         what to do.
@@ -5325,14 +5938,16 @@ class DriftObserver:
         a second time -- the original DriftDetected emission at the
         top of :meth:`handle_drift` already carried the signal.
         """
+        label = "terminate" if terminate else "pause_escalate"
         await self._dispatch_goldfive_pause_control(
             drift,
             session,
             reason=(
-                f"pause_escalate from {drift.kind.value}: {drift.detail}"
+                f"{label} from {drift.kind.value}: {drift.detail}"
                 if drift.detail
-                else f"pause_escalate from {drift.kind.value}"
+                else f"{label} from {drift.kind.value}"
             ),
+            terminate=terminate,
         )
         if drift.kind is DriftKind.HUMAN_INTERVENTION_REQUIRED:
             # Already emitted at the top of _handle_drift; just pause.
@@ -5538,6 +6153,17 @@ class DriftObserver:
         # normalised at the top of :meth:`handle_drift`.
         if (drift.authored_by or "").lower() == "user":
             return False
+        return self._invocation_target_gone(session)
+
+    def _invocation_target_gone(self, session: Session) -> bool:
+        """Return True when no invocation is live for the session.
+
+        Store-backed half of the late-verdict staleness gate, shared by
+        :meth:`_is_late_drift_for_terminated_invocation` (drift-side)
+        and the on-task condition-resolution path so a stale background
+        verdict can neither dispatch against nor resolve a fresh
+        condition.
+        """
         try:
             from goldfive.state_store import StateStore
 
@@ -5546,7 +6172,7 @@ class DriftObserver:
             cancel_pending = store.cancel_requested_invocation_ids()
         except Exception as exc:  # noqa: BLE001 — defensive
             log.debug(
-                "DefaultSteerer._is_late_drift_for_terminated_invocation: "
+                "DefaultSteerer._invocation_target_gone: "
                 "active_invocation_ids lookup raised (treating as not-late): %s",
                 exc,
             )
@@ -5661,14 +6287,14 @@ class DriftObserver:
           break — the task-cancel step is silently skipped.
 
         Observation-only mode (goldfive#254): when
-        :meth:`DefaultSteerer._should_inject` is ``False`` this method
+        :meth:`DefaultSteerer.is_active_steering` is ``False`` this method
         returns ``[]`` without consulting the plugin or stamping
         ``cancel_requested_invocation_ids``. Logged at INFO so an
         operator can see WHAT would have been cancelled (drift kind,
         task / agent id) without the cancel actually firing on the
         live invocation.
         """
-        if not self._steerer._should_inject():
+        if not self._steerer.is_active_steering():
             log.info(
                 "DefaultSteerer.request_invocation_cancel: "
                 "observation_only=True — SKIPPING cancel for "
@@ -6629,8 +7255,7 @@ class DriftObserver:
         """Side-effects for USER_STEER drift that aren't refine: state
         bookkeeping.
 
-        Called from :meth:`handle_drift` and
-        :meth:`apply_user_steer_with_plan` just before
+        Called from :meth:`handle_drift` just before
         ``_emit_drift_detected`` and well before any plan install so:
 
         1. The ``goldfive.active_steer.*`` keys are set so downstream

@@ -37,6 +37,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.reporting import BUILTIN_REPORTING_TOOLS, ReportingToolSpec  # noqa: E402
 from goldfive.steerer import (  # noqa: E402
     DefaultSteerer,
@@ -132,7 +133,7 @@ async def test_f1_report_task_completed_returns_plan_state_pointer() -> None:
     an information-free ack."""
     session = _multi_task_session(initial_status=TaskStatus.RUNNING)
     sink = _ListSink()
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=_StubPlanner())
 
     out = await _tool("report_task_completed").handler(
@@ -159,7 +160,7 @@ async def test_f1_skips_predecessor_blocked_pending_tasks() -> None:
     edge predecessor is terminal. t3 should NOT be surfaced over t2 even
     though both are PENDING — t3's predecessor (t2) is still PENDING."""
     session = _multi_task_session(initial_status=TaskStatus.RUNNING)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[_ListSink()], planner=_StubPlanner())
 
     out = await _tool("report_task_completed").handler(
@@ -174,7 +175,7 @@ async def test_f1_idempotent_re_report_still_includes_plan_state() -> None:
     task still carries the rich payload so the LLM sees the live plan
     state, not just an ack — that's the anchor that breaks the loop."""
     session = _multi_task_session(initial_status=TaskStatus.RUNNING)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[_ListSink()], planner=_StubPlanner())
 
     # First call: real transition.
@@ -209,7 +210,7 @@ async def test_f1_no_next_pending_when_plan_done() -> None:
         edges=[],
     )
     session = Session(run_id="r1", goals=[Goal(id="g1", summary="x")], plan=plan)
-    steerer = DefaultSteerer()
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[_ListSink()], planner=_StubPlanner())
 
     out = await _tool("report_task_completed").handler(
@@ -360,6 +361,238 @@ def test_f3_allows_dispatch_when_next_pending_is_same_agent() -> None:
     # short-circuits first. (Same path as test_f3_allows_dispatch_when_target_has_pending_work
     # but documents the intent.)
     assert _maybe_redirect_completed_agent(ctx=ctx, target_agent="researcher") is None
+
+
+def test_f3_not_needed_swept_predecessor_no_longer_causes_refusal() -> None:
+    """F3 predicate alignment: a PENDING task behind a NOT_NEEDED-swept
+    predecessor is NOT pin-ready (the delegation pin requires COMPLETED
+    predecessors), so F3 must not treat it as ``next_pending`` and
+    refuse a dispatch the pin machinery would let fall through.
+
+    Pre-fix F3 counted merely-terminal predecessors: t2's predecessors
+    (COMPLETED t1 + NOT_NEEDED t_pre) both passed, so F3 refused the
+    researcher dispatch and redirected toward a task the pin would then
+    decline to bind."""
+    from goldfive.adapters._adk_plugin import (
+        _completed_task_ids,
+        _maybe_redirect_completed_agent,
+        _predecessors_completed,
+    )
+
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="t1",
+                title="Research",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="t_pre",
+                title="Optional prep",
+                assignee_agent_id="helper",
+                status=TaskStatus.NOT_NEEDED,
+            ),
+            Task(
+                id="t2",
+                title="Draft",
+                assignee_agent_id="writer",
+                status=TaskStatus.PENDING,
+            ),
+        ],
+        edges=[
+            TaskEdge(from_task_id="t1", to_task_id="t2"),
+            TaskEdge(from_task_id="t_pre", to_task_id="t2"),
+        ],
+    )
+    ctx = _ctx_for_plan(plan)
+
+    # Pin-side readiness agrees: t2 is not DAG-ready because t_pre is
+    # NOT_NEEDED, not COMPLETED.
+    completed = _completed_task_ids(plan.tasks)
+    assert not _predecessors_completed("t2", edges=plan.edges, completed_ids=completed)
+
+    assert _maybe_redirect_completed_agent(ctx=ctx, target_agent="researcher") is None
+
+
+def test_f3_still_redirects_when_unrelated_task_swept_not_needed() -> None:
+    """F3: a NOT_NEEDED sweep on a task that is NOT a predecessor of the
+    next pending task must not suppress a legitimate redirect."""
+    from goldfive.adapters._adk_plugin import _maybe_redirect_completed_agent
+
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="t1",
+                title="Research",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+            Task(
+                id="t_opt",
+                title="Optional extra",
+                assignee_agent_id="helper",
+                status=TaskStatus.NOT_NEEDED,
+            ),
+            Task(
+                id="t2",
+                title="Draft",
+                assignee_agent_id="writer",
+                status=TaskStatus.PENDING,
+            ),
+        ],
+        edges=[TaskEdge(from_task_id="t1", to_task_id="t2")],
+    )
+    ctx = _ctx_for_plan(plan)
+
+    result = _maybe_redirect_completed_agent(ctx=ctx, target_agent="researcher")
+    assert result is not None
+    assert result["redirect_to"] == "writer"
+
+
+# ---------------------------------------------------------------------------
+# F3 — observation-only gate at the before_tool_callback dispatch point
+# ---------------------------------------------------------------------------
+
+
+class _StubSteererWithFlag:
+    def __init__(self, *, observation_only: bool, sinks: list[Any]) -> None:
+        self._observation_only = observation_only
+        self._sinks = sinks
+
+    def is_active_steering(self) -> bool:
+        return not self._observation_only
+
+
+def _plugin_redirect_harness(
+    monkeypatch: pytest.MonkeyPatch, *, observation_only: bool
+) -> tuple[Any, Any, _ListSink]:
+    """Build a plugin + AgentTool call harness with a canned F3 redirect.
+
+    ``_maybe_redirect_completed_agent`` is monkeypatched to always
+    return a redirect so the gate at the dispatch point is exercised
+    independently of the pin hook (which, on a live plan, binds the
+    next ready task to the invoked agent before F3 runs). The predicate
+    itself is covered by the helper-level tests above."""
+    pytest.importorskip("google.adk")
+    from goldfive.adapters import _adk_plugin as plugin_mod
+
+    plugin = plugin_mod.make_adk_plugin(host_agent_name="coord")
+    sink = _ListSink()
+    plan = Plan(
+        id="p1",
+        run_id="r1",
+        goal_ids=["g1"],
+        tasks=[
+            Task(
+                id="t1",
+                title="Research",
+                assignee_agent_id="researcher",
+                status=TaskStatus.COMPLETED,
+            ),
+        ],
+        edges=[],
+    )
+    session = Session(run_id="r1", goals=[Goal(id="g1", summary="x")], plan=plan)
+    ctx_obj = plugin_mod.SessionContext(
+        session=session,
+        steerer=_StubSteererWithFlag(observation_only=observation_only, sinks=[sink]),
+        task=None,
+        tool_handlers={},
+        host_agent_name="coord",
+    )
+    plugin.set_active_context(ctx_obj)
+
+    monkeypatch.setattr(
+        plugin_mod,
+        "_maybe_redirect_completed_agent",
+        lambda **_kw: {
+            "error": "All plan tasks for researcher are complete.",
+            "redirect_to": "writer",
+        },
+    )
+
+    class _FakeAgent:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _FakeAgentTool:
+        def __init__(self, agent_name: str) -> None:
+            self.agent = _FakeAgent(agent_name)
+            self.name = agent_name
+
+    class _FakeInvocationContext:
+        def __init__(self, state: dict, agent_name: str) -> None:
+            class _ADKSession:
+                def __init__(self, state: dict) -> None:
+                    self.state = state
+
+            self.session = _ADKSession(state)
+            self.invocation_id = "inv-1"
+            self.agent = _FakeAgent(agent_name)
+
+    class _FakeToolContext:
+        def __init__(self, inv_ctx: Any) -> None:
+            self._invocation_context = inv_ctx
+            self.function_call_id = "fc-1"
+
+    adk_state: dict[str, Any] = {plugin_mod.SESSION_CONTEXT_STATE_KEY: ctx_obj}
+    tool_ctx = _FakeToolContext(_FakeInvocationContext(adk_state, "coord"))
+    return plugin, (_FakeAgentTool("researcher"), tool_ctx), sink
+
+
+def _policy_applied_events(sink: _ListSink) -> list[Any]:
+    return [
+        e
+        for e in sink.events
+        if hasattr(e, "DESCRIPTOR") and e.WhichOneof("payload") == "policy_applied"
+    ]
+
+
+async def test_f3_redirect_suppressed_under_observation_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """observation_only=True: the F3 refusal is an intervention and must
+    not fire — the AgentTool dispatch proceeds untouched and the
+    would-have-redirected decision lands as PolicyApplied telemetry."""
+    plugin, (tool, tool_ctx), sink = _plugin_redirect_harness(monkeypatch, observation_only=True)
+
+    res = await plugin.before_tool_callback(
+        tool=tool, tool_args={"request": "go"}, tool_context=tool_ctx
+    )
+
+    assert res is None
+    events = _policy_applied_events(sink)
+    assert len(events) == 1
+    payload = events[0].policy_applied
+    assert payload.policy_name == "observation_only_gate"
+    assert payload.outcome == "suppressed"
+    assert payload.reason == "observation_only=True"
+    assert "intervention=f3_predispatch_redirect" in payload.detail
+    assert "target_agent=researcher" in payload.detail
+    assert "redirect_to=writer" in payload.detail
+
+
+async def test_f3_redirect_still_refuses_in_active_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """observation_only=False: the refusal short-circuits the dispatch
+    with the redirect payload, and no suppression telemetry is emitted."""
+    plugin, (tool, tool_ctx), sink = _plugin_redirect_harness(monkeypatch, observation_only=False)
+
+    res = await plugin.before_tool_callback(
+        tool=tool, tool_args={"request": "go"}, tool_context=tool_ctx
+    )
+
+    assert isinstance(res, dict)
+    assert res["redirect_to"] == "writer"
+    assert _policy_applied_events(sink) == []
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +760,10 @@ async def test_f10_overlay_returns_early_on_goldfive_pause() -> None:
             await asyncio.sleep(60)
 
     class _StubSteerer:
-        pass
+        # Explicit active mode: the executor drops the pause message
+        # under the shipped observation-only default.
+        def is_active_steering(self) -> bool:
+            return True
 
     class _StubReconciler:
         def reset_for_new_plan(self, plan: Any) -> None:

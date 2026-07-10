@@ -20,6 +20,7 @@ pytestmark = pytest.mark.skipif(
     reason="goldfive protobuf stubs not available (install the `dev` extra)",
 )
 
+from goldfive.config import SteeringConfig  # noqa: E402
 from goldfive.reporting import (  # noqa: E402
     BUILTIN_REPORTING_TOOLS,
     REPORTING_TOOL_NAMES,
@@ -86,7 +87,9 @@ def _fresh() -> tuple[DefaultSteerer, Session, ListSink, StubPlanner]:
     )
     sink = ListSink()
     planner = StubPlanner()
-    steerer = DefaultSteerer()
+    # Explicit active mode: the F1 ``plan_state`` directive surface is
+    # suppressed under the shipped observation-only default.
+    steerer = DefaultSteerer(steering_config=SteeringConfig(observation_only=False))
     steerer.bind(sinks=[sink], planner=planner)
     return steerer, session, sink, planner
 
@@ -137,6 +140,31 @@ async def test_report_task_started_marks_running() -> None:
     assert session.plan.tasks[0].status is TaskStatus.RUNNING
     # task_started lands in the stream (followed by goldfive#251 R4
     # TaskTransitioned envelope; see test_task_transitioned_events.py).
+    kinds = [e.WhichOneof("payload") for e in sink.events]
+    assert "task_started" in kinds
+
+
+async def test_report_task_started_ack_is_factual_under_observation_only() -> None:
+    """Observation-only counterpart: the transition (the agent's own
+    self-report) still lands and still emits, but the goldfive-authored
+    F1 ``plan_state`` directive is suppressed by ``is_active_steering``."""
+    session = Session(
+        run_id="r1",
+        goals=[Goal(id="g1", summary="do it")],
+        plan=_plan(),
+    )
+    sink = ListSink()
+    steerer = DefaultSteerer()  # shipped default: observation_only=True
+    steerer.bind(sinks=[sink], planner=StubPlanner())
+
+    out = await _tool("report_task_started").handler(
+        {"task_id": "t1", "detail": "starting"}, session, steerer
+    )
+
+    assert out["acknowledged"] is True
+    assert out["task"] == {"id": "t1", "status": TaskStatus.RUNNING.value}
+    assert "plan_state" not in out
+    assert session.plan.tasks[0].status is TaskStatus.RUNNING
     kinds = [e.WhichOneof("payload") for e in sink.events]
     assert "task_started" in kinds
 

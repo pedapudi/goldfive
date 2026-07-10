@@ -24,6 +24,8 @@ REPORTING_TOOL_NAMES: tuple[str, ...] = (
     "report_new_work_discovered",
     "report_plan_divergence",
     "report_awaiting_approval",
+    "declare_task_skipped",
+    "declare_task_not_needed",
 )
 ```
 
@@ -101,13 +103,17 @@ The current `task_id` is made available to the agent by the adapter —
 either in a shared session-state dict (ADK), a system prompt (Claude
 SDK), or as a direct argument (CallableAdapter).
 
-## The eight tools
+## The eight `report_*` tools
 
 Names are stable contract — do not rename. Mirrors harmonograf's
 canonical reporting tools; goldfive owns the list from v0.1 forward.
 `report_awaiting_approval` is documented at the end of this file —
 it's the task-level half of the human-in-the-loop approval flow
-(see [APPROVAL.md](../design/APPROVAL.md)).
+(see [APPROVAL.md](../design/APPROVAL.md)). The two `declare_task_*`
+tools (goldfive#271 Phase 3) complete the ten-name canonical set;
+they are observability-only — no state transition — and, like
+`report_plan_divergence`, register only when `drift_self_reporting`
+opts in (see the note above).
 
 ### 1. `report_task_started`
 
@@ -350,16 +356,23 @@ report_awaiting_approval(
 **Call when:** a task needs a human decision before it can proceed.
 Blocks the calling tool-call until an `APPROVE` or `REJECT`
 `ControlMessage` targeting the same id lands on the runner's
-`ControlChannel`.
+`ControlChannel`. The wait is finite: an explicit `timeout_ms > 0`
+is honoured; omitting it applies
+`SteeringConfig.approval_default_timeout_ms` (default 600 s). Expiry
+returns `decision="timeout"` and emits a
+`HUMAN_INTERVENTION_REQUIRED` WARNING drift. When the runner has no
+`ControlChannel` at all (the default `wrap()` posture) the handler
+returns `decision="unavailable"` immediately instead of blocking a
+task no human can ever unblock.
 
 **Side effects:**
 
 - Registers an `asyncio.Event` on
   `session.pending_approvals[target_id]` (defaults to `task_id`).
 - Emits `ApprovalRequested(task_id, target_id, detail)`.
-- Blocks until the control dispatcher sets the event, then returns
-  `{"acknowledged": True, "decision": "approve"|"reject",
-  "detail": "..."}`.
+- Blocks until the control dispatcher sets the event (or the finite
+  wait expires), then returns `{"acknowledged": True, "decision":
+  "approve"|"reject"|"timeout"|"unavailable", "detail": "..."}`.
 
 **Example:**
 
@@ -487,13 +500,13 @@ prefer them.
 
 ## Customizing the tool list
 
-The seven tools above are the minimum contract. Custom adapters can
-extend the list by appending to `tools` before calling
+The canonical tools above are the minimum contract. Custom adapters
+can extend the list by appending to `tools` before calling
 `adapter.register_reporting_tools(tools)`. The steerer ignores names
 it doesn't recognize, so custom tools pass through to the framework's
 normal tool-call path. A typical extension: domain-specific reporting
 tools like `report_budget_remaining` or `report_confidence`.
 
-Renaming or removing the seven canonical tools is not supported.
+Renaming or removing the canonical tools is not supported.
 Downstream consumers (harmonograf, planners, sinks) pattern-match on
 the canonical names.

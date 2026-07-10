@@ -693,16 +693,14 @@ class Runner:
         try:
             new_goals = await self._resolve_goals(user_input, context, session=session)
         except Exception as exc:  # noqa: BLE001
-            reason = f"goal derivation failed: {exc}"
             log.exception("goal derivation failed")
-            await self._emit_run_aborted(session, reason)
-            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            convo.absorb_turn(
-                outcome,
-                user_input_summary=_initial_goal_summary(user_input),
+            return await self._abort_turn(
+                session=session,
+                convo=convo,
+                user_input=user_input,
                 pinned=pinned,
+                reason=f"goal derivation failed: {exc}",
             )
-            return outcome
 
         # F9 (closes goldfive#322 Layer 4): mint fresh goal ids when
         # the deriver's LLM-supplied id collides with an existing
@@ -842,16 +840,14 @@ class Runner:
                     context=planner_context,
                 )
             except Exception as exc:  # noqa: BLE001
-                reason = f"planner.generate raised: {exc}"
                 log.exception("planner.generate raised")
-                await self._emit_run_aborted(session, reason)
-                outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-                convo.absorb_turn(
-                    outcome,
-                    user_input_summary=_initial_goal_summary(user_input),
+                return await self._abort_turn(
+                    session=session,
+                    convo=convo,
+                    user_input=user_input,
                     pinned=pinned,
+                    reason=f"planner.generate raised: {exc}",
                 )
-                return outcome
 
         # Install the produced plan as the next revision of
         # session.plan, OR (when next_plan is None and a real prior
@@ -932,17 +928,13 @@ class Runner:
                         )
 
                 if self._fail_fast_on_revision_rejection:
-                    reason = "plan revision rejected by validator"
-                    await self._emit_run_aborted(session, reason)
-                    outcome = ExecutionOutcome(
-                        success=False, session=session, reason=reason
-                    )
-                    convo.absorb_turn(
-                        outcome,
-                        user_input_summary=_initial_goal_summary(user_input),
+                    return await self._abort_turn(
+                        session=session,
+                        convo=convo,
+                        user_input=user_input,
                         pinned=pinned,
+                        reason="plan revision rejected by validator",
                     )
-                    return outcome
                 # Default: keep existing plan, continue. ``session.plan``
                 # is unchanged because ``_install_revision``'s
                 # rejection path returns False BEFORE applying the
@@ -953,15 +945,13 @@ class Runner:
             # First turn AND handle_turn returned None (purely
             # conversational on an empty seed). No plan to drive the
             # executor over — abort cleanly.
-            reason = "no plan generated"
-            await self._emit_run_aborted(session, reason)
-            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            convo.absorb_turn(
-                outcome,
-                user_input_summary=_initial_goal_summary(user_input),
+            return await self._abort_turn(
+                session=session,
+                convo=convo,
+                user_input=user_input,
                 pinned=pinned,
+                reason="no plan generated",
             )
-            return outcome
         else:
             # Conversational follow-up on a real prior plan. Reuse
             # session.plan unchanged. No PlanRevised — the prior
@@ -1000,31 +990,27 @@ class Runner:
                 select_reporting_tools(self.drift_self_reporting)
             )
         except Exception as exc:  # noqa: BLE001
-            reason = f"register_reporting_tools raised: {exc}"
             log.exception("register_reporting_tools raised")
-            await self._emit_run_aborted(session, reason)
-            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            convo.absorb_turn(
-                outcome,
-                user_input_summary=_initial_goal_summary(user_input),
+            return await self._abort_turn(
+                session=session,
+                convo=convo,
+                user_input=user_input,
                 pinned=pinned,
+                reason=f"register_reporting_tools raised: {exc}",
             )
-            return outcome
 
         # 6. Bind the steerer. (The executor may re-bind — that's fine.)
         try:
             self.steerer.bind(sinks=list(self.sinks), planner=self.planner)
         except Exception as exc:  # noqa: BLE001
-            reason = f"steerer.bind raised: {exc}"
             log.exception("steerer.bind raised")
-            await self._emit_run_aborted(session, reason)
-            outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-            convo.absorb_turn(
-                outcome,
-                user_input_summary=_initial_goal_summary(user_input),
+            return await self._abort_turn(
+                session=session,
+                convo=convo,
+                user_input=user_input,
                 pinned=pinned,
+                reason=f"steerer.bind raised: {exc}",
             )
-            return outcome
 
         # 6b. Wire the steerer into the adapter. Adapter plugin callbacks
         # (e.g. ADKAdapter's ``_emit_observability``) short-circuit when
@@ -1039,16 +1025,14 @@ class Runner:
             try:
                 bind_adapter_steerer(self.steerer)
             except Exception as exc:  # noqa: BLE001
-                reason = f"adapter.bind_steerer raised: {exc}"
                 log.exception("adapter.bind_steerer raised")
-                await self._emit_run_aborted(session, reason)
-                outcome = ExecutionOutcome(success=False, session=session, reason=reason)
-                convo.absorb_turn(
-                    outcome,
-                    user_input_summary=_initial_goal_summary(user_input),
+                return await self._abort_turn(
+                    session=session,
+                    convo=convo,
+                    user_input=user_input,
                     pinned=pinned,
+                    reason=f"adapter.bind_steerer raised: {exc}",
                 )
-                return outcome
 
         # 6c. Wire the adapter back into the steerer. Optional hook
         # (goldfive#139) the steerer uses to tag the adapter's next
@@ -1136,16 +1120,14 @@ class Runner:
                         executor_kwargs["user_input"] = executor_user_input
                 outcome = await self.executor.run(**executor_kwargs)
             except Exception as exc:  # noqa: BLE001
-                reason = f"executor.run raised: {exc}"
                 log.exception("executor.run raised")
-                await self._emit_run_aborted(session, reason)
-                aborted = ExecutionOutcome(success=False, session=session, reason=reason)
-                convo.absorb_turn(
-                    aborted,
-                    user_input_summary=_initial_goal_summary(user_input),
+                return await self._abort_turn(
+                    session=session,
+                    convo=convo,
+                    user_input=user_input,
                     pinned=pinned,
+                    reason=f"executor.run raised: {exc}",
                 )
-                return aborted
             finally:
                 # planner-gate: snapshot the turn's final plan so the next
                 # turn's planner_gate can classify against it.
@@ -1809,6 +1791,32 @@ class Runner:
             session_id=session.id,
         )
         await emit(self.sinks, evt)
+
+    async def _abort_turn(
+        self,
+        *,
+        session: Session,
+        convo: Conversation,
+        user_input: str | list[Goal],
+        pinned: bool,
+        reason: str,
+    ) -> ExecutionOutcome:
+        """Shared abort tail for every pre-/mid-turn failure in :meth:`_run_locked`.
+
+        Emits ``RunAborted``, builds the failed outcome, and absorbs
+        the turn into the Conversation so the next turn's carry-forward
+        sees a consistent stash. The only per-site deltas — the reason
+        string and whether ``log.exception`` fires — stay at the call
+        sites.
+        """
+        await self._emit_run_aborted(session, reason)
+        outcome = ExecutionOutcome(success=False, session=session, reason=reason)
+        convo.absorb_turn(
+            outcome,
+            user_input_summary=_initial_goal_summary(user_input),
+            pinned=pinned,
+        )
+        return outcome
 
     async def _emit_conversation_started(
         self, session: Session, *, conversation: Conversation

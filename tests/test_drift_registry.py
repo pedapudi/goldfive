@@ -9,10 +9,10 @@ duplicated across the goal-drift and reasoning-judge detectors:
   the uniform ``" … [truncated]"`` suffix.
 
 The registry itself stores ``(DriftKind, classifier_fn, DetectorConfig)``
-triples so callers can dispatch by kind via :func:`classify` without
+triples so callers can look up per-detector config by kind without
 importing the detector module directly. These tests cover the helper
 behaviour (parity with the byte-identical pre-Wave-A copies) and the
-register/dispatch contract.
+register/lookup contract.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ from goldfive.drift import registry
 from goldfive.drift.registry import (
     TRUNCATE_SUFFIX,
     DetectorConfig,
-    classify,
     format_goals_block,
     get_config,
     list_registered,
@@ -31,7 +30,7 @@ from goldfive.drift.registry import (
     register,
     truncate_for_observability,
 )
-from goldfive.types import DriftEvent, DriftKind, DriftSeverity
+from goldfive.types import DriftKind
 
 # ---------------------------------------------------------------------------
 # parse_json_response
@@ -157,7 +156,7 @@ class TestTruncate:
 
 
 # ---------------------------------------------------------------------------
-# register / classify
+# register / get_config / list_registered
 # ---------------------------------------------------------------------------
 
 
@@ -178,51 +177,7 @@ def fresh_registry(monkeypatch: pytest.MonkeyPatch) -> dict:
         registry._REGISTRY.update(saved)
 
 
-class TestRegisterAndClassify:
-    def test_sync_classifier_dispatches(self, fresh_registry: dict) -> None:
-        called: list[dict] = []
-
-        def stub(**kwargs):
-            called.append(kwargs)
-            return DriftEvent(
-                kind=DriftKind.TOOL_ERROR,
-                severity=DriftSeverity.WARNING,
-                detail="stub",
-            )
-
-        register(
-            DriftKind.TOOL_ERROR,
-            stub,
-            DetectorConfig(uses_llm=False),
-            is_async=False,
-        )
-        event = classify(kind=DriftKind.TOOL_ERROR, alpha=1, beta="two")
-        assert isinstance(event, DriftEvent)
-        assert event.kind is DriftKind.TOOL_ERROR
-        assert called == [{"alpha": 1, "beta": "two"}]
-
-    def test_async_classifier_returns_awaitable(self, fresh_registry: dict) -> None:
-        async def stub(**_kwargs) -> DriftEvent | None:
-            return None
-
-        register(
-            DriftKind.OFF_TOPIC,
-            stub,
-            DetectorConfig(uses_llm=True),
-            is_async=True,
-        )
-        result = classify(kind=DriftKind.OFF_TOPIC, reasoning="x")
-        # Async classifiers return a coroutine; the caller awaits it.
-        import inspect
-
-        assert inspect.iscoroutine(result)
-        result.close()
-
-    def test_unregistered_kind_raises(self, fresh_registry: dict) -> None:
-        with pytest.raises(KeyError) as excinfo:
-            classify(kind=DriftKind.TOOL_ERROR)
-        assert "no drift detector registered" in str(excinfo.value)
-
+class TestRegisterAndLookup:
     def test_get_config_returns_registered_config(
         self, fresh_registry: dict
     ) -> None:

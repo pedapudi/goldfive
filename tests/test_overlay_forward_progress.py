@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from goldfive.config import SteeringConfig
 from goldfive.executors.sequential import (
     SequentialExecutor,
     _fatally_failed_task_ids,
@@ -69,6 +70,12 @@ class StubSteerer:
         self._planner: Any = None
         self.observed: list[Any] = []
         self.transitions: list[tuple[str, TaskStatus]] = []
+
+    def is_active_steering(self) -> bool:
+        # Explicit active mode: the executor's nudge replay and
+        # abort-on-fatal-failure enforcement under test are suppressed
+        # under the shipped observation-only default.
+        return True
 
     def bind(self, *, sinks: list[EventSink], planner: Any) -> None:
         self._sinks = sinks
@@ -531,6 +538,9 @@ async def test_level_2_nudge_triggers_overlay_replay() -> None:
                 "The prior attempt looped on define_structure. Refined plan: "
                 "define (v2). Please try a different approach."
             )
+            # The real steerer records the install fact alongside the
+            # enqueue so the replay header may claim a plan revision.
+            session.pending_nudges_revision_installed = True
             return InvocationResult(task_id="", text="")
         # Second invocation (nudge replay): coordinator sees the framing
         # message, proceeds with the replacement + downstream.
@@ -678,7 +688,10 @@ async def test_absorb_on_looping_reasoning_queues_nudge() -> None:
     # LEGACY ABSORB-with-nudge behaviour for operators who disable
     # promotion; cover the promotion path in
     # tests/test_steer_unification.py.
-    steerer = DefaultSteerer(goldfive_steer_threshold="off")
+    steerer = DefaultSteerer(
+        goldfive_steer_threshold="off",
+        steering_config=SteeringConfig(observation_only=False, threshold="off"),
+    )
     steerer.bind(sinks=[sink], planner=_StubPlanner())
 
     drift = DriftEvent(
@@ -696,7 +709,9 @@ async def test_absorb_on_looping_reasoning_queues_nudge() -> None:
     assert session.plan is not None
     assert session.plan.id == revised.id
     assert session.plan.revision_index == 1
-    # Nudge queued for consumption by the overlay.
+    # Nudge queued for consumption by the overlay, with the install
+    # fact threaded so the replay header may claim a plan revision.
     assert len(session.pending_nudges) == 1
     nudge = session.pending_nudges[0]
     assert "define_structure" in nudge
+    assert session.pending_nudges_revision_installed is True

@@ -111,6 +111,7 @@ def test_wrap_threads_runtime_config() -> None:
         "exact_threshold": 4,
         "name_threshold": 6,
         "alternating_threshold": 6,
+        "name_axis_max_severity": "info",
     }
 
     # Steerer picks up goal-drift + tool-loop + reasoning-drift configs.
