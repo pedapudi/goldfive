@@ -7303,8 +7303,12 @@ def make_adk_plugin(
             *rendering* chokepoint so the block surfaces never re-render it.
             (``SignalDelivered`` is emitted once at the dispatch point, not
             here.) Returns ``None`` (no result replacement) when not in
-            request_context mode, the result is not a mapping, or no loop note
-            is pending — so the legacy path is untouched.
+            request_context mode, the result is not a mapping, no loop note
+            is pending, or the steerer is passive
+            (``observation_only=True`` — the note is still consumed as a
+            dry-run delivery for decision parity but nothing is annotated,
+            matching the other three surfaces) — so both the legacy path
+            and the strict-passive campaign are untouched.
             """
             if ctx is None or ctx.steerer is None or ctx.session is None:
                 return None
@@ -7315,6 +7319,15 @@ def make_adk_plugin(
                 return None
             if not isinstance(result, Mapping):
                 return None
+            # Kill-switch gate (parity with the other three observer-note
+            # surfaces: prompt_shaper.inject_observer_note,
+            # claude._consume_observer_note, sequential replay). Under
+            # ``observation_only=True`` the note is consumed as a dry-run
+            # delivery below but the real tool result passes through
+            # UNANNOTATED so nothing reaches the model — zero production
+            # authority until 13b (AGENCY-PRESERVATION §5.4). Resolved once
+            # here so ``mark_delivered`` still runs for decision parity.
+            passive = _is_observation_only(ctx)
             from goldfive.observer_note_queue import (
                 ObserverNoteQueue,
                 render_tool_annotation,
@@ -7339,6 +7352,15 @@ def make_adk_plugin(
                 surface="tool_annotation",
             )
             if not newly:
+                return None
+            if passive:
+                # observation_only: ``mark_delivered`` ran above (decision
+                # parity — pacing / coalescing behave identically to the
+                # active path), but return None so the real tool result
+                # passes through UNANNOTATED. Follow-up: a sibling PR owns
+                # the dry_run-truthfulness refactor; once it lands the
+                # dry-run marker on this consume lets telemetry attribution
+                # distinguish it from an active delivery.
                 return None
             # Append-only: copy the result and add the reserved annotation key.
             annotated = dict(result)

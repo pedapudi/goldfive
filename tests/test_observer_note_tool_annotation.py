@@ -27,6 +27,41 @@ from goldfive.steerer import DefaultSteerer  # noqa: E402
 from goldfive.types import Session, Task  # noqa: E402
 
 
+class _ListSink:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def emit(self, event_pb: Any) -> None:
+        self.events.append(event_pb)
+
+    async def close(self) -> None:
+        pass
+
+
+class _StubPlanner:
+    async def generate(self, **kwargs: Any) -> None:  # noqa: ARG002
+        return None
+
+    async def refine(self, **kwargs: Any) -> None:  # noqa: ARG002
+        return None
+
+
+class _ToolStub:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _InvCtxStub:
+    def __init__(self, invocation_id: str, agent_name: str) -> None:
+        self.invocation_id = invocation_id
+        self.agent = type("_A", (), {"name": agent_name})()
+
+
+class _ToolCtxStub:
+    def __init__(self, invocation_id: str, agent_name: str) -> None:
+        self._invocation_context = _InvCtxStub(invocation_id, agent_name)
+
+
 def _ctx(session: Session, steerer: Any) -> SessionContext:
     return SessionContext(
         session=session,
@@ -50,16 +85,26 @@ def _enqueue_loop_note(session: Session, *, drift_id: str = "d1") -> None:
     )
 
 
-def _steerer() -> DefaultSteerer:
+def _steerer(*, active: bool = False) -> DefaultSteerer:
+    """Build a ``request_context`` steerer.
+
+    Bare (``active=False``) is PASSIVE — ``observation_only=True`` is the
+    shipped production default and the branch's §5.4 shadow-campaign
+    config. Surface 4 must consume-but-not-annotate in that mode. Tests
+    that assert the active annotation delivery opt in via ``active=True``.
+    """
     return DefaultSteerer(
-        steering_config=SteeringConfig(signal_channel="request_context")
+        steering_config=SteeringConfig(
+            signal_channel="request_context",
+            observation_only=not active,
+        )
     )
 
 
 async def test_annotation_appends_without_modifying_real_result() -> None:
     plugin = make_adk_plugin(host_agent_name="test_agent")
     session = Session(run_id="r1")
-    steerer = _steerer()
+    steerer = _steerer(active=True)
     ctx = _ctx(session, steerer)
     _enqueue_loop_note(session)
 
@@ -111,3 +156,90 @@ async def test_annotation_noop_in_legacy_channel() -> None:
     # Legacy default: surface 4 is inert (returns None, note untouched).
     assert await plugin._maybe_annotate_tool_result(ctx, {"content": "x"}) is None
     assert ObserverNoteQueue.for_session(session).get("d1").delivered is False
+
+
+async def test_annotation_suppressed_under_observation_only() -> None:
+    """Surface-4 kill-switch gate: request_context + observation_only=True.
+
+    The §5.4 shadow-campaign config (request_context channel, passive
+    kill-switch — the branch default) must NOT annotate the tool result;
+    nothing reaches the model. But the note is still consumed as a
+    dry-run delivery (``mark_delivered`` runs for decision parity) so
+    pacing / coalescing behave identically to the active path.
+    """
+    plugin = make_adk_plugin(host_agent_name="test_agent")
+    session = Session(run_id="r1")
+    # Bare steerer -> observation_only=True (production default).
+    ctx = _ctx(session, _steerer())
+    _enqueue_loop_note(session)
+
+    result = {"content": [{"type": "text", "text": "search results..."}]}
+    annotated = await plugin._maybe_annotate_tool_result(ctx, result)
+
+    # No result replacement — after_tool_callback returns None and the
+    # real tool result passes through UNANNOTATED.
+    assert annotated is None
+    # Dry-run consume: the note is marked delivered for decision parity.
+    assert ObserverNoteQueue.for_session(session).get("d1").delivered is True
+
+
+async def _drive_repeated_loop(steerer: DefaultSteerer) -> tuple[Any, Session]:
+    """Drive a real repeated tool call through ``after_tool_callback``.
+
+    Exact-repeat x3 trips the tool-loop tracker's WARNING tier, so
+    ``after_tool_callback`` reaches surface 4 (it early-returns when the
+    call fired no drift). A loop note is pre-enqueued so the surface has
+    something to render. Returns the final callback return value and the
+    session.
+    """
+    plugin = make_adk_plugin(host_agent_name="test_agent")
+    session = Session(run_id="r1")
+    steerer.bind(sinks=[_ListSink()], planner=_StubPlanner())
+    ctx = _ctx(session, steerer)
+    plugin.set_active_context(ctx)
+    _enqueue_loop_note(session)
+
+    tool = _ToolStub("patch_file")
+    args = {"path": "a.py", "diff": "x"}
+    tool_ctx = _ToolCtxStub("inv-surface4", "worker")
+    result = {"content": [{"type": "text", "text": "patched"}], "ok": True}
+    returned: Any = None
+    for _ in range(3):  # exact-repeat x3 -> WARNING loop drift
+        returned = await plugin.after_tool_callback(
+            tool=tool, tool_args=args, tool_context=tool_ctx, result=dict(result)
+        )
+    return returned, session
+
+
+async def test_after_tool_callback_passes_result_through_unannotated_when_passive() -> None:
+    """End-to-end negative control through ``after_tool_callback``.
+
+    A repeated tool call under signal_channel="request_context" +
+    observation_only=True (the branch default) must NOT annotate the tool
+    result — the callback returns ``None`` so ADK keeps the real result
+    verbatim and nothing reaches the model — yet the note is still
+    consumed as a dry-run delivery for decision parity.
+    """
+    returned, session = await _drive_repeated_loop(_steerer())  # passive
+
+    # Passive: no annotated replacement — never carries the reserved key.
+    assert returned is None
+    if isinstance(returned, dict):  # defensive
+        assert "goldfive_observer_note" not in returned
+    # Consumed as a dry-run delivery (mark_delivered ran for parity).
+    assert ObserverNoteQueue.for_session(session).get("d1").delivered is True
+
+
+async def test_after_tool_callback_annotates_result_when_active() -> None:
+    """End-to-end positive control through ``after_tool_callback``.
+
+    The same drive under active mode (observation_only=False) DOES return
+    a result carrying the ``goldfive_observer_note`` annotation, with the
+    real result preserved verbatim.
+    """
+    returned, session = await _drive_repeated_loop(_steerer(active=True))
+
+    assert isinstance(returned, dict)
+    assert returned["ok"] is True  # real result preserved verbatim
+    assert returned["goldfive_observer_note"].startswith("[goldfive observer:")
+    assert ObserverNoteQueue.for_session(session).get("d1").delivered is True
