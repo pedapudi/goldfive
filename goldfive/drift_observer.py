@@ -148,6 +148,7 @@ from goldfive.drift import (
     classify_stop_reason,
     classify_tool_error,
 )
+from goldfive.task_state_machine import OUTCOME_JUDGE_SOURCE
 from goldfive.types import (
     RECENT_EVENT_AGENT_ACTIVITY_KINDS,
     RECENT_EVENT_KIND_TOOL_OBSERVED,
@@ -4403,7 +4404,7 @@ class DriftObserver:
                         tr.task_id,
                         session=session,
                         summary=tr.reason,
-                        source="goldfive_outcome_judge",
+                        source=OUTCOME_JUDGE_SOURCE,
                     )
                 elif tr.new_status is TaskStatus.FAILED:
                     await self._steerer.tasks.mark_task_failed(
@@ -4411,7 +4412,7 @@ class DriftObserver:
                         session=session,
                         reason=tr.reason,
                         recoverable=True,
-                        source="goldfive_outcome_judge",
+                        source=OUTCOME_JUDGE_SOURCE,
                     )
             except Exception as exc:  # noqa: BLE001 — never break the run
                 log.warning(

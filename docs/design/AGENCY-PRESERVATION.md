@@ -818,29 +818,84 @@ the task tracker):
    success and not worse on turns/tokens beyond the agreed margin across
    ≥2 tree shapes (§4 / §5.8).
 
-### 6.5 In-progress hardening wave (branch-native defects)
+### 6.5 Post-reconcile hardening wave (branch-native defects)
 
-Post-reconcile review surfaced branch-native defects that predate the
-merge. A hardening wave is addressing them; this note keeps §6 honest
-about what is and is not yet fixed. Each item is **in progress / tracked**,
-not claimed as merged, and all fixes preserve the flags-OFF invariant
-(§6.2) — they either affect only a non-default regime or close an
-`observation_only` leak (always correct):
+Post-reconcile review surfaced branch-native defects that predate the merge
+(12 high / 20 medium / 13 low). A hardening wave addressed them. Every fix
+preserves the flags-OFF invariant (§6.2) — each either affects only a
+non-default regime, closes an `observation_only` leak (always correct), or
+is telemetry-only. **Merged:**
 
-- **Injection surface 4 gate** — the fourth note-delivery surface needs
-  the same active-steering gate as the other three.
-- **`dry_run`/delivery telemetry truthfulness** — the emitted
-  decision/visibility records must not overstate what was delivered under
-  `observation_only`.
-- **SIGNAL repeat-escalation reachability** — the repeat-escalation rung
-  must be reachable on the intended path.
-- **Grace-window keying** — pacing keys must match the visibility identity
-  they intend to gate.
-- **Ledger-mode evidence wiring** — outcome/evidence must reach the ledger
-  disposition path.
-- **Bench measurement adequacy** — the 13b harness measurements must be
-  adequate to gate the flips (§6.4).
+- **Injection surface 4 gate** (#498) — the tool-result annotation surface
+  now carries the same `is_active_steering` gate as the other three, so no
+  note reaches the model under `observation_only`; a negative-control test
+  drives it end-to-end.
+- **`dry_run`/delivery telemetry truthfulness** (#502) — `ObserverNote`
+  gained `delivered_dry_run`; a passive/shadow consume is excluded from
+  `rendered_keys` (so `self_corrected_after_signal` is not over-attributed)
+  yet kept in `last_rendered_turn` (so grace-window pacing is byte-identical
+  between the shadow and live campaigns — §5.4 decision parity). Same PR:
+  `USER_PAUSE` no longer black-holes open signal keys (it is non-terminal),
+  and the run-boundary helper drains background drifts **before** finalizing
+  the ledger (a late drift no longer writes into a finalized ledger).
+- **Ledger-mode evidence wiring** (#500) — the outcome-progress judge's
+  evidence (`session.completed_outputs`) is now populated in overlay mode
+  (the only mode ledger supports) via the reconciler, and USER_STEER refine
+  no longer strips the OUTCOME/DISCOVERED task taxonomy.
+- **Bench measurement adequacy** (#499, #501) — the three-arm harness reports
+  `goal_grade=UNMEASURED` rather than silently passing when no goal predicate
+  and no genuinely-exercised OUTCOME task exist, and keys "ledger exercised"
+  on the outcome-progress judge's own `TaskTransitioned.source`
+  (`OUTCOME_JUDGE_SOURCE`, now a shared runtime constant so a rename cannot
+  silently dark the bench signal) rather than on stamped-OUTCOME terminality
+  (which a non-overlay stub force-completes via the legacy loop — a phantom).
+- **Flags-OFF invariant restored** (#497) — `descriptive_growth_enabled` was
+  the one behavior-changing flag shipping default-ON; reverted to `False`
+  (§5.1). Re-flips to `True` only if 13b justifies it.
 
-None of the above flips a default; the 13b LOCK (§6.4) remains intact —
-`plan_mode=ledger` and `observation_only=False` flip only on bench results
-plus explicit user sign-off.
+**Deferred to the 13b decision (NOT changed here):** two guardrail
+*reachability* gaps are genuine design decisions the flip work must resolve,
+not mechanical bugs — see §6.6. They are telemetry-only under the production
+default (`observation_only=True`), so leaving them for 13b changes no shipped
+behavior.
+
+The 13b LOCK (§6.4) remains intact — `plan_mode=ledger` and
+`observation_only=False` flip only on bench results plus explicit user
+sign-off.
+
+### 6.6 Guardrail-reachability gaps (decisions for the 13b work)
+
+PR 7 (ladder demotion, `legacy_ladder=False` — default-ON) and PR 8 (pacing
++ escalation, `signal_channel="request_context"` — default-OFF) have
+**inconsistent channel-conditionality**. On the default `legacy_user_message`
+channel the two interact badly, and the fixes change core escalation behavior
+that 13b is meant to measure, so they are documented here rather than changed
+unilaterally:
+
+- **SIGNAL repeat-escalation is unreachable on the legacy channel.** PR 7
+  demotes the goldfive-authored `CANCEL_REINVOKE` ladder cells to
+  `(SIGNAL, PAUSE_ESCALATE)` — the repeat cell is `PAUSE_ESCALATE` by design.
+  But the ladder's occurrence counter (`_occurrence_count_for_ladder`) reads
+  `session.refine_outcomes[…].fail_count`, and a SIGNAL-demoted kind no longer
+  refines (PR 7 stripped the promotion side-effects), so the counter stays `0`
+  forever → the ladder always resolves the first-occurrence `SIGNAL` cell and
+  the `PAUSE_ESCALATE` repeat cell is never reached. PR 8's grace-window
+  escalation would catch it, but PR 8 short-circuits to `"proceed"` on any
+  channel `!= "request_context"`. Net: on the default channel under active
+  steering, a repeated CRITICAL loop demoted to SIGNAL **advises forever with
+  no escalation path**. *Decision for 13b:* either feed a channel-independent
+  per-`(kind, task)` SIGNAL occurrence counter so the demoted ladder's repeat
+  cell fires on both channels, or accept that legacy = no PR-8 escalation and
+  gate the ladder demotion on the same channel as the escalation. (Under the
+  production default `observation_only=True` this is telemetry-only: the
+  escalate/advise decision is recorded but nothing dispatches.)
+- **Grace-window keys churn for trajectory-level kinds.** PR 8's grace window
+  keys on `(kind, current_task_id)`. For trajectory-level kinds (GOAL_DRIFT,
+  OFF_TOPIC, INTENT_DIVERGENCE) whose `current_task_id` churns or is empty,
+  the window never engages — the known gate-key failure mode (a per-condition
+  gate is only as good as its stable identity key). Effect is quality, not
+  safety: no suppression → noisier signals, never a runaway. *Decision for
+  13b:* choose the stable identity for a trajectory-level drift (e.g. keep the
+  task key for task-scoped kinds but fall back to a stable agent/goal anchor
+  for trajectory kinds) — a request_context-only change that alters that arm's
+  measured behavior, so it belongs with the flip experiment, not before it.
