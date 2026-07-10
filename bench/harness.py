@@ -97,6 +97,7 @@ __all__ = [
     "GOAL_GRADE_UNMET",
     "MANAGED_STEER_ENV",
     "KNOWN_STEER_ENV",
+    "OUTCOME_JUDGE_SOURCE",
     "Scenario",
     "apply_arm_env",
     "arm_flag_status",
@@ -119,6 +120,25 @@ GOAL_GRADE_MET = "met"
 GOAL_GRADE_UNMET = "unmet"
 GOAL_GRADE_ABORTED = "aborted"
 GOAL_GRADE_UNMEASURED = "unmeasured"
+
+#: The ``TaskTransitioned.source`` string goldfive's own outcome-progress judge
+#: stamps when it transitions an OUTCOME deliverable to a terminal status (see
+#: ``goldfive/drift_observer.py::_apply_outcome_transitions``). This is the
+#: GENUINE ledger-exercise trace. In ledger plan mode an OUTCOME task reaches a
+#: terminal status *only* when this judge grades it — the wrapped agent never
+#: reports on deliverables (``goldfive/drift/outcome_progress.py``), so "run
+#: completion = all OUTCOMEs terminal" is decidable without agent cooperation.
+#: The catch (the defect this constant guards): install-time OUTCOME stamping
+#: (``_stamp_ledger_outcome_kinds`` / ``PlanReviser._preserve_ledger_identity``)
+#: labels a plan's tasks OUTCOME the moment ``plan_mode=ledger`` resolves, so a
+#: NON-overlay run (StaticPlanner + the legacy per-task loop, which cannot
+#: dispatch OUTCOME deliverables) still force-completes those stamped tasks —
+#: with the default ``"other"`` source, NOT this judge. That terminality is a
+#: PHANTOM: OUTCOME-labelled tasks completed by per-task dispatch are not
+#: genuine ledger deliverables. Grading/exercise must therefore key on the
+#: judge's own transition trace, never on OUTCOME terminality alone (the
+#: "plan_mode=ledger consulted-but-ineffective yet reported-as-applied" defect).
+OUTCOME_JUDGE_SOURCE = "goldfive_outcome_judge"
 
 
 # ---------------------------------------------------------------------------
@@ -340,11 +360,18 @@ class ArmMetrics:
     #: The resolved :attr:`SteeringConfig.plan_mode` this build ran under
     #: (``forecast`` / ``ledger``) — what the flag *applied* to.
     plan_mode: str
-    #: ``True`` iff the ledger regime was actually EXERCISED on this workload
-    #: (plan_mode=ledger AND at least one OUTCOME or DISCOVERED task fired).
-    #: A ``plan_mode=ledger`` arm whose workload never mints an OUTCOME /
-    #: DISCOVERED task reports ``False`` — configured is not exercised, and a
-    #: stub that never fires the ledger path must not read as validating it.
+    #: ``True`` iff the ledger regime was actually EXERCISED on this workload:
+    #: plan_mode=ledger AND goldfive's own ledger machinery genuinely *fired* —
+    #: the outcome-progress judge transitioned an OUTCOME deliverable (an
+    #: observed ``TaskTransitioned`` whose source is
+    #: :data:`OUTCOME_JUDGE_SOURCE`), or a DISCOVERED trajectory task was
+    #: descriptively grown. Merely *stamping* a plan's tasks ``OUTCOME`` at
+    #: install (``_stamp_ledger_outcome_kinds`` / #500) and then force-completing
+    #: them via the legacy per-task loop is NOT exercise: those transitions
+    #: carry the default ``"other"`` source, the judge never ran, and no ledger
+    #: deliverable was produced. Configured is not exercised — a non-overlay
+    #: stub that never fires the outcome-progress judge must not read as
+    #: validating the ledger regime (the reported-as-applied phantom).
     ledger_exercised: bool
     # --- sink-event telemetry (PR 5) ----------------------------------
     drift_detected: int
@@ -465,6 +492,7 @@ def _grade_goal(
     predicate_count: int,
     outcome_total: int,
     outcome_terminal: dict[str, int],
+    outcome_exercised: bool,
 ) -> tuple[str, str]:
     """Grade a run on goal predicates + OUTCOME-task terminality (§6.4 rule 1).
 
@@ -474,13 +502,34 @@ def _grade_goal(
     alone is never a flip signal — with no goal ``success_predicate`` and no
     OUTCOME deliverable, the run is :data:`GOAL_GRADE_UNMEASURED`, never
     silently ``MET`` (deviation 1). An abort is a measured failure.
+
+    OUTCOME-task terminality is a grading signal ONLY when ``outcome_exercised``
+    — i.e. goldfive's own outcome-progress judge genuinely transitioned an
+    OUTCOME deliverable (:data:`OUTCOME_JUDGE_SOURCE`). OUTCOME tasks merely
+    *stamped* at install (#500) and force-completed by the legacy per-task loop
+    are a PHANTOM: their terminality proves no ledger deliverable was produced,
+    so it does not gate MET/UNMET and the run falls through to UNMEASURED (a
+    user goal predicate, if present, still grades independently).
     """
     if session is None:
         return GOAL_GRADE_UNMEASURED, "no session captured"
     if aborted:
         return GOAL_GRADE_ABORTED, abort_reason or "run aborted"
-    has_signal = predicate_count > 0 or outcome_total > 0
+    # An OUTCOME task's terminal disposition counts as a grading signal only
+    # when the ledger machinery (the outcome-progress judge) transitioned it;
+    # a stamped-but-legacy-completed OUTCOME task is not a genuine deliverable.
+    outcome_signal = outcome_total > 0 and outcome_exercised
+    has_signal = predicate_count > 0 or outcome_signal
     if not has_signal:
+        if outcome_total > 0:
+            return (
+                GOAL_GRADE_UNMEASURED,
+                f"{outcome_total} OUTCOME task(s) stamped but not transitioned "
+                "by the ledger outcome-progress judge (completed via the legacy "
+                "per-task dispatch loop, not a genuine ledger deliverable) — "
+                "run success is not gradeable (run.success alone is not a flip "
+                "signal)",
+            )
         return (
             GOAL_GRADE_UNMEASURED,
             "no goal success_predicate and no OUTCOME task — run success is "
@@ -490,7 +539,7 @@ def _grade_goal(
         reason = evaluate_goal_predicates(session)
         if reason is not None:
             return GOAL_GRADE_UNMET, reason
-    if outcome_total > 0:
+    if outcome_signal:
         failed = outcome_terminal.get("failed", 0)
         if failed:
             return GOAL_GRADE_UNMET, f"{failed} OUTCOME task(s) FAILED"
@@ -536,11 +585,21 @@ def metrics_from_events(
     aborted = False
     abort_reason = ""
     task_terminal = 0
+    #: OUTCOME deliverable ids the outcome-progress judge itself transitioned
+    #: (``TaskTransitioned.source == OUTCOME_JUDGE_SOURCE``) — the genuine
+    #: ledger-exercise trace. Empty when the ledger regime was configured but a
+    #: non-overlay run's legacy per-task loop merely force-completed stamped
+    #: OUTCOME tasks (the phantom this reducer must not grade off).
+    outcome_judge_task_ids: set[str] = set()
 
     for evt in events:
         which = evt.WhichOneof("payload") if hasattr(evt, "WhichOneof") else None
         if which == "drift_detected":
             drift_detected += 1
+        elif which == "task_transitioned":
+            tt = evt.task_transitioned
+            if tt.source == OUTCOME_JUDGE_SOURCE:
+                outcome_judge_task_ids.add(str(tt.task_id or ""))
         elif which == "signal_delivered":
             sd = evt.signal_delivered
             signals_total += 1
@@ -577,6 +636,10 @@ def metrics_from_events(
         if session is not None
         else 0
     )
+    # Genuine ledger exercise: the outcome-progress judge transitioned an
+    # OUTCOME deliverable on this run (its own source trace on the event
+    # stream), NOT the legacy per-task loop force-completing a stamped task.
+    outcome_exercised = bool(outcome_judge_task_ids)
     goal_grade, goal_reason = _grade_goal(
         session,
         aborted=aborted,
@@ -584,10 +647,17 @@ def metrics_from_events(
         predicate_count=predicate_count,
         outcome_total=outcome_total,
         outcome_terminal=outcome_terminal,
+        outcome_exercised=outcome_exercised,
     )
     goal_success = goal_grade == GOAL_GRADE_MET
+    # EXERCISED, not merely configured/stamped: the ledger machinery genuinely
+    # fired — the outcome-progress judge transitioned an OUTCOME deliverable, or
+    # a DISCOVERED trajectory task was descriptively grown (DISCOVERED tasks are
+    # only ever minted by descriptive growth, never stamped onto a StaticPlanner
+    # task, so their presence is itself genuine). A plan whose tasks were merely
+    # stamped OUTCOME and completed by the legacy loop reports False.
     ledger_exercised = plan_mode == "ledger" and (
-        outcome_total > 0 or discovered_total > 0
+        outcome_exercised or discovered_total > 0
     )
 
     applied, pending = arm_flag_status(arm)
