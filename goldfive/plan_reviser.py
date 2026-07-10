@@ -117,6 +117,7 @@ from goldfive.types import (
     bump_revision,
     channel_processor_active,
     discovery_identity_hash,
+    plan_has_ledger_shape,
     replace_edges,
     set_session_plan,
 )
@@ -1492,10 +1493,29 @@ class PlanReviser:
         Terminal DISCOVERED tasks are already validator-protected
         (terminal-task preservation) so they are never re-added here.
 
+        Both repairs additionally require the PRIOR plan to actually carry
+        ledger shape (:func:`goldfive.types.plan_has_ledger_shape`): the
+        repairs exist to restore a taxonomy the LLM rebuild ERASED, so
+        there must have been one to erase. A prior with no ledger-shaped
+        task — the initial install (the ``Plan.empty()`` seed) or a
+        hand-authored forecast-shaped plan under a ledger config — is not
+        a degraded ledger; stamping it would relabel genuine prescriptive
+        intent as OUTCOME deliverables, violating the documented
+        "StaticPlanner users keep forecast semantics" contract (design doc
+        Stage 3). Ledger-mode planners stamp their OWN initial output
+        (:func:`goldfive.planner._stamp_ledger_outcome_kinds`), so an
+        LLMPlanner ledger arrives here already shaped and the repairs
+        engage from the first revision onward.
+
         Returns a NEW :class:`Plan` when anything changed (frozen-Plan
         invariant, goldfive#247); the input reference otherwise.
         """
         if not self._ledger_mode():
+            return revised
+        if not plan_has_ledger_shape(prior):
+            # Nothing to preserve/restore: the prior was never a ledger
+            # (initial empty-seed install, or a hand-authored forecast
+            # plan that keeps forecast semantics under a ledger config).
             return revised
         prior_tasks = list(getattr(prior, "tasks", None) or ())
         prior_by_id: dict[str, Task] = {t.id: t for t in prior_tasks if t.id}

@@ -458,6 +458,10 @@ class Runner:
         self._fail_fast_on_revision_rejection: bool = bool(
             fail_fast_on_revision_rejection
         )
+        # One-shot latch for the ledger-mode / forecast-shaped-plan
+        # incoherent-combo warning (see
+        # :meth:`_warn_if_ledger_mode_without_ledger_plan`).
+        self._ledger_shape_warned: bool = False
         # Cross-turn prior-plan stash lives on :class:`Conversation`
         # (keyed by session id) so a Runner shared across multiple
         # outer ADK sessions does not leak one session's plan into
@@ -489,6 +493,51 @@ class Runner:
             return "ledger" if mode == "ledger" else "forecast"
         except Exception:  # noqa: BLE001
             return "forecast"
+
+    def _warn_if_ledger_mode_without_ledger_plan(self, session: Any) -> None:
+        """One-shot WARNING for the ledger-config / forecast-plan combo.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 10 incoherent-combo guard:
+        ``SteeringConfig.plan_mode == "ledger"`` resolved but the installed
+        plan carries no ledger-shaped task (no ``TaskKind.OUTCOME`` /
+        ``DISCOVERED``) — typically a hand-authored ``StaticPlanner``
+        template under a ledger config. Per the documented contract
+        ("StaticPlanner users keep forecast semantics — a hand-authored
+        plan is genuine prescriptive intent") the ledger-only pin-tier
+        bypass keys on the live plan's shape, so such a run keeps forecast
+        pin semantics; this warning is the operator's signal that the
+        configured ledger regime is not actually engaged. Fires at most
+        once per Runner; never raises.
+        """
+        if self._ledger_shape_warned:
+            return
+        try:
+            from goldfive.steerer import plan_mode_is_ledger
+            from goldfive.types import plan_has_ledger_shape
+
+            plan = getattr(session, "plan", None)
+            tasks = getattr(plan, "tasks", None) if plan is not None else None
+            if (
+                plan_mode_is_ledger(self.steerer)
+                and tasks
+                and not plan_has_ledger_shape(plan)
+            ):
+                self._ledger_shape_warned = True
+                log.warning(
+                    "Runner.run: plan_mode=ledger is configured but the "
+                    "installed plan has NO ledger-shaped task (no OUTCOME/"
+                    "DISCOVERED kind) — likely a hand-authored StaticPlanner "
+                    "plan. This run keeps forecast pin semantics (the "
+                    "ledger pin-tier bypass keys on plan shape, not config); "
+                    "use an LLMPlanner or opt tasks into the ledger taxonomy "
+                    "via Task.kind to engage ledger mode. plan_id=%s tasks=%d",
+                    (getattr(plan, "id", "") or "")[:16] or "<none>",
+                    len(tasks),
+                )
+        except Exception as exc:  # noqa: BLE001 — advisory only
+            log.debug(
+                "Runner._warn_if_ledger_mode_without_ledger_plan raised: %s", exc
+            )
 
     def _conversation_key(self, session_id: str | None) -> str:
         """Map an optional outer-session-id pin to the lookup key.
@@ -976,6 +1025,11 @@ class Runner:
                 int(session.plan.revision_index),
             )
             session._conversational_turn = True  # type: ignore[attr-defined]
+
+        # Incoherent-combo guard (AGENCY-PRESERVATION.md PR 10): warn once
+        # when plan_mode=ledger resolved but the plan that just landed has
+        # no ledger-shaped task — that run keeps forecast pin semantics.
+        self._warn_if_ledger_mode_without_ledger_plan(session)
 
         # 5. Register the canonical reporting tools on the adapter.
         # goldfive#196: ``drift_self_reporting`` decides whether the

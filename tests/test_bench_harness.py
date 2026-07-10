@@ -78,15 +78,14 @@ async def test_three_arm_harness_runs_and_emits_telemetry(tmp_path: Path) -> Non
 
     for m in results:
         # §6.4: goal grading is UNMEASURED on EVERY arm (not silently True) —
-        # the exact gap that blocks a flip decision on this workload. For
-        # baseline/legacy (forecast mode) that is because the workload defines
-        # no goal predicate and mints no OUTCOME task. For the signal arm
-        # (plan_mode=ledger) the StaticPlanner tasks ARE stamped OUTCOME at
-        # install (#500), but this run is non-overlay — the legacy per-task loop
-        # force-completes those stamped tasks and the outcome-progress judge
-        # never runs — so that OUTCOME terminality is a PHANTOM, not a genuine
-        # ledger deliverable, and still grades UNMEASURED (for the right
-        # reason, asserted below). run.success alone is not a flip signal.
+        # the exact gap that blocks a flip decision on this workload. The
+        # workload defines no goal predicate and mints no OUTCOME task: the
+        # bench plan is a hand-authored StaticPlanner template, and per the
+        # "StaticPlanner users keep forecast semantics" contract the
+        # ledger-shape gate on ``_preserve_ledger_identity`` no longer stamps
+        # a forecast-shaped plan OUTCOME at install even on the signal arm
+        # (plan_mode=ledger) — the #501 "stamped, not exercised" phantom is
+        # gone at its source. run.success alone is not a flip signal.
         assert m.goal_grade == "unmeasured", m.goal_reason
         assert m.goal_success is False
         assert m.goal_predicate_count == 0
@@ -101,8 +100,13 @@ async def test_three_arm_harness_runs_and_emits_telemetry(tmp_path: Path) -> Non
         assert m.signals_total > 0, f"{m.arm_name}: 0 signals — telemetry not wired"
 
     by_kind = {m.arm_kind: m for m in results}
-    # baseline/legacy run in forecast mode: no OUTCOME task is minted at all.
-    for kind in ("baseline", "legacy"):
+    # NO arm mints an OUTCOME task. baseline/legacy run in forecast mode;
+    # the signal arm (plan_mode=ledger) drives a hand-authored StaticPlanner
+    # plan, which keeps forecast semantics (the ledger-shape gate on
+    # ``_preserve_ledger_identity`` no longer OUTCOME-stamps a
+    # forecast-shaped plan at install — the pre-gate behaviour produced the
+    # #501 "stamped, not exercised" phantom this block used to pin).
+    for kind in ("baseline", "signal", "legacy"):
         m = by_kind[kind]
         assert m.outcome_tasks_total == 0
         assert m.outcome_terminal == {
@@ -112,28 +116,13 @@ async def test_three_arm_harness_runs_and_emits_telemetry(tmp_path: Path) -> Non
             "cancelled": 0,
             "non_terminal": 0,
         }
-    # The signal arm (plan_mode=ledger) legitimately DOES carry stamped OUTCOME
-    # tasks now — #500's install-time stamping labels the StaticPlanner tasks
-    # OUTCOME and the legacy per-task loop drives them to COMPLETED. This is
-    # exactly the phantom: OUTCOME tasks are present and terminal, yet NONE were
-    # transitioned by the outcome-progress judge, so the run stays UNMEASURED
-    # and the ledger reads NOT exercised (stamped, not exercised).
     sig = by_kind["signal"]
-    assert sig.outcome_tasks_total == 3
-    assert sig.outcome_terminal == {
-        "completed": 3,
-        "failed": 0,
-        "not_needed": 0,
-        "cancelled": 0,
-        "non_terminal": 0,
-    }
-    assert "outcome-progress judge" in sig.goal_reason
+    assert "no OUTCOME task" in sig.goal_reason
 
-    # plan_mode=ledger is CONFIGURED on arm B (a KNOWN/applied flag) AND its
-    # tasks are stamped OUTCOME — but a non-overlay run never fires the
-    # outcome-progress judge, so the ledger regime is stamped yet NOT genuinely
-    # EXERCISED. Configured-and-stamped must not read as validated: OUTCOME
-    # terminality from the legacy per-task loop does not validate the ledger.
+    # plan_mode=ledger is CONFIGURED on arm B (a KNOWN/applied flag) but the
+    # hand-authored plan is forecast-shaped, so the ledger regime is neither
+    # stamped nor genuinely EXERCISED (the outcome-progress judge never
+    # transitioned a deliverable). Configured must not read as validated.
     assert by_kind["signal"].plan_mode == "ledger"
     assert by_kind["signal"].ledger_exercised is False
     assert by_kind["signal"].discovered_tasks_total == 0

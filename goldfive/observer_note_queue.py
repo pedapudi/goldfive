@@ -528,6 +528,27 @@ class ObserverNoteQueue:
                 best = max(best, int(n.delivered_turn))
         return best
 
+    def signal_notes(self, kind: str, task_id: str) -> list[ObserverNote]:
+        """Return the SIGNAL notes enqueued for a ``(kind, task)`` key.
+
+        In enqueue order. Correction notes (task #11) are excluded — they
+        are a distinct mechanism, not drift signals (see
+        :meth:`_is_signal_note`). This is the read the 2nd-signal
+        re-authoring in ``DriftObserver._route_corrective_note`` keys on:
+        counting a correction as a prior signal would let the composer
+        falsely claim a plan-revision notice was "an earlier observer
+        note", and the caller additionally checks ``delivered`` /
+        ``delivered_dry_run`` on the single prior so it never quotes a
+        note the agent was never shown.
+        """
+        k = str(kind or "")
+        t = str(task_id or "")
+        return [
+            n
+            for n in self.notes()
+            if n.kind == k and n.task_id == t and self._is_signal_note(n)
+        ]
+
     def signal_count(self, kind: str, task_id: str) -> int:
         """Return the number of SIGNAL notes ENQUEUED for a ``(kind, task)`` key.
 
@@ -539,13 +560,7 @@ class ObserverNoteQueue:
         (task #11) are excluded — they are not drift signals and must not
         trip signal escalation.
         """
-        k = str(kind or "")
-        t = str(task_id or "")
-        return sum(
-            1
-            for n in self.notes()
-            if n.kind == k and n.task_id == t and self._is_signal_note(n)
-        )
+        return len(self.signal_notes(kind, task_id))
 
     def rendered_keys(self) -> set[tuple[str, str]]:
         """Return every ``(kind, task)`` with at least one RENDERED SIGNAL note.

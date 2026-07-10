@@ -4379,7 +4379,25 @@ def make_adk_plugin(
             # AGENCY-PRESERVATION.md Stage 3 PR 10 — ledger plan mode.
             # When on, the pin tiers are bypassed: every unforecast
             # delegation dedup-checks then grows a DISCOVERED ledger task.
+            # The bypass keys on the LIVE PLAN's shape, not on config
+            # alone: ``plan_mode="ledger"`` with a FORECAST-shaped plan
+            # (a hand-authored StaticPlanner template) keeps the forecast
+            # pin tiers — "StaticPlanner users keep forecast semantics —
+            # a hand-authored plan is genuine prescriptive intent" (design
+            # doc Stage 3). Without the shape gate, the config-only bypass
+            # silently stripped pinning + drift-repair from hand-authored
+            # forecast plans. The incoherent combo is warned about once at
+            # run start (``Runner._warn_if_ledger_mode_without_ledger_plan``).
             ledger_mode = _ledger_mode_enabled(ctx.steerer)
+            if ledger_mode:
+                try:
+                    from goldfive.types import (  # noqa: PLC0415 — lazy
+                        plan_has_ledger_shape,
+                    )
+
+                    ledger_mode = plan_has_ledger_shape(plan)
+                except Exception:  # noqa: BLE001 — fail toward forecast
+                    ledger_mode = False
             grow_capable = growth_mode or ledger_mode
             if not tasks and not grow_capable:
                 return False
@@ -7282,7 +7300,9 @@ def make_adk_plugin(
             # keys. Gated on ``signal_channel == "request_context"`` so the
             # legacy default is byte-identical (returns None as before).
             try:
-                annotated = await self._maybe_annotate_tool_result(ctx, result)
+                annotated = await self._maybe_annotate_tool_result(
+                    ctx, result, agent_name=agent_name
+                )
                 if annotated is not None:
                     return annotated
             except Exception as exc:  # noqa: BLE001
@@ -7292,7 +7312,9 @@ def make_adk_plugin(
                 )
             return None
 
-        async def _maybe_annotate_tool_result(self, ctx: Any, result: Any) -> Any:
+        async def _maybe_annotate_tool_result(
+            self, ctx: Any, result: Any, *, agent_name: str = ""
+        ) -> Any:
             """Return an annotated copy of ``result`` for a loop note, or ``None``.
 
             Surface 4 of the observer-note channel. Consumes the most-severe
@@ -7310,6 +7332,16 @@ def make_adk_plugin(
             dry-run delivery for decision parity but nothing is annotated,
             matching the other three surfaces) — so both the legacy path
             and the strict-passive campaign are untouched.
+
+            ``agent_name`` (task #11 agent-scoped delivery) is the agent
+            whose tool result this is — ``after_tool_callback`` passes the
+            ADK-resolved invoking agent. This surface is agent-aware: the
+            peek is scoped so it selects only broadcast notes or notes for
+            THIS agent, never annotating agent A's loop note onto agent B's
+            tool result (misdelivery). Empty ``agent_name`` (direct callers
+            / stubs that cannot resolve an agent) keeps the unscoped
+            broadcast behaviour, matching ``peek_for_render``'s
+            ``agent_id=None`` contract.
             """
             if ctx is None or ctx.steerer is None or ctx.session is None:
                 return None
@@ -7340,8 +7372,14 @@ def make_adk_plugin(
             # agent-targeted corrections do NOT (they ride the agent-aware
             # block surfaces). Exclude correction-origin notes structurally
             # even if a correction's triggering drift was a loop kind.
+            # Agent scoping: only broadcast notes or notes for the invoking
+            # agent are eligible — another agent's loop note stays pending
+            # for its own agent's surfaces (better undelivered than
+            # misdelivered, §0 dormancy bias).
             note = queue.peek_for_render(
-                kinds=_LOOP_KINDS, exclude_correction_notes=True
+                kinds=_LOOP_KINDS,
+                agent_id=agent_name or None,
+                exclude_correction_notes=True,
             )
             if note is None:
                 return None
