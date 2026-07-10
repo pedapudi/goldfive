@@ -806,8 +806,10 @@ using the degraded per-`(agent_name, "")` hash (no tool args at that
 hook).
 
 **Feature flag.** Gated on `SteeringConfig.descriptive_growth_enabled`
-(env `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`, **default ON** since
-goldfive#423 / AGENCY-PRESERVATION.md PR 2). When the flag is off,
+(env `GOLDFIVE_STEER_DESCRIPTIVE_GROWTH`, **default OFF** — the interim
+default-ON from goldfive#423 / AGENCY-PRESERVATION.md PR 2 was reverted
+by #497 pending the AGENCY-PRESERVATION.md §6.4 13b bench gate). When
+the flag is off,
 `_maybe_pin_delegation_task` retains the pre-#423 tier-1/2/3 fallback
 behaviour (scheduled for deletion in AGENCY-PRESERVATION.md PR 13) and
 `CAPABILITY_MISMATCH` Rule C can fire — though Rule C is itself

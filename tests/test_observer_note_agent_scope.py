@@ -343,3 +343,191 @@ async def test_claude_surface_is_agent_scoped() -> None:
     assert block is not None and "signal dW" in block
     pend = {n.drift_id for n in ObserverNoteQueue.for_session(session).pending()}
     assert pend == {"dR"}
+
+
+# ---------------------------------------------------------------------------
+# 6. Correction-note truthfulness + obsolescence GC (fix wave)
+# ---------------------------------------------------------------------------
+
+
+def test_correction_note_body_is_self_contained() -> None:
+    """A note-routed correction must not direct the agent to the
+    "Current assigned task" section — the corrections_via_notes regime
+    (request_context, pin retired) guarantees that section is ABSENT.
+    The corrected task title/id are inlined instead."""
+    from goldfive._correction_injection import queue_corrections_for_revision
+
+    session = _session()
+    ids = queue_corrections_for_revision(
+        session=session,
+        revised=_revised_with_one_correct(),
+        prev_plan=None,
+        drift=_drift(),
+        corrections_via_notes=True,
+    )
+    assert len(ids) == 1
+    note = ObserverNoteQueue.for_session(session).pending()[0]
+    assert "Current assigned task" not in note.body
+    # Self-contained: the corrected task is named inline.
+    assert "Research solar options (corrected scope)" in note.body
+    assert "research_solar_corrected" in note.body
+
+
+def _revised_superseding_the_correction() -> Plan:
+    """rev 3: a REPLACE-kind task supersedes the rev-2 correction task."""
+    base = _revised_with_one_correct()
+    return Plan(
+        id="p2",
+        run_id="r-scope",
+        goal_ids=["g1"],
+        tasks=[
+            *base.tasks,
+            Task(
+                id="research_solar_v3",
+                title="Research solar options (v3 scope)",
+                status=TaskStatus.PENDING,
+                assignee_agent_id="research_agent",
+                supersedes="research_solar_corrected",
+                supersedes_kind=SupersessionKind.REPLACE,
+            ),
+        ],
+        edges=list(base.edges),
+        revision_index=3,
+    )
+
+
+def test_superseded_correction_note_is_evicted_and_not_delivered() -> None:
+    """The slot regime's obsolescence GC now has a note-channel
+    counterpart: when a later revision supersedes the correction task,
+    the pending correction note is evicted — never delivered turns
+    later against a plan that moved past it."""
+    from goldfive._correction_injection import (
+        clear_obsolete_corrections_on_revision,
+        queue_corrections_for_revision,
+    )
+
+    session = _session()
+    queue_corrections_for_revision(
+        session=session,
+        revised=_revised_with_one_correct(),
+        prev_plan=None,
+        drift=_drift(),
+        corrections_via_notes=True,
+    )
+    assert len(ObserverNoteQueue.for_session(session).pending()) == 1
+
+    cleared = clear_obsolete_corrections_on_revision(
+        session, _revised_superseding_the_correction()
+    )
+    assert cleared  # the evicted note id is reported
+    q = ObserverNoteQueue.for_session(session)
+    assert q.pending() == []
+    assert q.peek_for_render(agent_id="research_agent") is None
+
+
+def test_ack_evicts_pending_correction_note() -> None:
+    """``report_task_started`` ack path: once the agent acknowledges the
+    corrected task, the pending correction note is evicted (parity with
+    the slot regime's ``clear_correction``)."""
+    from goldfive._correction_injection import (
+        clear_correction,
+        queue_corrections_for_revision,
+    )
+
+    session = _session()
+    queue_corrections_for_revision(
+        session=session,
+        revised=_revised_with_one_correct(),
+        prev_plan=None,
+        drift=_drift(),
+        corrections_via_notes=True,
+    )
+    assert clear_correction(
+        session, agent_name="research_agent", task_id="research_solar_corrected"
+    )
+    assert ObserverNoteQueue.for_session(session).pending() == []
+
+
+def test_evict_keeps_delivered_tombstones_and_signal_notes() -> None:
+    """Eviction is surgical: delivered correction notes stay as
+    tombstones (enqueue dedup) and drift-signal notes for the same task
+    are never touched."""
+    from goldfive.observer_note_queue import CORRECTION_DRIFT_ID_PREFIX
+
+    session = _session()
+    q = ObserverNoteQueue.for_session(session)
+    delivered = q.enqueue(
+        body="correction body",
+        observation="corr",
+        severity="warning",
+        drift_id=f"{CORRECTION_DRIFT_ID_PREFIX}research_agent:tX:2",
+        kind="off_topic",
+        task_id="tX",
+        agent_id="research_agent",
+    )
+    q.mark_delivered(delivered.note_id, channel="request_context", turn=1)
+    _enqueue(session, drift_id="dSig", agent_id="research_agent", severity="warning")
+    # The signal note above is enqueued with task_id="t1"; enqueue one on
+    # the SAME task id as the correction to prove kind isolation.
+    q.enqueue(
+        body="signal on tX",
+        observation="sig",
+        severity="warning",
+        drift_id="dSigX",
+        kind="looping_tool_call",
+        task_id="tX",
+        agent_id="research_agent",
+    )
+
+    evicted = q.evict_pending_correction_notes(task_id="tX")
+    assert evicted == []  # delivered tombstone kept; signal notes untouched
+    ids = {n.note_id for n in q.notes()}
+    assert delivered.note_id in ids
+    assert {n.drift_id for n in q.pending()} == {"dSig", "dSigX"}
+
+
+def test_evict_agent_filter_scopes_the_ack_sweep() -> None:
+    from goldfive.observer_note_queue import CORRECTION_DRIFT_ID_PREFIX
+
+    session = _session()
+    q = ObserverNoteQueue.for_session(session)
+    for agent in ("writer", "researcher"):
+        q.enqueue(
+            body=f"correction for {agent}",
+            observation="corr",
+            severity="warning",
+            drift_id=f"{CORRECTION_DRIFT_ID_PREFIX}{agent}:tY:2",
+            kind="off_topic",
+            task_id="tY",
+            agent_id=agent,
+        )
+    evicted = q.evict_pending_correction_notes(task_id="tY", agent_id="writer")
+    assert len(evicted) == 1
+    remaining = q.pending()
+    assert len(remaining) == 1 and remaining[0].agent_id == "researcher"
+
+
+def test_slot_regime_sweep_unaffected_by_note_eviction() -> None:
+    """Legacy slot regime: the sweep still clears the state slot and the
+    (empty) note queue read is a no-op — mixed-channel parity."""
+    from goldfive._correction_injection import (
+        clear_obsolete_corrections_on_revision,
+        is_pending_correction_key,
+        queue_corrections_for_revision,
+    )
+
+    session = _session()
+    queue_corrections_for_revision(
+        session=session,
+        revised=_revised_with_one_correct(),
+        prev_plan=None,
+        drift=_drift(),
+        corrections_via_notes=False,
+    )
+    assert any(is_pending_correction_key(k) for k in session.state)
+    cleared = clear_obsolete_corrections_on_revision(
+        session, _revised_superseding_the_correction()
+    )
+    assert any(is_pending_correction_key(k) for k in cleared)
+    assert not any(is_pending_correction_key(k) for k in session.state)
+    assert ObserverNoteQueue.for_session(session).pending() == []

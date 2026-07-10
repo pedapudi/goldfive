@@ -899,3 +899,34 @@ unilaterally:
   task key for task-scoped kinds but fall back to a stable agent/goal anchor
   for trajectory kinds) — a request_context-only change that alters that arm's
   measured behavior, so it belongs with the flip experiment, not before it.
+
+Two further gaps recorded by the pre-merge fix wave — same disposition
+(genuine 13b-scope decisions, documented rather than changed unilaterally):
+
+- **Rule C posture gap: under pure defaults neither the growth rescue nor
+  the mismatch detection runs.** #497 turned prevention default-OFF
+  (`descriptive_growth_enabled=False` — the pin-time growth that fixes the
+  "no right task existed" cause at the source), while detection —
+  CAPABILITY_MISMATCH Rule C — was already soft-retired behind
+  `GOLDFIVE_CAPABILITY_RULE_C` (env-gated OFF) *on the rationale that growth
+  covers its trigger shape*. With both OFF, a delegation the pin binds to a
+  structurally-wrong task is neither rescued (no discovered-task growth) nor
+  flagged (no Rule C verdict). Under the production default
+  (`observation_only=True`) this is telemetry-only, and the legacy tier-3
+  pin fallback still runs — but the pure-defaults arm of the bench measures
+  a regime where Rule C's retirement premise does not hold. *Decision for
+  13b:* either `descriptive_growth_enabled` flips ON with the regime
+  (restoring the premise), or Rule C's retirement plan changes (it cannot be
+  deleted in PR 13 on the strength of a rescue that ships OFF).
+- **Banned-class lexical heuristics remain in-tree, env-gated OFF.** Rule A's
+  leaf-task marker scan (`_looks_like_delegation_task` + the leaf-title
+  heuristic, behind `GOLDFIVE_CAPABILITY_RULE_A`) and Rule C's role-stem
+  match (behind `GOLDFIVE_CAPABILITY_RULE_C`) are stem/keyword NL
+  classification — the exact #166/#167 anti-pattern the project retired
+  twice and the no-regex-heuristics rule bans. They are flagged here per that
+  rule: default-OFF makes them inert, but an env flip resurrects a banned
+  mechanism verbatim. *Decision (13b-adjacent):* delete them outright in
+  PR 13 (consistent with the rule; loses the debug signal) or replace with
+  an LLM classifier / a structural redesign that makes the classification
+  unnecessary — re-enabling the lexical form as-shipped is not an accepted
+  outcome.

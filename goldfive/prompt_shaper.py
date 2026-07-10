@@ -713,13 +713,6 @@ class PromptShaper:
                         state.get(_sp.KEY_CURRENT_TASK_DESCRIPTION, "") or ""
                     )
 
-                pending_correction = _read_pending_correction(
-                    session=session,
-                    state=state,
-                    agent_name=agent_name,
-                    current_task_id=current_task_id,
-                )
-
                 # AGENCY-PRESERVATION.md Stage 3 PR 12 — for a DISCOVERED
                 # pin (ledger plan mode), render a [GOALS] block instead of
                 # the task block (the agent owns its own means-work; ground
@@ -737,6 +730,27 @@ class PromptShaper:
                 )
                 goals_block = (
                     _goals_block_from_session(session) if session is not None else ""
+                )
+
+                # Computed BEFORE the correction read so the correction is
+                # composed for the surface it actually lands on: the
+                # ``[GOALS]`` branch renders NO "Current assigned task"
+                # section, so its correction must inline the corrected task
+                # (``self_contained``) rather than direct the agent to an
+                # absent section. Mirrors ``_compose_instruction``'s branch
+                # condition exactly; forecast / OUTCOME pins keep the
+                # byte-identical default text (§5.1).
+                from goldfive.types import TaskKind
+
+                discovered_goals_pin = bool(
+                    task_kind == TaskKind.DISCOVERED.value and goals_block
+                )
+                pending_correction = _read_pending_correction(
+                    session=session,
+                    state=state,
+                    agent_name=agent_name,
+                    current_task_id=current_task_id,
+                    self_contained=discovered_goals_pin,
                 )
 
                 return _compose_instruction(

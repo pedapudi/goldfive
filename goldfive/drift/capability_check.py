@@ -50,15 +50,19 @@ Detection rules (intentionally surgical):
   caller to pass ``all_pending_tasks`` so the cross-task lookup can
   see non-DAG-ready tasks too; otherwise the rule is silent.
 
-  With descriptive growth at pin time
-  (``SteeringConfig.descriptive_growth_enabled``, default ON) the
-  "no right task existed" cause Rule C papered over is fixed at the
-  source — the plan grows a ``discovered=True`` task carrying the
-  agent's role stem, so Rule C's trigger shape no longer occurs
-  (design doc §7). The rule is therefore disabled unless the operator
-  explicitly re-enables it via ``GOLDFIVE_CAPABILITY_RULE_C=1``
+  With descriptive growth at pin time enabled
+  (``SteeringConfig.descriptive_growth_enabled`` — default OFF pending
+  the AGENCY-PRESERVATION.md §6.4 13b bench gate; #497 reverted the
+  interim default-ON) the "no right task existed" cause Rule C papered
+  over is fixed at the source — the plan grows a ``discovered=True``
+  task carrying the agent's role stem, so Rule C's trigger shape no
+  longer occurs (design doc §7). The rule is disabled unless the
+  operator explicitly re-enables it via ``GOLDFIVE_CAPABILITY_RULE_C=1``
   (per design doc §7.1 soft retirement; hard deletion follows in
-  AGENCY-PRESERVATION.md PR 13).
+  AGENCY-PRESERVATION.md PR 13). Note the resulting pure-defaults
+  posture (growth OFF *and* Rule C OFF: neither the rescue nor the
+  detection runs) is a recorded 13b decision — see
+  AGENCY-PRESERVATION.md §6.6.
 
 All three rules return :class:`~goldfive.types.DriftEvent` carrying the
 agent name + bound task id + the structural gap, suitable for the
@@ -114,8 +118,10 @@ def _rule_c_enabled() -> bool:
     """Return True iff the operator explicitly re-enabled Rule C.
 
     Rule C is soft-retired (default OFF) because descriptive growth at
-    pin time removes the trigger shape it existed to catch — see the
-    module docstring and ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §7.
+    pin time — when enabled; it is itself default-OFF pending 13b
+    (#497) — removes the trigger shape Rule C existed to catch. See the
+    module docstring, ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §7, and
+    AGENCY-PRESERVATION.md §6.6 for the pure-defaults posture.
     """
     raw = os.environ.get(_RULE_C_ENV_VAR, "").strip().lower()
     return raw in _RULE_C_TRUTHY
