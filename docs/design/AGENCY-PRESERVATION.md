@@ -611,6 +611,25 @@ deviation from the roadmap (each a reviewed decision, with its PR), states
 what is still default-OFF, and reproduces the PR-13b pre-flip checklist so
 it survives outside the task tracker. Stage 4 remains exploratory (unbuilt).
 
+### 6.0 Reconcile with `main` (#475–#494)
+
+The branch was reconciled onto `main` and now carries main #475–#494 as
+ancestors (merge #496). The reconcile inherited main's post-branch
+hardening — at a high level: terminus handling (#482), telemetry labels
+(#480), judge scheduling (#483), the tool-loop cap (#484), executor
+cleanup (#485), resolution handling (#486), the stall watchdog (#487), the
+`is_active_steering()` / `steering_is_active(steerer)` kill-switch
+predicate (#488), hot-path extraction (#489), dead-code deletion (#490),
+LLM consolidation (#491), templating (#477), and the enum-bridge (#494).
+
+Two branch hunks were obviated by the reconcile and **dropped**: the
+`_LADDER_BY_VALUE` lookup and the `_OBSERVATION_ONLY_DEFAULT` machinery
+(both superseded by main's equivalents). The #475 `observation_only`
+gate was **re-applied** to the branch's `_route_corrective_note` legacy
+leg so the observation-only leak main closed does not reopen on the
+branch's added path. All regime flags remain default-OFF (§6.2); the
+reconcile changed no defaults.
+
 ### 6.1 Status by stage (PRs #453–#472)
 
 | Roadmap item | PR(s) | Status |
@@ -644,6 +663,8 @@ behavior** (§5.1). As of #472 the production defaults are unchanged:
 - `SteeringConfig.observation_only = True` (active steering opt-in)
 - `SteeringConfig.signal_telemetry = False` (the §5.4 shadow campaign must
   enable it explicitly)
+- `SteeringConfig.descriptive_growth_enabled = False` (restored to OFF this
+  wave — deviation 8, §6.3; growth is opt-in until 13b justifies it)
 
 The full implementation accumulates production mileage with zero production
 authority until the 13b bench gate flips these (each flip a separate
@@ -737,6 +758,19 @@ during, the roadmap as written. They are intentional — not drift.
    the legacy channel stays unpaced, which keeps bench arm C's policy pure
    (deviation 2).
 
+8. **`descriptive_growth_enabled` restored to default-OFF** (this wave).
+   PR 2 (#454) shipped `descriptive_growth_enabled` with a `True` default
+   — the ONE behavior-changing branch flag that defaulted ON, violating
+   the branch's own §5.1 "no-op by default; one-line revertible flips"
+   discipline (and `main`'s "every behavior-changing flag defaults OFF"
+   rule). Reverted to `False` in `goldfive/config.py` (the `from_env`
+   default threads through `defaults.descriptive_growth_enabled`, so the
+   env fallback follows). This is a **sanctioned default correction**: it
+   un-violates the invariant and *disables* an improperly-defaulted feature
+   — it enables nothing. Growth is now opt-in
+   (`descriptive_growth_enabled=True`) and re-flips to `True` by default
+   only if the 13b bench justifies it (a separate one-line PR, §6.4).
+
 ### 6.4 PR-13b pre-flip checklist (the bench gate)
 
 PR 13b — run the three-arm bench on real workloads, produce the
@@ -783,3 +817,30 @@ the task tracker):
    The flips proceed only when arm B is non-inferior to arm A on goal
    success and not worse on turns/tokens beyond the agreed margin across
    ≥2 tree shapes (§4 / §5.8).
+
+### 6.5 In-progress hardening wave (branch-native defects)
+
+Post-reconcile review surfaced branch-native defects that predate the
+merge. A hardening wave is addressing them; this note keeps §6 honest
+about what is and is not yet fixed. Each item is **in progress / tracked**,
+not claimed as merged, and all fixes preserve the flags-OFF invariant
+(§6.2) — they either affect only a non-default regime or close an
+`observation_only` leak (always correct):
+
+- **Injection surface 4 gate** — the fourth note-delivery surface needs
+  the same active-steering gate as the other three.
+- **`dry_run`/delivery telemetry truthfulness** — the emitted
+  decision/visibility records must not overstate what was delivered under
+  `observation_only`.
+- **SIGNAL repeat-escalation reachability** — the repeat-escalation rung
+  must be reachable on the intended path.
+- **Grace-window keying** — pacing keys must match the visibility identity
+  they intend to gate.
+- **Ledger-mode evidence wiring** — outcome/evidence must reach the ledger
+  disposition path.
+- **Bench measurement adequacy** — the 13b harness measurements must be
+  adequate to gate the flips (§6.4).
+
+None of the above flips a default; the 13b LOCK (§6.4) remains intact —
+`plan_mode=ledger` and `observation_only=False` flip only on bench results
+plus explicit user sign-off.
