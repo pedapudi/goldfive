@@ -34,6 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from bench.harness import (  # noqa: E402
     KNOWN_STEER_ENV,
+    OUTCOME_JUDGE_SOURCE,
     Arm,
     Scenario,
     apply_arm_env,
@@ -76,21 +77,22 @@ async def test_three_arm_harness_runs_and_emits_telemetry(tmp_path: Path) -> Non
     assert [m.arm_kind for m in results] == ["baseline", "signal", "legacy"]
 
     for m in results:
-        # §6.4: the stub workload defines NO goal predicate and NO OUTCOME
-        # task, so goal grading is UNMEASURED (not silently True) — the exact
-        # gap that blocks a flip decision on this workload. run.success alone
-        # is not a flip signal (deviation 1).
+        # §6.4: goal grading is UNMEASURED on EVERY arm (not silently True) —
+        # the exact gap that blocks a flip decision on this workload. For
+        # baseline/legacy (forecast mode) that is because the workload defines
+        # no goal predicate and mints no OUTCOME task. For the signal arm
+        # (plan_mode=ledger) the StaticPlanner tasks ARE stamped OUTCOME at
+        # install (#500), but this run is non-overlay — the legacy per-task loop
+        # force-completes those stamped tasks and the outcome-progress judge
+        # never runs — so that OUTCOME terminality is a PHANTOM, not a genuine
+        # ledger deliverable, and still grades UNMEASURED (for the right
+        # reason, asserted below). run.success alone is not a flip signal.
         assert m.goal_grade == "unmeasured", m.goal_reason
         assert m.goal_success is False
         assert m.goal_predicate_count == 0
-        assert m.outcome_tasks_total == 0
-        assert m.outcome_terminal == {
-            "completed": 0,
-            "failed": 0,
-            "not_needed": 0,
-            "cancelled": 0,
-            "non_terminal": 0,
-        }
+        # No arm GENUINELY exercised the ledger: the outcome-progress judge
+        # transitioned no OUTCOME deliverable on any arm (stub is non-overlay).
+        assert m.ledger_exercised is False
         # The captured-artifact outcome is otherwise healthy.
         assert m.completed_outputs == 3
         assert m.turns >= 1
@@ -99,10 +101,39 @@ async def test_three_arm_harness_runs_and_emits_telemetry(tmp_path: Path) -> Non
         assert m.signals_total > 0, f"{m.arm_name}: 0 signals — telemetry not wired"
 
     by_kind = {m.arm_kind: m for m in results}
-    # plan_mode=ledger is CONFIGURED on arm B (a KNOWN/applied flag), but the
-    # StaticPlanner stub mints only FORECAST tasks, so the ledger regime is
-    # NOT exercised. Configured-and-applied must not read as validated: a stub
-    # that never fires an OUTCOME/DISCOVERED path does not validate ledger.
+    # baseline/legacy run in forecast mode: no OUTCOME task is minted at all.
+    for kind in ("baseline", "legacy"):
+        m = by_kind[kind]
+        assert m.outcome_tasks_total == 0
+        assert m.outcome_terminal == {
+            "completed": 0,
+            "failed": 0,
+            "not_needed": 0,
+            "cancelled": 0,
+            "non_terminal": 0,
+        }
+    # The signal arm (plan_mode=ledger) legitimately DOES carry stamped OUTCOME
+    # tasks now — #500's install-time stamping labels the StaticPlanner tasks
+    # OUTCOME and the legacy per-task loop drives them to COMPLETED. This is
+    # exactly the phantom: OUTCOME tasks are present and terminal, yet NONE were
+    # transitioned by the outcome-progress judge, so the run stays UNMEASURED
+    # and the ledger reads NOT exercised (stamped, not exercised).
+    sig = by_kind["signal"]
+    assert sig.outcome_tasks_total == 3
+    assert sig.outcome_terminal == {
+        "completed": 3,
+        "failed": 0,
+        "not_needed": 0,
+        "cancelled": 0,
+        "non_terminal": 0,
+    }
+    assert "outcome-progress judge" in sig.goal_reason
+
+    # plan_mode=ledger is CONFIGURED on arm B (a KNOWN/applied flag) AND its
+    # tasks are stamped OUTCOME — but a non-overlay run never fires the
+    # outcome-progress judge, so the ledger regime is stamped yet NOT genuinely
+    # EXERCISED. Configured-and-stamped must not read as validated: OUTCOME
+    # terminality from the legacy per-task loop does not validate the ledger.
     assert by_kind["signal"].plan_mode == "ledger"
     assert by_kind["signal"].ledger_exercised is False
     assert by_kind["signal"].discovered_tasks_total == 0
@@ -412,6 +443,26 @@ class _Aborted:
         self.reason = reason
 
 
+class _Transitioned:
+    """Duck-typed ``TaskTransitioned`` payload (task_id + source attribution)."""
+
+    def __init__(self, task_id: str, source: str) -> None:
+        self.task_id = task_id
+        self.source = source
+
+
+def _outcome_judge_events(*task_ids: str) -> list[_FakeEvent]:
+    """The ``TaskTransitioned`` events goldfive's outcome-progress judge emits
+    when it GENUINELY transitions OUTCOME deliverables (source is
+    :data:`OUTCOME_JUDGE_SOURCE`). The stub harness is non-overlay and never
+    fires that judge, so a unit test simulates a real ledger exercise by
+    injecting the judge's own source trace onto the reduced event stream."""
+    return [
+        _FakeEvent("task_transitioned", _Transitioned(tid, OUTCOME_JUDGE_SOURCE))
+        for tid in task_ids
+    ]
+
+
 _ARM = Arm(name="unit", kind="signal")
 
 
@@ -454,17 +505,24 @@ def test_outcome_terminality_census_is_deterministic() -> None:
 
 def test_outcome_all_terminal_success_grades_met() -> None:
     session = _outcome_session([TaskStatus.COMPLETED, TaskStatus.NOT_NEEDED])
-    m = metrics_from_events([], arm=_ARM, session=session, plan_mode="ledger")
+    # Genuine ledger exercise: the outcome-progress judge transitioned both
+    # OUTCOME deliverables (its own source trace on the stream), so their
+    # all-terminal-success terminality is a valid grading signal → MET.
+    events = _outcome_judge_events("o0", "o1")
+    m = metrics_from_events(events, arm=_ARM, session=session, plan_mode="ledger")
     assert m.goal_grade == "met"
     assert m.goal_success is True
     assert m.outcome_tasks_total == 2
-    # plan_mode=ledger AND OUTCOME tasks fired → the ledger regime was exercised.
+    # plan_mode=ledger AND the judge transitioned OUTCOME tasks → exercised.
     assert m.ledger_exercised is True
 
 
 def test_outcome_failed_grades_unmet() -> None:
     session = _outcome_session([TaskStatus.COMPLETED, TaskStatus.FAILED])
-    m = metrics_from_events([], arm=_ARM, session=session, plan_mode="ledger")
+    # The judge ran (it graded the deliverables) → genuine exercise, so the
+    # FAILED OUTCOME deliverable grades the run UNMET.
+    events = _outcome_judge_events("o0", "o1")
+    m = metrics_from_events(events, arm=_ARM, session=session, plan_mode="ledger")
     assert m.goal_grade == "unmet"
     assert m.goal_success is False
     assert "FAILED" in m.goal_reason
@@ -474,22 +532,30 @@ def test_outcome_non_terminal_grades_unmet_not_silently_met() -> None:
     # A deliverable still PENDING (uncertain, #208 carry-forward) is NOT a
     # demonstrated success — it grades UNMET for the flip criterion, never MET.
     session = _outcome_session([TaskStatus.COMPLETED, TaskStatus.PENDING])
-    m = metrics_from_events([], arm=_ARM, session=session, plan_mode="ledger")
+    # The judge ran (it completed o0) → genuine exercise; the non-terminal o1
+    # still bars MET.
+    events = _outcome_judge_events("o0")
+    m = metrics_from_events(events, arm=_ARM, session=session, plan_mode="ledger")
     assert m.goal_grade == "unmet"
     assert "non-terminal" in m.goal_reason
 
 
 def test_goal_predicate_gate_precedes_outcome() -> None:
-    # A failing predicate fails the run even when the OUTCOME tasks completed.
+    # A failing predicate fails the run even when the OUTCOME tasks completed
+    # (and the judge genuinely graded them) — the predicate gate precedes the
+    # OUTCOME-terminality branch.
     session = _outcome_session(
         [TaskStatus.COMPLETED], predicate=lambda _s: False
     )
-    m = metrics_from_events([], arm=_ARM, session=session, plan_mode="ledger")
+    events = _outcome_judge_events("o0")
+    m = metrics_from_events(events, arm=_ARM, session=session, plan_mode="ledger")
     assert m.goal_grade == "unmet"
     assert m.goal_predicate_count == 1
-    # A passing predicate + completed OUTCOME → met.
+    # A passing predicate + completed OUTCOME (judge-graded) → met.
     ok = _outcome_session([TaskStatus.COMPLETED], predicate=lambda _s: True)
-    m2 = metrics_from_events([], arm=_ARM, session=ok, plan_mode="ledger")
+    m2 = metrics_from_events(
+        _outcome_judge_events("o0"), arm=_ARM, session=ok, plan_mode="ledger"
+    )
     assert m2.goal_grade == "met"
     assert m2.goal_success is True
 
@@ -524,12 +590,72 @@ def test_ledger_exercised_needs_ledger_mode_and_a_ledger_task() -> None:
         [], arm=_ARM, session=outcome_session, plan_mode="forecast"
     )
     assert m_forecast.ledger_exercised is False
-    # DISCOVERED task in ledger mode also counts as exercised.
+    # OUTCOME tasks present, plan_mode=ledger, but NO outcome-progress-judge
+    # transition on the stream (legacy-loop force-completion) → stamped, NOT
+    # exercised. This is the phantom: configured/stamped is not exercised.
+    m_stamped = metrics_from_events(
+        [], arm=_ARM, session=outcome_session, plan_mode="ledger"
+    )
+    assert m_stamped.outcome_tasks_total == 1
+    assert m_stamped.ledger_exercised is False
+    # The SAME session, but WITH the judge's own transition trace → exercised.
+    m_judge = metrics_from_events(
+        _outcome_judge_events("o0"),
+        arm=_ARM,
+        session=outcome_session,
+        plan_mode="ledger",
+    )
+    assert m_judge.ledger_exercised is True
+    # A DISCOVERED task in ledger mode also counts as exercised: DISCOVERED
+    # tasks are only ever minted by descriptive growth (genuine ledger
+    # machinery), never stamped onto a StaticPlanner task, so their presence is
+    # itself a genuine-exercise signal — no judge transition needed.
     disc = _outcome_session([TaskStatus.COMPLETED], kind=TaskKind.DISCOVERED)
     m_disc = metrics_from_events([], arm=_ARM, session=disc, plan_mode="ledger")
     assert m_disc.discovered_tasks_total == 1
     assert m_disc.outcome_tasks_total == 0
     assert m_disc.ledger_exercised is True
+
+
+def test_stamped_outcome_grades_only_when_judge_transitioned() -> None:
+    """The #499×#500 phantom-grade guard, isolated: two runs with IDENTICAL
+    terminal OUTCOME tasks grade differently by PROVENANCE. The outcome-progress
+    judge's own transition (``OUTCOME_JUDGE_SOURCE``) is a genuine ledger
+    deliverable → MET/exercised; the legacy per-task loop's force-completion of
+    a merely-stamped OUTCOME task (default ``"other"`` source) is a phantom →
+    UNMEASURED/not-exercised. The fix must NOT simply make everything
+    unmeasured — the genuine path still grades MET."""
+    session = _outcome_session([TaskStatus.COMPLETED, TaskStatus.COMPLETED])
+    # Genuine: the outcome-progress judge transitioned both deliverables.
+    genuine = metrics_from_events(
+        _outcome_judge_events("o0", "o1"),
+        arm=_ARM,
+        session=session,
+        plan_mode="ledger",
+    )
+    assert genuine.goal_grade == "met"
+    assert genuine.goal_success is True
+    assert genuine.ledger_exercised is True
+    # Phantom: the SAME terminal OUTCOME tasks, transitioned by the legacy
+    # per-task loop (default "other" source) — not a genuine deliverable.
+    legacy_events = [
+        _FakeEvent("task_transitioned", _Transitioned("o0", "other")),
+        _FakeEvent("task_transitioned", _Transitioned("o1", "other")),
+    ]
+    phantom = metrics_from_events(
+        legacy_events, arm=_ARM, session=session, plan_mode="ledger"
+    )
+    assert phantom.goal_grade == "unmeasured"
+    assert phantom.goal_success is False
+    assert phantom.ledger_exercised is False
+    assert "outcome-progress judge" in phantom.goal_reason
+    # No transition events at all is likewise a phantom (OUTCOME tasks are
+    # stamped-terminal in the session, but the judge left no trace).
+    no_trace = metrics_from_events(
+        [], arm=_ARM, session=session, plan_mode="ledger"
+    )
+    assert no_trace.goal_grade == "unmeasured"
+    assert no_trace.ledger_exercised is False
 
 
 # ---------------------------------------------------------------------------
