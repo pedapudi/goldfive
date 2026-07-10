@@ -81,6 +81,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+from goldfive.steerer import signal_channel as _signal_channel_of
 from goldfive.steerer import steering_is_active
 
 if TYPE_CHECKING:
@@ -134,7 +135,7 @@ class PromptShaper:
         both resolve to ``"legacy_user_message"`` so the legacy path is
         the safe fallback.
         """
-        channel = getattr(steerer, "_signal_channel", "legacy_user_message")
+        channel = _signal_channel_of(steerer)
         return str(channel or "legacy_user_message")
 
     @classmethod

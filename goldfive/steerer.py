@@ -104,6 +104,8 @@ __all__ = [
     "InterventionLevel",
     "RefineExhausted",
     "compose_corrective_user_message",
+    "plan_mode_is_ledger",
+    "signal_channel",
     "steering_is_active",
 ]
 
@@ -126,6 +128,43 @@ def steering_is_active(steerer: Any) -> bool:
         return False
     try:
         return bool(predicate())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def signal_channel(steerer: Any) -> str:
+    """Return the resolved signal channel for a maybe-steerer.
+
+    The single definition of the ``"legacy_user_message"`` default — the
+    sibling of :func:`steering_is_active` for the channel flag. Before this
+    helper the default string was duplicated at nine read sites across five
+    modules; any one of them drifting (a typo, a stale copy after a rename)
+    would silently fork routing between surfaces. Consumers must not read
+    ``_signal_channel`` directly.
+
+    Fail-safe direction: ``None`` / missing attribute / non-string resolves to
+    the legacy channel — the regime whose delivery surfaces are fully
+    ``observation_only``-gated and default-inert.
+    """
+    raw = getattr(steerer, "_signal_channel", None)
+    if not isinstance(raw, str) or not raw:
+        return "legacy_user_message"
+    return raw
+
+
+def plan_mode_is_ledger(steerer: Any) -> bool:
+    """Return ``True`` iff the steerer's typed config selects ledger plan mode.
+
+    The single implementation of the ``plan_mode == "ledger"`` parse
+    (normalising case/whitespace, defaulting to ``"forecast"``) — previously
+    re-implemented verbatim by three ``_ledger_mode`` methods (reconciler,
+    plan reviser, drift observer). Reads the typed
+    :class:`~goldfive.config.SteeringConfig` stashed on the steerer; any
+    failure resolves ``False`` (forecast — the default, inert regime).
+    """
+    try:
+        cfg = getattr(steerer, "_steering_config", None)
+        return str(getattr(cfg, "plan_mode", "forecast")).strip().lower() == "ledger"
     except Exception:  # noqa: BLE001
         return False
 

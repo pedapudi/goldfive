@@ -95,6 +95,7 @@ from goldfive.state_store import (
     BindingSource,
     StateStore,
 )
+from goldfive.steerer import signal_channel as _signal_channel_of
 from goldfive.steerer import steering_is_active
 
 if TYPE_CHECKING:
@@ -5934,7 +5935,7 @@ def make_adk_plugin(
                 if (
                     ctx is not None
                     and ctx.session is not None
-                    and getattr(ctx.steerer, "_signal_channel", "legacy_user_message")
+                    and _signal_channel_of(ctx.steerer)
                     == "request_context"
                 ):
                     # Resolve the agent whose model call this is, so the
@@ -7313,7 +7314,7 @@ def make_adk_plugin(
             if ctx is None or ctx.steerer is None or ctx.session is None:
                 return None
             if (
-                getattr(ctx.steerer, "_signal_channel", "legacy_user_message")
+                _signal_channel_of(ctx.steerer)
                 != "request_context"
             ):
                 return None

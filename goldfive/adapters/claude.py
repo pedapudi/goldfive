@@ -44,6 +44,7 @@ from goldfive.adapters._tool_invocation import invoke_tool
 from goldfive.drift import classify_stop_reason
 from goldfive.reporting import REPORTING_TOOL_NAMES, ReportingToolSpec
 from goldfive.results import InvocationResult
+from goldfive.steerer import signal_channel as _signal_channel_of
 from goldfive.types import Session, Task
 
 # --------------------------------------------------------------------------- #
@@ -390,7 +391,7 @@ class ClaudeAgentSDKAdapter:
         # which never sets ``signal_channel``) keeps the unchanged single-hook
         # options object.
         if (
-            getattr(self._steerer, "_signal_channel", "legacy_user_message")
+            _signal_channel_of(self._steerer)
             == "request_context"
         ):
             hooks["PostToolUse"] = [
@@ -550,7 +551,7 @@ class ClaudeAgentSDKAdapter:
         if steerer is None:
             return None
         if (
-            getattr(steerer, "_signal_channel", "legacy_user_message")
+            _signal_channel_of(steerer)
             != "request_context"
         ):
             return None
