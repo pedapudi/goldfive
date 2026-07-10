@@ -233,3 +233,51 @@ async def test_forecast_control_pins_via_tier2_without_growth() -> None:
     assert session.current_task_id == "review"
     review = next(t for t in session.plan.tasks if t.id == "review")
     assert review.assignee_agent_id == "reviewer_agent"
+
+
+def _forecast_plan() -> Plan:
+    """The SAME titles as ``_outcome_plan`` but FORECAST-shaped — a
+    hand-authored StaticPlanner-style plan (no ``kind`` set)."""
+    return Plan(
+        id="p-static",
+        run_id="r-led",
+        goal_ids=["g-led"],
+        tasks=(
+            Task(id="summary", title="Summary delivered"),
+            Task(id="review", title="reviewer sign-off delivered"),
+        ),
+        edges=(),
+        revision_index=1,
+    )
+
+
+async def test_ledger_config_with_forecast_shaped_plan_keeps_pin_tiers() -> None:
+    """The documented contract: "StaticPlanner users keep forecast
+    semantics — a hand-authored plan is genuine prescriptive intent."
+    ``plan_mode="ledger"`` with a FORECAST-shaped plan (no OUTCOME /
+    DISCOVERED task) must NOT bypass the pin tiers: the delegation pins to
+    the stem-matching forecast task instead of silently stripping pinning
+    + drift-repair from the hand-authored plan."""
+    steerer, _sink = _make_steerer(plan_mode="ledger")
+    session = Session(
+        run_id="r-led",
+        goals=[Goal(id="g-led", summary="deliver the deck")],
+        plan=_forecast_plan(),
+    )
+    plugin, adk_state = _wire_plugin(session, steerer)
+
+    await _dispatch(
+        plugin,
+        adk_state,
+        agent=_FakeSubAgent("reviewer_agent"),
+        tool_args={"request": "review the deck"},
+    )
+
+    # No ledger bypass: the tier-2 stem match pins to "review"; the
+    # hand-authored tasks keep their forecast semantics.
+    assert session.current_task_id == "review"
+    review = next(t for t in session.plan.tasks if t.id == "review")
+    assert review.assignee_agent_id == "reviewer_agent"
+    assert review.kind is TaskKind.FORECAST
+    # No OUTCOME task was skipped-over into growth.
+    assert [t for t in session.plan.tasks if getattr(t, "discovered", False)] == []

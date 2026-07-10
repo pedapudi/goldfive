@@ -515,6 +515,44 @@ def test_preserve_ledger_identity_restores_kinds_and_identity() -> None:
     assert by_id["d2"].status is TaskStatus.RUNNING
 
 
+def test_preserve_ledger_identity_skips_non_ledger_shaped_prior() -> None:
+    """The repairs only restore a taxonomy that EXISTED: a prior with no
+    ledger-shaped task (the initial empty-seed install, or a hand-authored
+    forecast plan under a ledger config) must NOT have its tasks stamped
+    OUTCOME — "StaticPlanner users keep forecast semantics — a hand-authored
+    plan is genuine prescriptive intent" (design doc Stage 3)."""
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(observation_only=False, plan_mode="ledger")
+    )
+    hand_authored = Plan(
+        id="p-static",
+        run_id="r",
+        goal_ids=["g"],
+        tasks=[Task(id="t1", title="Do the work"), Task(id="t2", title="Review it")],
+        edges=[],
+        revision_index=1,
+    )
+
+    # Initial install: prior is the empty seed.
+    out = steerer.plans._preserve_ledger_identity(hand_authored, Plan.empty())
+    assert out is hand_authored
+    assert all(t.kind is TaskKind.FORECAST for t in out.tasks)
+
+    # Later revision of a forecast-shaped (never-a-ledger) prior: new
+    # tasks are NOT stamped OUTCOME either.
+    revised = Plan(
+        id="p-static",
+        run_id="r",
+        goal_ids=["g"],
+        tasks=[*hand_authored.tasks, Task(id="t3", title="Ship it")],
+        edges=[],
+        revision_index=2,
+    )
+    out = steerer.plans._preserve_ledger_identity(revised, hand_authored)
+    assert out is revised
+    assert all(t.kind is TaskKind.FORECAST for t in out.tasks)
+
+
 def test_preserve_ledger_identity_is_noop_in_forecast_mode() -> None:
     prior = _ledger_prior()
     revised = _refined_forecast_shape(prior)

@@ -288,6 +288,7 @@ class TaskStateMachine:
         reason: str = "",
         recoverable: bool = True,
         source: str = "other",
+        dispatch_drift_cascade: bool = True,
     ) -> None:
         """Transition ``task_id`` to ``FAILED`` and emit ``TaskFailed``.
 
@@ -295,6 +296,17 @@ class TaskStateMachine:
         ``TASK_FAILED_FATAL``. The drift event is dispatched through the
         same drift pipeline as observer-detected drift: if severity is
         ``>= WARNING`` (both of these are) we invoke ``planner.refine``.
+
+        ``dispatch_drift_cascade=False`` skips ONLY that fire-and-forget
+        drift dispatch (the intervention-ladder cascade whose advisory
+        note / nudge targets the still-running agent). The one caller is
+        the run-ending outcome-progress finalize
+        (:meth:`~goldfive.drift_observer.DriftObserver._apply_outcome_transitions`
+        with ``run_ending=True``): the run is over, so a cascade signal
+        could never be delivered — dispatching it would pollute signal
+        telemetry with forever-pending notes and phantom fire records.
+        Status transition, ``TaskFailed`` / ``TaskTransitioned`` emission,
+        lineage cleanup, and the fatal downstream cascade are unaffected.
 
         When ``recoverable=False`` the failure is fatal for this task
         lineage: **cascade-cancel every reachable downstream non-terminal
@@ -355,6 +367,15 @@ class TaskStateMachine:
             # ``"cancellation"`` from the framework's perspective — the
             # cascaded tasks weren't moved by the LLM directly).
             await self.cascade_cancel_downstream(session, task_id, source="cancellation")
+        if not dispatch_drift_cascade:
+            # Run-ending outcome finalize: no agent remains to receive the
+            # cascade's advisory signal (see docstring) — skip the dispatch.
+            log.debug(
+                "TaskStateMachine.mark_task_failed: drift cascade for task "
+                "%s suppressed (run-ending outcome finalize)",
+                task_id,
+            )
+            return
         kind = DriftKind.TASK_FAILED_RECOVERABLE if recoverable else DriftKind.TASK_FAILED_FATAL
         severity = DriftSeverity.WARNING if recoverable else DriftSeverity.CRITICAL
         drift = DriftEvent(

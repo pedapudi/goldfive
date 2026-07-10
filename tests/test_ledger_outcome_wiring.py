@@ -146,6 +146,48 @@ def test_finalize_outcomes_fails_confidently_unmet() -> None:
     assert by_id["o1"].status is TaskStatus.PENDING  # untouched (no verdict)
 
 
+def test_finalize_outcomes_failed_suppresses_drift_cascade() -> None:
+    """A run-ending confidently-unmet FAILED must NOT spawn the standard
+    FAILED drift cascade: the run is over, so the cascade's advisory
+    note/nudge could never be delivered — dispatching it would pollute
+    signal telemetry with forever-pending notes and phantom fire records.
+    The FAILED status itself (and its Task* events) still lands."""
+    payload = (
+        '{"outcomes": [{"task_id": "o2", "assessment": "failed", '
+        '"reason": "user cancelled the translation"}]}'
+    )
+    steerer = _make_steerer(plan_mode="ledger", judge_llm=_judge(payload))
+    session = _ledger_session()
+    spawned: list[Any] = []
+    steerer.drift._spawn_drift_handler_background = (  # type: ignore[method-assign]
+        lambda drift, session: spawned.append(drift)
+    )
+
+    asyncio.run(steerer.finalize_outcomes(session))
+
+    by_id = {t.id: t for t in session.plan.tasks}
+    assert by_id["o2"].status is TaskStatus.FAILED  # transition still lands
+    assert spawned == []  # never-deliverable advisory dispatch suppressed
+
+
+def test_mark_task_failed_still_dispatches_cascade_by_default() -> None:
+    """Control for the run-ending suppression: every other
+    ``mark_task_failed`` caller keeps the fire-and-forget drift cascade."""
+    steerer = _make_steerer(plan_mode="ledger", judge_llm=_judge("{}"))
+    session = _ledger_session()
+    spawned: list[Any] = []
+    steerer.drift._spawn_drift_handler_background = (  # type: ignore[method-assign]
+        lambda drift, session: spawned.append(drift)
+    )
+
+    asyncio.run(
+        steerer.tasks.mark_task_failed("o1", session=session, reason="boom")
+    )
+
+    assert {t.id: t for t in session.plan.tasks}["o1"].status is TaskStatus.FAILED
+    assert len(spawned) == 1  # default path unchanged
+
+
 def test_finalize_outcomes_forecast_mode_is_noop() -> None:
     calls: list[str] = []
 

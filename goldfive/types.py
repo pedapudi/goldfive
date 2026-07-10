@@ -1288,6 +1288,35 @@ def task_upstream_ready(plan: Plan, task_id: str) -> bool:
     return True
 
 
+def plan_has_ledger_shape(plan: Any) -> bool:
+    """Return ``True`` iff ``plan`` carries any ledger-taxonomy task.
+
+    AGENCY-PRESERVATION.md Stage 3 PR 10: a plan is *ledger-shaped* when at
+    least one task carries :attr:`TaskKind.OUTCOME` or
+    :attr:`TaskKind.DISCOVERED` — the taxonomy only the ledger regime
+    produces (an :class:`LLMPlanner` OUTCOME ledger, or a hand-authored
+    plan whose author explicitly opted tasks in). A purely FORECAST-kind
+    plan (notably a ``StaticPlanner`` template that never set ``kind``) is
+    NOT ledger-shaped even when ``SteeringConfig.plan_mode == "ledger"``:
+    "StaticPlanner users keep forecast semantics — a hand-authored plan is
+    genuine prescriptive intent" (design doc Stage 3), so ledger-only
+    behaviour (the delegation pin-tier bypass) must key on the live plan's
+    actual shape, not on config alone. Defensive: any read failure
+    resolves ``False`` (forecast — the default, inert regime).
+    """
+    try:
+        for t in getattr(plan, "tasks", None) or ():
+            kind = getattr(t, "kind", None)
+            if kind is None:
+                continue
+            value = str(getattr(kind, "value", kind) or "").strip().upper()
+            if value in (TaskKind.OUTCOME.value, TaskKind.DISCOVERED.value):
+                return True
+    except Exception:  # noqa: BLE001 — shape probe must never raise
+        return False
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Plan / Task derivation helpers (goldfive#247)
 # ---------------------------------------------------------------------------

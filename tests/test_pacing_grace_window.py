@@ -281,13 +281,17 @@ def test_pacing_grace_disabled_still_applies_user_steer_gate() -> None:
 async def test_second_signal_quotes_the_first() -> None:
     steerer = _steerer()
     session = _session(turn=5)
-    # Enqueue a first note manually so _route_corrective_note sees one prior.
-    ObserverNoteQueue.for_session(session).enqueue(
+    # Enqueue a first note manually so _route_corrective_note sees one prior,
+    # and RENDER it — the "This repeats an earlier observer note" claim is
+    # only truthful when the agent actually saw the prior.
+    q = ObserverNoteQueue.for_session(session)
+    q.enqueue(
         body="Observation: search_web looped",
         observation="search_web was called 5 times with identical args",
         severity="warning", drift_id="d1", kind="looping_tool_call",
         task_id="t1", turn=0,
     )
+    q.mark_delivered("d1", channel="request_context", turn=1)
     await steerer.drift._route_corrective_note(
         session, _drift(), "Observation: still looping", ladder_level="signal"
     )
@@ -297,6 +301,97 @@ async def test_second_signal_quotes_the_first() -> None:
     # The 2nd note's body quotes the first note's observation.
     assert "repeats an earlier observer note" in second[0].body
     assert "search_web was called 5 times" in second[0].body
+
+
+async def test_second_signal_unrendered_prior_is_not_quoted() -> None:
+    """Truthfulness: a prior the agent never SAW must not be claimed as
+    "an earlier observer note" — enqueued-but-never-rendered priors compose
+    the 2nd note WITHOUT the repeat claim."""
+    steerer = _steerer()
+    session = _session(turn=5)
+    ObserverNoteQueue.for_session(session).enqueue(
+        body="Observation: search_web looped",
+        observation="search_web was called 5 times with identical args",
+        severity="warning", drift_id="d1", kind="looping_tool_call",
+        task_id="t1", turn=0,
+    )  # NOT marked delivered — never rendered to the agent
+    await steerer.drift._route_corrective_note(
+        session, _drift(), "Observation: still looping", ladder_level="signal"
+    )
+    second = [
+        n
+        for n in ObserverNoteQueue.for_session(session).notes()
+        if n.drift_id != "d1"
+    ]
+    assert len(second) == 1
+    assert second[0].body == "Observation: still looping"
+    assert "repeats an earlier observer note" not in second[0].body
+
+
+async def test_second_signal_dry_run_prior_is_not_quoted() -> None:
+    """A dry-run consume (observation_only shadow) never reached the agent,
+    so it must not be quoted as a repeat either."""
+    steerer = _steerer()
+    session = _session(turn=5)
+    q = ObserverNoteQueue.for_session(session)
+    q.enqueue(
+        body="Observation: search_web looped",
+        observation="search_web was called 5 times with identical args",
+        severity="warning", drift_id="d1", kind="looping_tool_call",
+        task_id="t1", turn=0,
+    )
+    q.mark_delivered("d1", channel="request_context", turn=1, dry_run=True)
+    await steerer.drift._route_corrective_note(
+        session, _drift(), "Observation: still looping", ladder_level="signal"
+    )
+    second = [n for n in q.notes() if n.drift_id != "d1"]
+    assert len(second) == 1
+    assert "repeats an earlier observer note" not in second[0].body
+
+
+async def test_second_signal_correction_prior_is_not_counted_or_quoted() -> None:
+    """A task-#11 correction note is a plan-revision notice, not a drift
+    signal — it must never be quoted as "an earlier observer note" (a false
+    claim), nor count as the single prior that triggers the quote."""
+    from goldfive.observer_note_queue import CORRECTION_DRIFT_ID_PREFIX
+
+    steerer = _steerer()
+    session = _session(turn=5)
+    q = ObserverNoteQueue.for_session(session)
+    # A RENDERED correction note for the SAME (kind, task) key.
+    cid = f"{CORRECTION_DRIFT_ID_PREFIX}writer:t1:1"
+    q.enqueue(
+        body="The plan changed", observation="the plan was revised",
+        severity="warning", drift_id=cid, kind="looping_tool_call",
+        task_id="t1", agent_id="writer", turn=0,
+    )
+    q.mark_delivered(cid, channel="request_context", turn=1)
+    await steerer.drift._route_corrective_note(
+        session, _drift(), "Observation: still looping", ladder_level="signal"
+    )
+    new = [n for n in q.notes() if n.drift_id != cid]
+    assert len(new) == 1
+    # Treated as the FIRST signal: no repeat claim, and never quoting the
+    # correction's observation.
+    assert "repeats an earlier observer note" not in new[0].body
+    assert "the plan was revised" not in new[0].body
+
+
+def test_signal_notes_excludes_corrections_and_keeps_order() -> None:
+    from goldfive.observer_note_queue import CORRECTION_DRIFT_ID_PREFIX
+
+    session = _session()
+    q = ObserverNoteQueue.for_session(session)
+    _enqueue(session, drift_id="d1", turn=1)
+    q.enqueue(
+        body="b", observation="o", severity="warning",
+        drift_id=f"{CORRECTION_DRIFT_ID_PREFIX}writer:t1:1",
+        kind="looping_tool_call", task_id="t1", turn=2,
+    )
+    _enqueue(session, drift_id="d2", turn=3)
+    got = q.signal_notes("looping_tool_call", "t1")
+    assert [n.drift_id for n in got] == ["d1", "d2"]
+    assert q.signal_notes("off_topic", "t1") == []
 
 
 # ---------------------------------------------------------------------------

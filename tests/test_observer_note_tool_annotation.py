@@ -243,3 +243,79 @@ async def test_after_tool_callback_annotates_result_when_active() -> None:
     assert returned["ok"] is True  # real result preserved verbatim
     assert returned["goldfive_observer_note"].startswith("[goldfive observer:")
     assert ObserverNoteQueue.for_session(session).get("d1").delivered is True
+
+
+async def test_annotation_scoped_to_invoking_agent() -> None:
+    """Agent scoping on surface 4: agent A's loop note is never annotated
+    onto agent B's tool result (misdelivery) — it stays pending for A's own
+    surfaces. The SAME note IS annotated when A's own tool result comes
+    through, and a broadcast (empty agent_id) note reaches any agent."""
+    plugin = make_adk_plugin(host_agent_name="test_agent")
+    session = Session(run_id="r1")
+    ctx = _ctx(session, _steerer(active=True))
+    _enqueue_loop_note(session)  # agent_id="worker" (agent A)
+    result = {"content": "x"}
+
+    # Agent B's tool result: A's note must NOT land there.
+    annotated = await plugin._maybe_annotate_tool_result(
+        ctx, result, agent_name="researcher"
+    )
+    assert annotated is None
+    # ...and the note is untouched — still pending for A's surfaces
+    # (better undelivered than misdelivered).
+    assert ObserverNoteQueue.for_session(session).get("d1").delivered is False
+
+    # Agent A's own tool result: the note lands.
+    annotated = await plugin._maybe_annotate_tool_result(
+        ctx, result, agent_name="worker"
+    )
+    assert annotated is not None
+    assert annotated["goldfive_observer_note"].startswith("[goldfive observer:")
+    assert ObserverNoteQueue.for_session(session).get("d1").delivered is True
+
+    # A broadcast note (empty agent_id) reaches any agent.
+    ObserverNoteQueue.for_session(session).enqueue(
+        body="Observation: broadcast loop", observation="broadcast loop",
+        severity="warning", drift_id="d-bcast", kind="looping_tool_call",
+        task_id="t1", agent_id="", turn=0,
+    )
+    annotated = await plugin._maybe_annotate_tool_result(
+        ctx, result, agent_name="researcher"
+    )
+    assert annotated is not None
+    assert ObserverNoteQueue.for_session(session).get("d-bcast").delivered is True
+
+
+async def test_after_tool_callback_two_agents_no_misdelivery() -> None:
+    """End-to-end: a loop note enqueued for agent A never rides agent B's
+    repeated-tool result through ``after_tool_callback``."""
+    plugin = make_adk_plugin(host_agent_name="test_agent")
+    session = Session(run_id="r1")
+    steerer = _steerer(active=True)
+    steerer.bind(sinks=[_ListSink()], planner=_StubPlanner())
+    ctx = _ctx(session, steerer)
+    plugin.set_active_context(ctx)
+    # Agent A's note, with a distinctive observation.
+    ObserverNoteQueue.for_session(session).enqueue(
+        body="Observation: AGENT-A-LOOP-MARKER",
+        observation="AGENT-A-LOOP-MARKER: `search_web` looped for agent_a",
+        severity="warning", drift_id="dA", kind="looping_tool_call",
+        task_id="t1", agent_id="agent_a", turn=0,
+    )
+
+    # Drive agent B into a repeated-tool loop.
+    tool = _ToolStub("patch_file")
+    args = {"path": "a.py", "diff": "x"}
+    tool_ctx = _ToolCtxStub("inv-two-agents", "agent_b")
+    result = {"content": [{"type": "text", "text": "patched"}], "ok": True}
+    returned: Any = None
+    for _ in range(3):  # exact-repeat x3 -> WARNING loop drift
+        returned = await plugin.after_tool_callback(
+            tool=tool, tool_args=args, tool_context=tool_ctx, result=dict(result)
+        )
+
+    # A's note was never consumed by B's surface...
+    assert ObserverNoteQueue.for_session(session).get("dA").delivered is False
+    # ...and whatever annotation (if any) rode B's result, it is not A's.
+    if isinstance(returned, dict) and "goldfive_observer_note" in returned:
+        assert "AGENT-A-LOOP-MARKER" not in returned["goldfive_observer_note"]

@@ -1240,14 +1240,26 @@ class DriftObserver:
                 # suppression of in-window re-fires, and the 3rd-occurrence
                 # escalation are all decided in ``_signal_pacing_decision``
                 # before we get here; this only threads the quote into the
-                # body when exactly one prior note for the key exists.)
+                # body when exactly one prior SIGNAL note for the key
+                # exists.) Truthfulness gates on the claim (§0 — goldfive
+                # never lies to the agent):
+                #
+                # * priors are SIGNAL notes only (``signal_notes``) — a
+                #   task-#11 correction note is a plan-revision notice, not
+                #   "an earlier observer note" about this drift, so quoting
+                #   it here would be a false claim;
+                # * the prior must have been actually RENDERED to the agent
+                #   (``delivered`` and not ``delivered_dry_run``) — "This
+                #   repeats an earlier observer note" is only true if the
+                #   agent SAW that note; an enqueued-but-never-rendered or
+                #   dry-run-consumed prior repeats nothing the agent saw,
+                #   so the 2nd note composes without the claim.
                 body = note_text
-                priors = [
-                    n for n in queue.notes() if n.kind == kind and n.task_id == task
-                ]
+                priors = queue.signal_notes(kind, task)
                 if len(priors) == 1:
-                    first_obs = (priors[0].observation or "").strip()
-                    if first_obs:
+                    prior = priors[0]
+                    first_obs = (prior.observation or "").strip()
+                    if first_obs and prior.delivered and not prior.delivered_dry_run:
                         body = (
                             f"{note_text}\n\nThis repeats an earlier observer "
                             f'note for this work, which observed: "{first_obs}". '
@@ -4314,7 +4326,9 @@ class DriftObserver:
         # been revised in between (a USER_STEER refine can regenerate
         # OUTCOME deliverables under reused ids). Pass the snapshot so the
         # apply path can drop any verdict whose target no longer matches.
-        await self._apply_outcome_transitions(session, transitions, snapshot_plan=plan)
+        await self._apply_outcome_transitions(
+            session, transitions, snapshot_plan=plan, run_ending=run_ending
+        )
 
     @staticmethod
     def _outcome_stability_token(task: Any) -> tuple[str, str]:
@@ -4337,6 +4351,7 @@ class DriftObserver:
         transitions: list[Any],
         *,
         snapshot_plan: Any | None = None,
+        run_ending: bool = False,
     ) -> None:
         """Apply outcome transitions: stamp contributes_to, then transition.
 
@@ -4347,6 +4362,15 @@ class DriftObserver:
         Marking an OUTCOME terminal re-enters ``mark_task_*`` → the
         task-boundary hook, which the PR 11(c) OUTCOME-skip guard
         short-circuits, so this does not recurse.
+
+        ``run_ending=True`` (the ``finalize_outcomes`` cadence) suppresses
+        the FAILED transitions' advisory drift cascade: the run is over, so
+        the cascade's observer note / nudge could never be delivered to the
+        agent — dispatching it would only pollute signal telemetry with
+        forever-pending notes and phantom fire records. The FAILED status,
+        ``TaskFailed`` / ``TaskTransitioned`` events, and ledger
+        finalization all still land; only the never-deliverable signal
+        dispatch is skipped.
 
         ``snapshot_plan`` (when supplied) is the plan the verdicts were
         computed against, before the judge's LLM round-trip. The freshness
@@ -4426,6 +4450,9 @@ class DriftObserver:
                         reason=tr.reason,
                         recoverable=True,
                         source=OUTCOME_JUDGE_SOURCE,
+                        # Run-ending finalize: the advisory cascade's note
+                        # could never reach the agent (see docstring).
+                        dispatch_drift_cascade=not run_ending,
                     )
             except Exception as exc:  # noqa: BLE001 — never break the run
                 log.warning(
