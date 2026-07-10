@@ -792,7 +792,14 @@ def _note_content(body: str) -> FakeContent:
 
 @pytest.mark.asyncio
 async def test_prune_stale_steer_no_active_steer_drops_all_notes() -> None:
-    """With no active steer recorded, every goldfive note is residue."""
+    """Notes with NO bookkeeping match anywhere are residue and drop.
+
+    No active steer (legacy slot empty) AND no delivered note on the
+    ObserverNoteQueue matches these contents — so both staleness sources
+    agree they are residue. A freshly-delivered new-channel note is the
+    OPPOSITE case, covered by
+    ``test_prune_stale_steer_keeps_freshly_delivered_note``.
+    """
     sink = InMemorySink()
     editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[sink])
     request = FakeRequest(
@@ -877,6 +884,180 @@ async def test_prune_stale_steer_detects_observer_note_marker() -> None:
 
     assert result.applied_rules == ["prune_stale_steer"]
     assert [c.parts[0].text for c in request.contents] == ["real user request"]
+
+
+def _delivered_note_session(
+    *,
+    body: str,
+    delivered_turn: int,
+    reasoning_turn: int,
+    dry_run: bool = False,
+    surface: str = "boundary_replay",
+) -> tuple[FakeSession, FakeContent]:
+    """A session whose ObserverNoteQueue delivered ``body``, plus its rendered content.
+
+    Mirrors the new-regime boundary-replay path
+    (``SequentialExecutor._consume_observer_note_for_replay``): enqueue →
+    ``mark_delivered`` (exactly-once) → ``render_block`` fed as the next
+    user turn. ``goldfive.active_steer.body`` is deliberately NOT written
+    — the new regime never stamps it (PR 7).
+    """
+    from goldfive.observer_note_queue import ObserverNoteQueue, render_block
+
+    session = FakeSession()
+    session._reasoning_turn = reasoning_turn
+    queue = ObserverNoteQueue.for_session(session)
+    note = queue.enqueue(
+        body=body,
+        observation=body,
+        severity="warning",
+        drift_id="d-1",
+        kind="looping_tool_call",
+        task_id="t-1",
+        turn=delivered_turn,
+    )
+    assert queue.mark_delivered(
+        note.note_id,
+        channel="request_context",
+        turn=delivered_turn,
+        surface=surface,
+        dry_run=dry_run,
+    )
+    return session, _text_content(render_block(note))
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_steer_keeps_freshly_delivered_note() -> None:
+    """Finding-1 regression: a boundary-replay note delivered THIS turn survives.
+
+    The new regime never writes ``goldfive.active_steer.body``, so the
+    old active-steer proxy would call this note stale and drop it on the
+    FIRST request after delivery — permanently losing an exactly-once
+    delivery the SignalDelivered record claims was live. Staleness must
+    key on the note channel's own bookkeeping instead.
+    """
+    session, note_content = _delivered_note_session(
+        body="Observation: search_web called 5x with identical args.",
+        delivered_turn=3,
+        reasoning_turn=3,  # the agent has NOT had a full turn yet
+    )
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[sink])
+    request = FakeRequest(
+        contents=[
+            _text_content("real user request"),
+            _note_content("Observation: an older note from a resolved drift"),
+            note_content,
+        ]
+    )
+
+    result = await editor.apply(
+        request, session=session, host_agent_name="a", observation_only=False
+    )
+
+    # The stale footer note dropped; the freshly-delivered note SURVIVED.
+    assert result.applied_rules == ["prune_stale_steer"]
+    texts = [c.parts[0].text for c in request.contents]
+    assert len(texts) == 2
+    assert texts[0] == "real user request"
+    assert "search_web called 5x" in texts[1]
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_steer_prunes_delivered_note_after_turn_advances() -> None:
+    """A delivered note from an EARLIER reasoning turn is residue and drops."""
+    session, note_content = _delivered_note_session(
+        body="Observation: search_web called 5x with identical args.",
+        delivered_turn=3,
+        reasoning_turn=4,  # the agent had a full turn to see it
+    )
+    editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[InMemorySink()])
+    request = FakeRequest(
+        contents=[_text_content("real user request"), note_content]
+    )
+
+    result = await editor.apply(
+        request, session=session, host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == ["prune_stale_steer"]
+    assert [c.parts[0].text for c in request.contents] == ["real user request"]
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_steer_dry_run_delivery_does_not_anchor_freshness() -> None:
+    """A dry-run consume never reached the agent — it must not keep a note alive."""
+    session, note_content = _delivered_note_session(
+        body="Observation: search_web called 5x with identical args.",
+        delivered_turn=3,
+        reasoning_turn=3,
+        dry_run=True,
+    )
+    editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[InMemorySink()])
+    request = FakeRequest(
+        contents=[_text_content("real user request"), note_content]
+    )
+
+    result = await editor.apply(
+        request, session=session, host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == ["prune_stale_steer"]
+    assert [c.parts[0].text for c in request.contents] == ["real user request"]
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_steer_ignores_model_turn_quoting_marker() -> None:
+    """A MODEL turn quoting the marker string is not a goldfive note (finding 4)."""
+    from goldfive.observer_notes import OBSERVER_NOTE_MARKER_PREFIX
+
+    editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[InMemorySink()])
+    quoting_model_turn = _text_content(
+        f"The transcript contains a block starting with "
+        f"{OBSERVER_NOTE_MARKER_PREFIX} which I will now discuss.",
+        role="model",
+    )
+    request = FakeRequest(
+        contents=[_text_content("real user request"), quoting_model_turn]
+    )
+    original = list(request.contents)
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == []
+    assert request.contents == original
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_steer_ignores_tool_part_content_with_marker_text() -> None:
+    """A content carrying tool parts is never treated as a goldfive note (finding 4)."""
+    from goldfive.observer_notes import OBSERVER_NOTE_MARKER_PREFIX
+
+    editor = ContextEditor(rules=[PruneStaleSteerRule()], sinks=[InMemorySink()])
+    mixed = FakeContent(
+        role="user",
+        parts=[
+            FakePart(text=f"{OBSERVER_NOTE_MARKER_PREFIX} quoted next to a tool result"),
+            FakePart(
+                function_response=FakeFunctionResponse(
+                    id="fc-1", name="read", response={"ok": True}
+                )
+            ),
+        ],
+    )
+    request = FakeRequest(
+        contents=[_text_content("user"), _call_content("fc-1", name="read"), mixed]
+    )
+    original = list(request.contents)
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == []
+    assert request.contents == original
 
 
 @pytest.mark.asyncio
@@ -1009,6 +1190,296 @@ async def test_compact_prior_reasoning_drift_verdict_lowers_threshold() -> None:
         if p.function_call is not None
     ]
     assert fc_ids == ["fc-1"]
+
+
+@pytest.mark.asyncio
+async def test_compact_identical_claim_requires_identical_results() -> None:
+    """Finding-2 regression: differing errors are never called 'identical results'.
+
+    Three same-signature calls with three DIFFERENT errors collapse under
+    an HONEST summary that says the results differed and preserves the
+    LAST error verbatim — the progression's endpoint.
+    """
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[CompactPriorReasoningRule()], sinks=[sink])
+    request = FakeRequest(
+        contents=[
+            _text_content("user input"),
+            _call_content("fc-1", name="search"),
+            _failed_response_content("fc-1", name="search", detail="error A: index missing"),
+            _call_content("fc-2", name="search"),
+            _failed_response_content("fc-2", name="search", detail="error B: index corrupt"),
+            _call_content("fc-3", name="search"),
+            _failed_response_content("fc-3", name="search", detail="error C: index rebuilt"),
+        ]
+    )
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == ["compact_prior_reasoning"]
+    kept = {
+        p.function_response.id: p.function_response.response
+        for c in request.contents
+        for p in c.parts
+        if p.function_response is not None
+    }
+    assert set(kept) == {"fc-1"}
+    summary = kept["fc-1"]["goldfive_compacted"]
+    # Honest claim: results differed; the FALSE claim never appears.
+    assert "identical results" not in summary
+    assert "results differed" in summary
+    # The LAST error is preserved verbatim inside the summary.
+    assert "error C: index rebuilt" in summary
+    # Earlier errors are the collapsed material.
+    assert "error A" not in summary
+
+
+@pytest.mark.asyncio
+async def test_compact_identical_results_keeps_identical_claim() -> None:
+    """The original 'identical results' claim survives when payloads ARE identical."""
+    editor = ContextEditor(rules=[CompactPriorReasoningRule()], sinks=[InMemorySink()])
+    request = FakeRequest(
+        contents=[
+            _text_content("user input"),
+            _call_content("fc-1", name="search"),
+            _failed_response_content("fc-1", name="search"),
+            _call_content("fc-2", name="search"),
+            _failed_response_content("fc-2", name="search"),
+            _call_content("fc-3", name="search"),
+            _failed_response_content("fc-3", name="search"),
+        ]
+    )
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+    assert result.applied_rules == ["compact_prior_reasoning"]
+    kept = {
+        p.function_response.id: p.function_response.response
+        for c in request.contents
+        for p in c.parts
+        if p.function_response is not None
+    }
+    assert "identical arguments and identical results" in kept["fc-1"]["goldfive_compacted"]
+
+
+def _big_args_call_content(fc_id: str, name: str = "fetch") -> FakeContent:
+    """A call with sizeable args so collapsing clearly beats the summary bytes."""
+    return FakeContent(
+        role="model",
+        parts=[
+            FakePart(
+                function_call=FakeFunctionCall(
+                    id=fc_id,
+                    name=name,
+                    args={"query": "the same long query string " * 6},
+                )
+            )
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_composes_with_transient_redaction() -> None:
+    """Finding-3 regression: redaction upstream must not blind compaction.
+
+    Chain order [prune_transient_error, compact_prior_reasoning]: three
+    same-signature transient errors with DIFFERING messages are first
+    redacted in place (identical marker payloads), then compacted — the
+    redacted payloads count as failed, group under result identity, and
+    the summary honestly reports elided transient errors rather than
+    claiming identical tool results. Pins the rule composition.
+    """
+    sink = InMemorySink()
+    editor = ContextEditor(
+        rules=[PruneTransientErrorRule(), CompactPriorReasoningRule()],
+        sinks=[sink],
+    )
+    request = FakeRequest(
+        contents=[
+            _text_content("user input"),
+            _big_args_call_content("fc-1"),
+            _transient_response_content(
+                "fc-1",
+                response={"error": {"code": 429, "message": "rate limit exceeded; retry in 10s"}},
+            ),
+            _big_args_call_content("fc-2"),
+            _transient_response_content(
+                "fc-2",
+                response={"error": {"code": 429, "message": "rate limit exceeded; retry in 30s"}},
+            ),
+            _big_args_call_content("fc-3"),
+            _transient_response_content(
+                "fc-3",
+                response={"error": {"code": 429, "message": "rate limit exceeded; retry in 60s"}},
+            ),
+        ]
+    )
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == [
+        "prune_transient_error",
+        "compact_prior_reasoning",
+    ]
+    kept = {
+        p.function_response.id: p.function_response.response
+        for c in request.contents
+        for p in c.parts
+        if p.function_response is not None
+    }
+    assert set(kept) == {"fc-1"}
+    summary = kept["fc-1"]["goldfive_compacted"]
+    assert "transient error" in summary
+    assert "elided" in summary
+    # The transcript's payloads WERE identical post-redaction, but the
+    # tool's results were not observed to be — never claim they were.
+    assert "identical results" not in summary
+    # Pairing invariant held across the composed chain.
+    fc_ids = [
+        p.function_call.id
+        for c in request.contents
+        for p in c.parts
+        if p.function_call is not None
+    ]
+    assert fc_ids == ["fc-1"]
+
+
+@pytest.mark.asyncio
+async def test_compact_skips_content_with_idless_tool_part() -> None:
+    """Finding-5 regression: an id-less tool part is never clobbered or dropped.
+
+    A response content that batches the failed response WITH an id-less
+    function_response (unattributable to any call) fails the ownership
+    guard, so the whole group is conservatively left untouched.
+    """
+    mixed_response = FakeContent(
+        role="user",
+        parts=[
+            FakePart(
+                function_response=FakeFunctionResponse(
+                    id="fc-2", name="search", response={"error": "boom " * 12}
+                )
+            ),
+            # Id-less sibling part — unrelated payload that must survive.
+            FakePart(
+                function_response=FakeFunctionResponse(
+                    id="", name="stream_chunk", response={"data": "precious"}
+                )
+            ),
+        ],
+    )
+    editor = ContextEditor(rules=[CompactPriorReasoningRule()], sinks=[InMemorySink()])
+    request = FakeRequest(
+        contents=[
+            _text_content("user input"),
+            _call_content("fc-1", name="search"),
+            _failed_response_content("fc-1", name="search", detail="boom"),
+            _call_content("fc-2", name="search"),
+            mixed_response,
+            _call_content("fc-3", name="search"),
+            _failed_response_content("fc-3", name="search", detail="boom"),
+        ]
+    )
+    original = list(request.contents)
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == []
+    assert request.contents == original
+    # The id-less part's payload is untouched.
+    assert mixed_response.parts[1].function_response.response == {"data": "precious"}
+
+
+# ---------------------------------------------------------------------------
+# ContextEdited telemetry truthfulness (finding 6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_context_edited_before_count_is_per_rule() -> None:
+    """Each ContextEdited reports ITS rule's input count, not the pre-chain count."""
+
+    class _DropFirst:
+        name = "drop_first"
+
+        def edit(self, contents, ctx):  # type: ignore[no-untyped-def]
+            return contents[1:] if len(contents) > 1 else None
+
+    class _DropLast:
+        name = "drop_last"
+
+        def edit(self, contents, ctx):  # type: ignore[no-untyped-def]
+            return contents[:-1] if len(contents) > 1 else None
+
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[_DropFirst(), _DropLast()], sinks=[sink])
+    request = FakeRequest(
+        contents=[_text_content("a"), _text_content("b"), _text_content("c")]
+    )
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    assert result.applied_rules == ["drop_first", "drop_last"]
+    edited = [
+        e for e in sink.events if isinstance(e, dict) and e.get("kind") == "context_edited"
+    ]
+    by_rule = {e["payload"]["rule_name"]: e["payload"] for e in edited}
+    assert by_rule["drop_first"]["contents_count_before"] == 3
+    assert by_rule["drop_first"]["contents_count_after"] == 2
+    # The second rule saw the FIRST rule's output (2), not the original 3.
+    assert by_rule["drop_last"]["contents_count_before"] == 2
+    assert by_rule["drop_last"]["contents_count_after"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_swap_suppresses_context_edited_events() -> None:
+    """No ContextEdited survives a failed contents swap — the edit never landed."""
+
+    class _FrozenRequest:
+        """Request whose ``contents`` setter raises (swap failure)."""
+
+        def __init__(self, contents: list[FakeContent]) -> None:
+            self._contents = contents
+
+        @property
+        def contents(self) -> list[FakeContent]:
+            return self._contents
+
+        @contents.setter
+        def contents(self, value: list[FakeContent]) -> None:
+            raise RuntimeError("frozen request")
+
+    class _DropFirst:
+        name = "drop_first"
+
+        def edit(self, contents, ctx):  # type: ignore[no-untyped-def]
+            return contents[1:] if len(contents) > 1 else None
+
+    sink = InMemorySink()
+    editor = ContextEditor(rules=[_DropFirst()], sinks=[sink])
+    request = _FrozenRequest([_text_content("a"), _text_content("b")])
+    original = list(request.contents)
+
+    result = await editor.apply(
+        request, session=FakeSession(), host_agent_name="a", observation_only=False
+    )
+
+    # The edit was reverted and NO ContextEdited event claims otherwise.
+    assert result.applied_rules == []
+    assert request.contents == original
+    edited = [
+        e for e in sink.events if isinstance(e, dict) and e.get("kind") == "context_edited"
+    ]
+    assert edited == []
+    assert result.contents_count_after == 2
 
 
 # ---------------------------------------------------------------------------
