@@ -156,9 +156,22 @@ class KeyDivergence:
     #: Per-regime transport fields (channel / channel_action) that differ.
     #: Informational only — a key that differs ONLY here is NOT ``diverged``.
     transport_fields: list[str] = dataclasses.field(default_factory=list)
+    #: ``True`` when a one-sided key is a **join artifact**, not a real
+    #: silence: the other regime DID fire this drift kind, but on a disjoint
+    #: ``task_id`` namespace, so ``(kind, task_id, occurrence)`` structurally
+    #: cannot match. The flip-target comparison (ledger OUTCOME task ids vs.
+    #: forecast task ids) is exactly this case — the ids differ by
+    #: construction. Un-joinable keys are EXCLUDED from the divergence verdict
+    #: and logged separately, so a 13b operator is not misled by a silently
+    #: partial diff (a run-vs-run join that never aligned).
+    unjoinable: bool = False
 
     @property
     def diverged(self) -> bool:
+        if self.unjoinable:
+            # A join artifact, not a decision divergence: the other regime
+            # fired this kind on a different task-id namespace.
+            return False
         return self.present_in != "both" or bool(self.diverged_fields)
 
     @property
@@ -185,11 +198,21 @@ class DivergenceReport:
 
     @property
     def legacy_only(self) -> list[KeyDivergence]:
-        return [k for k in self.keys if k.present_in == "legacy_only"]
+        """Drifts the LEGACY regime fired and the new regime genuinely did not.
+
+        Excludes un-joinable keys (a join artifact — the new regime fired the
+        same kind on a different task-id namespace, so it is not a silence).
+        """
+        return [
+            k for k in self.keys if k.present_in == "legacy_only" and not k.unjoinable
+        ]
 
     @property
     def new_only(self) -> list[KeyDivergence]:
-        return [k for k in self.keys if k.present_in == "new_only"]
+        """Drifts the NEW regime fired and the legacy regime genuinely did not."""
+        return [
+            k for k in self.keys if k.present_in == "new_only" and not k.unjoinable
+        ]
 
     @property
     def field_divergences(self) -> list[KeyDivergence]:
@@ -199,6 +222,17 @@ class DivergenceReport:
     def transport_only_keys(self) -> list[KeyDivergence]:
         """Keys that differ ONLY in transport (channel) — informational, not divergences."""
         return [k for k in self.keys if k.transport_only]
+
+    @property
+    def unjoinable_keys(self) -> list[KeyDivergence]:
+        """One-sided keys that are join artifacts, not decision divergences.
+
+        The other regime fired the same drift kind on a disjoint ``task_id``
+        namespace (e.g. ledger OUTCOME ids vs. forecast ids), so the
+        ``(kind, task_id, occurrence)`` key structurally cannot align. Logged
+        separately so a partial join is never silently read as divergence.
+        """
+        return [k for k in self.keys if k.unjoinable]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -212,6 +246,7 @@ class DivergenceReport:
             "new_only": len(self.new_only),
             "field_divergences": len(self.field_divergences),
             "transport_only_keys": len(self.transport_only_keys),
+            "unjoinable_keys": len(self.unjoinable_keys),
             "keys": [dataclasses.asdict(k) for k in self.keys],
         }
 
@@ -315,10 +350,34 @@ def diff_two_logs(
     legacy_path: str = "legacy",
     new_path: str = "new",
 ) -> DivergenceReport:
-    """Align two logs per drift key and report decision divergences."""
+    """Align two logs per drift key and report decision divergences.
+
+    The cross-run join key is ``(kind, task_id, occurrence#)`` — drift ids are
+    per-run minted so cannot join across logs. ``task_id`` is stable within a
+    regime but NOT across regimes when the plan taxonomy differs (the
+    flip-target case: ledger OUTCOME task ids vs. forecast task ids). A
+    one-sided key whose kind DID fire in the other regime but on a disjoint
+    ``task_id`` namespace is therefore a **join artifact**, not a real
+    silence; it is flagged ``unjoinable`` and excluded from the divergence
+    verdict (see :attr:`KeyDivergence.unjoinable`) so a partial join is never
+    misread as divergence. A true cross-regime deliverable-identity join would
+    need a goal-anchored id on the wire (``SignalDelivered`` has none today —
+    a dependency for a sibling runtime PR); until then the un-joinable set is
+    surfaced explicitly rather than silently mis-bucketed.
+    """
     legacy_keyed = dict(_assign_occurrences(legacy))
     new_keyed = dict(_assign_occurrences(new))
     all_keys = sorted(set(legacy_keyed) | set(new_keyed))
+
+    # Per-kind task-id namespaces, to tell a genuine one-sided silence (the
+    # other regime never fired this kind at all) from a join artifact (it
+    # fired the kind, but on task ids that cannot align across regimes).
+    legacy_tids: dict[str, set[str]] = defaultdict(set)
+    new_tids: dict[str, set[str]] = defaultdict(set)
+    for rec in legacy:
+        legacy_tids[rec.kind].add(rec.task_id)
+    for rec in new:
+        new_tids[rec.kind].add(rec.task_id)
 
     keys: list[KeyDivergence] = []
     for key in all_keys:
@@ -343,6 +402,10 @@ def diff_two_logs(
                 )
             )
         elif lrec is not None:
+            # Un-joinable iff the new regime fired this kind but never on this
+            # task_id — same drift, disjoint task-id namespace (a join
+            # artifact), not a new-regime silence.
+            unjoinable = bool(new_tids[kind]) and task_id not in new_tids[kind]
             keys.append(
                 KeyDivergence(
                     kind=kind,
@@ -352,10 +415,12 @@ def diff_two_logs(
                     legacy=lrec.decision_view(),
                     new=None,
                     diverged_fields=[],
+                    unjoinable=unjoinable,
                 )
             )
         else:
             assert nrec is not None
+            unjoinable = bool(legacy_tids[kind]) and task_id not in legacy_tids[kind]
             keys.append(
                 KeyDivergence(
                     kind=kind,
@@ -365,6 +430,7 @@ def diff_two_logs(
                     legacy=None,
                     new=nrec.decision_view(),
                     diverged_fields=[],
+                    unjoinable=unjoinable,
                 )
             )
 
@@ -394,7 +460,36 @@ def render_two_log_text(report: DivergenceReport) -> str:
         f"  transport-only (channel): {len(report.transport_only_keys)}  "
         "(per-regime transport, not a divergence)"
     )
+    unjoinable = report.unjoinable_keys
+    lines.append(
+        f"  UN-JOINABLE (task-id ns):{len(unjoinable)}  "
+        "(disjoint task-id namespaces — NOT a divergence)"
+    )
     lines.append("-" * 64)
+
+    if unjoinable:
+        lines.append(
+            f"WARNING: {len(unjoinable)} drift key(s) could not be joined across "
+            "regimes:"
+        )
+        lines.append(
+            "  the two logs fire the same drift kind on DISJOINT task-id "
+            "namespaces (e.g. ledger OUTCOME ids vs. forecast ids), so the"
+        )
+        lines.append(
+            "  (kind, task_id, occurrence) key cannot align. These are join "
+            "artifacts, NOT decision divergences — do not read them as one"
+        )
+        lines.append(
+            "  regime staying silent. A goal-anchored deliverable id on the "
+            "wire would join them (a runtime dependency, not this tool's)."
+        )
+        for kd in unjoinable:
+            lines.append(
+                f"  [{kd.kind} / {kd.task_id} #{kd.occurrence}] {kd.present_in} "
+                "(un-joinable)"
+            )
+        lines.append("-" * 64)
 
     if not report.diverged_keys:
         lines.append("VERDICT: no decision divergence — the two regimes' steering")
@@ -437,14 +532,40 @@ def render_two_log_text(report: DivergenceReport) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Delivery channels the LEGACY regime rides (the four goldfive-authored
+#: dispatch decision points). On a log made of these, ``would_cancel_inflight``
+#: IS the legacy regime's own cancel verdict, so the single-event
+#: legacy-vs-new derivation below is valid.
+_LEGACY_TRANSPORT: frozenset[str] = frozenset(
+    {"nudge_replay", "steer_control", "pause_control", "promotion"}
+)
+#: The channel the NEW (signal) regime rides (PR 6). On a new-regime log,
+#: ``would_cancel_inflight`` is the NEW regime's (narrower) cancel verdict —
+#: it CANNOT reveal what legacy would have done, so a single-log census of a
+#: new-regime log is blind to cancel divergences (see :func:`single_log_report`).
+_NEW_TRANSPORT: frozenset[str] = frozenset({"request_context"})
+
+
+def _record_regime(rec: SignalRecord) -> str:
+    """Infer which regime a delivery belongs to from its transport channel.
+
+    Returns ``"new"`` for the request_context channel, ``"legacy"`` otherwise
+    (the four legacy dispatch channels; unknown channels default to legacy so
+    the derivation stays applicable rather than silently dropping the record).
+    """
+    return "new" if rec.channel in _NEW_TRANSPORT else "legacy"
+
+
 def _legacy_vs_new_within_event(rec: SignalRecord) -> dict[str, Any]:
     """Derive legacy-would-do vs. new-would-do from one delivery's payload.
 
-    The ``decision`` payload carries the legacy cancel intent
-    (``would_cancel_inflight``) and the chosen channel/ladder. The new
-    regime's contract is "signal without preempting in-flight work", so the
-    divergence within a single event is: does the legacy regime cancel /
-    swap the plan where the new regime would only signal?
+    VALID ONLY on a LEGACY-regime delivery. The ``decision`` payload carries
+    the running regime's cancel intent (``would_cancel_inflight``); on a
+    legacy log that IS the legacy verdict, so the divergence within a single
+    event is: does the legacy regime cancel / swap the plan where the new
+    regime would only signal? On a NEW-regime log the same field is the new
+    regime's (narrower) verdict and reveals nothing about legacy — the caller
+    (:func:`single_log_report`) must gate this to legacy-transport records.
     """
     cancels = bool(rec.decision.get("would_cancel_inflight")) or rec.channel in (
         "steer_control",
@@ -469,11 +590,23 @@ def _legacy_vs_new_within_event(rec: SignalRecord) -> dict[str, Any]:
 
 
 def single_log_report(records: list[SignalRecord]) -> dict[str, Any]:
-    """Census + per-event legacy-vs-new derivation for one shadow log."""
+    """Census + per-event legacy-vs-new derivation for one shadow log.
+
+    The legacy-vs-new derivation is derived ONLY from LEGACY-transport
+    deliveries: ``would_cancel_inflight`` is the *running* regime's cancel
+    verdict, so on a NEW-regime (request_context) log it is the new regime's
+    narrower verdict and reveals nothing about what legacy would have done.
+    Those deliveries are counted as ``undecidable`` and the report flags a
+    ``blind_spot`` — a single new-regime log CANNOT surface a cancel
+    divergence; use two-log mode (``--legacy``/``--new``) for that.
+    """
     by_channel: dict[str, int] = defaultdict(int)
     by_ladder: dict[str, int] = defaultdict(int)
     by_kind: dict[str, int] = defaultdict(int)
     dry = 0
+    legacy_transport = 0
+    new_transport = 0
+    undecidable = 0
     diverging: list[dict[str, Any]] = []
     for rec in records:
         by_channel[rec.channel] += 1
@@ -481,6 +614,13 @@ def single_log_report(records: list[SignalRecord]) -> dict[str, Any]:
         by_kind[rec.kind] += 1
         if rec.dry_run:
             dry += 1
+        if _record_regime(rec) == "new":
+            # would_cancel_inflight here is the NEW regime's (narrower) cancel
+            # verdict; it cannot reveal a legacy cancel divergence.
+            new_transport += 1
+            undecidable += 1
+            continue
+        legacy_transport += 1
         derived = _legacy_vs_new_within_event(rec)
         if derived["diverges"]:
             diverging.append(
@@ -492,6 +632,12 @@ def single_log_report(records: list[SignalRecord]) -> dict[str, Any]:
                     "new_action": derived["new_action"],
                 }
             )
+    if legacy_transport and new_transport:
+        regime = "mixed"
+    elif new_transport:
+        regime = "new"
+    else:
+        regime = "legacy"
     return {
         "deliveries": len(records),
         "dry_run": dry,
@@ -499,6 +645,14 @@ def single_log_report(records: list[SignalRecord]) -> dict[str, Any]:
         "by_channel": dict(by_channel),
         "by_ladder_level": dict(by_ladder),
         "by_kind": dict(by_kind),
+        "regime": regime,
+        "legacy_transport": legacy_transport,
+        "new_transport": new_transport,
+        # A single log can only derive legacy-vs-new from legacy-transport
+        # deliveries; new-transport deliveries are blind to cancel divergence.
+        "divergence_derivable": legacy_transport > 0,
+        "blind_spot": new_transport > 0,
+        "undecidable_deliveries": undecidable,
         "diverging_events": diverging,
     }
 
@@ -515,10 +669,38 @@ def render_single_log_text(report: dict[str, Any], *, path: str) -> str:
     lines.append(f"by channel:    {report['by_channel']}")
     lines.append(f"by ladder:     {report['by_ladder_level']}")
     lines.append(f"by kind:       {report['by_kind']}")
+    lines.append(
+        f"regime:        {report['regime']}  "
+        f"(legacy-transport={report['legacy_transport']}, "
+        f"new-transport={report['new_transport']})"
+    )
     lines.append("-" * 64)
+    if report["blind_spot"]:
+        lines.append(
+            f"BLIND SPOT: {report['undecidable_deliveries']} delivery(ies) ride "
+            "the NEW regime's transport (request_context)."
+        )
+        lines.append(
+            "  would_cancel_inflight on those is the NEW regime's own "
+            "(narrower) cancel verdict — it CANNOT reveal what legacy would"
+        )
+        lines.append(
+            "  have done, so a single-log census is blind to cancel "
+            "divergences here. Use two-log mode (--legacy/--new) to diff them."
+        )
+        lines.append("-" * 64)
     diverging = report["diverging_events"]
     if not diverging:
-        lines.append("no per-event legacy/new divergence derivable from the payloads.")
+        if report["divergence_derivable"]:
+            lines.append(
+                "no per-event legacy/new divergence derivable from the "
+                "legacy-transport payloads."
+            )
+        else:
+            lines.append(
+                "no legacy-transport deliveries — no legacy/new divergence is "
+                "derivable from this log alone (see BLIND SPOT above)."
+            )
         return "\n".join(lines)
     lines.append(f"{len(diverging)} delivery(ies) where legacy != new:")
     for d in diverging:

@@ -40,6 +40,8 @@ from bench.harness import (  # noqa: E402
     arm_flag_status,
     default_arms,
     make_linear_run_driver,
+    metrics_from_events,
+    outcome_terminality,
     run_arm,
     run_arms,
     shadow_arms,
@@ -49,9 +51,12 @@ from bench.shadow_diff import (  # noqa: E402
     SignalRecord,
     diff_two_logs,
     load_signals,
+    render_single_log_text,
     render_two_log_text,
     single_log_report,
 )
+from goldfive import Goal, Plan, Session, Task  # noqa: E402
+from goldfive.types import TaskKind, TaskStatus  # noqa: E402
 
 
 def _scenario(tasks: int = 3, inject: bool = True) -> Scenario:
@@ -71,8 +76,22 @@ async def test_three_arm_harness_runs_and_emits_telemetry(tmp_path: Path) -> Non
     assert [m.arm_kind for m in results] == ["baseline", "signal", "legacy"]
 
     for m in results:
-        # The workload completed: captured-artifact outcome is healthy.
-        assert m.goal_success, m.goal_reason
+        # §6.4: the stub workload defines NO goal predicate and NO OUTCOME
+        # task, so goal grading is UNMEASURED (not silently True) — the exact
+        # gap that blocks a flip decision on this workload. run.success alone
+        # is not a flip signal (deviation 1).
+        assert m.goal_grade == "unmeasured", m.goal_reason
+        assert m.goal_success is False
+        assert m.goal_predicate_count == 0
+        assert m.outcome_tasks_total == 0
+        assert m.outcome_terminal == {
+            "completed": 0,
+            "failed": 0,
+            "not_needed": 0,
+            "cancelled": 0,
+            "non_terminal": 0,
+        }
+        # The captured-artifact outcome is otherwise healthy.
         assert m.completed_outputs == 3
         assert m.turns >= 1
         # Telemetry flowed: the JSONL artifact exists and carries signals.
@@ -80,6 +99,16 @@ async def test_three_arm_harness_runs_and_emits_telemetry(tmp_path: Path) -> Non
         assert m.signals_total > 0, f"{m.arm_name}: 0 signals — telemetry not wired"
 
     by_kind = {m.arm_kind: m for m in results}
+    # plan_mode=ledger is CONFIGURED on arm B (a KNOWN/applied flag), but the
+    # StaticPlanner stub mints only FORECAST tasks, so the ledger regime is
+    # NOT exercised. Configured-and-applied must not read as validated: a stub
+    # that never fires an OUTCOME/DISCOVERED path does not validate ledger.
+    assert by_kind["signal"].plan_mode == "ledger"
+    assert by_kind["signal"].ledger_exercised is False
+    assert by_kind["signal"].discovered_tasks_total == 0
+    assert by_kind["baseline"].plan_mode == "forecast"
+    assert by_kind["baseline"].ledger_exercised is False
+    assert by_kind["legacy"].ledger_exercised is False
     # The baseline runs observation-only: every signal is dry-run, so the
     # self-correction *base rate* is fully unaided (the §2 counterfactual).
     base = by_kind["baseline"]
@@ -318,7 +347,9 @@ async def test_unknown_flag_degrades_gracefully(tmp_path: Path) -> None:
         },
     )
     metrics = await run_arm(arm, _scenario(), jsonl_dir=tmp_path)
-    assert metrics.goal_success
+    # The arm still runs and emits telemetry (the made-up flag no-ops); goal
+    # grading is UNMEASURED on the stub workload (no predicate / OUTCOME).
+    assert metrics.goal_grade == "unmeasured"
     assert metrics.signals_total > 0
     _, pending = arm_flag_status(arm)
     assert "GOLDFIVE_TOTALLY_MADE_UP_FLAG" in pending
@@ -342,6 +373,256 @@ def test_apply_arm_env_clears_and_restores(monkeypatch: pytest.MonkeyPatch) -> N
     # restored afterwards:
     assert os.environ["GOLDFIVE_STEER_OBSERVATION_ONLY"] == "1"
     assert "GOLDFIVE_STEER_SIGNAL_TELEMETRY" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# 7. Goal grading requires a signal; OUTCOME-terminality census (§6.4 rule 1)
+# ---------------------------------------------------------------------------
+
+
+def _outcome_session(
+    statuses: list[TaskStatus],
+    *,
+    predicate=None,
+    kind: TaskKind = TaskKind.OUTCOME,
+) -> Session:
+    """A synthetic run session whose plan carries tasks of the given kind."""
+    tasks = [
+        Task(id=f"o{i}", title=f"deliverable {i}", kind=kind, status=st)
+        for i, st in enumerate(statuses)
+    ]
+    plan = Plan(id="p", run_id="r", goal_ids=["g"], tasks=tasks, edges=[])
+    goal = Goal(id="g", summary="deliver the thing", success_predicate=predicate)
+    return Session(run_id="r", goals=[goal], plan=plan)
+
+
+class _FakeEvent:
+    """Minimal duck-typed proto event for the metric reducer (WhichOneof)."""
+
+    def __init__(self, which: str, payload: object) -> None:
+        self._which = which
+        setattr(self, which, payload)
+
+    def WhichOneof(self, _field: str) -> str:  # noqa: N802 - proto API shape
+        return self._which
+
+
+class _Aborted:
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+
+_ARM = Arm(name="unit", kind="signal")
+
+
+def test_outcome_terminality_census_is_deterministic() -> None:
+    session = _outcome_session(
+        [
+            TaskStatus.COMPLETED,
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.NOT_NEEDED,
+            TaskStatus.PENDING,
+            TaskStatus.CANCELLED,
+        ]
+    )
+    total, census, discovered = outcome_terminality(session)
+    assert total == 6
+    assert discovered == 0
+    # Fixed key order, exact counts.
+    assert list(census.keys()) == [
+        "completed",
+        "failed",
+        "not_needed",
+        "cancelled",
+        "non_terminal",
+    ]
+    assert census == {
+        "completed": 2,
+        "failed": 1,
+        "not_needed": 1,
+        "cancelled": 1,
+        "non_terminal": 1,  # PENDING (the #208 carry-forward set)
+    }
+    # None session / no plan → all-zero census, not a crash.
+    assert outcome_terminality(None) == (
+        0,
+        {k: 0 for k in census},
+        0,
+    )
+
+
+def test_outcome_all_terminal_success_grades_met() -> None:
+    session = _outcome_session([TaskStatus.COMPLETED, TaskStatus.NOT_NEEDED])
+    m = metrics_from_events([], arm=_ARM, session=session, plan_mode="ledger")
+    assert m.goal_grade == "met"
+    assert m.goal_success is True
+    assert m.outcome_tasks_total == 2
+    # plan_mode=ledger AND OUTCOME tasks fired → the ledger regime was exercised.
+    assert m.ledger_exercised is True
+
+
+def test_outcome_failed_grades_unmet() -> None:
+    session = _outcome_session([TaskStatus.COMPLETED, TaskStatus.FAILED])
+    m = metrics_from_events([], arm=_ARM, session=session, plan_mode="ledger")
+    assert m.goal_grade == "unmet"
+    assert m.goal_success is False
+    assert "FAILED" in m.goal_reason
+
+
+def test_outcome_non_terminal_grades_unmet_not_silently_met() -> None:
+    # A deliverable still PENDING (uncertain, #208 carry-forward) is NOT a
+    # demonstrated success — it grades UNMET for the flip criterion, never MET.
+    session = _outcome_session([TaskStatus.COMPLETED, TaskStatus.PENDING])
+    m = metrics_from_events([], arm=_ARM, session=session, plan_mode="ledger")
+    assert m.goal_grade == "unmet"
+    assert "non-terminal" in m.goal_reason
+
+
+def test_goal_predicate_gate_precedes_outcome() -> None:
+    # A failing predicate fails the run even when the OUTCOME tasks completed.
+    session = _outcome_session(
+        [TaskStatus.COMPLETED], predicate=lambda _s: False
+    )
+    m = metrics_from_events([], arm=_ARM, session=session, plan_mode="ledger")
+    assert m.goal_grade == "unmet"
+    assert m.goal_predicate_count == 1
+    # A passing predicate + completed OUTCOME → met.
+    ok = _outcome_session([TaskStatus.COMPLETED], predicate=lambda _s: True)
+    m2 = metrics_from_events([], arm=_ARM, session=ok, plan_mode="ledger")
+    assert m2.goal_grade == "met"
+    assert m2.goal_success is True
+
+
+def test_no_signal_is_unmeasured_not_true() -> None:
+    # FORECAST-only plan, no predicate → no grading signal at all. The run is
+    # UNMEASURED, and goal_success is False (never a silent True).
+    session = _outcome_session(
+        [TaskStatus.COMPLETED, TaskStatus.COMPLETED], kind=TaskKind.FORECAST
+    )
+    m = metrics_from_events([], arm=_ARM, session=session, plan_mode="forecast")
+    assert m.goal_grade == "unmeasured"
+    assert m.goal_success is False
+    assert m.outcome_tasks_total == 0
+    assert m.ledger_exercised is False
+
+
+def test_abort_is_a_measured_failure() -> None:
+    session = _outcome_session([TaskStatus.COMPLETED])
+    events = [_FakeEvent("run_aborted", _Aborted("runaway delegation"))]
+    m = metrics_from_events(events, arm=_ARM, session=session, plan_mode="ledger")
+    assert m.aborted is True
+    assert m.goal_grade == "aborted"
+    assert m.goal_success is False
+    assert "runaway delegation" in m.goal_reason
+
+
+def test_ledger_exercised_needs_ledger_mode_and_a_ledger_task() -> None:
+    outcome_session = _outcome_session([TaskStatus.COMPLETED])
+    # OUTCOME tasks present but plan_mode=forecast → not exercised.
+    m_forecast = metrics_from_events(
+        [], arm=_ARM, session=outcome_session, plan_mode="forecast"
+    )
+    assert m_forecast.ledger_exercised is False
+    # DISCOVERED task in ledger mode also counts as exercised.
+    disc = _outcome_session([TaskStatus.COMPLETED], kind=TaskKind.DISCOVERED)
+    m_disc = metrics_from_events([], arm=_ARM, session=disc, plan_mode="ledger")
+    assert m_disc.discovered_tasks_total == 1
+    assert m_disc.outcome_tasks_total == 0
+    assert m_disc.ledger_exercised is True
+
+
+# ---------------------------------------------------------------------------
+# 8. Shadow-diff un-joinable cross-regime keys (§6.4 flip-target comparison)
+# ---------------------------------------------------------------------------
+
+
+def _sig(seq: int, *, task_id: str, kind: str = "off_topic", channel: str = "nudge_replay",
+         **decision: object) -> SignalRecord:
+    return SignalRecord(
+        sequence=seq,
+        drift_id=f"d{seq}",
+        kind=kind,
+        task_id=task_id,
+        channel=channel,
+        severity="critical",
+        turn=1,
+        dry_run=True,
+        ladder_level=str(decision.get("ladder_level", "nudge")),
+        note_text="",
+        decision=dict(decision),
+    )
+
+
+def test_disjoint_task_id_namespaces_are_unjoinable_not_divergence() -> None:
+    # The flip-target case: the legacy log fires OFF_TOPIC on forecast id
+    # "t000"; the new (ledger) log fires the same kind on OUTCOME id "oc-0".
+    # The (kind, task_id, occurrence) key cannot align — this is a join
+    # artifact, NOT a "regime stayed silent" divergence.
+    legacy = [_sig(1, task_id="t000", would_cancel_inflight=True)]
+    new = [_sig(1, task_id="oc-0", channel="request_context", would_cancel_inflight=False)]
+    report = diff_two_logs(legacy, new)
+    assert len(report.unjoinable_keys) == 2
+    assert report.diverged_keys == []  # excluded from the verdict
+    assert report.legacy_only == []  # not counted as genuine silence
+    assert report.new_only == []
+    text = render_two_log_text(report)
+    assert "UN-JOINABLE" in text
+    assert "no decision divergence" in text
+    assert report.to_dict()["unjoinable_keys"] == 2
+
+
+def test_genuine_one_sided_silence_is_not_flagged_unjoinable() -> None:
+    # The new regime never fires LOOPING at all → a genuine new-silence, a real
+    # legacy_only divergence (not a namespace artifact).
+    legacy = [_sig(1, task_id="t0", kind="looping_tool_call", would_cancel_inflight=False)]
+    new = [_sig(1, task_id="t0", kind="off_topic",
+                channel="request_context", would_cancel_inflight=False)]
+    report = diff_two_logs(legacy, new)
+    looping = [k for k in report.keys if k.kind == "looping_tool_call"][0]
+    assert looping.present_in == "legacy_only"
+    assert looping.unjoinable is False
+    assert looping.diverged is True
+    assert looping in report.legacy_only
+
+
+# ---------------------------------------------------------------------------
+# 9. Single-log census blind spot on new-regime logs (defect 4)
+# ---------------------------------------------------------------------------
+
+
+def test_single_log_new_regime_is_blind_to_cancel_divergence() -> None:
+    # A new-regime (request_context) log. would_cancel_inflight is the NEW
+    # regime's own (narrower) verdict, so the single-log census CANNOT reveal
+    # the legacy cancel divergence — it must flag the blind spot, not silently
+    # report "no divergence".
+    records = [
+        _sig(1, task_id="t0", channel="request_context", would_cancel_inflight=False),
+        _sig(2, task_id="t1", channel="request_context", would_cancel_inflight=False),
+    ]
+    census = single_log_report(records)
+    assert census["regime"] == "new"
+    assert census["blind_spot"] is True
+    assert census["divergence_derivable"] is False
+    assert census["undecidable_deliveries"] == 2
+    assert census["diverging_events"] == []
+    text = render_single_log_text(census, path="new.jsonl")
+    assert "BLIND SPOT" in text
+    # It must NOT claim a benign "no divergence derivable from the payloads".
+    assert "no per-event legacy/new divergence derivable from the payloads" not in text
+
+
+def test_single_log_legacy_regime_derivation_still_works() -> None:
+    records = [
+        _sig(1, task_id="t0", channel="nudge_replay", would_cancel_inflight=True),
+        _sig(2, task_id="t1", channel="nudge_replay", would_cancel_inflight=False),
+    ]
+    census = single_log_report(records)
+    assert census["regime"] == "legacy"
+    assert census["blind_spot"] is False
+    assert census["divergence_derivable"] is True
+    # The cancelling delivery is derivably a legacy-vs-new divergence.
+    assert [d["task_id"] for d in census["diverging_events"]] == ["t0"]
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -80,11 +80,21 @@ from goldfive.config import RuntimeConfig
 from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
 from goldfive.sinks import InMemorySink, JSONLPersistenceSink
 from goldfive.steerer import DefaultSteerer
-from goldfive.types import DriftEvent, DriftKind, DriftSeverity
+from goldfive.types import (
+    DriftEvent,
+    DriftKind,
+    DriftSeverity,
+    TaskKind,
+    TaskStatus,
+)
 
 __all__ = [
     "Arm",
     "ArmMetrics",
+    "GOAL_GRADE_ABORTED",
+    "GOAL_GRADE_MET",
+    "GOAL_GRADE_UNMEASURED",
+    "GOAL_GRADE_UNMET",
     "MANAGED_STEER_ENV",
     "KNOWN_STEER_ENV",
     "Scenario",
@@ -94,9 +104,21 @@ __all__ = [
     "inject_demo_signals",
     "make_linear_run_driver",
     "metrics_from_events",
+    "outcome_terminality",
     "run_arm",
     "run_arms",
 ]
+
+#: The §6.4 goal-grading vocabulary. A run is only ``MET`` / ``UNMET`` when a
+#: grading SIGNAL exists — a :attr:`Goal.success_predicate` or an
+#: :attr:`TaskKind.OUTCOME` deliverable task. With neither, the run is
+#: ``UNMEASURED`` (NOT silently ``MET``): ``run.success`` alone is explicitly
+#: not a flip signal (§6.4 rule 1, deviation 1). An aborted run is a measured
+#: failure regardless of grading signals (``ABORTED``).
+GOAL_GRADE_MET = "met"
+GOAL_GRADE_UNMET = "unmet"
+GOAL_GRADE_ABORTED = "aborted"
+GOAL_GRADE_UNMEASURED = "unmeasured"
 
 
 # ---------------------------------------------------------------------------
@@ -287,13 +309,43 @@ class ArmMetrics:
     arm_name: str
     arm_kind: str
     # --- captured-artifact outcome (goldfive#447) ---------------------
+    #: ``True`` ONLY when :attr:`goal_grade` is ``MET`` (a grading signal
+    #: exists and it passed). ``False`` for UNMET / ABORTED **and** for
+    #: UNMEASURED — a run with no goal predicate and no OUTCOME task is NOT a
+    #: silent success (§6.4 rule 1). Read :attr:`goal_grade` to tell UNMET
+    #: (measured failure) from UNMEASURED (no flip signal on this workload).
     goal_success: bool
+    #: One of :data:`GOAL_GRADE_MET` / ``_UNMET`` / ``_ABORTED`` / ``_UNMEASURED``.
+    goal_grade: str
     goal_reason: str
+    #: Number of goals carrying a :attr:`Goal.success_predicate` (the first
+    #: grading signal). ``0`` on the stub workload.
+    goal_predicate_count: int
+    # --- OUTCOME-task terminality (§6.4 rule 1) ------------------------
+    #: Count of :attr:`TaskKind.OUTCOME` tasks in the final plan (the
+    #: goal-anchored deliverables; only minted in ``plan_mode=ledger``).
+    outcome_tasks_total: int
+    #: Terminal-disposition census over the OUTCOME tasks, deterministic key
+    #: order: ``completed`` / ``failed`` / ``not_needed`` / ``cancelled`` /
+    #: ``non_terminal`` (the #208 carry-forward PENDING/RUNNING/BLOCKED set).
+    outcome_terminal: dict[str, int]
+    #: Count of :attr:`TaskKind.DISCOVERED` tasks (descriptive-growth records).
+    discovered_tasks_total: int
     completed_outputs: int
     turns: int
     tokens: int | None  # best-effort; None when the adapter reports no usage
     aborted: bool
     abort_reason: str
+    # --- regime provenance: configured vs. EXERCISED ------------------
+    #: The resolved :attr:`SteeringConfig.plan_mode` this build ran under
+    #: (``forecast`` / ``ledger``) — what the flag *applied* to.
+    plan_mode: str
+    #: ``True`` iff the ledger regime was actually EXERCISED on this workload
+    #: (plan_mode=ledger AND at least one OUTCOME or DISCOVERED task fired).
+    #: A ``plan_mode=ledger`` arm whose workload never mints an OUTCOME /
+    #: DISCOVERED task reports ``False`` — configured is not exercised, and a
+    #: stub that never fires the ledger path must not read as validating it.
+    ledger_exercised: bool
     # --- sink-event telemetry (PR 5) ----------------------------------
     drift_detected: int
     signals_total: int
@@ -353,12 +405,119 @@ def _ledger_refire_rate(session: Session | None) -> float | None:
     return refires / len(delivered)
 
 
+#: OUTCOME-task disposition buckets, in a fixed order so the census dict has
+#: deterministic key order regardless of task iteration.
+_OUTCOME_DISPOSITIONS: tuple[tuple[str, TaskStatus | None], ...] = (
+    ("completed", TaskStatus.COMPLETED),
+    ("failed", TaskStatus.FAILED),
+    ("not_needed", TaskStatus.NOT_NEEDED),
+    ("cancelled", TaskStatus.CANCELLED),
+    ("non_terminal", None),  # PENDING / RUNNING / BLOCKED (#208 carry-forward)
+)
+
+
+def outcome_terminality(
+    session: Session | None,
+) -> tuple[int, dict[str, int], int]:
+    """Census the OUTCOME-task terminal dispositions on a run's final plan.
+
+    Returns ``(outcome_total, disposition_counts, discovered_total)``:
+
+    * ``outcome_total`` — number of :attr:`TaskKind.OUTCOME` tasks (the
+      goal-anchored deliverables; only minted in ``plan_mode=ledger``).
+    * ``disposition_counts`` — deterministic-key census over those tasks:
+      ``completed`` / ``failed`` / ``not_needed`` / ``cancelled`` /
+      ``non_terminal`` (the #208 carry-forward set: uncertain OUTCOME tasks
+      legitimately stay PENDING across turn boundaries — deviation 1).
+    * ``discovered_total`` — number of :attr:`TaskKind.DISCOVERED` tasks
+      (descriptive-growth records); used only to tell whether the ledger
+      path fired at all.
+
+    Pure over ``session.plan.tasks`` (a captured artifact); no runtime state
+    is mutated. Empty/zero when no session or no plan is available.
+    """
+    counts: dict[str, int] = {name: 0 for name, _ in _OUTCOME_DISPOSITIONS}
+    if session is None or getattr(session, "plan", None) is None:
+        return 0, counts, 0
+    outcome_total = 0
+    discovered_total = 0
+    for task in session.plan.tasks:
+        if task.kind is TaskKind.DISCOVERED:
+            discovered_total += 1
+        if task.kind is not TaskKind.OUTCOME:
+            continue
+        outcome_total += 1
+        status = task.status
+        bucket = "non_terminal"
+        for name, wanted in _OUTCOME_DISPOSITIONS:
+            if wanted is not None and status == wanted:
+                bucket = name
+                break
+        counts[bucket] += 1
+    return outcome_total, counts, discovered_total
+
+
+def _grade_goal(
+    session: Session | None,
+    *,
+    aborted: bool,
+    abort_reason: str,
+    predicate_count: int,
+    outcome_total: int,
+    outcome_terminal: dict[str, int],
+) -> tuple[str, str]:
+    """Grade a run on goal predicates + OUTCOME-task terminality (§6.4 rule 1).
+
+    Returns ``(grade, reason)`` where ``grade`` is one of the
+    :data:`GOAL_GRADE_MET` vocabulary. The cardinal rule: a run is graded a
+    success ONLY when a grading SIGNAL exists and it passes. ``run.success``
+    alone is never a flip signal — with no goal ``success_predicate`` and no
+    OUTCOME deliverable, the run is :data:`GOAL_GRADE_UNMEASURED`, never
+    silently ``MET`` (deviation 1). An abort is a measured failure.
+    """
+    if session is None:
+        return GOAL_GRADE_UNMEASURED, "no session captured"
+    if aborted:
+        return GOAL_GRADE_ABORTED, abort_reason or "run aborted"
+    has_signal = predicate_count > 0 or outcome_total > 0
+    if not has_signal:
+        return (
+            GOAL_GRADE_UNMEASURED,
+            "no goal success_predicate and no OUTCOME task — run success is "
+            "not gradeable (run.success alone is not a flip signal)",
+        )
+    if predicate_count > 0:
+        reason = evaluate_goal_predicates(session)
+        if reason is not None:
+            return GOAL_GRADE_UNMET, reason
+    if outcome_total > 0:
+        failed = outcome_terminal.get("failed", 0)
+        if failed:
+            return GOAL_GRADE_UNMET, f"{failed} OUTCOME task(s) FAILED"
+        cancelled = outcome_terminal.get("cancelled", 0)
+        if cancelled:
+            return GOAL_GRADE_UNMET, f"{cancelled} OUTCOME task(s) CANCELLED"
+        non_terminal = outcome_terminal.get("non_terminal", 0)
+        if non_terminal:
+            # Conservative for the flip criterion: a deliverable that never
+            # reached a successful terminal is not a demonstrated success (it
+            # is legitimately uncertain/carried-forward — deviation 1 — but
+            # not gradeable as MET).
+            return (
+                GOAL_GRADE_UNMET,
+                f"{non_terminal} OUTCOME task(s) non-terminal "
+                "(deliverable not demonstrably met; #208 carry-forward)",
+            )
+    return GOAL_GRADE_MET, ""
+
+
 def metrics_from_events(
     events: Sequence[Any],
     *,
     arm: Arm,
     session: Session | None = None,
     tokens: int | None = None,
+    plan_mode: str = "forecast",
     jsonl_path: str = "",
 ) -> ArmMetrics:
     """Reduce a captured event stream (+ optional session) to an :class:`ArmMetrics`.
@@ -411,25 +570,44 @@ def metrics_from_events(
         turns = int(getattr(session, "_reasoning_turn", 0) or 0)
     turns = max(turns, task_terminal)
 
-    goal_reason = ""
-    goal_success = not aborted
-    if session is not None:
-        reason = evaluate_goal_predicates(session)
-        if reason is not None:
-            goal_success = False
-            goal_reason = reason
+    # OUTCOME-task terminality (§6.4 rule 1) + ledger-exercised provenance.
+    outcome_total, outcome_terminal, discovered_total = outcome_terminality(session)
+    predicate_count = (
+        sum(1 for g in session.goals if g.success_predicate is not None)
+        if session is not None
+        else 0
+    )
+    goal_grade, goal_reason = _grade_goal(
+        session,
+        aborted=aborted,
+        abort_reason=abort_reason,
+        predicate_count=predicate_count,
+        outcome_total=outcome_total,
+        outcome_terminal=outcome_terminal,
+    )
+    goal_success = goal_grade == GOAL_GRADE_MET
+    ledger_exercised = plan_mode == "ledger" and (
+        outcome_total > 0 or discovered_total > 0
+    )
 
     applied, pending = arm_flag_status(arm)
     return ArmMetrics(
         arm_name=arm.name,
         arm_kind=arm.kind,
         goal_success=goal_success,
+        goal_grade=goal_grade,
         goal_reason=goal_reason,
+        goal_predicate_count=predicate_count,
+        outcome_tasks_total=outcome_total,
+        outcome_terminal=outcome_terminal,
+        discovered_tasks_total=discovered_total,
         completed_outputs=completed_outputs,
         turns=turns,
         tokens=tokens,
         aborted=aborted,
         abort_reason=abort_reason,
+        plan_mode=plan_mode,
+        ledger_exercised=ledger_exercised,
         drift_detected=drift_detected,
         signals_total=signals_total,
         signals_real=signals_real,
@@ -502,6 +680,7 @@ async def run_arm(
         arm=arm,
         session=outcome.session,
         tokens=tokens,
+        plan_mode=str(getattr(runtime.steering, "plan_mode", "forecast") or "forecast"),
         jsonl_path=str(jsonl_path),
     )
 
