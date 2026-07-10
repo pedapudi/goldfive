@@ -1460,6 +1460,91 @@ class PlanReviser:
         )
         return dataclasses.replace(revised, tasks=tuple(new_tasks))
 
+    def _preserve_ledger_identity(self, revised: Plan, prior: Plan | None) -> Plan:
+        """Carry the ledger taxonomy + DISCOVERED identity across a revision.
+
+        AGENCY-PRESERVATION.md Stage 3 PR 10/11(c). A no-op unless
+        ``SteeringConfig.plan_mode == "ledger"`` — forecast-mode installs
+        return ``revised`` untouched (bit-identical guarantee).
+
+        In ledger mode the plan is a ledger of goal-anchored OUTCOME
+        deliverables plus a descriptively-grown DISCOVERED trajectory. The
+        LLM-driven refine / user-steer paths reconstruct the plan from
+        JSON (``_plan_from_json``), which resets every ``Task.kind`` to the
+        FORECAST default and drops ``discovered`` / ``discovery_identity_hash``
+        / ``contributes_to`` / ``assignee_agent_id``. Left alone that
+        relabels OUTCOME deliverables as FORECAST (the outcome-progress
+        judge only grades OUTCOME tasks, so the flagship regime goes dark)
+        and severs the DISCOVERED lane's provenance. Two repairs, keyed by
+        id against ``prior``:
+
+        * **Preserve** — for a revised task whose id exists in ``prior``
+          with a non-FORECAST ledger kind, copy the prior ``kind`` and the
+          DISCOVERED identity fields (a non-empty prior value wins for the
+          hash / contributes_to / assignee; the revised task never carries
+          them since ``_plan_from_json`` drops them).
+        * **Stamp** — a genuinely new task (id absent from ``prior``,
+          still FORECAST) is a new OUTCOME deliverable, matching
+          :func:`goldfive.planner._stamp_ledger_outcome_kinds`.
+
+        Additionally, a NON-TERMINAL DISCOVERED task in ``prior`` that the
+        revision silently dropped is re-appended as an independent node
+        (no edges — DISCOVERED tasks are sub-DAG roots): the observed
+        trajectory is a historical record a refine must not erase.
+        Terminal DISCOVERED tasks are already validator-protected
+        (terminal-task preservation) so they are never re-added here.
+
+        Returns a NEW :class:`Plan` when anything changed (frozen-Plan
+        invariant, goldfive#247); the input reference otherwise.
+        """
+        if not self._ledger_mode():
+            return revised
+        prior_tasks = list(getattr(prior, "tasks", None) or ())
+        prior_by_id: dict[str, Task] = {t.id: t for t in prior_tasks if t.id}
+        revised_ids = {t.id for t in revised.tasks if t.id}
+        new_tasks: list[Task] = []
+        changed = False
+        for t in revised.tasks:
+            pt = prior_by_id.get(t.id)
+            if pt is not None and pt.kind is not TaskKind.FORECAST:
+                replacement = dataclasses.replace(
+                    t,
+                    kind=pt.kind,
+                    discovered=pt.discovered or t.discovered,
+                    discovery_identity_hash=(
+                        pt.discovery_identity_hash or t.discovery_identity_hash
+                    ),
+                    contributes_to=pt.contributes_to or t.contributes_to,
+                    assignee_agent_id=t.assignee_agent_id or pt.assignee_agent_id,
+                )
+                if replacement != t:
+                    changed = True
+                new_tasks.append(replacement)
+            elif pt is None and t.kind is TaskKind.FORECAST:
+                new_tasks.append(dataclasses.replace(t, kind=TaskKind.OUTCOME))
+                changed = True
+            else:
+                new_tasks.append(t)
+        readded: list[str] = []
+        for pt in prior_tasks:
+            if not pt.id or pt.id in revised_ids:
+                continue
+            is_discovered = pt.kind is TaskKind.DISCOVERED or pt.discovered
+            if is_discovered and pt.status not in TERMINAL_TASK_STATUSES:
+                new_tasks.append(pt)
+                readded.append(pt.id)
+        if readded:
+            changed = True
+            log.info(
+                "PlanReviser._preserve_ledger_identity: re-added %d dropped "
+                "non-terminal DISCOVERED task(s): %s",
+                len(readded),
+                ", ".join(readded),
+            )
+        if not changed:
+            return revised
+        return dataclasses.replace(revised, tasks=tuple(new_tasks))
+
     @staticmethod
     def _plans_structurally_identical(prior: Plan | None, revised: Plan) -> bool:
         """Return ``True`` iff ``revised`` has the same structural shape as ``prior``.
@@ -1817,6 +1902,18 @@ class PlanReviser:
         # already matches prior's terminal, this is a no-op. Returns a
         # NEW Plan (goldfive#247: Plan is frozen).
         revised = self._fold_runtime_terminal_statuses(revised, prev)
+        # AGENCY-PRESERVATION.md Stage 3 — ledger taxonomy preservation.
+        # The refine / user-steer paths rebuild the plan from LLM JSON via
+        # ``_plan_from_json``, which resets every ``Task.kind`` to the
+        # FORECAST default and drops the DISCOVERED identity fields. In
+        # ledger mode that silently erases the OUTCOME / DISCOVERED
+        # taxonomy — permanently disabling outcome judging — and can drop
+        # the DISCOVERED trajectory record. Re-fold the ledger identity
+        # from the prior plan here, the single chokepoint every install
+        # path (drift refine, user-steer, handle_turn, initial) funnels
+        # through. Ledger-gated: a no-op in forecast mode (Plan returned
+        # unchanged), so forecast-mode installs stay bit-identical.
+        revised = self._preserve_ledger_identity(revised, prev)
         prior_id = (getattr(prev, "id", "") or "") if prev is not None else ""
         next_index = (prev.revision_index + 1) if prev is not None else 1
         # goldfive#247: Plan is frozen — derive a new instance with the

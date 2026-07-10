@@ -782,3 +782,90 @@ async def test_lifecycle_deep_hierarchy() -> None:
     assert statuses == {"t0": TaskStatus.COMPLETED, "t1": TaskStatus.COMPLETED}
     # coord1 is plumbing — no PLAN_DIVERGENCE.
     assert steerer.drifts == []
+
+
+# ---------------------------------------------------------------------------
+# 9. Outcome-progress evidence capture (AGENCY-PRESERVATION.md PR 11(c)).
+#
+# In overlay mode — the ONLY execution mode ledger plan mode supports —
+# the executors that normally populate ``session.completed_outputs``
+# never run, so the outcome-progress judge would have no evidence. The
+# reconciler is the observation entry point that captures the agent's
+# observed output on task completion. Ledger-gated: forecast mode leaves
+# ``completed_outputs`` untouched.
+# ---------------------------------------------------------------------------
+
+
+class _LedgerSteerer(_RecordingSteerer):
+    """Recording steerer that also exposes a typed ledger/forecast config."""
+
+    def __init__(self, *, plan_mode: str) -> None:
+        super().__init__()
+        from goldfive.config import SteeringConfig
+
+        self._steering_config = SteeringConfig(plan_mode=plan_mode)
+
+
+async def test_after_agent_captures_completed_output_in_ledger_mode() -> None:
+    session = _make_session(
+        [
+            Task(id="t0", title="research", assignee_agent_id="research_agent"),
+        ]
+    )
+    steerer = _LedgerSteerer(plan_mode="ledger")
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="coordinator")
+
+    await rec.on_before_agent(agent_name="research_agent", invocation_id="inv1")
+    await rec.on_after_agent(
+        agent_name="research_agent",
+        invocation_id="inv1",
+        summary="found 3 facts about cherry trees",
+    )
+
+    # The observed output is now available to the outcome-progress judge,
+    # keyed by the closed task id.
+    assert session.completed_outputs["t0"] == "found 3 facts about cherry trees"
+    assert session.plan.tasks[0].status is TaskStatus.COMPLETED
+
+
+async def test_after_agent_does_not_capture_output_in_forecast_mode() -> None:
+    session = _make_session(
+        [
+            Task(id="t0", title="research", assignee_agent_id="research_agent"),
+        ]
+    )
+    steerer = _LedgerSteerer(plan_mode="forecast")
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="coordinator")
+
+    await rec.on_before_agent(agent_name="research_agent", invocation_id="inv1")
+    await rec.on_after_agent(
+        agent_name="research_agent",
+        invocation_id="inv1",
+        summary="found 3 facts",
+    )
+
+    # Forecast mode: the capture is a no-op — bit-identical to pre-PR-11.
+    assert session.completed_outputs == {}
+    assert session.plan.tasks[0].status is TaskStatus.COMPLETED
+
+
+async def test_after_agent_failed_task_does_not_capture_output() -> None:
+    session = _make_session(
+        [
+            Task(id="t0", title="research", assignee_agent_id="research_agent"),
+        ]
+    )
+    steerer = _LedgerSteerer(plan_mode="ledger")
+    rec = PlanReconciler(session=session, steerer=steerer, host_agent_name="coordinator")
+
+    await rec.on_before_agent(agent_name="research_agent", invocation_id="inv1")
+    await rec.on_after_agent(
+        agent_name="research_agent",
+        invocation_id="inv1",
+        error=RuntimeError("boom"),
+        summary="partial",
+    )
+
+    # A FAILED task is not evidence of a produced deliverable.
+    assert session.completed_outputs == {}
+    assert session.plan.tasks[0].status is TaskStatus.FAILED
