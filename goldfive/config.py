@@ -842,7 +842,7 @@ class SteeringConfig:
     #: data-model fields shipped in PR 1 (``Task.discovered``,
     #: ``Task.discovery_identity_hash``, ``DelegationObserved.tool_args_json``)
     #: are always available regardless of this flag.
-    descriptive_growth_enabled: bool = True
+    descriptive_growth_enabled: bool = False
     #: AGENCY-PRESERVATION.md PR 5 (#449/#452) — signal telemetry.
     #: When ``True`` the drift observer emits ``SignalDelivered`` /
     #: ``SignalOutcome`` events and maintains the StateStore-backed

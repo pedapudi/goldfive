@@ -3,7 +3,9 @@
 Pins the completed #423 contract per
 ``docs/design/PLAN-DESCRIPTIVE-GROWTH.md`` §4.3: the growth trigger
 lives in the delegation pin, not the CAPABILITY_MISMATCH verdict path.
-When ``SteeringConfig.descriptive_growth_enabled`` is ON (the default):
+When ``SteeringConfig.descriptive_growth_enabled`` is ON (opt-in; the
+default is OFF per AGENCY-PRESERVATION.md §5.1 until PR 13b justifies a
+flip — the tests below enable it explicitly via ``_make_steerer``):
 
 * a tier-1 (required-tools cover) or tier-2 (agent-name stem) hit pins
   the forecast task exactly as before — NO growth;
@@ -564,6 +566,15 @@ async def test_2d27ff4a_repeated_delegations_one_task_no_drift() -> None:
 # ---------------------------------------------------------------------------
 # Legacy escape hatches.
 # ---------------------------------------------------------------------------
+
+
+def test_descriptive_growth_defaults_off() -> None:
+    """The flag ships default-OFF (AGENCY-PRESERVATION.md §5.1): every
+    behavior-changing branch flag is no-op-by-default until PR 13b's
+    measurement justifies a flip. Growth is opt-in via an explicit
+    ``descriptive_growth_enabled=True``.
+    """
+    assert SteeringConfig().descriptive_growth_enabled is False
 
 
 async def test_flag_off_keeps_legacy_tier3_pin() -> None:
