@@ -1122,3 +1122,60 @@ async def test_discovery_via_install_revision_for_drift_under_observation_only()
     revised_events = _plan_revised_events(sink)
     assert len(revised_events) == 1
     assert revised_events[0].plan_revised.dry_run is False
+
+
+# ---------------------------------------------------------------------------
+# Shared flag accessors (siblings of steering_is_active — one default each)
+# ---------------------------------------------------------------------------
+
+
+def test_signal_channel_single_default_and_failsafe() -> None:
+    from goldfive.steerer import signal_channel
+
+    class _WithChannel:
+        _signal_channel = "request_context"
+
+    class _Bare:
+        pass
+
+    class _Wrong:
+        _signal_channel = 7  # non-string resolves to the fail-safe default
+
+    assert signal_channel(_WithChannel()) == "request_context"
+    assert signal_channel(_Bare()) == "legacy_user_message"
+    assert signal_channel(None) == "legacy_user_message"
+    assert signal_channel(_Wrong()) == "legacy_user_message"
+    assert signal_channel(type("E", (), {"_signal_channel": ""})()) == "legacy_user_message"
+
+
+def test_plan_mode_is_ledger_single_parse_and_failsafe() -> None:
+    from goldfive.steerer import plan_mode_is_ledger
+
+    class _Cfg:
+        def __init__(self, mode: object) -> None:
+            self.plan_mode = mode
+
+    class _Steerer:
+        def __init__(self, mode: object) -> None:
+            self._steering_config = _Cfg(mode)
+
+    assert plan_mode_is_ledger(_Steerer("ledger")) is True
+    assert plan_mode_is_ledger(_Steerer("  LEDGER  ")) is True  # normalised
+    assert plan_mode_is_ledger(_Steerer("forecast")) is False
+    assert plan_mode_is_ledger(None) is False
+    assert plan_mode_is_ledger(type("B", (), {})()) is False
+
+
+def test_ledger_mode_methods_delegate_to_shared_helper() -> None:
+    # The three _ledger_mode methods (reconciler / plan reviser / drift
+    # observer) must agree with the shared parse by construction — a stub
+    # steerer with a ledger config reads True through every one of them.
+    from goldfive.config import SteeringConfig
+    from goldfive.steerer import DefaultSteerer, plan_mode_is_ledger
+
+    steerer = DefaultSteerer(
+        steering_config=SteeringConfig(plan_mode="ledger", observation_only=True)
+    )
+    assert plan_mode_is_ledger(steerer) is True
+    assert steerer.drift._ledger_mode() is True
+    assert steerer.plans._ledger_mode() is True

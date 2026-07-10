@@ -217,6 +217,19 @@ def _nearest_rank_percentile(sorted_samples: list[int], q: float) -> int:
 
 
 log = logging.getLogger(__name__)
+
+
+def _signal_channel_of(steerer):
+    """Resolve the signal channel via :func:`goldfive.steerer.signal_channel`.
+
+    Lazy-import shim: this module cannot import :mod:`goldfive.steerer` at
+    load time (the steerer constructs :class:`DriftObserver`), so the shared
+    single-default helper is reached per call. Import cost is a dict hit
+    after the first call.
+    """
+    from goldfive.steerer import signal_channel
+
+    return signal_channel(steerer)
 # Wave C bucket 3b/3c post-cleanup: the module previously kept a
 # sibling ``_steerer_log = logging.getLogger("goldfive.steerer")``
 # because the test corpus asserted on ``record.name == "goldfive.steerer"``.
@@ -1101,7 +1114,7 @@ class DriftObserver:
         is a no-op there (§5.1). Best-effort: any failure degrades to
         ``"proceed"`` so pacing never blocks a legitimate signal.
         """
-        channel = getattr(self._steerer, "_signal_channel", "legacy_user_message")
+        channel = _signal_channel_of(self._steerer)
         if channel != "request_context":
             # Legacy regime: no queue visibility, and the promotion path's #441
             # gate is unchanged — PR 8 is a no-op here (§5.1).
@@ -1208,7 +1221,7 @@ class DriftObserver:
         the executor's replay header only claims a plan revision when one
         truly installed (goldfive#475 truthfulness).
         """
-        channel = getattr(self._steerer, "_signal_channel", "legacy_user_message")
+        channel = _signal_channel_of(self._steerer)
         if channel == "request_context":
             from goldfive.events import SIGNAL_CHANNEL_REQUEST_CONTEXT
             from goldfive.observer_note_queue import ObserverNoteQueue
@@ -1413,7 +1426,7 @@ class DriftObserver:
             # the dispatch-time ``has_real_delivery`` attribution.
             rendered_keys: set[tuple[str, str]] | None = None
             if (
-                getattr(self._steerer, "_signal_channel", "legacy_user_message")
+                _signal_channel_of(self._steerer)
                 == "request_context"
             ):
                 from goldfive.observer_note_queue import ObserverNoteQueue
@@ -3909,16 +3922,16 @@ class DriftObserver:
     def _ledger_mode(self) -> bool:
         """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
 
-        AGENCY-PRESERVATION.md Stage 3 PR 11. Read off the steerer's
-        typed config exactly as the pin path / reviser read it. Defensive:
-        any read failure resolves to forecast mode, so the goal-drift
-        judge stays on its pre-PR-11 binary/CRITICAL path by default.
+        AGENCY-PRESERVATION.md Stage 3 PR 11. Delegates to
+        :func:`goldfive.steerer.plan_mode_is_ledger` — the single
+        implementation of the parse. Defensive: any failure resolves to
+        forecast mode, so the goal-drift judge stays on its pre-PR-11
+        binary/CRITICAL path by default.
         """
         try:
-            cfg = getattr(self._steerer, "_steering_config", None)
-            if cfg is None:
-                return False
-            return str(getattr(cfg, "plan_mode", "forecast")).strip().lower() == "ledger"
+            from goldfive.steerer import plan_mode_is_ledger
+
+            return plan_mode_is_ledger(self._steerer)
         except Exception:  # noqa: BLE001
             return False
 

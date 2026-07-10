@@ -65,6 +65,7 @@ from goldfive.executors._shared import (
 )
 from goldfive.protocols import AgentAdapter, EventSink, Executor, Planner, Steerer
 from goldfive.results import ExecutionOutcome, evaluate_goal_predicates
+from goldfive.steerer import signal_channel as _signal_channel_of
 from goldfive.steerer import steering_is_active
 from goldfive.types import (
     DriftKind,
@@ -1632,7 +1633,7 @@ class SequentialExecutor(Executor):
         is no longer pending here, so it is never re-delivered
         (exactly-once, §5.2).
         """
-        if getattr(steerer, "_signal_channel", "legacy_user_message") == "request_context":
+        if _signal_channel_of(steerer) == "request_context":
             replay_msg: str | None = None
             if (
                 state.nudge_replays < self._MAX_NUDGE_REPLAYS

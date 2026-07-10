@@ -667,17 +667,15 @@ class PlanReconciler:
     def _ledger_mode(self) -> bool:
         """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
 
-        Reads through the bound steerer's typed config exactly as
-        :meth:`_maybe_grow_discovered_task` reads
-        ``descriptive_growth_enabled``. Defensive: any read failure
-        (custom steerer without a typed config, test stub) resolves to
+        Delegates to :func:`goldfive.steerer.plan_mode_is_ledger` — the
+        single implementation of the parse (three modules previously
+        re-implemented it verbatim). Defensive: any failure resolves to
         forecast mode so the legacy overlay path is untouched.
         """
         try:
-            cfg = getattr(self._steerer, "_steering_config", None)
-            if cfg is None:
-                return False
-            return str(getattr(cfg, "plan_mode", "forecast")).strip().lower() == "ledger"
+            from goldfive.steerer import plan_mode_is_ledger
+
+            return plan_mode_is_ledger(self._steerer)
         except Exception:  # noqa: BLE001
             return False
 

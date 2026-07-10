@@ -151,17 +151,15 @@ class PlanReviser:
     def _ledger_mode(self) -> bool:
         """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
 
-        AGENCY-PRESERVATION.md Stage 3 PR 10. Reads through
-        ``steerer._steering_config.plan_mode`` (the typed config), exactly
-        as the pin path reads ``descriptive_growth_enabled``. Defensive:
-        any read failure (custom steerer without a typed config, test
-        stub) resolves to forecast mode, keeping the legacy behaviour.
+        AGENCY-PRESERVATION.md Stage 3 PR 10. Delegates to
+        :func:`goldfive.steerer.plan_mode_is_ledger` — the single
+        implementation of the parse. Defensive: any failure resolves to
+        forecast mode, keeping the legacy behaviour.
         """
         try:
-            cfg = getattr(self._steerer, "_steering_config", None)
-            if cfg is None:
-                return False
-            return str(getattr(cfg, "plan_mode", "forecast")).strip().lower() == "ledger"
+            from goldfive.steerer import plan_mode_is_ledger
+
+            return plan_mode_is_ledger(self._steerer)
         except Exception:  # noqa: BLE001
             return False
 
