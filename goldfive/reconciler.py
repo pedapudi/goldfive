@@ -372,6 +372,19 @@ class PlanReconciler:
                 self._session.state, task, TaskStatus.FAILED
             )
             return
+        # AGENCY-PRESERVATION.md PR 11(c): capture the observed output as
+        # outcome-progress evidence BEFORE the COMPLETED transition (the
+        # transition re-enters the task-boundary hook that spawns the
+        # outcome-progress judge, which reads ``session.completed_outputs``).
+        # In overlay mode — the ONLY execution mode ledger plan mode
+        # supports — the executors that normally populate
+        # ``completed_outputs`` never run, so without this the outcome
+        # judge has no evidence and can never decide OUTCOME completion.
+        # Keyed by the closed task id (the DISCOVERED trajectory task) so
+        # the judge can attribute contributing steps. Ledger-gated: in
+        # forecast mode the dict is left untouched (bit-identical to
+        # pre-PR-11).
+        self._maybe_record_completed_output(task_id, summary)
         try:
             await self._steerer.transition(
                 task_id,
@@ -650,6 +663,50 @@ class PlanReconciler:
                 exc,
             )
             return None
+
+    def _ledger_mode(self) -> bool:
+        """Return True iff ``SteeringConfig.plan_mode == "ledger"``.
+
+        Reads through the bound steerer's typed config exactly as
+        :meth:`_maybe_grow_discovered_task` reads
+        ``descriptive_growth_enabled``. Defensive: any read failure
+        (custom steerer without a typed config, test stub) resolves to
+        forecast mode so the legacy overlay path is untouched.
+        """
+        try:
+            cfg = getattr(self._steerer, "_steering_config", None)
+            if cfg is None:
+                return False
+            return str(getattr(cfg, "plan_mode", "forecast")).strip().lower() == "ledger"
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _maybe_record_completed_output(self, task_id: str, summary: str) -> None:
+        """Record ``summary`` as the outcome-progress evidence for ``task_id``.
+
+        AGENCY-PRESERVATION.md PR 11(c). In ledger plan mode the
+        outcome-progress judge (``drift/outcome_progress.py``) grades
+        OUTCOME deliverables against ``session.completed_outputs`` — the
+        full-output capture the executors populate in the driving model.
+        Ledger plan mode only ever runs the overlay model, where the
+        executors never see task outputs, so this is the observation
+        entry point that populates that evidence source. No-op (and no
+        write) in forecast mode, so forecast-mode observation state is
+        byte-identical to pre-PR-11.
+        """
+        if not task_id or not summary:
+            return
+        if not self._ledger_mode():
+            return
+        try:
+            self._session.completed_outputs[task_id] = summary
+        except Exception as exc:  # noqa: BLE001 — observability capture
+            log.debug(
+                "PlanReconciler._maybe_record_completed_output: capture "
+                "for %r raised: %s",
+                task_id,
+                exc,
+            )
 
     def _find_task(self, task_id: str) -> Task | None:
         plan = self._session.plan

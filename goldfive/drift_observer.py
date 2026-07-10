@@ -4283,10 +4283,34 @@ class DriftObserver:
             run_ending=run_ending,
             goal_predicates_met=predicates_met,
         )
-        await self._apply_outcome_transitions(session, transitions)
+        # ``plan`` is the snapshot the verdicts were computed against
+        # BEFORE the judge's LLM round-trip; ``session.plan`` may have
+        # been revised in between (a USER_STEER refine can regenerate
+        # OUTCOME deliverables under reused ids). Pass the snapshot so the
+        # apply path can drop any verdict whose target no longer matches.
+        await self._apply_outcome_transitions(session, transitions, snapshot_plan=plan)
+
+    @staticmethod
+    def _outcome_stability_token(task: Any) -> tuple[str, str]:
+        """Stability token for an OUTCOME task's identity across a revision.
+
+        Pairs the ledger ``kind`` with the (normalised) title. A verdict
+        computed against a snapshot task is only safe to apply to the live
+        task of the same id when this token still matches — a reused id
+        carrying a different deliverable (different kind or title) is a
+        distinct task the stale verdict must not touch.
+        """
+        kind = getattr(task, "kind", None)
+        kind_str = str(getattr(kind, "value", kind) or "")
+        title = (getattr(task, "title", "") or "").strip()
+        return (kind_str, title)
 
     async def _apply_outcome_transitions(
-        self, session: Session, transitions: list[Any]
+        self,
+        session: Session,
+        transitions: list[Any],
+        *,
+        snapshot_plan: Any | None = None,
     ) -> None:
         """Apply outcome transitions: stamp contributes_to, then transition.
 
@@ -4297,9 +4321,54 @@ class DriftObserver:
         Marking an OUTCOME terminal re-enters ``mark_task_*`` → the
         task-boundary hook, which the PR 11(c) OUTCOME-skip guard
         short-circuits, so this does not recurse.
+
+        ``snapshot_plan`` (when supplied) is the plan the verdicts were
+        computed against, before the judge's LLM round-trip. The freshness
+        gate below mirrors the reasoning-judge late-verdict discipline
+        (goldfive#319): the evaluate → apply gap yields the event loop, so
+        a concurrent USER_STEER refine may have swapped ``session.plan``.
+        A transition is applied only when the LIVE task of the same id
+        still carries the snapshot's stability token and is non-terminal;
+        otherwise the verdict is stale (the deliverable it graded is gone
+        or has been replaced under the same id) and is skipped, so a stale
+        ``met`` verdict cannot false-complete a different deliverable.
         """
         if not transitions:
             return
+        if snapshot_plan is not None:
+            snap_tokens = {
+                t.id: self._outcome_stability_token(t)
+                for t in (getattr(snapshot_plan, "tasks", None) or ())
+                if getattr(t, "id", "")
+            }
+            live_by_id = {
+                t.id: t
+                for t in (getattr(session.plan, "tasks", None) or ())
+                if getattr(t, "id", "")
+            }
+            fresh: list[Any] = []
+            for tr in transitions:
+                live = live_by_id.get(tr.task_id)
+                snap_token = snap_tokens.get(tr.task_id)
+                if (
+                    live is None
+                    or snap_token is None
+                    or self._outcome_stability_token(live) != snap_token
+                    or getattr(live, "status", None) in TERMINAL_TASK_STATUSES
+                ):
+                    log.info(
+                        "DefaultSteerer: stale outcome verdict for task %r "
+                        "skipped; plan was revised under the judge round-trip "
+                        "(snapshot token %r, live token %r)",
+                        tr.task_id,
+                        snap_token,
+                        None if live is None else self._outcome_stability_token(live),
+                    )
+                    continue
+                fresh.append(tr)
+            transitions = fresh
+            if not transitions:
+                return
         stamps: list[tuple[str, str]] = [
             pair for tr in transitions for pair in getattr(tr, "contributes_stamps", ())
         ]

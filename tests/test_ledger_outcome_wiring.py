@@ -294,3 +294,102 @@ def test_executor_plan_mode_reads_steerer_config() -> None:
     assert _executor_plan_mode(forecast) == "forecast"
     # Defensive: a steerer without a typed config → forecast.
     assert _executor_plan_mode(object()) == "forecast"
+
+
+# ---------------------------------------------------------------------------
+# Outcome-verdict freshness gate (same-id false-complete guard).
+#
+# The judge computes verdicts against a plan snapshot BEFORE an LLM
+# round-trip; ``session.plan`` may be swapped by a concurrent USER_STEER
+# refine during that round-trip. A verdict is applied only when the live
+# task of the same id still carries the snapshot's stability token.
+# ---------------------------------------------------------------------------
+
+
+def _swap_plan(session: Session, new_plan: Plan) -> None:
+    from goldfive.types import channel_processor_active, set_session_plan
+
+    with channel_processor_active():
+        set_session_plan(session, new_plan)
+
+
+def test_finalize_outcomes_skips_stale_verdict_after_reused_id_revision() -> None:
+    # The judge says the OLD o1 is met, but a refine lands DURING the
+    # round-trip that regenerates o1 as a DIFFERENT deliverable under the
+    # same id. The stale "met" must NOT false-complete the new o1.
+    session = _ledger_session()
+    payload = (
+        '{"outcomes": [{"task_id": "o1", "assessment": "met", '
+        '"reason": "old summary present"}]}'
+    )
+
+    async def racing_llm(system: str, user: str, model: str) -> str:
+        _swap_plan(
+            session,
+            Plan(
+                id=session.plan.id,
+                run_id=session.plan.run_id,
+                goal_ids=list(session.plan.goal_ids),
+                tasks=(
+                    Task(id="o1", title="Entirely different deliverable", kind=TaskKind.OUTCOME),
+                    Task(id="o2", title="Translation delivered", kind=TaskKind.OUTCOME),
+                ),
+                edges=(),
+                revision_index=session.plan.revision_index + 1,
+            ),
+        )
+        return payload
+
+    steerer = _make_steerer(plan_mode="ledger", judge_llm=racing_llm)
+    asyncio.run(steerer.finalize_outcomes(session))
+
+    by_id = {t.id: t for t in session.plan.tasks}
+    assert by_id["o1"].status is TaskStatus.PENDING  # stale verdict skipped
+
+
+def test_finalize_outcomes_skips_verdict_when_outcome_task_removed() -> None:
+    # A refine drops o1 entirely during the round-trip; the verdict for a
+    # now-absent task is skipped rather than raising / mis-applying.
+    session = _ledger_session()
+    payload = (
+        '{"outcomes": [{"task_id": "o1", "assessment": "met", "reason": "x"},'
+        '{"task_id": "o2", "assessment": "met", "reason": "y"}]}'
+    )
+
+    async def racing_llm(system: str, user: str, model: str) -> str:
+        _swap_plan(
+            session,
+            Plan(
+                id=session.plan.id,
+                run_id=session.plan.run_id,
+                goal_ids=list(session.plan.goal_ids),
+                tasks=(
+                    Task(id="o2", title="Translation delivered", kind=TaskKind.OUTCOME),
+                ),
+                edges=(),
+                revision_index=session.plan.revision_index + 1,
+            ),
+        )
+        return payload
+
+    steerer = _make_steerer(plan_mode="ledger", judge_llm=racing_llm)
+    asyncio.run(steerer.finalize_outcomes(session))
+
+    by_id = {t.id: t for t in session.plan.tasks}
+    assert "o1" not in by_id  # dropped by the refine, not resurrected
+    # o2 still matches its snapshot token → its met verdict applies.
+    assert by_id["o2"].status is TaskStatus.COMPLETED
+
+
+def test_finalize_outcomes_applies_verdict_when_token_stable() -> None:
+    # Control: an unchanged plan (matching stability token) still applies
+    # the met verdict — the freshness gate does not over-reject.
+    session = _ledger_session()
+    payload = (
+        '{"outcomes": [{"task_id": "o1", "assessment": "met", "reason": "present"}]}'
+    )
+    steerer = _make_steerer(plan_mode="ledger", judge_llm=_judge(payload))
+    asyncio.run(steerer.finalize_outcomes(session))
+
+    by_id = {t.id: t for t in session.plan.tasks}
+    assert by_id["o1"].status is TaskStatus.COMPLETED
